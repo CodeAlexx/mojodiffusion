@@ -791,7 +791,12 @@ var SimpleMode = (function () {
     function loadModels() {
         Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities()])
             .then(function (loaded) {
-            var models = loaded[0];
+            // SCAIL-2 needs four uploaded media inputs; its complete surface is
+            // the Generate tab, so do not expose an unusable text-only card in
+            // Simple mode.
+            var models = loaded[0].filter(function (model) {
+                return ModelUtils.detectArchFromFilename(model.name) !== 'scail2';
+            });
             state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');

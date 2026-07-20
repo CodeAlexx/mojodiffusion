@@ -19,6 +19,7 @@ var ModelsTab = (function () {
         ltxv: '#10b981',
         wan: '#f59e0b',
         bernini: '#e879f9',
+        scail2: '#22d3ee',
         klein: '#ec4899',
         any: '#6b7280'
     };
@@ -32,6 +33,8 @@ var ModelsTab = (function () {
             return '~7 GB';
         if (f.includes('sd3'))
             return '~5 GB';
+        if (f.includes('scail'))
+            return '~58 GB source + bounded FP8 cache';
         if (f.includes('bernini'))
             return '~126 GB source · bounded FP8 cache';
         if (f.includes('ltx'))

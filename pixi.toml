@@ -19,6 +19,7 @@ cuda-driver-dev = ">=12.8,<14"
 cuda-nvrtc-dev = ">=12.8,<14"
 libcublas-dev = ">=12.8,<14"
 patchelf = ">=0.17,<0.18"
+ffmpeg = { version = ">=8.1.2,<8.2", build = "gpl_*" }
 
 [tasks]
 setup = "bash scripts/setup.sh"
@@ -26,7 +27,8 @@ repository-check = "bash scripts/check_repository_contract.sh"
 build-cshim = "bash serenitymojo/ops/cshim/build.sh"
 build-krea-stage = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm -Xlinker -lpng16 -Xlinker -lturbojpeg serenitymojo/pipeline/zimage_stage.mojo -o output/bin/serenity_image_dataset_stage"
 build-inference-stub = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm serenitymojo/serve/serenity_worker_stub.mojo -o output/bin/serenity_worker_stub"
-build-inference = { cmd = "bash scripts/verify_renamed_entrypoints.sh production-inference && bash scripts/fix_mojo_runpath.sh output/bin/serenity_sd3_conditioning output/bin/klein_precache_sample_prompts output/bin/klein_sample_cli", depends-on = ["build-cshim", "build-sd3-conditioning", "build-klein-precache", "build-klein-sampler"] }
+build-scail2 = { cmd = "bash scripts/build_scail2.sh", depends-on = ["build-cshim"] }
+build-inference = { cmd = "bash scripts/verify_renamed_entrypoints.sh production-inference && bash scripts/fix_mojo_runpath.sh output/bin/serenity_sd3_conditioning output/bin/klein_precache_sample_prompts output/bin/klein_sample_cli", depends-on = ["build-cshim", "build-sd3-conditioning", "build-klein-precache", "build-klein-sampler", "build-scail2"] }
 build-sd3-conditioning = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/serve/sd3_conditioning_cache.mojo -o output/bin/serenity_sd3_conditioning"
 build-klein-precache = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib serenitymojo/pipeline/klein9b_precache_sample_prompts.mojo -o output/bin/klein_precache_sample_prompts"
 build-klein-sampler = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/sampling/klein_sample_cli.mojo -o output/bin/klein_sample_cli", depends-on = ["build-cshim"] }

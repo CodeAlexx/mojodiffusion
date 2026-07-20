@@ -2976,8 +2976,8 @@ fn write_upload_bytes(
     )
 }
 
-/// Known image extensions we preserve from a multipart upload filename; anything
-/// else falls back to `png` (the historical default the worker path expects).
+/// Known media extensions preserved by the multipart upload seams; anything
+/// else falls back to PNG (the historical image-worker default).
 fn upload_ext_from_filename(fname: &str) -> &'static str {
     match std::path::Path::new(fname)
         .extension()
@@ -2989,6 +2989,10 @@ fn upload_ext_from_filename(fname: &str) -> &'static str {
         Some("jpg") | Some("jpeg") => "jpg",
         Some("webp") => "webp",
         Some("gif") => "gif",
+        Some("mp4") => "mp4",
+        Some("mov") => "mov",
+        Some("webm") => "webm",
+        Some("mkv") => "mkv",
         _ => "png",
     }
 }
@@ -3024,6 +3028,25 @@ async fn post_upload_image(State(st): State<AppState>, req: axum::extract::Reque
     };
     let body = String::from_utf8_lossy(&bytes).into_owned();
     handle_upload(&st, &body, "init")
+}
+
+/// POST /upload/media — land a browser-selected image, mask, or short driving
+/// video for path-based video-model requests. The response is the same
+/// `{name,path,url}` contract as /upload/image.
+async fn post_upload_media(State(st): State<AppState>, req: axum::extract::Request) -> Response {
+    let is_multipart = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("multipart/form-data"))
+        .unwrap_or(false);
+    if !is_multipart {
+        return error_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "media upload requires multipart/form-data",
+        );
+    }
+    upload_image_multipart(&st, req).await
 }
 
 /// Multipart arm of POST /upload/image: save the first usable file field. Mirrors
@@ -4245,6 +4268,10 @@ async fn main() -> anyhow::Result<()> {
         // path-based img2img/inpaint flow (init_image/mask_image) can read it.
         .route("/upload/image", post(post_upload_image))
         .route("/upload/mask", post(post_upload_mask))
+        .route(
+            "/upload/media",
+            post(post_upload_media).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .route("/v1/models", get(models::get_models))
         .route("/v1/llms", get(magic::get_llms))
         .route("/v1/magic_prompt", post(magic::post_magic_prompt))

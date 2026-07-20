@@ -15,6 +15,9 @@ Its current measured state is:
 - the Krea, Anima, and Chroma product paths create their own immutable run configuration, cache
   paths, durable log, status, checkpoints, and samples beneath
   `output/<run_id>/`;
+- the SCAIL-2 character-animation path builds seven Mojo stages, creates all
+  per-run conditioning automatically, uses the installed persistent FP8 cache,
+  and preserves driving-video audio through Serenity Studio `/v1/video`;
 - the trainer catalog reports all 15 source trainer families and exposes measured
   readiness reasons for families that are not yet admitted;
 - model weights and GPU end-to-end training/inference runs are not included in

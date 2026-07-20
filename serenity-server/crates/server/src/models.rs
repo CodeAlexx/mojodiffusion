@@ -104,7 +104,9 @@ fn detect_arch(header: &str) -> &'static str {
 fn detect_arch_from_name(name: &str) -> &'static str {
     let lo = name.to_lowercase();
     let c = |s: &str| lo.contains(s);
-    if c("bernini") {
+    if c("scail") {
+        "scail2"
+    } else if c("bernini") {
         "bernini"
     } else if c("wan2.2") || c("wan 2.2") || c("wan-2.2") || c("wan_2_2") || c("wan22") {
         "wan2.2"
@@ -537,6 +539,23 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
                 name: name.to_string(),
                 path: dir.clone(),
                 arch: "bernini".to_string(),
+                size: du_sb(&dir),
+                folder: folder_relative_to(&dir, &checkpoints),
+                sidecar: sidecar_for_dir(&dir),
+            });
+        }
+    }
+    // SCAIL-2 is a directory-backed multi-artifact model. Expose one product
+    // identity only after the local full-animation gate binds the current
+    // seven repo-built runners and installed FP8 cache.
+    if crate::video::scail2_product_gate_passed() {
+        let name = "SCAIL-2-Mojo";
+        let dir = format!("{checkpoints}/{name}");
+        if dir_exists(&dir) {
+            out.push(ScanEntry {
+                name: name.to_string(),
+                path: dir.clone(),
+                arch: "scail2".to_string(),
                 size: du_sb(&dir),
                 folder: folder_relative_to(&dir, &checkpoints),
                 sidecar: sidecar_for_dir(&dir),
@@ -994,6 +1013,7 @@ mod tests {
         );
         assert_eq!(detect_arch_from_name("ltx-2.3-22b-dev"), "ltx2");
         assert_eq!(detect_arch_from_name("Bernini-R-Diffusers"), "bernini");
+        assert_eq!(detect_arch_from_name("SCAIL-2-Mojo"), "scail2");
         assert_eq!(detect_arch_from_name("some-random-checkpoint"), "unknown");
     }
 

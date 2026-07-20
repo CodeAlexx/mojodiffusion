@@ -7,6 +7,7 @@
 **/target/
 *.md
 !README.md
+!serenity-server/README.md
 !docs/MOJO_AUTOGRAD_INTERNALS.md
 !docs/MOJO_CONVENTIONS.md
 !docs/MOJO_DIAGNOSTICS.md
@@ -31,6 +32,7 @@
 !serenitymojo/docs/SERENITYMOJO_KERNELS.md
 !serenitymojo/docs/SERENITYMOJO_MODULES.md
 !serenitymojo/docs/SERENITY_MEM_SYSTEM_DESIGN_2026-06-14.md
+!serenitymojo/docs/SCAIL2_INTAKE_2026-07-19.md
 !serenitymojo/docs/TRAINER_MANDATORY_RUNTIME_CONTRACT.md
 !serenitymojo/docs/ZIMAGE_DENOISE_SIGN_CONVENTION.md
 !serenitymojo/models/qwenimage/QWEN_DEVICE_PORT_MAP_2026-07-06.md

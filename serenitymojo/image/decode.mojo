@@ -361,6 +361,52 @@ def decode_webp(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
 def decode_image(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     # drop_alpha=True matches PIL Image.convert("RGB") (ignore alpha); default
     # False composites over white (legacy screenshot path).
+    # Select by file signature first. Real model/reference bundles sometimes
+    # contain JPEG payloads with a .png filename; extension-only dispatch makes
+    # those valid inputs fail before preprocessing.
+    var fd = sys_open(path, O_RDONLY, Int32(0))
+    if fd < 0:
+        raise Error(String("image open failed: ") + path)
+    var signature = alloc[UInt8](12)
+    var read_count = sys_pread(
+        fd, BytePtr(unsafe_from_address=Int(signature)), 12, 0,
+    )
+    _ = sys_close(fd)
+    if (
+        read_count >= 8
+        and signature[0] == UInt8(0x89)
+        and signature[1] == UInt8(0x50)
+        and signature[2] == UInt8(0x4E)
+        and signature[3] == UInt8(0x47)
+        and signature[4] == UInt8(0x0D)
+        and signature[5] == UInt8(0x0A)
+        and signature[6] == UInt8(0x1A)
+        and signature[7] == UInt8(0x0A)
+    ):
+        signature.free()
+        return decode_png(path, drop_alpha)
+    if (
+        read_count >= 3
+        and signature[0] == UInt8(0xFF)
+        and signature[1] == UInt8(0xD8)
+        and signature[2] == UInt8(0xFF)
+    ):
+        signature.free()
+        return decode_jpeg(path, drop_alpha)
+    if (
+        read_count >= 12
+        and signature[0] == UInt8(ord("R"))
+        and signature[1] == UInt8(ord("I"))
+        and signature[2] == UInt8(ord("F"))
+        and signature[3] == UInt8(ord("F"))
+        and signature[8] == UInt8(ord("W"))
+        and signature[9] == UInt8(ord("E"))
+        and signature[10] == UInt8(ord("B"))
+        and signature[11] == UInt8(ord("P"))
+    ):
+        signature.free()
+        return decode_webp(path, drop_alpha)
+    signature.free()
     if path.endswith(".png") or path.endswith(".PNG"):
         return decode_png(path, drop_alpha)
     if path.endswith(".jpg") or path.endswith(".jpeg") or path.endswith(".JPG") or path.endswith(".JPEG"):

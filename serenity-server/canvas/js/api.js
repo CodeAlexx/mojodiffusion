@@ -9,6 +9,32 @@ var SerenityAPI = (function () {
     function videoRequestFromWorkflow(workflow) {
         var nodes = workflow || {};
         var keys = Object.keys(nodes);
+        for (var si = 0; si < keys.length; si++) {
+            var scail = nodes[keys[si]];
+            if (scail && scail.class_type === 'SCAIL2Animation') {
+                var input = scail.inputs || {};
+                return {
+                    model: 'scail2',
+                    prompt: input.prompt || '',
+                    negative_prompt: input.negative_prompt || '',
+                    mode: input.mode || 'animation',
+                    reference_image: input.reference_image || '',
+                    reference_mask: input.reference_mask || '',
+                    driving_video: input.driving_video || '',
+                    driving_mask_video: input.driving_mask_video || '',
+                    additional_reference_images: Array.isArray(input.additional_reference_images) ? input.additional_reference_images : [],
+                    additional_reference_masks: Array.isArray(input.additional_reference_masks) ? input.additional_reference_masks : [],
+                    width: 896,
+                    height: 512,
+                    frames: 65,
+                    fps: 16,
+                    steps: 40,
+                    guidance: 5.0,
+                    seed: input.seed,
+                    quant: 'fp8'
+                };
+            }
+        }
         var ltxCheckpoint = '';
         for (var i = 0; i < keys.length; i++) {
             var candidate = nodes[keys[i]];

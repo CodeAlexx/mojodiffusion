@@ -229,6 +229,106 @@ extern "C" int serenity_cublas_gemm_bf16_rowmajor_nt(
 }
 
 // ---------------------------------------------------------------------------
+// Native FP8 E4M3 row-major NT GEMM for Blackwell:
+//   D[M,N] f32 = A[M,K] fp8 @ B[N,K] fp8^T
+//
+// Per-row activation and weight scales are applied to this F32 accumulator by
+// the caller's fused scale+bias+BF16 output kernel. The installed Blackwell
+// cuBLASLt rejects OUTER_VEC_32F for this FP8 layout, while the unscaled native
+// GEMM is supported and preserves the identical algebra.
+extern "C" int serenity_cublas_gemm_fp8e4m3_f32_rowmajor_nt(
+    const void* A, const void* B, void* D,
+    int M, int N, int K,
+    void* stream
+) {
+    if (!A || !B || !D) return -1;
+    if (M <= 0 || N <= 0 || K <= 0) return -1;
+    if (ensure_lt() != 0 || g_lt == nullptr) return -2;
+
+    std::lock_guard<std::mutex> lock(g_lt_call_mutex);
+
+    cublasLtMatmulDesc_t       op   = nullptr;
+    cublasLtMatrixLayout_t     Ad   = nullptr, Bd = nullptr;
+    cublasLtMatrixLayout_t     Cd   = nullptr, Dd = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    int rc = -3;
+
+    do {
+        if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+                != CUBLAS_STATUS_SUCCESS) break;
+        cublasOperation_t opA = CUBLAS_OP_T;
+        cublasOperation_t opB = CUBLAS_OP_N;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA))
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB))
+                != CUBLAS_STATUS_SUCCESS) break;
+
+        // Stored col-major views: weight B[N,K] row-major -> [K,N], and
+        // activation A[M,K] row-major -> [K,M].
+        if (cublasLtMatrixLayoutCreate(
+                &Ad, CUDA_R_8F_E4M3, (uint64_t)K, (uint64_t)N, K)
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatrixLayoutCreate(
+                &Bd, CUDA_R_8F_E4M3, (uint64_t)K, (uint64_t)M, K)
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatrixLayoutCreate(
+                &Cd, CUDA_R_32F, (uint64_t)N, (uint64_t)M, N)
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatrixLayoutCreate(
+                &Dd, CUDA_R_32F, (uint64_t)N, (uint64_t)M, N)
+                != CUBLAS_STATUS_SUCCESS) break;
+
+        int8_t fast_accum = 0;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+                &fast_accum, sizeof(fast_accum)) != CUBLAS_STATUS_SUCCESS) break;
+
+        if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatmulPreferenceSetAttribute(
+                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &g_lt_ws_bytes, sizeof(g_lt_ws_bytes))
+                != CUBLAS_STATUS_SUCCESS) break;
+
+        cublasLtMatmulHeuristicResult_t heur;
+        int returned = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(
+            g_lt, op, Ad, Bd, Cd, Dd, pref, 1, &heur, &returned);
+        if (hs != CUBLAS_STATUS_SUCCESS || returned == 0) {
+            fprintf(stderr,
+                    "[serenity_cublas] FP8 heuristic miss "
+                    "status=%d returned=%d (M=%d N=%d K=%d)\n",
+                    (int)hs, returned, M, N, K);
+            rc = -4;
+            break;
+        }
+
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t ms = cublasLtMatmul(
+            g_lt, op, &alpha, B, Ad, A, Bd, &beta, D, Cd, D, Dd,
+            &heur.algo, g_lt_ws, g_lt_ws_bytes, (cudaStream_t)stream);
+        if (ms != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                    "[serenity_cublas] FP8 matmul failed "
+                    "status=%d (M=%d N=%d K=%d)\n",
+                    (int)ms, M, N, K);
+            rc = (int)ms;
+            break;
+        }
+        rc = 0;
+    } while (0);
+
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (Dd)   cublasLtMatrixLayoutDestroy(Dd);
+    if (Cd)   cublasLtMatrixLayoutDestroy(Cd);
+    if (Bd)   cublasLtMatrixLayoutDestroy(Bd);
+    if (Ad)   cublasLtMatrixLayoutDestroy(Ad);
+    if (op)   cublasLtMatmulDescDestroy(op);
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
 // int8 W8A8 GEMM (mirrors SerenityTrainer LinearW8A8 int8_forward_tokenwise:
 // res = torch._int_mm(x_8, weight.T)  →  int8×int8 accumulate int32).
 //

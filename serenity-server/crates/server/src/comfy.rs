@@ -405,6 +405,28 @@ pub async fn get_object_info() -> Response {
                 "guide_frame_idx": int(0,0,240)
             } },
             "output": ["LATENT","VIDEO","AUDIO"], "output_name": ["LATENT","VIDEO","AUDIO"], "name": "LTXVSampler", "category": "sampling" },
+        "SCAIL2Animation": { "input": { "required": {
+                "model": str_w(),
+                "prompt": text_w(),
+                "negative_prompt": text_w(),
+                "mode": combo(&["animation".into(),"replacement".into()]),
+                "reference_image": str_w(),
+                "reference_mask": str_w(),
+                "driving_video": str_w(),
+                "driving_mask_video": str_w(),
+                "width": int(896,896,896),
+                "height": int(512,512,512),
+                "frames": int(65,65,65),
+                "fps": int(16,16,16),
+                "steps": int(40,40,40),
+                "cfg": fl(5.0,5.0,5.0),
+                "seed": int(0,0,281474976710655),
+                "quant": combo(&["fp8".into()])
+            }, "optional": {
+                "additional_reference_images": str_w(),
+                "additional_reference_masks": str_w()
+            } },
+            "output": ["VIDEO"], "output_name": ["VIDEO"], "name": "SCAIL2Animation", "category": "video" },
         "WanImageToVideo": { "input": { "required": { "positive": lk("CONDITIONING"), "negative": lk("CONDITIONING"), "vae": lk("VAE"), "width": int(832,64,4096), "height": int(480,64,4096), "length": int(81,1,1024), "batch_size": int(1,1,16) }, "optional": { "clip_vision_output": lk("CLIP_VISION_OUTPUT"), "start_image": lk("IMAGE") } },
             "output": ["CONDITIONING","CONDITIONING","LATENT"], "output_name": ["positive","negative","latent"], "name": "WanImageToVideo", "category": "video" },
         "EmptyLatentVideo": { "input": { "required": {

@@ -42,6 +42,26 @@ models/
   zimage/
 ```
 
+SCAIL-2 uses the shared Serenity registry because its official, converted, and
+reused artifacts span multiple checkpoint directories:
+
+```text
+$SERENITY_MODEL_ROOT/
+  checkpoints/
+    SCAIL-2/
+      umt5-xxl/tokenizer.json
+    SCAIL-2-Mojo/
+      clip_visual/model.safetensors
+      transformer/
+      transformer_fp8/
+    Wan2.2-TI2V-5B-Mojo/umt5/
+    Bernini-R-Diffusers/vae/diffusion_pytorch_model.safetensors
+```
+
+When `SERENITY_MODEL_ROOT` is unset, this is
+`$SERENITY_HOME/models` or `~/.serenity/models`. `pixi run build-scail2` builds
+the runtime binaries without requiring model weights to be inside the checkout.
+
 The installer creates these directories. Model acquisition is intentionally
 separate because access terms and authentication differ by model provider.
 

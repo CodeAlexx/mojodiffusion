@@ -9,6 +9,13 @@ file is "where does X live". First target: Z-Image text→image.
 
 ## 1. Entry points
 
+- **SCAIL-2 base animation**: `pipeline/scail2_stage_inputs.mojo` owns
+  Python-free user media ingest; `pipeline/scail2_animation.mojo` performs the
+  pure-Mojo 896x512x65 character-animation denoise with pinned 14B streamed FP8 weights;
+  `pipeline/scail2_decode.mojo` performs Wan VAE decode and automatic optional
+  reference-audio passthrough. The full 40-step RTX 5080 gate passes. Exact
+  provenance, commands, evidence, and unclaimed modes are in
+  `docs/SCAIL2_INTAKE_2026-07-19.md`.
 - **Pipeline driver**: `pipeline/zimage_pipeline.mojo` — the Z-Image text→image
   capstone (tokenizer → Qwen3-4B encoder layer-34 → NextDiT + rectified-flow
   Euler → Z-Image VAE → PNG). Denoise sign fix applied 2026-05-26; GPU rerun

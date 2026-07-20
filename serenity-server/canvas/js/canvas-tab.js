@@ -2539,6 +2539,9 @@ var CanvasTab = (function () {
     function loadModels() {
         ModelUtils.fetchAllModels()
             .then(function (models) {
+            models = models.filter(function (model) {
+                return ModelUtils.detectArchFromFilename(model.name) !== 'scail2';
+            });
             if (!models.length)
                 throw new Error('empty');
             els.model.innerHTML = '';

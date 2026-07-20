@@ -122,6 +122,32 @@ def _rope_interleaved_kernel_f32_tables[x_dtype: DType](
         o[r, 2 * i + 1] = rebind[o.element_type]((x0 * sv + x1 * cv).cast[x_dtype]())
 
 
+def _rope_interleaved_head_broadcast_kernel[
+    x_dtype: DType, table_dtype: DType
+](
+    x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    cos: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
+    sin: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    rows: Int,
+    half: Int,
+    heads: Int,
+):
+    """Interleaved RoPE with one compact table row shared by all heads."""
+    var idx = Int(global_idx.x)
+    var total = rows * half
+    if idx < total:
+        var r = idx // half
+        var i = idx % half
+        var token = r // heads
+        var x0 = rebind[Scalar[x_dtype]](x[r, 2 * i]).cast[DType.float32]()
+        var x1 = rebind[Scalar[x_dtype]](x[r, 2 * i + 1]).cast[DType.float32]()
+        var cv = rebind[Scalar[table_dtype]](cos[token, i]).cast[DType.float32]()
+        var sv = rebind[Scalar[table_dtype]](sin[token, i]).cast[DType.float32]()
+        o[r, 2 * i] = rebind[o.element_type]((x0 * cv - x1 * sv).cast[x_dtype]())
+        o[r, 2 * i + 1] = rebind[o.element_type]((x0 * sv + x1 * cv).cast[x_dtype]())
+
+
 # ── halfsplit kernels ──────────────────────────────────────────────────────
 def _rope_halfsplit_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
@@ -466,6 +492,146 @@ def rope_interleaved(
             ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+def rope_interleaved_head_broadcast(
+    x: Tensor, cos: Tensor, sin: Tensor, heads: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Interleaved RoPE using compact `[tokens,D/2]` tables for `[tokens,heads,D]`.
+
+    The flattened activation rows remain token-major then head-major. The GPU
+    kernel maps activation row `r` to compact table row `r // heads`, avoiding
+    a persistent `heads`-fold materialization of identical frequency values.
+    """
+    if heads <= 0:
+        raise Error("rope_interleaved_head_broadcast: heads must be positive")
+    var xshape = x.shape()
+    if len(xshape) < 1:
+        raise Error("rope_interleaved_head_broadcast: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    if d % 2 != 0:
+        raise Error("rope_interleaved_head_broadcast: last dim must be even")
+    var half = d // 2
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+    if rows % heads != 0:
+        raise Error("rope_interleaved_head_broadcast: activation rows/head mismatch")
+    var tokens = rows // heads
+    if cos.numel() != tokens * half or sin.numel() != tokens * half:
+        raise Error("rope_interleaved_head_broadcast: compact table shape mismatch")
+    var x_dt = x.dtype()
+    var cos_dt = cos.dtype()
+    if cos_dt != sin.dtype():
+        raise Error("rope_interleaved_head_broadcast: cos/sin dtype mismatch")
+    if x_dt != cos_dt:
+        if cos_dt != STDtype.F32 or x_dt == STDtype.F32:
+            raise Error("rope_interleaved_head_broadcast: x/table dtype mismatch")
+
+    var dt = x_dt.to_mojo_dtype()
+    var table_dt = cos_dt.to_mojo_dtype()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](tokens, half))
+    var total = rows * half
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[
+            _rope_interleaved_head_broadcast_kernel[
+                DType.float32, DType.float32
+            ],
+            _rope_interleaved_head_broadcast_kernel[
+                DType.float32, DType.float32
+            ],
+        ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.bfloat16, DType.float32
+                ],
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.bfloat16, DType.float32
+                ],
+            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+            )
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.bfloat16, DType.bfloat16
+                ],
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.bfloat16, DType.bfloat16
+                ],
+            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.float16, DType.float32
+                ],
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.float16, DType.float32
+                ],
+            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
+            )
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.float16, DType.float16
+                ],
+                _rope_interleaved_head_broadcast_kernel[
+                    DType.float16, DType.float16
+                ],
+            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, x.shape(), x_dt)
 
 
 def rope_interleaved_slab(

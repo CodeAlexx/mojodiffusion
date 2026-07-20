@@ -12,6 +12,10 @@ compatibility unless a separately reviewed contract migration changes them.
 - JavaScript and its checked-in `.map` file are one versioned artifact. A
   change that alters generated JavaScript must preserve or regenerate its valid
   source map; source maps are not cleanup debris.
+- When the historical TypeScript source is absent, regenerate each touched map
+  from the current production JavaScript with
+  `scripts/regenerate_canvas_identity_maps.py`; the embedded source must match
+  the served `.js` bytes.
 - `index.html`, CSS, assets, and JavaScript are served directly by the Rust
   server. Production behavior must not depend on an unrecorded local build
   directory, developer-home path, or another checkout.

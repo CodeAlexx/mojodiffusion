@@ -51,6 +51,8 @@ var ModelUtils = (function () {
         if (!filename)
             return 'sd15';
         var f = filename.toLowerCase();
+        if (f.includes('scail'))
+            return 'scail2';
         if (f.includes('bernini'))
             return 'bernini';
         if (f.includes('qwen'))
@@ -89,7 +91,7 @@ var ModelUtils = (function () {
     // Check if a detected architecture is a video model
     function isVideoModel(filename) {
         var arch = detectArchFromFilename(filename);
-        return arch === 'ltxv' || arch === 'wan' || arch === 'bernini';
+        return arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2';
     }
     // Standard video resolutions (smaller, snap to 32 for video VAE)
     var VIDEO_RESOLUTIONS = [

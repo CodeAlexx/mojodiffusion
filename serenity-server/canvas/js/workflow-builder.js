@@ -55,6 +55,9 @@ var WorkflowBuilder = (function () {
             case 'bernini':
                 workflow = buildBernini(params);
                 break;
+            case 'scail2':
+                workflow = buildScail2(params);
+                break;
             case 'zimage':
                 workflow = buildZImage(params);
                 break;
@@ -120,8 +123,11 @@ var WorkflowBuilder = (function () {
             return buildQwenImg2Img(params);
         }
         // Video models: fall back to txt2vid
-        if (arch === 'ltxv' || arch === 'wan' || arch === 'bernini') {
-            return arch === 'ltxv' ? buildLTXV(params) : (arch === 'bernini' ? buildBernini(params) : buildWan(params));
+        if (arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2') {
+            if (arch === 'ltxv') return buildLTXV(params);
+            if (arch === 'bernini') return buildBernini(params);
+            if (arch === 'scail2') return buildScail2(params);
+            return buildWan(params);
         }
         var workflow = {
             '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: params.model } },
@@ -744,6 +750,40 @@ var WorkflowBuilder = (function () {
         workflow['5'].inputs.height = 480;
         return workflow;
     }
+    // SCAIL-2 is reference/driving-video animation, not text-to-video. Keep
+    // its four media paths explicit in the saved workflow so API translation
+    // cannot silently execute the wrong modality.
+    function buildScail2(p) {
+        var seed = resolveSeed(p.seed);
+        return {
+            '1': { class_type: 'SCAIL2Animation', inputs: {
+                    model: p.model,
+                    prompt: p.prompt,
+                    negative_prompt: p.negPrompt || '',
+                    mode: p.scail2Mode || 'animation',
+                    reference_image: p.referenceImagePath || '',
+                    reference_mask: p.referenceMaskPath || '',
+                    driving_video: p.drivingVideoPath || '',
+                    driving_mask_video: p.drivingMaskVideoPath || '',
+                    additional_reference_images: p.additionalReferenceImagePaths || [],
+                    additional_reference_masks: p.additionalReferenceMaskPaths || [],
+                    width: 896,
+                    height: 512,
+                    frames: 65,
+                    fps: 16,
+                    steps: 40,
+                    cfg: 5.0,
+                    seed: seed,
+                    quant: 'fp8'
+                } },
+            '2': { class_type: 'SaveVideo', inputs: {
+                    video: ['1', 0],
+                    filename_prefix: 'sf_scail2',
+                    fps: 16,
+                    format: 'mp4'
+                } }
+        };
+    }
     function applyControlNetNodes(workflow, controlLayers) {
         if (!controlLayers || !controlLayers.length)
             return workflow;
@@ -851,7 +891,7 @@ var WorkflowBuilder = (function () {
         // Find the Save node that receives decoded images/video
         var saveNodeId = null;
         var sourceRef = null;
-        var isVideo = (arch === 'ltxv' || arch === 'wan' || arch === 'bernini');
+        var isVideo = (arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2');
         Object.keys(workflow).forEach(function (key) {
             var node = workflow[key];
             if (isVideo && node.class_type === 'SaveVideo') {

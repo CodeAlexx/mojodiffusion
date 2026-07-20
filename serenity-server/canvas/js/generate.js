@@ -80,7 +80,15 @@ var GenerateTab = (function () {
         edgeSize: 32,
         minDenoise: 0.0,
         maskBlur: 4,
-        infillMethod: 'patchmatch'
+        infillMethod: 'patchmatch',
+        referenceImagePath: '',
+        referenceMaskPath: '',
+        drivingVideoPath: '',
+        drivingMaskVideoPath: '',
+        scail2Mode: 'animation',
+        additionalReferenceImagePaths: [],
+        additionalReferenceMaskPaths: [],
+        mediaUploadsInFlight: 0
     };
     var initialized = false;
     // DOM refs (set in init)
@@ -134,6 +142,8 @@ var GenerateTab = (function () {
             return [{ label: '832×480', w: 832, h: 480, vw: 26, vh: 15 }];
         if (arch === 'bernini')
             return [{ label: '848×480', w: 848, h: 480, vw: 53, vh: 30 }];
+        if (arch === 'scail2')
+            return [{ label: '896×512', w: 896, h: 512, vw: 28, vh: 16 }];
         return ModelUtils.aspectsForArch(state.capabilities, arch);
     }
     function buildAspectOptions() {
@@ -377,6 +387,18 @@ var GenerateTab = (function () {
             '<input type="number" id="gen-fps" class="gen-number-input" min="8" max="60" step="1" value="24">' +
             '</div>' +
             '<div id="gen-duration-hint" class="gen-duration-hint"></div>' +
+            '</div>' +
+            '<div class="gen-section" id="gen-scail2-section" style="display:none">' +
+            '<label class="gen-label">SCAIL-2 Inputs</label>' +
+            '<div class="gen-duration-hint">Reference image + mask and driving video + mask are required. Audio is preserved from the driving video.</div>' +
+            '<label class="gen-label" style="margin-top:8px">Mode<select id="gen-scail2-mode" class="gen-select"><option value="animation">Animation</option><option value="replacement">Character replacement</option></select></label>' +
+            '<label class="gen-label">Reference image<input id="gen-scail2-reference-image" type="file" accept="image/*" class="gen-select"></label>' +
+            '<label class="gen-label">Reference mask<input id="gen-scail2-reference-mask" type="file" accept="image/*" class="gen-select"></label>' +
+            '<label class="gen-label">Driving video<input id="gen-scail2-driving-video" type="file" accept="video/*" class="gen-select"></label>' +
+            '<label class="gen-label">Driving mask video<input id="gen-scail2-driving-mask-video" type="file" accept="video/*" class="gen-select"></label>' +
+            '<label class="gen-label">Additional references (optional, up to 3)<input id="gen-scail2-additional-images" type="file" accept="image/*" multiple class="gen-select"></label>' +
+            '<label class="gen-label">Additional reference masks<input id="gen-scail2-additional-masks" type="file" accept="image/*" multiple class="gen-select"></label>' +
+            '<div id="gen-scail2-upload-status" class="gen-duration-hint"></div>' +
             '</div>' +
             // Compositing section
             '<div class="gen-section">' +
@@ -673,6 +695,9 @@ var GenerateTab = (function () {
         els.fpsInput = document.getElementById('gen-fps');
         els.fpsRange = document.getElementById('gen-fps-range');
         els.durationHint = document.getElementById('gen-duration-hint');
+        els.scail2Section = document.getElementById('gen-scail2-section');
+        els.scail2Mode = document.getElementById('gen-scail2-mode');
+        els.scail2UploadStatus = document.getElementById('gen-scail2-upload-status');
         els.imageHeader = document.getElementById('gen-image-header');
         els.imageBody = document.getElementById('gen-image-body');
         els.settingsHeader = document.getElementById('gen-settings-header');
@@ -765,7 +790,102 @@ var GenerateTab = (function () {
         }
     }
     // ── Event Binding ──
+    function bindScail2Upload(inputId, stateKey, label) {
+        var input = document.getElementById(inputId);
+        if (!input)
+            return;
+        input.addEventListener('change', function () {
+            var file = input.files && input.files[0];
+            if (!file)
+                return;
+            var form = new FormData();
+            form.append('file', file, file.name);
+            state.mediaUploadsInFlight += 1;
+            state[stateKey] = '';
+            if (els.scail2UploadStatus)
+                els.scail2UploadStatus.textContent = 'Uploading ' + label + '…';
+            fetch('/upload/media', { method: 'POST', body: form })
+                .then(function (response) {
+                return response.text().then(function (body) {
+                    var data = {};
+                    try { data = JSON.parse(body); }
+                    catch (error) { data = { detail: body }; }
+                    if (!response.ok || !data.path)
+                        throw new Error(data.detail || ('HTTP ' + response.status));
+                    return data;
+                });
+            })
+                .then(function (data) {
+                state[stateKey] = data.path;
+                if (els.scail2UploadStatus)
+                    els.scail2UploadStatus.textContent = label + ' ready: ' + data.name;
+            })
+                .catch(function (error) {
+                state[stateKey] = '';
+                showError('Could not upload ' + label + ': ' + error.message);
+            })
+                .finally(function () {
+                state.mediaUploadsInFlight = Math.max(0, state.mediaUploadsInFlight - 1);
+            });
+        });
+    }
+    function bindScail2MultiUpload(inputId, stateKey, label) {
+        var input = document.getElementById(inputId);
+        if (!input)
+            return;
+        input.addEventListener('change', function () {
+            var files = Array.prototype.slice.call(input.files || []);
+            if (!files.length)
+                return;
+            if (files.length > 3) {
+                input.value = '';
+                state[stateKey] = [];
+                showError('SCAIL-2 accepts at most 3 ' + label);
+                return;
+            }
+            state.mediaUploadsInFlight += files.length;
+            state[stateKey] = [];
+            Promise.all(files.map(function (file) {
+                var form = new FormData();
+                form.append('file', file, file.name);
+                return fetch('/upload/media', { method: 'POST', body: form })
+                    .then(function (response) {
+                    return response.text().then(function (body) {
+                        var data = {};
+                        try { data = JSON.parse(body); }
+                        catch (error) { data = { detail: body }; }
+                        if (!response.ok || !data.path)
+                            throw new Error(data.detail || ('HTTP ' + response.status));
+                        return data.path;
+                    });
+                });
+            }))
+                .then(function (paths) {
+                state[stateKey] = paths;
+                if (els.scail2UploadStatus)
+                    els.scail2UploadStatus.textContent = paths.length + ' ' + label + ' ready';
+            })
+                .catch(function (error) {
+                state[stateKey] = [];
+                showError('Could not upload ' + label + ': ' + error.message);
+            })
+                .finally(function () {
+                state.mediaUploadsInFlight = Math.max(0, state.mediaUploadsInFlight - files.length);
+            });
+        });
+    }
     function bindEvents() {
+        bindScail2Upload('gen-scail2-reference-image', 'referenceImagePath', 'reference image');
+        bindScail2Upload('gen-scail2-reference-mask', 'referenceMaskPath', 'reference mask');
+        bindScail2Upload('gen-scail2-driving-video', 'drivingVideoPath', 'driving video');
+        bindScail2Upload('gen-scail2-driving-mask-video', 'drivingMaskVideoPath', 'driving mask video');
+        bindScail2MultiUpload('gen-scail2-additional-images', 'additionalReferenceImagePaths', 'additional reference images');
+        bindScail2MultiUpload('gen-scail2-additional-masks', 'additionalReferenceMaskPaths', 'additional reference masks');
+        if (els.scail2Mode) {
+            els.scail2Mode.addEventListener('change', function () {
+                state.scail2Mode = this.value === 'replacement' ? 'replacement' : 'animation';
+            });
+        }
         // Auto-grow prompt textarea
         els.prompt.addEventListener('input', function () {
             state.prompt = this.value;
@@ -1466,7 +1586,8 @@ var GenerateTab = (function () {
             qwen: { w: 1024, h: 1024 },
             ltxv: { w: 1920, h: 1088 },
             wan: { w: 832, h: 480 },
-            bernini: { w: 848, h: 480 }
+            bernini: { w: 848, h: 480 },
+            scail2: { w: 896, h: 512 }
         };
         return defaults[arch] || { w: 1024, h: 1024 };
     }
@@ -1554,7 +1675,7 @@ var GenerateTab = (function () {
         var resolvedArch = (resolvedModel && ModelUtils.detectArchFromFilename(resolvedModel)) || arch || 'other';
         var archBadge = document.getElementById('gen-arch-badge');
         if (archBadge) {
-            var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
+            var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
             archBadge.textContent = archNames[resolvedArch] || resolvedArch.toUpperCase();
             archBadge.dataset.arch = resolvedArch;
         }
@@ -1570,13 +1691,13 @@ var GenerateTab = (function () {
         state.arch = arch;
         var isFlux = arch === 'flux' || arch === 'klein';
         var noNegative = isFlux || arch === 'ideogram4' || arch === 'sensenova';
-        var isVideo = arch === 'ltxv' || arch === 'wan' || arch === 'bernini';
+        var isVideo = arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2';
         // Each admitted product exposes only its measured sampler. Wan uses
         // creator-parity Flow-UniPC; image families and LTX keep their current
         // Euler-facing workflow control.
         if (els.scheduler) {
-            var admittedScheduler = arch === 'wan' || arch === 'bernini'
-                ? { value: 'uni_pc', label: arch === 'bernini' ? 'UniPC (Bernini-R)' : 'UniPC (Wan)' }
+            var admittedScheduler = arch === 'wan' || arch === 'bernini' || arch === 'scail2'
+                ? { value: 'uni_pc', label: arch === 'bernini' ? 'UniPC (Bernini-R)' : (arch === 'scail2' ? 'UniPC (SCAIL-2)' : 'UniPC (Wan)') }
                 : { value: 'euler', label: 'Euler' };
             els.scheduler.innerHTML = '<option value="' + admittedScheduler.value + '">' +
                 admittedScheduler.label + '</option>';
@@ -1620,6 +1741,11 @@ var GenerateTab = (function () {
         els.guidanceRow.style.display = isFlux ? 'flex' : 'none';
         // Video controls
         els.videoSection.style.display = isVideo ? 'block' : 'none';
+        if (els.scail2Section)
+            els.scail2Section.style.display = arch === 'scail2' ? 'block' : 'none';
+        if (els.secondsInput) els.secondsInput.disabled = arch === 'scail2';
+        if (els.fpsInput) els.fpsInput.disabled = arch === 'scail2';
+        if (els.fpsRange) els.fpsRange.disabled = arch === 'scail2';
         // Batch: hide for video models
         var batchSection = document.getElementById('gen-batch-section');
         if (batchSection)
@@ -1681,18 +1807,24 @@ var GenerateTab = (function () {
         }
         // Set video-appropriate defaults
         if (isVideo) {
-            state.cfg = arch === 'wan' ? 5.0 : (arch === 'bernini' ? 4.0 : 3.0);
-            state.frames = arch === 'bernini' ? 81 : 121;
-            state.fps = arch === 'bernini' ? 16 : 24;
+            state.cfg = arch === 'wan' ? 5.0 : (arch === 'bernini' ? 4.0 : (arch === 'scail2' ? 5.0 : 3.0));
+            state.frames = arch === 'bernini' ? 81 : (arch === 'scail2' ? 65 : 121);
+            state.fps = arch === 'bernini' || arch === 'scail2' ? 16 : 24;
+            if (arch === 'scail2') {
+                state.seconds = 4;
+                if (els.secondsInput) els.secondsInput.value = '4';
+            }
             if (arch === 'ltxv')
                 state.steps = 15;
             if (arch === 'wan')
                 state.steps = 50;
             if (arch === 'bernini')
                 state.steps = 40;
+            if (arch === 'scail2')
+                state.steps = 40;
             if (els.steps) els.steps.value = String(state.steps);
             if (els.stepsRange) els.stepsRange.value = String(state.steps);
-            if (els.fps) els.fps.value = String(state.fps);
+            if (els.fpsInput) els.fpsInput.value = String(state.fps);
             if (els.fpsRange) els.fpsRange.value = String(state.fps);
             if (els.cfg)
                 els.cfg.value = String(state.cfg);
@@ -1822,6 +1954,13 @@ var GenerateTab = (function () {
             seed: state.seed,
             frames: state.frames,
             fps: state.fps,
+            referenceImagePath: state.referenceImagePath,
+            referenceMaskPath: state.referenceMaskPath,
+            drivingVideoPath: state.drivingVideoPath,
+            drivingMaskVideoPath: state.drivingMaskVideoPath,
+            scail2Mode: state.scail2Mode,
+            additionalReferenceImagePaths: state.additionalReferenceImagePaths.slice(),
+            additionalReferenceMaskPaths: state.additionalReferenceMaskPaths.slice(),
             loras: enabledLoras,
             // Phase 3: Advanced
             vae: state.vae,
@@ -1856,6 +1995,25 @@ var GenerateTab = (function () {
         if (!state.prompt.trim()) {
             showError('Enter a prompt');
             return;
+        }
+        if (ModelUtils.detectArchFromFilename(state.model) === 'scail2') {
+            if (state.mediaUploadsInFlight > 0) {
+                showError('Wait for the SCAIL-2 media uploads to finish');
+                return;
+            }
+            var missingScail2 = [];
+            if (!state.referenceImagePath) missingScail2.push('reference image');
+            if (!state.referenceMaskPath) missingScail2.push('reference mask');
+            if (!state.drivingVideoPath) missingScail2.push('driving video');
+            if (!state.drivingMaskVideoPath) missingScail2.push('driving mask video');
+            if (missingScail2.length) {
+                showError('SCAIL-2 requires: ' + missingScail2.join(', '));
+                return;
+            }
+            if (state.additionalReferenceImagePaths.length !== state.additionalReferenceMaskPaths.length) {
+                showError('Each additional SCAIL-2 reference requires one paired mask');
+                return;
+            }
         }
         // Save to prompt history
         pushPromptHistory(state.prompt);
@@ -2351,8 +2509,8 @@ var GenerateTab = (function () {
         });
         // Group by architecture
         var groups = {};
-        var groupOrder = ['krea2', 'klein', 'flux2', 'flux', 'ideogram4', 'sdxl', 'sd3', 'zimage', 'qwen', 'hunyuan', 'sd15', 'ltxv', 'wan', 'bernini', 'other'];
-        var groupLabels = { krea2: 'KREA2', klein: 'KLEIN', flux2: 'FLUX 2', flux: 'FLUX', ideogram4: 'IDEOGRAM 4', sdxl: 'SDXL', sd3: 'SD3', zimage: 'Z-IMAGE', qwen: 'QWEN', hunyuan: 'HUNYUAN', sd15: 'SD 1.5', ltxv: 'Video (LTX)', wan: 'Video (WAN)', bernini: 'Video (BERNINI-R)', other: 'Other' };
+        var groupOrder = ['krea2', 'klein', 'flux2', 'flux', 'ideogram4', 'sdxl', 'sd3', 'zimage', 'qwen', 'hunyuan', 'sd15', 'ltxv', 'wan', 'bernini', 'scail2', 'other'];
+        var groupLabels = { krea2: 'KREA2', klein: 'KLEIN', flux2: 'FLUX 2', flux: 'FLUX', ideogram4: 'IDEOGRAM 4', sdxl: 'SDXL', sd3: 'SD3', zimage: 'Z-IMAGE', qwen: 'QWEN', hunyuan: 'HUNYUAN', sd15: 'SD 1.5', ltxv: 'Video (LTX)', wan: 'Video (WAN)', bernini: 'Video (BERNINI-R)', scail2: 'Video (SCAIL-2)', other: 'Other' };
         filtered.forEach(function (m) {
             var arch = ModelUtils.detectArchFromFilename(m.name) || 'other';
             if (!groups[arch])
@@ -3133,6 +3291,9 @@ var GenerateTab = (function () {
             seed: state.seed,
             frames: state.frames,
             fps: state.fps,
+            scail2Mode: state.scail2Mode,
+            additionalReferenceImagePaths: state.additionalReferenceImagePaths.slice(),
+            additionalReferenceMaskPaths: state.additionalReferenceMaskPaths.slice(),
             loras: state.loras.map(function (lora) {
                 return { name: lora.name, strength: lora.strength, enabled: lora.enabled !== false };
             })
@@ -3162,6 +3323,12 @@ var GenerateTab = (function () {
         });
         if (typeof params.scheduler === 'string' && params.scheduler)
             state.scheduler = params.scheduler;
+        if (params.scail2Mode === 'animation' || params.scail2Mode === 'replacement')
+            state.scail2Mode = params.scail2Mode;
+        if (Array.isArray(params.additionalReferenceImagePaths))
+            state.additionalReferenceImagePaths = params.additionalReferenceImagePaths.slice(0, 3);
+        if (Array.isArray(params.additionalReferenceMaskPaths))
+            state.additionalReferenceMaskPaths = params.additionalReferenceMaskPaths.slice(0, 3);
         if (Array.isArray(params.loras)) {
             state.loras = params.loras.map(function (lora) {
                 return {
@@ -3199,6 +3366,8 @@ var GenerateTab = (function () {
             els.fpsInput.value = String(state.fps);
         if (els.fpsRange)
             els.fpsRange.value = String(state.fps);
+        if (els.scail2Mode)
+            els.scail2Mode.value = state.scail2Mode;
         state.seconds = Math.max(1, Math.round(Math.max(0, state.frames - 1) / Math.max(1, state.fps)));
         if (els.secondsInput)
             els.secondsInput.value = String(state.seconds);

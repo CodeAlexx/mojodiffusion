@@ -4,7 +4,7 @@
 # proven distilled recipe from the desktop app. That legacy staged/smoke path is
 # retained. The production `refhq` path is separately pinned and parity tested
 # against Creator LTX revision 780984275fd47128b02bef9b5c085404276866ee and uses
-# the official LTX-2.3 dev-FP8 base, distilled LoRA, and 1.0 x2 upscaler.
+# the official LTX-2.3 dev-FP8 base, 1.1 distilled LoRA, and 1.1 x2 upscaler.
 # The earlier HANDOFF proved on real hardware:
 #   "Distilled FP8 + res2s + LoRA conditioning -> GOOD output"
 # i.e. the DISTILLED model (the fp8 one we already stream) + the second-order
@@ -100,7 +100,7 @@ from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet
 
 
-# ── libc getenv → String ("" if unset). For a trained-LoRA overlay. ────────
+# ── libc getenv → String ("" if unset). For the L2P trained-LoRA overlay. ─────
 from std.ffi import external_call
 
 comptime _HQEnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
@@ -165,7 +165,7 @@ def _refhq_spatial_upscaler() -> String:
 
 
 def _refhq_lora_distilled() -> String:
-    return env_or("LTX2_REFHQ_DISTILLED_LORA", serenity_checkpoint(String("ltx-2.3-22b-distilled-lora-384.safetensors")))
+    return env_or("LTX2_REFHQ_DISTILLED_LORA", serenity_checkpoint(String("ltx-2.3-22b-distilled-lora-384-1.1.safetensors")))
 
 
 def _lora_camera_static() -> String:
@@ -183,9 +183,8 @@ comptime LORA_CAMERA_STATIC_MULT = Float32(0.3)
 # The detailer IC LoRA is disabled by default until IC/reference conditioning is
 # wired. Applying it raw without the IC context warps faces.
 comptime LORA_DETAILER_MULT = Float32(0.0)
-# Trained-LoRA overlay strength. The product route supplies the selected value
-# through LTX2_TRAINED_LORA_MULT; direct CLI runs keep the proven 1.0 default.
-comptime LORA_TRAINED_MULT_DEFAULT = Float32(1.0)
+# Trained-LoRA overlay strength (L2P verdict renders; env LTX2_TRAINED_LORA).
+comptime LORA_TRAINED_MULT = Float32(1.0)
 
 # ── HQ short/staged shape (768x512 -> optional 2x stage) ─────────────────────
 # latent_h = 512//32 = 16 ; latent_w = 768//32 = 24
@@ -202,21 +201,6 @@ comptime N_TXT = 1024         # FULL text-context length (whole dump, no slice)
 comptime S_VPAD = 1024        # max(S_V=768, N_TXT=1024, S_A=17)
 comptime S_APAD = 1024
 comptime NUM_LAYERS = 48
-
-# ── Fast distilled LoRA test profile (384x256, 16 frames) ────────────────────
-# This is the interactive/product-speed path: the checkpoint-native 8-step
-# distilled Euler schedule performs one DiT evaluation per step (8 total),
-# instead of res_2s performing two evaluations per step plus a final denoise
-# (41 total at HQ_STEPS=20). It retains the full 1024-token conditioning and
-# the exact same runtime LoRA stack as the HQ routes.
-comptime NUM_FRAMES_FAST = 16
-comptime NF_FAST = 2
-comptime NH_FAST = 8
-comptime NW_FAST = 12
-comptime S_V_FAST = NF_FAST * NH_FAST * NW_FAST
-comptime S_A_FAST = 17
-comptime S_VPAD_FAST = 1024
-comptime S_APAD_FAST = 1024
 
 # ── Production single-stage temporal target (768x512) ────────────────────────
 # Video VAE decode emits 1 + (latent_f - 1) * 8 frames, so NF_LONG=4 is a real
@@ -312,12 +296,11 @@ struct _HQLoraStack(Movable):
     var distilled: LoraSet
     var camera_static: LoraSet
     var detailer: LoraSet
-    # Optional TRAINED LoRA (Mojo trainer / musubi comfy format,
-    # diffusion_model.transformer_blocks.* keys) applied at trained_mult
+    # L2P/verdict overlay: a TRAINED LoRA (Mojo trainer / musubi comfy format,
+    # diffusion_model.transformer_blocks.* keys) applied at LORA_TRAINED_MULT
     # on top of the standard stack. Opt-in via env LTX2_TRAINED_LORA=<path>
     # (empty/unset = None; no behavior change to any existing mode).
     var trained: Optional[LoraSet]
-    var trained_mult: Float32
 
     def __init__(
         out self,
@@ -325,32 +308,23 @@ struct _HQLoraStack(Movable):
         var camera_static: LoraSet,
         var detailer: LoraSet,
         var trained: Optional[LoraSet],
-        trained_mult: Float32,
     ):
         self.distilled = distilled^
         self.camera_static = camera_static^
         self.detailer = detailer^
         self.trained = trained^
-        self.trained_mult = trained_mult
 
     @staticmethod
     def load() raises -> _HQLoraStack:
         var trained = Optional[LoraSet](None)
-        var trained_mult = LORA_TRAINED_MULT_DEFAULT
         var tp = _env_str("LTX2_TRAINED_LORA")
-        var tm = _env_str("LTX2_TRAINED_LORA_MULT")
         if len(tp) > 0:
             trained = Optional[LoraSet](LoraSet.load(tp))
-            if len(tm) > 0:
-                trained_mult = Float32(Float64(tm))
-            if trained_mult < Float32(-10.0) or trained_mult > Float32(10.0):
-                raise Error("LTX2_TRAINED_LORA_MULT must be in [-10, 10]")
         return _HQLoraStack(
             LoraSet.load(_lora_distilled()),
             LoraSet.load(_lora_camera_static()),
             LoraSet.load(_lora_detailer()),
             trained^,
-            trained_mult,
         )
 
     def validate(self) raises:
@@ -362,11 +336,6 @@ struct _HQLoraStack(Movable):
             raise Error("HQ: camera-static LoRA has unmapped pairs")
         if self.detailer.num_lora_pairs_in_file() != self.detailer.num_mappings():
             raise Error("HQ: detailer LoRA has unmapped pairs")
-        if self.trained:
-            var trained_pairs = self.trained.value().num_lora_pairs_in_file()
-            var trained_mappings = self.trained.value().num_mappings()
-            if trained_pairs == 0 or trained_pairs != trained_mappings:
-                raise Error("HQ: trained LoRA has zero or unmapped LTX2 pairs")
 
     def print_summary_scaled(
         self,
@@ -382,8 +351,7 @@ struct _HQLoraStack(Movable):
               "mappings @", detailer_mult, "(disabled until IC)")
         if self.trained:
             print("  [lora] TRAINED overlay", self.trained.value().num_mappings(),
-                  "mappings @", self.trained_mult,
-                  "(env LTX2_TRAINED_LORA[_MULT])")
+                  "mappings @", LORA_TRAINED_MULT, "(env LTX2_TRAINED_LORA)")
 
     def print_summary(self) raises:
         self.print_summary_scaled(
@@ -496,7 +464,7 @@ struct _HQLoraStack(Movable):
             )
         if self.trained:
             total += self.trained.value().attach_ltx2_cached_block_factors(
-                block_idx, block, self.trained_mult, ctx
+                block_idx, block, LORA_TRAINED_MULT, ctx
             )
         return total
 
@@ -1324,17 +1292,15 @@ def run_single_p[
     S_APAD_CT: Int,
 ](
     apply_lora: Bool, out_dir: String, max_steps: Int, use_resident: Bool,
-    include_audio: Bool, use_nag: Bool, fast_distilled: Bool,
+    include_audio: Bool, use_nag: Bool,
 ) raises:
     var ctx = DeviceContext()
     var cfg = LTX2Config.ltx2()
-    print("=== LTX-2.3 T2V distilled ===")
+    print("=== LTX-2.3 T2V HQ (res_2s) 768x512 distilled ===")
     print("  target frames:", NUM_FRAMES_CT, " decoded frames:", 1 + (NF_CT - 1) * 8)
-    print("  res:", NW_CT * 32, "x", NH_CT * 32,
-          " NF/NH/NW:", NF_CT, NH_CT, NW_CT, " S_V:", S_V_CT, " S_A:", S_A_CT,
+    print("  res:768x512  NF/NH/NW:", NF_CT, NH_CT, NW_CT, " S_V:", S_V_CT, " S_A:", S_A_CT,
           " N_TXT:", N_TXT, " blocks:", NUM_LAYERS)
-    print("  sampler:", "distilled Euler (1 eval/step)" if fast_distilled else "res_2s (2 evals/step)",
-          " steps:", 8 if fast_distilled else HQ_STEPS,
+    print("  sampler: res_2s (2nd-order RK)  steps:", HQ_STEPS,
           "  LoRA:", "HQ stack" if apply_lora else "OFF", " out_dir:", out_dir)
     print("  weights:", "FP8-resident warm range" if use_resident else "FP8 stream")
     print("  audio:", "ON (A/V default)" if include_audio else "OFF (explicit noaudio)")
@@ -1459,13 +1425,11 @@ def run_single_p[
             )
             print("  [resident] resident storage bytes:", stream.resident_bytes())
 
-        # Fast mode uses the checkpoint-native 8-step Euler schedule. The HQ
-        # modes retain the proven token-shifted second-order res_2s schedule.
-        var sched = LTX2Scheduler.distilled()
-        if not fast_distilled:
-            sched = LTX2Scheduler(_ltx2_scheduler_sigmas(HQ_STEPS, S_V_CT))
+        # ── HQ res_2s sampler: 15-step token-shifted LTX2Scheduler ──
+        var sig_list = _ltx2_scheduler_sigmas(HQ_STEPS, S_V_CT)
+        var sched = LTX2Scheduler(sig_list.copy())
         var sigmas = sched.sigmas()
-        print("  [sampler] sigmas (", len(sigmas), "):", end="")
+        print("  [sampler] LTX2Scheduler token-shifted sigmas (", len(sigmas), "):", end="")
         for i in range(len(sigmas)):
             print(" ", sigmas[i], end="")
         print("")
@@ -1475,103 +1439,74 @@ def run_single_p[
             n_steps = max_steps
 
         for step in range(n_steps):
-            ctx.synchronize()
-            var step_t0 = perf_counter()
             var sigma = sigmas[step]
             var sigma_next = sigmas[step + 1]
             var sigma_next_eff = sigma_next
             if sigma_next == 0.0:
                 sigma_next_eff = RES2S_TERMINAL_SIGMA
-            var sigma_next_display = sigma_next if fast_distilled else sigma_next_eff
             print("  --- step", step + 1, "/", sched.num_steps, " sigma=", sigma,
-                  " -> ", sigma_next_display, "---")
+                  " -> ", sigma_next_eff, "---")
 
-            if fast_distilled:
-                var vel = _model_forward_p[
-                    S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT
-                ](
-                    ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
-                    LORA_CAMERA_STATIC_MULT, LORA_DETAILER_MULT, cfg, g, stream,
-                    video_x, audio_x, enc, aenc,
-                    v_cos, v_sin, a_cos, a_sin,
-                    ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
-                    nag,
-                    sigma, NF_CT, NH_CT, NW_CT, False, ctx,
-                )
-                video_x = sched.step(video_x, vel[0], step, ctx)
-                audio_x = sched.step(audio_x, vel[1], step, ctx)
-            else:
-                var c = res2s_coefficients(sigma, sigma_next_eff)
+            var c = res2s_coefficients(sigma, sigma_next_eff)  # h, a21, b1, b2, sub_sigma
 
-                # STAGE 1 — model @ current sigma. denoised_1 = x - v*sigma.
-                var s1 = _model_forward_p[
-                    S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT
-                ](
-                    ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
-                    LORA_CAMERA_STATIC_MULT, LORA_DETAILER_MULT, cfg, g, stream,
-                    video_x, audio_x, enc, aenc,
-                    v_cos, v_sin, a_cos, a_sin,
-                    ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
-                    nag,
-                    sigma, NF_CT, NH_CT, NW_CT, False, ctx,
-                )
-                var v_den1 = _denoise_from_vel(video_x, s1[0], sigma, ctx)
-                var a_den1 = _denoise_from_vel(audio_x, s1[1], sigma, ctx)
+            # STAGE 1 — model @ current sigma. denoised_1 = x - v*sigma.
+            var s1 = _model_forward_p[S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT](
+                ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
+                LORA_CAMERA_STATIC_MULT, LORA_DETAILER_MULT, cfg, g, stream,
+                video_x, audio_x, enc, aenc,
+                v_cos, v_sin, a_cos, a_sin,
+                ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
+                nag,
+                sigma, NF_CT, NH_CT, NW_CT, False, ctx,
+            )
+            var v_den1 = _denoise_from_vel(video_x, s1[0], sigma, ctx)
+            var a_den1 = _denoise_from_vel(audio_x, s1[1], sigma, ctx)
 
-                # midpoint sample: x_mid = x + h*a21*(denoised_1 - x)
-                var v_mid = res2s_substep(video_x, v_den1, c.h, c.a21, ctx)
-                var a_mid = res2s_substep(audio_x, a_den1, c.h, c.a21, ctx)
-                v_mid = res2s_sde_step(
-                    video_x, v_mid, Float64(sigma), Float64(c.sub_sigma),
-                    _res2s_hq_noise(v_mid, SEED + UInt64(10000 + step), ctx), ctx,
-                )
-                a_mid = res2s_sde_step(
-                    audio_x, a_mid, Float64(sigma), Float64(c.sub_sigma),
-                    _res2s_hq_noise(a_mid, SEED + UInt64(11000 + step), ctx), ctx,
-                )
-                var bong_iters = RES2S_BONG_ITERS if res2s_bong_active(c.h, sigma) else 0
-                var v_anchor = res2s_bong_refine(
-                    video_x, v_mid, v_den1, c.h, c.a21, bong_iters, ctx
-                )
-                var a_anchor = res2s_bong_refine(
-                    audio_x, a_mid, a_den1, c.h, c.a21, bong_iters, ctx
-                )
+            # midpoint sample: x_mid = x + h*a21*(denoised_1 - x)
+            var v_mid = res2s_substep(video_x, v_den1, c.h, c.a21, ctx)
+            var a_mid = res2s_substep(audio_x, a_den1, c.h, c.a21, ctx)
+            v_mid = res2s_sde_step(
+                video_x, v_mid, Float64(sigma), Float64(c.sub_sigma),
+                _res2s_hq_noise(v_mid, SEED + UInt64(10000 + step), ctx), ctx,
+            )
+            a_mid = res2s_sde_step(
+                audio_x, a_mid, Float64(sigma), Float64(c.sub_sigma),
+                _res2s_hq_noise(a_mid, SEED + UInt64(11000 + step), ctx), ctx,
+            )
+            var bong_iters = RES2S_BONG_ITERS if res2s_bong_active(c.h, sigma) else 0
+            var v_anchor = res2s_bong_refine(video_x, v_mid, v_den1, c.h, c.a21, bong_iters, ctx)
+            var a_anchor = res2s_bong_refine(audio_x, a_mid, a_den1, c.h, c.a21, bong_iters, ctx)
 
-                # STAGE 2 — model @ geometric-mean midpoint sigma.
-                var s2 = _model_forward_p[
-                    S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT
-                ](
-                    ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
-                    LORA_CAMERA_STATIC_MULT, LORA_DETAILER_MULT, cfg, g, stream,
-                    v_mid, a_mid, enc, aenc,
-                    v_cos, v_sin, a_cos, a_sin,
-                    ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
-                    nag,
-                    c.sub_sigma, NF_CT, NH_CT, NW_CT, False, ctx,
-                )
-                var v_den2 = _denoise_from_vel(v_mid, s2[0], c.sub_sigma, ctx)
-                var a_den2 = _denoise_from_vel(a_mid, s2[1], c.sub_sigma, ctx)
+            # STAGE 2 — model @ geometric-mean midpoint sigma.
+            var s2 = _model_forward_p[S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT](
+                ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
+                LORA_CAMERA_STATIC_MULT, LORA_DETAILER_MULT, cfg, g, stream,
+                v_mid, a_mid, enc, aenc,
+                v_cos, v_sin, a_cos, a_sin,
+                ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
+                nag,
+                c.sub_sigma, NF_CT, NH_CT, NW_CT, False, ctx,
+            )
+            # denoised_2 = x_mid - v*sub_sigma, but residual is vs the ANCHOR x:
+            #   eps_2 = denoised_2 - x  (res2s_combine subtracts x internally)
+            var v_den2 = _denoise_from_vel(v_mid, s2[0], c.sub_sigma, ctx)
+            var a_den2 = _denoise_from_vel(a_mid, s2[1], c.sub_sigma, ctx)
 
-                var v_next = res2s_combine(
-                    v_anchor, v_den1, v_den2, c.h, c.b1, c.b2, ctx
-                )
-                var a_next = res2s_combine(
-                    a_anchor, a_den1, a_den2, c.h, c.b1, c.b2, ctx
-                )
-                video_x = res2s_sde_step(
-                    v_anchor, v_next, Float64(sigma), Float64(sigma_next_eff),
-                    _res2s_hq_noise(v_next, SEED + UInt64(20000 + step), ctx), ctx,
-                )
-                audio_x = res2s_sde_step(
-                    a_anchor, a_next, Float64(sigma), Float64(sigma_next_eff),
-                    _res2s_hq_noise(a_next, SEED + UInt64(21000 + step), ctx), ctx,
-                )
+            # COMBINE: x_next = x + h*(b1*(den1-x) + b2*(den2-x))
+            var v_next = res2s_combine(v_anchor, v_den1, v_den2, c.h, c.b1, c.b2, ctx)
+            var a_next = res2s_combine(a_anchor, a_den1, a_den2, c.h, c.b1, c.b2, ctx)
+            video_x = res2s_sde_step(
+                v_anchor, v_next, Float64(sigma), Float64(sigma_next_eff),
+                _res2s_hq_noise(v_next, SEED + UInt64(20000 + step), ctx), ctx,
+            )
+            audio_x = res2s_sde_step(
+                a_anchor, a_next, Float64(sigma), Float64(sigma_next_eff),
+                _res2s_hq_noise(a_next, SEED + UInt64(21000 + step), ctx), ctx,
+            )
             _ = _stats(String("video_x"), video_x, ctx)
             _ = _stats(String("audio_x"), audio_x, ctx)
-            ctx.synchronize()
-            print("  [time] step", step + 1, "wall_s:", perf_counter() - step_t0)
 
-        if not fast_distilled and n_steps == sched.num_steps:
+        if n_steps == sched.num_steps:
             print("  [sampler] final denoise @ sigma=", RES2S_TERMINAL_SIGMA)
             var fz = _model_forward_p[S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT](
                 ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
@@ -1677,21 +1612,7 @@ def run(
     include_audio: Bool, use_nag: Bool,
 ) raises:
     run_single_p[NUM_FRAMES, NF, NH, NW, S_V, S_A, S_VPAD, S_APAD](
-        apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag,
-        False,
-    )
-
-
-def run_fast(
-    apply_lora: Bool, out_dir: String, max_steps: Int, use_resident: Bool,
-    include_audio: Bool, use_nag: Bool,
-) raises:
-    run_single_p[
-        NUM_FRAMES_FAST, NF_FAST, NH_FAST, NW_FAST, S_V_FAST, S_A_FAST,
-        S_VPAD_FAST, S_APAD_FAST,
-    ](
-        apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag,
-        True,
+        apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag
     )
 
 
@@ -1702,10 +1623,7 @@ def run_long(
     run_single_p[
         NUM_FRAMES_LONG, NF_LONG, NH, NW, S_V_LONG, S_A_LONG, S_VPAD_LONG,
         S_APAD_LONG,
-    ](
-        apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag,
-        False,
-    )
+    ](apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag)
 
 
 def run_audiosync(
@@ -1715,10 +1633,7 @@ def run_audiosync(
     run_single_p[
         NUM_FRAMES_AUDIOSYNC, NF_AUDIOSYNC, NH, NW, S_V_AUDIOSYNC,
         S_A_AUDIOSYNC, S_VPAD_AUDIOSYNC, S_APAD_AUDIOSYNC,
-    ](
-        apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag,
-        False,
-    )
+    ](apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2621,15 +2536,13 @@ def _refhq_video_rope(
 # (video [1,S_V,128], audio [1,S_A,128] — the layout the res_2s ref loop
 # carries), takes a PREBUILT _Mod (the 3 guidance passes share one sigma, so
 # the modulation is built once per eval), threads `skip_cross_modal` into the
-# block forward (the reference "mod" pass), and applies the official distilled
-# LoRA plus an optional trainer overlay via the dense per-block path.
+# block forward (the reference "mod" pass), and applies the distilled LoRA via
+# the Creator-parity dense per-block path at `lora_mult`.
 def _refhq_forward_flat[
     S_V_CT: Int, S_A_CT: Int, S_VPAD_CT: Int, S_APAD_CT: Int
 ](
     lora: LoraSet,
     lora_mult: Float32,
-    trained_lora: LoraSet,
-    trained_lora_mult: Float32,
     cfg: LTX2Config,
     g: _Globals,
     stream: LTX2BlockStream,
@@ -2654,10 +2567,6 @@ def _refhq_forward_flat[
         var w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
         if lora_mult != Float32(0.0):
             n_lora_total += lora.apply_to_av_block(i, w, lora_mult, ctx)
-        if trained_lora_mult != Float32(0.0):
-            n_lora_total += trained_lora.apply_to_av_block(
-                i, w, trained_lora_mult, ctx
-            )
         var outs = ltx2_block_forward_av[
             S_V_CT, S_A_CT, N_TXT, S_VPAD_CT, S_APAD_CT
         ](
@@ -2673,8 +2582,8 @@ def _refhq_forward_flat[
         cloned^.move_into(hs, ahs)
     if verbose_lora:
         print(
-            "  [refhq] dense LoRA apply count (official @", lora_mult,
-            ", trained @", trained_lora_mult, "):", n_lora_total,
+            "  [refhq] dense LoRA apply count (48 blocks @ mult",
+            lora_mult, "):", n_lora_total,
         )
     var v_vel = _output_stage(hs, g.v_sst, mod.v_embedded, g.v_pout_w,
                               g.v_pout_b, VD, ctx)
@@ -3186,27 +3095,6 @@ def run_refhq(
     else:
         print("  [lora] DISABLED (golden-reference no-LoRA contract)")
 
-    # Product/user LoRA stacks after the official distilled LoRA. Keep a
-    # zero-mult placeholder when unset so the no-overlay path remains identical.
-    var trained_lora = LoraSet.load(_refhq_lora_distilled())
-    var trained_lora_mult = Float32(0.0)
-    var trained_lora_path = _env_str("LTX2_TRAINED_LORA")
-    if trained_lora_path.byte_length() > 0:
-        trained_lora = LoraSet.load(trained_lora_path)
-        var trained_mult_text = _env_str("LTX2_TRAINED_LORA_MULT")
-        trained_lora_mult = LORA_TRAINED_MULT_DEFAULT
-        if trained_mult_text.byte_length() > 0:
-            trained_lora_mult = Float32(Float64(trained_mult_text))
-        if trained_lora_mult < Float32(-10.0) or trained_lora_mult > Float32(10.0):
-            raise Error("LTX2_TRAINED_LORA_MULT must be in [-10, 10]")
-        var trained_pairs = trained_lora.num_lora_pairs_in_file()
-        var trained_mappings = trained_lora.num_mappings()
-        if trained_pairs == 0 or trained_pairs != trained_mappings:
-            raise Error("refhq: trained LoRA has zero or unmapped LTX2 pairs")
-        print("  [lora] TRAINED overlay:", trained_lora_path)
-        print("  [lora] TRAINED mappings:", trained_mappings,
-              " mult:", trained_lora_mult)
-
     if stage2_only and (
         stage1_cache_path.byte_length() == 0 or
         upscaler_cache_path.byte_length() == 0
@@ -3221,9 +3109,6 @@ def run_refhq(
     if apply_lora:
         var n_g1 = lora.apply_to_globals(gw, initial_lora_mult, ctx)
         print("  [lora] global deltas:", n_g1)
-    if trained_lora_mult != Float32(0.0):
-        var n_tg1 = trained_lora.apply_to_globals(gw, trained_lora_mult, ctx)
-        print("  [lora] trained global deltas:", n_tg1)
     var g = _Globals(
         _clone(gw[String("patchify_proj.weight")][], ctx),
         _load_global_bf16(ck, "patchify_proj.bias", ctx),
@@ -3353,20 +3238,17 @@ def run_refhq(
         )
         # pass 1: cond (positive contexts)
         var c = _refhq_forward_flat[REFHQ_S_V1, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD](
-            lora, lora_mult_s1, trained_lora, trained_lora_mult,
-            cfg, g, stream, vx, ax, enc, aenc, mod, vr1,
+            lora, lora_mult_s1, cfg, g, stream, vx, ax, enc, aenc, mod, vr1,
             a_cos, a_sin, ca_a_cos, ca_a_sin, False, first_eval, ctx,
         )
         # pass 2: uncond (NEGATIVE contexts)
         var u = _refhq_forward_flat[REFHQ_S_V1, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD](
-            lora, lora_mult_s1, trained_lora, trained_lora_mult,
-            cfg, g, stream, vx, ax, neg_enc, neg_aenc, mod, vr1,
+            lora, lora_mult_s1, cfg, g, stream, vx, ax, neg_enc, neg_aenc, mod, vr1,
             a_cos, a_sin, ca_a_cos, ca_a_sin, False, False, ctx,
         )
         # pass 3: mod (positive contexts, cross-modal attention SKIPPED)
         var m = _refhq_forward_flat[REFHQ_S_V1, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD](
-            lora, lora_mult_s1, trained_lora, trained_lora_mult,
-            cfg, g, stream, vx, ax, enc, aenc, mod, vr1,
+            lora, lora_mult_s1, cfg, g, stream, vx, ax, enc, aenc, mod, vr1,
             a_cos, a_sin, ca_a_cos, ca_a_sin, True, False, ctx,
         )
         first_eval = False
@@ -3537,9 +3419,6 @@ def run_refhq(
         if apply_lora:
             var n_g2 = lora.apply_to_globals(gw, REFHQ_LORA_S2, ctx)
             print("  [lora] global deltas (stage-2):", n_g2)
-        if trained_lora_mult != Float32(0.0):
-            var n_tg2 = trained_lora.apply_to_globals(gw, trained_lora_mult, ctx)
-            print("  [lora] trained global deltas (stage-2):", n_tg2)
         g = _Globals(
             _clone(gw[String("patchify_proj.weight")][], ctx),
             _load_global_bf16(ck, "patchify_proj.bias", ctx),
@@ -3583,8 +3462,7 @@ def run_refhq(
             uniform_timestep=True,
         )
         var c = _refhq_forward_flat[REFHQ_S_V2, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD](
-            lora, lora_mult_s2, trained_lora, trained_lora_mult,
-            cfg, g, stream, vx, ax, enc, aenc, mod, vr2,
+            lora, lora_mult_s2, cfg, g, stream, vx, ax, enc, aenc, mod, vr2,
             a_cos, a_sin, ca_a_cos, ca_a_sin, False, first_eval2, ctx,
         )
         first_eval2 = False
@@ -3783,8 +3661,7 @@ def run_refhq_step1(
         c = _refhq_forward_flat[
             REFHQ_S_V1, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD
         ](
-            lora, lora_mult, lora, Float32(0.0),
-            cfg, g, stream, video_x, audio_x, enc, aenc, mod,
+            lora, lora_mult, cfg, g, stream, video_x, audio_x, enc, aenc, mod,
             vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, False, False, ctx,
         )
         _dump_f32(dn, dt, String("p0_vel_v"), c[0], ctx)
@@ -3804,8 +3681,7 @@ def run_refhq_step1(
         u = _refhq_forward_flat[
             REFHQ_S_V1, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD
         ](
-            lora, lora_mult, lora, Float32(0.0),
-            cfg, g, stream, video_x, audio_x, neg_enc,
+            lora, lora_mult, cfg, g, stream, video_x, audio_x, neg_enc,
             neg_aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
             False, ctx,
         )
@@ -3825,8 +3701,7 @@ def run_refhq_step1(
         m = _refhq_forward_flat[
             REFHQ_S_V1, REFHQ_S_A, REFHQ_SPAD, REFHQ_SPAD
         ](
-            lora, lora_mult, lora, Float32(0.0),
-            cfg, g, stream, video_x, audio_x, enc, aenc, mod,
+            lora, lora_mult, cfg, g, stream, video_x, audio_x, enc, aenc, mod,
             vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, True, False, ctx,
         )
         _dump_f32(dn, dt, String("p2_vel_v"), m[0], ctx)
@@ -4007,10 +3882,7 @@ def main() raises:
         return
     var mode = String("long")
     var argbase = 1
-    if len(a) >= 2 and String(a[1]) == "fast":
-        mode = String("fast")
-        argbase = 2
-    elif len(a) >= 2 and String(a[1]) == "single":
+    if len(a) >= 2 and String(a[1]) == "single":
         mode = String("single")
         argbase = 2
     elif len(a) >= 2 and String(a[1]) == "long":
@@ -4031,9 +3903,7 @@ def main() raises:
     var stage1_product = False
     var max_steps = 0
     var out_dir = serenity_output(String("ltx2_hq_long"))
-    if mode == "fast":
-        out_dir = serenity_output(String("ltx2_fast"))
-    elif mode == "single":
+    if mode == "single":
         out_dir = serenity_output(String("ltx2_hq"))
     elif mode == "audiosync":
         out_dir = serenity_output(String("ltx2_audiosync_97f"))
@@ -4089,10 +3959,6 @@ def main() raises:
         run_staged(
             apply_lora, out_dir, max_steps, use_resident, include_audio,
             use_nag, profile_dit, stage1_product,
-        )
-    elif mode == "fast":
-        run_fast(
-            apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag
         )
     elif mode == "single":
         run(apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag)

@@ -31,6 +31,11 @@ file is "where does X live". First target: Z-Image text→image.
   VAE decode → PNG. This is serenitymojo's **first fp8-weight model**; the
   reference is diffusers `/home/alex/ideogram4-ref` (NOT SerenityTrainer). 256²
   end-to-end image PSNR 29.7 dB vs torch; writes `output/ideogram4_256.png`.
+- **LTX2 fast video driver**: `pipeline/ltx2_t2v_av_hq.mojo fast` — the
+  pure-Mojo 384x256, 9-frame, 8-step distilled Euler path used by SerenityUI.
+  It keeps the full 1024-token context, accepts a trained Musubi/Comfy-format
+  LoRA through `LTX2_TRAINED_LORA` + `LTX2_TRAINED_LORA_MULT`, and writes the
+  middle-frame preview plus `ltx2_t2v_hq.mp4`.
 - **Run** (JIT, package-relative imports require `-I .`):
   ```
   cd /home/alex/mojodiffusion && pixi run mojo run -I . serenitymojo/pipeline/zimage_pipeline.mojo
@@ -146,6 +151,27 @@ but unused by the Z-Image pipeline.
 - `docs/SDXL_FLUX_KLEIN_PORT_STATUS.md` — corrected SDXL + FLUX/Klein port map,
   what was changed on 2026-05-26, and GPU-only kernel blockers.
 - Rust parity references live under `inference-flame/src/...` (read line-by-line; the docstrings cite exact files+lines).
+
+## 2026-07-19: LTX2 fast LoRA generation + SerenityUI route
+
+- Added the `fast` CLI mode to `pipeline/ltx2_t2v_av_hq.mojo`: 384x256,
+  9 decoded frames, checkpoint-native 8-step distilled Euler, one DiT eval per
+  step, full 1024-token conditioning, resident FP8 blocks, and per-step timing.
+- Recovered and validated the verified training artifact
+  `output/ltx2_eri2_rebaseline_v2/ltx2_video_lora_step3000.safetensors`
+  (384 mapped pairs, 402,758,589 bytes, SHA-256
+  `0979b759f394196328879ac18259313d0745ba1d29db939900fd5a26ae43acf3`).
+- GPU gate passed with that LoRA at 1.0. The cold process completed in 81.09 s;
+  step 1 was 25.138 s while populating the LoRA/block cache and steps 2-8 were
+  2.303-2.351 s each. Output:
+  `output/ltx2_fast_step3000/ltx2_t2v_hq.mp4` (H.264, 384x256, 24 fps,
+  9 frames; SHA-256
+  `a2c7ffa25a397135ed5194c31c604a450506aab39f824660d826511b778ba20a`).
+- MojoUI/SerenityUI now expose `LTX2 Fast`, hand one selected LoRA and weight to
+  the prebuilt runner, and parse its Mojo log into live `loading model`,
+  `step x of 8`, and `decoding video` status. The current route is deliberately
+  pinned to the validated cached Eri2 prompt until a native LTX2 prompt encoder
+  is wired; arbitrary prompt edits fail loudly instead of reusing stale context.
 
 ## 2026-07-19: LTX2 P6.2 CLOSED + shared-loader speed fix + UI trainer repair
 

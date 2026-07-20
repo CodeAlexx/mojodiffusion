@@ -72,6 +72,20 @@ debug comparison.
 - `probe_video_file(mp4_path: String) raises -> JSONValue` — `ffprobe`-backed MP4/A-V metadata (`width`, `height`, `frame_count`, `duration`, `fps`, codecs, muxing, audio behavior).
 - `ltx2_staged_smoke_video_result(body: JSONValue, video_id: String, backend_name: String, model_name: String, resident: String) raises -> JSONValue` — runs `output/bin/ltx2_video_smoke_runner`, writes `ltx2_video_result.json`, and sets artifact acceptance fields without claiming full video parity.
 
+### `sampling/ltx2_request_cli.mojo` — exact canonical LTX2 request route 🟠
+
+Pure-Mojo `serenity.genparams.v1` adapter used by SerenityUI's Video tab. Unlike
+the older bounded daemon smoke wrapper, it does not substitute a staged smoke
+profile: it preserves the exact request, resolves all authored LoRA rows and
+weights, validates cached conditioning against the authored prompt, and either
+admits the exact compiled geometry/sampler pair or fails before model loading.
+`pipeline/ltx2_t2v_av_hq.mojo` supplies atomic phase/step status plus a result
+manifest containing the executed schedule, artifact geometry/frame count,
+timings, and peak-VRAM sample. Experimental acceptance evidence (2026-07-19):
+768x512, 97 frames, 24 FPS, 8-step distilled Euler, step-3000 trained LoRA,
+valid H.264 MP4, 99.47 s wall, 10,024 MiB peak; frames 0/48/96 and a 13-frame
+contact sheet were visually inspected for convergence and temporal continuity.
+
 ---
 
 ## io/ — weight loading (pure-Mojo port of serenity-safetensors)

@@ -42,7 +42,7 @@ from std.sys import argv
 from std.time import perf_counter
 
 from serenitymojo.io.ffi import (
-    sys_open, sys_pwrite, sys_close, sys_system,
+    sys_open, sys_pwrite, sys_close, sys_system, sys_rename,
     O_WRONLY, O_CREAT, O_TRUNC, BytePtr,
 )
 from serenitymojo.tensor import Tensor
@@ -70,6 +70,7 @@ from serenitymojo.models.dit.ltx2_connector import (
     LTX2ConnectorConfig, LTX2ConnectorWeights, ltx2_connector_forward,
 )
 from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream
+from serenitymojo.offload.vmm_cuda import cu_mem_get_info
 from serenitymojo.sampling.ltx2_sampling import (
     LTX2Scheduler, res2s_coefficients, res2s_substep, res2s_combine, Res2sCoeffs,
     res2s_sde_step, res2s_bong_refine, res2s_bong_active,
@@ -98,6 +99,9 @@ from serenitymojo.models.upsampler.ltx2_upsampler import (
 )
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet
+from serenitymojo.serve.product_manifest import (
+    json_bool, json_escape, peak_vram_mib, write_text_file,
+)
 
 
 # ── libc getenv → String ("" if unset). For the L2P trained-LoRA overlay. ─────
@@ -183,7 +187,8 @@ comptime LORA_CAMERA_STATIC_MULT = Float32(0.3)
 # The detailer IC LoRA is disabled by default until IC/reference conditioning is
 # wired. Applying it raw without the IC context warps faces.
 comptime LORA_DETAILER_MULT = Float32(0.0)
-# Trained-LoRA overlay strength (L2P verdict renders; env LTX2_TRAINED_LORA).
+# Legacy direct-run overlay strength. Product requests use the indexed
+# LTX2_TRAINED_LORA_{i} / LTX2_TRAINED_LORA_MULT_{i} environment contract.
 comptime LORA_TRAINED_MULT = Float32(1.0)
 
 # ── HQ short/staged shape (768x512 -> optional 2x stage) ─────────────────────
@@ -296,35 +301,67 @@ struct _HQLoraStack(Movable):
     var distilled: LoraSet
     var camera_static: LoraSet
     var detailer: LoraSet
-    # L2P/verdict overlay: a TRAINED LoRA (Mojo trainer / musubi comfy format,
-    # diffusion_model.transformer_blocks.* keys) applied at LORA_TRAINED_MULT
-    # on top of the standard stack. Opt-in via env LTX2_TRAINED_LORA=<path>
-    # (empty/unset = None; no behavior change to any existing mode).
-    var trained: Optional[LoraSet]
+    # Runtime TRAINED LoRA overlays (Mojo trainer / musubi comfy format,
+    # diffusion_model.transformer_blocks.* keys). The indexed environment
+    # contract has no fixed stack length. LTX2_TRAINED_LORA remains a legacy
+    # one-overlay compatibility input for direct runner invocations.
+    var trained: List[ArcPointer[LoraSet]]
+    var trained_mults: List[Float32]
 
     def __init__(
         out self,
         var distilled: LoraSet,
         var camera_static: LoraSet,
         var detailer: LoraSet,
-        var trained: Optional[LoraSet],
+        var trained: List[ArcPointer[LoraSet]],
+        var trained_mults: List[Float32],
     ):
         self.distilled = distilled^
         self.camera_static = camera_static^
         self.detailer = detailer^
         self.trained = trained^
+        self.trained_mults = trained_mults^
 
     @staticmethod
     def load() raises -> _HQLoraStack:
-        var trained = Optional[LoraSet](None)
-        var tp = _env_str("LTX2_TRAINED_LORA")
-        if len(tp) > 0:
-            trained = Optional[LoraSet](LoraSet.load(tp))
+        var trained = List[ArcPointer[LoraSet]]()
+        var trained_mults = List[Float32]()
+        var count_text = _env_str("LTX2_TRAINED_LORA_COUNT")
+        var count = 0
+        if count_text.byte_length() > 0:
+            count = atol(count_text)
+            if count < 0:
+                raise Error("LTX2_TRAINED_LORA_COUNT must be >= 0")
+        for i in range(count):
+            var path = _env_str(String("LTX2_TRAINED_LORA_") + String(i))
+            if path.byte_length() == 0:
+                raise Error(
+                    String("missing LTX2_TRAINED_LORA_") + String(i)
+                )
+            var mult_text = _env_str(
+                String("LTX2_TRAINED_LORA_MULT_") + String(i)
+            )
+            var mult = Float32(1.0)
+            if mult_text.byte_length() > 0:
+                mult = Float32(Float64(mult_text))
+            if mult < Float32(-10.0) or mult > Float32(10.0):
+                raise Error(
+                    String("LTX2_TRAINED_LORA_MULT_") + String(i)
+                    + String(" must be in [-10, 10]")
+                )
+            trained.append(ArcPointer(LoraSet.load(path)))
+            trained_mults.append(mult)
+        if count == 0:
+            var legacy_path = _env_str("LTX2_TRAINED_LORA")
+            if legacy_path.byte_length() > 0:
+                trained.append(ArcPointer(LoraSet.load(legacy_path)))
+                trained_mults.append(LORA_TRAINED_MULT)
         return _HQLoraStack(
             LoraSet.load(_lora_distilled()),
             LoraSet.load(_lora_camera_static()),
             LoraSet.load(_lora_detailer()),
             trained^,
+            trained_mults^,
         )
 
     def validate(self) raises:
@@ -336,6 +373,15 @@ struct _HQLoraStack(Movable):
             raise Error("HQ: camera-static LoRA has unmapped pairs")
         if self.detailer.num_lora_pairs_in_file() != self.detailer.num_mappings():
             raise Error("HQ: detailer LoRA has unmapped pairs")
+        if len(self.trained) != len(self.trained_mults):
+            raise Error("HQ: trained LoRA path/weight count mismatch")
+        for i in range(len(self.trained)):
+            var pairs = self.trained[i][].num_lora_pairs_in_file()
+            if pairs == 0 or pairs != self.trained[i][].num_mappings():
+                raise Error(
+                    String("HQ: trained LoRA ") + String(i)
+                    + String(" has zero or unmapped LTX2 pairs")
+                )
 
     def print_summary_scaled(
         self,
@@ -349,9 +395,12 @@ struct _HQLoraStack(Movable):
               "mappings @", camera_static_mult)
         print("  [lora] detailer", self.detailer.num_mappings(),
               "mappings @", detailer_mult, "(disabled until IC)")
-        if self.trained:
-            print("  [lora] TRAINED overlay", self.trained.value().num_mappings(),
-                  "mappings @", LORA_TRAINED_MULT, "(env LTX2_TRAINED_LORA)")
+        for i in range(len(self.trained)):
+            print(
+                "  [lora] TRAINED overlay", i,
+                self.trained[i][].num_mappings(), "mappings @",
+                self.trained_mults[i],
+            )
 
     def print_summary(self) raises:
         self.print_summary_scaled(
@@ -390,12 +439,8 @@ struct _HQLoraStack(Movable):
         total += self.distilled.preload_ltx2_block_factors(ctx)
         total += self.camera_static.preload_ltx2_block_factors(ctx)
         total += self.detailer.preload_ltx2_block_factors(ctx)
-        if self.trained:
-            # take/put-back: preload mutates the set's factor cache; going
-            # through Optional.value() risks caching into a temporary.
-            var t = self.trained.take()
-            total += t.preload_ltx2_block_factors(ctx)
-            self.trained = Optional[LoraSet](t^)
+        for i in range(len(self.trained)):
+            total += self.trained[i][].preload_ltx2_block_factors(ctx)
         return total
 
     def apply_to_av_block(
@@ -462,9 +507,9 @@ struct _HQLoraStack(Movable):
             total += self.detailer.attach_ltx2_cached_block_factors(
                 block_idx, block, detailer_mult, ctx
             )
-        if self.trained:
-            total += self.trained.value().attach_ltx2_cached_block_factors(
-                block_idx, block, LORA_TRAINED_MULT, ctx
+        for i in range(len(self.trained)):
+            total += self.trained[i][].attach_ltx2_cached_block_factors(
+                block_idx, block, self.trained_mults[i], ctx
             )
         return total
 
@@ -1019,11 +1064,22 @@ def _load_ctx_len(
 def _load_video_nag_context(
     v_conn: LTX2ConnectorWeights,
     ctx: DeviceContext,
+    path: String = String(""),
 ) raises -> Tensor:
     """Load the cached null/negative video context and project it like positive context."""
-    var neg_st = ShardedSafeTensors.open(_neg_ctx_dump())
-    var neg_pre = Tensor.from_view_as_bf16(neg_st.tensor_view("text_hidden"), ctx)
-    var neg_valid = _load_ctx_len(neg_st, String("text_len"), ctx)
+    var resolved = path.copy()
+    if resolved.byte_length() == 0:
+        resolved = _neg_ctx_dump()
+    var neg_st = ShardedSafeTensors.open(resolved)
+    var tensor_key = String("text_hidden")
+    var len_key = String("text_len")
+    if _st_has(neg_st, String("neg_video_context")):
+        tensor_key = String("neg_video_context")
+        len_key = String("neg_video_len")
+    var neg_pre = Tensor.from_view_as_bf16(
+        neg_st.tensor_view(tensor_key), ctx
+    )
+    var neg_valid = _load_ctx_len(neg_st, len_key, ctx)
     print("  [ctx] NAG/neg valid rows:", neg_valid, "/", N_TXT)
     return ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](
         v_conn, neg_pre, ctx, valid_len=neg_valid
@@ -1281,6 +1337,115 @@ def _res2s_hq_noise(x: Tensor, seed: UInt64, ctx: DeviceContext) raises -> Tenso
     return cast_tensor(normalized, x.dtype(), ctx)
 
 
+def _write_ltx2_atomic(path: String, content: String) raises:
+    var tmp = path + String(".tmp")
+    write_text_file(tmp, content)
+    if sys_rename(tmp, path) != 0:
+        raise Error(String("LTX2 request: cannot publish ") + path)
+
+
+def _write_ltx2_status(
+    out_dir: String,
+    state: String,
+    phase: String,
+    step: Int,
+    total: Int,
+    message: String,
+) raises:
+    var body = String("{\n")
+    body += String('  "schema":"serenity.ltx2.status.v1",\n')
+    body += String('  "readiness_label":"experimental",\n')
+    body += String('  "state":"') + json_escape(state) + String('",\n')
+    body += String('  "phase":"') + json_escape(phase) + String('",\n')
+    body += String('  "step":') + String(step) + String(",\n")
+    body += String('  "total":') + String(total) + String(",\n")
+    body += String('  "message":"') + json_escape(message) + String('"\n')
+    body += String("}\n")
+    _write_ltx2_atomic(out_dir + String("/status.json"), body)
+
+
+def _record_ltx2_min_free(current: Int) raises -> Int:
+    var mem = cu_mem_get_info()
+    if current == 0 or mem.free_bytes < current:
+        return mem.free_bytes
+    return current
+
+
+def _write_ltx2_result(
+    out_dir: String,
+    artifact_path: String,
+    width: Int,
+    height: Int,
+    frame_count: Int,
+    fps: Float64,
+    steps: Int,
+    seed: UInt64,
+    include_audio: Bool,
+    sampler: String,
+    scheduler: String,
+    context_path: String,
+    negative_context_path: String,
+    request_lora_count: Int,
+    load_seconds: Float64,
+    conditioning_seconds: Float64,
+    prepare_seconds: Float64,
+    denoise_seconds: Float64,
+    video_decode_seconds: Float64,
+    audio_decode_seconds: Float64,
+    mux_seconds: Float64,
+    total_seconds: Float64,
+    total_vram_bytes: Int,
+    min_free_bytes: Int,
+) raises:
+    var denoise_per_step = Float64(0.0)
+    if steps > 0:
+        denoise_per_step = denoise_seconds / Float64(steps)
+    var peak_mib = Float64(0.0)
+    if total_vram_bytes > 0 and min_free_bytes > 0:
+        peak_mib = peak_vram_mib(total_vram_bytes, min_free_bytes)
+    var duration_seconds = Float64(0.0)
+    if fps > 0.0:
+        duration_seconds = Float64(frame_count) / fps
+
+    var body = String("{\n")
+    body += String('  "schema":"serenity.ltx2.result.v1",\n')
+    body += String('  "readiness_label":"experimental",\n')
+    body += String('  "state":"done",\n')
+    body += String('  "accepted_sampler_parity":false,\n')
+    body += String('  "accepted_speed_parity":false,\n')
+    body += String('  "request_path":"') + json_escape(out_dir + String("/request.json")) + String('",\n')
+    body += String('  "artifact_path":"') + json_escape(artifact_path) + String('",\n')
+    body += String('  "width":') + String(width) + String(",\n")
+    body += String('  "height":') + String(height) + String(",\n")
+    body += String('  "frame_count":') + String(frame_count) + String(",\n")
+    body += String('  "fps":') + String(fps) + String(",\n")
+    body += String('  "duration_seconds":') + String(duration_seconds) + String(",\n")
+    body += String('  "steps":') + String(steps) + String(",\n")
+    body += String('  "seed":') + String(seed) + String(",\n")
+    body += String('  "include_audio":') + json_bool(include_audio) + String(",\n")
+    body += String('  "executed_sampler":"') + json_escape(sampler) + String('",\n')
+    body += String('  "executed_scheduler":"') + json_escape(scheduler) + String('",\n')
+    body += String('  "conditioning_positive":"') + json_escape(context_path) + String('",\n')
+    body += String('  "conditioning_negative":"') + json_escape(negative_context_path) + String('",\n')
+    body += String('  "request_lora_count":') + String(request_lora_count) + String(",\n")
+    body += String('  "dtype_contract":"fp8_transformer_bf16_activations_f32_reductions",\n')
+    body += String('  "timings":{\n')
+    body += String('    "load_seconds":') + String(load_seconds) + String(",\n")
+    body += String('    "conditioning_seconds":') + String(conditioning_seconds) + String(",\n")
+    body += String('    "prepare_seconds":') + String(prepare_seconds) + String(",\n")
+    body += String('    "denoise_seconds":') + String(denoise_seconds) + String(",\n")
+    body += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
+    body += String('    "video_decode_seconds":') + String(video_decode_seconds) + String(",\n")
+    body += String('    "audio_decode_seconds":') + String(audio_decode_seconds) + String(",\n")
+    body += String('    "mux_seconds":') + String(mux_seconds) + String(",\n")
+    body += String('    "total_wall_seconds":') + String(total_seconds) + String("\n")
+    body += String("  },\n")
+    body += String('  "peak_vram_mib":') + String(peak_mib) + String(",\n")
+    body += String('  "artifact_paths":["') + json_escape(artifact_path) + String('","') + json_escape(out_dir + String("/result.json")) + String('"]\n')
+    body += String("}\n")
+    _write_ltx2_atomic(out_dir + String("/result.json"), body)
+
+
 def run_single_p[
     NUM_FRAMES_CT: Int,
     NF_CT: Int,
@@ -1293,14 +1458,36 @@ def run_single_p[
 ](
     apply_lora: Bool, out_dir: String, max_steps: Int, use_resident: Bool,
     include_audio: Bool, use_nag: Bool,
+    steps: Int = HQ_STEPS,
+    seed: UInt64 = SEED,
+    fps: Float64 = 24.0,
+    context_path: String = String(""),
+    negative_context_path: String = String(""),
+    distilled_euler: Bool = False,
 ) raises:
+    var total_t0 = perf_counter()
+    var load_seconds = Float64(0.0)
+    var conditioning_seconds = Float64(0.0)
+    var prepare_seconds = Float64(0.0)
+    var denoise_seconds = Float64(0.0)
+    var video_decode_seconds = Float64(0.0)
+    var audio_decode_seconds = Float64(0.0)
+    var mux_seconds = Float64(0.0)
+    _write_ltx2_status(
+        out_dir, String("running"), String("loading_model"), 0, steps,
+        String("Loading LTX2 model and LoRA weights"),
+    )
     var ctx = DeviceContext()
+    var mem0 = cu_mem_get_info()
+    var total_vram_bytes = mem0.total_bytes
+    var min_free_bytes = mem0.free_bytes
     var cfg = LTX2Config.ltx2()
     print("=== LTX-2.3 T2V HQ (res_2s) 768x512 distilled ===")
     print("  target frames:", NUM_FRAMES_CT, " decoded frames:", 1 + (NF_CT - 1) * 8)
     print("  res:768x512  NF/NH/NW:", NF_CT, NH_CT, NW_CT, " S_V:", S_V_CT, " S_A:", S_A_CT,
           " N_TXT:", N_TXT, " blocks:", NUM_LAYERS)
-    print("  sampler: res_2s (2nd-order RK)  steps:", HQ_STEPS,
+    print("  sampler:", "distilled Euler" if distilled_euler else "res_2s",
+          " steps:", steps,
           "  LoRA:", "HQ stack" if apply_lora else "OFF", " out_dir:", out_dir)
     print("  weights:", "FP8-resident warm range" if use_resident else "FP8 stream")
     print("  audio:", "ON (A/V default)" if include_audio else "OFF (explicit noaudio)")
@@ -1334,7 +1521,14 @@ def run_single_p[
         _load_global_bf16(ck, "scale_shift_table", ctx),
         _load_global_bf16(ck, "audio_scale_shift_table", ctx),
     )
+    load_seconds = perf_counter() - total_t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
+    _write_ltx2_status(
+        out_dir, String("running"), String("conditioning"), 0, steps,
+        String("Loading and projecting prompt conditioning"),
+    )
+    var conditioning_t0 = perf_counter()
     print("  [connector] loading + running video/audio (BF16 storage)")
     var v_conn = LTX2ConnectorWeights.load(
         _ckpt_fp8(), String("video_embeddings_connector"),
@@ -1346,8 +1540,10 @@ def run_single_p[
     )
 
     # FULL 1024-token contexts (no tail slice): use the entire dump.
-    var _ctx_dump_path = _env_str("LTX2_CTX_DUMP")   # prompt-conds override (L2P verdicts)
-    if len(_ctx_dump_path) == 0:
+    var _ctx_dump_path = context_path.copy()
+    if _ctx_dump_path.byte_length() == 0:
+        _ctx_dump_path = _env_str("LTX2_CTX_DUMP")
+    if _ctx_dump_path.byte_length() == 0:
         _ctx_dump_path = _audio_ctx_dump()
     else:
         print("  [ctx] OVERRIDE dump:", _ctx_dump_path)
@@ -1371,11 +1567,16 @@ def run_single_p[
     var nag = NAGContext.disabled(ctx)
     if use_nag:
         print("  [NAG] loading video null context (audio NAG disabled: no audio null dump)")
-        var nag_v = _load_video_nag_context(v_conn, ctx)
+        var nag_v = _load_video_nag_context(
+            v_conn, ctx, negative_context_path
+        )
         _ = _stats(String("nag_video_context"), nag_v, ctx)
         var nag_a = _nag_audio_placeholder(ctx)
         nag = NAGContext.defaults(nag_v^, nag_a^, False)
+    conditioning_seconds = perf_counter() - conditioning_t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
+    var prepare_t0 = perf_counter()
     print("  [rope] building 3D video + 1D audio + temporal cross tables")
     var vc = _build_video_coords_dims(NF_CT, NH_CT, NW_CT)
     var ac = _build_audio_coords_dims(S_A_CT)
@@ -1400,15 +1601,26 @@ def run_single_p[
     print("  [noise] init video + audio latents")
     # rng-contract: mojo-native-not-pytorch-parity. Runtime noise is BF16
     # storage; same-seed PyTorch parity requires oracle noise tensors.
-    var video_x = randn(_sh5(1, 128, NF_CT, NH_CT, NW_CT), SEED, STDtype.BF16, ctx)
-    var audio_x = randn(_sh4(1, AUDIO_C, S_A_CT, AUDIO_MEL), SEED + 1, STDtype.BF16, ctx)
+    var video_x = randn(_sh5(1, 128, NF_CT, NH_CT, NW_CT), seed, STDtype.BF16, ctx)
+    var audio_x = randn(_sh4(1, AUDIO_C, S_A_CT, AUDIO_MEL), seed + 1, STDtype.BF16, ctx)
+    if steps <= 0:
+        raise Error("steps must be > 0")
+    if fps <= 0.0:
+        raise Error("fps must be > 0")
     if max_steps < 0:
         raise Error("max_steps must be >= 0")
+    prepare_seconds = perf_counter() - prepare_t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
     # Keep the block stream scoped to denoise only, so the resident FP8 cache is
     # freed before VAE/vocoder decode allocate their own working sets.
     var run_denoise_scope = max_steps >= 0
     if run_denoise_scope:
+        _write_ltx2_status(
+            out_dir, String("running"), String("denoising"), 0, steps,
+            String("Preparing denoiser"),
+        )
+        var denoise_t0 = perf_counter()
         var stream = LTX2BlockStream.open(_ckpt_fp8())
         if stream.block_count() != NUM_LAYERS:
             raise Error("stream block_count != 48")
@@ -1425,9 +1637,17 @@ def run_single_p[
             )
             print("  [resident] resident storage bytes:", stream.resident_bytes())
 
-        # ── HQ res_2s sampler: 15-step token-shifted LTX2Scheduler ──
-        var sig_list = _ltx2_scheduler_sigmas(HQ_STEPS, S_V_CT)
-        var sched = LTX2Scheduler(sig_list.copy())
+        var sched = LTX2Scheduler(
+            _ltx2_scheduler_sigmas(steps, S_V_CT)
+        )
+        if distilled_euler:
+            sched = LTX2Scheduler.distilled()
+            if steps != sched.num_steps:
+                raise Error(
+                    String("distilled Euler requires exactly ")
+                    + String(sched.num_steps) + String(" steps; request supplied ")
+                    + String(steps)
+                )
         var sigmas = sched.sigmas()
         print("  [sampler] LTX2Scheduler token-shifted sigmas (", len(sigmas), "):", end="")
         for i in range(len(sigmas)):
@@ -1439,8 +1659,35 @@ def run_single_p[
             n_steps = max_steps
 
         for step in range(n_steps):
+            _write_ltx2_status(
+                out_dir, String("running"), String("denoising"), step + 1,
+                n_steps,
+                String("Denoising step ") + String(step + 1) + String(" of ")
+                + String(n_steps),
+            )
             var sigma = sigmas[step]
             var sigma_next = sigmas[step + 1]
+            if distilled_euler:
+                print(
+                    "  --- step", step + 1, "/", sched.num_steps,
+                    " sigma=", sigma, " -> ", sigma_next, "---",
+                )
+                var vel = _model_forward_p[
+                    S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT
+                ](
+                    ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
+                    LORA_CAMERA_STATIC_MULT, LORA_DETAILER_MULT, cfg, g, stream,
+                    video_x, audio_x, enc, aenc,
+                    v_cos, v_sin, a_cos, a_sin,
+                    ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
+                    nag,
+                    sigma, NF_CT, NH_CT, NW_CT, False, ctx,
+                )
+                video_x = sched.step(video_x, vel[0], step, ctx)
+                audio_x = sched.step(audio_x, vel[1], step, ctx)
+                _ = _stats(String("video_x"), video_x, ctx)
+                _ = _stats(String("audio_x"), audio_x, ctx)
+                continue
             var sigma_next_eff = sigma_next
             if sigma_next == 0.0:
                 sigma_next_eff = RES2S_TERMINAL_SIGMA
@@ -1467,11 +1714,11 @@ def run_single_p[
             var a_mid = res2s_substep(audio_x, a_den1, c.h, c.a21, ctx)
             v_mid = res2s_sde_step(
                 video_x, v_mid, Float64(sigma), Float64(c.sub_sigma),
-                _res2s_hq_noise(v_mid, SEED + UInt64(10000 + step), ctx), ctx,
+                _res2s_hq_noise(v_mid, seed + UInt64(10000 + step), ctx), ctx,
             )
             a_mid = res2s_sde_step(
                 audio_x, a_mid, Float64(sigma), Float64(c.sub_sigma),
-                _res2s_hq_noise(a_mid, SEED + UInt64(11000 + step), ctx), ctx,
+                _res2s_hq_noise(a_mid, seed + UInt64(11000 + step), ctx), ctx,
             )
             var bong_iters = RES2S_BONG_ITERS if res2s_bong_active(c.h, sigma) else 0
             var v_anchor = res2s_bong_refine(video_x, v_mid, v_den1, c.h, c.a21, bong_iters, ctx)
@@ -1497,16 +1744,16 @@ def run_single_p[
             var a_next = res2s_combine(a_anchor, a_den1, a_den2, c.h, c.b1, c.b2, ctx)
             video_x = res2s_sde_step(
                 v_anchor, v_next, Float64(sigma), Float64(sigma_next_eff),
-                _res2s_hq_noise(v_next, SEED + UInt64(20000 + step), ctx), ctx,
+                _res2s_hq_noise(v_next, seed + UInt64(20000 + step), ctx), ctx,
             )
             audio_x = res2s_sde_step(
                 a_anchor, a_next, Float64(sigma), Float64(sigma_next_eff),
-                _res2s_hq_noise(a_next, SEED + UInt64(21000 + step), ctx), ctx,
+                _res2s_hq_noise(a_next, seed + UInt64(21000 + step), ctx), ctx,
             )
             _ = _stats(String("video_x"), video_x, ctx)
             _ = _stats(String("audio_x"), audio_x, ctx)
 
-        if n_steps == sched.num_steps:
+        if not distilled_euler and n_steps == sched.num_steps:
             print("  [sampler] final denoise @ sigma=", RES2S_TERMINAL_SIGMA)
             var fz = _model_forward_p[S_V_CT, S_A_CT, S_VPAD_CT, S_APAD_CT](
                 ck, gw, lora_stack, apply_lora, LORA_DISTILLED_MULT,
@@ -1522,9 +1769,17 @@ def run_single_p[
             _ = _stats(String("video_x(final denoise)"), video_x, ctx)
             _ = _stats(String("audio_x(final denoise)"), audio_x, ctx)
 
+        denoise_seconds = perf_counter() - denoise_t0
+        min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+
     print("  [denoise] done -> decoding")
 
     # ── DECODE VIDEO ──
+    _write_ltx2_status(
+        out_dir, String("running"), String("decoding_video"), steps, steps,
+        String("Decoding video frames"),
+    )
+    var video_decode_t0 = perf_counter()
     print("  [decode] video VAE (latent -> frames)")
     var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
     var video_x_bf16 = cast_tensor(video_x, STDtype.BF16, ctx)
@@ -1544,13 +1799,36 @@ def run_single_p[
         save_png(chw, p, ctx, ValueRange.SIGNED)
         png_paths.append(p)
     print("  saved", n_frames_out, "frame PNGs ->", out_dir)
+    video_decode_seconds = perf_counter() - video_decode_t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
     if not include_audio:
         var mp4_video = out_dir + "/ltx2_t2v_hq.mp4"
         if max_steps != 0:
             mp4_video = out_dir + "/ltx2_t2v_dev_smoke.mp4"
         print("  [decode] audio disabled by explicit noaudio; muxing video-only mp4")
-        _mux_video_mp4(out_dir, mp4_video, frame_prefix)
+        _write_ltx2_status(
+            out_dir, String("running"), String("muxing"), steps, steps,
+            String("Muxing video"),
+        )
+        var mux_t0 = perf_counter()
+        _mux_video_mp4(out_dir, mp4_video, frame_prefix, fps)
+        mux_seconds = perf_counter() - mux_t0
+        min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+        var sampler_name = String("euler") if distilled_euler else String("res2s")
+        var scheduler_name = String("ltx2_distilled") if distilled_euler else String("ltx2")
+        _write_ltx2_result(
+            out_dir, mp4_video, fsh[4], fsh[3], n_frames_out, fps, steps,
+            seed, False, sampler_name, scheduler_name, context_path,
+            negative_context_path, len(lora_stack.trained), load_seconds,
+            conditioning_seconds, prepare_seconds, denoise_seconds,
+            video_decode_seconds, audio_decode_seconds, mux_seconds,
+            perf_counter() - total_t0, total_vram_bytes, min_free_bytes,
+        )
+        _write_ltx2_status(
+            out_dir, String("done"), String("done"), steps, steps,
+            String("Video ready"),
+        )
         print("=== HQ VIDEO DONE ===")
         print("  mp4:", mp4_video)
         print("  frames:", n_frames_out)
@@ -1562,6 +1840,11 @@ def run_single_p[
         wav_out = out_dir + "/dev_audio.wav"
         mp4_out = out_dir + "/ltx2_t2v_av_dev_smoke.mp4"
         print("  [quality] DEV SMOKE ONLY: audio mux is tested, output is not HQ quality")
+    _write_ltx2_status(
+        out_dir, String("running"), String("decoding_audio"), steps, steps,
+        String("Decoding audio"),
+    )
+    var audio_decode_t0 = perf_counter()
     print("  [decode] audio VAE (latent -> mel) -> vocoder (mel -> 48kHz wav)")
     var avae = LTX2AudioVaeDecoderWeights.load(_ckpt_bf16(), ctx)
     var audio_x_bf16 = cast_tensor(audio_x, STDtype.BF16, ctx)
@@ -1598,9 +1881,32 @@ def run_single_p[
             inter[s * 2 + ch] = wh[ch * L + s]
     _write_wav(wav_out, inter, voc.output_sample_rate())
     print("  wrote wav:", wav_out)
+    audio_decode_seconds = perf_counter() - audio_decode_t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
     print("  [mux] ffmpeg frames + wav -> mp4")
-    _mux_mp4(out_dir, n_frames_out, wav_out, mp4_out, frame_prefix)
+    _write_ltx2_status(
+        out_dir, String("running"), String("muxing"), steps, steps,
+        String("Muxing video and audio"),
+    )
+    var mux_t0 = perf_counter()
+    _mux_mp4(out_dir, n_frames_out, wav_out, mp4_out, frame_prefix, fps)
+    mux_seconds = perf_counter() - mux_t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    var sampler_name = String("euler") if distilled_euler else String("res2s")
+    var scheduler_name = String("ltx2_distilled") if distilled_euler else String("ltx2")
+    _write_ltx2_result(
+        out_dir, mp4_out, fsh[4], fsh[3], n_frames_out, fps, steps, seed,
+        True, sampler_name, scheduler_name, context_path,
+        negative_context_path, len(lora_stack.trained), load_seconds,
+        conditioning_seconds, prepare_seconds, denoise_seconds,
+        video_decode_seconds, audio_decode_seconds, mux_seconds,
+        perf_counter() - total_t0, total_vram_bytes, min_free_bytes,
+    )
+    _write_ltx2_status(
+        out_dir, String("done"), String("done"), steps, steps,
+        String("Video and audio ready"),
+    )
     print("=== HQ DONE ===")
     print("  mp4:", mp4_out)
     print("  wav:", wav_out)
@@ -1634,6 +1940,87 @@ def run_audiosync(
         NUM_FRAMES_AUDIOSYNC, NF_AUDIOSYNC, NH, NW, S_V_AUDIOSYNC,
         S_A_AUDIOSYNC, S_VPAD_AUDIOSYNC, S_APAD_AUDIOSYNC,
     ](apply_lora, out_dir, max_steps, use_resident, include_audio, use_nag)
+
+
+def run_request_profile(
+    width: Int,
+    height: Int,
+    frames: Int,
+    steps: Int,
+    seed: UInt64,
+    fps: Float64,
+    sampler: String,
+    scheduler: String,
+    context_path: String,
+    negative_context_path: String,
+    include_audio: Bool,
+    out_dir: String,
+) raises:
+    """Admit a runtime request onto one of the compiled LTX2 video kernels.
+
+    Request values are never substituted. Unsupported geometry/sampler pairs
+    fail before model loading so the UI can report the exact rejected values.
+    """
+    var sampler_key = String(sampler.lower())
+    var scheduler_key = String(scheduler.lower())
+    var distilled_euler = sampler_key == String("euler") and (
+        scheduler_key == String("ltx2_distilled")
+        or scheduler_key == String("distilled")
+    )
+    var res2s = (
+        sampler_key == String("res2s") or sampler_key == String("res_2s")
+    ) and scheduler_key == String("ltx2")
+    if not distilled_euler and not res2s:
+        raise Error(
+            String("LTX2 request: unsupported sampler/scheduler '")
+            + sampler + String("/") + scheduler
+            + String("'; supported: euler/ltx2_distilled, res2s/ltx2")
+        )
+    if context_path.byte_length() == 0:
+        raise Error("LTX2 request: caps_positive conditioning path is required")
+    if steps <= 0:
+        raise Error("LTX2 request: steps must be > 0")
+    if fps <= 0.0:
+        raise Error("LTX2 request: fps must be > 0")
+    if distilled_euler:
+        var official = LTX2Scheduler.distilled()
+        if steps != official.num_steps:
+            raise Error(
+                String("LTX2 request: ltx2_distilled requires exactly ")
+                + String(official.num_steps) + String(" steps; request supplied ")
+                + String(steps)
+            )
+    if width != 768 or height != 512:
+        raise Error(
+            String("LTX2 request: unsupported compiled size ")
+            + String(width) + String("x") + String(height)
+            + String("; available size: 768x512")
+        )
+    var use_nag = negative_context_path.byte_length() > 0
+    if frames == 25:
+        run_single_p[
+            NUM_FRAMES_LONG, NF_LONG, NH, NW, S_V_LONG, S_A_LONG,
+            S_VPAD_LONG, S_APAD_LONG,
+        ](
+            True, out_dir, 0, True, include_audio, use_nag,
+            steps, seed, fps, context_path, negative_context_path,
+            distilled_euler,
+        )
+        return
+    if frames == 97:
+        run_single_p[
+            NUM_FRAMES_AUDIOSYNC, NF_AUDIOSYNC, NH, NW, S_V_AUDIOSYNC,
+            S_A_AUDIOSYNC, S_VPAD_AUDIOSYNC, S_APAD_AUDIOSYNC,
+        ](
+            True, out_dir, 0, True, include_audio, use_nag,
+            steps, seed, fps, context_path, negative_context_path,
+            distilled_euler,
+        )
+        return
+    raise Error(
+        String("LTX2 request: unsupported compiled frame count ")
+        + String(frames) + String("; available counts: 25, 97")
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -4085,8 +4472,11 @@ def _write_wav(path: String, samples: List[Float32], sr: Int) raises:
 
 
 # ── ffmpeg mux via system() ──
-def _mux_video_mp4(out_dir: String, mp4: String, frame_prefix: String) raises:
-    var cmd = String("ffmpeg -y -framerate 24 -i ")
+def _mux_video_mp4(
+    out_dir: String, mp4: String, frame_prefix: String,
+    fps: Float64 = 24.0,
+) raises:
+    var cmd = String("ffmpeg -y -framerate ") + String(fps) + String(" -i ")
     cmd += out_dir + "/" + frame_prefix + "%02d.png"
     cmd += " -c:v libx264 -pix_fmt yuv420p -movflags +faststart " + mp4
     cmd += " >/dev/null 2>&1"
@@ -4095,8 +4485,11 @@ def _mux_video_mp4(out_dir: String, mp4: String, frame_prefix: String) raises:
         print("  [mux] WARNING: ffmpeg returned", rc, "(frames still saved)")
 
 
-def _mux_mp4(out_dir: String, n_frames: Int, wav: String, mp4: String, frame_prefix: String) raises:
-    var cmd = String("ffmpeg -y -framerate 24 -i ")
+def _mux_mp4(
+    out_dir: String, n_frames: Int, wav: String, mp4: String,
+    frame_prefix: String, fps: Float64 = 24.0,
+) raises:
+    var cmd = String("ffmpeg -y -framerate ") + String(fps) + String(" -i ")
     cmd += out_dir + "/" + frame_prefix + "%02d.png -i " + wav
     cmd += " -c:v libx264 -pix_fmt yuv420p -af apad -c:a aac -shortest -movflags +faststart " + mp4
     cmd += " >/dev/null 2>&1"

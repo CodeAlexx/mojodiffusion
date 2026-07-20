@@ -424,6 +424,18 @@ through `serenitymojo.sampling`: `LTX2Scheduler`, distilled sigma tables, and
 PyTorch-eager BF16 API so noiser/scheduler phase parity is not lost in fused
 tensor algebra.
 
+`sampling/ltx2_request_cli.mojo` is the pure-Mojo product adapter for canonical
+`serenity.genparams.v1` video requests. It preserves the exact authored JSON,
+checks conditioning sidecar prompt identity, resolves an arbitrary LoRA list
+under the shared model root, and dispatches only exact compiled profiles through
+`pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The pipeline publishes
+atomic `status.json` phase/step snapshots plus `result.json` with the MP4 path,
+executed geometry/schedule, timings, frame count/duration, dtype contract, and
+sampled peak VRAM. Current readiness is experimental: the 2026-07-19 gate
+produced a visually inspected 768x512, 97-frame, 24 FPS step-3000-LoRA movie in
+99.47 seconds at 10,024 MiB sampled peak VRAM; audio and sampler/speed parity
+remain separate acceptance gates.
+
 ---
 
 ## Forward op library (INFERENCE) — `ops/*.mojo` (non-`_backward`)

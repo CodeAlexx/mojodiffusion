@@ -196,6 +196,48 @@ fn append_lora(out: &mut JsonValue, name: &str, weight: f64) -> GraphResult<()> 
     Ok(())
 }
 
+/// `_workflow_append_lora_streams` (Mojo): like [`append_lora`] but for the
+/// KJNodes-style `LTX2LoraLoaderAdvanced` row — appends the five per-stream
+/// strengths (`video`, `video_to_audio`, `audio`, `audio_to_video`, `other`),
+/// emitting each key only when it differs from the 1.0 default so plain rows
+/// stay byte-identical to `append_lora` output.
+fn append_lora_streams(
+    out: &mut JsonValue,
+    name: &str,
+    weight: f64,
+    streams: [(&str, f64); 5],
+) -> GraphResult<()> {
+    if name.is_empty() {
+        return Err(GraphError::unsupported(
+            "workflow graph LoRA loader missing lora_name",
+        ));
+    }
+    if weight == 0.0 {
+        return Ok(());
+    }
+    let o = out.as_object_mut().expect("out is an object");
+    let mut arr = match o.get("lora") {
+        Some(JsonValue::Null) | None => Vec::new(),
+        Some(JsonValue::Array(a)) => a.clone(),
+        Some(_) => {
+            return Err(GraphError::unsupported(
+                "workflow graph lora metadata must be an array",
+            ))
+        }
+    };
+    let mut ent = json!({ "name": name, "weight": weight });
+    for (key, value) in streams {
+        if value != 1.0 {
+            ent.as_object_mut()
+                .expect("lora row is an object")
+                .insert(key.to_string(), json!(value));
+        }
+    }
+    arr.push(ent);
+    o.insert("lora".to_string(), JsonValue::Array(arr));
+    Ok(())
+}
+
 /// `_workflow_copy_lanpaint_field_alias` (Mojo 975).
 fn copy_lanpaint_alias(out: &mut JsonValue, fields: &JsonValue, src_key: &str, dst_key: &str) {
     copy_field_if_missing(out, fields, src_key, dst_key);
@@ -661,6 +703,74 @@ fn exec_node(
                     )?;
                 }
             }
+            Ok(Fire::Done)
+        }
+        "LTX2LoraLoaderAdvanced" => {
+            // KJNodes [BETA] LTX2 LoRA Loader Advanced: model-only LoRA with
+            // per-stream strengths for the LTX-2 joint AV DiT. `blocks`
+            // (SELECTEDDITBLOCKS) is not supported — fail-loud if wired.
+            let model_link = links.input(id, "model");
+            if !model_link.found {
+                return Err(GraphError::unsupported(
+                    "workflow graph LTX2LoraLoaderAdvanced missing model input",
+                )
+                .with_node(id));
+            }
+            if links.input(id, "blocks").found {
+                return Err(GraphError::unsupported(
+                    "workflow graph LTX2LoraLoaderAdvanced blocks input is not supported",
+                )
+                .with_node(id));
+            }
+            let path_link = links.input(id, "opt_lora_path");
+            let mut is_ready = ready(store, &model_link);
+            if path_link.found {
+                is_ready = is_ready && ready(store, &path_link);
+            }
+            if !is_ready {
+                return Ok(Fire::NotReady);
+            }
+            require_value_type(store, &model_link, "MODEL", "model")?;
+            let model_name = model_name_of(store, &model_link)?;
+            if !model_name.is_empty() {
+                set_if_missing(out, "model", json!(model_name));
+            }
+            let mut lora_name = wf_string(fields, "lora_name");
+            if path_link.found {
+                let path = scalar_string_of(store, &path_link, "opt_lora_path")?;
+                if !path.is_empty() {
+                    lora_name = path;
+                }
+            }
+            let strength = wf_float(fields, "strength_model", 1.0, -10.0, 10.0)?;
+            let video = wf_float(fields, "video", 1.0, 0.0, 1.0)?;
+            let video_to_audio = wf_float(fields, "video_to_audio", 1.0, 0.0, 1.0)?;
+            let audio = wf_float(fields, "audio", 1.0, 0.0, 1.0)?;
+            let audio_to_video = wf_float(fields, "audio_to_video", 1.0, 0.0, 1.0)?;
+            let other = wf_float(fields, "other", 1.0, 0.0, 1.0)?;
+            append_lora_streams(
+                out,
+                &lora_name,
+                strength,
+                [
+                    ("video", video),
+                    ("video_to_audio", video_to_audio),
+                    ("audio", audio),
+                    ("audio_to_video", audio_to_video),
+                    ("other", other),
+                ],
+            )?;
+            add_value(store, id, "MODEL", ValuePayload::Model { name: model_name })?;
+            // rank / loaded_keys_info are runtime load diagnostics; the
+            // lowering executor emits empty STRING placeholders so wired
+            // consumers resolve.
+            add_value(store, id, "rank", ValuePayload::ScalarString(String::new()))?;
+            add_value(
+                store,
+                id,
+                "loaded_keys_info",
+                ValuePayload::ScalarString(String::new()),
+            )?;
             Ok(Fire::Done)
         }
         "CLIPLoader" | "DualCLIPLoader" | "TripleCLIPLoader" => {

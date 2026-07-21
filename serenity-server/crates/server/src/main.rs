@@ -3695,10 +3695,7 @@ mod endpoint_tests {
             .contains("admitted product shapes"));
 
         params = valid_t2i_params("qwen-image");
-        params.loras.push(LoraSpec {
-            name: "adapter.safetensors".to_string(),
-            weight: 1.0,
-        });
+        params.loras.push(LoraSpec::new("adapter.safetensors".to_string(), 1.0));
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
             .contains("LoRA"));

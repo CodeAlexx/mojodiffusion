@@ -361,6 +361,42 @@ def _workflow_append_lora(mut obj: JSONValue, name: String, weight: Float64) rai
     obj.set("lora", arr^)
 
 
+def _workflow_append_lora_streams(
+    mut obj: JSONValue, name: String, weight: Float64,
+    video: Float64, video_to_audio: Float64, audio: Float64,
+    audio_to_video: Float64, other: Float64,
+) raises:
+    """Like `_workflow_append_lora` but for the KJNodes-style
+    `LTX2LoraLoaderAdvanced` row — appends the five per-stream strengths,
+    emitting each key only when it differs from the 1.0 default so plain rows
+    stay byte-identical to `_workflow_append_lora` output."""
+    if name == "":
+        raise Error("[501] workflow graph LoRA loader missing lora_name")
+    if weight == 0.0:
+        return
+    var arr = JSONValue.new_array()
+    if obj.contains("lora") and not obj["lora"].is_null():
+        if not obj["lora"].is_array():
+            raise Error("[501] workflow graph lora metadata must be an array")
+        for i in range(obj["lora"].length()):
+            arr.append(obj["lora"][i].copy())
+    var ent = JSONValue.new_object()
+    ent.set("name", JSONValue.from_string(name))
+    ent.set("weight", JSONValue.from_float(weight))
+    if video != 1.0:
+        ent.set("video", JSONValue.from_float(video))
+    if video_to_audio != 1.0:
+        ent.set("video_to_audio", JSONValue.from_float(video_to_audio))
+    if audio != 1.0:
+        ent.set("audio", JSONValue.from_float(audio))
+    if audio_to_video != 1.0:
+        ent.set("audio_to_video", JSONValue.from_float(audio_to_video))
+    if other != 1.0:
+        ent.set("other", JSONValue.from_float(other))
+    arr.append(ent^)
+    obj.set("lora", arr^)
+
+
 def _record_workflow_execution(
     mut obj: JSONValue, source: String, node_count: Int, edge_count: Int,
 ) raises:
@@ -1326,6 +1362,17 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("strength_model", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
         if type_id == "LoraLoader":
             fields.set("strength_clip", JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
+    elif type_id == "LTX2LoraLoaderAdvanced":
+        # KJ widget order (force_input `opt_lora_path` and the `blocks` socket
+        # are inputs, not widgets): lora_name, strength_model, video,
+        # video_to_audio, audio, audio_to_video, other.
+        fields.set("lora_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
+        fields.set("strength_model", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
+        fields.set("video", JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
+        fields.set("video_to_audio", JSONValue.from_float(_workflow_widget_float(widgets, 3, 1.0)))
+        fields.set("audio", JSONValue.from_float(_workflow_widget_float(widgets, 4, 1.0)))
+        fields.set("audio_to_video", JSONValue.from_float(_workflow_widget_float(widgets, 5, 1.0)))
+        fields.set("other", JSONValue.from_float(_workflow_widget_float(widgets, 6, 1.0)))
     elif (
         type_id == "CLIPTextEncode"
         or type_id == "CLIPTextEncodeFlux"
@@ -1644,6 +1691,13 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "LoraLoaderModelOnly" or typ == "ZImageLoraModelOnly":
         if slot == 0:
             return String("MODEL")
+    elif typ == "LTX2LoraLoaderAdvanced":
+        if slot == 0:
+            return String("MODEL")
+        if slot == 1:
+            return String("rank")
+        if slot == 2:
+            return String("loaded_keys_info")
     elif typ == "LoraLoader":
         if slot == 0:
             return String("MODEL")
@@ -1902,6 +1956,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "LoraLoader"
             or type_id == "LoraLoaderModelOnly"
             or type_id == "ZImageLoraModelOnly"
+            or type_id == "LTX2LoraLoaderAdvanced"
             or type_id == "CLIPLoader"
             or type_id == "DualCLIPLoader"
             or type_id == "TripleCLIPLoader"
@@ -2152,6 +2207,62 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                             _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP"))
                         else:
                             _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP_LORA_UNSUPPORTED"))
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "LTX2LoraLoaderAdvanced":
+                # KJNodes [BETA] LTX2 LoRA Loader Advanced: model-only LoRA
+                # with per-stream strengths for the LTX-2 joint AV DiT.
+                # `blocks` (SELECTEDDITBLOCKS) is not supported — fail-loud.
+                var model_link = _workflow_find_input_link(edges, node_id, String("model"))
+                if not model_link.found:
+                    raise Error("[501] workflow graph LTX2LoraLoaderAdvanced missing model input")
+                if _workflow_find_input_link(edges, node_id, String("blocks")).found:
+                    raise Error("[501] workflow graph LTX2LoraLoaderAdvanced blocks input is not supported")
+                var path_link = _workflow_find_input_link(edges, node_id, String("opt_lora_path"))
+                var ready = _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                if path_link.found:
+                    ready = ready and _workflow_value_index(value_nodes, value_ports, path_link.node_id, path_link.port) >= 0
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
+                    var model_name = _workflow_model_name(model_nodes, model_ports, model_names, model_link)
+                    if model_name != "":
+                        _set_if_missing(obj, String("model"), JSONValue.from_string(model_name))
+                    var lora_name = _workflow_string(fields, String("lora_name"))
+                    if path_link.found:
+                        var path_override = _workflow_scalar_string(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                            path_link, String("opt_lora_path"),
+                        )
+                        if path_override != "":
+                            lora_name = path_override^
+                    var strength = _workflow_float(fields, String("strength_model"), 1.0, -10.0, 10.0)
+                    var video = _workflow_float(fields, String("video"), 1.0, 0.0, 1.0)
+                    var video_to_audio = _workflow_float(fields, String("video_to_audio"), 1.0, 0.0, 1.0)
+                    var audio = _workflow_float(fields, String("audio"), 1.0, 0.0, 1.0)
+                    var audio_to_video = _workflow_float(fields, String("audio_to_video"), 1.0, 0.0, 1.0)
+                    var other = _workflow_float(fields, String("other"), 1.0, 0.0, 1.0)
+                    _workflow_append_lora_streams(
+                        obj, lora_name, strength,
+                        video, video_to_audio, audio, audio_to_video, other,
+                    )
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MODEL"), String("MODEL"))
+                    model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
+                    # rank / loaded_keys_info are runtime load diagnostics; the
+                    # lowering executor emits empty STRING placeholders so
+                    # wired consumers resolve.
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("rank"), String("STRING"))
+                    _workflow_add_scalar(
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+                        node_id, String("rank"), String("STRING"),
+                        0, 0.0, String(""), False,
+                    )
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("loaded_keys_info"), String("STRING"))
+                    _workflow_add_scalar(
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+                        node_id, String("loaded_keys_info"), String("STRING"),
+                        0, 0.0, String(""), False,
+                    )
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "CLIPLoader" or type_id == "DualCLIPLoader" or type_id == "TripleCLIPLoader":
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP"))

@@ -22,6 +22,7 @@ pub fn is_allowed_type(t: &str) -> bool {
             | "LoraLoader"
             | "LoraLoaderModelOnly"
             | "ZImageLoraModelOnly"
+            | "LTX2LoraLoaderAdvanced"
             | "CLIPLoader"
             | "DualCLIPLoader"
             | "TripleCLIPLoader"

@@ -203,6 +203,42 @@ def _configure_loras(obj: JSONValue) raises:
         _setenv(
             String("LTX2_TRAINED_LORA_MULT_") + String(i), String(weight)
         )
+        # Optional per-stream strengths (KJ LTX2LoraLoaderAdvanced): each in
+        # [0, 1], default 1.0. Encoded for the runner as five comma-joined
+        # floats `video,video_to_audio,audio,audio_to_video,other` — only set
+        # when at least one differs from 1.0.
+        var stream_names = [
+            String("video"), String("video_to_audio"), String("audio"),
+            String("audio_to_video"), String("other"),
+        ]
+        var stream_vals = List[Float64]()
+        var any_stream = False
+        for ref sname in stream_names:
+            var v = Float64(1.0)
+            if row.contains(sname):
+                if not row[sname].is_number():
+                    raise Error(
+                        String("LTX2 request: lora[") + String(i)
+                        + String("].") + sname + String(" must be a number")
+                    )
+                v = row[sname].as_float()
+                if v < 0.0 or v > 1.0:
+                    raise Error(
+                        String("LTX2 request: lora[") + String(i)
+                        + String("].") + sname + String(" must be in [0, 1]")
+                    )
+                if v != 1.0:
+                    any_stream = True
+            stream_vals.append(v)
+        if any_stream:
+            var enc = String("")
+            for j in range(len(stream_vals)):
+                if j > 0:
+                    enc += String(",")
+                enc += String(stream_vals[j])
+            _setenv(
+                String("LTX2_TRAINED_LORA_STREAMS_") + String(i), enc
+            )
 
 
 def _run_request(request_path: String, out_dir: String) raises:

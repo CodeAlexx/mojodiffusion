@@ -334,6 +334,17 @@ pub async fn get_object_info() -> Response {
             "output": ["MODEL","CLIP"], "output_name": ["MODEL","CLIP"], "name": "LoraLoader", "category": "loaders" },
         "LoraLoaderModelOnly": { "input": { "required": { "model": lk("MODEL"), "lora_name": combo(&loras), "strength_model": fl(1.0,-20.0,20.0) } },
             "output": ["MODEL"], "output_name": ["MODEL"], "name": "LoraLoaderModelOnly", "category": "loaders" },
+        "LTX2LoraLoaderAdvanced": { "input": { "required": {
+                "model": lk("MODEL"),
+                "lora_name": combo(&loras),
+                "strength_model": fl(1.0,-10.0,10.0),
+                "video": fl(1.0,0.0,1.0),
+                "video_to_audio": fl(1.0,0.0,1.0),
+                "audio": fl(1.0,0.0,1.0),
+                "audio_to_video": fl(1.0,0.0,1.0),
+                "other": fl(1.0,0.0,1.0)
+            }, "optional": { "opt_lora_path": lk("STRING") } },
+            "output": ["MODEL","STRING","STRING"], "output_name": ["MODEL","rank","loaded_keys_info"], "name": "LTX2 LoRA Loader Advanced", "category": "KJNodes/ltxv" },
         "CLIPTextEncode": { "input": { "required": { "clip": lk("CLIP"), "text": text_w() } },
             "output": ["CONDITIONING"], "output_name": ["CONDITIONING"], "name": "CLIPTextEncode", "category": "conditioning" },
         "CLIPTextEncodeFlux": { "input": { "required": { "clip": lk("CLIP"), "clip_l": text_w(), "t5xxl": text_w(), "guidance": fl(3.5,0.0,100.0) } },

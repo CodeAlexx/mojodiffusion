@@ -24,6 +24,12 @@ patchelf = ">=0.17,<0.18"
 setup = "bash scripts/setup.sh"
 repository-check = "bash scripts/check_repository_contract.sh"
 build-cshim = "bash serenitymojo/ops/cshim/build.sh"
+# Low-memory compile checks (-O0 -j 1): the default `-j 0` fans codegen out to
+# every core and OOM-kills a 16GB/desktop box; `-j 1` caps peak RSS to one
+# thread's working set and `-O0` skips the LLVM opt passes. Output is a throwaway
+# binary — these exist to typecheck+codegen the LoRA/workflow edits, not to ship.
+check-lower = "mkdir -p output/checks && mojo build -O0 -j 1 -I . -I vendor/mojo-libs serenitymojo/serve/serenity_lower_cli.mojo -o output/checks/serenity_lower_check"
+check-ltx2-reqcli = { cmd = "mkdir -p output/checks && mojo build -O0 -j 1 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -Lserenitymojo/ops/cshim/lib/cudnn_stubs -Xlinker -lcudnn -Xlinker -rpath -Xlinker \\$ORIGIN/../../serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib serenitymojo/sampling/ltx2_request_cli.mojo -o output/checks/ltx2_request_cli_check", depends-on = ["build-cshim"] }
 build-krea-stage = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm -Xlinker -lpng16 -Xlinker -lturbojpeg serenitymojo/pipeline/zimage_stage.mojo -o output/bin/serenity_image_dataset_stage"
 build-inference-stub = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm serenitymojo/serve/serenity_worker_stub.mojo -o output/bin/serenity_worker_stub"
 build-inference = { cmd = "bash scripts/verify_renamed_entrypoints.sh production-inference && bash scripts/fix_mojo_runpath.sh output/bin/serenity_sd3_conditioning output/bin/klein_precache_sample_prompts output/bin/klein_sample_cli", depends-on = ["build-cshim", "build-sd3-conditioning", "build-klein-precache", "build-klein-sampler"] }

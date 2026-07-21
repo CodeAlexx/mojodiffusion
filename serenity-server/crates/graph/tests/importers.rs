@@ -761,3 +761,88 @@ fn image_scale_by_is_rejected_loud() {
     assert!(msg.contains("ImageScaleBy"), "msg = {msg}");
     assert!(msg.contains("not resolvable"), "msg = {msg}");
 }
+
+#[test]
+fn ltx2_lora_loader_advanced_lowers_stream_strengths() {
+    let mut req = json!({
+        "workflow": {
+            "1": {
+                "class_type": "LTXVLoader",
+                "inputs": {
+                    "checkpoint_path": "ltx-2.3-22b-dev.safetensors",
+                    "gemma_path": "gemma-3-12b-it",
+                    "dtype": "bfloat16"
+                }
+            },
+            "2": {
+                "class_type": "LTX2LoraLoaderAdvanced",
+                "inputs": {
+                    "model": ["1", 0],
+                    "lora_name": "my_ltx2_overlay.safetensors",
+                    "strength_model": 0.9,
+                    "video": 0.75,
+                    "audio_to_video": 0.5
+                }
+            },
+            "3": {
+                "class_type": "LTXVSampler",
+                "inputs": {
+                    "ltxv_model": ["2", 0],
+                    "prompt": "cinematic foggy forest",
+                    "width": 768,
+                    "height": 512,
+                    "num_frames": 97,
+                    "steps": 25,
+                    "cfg": 3.0,
+                    "seed": 42,
+                    "frame_rate": 24,
+                    "mode": "dev"
+                }
+            },
+            "4": {
+                "class_type": "SaveVideo",
+                "inputs": {
+                    "video": ["3", 1],
+                    "filename_prefix": "ltx2_lora_adv",
+                    "fps": 24,
+                    "format": "mp4"
+                }
+            }
+        }
+    });
+    lower_request(&mut req).expect("LTX2 advanced-LoRA video graph lowers");
+    assert_eq!(req["model"].as_str(), Some("ltx-2.3-22b-dev.safetensors"));
+    let lora = req["lora"].as_array().expect("lora array present");
+    assert_eq!(lora.len(), 1);
+    let row = &lora[0];
+    assert_eq!(row["name"].as_str(), Some("my_ltx2_overlay.safetensors"));
+    assert_eq!(row["weight"].as_f64(), Some(0.9));
+    assert_eq!(row["video"].as_f64(), Some(0.75));
+    assert_eq!(row["audio_to_video"].as_f64(), Some(0.5));
+    // Default-1.0 streams are omitted so plain rows stay `{name, weight}`.
+    assert!(row.get("video_to_audio").is_none());
+    assert!(row.get("audio").is_none());
+    assert!(row.get("other").is_none());
+}
+
+#[test]
+fn ltx2_lora_loader_advanced_blocks_input_is_rejected_loud() {
+    let mut req = json!({
+        "workflow": {
+            "1": { "class_type": "LTXVLoader", "inputs": { "checkpoint_path": "ltx-2.3-22b-dev.safetensors" } },
+            "2": {
+                "class_type": "LTX2LoraLoaderAdvanced",
+                "inputs": {
+                    "model": ["1", 0],
+                    "blocks": ["1", 0],
+                    "lora_name": "my_ltx2_overlay.safetensors"
+                }
+            }
+        }
+    });
+    let err = lower_request(&mut req).unwrap_err().to_string();
+    assert!(
+        err.contains("blocks input is not supported") || err.contains("unsupported workflow graph node type"),
+        "unexpected error: {err}"
+    );
+}

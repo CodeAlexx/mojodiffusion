@@ -586,7 +586,7 @@ fn base_params(st: &AppState, req: &Value) -> Result<JobParams, String> {
                 continue;
             }
             let weight = it.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0);
-            specs.push(serenity_wire::LoraSpec { name, weight });
+            specs.push(serenity_wire::LoraSpec::new(name, weight));
         }
         p.loras = specs;
     }
@@ -679,10 +679,7 @@ fn apply_axis(p: &mut JobParams, axis: Axis, value: &Value) -> Result<String, St
                 Ok("none".to_string())
             } else {
                 let (name, weight) = parse_lora(trimmed);
-                p.loras = vec![serenity_wire::LoraSpec {
-                    name: name.clone(),
-                    weight,
-                }];
+                p.loras = vec![serenity_wire::LoraSpec::new(name.clone(), weight)];
                 // label: bare lora file stem + weight when not 1.0.
                 let stem = lora_stem(&name);
                 if (weight - 1.0).abs() < 1e-9 {

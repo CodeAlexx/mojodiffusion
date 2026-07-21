@@ -98,7 +98,9 @@ from serenitymojo.models.upsampler.ltx2_upsampler import (
     LatentUpsampler, upsample_video,
 )
 from serenitymojo.image.png import save_png, ValueRange
-from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet
+from serenitymojo.lora import (
+    LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet, LoraStreamMults,
+)
 from serenitymojo.serve.product_manifest import (
     json_bool, json_escape, peak_vram_mib, write_text_file,
 )
@@ -533,21 +535,47 @@ struct _RequestHQLoraStack(Movable):
     var distilled: LoraSet
     var trained: List[ArcPointer[LoraSet]]
     var trained_mults: List[Float32]
+    var trained_streams: List[LoraStreamMults]
 
     def __init__(
         out self,
         var distilled: LoraSet,
         var trained: List[ArcPointer[LoraSet]],
         var trained_mults: List[Float32],
+        var trained_streams: List[LoraStreamMults],
     ):
         self.distilled = distilled^
         self.trained = trained^
         self.trained_mults = trained_mults^
+        self.trained_streams = trained_streams^
+
+    @staticmethod
+    def _parse_streams(text: String, i: Int) raises -> LoraStreamMults:
+        """`LTX2_TRAINED_LORA_STREAMS_{i}` encoding: five comma-joined floats
+        `video,video_to_audio,audio,audio_to_video,other`, each in [0, 1]
+        (the KJ LTX2LoraLoaderAdvanced slider range)."""
+        var parts = text.split(String(","))
+        if len(parts) != 5:
+            raise Error(
+                String("LTX2_TRAINED_LORA_STREAMS_") + String(i)
+                + String(" must be 5 comma-joined floats")
+            )
+        var vals = List[Float32]()
+        for p in parts:
+            var v = Float32(Float64(String(p)))
+            if v < Float32(0.0) or v > Float32(1.0):
+                raise Error(
+                    String("LTX2_TRAINED_LORA_STREAMS_") + String(i)
+                    + String(" entries must be in [0, 1]")
+                )
+            vals.append(v)
+        return LoraStreamMults(vals[0], vals[1], vals[2], vals[3], vals[4])
 
     @staticmethod
     def load() raises -> _RequestHQLoraStack:
         var trained = List[ArcPointer[LoraSet]]()
         var trained_mults = List[Float32]()
+        var trained_streams = List[LoraStreamMults]()
         var count_text = _env_str("LTX2_TRAINED_LORA_COUNT")
         var count = 0
         if count_text.byte_length() > 0:
@@ -569,10 +597,18 @@ struct _RequestHQLoraStack(Movable):
                     String("LTX2_TRAINED_LORA_MULT_") + String(i)
                     + String(" must be in [-10, 10]")
                 )
+            var streams_text = _env_str(
+                String("LTX2_TRAINED_LORA_STREAMS_") + String(i)
+            )
+            var streams = LoraStreamMults.identity()
+            if streams_text.byte_length() > 0:
+                streams = _RequestHQLoraStack._parse_streams(streams_text, i)
             trained.append(ArcPointer(LoraSet.load(path)))
             trained_mults.append(mult)
+            trained_streams.append(streams)
         return _RequestHQLoraStack(
-            LoraSet.load(_refhq_lora_distilled()), trained^, trained_mults^
+            LoraSet.load(_refhq_lora_distilled()), trained^, trained_mults^,
+            trained_streams^,
         )
 
     def validate(self) raises:
@@ -597,6 +633,12 @@ struct _RequestHQLoraStack(Movable):
             print("  [lora] authored overlay", i,
                   self.trained[i][].num_mappings(), "mappings @",
                   self.trained_mults[i])
+            if not self.trained_streams[i].is_identity():
+                print("  [lora]   streams v", self.trained_streams[i].video,
+                      "v2a", self.trained_streams[i].video_to_audio,
+                      "a", self.trained_streams[i].audio,
+                      "a2v", self.trained_streams[i].audio_to_video,
+                      "other", self.trained_streams[i].other)
 
     def apply_to_globals(
         self,
@@ -606,8 +648,8 @@ struct _RequestHQLoraStack(Movable):
     ) raises -> Int:
         var total = self.distilled.apply_to_globals(gw, distilled_mult, ctx)
         for i in range(len(self.trained)):
-            total += self.trained[i][].apply_to_globals(
-                gw, self.trained_mults[i], ctx
+            total += self.trained[i][].apply_to_globals_streamed(
+                gw, self.trained_mults[i], self.trained_streams[i], ctx
             )
         return total
 
@@ -623,8 +665,9 @@ struct _RequestHQLoraStack(Movable):
             block_idx, deltas, distilled_mult, ctx
         )
         for i in range(len(self.trained)):
-            _ = self.trained[i][].accumulate_ltx2_block_deltas(
-                block_idx, deltas, self.trained_mults[i], ctx
+            _ = self.trained[i][].accumulate_ltx2_block_deltas_streamed(
+                block_idx, deltas, self.trained_mults[i],
+                self.trained_streams[i], ctx
             )
         return deltas.apply_to_av_block(block, ctx)
 
@@ -645,8 +688,9 @@ struct _RequestHQLoraStack(Movable):
             block_idx, block, distilled_mult, ctx
         )
         for i in range(len(self.trained)):
-            total += self.trained[i][].attach_ltx2_cached_block_factors(
-                block_idx, block, self.trained_mults[i], ctx
+            total += self.trained[i][].attach_ltx2_cached_block_factors_streamed(
+                block_idx, block, self.trained_mults[i],
+                self.trained_streams[i], ctx
             )
         return total
 

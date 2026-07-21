@@ -369,6 +369,12 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             1 => Some("CLIP"),
             _ => None,
         },
+        "LTX2LoraLoaderAdvanced" => match slot {
+            0 => Some("MODEL"),
+            1 => Some("rank"),
+            2 => Some("loaded_keys_info"),
+            _ => None,
+        },
         "CLIPLoader" | "DualCLIPLoader" | "TripleCLIPLoader" => (slot == 0).then_some("CLIP"),
         "CLIPVisionLoader" => (slot == 0).then_some("CLIP_VISION"),
         "CLIPVisionEncode" => (slot == 0).then_some("CLIP_VISION_OUTPUT"),
@@ -950,6 +956,27 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             if type_id == "LoraLoader" {
                 fields.insert("strength_clip".into(), json!(widget_float(widgets, 2, 1.0)));
             }
+        }
+        "LTX2LoraLoaderAdvanced" => {
+            // KJ widget order (force_input `opt_lora_path` and the `blocks`
+            // socket are inputs, not widgets): lora_name, strength_model,
+            // video, video_to_audio, audio, audio_to_video, other.
+            fields.insert("lora_name".into(), json!(widget_string(widgets, 0, "")));
+            fields.insert(
+                "strength_model".into(),
+                json!(widget_float(widgets, 1, 1.0)),
+            );
+            fields.insert("video".into(), json!(widget_float(widgets, 2, 1.0)));
+            fields.insert(
+                "video_to_audio".into(),
+                json!(widget_float(widgets, 3, 1.0)),
+            );
+            fields.insert("audio".into(), json!(widget_float(widgets, 4, 1.0)));
+            fields.insert(
+                "audio_to_video".into(),
+                json!(widget_float(widgets, 5, 1.0)),
+            );
+            fields.insert("other".into(), json!(widget_float(widgets, 6, 1.0)));
         }
         "CLIPTextEncode"
         | "CLIPTextEncodeFlux"

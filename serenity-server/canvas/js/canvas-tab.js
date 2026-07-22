@@ -3624,6 +3624,7 @@ var CanvasTab = (function () {
                     x: boundingBox.x(), y: boundingBox.y(),
                     width: boundingBox.width(), height: boundingBox.height(),
                     fill: 'rgba(239, 68, 68, 0.5)',
+                    name: 'full-frame-mask',
                     listening: false
                 });
                 layer.konvaLayer.add(rect);
@@ -4594,22 +4595,30 @@ var CanvasTab = (function () {
         if (children.length === 0)
             return Promise.resolve(null);
         return new Promise(function (resolve) {
-            // Export mask layer content in bbox region
-            canvasLayers.forEach(function (l) {
-                if (l !== maskLayer)
-                    l.konvaLayer.hide();
-            });
-            var maskDataURL = captureBoundingBoxDataURL(1, false);
-            // Restore visibility
-            canvasLayers.forEach(function (l) {
-                if (l.data.visible)
-                    l.konvaLayer.show();
-            });
-            stage.batchDraw();
-            // Convert to B&W: any non-transparent pixel becomes white
-            var offscreen = document.createElement('canvas');
+            // Export this layer directly. Exporting the whole stage makes its
+            // transparent background opaque on some browsers, which turns a
+            // small painted region into a full-frame mask.
             var bw = Math.round(boundingBox.width());
             var bh = Math.round(boundingBox.height());
+            var oldPosition = { x: stage.x(), y: stage.y() };
+            var oldScale = { x: stage.scaleX(), y: stage.scaleY() };
+            var maskDataURL = '';
+            try {
+                stage.position({ x: 0, y: 0 });
+                stage.scale({ x: 1, y: 1 });
+                stage.draw();
+                maskDataURL = maskLayer.konvaLayer.toDataURL({
+                    x: boundingBox.x(), y: boundingBox.y(),
+                    width: bw, height: bh, pixelRatio: 1
+                });
+            }
+            finally {
+                stage.position(oldPosition);
+                stage.scale(oldScale);
+                stage.draw();
+            }
+            // Convert to B&W: any non-transparent pixel becomes white
+            var offscreen = document.createElement('canvas');
             offscreen.width = bw;
             offscreen.height = bh;
             var ctx = offscreen.getContext('2d');
@@ -4624,9 +4633,11 @@ var CanvasTab = (function () {
                 // black/preserve, then make the uploaded grayscale mask opaque.
                 var imageData = ctx.getImageData(0, 0, bw, bh);
                 var data = imageData.data;
+                var paintedPixels = 0;
                 for (var i = 0; i < data.length; i += 4) {
                     var painted = data[i + 3] > 127;
                     if (painted) {
+                        paintedPixels += 1;
                         data[i] = 255;
                         data[i + 1] = 255;
                         data[i + 2] = 255;
@@ -4639,7 +4650,15 @@ var CanvasTab = (function () {
                     data[i + 3] = 255;
                 }
                 ctx.putImageData(imageData, 0, 0);
-                resolve(offscreen.toDataURL('image/png').split(',')[1]);
+                var coverage = paintedPixels / (bw * bh);
+                var fullFrameRequested = children.some(function (child) {
+                    return child.name && child.name() === 'full-frame-mask';
+                });
+                resolve({
+                    base64: offscreen.toDataURL('image/png').split(',')[1],
+                    coverage: coverage,
+                    fullFrameRequested: fullFrameRequested
+                });
             };
             img.onerror = function () { resolve(null); };
             img.src = maskDataURL;
@@ -4782,20 +4801,14 @@ var CanvasTab = (function () {
                 // Inpaint: export both init image and mask
                 exportBoundingBoxRegion().then(function (initBase64) {
                     return uploadInitImage(initBase64).then(function (initName) {
-                        return exportMaskAsBW().then(function (maskBase64) {
-                            if (!maskBase64) {
-                                // Mask export failed, fall back to img2img
-                                queueWorkflow(WorkflowBuilder.buildImg2Img({
-                                    model: genState.model || '', prompt: genState.prompt,
-                                    initImageName: initName, width: bw, height: bh,
-                                    steps: genState.steps, cfg: genState.cfg,
-                                    guidance: genState.guidance, denoise: genState.denoise, seed: seed,
-                                    negPrompt: genState.negative, sampler: genState.sampler, scheduler: genState.scheduler, batch: genState.batch,
-                                    loras: activeLoras
-                                }));
-                                return;
-                            }
-                            return uploadInitImage(maskBase64).then(function (maskName) {
+                        return exportMaskAsBW().then(function (maskExport) {
+                            if (!maskExport || !maskExport.base64)
+                                throw new Error('The painted mask could not be exported');
+                            if (maskExport.coverage <= 0)
+                                throw new Error('The painted mask is empty');
+                            if (maskExport.coverage >= 0.995 && !maskExport.fullFrameRequested)
+                                throw new Error('The mask unexpectedly covers the entire image; clear it and paint the edit area again');
+                            return uploadInitImage(maskExport.base64).then(function (maskName) {
                                 queueWorkflow(WorkflowBuilder.buildInpaint({
                                     model: genState.model || '', prompt: genState.prompt,
                                     negPrompt: genState.negative, initImageName: initName, maskImageName: maskName,
@@ -5968,6 +5981,7 @@ var CanvasTab = (function () {
         setPrompt: setPrompt,
         setModel: setModel,
         getCompositorContext: getCompositorContext,
+        exportMaskAsBW: exportMaskAsBW,
         getToolContext: function () { return stage ? getToolContext() : null; },
         getCanvasLayers: function () { return canvasLayers; },
         getStage: function () { return stage; },

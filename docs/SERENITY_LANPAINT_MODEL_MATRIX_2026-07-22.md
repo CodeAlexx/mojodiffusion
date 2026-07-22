@@ -82,3 +82,46 @@ That browser test verifies the enabled-engine set, the complete disabled
 upstream inventory, graph tails for every graph-ready deferred image family,
 Krea2 and Z-Image preflight, Z-Image LoRA rewiring, and the shared 1024x1024
 Canvas layout.
+
+## Mask export contract and 2026-07-22 repair
+
+Canvas mask export must produce an opaque grayscale PNG where white means edit
+and black means preserve. The previous `canvas-tab.js::exportMaskAsBW` hid the
+other authored layers but exported the whole Konva stage. On the live Chromium
+path, the stage's transparent background became opaque, and the alpha-to-mask
+conversion therefore turned every pixel white. Job `job-0273` is the failure
+artifact: source `canvas_init-0271.png` is the intended street portrait, mask
+`canvas_init-0272.png` is completely white, and the resulting frame is an
+unrelated full-frame image.
+
+The repaired exporter:
+
+1. exports only the selected mask layer;
+2. temporarily neutralizes stage pan and zoom so mask pixels remain aligned to
+   the 1024x1024 bounding box;
+3. converts painted alpha to white and transparent pixels to black;
+4. reports mask coverage and rejects an unexpected >=99.5% mask unless the
+   explicit `Fill All` action authored it; and
+5. fails loudly when mask export is empty or invalid instead of silently
+   submitting an img2img graph.
+
+`canvas-compositor.js::flattenMaskLayers` uses the same layer-only,
+transform-neutral export rule. The live Playwright contract adds a 256x256
+mask to a 1024x1024 Canvas and asserts black outside, white inside, and measured
+coverage between 5% and 8%.
+
+The optional real-generation gate is:
+
+```bash
+SERENITY_CANVAS_LANPAINT_SMOKE_SOURCE=/absolute/path/to/source.png \
+SERENITY_CANVAS_LANPAINT_SMOKE_PROMPT='complete target description' \
+SERENITY_CANVAS_LANPAINT_SMOKE_PROMPT_MODE='Image First' \
+node scripts/check_serenity_canvas_invoke_parity.js
+```
+
+Real Krea2 Turbo runs `job-0285` (`Image First`) and `job-0292` (`Prompt
+First`) both uploaded a localized 8.96% head mask and preserved the street,
+coat, pose, and surrounding people outside the masked region. Visual inspection
+also showed that neither run reliably produced a bald/no-hair target. That is a
+Turbo prompt-adherence/model-quality limitation for this test, not a mask
+routing pass; it must not be reported as a successful hair-removal result.

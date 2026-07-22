@@ -248,6 +248,48 @@ function checkpoint(message) {
   assert(lanpaintLayout.controlsVisible && lanpaintLayout.modelHidden,
     "LanPaint controls or authoritative engine selector are not visible");
 
+  const maskExport = await page.evaluate(async () => {
+    const ctx = CanvasTab.getToolContext();
+    const bb = ctx.boundingBox;
+    const maskLayer = ctx.addLayer("Mask export contract", "mask");
+    maskLayer.konvaLayer.add(new Konva.Rect({
+      x: bb.x() + 128, y: bb.y() + 128,
+      width: 256, height: 256,
+      fill: "rgba(239, 68, 68, 0.8)",
+      listening: false,
+    }));
+    maskLayer.konvaLayer.draw();
+    const result = await CanvasTab.exportMaskAsBW();
+    const image = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = `data:image/png;base64,${result.base64}`;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const imageCtx = canvas.getContext("2d");
+    imageCtx.drawImage(image, 0, 0);
+    const pixels = imageCtx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const valueAt = (x, y) => pixels[(y * canvas.width + x) * 4];
+    ctx.deleteActiveLayer();
+    return {
+      width: image.width,
+      height: image.height,
+      coverage: result.coverage,
+      outside: valueAt(32, 32),
+      inside: valueAt(192, 192),
+    };
+  });
+  assert(maskExport.width === 1024 && maskExport.height === 1024,
+    `mask export geometry changed: ${JSON.stringify(maskExport)}`);
+  assert(maskExport.outside === 0 && maskExport.inside === 255,
+    `mask export did not preserve black/preserve and white/edit pixels: ${JSON.stringify(maskExport)}`);
+  assert(maskExport.coverage > 0.05 && maskExport.coverage < 0.08,
+    `localized mask became empty or full-frame: ${JSON.stringify(maskExport)}`);
+  checkpoint("localized B&W mask export passed");
+
   await page.selectOption("#cv-lanpaint-engine", "zimage_base_1024");
   await page.dispatchEvent("#cv-lanpaint-engine", "change");
   const zimageMaskedLayout = await page.evaluate(() => {
@@ -612,11 +654,85 @@ function checkpoint(message) {
   assert(ltx.prompt.includes("vrtlEri2"), "Canvas lost the trained identity trigger");
   checkpoint("LTX2 and LoRA request passed");
 
+  let lanpaintSmoke = null;
+  const lanpaintSmokeSource = process.env.SERENITY_CANVAS_LANPAINT_SMOKE_SOURCE;
+  if (lanpaintSmokeSource) {
+    assert(fs.existsSync(lanpaintSmokeSource), `LanPaint smoke source does not exist: ${lanpaintSmokeSource}`);
+    checkpoint("run real Krea2 Turbo LanPaint generation");
+    const smokeContext = await browser.newContext({ viewport: { width: 1600, height: 900 } });
+    const smokePage = await smokeContext.newPage();
+    smokePage.on("console", (message) => {
+      if (message.type() === "error") errors.push(message.text());
+    });
+    smokePage.on("pageerror", (error) => errors.push(String(error)));
+    await smokePage.goto(process.env.SERENITY_URL || "http://127.0.0.1:7811", { waitUntil: "domcontentloaded" });
+    await smokePage.click('.nav-btn[data-tab="canvas"]');
+    await smokePage.waitForSelector("#cv-model option:not([disabled])", { state: "attached" });
+    await smokePage.selectOption("#cv-edit-mode", "inpaint");
+    await smokePage.dispatchEvent("#cv-edit-mode", "change");
+    await smokePage.selectOption("#cv-lanpaint-engine", "krea2_turbo_1024");
+    await smokePage.dispatchEvent("#cv-lanpaint-engine", "change");
+    const smokePromptMode = process.env.SERENITY_CANVAS_LANPAINT_SMOKE_PROMPT_MODE || "Image First";
+    await smokePage.selectOption("#cv-lanpaint-prompt-mode", smokePromptMode);
+    await smokePage.dispatchEvent("#cv-lanpaint-prompt-mode", "change");
+    await smokePage.setInputFiles("#cv-import-file", lanpaintSmokeSource);
+    await smokePage.waitForFunction(() => CanvasTab.getCanvasLayers().some((layer) =>
+      layer.data.type === "draw" && layer.konvaLayer.getChildren().length > 0));
+    const smokePrompt = process.env.SERENITY_CANVAS_LANPAINT_SMOKE_PROMPT ||
+      "a photorealistic bald woman with a natural bare scalp, standing on the same city street";
+    await smokePage.fill("#cv-prompt", smokePrompt);
+    const smokeMask = await smokePage.evaluate(async () => {
+      const ctx = CanvasTab.getToolContext();
+      const bb = ctx.boundingBox;
+      const maskLayer = ctx.addLayer("LanPaint smoke mask", "mask");
+      maskLayer.konvaLayer.add(new Konva.Ellipse({
+        x: bb.x() + bb.width() * 0.5,
+        y: bb.y() + bb.height() * 0.17,
+        radiusX: bb.width() * 0.16,
+        radiusY: bb.height() * 0.18,
+        fill: "rgba(239, 68, 68, 0.8)",
+        listening: false,
+      }));
+      maskLayer.konvaLayer.draw();
+      const exported = await CanvasTab.exportMaskAsBW();
+      return { coverage: exported.coverage, width: bb.width(), height: bb.height() };
+    });
+    assert(smokeMask.coverage > 0.05 && smokeMask.coverage < 0.15,
+      `LanPaint smoke mask is not localized: ${JSON.stringify(smokeMask)}`);
+    const priorJobIds = await smokePage.evaluate(async () =>
+      (await (await fetch("/v1/jobs", { cache: "no-store" })).json()).map((job) => job.id));
+    await smokePage.click("#cv-generate-btn");
+    const deadline = Date.now() + 300_000;
+    let smokeJob = null;
+    while (Date.now() < deadline) {
+      const jobs = await smokePage.evaluate(async () =>
+        await (await fetch("/v1/jobs", { cache: "no-store" })).json());
+      smokeJob = jobs.find((job) => !priorJobIds.includes(job.id) &&
+        job.metadata && job.metadata.prompt === smokePrompt) || null;
+      if (smokeJob && smokeJob.state === "done") break;
+      if (smokeJob && smokeJob.state === "error")
+        throw new Error(`LanPaint smoke generation failed: ${smokeJob.error || JSON.stringify(smokeJob)}`);
+      await smokePage.waitForTimeout(1000);
+    }
+    assert(smokeJob && smokeJob.state === "done", "LanPaint smoke generation timed out");
+    assert(smokeJob.output_path && fs.existsSync(smokeJob.output_path),
+      `LanPaint smoke output is missing: ${JSON.stringify(smokeJob)}`);
+    lanpaintSmoke = {
+      id: smokeJob.id,
+      outputPath: smokeJob.output_path,
+      maskCoverage: smokeMask.coverage,
+      prompt: smokePrompt,
+      promptMode: smokePromptMode,
+    };
+    await smokeContext.close();
+    checkpoint(`real LanPaint generation passed: ${lanpaintSmoke.outputPath}`);
+  }
+
   assert(errors.length === 0, `browser errors: ${errors.join(" | ")}`);
   const screenshot = process.env.SERENITY_CANVAS_SCREENSHOT || "/tmp/serenity-canvas-invoke-parity.png";
   await page.screenshot({ path: screenshot, fullPage: true });
   checkpoint("screenshot captured");
-  console.log(JSON.stringify({ layout, editLayout, flowedit, inpaint, zimageMaskedLayout, zimageInpaintPreflight, maskedEditScreenshot, samResult, editScreenshot, dyna, styleLayout, stylePreflight, styleScreenshot, transparency, boardState, ltx, screenshot }, null, 2));
+  console.log(JSON.stringify({ layout, editLayout, flowedit, inpaint, zimageMaskedLayout, zimageInpaintPreflight, maskedEditScreenshot, samResult, editScreenshot, dyna, styleLayout, stylePreflight, styleScreenshot, transparency, boardState, ltx, lanpaintSmoke, screenshot }, null, 2));
   await browser.close();
 })().catch((error) => {
   console.error(error.stack || error);

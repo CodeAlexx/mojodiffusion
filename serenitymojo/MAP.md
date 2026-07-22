@@ -2687,3 +2687,44 @@ work itself lives in the serenity-trainer + serenity-server trees).
   after later picker changes. The Playwright contract covers 17 discovered
   models and 13 templates, the three video backends, exact fixed profiles,
   request routing, gallery identity/scrolling, and zero browser errors.
+
+## 2026-07-21: Wan 2.2 + Wan 2.1 LoRA TRAINERS — all verticals RUN on real weights (Musubi-parity, 5080)
+
+Supersedes the "wan22 trainer blocked on data" note (2026-07-08): the 14B A14B
+weights were downloaded and all Wan LoRA trainers now run + are parity-certified
+against the **Musubi Tuner** oracle (`/home/alex/musubi-tuner`, not diffusers).
+NOTE: Musubi trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
+
+- **Entry point**: `training/train_wan22_real.mojo` — one loop, env-selected variant:
+  default = Wan2.2 T2V-A14B; `WAN22_I2V=1` = Wan2.2 I2V-A14B (36-ch);
+  `WAN21_MODEL=t2v_1.3b|t2v_14b` = Wan2.1 T2V; `WAN21_I2V=1` = Wan2.1 I2V-14B (CLIP).
+  Flow-match `x_t=(1-t)x0+t·noise`, target=`noise-x0`, MSE (musubi recipe cited).
+  Compile needs `-Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda` (offload loader).
+- **Dual high/low-noise expert** (Wan2.2 A14B): two resident bases + two streamed
+  loaders, per-step `use_high = t >= boundary` (T2V 0.875 / I2V 0.900); ONE shared
+  LoRA (musubi swaps base under the network). Env: `WAN22_DIT_HIGH_NOISE`,
+  `WAN22_TIMESTEP_BOUNDARY`, `WAN22_DUAL_EXPERT`. Peak VRAM ~5.9G streamed.
+- **`models/wan22/wan22_block.mojo`**: FFN LoRA added (10 targets: attn q/k/v/o×2 +
+  ffn.0/ffn.2). `wan22_i2v_block_lora_forward/backward[H,Dh,S,TXT,IMG]` = Wan2.1
+  `WanI2VCrossAttention` (k_img/v_img + norm_k_img; text-SDPA + img-SDPA share q,
+  ADD before o) — 12 targets. Certified vs musubi WanAttentionBlock cos≥0.999.
+- **`models/wan22/wan22_stack_lora.mojo`**: `wan22_i2v_stack_lora_{forward,backward}_offload`
+  (i2v block per layer, frozen context threaded once, 12/block LoRA); `Wan22I2VLoraSet`.
+  **LoRA save = ai-toolkit/ComfyUI format**: `_wan22_lora_prefixes` emits
+  `diffusion_model.blocks.N.<mod>.lora_A/lora_B.weight` (+ k_img/v_img for i2v-2.1).
+- **`models/wan22/weights.mojo`**: runtime patch_embed (in_dim 16/36 → 64/144 packed);
+  `detect_wan22_prefix` auto-detects bare (2.2, 2.1-14B) vs `model.diffusion_model.`
+  (2.1-1.3B) checkpoint keys; MLPProj (`img_emb.proj.{0,1,3,4}`) resident for i2v-2.1.
+- **`offload/wan22_plan.mojo`**: `prefix` param + `build_wan21_i2v_block_plan` (streams
+  cross_attn.{k_img,v_img,norm_k_img}). **`ops/activations.mojo`**: `gelu_exact` (erf)
+  for the CLIP MLPProj (musubi nn.GELU() default; NOT the ffn tanh-gelu).
+- **Data cache**: `models/wan22/parity/wan22_build_data_cache.py` (Musubi WanVAE 16-ch
+  + umt5; `--i2v` adds cond_y[20], `--i2v21` adds CLIP `clip[257,1280]` via the
+  onlyvisual xlm-roberta-vit-h-14). Mojo readers in the trainer patchify via patchify3d.
+- **Parity gates**: `models/wan22/parity/wan22_block_lora_{musubi_oracle.py,parity_musubi.mojo}`
+  (10-target T2V/2.2) + `wan22_i2v21_block_lora_{musubi_oracle.py,parity.mojo}`
+  (12-target i2v-2.1). Both PASS cos≥0.999. Oracle `.bin` dumps gitignored.
+- **Verified real-weight smokes** (own-gate): T2V-A14B (dual, 400 ad), I2V-A14B (dual@0.900,
+  400 ad), T2V-1.3B (300 ad, ~12s/step), T2V-14B (400 ad), I2V-14B-CLIP (480 ad).
+  All finite loss, LoRA saved diffusion_model.-prefixed. Perf ~106-144s/step (14B
+  streamed) — a lever, not correctness. `configs/wan22_{real_smoke_2step,dual_smoke_4step}.json`.

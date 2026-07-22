@@ -383,21 +383,27 @@ def main() raises:
         FRAME, H_TOK, W_TOK, N_TXT, H, ROPE_THETA, STDtype.F32, ctx
     )
 
+    # P3: config-first data cache (cfg.dataset_cache_dir ← JSON cache_dir /
+    # dataset_cache_dir); env MAGEFLOW_DATA_CACHE OVERRIDES when set. An
+    # explicit dir with no .safetensors FAILS LOUD (no silent synthetic).
     var cache_dir = _env_str(String("MAGEFLOW_DATA_CACHE"))
+    if cache_dir.byte_length() == 0:
+        cache_dir = cfg.dataset_cache_dir
     var cache_files = List[String]()
     if cache_dir.byte_length() > 0:
         cache_files = list_sorted_safetensors(cache_dir)
+        if len(cache_files) == 0:
+            raise Error(
+                String("[data] no .safetensors at cache dir: ") + cache_dir
+                + String(" (env MAGEFLOW_DATA_CACHE > config cache_dir; fail-loud)")
+            )
     var use_cache = len(cache_files) > 0
     if use_cache:
         print("[data] REAL cache:", cache_dir, " samples=", len(cache_files),
               " (round-robin; klein_dataset layout)")
     else:
-        if cache_dir.byte_length() > 0:
-            print("[data] MAGEFLOW_DATA_CACHE set but no .safetensors at",
-                  cache_dir, "-> SYNTHETIC")
-        else:
-            print("[data] SYNTHETIC x0/text (set MAGEFLOW_DATA_CACHE=<dir>;",
-                  "cache builder = chunk 5)")
+        print("[data] SYNTHETIC x0/text (set config cache_dir or env",
+              "MAGEFLOW_DATA_CACHE=<dir>; cache builder = chunk 5)")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)

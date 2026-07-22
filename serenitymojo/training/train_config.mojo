@@ -488,6 +488,26 @@ struct TrainConfig(Copyable, Movable):
     var controlnet_scale: Float64
     var controlnet_checkpoint: String
 
+    # ── P3 wan21/wan22 config-first keys (2026-07-22 env-retire) ────────────
+    # These promote the formerly env-only WAN21_*/WAN22_* knobs to config keys
+    # so runs reproduce from the config file alone. The env vars REMAIN as
+    # overrides (env wins ONLY when set — back-compat with the smoke scripts).
+    # dit_high_noise: wan22 high-noise expert ckpt ("" = low_noise→high_noise
+    #   filename convention). Env override: WAN22_DIT_HIGH_NOISE.
+    # dual_expert: -1 = auto (dual iff the high ckpt exists — today's default),
+    #   0 = force off, 1 = on (still requires the high ckpt on disk).
+    #   Env override: WAN22_DUAL_EXPERT.
+    # wan_i2v: wan22 I2V-A14B 36-ch arm (JSON key "i2v"). Env: WAN22_I2V.
+    # wan_variant: "" = wan22 (default) | "t2v_1.3b" | "t2v_14b" selects the
+    #   Wan2.1 single-expert arm. Env override: WAN21_MODEL.
+    # timestep_boundary: dual-expert split point; <=0 sentinel = unset → the
+    #   per-mode default (0.875 T2V / 0.900 I2V). Env: WAN22_TIMESTEP_BOUNDARY.
+    var dit_high_noise: String
+    var dual_expert: Int
+    var wan_i2v: Bool
+    var wan_variant: String
+    var timestep_boundary: Float32
+
     def n_layers(self) -> Int:
         """Total block count (back-compat convenience)."""
         return self.num_double + self.num_single
@@ -798,6 +818,11 @@ struct TrainConfig(Copyable, Movable):
         audio_ref_use_negative_positions: Bool = False,
         audio_ref_mask_cross_attention_to_reference: Bool = False,
         audio_ref_mask_reference_from_text_attention: Bool = False,
+        var dit_high_noise: String = String(""),   # P3 wan/mageflow env-retire —
+        dual_expert: Int = -1,                     # all defaults reproduce the
+        wan_i2v: Bool = False,                     # pre-P3 env-unset behavior
+        var wan_variant: String = String(""),
+        timestep_boundary: Float32 = Float32(-1.0),
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -1020,6 +1045,11 @@ struct TrainConfig(Copyable, Movable):
         self.audio_ref_use_negative_positions = audio_ref_use_negative_positions
         self.audio_ref_mask_cross_attention_to_reference = audio_ref_mask_cross_attention_to_reference
         self.audio_ref_mask_reference_from_text_attention = audio_ref_mask_reference_from_text_attention
+        self.dit_high_noise = dit_high_noise^
+        self.dual_expert = dual_expert
+        self.wan_i2v = wan_i2v
+        self.wan_variant = wan_variant^
+        self.timestep_boundary = timestep_boundary
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA

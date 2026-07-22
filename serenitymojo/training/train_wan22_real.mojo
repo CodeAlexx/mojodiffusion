@@ -237,10 +237,14 @@ def _env_is_set(name: String) -> Bool:
     return ret[0] == UInt8(49) and ret[1] == UInt8(0)
 
 
-# ── libc getenv → String ("" if unset). Dual-expert config overrides live in env
-#    (WAN22_DIT_HIGH_NOISE / WAN22_TIMESTEP_BOUNDARY / WAN22_DUAL_EXPERT) plus the
-#    smoke timestep pins (WAN22_ALTERNATE_T / WAN22_T_LOW / WAN22_T_HIGH) so we do
-#    NOT have to widen the shared TrainConfig constructor. Same pattern as
+# ── libc getenv → String ("" if unset). P3 (2026-07-22): the run knobs are
+#    CONFIG-FIRST (TrainConfig keys dit_high_noise / timestep_boundary /
+#    dual_expert / i2v / wan_variant / cache_dir); the env vars
+#    (WAN22_DIT_HIGH_NOISE / WAN22_TIMESTEP_BOUNDARY / WAN22_DUAL_EXPERT /
+#    WAN22_I2V / WAN21_MODEL / WAN22_DATA_CACHE / WAN22_DIT / WAN21_DIT) remain
+#    as OVERRIDES — env wins ONLY when set (back-compat with smoke scripts).
+#    The smoke timestep pins (WAN22_ALTERNATE_T / WAN22_T_LOW / WAN22_T_HIGH /
+#    WAN22_SHIFT_TIMESTEPS) stay env-only (test pins). Same pattern as
 #    ltx2_t2v_av_hq.mojo::_env_str.
 def _env_str(name: String) -> String:
     var n = name.byte_length()
@@ -644,21 +648,30 @@ def _run_wan21_train[H: Int](
     var cos = rope[0].copy()
     var sin = rope[1].copy()
 
+    # P3: config-first data cache (cfg.dataset_cache_dir ← JSON cache_dir /
+    # dataset_cache_dir); env WAN22_DATA_CACHE OVERRIDES when set (back-compat).
     var cache_dir = _env_str(String("WAN22_DATA_CACHE"))
+    if cache_dir.byte_length() == 0:
+        cache_dir = cfg.dataset_cache_dir
     var n_cache = 0
     var use_cache = False
     if cache_dir.byte_length() > 0:
         n_cache = _count_cache_samples(cache_dir)
-        use_cache = n_cache > 0
+        if n_cache == 0:
+            # Fail loud: an EXPLICIT cache dir (env or config) with no samples
+            # must never silently train on synthetic data (P3 discipline).
+            raise Error(
+                String("[data] no sample_*.safetensors at cache dir: ")
+                + cache_dir
+                + String(" (env WAN22_DATA_CACHE > config cache_dir; fail-loud)")
+            )
+        use_cache = True
     if use_cache:
         print("[data] REAL cache:", cache_dir, " samples=", n_cache,
               " (round-robin; REPLACES synthetic x0/text)")
     else:
-        if cache_dir.byte_length() > 0:
-            print("[data] WAN22_DATA_CACHE set but no sample_*.safetensors found at",
-                  cache_dir, "-> falling back to SYNTHETIC")
-        else:
-            print("[data] SYNTHETIC x0/text (set WAN22_DATA_CACHE=<dir> for real data)")
+        print("[data] SYNTHETIC x0/text (set cache_dir in the config or",
+              "env WAN22_DATA_CACHE=<dir> for real data)")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -1013,17 +1026,27 @@ def _run_wan21_i2v_train[H: Int](
     var cos = rope[0].copy()
     var sin = rope[1].copy()
 
+    # P3: config-first data cache; env WAN22_DATA_CACHE overrides when set.
     var cache_dir = _env_str(String("WAN22_DATA_CACHE"))
+    if cache_dir.byte_length() == 0:
+        cache_dir = cfg.dataset_cache_dir
     var n_cache = 0
     var use_cache = False
     if cache_dir.byte_length() > 0:
         n_cache = _count_cache_samples(cache_dir)
-        use_cache = n_cache > 0
+        if n_cache == 0:
+            raise Error(
+                String("[data] no sample_*.safetensors at cache dir: ")
+                + cache_dir
+                + String(" (env WAN22_DATA_CACHE > config cache_dir; fail-loud)")
+            )
+        use_cache = True
     if use_cache:
         print("[data] REAL --i2v21 cache:", cache_dir, " samples=", n_cache,
               " (latent16 + cond_y20 + clip[257,1280])")
     else:
-        print("[data] SYNTHETIC x0/cond_y/text/clip (set WAN22_DATA_CACHE=<dir> for real data)")
+        print("[data] SYNTHETIC x0/cond_y/text/clip (set config cache_dir or",
+              "env WAN22_DATA_CACHE=<dir> for real data)")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -1130,52 +1153,60 @@ def _run_wan21_i2v_train[H: Int](
 def main() raises:
     var ctx = DeviceContext()
 
-    # ── WAN 2.1 I2V-14B DISPATCH (env WAN21_I2V=1) ─────────────────────────────
+    # ── config (read FIRST — P3: config keys drive arm dispatch; the WAN21_*/
+    #    WAN22_* env vars stay as overrides for the legacy smoke scripts) ──────
+    var args = argv()
+    var config_path = String(DEFAULT_CONFIG)
+    if len(args) > 1:
+        config_path = String(args[1])
+    var cfg = read_model_config(config_path)
+
+    # ── WAN 2.1 I2V-14B DISPATCH (env WAN21_I2V=1; env-only test arm) ─────────
     # The DUAL cross-attn (WanI2VCrossAttention) variant. Checked BEFORE the
-    # WAN21_MODEL / Wan2.2 bodies so those paths stay untouched. Checkpoint via
+    # wan_variant / Wan2.2 bodies so those paths stay untouched. Checkpoint via
     # WAN21_DIT override else DEFAULT_CKPT_WAN21_I2V (absent -> weights-absent
     # guard, exit 0).
     if _env_is_set(String("WAN21_I2V")):
-        var i2v_cfg_path = String(DEFAULT_CONFIG)
-        var i2v_args = argv()
-        if len(i2v_args) > 1:
-            i2v_cfg_path = String(i2v_args[1])
-        var i2v_cfg = read_model_config(i2v_cfg_path)
-        var dit_env = _env_str(String("WAN21_DIT"))
-        var i2v_ck = dit_env if dit_env.byte_length() > 0 \
+        var i2v21_dit_env = _env_str(String("WAN21_DIT"))
+        var i2v_ck = i2v21_dit_env if i2v21_dit_env.byte_length() > 0 \
             else String(DEFAULT_CKPT_WAN21_I2V)
         _run_wan21_i2v_train[WAN21_I2V_14B_HEADS](
-            i2v_cfg, i2v_ck, WAN21_I2V_14B_DIM, WAN21_I2V_14B_FFN,
+            cfg, i2v_ck, WAN21_I2V_14B_DIM, WAN21_I2V_14B_FFN,
             WAN21_I2V_14B_BLOCKS, ctx,
         )
         return
 
-    # ── WAN 2.1 T2V DISPATCH (env WAN21_MODEL) ─────────────────────────────────
+    # ── WAN 2.1 T2V DISPATCH (config `wan_variant`; env WAN21_MODEL overrides) ─
     # Single-expert Wan2.1 path, comptime-monomorphized by head count. Selected
     # BEFORE the Wan2.2/I2V body so those paths stay untouched (back-compat).
-    #   WAN21_MODEL=t2v_1.3b -> H=12, dim1536/ffn8960/30 blocks, 1.3B checkpoint.
-    #   WAN21_MODEL=t2v_14b  -> H=40, dim5120/ffn13824/40 blocks, 14B checkpoint.
-    # Checkpoint override via env WAN21_DIT (else the per-variant default).
+    #   wan_variant/WAN21_MODEL=t2v_1.3b -> H=12, dim1536/ffn8960/30 blocks.
+    #   wan_variant/WAN21_MODEL=t2v_14b  -> H=40, dim5120/ffn13824/40 blocks.
+    # Checkpoint precedence: env WAN21_DIT > cfg.checkpoint (ONLY when the
+    # config itself selected the variant — a legacy env-selected run against a
+    # wan22 config must NOT pick up that config's wan2.2 checkpoint) > the
+    # per-variant default.
     var wan21_model = _env_str(String("WAN21_MODEL"))
+    if wan21_model.byte_length() == 0:
+        wan21_model = cfg.wan_variant
     if wan21_model.byte_length() > 0:
-        var wan21_cfg_path = String(DEFAULT_CONFIG)
-        var wan21_args = argv()
-        if len(wan21_args) > 1:
-            wan21_cfg_path = String(wan21_args[1])
-        var wan21_cfg = read_model_config(wan21_cfg_path)
         var dit_env = _env_str(String("WAN21_DIT"))
+        var cfg_ck = String("")
+        if cfg.wan_variant.byte_length() > 0:
+            cfg_ck = cfg.checkpoint
         if wan21_model == String("t2v_1.3b"):
             var ck = dit_env if dit_env.byte_length() > 0 \
-                else String(DEFAULT_CKPT_WAN21_1P3B)
+                else (cfg_ck if cfg_ck.byte_length() > 0
+                      else String(DEFAULT_CKPT_WAN21_1P3B))
             _run_wan21_train[WAN21_1P3B_HEADS](
-                wan21_cfg, ck, WAN21_1P3B_DIM, WAN21_1P3B_FFN, WAN21_1P3B_BLOCKS,
+                cfg, ck, WAN21_1P3B_DIM, WAN21_1P3B_FFN, WAN21_1P3B_BLOCKS,
                 String("t2v_1.3b"), ctx,
             )
         elif wan21_model == String("t2v_14b"):
             var ck = dit_env if dit_env.byte_length() > 0 \
-                else String(DEFAULT_CKPT_WAN21_14B)
+                else (cfg_ck if cfg_ck.byte_length() > 0
+                      else String(DEFAULT_CKPT_WAN21_14B))
             _run_wan21_train[WAN21_14B_HEADS](
-                wan21_cfg, ck, WAN21_14B_DIM, WAN21_14B_FFN, WAN21_14B_BLOCKS,
+                cfg, ck, WAN21_14B_DIM, WAN21_14B_FFN, WAN21_14B_BLOCKS,
                 String("t2v_14b"), ctx,
             )
         else:
@@ -1183,40 +1214,37 @@ def main() raises:
                 + String("' (expected t2v_1.3b | t2v_14b)"))
         return
 
-    # ── config ────────────────────────────────────────────────────────────────
-    var args = argv()
-    var config_path = String(DEFAULT_CONFIG)
-    if len(args) > 1:
-        config_path = String(args[1])
     print("==== Wan2.2-A14B (low-noise) LoRA trainer — musubi recipe ====")
-    print("     (T2V default; set WAN22_I2V=1 for the I2V-A14B 36-ch input variant)")
+    print("     (T2V default; config i2v=true or WAN22_I2V=1 for the I2V-A14B 36-ch variant)")
     print("config:", config_path)
 
-    var cfg = read_model_config(config_path)
-
-    # ── I2V MODE (WAN22_I2V=1) ────────────────────────────────────────────────
+    # ── I2V MODE (config `i2v`; env WAN22_I2V overrides when set) ─────────────
     # I2V-A14B differs from T2V-A14B ONLY in the DiT input (36ch = noisy_latent 16
     # + y 20) and the dual-expert boundary (0.900 vs 0.875). The block/stack/LoRA/
     # dual-expert compute is IDENTICAL (WanCrossAttention; no CLIP, no k_img/v_img —
     # musubi model.py:379-380). So I2V is a DATA-PATH + INPUT-CHANNEL change here:
     # patchified input width IN_CH_I2V=144, boundary I2V_BOUNDARY, I2V checkpoint.
-    var i2v_mode = _env_is_set(String("WAN22_I2V"))
+    var i2v_env = _env_str(String("WAN22_I2V"))
+    var i2v_mode = (i2v_env == String("1")) if i2v_env.byte_length() > 0 \
+        else cfg.wan_i2v
     var in_ch_eff = IN_CH_I2V if i2v_mode else IN_CH
 
-    # Checkpoint resolution. T2V: cfg.checkpoint else DEFAULT_CKPT. I2V needs the
-    # 36-ch I2V DiT — a T2V smoke config's checkpoint is the WRONG architecture
-    # (16-ch patch embed), so in I2V mode we take WAN22_DIT (explicit override)
-    # first, then cfg.checkpoint ONLY if it names an i2v ckpt, else DEFAULT_CKPT_I2V.
+    # Checkpoint resolution (P3 precedence: env WAN22_DIT > cfg.checkpoint >
+    # default). I2V needs the 36-ch I2V DiT — a T2V smoke config's checkpoint is
+    # the WRONG architecture (16-ch patch embed), so in I2V mode cfg.checkpoint
+    # is honored ONLY if it names an i2v ckpt, else DEFAULT_CKPT_I2V.
     var ckpt = cfg.checkpoint
+    var dit_env = _env_str(String("WAN22_DIT"))
     if i2v_mode:
-        var dit_env = _env_str(String("WAN22_DIT"))
         if dit_env.byte_length() > 0:
-            ckpt = dit_env^
+            ckpt = dit_env.copy()
         elif ckpt.byte_length() == 0 \
                 or (ckpt.find(String("i2v")) < 0 and ckpt.find(String("I2V")) < 0):
             ckpt = String(DEFAULT_CKPT_I2V)
     else:
-        if ckpt.byte_length() == 0:
+        if dit_env.byte_length() > 0:
+            ckpt = dit_env.copy()
+        elif ckpt.byte_length() == 0:
             ckpt = String(DEFAULT_CKPT)
 
     var rank = cfg.lora_rank if cfg.lora_rank > 0 else 16
@@ -1241,21 +1269,32 @@ def main() raises:
     # across BOTH experts (swap_high_low_weights :584 swaps the BASE state_dict under
     # the same LoRA — NOT a LoRA-per-expert), so we keep the single Wan22LoraSet and
     # swap only the (base, loader) pair per step.
-    #   * boundary:  WAN22_TIMESTEP_BOUNDARY (default 0.875 = DUAL_EXPERT_BOUNDARY).
-    #   * high ckpt: WAN22_DIT_HIGH_NOISE, else convention low_noise→high_noise.
-    #   * dual on iff the high ckpt file exists AND WAN22_DUAL_EXPERT != "0"
-    #     (back-compat: high-noise absent ⇒ single low-noise expert, as before).
+    # P3 precedence (env wins ONLY when set; config next; then the defaults):
+    #   * boundary:  WAN22_TIMESTEP_BOUNDARY > cfg.timestep_boundary >
+    #     per-mode default (0.875 = DUAL_EXPERT_BOUNDARY / 0.900 I2V).
+    #   * high ckpt: WAN22_DIT_HIGH_NOISE > cfg.dit_high_noise > convention
+    #     low_noise→high_noise.
+    #   * dual on iff the high ckpt file exists AND the gate allows it:
+    #     env WAN22_DUAL_EXPERT ("0"=off) > cfg.dual_expert (0=off; -1 auto/
+    #     1 on) — back-compat: high-noise absent ⇒ single low-noise expert.
     var boundary = I2V_BOUNDARY if i2v_mode else DUAL_EXPERT_BOUNDARY
+    if cfg.timestep_boundary > Float32(0.0):
+        boundary = cfg.timestep_boundary
     var boundary_env = _env_str(String("WAN22_TIMESTEP_BOUNDARY"))
     if boundary_env.byte_length() > 0:
         boundary = Float32(atof(boundary_env))
     var high_ckpt = _env_str(String("WAN22_DIT_HIGH_NOISE"))
     if high_ckpt.byte_length() == 0:
+        high_ckpt = cfg.dit_high_noise
+    if high_ckpt.byte_length() == 0:
         high_ckpt = ckpt.replace(String("low_noise"), String("high_noise"))
+    var dual_env = _env_str(String("WAN22_DUAL_EXPERT"))
+    var dual_gate = (dual_env != String("0")) if dual_env.byte_length() > 0 \
+        else (cfg.dual_expert != 0)
     var dual_expert = (
         _file_exists(high_ckpt)
         and high_ckpt != ckpt
-        and _env_str(String("WAN22_DUAL_EXPERT")) != String("0")
+        and dual_gate
     )
     # ── smoke timestep pins (GATE): force BOTH branches over ≥2 steps. Even steps
     #    → t_low_pin (<boundary ⇒ LOW expert), odd steps → t_high_pin (≥boundary ⇒
@@ -1369,25 +1408,31 @@ def main() raises:
     var cos = rope[0].copy()
     var sin = rope[1].copy()
 
-    # ── REAL DATA CACHE (gate: WAN22_DATA_CACHE=<dir>). When set + non-empty +
-    #    the dir has sample_*.safetensors, x0/text come from the cache (real VAE
-    #    latents + umt5 text), iterated ROUND-ROBIN across steps. When unset, the
-    #    synthetic Box-Muller path runs (back-compat). ───────────────────────────
+    # ── REAL DATA CACHE (P3: config cache_dir/dataset_cache_dir; env
+    #    WAN22_DATA_CACHE OVERRIDES when set). When the resolved dir is
+    #    non-empty + has sample_*.safetensors, x0/text come from the cache
+    #    (real VAE latents + umt5 text), iterated ROUND-ROBIN across steps.
+    #    When neither is set, the synthetic Box-Muller path runs. ──────────────
     var cache_dir = _env_str(String("WAN22_DATA_CACHE"))
+    if cache_dir.byte_length() == 0:
+        cache_dir = cfg.dataset_cache_dir
     var n_cache = 0
     var use_cache = False
     if cache_dir.byte_length() > 0:
         n_cache = _count_cache_samples(cache_dir)
-        use_cache = n_cache > 0
+        if n_cache == 0:
+            raise Error(
+                String("[data] no sample_*.safetensors at cache dir: ")
+                + cache_dir
+                + String(" (env WAN22_DATA_CACHE > config cache_dir; fail-loud)")
+            )
+        use_cache = True
     if use_cache:
         print("[data] REAL cache:", cache_dir, " samples=", n_cache,
               " (round-robin; REPLACES synthetic x0/text)")
     else:
-        if cache_dir.byte_length() > 0:
-            print("[data] WAN22_DATA_CACHE set but no sample_*.safetensors found at",
-                  cache_dir, "-> falling back to SYNTHETIC")
-        else:
-            print("[data] SYNTHETIC x0/text (set WAN22_DATA_CACHE=<dir> for real data)")
+        print("[data] SYNTHETIC x0/text (set config cache_dir or",
+              "env WAN22_DATA_CACHE=<dir> for real data)")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)

@@ -10,6 +10,7 @@
   "save_every": 0,
   "sample_every": 0,
   "seed": 42,
+  "cache_dir": "/home/alex/.serenity/mageflow_cache/40_woman",
   "output_model_destination": "/home/alex/mojodiffusion/output/mageflow_lora/mageflow_base_smoke_lora.safetensors",
   "optimizer": {
     "eps": 1e-8,

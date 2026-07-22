@@ -33,10 +33,10 @@
 #   input_source.png  the (unedited) source image at target res (for comparison)
 #   meta.txt          shapes + hyperparameters
 #
-# Run (OneTrainer venv, mage_flow on PYTHONPATH):
+# Run (current Python environment, mage_flow on PYTHONPATH):
 #   cd /home/alex/mojodiffusion
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-#     PYTHONPATH=/home/alex/Mage /home/alex/OneTrainer/venv/bin/python \
+#     PYTHONPATH=/home/alex/Mage pixi run python \
 #     serenitymojo/pipeline/parity/mageflow_edit_oracle.py
 import os
 import gc

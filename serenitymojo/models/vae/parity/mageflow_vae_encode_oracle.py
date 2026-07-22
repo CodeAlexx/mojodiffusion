@@ -17,7 +17,7 @@ Dumped for BOTH f32 (clean gate) and bf16 (ship dtype — the pipeline casts the
 encoded latent to bf16, pipeline.py:503). The Mojo probe reads these + loads the
 SAME real weights and compares each stage independently.
 
-Run: /home/alex/OneTrainer/venv/bin/python \
+Run: pixi run python \
      serenitymojo/models/vae/parity/mageflow_vae_encode_oracle.py
 """
 import os

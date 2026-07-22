@@ -546,6 +546,109 @@ pub(crate) fn has_text(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+fn has_lanpaint_params(params: &JobParams) -> bool {
+    params.lanpaint_mask_blend_overlap >= 0
+        || params.lanpaint_num_steps >= 0
+        || params.lanpaint_lambda >= 0.0
+        || params.lanpaint_step_size >= 0.0
+        || params.lanpaint_beta >= 0.0
+        || params.lanpaint_friction >= 0.0
+        || has_text(&params.lanpaint_prompt_mode)
+        || has_text(&params.lanpaint_inpainting_mode)
+        || has_text(&params.lanpaint_add_noise)
+        || params.lanpaint_noise_seed >= 0
+        || params.lanpaint_start_at_step >= 0
+        || params.lanpaint_end_at_step >= 0
+        || has_text(&params.lanpaint_return_with_leftover_noise)
+        || params.lanpaint_early_stop >= 0
+        || params.lanpaint_inner_threshold >= 0.0
+        || params.lanpaint_inner_patience >= 0
+}
+
+fn validate_krea_lanpaint(params: &JobParams) -> Result<(), String> {
+    if !has_text(&params.init_image) || !has_text(&params.mask_image) {
+        return Err("krea2 LanPaint requires both init_image and mask_image".to_string());
+    }
+    if params.width != 1024 || params.height != 1024 {
+        return Err(format!(
+            "krea2 LanPaint: unsupported size {}x{}; choose the compiled 1024x1024 profile",
+            params.width, params.height
+        ));
+    }
+    if !has_text(&params.lanpaint_mask_channel) {
+        return Err("krea2 LanPaint requires an explicit mask channel".to_string());
+    }
+    if params.lanpaint_num_steps < 0 {
+        return Err("krea2 LanPaint requires lanpaint_num_steps >= 0".to_string());
+    }
+    for (name, value) in [
+        ("lanpaint_lambda", params.lanpaint_lambda),
+        ("lanpaint_step_size", params.lanpaint_step_size),
+        ("lanpaint_beta", params.lanpaint_beta),
+        ("lanpaint_friction", params.lanpaint_friction),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!("krea2 LanPaint requires {name} > 0"));
+        }
+    }
+    let prompt_mode = params.lanpaint_prompt_mode.trim().to_ascii_lowercase();
+    if !matches!(prompt_mode.as_str(), "image first" | "prompt first") {
+        return Err("krea2 LanPaint prompt mode must be Image First or Prompt First".to_string());
+    }
+    if params
+        .lanpaint_inpainting_mode
+        .to_ascii_lowercase()
+        .contains("video")
+    {
+        return Err("krea2 LanPaint admits image inpainting only".to_string());
+    }
+    if params.lanpaint_add_noise.eq_ignore_ascii_case("disable") {
+        return Err("krea2 LanPaint add_noise=disable is not supported".to_string());
+    }
+    if params.lanpaint_start_at_step > 0 {
+        return Err("krea2 LanPaint start_at_step must be 0/full schedule".to_string());
+    }
+    if params.lanpaint_end_at_step >= 0 && params.lanpaint_end_at_step < params.steps {
+        return Err("krea2 LanPaint early end_at_step is not supported".to_string());
+    }
+    if params
+        .lanpaint_return_with_leftover_noise
+        .eq_ignore_ascii_case("enable")
+    {
+        return Err("krea2 LanPaint leftover-noise output is not supported".to_string());
+    }
+    if params.lanpaint_early_stop < 0 {
+        return Err("krea2 LanPaint requires lanpaint_early_stop >= 0".to_string());
+    }
+    if params.lanpaint_inner_threshold > 0.0 {
+        return Err(
+            "krea2 LanPaint semantic inner-threshold stopping is not supported".to_string(),
+        );
+    }
+    if params.lanpaint_mask_blend_overlap == 0
+        || params.lanpaint_mask_blend_overlap > 51
+        || (params.lanpaint_mask_blend_overlap > 0 && params.lanpaint_mask_blend_overlap % 2 == 0)
+    {
+        return Err("krea2 LanPaint mask blend overlap must be an odd value in 1..=51".to_string());
+    }
+    if (params.creativity - 1.0).abs() > f64::EPSILON {
+        return Err("krea2 LanPaint requires denoise/creativity=1.0".to_string());
+    }
+    if params.outpaint_left >= 0
+        || params.outpaint_top >= 0
+        || params.outpaint_right >= 0
+        || params.outpaint_bottom >= 0
+        || params.outpaint_feathering >= 0
+        || params.threshold_mask_value >= 0.0
+        || has_text(&params.threshold_mask_operator)
+    {
+        return Err(
+            "krea2 LanPaint outpaint preprocessing is not supported in this profile".to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn has_vae_override(value: &str) -> bool {
     let v = value.trim();
     if v.is_empty() {
@@ -762,6 +865,14 @@ fn request_model_is_ideogram4(obj: &JsonValue) -> bool {
         .contains("ideogram")
 }
 
+fn request_model_is_zimage(obj: &JsonValue) -> bool {
+    model_family(request_model_name(obj)) == Ok(ModelFamily::ZImage)
+}
+
+fn request_model_is_krea2(obj: &JsonValue) -> bool {
+    model_family(request_model_name(obj)) == Ok(ModelFamily::Krea2)
+}
+
 /// Klein ReferenceLatent edit: the klein worker's edit mode consumes
 /// reference_image (+ init_image as ref A when count==2). Only this shape is
 /// carved out of the raw image-conditioning/img2img rejections below.
@@ -861,7 +972,14 @@ pub(crate) fn reject_disabled_raw_surfaces(obj: &JsonValue) -> Result<(), String
         );
     }
 
-    if raw_string_is_set(map, "mask_image")
+    let zimage_edit = request_model_is_zimage(obj);
+    let has_init_image = raw_string_is_set(map, "init_image");
+    let has_mask_image = raw_string_is_set(map, "mask_image");
+    let krea_lanpaint = request_model_is_krea2(obj)
+        && has_init_image
+        && has_mask_image
+        && raw_number_gte(map, "lanpaint_num_steps", 0.0);
+    if (has_mask_image && !zimage_edit && !krea_lanpaint)
         || raw_any_string_is_set(
             map,
             &["inpaint_conditioning_image", "inpaint_conditioning_mask"],
@@ -872,7 +990,12 @@ pub(crate) fn reject_disabled_raw_surfaces(obj: &JsonValue) -> Result<(), String
             "inpaint is not production-admitted in the current /v1/generate route".to_string(),
         );
     }
-    if raw_string_is_set(map, "init_image") && !request_is_klein_reference_edit(obj) {
+    if has_mask_image && !has_init_image {
+        return Err(
+            "SetLatentNoiseMask/LanPaint requires init_image/VAEEncode source pixels".to_string(),
+        );
+    }
+    if has_init_image && !zimage_edit && !krea_lanpaint && !request_is_klein_reference_edit(obj) {
         return Err(
             "image-to-image is not production-admitted in the current /v1/generate route"
                 .to_string(),
@@ -953,6 +1076,18 @@ pub(crate) fn reject_disabled_raw_surfaces(obj: &JsonValue) -> Result<(), String
             "outpaint_bottom",
             "outpaint_feathering",
             "threshold_mask_value",
+        ],
+        0.0,
+    ) || raw_string_is_set(map, "threshold_mask_operator")
+    {
+        return Err(
+            "outpaint preprocessing is not production-admitted in the current /v1/generate route"
+                .to_string(),
+        );
+    }
+    if (raw_any_number_gte(
+        map,
+        &[
             "lanpaint_mask_blend_overlap",
             "lanpaint_num_steps",
             "lanpaint_lambda",
@@ -970,15 +1105,15 @@ pub(crate) fn reject_disabled_raw_surfaces(obj: &JsonValue) -> Result<(), String
     ) || raw_any_string_is_set(
         map,
         &[
-            "threshold_mask_operator",
             "lanpaint_prompt_mode",
             "lanpaint_inpainting_mode",
             "lanpaint_add_noise",
             "lanpaint_return_with_leftover_noise",
         ],
-    ) {
+    )) && !krea_lanpaint
+    {
         return Err(
-            "outpaint/LanPaint is not production-admitted in the current /v1/generate route"
+            "LanPaint is production-admitted only for the bounded Krea2 init+mask route"
                 .to_string(),
         );
     }
@@ -1000,10 +1135,12 @@ pub(crate) fn reject_disabled_raw_surfaces(obj: &JsonValue) -> Result<(), String
     }
     if let Some(denoise) = map.get("denoise").and_then(JsonValue::as_f64) {
         if denoise.is_finite() && (denoise - 1.0).abs() > f64::EPSILON {
-            return Err(
-                "denoise/img2img creativity is not admitted in the current /v1/generate route"
-                    .to_string(),
-            );
+            if !(zimage_edit && has_init_image) {
+                return Err(
+                    "denoise/img2img creativity is admitted only for Z-Image requests with init_image"
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -1207,9 +1344,30 @@ pub(crate) fn validate_generate_prequeue(
     let klein_ref_edit = (params.model.to_ascii_lowercase().contains("klein")
         || params.model.to_ascii_lowercase().contains("flux2"))
         && (1..=2).contains(&params.reference_latent_count);
-    if (has_text(&params.init_image) && !klein_ref_edit) || has_text(&params.mask_image) {
+    let zimage_edit = family == ModelFamily::ZImage && has_text(&params.init_image);
+    let lanpaint_requested = has_lanpaint_params(params);
+    let krea_lanpaint = family == ModelFamily::Krea2 && lanpaint_requested;
+    if lanpaint_requested {
+        if family != ModelFamily::Krea2 {
+            return Err(
+                "LanPaint is production-admitted only by the bounded Krea2 route".to_string(),
+            );
+        }
+        validate_krea_lanpaint(params)?;
+    }
+    if (has_text(&params.init_image)
+        && !klein_ref_edit
+        && family != ModelFamily::ZImage
+        && !krea_lanpaint)
+        || (has_text(&params.mask_image) && !zimage_edit && !krea_lanpaint)
+    {
         return Err(
-            "image-to-image, inpaint, and image conditioning are not in the current production /v1/generate scope".to_string(),
+            "image-to-image/inpaint is admitted only for Z-Image, except the bounded Krea2 LanPaint route; Klein ReferenceLatent remains separate".to_string(),
+        );
+    }
+    if has_text(&params.mask_image) && !has_text(&params.init_image) {
+        return Err(
+            "SetLatentNoiseMask/LanPaint requires init_image/VAEEncode source pixels".to_string(),
         );
     }
     if has_vae_override(&params.vae) {
@@ -1223,33 +1381,55 @@ pub(crate) fn validate_generate_prequeue(
         );
     }
 
-    // Krea2 FlowEdit runs the edit pipeline's compiled 512² geometry, not the
-    // t2i worker's 1024² product shape — swap the policy for edit jobs.
-    if !params.edit_src_image.is_empty() && family == ModelFamily::Krea2 {
+    // Krea2 FlowEdit has explicit 512² and 1024² Mojo geometry arms. Keep this
+    // narrower than the t2i aspect ladder because edit is square-only.
+    if krea_lanpaint {
+        require_resolution(
+            params,
+            family,
+            ResolutionPolicy {
+                mode: "shape_dispatch",
+                min_width: 1024,
+                max_width: 1024,
+                min_height: 1024,
+                max_height: 1024,
+                multiple: 1024,
+                square_only: true,
+                admitted_shapes: &[(1024, 1024)],
+                note: "Krea2 LanPaint worker mode is compiled at 1024x1024",
+            },
+        )?;
+    } else if !params.edit_src_image.is_empty() && family == ModelFamily::Krea2 {
         require_resolution(
             params,
             family,
             ResolutionPolicy {
                 mode: "shape_dispatch",
                 min_width: 512,
-                max_width: 512,
+                max_width: 1024,
                 min_height: 512,
-                max_height: 512,
+                max_height: 1024,
                 multiple: 512,
                 square_only: true,
-                admitted_shapes: &[(512, 512)],
-                note: "krea2 FlowEdit worker mode is compiled at 512x512",
+                admitted_shapes: &[(512, 512), (1024, 1024)],
+                note: "krea2 FlowEdit worker mode is compiled at 512x512 and 1024x1024",
             },
         )?;
     } else {
         require_resolution(params, family, resolution_policy_for_family(family))?;
     }
-    validate_sampler_scheduler(
+    let (sampler, _) = validate_sampler_scheduler(
         params,
         family,
         supported_samplers_for_family(family),
         supported_schedulers_for_family(family),
     )?;
+    if zimage_edit && matches!(sampler.as_str(), "uni_pc" | "uni_pc_bh2") {
+        return Err(
+            "zimage: UniPC img2img/inpaint is not admitted; use Euler/flowmatch_euler or DPM++ 2M"
+                .to_string(),
+        );
+    }
     if !supports_negative_prompt(family) {
         reject_negative(params, family)?;
     }
@@ -1315,9 +1495,8 @@ pub(crate) fn validate_generate_prequeue(
         | ModelFamily::Krea2
         | ModelFamily::Chroma => {}
     }
-    // FlowEdit (edit_src_image marks an edit job): admitted for Krea2 ONLY —
-    // serenity_worker_krea2's _step_flowedit implements the edit params (C1
-    // part 2). Any other family would silently run t2i and IGNORE the edit,
+    // FlowEdit (edit_src_image marks an edit job) is implemented by the Krea2
+    // and Ideogram4 Mojo workers. Other families would ignore these edit params,
     // so they stay fail-loud.
     if !params.edit_src_image.is_empty()
         && !matches!(family, ModelFamily::Krea2 | ModelFamily::Ideogram4)
@@ -1357,6 +1536,7 @@ fn blocked_feature_set(reason: &str) -> JsonValue {
         "multi_lora": unsupported_feature(reason),
         "image_to_image": unsupported_feature(reason),
         "inpaint": unsupported_feature(reason),
+        "instruction_edit": unsupported_feature(reason),
         "image_conditioning": unsupported_feature(reason),
         "vae_override": unsupported_feature(reason),
         "hires_two_pass": unsupported_feature(reason),
@@ -1432,6 +1612,49 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
     } else {
         unsupported_feature("bbox prompt JSON is currently admitted only by the Ideogram4 route")
     };
+    let image_to_image = if family == ModelFamily::ZImage {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "backend": "zimage",
+            "creativity_range": [0.0, 1.0],
+            "note": "VAE-encoded init image with sliced FlowMatch denoise schedule",
+        })
+    } else {
+        unsupported_feature("image-to-image is admitted only by the Z-Image production route")
+    };
+    let inpaint = if family == ModelFamily::ZImage {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "backend": "zimage",
+            "mask_contract": "SetLatentNoiseMask preserve semantics",
+            "note": "Mask-aware Z-Image denoise plus bounded final mask blend; full LanPaint inner-loop controls remain blocked",
+        })
+    } else if family == ModelFamily::Krea2 {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "backend": "krea2",
+            "engine": "lanpaint",
+            "sizes": [[1024, 1024]],
+            "mask_contract": "LanPaint latent preserve mask plus final feathered MaskBlend",
+            "lora": true,
+            "note": "Mojo-native damped LanPaint sampler for Krea2 Raw and Turbo",
+        })
+    } else {
+        unsupported_feature("mask-aware inpaint is admitted by Z-Image and bounded Krea2 LanPaint")
+    };
+    let instruction_edit = if matches!(family, ModelFamily::Krea2 | ModelFamily::Ideogram4) {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "engine": "flowedit",
+            "note": if family == ModelFamily::Krea2 { "compiled 512x512 and 1024x1024 FlowEdit" } else { "compiled 1024x1024 FlowEdit with structured JSON captions" },
+        })
+    } else {
+        unsupported_feature("FlowEdit is admitted only by the Krea2 and Ideogram4 Mojo workers")
+    };
 
     json!({
         "backend": family.backend_key(),
@@ -1450,7 +1673,7 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
             "sizes": size_limits_for_family(family),
             "resolution": resolution_policy_json(family),
             "one_image_per_job": true,
-            "txt2img_only": true,
+            "txt2img_only": !matches!(family, ModelFamily::ZImage | ModelFamily::Krea2),
             "runtime_dependency_on_external_repos": false,
         },
         "samplers": {
@@ -1467,8 +1690,9 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
             "prompt_weights": unsupported_feature("weighted prompt conditioning math is not product-admitted yet"),
             "lora": lora_feature_for_family(family),
             "multi_lora": multi_lora_feature_for_family(family),
-            "image_to_image": unsupported_feature("image-to-image is not admitted in the current production /v1/generate route"),
-            "inpaint": unsupported_feature("inpaint depends on image conditioning and is not admitted in the current production /v1/generate route"),
+            "image_to_image": image_to_image,
+            "inpaint": inpaint,
+            "instruction_edit": instruction_edit,
             "image_conditioning": unsupported_feature("image conditioning is not admitted in the current production /v1/generate route"),
             "vae_override": unsupported_feature("VAE override is not production-wired for /v1/generate"),
             "hires_two_pass": unsupported_feature("hires two-pass depends on img2img refine and is disabled"),
@@ -1599,8 +1823,8 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
         },
         "global_limits": {
             "one_image_per_job": true,
-            "txt2img_only": true,
-            "image_to_image": false,
+            "txt2img_only": false,
+            "image_to_image": true,
             "vae_override": false,
             "runtime_dependency_on_external_repos": false,
         },
@@ -1737,7 +1961,7 @@ mod tests {
     #[test]
     fn raw_surface_guard_rejects_disabled_feature_fields() {
         let base = json!({
-            "model": "zimage",
+            "model": "sdxl",
             "prompt": "raw surface guard",
             "width": 1024,
             "height": 1024,
@@ -1780,7 +2004,7 @@ mod tests {
             (json!({"outpaint_enabled": true}), "outpaint"),
             (json!({"outpaint_left": 64}), "outpaint"),
             (json!({"threshold_mask_value": 0.5}), "outpaint"),
-            (json!({"lanpaint_num_steps": 16}), "outpaint"),
+            (json!({"lanpaint_num_steps": 16}), "LanPaint"),
             (json!({"denoise": 0.5}), "denoise/img2img"),
         ];
 
@@ -1876,6 +2100,192 @@ mod tests {
             }
         });
         reject_disabled_raw_surfaces(&ideogram).unwrap();
+    }
+
+    #[test]
+    fn zimage_raw_surface_admits_init_image_mask_and_creativity_only() {
+        let img2img = json!({
+            "model": "zimage",
+            "prompt": "replace the sky",
+            "init_image": "/tmp/init.png",
+            "denoise": 0.65
+        });
+        reject_disabled_raw_surfaces(&img2img).unwrap();
+
+        let inpaint = json!({
+            "model": "zimage",
+            "prompt": "replace the sky",
+            "init_image": "/tmp/init.png",
+            "mask_image": "/tmp/mask.png",
+            "denoise": 0.65
+        });
+        reject_disabled_raw_surfaces(&inpaint).unwrap();
+
+        let missing_init = json!({
+            "model": "zimage",
+            "prompt": "replace the sky",
+            "mask_image": "/tmp/mask.png"
+        });
+        assert!(reject_disabled_raw_surfaces(&missing_init)
+            .unwrap_err()
+            .contains("requires init_image"));
+
+        let full_lanpaint = json!({
+            "model": "zimage",
+            "prompt": "replace the sky",
+            "init_image": "/tmp/init.png",
+            "mask_image": "/tmp/mask.png",
+            "lanpaint_num_steps": 16
+        });
+        assert!(reject_disabled_raw_surfaces(&full_lanpaint)
+            .unwrap_err()
+            .contains("LanPaint"));
+    }
+
+    #[test]
+    fn zimage_prequeue_admits_bounded_img2img_and_inpaint() {
+        let mut params = JobParams::default();
+        params.model = "zimage".to_string();
+        params.prompt = "replace the sky".to_string();
+        params.width = 512;
+        params.height = 512;
+        params.steps = 4;
+        params.cfg = 1.0;
+        params.sampler = "flowmatch_euler".to_string();
+        params.scheduler = "simple".to_string();
+        params.creativity = 0.65;
+        params.init_image = "/tmp/init.png".to_string();
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::ZImage
+        );
+
+        params.mask_image = "/tmp/mask.png".to_string();
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::ZImage
+        );
+
+        params.sampler = "uni_pc".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("UniPC img2img/inpaint"));
+
+        params.model = "sdxl".to_string();
+        params.sampler = "euler".to_string();
+        params.scheduler = "normal".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted only for Z-Image"));
+    }
+
+    #[test]
+    fn krea2_flowedit_prequeue_admits_both_compiled_square_profiles() {
+        let mut params = JobParams::default();
+        params.model = "krea2_turbo".to_string();
+        params.prompt = "the same subject in polished chrome".to_string();
+        params.edit_src_prompt = "a portrait beside a pool".to_string();
+        params.edit_src_image = "/tmp/source.png".to_string();
+        params.steps = 28;
+        params.cfg = 5.5;
+        params.sampler = "euler".to_string();
+        params.scheduler = "simple".to_string();
+
+        for size in [512, 1024] {
+            params.width = size;
+            params.height = size;
+            assert_eq!(
+                validate_generate_prequeue(&params, 1.0).unwrap(),
+                ModelFamily::Krea2
+            );
+        }
+
+        params.width = 768;
+        params.height = 768;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted product shapes"));
+    }
+
+    #[test]
+    fn krea2_lanpaint_raw_and_prequeue_admit_only_complete_1024_profile() {
+        let raw = json!({
+            "model": "krea2_turbo",
+            "prompt": "replace the hand with a red glove",
+            "width": 1024,
+            "height": 1024,
+            "init_image": "/tmp/source.png",
+            "mask_image": "/tmp/source.png",
+            "lanpaint_mask_channel": "load_image_mask",
+            "lanpaint_num_steps": 5,
+            "lanpaint_lambda": 16.0,
+            "lanpaint_step_size": 0.2,
+            "lanpaint_beta": 1.0,
+            "lanpaint_friction": 15.0,
+            "lanpaint_prompt_mode": "Image First",
+            "lanpaint_inpainting_mode": "Image Inpainting",
+            "lanpaint_early_stop": 1,
+            "lanpaint_mask_blend_overlap": 9,
+            "denoise": 1.0
+        });
+        reject_disabled_raw_surfaces(&raw).unwrap();
+
+        let mut params = JobParams::default();
+        params.model = "krea2_turbo".to_string();
+        params.prompt = "replace the hand with a red glove".to_string();
+        params.width = 1024;
+        params.height = 1024;
+        params.steps = 8;
+        params.cfg = 1.0;
+        params.sampler = "euler".to_string();
+        params.scheduler = "simple".to_string();
+        params.creativity = 1.0;
+        params.init_image = "/tmp/source.png".to_string();
+        params.mask_image = "/tmp/source.png".to_string();
+        params.lanpaint_mask_channel = "load_image_mask".to_string();
+        params.lanpaint_num_steps = 5;
+        params.lanpaint_lambda = 16.0;
+        params.lanpaint_step_size = 0.2;
+        params.lanpaint_beta = 1.0;
+        params.lanpaint_friction = 15.0;
+        params.lanpaint_prompt_mode = "Image First".to_string();
+        params.lanpaint_inpainting_mode = "Image Inpainting".to_string();
+        params.lanpaint_early_stop = 1;
+        params.lanpaint_inner_threshold = 0.0;
+        params.lanpaint_inner_patience = 1;
+        params.lanpaint_mask_blend_overlap = 9;
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::Krea2
+        );
+
+        params.width = 512;
+        params.height = 512;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("1024x1024"));
+        params.width = 1024;
+        params.height = 1024;
+        params.lanpaint_friction = -1.0;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("lanpaint_friction"));
+    }
+
+    #[test]
+    fn capability_document_exposes_only_verified_edit_backends() {
+        let zimage = capability_for_family(ModelFamily::ZImage);
+        assert_eq!(zimage["limits"]["txt2img_only"], false);
+        assert_eq!(zimage["features"]["image_to_image"]["supported"], true);
+        assert_eq!(zimage["features"]["inpaint"]["supported"], true);
+
+        let krea2 = capability_for_family(ModelFamily::Krea2);
+        let ideogram4 = capability_for_family(ModelFamily::Ideogram4);
+        let sdxl = capability_for_family(ModelFamily::Sdxl);
+        assert_eq!(krea2["features"]["instruction_edit"]["supported"], true);
+        assert_eq!(ideogram4["features"]["instruction_edit"]["supported"], true);
+        assert_eq!(sdxl["features"]["instruction_edit"]["supported"], false);
+        assert_eq!(sdxl["features"]["image_to_image"]["supported"], false);
     }
 
     #[test]

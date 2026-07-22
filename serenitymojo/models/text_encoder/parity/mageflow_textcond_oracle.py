@@ -17,8 +17,8 @@
 #
 # Run:
 #   cd /home/alex/mojodiffusion
-#   /home/alex/OneTrainer/venv/bin/python \
-#     .claude/worktrees/agent-a8b4b1b2e92480f73/serenitymojo/models/text_encoder/parity/mageflow_textcond_oracle.py
+#   pixi run python \
+#     serenitymojo/models/text_encoder/parity/mageflow_textcond_oracle.py
 import os
 import gc
 

@@ -18,7 +18,7 @@
 #
 # Run:
 #   cd /home/alex/mojodiffusion
-#   PYTHONPATH=/home/alex/Mage /home/alex/OneTrainer/venv/bin/python \
+#   PYTHONPATH=/home/alex/Mage pixi run python \
 #     serenitymojo/pipeline/parity/mageflow_t2i_oracle.py
 import os
 import gc

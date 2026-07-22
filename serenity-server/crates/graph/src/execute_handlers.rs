@@ -15,15 +15,19 @@ struct LatentGeom {
 
 fn latent_geom_of(store: &ValueStore, link: &WorkflowLink) -> Option<LatentGeom> {
     match latent_payload(store, link) {
-        Some(ValuePayload::Latent { width, height, batch, init_image, mask_image }) => {
-            Some(LatentGeom {
-                width: *width,
-                height: *height,
-                batch: *batch,
-                init_image: init_image.clone().unwrap_or_default(),
-                mask_image: mask_image.clone().unwrap_or_default(),
-            })
-        }
+        Some(ValuePayload::Latent {
+            width,
+            height,
+            batch,
+            init_image,
+            mask_image,
+        }) => Some(LatentGeom {
+            width: *width,
+            height: *height,
+            batch: *batch,
+            init_image: init_image.clone().unwrap_or_default(),
+            mask_image: mask_image.clone().unwrap_or_default(),
+        }),
         _ => None,
     }
 }
@@ -60,10 +64,10 @@ fn exec_ltxv_sampler(
     }
     let audio_link = links.input(id, "audio");
     if !model_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph LTXVSampler missing ltxv_model input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph LTXVSampler missing ltxv_model input")
+                .with_node(id),
+        );
     }
     if !(ready(store, &model_link) && optional_ready(store, &audio_link)) {
         return Ok(Fire::NotReady);
@@ -102,6 +106,12 @@ fn exec_ltxv_sampler(
     set_if_missing(out, "frame_rate", json!(fps));
     copy_field_if_missing(out, fields, "mode", "video_mode");
     copy_field_if_missing(out, fields, "stg_scale", "stg_scale");
+    copy_field_if_missing(out, fields, "sampler", "sampler");
+    copy_field_if_missing(out, fields, "scheduler", "scheduler");
+    copy_field_if_missing(out, fields, "caps_positive", "caps_positive");
+    copy_field_if_missing(out, fields, "caps_negative", "caps_negative");
+    copy_field_if_missing(out, fields, "noise_fixture", "noise_fixture");
+    copy_field_if_missing(out, fields, "include_audio", "include_audio");
     copy_field_if_missing(out, fields, "audio_start_time", "audio_start_time");
     copy_field_if_missing(out, fields, "audio_duration", "audio_duration");
     add_value(
@@ -116,8 +126,22 @@ fn exec_ltxv_sampler(
             mask_image: None,
         },
     )?;
-    add_value(store, id, "VIDEO", ValuePayload::Video { path: String::new() })?;
-    add_value(store, id, "AUDIO", ValuePayload::Audio { path: String::new() })?;
+    add_value(
+        store,
+        id,
+        "VIDEO",
+        ValuePayload::Video {
+            path: String::new(),
+        },
+    )?;
+    add_value(
+        store,
+        id,
+        "AUDIO",
+        ValuePayload::Audio {
+            path: String::new(),
+        },
+    )?;
     Ok(Fire::Done)
 }
 
@@ -298,7 +322,11 @@ fn exec_conditioning_set_mask(
     set_if_missing(out, "conditioning_mask_image", json!(mask_path));
     set_if_missing(out, "conditioning_mask_channel", json!(mask_source));
     set_if_missing(out, "conditioning_mask_strength", json!(strength));
-    set_if_missing(out, "conditioning_mask_set_area_to_bounds", json!(set_area_to_bounds));
+    set_if_missing(
+        out,
+        "conditioning_mask_set_area_to_bounds",
+        json!(set_area_to_bounds),
+    );
     add_value(store, id, "CONDITIONING", ValuePayload::Cond { text })?;
     Ok(Fire::Done)
 }
@@ -315,7 +343,7 @@ fn exec_ksampler(
     let id = node.id;
     let t = node.type_id.as_str();
     let fields = &node.fields;
-    let advanced = t == "KSamplerAdvanced";
+    let advanced = t == "KSamplerAdvanced" || t == "LanPaint_KSamplerAdvanced";
     let model_link = links.input(id, "model");
     let pos_link = links.input(id, "positive");
     let neg_link = links.input(id, "negative");
@@ -324,7 +352,11 @@ fn exec_ksampler(
     // seed input link from whichever field the node carries.
     let seed_link = {
         let l = links.input(id, "noise_seed");
-        if advanced && l.found { l } else { links.input(id, "seed") }
+        if advanced && l.found {
+            l
+        } else {
+            links.input(id, "seed")
+        }
     };
     let steps_link = links.input(id, "steps");
     let cfg_link = links.input(id, "cfg");
@@ -396,7 +428,11 @@ fn exec_ksampler(
         resolved_steps = Some(steps);
     } else {
         copy_field_if_missing(out, fields, "steps", "steps");
-        if let Some(n) = fields.as_object().and_then(|o| o.get("steps")).and_then(JsonValue::as_i64) {
+        if let Some(n) = fields
+            .as_object()
+            .and_then(|o| o.get("steps"))
+            .and_then(JsonValue::as_i64)
+        {
             resolved_steps = Some(n);
         }
     }
@@ -409,7 +445,12 @@ fn exec_ksampler(
         }
     } else if advanced {
         // KSamplerAdvanced names the seed `noise_seed`; fall back to `seed`.
-        if fields.as_object().and_then(|o| o.get("noise_seed")).map(|v| !v.is_null()).unwrap_or(false) {
+        if fields
+            .as_object()
+            .and_then(|o| o.get("noise_seed"))
+            .map(|v| !v.is_null())
+            .unwrap_or(false)
+        {
             set_field_if_nonneg_int(out, fields, "noise_seed", "seed")?;
         } else {
             set_field_if_nonneg_int(out, fields, "seed", "seed")?;
@@ -622,7 +663,11 @@ fn exec_flux2_scheduler(
         store,
         id,
         "SIGMAS",
-        ValuePayload::Sigmas { steps, scheduler: "flux2".to_string(), denoise: 1.0 },
+        ValuePayload::Sigmas {
+            steps,
+            scheduler: "flux2".to_string(),
+            denoise: 1.0,
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -639,10 +684,10 @@ fn exec_basic_scheduler(
     let fields = &node.fields;
     let model_link = links.input(id, "model");
     if !model_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph BasicScheduler missing model input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph BasicScheduler missing model input")
+                .with_node(id),
+        );
     }
     let scheduler_link = links.input(id, "scheduler");
     let steps_link = links.input(id, "steps");
@@ -686,7 +731,11 @@ fn exec_basic_scheduler(
         store,
         id,
         "SIGMAS",
-        ValuePayload::Sigmas { steps, scheduler, denoise },
+        ValuePayload::Sigmas {
+            steps,
+            scheduler,
+            denoise,
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -732,13 +781,26 @@ fn exec_sampler_custom_advanced(
     require_value_type(store, &sigmas_link, "SIGMAS", "sigmas")?;
     require_value_type(store, &latent_link, "LATENT", "latent_image")?;
 
-    if let Some(ValuePayload::Noise { seed }) = store.get(noise_link.node_id, &noise_link.port).map(|v| &v.payload) {
+    if let Some(ValuePayload::Noise { seed }) = store
+        .get(noise_link.node_id, &noise_link.port)
+        .map(|v| &v.payload)
+    {
         set_if_missing(out, "seed", json!(*seed));
     }
-    if let Some(ValuePayload::Sampler { name }) = store.get(sampler_link.node_id, &sampler_link.port).map(|v| &v.payload) {
+    if let Some(ValuePayload::Sampler { name }) = store
+        .get(sampler_link.node_id, &sampler_link.port)
+        .map(|v| &v.payload)
+    {
         set_if_missing(out, "sampler", json!(name));
     }
-    if let Some(ValuePayload::Sigmas { steps, scheduler, denoise }) = store.get(sigmas_link.node_id, &sigmas_link.port).map(|v| &v.payload) {
+    if let Some(ValuePayload::Sigmas {
+        steps,
+        scheduler,
+        denoise,
+    }) = store
+        .get(sigmas_link.node_id, &sigmas_link.port)
+        .map(|v| &v.payload)
+    {
         set_if_missing(out, "steps", json!(*steps));
         set_if_missing(out, "scheduler", json!(scheduler));
         set_if_missing(out, "creativity", json!(*denoise));
@@ -764,7 +826,13 @@ fn exec_sampler_custom_advanced(
     }
     let payload = match &geom {
         Some(g) => latent_payload_from(g),
-        None => ValuePayload::Latent { width: 0, height: 0, batch: 1, init_image: None, mask_image: None },
+        None => ValuePayload::Latent {
+            width: 0,
+            height: 0,
+            batch: 1,
+            init_image: None,
+            mask_image: None,
+        },
     };
     add_value(store, id, "LATENT", payload)?;
     Ok(Fire::Done)
@@ -814,7 +882,11 @@ fn exec_named_scheduler(
         store,
         id,
         "SIGMAS",
-        ValuePayload::Sigmas { steps, scheduler, denoise },
+        ValuePayload::Sigmas {
+            steps,
+            scheduler,
+            denoise,
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -884,13 +956,19 @@ fn exec_sampler_custom(
     copy_field_if_missing(out, fields, "cfg", "cfg");
     set_field_if_nonneg_int(out, fields, "noise_seed", "seed")?;
 
-    if let Some(ValuePayload::Sampler { name }) =
-        store.get(sampler_link.node_id, &sampler_link.port).map(|v| &v.payload)
+    if let Some(ValuePayload::Sampler { name }) = store
+        .get(sampler_link.node_id, &sampler_link.port)
+        .map(|v| &v.payload)
     {
         set_if_missing(out, "sampler", json!(name));
     }
-    if let Some(ValuePayload::Sigmas { steps, scheduler, denoise }) =
-        store.get(sigmas_link.node_id, &sigmas_link.port).map(|v| &v.payload)
+    if let Some(ValuePayload::Sigmas {
+        steps,
+        scheduler,
+        denoise,
+    }) = store
+        .get(sigmas_link.node_id, &sigmas_link.port)
+        .map(|v| &v.payload)
     {
         set_if_missing(out, "steps", json!(*steps));
         set_if_missing(out, "scheduler", json!(scheduler));
@@ -915,7 +993,13 @@ fn exec_sampler_custom(
     }
     let payload = match &geom {
         Some(g) => latent_payload_from(g),
-        None => ValuePayload::Latent { width: 0, height: 0, batch: 1, init_image: None, mask_image: None },
+        None => ValuePayload::Latent {
+            width: 0,
+            height: 0,
+            batch: 1,
+            init_image: None,
+            mask_image: None,
+        },
     };
     add_value(store, id, "LATENT", payload)?;
     Ok(Fire::Done)
@@ -933,10 +1017,9 @@ fn exec_image_to_mask(
     let fields = &node.fields;
     let image_link = links.input(id, "image");
     if !image_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph ImageToMask missing image input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph ImageToMask missing image input").with_node(id),
+        );
     }
     if !ready(store, &image_link) {
         return Ok(Fire::NotReady);
@@ -953,7 +1036,10 @@ fn exec_image_to_mask(
         store,
         id,
         "MASK",
-        ValuePayload::Mask { path: image_path, source: Some(mask_source) },
+        ValuePayload::Mask {
+            path: image_path,
+            source: Some(mask_source),
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -968,10 +1054,9 @@ fn exec_mask_to_image(
     let id = node.id;
     let mask_link = links.input(id, "mask");
     if !mask_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph MaskToImage missing mask input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph MaskToImage missing mask input").with_node(id),
+        );
     }
     if !ready(store, &mask_link) {
         return Ok(Fire::NotReady);
@@ -983,7 +1068,10 @@ fn exec_mask_to_image(
         store,
         id,
         "IMAGE",
-        ValuePayload::Image { path: mask_path, mask_source: opt_nonempty(&mask_source) },
+        ValuePayload::Image {
+            path: mask_path,
+            mask_source: opt_nonempty(&mask_source),
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -1000,10 +1088,10 @@ fn exec_threshold_mask(
     let fields = &node.fields;
     let mask_link = links.input(id, "mask");
     if !mask_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph ThresholdMask missing mask input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph ThresholdMask missing mask input")
+                .with_node(id),
+        );
     }
     if !ready(store, &mask_link) {
         return Ok(Fire::NotReady);
@@ -1018,7 +1106,10 @@ fn exec_threshold_mask(
         store,
         id,
         "MASK",
-        ValuePayload::Mask { path: mask_path, source: opt_nonempty(&mask_source) },
+        ValuePayload::Mask {
+            path: mask_path,
+            source: opt_nonempty(&mask_source),
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -1034,10 +1125,10 @@ fn exec_image_scale(
     let t = node.type_id.as_str();
     let image_link = links.input(id, "image");
     if !image_link.found {
-        return Err(GraphError::unsupported(format!(
-            "workflow graph {t} missing image input"
-        ))
-        .with_node(id));
+        return Err(
+            GraphError::unsupported(format!("workflow graph {t} missing image input"))
+                .with_node(id),
+        );
     }
     let width_link = links.input(id, "width");
     let height_link = links.input(id, "height");
@@ -1072,7 +1163,10 @@ fn exec_image_scale(
         store,
         id,
         "IMAGE",
-        ValuePayload::Image { path: image_path, mask_source: opt_nonempty(&mask_source) },
+        ValuePayload::Image {
+            path: image_path,
+            mask_source: opt_nonempty(&mask_source),
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -1096,10 +1190,10 @@ fn exec_image_scale_by(
     let fields = &node.fields;
     let image_link = links.input(id, "image");
     if !image_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph ImageScaleBy missing image input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph ImageScaleBy missing image input")
+                .with_node(id),
+        );
     }
     if !ready(store, &image_link) {
         return Ok(Fire::NotReady);
@@ -1136,10 +1230,10 @@ fn exec_image_resize_kj(
     let fields = &node.fields;
     let image_link = links.input(id, "image");
     if !image_link.found {
-        return Err(GraphError::unsupported(
-            "workflow graph ImageResizeKJ missing image input",
-        )
-        .with_node(id));
+        return Err(
+            GraphError::unsupported("workflow graph ImageResizeKJ missing image input")
+                .with_node(id),
+        );
     }
     // The width/height widgets may also arrive over typed links.
     let width_link = links.input(id, "width");
@@ -1204,7 +1298,10 @@ fn exec_image_resize_kj(
         store,
         id,
         "IMAGE",
-        ValuePayload::Image { path: image_path, mask_source: opt_nonempty(&mask_source) },
+        ValuePayload::Image {
+            path: image_path,
+            mask_source: opt_nonempty(&mask_source),
+        },
     )?;
     // Resolved width/height INT outputs (slots 1/2 of the KJ node).
     add_value(store, id, "width", ValuePayload::ScalarInt(width))?;
@@ -1248,13 +1345,19 @@ fn exec_image_pad(
         store,
         id,
         "IMAGE",
-        ValuePayload::Image { path: image_path.clone(), mask_source: None },
+        ValuePayload::Image {
+            path: image_path.clone(),
+            mask_source: None,
+        },
     )?;
     add_value(
         store,
         id,
         "MASK",
-        ValuePayload::Mask { path: image_path, source: Some("image_pad_for_outpaint".to_string()) },
+        ValuePayload::Mask {
+            path: image_path,
+            source: Some("image_pad_for_outpaint".to_string()),
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -1454,7 +1557,12 @@ fn exec_inpaint_model_conditioning(
     let vae_link = links.input(id, "vae");
     let pixels_link = links.input(id, "pixels");
     let mask_link = links.input(id, "mask");
-    if !pos_link.found || !neg_link.found || !vae_link.found || !pixels_link.found || !mask_link.found {
+    if !pos_link.found
+        || !neg_link.found
+        || !vae_link.found
+        || !pixels_link.found
+        || !mask_link.found
+    {
         return Err(GraphError::unsupported(
             "workflow graph InpaintModelConditioning missing required typed input",
         )
@@ -1487,8 +1595,22 @@ fn exec_inpaint_model_conditioning(
         set_if_missing(out, "mask_image", json!(mask_path));
         set_if_missing(out, "lanpaint_mask_channel", json!(mask_source));
     }
-    add_value(store, id, "positive", ValuePayload::Cond { text: positive_text })?;
-    add_value(store, id, "negative", ValuePayload::Cond { text: negative_text })?;
+    add_value(
+        store,
+        id,
+        "positive",
+        ValuePayload::Cond {
+            text: positive_text,
+        },
+    )?;
+    add_value(
+        store,
+        id,
+        "negative",
+        ValuePayload::Cond {
+            text: negative_text,
+        },
+    )?;
     add_value(
         store,
         id,
@@ -1498,7 +1620,11 @@ fn exec_inpaint_model_conditioning(
             height: 0,
             batch: 1,
             init_image: opt_nonempty(&image_path),
-            mask_image: if noise_mask { opt_nonempty(&mask_path) } else { None },
+            mask_image: if noise_mask {
+                opt_nonempty(&mask_path)
+            } else {
+                None
+            },
         },
     )?;
     Ok(Fire::Done)
@@ -1550,13 +1676,19 @@ fn exec_lanpaint_preproc(
         store,
         id,
         "MASK",
-        ValuePayload::Mask { path: mask_path, source: opt_nonempty(&mask_source) },
+        ValuePayload::Mask {
+            path: mask_path,
+            source: opt_nonempty(&mask_source),
+        },
     )?;
     add_value(
         store,
         id,
         "IMAGE",
-        ValuePayload::Image { path: init_path, mask_source: None },
+        ValuePayload::Image {
+            path: init_path,
+            mask_source: None,
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -1593,7 +1725,13 @@ fn exec_reference_latent(
     if latent_link.found {
         require_value_type(store, &latent_link, "LATENT", "latent")?;
         *reference_latent_count += 1;
-        add_value_typed(store, id, "CONDITIONING", "COND_LATENT", ValuePayload::Cond { text })?;
+        add_value_typed(
+            store,
+            id,
+            "CONDITIONING",
+            "COND_LATENT",
+            ValuePayload::Cond { text },
+        )?;
         // Mojo 2430-2444: the same (node_id, "CONDITIONING") port is ALSO
         // appended to the latent_* lists, COPYING the source latent's
         // width/height/batch/init_image/mask_image (or zeros if the source has
@@ -1659,18 +1797,26 @@ fn exec_reference_conditioning(
     set_if_missing(out, "reference_image", json!(reference_path));
     set_if_missing(out, "reference_latent_method", json!("index"));
     *reference_latent_count += 2;
-    add_value_typed(store, id, "CONDITIONING", "COND_LATENT", ValuePayload::Cond { text: pos_text })?;
-    add_value_typed(store, id, "CONDITIONING_1", "COND_LATENT", ValuePayload::Cond { text: neg_text })?;
+    add_value_typed(
+        store,
+        id,
+        "CONDITIONING",
+        "COND_LATENT",
+        ValuePayload::Cond { text: pos_text },
+    )?;
+    add_value_typed(
+        store,
+        id,
+        "CONDITIONING_1",
+        "COND_LATENT",
+        ValuePayload::Cond { text: neg_text },
+    )?;
     Ok(Fire::Done)
 }
 
 // --- SetNode / GetNode / Reroute / ComfySwitchNode (bus + passthrough) ---------
 
-fn exec_setnode(
-    node: &WorkflowNode,
-    links: &LinkMap,
-    store: &mut ValueStore,
-) -> GraphResult<Fire> {
+fn exec_setnode(node: &WorkflowNode, links: &LinkMap, store: &mut ValueStore) -> GraphResult<Fire> {
     let id = node.id;
     let set_link = links.setnode_input(id)?;
     if !set_link.found {
@@ -1719,11 +1865,7 @@ fn exec_getnode(node: &WorkflowNode, store: &mut ValueStore) -> GraphResult<Fire
     Ok(Fire::Done)
 }
 
-fn exec_reroute(
-    node: &WorkflowNode,
-    links: &LinkMap,
-    store: &mut ValueStore,
-) -> GraphResult<Fire> {
+fn exec_reroute(node: &WorkflowNode, links: &LinkMap, store: &mut ValueStore) -> GraphResult<Fire> {
     let id = node.id;
     let input_link = links.reroute_input(id)?;
     if !input_link.found {
@@ -1739,11 +1881,7 @@ fn exec_reroute(
     Ok(Fire::Done)
 }
 
-fn exec_switch(
-    node: &WorkflowNode,
-    links: &LinkMap,
-    store: &mut ValueStore,
-) -> GraphResult<Fire> {
+fn exec_switch(node: &WorkflowNode, links: &LinkMap, store: &mut ValueStore) -> GraphResult<Fire> {
     let id = node.id;
     let fields = &node.fields;
     let false_link = links.input(id, "on_false");
@@ -1761,7 +1899,11 @@ fn exec_switch(
     if switch_link.found {
         switch_value = scalar_bool_of(store, &switch_link, "switch")?;
     }
-    let selected = if switch_value { &true_link } else { &false_link };
+    let selected = if switch_value {
+        &true_link
+    } else {
+        &false_link
+    };
     if !selected.found {
         // Only the selected branch is required; a missing selected branch is a
         // genuinely under-specified graph.
@@ -1818,7 +1960,10 @@ fn exec_mask_blend(
         store,
         id,
         "IMAGE",
-        ValuePayload::Image { path: image_path, mask_source: None },
+        ValuePayload::Image {
+            path: image_path,
+            mask_source: None,
+        },
     )?;
     Ok(Fire::Done)
 }

@@ -1598,6 +1598,19 @@ def _write_ltx2_result(
     body += String('  "conditioning_positive":"') + json_escape(context_path) + String('",\n')
     body += String('  "conditioning_negative":"') + json_escape(negative_context_path) + String('",\n')
     body += String('  "request_lora_count":') + String(request_lora_count) + String(",\n")
+    body += String('  "request_loras":[')
+    for i in range(request_lora_count):
+        if i > 0:
+            body += String(",")
+        var name = _env_str(String("LTX2_TRAINED_LORA_NAME_") + String(i))
+        var path = _env_str(String("LTX2_TRAINED_LORA_") + String(i))
+        var weight = _env_str(String("LTX2_TRAINED_LORA_MULT_") + String(i))
+        if weight.byte_length() == 0:
+            weight = String("1.0")
+        body += String('{"name":"') + json_escape(name)
+        body += String('","path":"') + json_escape(path)
+        body += String('","weight":') + weight + String("}")
+    body += String("],\n")
     body += String('  "dtype_contract":"fp8_transformer_bf16_activations_f32_reductions",\n')
     body += String('  "timings":{\n')
     body += String('    "load_seconds":') + String(load_seconds) + String(",\n")
@@ -2113,6 +2126,7 @@ def run_audiosync(
 
 
 def run_request_profile(
+    checkpoint: String,
     width: Int,
     height: Int,
     frames: Int,
@@ -2133,6 +2147,13 @@ def run_request_profile(
     Request values are never substituted. Unsupported geometry/sampler pairs
     fail before model loading so the UI can report the exact rejected values.
     """
+    if checkpoint != String("ltx-2.3-22b-dev-fp8") and (
+        checkpoint != String("ltx-2.3-22b-dev-fp8.safetensors")
+    ):
+        raise Error(
+            String("LTX2 request: unsupported compiled checkpoint '")
+            + checkpoint + String("'; verified checkpoint: ltx-2.3-22b-dev-fp8")
+        )
     var sampler_key = String(sampler.lower())
     var scheduler_key = String(scheduler.lower())
     var res2s = (
@@ -4167,7 +4188,7 @@ def run_request_hq(
 
     _write_ltx2_status(
         out_dir, String("running"), String("loading_model"), 0,
-        progress_total, String("Loading LTX2 dev model and LoRA weights"),
+        progress_total, String("Loading LTX2 dev model"),
     )
     var ctx = DeviceContext()
     var mem0 = cu_mem_get_info()

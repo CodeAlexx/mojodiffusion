@@ -1267,6 +1267,27 @@ Pure-CPU PNG encoder (uncompressed STORED deflate — valid PNG, just larger). N
 - `crc32(data: Span[UInt8,_]) -> UInt32`, `adler32(data) -> UInt32` — PNG/zlib convention.
 - `save_png(image: Tensor, path: String, ctx, value_range: ValueRange = ValueRange.SIGNED) raises` — encode a `[1,3,H,W]` CHW float Tensor as 8-bit RGB PNG. Reads GPU→host F32, CHW→HWC interleave, filter-0 scanlines, IHDR/IDAT(zlib-stored)/IEND chunks, writes via `io/ffi` `sys_write` (binary-safe).
 
+---
+
+## MageFlow T2I and image edit (2026-07-22)
+
+- `models/dit/mageflow_dit.mojo`: Qwen-Image-family 12-block DiT with
+  MageFlow image-only MSRoPE.
+- `models/text_encoder/mageflow_qwen3vl.mojo`: T2I context and Qwen3-VL
+  image-edit conditioning, including the exact template row drops and edit
+  position construction.
+- `models/vae/mageflow_vae.mojo`: deterministic one-step image encode and
+  latent decode, generalized to non-square aspect-preserving edit shapes.
+- `pipeline/mageflow_pipeline.mojo`: four-step Turbo T2I with text encoder,
+  DiT, and VAE loaded sequentially for 16 GB-class operation.
+- `pipeline/mageflow_edit_pipeline.mojo`: source image plus instruction to
+  clean reference latent, pure-noise target, frame-2 token concatenation,
+  target-only Euler updates, and decoded edit.
+- Parity entrypoints live under the corresponding `parity/` directories. The
+  recorded T2I final-latent cosine is 0.9942; edit reference/final latent
+  cosines are 0.99979/0.99934 and both rendered comparisons were visually
+  accepted. No Serenity server worker or Canvas engine is wired yet.
+
 ### Ideogram-4 perf + magic round (see docs/IDEOGRAM4_STATUS.md)
 - `models/dit/ideogram4_resident.mojo` — `Ideogram4Weights` (resident fp8 cache: `.load(st,ctx)`, `.w(name)`), `ideogram4_build_masks(indicator,ctx)->Ideogram4Masks` (hoisted constant masks), `ideogram4_forward_r[S](w,x,llm,t,masks,cos,sin,...)` (hot path; `_lin` = dequant resident fp8→bf16 then vendor cuBLAS `linear`; attention now goes through `ideogram4_sdpa_product_fwd`). Resident DiT cos 0.999557 after Dh=256 flash wiring.
 - `ops/fp8_gemm.mojo` — `linear_fp8(x,w_fp8,scale,bias,ctx)` fused tiled fp8 GEMM (cos 0.99999698 vs dequant+BLAS; reference, slower than cuBLAS, not on hot path). The no-bias path now keeps bias storage BF16 and avoids the local dummy allocation/fence; `ops/tests/fp8_gemm_smoke.mojo` passes with `--target-accelerator sm_86`.

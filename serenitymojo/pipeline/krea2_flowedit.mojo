@@ -118,7 +118,7 @@ comptime NBLOCKS = 28
 # Shared PADDED text length: every context (src/tgt × pos/neg) is zero-row-padded
 # to this bucket; krea2_forward gets the real length per context. ONE comptime
 # instantiation covers all four contexts. Fail-loud if a prompt exceeds it.
-comptime LT_SHARED = 32
+comptime LT_SHARED = 256
 comptime LFULL = LT_SHARED + IMGLEN                 # 1056
 comptime LPAD = ((LFULL + 255) // 256) * 256        # 1280
 
@@ -126,7 +126,7 @@ comptime KREA2_TXT_LAYERS = 12
 comptime KREA2_TXT_DIM = 2560
 
 
-def _load_context_padded(
+def _load_context_padded_shape[LT_SHARED_: Int](
     path: String, name: String, ctx: DeviceContext
 ) raises -> Tuple[Tensor, Int]:
     """Load a krea2_encode_cli context bin [1, lt, 12, 2560] bf16 and zero-row-pad
@@ -140,53 +140,78 @@ def _load_context_padded(
             + "(expected [1, LT, 12, 2560]); regenerate with krea2_encode_cli: " + path
         )
     var lt = sh[1]
-    print("[flowedit] ", name, " context LT =", lt, " (pad to ", LT_SHARED, ")")
-    if lt > LT_SHARED:
+    print("[flowedit] ", name, " context LT =", lt, " (pad to ", LT_SHARED_, ")")
+    if lt > LT_SHARED_:
         raise Error(
             String("[flowedit] ") + name + " LT=" + String(lt) + " > LT_SHARED="
-            + String(LT_SHARED) + " — raise LT_SHARED (and rebuild)."
+            + String(LT_SHARED_) + " — shorten the prompt or compile a larger text bucket."
         )
-    if lt == LT_SHARED:
+    if lt == LT_SHARED_:
         return (stack^, lt)
     var pad = zeros_device(
-        [1, LT_SHARED - lt, KREA2_TXT_LAYERS, KREA2_TXT_DIM], STDtype.BF16, ctx
+        [1, LT_SHARED_ - lt, KREA2_TXT_LAYERS, KREA2_TXT_DIM], STDtype.BF16, ctx
     )
-    var padded = concat(1, ctx, stack, pad)          # [1, LT_SHARED, 12, 2560]
+    var padded = concat(1, ctx, stack, pad)
     return (padded^, lt)
 
 
-def _build_pos(ctx: DeviceContext) raises -> Tensor:
+def _load_context_padded(
+    path: String, name: String, ctx: DeviceContext
+) raises -> Tuple[Tensor, Int]:
+    return _load_context_padded_shape[LT_SHARED](path, name, ctx)
+
+
+def _build_pos_shape[LH_: Int, LW_: Int, LT_SHARED_: Int](
+    ctx: DeviceContext
+) raises -> Tensor:
     """pos [1, LT_SHARED+IMGLEN, 3] f32 = cat(txt zeros, img (0,gh_i,gw_i) grid).
     Shared by all four contexts (text pos rows are all-zero; krea2_forward reorders
     internally per real_text_len)."""
-    var gh = LH // 2
-    var gw = LW // 2
+    comptime GH_ = LH_ // 2
+    comptime GW_ = LW_ // 2
+    comptime LFULL_ = LT_SHARED_ + GH_ * GW_
     var host = List[Float32]()
-    for _ in range(LT_SHARED * 3):
+    for _ in range(LT_SHARED_ * 3):
         host.append(Float32(0.0))
-    for hi in range(gh):
-        for wi in range(gw):
+    for hi in range(GH_):
+        for wi in range(GW_):
             host.append(Float32(0.0))
             host.append(Float32(hi))
             host.append(Float32(wi))
-    return Tensor.from_host(host^, [1, LFULL, 3], STDtype.F32, ctx)
+    return Tensor.from_host(host^, [1, LFULL_, 3], STDtype.F32, ctx)
+
+
+def _build_pos(ctx: DeviceContext) raises -> Tensor:
+    return _build_pos_shape[LH, LW, LT_SHARED](ctx)
+
+
+def _patchify_latent_shape[LH_: Int, LW_: Int](
+    latent_nchw: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    """[1,16,LH,LW] -> [1, IMGLEN, 64] ((c ph pw) patchify, ph=pw=2)."""
+    comptime GH_ = LH_ // 2
+    comptime GW_ = LW_ // 2
+    var x6 = reshape(latent_nchw, [1, 16, GH_, 2, GW_, 2], ctx)
+    var xp = permute(x6, [0, 2, 4, 1, 3, 5], ctx)   # [1, gh, gw, 16, 2, 2]
+    return reshape(xp, [1, GH_ * GW_, 64], ctx)      # [1, IMGLEN, 64]
 
 
 def _patchify_latent(latent_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
-    """[1,16,LH,LW] -> [1, IMGLEN, 64] ((c ph pw) patchify, ph=pw=2)."""
-    var gh = LH // 2
-    var gw = LW // 2
-    var x6 = reshape(latent_nchw, [1, 16, gh, 2, gw, 2], ctx)
-    var xp = permute(x6, [0, 2, 4, 1, 3, 5], ctx)   # [1, gh, gw, 16, 2, 2]
-    return reshape(xp, [1, gh * gw, 64], ctx)        # [1, IMGLEN, 64]
+    return _patchify_latent_shape[LH, LW](latent_nchw, ctx)
+
+
+def _unpatch_shape[LH_: Int, LW_: Int](
+    tokens: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    comptime GH_ = LH_ // 2
+    comptime GW_ = LW_ // 2
+    var x6 = reshape(tokens, [1, GH_, GW_, 16, 2, 2], ctx)
+    var xp = permute(x6, [0, 3, 1, 4, 2, 5], ctx)   # [1, 16, gh, 2, gw, 2]
+    return reshape(xp, [1, 16, GH_ * 2, GW_ * 2], ctx)  # [1, 16, LH, LW]
 
 
 def _unpatch(tokens: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var gh = LH // 2
-    var gw = LW // 2
-    var x6 = reshape(tokens, [1, gh, gw, 16, 2, 2], ctx)
-    var xp = permute(x6, [0, 3, 1, 4, 2, 5], ctx)   # [1, 16, gh, 2, gw, 2]
-    return reshape(xp, [1, 16, gh * 2, gw * 2], ctx)  # [1, 16, LH, LW]
+    return _unpatch_shape[LH, LW](tokens, ctx)
 
 
 # ── AUTO-MASK helpers (host-side; 1024 tokens — trivially cheap vs 4 DiT
@@ -200,29 +225,41 @@ comptime NTOK = TOK_GH * TOK_GW         # 1024 == IMGLEN
 comptime LATPLANE = LH * LW             # 4096
 
 
-def _accum_saliency(dv_host: List[Float32], mut sal: List[Float32]):
+def _accum_saliency_shape[LH_: Int, LW_: Int](
+    dv_host: List[Float32], mut sal: List[Float32]
+):
     """sal[j] += ||dv token j||_2 over the 16x2x2 latent block (64 values —
     identical content to the [1,IMGLEN,64] token row, just latent layout)."""
-    for gy in range(TOK_GH):
-        for gx in range(TOK_GW):
+    comptime TOK_GH_ = LH_ // 2
+    comptime TOK_GW_ = LW_ // 2
+    comptime LATPLANE_ = LH_ * LW_
+    for gy in range(TOK_GH_):
+        for gx in range(TOK_GW_):
             var acc = Float32(0.0)
             for c in range(16):
-                var base = c * LATPLANE
+                var base = c * LATPLANE_
                 for ph in range(2):
-                    var row = base + (2 * gy + ph) * LW + 2 * gx
+                    var row = base + (2 * gy + ph) * LW_ + 2 * gx
                     for pw in range(2):
                         var v = dv_host[row + pw]
                         acc += v * v
-            sal[gy * TOK_GW + gx] += sqrt(acc)
+            sal[gy * TOK_GW_ + gx] += sqrt(acc)
 
 
-def _mask_from_saliency(
+def _accum_saliency(dv_host: List[Float32], mut sal: List[Float32]):
+    _accum_saliency_shape[LH, LW](dv_host, sal)
+
+
+def _mask_from_saliency_shape[LH_: Int, LW_: Int](
     sal: List[Float32], mask_q: Float32, dilate: Int
 ) -> List[Bool]:
     """Threshold accumulated saliency at quantile mask_q (tokens >= the q-th
     sorted value are IN the edit mask), then dilate `dilate` times with a 3x3
     neighborhood on the token grid."""
     # quantile threshold (insertion sort; NTOK=1024 host floats).
+    comptime TOK_GH_ = LH_ // 2
+    comptime TOK_GW_ = LW_ // 2
+    comptime NTOK_ = TOK_GH_ * TOK_GW_
     var sorted_sal = sal.copy()
     for i in range(1, len(sorted_sal)):
         var key = sorted_sal[i]
@@ -231,57 +268,72 @@ def _mask_from_saliency(
             sorted_sal[j + 1] = sorted_sal[j]
             j -= 1
         sorted_sal[j + 1] = key
-    var qi = Int(mask_q * Float32(NTOK))
+    var qi = Int(mask_q * Float32(NTOK_))
     if qi < 0:
         qi = 0
-    if qi > NTOK - 1:
-        qi = NTOK - 1
+    if qi > NTOK_ - 1:
+        qi = NTOK_ - 1
     var thr = sorted_sal[qi]
     var mask = List[Bool]()
-    for j in range(NTOK):
+    for j in range(NTOK_):
         mask.append(sal[j] >= thr)
     # dilation: token is masked if ANY 3x3 neighbor was masked.
     for _ in range(dilate):
         var grown = mask.copy()
-        for gy in range(TOK_GH):
-            for gx in range(TOK_GW):
-                if grown[gy * TOK_GW + gx]:
+        for gy in range(TOK_GH_):
+            for gx in range(TOK_GW_):
+                if grown[gy * TOK_GW_ + gx]:
                     continue
                 var hit = False
                 for dy in range(-1, 2):
                     var ny = gy + dy
-                    if ny < 0 or ny >= TOK_GH:
+                    if ny < 0 or ny >= TOK_GH_:
                         continue
                     for dx in range(-1, 2):
                         var nx = gx + dx
-                        if nx < 0 or nx >= TOK_GW:
+                        if nx < 0 or nx >= TOK_GW_:
                             continue
-                        if mask[ny * TOK_GW + nx]:
+                        if mask[ny * TOK_GW_ + nx]:
                             hit = True
                 if hit:
-                    grown[gy * TOK_GW + gx] = True
+                    grown[gy * TOK_GW_ + gx] = True
         mask = grown^
     return mask^
+
+
+def _mask_from_saliency(
+    sal: List[Float32], mask_q: Float32, dilate: Int
+) -> List[Bool]:
+    return _mask_from_saliency_shape[LH, LW](sal, mask_q, dilate)
+
+
+def _blend_outside_mask_shape[LH_: Int, LW_: Int](
+    mut z_host: List[Float32], z0_host: List[Float32], mask: List[Bool]
+):
+    """HARD-COPY source latent into every token OUTSIDE the mask (pixel-exact
+    background in latent space; only VAE-decode receptive-field bleed remains)."""
+    comptime TOK_GH_ = LH_ // 2
+    comptime TOK_GW_ = LW_ // 2
+    comptime LATPLANE_ = LH_ * LW_
+    for gy in range(TOK_GH_):
+        for gx in range(TOK_GW_):
+            if mask[gy * TOK_GW_ + gx]:
+                continue
+            for c in range(16):
+                var base = c * LATPLANE_
+                for ph in range(2):
+                    var row = base + (2 * gy + ph) * LW_ + 2 * gx
+                    for pw in range(2):
+                        z_host[row + pw] = z0_host[row + pw]
 
 
 def _blend_outside_mask(
     mut z_host: List[Float32], z0_host: List[Float32], mask: List[Bool]
 ):
-    """HARD-COPY source latent into every token OUTSIDE the mask (pixel-exact
-    background in latent space; only VAE-decode receptive-field bleed remains)."""
-    for gy in range(TOK_GH):
-        for gx in range(TOK_GW):
-            if mask[gy * TOK_GW + gx]:
-                continue
-            for c in range(16):
-                var base = c * LATPLANE
-                for ph in range(2):
-                    var row = base + (2 * gy + ph) * LW + 2 * gx
-                    for pw in range(2):
-                        z_host[row + pw] = z0_host[row + pw]
+    _blend_outside_mask_shape[LH, LW](z_host, z0_host, mask)
 
 
-def _save_mask_png(
+def _save_mask_png_shape[HEIGHT_: Int, WIDTH_: Int, LH_: Int, LW_: Int](
     mask: List[Bool], out_png: String, ctx: DeviceContext
 ) raises -> String:
     """Save the token mask as <out>_mask.png: 32x32 upscaled x16 nearest to
@@ -291,20 +343,28 @@ def _save_mask_png(
         mask_path = String(mask_path.removesuffix(".png"))
     mask_path += "_mask.png"
     var host = List[Float32]()
-    var scale_h = HEIGHT // TOK_GH   # 16
-    var scale_w = WIDTH // TOK_GW    # 16
+    comptime TOK_GH_ = LH_ // 2
+    comptime TOK_GW_ = LW_ // 2
+    var scale_h = HEIGHT_ // TOK_GH_
+    var scale_w = WIDTH_ // TOK_GW_
     for _ in range(3):               # R, G, B planes identical
-        for y in range(HEIGHT):
+        for y in range(HEIGHT_):
             var gy = y // scale_h
-            for x in range(WIDTH):
+            for x in range(WIDTH_):
                 var gx = x // scale_w
-                if mask[gy * TOK_GW + gx]:
+                if mask[gy * TOK_GW_ + gx]:
                     host.append(Float32(1.0))
                 else:
                     host.append(Float32(0.0))
-    var img = Tensor.from_host(host^, [1, 3, HEIGHT, WIDTH], STDtype.F32, ctx)
+    var img = Tensor.from_host(host^, [1, 3, HEIGHT_, WIDTH_], STDtype.F32, ctx)
     save_png(img, mask_path, ctx, ValueRange.UNIT)
     return mask_path
+
+
+def _save_mask_png(
+    mask: List[Bool], out_png: String, ctx: DeviceContext
+) raises -> String:
+    return _save_mask_png_shape[HEIGHT, WIDTH, LH, LW](mask, out_png, ctx)
 
 
 def _encode_source_latent(src_path: String, ctx: DeviceContext) raises -> Tensor:
@@ -330,7 +390,7 @@ def _encode_source_latent(src_path: String, ctx: DeviceContext) raises -> Tensor
     return clean_f32^
 
 
-def _velocity(
+def _velocity_shape[LH_: Int, LW_: Int, LT_SHARED_: Int](
     st: ShardedSafeTensors,
     latent_f32: Tensor,        # [1,16,LH,LW] F32
     ctx_pos: Tensor, lt_pos: Int,
@@ -345,9 +405,12 @@ def _velocity(
 ) raises -> Tensor:
     """One CFG velocity in latent space: [1,16,LH,LW] F32. PURE BASE (no LoRA,
     no img_in_ref — FlowEdit is training-free)."""
-    var tok_f32 = _patchify_latent(latent_f32, ctx)             # [1,IMGLEN,64] f32
+    comptime IMGLEN_ = (LH_ // 2) * (LW_ // 2)
+    comptime LFULL_ = LT_SHARED_ + IMGLEN_
+    comptime LPAD_ = ((LFULL_ + 255) // 256) * 256
+    var tok_f32 = _patchify_latent_shape[LH_, LW_](latent_f32, ctx)
     var tok = torch_f32_to_bf16_rne(tok_f32, ctx)               # bf16 feed
-    var v_cond = krea2_forward[LFULL, LPAD, LT_SHARED, NBLOCKS](
+    var v_cond = krea2_forward[LFULL_, LPAD_, LT_SHARED_, NBLOCKS](
         st, tok, ctx_pos, t_t, pos_grid, ctx, KREA2_RAW_KEY_PREFIX,
         Optional[LoraSet](None), Float32(1.0),
         Optional[Krea2ResidentFp8](None),
@@ -356,7 +419,14 @@ def _velocity(
         Optional[Krea2LoraSideCache](None), shared,
         Optional[Int](lt_pos),
     )
-    var v_uncond = krea2_forward[LFULL, LPAD, LT_SHARED, NBLOCKS](
+    # Krea's creator CFG is cond + scale*(cond-uncond). At scale=0 the
+    # unconditional branch contributes exactly nothing, so do not spend a full
+    # streamed DiT forward computing it. This is the same Turbo fast path used
+    # by models/krea2/krea2_infer.mojo.
+    if cfg_scale <= Float32(0.0):
+        var v_f32 = cast_tensor(v_cond, STDtype.F32, ctx)
+        return _unpatch_shape[LH_, LW_](v_f32, ctx)
+    var v_uncond = krea2_forward[LFULL_, LPAD_, LT_SHARED_, NBLOCKS](
         st, tok, ctx_neg, t_t, pos_grid, ctx, KREA2_RAW_KEY_PREFIX,
         Optional[LoraSet](None), Float32(1.0),
         Optional[Krea2ResidentFp8](None),
@@ -367,7 +437,26 @@ def _velocity(
     )
     var v_bf16 = krea2_cfg(v_cond, v_uncond, cfg_scale, ctx)    # [1,IMGLEN,64] bf16
     var v_f32 = cast_tensor(v_bf16, STDtype.F32, ctx)
-    return _unpatch(v_f32, ctx)                                 # [1,16,LH,LW] F32
+    return _unpatch_shape[LH_, LW_](v_f32, ctx)
+
+
+def _velocity(
+    st: ShardedSafeTensors,
+    latent_f32: Tensor,
+    ctx_pos: Tensor, lt_pos: Int,
+    ctx_neg: Tensor, lt_neg: Int,
+    pos_grid: Tensor,
+    t_t: Tensor,
+    cfg_scale: Float32,
+    resident_i8: Optional[Krea2ResidentInt8],
+    host_i8: Optional[Krea2HostInt8Inf],
+    shared: Optional[Krea2SharedResident],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    return _velocity_shape[LH, LW, LT_SHARED](
+        st, latent_f32, ctx_pos, lt_pos, ctx_neg, lt_neg, pos_grid, t_t,
+        cfg_scale, resident_i8, host_i8, shared, ctx,
+    )
 
 
 def main() raises:

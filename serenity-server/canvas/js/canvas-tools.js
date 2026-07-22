@@ -16,9 +16,16 @@ var CanvasTools = (function () {
     // Rect tool state
     var _rectStart = null;
     var _rectPreview = null;
+    var _shapeMode = 'rectangle';
+    var _shapeSubtract = false;
+    var _shapePolygonPoints = [];
     // Gradient tool state
     var _gradStart = null;
     var _gradPreview = null;
+    var _gradientMode = 'linear';
+    var _gradientStartColor = '#ffffff';
+    var _gradientEndColor = '#000000';
+    var _gradientClip = true;
     // Move tool state
     var _moveTarget = null;
     var _moveStart = null;
@@ -27,6 +34,9 @@ var CanvasTools = (function () {
     var _lassoPoints = [];
     var _lassoLine = null;
     var _lassoSelection = null;
+    var _lassoMode = 'freehand';
+    var _lassoSubtract = false;
+    var _lassoAutoMask = true;
     // Clone stamp state
     var _cloneSource = null;
     var _cloneOffset = null;
@@ -51,6 +61,14 @@ var CanvasTools = (function () {
     }
     function getCompositeOp(toolName) {
         return toolName === 'eraser' ? 'destination-out' : 'source-over';
+    }
+    function paintComposite(ctx, subtract) {
+        if (subtract)
+            return 'destination-out';
+        var active = ctx.getActiveLayer();
+        return active && active.data.type === 'draw' && active.data.lockTransparency
+            ? 'source-atop'
+            : 'source-over';
     }
     function scheduleLayerDraw(layer) {
         if (!_drawScheduled) {
@@ -82,7 +100,7 @@ var CanvasTools = (function () {
                 _currentLine = new Konva.Line({
                     stroke: ctx.getBrushColor(),
                     strokeWidth: ctx.getBrushSize(),
-                    globalCompositeOperation: 'source-over',
+                    globalCompositeOperation: paintComposite(ctx, false),
                     lineCap: 'round',
                     lineJoin: 'round',
                     tension: 0.3,
@@ -102,7 +120,7 @@ var CanvasTools = (function () {
             _currentLine = new Konva.Line({
                 stroke: ctx.getBrushColor(),
                 strokeWidth: ctx.getBrushSize(),
-                globalCompositeOperation: 'source-over',
+                globalCompositeOperation: paintComposite(ctx, false),
                 lineCap: 'round',
                 lineJoin: 'round',
                 tension: 0.3,
@@ -247,7 +265,41 @@ var CanvasTools = (function () {
             _currentLine = null;
         }
     };
-    // ── Rect Tool ──
+    function shapeFill(ctx, layer) {
+        return layer.data.type === 'mask' ? 'rgba(239, 68, 68, 0.5)' : ctx.getBrushColor();
+    }
+    function finishPolygonShape(ctx) {
+        if (!_rectPreview || _shapePolygonPoints.length < 6)
+            return;
+        var active = ctx.getActiveLayer();
+        if (active) {
+            active.konvaLayer.add(new Konva.Line({
+                points: _shapePolygonPoints.slice(),
+                closed: true,
+                fill: shapeFill(ctx, active),
+                opacity: _brushOpacity,
+                globalCompositeOperation: paintComposite(ctx, _shapeSubtract),
+                listening: false
+            }));
+            active.konvaLayer.batchDraw();
+            ctx.pushHistory();
+        }
+        _rectPreview.destroy();
+        _rectPreview = null;
+        _shapePolygonPoints = [];
+        ctx.uiLayer.batchDraw();
+    }
+    function cancelShape(ctx) {
+        if (_rectPreview)
+            _rectPreview.destroy();
+        _rectPreview = null;
+        _rectStart = null;
+        _shapePolygonPoints = [];
+        _drawing = false;
+        if (ctx && ctx.uiLayer)
+            ctx.uiLayer.batchDraw();
+    }
+    // ── Shapes Tool ──
     var RectTool = {
         name: 'rect',
         cursor: 'crosshair',
@@ -259,10 +311,45 @@ var CanvasTools = (function () {
             if (al.data.type !== 'draw' && al.data.type !== 'mask')
                 return;
             _rectStart = ctx.getRelativePointerPosition();
-            _rectPreview = new Konva.Rect({
+            if (_shapeMode === 'polygon') {
+                _shapePolygonPoints.push(_rectStart.x, _rectStart.y);
+                if (!_rectPreview) {
+                    _rectPreview = new Konva.Line({
+                        points: _shapePolygonPoints.slice(),
+                        closed: false,
+                        fill: shapeFill(ctx, al),
+                        opacity: 0.55,
+                        stroke: '#fff',
+                        strokeWidth: 1.5 / ctx.stage.scaleX(),
+                        dash: [4, 4],
+                        listening: false
+                    });
+                    ctx.uiLayer.add(_rectPreview);
+                }
+                if (e.evt && e.evt.detail >= 2)
+                    finishPolygonShape(ctx);
+                return;
+            }
+            if (_shapeMode === 'freehand') {
+                _shapePolygonPoints = [_rectStart.x, _rectStart.y];
+                _drawing = true;
+                _rectPreview = new Konva.Line({
+                    points: _shapePolygonPoints,
+                    closed: true,
+                    fill: shapeFill(ctx, al),
+                    opacity: 0.55,
+                    stroke: '#fff',
+                    strokeWidth: 1 / ctx.stage.scaleX(),
+                    listening: false
+                });
+                ctx.uiLayer.add(_rectPreview);
+                return;
+            }
+            var ShapeClass = _shapeMode === 'ellipse' ? Konva.Ellipse : Konva.Rect;
+            _rectPreview = new ShapeClass({
                 x: _rectStart.x, y: _rectStart.y,
-                width: 0, height: 0,
-                fill: al.data.type === 'mask' ? 'rgba(239, 68, 68, 0.5)' : ctx.getBrushColor(),
+                width: 0, height: 0, radiusX: 0, radiusY: 0,
+                fill: shapeFill(ctx, al),
                 opacity: _brushOpacity,
                 stroke: 'rgba(255,255,255,0.3)',
                 strokeWidth: 1,
@@ -274,28 +361,74 @@ var CanvasTools = (function () {
         onMouseMove: function (ctx, pos) {
             if (!_rectStart || !_rectPreview)
                 return;
+            if (_shapeMode === 'polygon') {
+                _rectPreview.points(_shapePolygonPoints.concat([pos.x, pos.y]));
+                ctx.uiLayer.batchDraw();
+                return;
+            }
+            if (_shapeMode === 'freehand') {
+                _shapePolygonPoints.push(pos.x, pos.y);
+                _rectPreview.points(_shapePolygonPoints);
+                ctx.uiLayer.batchDraw();
+                return;
+            }
             var x = Math.min(_rectStart.x, pos.x);
             var y = Math.min(_rectStart.y, pos.y);
             var w = Math.abs(pos.x - _rectStart.x);
             var h = Math.abs(pos.y - _rectStart.y);
-            _rectPreview.x(x);
-            _rectPreview.y(y);
-            _rectPreview.width(w);
-            _rectPreview.height(h);
+            if (_shapeMode === 'ellipse') {
+                _rectPreview.x(x + w / 2);
+                _rectPreview.y(y + h / 2);
+                _rectPreview.radiusX(w / 2);
+                _rectPreview.radiusY(h / 2);
+            }
+            else {
+                _rectPreview.x(x);
+                _rectPreview.y(y);
+                _rectPreview.width(w);
+                _rectPreview.height(h);
+            }
             ctx.uiLayer.batchDraw();
         },
         onMouseUp: function (ctx) {
             if (!_rectStart || !_rectPreview)
                 return;
+            if (_shapeMode === 'polygon')
+                return;
             var al = ctx.getActiveLayer();
-            if (al && _rectPreview.width() > 2 && _rectPreview.height() > 2) {
-                var committed = new Konva.Rect({
-                    x: _rectPreview.x(), y: _rectPreview.y(),
-                    width: _rectPreview.width(), height: _rectPreview.height(),
-                    fill: _rectPreview.fill(),
-                    opacity: _rectPreview.opacity(),
-                    listening: false
-                });
+            var valid = _shapeMode === 'freehand'
+                ? _shapePolygonPoints.length >= 6
+                : (_shapeMode === 'ellipse'
+                    ? _rectPreview.radiusX() > 2 && _rectPreview.radiusY() > 2
+                    : _rectPreview.width() > 2 && _rectPreview.height() > 2);
+            if (al && valid) {
+                var committed;
+                if (_shapeMode === 'freehand') {
+                    committed = new Konva.Line({
+                        points: _shapePolygonPoints.slice(), closed: true,
+                        fill: _rectPreview.fill(), opacity: _brushOpacity,
+                        globalCompositeOperation: paintComposite(ctx, _shapeSubtract),
+                        listening: false
+                    });
+                }
+                else if (_shapeMode === 'ellipse') {
+                    committed = new Konva.Ellipse({
+                        x: _rectPreview.x(), y: _rectPreview.y(),
+                        radiusX: _rectPreview.radiusX(), radiusY: _rectPreview.radiusY(),
+                        fill: _rectPreview.fill(), opacity: _rectPreview.opacity(),
+                        globalCompositeOperation: paintComposite(ctx, _shapeSubtract),
+                        listening: false
+                    });
+                }
+                else {
+                    committed = new Konva.Rect({
+                        x: _rectPreview.x(), y: _rectPreview.y(),
+                        width: _rectPreview.width(), height: _rectPreview.height(),
+                        fill: _rectPreview.fill(), opacity: _rectPreview.opacity(),
+                        globalCompositeOperation: paintComposite(ctx, _shapeSubtract),
+                        listening: false
+                    });
+                }
                 al.konvaLayer.add(committed);
                 al.konvaLayer.batchDraw();
                 ctx.pushHistory();
@@ -303,9 +436,28 @@ var CanvasTools = (function () {
             _rectPreview.destroy();
             _rectPreview = null;
             _rectStart = null;
+            _shapePolygonPoints = [];
+            _drawing = false;
             ctx.uiLayer.batchDraw();
-        }
+        },
+        onKeyDown: function (ctx, event) {
+            if (event.key === 'Enter' && _shapeMode === 'polygon') {
+                event.preventDefault();
+                finishPolygonShape(ctx);
+            }
+            else if (event.key === 'Escape') {
+                cancelShape(ctx);
+            }
+        },
+        onDeactivate: cancelShape
     };
+    function setShapeMode(mode) {
+        if (['rectangle', 'ellipse', 'polygon', 'freehand'].indexOf(mode) >= 0)
+            _shapeMode = mode;
+    }
+    function getShapeMode() { return _shapeMode; }
+    function setShapeSubtract(value) { _shapeSubtract = !!value; }
+    function getShapeSubtract() { return _shapeSubtract; }
     // ── Gradient Tool ──
     var GradientTool = {
         name: 'gradient',
@@ -356,22 +508,58 @@ var CanvasTools = (function () {
             tmpCanvas.width = bw;
             tmpCanvas.height = bh;
             var gc = tmpCanvas.getContext('2d');
-            var grad = gc.createLinearGradient(x0 - bx, y0 - by, x1 - bx, y1 - by);
-            grad.addColorStop(0, ctx.getBrushColor());
-            grad.addColorStop(1, 'transparent');
+            var grad;
+            if (_gradientMode === 'radial') {
+                grad = gc.createRadialGradient(x0 - bx, y0 - by, 0, x0 - bx, y0 - by, dist);
+            }
+            else {
+                grad = gc.createLinearGradient(x0 - bx, y0 - by, x1 - bx, y1 - by);
+            }
+            grad.addColorStop(0, _gradientStartColor);
+            grad.addColorStop(1, _gradientClip ? _gradientEndColor : 'transparent');
             gc.fillStyle = grad;
             gc.fillRect(0, 0, bw, bh);
             var img = new Image();
             img.onload = function () {
-                var kImg = new Konva.Image({ image: img, x: bx, y: by, width: bw, height: bh, opacity: _brushOpacity, listening: false });
+                var kImg = new Konva.Image({ image: img, x: bx, y: by, width: bw, height: bh, opacity: _brushOpacity, globalCompositeOperation: paintComposite(ctx, false), listening: false });
                 al.konvaLayer.add(kImg);
                 al.konvaLayer.batchDraw();
                 ctx.pushHistory();
             };
             img.src = tmpCanvas.toDataURL();
             _gradStart = null;
+        },
+        onKeyDown: function (ctx, event) {
+            if (event.key === 'Escape') {
+                if (_gradPreview)
+                    _gradPreview.destroy();
+                _gradPreview = null;
+                _gradStart = null;
+                ctx.uiLayer.batchDraw();
+            }
+        },
+        onDeactivate: function (ctx) {
+            if (_gradPreview)
+                _gradPreview.destroy();
+            _gradPreview = null;
+            _gradStart = null;
+            ctx.uiLayer.batchDraw();
         }
     };
+    function setGradientMode(mode) {
+        if (mode === 'linear' || mode === 'radial')
+            _gradientMode = mode;
+    }
+    function getGradientMode() { return _gradientMode; }
+    function setGradientColors(start, end) {
+        if (start)
+            _gradientStartColor = start;
+        if (end)
+            _gradientEndColor = end;
+    }
+    function getGradientColors() { return { start: _gradientStartColor, end: _gradientEndColor }; }
+    function setGradientClip(value) { _gradientClip = !!value; }
+    function getGradientClip() { return _gradientClip; }
     // ── Move Tool ──
     var MoveTool = {
         name: 'move',
@@ -554,7 +742,9 @@ var CanvasTools = (function () {
                 if (px < 0 || px >= bw || py < 0 || py >= bh)
                     return;
                 var fillColor = al.data.type === 'mask' ? [239, 68, 68, 128] : hexToRgba(ctx.getBrushColor(), Math.round(_brushOpacity * 255));
-                floodFill(imageData, px, py, fillColor, _fillThreshold);
+                if (al.data.lockTransparency && imageData.data[(py * bw + px) * 4 + 3] === 0)
+                    return;
+                floodFill(imageData, px, py, fillColor, _fillThreshold, !!al.data.lockTransparency);
                 fctx.putImageData(imageData, 0, 0);
                 var resultImg = new Image();
                 resultImg.onload = function () {
@@ -574,7 +764,7 @@ var CanvasTools = (function () {
         var b = parseInt(hex.slice(5, 7), 16) || 0;
         return [r, g, b, alpha];
     }
-    function floodFill(imageData, startX, startY, fillColor, threshold) {
+    function floodFill(imageData, startX, startY, fillColor, threshold, lockTransparency) {
         var data = imageData.data;
         var w = imageData.width;
         var h = imageData.height;
@@ -592,6 +782,8 @@ var CanvasTools = (function () {
             if (x < 0 || x >= w || y < 0 || y >= h || visited[i])
                 continue;
             var pi = i * 4;
+            if (lockTransparency && data[pi + 3] === 0)
+                continue;
             var dr = Math.abs(data[pi] - targetR);
             var dg = Math.abs(data[pi + 1] - targetG);
             var db = Math.abs(data[pi + 2] - targetB);
@@ -612,13 +804,24 @@ var CanvasTools = (function () {
         cursor: 'crosshair',
         showsBrushCursor: false,
         onMouseDown: function (ctx, _e) {
-            _lassoPoints = [];
             var pos = ctx.getRelativePointerPosition();
-            _lassoPoints.push(pos.x, pos.y);
-            if (_lassoLine) {
-                _lassoLine.destroy();
-                _lassoLine = null;
+            if (_lassoMode === 'polygon') {
+                _lassoPoints.push(pos.x, pos.y);
+                if (!_lassoLine) {
+                    _lassoLine = new Konva.Line({
+                        points: _lassoPoints.slice(), stroke: '#6c6af5',
+                        strokeWidth: 2 / ctx.stage.scaleX(), dash: [6, 3],
+                        closed: false, listening: false
+                    });
+                    ctx.uiLayer.add(_lassoLine);
+                }
+                if (_e.evt && _e.evt.detail >= 2)
+                    finishLasso(ctx);
+                return;
             }
+            _lassoPoints = [pos.x, pos.y];
+            if (_lassoLine)
+                _lassoLine.destroy();
             _lassoLine = new Konva.Line({
                 points: _lassoPoints,
                 stroke: '#6c6af5',
@@ -631,27 +834,32 @@ var CanvasTools = (function () {
             _drawing = true;
         },
         onMouseMove: function (ctx, pos) {
-            if (!_drawing || !_lassoLine)
+            if (!_lassoLine)
+                return;
+            if (_lassoMode === 'polygon') {
+                _lassoLine.points(_lassoPoints.concat([pos.x, pos.y]));
+                ctx.uiLayer.batchDraw();
+                return;
+            }
+            if (!_drawing)
                 return;
             _lassoPoints.push(pos.x, pos.y);
             _lassoLine.points(_lassoPoints);
             ctx.uiLayer.batchDraw();
         },
         onMouseUp: function (ctx) {
+            if (_lassoMode === 'polygon')
+                return;
             _drawing = false;
-            if (_lassoLine && _lassoPoints.length >= 6) {
-                _lassoLine.closed(true);
-                _lassoLine.fill('rgba(108, 106, 245, 0.15)');
-                ctx.uiLayer.batchDraw();
-                _lassoSelection = _lassoPoints.slice();
+            finishLasso(ctx);
+        },
+        onKeyDown: function (ctx, event) {
+            if (event.key === 'Enter' && _lassoMode === 'polygon') {
+                event.preventDefault();
+                finishLasso(ctx);
             }
-            else {
-                if (_lassoLine) {
-                    _lassoLine.destroy();
-                    _lassoLine = null;
-                }
-                _lassoSelection = null;
-                ctx.uiLayer.batchDraw();
+            else if (event.key === 'Escape') {
+                clearLassoSelection(ctx);
             }
         },
         onDeactivate: function (ctx) {
@@ -664,6 +872,30 @@ var CanvasTools = (function () {
             ctx.uiLayer.batchDraw();
         }
     };
+    function finishLasso(ctx) {
+        _drawing = false;
+        if (_lassoLine && _lassoPoints.length >= 6) {
+            _lassoLine.points(_lassoPoints);
+            _lassoLine.closed(true);
+            _lassoLine.fill(_lassoSubtract ? 'rgba(239, 68, 68, 0.18)' : 'rgba(108, 106, 245, 0.15)');
+            ctx.uiLayer.batchDraw();
+            _lassoSelection = _lassoPoints.slice();
+            if (_lassoAutoMask)
+                convertLassoToMask(ctx);
+        }
+        else {
+            clearLassoSelection(ctx);
+        }
+    }
+    function setLassoMode(mode) {
+        if (mode === 'freehand' || mode === 'polygon')
+            _lassoMode = mode;
+    }
+    function getLassoMode() { return _lassoMode; }
+    function setLassoSubtract(value) { _lassoSubtract = !!value; }
+    function getLassoSubtract() { return _lassoSubtract; }
+    function setLassoAutoMask(value) { _lassoAutoMask = !!value; }
+    function getLassoAutoMask() { return _lassoAutoMask; }
     // ── Clone Stamp Tool ──
     var CloneStampTool = {
         name: 'clonestamp',
@@ -735,6 +967,7 @@ var CanvasTools = (function () {
                         image: stampImg,
                         x: pos.x - half, y: pos.y - half,
                         width: size, height: size,
+                        globalCompositeOperation: paintComposite(ctx, false),
                         listening: false
                     });
                     al.konvaLayer.add(stamp);
@@ -778,7 +1011,7 @@ var CanvasTools = (function () {
                 _currentLine = new Konva.Line({
                     stroke: getStrokeColor(colorKey, ctx.getBrushColor()),
                     strokeWidth: 1,
-                    globalCompositeOperation: 'source-over',
+                    globalCompositeOperation: paintComposite(ctx, false),
                     lineCap: 'butt', lineJoin: 'miter',
                     tension: 0,
                     opacity: 1,
@@ -796,7 +1029,7 @@ var CanvasTools = (function () {
             _currentLine = new Konva.Line({
                 stroke: getStrokeColor(colorKey, ctx.getBrushColor()),
                 strokeWidth: 1,
-                globalCompositeOperation: 'source-over',
+                globalCompositeOperation: paintComposite(ctx, false),
                 lineCap: 'butt', lineJoin: 'miter',
                 tension: 0,
                 opacity: 1,
@@ -909,6 +1142,7 @@ var CanvasTools = (function () {
                     y: pos.y - bubbleH / 2,
                     width: bubbleW,
                     height: bubbleH + tailH,
+                    globalCompositeOperation: paintComposite(ctx, false),
                     listening: false
                 });
                 var layer = ctx.getActiveKonvaLayer();
@@ -974,11 +1208,15 @@ var CanvasTools = (function () {
     function convertLassoToMask(ctx) {
         if (!_lassoSelection || _lassoSelection.length < 6)
             return;
-        var maskLayer = ctx.addLayer('Mask from Lasso', 'mask');
+        var active = ctx.getActiveLayer();
+        var maskLayer = _lassoSubtract && active && active.data.type === 'mask'
+            ? active
+            : ctx.addLayer('Mask from Lasso', 'mask');
         var poly = new Konva.Line({
             points: _lassoSelection,
             fill: 'rgba(239, 68, 68, 0.5)',
             closed: true,
+            globalCompositeOperation: _lassoSubtract ? 'destination-out' : 'source-over',
             listening: false
         });
         maskLayer.konvaLayer.add(poly);
@@ -1006,6 +1244,22 @@ var CanvasTools = (function () {
         setBrushOpacity: setBrushOpacity,
         getClipboard: getClipboard,
         setClipboard: setClipboard,
+        setShapeMode: setShapeMode,
+        getShapeMode: getShapeMode,
+        setShapeSubtract: setShapeSubtract,
+        getShapeSubtract: getShapeSubtract,
+        setGradientMode: setGradientMode,
+        getGradientMode: getGradientMode,
+        setGradientColors: setGradientColors,
+        getGradientColors: getGradientColors,
+        setGradientClip: setGradientClip,
+        getGradientClip: getGradientClip,
+        setLassoMode: setLassoMode,
+        getLassoMode: getLassoMode,
+        setLassoSubtract: setLassoSubtract,
+        getLassoSubtract: getLassoSubtract,
+        setLassoAutoMask: setLassoAutoMask,
+        getLassoAutoMask: getLassoAutoMask,
     };
 })();
 //# sourceMappingURL=canvas-tools.js.map

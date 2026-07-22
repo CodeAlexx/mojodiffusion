@@ -13,7 +13,7 @@ Written for BOTH f32 (clean gate) and bf16 (ship dtype — the pipeline casts th
 vae to bf16, pipeline.py:757 + autocast bf16 at _decode_one). The Mojo probe reads
 these + loads the SAME real weights and compares each stage independently.
 
-Run: /home/alex/OneTrainer/venv/bin/python \
+Run: pixi run python \
      serenitymojo/models/vae/parity/mageflow_vae_decode_oracle.py
 """
 import os

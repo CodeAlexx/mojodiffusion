@@ -11,7 +11,7 @@
 #
 # Run (oracle FIRST — dumps byte-identical token ids + reference txt/vec):
 #   cd <worktree>
-#   /home/alex/OneTrainer/venv/bin/python \
+#   pixi run python \
 #     serenitymojo/models/text_encoder/parity/mageflow_textcond_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . \

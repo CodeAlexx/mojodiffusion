@@ -1,0 +1,96 @@
+{
+    "1": {
+        "class_type": "UNETLoader",
+        "inputs": {
+            "unet_name": "flux2-dev.safetensors",
+            "weight_dtype": "default"
+        },
+        "_meta": {"title": "Load UNet - Flux 2 Dev"}
+    },
+    "2": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {
+            "clip_name1": "clip_l.safetensors",
+            "clip_name2": "t5xxl_fp16.safetensors",
+            "type": "flux",
+            "device": "default"
+        },
+        "_meta": {"title": "Load Dual CLIP - Flux 2 Dev"}
+    },
+    "3": {
+        "class_type": "VAELoader",
+        "inputs": {
+            "vae_name": "ae.safetensors"
+        },
+        "_meta": {"title": "Load VAE"}
+    },
+    "10": {
+        "class_type": "LoraLoader",
+        "inputs": {
+            "model": ["1", 0],
+            "clip": ["2", 0],
+            "lora_name": "lora.safetensors",
+            "strength_model": 1.0,
+            "strength_clip": 1.0
+        },
+        "_meta": {"title": "Load LoRA"}
+    },
+    "4": {
+        "class_type": "CLIPTextEncodeFlux",
+        "inputs": {
+            "clip": ["10", 1],
+            "clip_l": "beautiful photograph of a mountain lake at sunset",
+            "t5xxl": "A serene mountain lake with golden sunset light reflecting off the calm water, surrounded by snow-capped peaks",
+            "guidance": 3.5
+        },
+        "_meta": {"title": "CLIP Text Encode Flux 2 Dev - Positive"}
+    },
+    "5": {
+        "class_type": "ConditioningZeroOut",
+        "inputs": {
+            "conditioning": ["4", 0]
+        },
+        "_meta": {"title": "Conditioning Zero Out - Negative"}
+    },
+    "6": {
+        "class_type": "EmptySD3LatentImage",
+        "inputs": {
+            "width": 1024,
+            "height": 1024,
+            "batch_size": 1
+        },
+        "_meta": {"title": "Empty SD3 Latent Image"}
+    },
+    "7": {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": ["10", 0],
+            "positive": ["4", 0],
+            "negative": ["5", 0],
+            "latent_image": ["6", 0],
+            "seed": 42,
+            "steps": 20,
+            "cfg": 1,
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "denoise": 1.0
+        },
+        "_meta": {"title": "KSampler"}
+    },
+    "8": {
+        "class_type": "VAEDecode",
+        "inputs": {
+            "samples": ["7", 0],
+            "vae": ["3", 0]
+        },
+        "_meta": {"title": "VAE Decode"}
+    },
+    "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+            "images": ["8", 0],
+            "filename_prefix": "flux2_dev_lora"
+        },
+        "_meta": {"title": "Save Image"}
+    }
+}

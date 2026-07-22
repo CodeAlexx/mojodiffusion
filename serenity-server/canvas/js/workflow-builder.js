@@ -98,6 +98,9 @@ var WorkflowBuilder = (function () {
             case 'sdxl':
                 workflow = buildSDXLImg2Img(params);
                 break;
+            case 'zimage':
+                workflow = buildZImageImg2Img(params);
+                break;
             default:
                 workflow = buildSD15Img2Img(params);
                 break;
@@ -112,39 +115,250 @@ var WorkflowBuilder = (function () {
         var w = ModelUtils.clampDimension(params.width);
         var h = ModelUtils.clampDimension(params.height);
         var seed = resolveSeed(params.seed);
-        // Flux uses standard img2img (no VAEEncodeForInpaint support)
-        if (arch === 'flux') {
-            return buildFluxImg2Img(params);
+        if (arch === 'krea2') {
+            var kreaWorkflow = buildKrea2LanPaint(Object.assign({}, params, {
+                width: w,
+                height: h,
+                seed: seed
+            }));
+            if (params.loras && params.loras.length > 0)
+                kreaWorkflow = injectLoRAs(kreaWorkflow, params.loras);
+            return kreaWorkflow;
         }
-        if (arch === 'qwen') {
-            return buildQwenImg2Img(params);
+        if (arch === 'zimage') {
+            var zimageWorkflow = buildZImageInpaint(params);
+            if (params.loras && params.loras.length > 0)
+                zimageWorkflow = injectLoRAs(zimageWorkflow, params.loras);
+            return zimageWorkflow;
         }
         // Video models: fall back to txt2vid
         if (arch === 'ltxv' || arch === 'wan' || arch === 'bernini') {
             return arch === 'ltxv' ? buildLTXV(params) : (arch === 'bernini' ? buildBernini(params) : buildWan(params));
         }
-        var workflow = {
-            '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: params.model } },
-            '2': { class_type: 'CLIPTextEncode', inputs: { text: params.prompt, clip: ['1', 1] } },
-            '3': { class_type: 'CLIPTextEncode', inputs: { text: params.negPrompt || '', clip: ['1', 1] } },
-            '4': { class_type: 'LoadImage', inputs: { image: params.initImageName } },
-            '5': { class_type: 'LoadImage', inputs: { image: params.maskImageName } },
-            '6': { class_type: 'VAEEncodeForInpaint', inputs: {
-                    pixels: ['4', 0], vae: ['1', 2], mask: ['5', 0], grow_mask_by: 6
-                } },
-            '7': { class_type: 'KSampler', inputs: {
-                    seed: seed, steps: params.steps, cfg: params.cfg || 7.0,
-                    sampler_name: parseSamplerScheduler(params.scheduler).sampler, scheduler: parseSamplerScheduler(params.scheduler).scheduler,
-                    denoise: params.denoise || 0.75,
-                    model: ['1', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['6', 0]
-                } },
-            '8': { class_type: 'VAEDecode', inputs: { samples: ['7', 0], vae: ['1', 2] } },
-            '9': { class_type: 'SaveImage', inputs: { images: ['8', 0], filename_prefix: 'sf_inpaint' } }
-        };
-        if (params.loras && params.loras.length > 0) {
-            workflow = injectLoRAs(workflow, params.loras);
+        return buildLanPaintCandidate(Object.assign({}, params, { width: w, height: h, seed: seed }));
+    }
+    // Build model-specific loaders and conditioning first, then replace only
+    // the latent/sampler tail with the shared LanPaint graph. Missing-model
+    // machines can author and statically validate these graphs; the server
+    // capability gate still rejects them until a real Mojo runtime is wired.
+    function buildLanPaintCandidate(p) {
+        if (!p.initImageName || !p.maskImageName)
+            throw new Error('LanPaint requires both a source image and a painted mask');
+        var arch = ModelUtils.detectArchFromFilename(p.model);
+        var graphReadyArchitectures = ['flux', 'klein', 'qwen', 'sd3', 'sdxl', 'anima', 'ideogram4', 'sd15'];
+        if (graphReadyArchitectures.indexOf(arch) < 0)
+            throw new Error('LanPaint graph authoring is not implemented for ' + arch);
+        var baseParams = Object.assign({}, p, { loras: [], upscale: 'none' });
+        var workflow = arch === 'qwen' && /edit/i.test(String(p.model || ''))
+            ? buildQwenImg2Img(baseParams)
+            : build(baseParams);
+        var samplerId = Object.keys(workflow).find(function (id) {
+            return workflow[id].class_type === 'KSampler' || workflow[id].class_type === 'KSamplerAdvanced';
+        });
+        var decodeId = Object.keys(workflow).find(function (id) {
+            return workflow[id].class_type === 'VAEDecode';
+        });
+        if (!samplerId || !decodeId || !workflow[decodeId].inputs || !workflow[decodeId].inputs.vae)
+            throw new Error('LanPaint requires a model graph with sampler and VAE decode nodes');
+        var originalSampler = workflow[samplerId].inputs;
+        var vaeRef = workflow[decodeId].inputs.vae;
+        var nextId = Math.max.apply(null, Object.keys(workflow).map(Number)) + 1;
+        function addNode(node) {
+            var id = String(nextId++);
+            workflow[id] = node;
+            return id;
         }
+        var sourceId = addNode({ class_type: 'LoadImage', inputs: { image: p.initImageName } });
+        var resizedSourceId = addNode({ class_type: 'ImageResizeKJ', inputs: {
+                image: [sourceId, 0], width: p.width, height: p.height,
+                keep_proportion: false, divisible_by: 2, upscale_method: 'nearest-exact'
+            } });
+        var encodedSourceId = addNode({ class_type: 'VAEEncode', inputs: {
+                pixels: [resizedSourceId, 0], vae: vaeRef
+            } });
+        var maskId = addNode({ class_type: 'LoadImage', inputs: { image: p.maskImageName } });
+        var resizedMaskId = addNode({ class_type: 'ImageResizeKJ', inputs: {
+                image: [maskId, 0], width: p.width, height: p.height,
+                keep_proportion: false, divisible_by: 2, upscale_method: 'nearest-exact'
+            } });
+        var maskChannelId = addNode({ class_type: 'ImageToMask', inputs: {
+                image: [resizedMaskId, 0], channel: 'red'
+            } });
+        var maskedLatentId = addNode({ class_type: 'SetLatentNoiseMask', inputs: {
+                samples: [encodedSourceId, 0], mask: [maskChannelId, 0]
+            } });
+        var steps = Math.max(1, Math.floor(Number(p.steps)));
+        var cfg = Number(p.cfg);
+        var innerSteps = Math.max(0, Math.floor(Number(p.lanpaintNumSteps == null ? 5 : p.lanpaintNumSteps)));
+        var lambda = Number(p.lanpaintLambda == null ? 16 : p.lanpaintLambda);
+        var stepSize = Number(p.lanpaintStepSize == null ? 0.2 : p.lanpaintStepSize);
+        var beta = Number(p.lanpaintBeta == null ? 1 : p.lanpaintBeta);
+        var friction = Number(p.lanpaintFriction == null ? 15 : p.lanpaintFriction);
+        var earlyStop = Math.max(0, Math.floor(Number(p.lanpaintEarlyStop == null ? 0 : p.lanpaintEarlyStop)));
+        var innerThreshold = Number(p.lanpaintInnerThreshold == null ? 0.001 : p.lanpaintInnerThreshold);
+        var innerPatience = Math.max(0, Math.floor(Number(p.lanpaintInnerPatience == null ? 0 : p.lanpaintInnerPatience)));
+        var blendOverlap = Math.floor(Number(p.lanpaintBlendOverlap == null ? 9 : p.lanpaintBlendOverlap));
+        var promptMode = String(p.lanpaintPromptMode || 'Image First');
+        if (!Number.isFinite(cfg) || !Number.isFinite(lambda) || !Number.isFinite(stepSize) ||
+            !Number.isFinite(beta) || !Number.isFinite(friction) || !Number.isFinite(innerThreshold))
+            throw new Error('LanPaint controls must be finite numbers');
+        if (lambda <= 0 || stepSize <= 0 || beta <= 0 || friction <= 0)
+            throw new Error('LanPaint lambda, step size, beta, and friction must be greater than zero');
+        if (promptMode !== 'Image First' && promptMode !== 'Prompt First')
+            throw new Error('LanPaint prompt mode must be Image First or Prompt First');
+        if (blendOverlap < 1 || blendOverlap > 51 || blendOverlap % 2 === 0)
+            throw new Error('LanPaint mask blend overlap must be an odd value from 1 to 51');
+        workflow[samplerId] = { class_type: 'LanPaint_KSamplerAdvanced', inputs: {
+                model: originalSampler.model,
+                positive: originalSampler.positive,
+                negative: originalSampler.negative,
+                latent_image: [maskedLatentId, 0],
+                add_noise: 'enable',
+                noise_seed: resolveSeed(p.seed),
+                steps: steps,
+                cfg: cfg,
+                sampler_name: p.sampler || originalSampler.sampler_name || 'euler',
+                scheduler: p.scheduler || originalSampler.scheduler || 'simple',
+                start_at_step: 0,
+                end_at_step: steps,
+                return_with_leftover_noise: 'disable',
+                LanPaint_NumSteps: innerSteps,
+                LanPaint_Lambda: lambda,
+                LanPaint_StepSize: stepSize,
+                LanPaint_Beta: beta,
+                LanPaint_Friction: friction,
+                LanPaint_PromptMode: promptMode,
+                LanPaint_EarlyStop: earlyStop,
+                LanPaint_InnerThreshold: innerThreshold,
+                LanPaint_InnerPatience: innerPatience,
+                Inpainting_mode: 'Image Inpainting'
+            } };
+        workflow[decodeId].inputs.samples = [samplerId, 0];
+        var blendId = addNode({ class_type: 'LanPaint_MaskBlend', inputs: {
+                image1: [resizedSourceId, 0], image2: [decodeId, 0],
+                mask: [maskChannelId, 0], blend_overlap: blendOverlap
+            } });
+        Object.keys(workflow).forEach(function (id) {
+            if (workflow[id].class_type === 'SaveImage')
+                workflow[id].inputs.images = [blendId, 0];
+        });
+        if (p.loras && p.loras.length > 0)
+            workflow = injectLoRAs(workflow, p.loras);
         return workflow;
+    }
+    function buildKrea2LanPaint(p) {
+        var width = ModelUtils.clampDimension(p.width);
+        var height = ModelUtils.clampDimension(p.height);
+        if (width !== 1024 || height !== 1024)
+            throw new Error('Krea2 LanPaint requires the compiled 1024x1024 shape');
+        if (!p.initImageName || !p.maskImageName)
+            throw new Error('Krea2 LanPaint requires both a source image and a painted mask');
+        var steps = Math.max(1, Math.floor(Number(p.steps)));
+        var cfg = Number(p.cfg);
+        var innerSteps = Math.max(0, Math.floor(Number(p.lanpaintNumSteps)));
+        var lambda = Number(p.lanpaintLambda);
+        var stepSize = Number(p.lanpaintStepSize);
+        var beta = Number(p.lanpaintBeta);
+        var friction = Number(p.lanpaintFriction);
+        var earlyStop = Math.max(0, Math.floor(Number(p.lanpaintEarlyStop)));
+        var innerThreshold = Number(p.lanpaintInnerThreshold);
+        var innerPatience = Math.max(0, Math.floor(Number(p.lanpaintInnerPatience)));
+        var blendOverlap = Math.floor(Number(p.lanpaintBlendOverlap));
+        var promptMode = String(p.lanpaintPromptMode || 'Image First');
+        if (!Number.isFinite(cfg) || !Number.isFinite(lambda) || !Number.isFinite(stepSize) ||
+            !Number.isFinite(beta) || !Number.isFinite(friction) || !Number.isFinite(innerThreshold))
+            throw new Error('Krea2 LanPaint controls must be finite numbers');
+        if (lambda <= 0 || stepSize <= 0 || beta <= 0 || friction <= 0)
+            throw new Error('Krea2 LanPaint lambda, step size, beta, and friction must be greater than zero');
+        if (promptMode !== 'Image First' && promptMode !== 'Prompt First')
+            throw new Error('Krea2 LanPaint prompt mode must be Image First or Prompt First');
+        if (blendOverlap < 1 || blendOverlap > 51 || blendOverlap % 2 === 0)
+            throw new Error('Krea2 LanPaint mask blend overlap must be an odd value from 1 to 51');
+        var negativeNode = String(p.negPrompt || '').trim().length > 0
+            ? { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.negPrompt } }
+            : { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['4', 0] } };
+        return {
+            '1': { class_type: 'UNETLoader', inputs: { unet_name: p.model, weight_dtype: 'default' } },
+            '2': { class_type: 'CLIPLoader', inputs: { clip_name: 'Qwen/Qwen3-VL-4B-Instruct', type: 'krea2', device: 'default' } },
+            '3': { class_type: 'VAELoader', inputs: { vae_name: 'qwen_image_vae.safetensors' } },
+            '4': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.prompt || '' } },
+            '5': negativeNode,
+            '6': { class_type: 'LoadImage', inputs: { image: p.initImageName } },
+            '7': { class_type: 'ImageResizeKJ', inputs: {
+                    image: ['6', 0], width: width, height: height,
+                    keep_proportion: false, divisible_by: 2, upscale_method: 'nearest-exact'
+                } },
+            '8': { class_type: 'LoadImage', inputs: { image: p.maskImageName } },
+            '9': { class_type: 'ImageResizeKJ', inputs: {
+                    image: ['8', 0], width: width, height: height,
+                    keep_proportion: false, divisible_by: 2, upscale_method: 'nearest-exact'
+                } },
+            '10': { class_type: 'ImageToMask', inputs: { image: ['9', 0], channel: 'red' } },
+            '11': { class_type: 'VAEEncode', inputs: { pixels: ['7', 0], vae: ['3', 0] } },
+            '12': { class_type: 'SetLatentNoiseMask', inputs: { samples: ['11', 0], mask: ['10', 0] } },
+            '13': { class_type: 'LanPaint_KSamplerAdvanced', inputs: {
+                    model: ['1', 0], positive: ['4', 0], negative: ['5', 0], latent_image: ['12', 0],
+                    add_noise: 'enable', noise_seed: p.seed, steps: steps, cfg: cfg,
+                    sampler_name: 'euler', scheduler: 'simple', start_at_step: 0, end_at_step: steps,
+                    return_with_leftover_noise: 'disable',
+                    LanPaint_NumSteps: innerSteps, LanPaint_Lambda: lambda,
+                    LanPaint_StepSize: stepSize, LanPaint_Beta: beta, LanPaint_Friction: friction,
+                    LanPaint_PromptMode: promptMode, LanPaint_EarlyStop: earlyStop,
+                    LanPaint_InnerThreshold: innerThreshold, LanPaint_InnerPatience: innerPatience,
+                    Inpainting_mode: 'Image Inpainting'
+                } },
+            '14': { class_type: 'VAEDecode', inputs: { samples: ['13', 0], vae: ['3', 0] } },
+            '15': { class_type: 'LanPaint_MaskBlend', inputs: {
+                    image1: ['7', 0], image2: ['14', 0], mask: ['10', 0], blend_overlap: blendOverlap
+                } },
+            '16': { class_type: 'SaveImage', inputs: { images: ['15', 0], filename_prefix: 'krea2_lanpaint' } }
+        };
+    }
+    function buildFlowEdit(p) {
+        var engine = p.engine === 'ideogram4' ? 'ideogram4' : 'krea2';
+        var ideogram = engine === 'ideogram4';
+        var kreaTurbo = !ideogram && String(p.engine || '').indexOf('turbo') >= 0;
+        var krea1024 = !ideogram && (String(p.engine || '').indexOf('1024') >= 0 || p.engine === 'krea2_1024');
+        var seed = resolveSeed(p.seed);
+        var steps = Math.max(1, Math.floor(Number(p.steps) || 28));
+        var nmax = Math.max(0, Math.floor(Number(p.nmax)));
+        var nmin = Math.max(0, Math.floor(Number(p.nmin)));
+        if (nmax > steps)
+            throw new Error('FlowEdit nmax cannot exceed steps');
+        if (nmin > nmax)
+            throw new Error('FlowEdit nmin cannot exceed nmax');
+        if (!p.initImageName)
+            throw new Error('FlowEdit requires a source image');
+        if (!String(p.sourcePrompt || '').trim())
+            throw new Error('FlowEdit requires a source description');
+        if (!String(p.prompt || '').trim())
+            throw new Error('FlowEdit requires a target description');
+        var modelName = ideogram ? 'ideogram4_fp8_scaled.safetensors' :
+            (kreaTurbo ? 'krea2_turbo.safetensors' : 'krea2_raw.safetensors');
+        var clipName = ideogram ? 'qwen3vl_8b_fp8_scaled.safetensors' : 'qwen3vl_4b.safetensors';
+        var nodeType = ideogram ? 'Ideogram4FlowEdit' : 'Krea2FlowEdit';
+        return {
+            '1': { class_type: 'UNETLoader', inputs: { unet_name: modelName, weight_dtype: 'default' } },
+            '2': { class_type: 'CLIPLoader', inputs: { clip_name: clipName, type: engine, device: 'default' } },
+            '3': { class_type: 'LoadImage', inputs: { image: p.initImageName } },
+            '4': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.sourcePrompt } },
+            '5': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.sourceNegative || '' } },
+            '6': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.prompt } },
+            '7': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.negPrompt || '' } },
+            '8': { class_type: nodeType, inputs: {
+                    model: ['1', 0], src_image: ['3', 0],
+                    src_positive: ['4', 0], src_negative: ['5', 0],
+                    tgt_positive: ['6', 0], tgt_negative: ['7', 0],
+                    width: ideogram || krea1024 ? 1024 : 512,
+                    height: ideogram || krea1024 ? 1024 : 512,
+                    steps: steps, nmax: nmax, nmin: nmin,
+                    src_cfg: Number(p.srcCfg), tgt_cfg: Number(p.cfg), seed: seed,
+                    auto_mask: p.autoMask !== false,
+                    mask_q: Number(p.maskQ), mask_dilate: Math.floor(Number(p.maskDilate)),
+                    mask_warmup: Math.floor(Number(p.maskWarmup))
+                } },
+            '9': { class_type: 'SaveImage', inputs: { images: ['8', 0], filename_prefix: (ideogram ? engine : (kreaTurbo ? 'krea2_turbo' : 'krea2_raw') + (krea1024 ? '_1024' : '_512')) + '_flowedit' } }
+        };
     }
     function resolveSeed(seed) {
         return seed === -1 ? Math.floor(Math.random() * 4294967296) : seed;
@@ -185,13 +399,13 @@ var WorkflowBuilder = (function () {
             var inputs = {
                 lora_name: lora.name,
                 strength_model: lora.strength,
-                strength_clip: lora.strength,
                 model: prevModelRef
             };
             if (prevClipRef) {
+                inputs.strength_clip = lora.strength;
                 inputs.clip = prevClipRef;
             }
-            workflow[id] = { class_type: 'LoraLoader', inputs: inputs };
+            workflow[id] = { class_type: prevClipRef ? 'LoraLoader' : 'LoraLoaderModelOnly', inputs: inputs };
             prevModelRef = [id, 0];
             if (prevClipRef)
                 prevClipRef = [id, 1];
@@ -199,7 +413,7 @@ var WorkflowBuilder = (function () {
         // Rewire nodes that referenced the original model/clip outputs
         Object.keys(workflow).forEach(function (key) {
             var node = workflow[key];
-            if (node.class_type === 'LoraLoader')
+            if (node.class_type === 'LoraLoader' || node.class_type === 'LoraLoaderModelOnly')
                 return;
             if (!node.inputs)
                 return;
@@ -235,7 +449,7 @@ var WorkflowBuilder = (function () {
                 } },
             '3': { class_type: 'VAELoader', inputs: { vae_name: 'ae.safetensors' } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: p.prompt, clip: ['2', 0] } },
-            '5': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '5': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '6': { class_type: 'FluxGuidance', inputs: { conditioning: ['4', 0], guidance: guidance } },
             // flux is guidance-distilled: the family rejects real negatives, so
             // the negative input is a ConditioningZeroOut (klein pattern) —
@@ -295,7 +509,7 @@ var WorkflowBuilder = (function () {
             '3': { class_type: 'VAELoader', inputs: { vae_name: 'flux2-vae.safetensors' } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
             '5': negativeNode,
-            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '7': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: steps, cfg: cfg,
                     sampler_name: 'euler', scheduler: 'simple', denoise: 1.0,
@@ -324,7 +538,7 @@ var WorkflowBuilder = (function () {
             '3': { class_type: 'VAELoader', inputs: { vae_name: 'ae.safetensors' } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
             '5': negativeNode,
-            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '7': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: steps, cfg: cfg,
                     sampler_name: 'euler', scheduler: 'simple', denoise: 1.0,
@@ -349,7 +563,7 @@ var WorkflowBuilder = (function () {
             '3': { class_type: 'VAELoader', inputs: { vae_name: 'sensenova-pixel-space.no-vae' } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: p.prompt || '', clip: ['2', 0] } },
             '5': { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['4', 0] } },
-            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '7': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: steps, cfg: cfg,
                     sampler_name: 'euler', scheduler: 'simple', denoise: 1.0,
@@ -377,7 +591,7 @@ var WorkflowBuilder = (function () {
             '3': { class_type: 'VAELoader', inputs: { vae_name: 'qwen_image_vae.safetensors' } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
             '5': negativeNode,
-            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '7': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: steps, cfg: cfg,
                     sampler_name: 'euler', scheduler: 'simple', denoise: 1.0,
@@ -416,7 +630,7 @@ var WorkflowBuilder = (function () {
             '3': { class_type: 'VAELoader', inputs: { vae_name: 'ideogram4-vae.safetensors' } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: caption, clip: ['2', 0] } },
             '5': { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['4', 0] } },
-            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '6': { class_type: 'EmptyFlux2LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             // scheduler must be 'simple'/'ideogram_logitnormal'; denoise 0.5 is
             // the bounded production route's pinned creativity value.
             '7': { class_type: 'KSampler', inputs: {
@@ -460,7 +674,7 @@ var WorkflowBuilder = (function () {
             '4': { class_type: 'ModelSamplingAuraFlow', inputs: { model: ['1', 0], shift: 3 } },
             '5': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
             '6': negativeNode,
-            '7': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '7': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '8': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: steps, cfg: cfg,
                     // The admitted Qwen product route is pinned to creativity
@@ -520,7 +734,7 @@ var WorkflowBuilder = (function () {
             '4': { class_type: 'ModelSamplingAuraFlow', inputs: { model: ['1', 0], shift: 3 } },
             '5': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
             '6': negativeNode,
-            '7': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '7': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '8': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: steps, cfg: cfg,
                     sampler_name: 'flowmatch_euler', scheduler: 'simple', denoise: 1.0,
@@ -529,6 +743,45 @@ var WorkflowBuilder = (function () {
             '9': { class_type: 'VAEDecode', inputs: { samples: ['8', 0], vae: ['3', 0] } },
             '10': { class_type: 'SaveImage', inputs: { images: ['9', 0], filename_prefix: 'zimage' } }
         };
+    }
+    function buildZImageImg2Img(p) {
+        var seed = resolveSeed(p.seed);
+        var prompt = p.prompt || '';
+        var negPrompt = typeof p.negPrompt === 'string' ? p.negPrompt.trim() : '';
+        var negativeNode = negPrompt.length > 0
+            ? { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: negPrompt } }
+            : { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['5', 0] } };
+        return {
+            '1': { class_type: 'UNETLoader', inputs: { unet_name: p.model, weight_dtype: 'default' } },
+            '2': { class_type: 'CLIPLoader', inputs: { clip_name: 'qwen_3_4b.safetensors', type: 'zimage', device: 'default' } },
+            '3': { class_type: 'VAELoader', inputs: { vae_name: 'ae.safetensors' } },
+            '4': { class_type: 'ModelSamplingAuraFlow', inputs: { model: ['1', 0], shift: 3 } },
+            '5': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
+            '6': negativeNode,
+            '7': { class_type: 'LoadImage', inputs: { image: p.initImageName } },
+            '8': { class_type: 'VAEEncode', inputs: { pixels: ['7', 0], vae: ['3', 0] } },
+            '9': { class_type: 'KSampler', inputs: {
+                    seed: seed, steps: p.steps || 4, cfg: p.cfg || 1,
+                    sampler_name: 'flowmatch_euler', scheduler: 'simple', denoise: Number(p.denoise),
+                    model: ['4', 0], positive: ['5', 0], negative: ['6', 0], latent_image: ['8', 0]
+                } },
+            '10': { class_type: 'VAEDecode', inputs: { samples: ['9', 0], vae: ['3', 0] } },
+            '11': { class_type: 'SaveImage', inputs: { images: ['10', 0], filename_prefix: 'zimage_img2img' } }
+        };
+    }
+    function buildZImageInpaint(p) {
+        var workflow = buildZImageImg2Img(p);
+        workflow['9'] = { class_type: 'LoadImage', inputs: { image: p.maskImageName } };
+        workflow['10'] = { class_type: 'ImageToMask', inputs: { image: ['9', 0], channel: 'red' } };
+        workflow['11'] = { class_type: 'SetLatentNoiseMask', inputs: { samples: ['8', 0], mask: ['10', 0] } };
+        workflow['12'] = { class_type: 'KSampler', inputs: {
+                seed: resolveSeed(p.seed), steps: p.steps || 4, cfg: p.cfg || 1,
+                sampler_name: 'flowmatch_euler', scheduler: 'simple', denoise: Number(p.denoise),
+                model: ['4', 0], positive: ['5', 0], negative: ['6', 0], latent_image: ['11', 0]
+            } };
+        workflow['13'] = { class_type: 'VAEDecode', inputs: { samples: ['12', 0], vae: ['3', 0] } };
+        workflow['14'] = { class_type: 'SaveImage', inputs: { images: ['13', 0], filename_prefix: 'zimage_inpaint' } };
+        return workflow;
     }
     // ─── SD3 ────────────────────────────────────────────────────────────────
     function buildSD3(p) {
@@ -539,7 +792,7 @@ var WorkflowBuilder = (function () {
             '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: p.model } },
             '2': { class_type: 'CLIPTextEncode', inputs: { text: p.prompt, clip: ['1', 1] } },
             '3': { class_type: 'CLIPTextEncode', inputs: { text: p.negPrompt || '', clip: ['1', 1] } },
-            '4': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '4': { class_type: 'EmptySD3LatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '5': { class_type: 'KSamplerAdvanced', inputs: {
                     add_noise: 'enable', noise_seed: seed, steps: p.steps, cfg: p.cfg || 7.0,
                     sampler_name: 'euler', scheduler: 'simple', start_at_step: 0, end_at_step: 10000,
@@ -579,7 +832,7 @@ var WorkflowBuilder = (function () {
             '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: p.model } },
             '2': { class_type: 'CLIPTextEncode', inputs: { text: p.prompt, clip: ['1', 1] } },
             '3': { class_type: 'CLIPTextEncode', inputs: { text: p.negPrompt || '', clip: ['1', 1] } },
-            '4': { class_type: 'EmptyLatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '4': { class_type: 'EmptyLatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '5': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: p.steps, cfg: p.cfg || 7.0,
                     sampler_name: parseSamplerScheduler(p.scheduler).sampler, scheduler: parseSamplerScheduler(p.scheduler).scheduler, denoise: 1.0,
@@ -617,7 +870,7 @@ var WorkflowBuilder = (function () {
             '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: p.model } },
             '2': { class_type: 'CLIPTextEncode', inputs: { text: p.prompt, clip: ['1', 1] } },
             '3': { class_type: 'CLIPTextEncode', inputs: { text: p.negPrompt || '', clip: ['1', 1] } },
-            '4': { class_type: 'EmptyLatentImage', inputs: { width: w, height: h, batch_size: 1 } },
+            '4': { class_type: 'EmptyLatentImage', inputs: { width: w, height: h, batch_size: Math.max(1, Math.min(8, p.batch || 1)) } },
             '5': { class_type: 'KSampler', inputs: {
                     seed: seed, steps: p.steps, cfg: p.cfg || 7.0,
                     sampler_name: parseSamplerScheduler(p.scheduler).sampler, scheduler: parseSamplerScheduler(p.scheduler).scheduler, denoise: 1.0,
@@ -648,34 +901,42 @@ var WorkflowBuilder = (function () {
     }
     // ─── LTX-V (Video) ──────────────────────────────────────────────────
     function buildLTXV(p) {
-        // The production LTX2 arm is Creator-gated at one measured contract.
-        // Keep the graph truthful; SerenityAPI routes it to /v1/video.
-        var w = 1920;
-        var h = 1088;
+        function requiredNumber(key) {
+            var value = Number(p[key]);
+            if (!Number.isFinite(value))
+                throw new Error('LTX2 requires numeric ' + key);
+            return value;
+        }
+        if (p.initImageName)
+            throw new Error('The LTX2 Mojo request runner is text-to-video only');
+        var w = ModelUtils.clampVideoDimension(requiredNumber('width'));
+        var h = ModelUtils.clampVideoDimension(requiredNumber('height'));
         var seed = resolveSeed(p.seed);
-        var frames = 121;
-        var fps = 24;
-        var hasGuideImage = typeof p.initImageName === 'string' && p.initImageName.length > 0;
+        var frames = Math.floor(requiredNumber('frames'));
+        var steps = Math.floor(requiredNumber('steps'));
+        var fps = requiredNumber('fps');
+        if (frames < 1 || steps < 1 || fps <= 0)
+            throw new Error('LTX2 frames, steps, and FPS must be positive');
         var loaderInputs = {
             checkpoint_path: p.model,
-            gemma_path: 'gemma-3-12b-it',
-            dtype: 'bfloat16',
-            quantization: 'auto',
             backend: 'mojo'
         };
         var samplerInputs = {
             ltxv_model: ['1', 0],
             prompt: p.prompt,
-            negative_prompt: p.negPrompt || 'worst quality, inconsistent motion, blurry, jittery, distorted',
+            negative_prompt: p.negPrompt || '',
             width: w,
             height: h,
             num_frames: frames,
-            steps: 15,
-            cfg: 3.0,
+            steps: steps,
             seed: seed,
             frame_rate: fps,
-            stg_scale: 1.0,
-            mode: 'dev'
+            sampler: p.sampler,
+            scheduler: p.scheduler,
+            caps_positive: p.capsPositive || '',
+            caps_negative: p.capsNegative || '',
+            noise_fixture: p.noiseFixture || '',
+            include_audio: p.includeAudio === true
         };
         var workflow = {
             '1': { class_type: 'LTXVLoader', inputs: loaderInputs },
@@ -687,12 +948,6 @@ var WorkflowBuilder = (function () {
                     format: 'mp4'
                 } }
         };
-        if (hasGuideImage) {
-            workflow['4'] = { class_type: 'LoadImage', inputs: { image: p.initImageName } };
-            workflow['2'].inputs.guide_image = ['4', 0];
-            workflow['2'].inputs.guide_strength = 1.0;
-            workflow['2'].inputs.guide_frame_idx = 0;
-        }
         return workflow;
     }
     // ─── WAN (Video) ──────────────────────────────────────────────────────
@@ -885,6 +1140,6 @@ var WorkflowBuilder = (function () {
         }
         return workflow;
     }
-    return { build: build, buildImg2Img: buildImg2Img, buildInpaint: buildInpaint, applyControlNetNodes: applyControlNetNodes, applyIPAdapterNodes: applyIPAdapterNodes };
+    return { build: build, buildImg2Img: buildImg2Img, buildInpaint: buildInpaint, buildLanPaintCandidate: buildLanPaintCandidate, buildKrea2LanPaint: buildKrea2LanPaint, buildFlowEdit: buildFlowEdit, applyControlNetNodes: applyControlNetNodes, applyIPAdapterNodes: applyIPAdapterNodes };
 })();
 //# sourceMappingURL=workflow-builder.js.map

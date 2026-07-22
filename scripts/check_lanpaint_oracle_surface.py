@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Check the local LanPaint/Comfy inpaint oracle surface.
+"""Check the local LanPaint/Comfy oracle and bounded Krea2 production surface.
 
 This is a no-heavy-model contract checker. It reads the local LanPaint Python
 nodes, representative LanPaint workflow exports, SerenityFlow's
-SetLatentNoiseMask node, and the current Mojo boundary. The goal is to preserve
-the actual oracle semantics while distinguishing the bounded Z-Image
-LanPaint_MaskBlend final-pixel slice, including its Comfy/PyTorch `area`
-base-image resize role, from full LanPaint sampler runtime parity.
+SetLatentNoiseMask node, Mojo sampler primitives, the complete Krea2 sampler and
+worker route, and the Canvas graph builder. The goal is to preserve the oracle
+semantics while distinguishing the bounded Krea2 production profile from the
+separate Z-Image LanPaint_MaskBlend final-pixel slice.
 """
 
 from __future__ import annotations
@@ -24,9 +24,12 @@ SERENITYFLOW_LATENT = Path("/home/alex/serenityflow-v2/serenityflow/nodes/latent
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
+KREA2_BACKEND = REPO / "serenitymojo/serve/krea2_backend.mojo"
+KREA2_INFER = REPO / "serenitymojo/models/krea2/krea2_infer.mojo"
 IMAGE_IO = REPO / "serenitymojo/serve/image_io.mojo"
 INPAINT_MOJO = REPO / "serenitymojo/sampling/inpaint.mojo"
 INPAINT_PARITY = REPO / "serenitymojo/sampling/parity/inpaint_parity.mojo"
+CANVAS_BUILDER = REPO / "serenity-server/canvas/js/workflow-builder.js"
 NODE_SURFACE = REPO / "scripts/check_workflow_node_surface.py"
 DEFAULT_REPORT = REPO / "output/checks/lanpaint_oracle_surface.json"
 
@@ -407,12 +410,70 @@ def run() -> dict[str, Any]:
             "def mask_blend",
             "mask == 1.0",
             "mask == 0.0",
+            "def lanpaint_flow_score",
+            "def lanpaint_overdamped_advance",
             "def lanpaint_overdamped_step",
-            "AGENT-DEFAULT",
+            "def lanpaint_damped_advance",
+            "struct LanPaintDampedStep",
             "score: Tensor",
         ],
     )
     blockers.extend(mojo_inpaint_blockers)
+
+    krea2_sampler, krea2_sampler_blockers = contains_all(
+        KREA2_INFER,
+        [
+            "def krea2_sample_lanpaint_latent[",
+            "LanPaint's damped SHO inner integrator",
+            "lanpaint_flow_score",
+            "lanpaint_damped_advance",
+            "lanpaint_overdamped_advance",
+            "lanpaint_num_steps",
+            "use_fixed_mu_1_15",
+            "progress_fd",
+        ],
+    )
+    blockers.extend(krea2_sampler_blockers)
+
+    krea2_worker, krea2_worker_blockers = contains_all(
+        KREA2_BACKEND,
+        [
+            "Run the complete Krea2 LanPaint image-inpaint request in Mojo",
+            "krea2_sample_lanpaint_latent",
+            "krea2_int8_cache_valid",
+            "load_krea2_int8_cache_resident",
+            "load_krea2_int8_cache_host",
+            "WARN no fresh int8 sidecar; using bounded",
+            "conditioning cache HIT (prompts unchanged)",
+            "source latent cache HIT (upload unchanged)",
+            "resident DiT cache HIT (checkpoint/profile unchanged)",
+            "def _drop_lanpaint_base_cache",
+            "load_lanpaint_latent_preserve_mask",
+            "load_lanpaint_pixel_blend_mask",
+            "apply_lanpaint_mask_blend_signed_chw",
+            "params.width != 1024 or params.height != 1024",
+            "krea2 LanPaint worker admits image inpainting only",
+            "semantic inner-threshold stopping is not supported",
+            "save_png(output_image, png_path",
+        ],
+    )
+    blockers.extend(krea2_worker_blockers)
+
+    canvas_route, canvas_route_blockers = contains_all(
+        CANVAS_BUILDER,
+        [
+            "function buildKrea2LanPaint",
+            "Krea2 LanPaint requires the compiled 1024x1024 shape",
+            "LanPaint_KSamplerAdvanced",
+            "LanPaint_NumSteps: innerSteps",
+            "LanPaint_Lambda: lambda",
+            "LanPaint_StepSize: stepSize",
+            "LanPaint_Beta: beta",
+            "LanPaint_Friction: friction",
+            "LanPaint_MaskBlend",
+        ],
+    )
+    blockers.extend(canvas_route_blockers)
 
     mojo_boundary, mojo_boundary_blockers = contains_all(
         WORKFLOW_GRAPH,
@@ -491,7 +552,7 @@ def run() -> dict[str, Any]:
             '"LanPaint_MaskBlend"',
             '"ImageToMask"',
             '"MaskToImage"',
-            "LanPaint canvas daemon smoke",
+            "Krea2 LanPaint Canvas preflight runner",
             "lanpaint_num_steps",
             AREA_RESIZE_ROLE,
         ],
@@ -515,8 +576,10 @@ def run() -> dict[str, Any]:
     parity_gate, parity_blockers = contains_all(
         INPAINT_PARITY,
         [
-            "mask-blend + overdamped LanPaint step",
-            "PASS: inpaint mask-blend + LanPaint overdamped step parity",
+            "lanpaint_flow_score: tensor == oracle",
+            "lanpaint_overdamped_advance A->0",
+            "lanpaint_damped_advance: upstream Python oracle",
+            "PASS: inpaint mask-blend + LanPaint flow/damped/overdamped parity",
             "--bitrot",
         ],
     )
@@ -535,6 +598,9 @@ def run() -> dict[str, Any]:
         "mojo": {
             "inpaint_math_substrate": mojo_inpaint,
             "inpaint_parity_gate": parity_gate,
+            "krea2_complete_sampler": krea2_sampler,
+            "krea2_worker_route": krea2_worker,
+            "canvas_krea2_route": canvas_route,
             "mask_io_boundary": mask_io,
             "zimage_mask_blend_slice": zimage_blend,
             "zimage_mask_blend_removed_size_precondition": zimage_blend_forbidden,
@@ -544,7 +610,8 @@ def run() -> dict[str, Any]:
         },
         "non_claims": [
             "Z-Image consumes plain SetLatentNoiseMask for img2img and has a bounded final-pixel LanPaint_MaskBlend slice; the area resize contract is only for the base/original image1 role before that final composite.",
-            "The current Mojo parity gate covers weight-free mask blend and one supplied-score overdamped step only; it does not prove full LanPaint_KSampler runtime parity.",
+            "Production LanPaint admission is intentionally bounded to Krea2 Raw/Turbo image inpainting at 1024x1024, one optional LoRA, Euler/Simple, full denoise/schedule, and inner_threshold=0.",
+            "The primitive parity gate uses fixed noise and does not claim PyTorch RNG-trajectory bit identity; full weighted acceptance is established separately by a decoded real-worker artifact and visual inspection.",
         ],
     }
 

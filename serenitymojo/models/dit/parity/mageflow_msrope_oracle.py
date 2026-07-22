@@ -13,7 +13,7 @@ We use a SMALL fixed even grid (frame=1, h=4, w=4 -> 16 image tokens), head_dim
 128, a small number of heads, and fixed non-degenerate randn q/k so the Mojo
 probe can gate BOTH the cos/sin tables AND the rope-applied q/k.
 
-Run:  /home/alex/OneTrainer/venv/bin/python .../mageflow_msrope_oracle.py
+Run:  pixi run python .../mageflow_msrope_oracle.py
 Output: safetensors next to this file, read by mageflow_msrope_probe.mojo.
 """
 

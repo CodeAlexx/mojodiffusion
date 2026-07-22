@@ -1,0 +1,104 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LTXVLoader",
+      "pos": [100, 200],
+      "size": [300, 170],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "MODEL", "type": "MODEL", "links": [1]},
+        {"name": "VAE", "type": "VAE", "links": null}
+      ],
+      "properties": {},
+      "widgets_values": [
+        "ltx-2.3-22b-dev-fp8",
+        "gemma-3-12b-it",
+        "fp8_e4m3fn",
+        "fp8",
+        "mojo"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "LoraLoaderModelOnly",
+      "pos": [475, 215],
+      "size": [330, 135],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "MODEL", "link": 1}
+      ],
+      "outputs": [
+        {"name": "MODEL", "type": "MODEL", "links": [3]}
+      ],
+      "properties": {},
+      "widgets_values": ["ltx2_eri2_step3000", 1.0]
+    },
+    {
+      "id": 2,
+      "type": "LTXVSampler",
+      "pos": [880, 100],
+      "size": [420, 430],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "ltxv_model", "type": "MODEL", "link": 3}
+      ],
+      "outputs": [
+        {"name": "LATENT", "type": "LATENT", "links": null},
+        {"name": "VIDEO", "type": "VIDEO", "links": [2]},
+        {"name": "AUDIO", "type": "AUDIO", "links": null}
+      ],
+      "properties": {},
+      "widgets_values": [
+        "Medium closeup of vrtlEri2, a woman in her late twenties with long dark wavy hair falling over her bare shoulders, standing before a plain textured cream wall washed in soft diffused window light. She slowly turns her head toward the camera and a gentle smile forms, her hair shifting as she moves, the delicate gold necklace at her collarbone catching the light. The camera holds a slow dolly-in, keeping her face centered as the light warms. Quiet room ambience with a soft rustle of fabric and her calm breathing.",
+        "text, watermark, title card, subtitles, captions, letters, words, logo, writing, typography, worst quality, inconsistent motion, blurry, jittery, distorted, silence, mute",
+        512,
+        768,
+        121,
+        20,
+        3.0,
+        42,
+        25,
+        1.0,
+        "dev",
+        "res2s",
+        "ltx2",
+        "/home/alex/mojodiffusion/output/ltx2_ui_step3000_oracle_prompt_512x768_121f/conditioning.json",
+        "",
+        "/home/alex/mojodiffusion-recovery-c91c365-20260719/output/ltx2_eri2_vid_fixed/step3000/noises.safetensors",
+        false
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveVideo",
+      "pos": [1375, 225],
+      "size": [300, 120],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 2}
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": ["ltx2_dev_t2v_lora"]
+    }
+  ],
+  "links": [
+    {"id": 1, "origin_id": 1, "origin_slot": 0, "target_id": 4, "target_slot": 0, "type": "MODEL"},
+    {"id": 3, "origin_id": 4, "origin_slot": 0, "target_id": 2, "target_slot": 0, "type": "MODEL"},
+    {"id": 2, "origin_id": 2, "origin_slot": 1, "target_id": 3, "target_slot": 0, "type": "VIDEO"}
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

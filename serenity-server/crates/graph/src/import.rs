@@ -1064,6 +1064,17 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
                 "LanPaint_NumSteps".into(),
                 json!(widget_int(widgets, 7, -1)),
             );
+            // These are fixed semantics of upstream LanPaint_KSampler (they
+            // are not widgets on the compact node). Materialize them into the
+            // typed request so the Mojo runner never substitutes a hidden
+            // sampling profile.
+            fields.insert("LanPaint_Lambda".into(), json!(16.0));
+            fields.insert("LanPaint_StepSize".into(), json!(0.2));
+            fields.insert("LanPaint_Beta".into(), json!(1.0));
+            fields.insert("LanPaint_Friction".into(), json!(15.0));
+            fields.insert("LanPaint_EarlyStop".into(), json!(1));
+            fields.insert("LanPaint_InnerThreshold".into(), json!(0.0));
+            fields.insert("LanPaint_InnerPatience".into(), json!(1));
             fields.insert(
                 "LanPaint_PromptMode".into(),
                 json!(widget_string(widgets, 8, "")),

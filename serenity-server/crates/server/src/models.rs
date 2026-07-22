@@ -895,6 +895,20 @@ pub fn lora_names() -> Vec<String> {
     scan_loras().into_iter().map(|e| e.name).collect()
 }
 
+/// Resolve a registry LoRA by its API name (with or without `.safetensors`) or
+/// exact scanned path. Video request preflight uses this before taking the GPU
+/// lease so missing and cross-architecture adapters never reach CUDA.
+pub fn lora_path_and_arch(name: &str) -> Option<(PathBuf, String)> {
+    let wanted = name.strip_suffix(".safetensors").unwrap_or(name);
+    scan_loras().into_iter().find_map(|entry| {
+        if entry.name == name || entry.name == wanted || entry.path == name {
+            Some((PathBuf::from(entry.path), entry.arch))
+        } else {
+            None
+        }
+    })
+}
+
 // ── DELETE /models/{type}/{name} — guarded single-file removal ────────────────────
 
 /// Map a URL `{type}` segment to its scan-root dir. Accepts the singular + plural

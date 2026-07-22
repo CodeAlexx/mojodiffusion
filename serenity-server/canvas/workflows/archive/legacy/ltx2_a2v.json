@@ -1,0 +1,236 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LTXVLoader",
+      "pos": [
+        100,
+        100
+      ],
+      "size": [
+        320,
+        140
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ltxv_model",
+          "type": "LTXV_MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LTXVLoader"
+      },
+      "widgets_values": [
+        "ltx-2.3-22b-dev.safetensors",
+        "gemma-3-12b-it",
+        "bfloat16"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "pos": [
+        100,
+        300
+      ],
+      "size": [
+        320,
+        140
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "input.mp3",
+        null,
+        null
+      ]
+    },
+    {
+      "id": 3,
+      "type": "LTXVSampler",
+      "pos": [
+        520,
+        100
+      ],
+      "size": [
+        380,
+        420
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ltxv_model",
+          "type": "LTXV_MODEL",
+          "link": 1
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "frames",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            3
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LTXVSampler"
+      },
+      "widgets_values": [
+        "A vibrant scene with dynamic motion perfectly synchronized to the audio rhythm.",
+        768,
+        512,
+        97,
+        20,
+        3.0,
+        42,
+        "worst quality, inconsistent motion, blurry, jittery, distorted",
+        24,
+        1.0,
+        "dev",
+        1.0,
+        0,
+        0.0,
+        4.0
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SaveVideo",
+      "pos": [
+        980,
+        150
+      ],
+      "size": [
+        280,
+        100
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "sf_ltx2_a2v",
+        24,
+        "mp4"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SaveAudioOpus",
+      "pos": [
+        980,
+        310
+      ],
+      "size": [
+        300,
+        90
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 4
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveAudioOpus"
+      },
+      "widgets_values": [
+        "sf_ltx2_a2v"
+      ]
+    }
+  ],
+  "links": [
+    {
+      "id": 1,
+      "origin_id": 1,
+      "origin_slot": 0,
+      "target_id": 3,
+      "target_slot": 0,
+      "type": "LTXV_MODEL"
+    },
+    {
+      "id": 2,
+      "origin_id": 2,
+      "origin_slot": 0,
+      "target_id": 3,
+      "target_slot": 1,
+      "type": "AUDIO"
+    },
+    {
+      "id": 3,
+      "origin_id": 3,
+      "origin_slot": 1,
+      "target_id": 4,
+      "target_slot": 0,
+      "type": "VIDEO"
+    },
+    {
+      "id": 4,
+      "origin_id": 3,
+      "origin_slot": 2,
+      "target_id": 5,
+      "target_slot": 0,
+      "type": "AUDIO"
+    }
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

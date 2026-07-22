@@ -30,7 +30,7 @@
 #   editcond_txt      [L-64,2560]   the DiT context res["txt"] (G-editcond target)
 #   last_hidden_state [1,L,2560]    full fused post-norm (debug)
 #
-# Run: /home/alex/OneTrainer/venv/bin/python \
+# Run: pixi run python \
 #        serenitymojo/models/text_encoder/parity/mageflow_editcond_oracle.py
 
 import os

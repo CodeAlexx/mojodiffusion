@@ -2145,7 +2145,7 @@ mod tests {
             "values": [1],
             "workflow": {
                 "params": {
-                    "model": "zimage",
+                    "model": "sdxl",
                     "prompt": "workflow params grid img2img",
                     "width": 1024,
                     "height": 1024,

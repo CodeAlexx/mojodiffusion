@@ -15,7 +15,7 @@
 # element-wise; the trailing 0 matches (t=0 -> sigma 0 == diffusers' appended 0).
 #
 # Oracle values from:
-#   /home/alex/OneTrainer/venv/bin/python \
+#   pixi run python \
 #     serenitymojo/sampling/parity/mageflow_scheduler_oracle.py
 # Build+run:
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \

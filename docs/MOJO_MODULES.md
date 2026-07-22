@@ -619,6 +619,29 @@ edits: see sections C and D of the parity-ported doc.
   selects the cache dir else the oracle dump; cache run is BYTE-IDENTICAL to dump-direct. **★ ACE-Step
   trainer vertical COMPLETE: fwd+bwd+train-step+driver+cache, all gated — trains a LoRA end-to-end.**
 
+## MageFlow image generation and editing (2026-07-22)
+
+- `models/dit/mageflow_dit.mojo` implements the 12-block MageFlow DiT using the
+  shared Qwen-Image block math plus image-only multi-axis RoPE. The component
+  gates report block cosine 0.99999 and full velocity cosine 0.99898.
+- `models/text_encoder/mageflow_qwen3vl.mojo` reuses the Qwen3-VL loader and
+  exposes both the T2I post-norm context path (`drop_idx=34`) and the edit
+  vision/deepstack fusion path (`drop_idx=64`).
+- `models/vae/mageflow_vae.mojo` provides one-step MageVAE encode and decode,
+  including non-square aspect-preserving edit geometry. The recorded full
+  encode mean cosine is 0.99999976; square decode remains cosine 1.0.
+- `pipeline/mageflow_pipeline.mojo` is the sequentially offloaded four-step
+  Turbo T2I capstone. Its recorded fixed-fixture final-latent cosine is 0.9942
+  and the image was visually matched to the oracle.
+- `pipeline/mageflow_edit_pipeline.mojo` VAE-encodes a clean reference,
+  concatenates its latent tokens after the pure-noise target, steps only the
+  target tokens, and preserves source aspect ratio. The recorded edit gate is
+  0.99979 for the reference latent and 0.99934 for the final target latent,
+  with a visually matching edited image.
+- These are direct pure-Mojo pipeline entrypoints and parity gates. They are not
+  yet registered as Serenity server workers or Canvas engines; the UI must not
+  route to them until capability, request, and worker lifecycle wiring exists.
+
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 
 Gates for the process-isolated **worker** runtime (`serve/`): they exercise the

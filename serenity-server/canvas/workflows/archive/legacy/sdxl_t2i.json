@@ -1,0 +1,66 @@
+{
+    "1": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+            "ckpt_name": "sd_xl_base_1.0.safetensors"
+        },
+        "_meta": {"title": "Load SDXL Checkpoint"}
+    },
+    "4": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "clip": ["1", 1],
+            "text": "a cat sitting on a windowsill, golden hour sunlight, photorealistic"
+        },
+        "_meta": {"title": "CLIP Text Encode - Positive"}
+    },
+    "5": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "clip": ["1", 1],
+            "text": "blurry, ugly, deformed"
+        },
+        "_meta": {"title": "CLIP Text Encode - Negative"}
+    },
+    "6": {
+        "class_type": "EmptyLatentImage",
+        "inputs": {
+            "width": 1024,
+            "height": 1024,
+            "batch_size": 1
+        },
+        "_meta": {"title": "Empty Latent Image"}
+    },
+    "7": {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": ["1", 0],
+            "positive": ["4", 0],
+            "negative": ["5", 0],
+            "latent_image": ["6", 0],
+            "seed": 42,
+            "steps": 20,
+            "cfg": 7.0,
+            "sampler_name": "euler",
+            "scheduler": "normal",
+            "denoise": 1.0
+        },
+        "_meta": {"title": "KSampler"}
+    },
+    "8": {
+        "class_type": "VAEDecode",
+        "inputs": {
+            "samples": ["7", 0],
+            "vae": ["1", 2]
+        },
+        "_meta": {"title": "VAE Decode"}
+    },
+    "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+            "images": ["8", 0],
+            "filename_prefix": "sdxl_test"
+        },
+        "_meta": {"title": "Save Image"}
+    }
+}

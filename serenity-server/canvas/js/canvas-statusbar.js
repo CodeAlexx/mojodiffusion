@@ -66,9 +66,18 @@ var CanvasStatusBar = (function () {
             queued: 'Queued',
             generating: 'Generating...',
             complete: 'Complete',
+            staging: 'Reviewing result',
+            starting: 'Starting...',
+            interrupted: 'Interrupted',
+            error: 'Failed',
         };
         _genStatusEl.textContent = labels[_genState] || String(_genState);
-        _genStatusEl.className = 'cv-sb-item cv-sb-gen cv-sb-gen-' + _genState;
+        var normalized = String(_genState).toLowerCase();
+        var bucket = normalized === 'idle' ? 'idle' :
+            normalized === 'queued' ? 'queued' :
+                normalized === 'complete' || normalized === 'staging' ? 'complete' :
+                    normalized === 'error' || normalized === 'interrupted' ? 'error' : 'generating';
+        _genStatusEl.className = 'cv-sb-item cv-sb-gen cv-sb-gen-' + bucket;
     }
     function updateVram(usedMb) {
         _vramMb = usedMb;

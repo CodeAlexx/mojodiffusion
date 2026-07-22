@@ -1,0 +1,115 @@
+{
+    "1": {
+        "class_type": "UNETLoader",
+        "inputs": {
+            "unet_name": "qwen_image_edit.safetensors",
+            "weight_dtype": "default"
+        },
+        "_meta": {"title": "Load Qwen Image Edit"}
+    },
+    "2": {
+        "class_type": "CLIPLoader",
+        "inputs": {
+            "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "type": "qwen",
+            "device": "default"
+        },
+        "_meta": {"title": "Load Qwen CLIP"}
+    },
+    "3": {
+        "class_type": "VAELoader",
+        "inputs": {
+            "vae_name": "qwen_image_vae.safetensors"
+        },
+        "_meta": {"title": "Load VAE"}
+    },
+    "13": {
+        "class_type": "LoraLoaderModelOnly",
+        "inputs": {
+            "model": ["1", 0],
+            "lora_name": "lora.safetensors",
+            "strength_model": 1.0
+        },
+        "_meta": {"title": "Load LoRA"}
+    },
+    "4": {
+        "class_type": "ModelSamplingAuraFlow",
+        "inputs": {
+            "model": ["13", 0],
+            "shift": 3
+        },
+        "_meta": {"title": "AuraFlow Sampling"}
+    },
+    "5": {
+        "class_type": "LoadImage",
+        "inputs": {
+            "image": "input.png"
+        },
+        "_meta": {"title": "Load Source Image"}
+    },
+    "6": {
+        "class_type": "ImageScaleToTotalPixels",
+        "inputs": {
+            "image": ["5", 0],
+            "upscale_method": "bicubic",
+            "megapixels": 1.0
+        },
+        "_meta": {"title": "Scale Image"}
+    },
+    "7": {
+        "class_type": "VAEEncode",
+        "inputs": {
+            "pixels": ["6", 0],
+            "vae": ["3", 0]
+        },
+        "_meta": {"title": "VAE Encode Source"}
+    },
+    "8": {
+        "class_type": "TextEncodeQwenImageEditPlus",
+        "inputs": {
+            "clip": ["2", 0],
+            "text": "change the background to a beach",
+            "image": ["6", 0]
+        },
+        "_meta": {"title": "Edit Prompt"}
+    },
+    "9": {
+        "class_type": "ConditioningZeroOut",
+        "inputs": {
+            "conditioning": ["8", 0]
+        },
+        "_meta": {"title": "Negative (Zero)"}
+    },
+    "10": {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": ["4", 0],
+            "positive": ["8", 0],
+            "negative": ["9", 0],
+            "latent_image": ["7", 0],
+            "seed": 42,
+            "steps": 20,
+            "cfg": 1,
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "denoise": 0.75
+        },
+        "_meta": {"title": "KSampler"}
+    },
+    "11": {
+        "class_type": "VAEDecode",
+        "inputs": {
+            "samples": ["10", 0],
+            "vae": ["3", 0]
+        },
+        "_meta": {"title": "VAE Decode"}
+    },
+    "12": {
+        "class_type": "SaveImage",
+        "inputs": {
+            "images": ["11", 0],
+            "filename_prefix": "qwen_edit_lora"
+        },
+        "_meta": {"title": "Save Image"}
+    }
+}

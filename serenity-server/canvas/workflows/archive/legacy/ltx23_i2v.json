@@ -1,0 +1,51 @@
+{
+    "1": {
+        "class_type": "LTXVLoader",
+        "inputs": {
+            "checkpoint_path": "ltx-2.3-22b-dev.safetensors",
+            "gemma_path": "gemma-3-12b-it",
+            "dtype": "bfloat16",
+            "quantization": "auto",
+            "backend": "legacy_stagehand"
+        },
+        "_meta": {"title": "Load LTX 2.3 Dev"}
+    },
+    "2": {
+        "class_type": "LoadImage",
+        "inputs": {
+            "image": "input.png"
+        },
+        "_meta": {"title": "Load Guide Image"}
+    },
+    "3": {
+        "class_type": "LTXVSampler",
+        "inputs": {
+            "ltxv_model": ["1", 0],
+            "prompt": "The subject slowly turns toward camera while soft atmospheric light blooms behind them",
+            "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
+            "width": 768,
+            "height": 512,
+            "num_frames": 97,
+            "steps": 25,
+            "cfg": 3.0,
+            "seed": 42,
+            "frame_rate": 24,
+            "stg_scale": 1.0,
+            "mode": "dev",
+            "guide_image": ["2", 0],
+            "guide_strength": 1.0,
+            "guide_frame_idx": 0
+        },
+        "_meta": {"title": "Sample Image To Video"}
+    },
+    "4": {
+        "class_type": "SaveVideo",
+        "inputs": {
+            "video": ["3", 1],
+            "filename_prefix": "ltx23_i2v",
+            "fps": 24,
+            "format": "mp4"
+        },
+        "_meta": {"title": "Save Video"}
+    }
+}

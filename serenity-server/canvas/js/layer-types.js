@@ -80,6 +80,7 @@ var LayerDefaults = (function () {
             ...base(name || 'Draw Layer', LayerType.Draw),
             type: 'draw',
             blendMode: 'Normal',
+            lockTransparency: false,
         };
     }
     function mask(name) {
@@ -206,6 +207,8 @@ var LayerValidation = (function () {
             case 'draw':
                 if (!data.blendMode)
                     data.blendMode = 'Normal';
+                if (typeof data.lockTransparency !== 'boolean')
+                    data.lockTransparency = false;
                 break;
             case 'mask':
                 data.denoiseStrength = clamp(safeNum(data.denoiseStrength, 0.75), 0, 1);
@@ -241,7 +244,7 @@ var LayerValidation = (function () {
     }
     function validateSession(state) {
         var errors = [];
-        if (state.version !== 1 && state.version !== 2)
+        if (state.version !== 1 && state.version !== 2 && state.version !== 3)
             errors.push('unsupported session version: ' + state.version);
         if (!Array.isArray(state.layers))
             errors.push('layers must be an array');
@@ -267,7 +270,7 @@ var LayerValidation = (function () {
 // ── Serialization ──
 var LayerSerializer = (function () {
     'use strict';
-    var SESSION_VERSION = 2;
+    var SESSION_VERSION = 3;
     var STORAGE_KEY = 'sf-canvas-session';
     function buildSessionState(layers, bbox, activeLayerId, genSettings) {
         // Capture each layer's pixel content as base64 PNG

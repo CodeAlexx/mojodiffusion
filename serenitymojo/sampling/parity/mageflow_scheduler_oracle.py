@@ -17,7 +17,7 @@ use_dynamic_shifting=false, num_train_timesteps=1000. There is NO use_time_shift
 field (static shift only).
 
 Run with a venv that has torch + diffusers, e.g.:
-    /home/alex/OneTrainer/venv/bin/python \
+    pixi run python \
         serenitymojo/sampling/parity/mageflow_scheduler_oracle.py
 """
 import torch

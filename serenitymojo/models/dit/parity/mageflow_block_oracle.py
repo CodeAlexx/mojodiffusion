@@ -9,12 +9,12 @@
 # inputs + a few taps + the (img, txt) block outputs as a single f32
 # safetensors so the Mojo probe gates against byte-identical inputs.
 #
-# GPU bf16. flash-attn is absent in the OneTrainer venv, so we force the
+# GPU bf16. flash-attn is absent in the current Python environment, so we force the
 # functionally-equivalent SDPA varlen fallback (softmax_scale=None => 1/sqrt(d),
 # dense/non-causal — exactly what MageFlow uses).
 #
 # Run:
-#   /home/alex/OneTrainer/venv/bin/python \
+#   pixi run python \
 #     serenitymojo/models/dit/parity/mageflow_block_oracle.py
 import os
 import numpy as np

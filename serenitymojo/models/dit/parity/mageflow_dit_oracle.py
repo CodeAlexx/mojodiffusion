@@ -8,11 +8,11 @@
 # output velocity plus taps (post img_in, post txt_in, temb, post-block0) as a
 # single f32 safetensors so the Mojo probe gates against byte-identical inputs.
 #
-# GPU bf16. flash-attn is absent in the OneTrainer venv, so we force the
+# GPU bf16. flash-attn is absent in the current Python environment, so we force the
 # functionally-equivalent SDPA varlen fallback (dense, non-causal, 1/sqrt(d)).
 #
 # Run:
-#   /home/alex/OneTrainer/venv/bin/python \
+#   pixi run python \
 #     serenitymojo/models/dit/parity/mageflow_dit_oracle.py
 import os
 

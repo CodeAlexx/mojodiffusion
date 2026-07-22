@@ -255,6 +255,27 @@ fn copy_lanpaint_sampler_fields(out: &mut JsonValue, fields: &JsonValue) {
     copy_lanpaint_alias(out, fields, "Inpainting_mode", "lanpaint_inpainting_mode");
     copy_lanpaint_alias(out, fields, "add_noise", "lanpaint_add_noise");
     copy_lanpaint_alias(out, fields, "noise_seed", "lanpaint_noise_seed");
+    copy_lanpaint_alias(out, fields, "start_at_step", "lanpaint_start_at_step");
+    copy_lanpaint_alias(out, fields, "end_at_step", "lanpaint_end_at_step");
+    copy_lanpaint_alias(
+        out,
+        fields,
+        "return_with_leftover_noise",
+        "lanpaint_return_with_leftover_noise",
+    );
+    copy_lanpaint_alias(out, fields, "LanPaint_EarlyStop", "lanpaint_early_stop");
+    copy_lanpaint_alias(
+        out,
+        fields,
+        "LanPaint_InnerThreshold",
+        "lanpaint_inner_threshold",
+    );
+    copy_lanpaint_alias(
+        out,
+        fields,
+        "LanPaint_InnerPatience",
+        "lanpaint_inner_patience",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1121,8 @@ fn exec_node(
             }
             copy_field_if_missing(out, fields, "steps", "steps");
             copy_field_if_missing(out, fields, "seed", "seed");
+            copy_field_if_missing(out, fields, "width", "width");
+            copy_field_if_missing(out, fields, "height", "height");
             copy_field_if_missing(out, fields, "tgt_cfg", "cfg");
             copy_field_if_missing(out, fields, "nmax", "edit_nmax");
             copy_field_if_missing(out, fields, "nmin", "edit_nmin");

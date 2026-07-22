@@ -201,6 +201,9 @@ def _configure_loras(obj: JSONValue) raises:
             _resolve_lora_path(name),
         )
         _setenv(
+            String("LTX2_TRAINED_LORA_NAME_") + String(i), name,
+        )
+        _setenv(
             String("LTX2_TRAINED_LORA_MULT_") + String(i), String(weight)
         )
         # Optional per-stream strengths (KJ LTX2LoraLoaderAdvanced): each in
@@ -289,6 +292,7 @@ def _run_request(request_path: String, out_dir: String) raises:
     _configure_loras(obj)
     _mkdir(out_dir)
     run_request_profile(
+        _require_string(obj, String("checkpoint")),
         _require_int(obj, String("width")),
         _require_int(obj, String("height")),
         _require_int(obj, String("frames")),

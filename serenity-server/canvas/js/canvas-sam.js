@@ -21,16 +21,41 @@ var CanvasSAM = (function () {
     var _resultsPanel = null;
     // ── API calls ──
     function getApiBase() {
-        return window.location.protocol + '//' + window.location.host;
+        return window.SERENITY_SAM3_API_BASE || (window.location.protocol + '//' + window.location.host + '/canvas/sam3');
+    }
+    function prepareGpu() {
+        return fetch('/canvas/sam3/prepare', { method: 'POST' }).then(function (res) {
+            return res.json().catch(function () { return ({}); }).then(function (data) {
+                if (!res.ok)
+                    throw new Error(data.error || ('SAM3 prepare HTTP ' + res.status));
+            });
+        });
     }
     function captureCanvasComposite(ctx) {
         return new Promise(function (resolve) {
             var bb = ctx.boundingBox;
+            var hiddenMasks = [];
+            if (ctx.getCanvasLayers) {
+                ctx.getCanvasLayers().forEach(function (layer) {
+                    if (layer.data.type === 'mask' && layer.konvaLayer.visible()) {
+                        layer.konvaLayer.hide();
+                        hiddenMasks.push(layer.konvaLayer);
+                    }
+                });
+            }
+            ctx.uiLayer.hide();
+            if (ctx.backgroundLayer)
+                ctx.backgroundLayer.hide();
             var dataUrl = ctx.stage.toDataURL({
                 x: bb.x(), y: bb.y(),
                 width: bb.width(), height: bb.height(),
                 pixelRatio: 1,
             });
+            hiddenMasks.forEach(function (layer) { layer.show(); });
+            ctx.uiLayer.show();
+            if (ctx.backgroundLayer)
+                ctx.backgroundLayer.show();
+            ctx.stage.batchDraw();
             // Convert data URL to Blob
             var byteString = atob(dataUrl.split(',')[1]);
             var mimeString = dataUrl.split(',')[0].split(':')[1].split(';')[0];
@@ -42,20 +67,28 @@ var CanvasSAM = (function () {
             resolve(new Blob([ab], { type: mimeString }));
         });
     }
+    function parseSamResponse(res) {
+        return res.json().then(function (data) {
+            if (!res.ok)
+                throw new Error(data.detail || data.error || ('SAM3 HTTP ' + res.status));
+            return data;
+        });
+    }
     function sendTextRequest(ctx, prompt, threshold) {
         if (_loading)
             return;
         _loading = true;
         updateLoadingState();
-        captureCanvasComposite(ctx).then(function (blob) {
+        prepareGpu().then(function () { return captureCanvasComposite(ctx); }).then(function (blob) {
             var form = new FormData();
             form.append('image', blob, 'canvas.png');
             form.append('prompt', prompt);
             form.append('threshold', String(threshold));
-            return fetch(getApiBase() + '/canvas/sam3/text', { method: 'POST', body: form });
-        }).then(function (res) { return res.json(); })
+            return fetch(getApiBase() + '/text', { method: 'POST', body: form });
+        }).then(parseSamResponse)
             .then(function (data) {
             _loading = false;
+            updateLoadingState();
             if (data.error) {
                 showSamError(data.error);
             }
@@ -72,14 +105,15 @@ var CanvasSAM = (function () {
             return;
         _loading = true;
         updateLoadingState();
-        captureCanvasComposite(ctx).then(function (blob) {
+        prepareGpu().then(function () { return captureCanvasComposite(ctx); }).then(function (blob) {
             var form = new FormData();
             form.append('image', blob, 'canvas.png');
             form.append('points', JSON.stringify(_clickPoints));
-            return fetch(getApiBase() + '/canvas/sam3/points', { method: 'POST', body: form });
-        }).then(function (res) { return res.json(); })
+            return fetch(getApiBase() + '/points', { method: 'POST', body: form });
+        }).then(parseSamResponse)
             .then(function (data) {
             _loading = false;
+            updateLoadingState();
             if (data.error) {
                 showSamError(data.error);
             }
@@ -96,14 +130,15 @@ var CanvasSAM = (function () {
             return;
         _loading = true;
         updateLoadingState();
-        captureCanvasComposite(ctx).then(function (blob) {
+        prepareGpu().then(function () { return captureCanvasComposite(ctx); }).then(function (blob) {
             var form = new FormData();
             form.append('image', blob, 'canvas.png');
             form.append('bbox', JSON.stringify(bbox));
-            return fetch(getApiBase() + '/canvas/sam3/exemplar', { method: 'POST', body: form });
-        }).then(function (res) { return res.json(); })
+            return fetch(getApiBase() + '/exemplar', { method: 'POST', body: form });
+        }).then(parseSamResponse)
             .then(function (data) {
             _loading = false;
+            updateLoadingState();
             if (data.error) {
                 showSamError(data.error);
             }
@@ -207,15 +242,32 @@ var CanvasSAM = (function () {
             var img = new window.Image();
             img.onload = function () {
                 var bb = ctx.boundingBox;
-                var kImg = new Konva.Image({
-                    image: img,
-                    x: bb.x(), y: bb.y(),
-                    width: bb.width(), height: bb.height(),
-                    listening: false,
-                });
-                // Tint the mask red for visualization
-                maskLayer.konvaLayer.add(kImg);
-                maskLayer.konvaLayer.batchDraw();
+                var tmpCanvas = document.createElement('canvas');
+                tmpCanvas.width = img.width;
+                tmpCanvas.height = img.height;
+                var tctx = tmpCanvas.getContext('2d');
+                tctx.drawImage(img, 0, 0);
+                var pixels = tctx.getImageData(0, 0, img.width, img.height);
+                for (var i = 0; i < pixels.data.length; i += 4) {
+                    var maskAlpha = pixels.data[i];
+                    pixels.data[i] = 239;
+                    pixels.data[i + 1] = 68;
+                    pixels.data[i + 2] = 68;
+                    pixels.data[i + 3] = maskAlpha;
+                }
+                tctx.putImageData(pixels, 0, 0);
+                var tinted = new window.Image();
+                tinted.onload = function () {
+                    var kImg = new Konva.Image({
+                        image: tinted,
+                        x: bb.x(), y: bb.y(),
+                        width: bb.width(), height: bb.height(),
+                        listening: false,
+                    });
+                    maskLayer.konvaLayer.add(kImg);
+                    maskLayer.konvaLayer.batchDraw();
+                };
+                tinted.src = tmpCanvas.toDataURL('image/png');
             };
             img.src = 'data:image/png;base64,' + inst.mask_png;
         });
@@ -386,6 +438,9 @@ var CanvasSAM = (function () {
         var existing = document.getElementById('sam-toolbar');
         if (existing) {
             existing.style.display = 'flex';
+            if (existing.parentElement)
+                existing.parentElement.classList.add('sam-toolbar-active');
+            document.body.classList.add('canvas-sam-active');
             return;
         }
         var toolbar = document.createElement('div');
@@ -409,6 +464,8 @@ var CanvasSAM = (function () {
         var stageContainer = document.getElementById('canvas-stage-container');
         if (stageContainer && stageContainer.parentElement) {
             stageContainer.parentElement.insertBefore(toolbar, stageContainer);
+            stageContainer.parentElement.classList.add('sam-toolbar-active');
+            document.body.classList.add('canvas-sam-active');
         }
         else {
             document.body.appendChild(toolbar);
@@ -472,8 +529,12 @@ var CanvasSAM = (function () {
     }
     function hideSamToolbar() {
         var toolbar = document.getElementById('sam-toolbar');
-        if (toolbar)
+        if (toolbar) {
             toolbar.style.display = 'none';
+            if (toolbar.parentElement)
+                toolbar.parentElement.classList.remove('sam-toolbar-active');
+            document.body.classList.remove('canvas-sam-active');
+        }
     }
     // ── Public API ──
     function getMode() { return _mode; }

@@ -210,6 +210,9 @@ pub(crate) enum DriverCtl {
     /// Drop an idle image worker before a subprocess GPU path starts. The
     /// acknowledgement is true only after the worker was killed and reaped.
     EvictIdle(std::sync::mpsc::Sender<bool>),
+    /// Prepare for the accessory SAM3 service. Z-Image's measured resident
+    /// footprint can coexist with SAM3; larger or unmeasured workers are reaped.
+    PrepareSam(std::sync::mpsc::Sender<bool>),
 }
 
 #[derive(Clone)]
@@ -340,6 +343,72 @@ struct GenerateRequest {
     /// Which channel of `mask_image` is the mask (alpha|red|green|blue|luminance).
     #[serde(default)]
     lanpaint_mask_channel: Option<String>,
+    #[serde(default)]
+    inpaint_conditioning_image: Option<String>,
+    #[serde(default)]
+    inpaint_conditioning_mask: Option<String>,
+    #[serde(default)]
+    inpaint_conditioning_noise_mask: Option<bool>,
+    #[serde(default)]
+    qwen_edit_conditioning_image: Option<String>,
+    #[serde(default)]
+    sample_caps_pos: Option<String>,
+    #[serde(default)]
+    sample_caps_neg: Option<String>,
+    #[serde(default)]
+    conditioning_mask_image: Option<String>,
+    #[serde(default)]
+    conditioning_mask_channel: Option<String>,
+    #[serde(default)]
+    conditioning_mask_strength: Option<f64>,
+    #[serde(default)]
+    conditioning_mask_set_area_to_bounds: Option<bool>,
+    #[serde(default)]
+    outpaint_left: Option<i64>,
+    #[serde(default)]
+    outpaint_top: Option<i64>,
+    #[serde(default)]
+    outpaint_right: Option<i64>,
+    #[serde(default)]
+    outpaint_bottom: Option<i64>,
+    #[serde(default)]
+    outpaint_feathering: Option<i64>,
+    #[serde(default)]
+    threshold_mask_value: Option<f64>,
+    #[serde(default)]
+    threshold_mask_operator: Option<String>,
+    #[serde(default)]
+    lanpaint_mask_blend_overlap: Option<i64>,
+    #[serde(default)]
+    lanpaint_num_steps: Option<i64>,
+    #[serde(default)]
+    lanpaint_lambda: Option<f64>,
+    #[serde(default)]
+    lanpaint_step_size: Option<f64>,
+    #[serde(default)]
+    lanpaint_beta: Option<f64>,
+    #[serde(default)]
+    lanpaint_friction: Option<f64>,
+    #[serde(default)]
+    lanpaint_prompt_mode: Option<String>,
+    #[serde(default)]
+    lanpaint_inpainting_mode: Option<String>,
+    #[serde(default)]
+    lanpaint_add_noise: Option<String>,
+    #[serde(default)]
+    lanpaint_noise_seed: Option<i64>,
+    #[serde(default)]
+    lanpaint_start_at_step: Option<i64>,
+    #[serde(default)]
+    lanpaint_end_at_step: Option<i64>,
+    #[serde(default)]
+    lanpaint_return_with_leftover_noise: Option<String>,
+    #[serde(default)]
+    lanpaint_early_stop: Option<i64>,
+    #[serde(default)]
+    lanpaint_inner_threshold: Option<f64>,
+    #[serde(default)]
+    lanpaint_inner_patience: Option<i64>,
     // ── hires-fix (control-plane only; NOT forwarded to the worker wire) ──
     /// >1.0 enables a second img2img refine pass at `scale*resolution`.
     #[serde(default)]
@@ -1287,6 +1356,105 @@ fn params_from_generate_request(
     if let Some(v) = req.lanpaint_mask_channel {
         params.lanpaint_mask_channel = v;
     }
+    if let Some(v) = req.inpaint_conditioning_image {
+        params.inpaint_conditioning_image = v;
+    }
+    if let Some(v) = req.inpaint_conditioning_mask {
+        params.inpaint_conditioning_mask = v;
+    }
+    if let Some(v) = req.inpaint_conditioning_noise_mask {
+        params.inpaint_conditioning_noise_mask = v;
+    }
+    if let Some(v) = req.qwen_edit_conditioning_image {
+        params.qwen_edit_conditioning_image = v;
+    }
+    if let Some(v) = req.sample_caps_pos {
+        params.sample_caps_pos = v;
+    }
+    if let Some(v) = req.sample_caps_neg {
+        params.sample_caps_neg = v;
+    }
+    if let Some(v) = req.conditioning_mask_image {
+        params.conditioning_mask_image = v;
+    }
+    if let Some(v) = req.conditioning_mask_channel {
+        params.conditioning_mask_channel = v;
+    }
+    if let Some(v) = req.conditioning_mask_strength {
+        params.conditioning_mask_strength = v;
+    }
+    if let Some(v) = req.conditioning_mask_set_area_to_bounds {
+        params.conditioning_mask_set_area_to_bounds = v;
+    }
+    if let Some(v) = req.outpaint_left {
+        params.outpaint_left = v;
+    }
+    if let Some(v) = req.outpaint_top {
+        params.outpaint_top = v;
+    }
+    if let Some(v) = req.outpaint_right {
+        params.outpaint_right = v;
+    }
+    if let Some(v) = req.outpaint_bottom {
+        params.outpaint_bottom = v;
+    }
+    if let Some(v) = req.outpaint_feathering {
+        params.outpaint_feathering = v;
+    }
+    if let Some(v) = req.threshold_mask_value {
+        params.threshold_mask_value = v;
+    }
+    if let Some(v) = req.threshold_mask_operator {
+        params.threshold_mask_operator = v;
+    }
+    if let Some(v) = req.lanpaint_mask_blend_overlap {
+        params.lanpaint_mask_blend_overlap = v;
+    }
+    if let Some(v) = req.lanpaint_num_steps {
+        params.lanpaint_num_steps = v;
+    }
+    if let Some(v) = req.lanpaint_lambda {
+        params.lanpaint_lambda = v;
+    }
+    if let Some(v) = req.lanpaint_step_size {
+        params.lanpaint_step_size = v;
+    }
+    if let Some(v) = req.lanpaint_beta {
+        params.lanpaint_beta = v;
+    }
+    if let Some(v) = req.lanpaint_friction {
+        params.lanpaint_friction = v;
+    }
+    if let Some(v) = req.lanpaint_prompt_mode {
+        params.lanpaint_prompt_mode = v;
+    }
+    if let Some(v) = req.lanpaint_inpainting_mode {
+        params.lanpaint_inpainting_mode = v;
+    }
+    if let Some(v) = req.lanpaint_add_noise {
+        params.lanpaint_add_noise = v;
+    }
+    if let Some(v) = req.lanpaint_noise_seed {
+        params.lanpaint_noise_seed = v;
+    }
+    if let Some(v) = req.lanpaint_start_at_step {
+        params.lanpaint_start_at_step = v;
+    }
+    if let Some(v) = req.lanpaint_end_at_step {
+        params.lanpaint_end_at_step = v;
+    }
+    if let Some(v) = req.lanpaint_return_with_leftover_noise {
+        params.lanpaint_return_with_leftover_noise = v;
+    }
+    if let Some(v) = req.lanpaint_early_stop {
+        params.lanpaint_early_stop = v;
+    }
+    if let Some(v) = req.lanpaint_inner_threshold {
+        params.lanpaint_inner_threshold = v;
+    }
+    if let Some(v) = req.lanpaint_inner_patience {
+        params.lanpaint_inner_patience = v;
+    }
     if let Some(v) = req.clip_skip {
         params.clip_skip = v;
     }
@@ -1555,11 +1723,18 @@ fn kind_from_bin(bin: &std::path::Path) -> String {
 
 /// Some Mojo runtimes keep a job's allocation pool pinned even after every
 /// backend tensor has been dropped. SD3 retains ~8.3 GiB after a completed
-/// 1024px job; Z-Image reaches ~14.5 GiB around its 16 GiB decode boundary.
-/// Recycle those measured workers after a terminal event so the OS performs the
-/// reclaim before another request is promoted.
+/// 1024px job, so recycle that measured worker after a terminal event.
+/// Z-Image deliberately keeps its DiT and VAE resident between jobs; recycling
+/// it here turns every Canvas edit into a multi-minute cold model load.
 fn kind_requires_per_job_recycle(kind: &str) -> bool {
-    matches!(kind, "sd3" | "zimage")
+    matches!(kind, "sd3")
+}
+
+/// Keep the one measured-safe resident edit worker through the common
+/// generate -> mask -> inpaint loop. Z-Image (~14.9 GiB resident) plus SAM3
+/// (~2.7 GiB active) fits on the 24 GiB product GPU; Krea2 at ~20.6 GiB does not.
+fn kind_can_share_gpu_with_sam(kind: &str) -> bool {
+    matches!(kind, "zimage")
 }
 
 /// Map a request's model -> (kind, worker binary in the same dir). One GPU = one
@@ -1661,6 +1836,15 @@ fn run_worker_driver(
                         }
                         let _ = done.send(true);
                     }
+                    Ok(DriverCtl::PrepareSam(done)) => {
+                        if !kind_can_share_gpu_with_sam(&current_kind) {
+                            if let Some(mut h) = handle.take() {
+                                h.kill();
+                                std::thread::sleep(std::time::Duration::from_millis(800));
+                            }
+                        }
+                        let _ = done.send(true);
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -1676,6 +1860,16 @@ fn run_worker_driver(
                     if let Some(mut h) = handle.take() {
                         h.kill();
                         std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                    let _ = done.send(true);
+                    continue;
+                }
+                Ok(DriverCtl::PrepareSam(done)) => {
+                    if !kind_can_share_gpu_with_sam(&current_kind) {
+                        if let Some(mut h) = handle.take() {
+                            h.kill();
+                            std::thread::sleep(std::time::Duration::from_millis(800));
+                        }
                     }
                     let _ = done.send(true);
                     continue;
@@ -1932,6 +2126,9 @@ fn drive_one_job(
                     // generate job is active. Fail closed if another caller races.
                     let _ = done.send(false);
                 }
+                Ok(DriverCtl::PrepareSam(done)) => {
+                    let _ = done.send(false);
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     return JobOutcome::ChannelClosed;
@@ -2009,6 +2206,9 @@ fn drive_one_pass(
                 }
                 Ok(DriverCtl::Wake) => {}
                 Ok(DriverCtl::EvictIdle(done)) => {
+                    let _ = done.send(false);
+                }
+                Ok(DriverCtl::PrepareSam(done)) => {
                     let _ = done.send(false);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -2825,6 +3025,55 @@ async fn get_capabilities() -> Json<serde_json::Value> {
     Json(generate_capabilities_v1())
 }
 
+/// GET /canvas/sam3/status — Canvas feature admission for object selection.
+///
+/// The browser must not discover this by provoking a 404 from the inference
+/// routes.  Keep the tool visible but disabled until a SAM3 service is wired
+/// into this server, with a machine-readable reason the UI can surface.
+async fn get_canvas_sam3_status() -> Json<serde_json::Value> {
+    let service_ready = tokio::time::timeout(
+        Duration::from_millis(300),
+        tokio::net::TcpStream::connect("127.0.0.1:7812"),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    Json(json!({
+        "available": service_ready,
+        "api_port": 7812,
+        "modes": ["text", "points", "exemplar"],
+        "reason": if service_ready { "" } else { "SAM3 model is installed but the local mask service on port 7812 is not ready" },
+    }))
+}
+
+/// POST /canvas/sam3/prepare — release an idle image worker before the browser
+/// calls the standalone SAM3 service. Krea2 can retain about 20 GiB after a
+/// 1024px edit; without this handshake SAM3 can fail even though both services
+/// are individually healthy. An active generation wins the race and returns
+/// 409 rather than being interrupted.
+async fn post_canvas_sam3_prepare(State(st): State<AppState>) -> Response {
+    let (evict_tx, evict_rx) = std::sync::mpsc::channel();
+    if st.ctl.send(DriverCtl::PrepareSam(evict_tx)).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "image worker driver unavailable before SAM3"})),
+        )
+            .into_response();
+    }
+    match evict_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(true) => (StatusCode::OK, Json(json!({"prepared": true}))).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "image generation is active; retry object selection when it finishes"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "timed out preparing GPU for SAM3"})),
+        )
+            .into_response(),
+    }
+}
+
 // ── /upload/image + /upload/mask — land a PNG on disk for the worker's path-based
 //    img2img / inpaint flow (init_image / mask_image are FILESYSTEM PATHS to the
 //    worker, never inline bytes). The Konva canvas paints a mask / drops an init
@@ -3514,10 +3763,10 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn measured_non_reclaiming_workers_recycle_per_job() {
+    fn only_measured_non_resident_workers_recycle_per_job() {
         assert!(kind_requires_per_job_recycle("sd3"));
-        assert!(kind_requires_per_job_recycle("zimage"));
         for kind in [
+            "zimage",
             "qwenimage",
             "sdxl",
             "flux2",
@@ -3528,6 +3777,14 @@ mod endpoint_tests {
             "ideogram4",
         ] {
             assert!(!kind_requires_per_job_recycle(kind), "kind={kind}");
+        }
+    }
+
+    #[test]
+    fn sam_keeps_only_the_measured_safe_resident_edit_worker() {
+        assert!(kind_can_share_gpu_with_sam("zimage"));
+        for kind in ["krea2", "ideogram4", "qwenimage", "sd3", "sdxl"] {
+            assert!(!kind_can_share_gpu_with_sam(kind), "kind={kind}");
         }
     }
 
@@ -3597,6 +3854,50 @@ mod endpoint_tests {
         let (params, _, _) = params_from_generate_request(req, "job-krea-turbo", "/tmp/out");
         assert_eq!(params.steps, 8);
         assert_eq!(params.cfg, 0.0);
+    }
+
+    #[test]
+    fn generate_request_preserves_complete_krea_lanpaint_controls() {
+        let req: GenerateRequest = serde_json::from_value(json!({
+            "model": "krea2-turbo",
+            "prompt": "a hand wearing a red glove",
+            "width": 1024,
+            "height": 1024,
+            "steps": 8,
+            "cfg": 1.0,
+            "sampler": "euler",
+            "scheduler": "simple",
+            "creativity": 1.0,
+            "init_image": "/tmp/source.png",
+            "mask_image": "/tmp/source.png",
+            "lanpaint_mask_channel": "load_image_mask",
+            "lanpaint_mask_blend_overlap": 9,
+            "lanpaint_num_steps": 5,
+            "lanpaint_lambda": 16.0,
+            "lanpaint_step_size": 0.2,
+            "lanpaint_beta": 1.0,
+            "lanpaint_friction": 15.0,
+            "lanpaint_prompt_mode": "Image First",
+            "lanpaint_inpainting_mode": "Image Inpainting",
+            "lanpaint_early_stop": 1,
+            "lanpaint_inner_threshold": 0.0,
+            "lanpaint_inner_patience": 1
+        }))
+        .unwrap();
+        let (params, hires_scale, _) =
+            params_from_generate_request(req, "job-krea-lanpaint", "/tmp/out");
+        assert_eq!(params.lanpaint_mask_blend_overlap, 9);
+        assert_eq!(params.lanpaint_num_steps, 5);
+        assert_eq!(params.lanpaint_lambda, 16.0);
+        assert_eq!(params.lanpaint_step_size, 0.2);
+        assert_eq!(params.lanpaint_beta, 1.0);
+        assert_eq!(params.lanpaint_friction, 15.0);
+        assert_eq!(params.lanpaint_prompt_mode, "Image First");
+        assert_eq!(params.lanpaint_early_stop, 1);
+        assert_eq!(
+            validate_generate_prequeue(&params, hires_scale).unwrap(),
+            ModelFamily::Krea2
+        );
     }
 
     #[test]
@@ -3700,11 +4001,11 @@ mod endpoint_tests {
             .unwrap_err()
             .contains("LoRA"));
 
-        params = valid_t2i_params("zimage");
+        params = valid_t2i_params("sdxl");
         params.init_image = "/tmp/init.png".to_string();
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
-            .contains("image-to-image"));
+            .contains("admitted only for Z-Image"));
 
         params = valid_t2i_params("zimage");
         params.vae = "sdxl_vae.safetensors".to_string();
@@ -3962,8 +4263,8 @@ mod endpoint_tests {
             "output/run_serenity_ui"
         );
         assert_eq!(doc["output_contract"]["location_field"], "output_location");
-        assert_eq!(doc["global_limits"]["txt2img_only"], true);
-        assert_eq!(doc["global_limits"]["image_to_image"], false);
+        assert_eq!(doc["global_limits"]["txt2img_only"], false);
+        assert_eq!(doc["global_limits"]["image_to_image"], true);
         assert_eq!(
             doc["global_limits"]["runtime_dependency_on_external_repos"],
             false
@@ -3993,8 +4294,6 @@ mod endpoint_tests {
             let entry = backend(name);
             assert_eq!(entry["production_status"], "admitted");
             assert_eq!(entry["features"]["text_to_image"]["supported"], true);
-            assert_eq!(entry["features"]["image_to_image"]["supported"], false);
-            assert_eq!(entry["features"]["image_to_image"]["policy"], "fail_loud");
             assert_eq!(entry["features"]["outpaint"]["supported"], false);
             assert_eq!(entry["features"]["outpaint"]["policy"], "fail_loud");
             assert_eq!(entry["features"]["vae_override"]["supported"], false);
@@ -4002,6 +4301,29 @@ mod endpoint_tests {
         }
 
         let zimage = backend("zimage");
+        assert_eq!(zimage["features"]["image_to_image"]["supported"], true);
+        assert_eq!(zimage["features"]["inpaint"]["supported"], true);
+        for name in [
+            "ideogram4",
+            "sdxl",
+            "anima",
+            "sd3",
+            "qwenimage",
+            "flux",
+            "flux2",
+            "sensenova",
+            "krea2",
+            "chroma",
+        ] {
+            assert_eq!(
+                backend(name)["features"]["image_to_image"]["supported"],
+                false
+            );
+            assert_eq!(
+                backend(name)["features"]["image_to_image"]["policy"],
+                "fail_loud"
+            );
+        }
         assert_eq!(zimage["features"]["negative_prompt"]["supported"], true);
         assert_eq!(zimage["features"]["lora"]["supported"], true);
         assert!(zimage["samplers"]["supported_schedulers"]
@@ -4238,9 +4560,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/health", get(get_health))
         .route("/v1/samplers", get(get_samplers))
         .route("/v1/capabilities", get(get_capabilities))
+        .route("/canvas/sam3/status", get(get_canvas_sam3_status))
+        .route("/canvas/sam3/prepare", post(post_canvas_sam3_prepare))
         // Phase 6 — mask/image upload seam: land a PNG on disk so the worker's
         // path-based img2img/inpaint flow (init_image/mask_image) can read it.
-        .route("/upload/image", post(post_upload_image))
+        // Browser-selected source/style PNGs routinely exceed Axum's 2 MiB
+        // default multipart ceiling. Keep this aligned with the endpoint's
+        // existing explicit 16 MiB JSON-body cap.
+        .route(
+            "/upload/image",
+            post(post_upload_image).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/upload/mask", post(post_upload_mask))
         .route("/v1/models", get(models::get_models))
         .route("/v1/llms", get(magic::get_llms))

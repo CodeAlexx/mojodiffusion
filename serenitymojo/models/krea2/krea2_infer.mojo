@@ -26,7 +26,9 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.cap_cache import load_tensor_bin
 from serenitymojo.io.env import env_or
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import reshape, concat, slice, permute, zeros_device
+from serenitymojo.ops.tensor_algebra import (
+    add, sub, mul_scalar, reshape, concat, slice, permute, zeros_device,
+)
 from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.random_torch import randn_torch
@@ -34,6 +36,11 @@ from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
 from serenitymojo.sampling.krea2_sampler import (
     krea2_packed_seq_len, krea2_timesteps, krea2_cfg, krea2_euler_step,
+)
+from serenitymojo.sampling.inpaint import (
+    mask_blend, lanpaint_coef_c, lanpaint_flow_score,
+    lanpaint_overdamped_advance, LanPaintDampedStep,
+    lanpaint_damped_advance,
 )
 from serenitymojo.models.krea2.krea2_cache_reader import (
     krea2_patchify, krea2_build_pos, krea2_build_refiner_mask,
@@ -51,6 +58,7 @@ from serenitymojo.models.krea2.krea2_stack import (
     Krea2ResidentFp8, build_krea2_resident_fp8,
     Krea2ResidentInt8, build_krea2_resident_int8,
 )
+from serenitymojo.models.dit.krea2_dit import Krea2HostInt8Inf
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice, lora_adapter_to_device
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import NamedLora, load_lora_for_resume
@@ -409,6 +417,103 @@ def load_krea2_stack_lora(
 # progress. Hoisted verbatim from train_krea2._krea2_sample_resident_latent +
 # _krea2_decode_latent_to_png.
 # ══════════════════════════════════════════════════════════════════════════════
+struct Krea2ComfyVelocityPair(Movable):
+    """Normal and BIG-guidance flow velocities from one cond/uncond pair.
+
+    LanPaint's Comfy sampler uses textbook CFG (`uncond + cfg*(cond-uncond)`),
+    which intentionally differs from Krea's creator T2I guidance helper.
+    """
+
+    var normal: Tensor
+    var big: Tensor
+
+    def __init__(out self, var normal: Tensor, var big: Tensor):
+        self.normal = normal^
+        self.big = big^
+
+
+def _krea2_comfy_cfg(
+    v_cond: Tensor, v_uncond: Tensor, scale: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    var diff = sub(v_cond, v_uncond, ctx)
+    return add(v_uncond, mul_scalar(diff, scale, ctx), ctx)
+
+
+def krea2_predict_comfy_velocity_pair[
+    LH: Int, LW: Int, LTMAX: Int, LFULL: Int
+](
+    st: ShardedSafeTensors,
+    key_prefix: String,
+    cond_w: Krea2ResidentCond,
+    fin: Krea2StreamFinal,
+    lora: Krea2StackLora,
+    cond: Krea2InlineCond,
+    uncond: Krea2InlineCond,
+    latent: Tensor,
+    timestep: Float32,
+    cfg_scale: Float32,
+    cfg_big: Float32,
+    resident: Optional[Krea2ResidentFp8],
+    resident_i8: Optional[Krea2ResidentInt8],
+    host_i8: Optional[Krea2HostInt8Inf],
+    ctx: DeviceContext,
+) raises -> Krea2ComfyVelocityPair:
+    """One Krea2 flow-model evaluation for the LanPaint inner loop.
+
+    The unconditional stack is skipped when both Comfy guidance scales are 1.
+    That is the verified Krea2-Turbo/Image-First profile, so each LanPaint
+    iteration costs one DiT forward instead of two.
+    """
+    comptime imglen = (LH // 2) * (LW // 2)
+    comptime assert LFULL == LTMAX + imglen, "Krea2 LanPaint LFULL mismatch"
+
+    var img_tokens_f32 = krea2_patchify[LH, LW](latent, ctx)
+    var img_tokens = torch_f32_to_bf16_rne(img_tokens_f32, ctx)
+    var t_t = _t_scalar(timestep, ctx)
+    var c = build_conditioning[LTMAX, LFULL](
+        cond_w, img_tokens, cond.context[], cond.pos[], t_t, cond.text_len, ctx,
+    )
+    var real_len_c = Optional[Int](cond.text_len + imglen)
+    var pred_c = krea2_stack_lora_forward_streamed[
+        LFULL, HEADS, KVHEADS, HEADDIM
+    ](
+        c.combined, c.blk_vec, c.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
+        resident_i8=resident_i8, host_i8_inf=host_i8,
+    )
+    var v_c = pred_c.velocity[].clone(ctx)
+
+    if cfg_scale == Float32(1.0) and cfg_big == Float32(1.0):
+        var v_c_f32 = cast_tensor(v_c, STDtype.F32, ctx)
+        var v_c_latent = _unpatch[LH, LW](v_c_f32, ctx)
+        return Krea2ComfyVelocityPair(v_c_latent.clone(ctx), v_c_latent^)
+
+    _ = pred_c^
+    ctx.synchronize()
+    var u = build_conditioning[LTMAX, LFULL](
+        cond_w, img_tokens, uncond.context[], uncond.pos[], t_t,
+        uncond.text_len, ctx,
+    )
+    var real_len_u = Optional[Int](uncond.text_len + imglen)
+    var pred_u = krea2_stack_lora_forward_streamed[
+        LFULL, HEADS, KVHEADS, HEADDIM
+    ](
+        u.combined, u.blk_vec, u.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        u.cos, u.sin, EPS, uncond.text_len, imglen, ctx, real_len_u, resident,
+        resident_i8=resident_i8, host_i8_inf=host_i8,
+    )
+    var v_u = pred_u.velocity[].clone(ctx)
+    var v_normal_bf16 = _krea2_comfy_cfg(v_c, v_u, cfg_scale, ctx)
+    var v_big_bf16 = _krea2_comfy_cfg(v_c, v_u, cfg_big, ctx)
+    var v_normal_f32 = cast_tensor(v_normal_bf16, STDtype.F32, ctx)
+    var v_big_f32 = cast_tensor(v_big_bf16, STDtype.F32, ctx)
+    var v_normal = _unpatch[LH, LW](v_normal_f32, ctx)
+    var v_big = _unpatch[LH, LW](v_big_f32, ctx)
+    return Krea2ComfyVelocityPair(v_normal^, v_big^)
+
+
 def krea2_sample_latent[LH: Int, LW: Int, LTMAX: Int, LFULL: Int](
     st: ShardedSafeTensors,
     key_prefix: String,
@@ -511,6 +616,358 @@ def krea2_sample_latent[LH: Int, LW: Int, LTMAX: Int, LFULL: Int](
                 print("[krea2-infer] progress IPC skipped:", String(e))
         if si == 0 or si + 1 == sample_steps or (si + 1) % 5 == 0:
             print("[krea2-infer] step", si + 1, "/", sample_steps, " t=", t_cur)
+    return latent^
+
+
+def _lanpaint_combined_c(
+    x_t: Tensor,
+    score: Tensor,
+    preserve_mask: Tensor,
+    a_unknown: Float32,
+    a_known: Float32,
+    abt: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var c_unknown = lanpaint_coef_c(x_t, score, a_unknown, abt, ctx)
+    var c_known = lanpaint_coef_c(x_t, score, a_known, abt, ctx)
+    return mask_blend(preserve_mask, c_known, c_unknown, ctx)
+
+
+def _lanpaint_branch_advance(
+    x_t: Tensor,
+    c: Tensor,
+    noise: Tensor,
+    preserve_mask: Tensor,
+    a_unknown: Float32,
+    dt_unknown: Float32,
+    a_known: Float32,
+    dt_known: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var x_unknown = lanpaint_overdamped_advance(
+        x_t, c, noise, a_unknown, dt_unknown, ctx
+    )
+    var x_known = lanpaint_overdamped_advance(
+        x_t, c, noise, a_known, dt_known, ctx
+    )
+    return mask_blend(preserve_mask, x_known, x_unknown, ctx)
+
+
+def _lanpaint_branch_c_kick(
+    x_t: Tensor,
+    c_new: Tensor,
+    c_previous: Tensor,
+    preserve_mask: Tensor,
+    dt_unknown: Float32,
+    dt_known: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var delta = sub(c_new, c_previous, ctx)
+    var x_unknown = add(x_t, mul_scalar(delta, dt_unknown, ctx), ctx)
+    var x_known = add(x_t, mul_scalar(delta, dt_known, ctx), ctx)
+    return mask_blend(preserve_mask, x_known, x_unknown, ctx)
+
+
+struct Krea2LanPaintDampedBranch(Movable):
+    var x: Tensor
+    var velocity: Tensor
+
+    def __init__(out self, var x: Tensor, var velocity: Tensor):
+        self.x = x^
+        self.velocity = velocity^
+
+
+def _lanpaint_branch_damped_advance(
+    x_t: Tensor,
+    velocity: Tensor,
+    c: Tensor,
+    noise_y: Tensor,
+    noise_v: Tensor,
+    preserve_mask: Tensor,
+    gamma: Float32,
+    a_unknown: Float32,
+    dt_unknown: Float32,
+    a_known: Float32,
+    dt_known: Float32,
+    ctx: DeviceContext,
+) raises -> Krea2LanPaintDampedBranch:
+    var unknown = lanpaint_damped_advance(
+        x_t, velocity, c, noise_y, noise_v,
+        gamma, a_unknown, dt_unknown, ctx,
+    )
+    var known = lanpaint_damped_advance(
+        x_t, velocity, c, noise_y, noise_v,
+        gamma, a_known, dt_known, ctx,
+    )
+    var x_next = mask_blend(preserve_mask, known.x, unknown.x, ctx)
+    var v_next = mask_blend(
+        preserve_mask, known.velocity, unknown.velocity, ctx
+    )
+    return Krea2LanPaintDampedBranch(x_next^, v_next^)
+
+
+def _lanpaint_branch_velocity_kick(
+    velocity: Tensor,
+    c_new: Tensor,
+    c_previous: Tensor,
+    preserve_mask: Tensor,
+    gamma: Float32,
+    dt_unknown: Float32,
+    dt_known: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    # Upstream run_damped midpoint correction:
+    #   v += sqrt(Gamma) * (C_new - C_previous) * dt
+    var delta = sub(c_new, c_previous, ctx)
+    var sqrt_gamma = gamma ** 0.5
+    var v_unknown = add(
+        velocity, mul_scalar(delta, sqrt_gamma * dt_unknown, ctx), ctx
+    )
+    var v_known = add(
+        velocity, mul_scalar(delta, sqrt_gamma * dt_known, ctx), ctx
+    )
+    return mask_blend(preserve_mask, v_known, v_unknown, ctx)
+
+
+def krea2_sample_lanpaint_latent[
+    LH: Int, LW: Int, LTMAX: Int, LFULL: Int
+](
+    st: ShardedSafeTensors,
+    key_prefix: String,
+    cond_w: Krea2ResidentCond,
+    fin: Krea2StreamFinal,
+    lora: Krea2StackLora,
+    cond: Krea2InlineCond,
+    uncond: Krea2InlineCond,
+    source_latent: Tensor,
+    preserve_mask: Tensor,
+    sample_steps: Int,
+    cfg_scale: Float32,
+    seed: UInt64,
+    lanpaint_num_steps: Int,
+    lanpaint_lambda: Float32,
+    lanpaint_step_size: Float32,
+    lanpaint_beta: Float32,
+    lanpaint_friction: Float32,
+    lanpaint_prompt_mode: String,
+    lanpaint_early_stop: Int,
+    resident: Optional[Krea2ResidentFp8],
+    resident_i8: Optional[Krea2ResidentInt8],
+    host_i8: Optional[Krea2HostInt8Inf],
+    ctx: DeviceContext,
+    use_fixed_mu_1_15: Bool = False,
+    progress_fd: Int32 = Int32(-1),
+) raises -> Tensor:
+    """Krea2 flow sampling with LanPaint's damped SHO inner integrator.
+
+    This follows upstream LanPaint's run_damped trajectory: exact stochastic
+    harmonic-oscillator advances, midpoint C refresh, velocity kick, known-mask
+    replacement, flow/VP conversion, and the outer Euler update. Model calls,
+    sampler math, noise tensors, and latent state all execute in Mojo.
+    """
+    comptime imglen = (LH // 2) * (LW // 2)
+    comptime assert LFULL == LTMAX + imglen, "Krea2 LanPaint LFULL mismatch"
+    if sample_steps < 1:
+        raise Error("krea2 LanPaint: sample steps must be >= 1")
+    if lanpaint_num_steps < 0:
+        raise Error("krea2 LanPaint: inner steps must be >= 0")
+    if lanpaint_step_size <= Float32(0.0):
+        raise Error("krea2 LanPaint: step size must be > 0")
+    if lanpaint_beta <= Float32(0.0):
+        raise Error("krea2 LanPaint: beta must be > 0")
+    if lanpaint_friction <= Float32(0.0):
+        raise Error("krea2 LanPaint: friction must be > 0")
+
+    var base_noise = randn_torch([1, 16, LH, LW], seed, ctx)
+    var latent = base_noise.clone(ctx)
+    var seq = krea2_packed_seq_len(LH * 8, LW * 8)
+    var ts = krea2_timesteps(
+        seq, sample_steps,
+        mu_override=Float32(1.15),
+        use_mu_override=use_fixed_mu_1_15,
+    )
+    var cfg_big = cfg_scale
+    if lanpaint_prompt_mode.lower().find("prompt first") >= 0:
+        cfg_big = Float32(-0.5)
+    print(
+        "[krea2-lanpaint] damped steps=", sample_steps,
+        " inner=", lanpaint_num_steps, " cfg=", cfg_scale,
+        " cfg_big=", cfg_big, " lambda=", lanpaint_lambda,
+        " step_size=", lanpaint_step_size, " beta=", lanpaint_beta,
+        " friction=", lanpaint_friction,
+    )
+
+    for si in range(sample_steps):
+        var t_cur = ts[si]
+        var t_prev = ts[si + 1]
+        var one_minus_t = Float32(1.0) - t_cur
+        var denom = one_minus_t * one_minus_t + t_cur * t_cur
+        var abt = (one_minus_t * one_minus_t) / denom
+        var vp_factor = abt ** 0.5 + (Float32(1.0) - abt) ** 0.5
+
+        # Comfy flow noise_scaling(t, noise, source), then replace only known
+        # pixels before switching to LanPaint's VP notation.
+        var known_noised = add(
+            mul_scalar(source_latent, one_minus_t, ctx),
+            mul_scalar(base_noise, t_cur, ctx),
+            ctx,
+        )
+        latent = mask_blend(preserve_mask, known_noised, latent, ctx)
+        var x_t = mul_scalar(latent, vp_factor, ctx)
+
+        var a_unknown = Float32(1.0) / (Float32(1.0) - abt)
+        var a_known = (Float32(1.0) + lanpaint_lambda) / (Float32(1.0) - abt)
+        var dt_unknown = lanpaint_step_size * (Float32(1.0) - abt)
+        var dt_known = dt_unknown * lanpaint_beta
+        # prepare_step_size() in upstream LanPaint reduces both branches to the
+        # same Gamma; beta changes dt_known, not this friction coefficient.
+        var gamma = (
+            lanpaint_friction * lanpaint_friction
+            / (Float32(0.2) * (Float32(1.0) - abt))
+        )
+        var inner_steps = lanpaint_num_steps
+        if sample_steps - si <= lanpaint_early_stop:
+            inner_steps = 0
+        var c_state = Optional[Tensor](None)
+        var velocity_state = Optional[Tensor](None)
+
+        for li in range(inner_steps):
+            if li > 0:
+                var c_previous = c_state[].clone(ctx)
+                var velocity_previous = velocity_state[].clone(ctx)
+                var noise_y_half = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000000 + si * 65536 + li * 8),
+                    ctx,
+                )
+                var noise_v_half = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000001 + si * 65536 + li * 8),
+                    ctx,
+                )
+                var first_half = _lanpaint_branch_damped_advance(
+                    x_t, velocity_previous, c_previous,
+                    noise_y_half, noise_v_half, preserve_mask, gamma,
+                    a_unknown, dt_unknown * 0.5,
+                    a_known, dt_known * 0.5, ctx,
+                )
+                # Clone both fields so the move-only result remains whole for
+                # destruction; each latent copy is tiny beside one DiT call.
+                x_t = first_half.x.clone(ctx)
+                velocity_state = Optional[Tensor](
+                    first_half.velocity.clone(ctx)
+                )
+
+            var x_model = mul_scalar(x_t, Float32(1.0) / vp_factor, ctx)
+            var pair = krea2_predict_comfy_velocity_pair[
+                LH, LW, LTMAX, LFULL
+            ](
+                st, key_prefix, cond_w, fin, lora, cond, uncond,
+                x_model, t_cur, cfg_scale, cfg_big,
+                resident, resident_i8, host_i8, ctx,
+            )
+            var x0 = sub(x_model, mul_scalar(pair.normal, t_cur, ctx), ctx)
+            var x0_big = sub(x_model, mul_scalar(pair.big, t_cur, ctx), ctx)
+            var score = lanpaint_flow_score(
+                x_t, x0, x0_big, source_latent, preserve_mask,
+                lanpaint_lambda, ctx,
+            )
+            var c_new = _lanpaint_combined_c(
+                x_t, score, preserve_mask, a_unknown, a_known, abt, ctx
+            )
+
+            if li == 0:
+                # D=sqrt(2), so upstream's v0=randn*D/sqrt(2) is randn.
+                var velocity_initial = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000000 + si * 65536),
+                    ctx,
+                )
+                var noise_y_full = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000001 + si * 65536),
+                    ctx,
+                )
+                var noise_v_full = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000002 + si * 65536),
+                    ctx,
+                )
+                var full = _lanpaint_branch_damped_advance(
+                    x_t, velocity_initial, c_new,
+                    noise_y_full, noise_v_full, preserve_mask, gamma,
+                    a_unknown, dt_unknown, a_known, dt_known, ctx,
+                )
+                x_t = full.x.clone(ctx)
+                velocity_state = Optional[Tensor](full.velocity.clone(ctx))
+            else:
+                var c_previous = c_state[].clone(ctx)
+                var velocity_kicked = _lanpaint_branch_velocity_kick(
+                    velocity_state[], c_new, c_previous, preserve_mask,
+                    gamma, dt_unknown, dt_known, ctx,
+                )
+                var noise_y_half = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000002 + si * 65536 + li * 8),
+                    ctx,
+                )
+                var noise_v_half = randn_torch(
+                    [1, 16, LH, LW],
+                    seed + UInt64(1000003 + si * 65536 + li * 8),
+                    ctx,
+                )
+                var second_half = _lanpaint_branch_damped_advance(
+                    x_t, velocity_kicked, c_previous,
+                    noise_y_half, noise_v_half, preserve_mask, gamma,
+                    a_unknown, dt_unknown * 0.5,
+                    a_known, dt_known * 0.5, ctx,
+                )
+                x_t = second_half.x.clone(ctx)
+                velocity_state = Optional[Tensor](
+                    second_half.velocity.clone(ctx)
+                )
+            c_state = Optional[Tensor](c_new^)
+
+        # KSampler sees the advanced model-space x plus a denoised x0. Convert
+        # that pair back into the velocity used by Krea's outer Euler update.
+        var advanced_x = mul_scalar(x_t, Float32(1.0) / vp_factor, ctx)
+        var final_pair = krea2_predict_comfy_velocity_pair[
+            LH, LW, LTMAX, LFULL
+        ](
+            st, key_prefix, cond_w, fin, lora, cond, uncond,
+            advanced_x, t_cur, cfg_scale, cfg_scale,
+            resident, resident_i8, host_i8, ctx,
+        )
+        var final_x0 = sub(
+            advanced_x, mul_scalar(final_pair.normal, t_cur, ctx), ctx
+        )
+        var denoised = mask_blend(
+            preserve_mask, source_latent, final_x0, ctx
+        )
+        if t_cur <= Float32(1.0e-6):
+            latent = denoised^
+        else:
+            var effective_v = mul_scalar(
+                sub(advanced_x, denoised, ctx), Float32(1.0) / t_cur, ctx
+            )
+            latent = krea2_euler_step(
+                advanced_x, effective_v, t_cur, t_prev, ctx
+            )
+        ctx.synchronize()
+
+        if progress_fd >= 0:
+            try:
+                write_msg(
+                    progress_fd,
+                    String("{\"ev\":\"progress\",\"step\":")
+                    + String(si + 1)
+                    + String(",\"total\":")
+                    + String(sample_steps)
+                    + String(",\"phase\":\"sampling\",\"preview\":\"\"}"),
+                )
+            except e:
+                print("[krea2-lanpaint] progress IPC skipped:", String(e))
+        print("[krea2-lanpaint] step", si + 1, "/", sample_steps, " t=", t_cur)
     return latent^
 
 

@@ -1,12 +1,14 @@
-# sampling/parity/inpaint_parity.mojo — mask-blend + overdamped LanPaint step
-# parity gate against a hand-computed oracle, all on synthetic latents.
+# sampling/parity/inpaint_parity.mojo — LanPaint primitive parity on synthetic
+# latents, including a fixed-noise upstream Python SHO oracle.
 #
-# Self-contained: no model weights. Three checks:
+# Self-contained: no model weights. Five checks:
 #   (1) mask_blend endpoints exact: mask=1 → base, mask=0 → denoised.
 #   (2) mask_blend with a mixed mask: cos >= 0.999 vs hand oracle, AND exact
 #       per-lane (within F32 tol).
 #   (3) lanpaint_overdamped_step: one step vs an open-coded scalar oracle of
 #       the same OU closed form, cos >= 0.999 and exact per-lane.
+#   (4) flow-score splice and the stable A→0 overdamped branch.
+#   (5) damped SHO position/velocity vs upstream LanPaint Python coefficients.
 #
 # PARITY-BITROT GUARD: pass `--bitrot` to flip the blend convention in the
 # *oracle* (uses (1-mask) for base instead of mask). The module's (correct)
@@ -18,14 +20,17 @@
 #   (append `--bitrot` for the deliberate-wrong exit-1 demo)
 
 from std.collections import List
-from sys import argv
-from math import exp, sqrt
+from std.sys import argv
+from std.math import exp, sqrt
 from std.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.sampling.inpaint import (
     mask_blend,
+    lanpaint_flow_score,
+    lanpaint_damped_advance,
+    lanpaint_overdamped_advance,
     lanpaint_overdamped_step,
 )
 
@@ -71,7 +76,7 @@ def main() raises:
             bitrot = True
 
     var ctx = DeviceContext()
-    print("=== inpaint mask-blend + LanPaint overdamped parity ===" + (" [BITROT]" if bitrot else ""))
+    print("=== inpaint mask-blend + LanPaint flow/damped/overdamped parity ===" + (" [BITROT]" if bitrot else ""))
 
     var N = 8
     # Synthetic latents.
@@ -170,4 +175,73 @@ def main() raises:
     if x_next.dtype() != STDtype.F32:
         raise Error("lanpaint step must preserve F32 latent dtype")
 
-    print("PASS: inpaint mask-blend + LanPaint overdamped step parity")
+    # ---- (4) flow score splice + A->0 OU limit ----
+    var x0_v = List[Float32]()
+    var x0_big_v = List[Float32]()
+    var source_v = List[Float32]()
+    for i in range(N):
+        x0_v.append(x_v[i] * 0.7 + 0.15)
+        x0_big_v.append(x_v[i] * 0.5 - 0.05)
+        source_v.append(Float32(i) * 0.03 - 0.2)
+    var x0 = Tensor.from_host(x0_v, _shape(N), STDtype.F32, ctx)
+    var x0_big = Tensor.from_host(x0_big_v, _shape(N), STDtype.F32, ctx)
+    var source = Tensor.from_host(source_v, _shape(N), STDtype.F32, ctx)
+    var lamb: Float32 = 3.0
+    var flow_score = lanpaint_flow_score(
+        x_t, x0, x0_big, source, mask, lamb, ctx
+    )
+    var flow_score_h = flow_score.to_host(ctx)
+    for i in range(N):
+        var score_x = x0_v[i] - x_v[i]
+        var score_y = (
+            -(1.0 + lamb) * (x_v[i] - source_v[i])
+            + lamb * (x_v[i] - x0_big_v[i])
+        )
+        var expected = mask_v[i] * score_y + (1.0 - mask_v[i]) * score_x
+        _check_close("flow score lane" + String(i), flow_score_h[i], expected, 1.0e-4)
+    print("  lanpaint_flow_score: tensor == oracle  OK")
+
+    # At A=0, k=k2=dt exactly. This also guards the production small-A path.
+    var c_zero = Tensor.from_host(score_v, _shape(N), STDtype.F32, ctx)
+    var dt_zero: Float32 = 0.125
+    var zero_advance = lanpaint_overdamped_advance(
+        x_t, c_zero, noise, Float32(0.0), dt_zero, ctx
+    )
+    var zero_h = zero_advance.to_host(ctx)
+    var zero_sd = sqrt(2.0 * dt_zero)
+    for i in range(N):
+        var expected = x_v[i] + dt_zero * score_v[i] + zero_sd * noise_v[i]
+        _check_close("A0 advance lane" + String(i), zero_h[i], expected, 1.0e-4)
+    print("  lanpaint_overdamped_advance A->0: tensor == oracle  OK")
+
+    # ---- (5) damped SHO step vs upstream Python LanPaint.utils ----
+    # The expected vectors were produced by StochasticHarmonicOscillator with
+    # its MultivariateNormal sample patched to consume the supplied z_y/z_v.
+    var v0_v: List[Float32] = [0.20, -0.10, 0.30, -0.20, 0.10, 0.0, -0.30, 0.25]
+    var c_v: List[Float32] = [0.15, 0.10, 0.05, 0.0, -0.05, -0.10, -0.15, -0.20]
+    var zy_v: List[Float32] = [-0.4, 0.0, 0.4, -0.2, 0.2, -0.3, 0.3, 0.1]
+    var zv_v: List[Float32] = [0.1, -0.3, 0.2, 0.4, -0.4, 0.0, 0.3, -0.2]
+    var expected_x: List[Float32] = [
+        -0.40322757, -0.15491638, 0.10665154, -0.09252832,
+        0.16714579, 0.01991153, 0.35696343, 0.35515004,
+    ]
+    var expected_v: List[Float32] = [
+        0.09807198, -0.29144678, 0.21770227, 0.39278099,
+        -0.39681122, -0.01870697, 0.29813609, -0.21291317,
+    ]
+    var v0_t = Tensor.from_host(v0_v, _shape(N), STDtype.F32, ctx)
+    var c_t = Tensor.from_host(c_v, _shape(N), STDtype.F32, ctx)
+    var zy_t = Tensor.from_host(zy_v, _shape(N), STDtype.F32, ctx)
+    var zv_t = Tensor.from_host(zv_v, _shape(N), STDtype.F32, ctx)
+    var damped = lanpaint_damped_advance(
+        x_t, v0_t, c_t, zy_t, zv_t,
+        Float32(1875.0), Float32(1.0 / 0.6), Float32(0.12), ctx,
+    )
+    var damped_x_h = damped.x.to_host(ctx)
+    var damped_v_h = damped.velocity.to_host(ctx)
+    for i in range(N):
+        _check_close("damped x lane" + String(i), damped_x_h[i], expected_x[i], 2.0e-4)
+        _check_close("damped v lane" + String(i), damped_v_h[i], expected_v[i], 2.0e-4)
+    print("  lanpaint_damped_advance: upstream Python oracle  OK")
+
+    print("PASS: inpaint mask-blend + LanPaint flow/damped/overdamped parity")

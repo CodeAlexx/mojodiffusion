@@ -23,7 +23,7 @@
 # Run (oracle FIRST):
 #   cd /home/alex/mojodiffusion
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True VF_HF_ATTN_IMPL=eager \
-#     PYTHONPATH=/home/alex/Mage /home/alex/OneTrainer/venv/bin/python \
+#     PYTHONPATH=/home/alex/Mage pixi run python \
 #     serenitymojo/pipeline/parity/mageflow_edit_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   LD_LIBRARY_PATH="serenitymojo/ops/cshim/lib:<cudnn wheel lib>" \

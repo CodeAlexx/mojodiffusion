@@ -77,7 +77,10 @@ debug comparison.
 Pure-Mojo `serenity.genparams.v1` adapter used by SerenityUI's Video tab. Unlike
 the older bounded daemon smoke wrapper, it does not substitute a staged smoke
 profile: it preserves the exact request, resolves all authored LoRA rows and
-weights, validates cached conditioning against the authored prompt, and either
+weights — including the optional per-row per-stream strengths
+`video/video_to_audio/audio/audio_to_video/other` (validated `[0,1]`; the
+`LTX2LoraLoaderAdvanced` intake, only emitted when any ≠ 1.0) — validates cached
+conditioning against the authored prompt, and either
 admits the exact compiled geometry/sampler pair or fails before model loading.
 `pipeline/ltx2_t2v_av_hq.mojo` supplies atomic phase/step status plus a result
 manifest containing the executed schedule, artifact geometry/frame count,
@@ -85,6 +88,28 @@ timings, and peak-VRAM sample. Experimental acceptance evidence (2026-07-19):
 768x512, 97 frames, 24 FPS, 8-step distilled Euler, step-3000 trained LoRA,
 valid H.264 MP4, 99.47 s wall, 10,024 MiB peak; frames 0/48/96 and a 13-frame
 contact sheet were visually inspected for convergence and temporal continuity.
+
+---
+
+## lora.mojo — inference LoRA loader (`LoraSet`)
+
+**INFERENCE-only.** Opens a LoRA `.safetensors`, auto-detects its key format,
+computes `delta = scale·(B@A)`, and either **merges** into resident base weights
+(`merge_into`/`merge_into_indexed`) or **applies at-dequant** onto FP8-streamed
+LTX-2 blocks (re-added each dequant, never fused to disk). Full API + line refs in
+the repo-root `docs/MOJO_MODULES.md` "LoRA — lora.mojo" section; summary:
+
+- **5 formats** (`_detect_format`): `FMT_KOHYA_SDXL`, `FMT_LTX2_DISTILLED`,
+  **`FMT_DIFFUSION_MODEL`** (`diffusion_model.<module>.lora_A/lora_B.weight` = the
+  ai-toolkit/ComfyUI format the Wan2.2/2.1 + Klein + LTX-2 trainers save → loads
+  back with NO conversion), `FMT_ZIMAGE_TRAINER`, `FMT_KLEIN_TRAINER`.
+- **Scale** `(alpha/rank)·multiplier`; absent `.alpha` ⇒ `scale=multiplier`.
+- **KJNodes `LTX2LoraLoaderAdvanced`** (`LoraStreamMults`): five per-stream
+  strengths `video/video_to_audio/audio/audio_to_video/other`, substring-matched
+  with most-specific precedence, `0.0` drops the module; via env
+  `LTX2_TRAINED_LORA_STREAMS_{i}`, the request CLI rows, and the Rust serve node.
+- Callers: Klein (`validation_sampler`), krea2 (`krea2_pipeline --lora`), LTX-2.
+  Wan trained LoRAs are loadable but not yet wired into a Wan inference pipeline.
 
 ---
 

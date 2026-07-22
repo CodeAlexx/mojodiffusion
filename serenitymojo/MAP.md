@@ -2728,3 +2728,27 @@ NOTE: Musubi trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
   400 ad), T2V-1.3B (300 ad, ~12s/step), T2V-14B (400 ad), I2V-14B-CLIP (480 ad).
   All finite loss, LoRA saved diffusion_model.-prefixed. Perf ~106-144s/step (14B
   streamed) — a lever, not correctness. `configs/wan22_{real_smoke_2step,dual_smoke_4step}.json`.
+- **Save↔load closed**: these ai-toolkit-format saves load back through the inference
+  loader `lora.mojo` `FMT_DIFFUSION_MODEL` with NO conversion (`_map_diffusion_model`
+  strips `diffusion_model.`). No Wan *inference* pipeline wires `LoraSet` yet — the
+  files are loadable but the Wan inference apply path is a follow-up.
+
+## 2026-07-21: LoRA LOADER (`lora.mojo`) — 5-format detect + LTX2LoraLoaderAdvanced per-stream
+
+The inference LoRA loader `serenitymojo/lora.mojo` (`LoraSet`) is the single
+merge-at-load / at-dequant apply path (INFERENCE-only; `training/lora_save.mojo` is
+its inverse). Auto-detects 5 key formats (`_detect_format`, `lora.mojo:192-237`):
+`FMT_KOHYA_SDXL`, `FMT_LTX2_DISTILLED` (AV cross-modal families, matched first),
+**`FMT_DIFFUSION_MODEL`** (`diffusion_model.<mod>.lora_A/lora_B.weight` = ai-toolkit/
+ComfyUI = what the Wan/Klein/LTX2 trainers save), `FMT_ZIMAGE_TRAINER`,
+`FMT_KLEIN_TRAINER` (split→fused QKV). Scale `(alpha/rank)·multiplier`; absent
+`.alpha` ⇒ `scale=multiplier`. Resident `merge_into*` SKIPS unmatched base keys
+(not fail-loud); LTX-2 at-dequant hooks (`apply_to_av_block`,
+`attach_ltx2_block_factors*`, `accumulate_ltx2_block_deltas*`, `apply_to_globals*`)
+ARE fail-closed. **KJNodes `LTX2LoraLoaderAdvanced`** (commit `4706f99`):
+`LoraStreamMults` = five per-stream strengths `video/video_to_audio/audio/
+audio_to_video/other`, `0.0`=drop; via env `LTX2_TRAINED_LORA_STREAMS_{i}`, the
+`ltx2_request_cli` per-row fields, and the Rust serve `LTX2LoraLoaderAdvanced` node
+(`serve/workflow_graph.mojo` + `graph/execute.rs`, category `KJNodes/ltxv`). Callers:
+Klein (`validation_sampler`), krea2 (`krea2_pipeline --lora`), LTX-2 runtime.
+Full API: `docs/MOJO_MODULES.md` "LoRA — lora.mojo" + `docs/SERENITYMOJO_MODULES.md`.

@@ -368,14 +368,51 @@ training run uses to bring real Z-Image weights onto the device. Status:
 ---
 
 ## LoRA — `lora.mojo`
-**INFERENCE-only** merge-at-load LoRA (`lora.mojo:1-2` header). Loads a LoRA
-`.safetensors`, computes `delta_W = scale·(B@A)`, `scale=(alpha/rank)·multiplier`,
-and merges in place into the base weight Dict (`W[target] += delta_W`) with
-row/col/row-range slotting (`SLOT_FULL/ROWS/COLS/...`, `lora.mojo:~70+`). The
-runtime `forward_lora` overlay path is **NOT** ported (needs model-forward
-changes). Port of inference-flame `lora_merge.rs`. **NOT a training LoRA** — it
-fuses an already-trained adapter for inference. `lora_probe.mojo` is its smoke.
-Status: **INFERENCE**.
+**INFERENCE-only** LoRA loader (`LoraSet`). Opens a LoRA `.safetensors`, detects
+its key format, computes `delta = scale·(B@A)`, and either **merges** into a
+resident base weight Dict/List (`merge_into` / `merge_into_indexed`) or **applies
+at-dequant** onto FP8-streamed LTX-2 blocks (re-added every dequant, never fused
+to disk). **NOT a training LoRA** — `training/lora_save.mojo` is the exact inverse
+(save side). `lora_probe.mojo` is its smoke.
+
+**Accepted key formats** (`_detect_format`, `lora.mojo:192-237`):
+- `FMT_KOHYA_SDXL` — `lora_unet_….lora_down/.lora_up` + `.alpha` (TE `lora_te*` skipped)
+- `FMT_LTX2_DISTILLED` — `diffusion_model.…lora_A/lora_B.weight` with the cross-modal
+  AV attention families (`audio_to_video_attn`/`video_to_audio_attn`/`audio_attn1`);
+  matched BEFORE the generic DM branch (`lora.mojo:229-232`)
+- `FMT_DIFFUSION_MODEL` — **`diffusion_model.<module>.lora_A/lora_B.weight`** (peft /
+  ai-toolkit / ComfyUI); `_map_diffusion_model` strips `diffusion_model.`+`.default`,
+  appends `.weight` (`lora.mojo:411-426`). **This is the exact format the Wan2.2/2.1
+  (and Klein/LTX-2) trainers save — trained LoRAs load back with NO conversion.**
+- `FMT_ZIMAGE_TRAINER` — split `attention.to_q/k/v` → fused `attention.qkv` row-ranges
+- `FMT_KLEIN_TRAINER` — bare `<prefix>.lora_A`; EDv2 `train_klein` split→fused QKV
+  remap (`_map_klein_split_qkv`, `lora.mojo:429-467`)
+
+**Scale** (`_module_scale`, `lora.mojo:656-681`): per-module `scale=(alpha/rank)·multiplier`;
+**when `.alpha` is absent, alpha defaults to module_rank ⇒ `scale=multiplier`** (so a
+train_klein/Wan-style file that ships no `.alpha` needs the caller to pass `alpha/rank`
+as `multiplier`). LTX-2 uses `strength·(B@A)` (no alpha/rank division).
+
+**LTX-2 at-dequant runtime hooks** (distinct from resident `merge_into*`):
+`apply_to_av_block`, `attach_ltx2_block_factors*`, `accumulate_ltx2_block_deltas*`,
+`apply_to_globals*`. These are fail-closed on unmatched keys; the resident `merge_into`
+path SKIPS an absent base key (does not fail-loud, `lora.mojo:751-752`).
+
+**KJNodes `LTX2LoraLoaderAdvanced` — per-stream strengths** (commit `4706f99`):
+`LoraStreamMults` POD (`lora.mojo:101-142`) = five multipliers
+`video / video_to_audio / audio / audio_to_video / other`, matched by key substring
+with KJ most-specific precedence (`mult_for_key`); a `0.0` slider drops the module
+after fail-closed validation. `_streamed` overloads on all four LTX-2 apply seams
+(`lora.mojo:865-1112`); non-streamed methods delegate via `LoraStreamMults.identity()`.
+Exposed via env `LTX2_TRAINED_LORA_STREAMS_{i}` (five comma-joined floats), the
+`ltx2_request_cli` per-row `video/video_to_audio/audio/audio_to_video/other` fields
+(validated `[0,1]`; default rows stay byte-identical), and the Rust serve
+`LTX2LoraLoaderAdvanced` node (`serve/workflow_graph.mojo` + `graph/execute.rs`).
+
+**Callers today**: Klein (`training/validation_sampler.mojo`), krea2 inference
+(`pipeline/krea2_pipeline.mojo --lora`), LTX-2 runtime. NOTE: no Wan *inference*
+pipeline calls `LoraSet` yet — Wan trained LoRAs are loadable (FMT_DIFFUSION_MODEL)
+but not yet wired into a Wan inference run. Status: **INFERENCE**.
 
 ---
 

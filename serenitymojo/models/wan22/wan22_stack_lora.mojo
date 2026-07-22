@@ -15,12 +15,14 @@
 #       e = (block_mod + e0)  [S,6,dim]  then chunk(6) -> shift_sa, scale_sa,
 #           gate_sa, shift_ffn, scale_ffn, gate_ffn  (each [S,dim])
 #   - head.modulation [1,2,dim] + e_head [1,S,dim] -> head shift/scale [1,S,dim]
-#   - LoRA targets: 8 per block — self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}
-#     (wan22.rs:199-206). in=out=dim each. 40 blocks -> 320 adapters.
+#   - LoRA targets: 10 per block — self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}
+#     (in=out=dim each) + ffn.0 (dim->ffn) + ffn.2 (ffn->dim), matching Musubi's
+#     wrapped-linear set. 40 blocks -> 400 adapters.
 #   - CHECKPOINT KEYS: blocks.{i}.self_attn.q.weight etc. (NOT fused).
 #
-# CARRIER DESIGN: Wan22LoraSet has a flat List[LoraAdapter], 8 slots per block.
-# Slot order per block: sa_q, sa_k, sa_v, sa_o, ca_q, ca_k, ca_v, ca_o.
+# CARRIER DESIGN: Wan22LoraSet has a flat List[LoraAdapter], 10 slots per block.
+# Slot order per block: sa_q, sa_k, sa_v, sa_o, ca_q, ca_k, ca_v, ca_o, ffn0, ffn2
+# (the ffn slots are non-square: ffn0 A=[r,dim]/B=[ffn,r]; ffn2 A=[r,ffn]/B=[dim,r]).
 #
 # MODULATION PROVIDER: the frozen time embedding chain + per-block modulation
 # weights. In training scope the modulation chain IS frozen (LoRA only adapts
@@ -63,6 +65,8 @@ from serenitymojo.models.wan22.wan22_block import (
     WAN_DIRECT_ALGO_DORA, WAN_DIRECT_ALGO_OFT,
     wan22_block_lora_forward, wan22_block_lora_backward,
     wan22_block_direct_lycoris_forward, wan22_block_direct_lycoris_backward,
+    WanI2VBlockWeights, WanI2VBlockLora, WanI2VBlockLoraGrads, WanI2VSaved,
+    wan22_i2v_block_lora_forward, wan22_i2v_block_lora_backward,
 )
 from serenitymojo.models.klein.lora_block import KleinLoraGrads
 from serenitymojo.training.dora_adapter import DoRAGrads
@@ -90,8 +94,15 @@ from serenitymojo.models.wan22.wan22_direct_lycoris_stack import (
 
 comptime TArc = ArcPointer[Tensor]
 
-# LoRA slots per block (8 attention projections).
+# Attention-only slots per block (8 projections). This constant governs the
+# DIRECT DoRA/OFT paths (FlatDirectDoRASet/FlatDirectOFTSet), which wrap ONLY the
+# 8 attention linears — do NOT widen it, or their `len(ad)//WAN_SLOTS` block
+# counts + _block_base offsets break.
 comptime WAN_SLOTS = 8
+# LoRA carrier slots per block (10 linears = 8 attention + ffn.0 + ffn.2). The
+# plain-LoRA Wan22LoraSet uses THIS count. Deterministic order: attn first, then
+# ffn.0, ffn.2.
+comptime WAN_LORA_SLOTS = 10
 # Slot indices within a block's 8-slot window.
 comptime W_SA_Q = 0
 comptime W_SA_K = 1
@@ -101,6 +112,9 @@ comptime W_CA_Q = 4
 comptime W_CA_K = 5
 comptime W_CA_V = 6
 comptime W_CA_O = 7
+# The 2 extra LoRA-only slots (attn+ffn = 10-slot window).
+comptime W_FFN0 = 8   # ffn.0: in=dim, out=ffn
+comptime W_FFN2 = 9   # ffn.2: in=ffn, out=dim
 
 
 # ── host helpers ──────────────────────────────────────────────────────────────
@@ -209,7 +223,7 @@ struct Wan22StackBase(Movable):
         self.head_mod = head_mod^
 
 
-# ── LoRA carrier (flat, 8 slots/block) ────────────────────────────────────────
+# ── LoRA carrier (flat, 10 slots/block) ───────────────────────────────────────
 struct Wan22LoraSet(Movable):
     var ad: List[LoraAdapter]  # flat: block bi -> ad[bi*8 + slot]
     var num_blocks: Int
@@ -233,31 +247,44 @@ def _make_adapter(rank: Int, alpha: Float32, in_f: Int, out_f: Int, seed: UInt64
 
 
 def build_wan22_lora_set(
-    num_blocks: Int, dim: Int, rank: Int, alpha: Float32,
+    num_blocks: Int, dim: Int, ffn: Int, rank: Int, alpha: Float32,
 ) -> Wan22LoraSet:
     """Build a full Wan22LoraSet (A=randn, B=0 -> identity at init).
-    8 adapters per block: sa_{q,k,v,o} + ca_{q,k,v,o}, all in=out=dim.
+    10 adapters per block, deterministic order: sa_{q,k,v,o} + ca_{q,k,v,o}
+    (all in=out=dim), then ffn.0 (in=dim,out=ffn) + ffn.2 (in=ffn,out=dim).
     """
     var ad = List[LoraAdapter]()
     var seed = UInt64(9001)
     for _ in range(num_blocks):
+        # 8 square attention adapters
         for _ in range(8):
             ad.append(_make_adapter(rank, alpha, dim, dim, seed))
             seed += 1
+        # ffn.0: dim -> ffn ; ffn.2: ffn -> dim (non-square)
+        ad.append(_make_adapter(rank, alpha, dim, ffn, seed))
+        seed += 1
+        ad.append(_make_adapter(rank, alpha, ffn, dim, seed))
+        seed += 1
     return Wan22LoraSet(ad^, num_blocks, rank)
 
 
 def wan22_total_adapters(lora: Wan22LoraSet) -> Int:
-    return lora.num_blocks * WAN_SLOTS
+    return lora.num_blocks * WAN_LORA_SLOTS
 
 
 def _block_base(bi: Int) -> Int:
+    # DIRECT DoRA/OFT (8 attention slots/block).
     return bi * WAN_SLOTS
 
 
-# Build the WanBlockLora struct for block bi from the flat carrier.
+def _lora_block_base(bi: Int) -> Int:
+    # Plain-LoRA carrier (10 slots/block).
+    return bi * WAN_LORA_SLOTS
+
+
+# Build the WanBlockLora struct for block bi from the flat carrier (10 slots).
 def _wan_block_lora_for(lora: Wan22LoraSet, bi: Int) -> WanBlockLora:
-    var base = _block_base(bi)
+    var base = _lora_block_base(bi)
     return WanBlockLora(
         Optional[LoraAdapter](lora.ad[base + W_SA_Q].copy()),
         Optional[LoraAdapter](lora.ad[base + W_SA_K].copy()),
@@ -267,6 +294,8 @@ def _wan_block_lora_for(lora: Wan22LoraSet, bi: Int) -> WanBlockLora:
         Optional[LoraAdapter](lora.ad[base + W_CA_K].copy()),
         Optional[LoraAdapter](lora.ad[base + W_CA_V].copy()),
         Optional[LoraAdapter](lora.ad[base + W_CA_O].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_FFN0].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_FFN2].copy()),
     )
 
 
@@ -284,8 +313,8 @@ def _wan_block_direct_oft_for(oft: FlatDirectOFTSet, bi: Int) -> WanBlockDirectL
 
 # ── LoRA grad carrier ─────────────────────────────────────────────────────────
 struct Wan22LoraGradSet(Movable):
-    var d_a: List[List[Float32]]   # [num_blocks*8][rank*dim]
-    var d_b: List[List[Float32]]   # [num_blocks*8][dim*rank]
+    var d_a: List[List[Float32]]   # [num_blocks*10][rank*in]  (ffn slots non-square)
+    var d_b: List[List[Float32]]   # [num_blocks*10][out*rank]
     var d_x_tokens: List[Float32]  # [S,dim] input grad (load-bearing arm)
     var d_context: List[Float32]   # [TXT,dim] context input grad
     var nonfinite_lora_grads: Int
@@ -675,8 +704,8 @@ def wan22_stack_lora_forward_offload[
 
     loader.prefetch_with_ctx(0, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
 
     # ── frozen embeddings ──
     var img = _embed_image(img_tokens, S, in_ch, dim, base, ctx)
@@ -750,8 +779,8 @@ def wan22_stack_direct_dora_forward_offload[
 
     loader.prefetch_with_ctx(0, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
 
     var img = _embed_image(img_tokens, S, in_ch, dim, base, ctx)
     var context_emb = _embed_context(txt_tokens, TXT, text_dim, dim, base, ctx)
@@ -816,8 +845,8 @@ def wan22_stack_direct_oft_forward_offload[
 
     loader.prefetch_with_ctx(0, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
 
     var img = _embed_image(img_tokens, S, in_ch, dim, base, ctx)
     var context_emb = _embed_context(txt_tokens, TXT, text_dim, dim, base, ctx)
@@ -890,8 +919,8 @@ def wan22_stack_lora_backward_offload[
     if loader.block_count() > 0:
         loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
 
     # ── head backward (proj_out -> modulate -> LN_no_affine) ──
     from serenitymojo.ops.norm import layer_norm
@@ -927,6 +956,7 @@ def wan22_stack_lora_backward_offload[
     var mbh = modulate_backward(
         _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
         _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+        compute_param_grads=False,  # head modulation frozen (LoRA): only d_x needed; scale is per-token [S,dim]
     )
     var d_ln_img = mbh.d_x.to_host(ctx)
     # LN_no_affine backward
@@ -964,8 +994,8 @@ def wan22_stack_lora_backward_offload[
         d_x_img = bg.base.d_x.copy()
         # context grad: accumulated (cross-attn; frozen context_emb discarded)
 
-        # Scatter LoRA grads into flat arrays.
-        var bbase = _block_base(bi)
+        # Scatter LoRA grads into flat arrays (10 slots/block).
+        var bbase = _lora_block_base(bi)
         d_a_flat[bbase + W_SA_Q] = bg.sa_q_da.copy()
         d_b_flat[bbase + W_SA_Q] = bg.sa_q_db.copy()
         d_a_flat[bbase + W_SA_K] = bg.sa_k_da.copy()
@@ -982,6 +1012,10 @@ def wan22_stack_lora_backward_offload[
         d_b_flat[bbase + W_CA_V] = bg.ca_v_db.copy()
         d_a_flat[bbase + W_CA_O] = bg.ca_o_da.copy()
         d_b_flat[bbase + W_CA_O] = bg.ca_o_db.copy()
+        d_a_flat[bbase + W_FFN0] = bg.ffn0_da.copy()
+        d_b_flat[bbase + W_FFN0] = bg.ffn0_db.copy()
+        d_a_flat[bbase + W_FFN2] = bg.ffn2_da.copy()
+        d_b_flat[bbase + W_FFN2] = bg.ffn2_db.copy()
 
         nonfinite += _nonfinite(bg.sa_q_da) + _nonfinite(bg.sa_q_db)
         nonfinite += _nonfinite(bg.sa_k_da) + _nonfinite(bg.sa_k_db)
@@ -991,6 +1025,8 @@ def wan22_stack_lora_backward_offload[
         nonfinite += _nonfinite(bg.ca_k_da) + _nonfinite(bg.ca_k_db)
         nonfinite += _nonfinite(bg.ca_v_da) + _nonfinite(bg.ca_v_db)
         nonfinite += _nonfinite(bg.ca_o_da) + _nonfinite(bg.ca_o_db)
+        nonfinite += _nonfinite(bg.ffn0_da) + _nonfinite(bg.ffn0_db)
+        nonfinite += _nonfinite(bg.ffn2_da) + _nonfinite(bg.ffn2_db)
 
         loader.mark_active_block_done(ctx)
         bi -= 1
@@ -1029,8 +1065,8 @@ def wan22_stack_direct_dora_backward_offload[
     if loader.block_count() > 0:
         loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
 
     from serenitymojo.ops.norm import layer_norm
     from serenitymojo.ops.norm_backward import layer_norm_backward_dx
@@ -1062,6 +1098,7 @@ def wan22_stack_direct_dora_backward_offload[
     var mbh = modulate_backward(
         _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
         _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+        compute_param_grads=False,  # head modulation frozen (LoRA): only d_x needed; scale is per-token [S,dim]
     )
     var d_ln_img = mbh.d_x.to_host(ctx)
     var lnbh = layer_norm_backward_dx(
@@ -1141,8 +1178,8 @@ def wan22_stack_direct_oft_backward_offload[
     if loader.block_count() > 0:
         loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
 
     from serenitymojo.ops.norm import layer_norm
     from serenitymojo.ops.norm_backward import layer_norm_backward_dx
@@ -1174,6 +1211,7 @@ def wan22_stack_direct_oft_backward_offload[
     var mbh = modulate_backward(
         _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
         _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+        compute_param_grads=False,  # head modulation frozen (LoRA): only d_x needed; scale is per-token [S,dim]
     )
     var d_ln_img = mbh.d_x.to_host(ctx)
     var lnbh = layer_norm_backward_dx(
@@ -1329,11 +1367,15 @@ def wan22_lora_adamw_step_resident(
 
 
 # ── PEFT-keyed save ───────────────────────────────────────────────────────────
-# Key format: "blocks.{i}.self_attn.q.lora_A.weight" etc.
+# Key format: "diffusion_model.blocks.{i}.self_attn.q.lora_A.weight" etc.
+# ai-toolkit / ComfyUI Wan LoRA convention: `diffusion_model.` prefix + lora_A/lora_B
+# (ai-toolkit stores internally as `transformer.` and rewrites to `diffusion_model.`
+# on save for ComfyUI — see ai-toolkit base_audio_model.py:73-84 / network_mixins.py).
+# Save + resume both use this function, so keys stay internally consistent.
 def _wan22_lora_prefixes(num_blocks: Int) -> List[String]:
     var out = List[String]()
     for bi in range(num_blocks):
-        var b = String("blocks.") + String(bi) + "."
+        var b = String("diffusion_model.blocks.") + String(bi) + "."
         out.append(b + String("self_attn.q"))
         out.append(b + String("self_attn.k"))
         out.append(b + String("self_attn.v"))
@@ -1342,6 +1384,8 @@ def _wan22_lora_prefixes(num_blocks: Int) -> List[String]:
         out.append(b + String("cross_attn.k"))
         out.append(b + String("cross_attn.v"))
         out.append(b + String("cross_attn.o"))
+        out.append(b + String("ffn.0"))
+        out.append(b + String("ffn.2"))
     return out^
 
 
@@ -1358,7 +1402,7 @@ def save_wan22_lora(lora: Wan22LoraSet, path: String, ctx: DeviceContext) raises
 # The PEFT save above is inference-only. This `.state` variant additionally carries
 # adam_m/adam_v via the shared training/lora_save.mojo plumbing so a resumed run does
 # NOT zero AdamW momentum (the MJ-1077 / MJ-1088 warm-restart class). Same block
-# prefixes and flat 8×num_blocks adapter order as save_wan22_lora.
+# prefixes and flat 10×num_blocks adapter order as save_wan22_lora.
 def save_wan22_lora_state(
     lora: Wan22LoraSet, path: String, ctx: DeviceContext,
     var meta: List[Float32] = List[Float32](),
@@ -1403,3 +1447,462 @@ def load_wan22_lora_resume(
     for ref nl in loaded:
         ad.append(nl.adapter.copy())
     return Wan22LoraSet(ad^, num_blocks, rank)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WAN 2.1 I2V-14B — DUAL CROSS-ATTENTION offload stack (12-slot LoRA/block).
+#
+# Mirrors the base T2V offload fwd/bwd above, but per block calls the CERTIFIED
+# wan22_i2v_block_lora_forward/backward (models/wan22/wan22_block.mojo, cos>=0.999
+# vs Musubi). Deltas vs the T2V stack:
+#   (a) TWO frozen contexts — computed ONCE before the block loop, threaded
+#       (copied) into every block: context_txt = text_embedding(umt5) [TXT,dim]
+#       (frozen, embedded here) and context_img [IMG,dim] (frozen CLIP already
+#       projected by MLPProj in the trainer, passed in). NOT re-derived per block.
+#   (b) Each block streams the 5 extra image-branch weights alongside the base 27:
+#       cross_attn.{k_img,v_img}.{weight,bias} + cross_attn.norm_k_img.weight.
+#   (c) 12 LoRA adapters/block (base 10 + cross_attn.k_img + cross_attn.v_img).
+#   (d) d_context (umt5 text / CLIP image) is NOT propagated out — umt5, CLIP, and
+#       MLPProj are all FROZEN; only the per-block LoRA A/B grads matter.
+# The certified block math + the T2V stack above are UNCHANGED.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# LoRA carrier slots per I2V block (12 = base 10 + img_k + img_v). Slot order:
+# sa_{q,k,v,o}, ca_{q,k,v,o}, ffn.0, ffn.2, cross_attn.k_img, cross_attn.v_img.
+comptime WAN_I2V_LORA_SLOTS = 12
+comptime W_IMG_K = 10   # cross_attn.k_img: in=dim, out=dim
+comptime W_IMG_V = 11   # cross_attn.v_img: in=dim, out=dim
+
+
+struct Wan22I2VLoraSet(Movable):
+    var ad: List[LoraAdapter]  # flat: block bi -> ad[bi*12 + slot]
+    var num_blocks: Int
+    var rank: Int
+
+    def __init__(out self, var ad: List[LoraAdapter], num_blocks: Int, rank: Int):
+        self.ad = ad^
+        self.num_blocks = num_blocks
+        self.rank = rank
+
+
+def build_wan22_i2v_lora_set(
+    num_blocks: Int, dim: Int, ffn: Int, rank: Int, alpha: Float32,
+) -> Wan22I2VLoraSet:
+    """Build a full Wan22I2VLoraSet (A=randn, B=0 -> identity at init).
+    12 adapters per block, deterministic order: sa_{q,k,v,o} + ca_{q,k,v,o}
+    (all in=out=dim), ffn.0 (dim->ffn), ffn.2 (ffn->dim), then cross_attn.k_img
+    + cross_attn.v_img (both in=out=dim)."""
+    var ad = List[LoraAdapter]()
+    var seed = UInt64(31337)
+    for _ in range(num_blocks):
+        for _ in range(8):
+            ad.append(_make_adapter(rank, alpha, dim, dim, seed))
+            seed += 1
+        ad.append(_make_adapter(rank, alpha, dim, ffn, seed))
+        seed += 1
+        ad.append(_make_adapter(rank, alpha, ffn, dim, seed))
+        seed += 1
+        # image-branch cross-attn: k_img + v_img (both square dim->dim)
+        ad.append(_make_adapter(rank, alpha, dim, dim, seed))
+        seed += 1
+        ad.append(_make_adapter(rank, alpha, dim, dim, seed))
+        seed += 1
+    return Wan22I2VLoraSet(ad^, num_blocks, rank)
+
+
+def wan22_i2v_total_adapters(lora: Wan22I2VLoraSet) -> Int:
+    return lora.num_blocks * WAN_I2V_LORA_SLOTS
+
+
+def _i2v_lora_block_base(bi: Int) -> Int:
+    return bi * WAN_I2V_LORA_SLOTS
+
+
+def _wan_i2v_block_lora_for(lora: Wan22I2VLoraSet, bi: Int) -> WanI2VBlockLora:
+    var base = _i2v_lora_block_base(bi)
+    var base_lora = WanBlockLora(
+        Optional[LoraAdapter](lora.ad[base + W_SA_Q].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_SA_K].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_SA_V].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_SA_O].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_CA_Q].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_CA_K].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_CA_V].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_CA_O].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_FFN0].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_FFN2].copy()),
+    )
+    return WanI2VBlockLora(
+        base_lora^,
+        Optional[LoraAdapter](lora.ad[base + W_IMG_K].copy()),
+        Optional[LoraAdapter](lora.ad[base + W_IMG_V].copy()),
+    )
+
+
+struct Wan22I2VLoraGradSet(Movable):
+    var d_a: List[List[Float32]]   # [num_blocks*12][rank*in]
+    var d_b: List[List[Float32]]   # [num_blocks*12][out*rank]
+    var d_x_tokens: List[Float32]  # [S,in_ch] input grad (frozen patch-embed backward)
+    var nonfinite_lora_grads: Int
+
+    def __init__(
+        out self,
+        var d_a: List[List[Float32]], var d_b: List[List[Float32]],
+        var d_x_tokens: List[Float32], nonfinite_lora_grads: Int,
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x_tokens = d_x_tokens^
+        self.nonfinite_lora_grads = nonfinite_lora_grads
+
+
+# Load per-block I2V weights: the base 27 tensors PLUS the 5 image-branch weights
+# (cross_attn.k_img/v_img weight+bias, cross_attn.norm_k_img.weight). Streamed
+# under the SAME "blocks.{i}." prefix as the base tensors.
+def _wan22_i2v_block_weights_from_block(
+    block: Block, prefix: String, dim: Int, ffn: Int, hd: Int, ctx: DeviceContext,
+) raises -> WanI2VBlockWeights:
+    var base = _wan22_block_weights_from_block(block, prefix, dim, ffn, hd, ctx)
+    var bp = prefix + "."
+    return WanI2VBlockWeights(
+        base^,
+        _block_f32(block, bp + String("cross_attn.k_img.weight"), ctx),
+        _block_f32(block, bp + String("cross_attn.k_img.bias"), ctx),
+        _block_f32(block, bp + String("cross_attn.v_img.weight"), ctx),
+        _block_f32(block, bp + String("cross_attn.v_img.bias"), ctx),
+        _block_f32(block, bp + String("cross_attn.norm_k_img.weight"), ctx),
+        dim, ctx,
+    )
+
+
+# ── I2V forward tape ──────────────────────────────────────────────────────────
+struct Wan22I2VStackForward(Movable):
+    var out: List[Float32]                   # [S, out_ch] velocity prediction
+    var block_saved: List[WanI2VSaved]       # per-block activations (dual cross-attn)
+    var block_modvecs: List[WanModVecs]      # per-block modulation vectors (F32)
+    var x_img: List[Float32]                 # [S, dim] image tokens before head
+    var context_txt: List[Float32]           # [TXT, dim] embedded text context (frozen)
+    var context_img: List[Float32]           # [IMG, dim] MLPProj image context (frozen)
+    var e_head_f32: List[Float32]            # [S, dim]
+    var head_shift: List[Float32]            # [S, dim]
+    var head_scale: List[Float32]            # [S, dim]
+
+    def __init__(
+        out self,
+        var out: List[Float32],
+        var block_saved: List[WanI2VSaved],
+        var block_modvecs: List[WanModVecs],
+        var x_img: List[Float32],
+        var context_txt: List[Float32],
+        var context_img: List[Float32],
+        var e_head_f32: List[Float32],
+        var head_shift: List[Float32],
+        var head_scale: List[Float32],
+    ):
+        self.out = out^
+        self.block_saved = block_saved^
+        self.block_modvecs = block_modvecs^
+        self.x_img = x_img^
+        self.context_txt = context_txt^
+        self.context_img = context_img^
+        self.e_head_f32 = e_head_f32^
+        self.head_shift = head_shift^
+        self.head_scale = head_scale^
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# I2V FULL FORWARD WITH LoRA, BLOCK-SWAP OFFLOAD.
+#   img_tokens:     [S, in_ch]      (I2V packed patch: noisy16->64 ++ cond_y20->80 = 144)
+#   txt_tokens:     [TXT, text_dim] (raw umt5 embeddings — embedded here, frozen)
+#   context_img_h:  [IMG, dim]      (CLIP already projected by frozen MLPProj)
+#   t_model:        Float32 scalar timestep
+#   cos/sin:        RoPE tables [S, Dh/2]
+# ═══════════════════════════════════════════════════════════════════════════════
+def wan22_i2v_stack_lora_forward_offload[
+    H: Int, Dh: Int, S: Int, TXT: Int, IMG: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    context_img_h: List[Float32],
+    t_model: Float32,
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, lora: Wan22I2VLoraSet,
+    cos: List[Float32], sin: List[Float32],
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22I2VStackForward:
+    var num_blocks = lora.num_blocks
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
+
+    # ── frozen embeddings — context assembled ONCE, shared by every block ──
+    var img = _embed_image(img_tokens, S, in_ch, dim, base, ctx)
+    var context_txt = _embed_context(txt_tokens, TXT, text_dim, dim, base, ctx)
+    var context_img = context_img_h.copy()   # already [IMG,dim] via MLPProj (frozen)
+
+    # ── frozen time feature chain ──
+    var tfeats = _time_features(t_model, S, dim, freq_dim, base, ctx)
+    var e0_flat = tfeats[0].copy()
+    var e_head = tfeats[1].copy()
+
+    var block_saved = List[WanI2VSaved]()
+    var block_modvecs = List[WanModVecs]()
+
+    for bi in range(num_blocks):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+
+        var bp = handle.prefix + "."
+        var mod_key = bp + String("modulation")
+        if not (mod_key in handle.block):
+            raise Error(String("wan21-i2v block missing modulation: ") + mod_key)
+        var block_mod_t = cast_tensor(handle.block[mod_key][], STDtype.F32, ctx)
+        var block_mod_h = block_mod_t.to_host(ctx)
+
+        var mv = _block_modvecs(e0_flat, block_mod_h, bi, S, dim)
+        var w = _wan22_i2v_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var bl = _wan_i2v_block_lora_for(lora, bi)
+        var fwd = wan22_i2v_block_lora_forward[H, Dh, S, TXT, IMG](
+            img.copy(), context_txt.copy(), context_img.copy(),
+            mv, w, bl, cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+
+        block_saved.append(fwd.saved.copy())
+        block_modvecs.append(mv.copy())
+        img = fwd.x_out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var head_mod_h = base.head_mod[].to_host(ctx)
+    var hmod = _head_modvecs(head_mod_h, e_head, S, dim)
+    var head_shift = hmod[0].copy()
+    var head_scale = hmod[1].copy()
+    var out = _head_forward(img, head_shift, head_scale, S, dim, out_ch, eps, base, ctx)
+
+    return Wan22I2VStackForward(
+        out^, block_saved^, block_modvecs^,
+        img^, context_txt^, context_img^,
+        e_head^, head_shift^, head_scale^,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# I2V FULL BACKWARD WITH LoRA, BLOCK-SWAP OFFLOAD (REVERSE block stream).
+# Only the 12 LoRA d_A/d_B per block are collected (all base/img frozen-weight
+# grads + d_context are discarded — umt5/CLIP/MLPProj frozen).
+# ═══════════════════════════════════════════════════════════════════════════════
+def wan22_i2v_stack_lora_backward_offload[
+    H: Int, Dh: Int, S: Int, TXT: Int, IMG: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, lora: Wan22I2VLoraSet,
+    cos: List[Float32], sin: List[Float32],
+    saved: Wan22I2VStackForward,
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22I2VLoraGradSet:
+    var num_blocks = lora.num_blocks
+    var n_adapters = wan22_i2v_total_adapters(lora)
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
+
+    # ── head backward (identical to the base T2V stack) ──
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.norm_backward import layer_norm_backward_dx
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var ones = List[Float32]()
+    for _ in range(dim):
+        ones.append(Float32(1.0))
+    var zeros = List[Float32]()
+    for _ in range(dim):
+        zeros.append(Float32(0.0))
+    var ln_x_img = layer_norm(
+        _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), _t(zeros^, [dim], ctx), eps, ctx,
+    ).to_host(ctx)
+    var scale_d = _t(saved.head_scale.copy(), [S, dim], ctx)
+    var shift_d = _t(saved.head_shift.copy(), [S, dim], ctx)
+    from serenitymojo.ops.tensor_algebra import add_scalar as _add_scalar
+    var sc1 = _add_scalar(scale_d, Float32(1.0), ctx)
+    var ln_x_t = _t(ln_x_img.copy(), [S, dim], ctx)
+    var modulated = mul(ln_x_t, sc1, ctx)
+    modulated = add(modulated, shift_d, ctx)
+    var lbh = linear_backward(
+        _t_like(d_out, [S, out_ch], base.hh_w[], ctx),
+        _cast_like(modulated, base.hh_w[], ctx), base.hh_w[],
+        S, dim, out_ch, ctx,
+    )
+    var d_modulated = lbh.d_x.to_host(ctx)
+    var mbh = modulate_backward(
+        _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
+        _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_ln_img = mbh.d_x.to_host(ctx)
+    var lnbh = layer_norm_backward_dx(
+        _t(d_ln_img, [S, dim], ctx), _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), eps, ctx,
+    )
+    var d_x_img = lnbh.to_host(ctx)
+
+    # ── init grad accumulators (12 slots/block) ──
+    var d_a_flat = List[List[Float32]]()
+    var d_b_flat = List[List[Float32]]()
+    for _ in range(n_adapters):
+        d_a_flat.append(List[Float32]())
+        d_b_flat.append(List[Float32]())
+    var nonfinite = 0
+
+    # ── stream blocks in REVERSE ──
+    var bi = num_blocks - 1
+    while bi >= 0:
+        var block_idx = bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+
+        var mv = saved.block_modvecs[bi].copy()
+        var w = _wan22_i2v_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var bl = _wan_i2v_block_lora_for(lora, bi)
+
+        var bg = wan22_i2v_block_lora_backward[H, Dh, S, TXT, IMG](
+            d_x_img.copy(), mv, w, bl, saved.block_saved[bi],
+            cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+
+        d_x_img = bg.base.base.d_x.copy()
+
+        var bbase = _i2v_lora_block_base(bi)
+        d_a_flat[bbase + W_SA_Q] = bg.base.sa_q_da.copy()
+        d_b_flat[bbase + W_SA_Q] = bg.base.sa_q_db.copy()
+        d_a_flat[bbase + W_SA_K] = bg.base.sa_k_da.copy()
+        d_b_flat[bbase + W_SA_K] = bg.base.sa_k_db.copy()
+        d_a_flat[bbase + W_SA_V] = bg.base.sa_v_da.copy()
+        d_b_flat[bbase + W_SA_V] = bg.base.sa_v_db.copy()
+        d_a_flat[bbase + W_SA_O] = bg.base.sa_o_da.copy()
+        d_b_flat[bbase + W_SA_O] = bg.base.sa_o_db.copy()
+        d_a_flat[bbase + W_CA_Q] = bg.base.ca_q_da.copy()
+        d_b_flat[bbase + W_CA_Q] = bg.base.ca_q_db.copy()
+        d_a_flat[bbase + W_CA_K] = bg.base.ca_k_da.copy()
+        d_b_flat[bbase + W_CA_K] = bg.base.ca_k_db.copy()
+        d_a_flat[bbase + W_CA_V] = bg.base.ca_v_da.copy()
+        d_b_flat[bbase + W_CA_V] = bg.base.ca_v_db.copy()
+        d_a_flat[bbase + W_CA_O] = bg.base.ca_o_da.copy()
+        d_b_flat[bbase + W_CA_O] = bg.base.ca_o_db.copy()
+        d_a_flat[bbase + W_FFN0] = bg.base.ffn0_da.copy()
+        d_b_flat[bbase + W_FFN0] = bg.base.ffn0_db.copy()
+        d_a_flat[bbase + W_FFN2] = bg.base.ffn2_da.copy()
+        d_b_flat[bbase + W_FFN2] = bg.base.ffn2_db.copy()
+        d_a_flat[bbase + W_IMG_K] = bg.img_k_da.copy()
+        d_b_flat[bbase + W_IMG_K] = bg.img_k_db.copy()
+        d_a_flat[bbase + W_IMG_V] = bg.img_v_da.copy()
+        d_b_flat[bbase + W_IMG_V] = bg.img_v_db.copy()
+
+        nonfinite += _nonfinite(bg.base.sa_q_da) + _nonfinite(bg.base.sa_q_db)
+        nonfinite += _nonfinite(bg.base.sa_k_da) + _nonfinite(bg.base.sa_k_db)
+        nonfinite += _nonfinite(bg.base.sa_v_da) + _nonfinite(bg.base.sa_v_db)
+        nonfinite += _nonfinite(bg.base.sa_o_da) + _nonfinite(bg.base.sa_o_db)
+        nonfinite += _nonfinite(bg.base.ca_q_da) + _nonfinite(bg.base.ca_q_db)
+        nonfinite += _nonfinite(bg.base.ca_k_da) + _nonfinite(bg.base.ca_k_db)
+        nonfinite += _nonfinite(bg.base.ca_v_da) + _nonfinite(bg.base.ca_v_db)
+        nonfinite += _nonfinite(bg.base.ca_o_da) + _nonfinite(bg.base.ca_o_db)
+        nonfinite += _nonfinite(bg.base.ffn0_da) + _nonfinite(bg.base.ffn0_db)
+        nonfinite += _nonfinite(bg.base.ffn2_da) + _nonfinite(bg.base.ffn2_db)
+        nonfinite += _nonfinite(bg.img_k_da) + _nonfinite(bg.img_k_db)
+        nonfinite += _nonfinite(bg.img_v_da) + _nonfinite(bg.img_v_db)
+
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    # ── input projection backward (frozen patch-embed; grad reported not used) ──
+    var lbi = linear_backward(
+        _t_like(d_x_img, [S, dim], base.pe_w[], ctx),
+        _t_like(img_tokens, [S, in_ch], base.pe_w[], ctx), base.pe_w[],
+        S, in_ch, dim, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+
+    return Wan22I2VLoraGradSet(d_a_flat^, d_b_flat^, d_img_tokens^, nonfinite)
+
+
+# ── AdamW step on all 12/block I2V adapters (fused GPU plain-AdamW; same kernel
+#    as the T2V path). The I2V backward fills ALL 12 slots per block, so this is
+#    normally ONE fused call over [0, n). ─────────────────────────────────────
+def wan22_i2v_lora_adamw_step(
+    mut lora: Wan22I2VLoraSet, grads: Wan22I2VLoraGradSet, t: Int, lr: Float32,
+    ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
+    eps_opt: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
+) raises:
+    comptime if WAN22_GPU_ADAMW:
+        var n = wan22_i2v_total_adapters(lora)
+        var i = 0
+        while i < n:
+            if len(grads.d_a[i]) == 0:
+                i += 1
+                continue
+            var run_start = i
+            while i < n and len(grads.d_a[i]) != 0:
+                i += 1
+            fused_lora_adamw_plain_step(
+                lora.ad, grads.d_a, grads.d_b, run_start, i,
+                t, lr, beta1, beta2, eps_opt, weight_decay, ctx,
+            )
+    else:
+        var n = wan22_i2v_total_adapters(lora)
+        for i in range(n):
+            if len(grads.d_a[i]) == 0:
+                continue
+            var lg = LoraGrads(grads.d_a[i].copy(), grads.d_b[i].copy())
+            _lora_adamw(lora.ad[i], lg, t, lr, ctx, beta1, beta2, eps_opt, weight_decay)
+
+
+# ── PEFT-keyed save (12 targets/block; diffusion_model.-prefixed) ─────────────
+# The 2 extra keys vs T2V are cross_attn.k_img and cross_attn.v_img.
+def _wan22_i2v_lora_prefixes(num_blocks: Int) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_blocks):
+        var b = String("diffusion_model.blocks.") + String(bi) + "."
+        out.append(b + String("self_attn.q"))
+        out.append(b + String("self_attn.k"))
+        out.append(b + String("self_attn.v"))
+        out.append(b + String("self_attn.o"))
+        out.append(b + String("cross_attn.q"))
+        out.append(b + String("cross_attn.k"))
+        out.append(b + String("cross_attn.v"))
+        out.append(b + String("cross_attn.o"))
+        out.append(b + String("ffn.0"))
+        out.append(b + String("ffn.2"))
+        out.append(b + String("cross_attn.k_img"))
+        out.append(b + String("cross_attn.v_img"))
+    return out^
+
+
+def save_wan22_i2v_lora(lora: Wan22I2VLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var prefixes = _wan22_i2v_lora_prefixes(lora.num_blocks)
+    var named = List[NamedLora]()
+    var n = wan22_i2v_total_adapters(lora)
+    for i in range(n):
+        named.append(NamedLora(prefixes[i], lora.ad[i].copy()))
+    return save_lora_peft(named, path, ctx)
+
+
+def save_wan22_i2v_lora_state(
+    lora: Wan22I2VLoraSet, path: String, ctx: DeviceContext,
+    var meta: List[Float32] = List[Float32](),
+) raises -> Int:
+    """RESUME state (A/B + AdamW moments) for the 12/block I2V LoRA."""
+    var prefixes = _wan22_i2v_lora_prefixes(lora.num_blocks)
+    var named = List[NamedLora]()
+    var n = wan22_i2v_total_adapters(lora)
+    for i in range(n):
+        named.append(NamedLora(prefixes[i], lora.ad[i].copy()))
+    return save_lora_train_state(named, path, ctx, meta^)

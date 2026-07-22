@@ -875,7 +875,9 @@ comptime WDIR_CA_V = 6
 comptime WDIR_CA_O = 7
 
 
-# Optional LoRA adapters for the block's 8 trained attention projections.
+# Optional LoRA adapters for the block's 10 trained linears: 8 attention
+# projections + ffn.0 (dim->ffn) + ffn.2 (ffn->dim). Mirrors Musubi wrapping
+# self_attn.{q,k,v,o} + cross_attn.{q,k,v,o} + ffn.0 + ffn.2.
 struct WanBlockLora(Copyable, Movable):
     var sa_q: Optional[LoraAdapter]
     var sa_k: Optional[LoraAdapter]
@@ -885,6 +887,8 @@ struct WanBlockLora(Copyable, Movable):
     var ca_k: Optional[LoraAdapter]
     var ca_v: Optional[LoraAdapter]
     var ca_o: Optional[LoraAdapter]
+    var ffn0: Optional[LoraAdapter]   # in=dim, out=ffn
+    var ffn2: Optional[LoraAdapter]   # in=ffn, out=dim
 
     def __init__(
         out self,
@@ -892,6 +896,7 @@ struct WanBlockLora(Copyable, Movable):
         var sa_v: Optional[LoraAdapter], var sa_o: Optional[LoraAdapter],
         var ca_q: Optional[LoraAdapter], var ca_k: Optional[LoraAdapter],
         var ca_v: Optional[LoraAdapter], var ca_o: Optional[LoraAdapter],
+        var ffn0: Optional[LoraAdapter], var ffn2: Optional[LoraAdapter],
     ):
         self.sa_q = sa_q^
         self.sa_k = sa_k^
@@ -901,6 +906,8 @@ struct WanBlockLora(Copyable, Movable):
         self.ca_k = ca_k^
         self.ca_v = ca_v^
         self.ca_o = ca_o^
+        self.ffn0 = ffn0^
+        self.ffn2 = ffn2^
 
 
 # d_A/d_B for the 8 adapters (empty when absent).
@@ -922,6 +929,10 @@ struct WanBlockLoraGrads(Copyable, Movable):
     var ca_v_db: List[Float32]
     var ca_o_da: List[Float32]
     var ca_o_db: List[Float32]
+    var ffn0_da: List[Float32]
+    var ffn0_db: List[Float32]
+    var ffn2_da: List[Float32]
+    var ffn2_db: List[Float32]
 
     def __init__(
         out self, var base: WanBlockGrads,
@@ -933,6 +944,8 @@ struct WanBlockLoraGrads(Copyable, Movable):
         var ca_k_da: List[Float32], var ca_k_db: List[Float32],
         var ca_v_da: List[Float32], var ca_v_db: List[Float32],
         var ca_o_da: List[Float32], var ca_o_db: List[Float32],
+        var ffn0_da: List[Float32], var ffn0_db: List[Float32],
+        var ffn2_da: List[Float32], var ffn2_db: List[Float32],
     ):
         self.base = base^
         self.sa_q_da = sa_q_da^
@@ -951,6 +964,10 @@ struct WanBlockLoraGrads(Copyable, Movable):
         self.ca_v_db = ca_v_db^
         self.ca_o_da = ca_o_da^
         self.ca_o_db = ca_o_db^
+        self.ffn0_da = ffn0_da^
+        self.ffn0_db = ffn0_db^
+        self.ffn2_da = ffn2_da^
+        self.ffn2_db = ffn2_db^
 
 
 def _empty() -> List[Float32]:
@@ -1313,11 +1330,17 @@ def wan22_block_lora_forward[
     var ca_out = _add_lora_delta(ca_out_base, ca_att_h, lora.ca_o, S, ctx)
     var x_ca = add(x_sa, ca_out, ctx)
 
-    # ── FFN (no LoRA) ──
+    # ── FFN (LoRA on ffn.0 / ffn.2) ──
+    # ffn.0 LoRA input = post-modulation FFN input (ffn_mp.o) [S,dim]; out [S,ffn].
+    # ffn.2 LoRA input = GELU output (ffn_act) [S,ffn]; out [S,dim].
     var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
-    var ffn_h = linear(ffn_mp.o[], w.ffn0_w[], Optional[Tensor](_clone_t(w.ffn0_b[], ctx)), ctx)
+    var ffn_in_h = ffn_mp.o[].to_host(ctx)
+    var ffn_h_base = linear(ffn_mp.o[], w.ffn0_w[], Optional[Tensor](_clone_t(w.ffn0_b[], ctx)), ctx)
+    var ffn_h = _add_lora_delta(ffn_h_base, ffn_in_h, lora.ffn0, S, ctx)
     var ffn_act = gelu(ffn_h, ctx)
-    var ffn_out = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
+    var ffn_act_h = ffn_act.to_host(ctx)
+    var ffn_out_base = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
+    var ffn_out = _add_lora_delta(ffn_out_base, ffn_act_h, lora.ffn2, S, ctx)
     var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
 
     var x_out = x_final.to_host(ctx)
@@ -1373,25 +1396,39 @@ def wan22_block_lora_backward[
 
     var d_out = _ta16(d_out_h, [S, dim], ctx)
 
-    # ════════════════ FFN backward (no LoRA) ════════════════
+    # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
     var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
     var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
+    var ffn_act_h = lsv_ffn_act.to_host(ctx)     # ffn.2 LoRA input [S,ffn]
+    # ffn_out base recompute (base-only is fine: d_gate uses the FULL ffn_out but
+    # gate_ffn is frozen/discarded; d_y=go*gate and d_x=go don't depend on it).
     var ffn_out_rc = linear(lsv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
     var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
     var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
+    # ffn.2: base frozen weight grads (reported) + LoRA d_A/d_B + LoRA d_x fold-in.
     var lb_ffn2 = linear_backward(gb_ffn2.d_y, lsv_ffn_act, w.ffn2_w[], S, ffn, dim, ctx)
     var d_ffn2_w = lb_ffn2.d_w.to_host(ctx)
     var d_ffn2_b = lb_ffn2.d_b.to_host(ctx)
+    var d_ffn_out_h = gb_ffn2.d_y.to_host(ctx)   # output grad of the ffn.2 proj
+    var ffn2_g = _lora_bwd_opt(lora.ffn2, d_ffn_out_h, ffn_act_h, S, ffn, ctx)
+    # ffn_act grad = base(lb_ffn2.d_x) + LoRA d_x(ffn2)   [S,ffn]
+    var d_ffn_act = add(lb_ffn2.d_x, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
     var lsv_ffn_h = _tbf16(saved.ffn_h.copy(), [S, ffn], ctx)
-    var d_ffn_h = gelu_backward(lb_ffn2.d_x, lsv_ffn_h, ctx)
+    var d_ffn_h = gelu_backward(d_ffn_act, lsv_ffn_h, ctx)
     var lsv_ffn_in = _tbf16(saved.ffn_in.copy(), [S, dim], ctx)
+    var ffn_in_h = lsv_ffn_in.to_host(ctx)       # ffn.0 LoRA input [S,dim]
+    # ffn.0: base frozen weight grads (reported) + LoRA d_A/d_B + LoRA d_x fold-in.
     var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.ffn0_w[], S, dim, ffn, ctx)
     var d_ffn0_w = lb_ffn0.d_w.to_host(ctx)
     var d_ffn0_b = lb_ffn0.d_b.to_host(ctx)
+    var d_ffn_h_h = d_ffn_h.to_host(ctx)         # output grad of the ffn.0 proj
+    var ffn0_g = _lora_bwd_opt(lora.ffn0, d_ffn_h_h, ffn_in_h, S, dim, ctx)
+    # ffn_in grad = base(lb_ffn0.d_x) + LoRA d_x(ffn0)   [S,dim]
+    var d_ffn_in = add(lb_ffn0.d_x, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
     var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
-    var mb_ffn = wan_modulate_backward(lb_ffn0.d_x, lsv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
     var d_scale_ffn = mb_ffn.d_scale.to_host(ctx)
     var d_shift_ffn = mb_ffn.d_shift.to_host(ctx)
     var lsv_x_ca = _tbf16(saved.x_ca.copy(), [S, dim], ctx)
@@ -1552,6 +1589,8 @@ def wan22_block_lora_backward[
         ca_k_g.d_a.copy(), ca_k_g.d_b.copy(),
         ca_v_g.d_a.copy(), ca_v_g.d_b.copy(),
         ca_o_g.d_a.copy(), ca_o_g.d_b.copy(),
+        ffn0_g.d_a.copy(), ffn0_g.d_b.copy(),
+        ffn2_g.d_a.copy(), ffn2_g.d_b.copy(),
     )
 
 
@@ -1830,4 +1869,530 @@ def wan22_block_direct_lycoris_backward[
         _direct_grad_dev_to_public(ca_k_g^),
         _direct_grad_dev_to_public(ca_v_g^),
         _direct_grad_dev_to_public(ca_o_g^),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WAN 2.1 I2V-14B VARIANT — DUAL CROSS-ATTENTION (WanI2VCrossAttention)
+#
+# The ONLY new compute vs the certified block: the cross-attn is
+# WanI2VCrossAttention (musubi model.py:284-340) instead of WanCrossAttention.
+# The context prepends 257 CLIP-image tokens (projected to `dim` by the frozen
+# img_emb/MLPProj OUTSIDE the block) to the umt5 text tokens; the block splits
+# context at 257:
+#   context_img = context[:, :IMG]   (IMG=257 in the real model)
+#   context_txt = context[:, IMG:]
+#   q     = norm_q(q(x))                            # SHARED query
+#   k     = norm_k(k(context_txt));   v     = v(context_txt)
+#   x_txt = sdpa(q, k, v)                           # TEXT cross-attn  (kv=TXT)
+#   k_img = norm_k_img(k_img(context_img)); v_img = v_img(context_img)
+#   x_img = sdpa(q, k_img, v_img)                   # IMG  cross-attn  (kv=IMG)
+#   x     = x_txt + x_img                           # ELEMENT-WISE ADD (pre-o)
+#   x     = o(x)                                    # shared output proj
+# Backward: d(o-input) splits equally to both branches (add); each branch runs a
+# rect SDPA backward on the SHARED q — d_q accumulates from both branches; the
+# text branch feeds d_context_txt, the image branch feeds d_context_img. Extra
+# per-block frozen modules: cross_attn.k_img/v_img (Linear dim->dim) + norm_k_img
+# (RMSNorm). LoRA targets = the existing 10 PLUS k_img + v_img = 12/block.
+#
+# This is a SEPARATE code path: the certified WanCrossAttention block above is
+# NOT modified. Reuses every existing forward op + backward arm; the only new
+# wiring is the second SDPA (shared q, kv=IMG) and the ADD.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# I2V block weights = the base block weights PLUS the image-branch cross-attn
+# modules (k_img/v_img Linear dim->dim with bias, norm_k_img RMSNorm weight).
+struct WanI2VBlockWeights(Copyable, Movable):
+    var base: WanBlockWeights
+    var ca_wk_img: TArc     # [dim,dim]
+    var ca_bk_img: TArc     # [dim]
+    var ca_wv_img: TArc     # [dim,dim]
+    var ca_bv_img: TArc     # [dim]
+    var ca_kn_img: TArc     # [dim]  norm_k_img RMS weight
+
+    def __init__(
+        out self, var base: WanBlockWeights,
+        var ca_wk_img: List[Float32], var ca_bk_img: List[Float32],
+        var ca_wv_img: List[Float32], var ca_bv_img: List[Float32],
+        var ca_kn_img: List[Float32], dim: Int, ctx: DeviceContext,
+    ) raises:
+        self.base = base^
+        self.ca_wk_img = TArc(Tensor.from_host(ca_wk_img^, [dim, dim], STDtype.BF16, ctx))
+        self.ca_bk_img = TArc(Tensor.from_host(ca_bk_img^, [dim], STDtype.BF16, ctx))
+        self.ca_wv_img = TArc(Tensor.from_host(ca_wv_img^, [dim, dim], STDtype.BF16, ctx))
+        self.ca_bv_img = TArc(Tensor.from_host(ca_bv_img^, [dim], STDtype.BF16, ctx))
+        self.ca_kn_img = TArc(Tensor.from_host(ca_kn_img^, [dim], STDtype.BF16, ctx))
+
+
+# I2V saved activations = the base WanSaved (its `context` field holds the TEXT
+# context [TXT,dim], its `ca_att` field holds the ADDED x_txt+x_img [S,dim], its
+# ca_q_pre/ca_q_rms hold the SHARED query) PLUS the image-branch activations.
+struct WanI2VSaved(Copyable, Movable):
+    var base: WanSaved
+    var img_context: List[BFloat16]   # [IMG,dim]  CLIP-projected image context
+    var img_k_pre: List[BFloat16]     # [IMG,dim]  k_img linear out (pre-rms)
+    var img_k_rms: List[BFloat16]     # [1,IMG,H,Dh]
+    var img_v: List[BFloat16]         # [1,IMG,H,Dh]
+
+    def __init__(
+        out self, var base: WanSaved,
+        var img_context: List[BFloat16], var img_k_pre: List[BFloat16],
+        var img_k_rms: List[BFloat16], var img_v: List[BFloat16],
+    ):
+        self.base = base^
+        self.img_context = img_context^
+        self.img_k_pre = img_k_pre^
+        self.img_k_rms = img_k_rms^
+        self.img_v = img_v^
+
+
+struct WanI2VBlockForward(Copyable, Movable):
+    var x_out: List[Float32]
+    var saved: WanI2VSaved
+
+    def __init__(out self, var x_out: List[Float32], var saved: WanI2VSaved):
+        self.x_out = x_out^
+        self.saved = saved^
+
+
+# I2V LoRA = the base 10 adapters PLUS the two image-branch projections.
+struct WanI2VBlockLora(Copyable, Movable):
+    var base: WanBlockLora
+    var img_k: Optional[LoraAdapter]   # in=dim, out=dim
+    var img_v: Optional[LoraAdapter]   # in=dim, out=dim
+
+    def __init__(
+        out self, var base: WanBlockLora,
+        var img_k: Optional[LoraAdapter], var img_v: Optional[LoraAdapter],
+    ):
+        self.base = base^
+        self.img_k = img_k^
+        self.img_v = img_v^
+
+
+# I2V LoRA grads = the base grads (d_x, d_context=TEXT, 10 adapters) PLUS the
+# image-branch frozen weight grads (reported), the image context grad, and the
+# k_img/v_img LoRA d_A/d_B.
+struct WanI2VBlockLoraGrads(Copyable, Movable):
+    var base: WanBlockLoraGrads
+    var d_context_img: List[Float32]  # [IMG,dim]
+    var d_ca_wk_img: List[Float32]
+    var d_ca_bk_img: List[Float32]
+    var d_ca_wv_img: List[Float32]
+    var d_ca_bv_img: List[Float32]
+    var d_ca_kn_img: List[Float32]
+    var img_k_da: List[Float32]
+    var img_k_db: List[Float32]
+    var img_v_da: List[Float32]
+    var img_v_db: List[Float32]
+
+    def __init__(
+        out self, var base: WanBlockLoraGrads,
+        var d_context_img: List[Float32],
+        var d_ca_wk_img: List[Float32], var d_ca_bk_img: List[Float32],
+        var d_ca_wv_img: List[Float32], var d_ca_bv_img: List[Float32],
+        var d_ca_kn_img: List[Float32],
+        var img_k_da: List[Float32], var img_k_db: List[Float32],
+        var img_v_da: List[Float32], var img_v_db: List[Float32],
+    ):
+        self.base = base^
+        self.d_context_img = d_context_img^
+        self.d_ca_wk_img = d_ca_wk_img^
+        self.d_ca_bk_img = d_ca_bk_img^
+        self.d_ca_wv_img = d_ca_wv_img^
+        self.d_ca_bv_img = d_ca_bv_img^
+        self.d_ca_kn_img = d_ca_kn_img^
+        self.img_k_da = img_k_da^
+        self.img_k_db = img_k_db^
+        self.img_v_da = img_v_da^
+        self.img_v_db = img_v_db^
+
+
+# ── FORWARD of one Wan2.1 I2V block WITH LoRA (12 targets) ────────────────────
+# Mirrors wan22_block_lora_forward for self-attn + ffn; the cross-attn is the
+# dual (text + image) WanI2VCrossAttention with a shared query.
+def wan22_i2v_block_lora_forward[
+    H: Int, Dh: Int, S: Int, TXT: Int, IMG: Int
+](
+    x_h: List[Float32], context_txt_h: List[Float32], context_img_h: List[Float32],
+    mv: WanModVecs, w: WanI2VBlockWeights, lora: WanI2VBlockLora,
+    cos: Tensor, sin: Tensor,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> WanI2VBlockForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t16(_ones(dim), [dim], ctx)
+    var zeros_t = _t16(_zeros(dim), [dim], ctx)
+
+    var x = _ta16(x_h, [S, dim], ctx)
+    var context_txt = _ta16(context_txt_h, [TXT, dim], ctx)
+    var context_img = _ta16(context_img_h, [IMG, dim], ctx)
+    var context_txt_host = context_txt_h.copy()
+    var context_img_host = context_img_h.copy()
+
+    var shift_sa = _t16(mv.shift_sa.copy(), [S, dim], ctx)
+    var scale_sa = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var gate_sa = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var shift_ffn = _t16(mv.shift_ffn.copy(), [S, dim], ctx)
+    var scale_ffn = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var gate_ffn = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+
+    var cos16 = cast_tensor(cos, STDtype.BF16, ctx)
+    var sin16 = cast_tensor(sin, STDtype.BF16, ctx)
+
+    # ── self-attention (LoRA on q/k/v/o) — identical to the base block ──
+    var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
+    var sa_in_h = sa_mp.o[].to_host(ctx)
+    var q_base = linear(sa_mp.o[], w.base.sa_wq[], Optional[Tensor](_clone_t(w.base.sa_bq[], ctx)), ctx)
+    var k_base = linear(sa_mp.o[], w.base.sa_wk[], Optional[Tensor](_clone_t(w.base.sa_bk[], ctx)), ctx)
+    var v_base = linear(sa_mp.o[], w.base.sa_wv[], Optional[Tensor](_clone_t(w.base.sa_bv[], ctx)), ctx)
+    var q_flat = _add_lora_delta(q_base, sa_in_h, lora.base.sa_q, S, ctx)
+    var k_flat = _add_lora_delta(k_base, sa_in_h, lora.base.sa_k, S, ctx)
+    var v_flat = _add_lora_delta(v_base, sa_in_h, lora.base.sa_v, S, ctx)
+    var q_rms_flat = rms_norm(q_flat, w.base.sa_qn[], eps, ctx)
+    var k_rms_flat = rms_norm(k_flat, w.base.sa_kn[], eps, ctx)
+    var q_pre = _to_bshd(q_flat^, S, H, Dh, ctx)
+    var k_pre = _to_bshd(k_flat^, S, H, Dh, ctx)
+    var v4 = _to_bshd(v_flat^, S, H, Dh, ctx)
+    var q_rms = _to_bshd(q_rms_flat^, S, H, Dh, ctx)
+    var k_rms = _to_bshd(k_rms_flat^, S, H, Dh, ctx)
+    var cos_e = _expand_rope_per_head(cos16, S, H, Dh // 2, ctx)
+    var sin_e = _expand_rope_per_head(sin16, S, H, Dh // 2, ctx)
+    var q_rope = rope_interleaved(q_rms, cos_e, sin_e, ctx)
+    var k_rope = rope_interleaved(k_rms, cos_e, sin_e, ctx)
+    var att4 = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v4, scale, ctx)
+    var sa_att = _from_bshd(att4^, S, dim, ctx)
+    var sa_att_h = sa_att.to_host(ctx)
+    var sa_out_base = linear(sa_att, w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx)
+    var sa_out = _add_lora_delta(sa_out_base, sa_att_h, lora.base.sa_o, S, ctx)
+    var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
+
+    # ── DUAL cross-attention (text + image; shared query) ──
+    var n3 = layer_norm(x_sa, w.base.n3_w[], w.base.n3_b[], eps, ctx)
+    var n3_h = n3.to_host(ctx)
+    # shared query
+    var caq_base = linear(n3, w.base.ca_wq[], Optional[Tensor](_clone_t(w.base.ca_bq[], ctx)), ctx)
+    var caq_flat = _add_lora_delta(caq_base, n3_h, lora.base.ca_q, S, ctx)
+    var caq_rms_flat = rms_norm(caq_flat, w.base.ca_qn[], eps, ctx)
+    var caq_pre = _to_bshd(caq_flat^, S, H, Dh, ctx)
+    var caq_rms = _to_bshd(caq_rms_flat^, S, H, Dh, ctx)
+    # TEXT branch (kv = context_txt)
+    var cak_base = linear(context_txt[], w.base.ca_wk[], Optional[Tensor](_clone_t(w.base.ca_bk[], ctx)), ctx)
+    var cav_base = linear(context_txt[], w.base.ca_wv[], Optional[Tensor](_clone_t(w.base.ca_bv[], ctx)), ctx)
+    var cak_flat = _add_lora_delta(cak_base, context_txt_host, lora.base.ca_k, TXT, ctx)
+    var cav_flat = _add_lora_delta(cav_base, context_txt_host, lora.base.ca_v, TXT, ctx)
+    var cak_rms_flat = rms_norm(cak_flat, w.base.ca_kn[], eps, ctx)
+    var cak_pre = reshape(cak_flat^, [1, TXT, H, Dh], ctx)
+    var cav4 = reshape(cav_flat^, [1, TXT, H, Dh], ctx)
+    var cak_rms = reshape(cak_rms_flat^, [1, TXT, H, Dh], ctx)
+    var ca_att4_txt = _cross_attention[S, TXT, H, Dh](caq_rms, cak_rms, cav4, scale, ctx)
+    var ca_att_txt = _from_bshd(ca_att4_txt^, S, dim, ctx)
+    # IMAGE branch (kv = context_img); k_img -> norm_k_img, v_img (no norm)
+    var imgk_base = linear(context_img[], w.ca_wk_img[], Optional[Tensor](_clone_t(w.ca_bk_img[], ctx)), ctx)
+    var imgv_base = linear(context_img[], w.ca_wv_img[], Optional[Tensor](_clone_t(w.ca_bv_img[], ctx)), ctx)
+    var imgk_flat = _add_lora_delta(imgk_base, context_img_host, lora.img_k, IMG, ctx)
+    var imgv_flat = _add_lora_delta(imgv_base, context_img_host, lora.img_v, IMG, ctx)
+    var imgk_rms_flat = rms_norm(imgk_flat, w.ca_kn_img[], eps, ctx)
+    var imgk_pre = reshape(imgk_flat^, [1, IMG, H, Dh], ctx)
+    var imgv4 = reshape(imgv_flat^, [1, IMG, H, Dh], ctx)
+    var imgk_rms = reshape(imgk_rms_flat^, [1, IMG, H, Dh], ctx)
+    var ca_att4_img = _cross_attention[S, IMG, H, Dh](caq_rms, imgk_rms, imgv4, scale, ctx)
+    var ca_att_img = _from_bshd(ca_att4_img^, S, dim, ctx)
+    # ADD (x_txt + x_img) BEFORE the shared output proj
+    var ca_att = add(ca_att_txt, ca_att_img, ctx)
+    var ca_att_h = ca_att.to_host(ctx)
+    var ca_out_base = linear(ca_att, w.base.ca_wo[], Optional[Tensor](_clone_t(w.base.ca_bo[], ctx)), ctx)
+    var ca_out = _add_lora_delta(ca_out_base, ca_att_h, lora.base.ca_o, S, ctx)
+    var x_ca = add(x_sa, ca_out, ctx)
+
+    # ── FFN (LoRA on ffn.0 / ffn.2) — identical to the base block ──
+    var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
+    var ffn_in_h = ffn_mp.o[].to_host(ctx)
+    var ffn_h_base = linear(ffn_mp.o[], w.base.ffn0_w[], Optional[Tensor](_clone_t(w.base.ffn0_b[], ctx)), ctx)
+    var ffn_h = _add_lora_delta(ffn_h_base, ffn_in_h, lora.base.ffn0, S, ctx)
+    var ffn_act = gelu(ffn_h, ctx)
+    var ffn_act_h = ffn_act.to_host(ctx)
+    var ffn_out_base = linear(ffn_act, w.base.ffn2_w[], Optional[Tensor](_clone_t(w.base.ffn2_b[], ctx)), ctx)
+    var ffn_out = _add_lora_delta(ffn_out_base, ffn_act_h, lora.base.ffn2, S, ctx)
+    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
+
+    var x_out = x_final.to_host(ctx)
+    var base_saved = WanSaved(
+        x[].to_host_bf16(ctx),
+        sa_mp.ln[].to_host_bf16(ctx), sa_mp.o[].to_host_bf16(ctx),
+        q_pre.to_host_bf16(ctx), k_pre.to_host_bf16(ctx),
+        v4.to_host_bf16(ctx), q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx),
+        sa_att.to_host_bf16(ctx), x_sa.to_host_bf16(ctx),
+        n3.to_host_bf16(ctx), caq_pre.to_host_bf16(ctx), cak_pre.to_host_bf16(ctx),
+        caq_rms.to_host_bf16(ctx), cak_rms.to_host_bf16(ctx),
+        cav4.to_host_bf16(ctx), ca_att.to_host_bf16(ctx),
+        context_txt[].to_host_bf16(ctx), x_ca.to_host_bf16(ctx),
+        ffn_mp.ln[].to_host_bf16(ctx), ffn_mp.o[].to_host_bf16(ctx),
+        ffn_h.to_host_bf16(ctx), ffn_act.to_host_bf16(ctx),
+    )
+    var saved = WanI2VSaved(
+        base_saved^,
+        context_img[].to_host_bf16(ctx),
+        imgk_pre.to_host_bf16(ctx),
+        imgk_rms.to_host_bf16(ctx),
+        imgv4.to_host_bf16(ctx),
+    )
+    return WanI2VBlockForward(x_out^, saved^)
+
+
+# ── BACKWARD of one Wan2.1 I2V block WITH LoRA (12 targets) ───────────────────
+# Full reverse of the dual-cross-attn forward; self-attn + ffn arms identical to
+# wan22_block_lora_backward.
+def wan22_i2v_block_lora_backward[
+    H: Int, Dh: Int, S: Int, TXT: Int, IMG: Int
+](
+    d_out_h: List[Float32], mv: WanModVecs, w: WanI2VBlockWeights,
+    lora: WanI2VBlockLora, saved: WanI2VSaved, cos: Tensor, sin: Tensor,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> WanI2VBlockLoraGrads:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t16(_ones(dim), [dim], ctx)
+    var cos_e = _expand_rope_per_head(cos, S, H, Dh // 2, ctx)
+    var sin_e = _expand_rope_per_head(sin, S, H, Dh // 2, ctx)
+
+    var sv_lora_sa_in = _tbf16(saved.base.sa_in.copy(), [S, dim], ctx)
+    var sv_lora_sa_att = _tbf16(saved.base.sa_att.copy(), [S, dim], ctx)
+    var sv_lora_ca_n3 = _tbf16(saved.base.ca_n3.copy(), [S, dim], ctx)
+    var sv_lora_context = _tbf16(saved.base.context.copy(), [TXT, dim], ctx)  # TEXT ctx
+    var sv_lora_ca_att = _tbf16(saved.base.ca_att.copy(), [S, dim], ctx)      # x_txt+x_img
+    var sv_lora_img_ctx = _tbf16(saved.img_context.copy(), [IMG, dim], ctx)
+    var sa_in_h = sv_lora_sa_in.to_host(ctx)
+    var sa_att_h = sv_lora_sa_att.to_host(ctx)
+    var n3_h = sv_lora_ca_n3.to_host(ctx)
+    var context_txt_h = sv_lora_context.to_host(ctx)
+    var context_img_h = sv_lora_img_ctx.to_host(ctx)
+    var ca_att_h = sv_lora_ca_att.to_host(ctx)
+
+    var d_out = _ta16(d_out_h, [S, dim], ctx)
+
+    # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
+    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var lsv_ffn_act = _tbf16(saved.base.ffn_act.copy(), [S, ffn], ctx)
+    var ffn_act_h = lsv_ffn_act.to_host(ctx)
+    var ffn_out_rc = linear(lsv_ffn_act, w.base.ffn2_w[], Optional[Tensor](_clone_t(w.base.ffn2_b[], ctx)), ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
+    var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
+    var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
+    var lb_ffn2 = linear_backward(gb_ffn2.d_y, lsv_ffn_act, w.base.ffn2_w[], S, ffn, dim, ctx)
+    var d_ffn2_w = lb_ffn2.d_w.to_host(ctx)
+    var d_ffn2_b = lb_ffn2.d_b.to_host(ctx)
+    var d_ffn_out_h = gb_ffn2.d_y.to_host(ctx)
+    var ffn2_g = _lora_bwd_opt(lora.base.ffn2, d_ffn_out_h, ffn_act_h, S, ffn, ctx)
+    var d_ffn_act = add(lb_ffn2.d_x, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
+    var lsv_ffn_h = _tbf16(saved.base.ffn_h.copy(), [S, ffn], ctx)
+    var d_ffn_h = gelu_backward(d_ffn_act, lsv_ffn_h, ctx)
+    var lsv_ffn_in = _tbf16(saved.base.ffn_in.copy(), [S, dim], ctx)
+    var ffn_in_h = lsv_ffn_in.to_host(ctx)
+    var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.base.ffn0_w[], S, dim, ffn, ctx)
+    var d_ffn0_w = lb_ffn0.d_w.to_host(ctx)
+    var d_ffn0_b = lb_ffn0.d_b.to_host(ctx)
+    var d_ffn_h_h = d_ffn_h.to_host(ctx)
+    var ffn0_g = _lora_bwd_opt(lora.base.ffn0, d_ffn_h_h, ffn_in_h, S, dim, ctx)
+    var d_ffn_in = add(lb_ffn0.d_x, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
+    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var lsv_ffn_ln = _tbf16(saved.base.ffn_ln.copy(), [S, dim], ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
+    var d_scale_ffn = mb_ffn.d_scale.to_host(ctx)
+    var d_shift_ffn = mb_ffn.d_shift.to_host(ctx)
+    var lsv_x_ca = _tbf16(saved.base.x_ca.copy(), [S, dim], ctx)
+    var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, lsv_x_ca, ones_t, eps, ctx)
+    var d_x_ca = TArc(add(d_x_ca_resid[], lnb_ffn, ctx))
+
+    # ════════════════ DUAL cross-attention backward (LoRA q/k/v/o + k_img/v_img)
+    # ca_out = linear(ca_att_sum, ca_wo, ca_bo) + LoRA(ca_o); ca_att_sum = x_txt+x_img
+    var d_ca_out_h = d_x_ca[].to_host(ctx)
+    var lb_cao = linear_backward(d_x_ca[], sv_lora_ca_att, w.base.ca_wo[], S, dim, dim, ctx)
+    var d_ca_wo = lb_cao.d_w.to_host(ctx)
+    var d_ca_bo = lb_cao.d_b.to_host(ctx)
+    var ca_o_g = _lora_bwd_opt(lora.base.ca_o, d_ca_out_h, ca_att_h, S, dim, ctx)
+    # grad of the SUM (o-input); the add sends this SAME grad to BOTH branches.
+    var d_ca_att = add(lb_cao.d_x, _t16(ca_o_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_ca_att4_txt = reshape(d_ca_att, [1, S, H, Dh], ctx)
+    var d_ca_att4_img = reshape(d_ca_att, [1, S, H, Dh], ctx)
+
+    # shared saved query
+    var lsv_ca_q_rms = _tbf16(saved.base.ca_q_rms.copy(), [1, S, H, Dh], ctx)
+    # TEXT branch SDPA backward (kv=TXT)
+    var lsv_ca_k_rms = _tbf16(saved.base.ca_k_rms.copy(), [1, TXT, H, Dh], ctx)
+    var lsv_ca_v = _tbf16(saved.base.ca_v.copy(), [1, TXT, H, Dh], ctx)
+    var csb_txt = sdpa_backward_rect[1, S, TXT, H, Dh](
+        lsv_ca_q_rms, lsv_ca_k_rms, lsv_ca_v, d_ca_att4_txt, scale, ctx,
+    )
+    # IMAGE branch SDPA backward (kv=IMG), SAME saved query
+    var lsv_img_k_rms = _tbf16(saved.img_k_rms.copy(), [1, IMG, H, Dh], ctx)
+    var lsv_img_v = _tbf16(saved.img_v.copy(), [1, IMG, H, Dh], ctx)
+    var csb_img = sdpa_backward_rect[1, S, IMG, H, Dh](
+        lsv_ca_q_rms, lsv_img_k_rms, lsv_img_v, d_ca_att4_img, scale, ctx,
+    )
+    # shared query grad = TEXT + IMG
+    var d_caq_rms4 = add(csb_txt.d_q, csb_img.d_q, ctx)
+    var d_caq_rms_flat = reshape(d_caq_rms4, [S, dim], ctx)
+    var lsv_ca_q_pre = _tbf16(saved.base.ca_q_pre.copy(), [S, dim], ctx)
+    var rb_caq_dx = rms_norm_backward_dx(d_caq_rms_flat, lsv_ca_q_pre, w.base.ca_qn[], eps, ctx)
+    var d_ca_qn = _zeros(dim)
+    # TEXT k/v grads
+    var d_cak_rms_flat = reshape(csb_txt.d_k, [TXT, dim], ctx)
+    var lsv_ca_k_pre = _tbf16(saved.base.ca_k_pre.copy(), [TXT, dim], ctx)
+    var rb_cak_dx = rms_norm_backward_dx(d_cak_rms_flat, lsv_ca_k_pre, w.base.ca_kn[], eps, ctx)
+    var d_ca_kn = _zeros(dim)
+    var d_cav_flat = reshape(csb_txt.d_v, [TXT, dim], ctx)
+    var d_caq_h = rb_caq_dx.to_host(ctx)
+    var d_cak_h = rb_cak_dx.to_host(ctx)
+    var d_cav_h = d_cav_flat.to_host(ctx)
+    # IMAGE k/v grads (norm_k_img frozen -> d_x-only; d_g discarded)
+    var d_imgk_rms_flat = reshape(csb_img.d_k, [IMG, dim], ctx)
+    var lsv_img_k_pre = _tbf16(saved.img_k_pre.copy(), [IMG, dim], ctx)
+    var rb_imgk_dx = rms_norm_backward_dx(d_imgk_rms_flat, lsv_img_k_pre, w.ca_kn_img[], eps, ctx)
+    var d_ca_kn_img = _zeros(dim)
+    var d_imgv_flat = reshape(csb_img.d_v, [IMG, dim], ctx)
+    var d_imgk_h = rb_imgk_dx.to_host(ctx)
+    var d_imgv_h = d_imgv_flat.to_host(ctx)
+
+    # projection linears (base frozen weight grads + LoRA)
+    var lb_caq = linear_backward(rb_caq_dx, sv_lora_ca_n3, w.base.ca_wq[], S, dim, dim, ctx)
+    var lb_cak = linear_backward(rb_cak_dx, sv_lora_context, w.base.ca_wk[], TXT, dim, dim, ctx)
+    var lb_cav = linear_backward(d_cav_flat, sv_lora_context, w.base.ca_wv[], TXT, dim, dim, ctx)
+    var lb_imgk = linear_backward(rb_imgk_dx, sv_lora_img_ctx, w.ca_wk_img[], IMG, dim, dim, ctx)
+    var lb_imgv = linear_backward(d_imgv_flat, sv_lora_img_ctx, w.ca_wv_img[], IMG, dim, dim, ctx)
+    var d_ca_wq = lb_caq.d_w.to_host(ctx)
+    var d_ca_bq = lb_caq.d_b.to_host(ctx)
+    var d_ca_wk = lb_cak.d_w.to_host(ctx)
+    var d_ca_bk = lb_cak.d_b.to_host(ctx)
+    var d_ca_wv = lb_cav.d_w.to_host(ctx)
+    var d_ca_bv = lb_cav.d_b.to_host(ctx)
+    var d_ca_wk_img = lb_imgk.d_w.to_host(ctx)
+    var d_ca_bk_img = lb_imgk.d_b.to_host(ctx)
+    var d_ca_wv_img = lb_imgv.d_w.to_host(ctx)
+    var d_ca_bv_img = lb_imgv.d_b.to_host(ctx)
+    var ca_q_g = _lora_bwd_opt(lora.base.ca_q, d_caq_h, n3_h, S, dim, ctx)
+    var ca_k_g = _lora_bwd_opt(lora.base.ca_k, d_cak_h, context_txt_h, TXT, dim, ctx)
+    var ca_v_g = _lora_bwd_opt(lora.base.ca_v, d_cav_h, context_txt_h, TXT, dim, ctx)
+    var img_k_g = _lora_bwd_opt(lora.img_k, d_imgk_h, context_img_h, IMG, dim, ctx)
+    var img_v_g = _lora_bwd_opt(lora.img_v, d_imgv_h, context_img_h, IMG, dim, ctx)
+    # n3 grad = base d_x(caq) + LoRA d_x(ca_q)
+    var d_n3_in = add(lb_caq.d_x, _t16(ca_q_g.d_x.copy(), [S, dim], ctx), ctx)
+    # TEXT context grad = base(cak+cav) + LoRA(ca_k + ca_v)
+    var d_ctx_base = add(lb_cak.d_x, lb_cav.d_x, ctx)
+    var d_ctx_lora = add(
+        _t16(ca_k_g.d_x.copy(), [TXT, dim], ctx), _t16(ca_v_g.d_x.copy(), [TXT, dim], ctx), ctx
+    )
+    var d_context_t = TArc(add(d_ctx_base, d_ctx_lora, ctx))
+    # IMAGE context grad = base(imgk+imgv) + LoRA(img_k + img_v)
+    var d_imgctx_base = add(lb_imgk.d_x, lb_imgv.d_x, ctx)
+    var d_imgctx_lora = add(
+        _t16(img_k_g.d_x.copy(), [IMG, dim], ctx), _t16(img_v_g.d_x.copy(), [IMG, dim], ctx), ctx
+    )
+    var d_context_img = add(d_imgctx_base, d_imgctx_lora, ctx).to_host(ctx)
+
+    var lsv_x_sa = _tbf16(saved.base.x_sa.copy(), [S, dim], ctx)
+    var lnb_n3_dx = layer_norm_backward_dx(d_n3_in, lsv_x_sa, w.base.n3_w[], eps, ctx)
+    var d_n3_w = _zeros(dim)
+    var d_n3_b = _zeros(dim)
+    var d_x_sa = TArc(add(lnb_n3_dx, d_x_ca[], ctx))
+
+    # ════════════════ Self-attention backward (LoRA q/k/v/o) — base arm ════════
+    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var sa_out_rc = linear(sv_lora_sa_att, w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var d_gate_sa = gb_sa.d_gate.to_host(ctx)
+    var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
+    var d_sa_out_h = gb_sa.d_y.to_host(ctx)
+    var lb_sao = linear_backward(gb_sa.d_y, sv_lora_sa_att, w.base.sa_wo[], S, dim, dim, ctx)
+    var d_sa_wo = lb_sao.d_w.to_host(ctx)
+    var d_sa_bo = lb_sao.d_b.to_host(ctx)
+    var sa_o_g = _lora_bwd_opt(lora.base.sa_o, d_sa_out_h, sa_att_h, S, dim, ctx)
+    var d_sa_att = add(lb_sao.d_x, _t16(sa_o_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_sa_att4 = reshape(d_sa_att, [1, S, H, Dh], ctx)
+
+    var lsv_sa_q_rope = _tbf16(saved.base.sa_q_rope.copy(), [1, S, H, Dh], ctx)
+    var lsv_sa_k_rope = _tbf16(saved.base.sa_k_rope.copy(), [1, S, H, Dh], ctx)
+    var lsv_sa_v = _tbf16(saved.base.sa_v.copy(), [1, S, H, Dh], ctx)
+    var ssb = sdpa_backward[1, S, H, Dh](
+        lsv_sa_q_rope, lsv_sa_k_rope, lsv_sa_v, d_sa_att4, scale, ctx,
+    )
+    var ssb_dq_f32 = cast_tensor(ssb.d_q, STDtype.F32, ctx)
+    var ssb_dk_f32 = cast_tensor(ssb.d_k, STDtype.F32, ctx)
+    var d_q_rms = rope_backward(ssb_dq_f32, cos_e, sin_e, True, ctx)
+    var d_k_rms = rope_backward(ssb_dk_f32, cos_e, sin_e, True, ctx)
+    var d_q_rms_b = cast_tensor(d_q_rms, STDtype.BF16, ctx)
+    var d_q_rms_flat = reshape(d_q_rms_b, [S, dim], ctx)
+    var lsv_sa_q_pre = _tbf16(saved.base.sa_q_pre.copy(), [S, dim], ctx)
+    var rb_saq_dx = rms_norm_backward_dx(d_q_rms_flat, lsv_sa_q_pre, w.base.sa_qn[], eps, ctx)
+    var d_sa_qn = _zeros(dim)
+    var d_k_rms_b = cast_tensor(d_k_rms, STDtype.BF16, ctx)
+    var d_k_rms_flat = reshape(d_k_rms_b, [S, dim], ctx)
+    var lsv_sa_k_pre = _tbf16(saved.base.sa_k_pre.copy(), [S, dim], ctx)
+    var rb_sak_dx = rms_norm_backward_dx(d_k_rms_flat, lsv_sa_k_pre, w.base.sa_kn[], eps, ctx)
+    var d_sa_kn = _zeros(dim)
+    var d_sav_flat = reshape(ssb.d_v, [S, dim], ctx)
+    var d_saq_h = rb_saq_dx.to_host(ctx)
+    var d_sak_h = rb_sak_dx.to_host(ctx)
+    var d_sav_h = d_sav_flat.to_host(ctx)
+
+    var lb_saq = linear_backward(rb_saq_dx, sv_lora_sa_in, w.base.sa_wq[], S, dim, dim, ctx)
+    var lb_sak = linear_backward(rb_sak_dx, sv_lora_sa_in, w.base.sa_wk[], S, dim, dim, ctx)
+    var lb_sav = linear_backward(d_sav_flat, sv_lora_sa_in, w.base.sa_wv[], S, dim, dim, ctx)
+    var d_sa_wq = lb_saq.d_w.to_host(ctx)
+    var d_sa_bq = lb_saq.d_b.to_host(ctx)
+    var d_sa_wk = lb_sak.d_w.to_host(ctx)
+    var d_sa_bk = lb_sak.d_b.to_host(ctx)
+    var d_sa_wv = lb_sav.d_w.to_host(ctx)
+    var d_sa_bv = lb_sav.d_b.to_host(ctx)
+    var sa_q_g = _lora_bwd_opt(lora.base.sa_q, d_saq_h, sa_in_h, S, dim, ctx)
+    var sa_k_g = _lora_bwd_opt(lora.base.sa_k, d_sak_h, sa_in_h, S, dim, ctx)
+    var sa_v_g = _lora_bwd_opt(lora.base.sa_v, d_sav_h, sa_in_h, S, dim, ctx)
+    var d_sa_in_base = add(add(lb_saq.d_x, lb_sak.d_x, ctx), lb_sav.d_x, ctx)
+    var d_sa_in_lora = add(
+        add(_t16(sa_q_g.d_x.copy(), [S, dim], ctx), _t16(sa_k_g.d_x.copy(), [S, dim], ctx), ctx),
+        _t16(sa_v_g.d_x.copy(), [S, dim], ctx), ctx,
+    )
+    var d_sa_in = TArc(add(d_sa_in_base, d_sa_in_lora, ctx))
+
+    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var lsv_sa_ln = _tbf16(saved.base.sa_ln.copy(), [S, dim], ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var d_scale_sa = mb_sa.d_scale.to_host(ctx)
+    var d_shift_sa = mb_sa.d_shift.to_host(ctx)
+    var lsv_x = _tbf16(saved.base.x.copy(), [S, dim], ctx)
+    var lnb_sa = layer_norm_backward_dx(mb_sa.d_ln, lsv_x, ones_t, eps, ctx)
+    var d_x = add(lnb_sa, d_x_resid[], ctx)
+    var d_x_h = d_x.to_host(ctx)
+    var d_context_h = d_context_t[].to_host(ctx)
+
+    var base_grads = WanBlockGrads(
+        d_x_h^, d_context_h^,
+        d_sa_wq^, d_sa_wk^, d_sa_wv^, d_sa_wo^,
+        d_sa_bq^, d_sa_bk^, d_sa_bv^, d_sa_bo^,
+        d_sa_qn^, d_sa_kn^,
+        d_ca_wq^, d_ca_wk^, d_ca_wv^, d_ca_wo^,
+        d_ca_bq^, d_ca_bk^, d_ca_bv^, d_ca_bo^,
+        d_ca_qn^, d_ca_kn^,
+        d_n3_w^, d_n3_b^,
+        d_ffn0_w^, d_ffn0_b^, d_ffn2_w^, d_ffn2_b^,
+        d_shift_sa^, d_scale_sa^, d_gate_sa^,
+        d_shift_ffn^, d_scale_ffn^, d_gate_ffn^,
+    )
+    var lora_grads = WanBlockLoraGrads(
+        base_grads^,
+        sa_q_g.d_a.copy(), sa_q_g.d_b.copy(),
+        sa_k_g.d_a.copy(), sa_k_g.d_b.copy(),
+        sa_v_g.d_a.copy(), sa_v_g.d_b.copy(),
+        sa_o_g.d_a.copy(), sa_o_g.d_b.copy(),
+        ca_q_g.d_a.copy(), ca_q_g.d_b.copy(),
+        ca_k_g.d_a.copy(), ca_k_g.d_b.copy(),
+        ca_v_g.d_a.copy(), ca_v_g.d_b.copy(),
+        ca_o_g.d_a.copy(), ca_o_g.d_b.copy(),
+        ffn0_g.d_a.copy(), ffn0_g.d_b.copy(),
+        ffn2_g.d_a.copy(), ffn2_g.d_b.copy(),
+    )
+    return WanI2VBlockLoraGrads(
+        lora_grads^,
+        d_context_img^,
+        d_ca_wk_img^, d_ca_bk_img^, d_ca_wv_img^, d_ca_bv_img^, d_ca_kn_img^,
+        img_k_g.d_a.copy(), img_k_g.d_b.copy(),
+        img_v_g.d_a.copy(), img_v_g.d_b.copy(),
     )

@@ -47,7 +47,9 @@ from serenitymojo.models.wan22.wan22_stack_lora import (
 
 
 comptime NUM_BLOCKS = 2
-comptime SLOTS = 8            # WAN_SLOTS: sa_{q,k,v,o} + ca_{q,k,v,o}
+comptime SLOTS = 10           # WAN_LORA_SLOTS: sa_{q,k,v,o}+ca_{q,k,v,o}+ffn.0+ffn.2
+# (synthetic set uses square DIM×DIM adapters for all slots; the AdamW update is
+# per-adapter shape-agnostic, so this stays a valid host-vs-GPU equivalence gate.)
 comptime DIM = 96             # wan22 adapters are all in=out=dim
 comptime RANK = 4
 comptime EMPTY_ADAPTER = 5    # this one gets empty grads (skip-empty gate)

@@ -1,16 +1,17 @@
-# serenitymojo/models/wan22/parity/wan22_block_lora_parity.mojo
+# serenitymojo/models/wan22/parity/wan22_block_lora_parity_musubi.mojo
 #
-# PARITY GATE for the Wan2.2 WanAttentionBlock LoRA training unit
-# (models/wan22/wan22_block.mojo wan22_block_lora_*). Loads the inputs + torch
-# autograd LoRA d_A/d_B + input grads dumped by wan22_block_lora_oracle.py, runs
-# wan22_block_lora_forward + wan22_block_lora_backward, and compares x_out, d_x,
-# d_context, and the 8 adapters' d_A/d_B at cos >= 0.999.
+# MUSUBI-TUNER PARITY GATE for the Wan2.2 WanAttentionBlock LoRA training unit
+# (models/wan22/wan22_block.mojo wan22_block_lora_*). Identical structure to
+# wan22_block_lora_parity.mojo but consumes the dump produced by
+# wan22_block_lora_musubi_oracle.py (the reference driven through Musubi Tuner's
+# REAL WanAttentionBlock.forward at real A14B dims). Compares x_out, d_x,
+# d_context, and the 8 adapters' d_A/d_B against the Musubi reference.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/serenityflow-v2/.venv/bin/python \
-#       serenitymojo/models/wan22/parity/wan22_block_lora_oracle.py
+#   /home/alex/ai-toolkit/venv/bin/python \
+#       serenitymojo/models/wan22/parity/wan22_block_lora_musubi_oracle.py
 #   rm -f serenitymojo.mojopkg
-#   pixi run mojo run -I . serenitymojo/models/wan22/parity/wan22_block_lora_parity.mojo
+#   pixi run mojo run -I . serenitymojo/models/wan22/parity/wan22_block_lora_parity_musubi.mojo
 
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
@@ -28,15 +29,17 @@ from serenitymojo.models.wan22.wan22_block import (
 
 comptime REF_DIR = "/home/alex/mojodiffusion/serenitymojo/models/wan22/parity/"
 
-comptime H = 24
-comptime Dh = 8
-comptime DIM = H * Dh        # 192
-comptime S = 5
-comptime TXT = 4
-comptime FFN = 40
+# Real Wan2.2 A14B block dims (dim=5120, heads=40, head_dim=128, ffn=13824),
+# small sequence (1x4x4 grid = 16 image tokens, 8 text tokens), LoRA rank 8.
+comptime H = 40
+comptime Dh = 128
+comptime DIM = H * Dh          # 5120
+comptime S = 16
+comptime TXT = 8
+comptime FFN = 13824
 comptime EPS = Float32(1e-06)
-comptime RANK = 4
-comptime LSCALE = Float32(1.0)   # alpha/rank = 4/4
+comptime RANK = 8
+comptime LSCALE = Float32(1.0)   # alpha/rank = 8/8
 
 
 def _read_bin_f32(path: String) raises -> List[Float32]:
@@ -96,23 +99,33 @@ def _load_mod() raises -> WanModVecs:
     )
 
 
-def _make_adapter(a: List[Float32], b: List[Float32]) -> LoraAdapter:
+def _make_adapter(a: List[Float32], b: List[Float32], in_f: Int, out_f: Int) -> LoraAdapter:
     return LoraAdapter(
-        a.copy(), b.copy(), RANK, DIM, DIM, LSCALE,
-        _zeros(RANK * DIM), _zeros(RANK * DIM),
-        _zeros(DIM * RANK), _zeros(DIM * RANK),
+        a.copy(), b.copy(), RANK, in_f, out_f, LSCALE,
+        _zeros(RANK * in_f), _zeros(RANK * in_f),
+        _zeros(out_f * RANK), _zeros(out_f * RANK),
     )
 
 
 def _adapter(name: String) raises -> Optional[LoraAdapter]:
-    return Optional[LoraAdapter](_make_adapter(_in("lin_" + name + "_A"), _in("lin_" + name + "_B")))
+    # square attention adapters (in=out=dim)
+    return Optional[LoraAdapter](
+        _make_adapter(_in("lin_" + name + "_A"), _in("lin_" + name + "_B"), DIM, DIM)
+    )
+
+
+def _adapter_shaped(name: String, in_f: Int, out_f: Int) raises -> Optional[LoraAdapter]:
+    return Optional[LoraAdapter](
+        _make_adapter(_in("lin_" + name + "_A"), _in("lin_" + name + "_B"), in_f, out_f)
+    )
 
 
 def _load_lora() raises -> WanBlockLora:
     return WanBlockLora(
         _adapter("sa_q"), _adapter("sa_k"), _adapter("sa_v"), _adapter("sa_o"),
         _adapter("ca_q"), _adapter("ca_k"), _adapter("ca_v"), _adapter("ca_o"),
-        Optional[LoraAdapter](), Optional[LoraAdapter](),  # ffn.0/ffn.2 not tested here
+        _adapter_shaped("ffn0", DIM, FFN),   # ffn.0: dim->ffn
+        _adapter_shaped("ffn2", FFN, DIM),   # ffn.2: ffn->dim
     )
 
 
@@ -127,10 +140,9 @@ def _check(
         allok = False
 
 
-# Adapter d_A/d_B gate. The block runs NATIVE bf16 compute, so the rank-r LoRA
-# factor grads (tiny A/B ~0.05, rank 4) carry more bf16 rounding than full
-# weights — the d_A factors land ~0.997. Gate the adapter factors at the bf16-
-# appropriate 0.995 (forward + base input/weight grads stay strict at 0.999).
+# Adapter d_A/d_B gate at the bf16-appropriate 0.995 (native bf16 rank-r factor
+# grads carry more rounding than full weights). Forward + input grads stay strict
+# at 0.999.
 def _check_lora(
     name: String, actual: List[Float32], expected: List[Float32], mut allok: Bool,
 ) raises:
@@ -144,8 +156,8 @@ def _check_lora(
 
 def main() raises:
     var ctx = DeviceContext()
-    print("==== wan22_block_lora_parity (Wan2.2 block + 8 LoRA adapters vs torch) ====")
-    print("H=", H, " Dh=", Dh, " DIM=", DIM, " S=", S, " TXT=", TXT, " RANK=", RANK)
+    print("==== wan22_block_lora_parity_musubi (Wan2.2 A14B block + 8 LoRA vs Musubi) ====")
+    print("H=", H, " Dh=", Dh, " DIM=", DIM, " S=", S, " TXT=", TXT, " FFN=", FFN, " RANK=", RANK)
 
     var x = _in("lin_x")
     var context = _in("lin_context")
@@ -163,7 +175,7 @@ def main() raises:
     var allok = True
 
     print("")
-    print("---- forward output vs torch ----")
+    print("---- forward output vs Musubi ----")
     _check(harness, "x_out", fwd.x_out, _in("lref_x_out"), allok)
 
     var d_out = _in("lin_d_out")
@@ -172,12 +184,12 @@ def main() raises:
     )
 
     print("")
-    print("---- input grads vs torch (incl LoRA branch) ----")
+    print("---- input grads vs Musubi (incl LoRA branch) ----")
     _check(harness, "d_x (img)    ", g.base.d_x, _in("lref_d_x"), allok)
     _check(harness, "d_context(txt)", g.base.d_context, _in("lref_d_context"), allok)
 
     print("")
-    print("---- LoRA d_A / d_B vs torch (8 adapters; bf16 gate 0.995) ----")
+    print("---- LoRA d_A / d_B vs Musubi (10 adapters; bf16 gate 0.995) ----")
     _check_lora("sa_q dA", g.sa_q_da, _in("lref_sa_q_dA"), allok)
     _check_lora("sa_q dB", g.sa_q_db, _in("lref_sa_q_dB"), allok)
     _check_lora("sa_k dA", g.sa_k_da, _in("lref_sa_k_dA"), allok)
@@ -194,9 +206,13 @@ def main() raises:
     _check_lora("ca_v dB", g.ca_v_db, _in("lref_ca_v_dB"), allok)
     _check_lora("ca_o dA", g.ca_o_da, _in("lref_ca_o_dA"), allok)
     _check_lora("ca_o dB", g.ca_o_db, _in("lref_ca_o_dB"), allok)
+    _check_lora("ffn0 dA", g.ffn0_da, _in("lref_ffn0_dA"), allok)
+    _check_lora("ffn0 dB", g.ffn0_db, _in("lref_ffn0_dB"), allok)
+    _check_lora("ffn2 dA", g.ffn2_da, _in("lref_ffn2_dA"), allok)
+    _check_lora("ffn2 dB", g.ffn2_db, _in("lref_ffn2_dB"), allok)
 
     print("")
     if allok:
-        print("VERDICT: PASS — Wan2.2 block LoRA fwd+bwd matches torch (cos>=0.999)")
+        print("VERDICT: PASS -- Wan2.2 A14B block LoRA fwd+bwd matches Musubi (cos>=0.999)")
     else:
-        print("VERDICT: FAIL — at least one output diverged (see FAIL lines above)")
+        print("VERDICT: FAIL -- at least one output diverged (see FAIL lines above)")

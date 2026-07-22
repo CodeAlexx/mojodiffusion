@@ -2904,3 +2904,32 @@ Full API: `docs/MOJO_MODULES.md` "LoRA — lora.mojo" + `docs/SERENITYMOJO_MODUL
 - This sync adds Mojo pipelines and parity surfaces only. There is no server
   worker, capability profile, model card, or Canvas engine yet; product routing
   stays fail-closed until those surfaces and lifecycle gates are implemented.
+
+## 2026-07-22: MageFlow LoRA TRAINER — Base-targeted, block backward = qwenimage reuse (5080)
+
+LoRA-only training for Mage-Flow (trains on **Mage-Flow-Base**; full repo at
+`~/.serenity/models/checkpoints/Mage-Flow-Base`). The block backward is PURE
+REUSE: `models/qwenimage/qwenimage_block.mojo::double_block_lora_forward/backward`
+is byte-for-byte MageFlow's block; the text-not-roped delta is carried by the
+rope INPUT table (`build_mageflow_rope_tables` text-identity rows) through fwd
+AND bwd — zero block-math changes.
+
+- **Gate**: `models/mageflow/parity/mageflow_block_lora_{oracle.py,parity.mojo}` —
+  torch autograd over the REAL `MageFlowTransformerBlock` (real Turbo block-0
+  weights, fp64 oracle): 30/30 cos ≥ 0.999; rope cross-check vs the real
+  `MageFlowEmbedRope` cos = 1.0. Oracle LoRA B init randn×0.02 (B=0 degenerates dA).
+- **Surface**: `models/mageflow/{config,weights,mageflow_stack_lora}.mojo` —
+  12 blocks / 3072 / 24h / ctx 2560 / shift 6.0; 144 adapters (12 house targets
+  × 12 blocks); **OFFLOAD streaming** (TurboPlannedLoader; 8.2G resident too
+  tight on 16G — measured peak 5.9G synthetic / 3.8G real-cache).
+- **Trainer**: `training/train_mageflow_real.mojo` — logit-normal σ (shift 6.0),
+  `x_t=(1-σ)x0+σ·noise`, target=`noise−x0`, RAW-σ timestep, levers MSE, AdamW +
+  clip 1.0; saves ai-toolkit `diffusion_model.transformer_blocks.{i}.*.lora_A/B`
+  + `.state` (F32 adam moments). Configs `configs/mageflow_base_{smoke,real4}.json`.
+- **Cache**: `training/mageflow_cache_builder.mojo` — PURE-MOJO (Qwen3-VL text
+  cond + MageVAE encode, offload-staged) → `klein_dataset` layout at
+  `~/.serenity/mageflow_cache/40_woman` (round-trip stats digit-exact).
+- **Real-data smokes on Base**: 2-step + 4-step, finite σ-tracking losses,
+  ~7.5s/step. BUILD NOTE: **binary build required** (`mojo build
+  --target-accelerator sm_120 … -Xlinker -lcuda`; `mojo run` JIT can't resolve
+  `cuMemcpyHtoDAsync_v2`).

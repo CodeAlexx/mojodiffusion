@@ -129,13 +129,13 @@ def mageflow_denoise[
 # ── STAGE 3: MageVAE one-step decode → RGB [1,3,SH*16,SH*16] ──────────────────
 # latent_f32: [1, N_IMG, 128] F32. unpack "(h w) c -> c h w" then MageVAE decode.
 def mageflow_decode_latent[
-    N_IMG: Int, SH: Int
+    N_IMG: Int, SH_H: Int, SH_W: Int
 ](vae_path: String, latent_f32: Tensor, ctx: DeviceContext) raises -> Tensor:
     var st = ShardedSafeTensors.open(vae_path)
-    # unpack: [1, SH*SH, 128] (b (h w) c) → [1, SH, SH, 128] (b h w c) → NCHW
-    var nhwc = reshape(latent_f32, [1, SH, SH, 128], ctx)
-    var nchw = permute(nhwc, [0, 3, 1, 2], ctx)  # [1, 128, SH, SH]
-    return mageflow_decode[SH](nchw, st, ctx)  # [1, 3, SH*16, SH*16]
+    # unpack: [1, SH_H*SH_W, 128] (b (h w) c) → [1, SH_H, SH_W, 128] (b h w c) → NCHW
+    var nhwc = reshape(latent_f32, [1, SH_H, SH_W, 128], ctx)
+    var nchw = permute(nhwc, [0, 3, 1, 2], ctx)  # [1, 128, SH_H, SH_W]
+    return mageflow_decode[SH_H, SH_W](nchw, st, ctx)  # [1, 3, SH_H*16, SH_W*16]
 
 
 # ── seeded Gaussian noise (Box-Muller) for fresh generation ──────────────────
@@ -198,7 +198,7 @@ def generate_mageflow[
     print("[mageflow]   final latent computed (DiT freed)")
 
     print("[mageflow] STAGE3 MageVAE decode → RGB ...")
-    var rgb = mageflow_decode_latent[N_IMG, SH](String(MF_VAE), latent, ctx)
+    var rgb = mageflow_decode_latent[N_IMG, SH, SH](String(MF_VAE), latent, ctx)
     var rs = rgb.shape()
     print("[mageflow]   image =", rs[0], rs[1], rs[2], rs[3])
 

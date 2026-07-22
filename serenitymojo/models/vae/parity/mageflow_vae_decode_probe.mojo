@@ -217,7 +217,7 @@ def main() raises:
 
     # ── G7: CoD decoder cond (latent z -> cond) ──────────────────────────────
     var z_nhwc = _nchw_to_nhwc(load_f32(orc, "z", ctx), ctx)  # [1,4,4,128]
-    var cond_out = cod_decode[SH](z_nhwc, st, ctx)  # [1,4,4,384]
+    var cond_out = cod_decode[SH, SH](z_nhwc, st, ctx)  # [1,4,4,384]
     var cond_h = cond_out.to_host(ctx)
     var cond_ref = _nchw_to_nhwc(load_f32(orc, "cond", ctx), ctx).to_host(ctx)
     var g7 = _cos_maxabs(cond_h, cond_ref)
@@ -225,7 +225,7 @@ def main() raises:
 
     # ── G8a: nerf x-embedder (cond -> x_xembed), DCT-positional isolation ─────
     var cond_nhwc = _nchw_to_nhwc(load_f32(orc, "cond", ctx), ctx)
-    var xemb = nerf_forward[SH](cond_nhwc, st, ctx)  # [16*256,32]
+    var xemb = nerf_forward[SH, SH](cond_nhwc, st, ctx)  # [16*256,32]
     var xemb_h = xemb.to_host(ctx)
     var xemb_ref = load_f32(orc, "x_xembed", ctx).to_host(ctx)  # [16,256,32] flat
     var g8a = _cos_maxabs(xemb_h, xemb_ref)
@@ -236,7 +236,7 @@ def main() raises:
     var xin_rows = vae_reshape(xin2, [16 * 256, 32], ctx)
     var s_last = _nchw_to_nhwc(load_f32(orc, "s_blocklast", ctx), ctx)  # [1,4,4,384]
     var s_cond = vae_reshape(s_last, [16, 384], ctx)
-    var xdec = decnet_forward[SH](xin_rows, s_cond, st, ctx)
+    var xdec = decnet_forward[SH, SH](xin_rows, s_cond, st, ctx)
     var xdec_h = xdec.to_host(ctx)
     var xdec_ref = load_f32(orc, "x_decnet", ctx).to_host(ctx)
     var g8b = _cos_maxabs(xdec_h, xdec_ref)
@@ -244,7 +244,7 @@ def main() raises:
 
     # ── G9: FULL RGB decode (latent z -> rgb) ────────────────────────────────
     var z_full = load_f32(orc, "z", ctx)  # [1,128,4,4] NCHW
-    var rgb = mageflow_decode[SH](z_full, st, ctx)  # [1,3,64,64] NCHW
+    var rgb = mageflow_decode[SH, SH](z_full, st, ctx)  # [1,3,64,64] NCHW
     var rgb_h = rgb.to_host(ctx)
     var rgb_ref = load_f32(orc, "rgb", ctx).to_host(ctx)
     var g9 = _cos_maxabs(rgb_h, rgb_ref)

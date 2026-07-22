@@ -43,7 +43,7 @@ from serenitymojo.ops.reduce import reduce_mean
 from serenitymojo.ops.softmax import softmax_lastdim
 from serenitymojo.ops.tensor_algebra import permute, mul_scalar
 from serenitymojo.models.vae.vae_ops import reshape as vae_reshape, clone, add as vae_add
-from serenitymojo.models.vae.decoder2d import ResnetBlock, nchw_to_nhwc
+from serenitymojo.models.vae.decoder2d import ResnetBlock, nchw_to_nhwc, nhwc_to_nchw
 
 
 comptime _L1 = Layout.row_major(-1)
@@ -491,9 +491,9 @@ def cod_attn_forward(
 
 
 # ── CoD ResnetBlock (reuse decoder2d.ResnetBlock struct + forward, F32 weights) ─
-def load_cod_resnet_f32[SH: Int](
+def load_cod_resnet_f32[SH_H: Int, SH_W: Int](
     st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
-) raises -> ResnetBlock[1, SH, SH, 384, 384]:
+) raises -> ResnetBlock[1, SH_H, SH_W, 384, 384]:
     var n1w = load_f32(st, prefix + ".norm1.weight", ctx)
     var n1b = load_f32(st, prefix + ".norm1.bias", ctx)
     var c1w = load_conv_rscf_f32(st, prefix + ".conv1.weight", ctx)
@@ -506,33 +506,33 @@ def load_cod_resnet_f32[SH: Int](
     var ds = List[Int](); ds.append(1)
     var scw = Tensor.from_host(d.copy(), ds.copy(), STDtype.F32, ctx)
     var scb = Tensor.from_host(d, ds^, STDtype.F32, ctx)
-    return ResnetBlock[1, SH, SH, 384, 384](
+    return ResnetBlock[1, SH_H, SH_W, 384, 384](
         n1w^, n1b^, c1w^, c1b^, n2w^, n2b^, c2w^, c2b^, False, scw^, scb^
     )
 
 
-# ── CoD _Decoder: latent z[1,SH,SH,128] -> cond[1,SH,SH,384] (mage_vae.py:376) ─
-def cod_decode[SH: Int](
+# ── CoD _Decoder: latent z[1,SH_H,SH_W,128] -> cond[1,SH_H,SH_W,384] (mage_vae.py:376) ─
+def cod_decode[SH_H: Int, SH_W: Int](
     z_nhwc: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
 ) raises -> Tensor:
     var P = String("pipeline.y_embedder.decoder")
     var ciw = load_conv_rscf_f32(st, P + ".conv_in.weight", ctx)
     var cib = load_f32(st, P + ".conv_in.bias", ctx)
-    var h = conv2d[1, SH, SH, 128, 3, 3, 384, 1, 1, 1, 1](
+    var h = conv2d[1, SH_H, SH_W, 128, 3, 3, 384, 1, 1, 1, 1](
         z_nhwc, ciw, Optional[Tensor](cib^), ctx
     )
-    h = load_cod_resnet_f32[SH](st, P + ".block.0", ctx).forward(h, ctx)
+    h = load_cod_resnet_f32[SH_H, SH_W](st, P + ".block.0", ctx).forward(h, ctx)
     h = cod_attn_forward(h, st, P + ".block.1", 32, ctx)
-    h = load_cod_resnet_f32[SH](st, P + ".block.2", ctx).forward(h, ctx)
+    h = load_cod_resnet_f32[SH_H, SH_W](st, P + ".block.2", ctx).forward(h, ctx)
     h = cod_attn_forward(h, st, P + ".block.3", 32, ctx)
-    h = load_cod_resnet_f32[SH](st, P + ".block.4", ctx).forward(h, ctx)
+    h = load_cod_resnet_f32[SH_H, SH_W](st, P + ".block.4", ctx).forward(h, ctx)
     var now = load_f32(st, P + ".norm_out.weight", ctx)
     var nob = load_f32(st, P + ".norm_out.bias", ctx)
     h = group_norm(h, now, nob, 32, Float32(1e-6), ctx)
     h = silu(h, ctx)  # nonlinearity = x*sigmoid(x)
     var cow = load_conv_rscf_f32(st, P + ".conv_out.weight", ctx)
     var cob = load_f32(st, P + ".conv_out.bias", ctx)
-    return conv2d[1, SH, SH, 384, 3, 3, 384, 1, 1, 1, 1](
+    return conv2d[1, SH_H, SH_W, 384, 3, 3, 384, 1, 1, 1, 1](
         h, cow, Optional[Tensor](cob^), ctx
     )
 
@@ -614,14 +614,14 @@ def build_dct_rows[L: Int](ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(tbl, osh^, STDtype.F32, ctx)
 
 
-def nerf_forward[SH: Int](
+def nerf_forward[SH_H: Int, SH_W: Int](
     cond_nhwc: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
 ) raises -> Tensor:
-    """cond[1,SH,SH,384] -> x_embedder features [SH*SH*256, 32] (rows L*256+p).
+    """cond[1,SH_H,SH_W,384] -> x_embedder features [SH_H*SH_W*256, 32] (rows L*256+p).
     Builds the y_embedder_x per-(patch,pixel) 32-feature, cats the DCT positional,
     and runs embedder Linear(99->32). The 3 image channels are exactly 0 (noise=0)
     so their weight columns are dropped."""
-    comptime L = SH * SH
+    comptime L = SH_H * SH_W
     var cr = vae_reshape(cond_nhwc, [L, 384], ctx)
     var yw = load_conv1x1_as_linear(st, "pipeline.y_embedder_x.weight", ctx)  # [8192,384]
     var yb = load_f32(st, "pipeline.y_embedder_x.bias", ctx)
@@ -675,11 +675,11 @@ def _mlpresblock(
     return residual_gate(x, gate, m, ctx)  # x + gate*m  (per-row gate)
 
 
-def decnet_forward[SH: Int](
+def decnet_forward[SH_H: Int, SH_W: Int](
     x_rows: Tensor, s_cond: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
 ) raises -> Tensor:
     """SimpleMLPAdaLN (mage_vae.py:221-242). x_rows:[L*256,32], s_cond:[L,384]."""
-    comptime L = SH * SH
+    comptime L = SH_H * SH_W
     var ipw = load_f32(st, "pipeline.dec_net.input_proj.weight", ctx)
     var ipb = load_f32(st, "pipeline.dec_net.input_proj.bias", ctx)
     var x = linear_bias(x_rows, ipw, ipb, ctx)  # [L*256,32]
@@ -692,13 +692,13 @@ def decnet_forward[SH: Int](
     return x^
 
 
-def final_fold[SH: Int](
+def final_fold[SH_H: Int, SH_W: Int](
     x_rows: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
 ) raises -> Tensor:
     """NerfFinalLayer (RMSNorm+Linear 32->3) then fold to RGB [1,3,H,W] NCHW."""
-    comptime L = SH * SH
-    comptime H = SH * 16
-    comptime W = SH * 16
+    comptime L = SH_H * SH_W
+    comptime H = SH_H * 16
+    comptime W = SH_W * 16
     var fw = load_f32(st, "pipeline.final_layer.norm.weight", ctx)
     var xn = rms_norm(x_rows, fw, Float32(1e-6), ctx)  # [L*256,32]
     var flw = load_f32(st, "pipeline.final_layer.linear.weight", ctx)  # [3,32]
@@ -712,19 +712,19 @@ def final_fold[SH: Int](
     var total = L * 256 * 3
     var grid = (total + _MBLK - 1) // _MBLK
     ctx.enqueue_function[_fold_kernel, _fold_kernel](
-        _lt(rgb_rows), D, L, 256, 3, H, W, 16, SH, total,
+        _lt(rgb_rows), D, L, 256, 3, H, W, 16, SH_W, total,
         grid_dim=grid, block_dim=_MBLK
     )
     var osh = List[Int](); osh.append(1); osh.append(3); osh.append(H); osh.append(W)
     return Tensor(out_buf^, osh^, STDtype.F32)
 
 
-# ── FULL decode: latent z[1,128,SH,SH] NCHW -> RGB [1,3,SH*16,SH*16] NCHW ──────
-def mageflow_decode[SH: Int](
+# ── FULL decode: latent z[1,128,SH_H,SH_W] NCHW -> RGB [1,3,SH_H*16,SH_W*16] NCHW ──
+def mageflow_decode[SH_H: Int, SH_W: Int](
     z_nchw: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
 ) raises -> Tensor:
-    var z_nhwc = nchw_to_nhwc(z_nchw, ctx)  # [1,SH,SH,128]
-    var cond = cod_decode[SH](z_nhwc, st, ctx)  # [1,SH,SH,384]
+    var z_nhwc = nchw_to_nhwc(z_nchw, ctx)  # [1,SH_H,SH_W,128]
+    var cond = cod_decode[SH_H, SH_W](z_nhwc, st, ctx)  # [1,SH_H,SH_W,384]
     # c = t_embedder(0): emb(0) = [1]*128 ++ [0]*128
     var emb = List[Float32]()
     for _ in range(128):
@@ -741,14 +741,212 @@ def mageflow_decode[SH: Int](
     c = linear_bias(c, w2, b2, ctx)  # [1,384]
     # s = s_embedder(cond); 21 DiCoBlocks
     var semb = SEmbedder[384, 128].load(st, ctx)
-    var s = semb.forward[1, SH, SH](cond, ctx)
+    var s = semb.forward[1, SH_H, SH_W](cond, ctx)
     for bi in range(21):
         var blk = DiCoBlock[384, 1536].load(
             st, String("pipeline.blocks.") + String(bi), ctx
         )
-        s = blk.forward[1, SH, SH](s, c, ctx)
-    var s_cond = vae_reshape(s, [SH * SH, 384], ctx)
+        s = blk.forward[1, SH_H, SH_W](s, c, ctx)
+    var s_cond = vae_reshape(s, [SH_H * SH_W, 384], ctx)
     # x-path
-    var xemb = nerf_forward[SH](cond, st, ctx)  # [L*256,32]
-    var xdec = decnet_forward[SH](xemb, s_cond, st, ctx)  # [L*256,32]
-    return final_fold[SH](xdec, st, ctx)  # [1,3,H,W]
+    var xemb = nerf_forward[SH_H, SH_W](cond, st, ctx)  # [L*256,32]
+    var xdec = decnet_forward[SH_H, SH_W](xemb, s_cond, st, ctx)  # [L*256,32]
+    return final_fold[SH_H, SH_W](xdec, st, ctx)  # [1,3,H,W]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENCODE path (RGB image → 128-ch latent), mage_vae.py:402-441 _DConvEncoder +
+# :597-623 MageVAE._moments/encode. Deterministic (sample_posterior=False → mean).
+#
+# forward_pred(z_t=0, t=0, y=image):
+#   cond = patch_cond_embed(y)              # Conv2d 3→768, k=16 s=16 (patchify)
+#   for b in head_blocks[0..1]: cond = _EncoderDiCoBlock(cond)   # 768-ch, no adaLN
+#   cond = proj_down(cond)                  # 1×1 768→384
+#   s = fuse_proj(cat([cond, z_proj(z_t)])) # z_t=0 → z_proj(0)=z_proj.bias broadcast
+#   c = t_embedder(t=0)                      # encoder's own t-MLP
+#   for b in blocks[0..20]: s = DiCoBlock(s, c)  # 384-ch adaLN DConv (SAME struct as decode)
+#   out = proj_out(norm_out(s))             # LayerNorm2d(affine) then 1×1 384→256
+# mean = out[:, :128]  (logvar = out[:,128:] dropped for the deterministic latent).
+#
+# NHWC internally (last dim = channels), same as the decode path.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── _EncoderDiCoBlock (mage_vae.py:152-177): DiCoBlock WITHOUT adaLN; norm1/norm2
+#    are affine LayerNorm2d; residual is inp+x (no gate); FFN adds directly. ──────
+@fieldwise_init
+struct EncoderDiCoBlock[C: Int, FFN: Int](Movable):
+    var norm1_w: Tensor  # [C]
+    var norm1_b: Tensor  # [C]
+    var conv1_w: Tensor  # [C,C]
+    var conv1_b: Tensor  # [C]
+    var conv2_rscf: Tensor  # [3,3,C,C] block-diagonal depthwise
+    var conv2_b: Tensor  # [C]
+    var conv3_w: Tensor  # [C,C]
+    var conv3_b: Tensor  # [C]
+    var ca_w: Tensor  # [C,C]
+    var ca_b: Tensor  # [C]
+    var conv4_w: Tensor  # [FFN,C]
+    var conv4_b: Tensor  # [FFN]
+    var conv5_w: Tensor  # [C,FFN]
+    var conv5_b: Tensor  # [C]
+    var norm2_w: Tensor  # [C]
+    var norm2_b: Tensor  # [C]
+
+    @staticmethod
+    def load(st: ShardedSafeTensors, p: String, ctx: DeviceContext) raises -> EncoderDiCoBlock[Self.C, Self.FFN]:
+        return EncoderDiCoBlock[Self.C, Self.FFN](
+            load_f32(st, p + ".norm1.weight", ctx),
+            load_f32(st, p + ".norm1.bias", ctx),
+            load_conv1x1_as_linear(st, p + ".conv1.weight", ctx),
+            load_f32(st, p + ".conv1.bias", ctx),
+            load_depthwise_rscf(st, p + ".conv2.weight", Self.C, ctx),
+            load_f32(st, p + ".conv2.bias", ctx),
+            load_conv1x1_as_linear(st, p + ".conv3.weight", ctx),
+            load_f32(st, p + ".conv3.bias", ctx),
+            load_conv1x1_as_linear(st, p + ".ca.1.weight", ctx),
+            load_f32(st, p + ".ca.1.bias", ctx),
+            load_conv1x1_as_linear(st, p + ".conv4.weight", ctx),
+            load_f32(st, p + ".conv4.bias", ctx),
+            load_conv1x1_as_linear(st, p + ".conv5.weight", ctx),
+            load_f32(st, p + ".conv5.bias", ctx),
+            load_f32(st, p + ".norm2.weight", ctx),
+            load_f32(st, p + ".norm2.bias", ctx),
+        )
+
+    def forward[N: Int, H: Int, W: Int](
+        self, inp: Tensor, ctx: DeviceContext
+    ) raises -> Tensor:
+        """inp: [N,H,W,C] NHWC -> [N,H,W,C]."""
+        comptime eps = Float32(1e-6)
+        comptime cC = Self.C
+        var rows = N * H * W
+        var rsh = List[Int](); rsh.append(rows); rsh.append(cC)
+        var inp_rows = vae_reshape(inp, rsh.copy(), ctx)
+        # x = norm1(inp)  (affine LayerNorm2d over C)
+        var x = layer_norm(inp_rows, self.norm1_w, self.norm1_b, eps, ctx)
+        # conv1 (1x1)
+        x = linear_bias(x, self.conv1_w, self.conv1_b, ctx)
+        # conv2 (depthwise 3x3)
+        var nhwc = List[Int](); nhwc.append(N); nhwc.append(H); nhwc.append(W); nhwc.append(cC)
+        var x4 = vae_reshape(x, nhwc.copy(), ctx)
+        x4 = conv2d[N, H, W, Self.C, 3, 3, Self.C, 1, 1, 1, 1](
+            x4, clone(self.conv2_rscf, ctx),
+            Optional[Tensor](clone(self.conv2_b, ctx)), ctx
+        )
+        # gelu (exact / erf)
+        x4 = gelu_exact(x4, ctx)
+        # channel attention: x * sigmoid(conv1x1(mean_hw(x)))
+        var mdims = List[Int](); mdims.append(1); mdims.append(2)
+        var m = reduce_mean(x4, mdims^, False, ctx)  # [N,C]
+        m = linear_bias(m, self.ca_w, self.ca_b, ctx)
+        m = sigmoid(m, ctx)
+        var zc = _zeros_nhwc(N, H, W, cC, ctx)
+        x4 = residual_gate(zc, m, x4, ctx)  # 0 + ca * x
+        # conv3 (1x1)
+        var xr = vae_reshape(x4, rsh.copy(), ctx)
+        xr = linear_bias(xr, self.conv3_w, self.conv3_b, ctx)
+        # residual: inp + x  (NO gate)
+        var h = vae_add(inp_rows, xr, ctx)  # [rows,C]
+        # FFN: h + conv5(gelu(conv4(norm2(h))))
+        var f = layer_norm(h, self.norm2_w, self.norm2_b, eps, ctx)
+        f = linear_bias(f, self.conv4_w, self.conv4_b, ctx)  # [rows,FFN]
+        f = gelu_exact(f, ctx)
+        f = linear_bias(f, self.conv5_w, self.conv5_b, ctx)  # [rows,C]
+        var out = vae_add(h, f, ctx)  # [rows,C]
+        var nhwc2 = List[Int](); nhwc2.append(N); nhwc2.append(H); nhwc2.append(W); nhwc2.append(cC)
+        return vae_reshape(out, nhwc2^, ctx)
+
+
+# ── fuse_proj fold (mage_vae.py:437): s = fuse_proj(cat([cond, z_proj(0)])).
+#    z_proj(z_t=0) = z_proj.bias broadcast (1x1 conv on zeros). So with fuse weight
+#    [384, 768] split into cond-half [:, :384] and z-half [:, 384:768]:
+#      s = cond @ cond_half^T + (z_half @ z_proj.bias + fuse.bias)
+#    i.e. a plain linear over cond with a folded constant bias. ────────────────
+def fuse_encode(
+    cond_rows: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
+) raises -> Tensor:
+    """cond_rows: [rows,384] -> s_rows: [rows,384]."""
+    var fw = load_conv1x1_as_linear(st, "student.dconv_encoder.fuse_proj.weight", ctx)  # [384,768]
+    var fb = load_f32(st, "student.dconv_encoder.fuse_proj.bias", ctx)  # [384]
+    var fwh = fw.to_host(ctx)  # [384,768] row-major
+    # split cond-half (in-cols 0:384) and z-half (in-cols 384:768)
+    var cond_half = List[Float32]()
+    var z_half = List[Float32]()
+    for o in range(384):
+        for ci in range(384):
+            cond_half.append(fwh[o * 768 + ci])
+        for ci in range(384, 768):
+            z_half.append(fwh[o * 768 + ci])
+    var cond_w = Tensor.from_host(cond_half, [384, 384], STDtype.F32, ctx)
+    var z_w = Tensor.from_host(z_half, [384, 384], STDtype.F32, ctx)
+    # zconst = z_half @ z_proj(0) + fuse.bias  -> [384].
+    # z_proj is Conv2d(128->384); on zero input its output is z_proj.bias [384]
+    # broadcast, so the concatenated z-channels equal the 384-dim z_proj.bias.
+    var zpb = load_f32(st, "student.dconv_encoder.z_proj.bias", ctx)  # [384]
+    var zpb_row = vae_reshape(zpb, [1, 384], ctx)  # z_proj.bias as a row vector
+    var zconst = linear_bias(zpb_row, z_w, fb, ctx)  # [1,384] = zpb@z_w^T + fb
+    var zconst_vec = vae_reshape(zconst, [384], ctx)  # [384] bias vector
+    return linear_bias(cond_rows, cond_w, zconst_vec, ctx)  # [rows,384]
+
+
+# ── FULL encode: image[1,3,IH,IW] NCHW -> latent mean[1,128,IH/16,IW/16] NCHW ──
+def mageflow_encode[IH: Int, IW: Int](
+    img_nchw: Tensor, st: ShardedSafeTensors, ctx: DeviceContext
+) raises -> Tensor:
+    comptime SH = IH // 16
+    comptime SW = IW // 16
+    var P = String("student.dconv_encoder")
+    var y = nchw_to_nhwc(img_nchw, ctx)  # [1,IH,IW,3]
+    # patch_cond_embed: Conv2d 3->768, k=16 s=16 (patchify)
+    var pw = load_conv_rscf_f32(st, P + ".patch_cond_embed.weight", ctx)  # [16,16,3,768]
+    var pb = load_f32(st, P + ".patch_cond_embed.bias", ctx)
+    var cond = conv2d[1, IH, IW, 3, 16, 16, 768, 16, 16, 0, 0](
+        y, pw, Optional[Tensor](pb^), ctx
+    )  # [1,SH,SW,768]
+    # 2 head blocks (encoder DiCo, C=768, FFN=3072)
+    for hb in range(2):
+        var blk = EncoderDiCoBlock[768, 3072].load(
+            st, P + ".head_blocks." + String(hb), ctx
+        )
+        cond = blk.forward[1, SH, SW](cond, ctx)
+    # proj_down: 1x1 768->384
+    var pdw = load_conv1x1_as_linear(st, P + ".proj_down.weight", ctx)  # [384,768]
+    var pdb = load_f32(st, P + ".proj_down.bias", ctx)
+    var rows = SH * SW
+    var cond_rows = vae_reshape(cond, [rows, 768], ctx)
+    cond_rows = linear_bias(cond_rows, pdw, pdb, ctx)  # [rows,384]
+    # fuse_proj fold (z_t=0)
+    var s_rows = fuse_encode(cond_rows, st, ctx)  # [rows,384]
+    var s = vae_reshape(s_rows, [1, SH, SW, 384], ctx)
+    # c = t_embedder(0): emb(0) = [1]*128 ++ [0]*128, then encoder's t-MLP
+    var emb = List[Float32]()
+    for _ in range(128):
+        emb.append(1.0)
+    for _ in range(128):
+        emb.append(0.0)
+    var c = Tensor.from_host(emb, [1, 256], STDtype.F32, ctx)
+    var w0 = load_f32(st, P + ".t_embedder.mlp.0.weight", ctx)
+    var b0 = load_f32(st, P + ".t_embedder.mlp.0.bias", ctx)
+    var w2 = load_f32(st, P + ".t_embedder.mlp.2.weight", ctx)
+    var b2 = load_f32(st, P + ".t_embedder.mlp.2.bias", ctx)
+    c = linear_bias(c, w0, b0, ctx)
+    c = silu(c, ctx)
+    c = linear_bias(c, w2, b2, ctx)  # [1,384]
+    # 21 adaLN DiCoBlocks (SAME struct as decode; encoder's own weights)
+    for bi in range(21):
+        var blk = DiCoBlock[384, 1536].load(
+            st, P + ".blocks." + String(bi), ctx
+        )
+        s = blk.forward[1, SH, SW](s, c, ctx)
+    # norm_out (affine LayerNorm2d over 384) then proj_out 1x1 384->256
+    var now = load_f32(st, P + ".norm_out.weight", ctx)
+    var nob = load_f32(st, P + ".norm_out.bias", ctx)
+    var s2 = vae_reshape(s, [rows, 384], ctx)
+    s2 = layer_norm(s2, now, nob, Float32(1e-6), ctx)
+    var pow_ = load_conv1x1_as_linear(st, P + ".proj_out.weight", ctx)  # [256,384]
+    var pob = load_f32(st, P + ".proj_out.bias", ctx)
+    var out = linear_bias(s2, pow_, pob, ctx)  # [rows,256]
+    # mean = out[:, :128]
+    var mean_rows = _col_slice(out, 0, 128, ctx)  # [rows,128]
+    var mean_nhwc = vae_reshape(mean_rows, [1, SH, SW, 128], ctx)
+    return nhwc_to_nchw(mean_nhwc, ctx)  # [1,128,SH,SW]

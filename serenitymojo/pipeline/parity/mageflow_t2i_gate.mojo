@@ -121,7 +121,7 @@ def main() raises:
 
     # ── (4) Mojo decode → compare RGB + write PNG ────────────────────────────
     print("[gate] STAGE3 MageVAE decode ...")
-    var rgb = mageflow_decode_latent[N_IMG, SH](String(MF_VAE), latent, ctx)
+    var rgb = mageflow_decode_latent[N_IMG, SH, SH](String(MF_VAE), latent, ctx)
     var ref_rgb = _read_bin_f32(DUMP + "rgb.bin")
     var r_rgb = harness.compare(rgb, ref_rgb, ctx)
     print("[gate] DECODED RGB  ", r_rgb)

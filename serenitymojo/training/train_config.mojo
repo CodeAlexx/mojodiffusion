@@ -432,6 +432,15 @@ struct TrainConfig(Copyable, Movable):
     # (valid at any LTMAX/bucket). Set false to always re-quantize.
     var fp8_cache: Bool
 
+    # ── 16GB residency refit (P6 wave 2, 2026-07-22): optional cap on how many
+    # transformer blocks the driver pins device-resident (config key
+    # `resident_blocks`, mirrors the ltx2_av --resident_blocks flag semantics).
+    # -1 (default / key absent) = the driver's own comptime residency budget
+    # (unchanged 24GB-box behavior). >=0 = pin AT MOST this many blocks in plan
+    # order (0 = pin nothing, stream everything). Residency knob ONLY — pinned
+    # bytes are byte-identical to streamed bytes (no numerics change).
+    var resident_blocks: Int
+
     # ── LTX2 IC-LoRA / v2v (P5 (d)); all default-OFF -> C13 byte-identical ──────
     var ic_lora_strategy: String        # "auto"|"none"|"v2v"|"audio_ref_only_ic" (musubi IC_LORA_STRATEGIES)
     var reference_downscale: Int        # >=1, default 1 (integer ref position multiplier)
@@ -783,6 +792,7 @@ struct TrainConfig(Copyable, Movable):
         text_encoder_2_dropout_prob: Float32 = Float32(0.0),  # reference trainer SDXL TE2 dropout
         save_max_keep: Int = 0,                               # rolling retention (0 = keep all)
         fp8_cache: Bool = True,                               # fp8-resident disk sidecar (default on)
+        resident_blocks: Int = -1,                            # 16GB refit residency cap (-1 = driver default)
         var ic_lora_strategy: String = String("auto"),        # LTX2 v2v (P5 (d)) — all default-off
         reference_downscale: Int = 1,
         first_frame_conditioning_p: Float32 = Float32(0.0),
@@ -1010,6 +1020,7 @@ struct TrainConfig(Copyable, Movable):
         self.lokr_targets = lokr_targets
         self.init_lokr_norm = init_lokr_norm
         self.fp8_cache = fp8_cache
+        self.resident_blocks = resident_blocks
         self.ic_lora_strategy = ic_lora_strategy^
         self.reference_downscale = reference_downscale
         self.first_frame_conditioning_p = first_frame_conditioning_p

@@ -1,6 +1,6 @@
 {
  "model_type": "flux",
- "quantized_resident": "fp8_e4m3",
+ "quantized_resident": "streamed_base_opt_in",
  "checkpoint": "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors",
  "vae": "models/vae/flux.safetensors",
  "validation_prompts_file": "serenitymojo/configs/flux_smoke_prompts_512.json",

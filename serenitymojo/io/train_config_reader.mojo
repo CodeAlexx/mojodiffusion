@@ -860,6 +860,18 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             # fp8-resident disk sidecar toggle (default True in TrainConfig).
             # Only consulted when quantized_resident=="fp8_e4m3".
             cfg.fp8_cache = _read_bool(cur)
+        elif key == "resident_blocks":
+            # 16GB residency refit (P6 wave 2, 2026-07-22): cap on how many
+            # transformer blocks the driver pins device-resident (ltx2_av
+            # --resident_blocks semantics). -1/absent = driver comptime default;
+            # 0 = pin nothing (stream all); >0 = pin at most N blocks.
+            var n = Int(_read_scalar(cur).num)
+            if n < -1:
+                raise Error(
+                    String("train config: resident_blocks must be >= -1, got ")
+                    + String(n)
+                )
+            cfg.resident_blocks = n
         elif key == "controlnet_layers":
             # T2.E ControlNet training (default-off 0). Fail loud on negatives.
             var n = Int(_read_scalar(cur).num)

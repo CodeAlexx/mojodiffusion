@@ -50,7 +50,9 @@ from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
+from serenitymojo.ops.linear import linear
+from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 
@@ -70,9 +72,27 @@ from serenitymojo.models.qwenimage.qwenimage_stack import (
 )
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     DBL_SLOTS, QwenLoraSet, build_qwen_lora_set, double_lora_for,
-    QwenOffloadForward,
+    QwenOffloadForward, QwenOffloadForwardDevice,
     _double_block_weights_from_block, _modvecs_from_block,
     _compute_final_modvecs, _slot_suffix, _nonfinite_check,
+)
+
+# DEVICE-BOUNDARY block arms (MJ-1084 device port; parity gate
+# qwen_block_device_parity 28/28 max_abs=0.0 vs the host block). SAME gated
+# block math, device tensors — the mageflow device conductors below mirror
+# qwenimage_stack_lora_forward/backward_offload_device.
+from serenitymojo.models.qwenimage.qwenimage_block_device import (
+    qwen_modvecs_to_device, qwen_double_block_lora_to_device,
+    QwenDoubleBlockSavedDevice,
+    qwen_double_block_lora_forward_device, qwen_double_block_lora_backward_device,
+)
+
+# fused device AdamW (plain-AdamW semantics == train_step._adamw_host_list;
+# ±1-ulp FMA-contraction class documented in lora_adamw_plain_fused.mojo).
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
+    fused_lora_adamw_plain_step_resident,
+    lora_adamw_plain_device_state_sync_moments,
 )
 
 from serenitymojo.models.mageflow.weights import MageFlowBase
@@ -423,3 +443,395 @@ def load_mageflow_lora_state(
     for i in range(num_double * DBL_SLOTS):
         dbl.append(named[i].adapter.copy())
     return MageFlowLoraSet(dbl^, num_double, rank)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SAMPLE-TIME FORWARD (inference with LIVE LoRA, block-swap offload).
+# Byte-for-byte the mageflow_stack_lora_forward_offload path — same gated
+# double_block_lora_forward block math, same frozen input/final projections —
+# EXCEPT that no backward state is retained: each block's DoubleBlockSaved
+# (device tensors: q/k/v ropes + StreamSaved, ~hundreds of MB at S≈4100) is
+# DROPPED at the end of its iteration, so in-train 1024² sampling stays inside
+# the 16GB budget. Used by train_mageflow_real.mojo's in-train sampler; NOT a
+# training path (no grads). Returns the velocity out [N_IMG * out_ch] host F32.
+# ═════════════════════════════════════════════════════════════════════════════
+def mageflow_stack_lora_sample_forward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_raw: List[Float32],
+    silu_temb_h: List[Float32],
+    base: MageFlowBase,
+    mut loader: TurboPlannedLoader, lora: MageFlowLoraSet,
+    pe_cos: Tensor, pe_sin: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+    var num_double = lora.num_double
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    # input projections (frozen base) — identical to the training forward.
+    var img = _linear_b(
+        img_tokens, base.stack.img_in_w[], base.stack.img_in_b[], N_IMG, in_ch, ctx
+    )
+    var txt_t = Tensor.from_host(txt_raw.copy(), [N_TXT, txt_ch], STDtype.BF16, ctx)
+    var txt_normed = rms_norm(txt_t, base.txt_norm_w[], eps, ctx).to_host(ctx)
+    var txt = _linear_b(
+        txt_normed, base.stack.txt_in_w[], base.stack.txt_in_b[], N_TXT, txt_ch, ctx
+    )
+
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
+        var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
+        var bl = double_lora_for(lora, bi)
+
+        var fwd = double_block_lora_forward[H, Dh, N_IMG, N_TXT, S](
+            img.copy(), txt.copy(), w, img_mod, txt_mod, bl,
+            pe_cos, pe_sin, D, F, eps, ctx,
+        )
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        # fwd (incl. fwd.saved device tensors) destroyed here — no accumulation.
+        loader.mark_active_block_done(ctx)
+
+    # final layer: AdaLayerNormContinuous -> proj_out (same as training fwd).
+    var final_mods = _compute_final_modvecs(
+        silu_temb_h, base.norm_out_w, base.norm_out_b, D, ctx
+    )
+    var final_scale = final_mods[0].copy()
+    var final_shift = final_mods[1].copy()
+
+    var img_t = Tensor.from_host(img^, [N_IMG, D], STDtype.BF16, ctx)
+    var ln_img_out_t = layer_norm(
+        img_t,
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        Tensor.from_host(_qstack_zeros(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var normed = modulate(
+        ln_img_out_t,
+        Tensor.from_host(final_scale^, [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift^, [D], STDtype.BF16, ctx),
+        ctx,
+    ).to_host(ctx)
+    return _linear_b(
+        normed, base.stack.proj_out_w[], base.stack.proj_out_b[], N_IMG, D, ctx
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DEVICE-BOUNDARY conductors (the qwenimage `_offload_device` arm, MJ-1084
+# rung 2). Activations stay on GPU between blocks; per-block tapes are DEVICE
+# tensors (QwenDoubleBlockSavedDevice). Combined with loader.pin_residents
+# (all 12 blocks device-resident, byte-identical bytes) this removes BOTH the
+# host List[Float32] block-boundary crossings AND the per-step weight
+# streaming. LoRA d_A/d_B still leave as host lists in the same slot layout
+# (the optimizer seam is unchanged; fused device AdamW = separate rung).
+#
+# NUMERICS: the device block fns are the qwen device port gated max_abs=0.0
+# vs the SAME host block math this stack banks on
+# (parity/qwen_block_device_parity.mojo). MageFlow deltas enter exactly as in
+# the host conductors above: txt RMSNorm+txt_in host input projection
+# (identical host calls -> identical bits), F32 rope tables passed AS GIVEN
+# (the device block does not cast cos/sin — matches the host block), mage
+# silu_temb through the SAME `_modvecs_from_block`/`_compute_final_modvecs`
+# readers. Gate: the smoke12 anchor loss stream must reproduce bit-exact
+# (math sdpa, no flash).
+# ═════════════════════════════════════════════════════════════════════════════
+def mageflow_stack_lora_forward_offload_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_raw: List[Float32],
+    silu_temb_h: List[Float32],
+    base: MageFlowBase,
+    mut loader: TurboPlannedLoader, lora: MageFlowLoraSet,
+    pe_cos: Tensor, pe_sin: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> QwenOffloadForwardDevice:
+    comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+    var num_double = lora.num_double
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    # input projections (frozen base) — IDENTICAL host calls to the host
+    # conductor (same bits), then ONE upload; the device chain starts here.
+    var img_h = _linear_b(
+        img_tokens, base.stack.img_in_w[], base.stack.img_in_b[], N_IMG, in_ch, ctx
+    )
+    var txt_t = Tensor.from_host(txt_raw.copy(), [N_TXT, txt_ch], STDtype.BF16, ctx)
+    var txt_normed = rms_norm(txt_t, base.txt_norm_w[], eps, ctx).to_host(ctx)
+    var txt_h = _linear_b(
+        txt_normed, base.stack.txt_in_w[], base.stack.txt_in_b[], N_TXT, txt_ch, ctx
+    )
+    var img = TArc(Tensor.from_host(img_h^, [N_IMG, D], STDtype.BF16, ctx))
+    var txt = TArc(Tensor.from_host(txt_h^, [N_TXT, D], STDtype.BF16, ctx))
+
+    var dbl_saved = List[QwenDoubleBlockSavedDevice]()
+
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = qwen_modvecs_to_device(
+            _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx), D, ctx)
+        var txt_mod = qwen_modvecs_to_device(
+            _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx), D, ctx)
+        var bl = qwen_double_block_lora_to_device(double_lora_for(lora, bi), ctx)
+
+        var fwd = qwen_double_block_lora_forward_device[H, Dh, N_IMG, N_TXT, S](
+            img, txt, w, img_mod, txt_mod, bl, pe_cos, pe_sin, D, F, eps, ctx,
+        )
+        dbl_saved.append(fwd.saved.copy())
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        # Conservative queue drain before this iteration's transients (weight
+        # views, lora device copies) are destroyed. Measured cost nil (fwd
+        # phase 0.163s with or without). NOT a wobble fix — the 2026-07-22
+        # run-to-run wobble was the pin_residents copy-stream fence
+        # (turbo_planned_loader.mojo), fixed there.
+        ctx.synchronize()
+        loader.mark_active_block_done(ctx)
+
+    # final layer (device): layer_norm -> modulate(final) -> proj_out.
+    var final_mods = _compute_final_modvecs(
+        silu_temb_h, base.norm_out_w, base.norm_out_b, D, ctx
+    )
+    var final_scale = final_mods[0].copy()
+    var final_shift = final_mods[1].copy()
+
+    var ln_img_out = layer_norm(
+        img[],
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        Tensor.from_host(_qstack_zeros(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var normed = modulate(
+        ln_img_out,
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    )
+    var nb = Optional[Tensor](base.stack.proj_out_b[].clone(ctx))
+    var out_t = linear(normed, base.stack.proj_out_w[], nb, ctx)
+    var out = out_t.to_host(ctx)
+
+    return QwenOffloadForwardDevice(
+        out^, dbl_saved^, img.copy(), TArc(ln_img_out^),
+        final_scale^, final_shift^,
+    )
+
+
+# DEVICE backward: reverse block walk over the device tapes. LoRA-only scope —
+# frozen mod-MLP grads discarded, frozen input-projection tail SKIPPED (the
+# mageflow host backward contract). d_A/d_B leave as host lists in the same
+# slot layout (img 0..5, txt 6..11) the host optimizer consumes.
+def mageflow_stack_lora_backward_offload_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    silu_temb_h: List[Float32],
+    base: MageFlowBase,
+    mut loader: TurboPlannedLoader, lora: MageFlowLoraSet,
+    pe_cos: Tensor, pe_sin: Tensor,
+    saved: QwenOffloadForwardDevice,
+    D: Int, F: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> MageFlowLoraGradSet:
+    comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+    var num_double = lora.num_double
+    var n_adapters = num_double * DBL_SLOTS
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var d_a_flat = List[List[Float32]]()
+    var d_b_flat = List[List[Float32]]()
+    for _ in range(n_adapters):
+        d_a_flat.append(List[Float32]())
+        d_b_flat.append(List[Float32]())
+    var nonfinite = 0
+
+    # ── final layer backward (device; frozen -> dx-only) ──────────────────────
+    var d_out_t = Tensor.from_host(d_out, [N_IMG, out_ch], STDtype.BF16, ctx)
+    var d_normed = linear_backward_dx(
+        d_out_t, base.stack.proj_out_w[], N_IMG, D, out_ch, ctx
+    )
+    var mbf = modulate_backward(
+        d_normed, saved.ln_img_out[],
+        Tensor.from_host(saved.final_scale.copy(), [D], STDtype.BF16, ctx),
+        ctx, False,
+    )
+    var d_img_dev = TArc(layer_norm_backward_dx(
+        mbf.d_x, saved.img_out[],
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    ))
+    var d_txt_dev = TArc(Tensor.from_host(
+        _qstack_zeros(N_TXT * D), [N_TXT, D], STDtype.BF16, ctx
+    ))
+
+    # ── double-stream backward (REVERSE; device blocks) ───────────────────────
+    var di = num_double - 1
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = qwen_modvecs_to_device(
+            _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx), D, ctx)
+        var txt_mod = qwen_modvecs_to_device(
+            _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx), D, ctx)
+        var bl = qwen_double_block_lora_to_device(double_lora_for(lora, di), ctx)
+
+        var bg = qwen_double_block_lora_backward_device[H, Dh, N_IMG, N_TXT, S](
+            d_img_dev, d_txt_dev, w, img_mod, txt_mod,
+            bl, saved.dbl_saved[di], pe_cos, pe_sin, D, F, eps, ctx,
+        )
+        # next block's upstream grads: the host chain feeds F32 lists into
+        # `_t` (bf16) — mirror with a device bf16 cast of the F32 sums.
+        d_img_dev = TArc(cast_tensor(bg.img.d_x[], STDtype.BF16, ctx))
+        d_txt_dev = TArc(cast_tensor(bg.txt.d_x[], STDtype.BF16, ctx))
+
+        var base_slot = di * DBL_SLOTS
+        # img slots 0..5, txt slots 6..11 (host scatter layout)
+        for slot in range(6):
+            var ia = bg.img.d_a[slot]
+            var ib = bg.img.d_b[slot]
+            if ia:
+                d_a_flat[base_slot + slot] = ia.value()[].to_host(ctx)
+            if ib:
+                d_b_flat[base_slot + slot] = ib.value()[].to_host(ctx)
+            var ta = bg.txt.d_a[slot]
+            var tb = bg.txt.d_b[slot]
+            if ta:
+                d_a_flat[base_slot + 6 + slot] = ta.value()[].to_host(ctx)
+            if tb:
+                d_b_flat[base_slot + 6 + slot] = tb.value()[].to_host(ctx)
+
+        nonfinite += (
+            _nonfinite_check(d_a_flat[base_slot + 0]) + _nonfinite_check(d_b_flat[base_slot + 0]) +
+            _nonfinite_check(d_a_flat[base_slot + 6]) + _nonfinite_check(d_b_flat[base_slot + 6])
+        )
+
+        # conservative queue drain (see forward conductor note; cost nil).
+        ctx.synchronize()
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    # frozen input-projection backward intentionally skipped (host contract).
+    return MageFlowLoraGradSet(d_a_flat^, d_b_flat^, nonfinite)
+
+
+# ── SAMPLE-TIME device forward (inference with LIVE LoRA; no tape retained) ──
+# Byte-for-byte the device training forward EXCEPT each block's device tape is
+# DROPPED at the end of its iteration (the host sample-forward contract), so
+# in-train 1024² sampling stays inside the 16GB budget.
+def mageflow_stack_lora_sample_forward_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_raw: List[Float32],
+    silu_temb_h: List[Float32],
+    base: MageFlowBase,
+    mut loader: TurboPlannedLoader, lora: MageFlowLoraSet,
+    pe_cos: Tensor, pe_sin: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+    var num_double = lora.num_double
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var img_h = _linear_b(
+        img_tokens, base.stack.img_in_w[], base.stack.img_in_b[], N_IMG, in_ch, ctx
+    )
+    var txt_t = Tensor.from_host(txt_raw.copy(), [N_TXT, txt_ch], STDtype.BF16, ctx)
+    var txt_normed = rms_norm(txt_t, base.txt_norm_w[], eps, ctx).to_host(ctx)
+    var txt_h = _linear_b(
+        txt_normed, base.stack.txt_in_w[], base.stack.txt_in_b[], N_TXT, txt_ch, ctx
+    )
+    var img = TArc(Tensor.from_host(img_h^, [N_IMG, D], STDtype.BF16, ctx))
+    var txt = TArc(Tensor.from_host(txt_h^, [N_TXT, D], STDtype.BF16, ctx))
+
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = qwen_modvecs_to_device(
+            _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx), D, ctx)
+        var txt_mod = qwen_modvecs_to_device(
+            _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx), D, ctx)
+        var bl = qwen_double_block_lora_to_device(double_lora_for(lora, bi), ctx)
+
+        var fwd = qwen_double_block_lora_forward_device[H, Dh, N_IMG, N_TXT, S](
+            img, txt, w, img_mod, txt_mod, bl, pe_cos, pe_sin, D, F, eps, ctx,
+        )
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        # fwd (incl. fwd.saved device tape) destroyed here — no accumulation.
+        loader.mark_active_block_done(ctx)
+
+    var final_mods = _compute_final_modvecs(
+        silu_temb_h, base.norm_out_w, base.norm_out_b, D, ctx
+    )
+    var final_scale = final_mods[0].copy()
+    var final_shift = final_mods[1].copy()
+
+    var ln_img_out = layer_norm(
+        img[],
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        Tensor.from_host(_qstack_zeros(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var normed = modulate(
+        ln_img_out,
+        Tensor.from_host(final_scale^, [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift^, [D], STDtype.BF16, ctx),
+        ctx,
+    )
+    var nb = Optional[Tensor](base.stack.proj_out_b[].clone(ctx))
+    return linear(normed, base.stack.proj_out_w[], nb, ctx).to_host(ctx)
+
+
+# ── fused device AdamW over the flat adapter set (rung 4) ─────────────────────
+# Plain-AdamW semantics == the host `_lora_adamw` chain; persistent device
+# P/M/V, ONE fused launch, params synced back to the host adapter mirror each
+# step (the forward re-uploads adapters from host lists). Moments sync to host
+# only at save cadence via mageflow_lora_adamw_sync_moments.
+def mageflow_lora_adamw_state_init(
+    set: MageFlowLoraSet, ctx: DeviceContext
+) raises -> LoraAdamWPlainDeviceState:
+    return lora_adamw_plain_device_state_init(
+        set.dbl, 0, set.num_double * DBL_SLOTS, ctx
+    )
+
+
+def mageflow_lora_adamw_step_resident(
+    mut state: LoraAdamWPlainDeviceState,
+    mut set: MageFlowLoraSet, grads: MageFlowLoraGradSet,
+    t: Int, lr: Float32, ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
+) raises:
+    if len(grads.d_a) != len(set.dbl) or len(grads.d_b) != len(set.dbl):
+        raise Error("mageflow_lora_adamw_step_resident: grad/adapter count mismatch")
+    fused_lora_adamw_plain_step_resident(
+        state, set.dbl, grads.d_a, grads.d_b,
+        t, lr, beta1, beta2, eps, weight_decay, ctx,
+    )
+
+
+def mageflow_lora_adamw_sync_moments(
+    mut state: LoraAdamWPlainDeviceState,
+    mut set: MageFlowLoraSet, ctx: DeviceContext,
+) raises:
+    lora_adamw_plain_device_state_sync_moments(state, set.dbl, ctx)

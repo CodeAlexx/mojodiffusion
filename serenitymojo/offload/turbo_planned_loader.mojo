@@ -512,7 +512,15 @@ struct TurboPlannedLoader(Movable):
                 n_bytes,
                 self._turbo.copy_stream,
             )
-            ctx.synchronize()  # staging is reused next block — fence the copy
+            # Fence the COPY STREAM specifically: the h2d above runs on
+            # self._turbo.copy_stream, which ctx.synchronize() does NOT cover
+            # (it only waits on the context's own stream — same trap documented
+            # at the fp8 pin path below, "measured cos 0.09 without this
+            # fence"). Without this, the staging memcpy for the NEXT block
+            # races the in-flight DMA and pins nondeterministically corrupted
+            # bytes (measured: mageflow run-to-run loss wobble, 2026-07-22).
+            self._turbo.copy_stream.synchronize()
+            ctx.synchronize()
             self._res_prefixes.append(p)
             self._res_devs.append(dev^)
             self._res_recs.append(recs^)

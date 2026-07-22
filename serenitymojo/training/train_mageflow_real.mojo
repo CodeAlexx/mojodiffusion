@@ -28,10 +28,31 @@
 #   * optimizer = AdamW (betas 0.9/0.999, eps 1e-8, wd 0.01) over the 144 LoRA
 #       adapters via the shared _lora_adamw; global grad-clip max_norm 1.0.
 #
-# ── GEOMETRY (comptime smoke: one 256x256 image) ─────────────────────────────
-#   latent [1,128,16,16] -> N_IMG = 256 tokens x 128 ch (patch_size 1: token
+# ── GEOMETRY (comptime production: one 512x512 image) ────────────────────────
+#   latent [1,128,32,32] -> N_IMG = 1024 tokens x 128 ch (patch_size 1: token
 #   (h,w) = latent[:, h, w]). Text: Qwen3-VL context [N_TXT=256, 2560]
 #   (cache samples pad/truncate to N_TXT; LoRA block treats all rows as real).
+#
+# ── SAVE CADENCE ─────────────────────────────────────────────────────────────
+#   cfg.save_every > 0 -> step-numbered artifacts every save_every optimizer
+#   steps (<prefix>_step{N}.safetensors + .state — the ltx2/wan22 house
+#   pattern) + the final save at out_path.
+#
+# ── IN-TRAIN SAMPLING (cfg.sample_every > 0) ─────────────────────────────────
+#   3 baked prompts (trigger vrtlEri2) at 1024x1024 (SH=64, N_IMG=4096 — the
+#   PROVEN mageflow pipeline monomorphization), sampled at step 0 (pre-train
+#   baseline) and every sample_every optimizer steps. Text conds are encoded
+#   ONCE at startup (Qwen3-VL loaded + freed BEFORE the trainer loads base +
+#   block loader — the pipeline's offload staging), held host-side. Each sample
+#   point runs a 20-step flow-match Euler denoise (build_sigma_schedule, shift
+#   6.0, RAW sigma to the model, bf16 latent at step boundaries — the pipeline
+#   trajectory discipline) through mageflow_stack_lora_sample_forward: the SAME
+#   gated LoRA block math as training with the CURRENT adapters applied live
+#   (the klein_sampler validation pattern), streaming blocks through the
+#   trainer's own TurboPlannedLoader (no second loader, no saved activations).
+#   CFG 5.0 (Mage-Flow-Base default): cond + uncond (empty-prompt) forwards per
+#   step, pred = uncond + cfg*(cond-uncond). MageVAE decode (weights loaded /
+#   freed per call) -> samples/step{N}_p{i}.png.
 #
 # ── DATA ─────────────────────────────────────────────────────────────────────
 #   MAGEFLOW_DATA_CACHE=<dir> reads the klein_dataset cache layout
@@ -96,6 +117,26 @@ from serenitymojo.models.mageflow.mageflow_stack_lora import (
     build_mageflow_lora_set, mageflow_total_adapters,
     mageflow_stack_lora_forward_offload, mageflow_stack_lora_backward_offload,
     mageflow_lora_adamw_step, save_mageflow_lora, save_mageflow_lora_state,
+    mageflow_stack_lora_sample_forward,
+    # DEVICE arms (resident weights + device activations + fused AdamW):
+    mageflow_stack_lora_forward_offload_device,
+    mageflow_stack_lora_backward_offload_device,
+    mageflow_stack_lora_sample_forward_device,
+    mageflow_lora_adamw_state_init, mageflow_lora_adamw_step_resident,
+    mageflow_lora_adamw_sync_moments,
+)
+
+# in-train sampling reuses the PROVEN pipeline pieces: tokenizer+template,
+# seeded Gaussian init, sigma schedule, MageVAE decode->PNG.
+from serenitymojo.io.ffi import sys_system
+from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.sampling.flow_match import build_sigma_schedule
+from serenitymojo.pipeline.mageflow_pipeline import (
+    mageflow_tokenize, gaussian_noise, mageflow_decode_latent,
+)
+from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.models.text_encoder.mageflow_qwen3vl import (
+    encode_mageflow_text, load_krea2_qwen3vl_4b, MAGEFLOW_T2I_DROP_IDX,
 )
 
 
@@ -111,13 +152,43 @@ comptime DEPTH = 12
 comptime EPS = Float32(1.0e-6)
 comptime ROPE_THETA = Float64(10000.0)
 
-# ── smoke geometry: latent [1,128,16,16] (256px image) ────────────────────────
+# ── training geometry: latent [1,128,32,32] (512px image) ─────────────────────
 comptime FRAME = 1
-comptime H_TOK = 16
-comptime W_TOK = 16
-comptime N_IMG = FRAME * H_TOK * W_TOK    # 256 image tokens
+comptime H_TOK = 32
+comptime W_TOK = 32
+comptime N_IMG = FRAME * H_TOK * W_TOK    # 1024 image tokens
 comptime N_TXT = 256                      # Qwen3-VL context rows (pad/trunc)
-comptime S = N_IMG + N_TXT                # 512 joint tokens
+comptime S = N_IMG + N_TXT                # 1280 joint tokens
+
+# ── in-train sampling geometry: 1024x1024 (proven pipeline monomorphization) ──
+comptime MF_BASE_DIR = "/home/alex/.serenity/models/checkpoints/Mage-Flow-Base"
+comptime MF_TE_DIR = MF_BASE_DIR + "/text_encoder"
+comptime MF_TOK_JSON = MF_TE_DIR + "/tokenizer.json"
+comptime MF_VAE_PATH = MF_BASE_DIR + "/vae/diffusion_pytorch_model.safetensors"
+comptime SAMPLE_SH = 64                       # 1024/16 latent side
+comptime SAMPLE_NIMG = SAMPLE_SH * SAMPLE_SH  # 4096 image tokens
+comptime SAMPLE_STEPS = 20                    # Mage-Flow-BASE needs ~20 (not turbo-4)
+comptime SAMPLE_CFG = Float32(5.0)            # base default; 1.0 => single-forward
+
+# 3 fixed sample prompts (trigger vrtlEri2) + the empty uncond prompt. keep
+# token counts (L_full - drop 34) measured with the Base tokenizer via the
+# mageflow_count_tokens probe pattern; VERIFIED at runtime against the real
+# tokenizer output in _encode_sample_prompts (fail loud on drift).
+comptime SP1 = (
+    "vrtlEri2 standing in a sunlit olive garden, white summer dress, golden hour"
+    " portrait, photorealistic"
+)
+comptime SP2 = (
+    "vrtlEri2 in a black leather jacket on a neon-lit city street at night,"
+    " cinematic"
+)
+comptime SP3 = (
+    "close-up portrait of vrtlEri2 smiling, soft studio light, grey backdrop, 85mm"
+)
+comptime SP1_KEEP = 29
+comptime SP2_KEEP = 26
+comptime SP3_KEEP = 27
+comptime UNCOND_KEEP = 5
 
 # ── recipe defaults (config overrides where present) ──────────────────────────
 comptime DEFAULT_LR = Float32(1.0e-4)
@@ -276,7 +347,8 @@ def _load_mageflow_cache_sample(
     if lh != H_TOK or lw != W_TOK:
         raise Error(
             String("cache latent grid ") + String(lh) + "x" + String(lw)
-            + " != comptime smoke grid 16x16 in " + path
+            + " != comptime training grid " + String(H_TOK) + "x"
+            + String(W_TOK) + " in " + path
         )
     var lat = _st_host_f32_any(st, String(LATENT_KEY), ctx)   # [128*256] ch-slowest
     var x0 = List[Float32]()
@@ -306,6 +378,179 @@ def _load_mageflow_cache_sample(
     return out^
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# IN-TRAIN SAMPLING (1024², live LoRA, trainer loader reused)
+# ══════════════════════════════════════════════════════════════════════════════
+def _bf16r(x: Float32) -> Float32:
+    # host bf16 RNE round-trip (the pipeline latent-boundary discipline; the
+    # same cast idiom weights.mojo::mage_time_sinusoid_host uses).
+    return x.cast[DType.bfloat16]().cast[DType.float32]()
+
+
+def _dirname(path: String) -> String:
+    var b = path.as_bytes()
+    var last = -1
+    for i in range(len(b)):
+        if b[i] == UInt8(47):   # '/'
+            last = i
+    if last <= 0:
+        return String(".")
+    var out = List[UInt8]()
+    for i in range(last):
+        out.append(b[i])
+    return String(unsafe_from_utf8=out)
+
+
+# Encode the 3 sample prompts + the empty uncond prompt ONCE. The 8.9 GB
+# Qwen3-VL encoder is loaded HERE and freed on return — the caller invokes this
+# BEFORE loading the resident base + block loader (the pipeline's staging), so
+# the encoder and the streamed DiT never co-reside. Returns 4 host-F32 conds
+# [keep*2560] in order [SP1, SP2, SP3, uncond]; verifies each keep count
+# against the baked comptime (fail loud on tokenizer drift).
+def _encode_sample_prompts(ctx: DeviceContext) raises -> List[List[Float32]]:
+    var prompts = List[String]()
+    prompts.append(String(SP1))
+    prompts.append(String(SP2))
+    prompts.append(String(SP3))
+    prompts.append(String(""))
+    var expected = List[Int]()
+    expected.append(SP1_KEEP)
+    expected.append(SP2_KEEP)
+    expected.append(SP3_KEEP)
+    expected.append(UNCOND_KEEP)
+
+    print("[sample] encoding 3 prompts + uncond (Qwen3-VL loaded ONCE, freed",
+          "before the trainer's loader) ...")
+    var enc = load_krea2_qwen3vl_4b(String(MF_TE_DIR), ctx)
+    var out = List[List[Float32]]()
+    for i in range(len(prompts)):
+        var ids = mageflow_tokenize(String(MF_TOK_JSON), prompts[i])
+        var keep = len(ids) - MAGEFLOW_T2I_DROP_IDX
+        if keep != expected[i]:
+            raise Error(
+                String("_encode_sample_prompts: prompt ") + String(i)
+                + " keep=" + String(keep) + " != baked comptime "
+                + String(expected[i]) + " — recount tokens and rebake."
+            )
+        var txt = encode_mageflow_text(enc, ids, MAGEFLOW_T2I_DROP_IDX, ctx)
+        out.append(cast_tensor(txt, STDtype.F32, ctx).to_host(ctx))
+        print("[sample]   cond", i, "keep=", keep, "(",
+              prompts[i].byte_length(), "chars )")
+    print("[sample] conds cached host-side (encoder freed on return)")
+    return out^
+
+
+# Denoise ONE prompt at 1024² with the CURRENT LoRA applied live (the
+# klein_sampler validation pattern: same gated block math as training), CFG
+# cond/uncond, then MageVAE decode -> PNG. Streams blocks via the TRAINER's
+# loader (blocks stream anyway; no second loader).
+def _sample_one[
+    NT: Int
+](
+    tag: String,
+    txt_cond: List[Float32], txt_uncond: List[Float32],
+    base: MageFlowBase, mut loader: TurboPlannedLoader,
+    lora: MageFlowLoraSet, spec: MageFlowTrainSpec,
+    flow_shift: Float32, seed: UInt64, out_png: String,
+    ctx: DeviceContext, host_path: Bool,
+) raises:
+    comptime SC = SAMPLE_NIMG + NT
+    comptime SU = SAMPLE_NIMG + UNCOND_KEEP
+    var t0 = perf_counter_ns()
+
+    var rope_c = build_mageflow_rope_tables(
+        FRAME, SAMPLE_SH, SAMPLE_SH, NT, H, ROPE_THETA, STDtype.F32, ctx
+    )
+    var rope_u = build_mageflow_rope_tables(
+        FRAME, SAMPLE_SH, SAMPLE_SH, UNCOND_KEEP, H, ROPE_THETA, STDtype.F32, ctx
+    )
+    var sigmas = build_sigma_schedule(SAMPLE_STEPS, flow_shift)
+    var x = gaussian_noise(SAMPLE_NIMG * IN_CH, seed)   # F32 host
+
+    for i in range(SAMPLE_STEPS):
+        # bf16 latent at the step boundary (pipeline trajectory discipline).
+        var x_bf = List[Float32]()
+        for j in range(len(x)):
+            x_bf.append(_bf16r(x[j]))
+        var silu_temb = compute_mageflow_silu_temb(base, sigmas[i], spec, ctx)
+
+        var vel: List[Float32]
+        if host_path:
+            vel = mageflow_stack_lora_sample_forward[H, Dh, SAMPLE_NIMG, NT, SC](
+                x_bf, txt_cond, silu_temb, base, loader, lora,
+                rope_c[0], rope_c[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+        else:
+            vel = mageflow_stack_lora_sample_forward_device[
+                H, Dh, SAMPLE_NIMG, NT, SC
+            ](
+                x_bf, txt_cond, silu_temb, base, loader, lora,
+                rope_c[0], rope_c[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+        if SAMPLE_CFG != Float32(1.0):
+            var vel_u: List[Float32]
+            if host_path:
+                vel_u = mageflow_stack_lora_sample_forward[
+                    H, Dh, SAMPLE_NIMG, UNCOND_KEEP, SU
+                ](
+                    x_bf, txt_uncond, silu_temb, base, loader, lora,
+                    rope_u[0], rope_u[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+                )
+            else:
+                vel_u = mageflow_stack_lora_sample_forward_device[
+                    H, Dh, SAMPLE_NIMG, UNCOND_KEEP, SU
+                ](
+                    x_bf, txt_uncond, silu_temb, base, loader, lora,
+                    rope_u[0], rope_u[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+                )
+            for j in range(len(vel)):
+                vel[j] = vel_u[j] + SAMPLE_CFG * (vel[j] - vel_u[j])
+
+        var dt = sigmas[i + 1] - sigmas[i]
+        for j in range(len(x)):
+            x[j] = _bf16r(x_bf[j] + _bf16r(vel[j] * dt))
+        print("[sample]   ", tag, " step", i + 1, "/", SAMPLE_STEPS,
+              " sigma", sigmas[i], "->", sigmas[i + 1])
+
+    # MageVAE decode (weights loaded/freed inside) -> PNG.
+    var lat = Tensor.from_host(x^, [1, SAMPLE_NIMG, IN_CH], STDtype.F32, ctx)
+    var rgb = mageflow_decode_latent[SAMPLE_NIMG, SAMPLE_SH, SAMPLE_SH](
+        String(MF_VAE_PATH), lat, ctx
+    )
+    save_png(rgb, out_png, ctx, ValueRange.SIGNED)
+    print("[sample]   ", tag, " saved:", out_png, " (",
+          Float64(perf_counter_ns() - t0) / 1.0e9, "sec )")
+
+
+# One sample point: all 3 prompts at the given step label. Seeds are FIXED per
+# prompt (cfg seed + 100 + i) so progress across sample points is comparable.
+def _run_sample_point(
+    step_label: Int,
+    conds: List[List[Float32]],
+    base: MageFlowBase, mut loader: TurboPlannedLoader,
+    lora: MageFlowLoraSet, spec: MageFlowTrainSpec,
+    flow_shift: Float32, seed: UInt64, samples_dir: String,
+    ctx: DeviceContext, host_path: Bool,
+) raises:
+    print("")
+    print("[sample] === step", step_label, ": 3 prompts @ 1024², ",
+          SAMPLE_STEPS, "-step, CFG", SAMPLE_CFG,
+          "(cond+uncond per step), live LoRA ===")
+    var pre = samples_dir + "/step" + String(step_label) + "_p"
+    _sample_one[SP1_KEEP](
+        String("p0(olive garden)"), conds[0], conds[3], base, loader, lora,
+        spec, flow_shift, seed + UInt64(100), pre + "0.png", ctx, host_path,
+    )
+    _sample_one[SP2_KEEP](
+        String("p1(neon street)"), conds[1], conds[3], base, loader, lora,
+        spec, flow_shift, seed + UInt64(101), pre + "1.png", ctx, host_path,
+    )
+    _sample_one[SP3_KEEP](
+        String("p2(85mm portrait)"), conds[2], conds[3], base, loader, lora,
+        spec, flow_shift, seed + UInt64(102), pre + "2.png", ctx, host_path,
+    )
+
+
 def main() raises:
     var ctx = DeviceContext()
     var spec = MageFlowTrainSpec.mageflow_base()
@@ -332,11 +577,17 @@ def main() raises:
         else Float32(0.01)
     var flow_shift = cfg.timestep_shift if cfg.timestep_shift > Float32(0.0) \
         else DEFAULT_FLOW_SHIFT
+    var warmup = cfg.lr_warmup_steps if cfg.lr_warmup_steps > 0 else 0
 
     var out_path = cfg.output_model_destination
     if out_path.byte_length() == 0:
         out_path = String("/home/alex/mojodiffusion/output/mageflow_lora/") \
             + String("mageflow_base_lora.safetensors")
+    var save_prefix = out_path
+    if save_prefix.endswith(".safetensors"):
+        save_prefix = String(save_prefix.removesuffix(".safetensors"))
+    var out_dir = _dirname(out_path)
+    var samples_dir = out_dir + "/samples"
 
     print("==== Mage-Flow-Base LoRA trainer — flow-match (shift", flow_shift, ") ====")
     print("arch: D=", DIM, " blocks=", DEPTH, " heads=", H, " head_dim=", Dh,
@@ -346,10 +597,12 @@ def main() raises:
     print("lora: rank=", rank, " alpha=", alpha,
           " (12 targets/block x", DEPTH, "blocks = 144 adapters)")
     print("optim: lr=", lr, " max_grad_norm=", max_grad_norm,
-          " betas=(", beta1, ",", beta2, ") eps=", opt_eps, " wd=", weight_decay)
+          " betas=(", beta1, ",", beta2, ") eps=", opt_eps, " wd=", weight_decay,
+          " warmup=", warmup, "(constant after)")
     print("timestep: logit-normal + shift", flow_shift,
           " (schedule.mojo sample_timestep_logit_normal); model gets RAW sigma")
-    print("steps:", steps, " seed:", seed)
+    print("steps:", steps, " seed:", seed,
+          " save_every:", cfg.save_every, " sample_every:", cfg.sample_every)
     print("ckpt:", ckpt)
 
     # ── weights-absent guard (Base transformer DOWNLOADING) ───────────────────
@@ -361,6 +614,13 @@ def main() raises:
               "flow-match wired + type-checked; re-run once safetensors lands.)")
         print("RESULT: mageflow trainer wired OK (weights-absent path, exit 0)")
         return
+
+    # ── in-train sampling conds: encode BEFORE the base/loader load (staged) ──
+    var sample_conds = List[List[Float32]]()
+    if cfg.sample_every > 0:
+        sample_conds = _encode_sample_prompts(ctx)
+        _ = sys_system(String("mkdir -p '") + samples_dir + String("'"))
+    _ = sys_system(String("mkdir -p '") + out_dir + String("'"))
 
     # ══════════════════════════════════════════════════════════════════════════
     # REAL STEP: resident non-block base + block-swap loader + 144-adapter LoRA.
@@ -374,8 +634,41 @@ def main() raises:
         ckpt, plan^, OffloadConfig.synchronous_single(), ctx, False
     )
 
+    # ── path select: DEVICE arm default (resident-12 blocks + device
+    # activations), HOST AdamW — this chain reproduces the host-arm anchor
+    # loss stream BIT-EXACT (gated 2026-07-22, smoke12 losses+grad norms).
+    # MAGEFLOW_HOST_PATH=1 = the original host parity fallback (streamed
+    # blocks, host block API) — the anchor reference itself.
+    # MAGEFLOW_FUSED_ADAMW=1 = fused device AdamW (opt 0.065->0.010 s/step);
+    # deterministic but ±1-ulp FMA class vs the host optimizer
+    # (lora_adamw_plain_fused.mojo contract) — losses drift ulp-level from
+    # step 3 (measured max |dloss| ~2e-4 over 12 steps), so it is OPT-IN.
+    var host_path = _env_str(String("MAGEFLOW_HOST_PATH")) == String("1")
+    var use_fused = (not host_path) \
+        and _env_str(String("MAGEFLOW_FUSED_ADAMW")) == String("1")
+    if host_path:
+        print("[path] HOST parity fallback (MAGEFLOW_HOST_PATH=1): streamed",
+              "blocks + host block API + host AdamW")
+    else:
+        # all 12 blocks device-resident ONCE (byte-identical bytes; await_block
+        # becomes a pure sub-buffer-view build — no per-step streaming).
+        var pinned = loader.pin_residents(10 * 1024 * 1024 * 1024, ctx)
+        if pinned != DEPTH:
+            raise Error(
+                String("[resident] pinned ") + String(pinned) + " of "
+                + String(DEPTH) + " blocks — 16GB budget regression, refusing"
+                + " partial residency (unset via MAGEFLOW_HOST_PATH=1)"
+            )
+        print("[path] DEVICE arm:", pinned, "blocks device-resident (~8.2GB),",
+              "device activations,",
+              "FUSED device AdamW (MAGEFLOW_FUSED_ADAMW=1, ulp-class)"
+              if use_fused else "host AdamW (anchor-exact default)")
+
     var lora = build_mageflow_lora_set(DEPTH, DIM, FFN, rank, alpha)
     print("[lora] adapters:", mageflow_total_adapters(lora))
+    # fused device AdamW state (persistent device P/M/V, ~300MB). Initialized
+    # unconditionally (branch-free typing); only the fused arm steps it.
+    var opt_state = mageflow_lora_adamw_state_init(lora, ctx)
 
     # MageFlow msrope: image rows roped, text rows identity — built ONCE
     # (constant geometry), reused across all blocks fwd+bwd.
@@ -409,6 +702,11 @@ def main() raises:
     var last_loss = Float32(0.0)
     var have_first = False
     var train_start = perf_counter_ns()
+
+    # ── step-0 sample: pre-training baseline (LoRA B=0 => base-model output) ──
+    if cfg.sample_every > 0:
+        _run_sample_point(0, sample_conds, base, loader, lora, spec,
+                          flow_shift, seed, samples_dir, ctx, host_path)
 
     print("")
     print("step  sigma     loss           grad_norm     sec")
@@ -447,31 +745,103 @@ def main() raises:
 
         # temb: mage bf16-rounded sinusoid pipeline; RAW sigma in.
         var silu_temb = compute_mageflow_silu_temb(base, sigma, spec, ctx)
+        var t_data = Float64(perf_counter_ns() - t0) / 1.0e9
 
-        var fwd = mageflow_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
-            img_tokens, txt_raw, silu_temb, base, loader, lora,
-            rope[0], rope[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
-        )
-
-        # loss + d_pred through the shared levers entry (MSE default).
-        var lg = levers_loss_grad(fwd.out, target, sigma, cfg)
+        # fwd + loss + bwd — HOST parity arm or the DEVICE arm (same gated
+        # block math; device tensors between blocks). Phase-timed.
+        var step_loss: Float32
+        var grads: MageFlowLoraGradSet
+        var t_fwd: Float64
+        var t_bwd: Float64
+        if host_path:
+            var tf0 = perf_counter_ns()
+            var fwd = mageflow_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                img_tokens, txt_raw, silu_temb, base, loader, lora,
+                rope[0], rope[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            # loss + d_pred through the shared levers entry (MSE default).
+            var lg = levers_loss_grad(fwd.out, target, sigma, cfg)
+            step_loss = lg.loss
+            t_fwd = Float64(perf_counter_ns() - tf0) / 1.0e9
+            var tb0 = perf_counter_ns()
+            grads = mageflow_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                lg.d_pred, silu_temb, base, loader, lora,
+                rope[0], rope[1], fwd, DIM, FFN, OUT_CH, EPS, ctx,
+            )
+            t_bwd = Float64(perf_counter_ns() - tb0) / 1.0e9
+        else:
+            var tf0 = perf_counter_ns()
+            var fwd = mageflow_stack_lora_forward_offload_device[
+                H, Dh, N_IMG, N_TXT, S
+            ](
+                img_tokens, txt_raw, silu_temb, base, loader, lora,
+                rope[0], rope[1], DIM, FFN, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            var lg = levers_loss_grad(fwd.out, target, sigma, cfg)
+            step_loss = lg.loss
+            t_fwd = Float64(perf_counter_ns() - tf0) / 1.0e9
+            var tb0 = perf_counter_ns()
+            grads = mageflow_stack_lora_backward_offload_device[
+                H, Dh, N_IMG, N_TXT, S
+            ](
+                lg.d_pred, silu_temb, base, loader, lora,
+                rope[0], rope[1], fwd, DIM, FFN, OUT_CH, EPS, ctx,
+            )
+            t_bwd = Float64(perf_counter_ns() - tb0) / 1.0e9
         if not have_first:
-            first_loss = lg.loss
+            first_loss = step_loss
             have_first = True
-        last_loss = lg.loss
+        last_loss = step_loss
 
-        var grads = mageflow_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
-            lg.d_pred, silu_temb, base, loader, lora,
-            rope[0], rope[1], fwd, DIM, FFN, OUT_CH, EPS, ctx,
-        )
+        var tc0 = perf_counter_ns()
         var gn = _clip(grads, max_grad_norm)
-        mageflow_lora_adamw_step(lora, grads, step + 1, lr, ctx,
-                                 beta1, beta2, opt_eps, weight_decay)
+        var t_clip = Float64(perf_counter_ns() - tc0) / 1.0e9
+        # constant LR + linear warmup over the first `warmup` optimizer steps.
+        var opt_step = step + 1
+        var step_lr = lr
+        if warmup > 0 and opt_step < warmup:
+            step_lr = lr * Float32(opt_step) / Float32(warmup)
+        var to0 = perf_counter_ns()
+        if use_fused:
+            mageflow_lora_adamw_step_resident(
+                opt_state, lora, grads, opt_step, step_lr, ctx,
+                beta1, beta2, opt_eps, weight_decay,
+            )
+        else:
+            mageflow_lora_adamw_step(lora, grads, opt_step, step_lr, ctx,
+                                     beta1, beta2, opt_eps, weight_decay)
+        var t_opt = Float64(perf_counter_ns() - to0) / 1.0e9
         var secs = Float64(perf_counter_ns() - t0) / 1.0e9
-        print(step, "  ", sigma, "  ", lg.loss, "  ", gn, "  ", secs)
+        print(step, "  ", sigma, "  ", step_loss, "  ", gn, "  ", secs,
+              "  lr=", step_lr)
+        print("  [phase] data=", t_data, " fwd=", t_fwd, " bwd=", t_bwd,
+              " clip=", t_clip, " opt=", t_opt)
         if grads.nonfinite_lora_grads != 0:
             print("  !! nonfinite lora grads =", grads.nonfinite_lora_grads)
 
+        # ── save cadence: step-numbered artifacts (ltx2/wan22 house pattern) ──
+        if cfg.save_every > 0 and opt_step % cfg.save_every == 0:
+            if use_fused:
+                # params sync every step; moments only at save cadence.
+                mageflow_lora_adamw_sync_moments(opt_state, lora, ctx)
+            var sp = save_prefix + "_step" + String(opt_step)
+            var np_ = save_mageflow_lora(lora, sp + ".safetensors", ctx)
+            var smeta = List[Float32]()
+            smeta.append(Float32(opt_step))
+            smeta.append(Float32(Int(seed)))
+            var ns_ = save_mageflow_lora_state(
+                lora, sp + ".safetensors.state", ctx, smeta^
+            )
+            print("  [save] step", opt_step, ":", np_, "PEFT pairs ->",
+                  sp + ".safetensors", " (+", ns_, "state tensors)")
+
+        # ── sample cadence: 3 prompts @1024² with the CURRENT adapters ────────
+        if cfg.sample_every > 0 and opt_step % cfg.sample_every == 0:
+            _run_sample_point(opt_step, sample_conds, base, loader, lora, spec,
+                              flow_shift, seed, samples_dir, ctx, host_path)
+
+    if use_fused:
+        mageflow_lora_adamw_sync_moments(opt_state, lora, ctx)
     var npairs = save_mageflow_lora(lora, out_path, ctx)
     var meta = List[Float32]()
     meta.append(Float32(steps))

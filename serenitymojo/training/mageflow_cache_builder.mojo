@@ -1,23 +1,31 @@
 # serenitymojo/training/mageflow_cache_builder.mojo — Mage-Flow REAL data cache
-# builder (chunk 5). Pure Mojo + MAX, GPU, 16GB-offload-staged exactly like
+# builder. Pure Mojo + MAX, GPU, 16GB-offload-staged exactly like
 # pipeline/mageflow_pipeline.mojo: the two heavyweight encoders NEVER co-reside.
 #
+# PRODUCTION TARGET (eri2 LoRA run): ALL images of /home/alex/eri2_with_trigger
+# (.jpg + .png; 118 samples, trigger `vrtlEri2`) at 512x512. Captions: each
+# <stem>.txt holds a JSON object — the caption is its `high_level_description`
+# string (verified: all 118 .txt parse, all contain the key; the sibling .json
+# files carry the same high_level_description). A plain-text .txt (no leading
+# '{') is used as-is (fallback).
+#
 #   STAGE A  load Qwen3-VL text encoder (Base text_encoder, 8.9 GB) ONCE ->
-#            for each of the first NUM 40_woman samples: read the caption .txt,
+#            for each sample: read <stem>.txt, extract high_level_description,
 #            tokenize with the mage-flow t2i template (pipeline mageflow_tokenize,
 #            Qwen3Tokenizer), encode_mageflow_text (drop_idx 34) ->
 #            hold [keep,2560] F32 on HOST -> encoder freed on def return.
 #   STAGE B  MageVAE (Base vae; weights loaded per mageflow_encode call, freed
-#            per return) -> for each sample: decode jpg, bicubic cover-resize +
-#            center-crop to 256^2 (PIL-faithful _cover_resize_crop, the same
+#            per return) -> for each sample: decode jpg/png, bicubic cover-resize
+#            + center-crop to 512^2 (PIL-faithful _cover_resize_crop, the same
 #            resample kernels mageflow_load_image_nchw uses), normalize
-#            [-1,1] NCHW -> mageflow_encode[256,256] -> latent [1,128,16,16]
-#            F32 on HOST. Per-sample latent mean/std printed (sanity: the
-#            MageVAE parity fixture latent std was ~0.77 — wildly-off = flag).
+#            [-1,1] NCHW -> mageflow_encode[512,512] -> latent [1,128,32,32]
+#            F32 on HOST. Per-sample latent mean/std printed (sanity band
+#            ~0.4-1.2; the MageVAE parity fixture latent std was ~0.77).
 #   STAGE C  klein_dataset.write_sample(latent, text_embedding, text_mask) ->
-#            /home/alex/.serenity/mageflow_cache/40_woman/<stem>.safetensors
-#            (the KleinCache layout train_mageflow_real.mojo's
-#            MAGEFLOW_DATA_CACHE reader consumes; all-F32, klein convention).
+#            /home/alex/.serenity/mageflow_cache/eri2_with_trigger_512/
+#            <stem>.safetensors (the KleinCache layout train_mageflow_real
+#            .mojo's MAGEFLOW_DATA_CACHE reader consumes; all-F32, klein
+#            convention).
 #
 # GATED math reused, NOT modified: mageflow_encode (models/vae/mageflow_vae),
 # encode_mageflow_text + load_krea2_qwen3vl_4b (models/text_encoder/
@@ -64,18 +72,17 @@ comptime MF_BASE = "/home/alex/.serenity/models/checkpoints/Mage-Flow-Base"
 comptime MF_TE_DIR = MF_BASE + "/text_encoder"
 comptime MF_TOK_JSON = MF_TE_DIR + "/tokenizer.json"
 comptime MF_VAE = MF_BASE + "/vae/diffusion_pytorch_model.safetensors"
-comptime DATASET_DIR = "/mnt/disk2/datasets/40_woman"
-comptime CACHE_DIR = "/home/alex/.serenity/mageflow_cache/40_woman"
-comptime NUM = 8            # first 8 samples (mechanism smoke)
-comptime IH = 256           # image side -> latent 16x16 (trainer smoke grid)
-comptime IW = 256
-comptime SH = IH // 16      # 16
-comptime SW = IW // 16      # 16
+comptime DATASET_DIR = "/home/alex/eri2_with_trigger"
+comptime CACHE_DIR = "/home/alex/.serenity/mageflow_cache/eri2_with_trigger_512"
+comptime IH = 512           # image side -> latent 32x32 (512^2 training grid)
+comptime IW = 512
+comptime SH = IH // 16      # 32
+comptime SW = IW // 16      # 32
 comptime TXT_CH = 2560
 comptime LAT_N = 128 * SH * SW
 
 
-# ── dataset enumeration: sorted .jpg stems, first NUM ────────────────────────
+# ── dataset enumeration: ALL sorted .jpg/.png image files ────────────────────
 def _sort_strings(mut xs: List[String]):
     for i in range(1, len(xs)):
         var key = xs[i]
@@ -86,22 +93,25 @@ def _sort_strings(mut xs: List[String]):
         xs[j + 1] = key
 
 
-def _first_jpg_stems(dir: String, n: Int) raises -> List[String]:
+# Returns the sorted image FILENAMES (extension kept: .jpg or .png). The stem
+# (filename minus extension) addresses the sibling <stem>.txt caption and the
+# cache output <stem>.safetensors.
+def _all_image_files(dir: String) raises -> List[String]:
     var raw = listdir(dir)
-    var stems = List[String]()
+    var files = List[String]()
     for i in range(len(raw)):
-        if raw[i].endswith(".jpg"):
-            stems.append(String(raw[i].removesuffix(".jpg")))
-    _sort_strings(stems)
-    if len(stems) < n:
-        raise Error(
-            String("dataset has only ") + String(len(stems))
-            + " jpgs, need " + String(n) + " in " + dir
-        )
-    var out = List[String]()
-    for i in range(n):
-        out.append(stems[i])
-    return out^
+        if raw[i].endswith(".jpg") or raw[i].endswith(".png"):
+            files.append(String(raw[i]))
+    _sort_strings(files)
+    if len(files) == 0:
+        raise Error(String("no .jpg/.png images in ") + dir)
+    return files^
+
+
+def _stem_of(filename: String) -> String:
+    if filename.endswith(".jpg"):
+        return String(filename.removesuffix(".jpg"))
+    return String(filename.removesuffix(".png"))
 
 
 # ── caption IO (io/ffi sys_pread idiom, klein_prepare verbatim) ──────────────
@@ -134,6 +144,67 @@ def _read_caption(path: String) raises -> String:
     return String(unsafe_from_utf8=bytes)
 
 
+# ── caption extraction: JSON `high_level_description` value ──────────────────
+# The eri2_with_trigger .txt files each hold a JSON object; the caption is the
+# `high_level_description` string. Byte-level scan (no JSON dependency):
+# find the key, skip to the ':', take the following quoted string with escape
+# handling (\" \\ \/ \n \t \r). Plain-text files (no leading '{') pass through
+# unchanged; a JSON file WITHOUT the key fails loud.
+def _extract_hld_caption(raw: String, path: String) raises -> String:
+    var b = raw.as_bytes()
+    var n = len(b)
+    # leading whitespace then '{' ? else: plain-text caption, use as-is.
+    var p = 0
+    while p < n and (b[p] == 32 or b[p] == 9 or b[p] == 10 or b[p] == 13):
+        p += 1
+    if p >= n or b[p] != UInt8(123):   # '{'
+        return raw
+    # find "high_level_description"
+    var key = String("\"high_level_description\"")
+    var kb = key.as_bytes()
+    var kn = len(kb)
+    var kpos = -1
+    for i in range(n - kn + 1):
+        var hit = True
+        for j in range(kn):
+            if b[i + j] != kb[j]:
+                hit = False
+                break
+        if hit:
+            kpos = i
+            break
+    if kpos < 0:
+        raise Error(String("caption JSON missing high_level_description: ") + path)
+    var q = kpos + kn
+    while q < n and b[q] != UInt8(34):   # skip past ':' to opening '"'
+        q += 1
+    if q >= n:
+        raise Error(String("caption JSON malformed after key: ") + path)
+    q += 1
+    var out_bytes = List[UInt8]()
+    while q < n:
+        var c = b[q]
+        if c == UInt8(92):   # backslash escape
+            if q + 1 >= n:
+                raise Error(String("caption JSON truncated escape: ") + path)
+            var e = b[q + 1]
+            if e == UInt8(110):
+                out_bytes.append(10)     # \n
+            elif e == UInt8(116):
+                out_bytes.append(9)      # \t
+            elif e == UInt8(114):
+                out_bytes.append(13)     # \r
+            else:
+                out_bytes.append(e)      # \" \\ \/ and anything else literal
+            q += 2
+            continue
+        if c == UInt8(34):   # closing '"'
+            return String(unsafe_from_utf8=out_bytes)
+        out_bytes.append(c)
+        q += 1
+    raise Error(String("caption JSON unterminated string: ") + path)
+
+
 # ── host stats ───────────────────────────────────────────────────────────────
 def _mean_std(vals: List[Float32]) -> Tuple[Float64, Float64]:
     var n = len(vals)
@@ -151,19 +222,22 @@ def _mean_std(vals: List[Float32]) -> Tuple[Float64, Float64]:
 
 
 # ── STAGE A: text conditioning (Qwen3-VL freed on return) ────────────────────
-# Per sample: caption -> mage t2i template tokens -> encode_mageflow_text
-# (drop 34) -> [1,keep,2560] BF16 -> F32 host row-major [keep*2560].
+# Per sample: <stem>.txt -> high_level_description caption -> mage t2i template
+# tokens -> encode_mageflow_text (drop 34) -> [1,keep,2560] BF16 -> F32 host
+# row-major [keep*2560].
 def _stage_a_texts(
-    stems: List[String],
+    files: List[String],
     ctx: DeviceContext,
     mut texts: List[List[Float32]],
     mut keeps: List[Int],
 ) raises:
     print("[cache] STAGE A: loading Qwen3-VL text encoder (Base) ...")
     var enc = load_krea2_qwen3vl_4b(String(MF_TE_DIR), ctx)
-    for i in range(len(stems)):
-        var cap_path = String(DATASET_DIR) + "/" + stems[i] + ".txt"
-        var cap = _read_caption(cap_path)
+    for i in range(len(files)):
+        var stem = _stem_of(files[i])
+        var cap_path = String(DATASET_DIR) + "/" + stem + ".txt"
+        var cap_raw = _read_caption(cap_path)
+        var cap = _extract_hld_caption(cap_raw, cap_path)
         var ids = mageflow_tokenize(String(MF_TOK_JSON), cap)
         var l_full = len(ids)
         var txt = encode_mageflow_text(enc, ids, MAGEFLOW_T2I_DROP_IDX, ctx)
@@ -172,19 +246,20 @@ def _stage_a_texts(
         var keep = l_full - MAGEFLOW_T2I_DROP_IDX
         var ms = _mean_std(host)
         print(
-            "[cache]   sample", i, "(", stems[i], ") caption='", cap,
-            "' L_full=", l_full, " keep=", keep,
+            "[cache]   sample", i, "(", stem, ") cap_chars=", cap.byte_length(),
+            " L_full=", l_full, " keep=", keep,
             " txt mean=", Float32(ms[0]), " std=", Float32(ms[1]),
         )
+        print("[cache]     caption='", cap, "'")
         texts.append(host^)
         keeps.append(keep)
     print("[cache] STAGE A done (encoder freed on return)")
 
 
 # ── STAGE B: MageVAE latents (weights loaded/freed per encode call) ──────────
-# jpg -> bicubic cover-resize + center-crop 256^2 -> [-1,1] NCHW ->
-# mageflow_encode[256,256] -> [1,128,16,16] F32 host.
-def _load_image_256(path: String, ctx: DeviceContext) raises -> Tensor:
+# jpg/png -> bicubic cover-resize + center-crop 512^2 -> [-1,1] NCHW ->
+# mageflow_encode[512,512] -> [1,128,32,32] F32 host.
+def _load_image_512(path: String, ctx: DeviceContext) raises -> Tensor:
     var img = decode_image(path, True)          # RGB, drop alpha
     var crop = _cover_resize_crop(img, IH, IW)  # [IH,IW,3] f64 in [0,255]
     var vals = List[Float32]()
@@ -198,21 +273,22 @@ def _load_image_256(path: String, ctx: DeviceContext) raises -> Tensor:
 
 
 def _stage_b_latents(
-    stems: List[String],
+    files: List[String],
     ctx: DeviceContext,
     mut lats: List[List[Float32]],
 ) raises:
     print("[cache] STAGE B: MageVAE encode (Base vae) ...")
     var st = ShardedSafeTensors.open(String(MF_VAE))
-    for i in range(len(stems)):
-        var img_path = String(DATASET_DIR) + "/" + stems[i] + ".jpg"
-        var img = _load_image_256(img_path, ctx)
-        var lat = mageflow_encode[IH, IW](img, st, ctx)   # [1,128,16,16]
+    for i in range(len(files)):
+        var stem = _stem_of(files[i])
+        var img_path = String(DATASET_DIR) + "/" + files[i]
+        var img = _load_image_512(img_path, ctx)
+        var lat = mageflow_encode[IH, IW](img, st, ctx)   # [1,128,32,32]
         var ls = lat.shape()
         if len(ls) != 4 or ls[1] != 128 or ls[2] != SH or ls[3] != SW:
             raise Error(
-                String("latent shape wrong for ") + stems[i]
-                + " (expect [1,128,16,16])"
+                String("latent shape wrong for ") + stem
+                + " (expect [1,128,32,32])"
             )
         var lat_f32 = lat.clone(ctx)
         if lat_f32.dtype() != STDtype.F32:
@@ -220,15 +296,15 @@ def _stage_b_latents(
         var host = lat_f32.to_host(ctx)
         var ms = _mean_std(host)
         print(
-            "[cache]   sample", i, "(", stems[i], ") latent [1,128,16,16]",
+            "[cache]   sample", i, "(", stem, ") latent [1,128,32,32]",
             " mean=", Float32(ms[0]), " std=", Float32(ms[1]),
         )
-        # sanity: MageVAE latent std ~0.77 on the parity fixture. FLAG (do not
-        # abort) if wildly off — a scramble shows up as std >> 1 or ~0.
-        if ms[1] < 0.30 or ms[1] > 1.60:
+        # sanity band ~0.4-1.2 (MageVAE parity fixture latent std ~0.77). FLAG
+        # (do not abort) if outside — a scramble shows up as std >> 1 or ~0.
+        if ms[1] < 0.40 or ms[1] > 1.20:
             print(
                 "[cache]   WARNING: latent std", Float32(ms[1]),
-                "outside [0.30,1.60] (fixture ~0.77) — possible scramble!"
+                "outside sanity band [0.40,1.20] (fixture ~0.77) — inspect!"
             )
         lats.append(host^)
     print("[cache] STAGE B done (VAE freed)")
@@ -237,26 +313,27 @@ def _stage_b_latents(
 def main() raises:
     var ctx = DeviceContext()
     print("=== Mage-Flow REAL data cache builder (pure Mojo, staged 16GB) ===")
-    print("  dataset:", DATASET_DIR, " -> cache:", CACHE_DIR, " samples:", NUM)
-
-    var stems = _first_jpg_stems(String(DATASET_DIR), NUM)
-    for i in range(len(stems)):
-        print("  [", i, "]", stems[i] + ".jpg /", stems[i] + ".txt")
+    var files = _all_image_files(String(DATASET_DIR))
+    print("  dataset:", DATASET_DIR, " -> cache:", CACHE_DIR,
+          " samples:", len(files), " @", IH, "x", IW)
 
     # STAGE A: text (encoder loads+frees inside)
     var texts = List[List[Float32]]()
     var keeps = List[Int]()
-    _stage_a_texts(stems, ctx, texts, keeps)
+    _stage_a_texts(files, ctx, texts, keeps)
 
     # STAGE B: latents (VAE loads+frees inside)
     var lats = List[List[Float32]]()
-    _stage_b_latents(stems, ctx, lats)
+    _stage_b_latents(files, ctx, lats)
 
     # STAGE C: write klein_dataset cache samples
     print("[cache] STAGE C: write_sample ->", CACHE_DIR)
-    _ = sys_system(String("mkdir -p ") + String(CACHE_DIR))
-    _ = sys_system(String("rm -f ") + String(CACHE_DIR) + String("/*.safetensors"))
-    for i in range(len(stems)):
+    _ = sys_system(String("mkdir -p '") + String(CACHE_DIR) + String("'"))
+    _ = sys_system(
+        String("rm -f '") + String(CACHE_DIR) + String("'/*.safetensors")
+    )
+    for i in range(len(files)):
+        var stem = _stem_of(files[i])
         var keep = keeps[i]
         var latent = Tensor.from_host(
             lats[i].copy(), [1, 128, SH, SW], STDtype.F32, ctx
@@ -268,11 +345,11 @@ def main() raises:
         for _ in range(keep):
             ones.append(1.0)
         var mask = Tensor.from_host(ones^, [1, keep], STDtype.F32, ctx)
-        var out_path = String(CACHE_DIR) + "/" + stems[i] + ".safetensors"
+        var out_path = String(CACHE_DIR) + "/" + stem + ".safetensors"
         write_sample(latent, txt, mask, out_path, ctx)
-        print("[cache]   wrote", out_path, " (latent[1,128,16,16] txt[1,", keep, ",2560])")
+        print("[cache]   wrote", out_path, " (latent[1,128,32,32] txt[1,", keep, ",2560])")
 
     print("")
-    print("PASS: wrote", NUM, "cache samples ->", CACHE_DIR)
+    print("PASS: wrote", len(files), "cache samples ->", CACHE_DIR)
     print("      run: MAGEFLOW_DATA_CACHE=" + String(CACHE_DIR),
           "<train_mageflow_real binary>")

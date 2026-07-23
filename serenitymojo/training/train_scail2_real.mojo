@@ -275,6 +275,13 @@ def main() raises:
     # ── frozen shared weights + head/embed/conditioning host ──
     var dit = Scail2StreamedDiT.open(CACHE_DIR, ctx)
     var stream = Scail2A14BFP8Stream.open(CACHE_DIR)
+    # HOST-RESIDENT fp8 base: read all 40 frozen blocks into host RAM ONCE so the
+    # streaming fwd/bwd serve them per step with no disk I/O (was ~500 s/step,
+    # almost entirely per-step re-reads). Bit-identical to the disk dequant path.
+    var _preload_t0 = perf_counter()
+    stream.preload_resident(ctx)
+    print("[scail2-resident] preload wall =", perf_counter() - _preload_t0, "sec")
+    print("")
 
     # ── real staged latents (cropped to the reduced grid) ──
     var ref5 = _load_view(RUN_DIR + String("/reference.safetensors"),

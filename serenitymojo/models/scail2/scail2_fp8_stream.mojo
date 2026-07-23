@@ -13,8 +13,10 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.components.artifacts import shell_quote
 from serenitymojo.io.ffi import (
     O_RDONLY,
+    BytePtr,
     file_size,
     sys_close,
+    sys_memcpy,
     sys_mkdirs,
     sys_open,
     sys_pread,
@@ -22,6 +24,7 @@ from serenitymojo.io.ffi import (
 )
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.tensor_view import TensorView, from_parts
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 from serenitymojo.ops.fp8_quant import fp8_e4m3_encode_perrow, fp8_e4m3_rowscale
 from serenitymojo.tensor import Tensor
@@ -518,8 +521,83 @@ def validate_scail2_14b_fp8_cache(cache_dir: String) raises -> Bool:
     return shared == SCAIL2_SHARED_TENSORS
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOST-RESIDENT FP8 BASE (speed): copy each block's raw cache bytes into OWNED
+# host RAM ONCE (preload), then serve `load_block_bf16` from that resident store
+# with NO per-step `ShardedSafeTensors.open` / mmap fault / disk read. The 40
+# blocks are 15.4 GB of fp8 (E4M3 matrices + F32 row-scale sidecars + the 20
+# exact-BF16 per-block tensors) — fits comfortably in the 52 GB free host RAM.
+#
+# CORRECTNESS: the resident bytes are a verbatim memcpy of the SAME cache bytes
+# the disk path reads, reconstructed into an identical `TensorView` via
+# `from_parts` and fed through the SAME `Tensor.from_view_raw` / `Tensor.from_view`
+# + `fp8_e4m3_dequant_perrow_to_bf16`. The produced BF16 weights are therefore
+# BIT-IDENTICAL to the disk path (same bytes → same H2D copy → same dequant).
+# ═══════════════════════════════════════════════════════════════════════════════
+def _own_bytes[
+    mut: Bool, //, origin: Origin[mut=mut]
+](tv: TensorView[origin]) raises -> List[UInt8]:
+    """Verbatim owned-host-RAM copy of a TensorView's raw bytes (bulk memcpy).
+
+    Copying OUT of the mmap into anonymous heap RAM is what makes the per-step
+    load deterministic: subsequent H2D uploads read from resident RAM, never
+    fault the file back from disk. Uses the same fast `sys_memcpy` path as the
+    Tensor H2D staging (a per-byte scalar loop over a 385 MB block would cost
+    seconds)."""
+    var n = tv.nbytes()
+    var out = List[UInt8]()
+    out.resize(n, UInt8(0))
+    if n > 0:
+        var dst = BytePtr(unsafe_from_address=Int(out.unsafe_ptr()))
+        var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+        _ = sys_memcpy(dst, src, n)
+    return out^
+
+
+struct _ResidentBlock(Movable):
+    """One block's cache tensors held in owned host RAM (44 entries: 12 fp8
+    matrices + 12 F32 row-scale sidecars + 20 exact BF16). Short names (the
+    `blocks.{i}.` prefix stripped) with an index for the fp8→scale sidecar
+    lookup. Held behind an ArcPointer so the resident List never copies the
+    385 MB payloads."""
+
+    var names: List[String]
+    var dtypes: List[STDtype]
+    var shapes: List[List[Int]]
+    var datas: List[List[UInt8]]
+    var index: Dict[String, Int]
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.dtypes = List[STDtype]()
+        self.shapes = List[List[Int]]()
+        self.datas = List[List[UInt8]]()
+        self.index = Dict[String, Int]()
+
+    def add(
+        mut self, var name: String, dtype: STDtype,
+        var shape: List[Int], var data: List[UInt8],
+    ):
+        self.index[name] = len(self.names)
+        self.names.append(name^)
+        self.dtypes.append(dtype)
+        self.shapes.append(shape^)
+        self.datas.append(data^)
+
+    def nbytes(self) -> Int:
+        var total = 0
+        for i in range(len(self.datas)):
+            total += len(self.datas[i])
+        return total
+
+
+comptime _RArc = ArcPointer[_ResidentBlock]
+
+
 struct Scail2A14BFP8Stream(Movable):
     var cache_dir: String
+    var resident: Bool
+    var blocks: List[_RArc]
 
     @staticmethod
     def open(cache_dir: String) raises -> Scail2A14BFP8Stream:
@@ -529,6 +607,81 @@ struct Scail2A14BFP8Stream(Movable):
 
     def __init__(out self, var cache_dir: String):
         self.cache_dir = cache_dir^
+        self.resident = False
+        self.blocks = List[_RArc]()
+
+    # ── HOST-RESIDENT preload (call ONCE before the training step loop) ──────
+    def preload_resident(mut self, ctx: DeviceContext) raises:
+        """Read all 40 blocks' fp8 cache tensors into owned host RAM once.
+
+        After this, `load_block_bf16` serves from the resident store with no
+        disk read / mmap fault per step. Idempotent (a second call is a no-op).
+        The exact-bf16 tensors and the fp8 E4M3 matrices + F32 scale sidecars
+        are all copied verbatim, so the served BF16 weights are byte-identical
+        to the disk path. `ctx` is unused here (host-only copy) but kept for a
+        uniform preload signature and a possible future device-resident tier."""
+        if self.resident:
+            return
+        var blocks = List[_RArc]()
+        var total_bytes = 0
+        for bi in range(SCAIL2_BLOCKS):
+            var st = ShardedSafeTensors.open(
+                scail2_block_cache_path(self.cache_dir, bi)
+            )
+            var prefix = scail2_block_prefix(bi)
+            var rb = _ResidentBlock()
+            for ref raw_name in st.names():
+                var name = String(raw_name)
+                if not name.startswith(prefix):
+                    raise Error(
+                        String("SCAIL-2 resident: unexpected tensor ") + name
+                    )
+                var short_name = _substr(name, len(prefix), len(name))
+                var tv = st.tensor_view(name)
+                rb.add(short_name, tv.dtype, tv.shape.copy(), _own_bytes(tv))
+            total_bytes += rb.nbytes()
+            blocks.append(_RArc(rb^))
+        self.blocks = blocks^
+        self.resident = True
+        _ = ctx
+        print(
+            "[scail2-resident] preloaded", SCAIL2_BLOCKS, "fp8 blocks into host RAM =",
+            total_bytes, "bytes (", Float64(total_bytes) / Float64(1 << 30), "GiB)",
+        )
+
+    def _load_block_bf16_resident(
+        self, index: Int, ctx: DeviceContext
+    ) raises -> Dict[String, TArc]:
+        """Serve `load_block_bf16` from the resident host store (no disk I/O).
+        Same dequant math as the disk path; bit-identical weights."""
+        ref rb = self.blocks[index][]
+        var out = Dict[String, TArc]()
+        for i in range(len(rb.names)):
+            var short_name = rb.names[i]
+            if short_name.endswith(SCAIL2_FP8_SCALE_SUFFIX):
+                continue
+            var dtype = rb.dtypes[i]
+            if dtype == STDtype.F8_E4M3:
+                var w_view = from_parts(dtype, rb.shapes[i].copy(), Span(rb.datas[i]))
+                var raw = Tensor.from_view_raw(w_view, ctx)
+                var si = rb.index[short_name + String(SCAIL2_FP8_SCALE_SUFFIX)]
+                var s_view = from_parts(
+                    rb.dtypes[si], rb.shapes[si].copy(), Span(rb.datas[si])
+                )
+                var scale = Tensor.from_view(s_view, ctx)
+                var bf16 = fp8_e4m3_dequant_perrow_to_bf16(raw, scale, ctx)
+                out[short_name] = TArc(bf16^)
+            elif dtype == STDtype.BF16:
+                var t_view = from_parts(dtype, rb.shapes[i].copy(), Span(rb.datas[i]))
+                out[short_name] = TArc(Tensor.from_view(t_view, ctx))
+            else:
+                raise Error(
+                    String("unsupported SCAIL-2 resident dtype: ") + dtype.name()
+                )
+        ctx.synchronize()
+        if len(out) != SCAIL2_BLOCK_SOURCE_TENSORS:
+            raise Error("SCAIL-2 resident block tensor count mismatch")
+        return out^
 
     def load_shared(self, ctx: DeviceContext) raises -> Dict[String, TArc]:
         var st = ShardedSafeTensors.open(
@@ -550,6 +703,10 @@ struct Scail2A14BFP8Stream(Movable):
     ) raises -> Dict[String, TArc]:
         if index < 0 or index >= SCAIL2_BLOCKS:
             raise Error("SCAIL-2 block index out of range")
+        # Resident fast path: serve from owned host RAM (no disk read). Falls
+        # through to the disk/mmap path when the base was not preloaded.
+        if self.resident:
+            return self._load_block_bf16_resident(index, ctx)
         var prefix = scail2_block_prefix(index)
         var st = ShardedSafeTensors.open(
             scail2_block_cache_path(self.cache_dir, index)

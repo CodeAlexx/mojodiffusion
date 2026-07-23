@@ -83,6 +83,25 @@ def bernini_recipe_for(task: String) raises -> BerniniTaskRecipe:
     raise Error(String("bernini_recipe_for: unknown task '") + task + String("'"))
 
 
+# task_id (0..11) -> task name. Stable order == scripts/bernini_r_build_cache.py
+# TASK_IDS. Used by the multi-sample trainer to drive per-sample recipe from the
+# cache's stored task_id. Returns "" for an out-of-range id.
+def bernini_task_name_for_id(task_id: Int) -> String:
+    if task_id == 0: return String("t2i")
+    if task_id == 1: return String("t2v")
+    if task_id == 2: return String("i2i")
+    if task_id == 3: return String("r2i")
+    if task_id == 4: return String("r2v")
+    if task_id == 5: return String("v2v")
+    if task_id == 6: return String("i2v")
+    if task_id == 7: return String("vi2v")
+    if task_id == 8: return String("vr2v")
+    if task_id == 9: return String("vrc2v")
+    if task_id == 10: return String("mv2v")
+    if task_id == 11: return String("ads2v")
+    return String("")
+
+
 # Per-conditioning-segment token-grid geometry for the representative smoke.
 # Each segment is a CLEAN VAE latent patchified (1,2,2). The grid (f,h,w) is the
 # post-patchify token grid; token count = f*h*w. Real caches override these with

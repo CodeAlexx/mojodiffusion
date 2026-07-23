@@ -29,10 +29,18 @@
 #       ...
 #     ]
 #   }
-# A target/conditioning entry may instead be a dict reusing an EXISTING on-disk
-# latent (no re-encode) — the gate-sanctioned "reuse a wan/bernini/scail2 latent"
-# path:  {"latent": "<sample.safetensors>", "key": "latent"}  (key default
-# "latent"; the stored tensor must be [16,F,H,W] or [1,16,F,H,W]).
+# A target/conditioning entry may take any of these forms:
+#   "img.jpg"                              single RGB image  -> encode() [16,1,h,w]
+#   {"frames": ["f0.jpg","f1.jpg",...]}    multi-frame clip  -> encode_video()
+#                                          [16,Tlat,h,w], Tlat=1+(F-1)//4  (VIDEO)
+#   {"synth_frames": N, "res": 128}        N synthesized frames (no assets needed)
+#                                          -> encode_video() (gate smoke helper)
+#   {"latent": "<sample.safetensors>", "key": "latent"}   reuse an EXISTING on-disk
+#                                          latent [16,F,H,W] or [1,16,F,H,W] (no
+#                                          re-encode; gate-sanctioned reuse path).
+# A sample may also carry {"reuse_text": "<file>", "text_key": "text",
+# "len_key": "text_len"} to copy a previously-encoded umt5 [512,4096] text tensor
+# instead of re-running umt5 (lets a gate cache be built without the umt5 weights).
 #
 # OUTPUT (one file per sample) under <out_dir>:
 #   sample_{i}.safetensors, keys:
@@ -117,13 +125,47 @@ def stage_pixel(image_path: Path, res: int, tmp: Path) -> Path:
     return out
 
 
+def stage_clip(frames: list[Path], res: int, tmp: Path, tag: str, idx: int) -> Path:
+    """List of RGB image paths -> center-crop square -> resize res -> NCTHW clip
+    [1,3,F,res,res] in [0,1]."""
+    ts = []
+    for fp in frames:
+        img = Image.open(fp).convert("RGB")
+        w, h = img.size
+        s = min(w, h)
+        left, top = (w - s) // 2, (h - s) // 2
+        img = img.crop((left, top, left + s, top + s)).resize((res, res), Image.BICUBIC)
+        arr = np.asarray(img, dtype=np.float32) / 255.0        # [H,W,C]
+        ts.append(torch.from_numpy(arr).permute(2, 0, 1))      # [C,H,W]
+    clip = torch.stack(ts, dim=1).unsqueeze(0).contiguous()    # [1,3,F,res,res]
+    out = tmp / f"clip_{idx}_{tag}_{res}.safetensors"
+    save_file({"pixel": clip}, str(out))
+    return out
+
+
+def stage_synth_clip(n: int, res: int, tmp: Path, tag: str, idx: int) -> Path:
+    """Synthesize N smooth-ish random frames -> NCTHW clip [1,3,N,res,res]. Used by
+    gate smokes that exercise the multi-frame VAE path without needing assets."""
+    g = torch.Generator().manual_seed(1234 + idx * 17 + hash(tag) % 997)
+    base = torch.rand(3, 1, res, res, generator=g)
+    frames = []
+    for f in range(n):
+        frames.append((base + 0.04 * f + 0.08 * torch.randn(3, 1, res, res, generator=g)).clamp(0, 1))
+    clip = torch.cat(frames, dim=1).unsqueeze(0).contiguous()  # [1,3,N,res,res]
+    out = tmp / f"synth_{idx}_{tag}_{res}.safetensors"
+    save_file({"pixel": clip}, str(out))
+    return out
+
+
 def run(cmd: list[str]) -> None:
     print("[cache]   $", " ".join(str(c) for c in cmd))
     subprocess.run([str(c) for c in cmd], check=True)
 
 
 def encode_vae(entry, res: int, vae: str, tmp: Path, idx: int, tag: str) -> torch.Tensor:
-    """Return a [16,F,H,W] f32 latent for a media path or a reuse-latent dict."""
+    """Return a [16,F,H,W] f32 latent for an image path, a multi-frame clip, a
+    synthesized clip, or a reuse-latent dict. F>1 <=> VIDEO conditioning/target."""
+    # --- reuse an existing on-disk latent (no re-encode) ---
     if isinstance(entry, dict) and "latent" in entry:
         key = entry.get("key", "latent")
         t = load_file(entry["latent"])[key].float()
@@ -135,6 +177,27 @@ def encode_vae(entry, res: int, vae: str, tmp: Path, idx: int, tag: str) -> torc
               f"std={t.std().item():.4f} <- {entry['latent']}")
         return t.contiguous()
 
+    # --- multi-frame clip (real frames or synthesized) -> encode_video ---
+    if isinstance(entry, dict) and ("frames" in entry or "synth_frames" in entry):
+        vres = int(entry.get("res", res))
+        if "frames" in entry:
+            staged = stage_clip([Path(p) for p in entry["frames"]], vres, tmp, tag, idx)
+            nframe = len(entry["frames"])
+            srcdesc = f"{nframe} frames"
+        else:
+            nframe = int(entry["synth_frames"])
+            staged = stage_synth_clip(nframe, vres, tmp, tag, idx)
+            srcdesc = f"synth x{nframe}"
+        out = tmp / f"lat_{idx}_{tag}.safetensors"
+        run([VAE_BIN, staged, vae, out])
+        lat = load_file(str(out))["latent"].float()   # [1,16,Tlat,h,w]
+        if lat.ndim == 5 and lat.shape[0] == 1:
+            lat = lat.squeeze(0)                       # [16,Tlat,h,w]
+        print(f"[cache] sample {idx} {tag}: VIDEO encoded {tuple(lat.shape)} "
+              f"std={lat.std().item():.4f} <- {srcdesc} @res{vres}")
+        return lat.contiguous()
+
+    # --- single RGB image -> encode() [16,1,h,w] ---
     media = Path(entry)
     staged = stage_pixel(media, res, tmp)
     out = tmp / f"lat_{idx}_{tag}.safetensors"
@@ -144,6 +207,23 @@ def encode_vae(entry, res: int, vae: str, tmp: Path, idx: int, tag: str) -> torc
         lat = lat.squeeze(0)                       # [16,1,h,w]
     print(f"[cache] sample {idx} {tag}: encoded {tuple(lat.shape)} std={lat.std().item():.4f} <- {media.name}")
     return lat.contiguous()
+
+
+def reuse_text(smp: dict, idx: int) -> tuple[torch.Tensor, int]:
+    """Copy a previously-encoded umt5 [512,4096] text tensor + its true length from
+    an existing sample file (no umt5 run). For gate caches without umt5 weights."""
+    src = smp["reuse_text"]
+    tkey = smp.get("text_key", "text")
+    lkey = smp.get("len_key", "text_len")
+    d = load_file(src)
+    emb = d[tkey].float()
+    if emb.ndim == 3 and emb.shape[0] == 1:
+        emb = emb.squeeze(0)
+    if emb.shape != (TEXT_LEN, TEXT_DIM):
+        raise ValueError(f"reuse_text {src}[{tkey}] must be [512,4096], got {tuple(emb.shape)}")
+    tl = int(d[lkey].flatten()[0].item()) if lkey in d else TEXT_LEN
+    print(f"[cache] sample {idx}: REUSE text {tuple(emb.shape)} true_len={tl} <- {src}")
+    return emb.to(torch.bfloat16).contiguous(), tl
 
 
 def encode_text(task: str, caption: str, umt5_dir: str, tokenizer: str,
@@ -172,15 +252,16 @@ def main() -> int:
 
     spec = json.loads(args.manifest.read_text())
     vae = spec["vae"]
-    umt5_dir = spec["umt5_dir"]
-    tokenizer = spec["umt5_tokenizer"]
+    umt5_dir = spec.get("umt5_dir", "")
+    tokenizer = spec.get("umt5_tokenizer", "")
     target_res = int(spec.get("target_res", 256))
     cond_res = int(spec.get("cond_res", 256))
     samples = spec["samples"]
 
+    needs_umt5 = any("reuse_text" not in smp for smp in samples)
     if not VAE_BIN.exists():
         raise SystemExit(f"missing VAE binary {VAE_BIN} (build bernini_r_encode_vae)")
-    if not PROMPT_BIN.exists():
+    if needs_umt5 and not PROMPT_BIN.exists():
         raise SystemExit(f"missing prompt binary {PROMPT_BIN} (build scail2_encode_prompt)")
 
     out_dir = args.out_dir
@@ -199,11 +280,14 @@ def main() -> int:
             per_sample_latents.append((tgt, conds))
         print("[cache] VAE phase done (encoder freed between every invocation)")
 
-        # ── PHASE 2: umt5 encode every caption ────────────────────────────────
+        # ── PHASE 2: umt5 encode every caption (or reuse a cached text tensor) ──
         per_sample_text = []
         for i, smp in enumerate(samples):
-            emb, tl = encode_text(smp["task"], smp.get("caption", ""),
-                                  umt5_dir, tokenizer, tmp, i)
+            if "reuse_text" in smp:
+                emb, tl = reuse_text(smp, i)
+            else:
+                emb, tl = encode_text(smp["task"], smp.get("caption", ""),
+                                      umt5_dir, tokenizer, tmp, i)
             per_sample_text.append((emb, tl))
 
     # ── WRITE ─────────────────────────────────────────────────────────────────

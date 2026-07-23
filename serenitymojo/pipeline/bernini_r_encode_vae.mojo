@@ -13,9 +13,12 @@
 # argv:
 #   bernini_r_encode_vae <staged.safetensors> <vae.safetensors> <out.safetensors>
 #
-# `staged.safetensors` carries key "pixel" = NCTHW [1,3,1,H,W] in [0,1], with
-# H==W in {256, 128}. Output key "latent" = NCTHW [1,16,1,H/8,W/8] f32 (Wan2.1
-# per-channel normalized — the SAME convention as the wan22/scail2 caches).
+# `staged.safetensors` carries key "pixel" = NCTHW [1,3,F,H,W] in [0,1], with
+# H==W in {256, 128}. When F==1 the single-frame image encoder runs (unchanged);
+# when F>1 the multi-frame clip is encoded through `LingBotWanVaeEncoder.
+# encode_video` (Tlat = 1+(F-1)//4). Output key "latent" = NCTHW [1,16,f,H/8,W/8]
+# f32 (Wan2.1 per-channel normalized — the SAME convention as the wan22/scail2
+# caches; f==1 for images, f>1 for video conditioning / multi-frame targets).
 #
 # BUILD (binary):
 #   cd /home/alex/mojodiffusion; rm -f serenitymojo.mojopkg
@@ -90,6 +93,46 @@ def _encode_at[RES: Int](
     return latent^
 
 
+# Multi-frame clip encode: pixel NCTHW [1,3,F,H,W] (F>1) -> normalized latent
+# NCTHW [1,16,Tlat,H/8,W/8], Tlat = 1+(F-1)//4. REUSES LingBotWanVaeEncoder.
+# encode_video verbatim (the scail2 `pose` mode precedent) — no encoder math here.
+def _encode_video_at[RES: Int](
+    pixel: Tensor, vae_path: String, ctx: DeviceContext,
+) raises -> Tensor:
+    var encoder = LingBotWanVaeEncoder[RES, RES].load(vae_path, ctx)
+    var latent = encoder.encode_video(pixel, ctx)
+    var latent_shape = latent.shape()
+    var lr = RES // 8
+    if (
+        len(latent_shape) != 5 or latent_shape[0] != 1 or latent_shape[1] != 16
+        or latent_shape[3] != lr or latent_shape[4] != lr
+    ):
+        raise Error(
+            String("bernini_r VAE video latent shape mismatch: ")
+            + _shape_string(latent_shape)
+        )
+    var host = latent.to_host(ctx)
+    var s = Float64(0.0)
+    var ss = Float64(0.0)
+    for i in range(len(host)):
+        s += Float64(host[i])
+        ss += Float64(host[i]) * Float64(host[i])
+    var mean = s / Float64(len(host))
+    var varp = ss / Float64(len(host)) - mean * mean
+    if varp < 0.0:
+        varp = 0.0
+    from std.math import sqrt as _sqrt
+    var std = _sqrt(varp)
+    var flag = String("")
+    if not (0.15 <= std <= 1.30):
+        flag = String("  <-- STD OUT OF RANGE (possible scramble bug!)")
+    print(
+        "bernini_r VAE VIDEO latent", _shape_string(latent_shape),
+        " std=", std, " mean=", mean, " Tlat=", latent_shape[2], flag,
+    )
+    return latent^
+
+
 def main() raises:
     var args = argv()
     if len(args) != 4:
@@ -108,23 +151,37 @@ def main() raises:
     var pixel = Tensor.from_view_as_f32(staged.tensor_view(String("pixel")), ctx)
     var shape = pixel.shape()
     if (
-        len(shape) != 5 or shape[0] != 1 or shape[1] != 3 or shape[2] != 1
+        len(shape) != 5 or shape[0] != 1 or shape[1] != 3 or shape[2] < 1
         or shape[3] != shape[4]
     ):
         raise Error(
-            String("bernini_r pixel must be NCTHW [1,3,1,H,W] with H==W, got ")
+            String("bernini_r pixel must be NCTHW [1,3,F,H,W] with H==W, got ")
             + _shape_string(shape)
         )
+    var nframe = shape[2]
     var res = shape[3]
     var latent: Tensor
-    if res == 256:
-        latent = _encode_at[256](pixel, vae_path, ctx)
-    elif res == 128:
-        latent = _encode_at[128](pixel, vae_path, ctx)
+    if nframe == 1:
+        # single-frame image (unchanged path + std gate).
+        if res == 256:
+            latent = _encode_at[256](pixel, vae_path, ctx)
+        elif res == 128:
+            latent = _encode_at[128](pixel, vae_path, ctx)
+        else:
+            raise Error(
+                String("bernini_r pixel resolution must be 256 or 128, got ")
+                + String(res)
+            )
     else:
-        raise Error(
-            String("bernini_r pixel resolution must be 256 or 128, got ")
-            + String(res)
-        )
+        # multi-frame clip -> encode_video.
+        if res == 256:
+            latent = _encode_video_at[256](pixel, vae_path, ctx)
+        elif res == 128:
+            latent = _encode_video_at[128](pixel, vae_path, ctx)
+        else:
+            raise Error(
+                String("bernini_r pixel resolution must be 256 or 128, got ")
+                + String(res)
+            )
     _save(String("latent"), latent^, out_path, ctx)
     print("bernini_r VAE encode PASS output=", out_path)

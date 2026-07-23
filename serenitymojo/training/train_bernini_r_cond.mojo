@@ -82,6 +82,7 @@ from serenitymojo.training.train_step import LoraAdapter
 # The per-task recipe table (shift / weighting / n_cond / prompt) + smoke geometry.
 from serenitymojo.training.bernini_tasks import (
     BerniniTaskRecipe, bernini_recipe_for, BerniniCondSeg, bernini_smoke_cond_segments,
+    bernini_task_name_for_id,
 )
 
 
@@ -286,27 +287,55 @@ def _patchify_latent(
     return patched.to_host(ctx)
 
 
-# ── Read the cached target latent [16,1,32,32] f32 from sample_{idx}. ──────────
+# ── Read the cached target latent [16,F,H,W] f32 from sample_{idx}. ────────────
+# Generalized: the target may be single-frame (image, F=1) OR multi-frame (video/
+# clip, F>1). Returns the patchified token grid [S_tgt, IN_CH] flat and writes the
+# post-patchify grid (out_f=F, out_h=H/2, out_w=W/2). S_tgt = out_f*out_h*out_w.
 def _load_cache_target(
     cache_dir: String, idx: Int, ctx: DeviceContext,
     mut out_std: Float32, mut out_mean: Float32,
+    mut out_f: Int, mut out_h: Int, mut out_w: Int,
 ) raises -> List[Float32]:
     var path = cache_dir + String("/sample_") + String(idx) + String(".safetensors")
     var st = SafeTensors.open(path)
     var info = st.tensor_info(String("latent"))
     if info.dtype != STDtype.F32:
         raise Error(String("cache latent dtype != F32 in ") + path)
-    var nlat = 1
-    for i in range(len(info.shape)):
-        nlat *= info.shape[i]
-    if nlat != 16 * 1 * 32 * 32:
-        raise Error(String("cache latent numel != 16*1*32*32 in ") + path)
+    if len(info.shape) != 4 or info.shape[0] != 16:
+        raise Error(String("cache latent must be [16,F,H,W] in ") + path)
+    var ff = info.shape[1]
+    var hl = info.shape[2]
+    var wl = info.shape[3]
+    if hl % 2 != 0 or wl % 2 != 0:
+        raise Error(String("cache latent spatial dims must be even in ") + path)
+    var nlat = 16 * ff * hl * wl
     var lb = st.tensor_bytes(String("latent"))
     var fp = lb.unsafe_ptr().bitcast[Float32]()
     var vals = List[Float32]()
     for i in range(nlat):
         vals.append(fp[i])
-    return _patchify_latent(vals^, 1, 32, 32, ctx, out_std, out_mean)
+    out_f = ff
+    out_h = hl // 2
+    out_w = wl // 2
+    return _patchify_latent(vals^, ff, hl, wl, ctx, out_std, out_mean)
+
+
+# Task id (0..11) stored in sample_{idx}; -1 if the key is absent (legacy cache).
+def _load_cache_task_id(cache_dir: String, idx: Int) raises -> Int:
+    var st = SafeTensors.open(_cache_sample_path(cache_dir, idx))
+    if not _st_has(st, String("task_id")):
+        return -1
+    var lb = st.tensor_bytes(String("task_id"))
+    var ip = lb.unsafe_ptr().bitcast[Int32]()
+    return Int(ip[0])
+
+
+# Number of consecutive sample_{i}.safetensors files (starting at 0) in cache_dir.
+def _count_cache_samples(cache_dir: String) -> Int:
+    var n = 0
+    while _file_exists(_cache_sample_path(cache_dir, n)):
+        n += 1
+    return n
 
 
 # ── Real-cache conditioning + text readers (Bernini-R sample schema) ───────────
@@ -476,34 +505,350 @@ def _save_ema_sibling(
     return save_wan22_lora(ema_set, path, ctx)
 
 
+
+
+# Read a float env var (empty/unset -> default). Used for the C13 default-off
+# condition-dropout probabilities (text/img/video).
+def _env_float(name: String, default: Float32) -> Float32:
+    var s = _env_str(name)
+    if s.byte_length() == 0:
+        return default
+    var n = s.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = s.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cptr = _EnvPtr(unsafe_from_address=Int(buf))
+    var v = external_call["atof", Float64](cptr)
+    buf.free()
+    return Float32(v)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# The step loop, comptime-monomorphized on the packed sequence length SEQ.
-# SEQ = S_TGT + sum(conditioning tokens). The TARGET region is ALWAYS the trailing
-# S_TGT tokens (offset = SEQ - S_TGT; = 0 when there is no conditioning).
-# cond_tokens is empty in no-cond mode, so the prepend is a no-op.
-#
-# Timestep policy: overfit-pin (pin_sigma fixed, from the TASK's Bernini sampler)
-# for a crisp 1-sample monotone drop, or per-step Bernini re-draw when stochastic.
-# EMA (decay=ema_decay) shadows the LoRA params each step; saved as a sibling.
+# Per-sample precomputed training bundle (host). One per cache sample (round-robin
+# scheduled) or a single synthetic bundle. The TARGET is ALWAYS the trailing
+# n_tgt_tokens of the packed sequence; conditioning (N segments, source-id 1..N)
+# is packed AHEAD. task_id drives the per-sample recipe (shift/weighting/window).
 # ══════════════════════════════════════════════════════════════════════════════
-def _train_loop[SEQ: Int](
+@fieldwise_init
+struct BerniniSample(Copyable, Movable):
+    var task_id: Int
+    var task_name: String
+    var is_mode: Bool
+    var shift: Float64
+    var win: BerniniWindow
+    var pin_sigma: Float32
+    var no_cond: Bool
+    var seq_len: Int
+    var n_tgt_tokens: Int
+    var tgt_std: Float32
+    var x0: List[Float32]            # n_tgt_tokens * IN_CH (clean, patchified)
+    var cond_tokens: List[Float32]   # n_cond_tokens * IN_CH (clean, patchified)
+    var txt_tokens: List[Float32]    # TXT * TEXT_DIM
+    var cos_h: List[Float32]         # seq_len * Dh/2
+    var sin_h: List[Float32]
+    var seg_f: List[Int]             # per-cond-seg post-patchify grid + src id
+    var seg_h: List[Int]
+    var seg_w: List[Int]
+    var seg_src: List[Float32]
+    var seg_kind: List[String]
+
+
+@fieldwise_init
+struct StepOut(Copyable, Movable):
+    var loss: Float32
+    var gn: Float32
+    var absum: Float32
+    var nonfinite: Int
+    var sigma: Float32
+
+
+# Build the packed source-id rope (cond segs src 1..N then target src 0) -> host.
+def _build_sample_rope(
+    seg_f: List[Int], seg_h: List[Int], seg_w: List[Int], seg_src: List[Float32],
+    tgt_f: Int, tgt_h: Int, tgt_w: Int, seq_len: Int, ctx: DeviceContext,
+    mut cos_h: List[Float32], mut sin_h: List[Float32],
+) raises:
+    var rope_segments = List[BerniniRopeSegment]()
+    for i in range(len(seg_f)):
+        rope_segments.append(
+            BerniniRopeSegment(seg_f[i], seg_h[i], seg_w[i], seg_src[i])
+        )
+    rope_segments.append(BerniniRopeSegment(tgt_f, tgt_h, tgt_w, TGT_SRC_ID))
+    var rope = build_bernini_src_id_rope(rope_segments, Dh, ROPE_THETA, STDtype.F32, ctx)
+    cos_h = rope[0].to_host(ctx)
+    sin_h = rope[1].to_host(ctx)
+    var expect_rope = seq_len * (Dh // 2)
+    if len(cos_h) != expect_rope or len(sin_h) != expect_rope:
+        raise Error("packed rope length != seq_len*Dh/2 — segment/geometry mismatch")
+
+
+# Build one bundle from a REAL cache sample. task_id (if stored) drives the recipe;
+# otherwise env_task is used (legacy caches). force_no_cond ignores conditioning.
+def _build_cache_sample(
+    cache_dir: String, idx: Int, env_task: String, force_no_cond: Bool,
+    seed: UInt64, ctx: DeviceContext,
+) raises -> BerniniSample:
+    var tid = _load_cache_task_id(cache_dir, idx)
+    var task_name = env_task
+    if tid >= 0:
+        var nm = bernini_task_name_for_id(tid)
+        if nm.byte_length() > 0:
+            task_name = nm
+    var recipe = bernini_recipe_for(task_name)
+    var win = bernini_task_window(recipe.shift, NOISE_TMIN, NOISE_TMAX)
+    var pin = bernini_sample_sigma(
+        recipe.is_mode, recipe.shift, seed + UInt64(idx) * UInt64(7919),
+        LOGIT_MEAN, LOGIT_STD, MODE_SCALE, win,
+    )
+
+    var cond_count = _load_cache_cond_count(cache_dir, idx)
+    var no_cond = force_no_cond or cond_count == 0
+
+    # ── conditioning segments (skipped when no_cond) ─────────────────────────────
+    var seg_f = List[Int]()
+    var seg_h = List[Int]()
+    var seg_w = List[Int]()
+    var seg_src = List[Float32]()
+    var seg_kind = List[String]()
+    var cond_tokens = List[Float32]()
+    var n_cond_tokens = 0
+    if not no_cond:
+        for k in range(cond_count):
+            var cc = _load_cache_cond(cache_dir, idx, k, ctx)
+            var want = cc.f * cc.h * cc.w * IN_CH
+            if len(cc.tokens) != want:
+                raise Error("cache conditioning seg patch len mismatch")
+            for j in range(len(cc.tokens)):
+                cond_tokens.append(cc.tokens[j])
+            seg_f.append(cc.f)
+            seg_h.append(cc.h)
+            seg_w.append(cc.w)
+            seg_src.append(cc.src_id)
+            seg_kind.append(String("video") if cc.f > 1 else String("image"))
+            n_cond_tokens += cc.f * cc.h * cc.w
+
+    # ── target latent (single- OR multi-frame) ───────────────────────────────────
+    var tgt_std = Float32(0.0)
+    var tgt_mean = Float32(0.0)
+    var tgt_f = 0
+    var tgt_h = 0
+    var tgt_w = 0
+    var x0 = _load_cache_target(cache_dir, idx, ctx, tgt_std, tgt_mean,
+                               tgt_f, tgt_h, tgt_w)
+    var n_tgt_tokens = tgt_f * tgt_h * tgt_w
+    if len(x0) != n_tgt_tokens * IN_CH:
+        raise Error("target patch len != n_tgt_tokens*IN_CH")
+    var seq_len = n_cond_tokens + n_tgt_tokens
+
+    # ── text + rope ──────────────────────────────────────────────────────────────
+    var txt = _load_cache_text(cache_dir, idx, ctx)
+    var cos_h = List[Float32]()
+    var sin_h = List[Float32]()
+    _build_sample_rope(seg_f, seg_h, seg_w, seg_src, tgt_f, tgt_h, tgt_w,
+                       seq_len, ctx, cos_h, sin_h)
+
+    return BerniniSample(
+        tid, task_name, recipe.is_mode, recipe.shift, win^, pin, no_cond,
+        seq_len, n_tgt_tokens, tgt_std, x0^, cond_tokens^, txt^, cos_h^, sin_h^,
+        seg_f^, seg_h^, seg_w^, seg_src^, seg_kind^,
+    )
+
+
+# Build one synthetic bundle (no cache): env_task recipe + smoke cond geometry.
+def _build_synth_sample(
+    env_task: String, force_no_cond: Bool, seed: UInt64, ctx: DeviceContext,
+) raises -> BerniniSample:
+    var recipe = bernini_recipe_for(env_task)
+    var win = bernini_task_window(recipe.shift, NOISE_TMIN, NOISE_TMAX)
+    var pin = bernini_sample_sigma(
+        recipe.is_mode, recipe.shift, seed, LOGIT_MEAN, LOGIT_STD, MODE_SCALE, win,
+    )
+    var no_cond = force_no_cond or recipe.n_cond == 0
+
+    var seg_f = List[Int]()
+    var seg_h = List[Int]()
+    var seg_w = List[Int]()
+    var seg_src = List[Float32]()
+    var seg_kind = List[String]()
+    var cond_tokens = List[Float32]()
+    var n_cond_tokens = 0
+    if not no_cond:
+        var segs = bernini_smoke_cond_segments(env_task)
+        for i in range(len(segs)):
+            var seg = segs[i].copy()
+            var cs = Float32(0.0)
+            var cm = Float32(0.0)
+            var cl = _synth(16 * seg.f * (seg.h * 2) * (seg.w * 2),
+                            seed * 7 + UInt64(101 + i * 13))
+            var toks = _patchify_latent(cl^, seg.f, seg.h * 2, seg.w * 2, ctx, cs, cm)
+            for j in range(len(toks)):
+                cond_tokens.append(toks[j])
+            seg_f.append(seg.f)
+            seg_h.append(seg.h)
+            seg_w.append(seg.w)
+            seg_src.append(Float32(i + 1))
+            seg_kind.append(String("video") if seg.f > 1 else String("image"))
+            n_cond_tokens += seg.f * seg.h * seg.w
+
+    var tgt_std = Float32(0.0)
+    var tgt_mean = Float32(0.0)
+    var tl = _synth(16 * 1 * 32 * 32, seed * 13 + 1)
+    var x0 = _patchify_latent(tl^, 1, 32, 32, ctx, tgt_std, tgt_mean)
+    var n_tgt_tokens = 1 * 16 * 16       # single-frame 32x32 target
+    var seq_len = n_cond_tokens + n_tgt_tokens
+
+    var txt = _synth(TXT * TEXT_DIM, seed * 777 + 9)
+    var cos_h = List[Float32]()
+    var sin_h = List[Float32]()
+    _build_sample_rope(seg_f, seg_h, seg_w, seg_src, 1, 16, 16,
+                       seq_len, ctx, cos_h, sin_h)
+
+    return BerniniSample(
+        -1, env_task, recipe.is_mode, recipe.shift, win^, pin, no_cond,
+        seq_len, n_tgt_tokens, tgt_std, x0^, cond_tokens^, txt^, cos_h^, sin_h^,
+        seg_f^, seg_h^, seg_w^, seg_src^, seg_kind^,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ONE training step, comptime-monomorphized on the packed sequence length SEQ.
+# Assembles [cond_1..N (clean, per-seg dropout) | target (noised)], forwards the
+# certified stack, velocity-MSE on the TARGET region ONLY, LoRA backward + AdamW +
+# EMA. Condition dropout (per Bernini config): a dropped modality's tokens are
+# replaced with the NULL/empty (zero) embedding; text dropout zeros the umt5 kv.
+# ══════════════════════════════════════════════════════════════════════════════
+def _run_one_step[SEQ: Int](
+    smp: BerniniSample,
     base: Wan22StackBase, mut loader: TurboPlannedLoader, mut lora: Wan22LoraSet,
-    cos_h: List[Float32], sin_h: List[Float32],
-    cond_tokens: List[Float32], txt_tokens: List[Float32],
-    cache_dir: String, use_cache: Bool,
-    steps: Int, seed: UInt64, stochastic: Bool,
-    is_mode: Bool, shift: Float64, win: BerniniWindow, pin_sigma: Float32,
+    mut ema_a: List[List[Float32]], mut ema_b: List[List[Float32]],
+    step: Int, sample_idx: Int, seed: UInt64, stochastic: Bool,
+    drop_text: Bool, drop_img: Bool, drop_video: Bool,
     lr: Float32, max_grad_norm: Float32,
     beta1: Float32, beta2: Float32, opt_eps: Float32, weight_decay: Float32,
-    ema_decay: Float32, out_path: String, no_cond: Bool, ctx: DeviceContext,
+    ema_decay: Float32, ctx: DeviceContext,
+) raises -> StepOut:
+    # timestep sigma: overfit pin (per-sample fixed) or Bernini per-step re-draw.
+    var t = smp.pin_sigma
+    if stochastic:
+        t = bernini_sample_sigma(
+            smp.is_mode, smp.shift,
+            seed + UInt64(sample_idx) * UInt64(1000003)
+                 + UInt64(step) * UInt64(2654435761) + 1,
+            LOGIT_MEAN, LOGIT_STD, MODE_SCALE, smp.win,
+        )
+
+    var n_tgt = smp.n_tgt_tokens
+    var ntgt_ch = n_tgt * IN_CH
+
+    # ── flow-match noise on the TARGET only (conditioning stays clean) ───────────
+    var noise_seed = seed * UInt64(2000003) + UInt64(sample_idx) * 100003 + 3
+    if stochastic:
+        noise_seed = seed * UInt64(2000003) + UInt64(sample_idx) * 100003 \
+                     + UInt64(step) * 104729 + 3
+    var noise = _noise(ntgt_ch, noise_seed)
+    var tgt_in = List[Float32]()
+    var target = List[Float32]()
+    for i in range(ntgt_ch):
+        tgt_in.append((Float32(1.0) - t) * smp.x0[i] + t * noise[i])
+        target.append(noise[i] - smp.x0[i])
+
+    # ── ASSEMBLE packed [cond_1..N (clean; dropped seg -> null/zero) | target] ────
+    var model_in = List[Float32]()
+    var off = 0
+    for si in range(len(smp.seg_f)):
+        var seg_tok_ch = smp.seg_f[si] * smp.seg_h[si] * smp.seg_w[si] * IN_CH
+        var is_video = smp.seg_f[si] > 1
+        var drop = (is_video and drop_video) or ((not is_video) and drop_img)
+        if drop:
+            for _ in range(seg_tok_ch):
+                model_in.append(Float32(0.0))
+        else:
+            for j in range(seg_tok_ch):
+                model_in.append(smp.cond_tokens[off + j])
+        off += seg_tok_ch
+    for i in range(len(tgt_in)):
+        model_in.append(tgt_in[i])
+    if len(model_in) != SEQ * IN_CH:
+        raise Error("packed model_in len != SEQ*IN_CH")
+
+    # ── text: dropped -> null/empty (zero) embedding ─────────────────────────────
+    var txt_in = List[Float32]()
+    if drop_text:
+        for _ in range(len(smp.txt_tokens)):
+            txt_in.append(Float32(0.0))
+    else:
+        txt_in = smp.txt_tokens.copy()
+
+    var t_model = t * Float32(1000.0) + Float32(1.0)
+
+    var fwd = wan22_stack_lora_forward_offload[H, Dh, SEQ, TXT](
+        model_in.copy(), txt_in.copy(), t_model,
+        base, loader, lora, smp.cos_h.copy(), smp.sin_h.copy(),
+        DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+    )
+
+    # ── velocity-MSE on the TARGET region ONLY (trailing n_tgt tokens) ───────────
+    var nout = len(fwd.out)
+    var tgt_off = (SEQ - n_tgt) * OUT_CH
+    var ntgt = n_tgt * OUT_CH
+    var inv_n = Float32(2.0) / Float32(ntgt)
+    var d_out = List[Float32]()
+    for _ in range(tgt_off):
+        d_out.append(Float32(0.0))
+    var loss = Float32(0.0)
+    for i in range(ntgt):
+        var pred = fwd.out[tgt_off + i]
+        var diff = pred - target[i]
+        loss += diff * diff
+        d_out.append(inv_n * diff)
+    loss = loss / Float32(ntgt)
+    if len(d_out) != nout:
+        raise Error("d_out len != stack out len")
+
+    var grads = wan22_stack_lora_backward_offload[H, Dh, SEQ, TXT](
+        d_out, model_in.copy(), txt_in.copy(),
+        base, loader, lora, smp.cos_h.copy(), smp.sin_h.copy(), fwd,
+        DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+    )
+    var absum = _grad_abs_sum(grads)
+    var gn = _clip(grads, max_grad_norm)
+    wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
+                          beta1, beta2, opt_eps, weight_decay)
+
+    # ── EMA shadow: ema = decay*ema + (1-decay)*live (host F32) ──────────────────
+    var one_m = Float32(1.0) - ema_decay
+    for i in range(len(lora.ad)):
+        for j in range(len(lora.ad[i].a)):
+            ema_a[i][j] = ema_decay * ema_a[i][j] + one_m * Float32(lora.ad[i].a[j])
+        for j in range(len(lora.ad[i].b)):
+            ema_b[i][j] = ema_decay * ema_b[i][j] + one_m * Float32(lora.ad[i].b[j])
+
+    return StepOut(loss, gn, absum, grads.nonfinite_lora_grads, t)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Multi-sample driver: round-robin over samples[0..M-1], each step using THAT
+# sample's task/recipe/cond-layout and dispatching on ITS packed seq_len.
+# ══════════════════════════════════════════════════════════════════════════════
+def _train_run(
+    var samples: List[BerniniSample],
+    base: Wan22StackBase, mut loader: TurboPlannedLoader, mut lora: Wan22LoraSet,
+    steps: Int, seed: UInt64, stochastic: Bool,
+    prob_text: Float32, prob_img: Float32, prob_video: Float32,
+    lr: Float32, max_grad_norm: Float32,
+    beta1: Float32, beta2: Float32, opt_eps: Float32, weight_decay: Float32,
+    ema_decay: Float32, out_path: String, ctx: DeviceContext,
 ) raises:
+    var M = len(samples)
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
     var min_loss = Float32(0.0)
     var have_first = False
     var train_start = perf_counter_ns()
 
-    # ── EMA shadow init (host F32, mirrors each adapter's live BF16 a/b) ─────────
+    # EMA shadow init (host F32, mirrors each adapter's live BF16 a/b).
     var ema_a = List[List[Float32]]()
     var ema_b = List[List[Float32]]()
     for i in range(len(lora.ad)):
@@ -517,110 +862,69 @@ def _train_loop[SEQ: Int](
         ema_b.append(b^)
 
     print("")
-    print("step  sigma     target_MSE       grad_norm    grad_absum    sec")
+    print("step  smp  task     seq  sigma      target_MSE      grad_norm    grad_absum   sec")
     for step in range(steps):
+        var s = step % M
         var t0 = perf_counter_ns()
 
-        # timestep sigma: overfit pin (fixed pair) or Bernini per-step re-draw.
-        var t = pin_sigma
-        if stochastic:
-            t = bernini_sample_sigma(
-                is_mode, shift, seed + UInt64(step) * UInt64(2654435761) + 1,
-                LOGIT_MEAN, LOGIT_STD, MODE_SCALE, win,
-            )
+        # ── seeded, deterministic per-(step,sample) condition dropout ────────────
+        var dbase = seed + UInt64(step) * UInt64(0x9E3779B1) \
+                         + UInt64(s) * UInt64(0x85EBCA77)
+        var drop_text = prob_text > Float32(0.0) \
+            and _u01(dbase + UInt64(101)) < prob_text
+        var drop_img = prob_img > Float32(0.0) \
+            and _u01(dbase + UInt64(202)) < prob_img
+        var drop_video = prob_video > Float32(0.0) \
+            and _u01(dbase + UInt64(303)) < prob_video
 
-        # ── TARGET clean latent x0 [S_TGT, IN_CH] ───────────────────────────────
-        var tgt_std = Float32(0.0)
-        var tgt_mean = Float32(0.0)
-        var x0: List[Float32]
-        if use_cache:
-            x0 = _load_cache_target(cache_dir, 0, ctx, tgt_std, tgt_mean)
+        var seq = samples[s].seq_len
+        var r: StepOut
+        if seq == 256:
+            r = _run_one_step[256](samples[s], base, loader, lora, ema_a, ema_b,
+                step, s, seed, stochastic, drop_text, drop_img, drop_video,
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+        elif seq == 320:
+            r = _run_one_step[320](samples[s], base, loader, lora, ema_a, ema_b,
+                step, s, seed, stochastic, drop_text, drop_img, drop_video,
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+        elif seq == 384:
+            r = _run_one_step[384](samples[s], base, loader, lora, ema_a, ema_b,
+                step, s, seed, stochastic, drop_text, drop_img, drop_video,
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+        elif seq == 448:
+            r = _run_one_step[448](samples[s], base, loader, lora, ema_a, ema_b,
+                step, s, seed, stochastic, drop_text, drop_img, drop_video,
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+        elif seq == 512:
+            r = _run_one_step[512](samples[s], base, loader, lora, ema_a, ema_b,
+                step, s, seed, stochastic, drop_text, drop_img, drop_video,
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
         else:
-            var tl = _synth(16 * 1 * 32 * 32, seed * 13 + 1)
-            x0 = _patchify_latent(tl^, 1, 32, 32, ctx, tgt_std, tgt_mean)
-        if len(x0) != S_TGT * IN_CH:
-            raise Error("target patch len != S_TGT*IN_CH")
-        if step == 0:
-            print("  [data] target latent std=", tgt_std, " mean=", tgt_mean)
+            raise Error(String("unsupported packed seq_len ") + String(seq) +
+                        String(" (sample ") + String(s) +
+                        String(", task ") + samples[s].task_name +
+                        String("); add a monomorphization"))
 
-        # ── flow-match noise on the TARGET only (conditioning is clean) ──────────
-        var noise_seed = seed * UInt64(2000003) + 3
-        if stochastic:
-            noise_seed = seed * UInt64(2000003) + UInt64(step) * 104729 + 3
-        var noise = _noise(S_TGT * IN_CH, noise_seed)
-
-        var tgt_in = List[Float32]()      # noised target [S_TGT, IN_CH]
-        var target = List[Float32]()      # velocity target = noise - x0
-        for i in range(len(x0)):
-            tgt_in.append((Float32(1.0) - t) * x0[i] + t * noise[i])
-            target.append(noise[i] - x0[i])
-
-        # ── ASSEMBLE the packed model input [cond_1..N (clean) | target(noised)] ─
-        var model_in = List[Float32]()
-        for i in range(len(cond_tokens)):     # empty in no-cond mode
-            model_in.append(cond_tokens[i])
-        for i in range(len(tgt_in)):
-            model_in.append(tgt_in[i])
-        if len(model_in) != SEQ * IN_CH:
-            raise Error("packed model_in len != SEQ*IN_CH")
-
-        var t_model = t * Float32(1000.0) + Float32(1.0)
-
-        # ── FORWARD over the PACKED sequence (existing certified stack) ──────────
-        var fwd = wan22_stack_lora_forward_offload[H, Dh, SEQ, TXT](
-            model_in.copy(), txt_tokens.copy(), t_model,
-            base, loader, lora, cos_h.copy(), sin_h.copy(),
-            DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
-        )
-
-        # ── velocity-MSE on the TARGET region ONLY ──────────────────────────────
-        var nout = len(fwd.out)                     # SEQ * OUT_CH
-        var tgt_off = (SEQ - S_TGT) * OUT_CH
-        var ntgt = S_TGT * OUT_CH
-        var inv_n = Float32(2.0) / Float32(ntgt)
-        var d_out = List[Float32]()
-        for _ in range(tgt_off):
-            d_out.append(Float32(0.0))              # conditioning region: no grad
-        var loss = Float32(0.0)
-        for i in range(ntgt):
-            var pred = fwd.out[tgt_off + i]
-            var diff = pred - target[i]
-            loss += diff * diff
-            d_out.append(inv_n * diff)
-        loss = loss / Float32(ntgt)
-        if len(d_out) != nout:
-            raise Error("d_out len != stack out len")
         if not have_first:
-            first_loss = loss
-            min_loss = loss
+            first_loss = r.loss
+            min_loss = r.loss
             have_first = True
-        if loss < min_loss:
-            min_loss = loss
-        last_loss = loss
-
-        # ── BACKWARD over the whole packed sequence; LoRA grads only ─────────────
-        var grads = wan22_stack_lora_backward_offload[H, Dh, SEQ, TXT](
-            d_out, model_in.copy(), txt_tokens.copy(),
-            base, loader, lora, cos_h.copy(), sin_h.copy(), fwd,
-            DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
-        )
-        var absum = _grad_abs_sum(grads)
-        var gn = _clip(grads, max_grad_norm)
-        wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
-                              beta1, beta2, opt_eps, weight_decay)
-
-        # ── EMA shadow: ema = decay*ema + (1-decay)*live (host F32) ──────────────
-        var one_m = Float32(1.0) - ema_decay
-        for i in range(len(lora.ad)):
-            for j in range(len(lora.ad[i].a)):
-                ema_a[i][j] = ema_decay * ema_a[i][j] + one_m * Float32(lora.ad[i].a[j])
-            for j in range(len(lora.ad[i].b)):
-                ema_b[i][j] = ema_decay * ema_b[i][j] + one_m * Float32(lora.ad[i].b[j])
+        if r.loss < min_loss:
+            min_loss = r.loss
+        last_loss = r.loss
 
         var secs = Float64(perf_counter_ns() - t0) / 1.0e9
-        print(step, "  ", t, "  ", loss, "  ", gn, "  ", absum, "  ", secs)
-        if grads.nonfinite_lora_grads != 0:
-            print("  !! nonfinite lora grads =", grads.nonfinite_lora_grads)
+        var dstr = String("")
+        if drop_text or drop_img or drop_video:
+            dstr = String("  drop[")
+            if drop_text: dstr += String("txt ")
+            if drop_img: dstr += String("img ")
+            if drop_video: dstr += String("vid ")
+            dstr += String("]")
+        print(step, "  ", s, "  ", samples[s].task_name, "  ", seq, "  ",
+              r.sigma, "  ", r.loss, "  ", r.gn, "  ", r.absum, "  ", secs, dstr)
+        if r.nonfinite != 0:
+            print("  !! nonfinite lora grads =", r.nonfinite)
 
     var npairs = save_wan22_lora(lora, out_path, ctx)
     var meta = List[Float32]()
@@ -634,14 +938,12 @@ def _train_loop[SEQ: Int](
     print("[save] wrote", npairs, "PEFT pairs ->", out_path)
     print("[save] wrote", nstate, "state tensors ->", state_path)
     print("[save] wrote", nema, "EMA (decay=", ema_decay, ") PEFT pairs ->", ema_path)
-    print("trained steps=", steps, " first target_MSE=", first_loss,
+    print("trained steps=", steps, " samples(M)=", M, " first target_MSE=", first_loss,
           " last=", last_loss, " min=", min_loss,
           " total sec=", Float64(perf_counter_ns() - train_start) / 1.0e9)
-    if no_cond:
-        print("RESULT: bernini-r NO-COND (Tier-1 T2V; packed==target) ran.")
-    else:
-        print("RESULT: bernini-r CONDITIONED (packed [cond_1..N | target], src-id rope,",
-              "velocity-MSE on target region only; real fp8 base) ran.")
+    print("RESULT: bernini-r multi-sample CONDITIONED renderer trainer ran",
+          "(round-robin over", M, "sample(s); per-sample task/recipe/cond-layout;",
+          "src-id rope; velocity-MSE on target region only).")
 
 
 def main() raises:
@@ -655,33 +957,24 @@ def main() raises:
         raise Error(String("config not found: ") + config_path)
     var cfg = read_model_config(config_path)
 
-    # ── task selection ──────────────────────────────────────────────────────────
+    # ── task selection (legacy / synthetic / cache-without-task_id fallback) ─────
     var task = _env_str(String("BERNINI_TASK"))
     if task.byte_length() == 0:
         task = String("t2v")
-    var recipe = bernini_recipe_for(task)
 
-    # regression switch: BERNINI_NO_COND=1 -> force n_cond=0 (Tier-1) for any task.
     var stochastic = _env_is_set(String("BERNINI_STOCHASTIC"))
+    var force_no_cond = _env_is_set(String("BERNINI_NO_COND"))
 
-    # ── data source: real per-sample cache (sample_0.safetensors) or synthetic ──
+    # ── condition dropout probabilities (Bernini config 0.1; C13 default-off) ────
+    var prob_text = _env_float(String("BERNINI_TEXT_DROPOUT"), Float32(0.0))
+    var prob_img = _env_float(String("BERNINI_IMG_DROPOUT"), Float32(0.0))
+    var prob_video = _env_float(String("BERNINI_VIDEO_DROPOUT"), Float32(0.0))
+
+    # ── data source ──────────────────────────────────────────────────────────────
     var cache_dir = cfg.dataset_cache_dir
     var use_cache = cache_dir.byte_length() > 0 and _file_exists(
         _cache_sample_path(cache_dir, 0)
     )
-
-    # no_cond: when reading the real cache, the cache's cond_count is authoritative;
-    # otherwise the per-task recipe drives it (BERNINI_NO_COND forces Tier-1 T2V).
-    var cache_cond_count = 0
-    if use_cache:
-        cache_cond_count = _load_cache_cond_count(cache_dir, 0)
-    var no_cond = _env_is_set(String("BERNINI_NO_COND"))
-    if use_cache:
-        if cache_cond_count == 0:
-            no_cond = True
-    else:
-        if recipe.n_cond == 0:
-            no_cond = True
 
     var rank = cfg.lora_rank if cfg.lora_rank > 0 else 16
     var alpha = cfg.lora_alpha if cfg.lora_alpha > Float32(0.0) else Float32(16.0)
@@ -695,86 +988,70 @@ def main() raises:
     var opt_eps = cfg.eps if cfg.eps > Float32(0.0) else Float32(1.0e-8)
     var weight_decay = cfg.weight_decay if cfg.weight_decay >= Float32(0.0) \
         else Float32(0.01)
-
     var ema_decay = DEFAULT_EMA_DECAY
 
     var ckpt = cfg.checkpoint if cfg.checkpoint.byte_length() > 0 \
         else String(DEFAULT_CKPT_LOW)
-
     var out_path = cfg.output_model_destination
     if out_path.byte_length() == 0:
         out_path = String(
             "/home/alex/mojodiffusion/output/bernini_r_lora/bernini_r_cond_lora.safetensors"
         )
 
-    # ── recipe -> shift / weighting / window ────────────────────────────────────
-    var shift = recipe.shift
-    var is_mode = recipe.is_mode
-    var win = bernini_task_window(shift, NOISE_TMIN, NOISE_TMAX)
-    # overfit-pin sigma: one deterministic Bernini draw for the whole run.
-    var pin_sigma = bernini_sample_sigma(
-        is_mode, shift, seed, LOGIT_MEAN, LOGIT_STD, MODE_SCALE, win
-    )
-
-    # ── conditioning segments (skip when no_cond) ───────────────────────────────
-    # From the REAL cache: grids + source-ids come from the stored cond_{k} tensors.
-    # Synthetic fallback: the per-task smoke geometry (bernini_smoke_cond_segments).
-    var segs = List[BerniniCondSeg]()
-    var cond_src_ids = List[Float32]()
-    if not no_cond:
-        if use_cache:
-            for k in range(cache_cond_count):
-                var g = _load_cache_cond_grid(cache_dir, 0, k)
-                segs.append(BerniniCondSeg(g.f, g.h, g.w, String("cache")))
-                cond_src_ids.append(g.src_id)
-        else:
-            segs = bernini_smoke_cond_segments(task)
-            for i in range(len(segs)):
-                cond_src_ids.append(Float32(i + 1))
-    var n_cond_tokens = 0
-    for i in range(len(segs)):
-        n_cond_tokens += segs[i].f * segs[i].h * segs[i].w
-    var seq_len = S_TGT + n_cond_tokens
-
-    print("==== Bernini-R CONDITIONED LoRA trainer (12-task renderer) ====")
-    print("TASK:", task, "  shift=", shift,
-          "  weighting=", ("mode(video)" if is_mode else "logit_normal(image)"),
-          "  n_cond=", len(segs), "(", recipe.cond_kind, ")")
-    print("system_prompt:", recipe.system_prompt)
-    print("timestep window (u in [tmin,tmax]): tmin=", win.tmin, " tmax=", win.tmax,
-          "  pin_sigma=", pin_sigma)
-    if no_cond:
-        print("MODE: NO-COND (Tier-1 T2V; packed == target, src_id=0 == stock wan rope)")
+    # ── build the per-sample bundles (round-robin schedule) ──────────────────────
+    var samples = List[BerniniSample]()
+    var M = 1
+    if use_cache:
+        M = _count_cache_samples(cache_dir)
+        if M < 1:
+            M = 1
+        for i in range(M):
+            samples.append(
+                _build_cache_sample(cache_dir, i, task, force_no_cond, seed, ctx)
+            )
     else:
-        print("MODE: CONDITIONED  packed order [cond_1..N | target] (pack_vae_latents)")
-    for i in range(len(segs)):
-        print("  cond seg", i, "src_id=", cond_src_ids[i], " grid(f,h,w)=(", segs[i].f, ",",
-              segs[i].h, ",", segs[i].w, ") kind=", segs[i].kind,
-              " tokens=", segs[i].f * segs[i].h * segs[i].w)
-    print("packed sequence: cond=", n_cond_tokens, " + target=", S_TGT, " = S=", seq_len)
+        samples.append(_build_synth_sample(task, force_no_cond, seed, ctx))
+
+    print("==== Bernini-R multi-sample CONDITIONED LoRA trainer (12-task renderer) ====")
+    print("data:", ("REAL cache " + cache_dir) if use_cache else String("SYNTHETIC (no cache)"))
+    print("samples(M)=", len(samples), " round-robin over steps")
+    print("condition dropout: text=", prob_text, " img=", prob_img, " video=", prob_video,
+          " (C13 default-off at 0.0)")
+    if stochastic:
+        print("timestep/noise: STOCHASTIC Bernini per-step (sigma re-drawn each step)")
+    else:
+        print("timestep/noise: OVERFIT PIN (per-sample fixed sigma + fixed noise)")
     print("arch: dim=", DIM, " blocks=", NUM_BLOCKS, " heads=", H, " head_dim=", Dh,
           " ffn=", FFN, " in_ch=", IN_CH, " out_ch=", OUT_CH, " TXT=", TXT)
     print("lora: rank=", rank, " alpha=", alpha, " (10/block: 8 attn + ffn.0 + ffn.2)")
     print("optim: lr=", lr, " max_grad_norm=", max_grad_norm, " ema_decay=", ema_decay)
-    if stochastic:
-        print("timestep/noise: STOCHASTIC Bernini per-step (sigma re-drawn each step)")
-    else:
-        print("timestep/noise: OVERFIT PIN (fixed sigma=pin_sigma + fixed noise)")
     print("steps:", steps, " seed:", seed)
+    for i in range(len(samples)):
+        var sm = samples[i].copy()
+        print("  sample", i, ": task=", sm.task_name, " (id=", sm.task_id, ")",
+              " shift=", sm.shift,
+              " weighting=", ("mode(video)" if sm.is_mode else "logit_normal(image)"),
+              " n_cond=", len(sm.seg_f), " no_cond=", sm.no_cond,
+              " tgt_tokens=", sm.n_tgt_tokens, " seq_len=", sm.seq_len,
+              " pin_sigma=", sm.pin_sigma)
+        for k in range(len(sm.seg_f)):
+            print("      cond seg", k, " src_id=", sm.seg_src[k], " kind=", sm.seg_kind[k],
+                  " grid(f,h,w)=(", sm.seg_f[k], ",", sm.seg_h[k], ",", sm.seg_w[k], ")",
+                  " tokens=", sm.seg_f[k] * sm.seg_h[k] * sm.seg_w[k])
     print("ckpt (low):", ckpt)
 
-    # ── checkpoint-absent guard ────────────────────────────────────────────────
+    # ── checkpoint-absent guard (type-check path, exit 0) ────────────────────────
     if not _file_exists(_base_file_for(ckpt)):
         print("")
         print("[bernini-r] fp8 base not present, skipping real step:")
         print("        ", ckpt)
-        print("        (recipe/geometry/packing + the S=", seq_len,
-              "monomorphization type-checked; re-run once the fp8 cache lands.)")
+        print("        (recipe/geometry/packing + seq_len monomorphizations",
+              "type-checked; re-run once the fp8 cache lands.)")
         print("RESULT: bernini-r cond trainer wired OK (weights-absent path, exit 0)")
         return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # REAL WEIGHTED STEP — build resident base + block-swap loader (single low expert).
+    # REAL WEIGHTED RUN — resident base + block-swap loader (single low expert).
     # ══════════════════════════════════════════════════════════════════════════
     print("")
     print("[bernini-r] fp8 base present — building resident base + block-swap loader")
@@ -789,92 +1066,6 @@ def main() raises:
     var lora = build_wan22_lora_set(NUM_BLOCKS, DIM, FFN, rank, alpha)
     print("[lora] adapters:", wan22_total_adapters(lora))
 
-    # ── build the PACKED source-id RoPE for [cond_1..N (src 1..N) | target (0)] ──
-    var rope_segments = List[BerniniRopeSegment]()
-    for i in range(len(segs)):
-        rope_segments.append(
-            BerniniRopeSegment(segs[i].f, segs[i].h, segs[i].w, cond_src_ids[i])
-        )
-    rope_segments.append(BerniniRopeSegment(TGT_FG, TGT_HG, TGT_WG, TGT_SRC_ID))
-    var rope = build_bernini_src_id_rope(rope_segments, Dh, ROPE_THETA, STDtype.F32, ctx)
-    var cos_h = rope[0].to_host(ctx)   # [seq_len * Dh/2]
-    var sin_h = rope[1].to_host(ctx)
-    var expect_rope = seq_len * (Dh // 2)
-    if len(cos_h) != expect_rope or len(sin_h) != expect_rope:
-        raise Error("packed rope length != seq_len*Dh/2 — segment/geometry mismatch")
-    print("[rope] packed src-id rope built: segments=", len(rope_segments),
-          " rows=", seq_len, " cols(Dh/2)=", Dh // 2)
-
-    # ── conditioning tokens: N CLEAN patchified latents concatenated in order ────
-    # REAL cache: load each stored cond_{k} latent (CLEAN) and patchify it.
-    # Synthetic fallback: deterministic per-seg random latent (regression path).
-    var cond_tokens = List[Float32]()
-    for i in range(len(segs)):
-        if use_cache:
-            var cc = _load_cache_cond(cache_dir, 0, i, ctx)
-            var want = segs[i].f * segs[i].h * segs[i].w * IN_CH
-            if len(cc.tokens) != want:
-                raise Error("cache conditioning seg patch len mismatch")
-            for j in range(len(cc.tokens)):
-                cond_tokens.append(cc.tokens[j])
-        else:
-            var seg = segs[i].copy()
-            var cs = Float32(0.0)
-            var cm = Float32(0.0)
-            var cl = _synth(16 * seg.f * (seg.h * 2) * (seg.w * 2),
-                            seed * 7 + UInt64(101 + i * 13))
-            var toks = _patchify_latent(cl^, seg.f, seg.h * 2, seg.w * 2, ctx, cs, cm)
-            var want = seg.f * seg.h * seg.w * IN_CH
-            if len(toks) != want:
-                raise Error("conditioning seg patch len mismatch")
-            for j in range(len(toks)):
-                cond_tokens.append(toks[j])
-            print("[data] cond seg", i, "(synthetic clean, src_id=", cond_src_ids[i],
-                  "): std=", cs, " mean=", cm, " tokens=", seg.f * seg.h * seg.w)
-    if len(cond_tokens) != n_cond_tokens * IN_CH:
-        raise Error("total cond tokens mismatch")
-
-    # ── data: real cached TARGET+COND+TEXT when present, else synthetic ──────────
-    if use_cache:
-        print("[data] REAL cache:", cache_dir,
-              " (target latent + conditioning latents + umt5 text ALL from cache)")
-    else:
-        print("[data] SYNTHETIC target/conditioning/text (no cache_dir sample_0)")
-
-    var txt_tokens: List[Float32]
-    if use_cache:
-        txt_tokens = _load_cache_text(cache_dir, 0, ctx)
-        print("[data] REAL cached umt5 text [512,4096] loaded (", len(txt_tokens),
-              "floats)")
-    else:
-        txt_tokens = _synth(TXT * TEXT_DIM, seed * 777 + 9)
-
-    # ── comptime dispatch on the packed sequence length ──────────────────────────
-    if seq_len == 256:
-        _train_loop[256](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
-            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
-            ema_decay, out_path, no_cond, ctx)
-    elif seq_len == 320:
-        _train_loop[320](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
-            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
-            ema_decay, out_path, no_cond, ctx)
-    elif seq_len == 384:
-        _train_loop[384](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
-            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
-            ema_decay, out_path, no_cond, ctx)
-    elif seq_len == 448:
-        _train_loop[448](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
-            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
-            ema_decay, out_path, no_cond, ctx)
-    elif seq_len == 512:
-        _train_loop[512](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
-            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
-            ema_decay, out_path, no_cond, ctx)
-    else:
-        raise Error(String("unsupported packed seq_len ") + String(seq_len) +
-                    String(" (task ") + task + String("); add a monomorphization"))
+    _train_run(samples^, base, loader, lora, steps, seed, stochastic,
+               prob_text, prob_img, prob_video, lr, max_grad_norm,
+               beta1, beta2, opt_eps, weight_decay, ema_decay, out_path, ctx)

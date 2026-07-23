@@ -305,7 +305,7 @@ struct Scail2StreamedStackForward(Movable):
 
 
 def scail2_stack_lora_forward_streamed[
-    H: Int, DH: Int, S: Int, TXT: Int, IMG: Int
+    H: Int, DH: Int, S: Int, TXT: Int, IMG: Int, FLASH: Bool = False
 ](
     var sequence: List[Float32],
     e0_host: List[Float32],
@@ -323,7 +323,7 @@ def scail2_stack_lora_forward_streamed[
         var block_mod_h = cast_tensor(wd["modulation"][], STDtype.F32, ctx).to_host(ctx)
         var mv = scail2_modvecs_from_stream(e0_host, block_mod_h, S, dim)
         var bl = _scail2_block_lora_for(lora_set, bi)
-        var fwd = scail2_block_lora_forward[S, TXT, IMG, H, DH](
+        var fwd = scail2_block_lora_forward[S, TXT, IMG, H, DH, FLASH](
             x.copy(), context_txt.copy(), context_img.copy(),
             mv, w, bl, cos, sin, dim, ffn, eps, ctx,
         )
@@ -333,7 +333,7 @@ def scail2_stack_lora_forward_streamed[
 
 
 def scail2_stack_lora_backward_streamed[
-    H: Int, DH: Int, S: Int, TXT: Int, IMG: Int
+    H: Int, DH: Int, S: Int, TXT: Int, IMG: Int, FLASH: Bool = False
 ](
     var d_out: List[Float32],
     e0_host: List[Float32],
@@ -361,11 +361,11 @@ def scail2_stack_lora_backward_streamed[
         var bl = _scail2_block_lora_for(lora_set, bi)
 
         # RECOMPUTE this block's forward from its saved F32 input, then backward.
-        var rc = scail2_block_lora_forward[S, TXT, IMG, H, DH](
+        var rc = scail2_block_lora_forward[S, TXT, IMG, H, DH, FLASH](
             fwd_state.block_inputs[bi].copy(), context_txt.copy(), context_img.copy(),
             mv, w, bl, cos, sin, dim, ffn, eps, ctx,
         )
-        var bg = scail2_block_lora_backward[S, TXT, IMG, H, DH](
+        var bg = scail2_block_lora_backward[S, TXT, IMG, H, DH, FLASH](
             d_cur.copy(), mv, w, bl, rc.saved, cos, sin, dim, ffn, eps, ctx,
         )
         d_cur = bg.base.base.d_x.copy()

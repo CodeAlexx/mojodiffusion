@@ -1287,6 +1287,15 @@ Pure-CPU PNG encoder (uncompressed STORED deflate — valid PNG, just larger). N
   recorded T2I final-latent cosine is 0.9942; edit reference/final latent
   cosines are 0.99979/0.99934 and both rendered comparisons were visually
   accepted. No Serenity server worker or Canvas engine is wired yet.
+- `training/train_mageflow_real.mojo`: MageFlow LoRA trainer (Base-targeted;
+  device-resident 0.44 s/step at 512², block math = qwenimage reuse).
+  Config keys: `train_timestep_shift` (training σ-draw decouple — the
+  disfigured-faces fix; inference keeps `timestep_shift`), cold-exact resume
+  via `resume_state`/`start_step`/`warm_resume`, save cadence writes
+  ai-toolkit-format LoRA + `.state` (F32 Adam moments), in-train 1024²
+  sampling with token-count-verified baked prompts.
+- `pipeline/mageflow_lora_infer.mojo`: standalone Base+LoRA inference driver
+  (argv: lora path, seed; 144-adapter fail-loud load, 20-step CFG-5 1024²).
 
 ### Ideogram-4 perf + magic round (see docs/IDEOGRAM4_STATUS.md)
 - `models/dit/ideogram4_resident.mojo` — `Ideogram4Weights` (resident fp8 cache: `.load(st,ctx)`, `.w(name)`), `ideogram4_build_masks(indicator,ctx)->Ideogram4Masks` (hoisted constant masks), `ideogram4_forward_r[S](w,x,llm,t,masks,cos,sin,...)` (hot path; `_lin` = dequant resident fp8→bf16 then vendor cuBLAS `linear`; attention now goes through `ideogram4_sdpa_product_fwd`). Resident DiT cos 0.999557 after Dh=256 flash wiring.

@@ -2933,3 +2933,31 @@ AND bwd — zero block-math changes.
   ~7.5s/step. BUILD NOTE: **binary build required** (`mojo build
   --target-accelerator sm_120 … -Xlinker -lcuda`; `mojo run` JIT can't resolve
   `cuMemcpyHtoDAsync_v2`).
+
+### 2026-07-22 hardening: σ-decouple, resume, device-resident speed
+
+- **`train_timestep_shift`** (TrainConfig + reader + trainer): decouples the
+  TRAINING σ-draw from the inference `timestep_shift`. At shift 6.0 the
+  logit-normal draw has median σ≈0.86 — the low-σ detail regime is starved and
+  LoRA subjects converge with degraded faces. Production recipe:
+  `train_timestep_shift 1.0` + lr 1e-4 (inference keeps shift 6.0). Key absent
+  ⇒ legacy behavior (draw follows `timestep_shift`).
+- **Cold-exact resume**: `resume_state` / `start_step` / `warm_resume` config
+  keys; the loop runs `range(start_step, steps)` so AdamW bias-correction t,
+  warmup, cadences, data round-robin and the seed+step σ/noise streams continue
+  the uninterrupted sequence (sha256-identical continuation proven).
+- **Device-resident training**: 12 blocks pinned (~8.2G) with device
+  conductors mirroring the qwenimage offload seams; 0.44–0.45 s/step at 512²
+  (was 13.5 s/step streamed). Host `List[Float32]` parity fallback via
+  `MAGEFLOW_HOST_PATH=1`; fused AdamW opt-in `MAGEFLOW_FUSED_ADAMW=1` (ulp
+  drift, off by default). **pin_residents copy-stream race fixed**
+  (`turbo_planned_loader.mojo`): staging-buffer reuse now fences
+  `copy_stream.synchronize()`, not only `ctx.synchronize()`.
+- **In-train sampling + prompts**: 1024² 20-step CFG-5 renders at the sample
+  cadence; baked prompts are woman-explicit with re-measured KEEP token counts
+  (fail-loud vs the real Base tokenizer at runtime).
+- **Standalone LoRA inference driver**: `pipeline/mageflow_lora_infer.mojo`
+  (argv lora path + seed; 144-adapter fail-loud load; 4 prompts, ~21 s/render).
+- Production configs: `configs/mageflow_eri2_final.json` (shift-1 draw, lr
+  1e-4, 2000 steps), `configs/mageflow_eri2_resume3500.json` (cold-exact
+  2000→3500 continuation).

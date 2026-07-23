@@ -182,19 +182,20 @@ comptime SAMPLE_CFG = Float32(5.0)            # base default; 1.0 => single-forw
 # mageflow_count_tokens probe pattern; VERIFIED at runtime against the real
 # tokenizer output in _encode_sample_prompts (fail loud on drift).
 comptime SP1 = (
-    "vrtlEri2 standing in a sunlit olive garden, white summer dress, golden hour"
-    " portrait, photorealistic"
+    "vrtlEri2, a beautiful woman, standing in a sunlit olive garden, white"
+    " summer dress, golden hour portrait, photorealistic"
 )
 comptime SP2 = (
-    "vrtlEri2 in a black leather jacket on a neon-lit city street at night,"
-    " cinematic"
+    "vrtlEri2, a beautiful woman, in a black leather jacket on a neon-lit city"
+    " street at night, cinematic"
 )
 comptime SP3 = (
-    "close-up portrait of vrtlEri2 smiling, soft studio light, grey backdrop, 85mm"
+    "close-up portrait of vrtlEri2, a beautiful woman, smiling, soft studio"
+    " light, grey backdrop, 85mm"
 )
-comptime SP1_KEEP = 29
-comptime SP2_KEEP = 26
-comptime SP3_KEEP = 27
+comptime SP1_KEEP = 34
+comptime SP2_KEEP = 31
+comptime SP3_KEEP = 32
 comptime UNCOND_KEEP = 5
 
 # ── recipe defaults (config overrides where present) ──────────────────────────

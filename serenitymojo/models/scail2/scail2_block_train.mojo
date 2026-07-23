@@ -54,6 +54,9 @@ from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import gelu
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd, sdpa_flash_backward,
+)
 from serenitymojo.ops.tensor_algebra import reshape, add, mul, add_scalar
 from serenitymojo.ops.linalg_backward import linear_backward, LinearGrads
 from serenitymojo.ops.norm_backward import (
@@ -116,6 +119,54 @@ def scail2_gated_residual_f32(
 # F32 ungated residual: o = f32(x) + f32(y).
 def scail2_residual_f32(x: Tensor, y: Tensor, ctx: DeviceContext) raises -> Tensor:
     return add(cast_tensor(x, STDtype.F32, ctx), cast_tensor(y, STDtype.F32, ctx), ctx)
+
+
+# ── SELF-attention forward/backward: DENSE (chunk-1) vs FLASH (chunk-2c) ──────
+# The self-attn is NON-CAUSAL full attention over the whole concatenated
+# sequence, softmax scale = 1/sqrt(DH). The DENSE path materializes an [1,H,S,S]
+# score matrix (sdpa_nomask / sdpa_backward) — ~254 GB at the real video S≈39,872
+# → OOM. The FLASH path routes q/k/v [1,S,H,DH] bf16 through the cuDNN v9 flash
+# shim (ops/attention_flash.mojo), which never materializes S×S; peak memory is
+# O(S). Everything ELSE in the block is byte-identical between the two paths;
+# only the attention core is swapped, gated on the comptime FLASH flag.
+#
+# q_rope/k_rope/v are bf16 [1,S,H,DH]; the flash forward pads S→128-multiple and
+# masks the pad rows via the real-length arg, so the output over the real S rows
+# equals full attention. The flash BACKWARD RECOMPUTES the flash forward from the
+# saved q_rope/k_rope/v (already host-saved as sa_q_rope/sa_k_rope/sa_v), so the
+# Scail2Saved struct is UNCHANGED between the dense and flash variants. Flash bwd
+# dQ is nondeterministic run-to-run (~1e-4) — a VALUE-class, not a bit gate.
+def _scail2_sa_fwd[FLASH: Bool, S: Int, H: Int, DH: Int](
+    q_rope: Tensor, k_rope: Tensor, v4: Tensor, scale: Float32,
+    dim: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    comptime if FLASH:
+        var ff = sdpa_flash_train_fwd[1, S, H, DH](q_rope, k_rope, v4, scale, ctx)
+        # ff.o is a (possibly padded-buffer) view; buf.copy() bumps the refcount
+        # so the [1,S,H,DH] output outlives ff (the klein/krea2 flash pattern).
+        var att4 = Tensor(ff.o.buf.copy(), ff.o.shape(), ff.o.dtype())
+        return _from_bshd(att4^, S, dim, ctx)
+    else:
+        var att4 = sdpa_nomask[1, S, H, DH](q_rope, k_rope, v4, scale, ctx)
+        return _from_bshd(att4^, S, dim, ctx)
+
+
+def _scail2_sa_bwd[FLASH: Bool, S: Int, H: Int, DH: Int](
+    q_rope4: Tensor, k_rope4: Tensor, v4: Tensor, d_att4: Tensor,
+    scale: Float32, ctx: DeviceContext,
+) raises -> SdpaGrads:
+    comptime if FLASH:
+        # recompute the flash forward (q/k/v/o/stats) then run the flash backward.
+        var ff = sdpa_flash_train_fwd[1, S, H, DH](q_rope4, k_rope4, v4, scale, ctx)
+        var fb = sdpa_flash_backward[1, S, H, DH](ff, d_att4, scale, ctx)
+        # buf.copy() refcount-bumps so fb destroys cleanly (no partial move).
+        return SdpaGrads(
+            Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype()),
+            Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype()),
+            Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype()),
+        )
+    else:
+        return sdpa_backward[1, S, H, DH](q_rope4, k_rope4, v4, d_att4, scale, ctx)
 
 
 # ── saved activations (host-resident; F32 for the residual/modulate stream,
@@ -212,7 +263,7 @@ comptime Scail2BlockWeights = WanI2VBlockWeights
 
 # ── FORWARD (F32 residual, saving activations, 12 LoRA targets) ───────────────
 def scail2_block_lora_forward[
-    S: Int, TXT: Int, IMG: Int, H: Int, DH: Int
+    S: Int, TXT: Int, IMG: Int, H: Int, DH: Int, FLASH: Bool = False
 ](
     x_h: List[Float32], context_txt_h: List[Float32], context_img_h: List[Float32],
     mv: WanModVecs, w: WanI2VBlockWeights, lora: WanI2VBlockLora,
@@ -258,8 +309,7 @@ def scail2_block_lora_forward[
     var sin_e = _expand_rope_per_head(sin16, S, H, DH // 2, ctx)
     var q_rope = rope_interleaved(q_rms, cos_e, sin_e, ctx)
     var k_rope = rope_interleaved(k_rms, cos_e, sin_e, ctx)
-    var att4 = sdpa_nomask[1, S, H, DH](q_rope, k_rope, v4, scale, ctx)
-    var sa_att = _from_bshd(att4^, S, dim, ctx)
+    var sa_att = _scail2_sa_fwd[FLASH, S, H, DH](q_rope, k_rope, v4, scale, dim, ctx)
     var sa_att_h = sa_att.to_host(ctx)
     var sa_out_base = linear(sa_att, w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx)
     var sa_out = _add_lora_delta(sa_out_base, sa_att_h, lora.base.sa_o, S, ctx)
@@ -335,7 +385,7 @@ def scail2_block_lora_forward[
 
 # ── BACKWARD (F32 residual, 12 LoRA targets) ─────────────────────────────────
 def scail2_block_lora_backward[
-    S: Int, TXT: Int, IMG: Int, H: Int, DH: Int
+    S: Int, TXT: Int, IMG: Int, H: Int, DH: Int, FLASH: Bool = False
 ](
     d_out_h: List[Float32], mv: WanModVecs, w: WanI2VBlockWeights,
     lora: WanI2VBlockLora, saved: Scail2Saved, cos: Tensor, sin: Tensor,
@@ -517,7 +567,7 @@ def scail2_block_lora_backward[
     var lsv_sa_q_rope = _tbf16(saved.sa_q_rope.copy(), [1, S, H, DH], ctx)
     var lsv_sa_k_rope = _tbf16(saved.sa_k_rope.copy(), [1, S, H, DH], ctx)
     var lsv_sa_v = _tbf16(saved.sa_v.copy(), [1, S, H, DH], ctx)
-    var ssb = sdpa_backward[1, S, H, DH](
+    var ssb = _scail2_sa_bwd[FLASH, S, H, DH](
         lsv_sa_q_rope, lsv_sa_k_rope, lsv_sa_v, d_sa_att4, scale, ctx,
     )
     var ssb_dq_f32 = cast_tensor(ssb.d_q, STDtype.F32, ctx)

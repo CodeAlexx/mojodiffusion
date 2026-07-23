@@ -71,7 +71,7 @@ from serenitymojo.ops.rope_struct_backward import rope_backward
 # ── reused wan22 i2v structs + helpers (the block is a thin fork) ─────────────
 from serenitymojo.models.wan22.wan22_block import (
     # host helpers
-    _add_lists, _ones, _zeros, _t16, _ta16, _tbf16, _clone_t,
+    _add_lists, _ones, _zeros, _t16, _ta16, _clone_t,
     _to_bshd, _from_bshd, _expand_rope_per_head, _cross_attention,
     _add_lora_delta, _lora_bwd_opt,
     # AdaLN primitives (elementwise; F32-safe) + carriers
@@ -169,81 +169,48 @@ def _scail2_sa_bwd[FLASH: Bool, S: Int, H: Int, DH: Int](
         return sdpa_backward[1, S, H, DH](q_rope4, k_rope4, v4, d_att4, scale, ctx)
 
 
-# ── saved activations (host-resident; F32 for the residual/modulate stream,
-#    BF16 for the attention/FFN interior — matching the Wan2.2 i2v layout) ─────
+# ── saved activations (DEVICE-RESIDENT on-GPU tape; TArc = ArcPointer[Tensor]).
+#    The tape used to be host List[BFloat16]/List[Float32] (device→host per op in
+#    the forward, host→device per op in the backward — ~93 round-trips/block that
+#    made the trainer CPU-bound at ~195 s/step). It is now the SAME activations,
+#    SAME dtypes (bf16 for the attention/FFN interior, F32 for the residual /
+#    modulate stream), just kept ON DEVICE: the forward stores the already-on-GPU
+#    Tensor (ArcPointer refcount bump — no copy), and the backward reads it back
+#    straight into the (already device-native) backward arms. The bf16 device
+#    tensor holds the same bytes the old to_host_bf16→from_host_bf16 path produced,
+#    so the dense path stays bit-identical. Per-block RECOMPUTE keeps only ONE
+#    block's tape live at a time (streaming trainer), so device VRAM stays ~one
+#    block. Shapes: the *_pre fields keep their [1,M,H,Dh] forward layout (same
+#    bytes as [M,dim]); the backward reshapes them to [M,dim] at the rms-norm arm.
+@fieldwise_init
 struct Scail2Saved(Copyable, Movable):
-    var x: List[BFloat16]           # [S,dim]   block input (bf16)
-    var sa_ln: List[Float32]        # [S,dim]   F32 ln (modulate input, self-attn)
-    var sa_in: List[BFloat16]       # [S,dim]   mod_pre output (self-attn linear input)
-    var sa_q_pre: List[BFloat16]    # [1,S,H,Dh]
-    var sa_k_pre: List[BFloat16]
-    var sa_v: List[BFloat16]
-    var sa_q_rope: List[BFloat16]
-    var sa_k_rope: List[BFloat16]
-    var sa_att: List[BFloat16]      # [S,dim]   attn out (pre o-linear)
-    var x_sa: List[Float32]         # [S,dim]   F32 gated residual after self-attn
-    var ca_n3: List[BFloat16]       # [S,dim]   layer_norm(norm3) on bf16 x_sa
-    var ca_q_pre: List[BFloat16]    # [1,S,H,Dh]
-    var ca_q_rms: List[BFloat16]
-    var context_txt: List[BFloat16] # [TXT,dim]
-    var ca_k_pre: List[BFloat16]    # [1,TXT,H,Dh]
-    var ca_k_rms: List[BFloat16]
-    var ca_v: List[BFloat16]        # [1,TXT,H,Dh]
-    var img_context: List[BFloat16] # [IMG,dim]
-    var img_k_pre: List[BFloat16]   # [IMG,dim]
-    var img_k_rms: List[BFloat16]   # [1,IMG,H,Dh]
-    var img_v: List[BFloat16]       # [1,IMG,H,Dh]
-    var ca_att: List[BFloat16]      # [S,dim]   x_txt + x_img (pre o-linear)
-    var x_ca: List[Float32]         # [S,dim]   F32 ungated residual after cross-attn
-    var ffn_ln: List[Float32]       # [S,dim]   F32 ln (modulate input, ffn) — LN(x_ca F32)
-    var ffn_in: List[BFloat16]      # [S,dim]   mod_pre output (ffn.0 input)
-    var ffn_h: List[BFloat16]       # [S,ffn]   ffn.0 out (pre-gelu)
-    var ffn_act: List[BFloat16]     # [S,ffn]   gelu(ffn_h)
-
-    def __init__(
-        out self, var x: List[BFloat16],
-        var sa_ln: List[Float32], var sa_in: List[BFloat16],
-        var sa_q_pre: List[BFloat16], var sa_k_pre: List[BFloat16],
-        var sa_v: List[BFloat16], var sa_q_rope: List[BFloat16],
-        var sa_k_rope: List[BFloat16], var sa_att: List[BFloat16],
-        var x_sa: List[Float32],
-        var ca_n3: List[BFloat16], var ca_q_pre: List[BFloat16],
-        var ca_q_rms: List[BFloat16], var context_txt: List[BFloat16],
-        var ca_k_pre: List[BFloat16], var ca_k_rms: List[BFloat16],
-        var ca_v: List[BFloat16],
-        var img_context: List[BFloat16], var img_k_pre: List[BFloat16],
-        var img_k_rms: List[BFloat16], var img_v: List[BFloat16],
-        var ca_att: List[BFloat16], var x_ca: List[Float32],
-        var ffn_ln: List[Float32], var ffn_in: List[BFloat16],
-        var ffn_h: List[BFloat16], var ffn_act: List[BFloat16],
-    ):
-        self.x = x^
-        self.sa_ln = sa_ln^
-        self.sa_in = sa_in^
-        self.sa_q_pre = sa_q_pre^
-        self.sa_k_pre = sa_k_pre^
-        self.sa_v = sa_v^
-        self.sa_q_rope = sa_q_rope^
-        self.sa_k_rope = sa_k_rope^
-        self.sa_att = sa_att^
-        self.x_sa = x_sa^
-        self.ca_n3 = ca_n3^
-        self.ca_q_pre = ca_q_pre^
-        self.ca_q_rms = ca_q_rms^
-        self.context_txt = context_txt^
-        self.ca_k_pre = ca_k_pre^
-        self.ca_k_rms = ca_k_rms^
-        self.ca_v = ca_v^
-        self.img_context = img_context^
-        self.img_k_pre = img_k_pre^
-        self.img_k_rms = img_k_rms^
-        self.img_v = img_v^
-        self.ca_att = ca_att^
-        self.x_ca = x_ca^
-        self.ffn_ln = ffn_ln^
-        self.ffn_in = ffn_in^
-        self.ffn_h = ffn_h^
-        self.ffn_act = ffn_act^
+    var x: TArc            # [S,dim]      block input (bf16)
+    var sa_ln: TArc        # [S,dim]  F32 ln (modulate input, self-attn)
+    var sa_in: TArc        # [S,dim]      mod_pre output (self-attn linear input)
+    var sa_q_pre: TArc     # [1,S,H,Dh]   q_flat reshaped (rms-norm bwd input as [S,dim])
+    var sa_k_pre: TArc      # [1,S,H,Dh]
+    var sa_v: TArc          # [1,S,H,Dh]
+    var sa_q_rope: TArc     # [1,S,H,Dh]
+    var sa_k_rope: TArc     # [1,S,H,Dh]
+    var sa_att: TArc       # [S,dim]      attn out (pre o-linear)
+    var x_sa: TArc         # [S,dim]  F32 gated residual after self-attn
+    var ca_n3: TArc        # [S,dim]      layer_norm(norm3) on bf16 x_sa
+    var ca_q_pre: TArc     # [1,S,H,Dh]
+    var ca_q_rms: TArc     # [1,S,H,Dh]
+    var context_txt: TArc  # [TXT,dim]
+    var ca_k_pre: TArc     # [1,TXT,H,Dh]
+    var ca_k_rms: TArc     # [1,TXT,H,Dh]
+    var ca_v: TArc         # [1,TXT,H,Dh]
+    var img_context: TArc  # [IMG,dim]
+    var img_k_pre: TArc    # [1,IMG,H,Dh]
+    var img_k_rms: TArc    # [1,IMG,H,Dh]
+    var img_v: TArc        # [1,IMG,H,Dh]
+    var ca_att: TArc       # [S,dim]      x_txt + x_img (pre o-linear)
+    var x_ca: TArc         # [S,dim]  F32 ungated residual after cross-attn
+    var ffn_ln: TArc       # [S,dim]  F32 ln (modulate input, ffn) — LN(x_ca F32)
+    var ffn_in: TArc       # [S,dim]      mod_pre output (ffn.0 input)
+    var ffn_h: TArc        # [S,ffn]      ffn.0 out (pre-gelu)
+    var ffn_act: TArc      # [S,ffn]      gelu(ffn_h)
 
 
 struct Scail2BlockForward(Copyable, Movable):
@@ -365,20 +332,23 @@ def scail2_block_lora_forward[
     var x_final = scail2_gated_residual_f32(x_ca, ffn_out, gate_ffn, ctx)   # F32
 
     var x_out = x_final.to_host(ctx)
+    # ── DEVICE TAPE: store the already-on-GPU activations directly (ArcPointer
+    #    refcount bump for the TArc-carried ones; move the plain Tensors into a
+    #    fresh TArc). No to_host/to_host_bf16 — the tape never leaves the GPU. ──
     var saved = Scail2Saved(
-        x[].to_host_bf16(ctx),
-        sa_mp.ln[].to_host(ctx), sa_mp.o[].to_host_bf16(ctx),
-        q_pre.to_host_bf16(ctx), k_pre.to_host_bf16(ctx), v4.to_host_bf16(ctx),
-        q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx),
-        sa_att.to_host_bf16(ctx), x_sa.to_host(ctx),
-        n3.to_host_bf16(ctx), caq_pre.to_host_bf16(ctx), caq_rms.to_host_bf16(ctx),
-        context_txt[].to_host_bf16(ctx),
-        cak_pre.to_host_bf16(ctx), cak_rms.to_host_bf16(ctx), cav4.to_host_bf16(ctx),
-        context_img[].to_host_bf16(ctx),
-        imgk_pre.to_host_bf16(ctx), imgk_rms.to_host_bf16(ctx), imgv4.to_host_bf16(ctx),
-        ca_att.to_host_bf16(ctx), x_ca.to_host(ctx),
-        ffn_mp.ln[].to_host(ctx), ffn_mp.o[].to_host_bf16(ctx),
-        ffn_h.to_host_bf16(ctx), ffn_act.to_host_bf16(ctx),
+        x.copy(),
+        sa_mp.ln.copy(), sa_mp.o.copy(),
+        TArc(q_pre^), TArc(k_pre^), TArc(v4^),
+        TArc(q_rope^), TArc(k_rope^),
+        TArc(sa_att^), TArc(x_sa^),
+        TArc(n3^), TArc(caq_pre^), TArc(caq_rms^),
+        context_txt.copy(),
+        TArc(cak_pre^), TArc(cak_rms^), TArc(cav4^),
+        context_img.copy(),
+        TArc(imgk_pre^), TArc(imgk_rms^), TArc(imgv4^),
+        TArc(ca_att^), TArc(x_ca^),
+        ffn_mp.ln.copy(), ffn_mp.o.copy(),
+        TArc(ffn_h^), TArc(ffn_act^),
     )
     return Scail2BlockForward(x_out^, saved^)
 
@@ -397,34 +367,26 @@ def scail2_block_lora_backward[
     var ones_f32 = Tensor.from_host(_ones(dim), [dim], STDtype.F32, ctx)
     var ones_bf16 = Tensor.from_host(_ones(dim), [dim], STDtype.BF16, ctx)
 
-    # recompute-friendly saved tensors (bf16 interior)
-    var sv_sa_in = _tbf16(saved.sa_in.copy(), [S, dim], ctx)
-    var sv_sa_att = _tbf16(saved.sa_att.copy(), [S, dim], ctx)
-    var sv_ca_n3 = _tbf16(saved.ca_n3.copy(), [S, dim], ctx)
-    var sv_context = _tbf16(saved.context_txt.copy(), [TXT, dim], ctx)
-    var sv_ca_att = _tbf16(saved.ca_att.copy(), [S, dim], ctx)
-    var sv_img_ctx = _tbf16(saved.img_context.copy(), [IMG, dim], ctx)
-    var sa_in_h = sv_sa_in.to_host(ctx)
-    var sa_att_h = sv_sa_att.to_host(ctx)
-    var n3_h = sv_ca_n3.to_host(ctx)
-    var context_txt_h = sv_context.to_host(ctx)
-    var context_img_h = sv_img_ctx.to_host(ctx)
-    var ca_att_h = sv_ca_att.to_host(ctx)
-
-    # F32 residual-stream saved tensors
-    var sv_x_bf16 = _tbf16(saved.x.copy(), [S, dim], ctx)
-    var sv_x_sa_f32 = Tensor.from_host(saved.x_sa.copy(), [S, dim], STDtype.F32, ctx)
-    var sv_x_ca_f32 = Tensor.from_host(saved.x_ca.copy(), [S, dim], STDtype.F32, ctx)
+    # ── DEVICE TAPE READ: the saved activations are already on the GPU
+    #    (Scail2Saved now carries device TArc), so the backward arms read them
+    #    straight from `saved.<field>[]` — the ~93 per-block from_host reloads are
+    #    GONE. The ONLY to_host that remain here are the LoRA-backward host inputs
+    #    (the LoRA math is host-side) + the block-OUTPUT boundary grads. ──
+    var sa_in_h = saved.sa_in[].to_host(ctx)
+    var sa_att_h = saved.sa_att[].to_host(ctx)
+    var n3_h = saved.ca_n3[].to_host(ctx)
+    var context_txt_h = saved.context_txt[].to_host(ctx)
+    var context_img_h = saved.img_context[].to_host(ctx)
+    var ca_att_h = saved.ca_att[].to_host(ctx)
 
     var d_out = Tensor.from_host(d_out_h.copy(), [S, dim], STDtype.F32, ctx)  # F32
 
     # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
     var gate_ffn_t = Tensor.from_host(mv.gate_ffn.copy(), [S, dim], STDtype.F32, ctx)
-    var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
-    var ffn_act_h = lsv_ffn_act.to_host(ctx)
+    var ffn_act_h = saved.ffn_act[].to_host(ctx)
     # recompute ffn_out (base only; y is used only for the frozen d_gate) in F32
     var ffn_out_rc = cast_tensor(
-        linear(lsv_ffn_act, w.base.ffn2_w[], Optional[Tensor](_clone_t(w.base.ffn2_b[], ctx)), ctx),
+        linear(saved.ffn_act[], w.base.ffn2_w[], Optional[Tensor](_clone_t(w.base.ffn2_b[], ctx)), ctx),
         STDtype.F32, ctx,
     )
     var gb_ffn2 = wan_gate_residual_backward(d_out, ffn_out_rc, gate_ffn_t, ctx)
@@ -432,16 +394,14 @@ def scail2_block_lora_backward[
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))                          # F32
     var d_ffn_out_bf16 = cast_tensor(gb_ffn2.d_y, STDtype.BF16, ctx)
     var d_ffn_out_h = d_ffn_out_bf16.to_host(ctx)
-    var lb_ffn2 = linear_backward(d_ffn_out_bf16, lsv_ffn_act, w.base.ffn2_w[], S, ffn, dim, ctx)
+    var lb_ffn2 = linear_backward(d_ffn_out_bf16, saved.ffn_act[], w.base.ffn2_w[], S, ffn, dim, ctx)
     var d_ffn2_w = lb_ffn2.d_w.to_host(ctx)
     var d_ffn2_b = lb_ffn2.d_b.to_host(ctx)
     var ffn2_g = _lora_bwd_opt(lora.base.ffn2, d_ffn_out_h, ffn_act_h, S, ffn, ctx)
     var d_ffn_act = add(lb_ffn2.d_x, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
-    var lsv_ffn_h = _tbf16(saved.ffn_h.copy(), [S, ffn], ctx)
-    var d_ffn_h = gelu_backward(d_ffn_act, lsv_ffn_h, ctx)
-    var lsv_ffn_in = _tbf16(saved.ffn_in.copy(), [S, dim], ctx)
-    var ffn_in_h = lsv_ffn_in.to_host(ctx)
-    var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.base.ffn0_w[], S, dim, ffn, ctx)
+    var d_ffn_h = gelu_backward(d_ffn_act, saved.ffn_h[], ctx)
+    var ffn_in_h = saved.ffn_in[].to_host(ctx)
+    var lb_ffn0 = linear_backward(d_ffn_h, saved.ffn_in[], w.base.ffn0_w[], S, dim, ffn, ctx)
     var d_ffn0_w = lb_ffn0.d_w.to_host(ctx)
     var d_ffn0_b = lb_ffn0.d_b.to_host(ctx)
     var d_ffn_h_h = d_ffn_h.to_host(ctx)
@@ -450,17 +410,16 @@ def scail2_block_lora_backward[
     # F32 modulate backward (ln = LN(x_ca F32); layer_norm_backward_dx on F32 x_ca)
     var d_ffn_in_f32 = cast_tensor(d_ffn_in, STDtype.F32, ctx)
     var scale_ffn_t = Tensor.from_host(mv.scale_ffn.copy(), [S, dim], STDtype.F32, ctx)
-    var lsv_ffn_ln = Tensor.from_host(saved.ffn_ln.copy(), [S, dim], STDtype.F32, ctx)
-    var mb_ffn = wan_modulate_backward(d_ffn_in_f32, lsv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in_f32, saved.ffn_ln[], scale_ffn_t, ctx)
     var d_scale_ffn = mb_ffn.d_scale.to_host(ctx)
     var d_shift_ffn = mb_ffn.d_shift.to_host(ctx)
-    var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, sv_x_ca_f32, ones_f32, eps, ctx)  # F32
+    var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, saved.x_ca[], ones_f32, eps, ctx)  # F32
     var d_x_ca = TArc(add(d_x_ca_resid[], lnb_ffn, ctx))                     # F32
 
     # ════════════════ DUAL cross-attention backward (LoRA q/k/v/o + k_img/v_img)
     var d_x_ca_bf16 = cast_tensor(d_x_ca[], STDtype.BF16, ctx)
     var d_ca_out_h = d_x_ca_bf16.to_host(ctx)
-    var lb_cao = linear_backward(d_x_ca_bf16, sv_ca_att, w.base.ca_wo[], S, dim, dim, ctx)
+    var lb_cao = linear_backward(d_x_ca_bf16, saved.ca_att[], w.base.ca_wo[], S, dim, dim, ctx)
     var d_ca_wo = lb_cao.d_w.to_host(ctx)
     var d_ca_bo = lb_cao.d_b.to_host(ctx)
     var ca_o_g = _lora_bwd_opt(lora.base.ca_o, d_ca_out_h, ca_att_h, S, dim, ctx)
@@ -469,27 +428,23 @@ def scail2_block_lora_backward[
     var d_ca_att4_txt = reshape(d_ca_att, [1, S, H, DH], ctx)
     var d_ca_att4_img = reshape(d_ca_att, [1, S, H, DH], ctx)
 
-    var lsv_ca_q_rms = _tbf16(saved.ca_q_rms.copy(), [1, S, H, DH], ctx)
-    # TEXT branch SDPA backward (kv=TXT)
-    var lsv_ca_k_rms = _tbf16(saved.ca_k_rms.copy(), [1, TXT, H, DH], ctx)
-    var lsv_ca_v = _tbf16(saved.ca_v.copy(), [1, TXT, H, DH], ctx)
+    # TEXT branch SDPA backward (kv=TXT); shared saved query re-borrowed for IMG
     var csb_txt = sdpa_backward_rect[1, S, TXT, H, DH](
-        lsv_ca_q_rms, lsv_ca_k_rms, lsv_ca_v, d_ca_att4_txt, scale, ctx,
+        saved.ca_q_rms[], saved.ca_k_rms[], saved.ca_v[], d_ca_att4_txt, scale, ctx,
     )
     # IMAGE branch SDPA backward (kv=IMG), SAME saved query
-    var lsv_img_k_rms = _tbf16(saved.img_k_rms.copy(), [1, IMG, H, DH], ctx)
-    var lsv_img_v = _tbf16(saved.img_v.copy(), [1, IMG, H, DH], ctx)
     var csb_img = sdpa_backward_rect[1, S, IMG, H, DH](
-        lsv_ca_q_rms, lsv_img_k_rms, lsv_img_v, d_ca_att4_img, scale, ctx,
+        saved.ca_q_rms[], saved.img_k_rms[], saved.img_v[], d_ca_att4_img, scale, ctx,
     )
     # shared query grad = TEXT + IMG (FIXED left-fold order)
     var d_caq_rms4 = add(csb_txt.d_q, csb_img.d_q, ctx)
     var d_caq_rms_flat = reshape(d_caq_rms4, [S, dim], ctx)
-    var lsv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [S, dim], ctx)
+    # *_pre saved as [1,M,H,DH]; reshape to [M,dim] (same bytes) for the rms arm.
+    var lsv_ca_q_pre = reshape(saved.ca_q_pre[], [S, dim], ctx)
     var rb_caq_dx = rms_norm_backward_dx(d_caq_rms_flat, lsv_ca_q_pre, w.base.ca_qn[], eps, ctx)
     # TEXT k/v grads
     var d_cak_rms_flat = reshape(csb_txt.d_k, [TXT, dim], ctx)
-    var lsv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [TXT, dim], ctx)
+    var lsv_ca_k_pre = reshape(saved.ca_k_pre[], [TXT, dim], ctx)
     var rb_cak_dx = rms_norm_backward_dx(d_cak_rms_flat, lsv_ca_k_pre, w.base.ca_kn[], eps, ctx)
     var d_cav_flat = reshape(csb_txt.d_v, [TXT, dim], ctx)
     var d_caq_h = rb_caq_dx.to_host(ctx)
@@ -497,18 +452,18 @@ def scail2_block_lora_backward[
     var d_cav_h = d_cav_flat.to_host(ctx)
     # IMAGE k/v grads (norm_k_img frozen -> d_x-only)
     var d_imgk_rms_flat = reshape(csb_img.d_k, [IMG, dim], ctx)
-    var lsv_img_k_pre = _tbf16(saved.img_k_pre.copy(), [IMG, dim], ctx)
+    var lsv_img_k_pre = reshape(saved.img_k_pre[], [IMG, dim], ctx)
     var rb_imgk_dx = rms_norm_backward_dx(d_imgk_rms_flat, lsv_img_k_pre, w.ca_kn_img[], eps, ctx)
     var d_imgv_flat = reshape(csb_img.d_v, [IMG, dim], ctx)
     var d_imgk_h = rb_imgk_dx.to_host(ctx)
     var d_imgv_h = d_imgv_flat.to_host(ctx)
 
     # projection linears (base frozen weight grads + LoRA)
-    var lb_caq = linear_backward(rb_caq_dx, sv_ca_n3, w.base.ca_wq[], S, dim, dim, ctx)
-    var lb_cak = linear_backward(rb_cak_dx, sv_context, w.base.ca_wk[], TXT, dim, dim, ctx)
-    var lb_cav = linear_backward(d_cav_flat, sv_context, w.base.ca_wv[], TXT, dim, dim, ctx)
-    var lb_imgk = linear_backward(rb_imgk_dx, sv_img_ctx, w.ca_wk_img[], IMG, dim, dim, ctx)
-    var lb_imgv = linear_backward(d_imgv_flat, sv_img_ctx, w.ca_wv_img[], IMG, dim, dim, ctx)
+    var lb_caq = linear_backward(rb_caq_dx, saved.ca_n3[], w.base.ca_wq[], S, dim, dim, ctx)
+    var lb_cak = linear_backward(rb_cak_dx, saved.context_txt[], w.base.ca_wk[], TXT, dim, dim, ctx)
+    var lb_cav = linear_backward(d_cav_flat, saved.context_txt[], w.base.ca_wv[], TXT, dim, dim, ctx)
+    var lb_imgk = linear_backward(rb_imgk_dx, saved.img_context[], w.ca_wk_img[], IMG, dim, dim, ctx)
+    var lb_imgv = linear_backward(d_imgv_flat, saved.img_context[], w.ca_wv_img[], IMG, dim, dim, ctx)
     var d_ca_wq = lb_caq.d_w.to_host(ctx)
     var d_ca_bq = lb_caq.d_b.to_host(ctx)
     var d_ca_wk = lb_cak.d_w.to_host(ctx)
@@ -540,7 +495,7 @@ def scail2_block_lora_backward[
     var d_context_img = add(d_imgctx_base, d_imgctx_lora, ctx).to_host(ctx)
 
     # norm3 backward: layer_norm ran on bf16 x_sa -> feed bf16 x_sa
-    var lnb_n3_dx = layer_norm_backward_dx(d_n3_in, x_sa_bf16_from(sv_x_sa_f32, ctx), w.base.n3_w[], eps, ctx)
+    var lnb_n3_dx = layer_norm_backward_dx(d_n3_in, x_sa_bf16_from(saved.x_sa[], ctx), w.base.n3_w[], eps, ctx)
     var d_n3_w = _zeros(dim)
     var d_n3_b = _zeros(dim)
     # d_x_sa = residual branch (F32) + norm3 branch (bf16 -> F32)
@@ -549,7 +504,7 @@ def scail2_block_lora_backward[
     # ════════════════ Self-attention backward (LoRA q/k/v/o) ════════════════
     var gate_sa_t = Tensor.from_host(mv.gate_sa.copy(), [S, dim], STDtype.F32, ctx)
     var sa_out_rc = cast_tensor(
-        linear(sv_sa_att, w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx),
+        linear(saved.sa_att[], w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx),
         STDtype.F32, ctx,
     )
     var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
@@ -557,18 +512,15 @@ def scail2_block_lora_backward[
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))                              # F32
     var d_sa_out_bf16 = cast_tensor(gb_sa.d_y, STDtype.BF16, ctx)
     var d_sa_out_h = d_sa_out_bf16.to_host(ctx)
-    var lb_sao = linear_backward(d_sa_out_bf16, sv_sa_att, w.base.sa_wo[], S, dim, dim, ctx)
+    var lb_sao = linear_backward(d_sa_out_bf16, saved.sa_att[], w.base.sa_wo[], S, dim, dim, ctx)
     var d_sa_wo = lb_sao.d_w.to_host(ctx)
     var d_sa_bo = lb_sao.d_b.to_host(ctx)
     var sa_o_g = _lora_bwd_opt(lora.base.sa_o, d_sa_out_h, sa_att_h, S, dim, ctx)
     var d_sa_att = add(lb_sao.d_x, _t16(sa_o_g.d_x.copy(), [S, dim], ctx), ctx)
     var d_sa_att4 = reshape(d_sa_att, [1, S, H, DH], ctx)
 
-    var lsv_sa_q_rope = _tbf16(saved.sa_q_rope.copy(), [1, S, H, DH], ctx)
-    var lsv_sa_k_rope = _tbf16(saved.sa_k_rope.copy(), [1, S, H, DH], ctx)
-    var lsv_sa_v = _tbf16(saved.sa_v.copy(), [1, S, H, DH], ctx)
     var ssb = _scail2_sa_bwd[FLASH, S, H, DH](
-        lsv_sa_q_rope, lsv_sa_k_rope, lsv_sa_v, d_sa_att4, scale, ctx,
+        saved.sa_q_rope[], saved.sa_k_rope[], saved.sa_v[], d_sa_att4, scale, ctx,
     )
     var ssb_dq_f32 = cast_tensor(ssb.d_q, STDtype.F32, ctx)
     var ssb_dk_f32 = cast_tensor(ssb.d_k, STDtype.F32, ctx)
@@ -576,20 +528,20 @@ def scail2_block_lora_backward[
     var d_k_rms = rope_backward(ssb_dk_f32, cos_e, sin_e, True, ctx)
     var d_q_rms_b = cast_tensor(d_q_rms, STDtype.BF16, ctx)
     var d_q_rms_flat = reshape(d_q_rms_b, [S, dim], ctx)
-    var lsv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [S, dim], ctx)
+    var lsv_sa_q_pre = reshape(saved.sa_q_pre[], [S, dim], ctx)
     var rb_saq_dx = rms_norm_backward_dx(d_q_rms_flat, lsv_sa_q_pre, w.base.sa_qn[], eps, ctx)
     var d_k_rms_b = cast_tensor(d_k_rms, STDtype.BF16, ctx)
     var d_k_rms_flat = reshape(d_k_rms_b, [S, dim], ctx)
-    var lsv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [S, dim], ctx)
+    var lsv_sa_k_pre = reshape(saved.sa_k_pre[], [S, dim], ctx)
     var rb_sak_dx = rms_norm_backward_dx(d_k_rms_flat, lsv_sa_k_pre, w.base.sa_kn[], eps, ctx)
     var d_sav_flat = reshape(ssb.d_v, [S, dim], ctx)
     var d_saq_h = rb_saq_dx.to_host(ctx)
     var d_sak_h = rb_sak_dx.to_host(ctx)
     var d_sav_h = d_sav_flat.to_host(ctx)
 
-    var lb_saq = linear_backward(rb_saq_dx, sv_sa_in, w.base.sa_wq[], S, dim, dim, ctx)
-    var lb_sak = linear_backward(rb_sak_dx, sv_sa_in, w.base.sa_wk[], S, dim, dim, ctx)
-    var lb_sav = linear_backward(d_sav_flat, sv_sa_in, w.base.sa_wv[], S, dim, dim, ctx)
+    var lb_saq = linear_backward(rb_saq_dx, saved.sa_in[], w.base.sa_wq[], S, dim, dim, ctx)
+    var lb_sak = linear_backward(rb_sak_dx, saved.sa_in[], w.base.sa_wk[], S, dim, dim, ctx)
+    var lb_sav = linear_backward(d_sav_flat, saved.sa_in[], w.base.sa_wv[], S, dim, dim, ctx)
     var d_sa_wq = lb_saq.d_w.to_host(ctx)
     var d_sa_bq = lb_saq.d_b.to_host(ctx)
     var d_sa_wk = lb_sak.d_w.to_host(ctx)
@@ -608,12 +560,11 @@ def scail2_block_lora_backward[
     # F32 modulate backward; norm1 ran on bf16 block input -> bf16 layer_norm_backward
     var d_sa_in_f32 = cast_tensor(d_sa_in, STDtype.F32, ctx)
     var scale_sa_t = Tensor.from_host(mv.scale_sa.copy(), [S, dim], STDtype.F32, ctx)
-    var lsv_sa_ln = Tensor.from_host(saved.sa_ln.copy(), [S, dim], STDtype.F32, ctx)
-    var mb_sa = wan_modulate_backward(d_sa_in_f32, lsv_sa_ln, scale_sa_t, ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in_f32, saved.sa_ln[], scale_sa_t, ctx)
     var d_scale_sa = mb_sa.d_scale.to_host(ctx)
     var d_shift_sa = mb_sa.d_shift.to_host(ctx)
     var d_ln_sa_bf16 = cast_tensor(mb_sa.d_ln, STDtype.BF16, ctx)
-    var lnb_sa = layer_norm_backward_dx(d_ln_sa_bf16, sv_x_bf16, ones_bf16, eps, ctx)  # bf16
+    var lnb_sa = layer_norm_backward_dx(d_ln_sa_bf16, saved.x[], ones_bf16, eps, ctx)  # bf16
     var d_x = add(cast_tensor(lnb_sa, STDtype.F32, ctx), d_x_resid[], ctx)  # F32
     var d_x_h = d_x.to_host(ctx)
     var d_context_h = d_context_t[].to_host(ctx)

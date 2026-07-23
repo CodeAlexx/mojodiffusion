@@ -250,6 +250,14 @@ def scail2_stack_lora_forward[
 
     var x = sequence^
     var block_inputs = List[List[Float32]]()
+    # NOTE (device tape): Scail2Saved is now DEVICE-resident (ArcPointer[Tensor]),
+    # so this save-all `block_saved` holds num_layers × one-block of ACTIVATION
+    # VRAM simultaneously. That is fine for the small compositions this function
+    # serves (the 3-block parity's recompute-vs-save-all gate). The real 40-block
+    # trainer does NOT use this path — it uses the STREAMING driver in
+    # scail2_stack_train_full.mojo, whose backward RECOMPUTES each block from a
+    # host F32 input tape so only ONE block's device tape is live at a time
+    # (no VRAM blowup). Do not run this non-streamed save-all path at full depth.
     var block_saved = List[Scail2Saved]()
 
     for bi in range(num_layers):

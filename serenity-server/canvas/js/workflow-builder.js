@@ -1011,6 +1011,7 @@ var WorkflowBuilder = (function () {
             throw new Error('LTX2 frames, steps, and FPS must be positive');
         var loaderInputs = {
             checkpoint_path: p.model,
+            quantization: p.quantization || 'int4',
             backend: 'mojo'
         };
         var samplerInputs = {

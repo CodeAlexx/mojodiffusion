@@ -464,14 +464,21 @@ tensor algebra.
 `sampling/ltx2_request_cli.mojo` is the pure-Mojo product adapter for canonical
 `serenity.genparams.v1` video requests. It preserves the exact authored JSON,
 checks conditioning sidecar prompt identity, resolves an arbitrary LoRA list
-under the shared model root, and dispatches only exact compiled profiles through
-`pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The pipeline publishes
+under the shared model root, carries the request's `model_quant`, and dispatches
+only exact compiled profiles through
+`pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The admitted `int4` path
+loads the resident 48-block SVD-int4 slab and streams factorized LoRA A/B
+matrices per block; it does not allocate dense LoRA deltas. The pipeline publishes
 atomic `status.json` phase/step snapshots plus `result.json` with the MP4 path,
 executed geometry/schedule, timings, frame count/duration, dtype contract, and
-sampled peak VRAM. Current readiness is experimental: the 2026-07-19 gate
-produced a visually inspected 768x512, 97-frame, 24 FPS step-3000-LoRA movie in
-99.47 seconds at 10,024 MiB sampled peak VRAM; audio and sampler/speed parity
-remain separate acceptance gates.
+sampled peak VRAM. Current readiness is experimental: the 2026-07-23 request
+gate produced a visually inspected 512x768, 121-frame, 25 FPS step-3000-LoRA
+movie in 377.07 seconds at 18,571 MiB sampled peak VRAM. The matching FP8
+request took 511.09 seconds, so int4 reduced end-to-end time by 26.2% and
+denoise time by 28.2%. Nsight Systems still attributes the largest GPU share
+to BF16 CUTLASS GEMM; factorized linear/bias kernels and int4 dequantization are
+the next measured optimization targets. Audio acceptance remains a separate
+gate.
 
 ---
 

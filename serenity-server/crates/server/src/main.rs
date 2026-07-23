@@ -72,6 +72,7 @@ mod result_manifest;
 mod settings;
 mod trainer;
 mod video;
+mod video_edit;
 
 use capabilities::{
     capability_profile_for_model, generate_capabilities_v1, has_text, has_vae_override,
@@ -4700,6 +4701,48 @@ async fn main() -> anyhow::Result<()> {
             "/video_edit/resolve_view_path",
             get(settings::get_resolve_view_path).post(settings::post_resolve_view_path),
         )
+        // --- Genesis browser video editor ---
+        // The web tab stays inside Serenity. Genesis runs only as the isolated
+        // Rust/C/FFmpeg/OpenCL gcompose sidecar; this path never launches the
+        // native egui window and never calls Mojo.
+        .route("/video_edit/status", get(video_edit::get_status))
+        .route("/video_edit/projects", post(video_edit::post_projects))
+        .route(
+            "/video_edit/projects/:id",
+            get(video_edit::get_project).put(video_edit::put_project),
+        )
+        .route(
+            "/video_edit/projects/:id/import_clip",
+            post(video_edit::post_import_clip)
+                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/video_edit/preview",
+            post(video_edit::post_preview)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/video_edit/preview_effect",
+            post(video_edit::post_preview_effect)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/video_edit/luts", get(video_edit::get_luts))
+        .route(
+            "/video_edit/luts/upload",
+            post(video_edit::post_lut_upload)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route(
+            "/video_edit/luts/preview",
+            post(video_edit::post_lut_preview)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/video_edit/thumbnails", post(video_edit::post_thumbnails))
+        .route("/video_edit/waveform", post(video_edit::post_waveform))
+        .route("/video_edit/export", post(video_edit::post_export))
+        .route("/video_edit/export/:id", get(video_edit::get_export))
+        .route("/video_edit/media/*path", get(video_edit::get_media))
+        .route("/video_edit/cache/:name", get(video_edit::get_cache))
         .route("/output_files", get(settings::get_output_files))
         .route(
             "/output_files/:name",

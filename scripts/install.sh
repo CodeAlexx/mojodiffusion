@@ -64,6 +64,7 @@ pixi run setup
 pixi run repository-check
 pixi run build-trainer
 pixi run build-inference
+pixi run build-genesis-video-editor
 pixi run check
 
 echo "Serenity installation verified at $repo_root"

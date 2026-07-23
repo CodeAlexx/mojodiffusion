@@ -1,0 +1,10 @@
+[package]
+name = "genesis-web"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Genesis project model and Rust client for the isolated gcompose engine"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ab_glyph = "0.2"

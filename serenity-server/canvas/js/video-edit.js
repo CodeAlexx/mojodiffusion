@@ -118,6 +118,9 @@ var VideoEditTab = (function () {
     var previewActiveClipId = null;
     var previewDebounceTimer = null;
     var PREVIEW_DEBOUNCE_MS = 66; // ~15fps max during scrub
+    var genesisPreviewInFlight = false;
+    var genesisPreviewPending = false;
+    var genesisPreviewSequence = 0;
 
     var thumbnailCache = new Map();   // clipId -> { img, thumbW, thumbH, frameCount }
     var thumbnailLoading = new Set(); // clipIds currently loading
@@ -141,6 +144,7 @@ var VideoEditTab = (function () {
     var exportDialogEl = null;
     var exportId = null;
     var isExporting = false;
+    var exportPollTimer = null;
     var fileMenuEl = null;
     var subtitleEditorEl = null;
     var subtitleEditingClipId = null;
@@ -389,6 +393,7 @@ var VideoEditTab = (function () {
                     }
                     recalcTotalFrames();
                     renderTimeline();
+                    updatePreview();
                 })
                 .catch(function () {
                     // Project not found, create new
@@ -441,6 +446,7 @@ var VideoEditTab = (function () {
                 '<span id="ve-zoom-label" class="ve-zoom-label">100%</span>' +
                 '<input id="ve-zoom-slider" type="range" min="5" max="2000" value="400" class="ve-zoom-slider">' +
                 '<span id="ve-duration" class="ve-timecode">' + frameToTimecode(totalFrames) + '</span>' +
+                '<span id="ve-engine-status" class="ve-engine-status">Genesis: checking...</span>' +
                 '<button id="ve-btn-export" class="ve-tb-btn" title="Export" style="font-size:11px;width:auto;padding:0 8px;">Export</button>' +
             '</div>';
 
@@ -497,6 +503,24 @@ var VideoEditTab = (function () {
                 renderTimeline();
             });
         }
+
+        fetch(getApiBase() + '/video_edit/status')
+            .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('status ' + r.status)); })
+            .then(function (data) {
+                var status = document.getElementById('ve-engine-status');
+                if (!status) return;
+                status.textContent = data.worker_ready
+                    ? 'Genesis · Rust/C · Ready'
+                    : 'Genesis worker missing';
+                status.classList.toggle('ve-engine-error', !data.worker_ready);
+            })
+            .catch(function () {
+                var status = document.getElementById('ve-engine-status');
+                if (status) {
+                    status.textContent = 'Genesis unavailable';
+                    status.classList.add('ve-engine-error');
+                }
+            });
     }
 
     function buildContextMenu() {
@@ -743,6 +767,8 @@ var VideoEditTab = (function () {
         var clip = findActiveClipAtFrame(currentFrame);
 
         if (!clip) {
+            // Invalidate a compositor reply that was requested for an older playhead.
+            genesisPreviewSequence++;
             // Black frame — no clip at playhead
             previewCtx.fillStyle = '#111';
             previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
@@ -757,6 +783,7 @@ var VideoEditTab = (function () {
 
         // Placeholder clip (no source file) — show color card with label
         if (!clip.source_path) {
+            genesisPreviewSequence++;
             previewActiveClipId = clip.id;
             previewCtx.fillStyle = clip.color || '#333';
             previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
@@ -813,6 +840,84 @@ var VideoEditTab = (function () {
 
         // Subtitle overlay
         renderSubtitleOverlay();
+
+        // The browser video element above is an immediate fallback. Genesis replaces it
+        // with the actual composited/effected timeline frame when the worker replies.
+        requestGenesisPreview();
+    }
+
+    function setGenesisStatus(text, isError) {
+        var status = document.getElementById('ve-engine-status');
+        if (!status) return;
+        status.textContent = text;
+        status.classList.toggle('ve-engine-error', !!isError);
+    }
+
+    function requestGenesisPreview() {
+        genesisPreviewSequence++;
+        if (genesisPreviewInFlight) {
+            genesisPreviewPending = true;
+            return;
+        }
+
+        var sequence = genesisPreviewSequence;
+        var frame = currentFrame;
+        genesisPreviewInFlight = true;
+        setGenesisStatus('Genesis · rendering frame ' + frame, false);
+
+        fetch(getApiBase() + '/video_edit/preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                project_id: projectId,
+                project: project,
+                frame: frame,
+            }),
+        })
+        .then(function (r) {
+            if (!r.ok) {
+                return r.text().then(function (body) {
+                    throw new Error(body || ('preview status ' + r.status));
+                });
+            }
+            return r.blob();
+        })
+        .then(function (blob) {
+            return createImageBitmap(blob);
+        })
+        .then(function (bitmap) {
+            if (sequence === genesisPreviewSequence && previewCtx && previewCanvas) {
+                previewCtx.fillStyle = '#111';
+                previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
+                var scale = Math.min(
+                    previewCanvas.width / bitmap.width,
+                    previewCanvas.height / bitmap.height
+                );
+                var dw = bitmap.width * scale;
+                var dh = bitmap.height * scale;
+                previewCtx.drawImage(
+                    bitmap,
+                    (previewCanvas.width - dw) / 2,
+                    (previewCanvas.height - dh) / 2,
+                    dw,
+                    dh
+                );
+                renderSubtitleOverlay();
+            }
+            bitmap.close();
+            setGenesisStatus('Genesis · Rust/C · Ready', false);
+        })
+        .catch(function (err) {
+            console.warn('Genesis preview failed:', err);
+            setGenesisStatus('Genesis preview failed', true);
+        })
+        .finally(function () {
+            genesisPreviewInFlight = false;
+            if (genesisPreviewPending) {
+                genesisPreviewPending = false;
+                requestGenesisPreview();
+            }
+        });
     }
 
     function updatePreviewDebounced() {
@@ -1714,6 +1819,10 @@ var VideoEditTab = (function () {
     function closeExportDialog() {
         isExporting = false;
         exportId = null;
+        if (exportPollTimer) {
+            clearTimeout(exportPollTimer);
+            exportPollTimer = null;
+        }
         if (exportDialogEl) {
             exportDialogEl.remove();
             exportDialogEl = null;
@@ -1794,10 +1903,41 @@ var VideoEditTab = (function () {
                 return;
             }
             exportId = data.export_id;
+            pollExportStatus();
         })
         .catch(function (err) {
             onExportError({ data: { error: String(err) } });
         });
+    }
+
+    function pollExportStatus() {
+        if (!exportId || !isExporting) return;
+        var expectedId = exportId;
+        fetch(getApiBase() + '/video_edit/export/' + encodeURIComponent(expectedId))
+            .then(function (r) {
+                if (!r.ok) throw new Error('export status ' + r.status);
+                return r.json();
+            })
+            .then(function (data) {
+                if (exportId !== expectedId) return;
+                if (data.state === 'complete') {
+                    onExportComplete({ data: data });
+                    return;
+                }
+                if (data.state === 'failed') {
+                    onExportError({ data: data });
+                    return;
+                }
+                var text = document.getElementById('ve-exp-progress-text');
+                if (text) text.textContent = 'Genesis is encoding...';
+                exportPollTimer = setTimeout(pollExportStatus, 750);
+            })
+            .catch(function (err) {
+                if (exportId !== expectedId || !isExporting) return;
+                var text = document.getElementById('ve-exp-progress-text');
+                if (text) text.textContent = 'Waiting for Genesis: ' + String(err);
+                exportPollTimer = setTimeout(pollExportStatus, 1250);
+            });
     }
 
     function onExportProgress(msg) {
@@ -1812,8 +1952,12 @@ var VideoEditTab = (function () {
     function onExportComplete(msg) {
         var d = msg.data || msg;
         if (exportId && d.export_id !== exportId) return;
+        if (exportPollTimer) {
+            clearTimeout(exportPollTimer);
+            exportPollTimer = null;
+        }
         var text = document.getElementById('ve-exp-progress-text');
-        if (text) text.textContent = 'Export complete: ' + (d.output_path || '');
+        if (text) text.textContent = 'Export complete: ' + (d.output_path || d.output_url || '');
         var fill = document.getElementById('ve-exp-fill');
         if (fill) fill.style.width = '100%';
         isExporting = false;
@@ -1827,6 +1971,10 @@ var VideoEditTab = (function () {
 
     function onExportError(msg) {
         var d = msg.data || msg;
+        if (exportPollTimer) {
+            clearTimeout(exportPollTimer);
+            exportPollTimer = null;
+        }
         var text = document.getElementById('ve-exp-progress-text');
         if (text) text.textContent = 'Error: ' + (d.error || 'Unknown error');
         isExporting = false;

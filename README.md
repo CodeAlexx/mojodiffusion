@@ -18,6 +18,13 @@ Its current measured state is:
 - the SCAIL-2 character-animation path builds seven Mojo stages, creates all
   per-run conditioning automatically, uses the installed persistent FP8 cache,
   and preserves driving-video audio through Serenity Studio `/v1/video`;
+- the request-driven pure-Mojo LTX-2.3 path accepts the UI's selected quant
+  mode and LoRA list; its resident SVD-int4/factorized-LoRA profile produced a
+  visually inspected 512x768, 121-frame movie in 377.07 seconds, 26.2% faster
+  end to end than the measured FP8 baseline;
+- Serenity's browser Video Edit tab uses the separately vendored Genesis
+  Rust/C/FFmpeg/OpenCL compositor for timeline preview, media analysis, LUT
+  previews, and export; it does not launch Genesis's native UI or call Mojo;
 - the trainer catalog reports all 15 source trainer families and exposes measured
   readiness reasons for families that are not yet admitted;
 - model weights and GPU end-to-end training/inference runs are not included in
@@ -35,6 +42,12 @@ The installer detects moved, non-relocatable Pixi and Cargo build artifacts,
 archives them instead of deleting them, and rebuilds from the current checkout.
 It builds the admitted trainer lifecycle and every registered Mojo inference
 worker. The individual Pixi tasks remain available for development.
+
+The isolated Genesis video worker can also be rebuilt without touching Mojo:
+
+```bash
+pixi run build-genesis-video-editor
+```
 
 The broader, sequential compile matrix is intentionally expensive:
 

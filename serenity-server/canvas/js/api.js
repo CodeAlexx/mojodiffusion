@@ -36,10 +36,14 @@ var SerenityAPI = (function () {
             }
         }
         var ltxCheckpoint = '';
+        var ltxQuantization = '';
         for (var i = 0; i < keys.length; i++) {
             var candidate = nodes[keys[i]];
-            if (candidate && candidate.class_type === 'LTXVLoader')
-                ltxCheckpoint = (candidate.inputs || {}).checkpoint_path || '';
+            if (candidate && candidate.class_type === 'LTXVLoader') {
+                var loaderInputs = candidate.inputs || {};
+                ltxCheckpoint = loaderInputs.checkpoint_path || '';
+                ltxQuantization = loaderInputs.quantization || '';
+            }
         }
         for (var i = 0; i < keys.length; i++) {
             var ltx = nodes[keys[i]];
@@ -69,6 +73,7 @@ var SerenityAPI = (function () {
                     model: 'ltx2',
                     runner: 'ltx2_mojo_request',
                     checkpoint: ltxCheckpoint,
+                    quant: ltxQuantization || 'fp8',
                     schema: 'serenity.genparams.v1',
                     prompt: li.prompt || '',
                     negative: li.negative_prompt || '',

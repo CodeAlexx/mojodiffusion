@@ -1,0 +1,12 @@
+[package]
+name = "gcompose"
+version = "0.1.0"
+edition = "2021"
+description = "Genesis engine worker — decode + OpenCL composite via the vendored C shims. No GUI libs."
+
+# No runtime deps: this binary links only the C engine (FFmpeg + OpenCL) via build.rs.
+# Keeping it free of eframe/GL is the whole point — it's the process that owns OpenCL.
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

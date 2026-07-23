@@ -1553,6 +1553,7 @@ def _write_ltx2_result(
     include_audio: Bool,
     sampler: String,
     scheduler: String,
+    quant: String,
     context_path: String,
     negative_context_path: String,
     request_lora_count: Int,
@@ -1595,6 +1596,7 @@ def _write_ltx2_result(
     body += String('  "include_audio":') + json_bool(include_audio) + String(",\n")
     body += String('  "executed_sampler":"') + json_escape(sampler) + String('",\n')
     body += String('  "executed_scheduler":"') + json_escape(scheduler) + String('",\n')
+    body += String('  "quant":"') + json_escape(quant) + String('",\n')
     body += String('  "conditioning_positive":"') + json_escape(context_path) + String('",\n')
     body += String('  "conditioning_negative":"') + json_escape(negative_context_path) + String('",\n')
     body += String('  "request_lora_count":') + String(request_lora_count) + String(",\n")
@@ -1611,7 +1613,12 @@ def _write_ltx2_result(
         body += String('","path":"') + json_escape(path)
         body += String('","weight":') + weight + String("}")
     body += String("],\n")
-    body += String('  "dtype_contract":"fp8_transformer_bf16_activations_f32_reductions",\n')
+    var dtype_contract = String(
+        "int4_resident_w4a16_bf16_activations_f32_reductions"
+    ) if quant == String("int4") else String(
+        "fp8_transformer_bf16_activations_f32_reductions"
+    )
+    body += String('  "dtype_contract":"') + dtype_contract + String('",\n')
     body += String('  "timings":{\n')
     body += String('    "load_seconds":') + String(load_seconds) + String(",\n")
     body += String('    "conditioning_seconds":') + String(conditioning_seconds) + String(",\n")
@@ -2002,7 +2009,7 @@ def run_single_p[
         var scheduler_name = String("ltx2_distilled") if distilled_euler else String("ltx2")
         _write_ltx2_result(
             out_dir, mp4_video, fsh[4], fsh[3], n_frames_out, fps, steps,
-            seed, False, sampler_name, scheduler_name, context_path,
+            seed, False, sampler_name, scheduler_name, String("fp8"), context_path,
             negative_context_path, len(lora_stack.trained), load_seconds,
             conditioning_seconds, prepare_seconds, denoise_seconds,
             video_decode_seconds, audio_decode_seconds, mux_seconds,
@@ -2080,7 +2087,7 @@ def run_single_p[
     var scheduler_name = String("ltx2_distilled") if distilled_euler else String("ltx2")
     _write_ltx2_result(
         out_dir, mp4_out, fsh[4], fsh[3], n_frames_out, fps, steps, seed,
-        True, sampler_name, scheduler_name, context_path,
+        True, sampler_name, scheduler_name, String("fp8"), context_path,
         negative_context_path, len(lora_stack.trained), load_seconds,
         conditioning_seconds, prepare_seconds, denoise_seconds,
         video_decode_seconds, audio_decode_seconds, mux_seconds,
@@ -2127,6 +2134,7 @@ def run_audiosync(
 
 def run_request_profile(
     checkpoint: String,
+    quant: String,
     width: Int,
     height: Int,
     frames: Int,
@@ -2153,6 +2161,11 @@ def run_request_profile(
         raise Error(
             String("LTX2 request: unsupported compiled checkpoint '")
             + checkpoint + String("'; verified checkpoint: ltx-2.3-22b-dev-fp8")
+        )
+    if quant != String("fp8") and quant != String("int4"):
+        raise Error(
+            String("LTX2 request: unsupported quant '") + quant
+            + String("'; verified request modes: fp8, int4")
         )
     var sampler_key = String(sampler.lower())
     var scheduler_key = String(scheduler.lower())
@@ -2196,7 +2209,7 @@ def run_request_profile(
         )
     run_request_hq(
         context_path, negative_context_path, contexts_are_projected,
-        noise_fixture_path, out_dir, seed, include_audio
+        noise_fixture_path, out_dir, seed, include_audio, quant
     )
 
 
@@ -3210,6 +3223,7 @@ def _request_hq_forward_flat[
     a_cos: Tensor, a_sin: Tensor, ca_a_cos: Tensor, ca_a_sin: Tensor,
     skip_cross_modal: Bool,
     verbose_lora: Bool,
+    factorized_lora: Bool,
     ctx: DeviceContext,
 ) raises -> Tuple[Tensor, Tensor]:
     var hs = _linear_b(v_flat, g.v_pin_w, g.v_pin_b, ctx)
@@ -3218,9 +3232,14 @@ def _request_hq_forward_flat[
     for i in range(NUM_LAYERS):
         var blk = stream.load_block_bf16(i, ctx)
         var w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
-        n_lora_total += loras.attach_to_av_block(
-            i, w, distilled_mult, ctx
-        )
+        if factorized_lora:
+            n_lora_total += loras.attach_to_av_block(
+                i, w, distilled_mult, ctx
+            )
+        else:
+            n_lora_total += loras.apply_to_av_block(
+                i, w, distilled_mult, ctx
+            )
         var outs = ltx2_block_forward_av[
             S_V_CT, S_A_CT, N_TXT, S_VPAD_CT, S_APAD_CT
         ](
@@ -3235,7 +3254,7 @@ def _request_hq_forward_flat[
         var cloned = _clone_pair(outs[0], outs[1], ctx)
         cloned^.move_into(hs, ahs)
     if verbose_lora:
-        print("  [request-hq] dense LoRA applications:", n_lora_total,
+        print("  [request-hq] factorized LoRA attachments:", n_lora_total,
               " support multiplier:", distilled_mult)
     var v_vel = _output_stage(
         hs, g.v_sst, mod.v_embedded, g.v_pout_w, g.v_pout_b, VD, ctx
@@ -4175,6 +4194,7 @@ def run_request_hq(
     out_dir: String,
     seed: UInt64,
     include_audio: Bool,
+    quant: String,
 ) raises:
     var total_t0 = perf_counter()
     var load_seconds = Float64(0.0)
@@ -4209,9 +4229,15 @@ def run_request_hq(
     var loras = _RequestHQLoraStack.load()
     loras.validate()
     loras.print_summary()
-    print("  [lora] preloading factor tensors once for the complete request")
-    var n_preloaded = loras.preload_block_factors(ctx)
-    print("  [lora] preloaded block factors:", n_preloaded)
+    var preload_lora_factors = quant == String("fp8")
+    if preload_lora_factors:
+        print("  [lora] preloading factor tensors once for the complete request")
+        var n_preloaded = loras.preload_block_factors(ctx)
+        print("  [lora] preloaded block factors:", n_preloaded)
+    else:
+        print(
+            "  [lora] factorized per-block streaming to reserve VRAM for int4 residency"
+        )
 
     print("  [load] stage-1 globals")
     var gw = _load_global_weights_dict(ck, ctx)
@@ -4340,6 +4366,16 @@ def run_request_hq(
     var stream = LTX2BlockStream.open(_refhq_ckpt_fp8())
     if stream.block_count() != NUM_LAYERS:
         raise Error("LTX2 request HQ: stream block_count != 48")
+    if quant == String("int4"):
+        var int4_slab = _env_str("LTX2_INT4_SLAB")
+        if int4_slab.byte_length() == 0:
+            raise Error(
+                "LTX2 request HQ: quant int4 requires LTX2_INT4_SLAB"
+            )
+        stream.attach_int4(int4_slab)
+        print("  [int4-resident] preloading all 48 dev-model blocks:", int4_slab)
+        stream.enable_int4_resident_range(0, NUM_LAYERS - 1, ctx)
+        print("  [int4-resident] resident storage bytes:", stream.resident_bytes())
     var ns: NoiseSource
     var video_x: Tensor
     var audio_x: Tensor
@@ -4397,7 +4433,7 @@ def run_request_hq(
         ](
             loras, REFHQ_LORA_S1, cfg, g, stream, vx, ax, enc, aenc,
             mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
-            first_s1_eval, ctx,
+            first_s1_eval, True, ctx,
         )
         var u = _request_hq_forward_flat[
             REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
@@ -4405,14 +4441,15 @@ def run_request_hq(
         ](
             loras, REFHQ_LORA_S1, cfg, g, stream, vx, ax,
             neg_enc, neg_aenc, mod, vr1, a_cos, a_sin, ca_a_cos,
-            ca_a_sin, False, False, ctx,
+            ca_a_sin, False, False, True, ctx,
         )
         var m = _request_hq_forward_flat[
             REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
             REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
         ](
             loras, REFHQ_LORA_S1, cfg, g, stream, vx, ax, enc, aenc,
-            mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, True, False, ctx,
+            mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, True, False,
+            True, ctx,
         )
         first_s1_eval = False
         var c_v = _refhq_x0(vx, c[0], sigma, ctx)
@@ -4520,7 +4557,7 @@ def run_request_hq(
         ](
             loras, REFHQ_LORA_S2, cfg, g, stream, vx, ax, enc, aenc,
             mod, vr2, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
-            first_s2_eval, ctx,
+            first_s2_eval, True, ctx,
         )
         first_s2_eval = False
         return (
@@ -4612,7 +4649,7 @@ def run_request_hq(
     _write_ltx2_result(
         out_dir, mp4_out, fsh[4], fsh[3], n_frames_out, REQUEST_HQ_FPS,
         REQUEST_HQ_STEPS, seed, include_audio, String("res2s"),
-        String("ltx2"), contexts_path, negative_contexts_path,
+        String("ltx2"), quant, contexts_path, negative_contexts_path,
         len(loras.trained), load_seconds, conditioning_seconds,
         prepare_seconds, denoise_seconds, video_decode_seconds,
         audio_decode_seconds, mux_seconds, perf_counter() - total_t0,

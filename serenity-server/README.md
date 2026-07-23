@@ -6,6 +6,13 @@ browser application in this repository. The browser source is
 HTTP, WebSocket, queues, graph lowering, GPU leases, and Mojo worker lifecycle.
 Model execution remains in the Mojo workers under `output/bin/`.
 
+The browser Video Edit tab is the one deliberate exception to that execution
+architecture: it uses the vendored Genesis Rust/C/FFmpeg/OpenCL compositor as a
+separate `gcompose` sidecar. It does not use Mojo and it never launches
+Genesis's native egui application. The boundary, API, build, and measured smoke
+evidence are documented in
+`../docs/SERENITY_GENESIS_VIDEO_EDITOR_2026-07-23.md`.
+
 Run every command from the repository root. Do not use another checkout, a
 standalone static-file server, a retired Mojo daemon, or the trainer web UI as a
 substitute for Serenity Studio.
@@ -48,6 +55,7 @@ In another terminal, prove the exact running process before browser debugging:
 curl -fsS http://127.0.0.1:7801/v1/health
 curl -fsS http://127.0.0.1:7801/v1/capabilities
 curl -fsS http://127.0.0.1:7801/
+curl -fsS http://127.0.0.1:7801/video_edit/status
 ```
 
 If port 7801 is occupied, inspect its owner. Do not kill it or silently select
@@ -63,6 +71,17 @@ pixi run cargo build --release \
   --manifest-path serenity-server/Cargo.toml \
   --bin serenity-server
 ```
+
+Build the separate browser video-editor worker when
+`output/bin/genesis-gcompose` is missing or stale:
+
+```bash
+pixi run build-genesis-video-editor
+```
+
+For an output directory directly under the repository's `output/` directory,
+the server resolves that worker automatically. An unusual deployment can set
+`SERENITY_GENESIS_WORKER` and `SERENITY_GENESIS_ASSETS` explicitly.
 
 Mojo worker builds are separate, GPU-architecture-specific operations. Never
 run a broad `pixi run build-*` merely to debug the browser. Identify the exact

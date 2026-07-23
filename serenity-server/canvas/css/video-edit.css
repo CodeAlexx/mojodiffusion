@@ -101,6 +101,28 @@
     user-select: none;
 }
 
+.ve-engine-status {
+    flex: 0 1 auto;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin: 0 6px;
+    padding: 3px 8px;
+    border: 1px solid rgba(74, 222, 128, 0.32);
+    border-radius: 999px;
+    background: rgba(34, 197, 94, 0.10);
+    color: #86efac;
+    font-size: 10px;
+    line-height: 1.2;
+}
+
+.ve-engine-status.ve-engine-error {
+    border-color: rgba(248, 113, 113, 0.48);
+    background: rgba(239, 68, 68, 0.12);
+    color: #fca5a5;
+}
+
 .ve-spacer {
     flex: 1;
 }

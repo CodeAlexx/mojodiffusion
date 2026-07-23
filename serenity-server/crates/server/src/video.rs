@@ -153,6 +153,10 @@ fn ltx2_decode_ld_path() -> std::ffi::OsString {
 /// (`CKPT_FP8` in ltx2_t2v_av_hq.mojo). Selected via `LTX2_INT4_SLAB` for the
 /// int4 W4A16-resident path. (Verified present on this box, 2026-07-11.)
 const LTX2_INT4_SLAB: &str = "checkpoints/ltx-2.3-22b-distilled-svdint4-r32.safetensors";
+/// W4A16 resident slab reconstructed from the LTX-2.3 dev checkpoint. The
+/// request runner applies the official support LoRA and authored LoRAs on top,
+/// so it must not use the already-distilled slab above.
+const LTX2_REFHQ_INT4_SLAB: &str = "checkpoints/ltx-2.3-22b-svdint4-r32.safetensors";
 /// wan22_t2v compiled (comptime) geometry — MUST match the binary. It raises on
 /// any `frames != WAN22_FRAMES`, so the server rejects a mismatch up front rather
 /// than burning a multi-minute render on a guaranteed failure.
@@ -1095,7 +1099,7 @@ fn readiness_doc() -> Value {
                         "prompt", "negative", "width", "height", "frames",
                         "steps", "seed", "fps", "sampler", "scheduler",
                         "caps_positive", "caps_negative", "noise_fixture",
-                        "include_audio", "lora"
+                        "include_audio", "lora", "quant"
                     ],
                     "requires_authored_conditioning": true,
                     "available": ltx2_request_ready,
@@ -1424,6 +1428,21 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
             "LTX2 checkpoint '{checkpoint}' is not a compiled request profile; use {LTX2_REFHQ_CHECKPOINT}"
         ));
     }
+    let quant = body.get("quant").and_then(Value::as_str).unwrap_or("");
+    if !matches!(quant, "fp8" | "int4") {
+        return Err(format!(
+            "LTX2 Mojo request requires quant 'fp8' or 'int4'; got '{quant}'"
+        ));
+    }
+    if quant == "int4" {
+        let slab = model_path(LTX2_REFHQ_INT4_SLAB);
+        if !slab.is_file() {
+            return Err(format!(
+                "LTX2 request selected int4 but the dev-model slab is missing: {}",
+                slab.display()
+            ));
+        }
+    }
     for key in ["width", "height", "frames", "steps", "seed"] {
         if body.get(key).and_then(Value::as_i64).is_none() {
             return Err(format!("LTX2 Mojo request requires integer '{key}'"));
@@ -1530,6 +1549,12 @@ fn start_ltx2_mojo_request(
     body: &Value,
     gpu: crate::gpu_lock::GpuGuard,
 ) -> Response {
+    let quant = body
+        .get("quant")
+        .and_then(Value::as_str)
+        .unwrap_or("fp8")
+        .to_string();
+    let int4_slab = (quant == "int4").then(|| model_path(LTX2_REFHQ_INT4_SLAB));
     let n = st
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1595,15 +1620,18 @@ fn start_ltx2_mojo_request(
                 return;
             }
         };
-        let mut child = match std::process::Command::new(repo_path(LTX2_MOJO_REQUEST_RUNNER))
+        let mut command = std::process::Command::new(repo_path(LTX2_MOJO_REQUEST_RUNNER));
+        command
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", mojo_ld_path())
             .arg(&thread_request_path)
             .arg(&thread_out_dir)
             .stdout(std::process::Stdio::from(log))
-            .stderr(std::process::Stdio::from(stderr))
-            .spawn()
-        {
+            .stderr(std::process::Stdio::from(stderr));
+        if let Some(path) = int4_slab {
+            command.env("LTX2_INT4_SLAB", path);
+        }
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 publish(WorkerEvent::Failed {
@@ -1707,6 +1735,7 @@ fn start_ltx2_mojo_request(
             "model": "ltx2",
             "runner": "ltx2_mojo_request",
             "backend": "mojo",
+            "quant": quant,
             "state": "queued",
             "status_url": format!("/out/{video_id}/status.json"),
             "result_url": format!("/out/{video_id}/result.json"),
@@ -3913,6 +3942,7 @@ mod tests {
         std::fs::write(&caps, b"{}").unwrap();
         let request = json!({
             "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
             "prompt": "vrtlEri2 turns toward camera",
             "sampler": "res2s",
             "scheduler": "ltx2",
@@ -3934,6 +3964,7 @@ mod tests {
     fn ltx2_mojo_request_preflight_rejects_missing_conditioning_before_gpu() {
         let request = json!({
             "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
             "prompt": "vrtlEri2 turns toward camera",
             "sampler": "res2s",
             "scheduler": "ltx2",

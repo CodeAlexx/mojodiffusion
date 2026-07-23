@@ -290,9 +290,16 @@ def _run_request(request_path: String, out_dir: String) raises:
             String("LTX2 request: noise_fixture not found: ") + noise_fixture
         )
     _configure_loras(obj)
+    var quant = _require_string(obj, String("quant")).lower()
+    if quant != String("fp8") and quant != String("int4"):
+        raise Error(
+            String("LTX2 request: quant must be fp8 or int4; got '")
+            + quant + String("'")
+        )
     _mkdir(out_dir)
     run_request_profile(
         _require_string(obj, String("checkpoint")),
+        quant,
         _require_int(obj, String("width")),
         _require_int(obj, String("height")),
         _require_int(obj, String("frames")),

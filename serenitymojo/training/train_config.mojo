@@ -517,6 +517,27 @@ struct TrainConfig(Copyable, Movable):
     var wan_variant: String
     var timestep_boundary: Float32
 
+    # ── RESUME (config-first; the webui overrides emit resume_state +
+    #   start_step — per-backend argv pairs remain the legacy route) ─────────
+    # resume_state: checkpoint to resume from — a `.state` sidecar (FULL: A/B
+    #   + AdamW moments) or a PEFT .safetensors whose `.state` sibling is
+    #   resolved via trainer_resolve_resume_path. "" (default) = fresh run.
+    # start_step: GLOBAL optimizer-step count already completed (loop runs
+    #   [start_step, max_steps)). -1 (default) = derive from the resume
+    #   artifact filename `_step{N}` when present, else 0.
+    # warm_resume: True = A/B-only load (AdamW moments ZEROED — the loud
+    #   trainer_warn_warm_resume banner; trajectory differs from an
+    #   uninterrupted run).
+    var resume_state: String
+    var start_step: Int
+    var warm_resume: Bool
+    # train_timestep_shift: shift applied to the TRAINING sigma draw only
+    #   (sample_timestep_logit_normal). -1 (default) = use timestep_shift
+    #   (legacy coupling). Decoupled 2026-07-22 for the mageflow sigma-
+    #   distribution experiment: inference/sampling schedules keep
+    #   timestep_shift; this key moves only where training density lands.
+    var train_timestep_shift: Float32
+
     def n_layers(self) -> Int:
         """Total block count (back-compat convenience)."""
         return self.num_double + self.num_single
@@ -833,6 +854,10 @@ struct TrainConfig(Copyable, Movable):
         wan_i2v: Bool = False,                     # pre-P3 env-unset behavior
         var wan_variant: String = String(""),
         timestep_boundary: Float32 = Float32(-1.0),
+        var resume_state: String = String(""),     # "" = fresh run
+        start_step: Int = -1,                      # -1 = derive from _step{N}
+        warm_resume: Bool = False,                 # True = A/B only, moments 0
+        train_timestep_shift: Float32 = -1.0,      # -1 = use timestep_shift
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -1061,6 +1086,10 @@ struct TrainConfig(Copyable, Movable):
         self.wan_i2v = wan_i2v
         self.wan_variant = wan_variant^
         self.timestep_boundary = timestep_boundary
+        self.resume_state = resume_state^
+        self.start_step = start_step
+        self.warm_resume = warm_resume
+        self.train_timestep_shift = train_timestep_shift
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA

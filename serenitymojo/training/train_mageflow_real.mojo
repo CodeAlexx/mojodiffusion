@@ -98,6 +98,12 @@ from serenitymojo.training.levers import levers_loss_grad
 from serenitymojo.training.klein_dataset import (
     LATENT_KEY, TEXT_KEY, MASK_KEY, list_sorted_safetensors,
 )
+from serenitymojo.training.trainer_core import (
+    trainer_resolve_resume_path, trainer_warn_warm_resume,
+)
+from serenitymojo.training.lora_save import (
+    lora_train_state_has_moments, load_lora_train_state_meta,
+)
 
 # PROVEN inference-geometry RoPE — image msrope rows, TEXT ROWS IDENTITY
 # (cos=1/sin=0; cross-checked vs the real MageFlowEmbedRope by the chunk-1
@@ -117,6 +123,7 @@ from serenitymojo.models.mageflow.mageflow_stack_lora import (
     build_mageflow_lora_set, mageflow_total_adapters,
     mageflow_stack_lora_forward_offload, mageflow_stack_lora_backward_offload,
     mageflow_lora_adamw_step, save_mageflow_lora, save_mageflow_lora_state,
+    load_mageflow_lora_state, load_mageflow_lora_resume, mageflow_lora_prefixes,
     mageflow_stack_lora_sample_forward,
     # DEVICE arms (resident weights + device activations + fused AdamW):
     mageflow_stack_lora_forward_offload_device,
@@ -387,6 +394,32 @@ def _bf16r(x: Float32) -> Float32:
     return x.cast[DType.bfloat16]().cast[DType.float32]()
 
 
+def _derive_step_from_name(path: String) -> Int:
+    # `<prefix>_step{N}.safetensors[.state]` -> N (the ltx2/wan22 house
+    # artifact naming). Uses the LAST `_step{digits}` run in the path; 0 when
+    # the name carries none (e.g. the final out_path artifact).
+    var b = path.as_bytes()
+    var best = -1
+    var i = 0
+    while i + 5 < len(b):
+        if (b[i] == UInt8(95)          # '_'
+                and b[i + 1] == UInt8(115)   # 's'
+                and b[i + 2] == UInt8(116)   # 't'
+                and b[i + 3] == UInt8(101)   # 'e'
+                and b[i + 4] == UInt8(112)): # 'p'
+            var j = i + 5
+            var n = 0
+            var got = False
+            while j < len(b) and b[j] >= UInt8(48) and b[j] <= UInt8(57):
+                n = n * 10 + Int(b[j] - UInt8(48))
+                j += 1
+                got = True
+            if got:
+                best = n
+        i += 1
+    return best if best >= 0 else 0
+
+
 def _dirname(path: String) -> String:
     var b = path.as_bytes()
     var last = -1
@@ -577,7 +610,38 @@ def main() raises:
         else Float32(0.01)
     var flow_shift = cfg.timestep_shift if cfg.timestep_shift > Float32(0.0) \
         else DEFAULT_FLOW_SHIFT
+    # TRAINING sigma-draw shift (decoupled 2026-07-22): train_timestep_shift
+    # if set (>0), else the legacy coupling to timestep_shift. Inference/sample
+    # schedules always use flow_shift.
+    var train_shift = cfg.train_timestep_shift if cfg.train_timestep_shift > Float32(0.0) else flow_shift
     var warmup = cfg.lr_warmup_steps if cfg.lr_warmup_steps > 0 else 0
+
+    # ── RESUME knobs: config keys resume_state / start_step / warm_resume
+    #   (the webui override route); optional argv pair args[2]=<path>
+    #   [args[3]=<step>] overrides (the per-backend slot-table route).
+    #   start_step = GLOBAL optimizer steps already completed — the loop runs
+    #   [start_step, steps); -1 = derive from the artifact `_step{N}` name. ──
+    var resume_path = cfg.resume_state
+    var start_step = cfg.start_step
+    var warm_resume = cfg.warm_resume
+    if len(args) > 2:
+        resume_path = String(args[2])
+    if len(args) > 3:
+        start_step = Int(String(args[3]))
+    if resume_path.byte_length() == 0:
+        if start_step > 0:
+            print("[resume] start_step", start_step,
+                  "ignored (no resume_state) -> fresh run from 0")
+        start_step = 0
+    else:
+        if start_step < 0:
+            start_step = _derive_step_from_name(resume_path)
+            print("[resume] start_step derived from artifact name:", start_step)
+        if start_step >= steps:
+            raise Error(
+                String("[resume] start_step ") + String(start_step)
+                + " >= max_steps " + String(steps) + " — nothing to train"
+            )
 
     var out_path = cfg.output_model_destination
     if out_path.byte_length() == 0:
@@ -603,6 +667,10 @@ def main() raises:
           " (schedule.mojo sample_timestep_logit_normal); model gets RAW sigma")
     print("steps:", steps, " seed:", seed,
           " save_every:", cfg.save_every, " sample_every:", cfg.sample_every)
+    if resume_path.byte_length() > 0:
+        print("resume:", resume_path, " start_step:", start_step,
+              " (WARM — moments zeroed)" if warm_resume
+              else " (FULL — A/B + AdamW moments)")
     print("ckpt:", ckpt)
 
     # ── weights-absent guard (Base transformer DOWNLOADING) ───────────────────
@@ -664,10 +732,55 @@ def main() raises:
               "FUSED device AdamW (MAGEFLOW_FUSED_ADAMW=1, ulp-class)"
               if use_fused else "host AdamW (anchor-exact default)")
 
-    var lora = build_mageflow_lora_set(DEPTH, DIM, FFN, rank, alpha)
+    # ── LoRA set: fresh init OR resume (BEFORE the device AdamW state init so
+    #   the device M/V buffers seed from the LOADED host moments — the
+    #   lora_adamw_plain_device_state_init pack path uploads ma/va/mb/vb). ───
+    var lora: MageFlowLoraSet
+    if resume_path.byte_length() > 0:
+        if not _file_exists(resume_path):
+            raise Error(
+                String("[mageflow-resume] resume_state not found: ")
+                + resume_path
+            )
+        var probe = mageflow_lora_prefixes(DEPTH)[0]
+        # PEFT path given but `.state` sidecar present -> resolve to the
+        # sidecar (the MJ-1077 trainer_resolve_resume_path house rule).
+        var resolved = trainer_resolve_resume_path(resume_path, probe)
+        if warm_resume:
+            trainer_warn_warm_resume(String("mageflow"), resolved)
+            lora = load_mageflow_lora_resume(DEPTH, rank, alpha, resolved, ctx)
+        elif not lora_train_state_has_moments(resolved, probe):
+            raise Error(
+                String("[mageflow-resume] PEFT-as-resume: '") + resolved
+                + "' carries no AdamW moments (bare PEFT, no `.state`"
+                + " sidecar found). Pass the `.state` sidecar or use"
+                + " warm_resume (A/B only, moments zeroed)."
+            )
+        else:
+            print("[mageflow-resume] FULL resume (A/B + AdamW moments) from",
+                  resolved)
+            lora = load_mageflow_lora_state(DEPTH, rank, alpha, resolved, ctx)
+            # warn-only step/seed guard (mageflow .state meta = [opt_step, seed];
+            # sigma/noise/order are seed+step-derived, so these two knobs ARE
+            # the whole resume scope).
+            var rmeta = load_lora_train_state_meta(resolved, ctx)
+            if len(rmeta) >= 2:
+                if Int(rmeta[0]) != start_step:
+                    print("  [mageflow-resume][WARN] .state saved at step=",
+                          Int(rmeta[0]), " but resuming AT start_step=",
+                          start_step, "— streams are step-derived; exact",
+                          "continuation needs the saved step")
+                if Int(rmeta[1]) != Int(Float32(Int(seed))):
+                    print("  [mageflow-resume][WARN] seed changed: .state=",
+                          Int(rmeta[1]), " live=", Int(seed),
+                          "— the seed+step streams will DIVERGE")
+    else:
+        lora = build_mageflow_lora_set(DEPTH, DIM, FFN, rank, alpha)
     print("[lora] adapters:", mageflow_total_adapters(lora))
     # fused device AdamW state (persistent device P/M/V, ~300MB). Initialized
     # unconditionally (branch-free typing); only the fused arm steps it.
+    # On resume this packs the LOADED host moments (not zeros) — device state
+    # is seeded, not just host.
     var opt_state = mageflow_lora_adamw_state_init(lora, ctx)
 
     # MageFlow msrope: image rows roped, text rows identity — built ONCE
@@ -703,18 +816,25 @@ def main() raises:
     var have_first = False
     var train_start = perf_counter_ns()
 
-    # ── step-0 sample: pre-training baseline (LoRA B=0 => base-model output) ──
-    if cfg.sample_every > 0:
+    # ── step-0 sample: pre-training baseline (LoRA B=0 => base-model output).
+    #   FRESH runs only — a resumed segment samples at cadence points inside
+    #   the loop (step % sample_every), never unconditionally at start. ──────
+    if cfg.sample_every > 0 and start_step == 0:
         _run_sample_point(0, sample_conds, base, loader, lora, spec,
                           flow_shift, seed, samples_dir, ctx, host_path)
 
     print("")
     print("step  sigma     loss           grad_norm     sec")
-    for step in range(steps):
+    # GLOBAL step numbering: [start_step, steps). opt_step = step+1 stays the
+    # global optimizer step, so on resume the AdamW bias correction t, LR
+    # warmup, save/sample cadence, artifact numbering, data round-robin
+    # (step % n_cache) and the seed+step sigma/noise streams all CONTINUE the
+    # uninterrupted run's sequence exactly.
+    for step in range(start_step, steps):
         var t0 = perf_counter_ns()
 
         # sigma stream: seed + step (levers.mojo:104 stream convention).
-        var sigma = sample_timestep_logit_normal(seed + UInt64(step), flow_shift)
+        var sigma = sample_timestep_logit_normal(seed + UInt64(step), train_shift)
 
         var x0: List[Float32]
         var txt_raw: List[Float32]
@@ -851,7 +971,7 @@ def main() raises:
     print("")
     print("[save] wrote", npairs, "PEFT pairs (diffusion_model.* keys) ->", out_path)
     print("[save] wrote", nstate, "state tensors ->", state_path)
-    print("trained steps=", steps, " first loss=", first_loss,
+    print("trained steps=", steps - start_step, " first loss=", first_loss,
           " last loss=", last_loss,
           " total sec=", Float64(perf_counter_ns() - train_start) / 1.0e9)
     print("RESULT: mageflow Base LoRA trainer ran (block math == chunk-1",

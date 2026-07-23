@@ -872,6 +872,27 @@ def read_model_config(json_path: String) raises -> TrainConfig:
                     + String(n)
                 )
             cfg.resident_blocks = n
+        elif key == "resume_state" or key == "resume_from_checkpoint":
+            # RESUME source: a `.state` sidecar (FULL: A/B + AdamW moments) or
+            # a PEFT .safetensors whose `.state` sibling the trainer resolves
+            # (trainer_resolve_resume_path). The webui overrides emit
+            # resume_state; "" / absent = fresh run.
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.resume_state = sc.s
+        elif key == "start_step" or key == "resume_step":
+            # GLOBAL optimizer steps already completed (loop resumes at this
+            # step index). -1/absent = derive from the artifact `_step{N}`.
+            var n = Int(_read_scalar(cur).num)
+            if n < -1:
+                raise Error(
+                    String("train config: start_step must be >= -1, got ")
+                    + String(n)
+                )
+            cfg.start_step = n
+        elif key == "warm_resume":
+            # True = A/B-only resume (AdamW moments zeroed; loud banner).
+            cfg.warm_resume = _read_bool(cur)
         elif key == "controlnet_layers":
             # T2.E ControlNet training (default-off 0). Fail loud on negatives.
             var n = Int(_read_scalar(cur).num)
@@ -951,6 +972,8 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.lora_alpha = Float32(_read_scalar(cur).num)
         elif key == "timestep_shift":
             cfg.timestep_shift = Float32(_read_scalar(cur).num)
+        elif key == "train_timestep_shift":
+            cfg.train_timestep_shift = Float32(_read_scalar(cur).num)
         elif key == "max_grad_norm" or key == "clip_grad_norm":
             cfg.max_grad_norm = Float32(_read_scalar(cur).num)
         elif key == "max_steps" or key == "max_train_steps":

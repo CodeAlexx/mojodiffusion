@@ -90,52 +90,56 @@ def _nonfinite(v: List[Float32]) -> Int:
 # "blocks.{i}." prefix is already stripped). 31 map to the typed weight struct;
 # "modulation" is consumed separately (per-block AdaLN, see below).
 # ═══════════════════════════════════════════════════════════════════════════════
-def _blk_f32(w: Dict[String, TArc], key: String, ctx: DeviceContext) raises -> List[Float32]:
+# Device-native pull: return the already-bf16-device TArc DIRECTLY (refcount
+# bump only). This replaces the old _blk_f32 path (cast->to_host SCALAR
+# List[Float32] materialization), which was the ~500s/step CPU bottleneck —
+# billions of scalar host appends per step for the 31 frozen base matrices.
+def _blk_dev(w: Dict[String, TArc], key: String) raises -> TArc:
     if key not in w:
         raise Error(String("SCAIL-2 streamed block missing tensor: ") + key)
-    return cast_tensor(w[key][], STDtype.F32, ctx).to_host(ctx)
+    return w[key].copy()
 
 
 def scail2_block_weights_from_stream(
     w: Dict[String, TArc], dim: Int, ffn: Int, hd: Int, ctx: DeviceContext,
 ) raises -> WanI2VBlockWeights:
-    var base = WanBlockWeights(
-        _blk_f32(w, String("self_attn.q.weight"), ctx),
-        _blk_f32(w, String("self_attn.k.weight"), ctx),
-        _blk_f32(w, String("self_attn.v.weight"), ctx),
-        _blk_f32(w, String("self_attn.o.weight"), ctx),
-        _blk_f32(w, String("self_attn.q.bias"), ctx),
-        _blk_f32(w, String("self_attn.k.bias"), ctx),
-        _blk_f32(w, String("self_attn.v.bias"), ctx),
-        _blk_f32(w, String("self_attn.o.bias"), ctx),
-        _blk_f32(w, String("self_attn.norm_q.weight"), ctx),
-        _blk_f32(w, String("self_attn.norm_k.weight"), ctx),
-        _blk_f32(w, String("cross_attn.q.weight"), ctx),
-        _blk_f32(w, String("cross_attn.k.weight"), ctx),
-        _blk_f32(w, String("cross_attn.v.weight"), ctx),
-        _blk_f32(w, String("cross_attn.o.weight"), ctx),
-        _blk_f32(w, String("cross_attn.q.bias"), ctx),
-        _blk_f32(w, String("cross_attn.k.bias"), ctx),
-        _blk_f32(w, String("cross_attn.v.bias"), ctx),
-        _blk_f32(w, String("cross_attn.o.bias"), ctx),
-        _blk_f32(w, String("cross_attn.norm_q.weight"), ctx),
-        _blk_f32(w, String("cross_attn.norm_k.weight"), ctx),
-        _blk_f32(w, String("norm3.weight"), ctx),
-        _blk_f32(w, String("norm3.bias"), ctx),
-        _blk_f32(w, String("ffn.0.weight"), ctx),
-        _blk_f32(w, String("ffn.0.bias"), ctx),
-        _blk_f32(w, String("ffn.2.weight"), ctx),
-        _blk_f32(w, String("ffn.2.bias"), ctx),
-        dim, ffn, hd, ctx,
+    # bf16 device -> bf16 device (stored directly). Bit-identical to the old
+    # bf16->F32->host->bf16 path because bf16->F32->bf16 is lossless.
+    var base = WanBlockWeights.from_device(
+        _blk_dev(w, String("self_attn.q.weight")),
+        _blk_dev(w, String("self_attn.k.weight")),
+        _blk_dev(w, String("self_attn.v.weight")),
+        _blk_dev(w, String("self_attn.o.weight")),
+        _blk_dev(w, String("self_attn.q.bias")),
+        _blk_dev(w, String("self_attn.k.bias")),
+        _blk_dev(w, String("self_attn.v.bias")),
+        _blk_dev(w, String("self_attn.o.bias")),
+        _blk_dev(w, String("self_attn.norm_q.weight")),
+        _blk_dev(w, String("self_attn.norm_k.weight")),
+        _blk_dev(w, String("cross_attn.q.weight")),
+        _blk_dev(w, String("cross_attn.k.weight")),
+        _blk_dev(w, String("cross_attn.v.weight")),
+        _blk_dev(w, String("cross_attn.o.weight")),
+        _blk_dev(w, String("cross_attn.q.bias")),
+        _blk_dev(w, String("cross_attn.k.bias")),
+        _blk_dev(w, String("cross_attn.v.bias")),
+        _blk_dev(w, String("cross_attn.o.bias")),
+        _blk_dev(w, String("cross_attn.norm_q.weight")),
+        _blk_dev(w, String("cross_attn.norm_k.weight")),
+        _blk_dev(w, String("norm3.weight")),
+        _blk_dev(w, String("norm3.bias")),
+        _blk_dev(w, String("ffn.0.weight")),
+        _blk_dev(w, String("ffn.0.bias")),
+        _blk_dev(w, String("ffn.2.weight")),
+        _blk_dev(w, String("ffn.2.bias")),
     )
-    return WanI2VBlockWeights(
+    return WanI2VBlockWeights.from_device(
         base^,
-        _blk_f32(w, String("cross_attn.k_img.weight"), ctx),
-        _blk_f32(w, String("cross_attn.k_img.bias"), ctx),
-        _blk_f32(w, String("cross_attn.v_img.weight"), ctx),
-        _blk_f32(w, String("cross_attn.v_img.bias"), ctx),
-        _blk_f32(w, String("cross_attn.norm_k_img.weight"), ctx),
-        dim, ctx,
+        _blk_dev(w, String("cross_attn.k_img.weight")),
+        _blk_dev(w, String("cross_attn.k_img.bias")),
+        _blk_dev(w, String("cross_attn.v_img.weight")),
+        _blk_dev(w, String("cross_attn.v_img.bias")),
+        _blk_dev(w, String("cross_attn.norm_k_img.weight")),
     )
 
 
@@ -151,20 +155,45 @@ def scail2_modvecs_from_stream(
 ) -> WanModVecs:
     # e0_host, block_mod_h both [6*dim]: group j (axis over the 6 chunks) at
     # [j*dim + d]. Broadcast the shared [dim] row across all S tokens.
-    var shift_sa = List[Float32]()
-    var scale_sa = List[Float32]()
-    var gate_sa = List[Float32]()
-    var shift_ffn = List[Float32]()
-    var scale_ffn = List[Float32]()
-    var gate_ffn = List[Float32]()
+    # Pre-reserve S*dim so the 6 broadcast lists never reallocate while filling
+    # (append from capacity 0 recopied each buffer ~log2(S*dim) times — a large
+    # per-block CPU cost, 6*S*dim ~= tens of millions of elements/block). The
+    # per-token row is identical, so precompute it ONCE, then replay per token.
+    var row_shift_sa = List[Float32](capacity=dim)
+    var row_scale_sa = List[Float32](capacity=dim)
+    var row_gate_sa = List[Float32](capacity=dim)
+    var row_shift_ffn = List[Float32](capacity=dim)
+    var row_scale_ffn = List[Float32](capacity=dim)
+    var row_gate_ffn = List[Float32](capacity=dim)
+    var ep = e0_host.unsafe_ptr()
+    var mp = block_mod_h.unsafe_ptr()
+    for d in range(dim):
+        row_shift_sa.append(ep[0 * dim + d] + mp[0 * dim + d])
+        row_scale_sa.append(ep[1 * dim + d] + mp[1 * dim + d])
+        row_gate_sa.append(ep[2 * dim + d] + mp[2 * dim + d])
+        row_shift_ffn.append(ep[3 * dim + d] + mp[3 * dim + d])
+        row_scale_ffn.append(ep[4 * dim + d] + mp[4 * dim + d])
+        row_gate_ffn.append(ep[5 * dim + d] + mp[5 * dim + d])
+    var shift_sa = List[Float32](capacity=S * dim)
+    var scale_sa = List[Float32](capacity=S * dim)
+    var gate_sa = List[Float32](capacity=S * dim)
+    var shift_ffn = List[Float32](capacity=S * dim)
+    var scale_ffn = List[Float32](capacity=S * dim)
+    var gate_ffn = List[Float32](capacity=S * dim)
+    var rsa = row_shift_sa.unsafe_ptr()
+    var rsc = row_scale_sa.unsafe_ptr()
+    var rga = row_gate_sa.unsafe_ptr()
+    var rsf = row_shift_ffn.unsafe_ptr()
+    var rcf = row_scale_ffn.unsafe_ptr()
+    var rgf = row_gate_ffn.unsafe_ptr()
     for _ in range(S):
         for d in range(dim):
-            shift_sa.append(e0_host[0 * dim + d] + block_mod_h[0 * dim + d])
-            scale_sa.append(e0_host[1 * dim + d] + block_mod_h[1 * dim + d])
-            gate_sa.append(e0_host[2 * dim + d] + block_mod_h[2 * dim + d])
-            shift_ffn.append(e0_host[3 * dim + d] + block_mod_h[3 * dim + d])
-            scale_ffn.append(e0_host[4 * dim + d] + block_mod_h[4 * dim + d])
-            gate_ffn.append(e0_host[5 * dim + d] + block_mod_h[5 * dim + d])
+            shift_sa.append(rsa[d])
+            scale_sa.append(rsc[d])
+            gate_sa.append(rga[d])
+            shift_ffn.append(rsf[d])
+            scale_ffn.append(rcf[d])
+            gate_ffn.append(rgf[d])
     return WanModVecs(shift_sa^, scale_sa^, gate_sa^, shift_ffn^, scale_ffn^, gate_ffn^)
 
 

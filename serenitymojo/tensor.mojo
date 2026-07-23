@@ -133,18 +133,21 @@ struct Tensor(Movable):
         # Stage in a host byte buffer, casting F32 -> compute dtype.
         var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
         var dt = dtype.to_mojo_dtype()
+        var vp = values.unsafe_ptr()  # raw read: skip per-element List bounds check
         if dt == DType.float32:
-            var fp = host.unsafe_ptr().bitcast[Float32]()
-            for i in range(n):
-                fp[i] = values[i]
+            # F32->F32 is a verbatim byte copy: bulk memcpy (the modvec [S,dim]
+            # uploads hit this path 6x/block). Bit-identical to the scalar loop.
+            var dst = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
+            var src = BytePtr(unsafe_from_address=Int(vp))
+            _ = sys_memcpy(dst, src, nbytes)
         elif dt == DType.bfloat16:
             var bp = host.unsafe_ptr().bitcast[BFloat16]()
             for i in range(n):
-                bp[i] = values[i].cast[DType.bfloat16]()
+                bp[i] = vp[i].cast[DType.bfloat16]()
         else:  # float16
             var hp = host.unsafe_ptr().bitcast[Float16]()
             for i in range(n):
-                hp[i] = values[i].cast[DType.float16]()
+                hp[i] = vp[i].cast[DType.float16]()
         var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
         ctx.enqueue_copy(dst_buf=dev, src_buf=host)
         ctx.synchronize()
@@ -337,7 +340,10 @@ struct Tensor(Movable):
         var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
         ctx.enqueue_copy(dst_buf=host, src_buf=self.buf)
         ctx.synchronize()
-        var out = List[Float32]()
+        # Pre-reserve so the fill loop never reallocates (append from capacity 0
+        # copied the growing buffer ~log2(n) times — the CPU-bound "scalar host
+        # list materialization" cost on [S,dim] tapes). Bit-identical output.
+        var out = List[Float32](capacity=n)
         var dt = self._dtype.to_mojo_dtype()
         if dt == DType.float32:
             var fp = host.unsafe_ptr().bitcast[Float32]()
@@ -366,7 +372,7 @@ struct Tensor(Movable):
         var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
         ctx.enqueue_copy(dst_buf=host, src_buf=self.buf)
         ctx.synchronize()
-        var out = List[BFloat16]()
+        var out = List[BFloat16](capacity=n)  # pre-reserve: no realloc growth
         var dt = self._dtype.to_mojo_dtype()
         if dt == DType.bfloat16:
             var bp = host.unsafe_ptr().bitcast[BFloat16]()
@@ -405,9 +411,11 @@ struct Tensor(Movable):
             )
         var nbytes = n * STDtype.BF16.byte_size()
         var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
-        var bp = host.unsafe_ptr().bitcast[BFloat16]()
-        for i in range(n):
-            bp[i] = values[i]
+        # BF16->BF16 verbatim: bulk memcpy (backward re-uploads every [S,dim]
+        # saved-activation tape through here). Bit-identical to the scalar loop.
+        var dst = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
+        var src = BytePtr(unsafe_from_address=Int(values.unsafe_ptr()))
+        _ = sys_memcpy(dst, src, nbytes)
         var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
         ctx.enqueue_copy(dst_buf=dev, src_buf=host)
         ctx.synchronize()

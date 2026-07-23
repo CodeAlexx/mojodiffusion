@@ -308,6 +308,74 @@ struct WanBlockWeights(Copyable, Movable):
         self.ffn2_w = TArc(Tensor.from_host(ffn2_w^, [dim, ffn], STDtype.BF16, ctx))
         self.ffn2_b = TArc(Tensor.from_host(ffn2_b^, [dim], STDtype.BF16, ctx))
 
+    # Device-native builder: takes already-bf16-device TArc weights and stores
+    # them DIRECTLY (no to_host / from_host / dtype conversion). Used by the
+    # streamed FP8 base loader, which already returns bf16 device tensors, to
+    # skip the per-step host round-trip. bf16 in == bf16 stored, bit-identical
+    # to the List[Float32] path (bf16->F32->bf16 is lossless).
+    def __init__(
+        out self,
+        var sa_wq: TArc, var sa_wk: TArc, var sa_wv: TArc, var sa_wo: TArc,
+        var sa_bq: TArc, var sa_bk: TArc, var sa_bv: TArc, var sa_bo: TArc,
+        var sa_qn: TArc, var sa_kn: TArc,
+        var ca_wq: TArc, var ca_wk: TArc, var ca_wv: TArc, var ca_wo: TArc,
+        var ca_bq: TArc, var ca_bk: TArc, var ca_bv: TArc, var ca_bo: TArc,
+        var ca_qn: TArc, var ca_kn: TArc,
+        var n3_w: TArc, var n3_b: TArc,
+        var ffn0_w: TArc, var ffn0_b: TArc,
+        var ffn2_w: TArc, var ffn2_b: TArc,
+    ):
+        self.sa_wq = sa_wq^
+        self.sa_wk = sa_wk^
+        self.sa_wv = sa_wv^
+        self.sa_wo = sa_wo^
+        self.sa_bq = sa_bq^
+        self.sa_bk = sa_bk^
+        self.sa_bv = sa_bv^
+        self.sa_bo = sa_bo^
+        self.sa_qn = sa_qn^
+        self.sa_kn = sa_kn^
+        self.ca_wq = ca_wq^
+        self.ca_wk = ca_wk^
+        self.ca_wv = ca_wv^
+        self.ca_wo = ca_wo^
+        self.ca_bq = ca_bq^
+        self.ca_bk = ca_bk^
+        self.ca_bv = ca_bv^
+        self.ca_bo = ca_bo^
+        self.ca_qn = ca_qn^
+        self.ca_kn = ca_kn^
+        self.n3_w = n3_w^
+        self.n3_b = n3_b^
+        self.ffn0_w = ffn0_w^
+        self.ffn0_b = ffn0_b^
+        self.ffn2_w = ffn2_w^
+        self.ffn2_b = ffn2_b^
+
+    @staticmethod
+    def from_device(
+        var sa_wq: TArc, var sa_wk: TArc, var sa_wv: TArc, var sa_wo: TArc,
+        var sa_bq: TArc, var sa_bk: TArc, var sa_bv: TArc, var sa_bo: TArc,
+        var sa_qn: TArc, var sa_kn: TArc,
+        var ca_wq: TArc, var ca_wk: TArc, var ca_wv: TArc, var ca_wo: TArc,
+        var ca_bq: TArc, var ca_bk: TArc, var ca_bv: TArc, var ca_bo: TArc,
+        var ca_qn: TArc, var ca_kn: TArc,
+        var n3_w: TArc, var n3_b: TArc,
+        var ffn0_w: TArc, var ffn0_b: TArc,
+        var ffn2_w: TArc, var ffn2_b: TArc,
+    ) -> Self:
+        return Self(
+            sa_wq^, sa_wk^, sa_wv^, sa_wo^,
+            sa_bq^, sa_bk^, sa_bv^, sa_bo^,
+            sa_qn^, sa_kn^,
+            ca_wq^, ca_wk^, ca_wv^, ca_wo^,
+            ca_bq^, ca_bk^, ca_bv^, ca_bo^,
+            ca_qn^, ca_kn^,
+            n3_w^, n3_b^,
+            ffn0_w^, ffn0_b^,
+            ffn2_w^, ffn2_b^,
+        )
+
 
 # ── saved activations (HOST-RESIDENT BF16 — half the bytes of F32 device TArc) ───
 # flame-core (Rust reference) holds saved activations in BF16; we match that.
@@ -1922,6 +1990,32 @@ struct WanI2VBlockWeights(Copyable, Movable):
         self.ca_wv_img = TArc(Tensor.from_host(ca_wv_img^, [dim, dim], STDtype.BF16, ctx))
         self.ca_bv_img = TArc(Tensor.from_host(ca_bv_img^, [dim], STDtype.BF16, ctx))
         self.ca_kn_img = TArc(Tensor.from_host(ca_kn_img^, [dim], STDtype.BF16, ctx))
+
+    # Device-native builder: stores already-bf16-device TArc weights directly
+    # (no host round-trip). See WanBlockWeights.from_device.
+    def __init__(
+        out self, var base: WanBlockWeights,
+        var ca_wk_img: TArc, var ca_bk_img: TArc,
+        var ca_wv_img: TArc, var ca_bv_img: TArc,
+        var ca_kn_img: TArc,
+    ):
+        self.base = base^
+        self.ca_wk_img = ca_wk_img^
+        self.ca_bk_img = ca_bk_img^
+        self.ca_wv_img = ca_wv_img^
+        self.ca_bv_img = ca_bv_img^
+        self.ca_kn_img = ca_kn_img^
+
+    @staticmethod
+    def from_device(
+        var base: WanBlockWeights,
+        var ca_wk_img: TArc, var ca_bk_img: TArc,
+        var ca_wv_img: TArc, var ca_bv_img: TArc,
+        var ca_kn_img: TArc,
+    ) -> Self:
+        return Self(
+            base^, ca_wk_img^, ca_bk_img^, ca_wv_img^, ca_bv_img^, ca_kn_img^,
+        )
 
 
 # I2V saved activations = the base WanSaved (its `context` field holds the TEXT

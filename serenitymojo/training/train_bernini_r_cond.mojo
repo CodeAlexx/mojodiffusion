@@ -309,6 +309,145 @@ def _load_cache_target(
     return _patchify_latent(vals^, 1, 32, 32, ctx, out_std, out_mean)
 
 
+# ── Real-cache conditioning + text readers (Bernini-R sample schema) ───────────
+# sample_{idx}.safetensors keys (scripts/bernini_r_build_cache.py):
+#   latent [16,F,H,W] f32 (target)  |  cond_count [1] i32  |
+#   cond_{k} [16,f,h,w] f32 (CLEAN)  |  cond_{k}_src_id [1] i32  |
+#   text [512,4096] bf16  |  text_len [1] i32  |  task_id [1] i32
+def _cache_sample_path(cache_dir: String, idx: Int) -> String:
+    return cache_dir + String("/sample_") + String(idx) + String(".safetensors")
+
+
+def _st_has(st: SafeTensors, name: String) -> Bool:
+    var nms = st.names()
+    for i in range(len(nms)):
+        if nms[i] == name:
+            return True
+    return False
+
+
+# Number of conditioning segments stored in the sample (0 if key absent).
+def _load_cache_cond_count(cache_dir: String, idx: Int) raises -> Int:
+    var st = SafeTensors.open(_cache_sample_path(cache_dir, idx))
+    if not _st_has(st, String("cond_count")):
+        return 0
+    var lb = st.tensor_bytes(String("cond_count"))
+    var ip = lb.unsafe_ptr().bitcast[Int32]()
+    return Int(ip[0])
+
+
+# One CLEAN conditioning latent: [16,f,hl,wl] -> patchify(1,2,2) -> [S,IN_CH]
+# tokens, returning the post-patchify token grid (f, hl/2, wl/2) + its source id.
+struct CacheCond(Movable):
+    var tokens: List[Float32]
+    var f: Int
+    var h: Int
+    var w: Int
+    var src_id: Float32
+
+    fn __init__(out self, var tokens: List[Float32], f: Int, h: Int, w: Int,
+                src_id: Float32):
+        self.tokens = tokens^
+        self.f = f
+        self.h = h
+        self.w = w
+        self.src_id = src_id
+
+
+# Header-only conditioning grid (f, hl/2, wl/2) + source id — no token load.
+struct CacheGrid(Copyable, Movable):
+    var f: Int
+    var h: Int
+    var w: Int
+    var src_id: Float32
+
+    fn __init__(out self, f: Int, h: Int, w: Int, src_id: Float32):
+        self.f = f
+        self.h = h
+        self.w = w
+        self.src_id = src_id
+
+
+def _load_cache_cond_grid(cache_dir: String, idx: Int, k: Int) raises -> CacheGrid:
+    var st = SafeTensors.open(_cache_sample_path(cache_dir, idx))
+    var key = String("cond_") + String(k)
+    var info = st.tensor_info(key)
+    if len(info.shape) != 4 or info.shape[0] != 16:
+        raise Error(String("cache cond must be [16,f,h,w]: ") + key)
+    var ff = info.shape[1]
+    var hl = info.shape[2]
+    var wl = info.shape[3]
+    if hl % 2 != 0 or wl % 2 != 0:
+        raise Error(String("cache cond spatial dims must be even: ") + key)
+    var sid = Float32(k + 1)
+    var sid_key = key + String("_src_id")
+    if _st_has(st, sid_key):
+        var sb = st.tensor_bytes(sid_key)
+        var sp = sb.unsafe_ptr().bitcast[Int32]()
+        sid = Float32(Int(sp[0]))
+    return CacheGrid(ff, hl // 2, wl // 2, sid)
+
+
+def _load_cache_cond(
+    cache_dir: String, idx: Int, k: Int, ctx: DeviceContext,
+) raises -> CacheCond:
+    var st = SafeTensors.open(_cache_sample_path(cache_dir, idx))
+    var key = String("cond_") + String(k)
+    var info = st.tensor_info(key)
+    if info.dtype != STDtype.F32:
+        raise Error(String("cache cond dtype != F32: ") + key)
+    if len(info.shape) != 4 or info.shape[0] != 16:
+        raise Error(String("cache cond must be [16,f,h,w]: ") + key)
+    var ff = info.shape[1]
+    var hl = info.shape[2]
+    var wl = info.shape[3]
+    if hl % 2 != 0 or wl % 2 != 0:
+        raise Error(String("cache cond spatial dims must be even: ") + key)
+    var nlat = 16 * ff * hl * wl
+    var lb = st.tensor_bytes(key)
+    var fp = lb.unsafe_ptr().bitcast[Float32]()
+    var vals = List[Float32]()
+    for i in range(nlat):
+        vals.append(fp[i])
+    var cs = Float32(0.0)
+    var cm = Float32(0.0)
+    var toks = _patchify_latent(vals^, ff, hl, wl, ctx, cs, cm)
+    # source id (target=0, conditioning k -> k+1 per pack_vae_latents ordering).
+    var sid = Float32(k + 1)
+    var sid_key = key + String("_src_id")
+    if _st_has(st, sid_key):
+        var sb = st.tensor_bytes(sid_key)
+        var sp = sb.unsafe_ptr().bitcast[Int32]()
+        sid = Float32(Int(sp[0]))
+    print("[data] cond seg", k, "(cache CLEAN, src_id=", sid, "): std=", cs,
+          " mean=", cm, " grid(f,h,w)=(", ff, ",", hl // 2, ",", wl // 2, ")")
+    return CacheCond(toks^, ff, hl // 2, wl // 2, sid)
+
+
+# umt5 text [512,4096] bf16 -> flat f32 [TXT*TEXT_DIM].
+def _load_cache_text(
+    cache_dir: String, idx: Int, ctx: DeviceContext,
+) raises -> List[Float32]:
+    var st = SafeTensors.open(_cache_sample_path(cache_dir, idx))
+    var info = st.tensor_info(String("text"))
+    if len(info.shape) != 2 or info.shape[0] != TXT or info.shape[1] != TEXT_DIM:
+        raise Error("cache text must be [512,4096]")
+    var n = TXT * TEXT_DIM
+    var lb = st.tensor_bytes(String("text"))
+    var out = List[Float32]()
+    if info.dtype == STDtype.BF16:
+        var bp = lb.unsafe_ptr().bitcast[BFloat16]()
+        for i in range(n):
+            out.append(Float32(bp[i]))
+    elif info.dtype == STDtype.F32:
+        var fp = lb.unsafe_ptr().bitcast[Float32]()
+        for i in range(n):
+            out.append(fp[i])
+    else:
+        raise Error("cache text dtype must be BF16 or F32")
+    return out^
+
+
 # ── Save an EMA-shadow LoRA sibling (host F32 ema_a/ema_b -> PEFT safetensors). ─
 def _save_ema_sibling(
     lora: Wan22LoraSet, ema_a: List[List[Float32]], ema_b: List[List[Float32]],
@@ -523,8 +662,26 @@ def main() raises:
     var recipe = bernini_recipe_for(task)
 
     # regression switch: BERNINI_NO_COND=1 -> force n_cond=0 (Tier-1) for any task.
-    var no_cond = _env_is_set(String("BERNINI_NO_COND")) or recipe.n_cond == 0
     var stochastic = _env_is_set(String("BERNINI_STOCHASTIC"))
+
+    # ── data source: real per-sample cache (sample_0.safetensors) or synthetic ──
+    var cache_dir = cfg.dataset_cache_dir
+    var use_cache = cache_dir.byte_length() > 0 and _file_exists(
+        _cache_sample_path(cache_dir, 0)
+    )
+
+    # no_cond: when reading the real cache, the cache's cond_count is authoritative;
+    # otherwise the per-task recipe drives it (BERNINI_NO_COND forces Tier-1 T2V).
+    var cache_cond_count = 0
+    if use_cache:
+        cache_cond_count = _load_cache_cond_count(cache_dir, 0)
+    var no_cond = _env_is_set(String("BERNINI_NO_COND"))
+    if use_cache:
+        if cache_cond_count == 0:
+            no_cond = True
+    else:
+        if recipe.n_cond == 0:
+            no_cond = True
 
     var rank = cfg.lora_rank if cfg.lora_rank > 0 else 16
     var alpha = cfg.lora_alpha if cfg.lora_alpha > Float32(0.0) else Float32(16.0)
@@ -560,9 +717,20 @@ def main() raises:
     )
 
     # ── conditioning segments (skip when no_cond) ───────────────────────────────
+    # From the REAL cache: grids + source-ids come from the stored cond_{k} tensors.
+    # Synthetic fallback: the per-task smoke geometry (bernini_smoke_cond_segments).
     var segs = List[BerniniCondSeg]()
+    var cond_src_ids = List[Float32]()
     if not no_cond:
-        segs = bernini_smoke_cond_segments(task)
+        if use_cache:
+            for k in range(cache_cond_count):
+                var g = _load_cache_cond_grid(cache_dir, 0, k)
+                segs.append(BerniniCondSeg(g.f, g.h, g.w, String("cache")))
+                cond_src_ids.append(g.src_id)
+        else:
+            segs = bernini_smoke_cond_segments(task)
+            for i in range(len(segs)):
+                cond_src_ids.append(Float32(i + 1))
     var n_cond_tokens = 0
     for i in range(len(segs)):
         n_cond_tokens += segs[i].f * segs[i].h * segs[i].w
@@ -580,7 +748,7 @@ def main() raises:
     else:
         print("MODE: CONDITIONED  packed order [cond_1..N | target] (pack_vae_latents)")
     for i in range(len(segs)):
-        print("  cond seg", i, "src_id=", i + 1, " grid(f,h,w)=(", segs[i].f, ",",
+        print("  cond seg", i, "src_id=", cond_src_ids[i], " grid(f,h,w)=(", segs[i].f, ",",
               segs[i].h, ",", segs[i].w, ") kind=", segs[i].kind,
               " tokens=", segs[i].f * segs[i].h * segs[i].w)
     print("packed sequence: cond=", n_cond_tokens, " + target=", S_TGT, " = S=", seq_len)
@@ -625,7 +793,7 @@ def main() raises:
     var rope_segments = List[BerniniRopeSegment]()
     for i in range(len(segs)):
         rope_segments.append(
-            BerniniRopeSegment(segs[i].f, segs[i].h, segs[i].w, Float32(i + 1))
+            BerniniRopeSegment(segs[i].f, segs[i].h, segs[i].w, cond_src_ids[i])
         )
     rope_segments.append(BerniniRopeSegment(TGT_FG, TGT_HG, TGT_WG, TGT_SRC_ID))
     var rope = build_bernini_src_id_rope(rope_segments, Dh, ROPE_THETA, STDtype.F32, ctx)
@@ -638,38 +806,48 @@ def main() raises:
           " rows=", seq_len, " cols(Dh/2)=", Dh // 2)
 
     # ── conditioning tokens: N CLEAN patchified latents concatenated in order ────
+    # REAL cache: load each stored cond_{k} latent (CLEAN) and patchify it.
+    # Synthetic fallback: deterministic per-seg random latent (regression path).
     var cond_tokens = List[Float32]()
     for i in range(len(segs)):
-        var seg = segs[i].copy()
-        var cs = Float32(0.0)
-        var cm = Float32(0.0)
-        var cl = _synth(16 * seg.f * (seg.h * 2) * (seg.w * 2),
-                        seed * 7 + UInt64(101 + i * 13))
-        var toks = _patchify_latent(cl^, seg.f, seg.h * 2, seg.w * 2, ctx, cs, cm)
-        var want = seg.f * seg.h * seg.w * IN_CH
-        if len(toks) != want:
-            raise Error("conditioning seg patch len mismatch")
-        for j in range(len(toks)):
-            cond_tokens.append(toks[j])
-        print("[data] cond seg", i, "(clean, src_id=", i + 1, "): std=", cs,
-              " mean=", cm, " tokens=", seg.f * seg.h * seg.w)
+        if use_cache:
+            var cc = _load_cache_cond(cache_dir, 0, i, ctx)
+            var want = segs[i].f * segs[i].h * segs[i].w * IN_CH
+            if len(cc.tokens) != want:
+                raise Error("cache conditioning seg patch len mismatch")
+            for j in range(len(cc.tokens)):
+                cond_tokens.append(cc.tokens[j])
+        else:
+            var seg = segs[i].copy()
+            var cs = Float32(0.0)
+            var cm = Float32(0.0)
+            var cl = _synth(16 * seg.f * (seg.h * 2) * (seg.w * 2),
+                            seed * 7 + UInt64(101 + i * 13))
+            var toks = _patchify_latent(cl^, seg.f, seg.h * 2, seg.w * 2, ctx, cs, cm)
+            var want = seg.f * seg.h * seg.w * IN_CH
+            if len(toks) != want:
+                raise Error("conditioning seg patch len mismatch")
+            for j in range(len(toks)):
+                cond_tokens.append(toks[j])
+            print("[data] cond seg", i, "(synthetic clean, src_id=", cond_src_ids[i],
+                  "): std=", cs, " mean=", cm, " tokens=", seg.f * seg.h * seg.w)
     if len(cond_tokens) != n_cond_tokens * IN_CH:
         raise Error("total cond tokens mismatch")
 
-    # ── data: real cached TARGET latent when present, else synthetic ─────────────
-    var cache_dir = cfg.dataset_cache_dir
-    var use_cache = False
-    if cache_dir.byte_length() > 0 and _file_exists(
-        cache_dir + String("/sample_0.safetensors")
-    ):
-        use_cache = True
+    # ── data: real cached TARGET+COND+TEXT when present, else synthetic ──────────
     if use_cache:
-        print("[data] REAL cached target latent:", cache_dir,
-              " (synthetic conditioning + synthetic text)")
+        print("[data] REAL cache:", cache_dir,
+              " (target latent + conditioning latents + umt5 text ALL from cache)")
     else:
         print("[data] SYNTHETIC target/conditioning/text (no cache_dir sample_0)")
 
-    var txt_tokens = _synth(TXT * TEXT_DIM, seed * 777 + 9)
+    var txt_tokens: List[Float32]
+    if use_cache:
+        txt_tokens = _load_cache_text(cache_dir, 0, ctx)
+        print("[data] REAL cached umt5 text [512,4096] loaded (", len(txt_tokens),
+              "floats)")
+    else:
+        txt_tokens = _synth(TXT * TEXT_DIM, seed * 777 + 9)
 
     # ── comptime dispatch on the packed sequence length ──────────────────────────
     if seq_len == 256:

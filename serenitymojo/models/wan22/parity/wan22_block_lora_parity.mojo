@@ -112,6 +112,7 @@ def _load_lora() raises -> WanBlockLora:
     return WanBlockLora(
         _adapter("sa_q"), _adapter("sa_k"), _adapter("sa_v"), _adapter("sa_o"),
         _adapter("ca_q"), _adapter("ca_k"), _adapter("ca_v"), _adapter("ca_o"),
+        Optional[LoraAdapter](), Optional[LoraAdapter](),  # ffn.0/ffn.2 not tested here
     )
 
 

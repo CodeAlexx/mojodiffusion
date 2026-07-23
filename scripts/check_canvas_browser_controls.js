@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 "use strict";
 
-// The production canvas no longer exposes the Design-B `window.Serenity`
-// module/store contract exercised by the historical suite below. Keep that
-// suite available for archaeology, but make the established command run the
-// deployed Serenity Studio contract by default.
+// The production Canvas has its own live Invoke-parity gate. Keep the
+// historical Design-B suite below available for archaeology, but make this
+// established Canvas command exercise the deployed Canvas contract by default.
 if (process.env.SERENITY_LEGACY_CANVAS_TEST !== "1") {
-  require("./check_serenity_playwright_ui.js");
+  require("./check_serenity_canvas_invoke_parity.js");
 } else {
 
 const fs = require("fs");

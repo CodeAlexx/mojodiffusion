@@ -434,16 +434,23 @@ struct TurboPlannedLoader(Movable):
                 return r
         return -1
 
-    def pin_residents(mut self, budget_bytes: Int, ctx: DeviceContext) raises -> Int:
+    def pin_residents(
+        mut self, budget_bytes: Int, ctx: DeviceContext, max_blocks: Int = -1
+    ) raises -> Int:
         """Pin plan blocks (in plan order) permanently on device until
         `budget_bytes` is reached. Each pinned block gets its OWN device buffer,
         H2D'd ONCE from the turbo loader's pinned block store — byte-identical
         to the streaming path (same source bytes, same per-tensor records).
         Returns the number of blocks pinned. One ctx.synchronize() at the end
         fences all resident copies; afterwards await_block on a resident is a
-        pure sub-buffer-view build (no copy, no slot, no fence)."""
+        pure sub-buffer-view build (no copy, no slot, no fence).
+        `max_blocks` (16GB refit, P6 wave 2): additional cap on the number of
+        pinned blocks (-1 = unlimited, budget-only — the pre-existing behavior;
+        0 = pin nothing). Residency knob only: bytes are unchanged."""
         var used = 0
         var pinned = 0
+        if max_blocks == 0:
+            return 0
         # Reusable PINNED staging buffer (the block_store is a 1-byte dummy
         # when TURBO_USE_PERSISTENT_BLOCK_STORE=False — measured rc=1 when
         # pointing cuMemcpy at it). mmap -> pinned staging -> device, like
@@ -470,6 +477,8 @@ struct TurboPlannedLoader(Movable):
             var n_bytes = self._turbo.store_nbytes[prefix_idx]
             if used + n_bytes > budget_bytes:
                 break  # plan-order contiguous pin; the rest keep streaming
+            if max_blocks >= 0 and pinned >= max_blocks:
+                break  # 16GB refit block-count cap; the rest keep streaming
             # per-tensor records + mmap->staging memcpy, EXACTLY like
             # TurboBlockLoader.prefetch's non-store path
             var recs = List[_TensorRecord]()
@@ -503,7 +512,15 @@ struct TurboPlannedLoader(Movable):
                 n_bytes,
                 self._turbo.copy_stream,
             )
-            ctx.synchronize()  # staging is reused next block — fence the copy
+            # Fence the COPY STREAM specifically: the h2d above runs on
+            # self._turbo.copy_stream, which ctx.synchronize() does NOT cover
+            # (it only waits on the context's own stream — same trap documented
+            # at the fp8 pin path below, "measured cos 0.09 without this
+            # fence"). Without this, the staging memcpy for the NEXT block
+            # races the in-flight DMA and pins nondeterministically corrupted
+            # bytes (measured: mageflow run-to-run loss wobble, 2026-07-22).
+            self._turbo.copy_stream.synchronize()
+            ctx.synchronize()
             self._res_prefixes.append(p)
             self._res_devs.append(dev^)
             self._res_recs.append(recs^)

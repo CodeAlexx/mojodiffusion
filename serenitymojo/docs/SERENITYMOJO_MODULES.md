@@ -77,7 +77,10 @@ debug comparison.
 Pure-Mojo `serenity.genparams.v1` adapter used by SerenityUI's Video tab. Unlike
 the older bounded daemon smoke wrapper, it does not substitute a staged smoke
 profile: it preserves the exact request, resolves all authored LoRA rows and
-weights, validates cached conditioning against the authored prompt, and either
+weights — including the optional per-row per-stream strengths
+`video/video_to_audio/audio/audio_to_video/other` (validated `[0,1]`; the
+`LTX2LoraLoaderAdvanced` intake, only emitted when any ≠ 1.0) — validates cached
+conditioning against the authored prompt, and either
 admits the exact compiled geometry/sampler pair or fails before model loading.
 `pipeline/ltx2_t2v_av_hq.mojo` supplies atomic phase/step status plus a result
 manifest containing the executed schedule, artifact geometry/frame count,
@@ -85,6 +88,28 @@ timings, and peak-VRAM sample. Experimental acceptance evidence (2026-07-19):
 768x512, 97 frames, 24 FPS, 8-step distilled Euler, step-3000 trained LoRA,
 valid H.264 MP4, 99.47 s wall, 10,024 MiB peak; frames 0/48/96 and a 13-frame
 contact sheet were visually inspected for convergence and temporal continuity.
+
+---
+
+## lora.mojo — inference LoRA loader (`LoraSet`)
+
+**INFERENCE-only.** Opens a LoRA `.safetensors`, auto-detects its key format,
+computes `delta = scale·(B@A)`, and either **merges** into resident base weights
+(`merge_into`/`merge_into_indexed`) or **applies at-dequant** onto FP8-streamed
+LTX-2 blocks (re-added each dequant, never fused to disk). Full API + line refs in
+the repo-root `docs/MOJO_MODULES.md` "LoRA — lora.mojo" section; summary:
+
+- **5 formats** (`_detect_format`): `FMT_KOHYA_SDXL`, `FMT_LTX2_DISTILLED`,
+  **`FMT_DIFFUSION_MODEL`** (`diffusion_model.<module>.lora_A/lora_B.weight` = the
+  ai-toolkit/ComfyUI format the Wan2.2/2.1 + Klein + LTX-2 trainers save → loads
+  back with NO conversion), `FMT_ZIMAGE_TRAINER`, `FMT_KLEIN_TRAINER`.
+- **Scale** `(alpha/rank)·multiplier`; absent `.alpha` ⇒ `scale=multiplier`.
+- **KJNodes `LTX2LoraLoaderAdvanced`** (`LoraStreamMults`): five per-stream
+  strengths `video/video_to_audio/audio/audio_to_video/other`, substring-matched
+  with most-specific precedence, `0.0` drops the module; via env
+  `LTX2_TRAINED_LORA_STREAMS_{i}`, the request CLI rows, and the Rust serve node.
+- Callers: Klein (`validation_sampler`), krea2 (`krea2_pipeline --lora`), LTX-2.
+  Wan trained LoRAs are loadable but not yet wired into a Wan inference pipeline.
 
 ---
 
@@ -1241,6 +1266,36 @@ Pure-CPU PNG encoder (uncompressed STORED deflate — valid PNG, just larger). N
 - `@fieldwise_init struct ValueRange(...)` — `SIGNED` ([-1,1] → `(v+1)·127.5`, **default**), `UNIT` ([0,1] → `v·255`); both clamp+round to u8.
 - `crc32(data: Span[UInt8,_]) -> UInt32`, `adler32(data) -> UInt32` — PNG/zlib convention.
 - `save_png(image: Tensor, path: String, ctx, value_range: ValueRange = ValueRange.SIGNED) raises` — encode a `[1,3,H,W]` CHW float Tensor as 8-bit RGB PNG. Reads GPU→host F32, CHW→HWC interleave, filter-0 scanlines, IHDR/IDAT(zlib-stored)/IEND chunks, writes via `io/ffi` `sys_write` (binary-safe).
+
+---
+
+## MageFlow T2I and image edit (2026-07-22)
+
+- `models/dit/mageflow_dit.mojo`: Qwen-Image-family 12-block DiT with
+  MageFlow image-only MSRoPE.
+- `models/text_encoder/mageflow_qwen3vl.mojo`: T2I context and Qwen3-VL
+  image-edit conditioning, including the exact template row drops and edit
+  position construction.
+- `models/vae/mageflow_vae.mojo`: deterministic one-step image encode and
+  latent decode, generalized to non-square aspect-preserving edit shapes.
+- `pipeline/mageflow_pipeline.mojo`: four-step Turbo T2I with text encoder,
+  DiT, and VAE loaded sequentially for 16 GB-class operation.
+- `pipeline/mageflow_edit_pipeline.mojo`: source image plus instruction to
+  clean reference latent, pure-noise target, frame-2 token concatenation,
+  target-only Euler updates, and decoded edit.
+- Parity entrypoints live under the corresponding `parity/` directories. The
+  recorded T2I final-latent cosine is 0.9942; edit reference/final latent
+  cosines are 0.99979/0.99934 and both rendered comparisons were visually
+  accepted. No Serenity server worker or Canvas engine is wired yet.
+- `training/train_mageflow_real.mojo`: MageFlow LoRA trainer (Base-targeted;
+  device-resident 0.44 s/step at 512², block math = qwenimage reuse).
+  Config keys: `train_timestep_shift` (training σ-draw decouple — the
+  disfigured-faces fix; inference keeps `timestep_shift`), cold-exact resume
+  via `resume_state`/`start_step`/`warm_resume`, save cadence writes
+  ai-toolkit-format LoRA + `.state` (F32 Adam moments), in-train 1024²
+  sampling with token-count-verified baked prompts.
+- `pipeline/mageflow_lora_infer.mojo`: standalone Base+LoRA inference driver
+  (argv: lora path, seed; 144-adapter fail-loud load, 20-step CFG-5 1024²).
 
 ### Ideogram-4 perf + magic round (see docs/IDEOGRAM4_STATUS.md)
 - `models/dit/ideogram4_resident.mojo` — `Ideogram4Weights` (resident fp8 cache: `.load(st,ctx)`, `.w(name)`), `ideogram4_build_masks(indicator,ctx)->Ideogram4Masks` (hoisted constant masks), `ideogram4_forward_r[S](w,x,llm,t,masks,cos,sin,...)` (hot path; `_lin` = dequant resident fp8→bf16 then vendor cuBLAS `linear`; attention now goes through `ideogram4_sdpa_product_fwd`). Resident DiT cos 0.999557 after Dh=256 flash wiring.

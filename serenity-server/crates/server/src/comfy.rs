@@ -129,7 +129,9 @@ async fn run_comfy_ws(mut socket: WebSocket, mut rx: broadcast::Receiver<(String
 fn comfy_messages_for(prompt_id: &str, ev: &WorkerEvent) -> Vec<String> {
     match ev {
         WorkerEvent::Ready => vec![],
-        WorkerEvent::Progress { step, total, .. } => {
+        WorkerEvent::Progress {
+            step, total, phase, ..
+        } => {
             let mut out = Vec::new();
             // Announce start on the first step so the canvas resets/enables its
             // progress UI even if it connected after the job was queued.
@@ -142,18 +144,55 @@ fn comfy_messages_for(prompt_id: &str, ev: &WorkerEvent) -> Vec<String> {
             out.push(
                 json!({
                     "type": "progress",
-                    "data": { "value": step, "max": total, "prompt_id": prompt_id }
+                    "data": {
+                        "value": step,
+                        "max": total,
+                        "phase": phase,
+                        "prompt_id": prompt_id
+                    }
                 })
                 .to_string(),
             );
             out
         }
         WorkerEvent::Done { output_path } => {
-            let filename = std::path::Path::new(output_path)
+            let path = std::path::Path::new(output_path);
+            let filename = path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
+            let is_video = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "mp4" | "webm" | "mov"))
+                .unwrap_or(false);
+            let subfolder = if is_video {
+                path.parent()
+                    .and_then(std::path::Path::file_name)
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let output = if is_video {
+                json!({
+                    "videos": [{
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "type": "output"
+                    }]
+                })
+            } else {
+                json!({
+                    "images": [{
+                        "filename": filename,
+                        "subfolder": "",
+                        "type": "output"
+                    }]
+                })
+            };
             vec![
                 json!({
                     "type": "executed",
@@ -161,9 +200,7 @@ fn comfy_messages_for(prompt_id: &str, ev: &WorkerEvent) -> Vec<String> {
                         "node": "save",
                         "display_node": "save",
                         "prompt_id": prompt_id,
-                        "output": {
-                            "images": [ { "filename": filename, "subfolder": "", "type": "output" } ]
-                        }
+                        "output": output
                     }
                 })
                 .to_string(),
@@ -334,6 +371,17 @@ pub async fn get_object_info() -> Response {
             "output": ["MODEL","CLIP"], "output_name": ["MODEL","CLIP"], "name": "LoraLoader", "category": "loaders" },
         "LoraLoaderModelOnly": { "input": { "required": { "model": lk("MODEL"), "lora_name": combo(&loras), "strength_model": fl(1.0,-20.0,20.0) } },
             "output": ["MODEL"], "output_name": ["MODEL"], "name": "LoraLoaderModelOnly", "category": "loaders" },
+        "LTX2LoraLoaderAdvanced": { "input": { "required": {
+                "model": lk("MODEL"),
+                "lora_name": combo(&loras),
+                "strength_model": fl(1.0,-10.0,10.0),
+                "video": fl(1.0,0.0,1.0),
+                "video_to_audio": fl(1.0,0.0,1.0),
+                "audio": fl(1.0,0.0,1.0),
+                "audio_to_video": fl(1.0,0.0,1.0),
+                "other": fl(1.0,0.0,1.0)
+            }, "optional": { "opt_lora_path": lk("STRING") } },
+            "output": ["MODEL","STRING","STRING"], "output_name": ["MODEL","rank","loaded_keys_info"], "name": "LTX2 LoRA Loader Advanced", "category": "KJNodes/ltxv" },
         "CLIPTextEncode": { "input": { "required": { "clip": lk("CLIP"), "text": text_w() } },
             "output": ["CONDITIONING"], "output_name": ["CONDITIONING"], "name": "CLIPTextEncode", "category": "conditioning" },
         "CLIPTextEncodeFlux": { "input": { "required": { "clip": lk("CLIP"), "clip_l": text_w(), "t5xxl": text_w(), "guidance": fl(3.5,0.0,100.0) } },
@@ -390,19 +438,25 @@ pub async fn get_object_info() -> Response {
                 "ltxv_model": lk("MODEL"),
                 "prompt": text_w(),
                 "negative_prompt": text_w(),
-                "width": int(960,960,960),
-                "height": int(544,544,544),
-                "num_frames": int(241,241,241),
-                "steps": int(15,15,15),
-                "cfg": fl(3.0,3.0,3.0),
+                "width": int(768,16,4096),
+                "height": int(512,16,4096),
+                "num_frames": int(97,1,4096),
+                "steps": int(25,1,1000),
+                "cfg": fl(3.0,0.0,100.0),
                 "seed": int(0,0,281474976710655),
-                "frame_rate": int(24,24,24),
-                "stg_scale": fl(1.0,1.0,1.0),
-                "mode": combo(&["distilled".into(),"dev".into()])
+                "frame_rate": int(24,1,240),
+                "stg_scale": fl(1.0,0.0,20.0),
+                "mode": combo(&["distilled".into(),"dev".into()]),
+                "sampler": combo(&["res2s".into(),"euler".into()]),
+                "scheduler": combo(&["ltx2".into(),"ltx2_distilled".into()]),
+                "caps_positive": str_w(),
+                "caps_negative": str_w(),
+                "noise_fixture": str_w(),
+                "include_audio": json!(["BOOLEAN", {"default": false}])
             }, "optional": {
                 "guide_image": lk("IMAGE"),
                 "guide_strength": fl(1.0,0.0,1.0),
-                "guide_frame_idx": int(0,0,240)
+                "guide_frame_idx": int(0,0,4095)
             } },
             "output": ["LATENT","VIDEO","AUDIO"], "output_name": ["LATENT","VIDEO","AUDIO"], "name": "LTXVSampler", "category": "sampling" },
         "SCAIL2Animation": { "input": { "required": {

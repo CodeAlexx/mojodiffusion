@@ -15,10 +15,12 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
+use serenity_wire::WorkerEvent;
 
 use crate::AppState;
 
 const RUNNER: &str = "output/bin/ltx2_video_smoke_runner";
+const LTX2_MOJO_REQUEST_RUNNER: &str = "output/bin/ltx2_serenity_cli";
 const LTX2_CSHIM: &str = "serenitymojo/ops/cshim/lib/libserenity_cudnn_sdpa.so";
 const LTX2_CONTEXT_PYTHON: &str = ".local/share/LTXDesktop/python/bin/python3";
 const LTX2_CONTEXT_SCRIPT: &str = "scripts/ltx2_refhq_contexts.py";
@@ -908,7 +910,9 @@ pub(crate) fn scail2_product_gate_passed() -> bool {
 fn readiness_doc() -> Value {
     let ltx2_runner_ready = runner_available();
     let ltx2_decode_ready = ltx2_decode_runtime_available();
-    let ltx2_ready = ltx2_runner_ready && ltx2_decode_ready;
+    let ltx2_legacy_ready = ltx2_runner_ready && ltx2_decode_ready;
+    let ltx2_request_ready = bin_x(LTX2_MOJO_REQUEST_RUNNER);
+    let ltx2_ready = ltx2_request_ready || ltx2_legacy_ready;
     let ltx2_sampler_parity = ltx2_parity_report_passed(
         LTX2_SAMPLER_PARITY_REPORT,
         "serenity.ltx2.sampler_parity.v1",
@@ -937,12 +941,16 @@ fn readiness_doc() -> Value {
     let scail2_product_accepted = scail2_ready && scail2_product_gate_passed();
     // top-level state reflects whether ANY arm is runnable.
     let any_ready = ltx2_ready || wan22_ready || bernini_ready || scail2_ready;
-    let state = if any_ready {
+    let state = if ltx2_request_ready {
+        "request_runner_ready"
+    } else if any_ready {
         "bounded_smoke_ready"
     } else {
         "runner_missing"
     };
-    let ltx2_status = if ltx2_ready {
+    let ltx2_status = if ltx2_request_ready {
+        "mojo_request_ready"
+    } else if ltx2_legacy_ready {
         "refhq_ready"
     } else if !ltx2_runner_ready {
         "runner_missing"
@@ -995,6 +1003,22 @@ fn readiness_doc() -> Value {
                     "sampler_parity_report": LTX2_SAMPLER_PARITY_REPORT,
                     "vae_parity_report": LTX2_VAE_PARITY_REPORT,
                     "audio_parity_report": LTX2_AUDIO_PARITY_REPORT,
+                },
+                "ltx2_mojo_request": {
+                    "runner": LTX2_MOJO_REQUEST_RUNNER,
+                    "request_schema": "serenity.genparams.v1",
+                    "status_schema": "serenity.ltx2.status.v1",
+                    "result_schema": "serenity.ltx2.result.v1",
+                    "asynchronous": true,
+                    "ui_progress": true,
+                    "authored_fields": [
+                        "prompt", "negative", "width", "height", "frames",
+                        "steps", "seed", "fps", "sampler", "scheduler",
+                        "caps_positive", "caps_negative", "noise_fixture",
+                        "include_audio", "lora"
+                    ],
+                    "requires_authored_conditioning": true,
+                    "available": ltx2_request_ready,
                 },
             },
             "target_fps": 24,
@@ -1088,7 +1112,7 @@ fn readiness_doc() -> Value {
         "schema": "serenity.video_status.v1",
         "endpoint": "/v1/video",
         "state": state,
-        "readiness_label": if any_ready { "bounded_daemon_smoke" } else { "build_required" },
+        "readiness_label": if ltx2_request_ready { "experimental_request_runner_ready" } else if any_ready { "bounded_daemon_smoke" } else { "build_required" },
         "accepted": false,
         "backend": BACKEND_NAME,
         "control_plane": "serenity-server",
@@ -1133,6 +1157,19 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!("unsupported video model '{model}'; use ltx2, wan22, bernini, or scail2"),
         );
+    }
+    let is_ltx2_mojo_request =
+        model == "ltx2" && b.get("runner").and_then(Value::as_str) == Some("ltx2_mojo_request");
+    if is_ltx2_mojo_request {
+        if !bin_x(LTX2_MOJO_REQUEST_RUNNER) {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("missing executable {LTX2_MOJO_REQUEST_RUNNER}"),
+            );
+        }
+        if let Err(error) = validate_ltx2_mojo_request(&b) {
+            return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
+        }
     }
     // Fail closed before taking the GPU lease or evicting an idle image model.
     // A partially installed or non-accepted video arm is not a GPU operation.
@@ -1213,7 +1250,7 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     // work in a subprocess; it must not co-run with a generate/caption/magic
     // job on a 16GB card. Held (RAII) across the whole arm; 409 if busy.
     let gpu_tag = crate::gpu_lock::next_tag("video");
-    let _gpu = match crate::gpu_lock::try_acquire(&st.gpu_owner, "video", &gpu_tag) {
+    let gpu = match crate::gpu_lock::try_acquire(&st.gpu_owner, "video", &gpu_tag) {
         Ok(g) => g,
         Err(cur) => {
             return (
@@ -1249,6 +1286,9 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
             )
         }
     }
+    if is_ltx2_mojo_request {
+        return start_ltx2_mojo_request(&st, &b, gpu);
+    }
     match model.as_str() {
         "ltx2" => post_video_ltx2(&st, &b),
         "wan22" => post_video_wan22(&st, &b),
@@ -1256,6 +1296,283 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
         "scail2" => post_video_scail2(&st, &b),
         _ => unreachable!("video model validated before GPU acquisition"),
     }
+}
+
+fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
+    let required_strings = [
+        "checkpoint",
+        "prompt",
+        "sampler",
+        "scheduler",
+        "caps_positive",
+    ];
+    for key in required_strings {
+        let value = body.get(key).and_then(Value::as_str).unwrap_or("").trim();
+        if value.is_empty() {
+            return Err(format!("LTX2 Mojo request requires non-empty '{key}'"));
+        }
+    }
+    let checkpoint = body["checkpoint"].as_str().unwrap_or("");
+    if checkpoint != LTX2_REFHQ_CHECKPOINT
+        && checkpoint != format!("{LTX2_REFHQ_CHECKPOINT}.safetensors")
+    {
+        return Err(format!(
+            "LTX2 checkpoint '{checkpoint}' is not a compiled request profile; use {LTX2_REFHQ_CHECKPOINT}"
+        ));
+    }
+    for key in ["width", "height", "frames", "steps", "seed"] {
+        if body.get(key).and_then(Value::as_i64).is_none() {
+            return Err(format!("LTX2 Mojo request requires integer '{key}'"));
+        }
+    }
+    if !body.get("fps").map(Value::is_number).unwrap_or(false) {
+        return Err("LTX2 Mojo request requires numeric 'fps'".to_string());
+    }
+    if !body
+        .get("include_audio")
+        .map(Value::is_boolean)
+        .unwrap_or(false)
+    {
+        return Err("LTX2 Mojo request requires boolean 'include_audio'".to_string());
+    }
+    let caps = body["caps_positive"].as_str().unwrap_or("");
+    if !std::path::Path::new(caps).is_file() {
+        return Err(format!("LTX2 conditioning artifact not found: {caps}"));
+    }
+    if let Some(noise) = body.get("noise_fixture").and_then(Value::as_str) {
+        if !noise.is_empty() && !std::path::Path::new(noise).is_file() {
+            return Err(format!("LTX2 noise fixture not found: {noise}"));
+        }
+    }
+    match body.get("lora") {
+        Some(Value::Array(rows)) => {
+            for (index, row) in rows.iter().enumerate() {
+                let Some(obj) = row.as_object() else {
+                    return Err(format!("LTX2 lora[{index}] must be an object"));
+                };
+                let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    return Err(format!("LTX2 lora[{index}].name is required"));
+                }
+                let weight = obj.get("weight").and_then(Value::as_f64).unwrap_or(1.0);
+                if obj.get("weight").is_some_and(|v| !v.is_number()) {
+                    return Err(format!("LTX2 lora[{index}].weight must be numeric"));
+                }
+                if !(-10.0..=10.0).contains(&weight) {
+                    return Err(format!("LTX2 lora[{index}].weight must be in [-10, 10]"));
+                }
+                let Some((path, arch)) = crate::models::lora_path_and_arch(name) else {
+                    return Err(format!(
+                        "LTX2 lora[{index}] not found in the model registry: {name}"
+                    ));
+                };
+                if !path.is_file() {
+                    return Err(format!(
+                        "LTX2 lora[{index}] registry path is missing: {}",
+                        path.display()
+                    ));
+                }
+                if arch != "ltx2" {
+                    return Err(format!(
+                        "LTX2 lora[{index}] '{name}' targets '{arch}', not ltx2"
+                    ));
+                }
+            }
+        }
+        Some(_) => return Err("LTX2 'lora' must be an array".to_string()),
+        None => return Err("LTX2 Mojo request requires the authored 'lora' array".to_string()),
+    }
+    Ok(())
+}
+
+fn start_ltx2_mojo_request(
+    st: &AppState,
+    body: &Value,
+    gpu: crate::gpu_lock::GpuGuard,
+) -> Response {
+    let n = st
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let video_id = format!("video-{n:04}");
+    let out_dir = st.out_dir.join(&video_id);
+    if let Err(error) = std::fs::create_dir_all(&out_dir) {
+        return err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot create LTX2 output directory: {error}"),
+        );
+    }
+    let request_path = out_dir.join("request.json");
+    let request_bytes = match serde_json::to_vec_pretty(body) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return err_detail(
+                StatusCode::BAD_REQUEST,
+                &format!("cannot serialize LTX2 request: {error}"),
+            )
+        }
+    };
+    if let Err(error) = std::fs::write(&request_path, request_bytes) {
+        return err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot write LTX2 request: {error}"),
+        );
+    }
+
+    let bus = st.comfy_ws.clone();
+    let prompt_id = video_id.clone();
+    let thread_video_id = video_id.clone();
+    let thread_out_dir = out_dir.clone();
+    let thread_request_path = request_path.clone();
+    std::thread::spawn(move || {
+        let _gpu = gpu;
+        let publish = |event: WorkerEvent| {
+            let _ = bus.send((thread_video_id.clone(), event));
+        };
+        publish(WorkerEvent::Progress {
+            step: 0,
+            total: 0,
+            phase: "Starting LTX2 Mojo runner".to_string(),
+            preview: String::new(),
+        });
+
+        let log_path = thread_out_dir.join("runner.log");
+        let log = match std::fs::File::create(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                publish(WorkerEvent::Failed {
+                    error: format!("cannot create LTX2 runner log: {error}"),
+                });
+                return;
+            }
+        };
+        let stderr = match log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                publish(WorkerEvent::Failed {
+                    error: format!("cannot clone LTX2 runner log handle: {error}"),
+                });
+                return;
+            }
+        };
+        let mut child = match std::process::Command::new(repo_path(LTX2_MOJO_REQUEST_RUNNER))
+            .current_dir(repo_root())
+            .env("LD_LIBRARY_PATH", mojo_ld_path())
+            .arg(&thread_request_path)
+            .arg(&thread_out_dir)
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                publish(WorkerEvent::Failed {
+                    error: format!("cannot start LTX2 Mojo runner: {error}"),
+                });
+                return;
+            }
+        };
+
+        let status_path = thread_out_dir.join("status.json");
+        let mut last_status = String::new();
+        let exit_status = loop {
+            if let Ok(text) = std::fs::read_to_string(&status_path) {
+                if text != last_status {
+                    if let Ok(status) = serde_json::from_str::<Value>(&text) {
+                        let step = status.get("step").and_then(Value::as_i64).unwrap_or(0);
+                        let total = status.get("total").and_then(Value::as_i64).unwrap_or(0);
+                        let message = status
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| status.get("phase").and_then(Value::as_str))
+                            .unwrap_or("LTX2 running")
+                            .to_string();
+                        publish(WorkerEvent::Progress {
+                            step,
+                            total,
+                            phase: message,
+                            preview: String::new(),
+                        });
+                    }
+                    last_status = text;
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
+                Err(error) => {
+                    publish(WorkerEvent::Failed {
+                        error: format!("cannot monitor LTX2 Mojo runner: {error}"),
+                    });
+                    break None;
+                }
+            }
+        };
+
+        let result_path = thread_out_dir.join("result.json");
+        let result = std::fs::read_to_string(&result_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let succeeded = exit_status
+            .as_ref()
+            .map(std::process::ExitStatus::success)
+            .unwrap_or(false)
+            && result
+                .as_ref()
+                .and_then(|doc| doc.get("state"))
+                .and_then(Value::as_str)
+                == Some("done");
+        if succeeded {
+            let authored = result
+                .as_ref()
+                .and_then(|doc| doc.get("artifact_path"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let artifact = if std::path::Path::new(authored).is_absolute() {
+                std::path::PathBuf::from(authored)
+            } else {
+                repo_root().join(authored)
+            };
+            if artifact.is_file() {
+                publish(WorkerEvent::Done {
+                    output_path: artifact.to_string_lossy().into_owned(),
+                });
+                return;
+            }
+        }
+        let status_error = std::fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|doc| {
+                doc.get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        publish(WorkerEvent::Failed {
+            error: status_error.unwrap_or_else(|| {
+                format!(
+                    "LTX2 Mojo runner failed; inspect {}",
+                    log_path.to_string_lossy()
+                )
+            }),
+        });
+    });
+
+    json_resp(
+        StatusCode::ACCEPTED,
+        &json!({
+            "schema": "serenity.video_job.v1",
+            "video_id": video_id,
+            "prompt_id": prompt_id,
+            "model": "ltx2",
+            "runner": "ltx2_mojo_request",
+            "backend": "mojo",
+            "state": "queued",
+            "status_url": format!("/out/{video_id}/status.json"),
+            "result_url": format!("/out/{video_id}/result.json"),
+            "request_url": format!("/out/{video_id}/request.json"),
+        }),
+    )
 }
 
 /// LTX2 staged-smoke arm (behavior intact from the original handler; adds the
@@ -3075,7 +3392,9 @@ mod tests {
         assert_eq!(d.get("endpoint").unwrap(), "/v1/video");
         // bin_x resolves against the active repo root, so runner presence is
         // machine-dependent (built on the dev boxes, absent on CI).
-        let ltx2_ready = runner_available() && ltx2_decode_runtime_available();
+        let ltx2_request_ready = bin_x(LTX2_MOJO_REQUEST_RUNNER);
+        let ltx2_ready =
+            ltx2_request_ready || (runner_available() && ltx2_decode_runtime_available());
         let wan22_built = wan22_missing().is_empty();
         let bernini_built = bernini_missing().is_empty();
         let scail2_built = scail2_missing().is_empty();
@@ -3105,6 +3424,11 @@ mod tests {
             refhq["conditioning_cache"].get("producer").unwrap(),
             LTX2_CONTEXT_SCRIPT
         );
+        let request_runner = &runners[1]["modes"]["ltx2_mojo_request"];
+        assert_eq!(request_runner["runner"], LTX2_MOJO_REQUEST_RUNNER);
+        assert_eq!(request_runner["asynchronous"], true);
+        assert_eq!(request_runner["ui_progress"], true);
+        assert_eq!(request_runner["available"], ltx2_request_ready);
         assert_eq!(runners[2].get("model").unwrap(), "wan22_t2v");
         if !wan22_built {
             assert_eq!(runners[2].get("status").unwrap(), "prerequisites_missing");
@@ -3202,6 +3526,55 @@ mod tests {
         assert!(paths.decode_dir.join("frame_0.png").is_file());
         assert!(paths.run_dir.join("scail2_denoise.log").is_file());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ltx2_mojo_request_preflight_preserves_ui_owned_profile() {
+        let caps = std::env::temp_dir().join(format!(
+            "serenity-ltx2-ui-caps-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&caps, b"{}").unwrap();
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "prompt": "vrtlEri2 turns toward camera",
+            "sampler": "res2s",
+            "scheduler": "ltx2",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 20,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+        });
+        validate_ltx2_mojo_request(&request).unwrap();
+        let _ = std::fs::remove_file(caps);
+    }
+
+    #[test]
+    fn ltx2_mojo_request_preflight_rejects_missing_conditioning_before_gpu() {
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "prompt": "vrtlEri2 turns toward camera",
+            "sampler": "res2s",
+            "scheduler": "ltx2",
+            "caps_positive": "/definitely/missing/ltx2-conditioning.json",
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 20,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+        });
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("conditioning artifact not found"));
     }
 
     #[test]

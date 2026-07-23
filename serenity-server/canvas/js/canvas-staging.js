@@ -28,12 +28,15 @@ var CanvasStaging = (function () {
     // Partial mask drawing state
     var _partialDrawing = false;
     var _partialLine = null;
+    var _keyboardBound = false;
     // ── Context reference (set when staging activates) ──
     var _ctx = null;
     // ── Core ──
     function activate(results, ctx) {
         if (_state.active)
             deactivate();
+        if (!Array.isArray(results) || results.length === 0 || !ctx)
+            return;
         _ctx = ctx;
         _state.active = true;
         _state.results = results;
@@ -85,6 +88,7 @@ var CanvasStaging = (function () {
         _stagingLayer.add(_stagingLabel);
         showResult(0, ctx);
         showPanel();
+        bindKeyboard();
     }
     function deactivate() {
         _state.active = false;
@@ -119,6 +123,8 @@ var CanvasStaging = (function () {
         }
         _originalSnapshot = null;
         hidePanel();
+        if (typeof CanvasStatusBar !== 'undefined')
+            CanvasStatusBar.updateGenStatus('idle');
         _ctx = null;
     }
     // ── Result Display ──
@@ -197,6 +203,12 @@ var CanvasStaging = (function () {
     }
     // ── Accept / Reject ──
     function accept() {
+        acceptResult(false);
+    }
+    function acceptToNewLayer() {
+        acceptResult(true);
+    }
+    function acceptResult(createNewLayer) {
         if (!_state.active || !_ctx)
             return;
         var result = _state.results[_state.currentIndex];
@@ -207,13 +219,20 @@ var CanvasStaging = (function () {
             acceptPartial(_ctx, result);
         }
         else {
-            // Full accept: place result on active draw layer
-            acceptFull(_ctx, result);
+            acceptFull(_ctx, result, createNewLayer);
         }
     }
-    function acceptFull(ctx, result) {
+    function attachMetadata(layer, result) {
+        if (!layer || !layer.data)
+            return;
+        layer.data.generationMetadata = JSON.parse(JSON.stringify(result.metadata || {}));
+        layer.data.generationMetadata.source = result.src;
+        layer.data.generationMetadata.acceptedAt = new Date().toISOString();
+    }
+    function acceptFull(ctx, result, createNewLayer) {
         if (result.isVideo) {
-            // Video: delegate to existing video overlay handler
+            if (ctx.placeVideoResult)
+                ctx.placeVideoResult(result.src, result.metadata || {});
             deactivate();
             return;
         }
@@ -230,10 +249,14 @@ var CanvasStaging = (function () {
                 draggable: false,
                 listening: false,
             });
-            var activeLayer = ctx.getActiveKonvaLayer();
+            var active = createNewLayer && ctx.createRasterLayer
+                ? ctx.createRasterLayer('Generation ' + new Date().toLocaleTimeString())
+                : ctx.getActiveLayer();
+            var activeLayer = active ? active.konvaLayer : ctx.getActiveKonvaLayer();
             if (activeLayer) {
                 activeLayer.add(kImg);
                 activeLayer.batchDraw();
+                attachMetadata(active || ctx.getActiveLayer(), result);
             }
             ctx.pushHistory();
             deactivate();
@@ -275,6 +298,7 @@ var CanvasStaging = (function () {
                 if (activeLayer) {
                     activeLayer.add(kImg);
                     activeLayer.batchDraw();
+                    attachMetadata(ctx.getActiveLayer(), result);
                 }
                 ctx.pushHistory();
                 deactivate();
@@ -297,6 +321,34 @@ var CanvasStaging = (function () {
         // Dispatch custom event that canvas-tab listens for
         var event = new CustomEvent('sf-staging-regenerate');
         document.dispatchEvent(event);
+    }
+    function bindKeyboard() {
+        if (_keyboardBound)
+            return;
+        _keyboardBound = true;
+        document.addEventListener('keydown', function (event) {
+            if (!_state.active)
+                return;
+            var tag = event.target && event.target.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')
+                return;
+            if (event.key === 'ArrowLeft') {
+                event.preventDefault();
+                prevResult();
+            }
+            else if (event.key === 'ArrowRight') {
+                event.preventDefault();
+                nextResult();
+            }
+            else if (event.key === 'Enter') {
+                event.preventDefault();
+                accept();
+            }
+            else if (event.key === 'Escape') {
+                event.preventDefault();
+                reject();
+            }
+        });
     }
     // ── Compare Mode ──
     function captureOriginal(ctx) {
@@ -420,6 +472,23 @@ var CanvasStaging = (function () {
             '<span class="staging-title">Staging</span>' +
             '<span class="staging-counter">' + current + ' / ' + total + '</span>' +
             '</div>';
+        var metadata = result && result.metadata ? result.metadata : {};
+        var dimensions = metadata.width && metadata.height
+            ? metadata.width + '×' + metadata.height
+            : '';
+        var metaParts = [metadata.model || '', dimensions];
+        if (metadata.frames)
+            metaParts.push(metadata.frames + 'f @ ' + (metadata.fps || '?') + 'fps');
+        if (metadata.steps != null)
+            metaParts.push(metadata.steps + ' steps');
+        if (metadata.seed != null)
+            metaParts.push('seed ' + metadata.seed);
+        var loras = metadata.lora || metadata.loras || [];
+        if (Array.isArray(loras) && loras.length)
+            metaParts.push(loras.length + ' LoRA' + (loras.length === 1 ? '' : 's'));
+        metaParts = metaParts.filter(Boolean);
+        if (metaParts.length)
+            html += '<div class="staging-meta" title="Generation metadata">' + escapeHtml(metaParts.join(' · ')) + '</div>';
         // Video preview
         if (result && result.isVideo) {
             html += '<div class="staging-video-preview">' +
@@ -435,7 +504,8 @@ var CanvasStaging = (function () {
         }
         // Actions
         html += '<div class="staging-actions">' +
-            '<button class="staging-btn staging-accept" id="stg-accept">Accept</button>' +
+            '<button class="staging-btn staging-accept" id="stg-accept" title="Accept onto active layer (Enter)">Accept</button>' +
+            '<button class="staging-btn" id="stg-new-layer" title="Accept onto a new raster layer">New Layer</button>' +
             '<button class="staging-btn staging-reject" id="stg-reject">Reject</button>' +
             '<button class="staging-btn" id="stg-regen" title="Regenerate with new seed">Regenerate</button>' +
             '</div>';
@@ -449,6 +519,7 @@ var CanvasStaging = (function () {
         var prevBtn = document.getElementById('stg-prev');
         var nextBtn = document.getElementById('stg-next');
         var acceptBtn = document.getElementById('stg-accept');
+        var newLayerBtn = document.getElementById('stg-new-layer');
         var rejectBtn = document.getElementById('stg-reject');
         var regenBtn = document.getElementById('stg-regen');
         var compareBtn = document.getElementById('stg-compare');
@@ -459,6 +530,8 @@ var CanvasStaging = (function () {
             nextBtn.addEventListener('click', nextResult);
         if (acceptBtn)
             acceptBtn.addEventListener('click', accept);
+        if (newLayerBtn)
+            newLayerBtn.addEventListener('click', acceptToNewLayer);
         if (rejectBtn)
             rejectBtn.addEventListener('click', reject);
         if (regenBtn)
@@ -467,6 +540,11 @@ var CanvasStaging = (function () {
             compareBtn.addEventListener('click', toggleCompare);
         if (partialBtn)
             partialBtn.addEventListener('click', togglePartialMask);
+    }
+    function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, function (character) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character];
+        });
     }
     // ── Public API ──
     function isActive() { return _state.active; }
@@ -478,6 +556,7 @@ var CanvasStaging = (function () {
         activate: activate,
         deactivate: deactivate,
         accept: accept,
+        acceptToNewLayer: acceptToNewLayer,
         reject: reject,
         regenerate: regenerate,
         nextResult: nextResult,

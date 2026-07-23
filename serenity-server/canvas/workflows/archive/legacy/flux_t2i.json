@@ -1,0 +1,63 @@
+{
+    "version": 1,
+    "prompt": {
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "flux1-dev.safetensors", "weight_dtype": "default"}
+        },
+        "2": {
+            "class_type": "DualCLIPLoader",
+            "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp16.safetensors", "type": "flux"}
+        },
+        "3": {
+            "class_type": "VAELoader",
+            "inputs": {"vae_name": "ae.safetensors"}
+        },
+        "4": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"clip": ["2", 0], "text": "a photograph of an orange cat sitting on a windowsill, natural lighting, detailed fur"}
+        },
+        "5": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"clip": ["2", 0], "text": "low quality, blurry, deformed"}
+        },
+        "6": {
+            "class_type": "EmptySD3LatentImage",
+            "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+        },
+        "7": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["4", 0],
+                "negative": ["5", 0],
+                "latent_image": ["6", 0],
+                "seed": 42,
+                "steps": 20,
+                "cfg": 1.0,
+                "sampler_name": "euler",
+                "scheduler": "simple",
+                "denoise": 1.0
+            }
+        },
+        "8": {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": ["7", 0], "vae": ["3", 0]}
+        },
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {"images": ["8", 0], "filename_prefix": "SerenityFlow"}
+        }
+    },
+    "nodes": {
+        "1": {"pos": [100, 100]},
+        "2": {"pos": [100, 300]},
+        "3": {"pos": [100, 500]},
+        "4": {"pos": [450, 200]},
+        "5": {"pos": [450, 400]},
+        "6": {"pos": [450, 600]},
+        "7": {"pos": [800, 350]},
+        "8": {"pos": [1150, 350]},
+        "9": {"pos": [1500, 350]}
+    }
+}

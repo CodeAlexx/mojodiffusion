@@ -44,6 +44,31 @@ fn err(code: StatusCode, msg: &str) -> Response {
     (code, axum::Json(json!({ "error": msg }))).into_response()
 }
 
+/// The generation lease excludes an active image job, but an idle Mojo worker
+/// can still retain almost the entire GPU (Krea2 measures about 20 GiB after a
+/// 1024px render). Reap it before the one-shot vision model starts so automatic
+/// Canvas captioning does not fail with an empty CUDA/OOM error.
+fn evict_idle_image_worker(st: &AppState) -> Result<(), Response> {
+    let (evict_tx, evict_rx) = std::sync::mpsc::channel();
+    if st.ctl.send(crate::DriverCtl::EvictIdle(evict_tx)).is_err() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "image worker driver unavailable before captioning",
+        ));
+    }
+    match evict_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(err(
+            StatusCode::CONFLICT,
+            "image worker became active before captioning",
+        )),
+        Err(_) => Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "timed out evicting idle image worker before captioning",
+        )),
+    }
+}
+
 /// Validate an image path against the server output and optional dataset root.
 fn validate_image_path(p: &str, out_dir: &Path) -> Result<(), String> {
     if p.is_empty() {
@@ -125,6 +150,9 @@ pub async fn post_caption(State(st): State<AppState>, body: String) -> Response 
                 .into_response()
         }
     };
+    if let Err(response) = evict_idle_image_worker(&st) {
+        return response;
+    }
 
     let prompt = v["prompt"]
         .as_str()
@@ -159,7 +187,8 @@ pub async fn post_caption(State(st): State<AppState>, body: String) -> Response 
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!(
-                "caption failed: {}",
+                "caption failed ({}): {}",
+                out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
         );

@@ -163,3 +163,53 @@ fail-loud at context load; auto-mask SUPPRESSES global restyles by design
 contract. New gotcha for future flat keys: the server's GenerateRequest
 middleman silently drops undeclared lowered keys — declare in wire+codec+
 GenerateRequest+params_from_generate_request or the worker never sees them.
+
+### Web production update (2026-07-21)
+
+Krea2FlowEdit now dispatches both Raw and Turbo at compiled 512² and 1024²
+shapes. Turbo uses a visible, editable 8-step profile with source/target CFG
+zero; `_velocity_shape` returns the conditional velocity directly at CFG zero,
+so each active FlowEdit step performs the required source and target forwards
+without two unused unconditional forwards. The corrected 1024² Turbo path
+measured 74.53s warm-cache versus 362.6s for the prior Raw-like schedule and
+produced a visually coherent full-frame style edit. A cold file-cache/model
+switch measured 138.35s and is not represented as warm performance.
+
+The serving backend now keeps a keyed last-request cache for all four context
+bins, the normalized source latent, and the matching int8 DiT. Exact 1024²
+Regenerate measured 52.56s inside Mojo / 57s through the HTTP lifecycle with
+text encode at 0.00003s, source-latent restore at 0.018s cumulative, and DiT
+reuse at 0.001s. A changed target prompt drops the 20.7 GiB DiT before starting
+the text encoder, then rebuilds it after conditioning; the measured warm-file
+case remained safe and finished in 59.19s Mojo / 62s HTTP. A source, prompt,
+Raw/Turbo checkpoint, or resident-block-profile change cannot reuse an
+incompatible base.
+
+The Canvas style workspace defaults Entire image on (`auto_mask=false`) because
+the localization mask intentionally suppresses global restyles. SAM3 requests
+use the Rust `/canvas/sam3/prepare` control-plane handshake before calling the
+isolated mask service, preventing a resident 20+ GiB Krea2 worker from causing
+an accessory-model OOM. Z-Image retains its Mojo-owned DiT/VAE state between
+jobs: warm img2img and masked inpaint measured 1.60s and 4.22s end-to-end.
+
+Canvas now exposes this work through one `Masked Edit - LanPaint` screen. Krea2
+Raw/Turbo and the bounded Z-Image Base masked route are selectable only when
+their live capability and local-model gates pass. The same selector inventories
+the other upstream LanPaint model families as disabled entries. For model
+families whose existing text/loader/VAE graph is reusable,
+`WorkflowBuilder.buildLanPaintCandidate` preserves those model-specific nodes
+and the LoRA chain and replaces only the latent tail with source encode, mask
+extraction, `SetLatentNoiseMask`, `LanPaint_KSamplerAdvanced`, decode, and final
+blend. These candidate graphs remain blocked by `/v1/preflight` until that
+family has a real Mojo mask sampler; models absent on this machine are not
+downloaded. The runtime handoff matrix is
+`docs/SERENITY_LANPAINT_MODEL_MATRIX_2026-07-22.md`.
+
+The 5080 branch also added pure-Mojo MageFlow instruction editing in
+`pipeline/mageflow_edit_pipeline.mojo`. It uses Qwen3-VL image/text
+conditioning, MageVAE source encode, clean-reference token concatenation beside
+a pure-noise target, target-only four-step Euler updates, and aspect-preserving
+decode. Its recorded reference/final latent cosines are 0.99979/0.99934 and the
+render was visually matched to the oracle. This is a direct pipeline and parity
+surface only; it is not yet a Canvas engine or Serenity worker, so the web UI
+must continue to fail closed rather than aliasing it to FlowEdit or LanPaint.

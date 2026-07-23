@@ -432,6 +432,15 @@ struct TrainConfig(Copyable, Movable):
     # (valid at any LTMAX/bucket). Set false to always re-quantize.
     var fp8_cache: Bool
 
+    # ── 16GB residency refit (P6 wave 2, 2026-07-22): optional cap on how many
+    # transformer blocks the driver pins device-resident (config key
+    # `resident_blocks`, mirrors the ltx2_av --resident_blocks flag semantics).
+    # -1 (default / key absent) = the driver's own comptime residency budget
+    # (unchanged 24GB-box behavior). >=0 = pin AT MOST this many blocks in plan
+    # order (0 = pin nothing, stream everything). Residency knob ONLY — pinned
+    # bytes are byte-identical to streamed bytes (no numerics change).
+    var resident_blocks: Int
+
     # ── LTX2 IC-LoRA / v2v (P5 (d)); all default-OFF -> C13 byte-identical ──────
     var ic_lora_strategy: String        # "auto"|"none"|"v2v"|"audio_ref_only_ic" (musubi IC_LORA_STRATEGIES)
     var reference_downscale: Int        # >=1, default 1 (integer ref position multiplier)
@@ -487,6 +496,47 @@ struct TrainConfig(Copyable, Movable):
     var controlnet_layers: Int
     var controlnet_scale: Float64
     var controlnet_checkpoint: String
+
+    # ── P3 wan21/wan22 config-first keys (2026-07-22 env-retire) ────────────
+    # These promote the formerly env-only WAN21_*/WAN22_* knobs to config keys
+    # so runs reproduce from the config file alone. The env vars REMAIN as
+    # overrides (env wins ONLY when set — back-compat with the smoke scripts).
+    # dit_high_noise: wan22 high-noise expert ckpt ("" = low_noise→high_noise
+    #   filename convention). Env override: WAN22_DIT_HIGH_NOISE.
+    # dual_expert: -1 = auto (dual iff the high ckpt exists — today's default),
+    #   0 = force off, 1 = on (still requires the high ckpt on disk).
+    #   Env override: WAN22_DUAL_EXPERT.
+    # wan_i2v: wan22 I2V-A14B 36-ch arm (JSON key "i2v"). Env: WAN22_I2V.
+    # wan_variant: "" = wan22 (default) | "t2v_1.3b" | "t2v_14b" selects the
+    #   Wan2.1 single-expert arm. Env override: WAN21_MODEL.
+    # timestep_boundary: dual-expert split point; <=0 sentinel = unset → the
+    #   per-mode default (0.875 T2V / 0.900 I2V). Env: WAN22_TIMESTEP_BOUNDARY.
+    var dit_high_noise: String
+    var dual_expert: Int
+    var wan_i2v: Bool
+    var wan_variant: String
+    var timestep_boundary: Float32
+
+    # ── RESUME (config-first; the webui overrides emit resume_state +
+    #   start_step — per-backend argv pairs remain the legacy route) ─────────
+    # resume_state: checkpoint to resume from — a `.state` sidecar (FULL: A/B
+    #   + AdamW moments) or a PEFT .safetensors whose `.state` sibling is
+    #   resolved via trainer_resolve_resume_path. "" (default) = fresh run.
+    # start_step: GLOBAL optimizer-step count already completed (loop runs
+    #   [start_step, max_steps)). -1 (default) = derive from the resume
+    #   artifact filename `_step{N}` when present, else 0.
+    # warm_resume: True = A/B-only load (AdamW moments ZEROED — the loud
+    #   trainer_warn_warm_resume banner; trajectory differs from an
+    #   uninterrupted run).
+    var resume_state: String
+    var start_step: Int
+    var warm_resume: Bool
+    # train_timestep_shift: shift applied to the TRAINING sigma draw only
+    #   (sample_timestep_logit_normal). -1 (default) = use timestep_shift
+    #   (legacy coupling). Decoupled 2026-07-22 for the mageflow sigma-
+    #   distribution experiment: inference/sampling schedules keep
+    #   timestep_shift; this key moves only where training density lands.
+    var train_timestep_shift: Float32
 
     def n_layers(self) -> Int:
         """Total block count (back-compat convenience)."""
@@ -763,6 +813,7 @@ struct TrainConfig(Copyable, Movable):
         text_encoder_2_dropout_prob: Float32 = Float32(0.0),  # reference trainer SDXL TE2 dropout
         save_max_keep: Int = 0,                               # rolling retention (0 = keep all)
         fp8_cache: Bool = True,                               # fp8-resident disk sidecar (default on)
+        resident_blocks: Int = -1,                            # 16GB refit residency cap (-1 = driver default)
         var ic_lora_strategy: String = String("auto"),        # LTX2 v2v (P5 (d)) — all default-off
         reference_downscale: Int = 1,
         first_frame_conditioning_p: Float32 = Float32(0.0),
@@ -798,6 +849,15 @@ struct TrainConfig(Copyable, Movable):
         audio_ref_use_negative_positions: Bool = False,
         audio_ref_mask_cross_attention_to_reference: Bool = False,
         audio_ref_mask_reference_from_text_attention: Bool = False,
+        var dit_high_noise: String = String(""),   # P3 wan/mageflow env-retire —
+        dual_expert: Int = -1,                     # all defaults reproduce the
+        wan_i2v: Bool = False,                     # pre-P3 env-unset behavior
+        var wan_variant: String = String(""),
+        timestep_boundary: Float32 = Float32(-1.0),
+        var resume_state: String = String(""),     # "" = fresh run
+        start_step: Int = -1,                      # -1 = derive from _step{N}
+        warm_resume: Bool = False,                 # True = A/B only, moments 0
+        train_timestep_shift: Float32 = -1.0,      # -1 = use timestep_shift
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -985,6 +1045,7 @@ struct TrainConfig(Copyable, Movable):
         self.lokr_targets = lokr_targets
         self.init_lokr_norm = init_lokr_norm
         self.fp8_cache = fp8_cache
+        self.resident_blocks = resident_blocks
         self.ic_lora_strategy = ic_lora_strategy^
         self.reference_downscale = reference_downscale
         self.first_frame_conditioning_p = first_frame_conditioning_p
@@ -1020,6 +1081,15 @@ struct TrainConfig(Copyable, Movable):
         self.audio_ref_use_negative_positions = audio_ref_use_negative_positions
         self.audio_ref_mask_cross_attention_to_reference = audio_ref_mask_cross_attention_to_reference
         self.audio_ref_mask_reference_from_text_attention = audio_ref_mask_reference_from_text_attention
+        self.dit_high_noise = dit_high_noise^
+        self.dual_expert = dual_expert
+        self.wan_i2v = wan_i2v
+        self.wan_variant = wan_variant^
+        self.timestep_boundary = timestep_boundary
+        self.resume_state = resume_state^
+        self.start_step = start_step
+        self.warm_resume = warm_resume
+        self.train_timestep_shift = train_timestep_shift
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA

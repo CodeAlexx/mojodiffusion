@@ -137,6 +137,8 @@ def _empty_lora() -> WanBlockLora:
         Optional[LoraAdapter](),
         Optional[LoraAdapter](),
         Optional[LoraAdapter](),
+        Optional[LoraAdapter](),   # ffn.0
+        Optional[LoraAdapter](),   # ffn.2
     )
 
 

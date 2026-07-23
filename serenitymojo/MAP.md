@@ -94,8 +94,8 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/text_encoder/ideogram_qwen3vl.mojo` | `load_ideogram_qwen3vl` / `encode_ideogram_taps`: Ideogram-4 Qwen3-VL text path (reuses `Qwen3Encoder`; θ=5e6, fp8 load, 13-tap concat → [1,L,53248]). | ✅ 13-tap cos 0.99998625 |
 | `serve/serenity_daemon.mojo` | localhost SerenityUI HTTP/WebSocket daemon: `/v1/generate`, jobs/progress, gallery, model browser, sampler registry, workflow, presets/state, and route dispatch for `/v1/video`. | ✅ product gates |
 | `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
-| `sampling/ltx2_request_cli.mojo` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt/conditioning sidecars, resolves every requested LoRA and scale, preserves an exact request copy, then calls only an exact admitted compiled video profile. Emits atomic `status.json` and consumes no Python or Rust product runtime. | 🟠 experimental; 768x512 97f LoRA artifact gate passed |
-| `pipeline/ltx2_t2v_av_hq.mojo` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. The request path admits exact 768x512 25f/97f geometry, distilled-Euler or res2s scheduling, runtime seed/FPS/steps/conditioning/audio, and an arbitrary trained-LoRA overlay list; unsupported values fail before model load. Writes atomic progress and result manifests with timings, output geometry, frame count, duration, dtype contract, and sampled peak VRAM. | 🟠 request route experimental; 97f video-only gate passed |
+| `sampling/ltx2_request_cli.mojo` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and pre/post-connector conditioning sidecars, resolves every requested LoRA and scale, preserves an exact request copy, then calls only an exact admitted compiled video profile. Emits atomic `status.json` and consumes no Python or Rust product runtime. | 🟠 experimental; 512x768 121f step-3000 LoRA artifact visually accepted |
+| `pipeline/ltx2_t2v_av_hq.mojo` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. The admitted HQ request path consumes runtime seed/FPS/steps/conditioning/audio/LoRA selection and fail-loud validates its compiled 512x768, 121-frame, 20-step res2s/ltx2 profile before model load. Writes atomic progress and result manifests with timings, output geometry, frame count, duration, dtype contract, and sampled peak VRAM. | 🟠 experimental; visually accepted 121f video-only gate: 489.06s, 16,555 MiB peak |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
 | `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder` + `load_ideogram4_vae_decoder` (AutoencoderKLFlux2, latent_ch 32, scale 1/shift 0, has_pqc). | ✅ Flux2 decode cos 0.99995 |
@@ -2593,6 +2593,137 @@ work itself lives in the serenity-trainer + serenity-server trees).
   truthing. Worker families (capabilities.rs): zimage/qwenimage/ideogram4/
   sdxl/anima/sd3/flux/flux2→klein/sensenova; LoRA validated per family
   (lora_limit_for_family, capabilities.rs:400).
+- **SerenityFlow curated templates restored on :7811 (2026-07-20)**: the web
+  server ships verified workflows from `serenity-server/canvas/workflows/*.json`
+  and `/templates` merges those built-ins with user templates from
+  `<out-dir>/templates` (a user file of the same name wins). Legacy compatibility
+  workflows remain preserved under `canvas/workflows/archive/legacy/`, outside
+  the active menu. The active endpoint intentionally exposes the verified
+  `ltx2_dev_t2v_lora` workflow plus saved user templates; the small model-aware
+  fallback catalog remains available. Playwright verified console-clean loading
+  of `ltx2_dev_t2v_lora` as the landscape graph
+  `LTXVLoader -> LoraLoaderModelOnly -> LTXVSampler -> SaveVideo`. LTXVSampler's
+  object-info ranges are editable rather than min=max clamps, so authored
+  512x768 / 121-frame / 20-step / 25-fps values survive template loading. The
+  Generate path now dispatches that graph asynchronously to the pure-Mojo
+  `output/bin/ltx2_serenity_cli` request runner, preserving sampler, scheduler,
+  conditioning/noise artifacts, and connected LoRA rows rather than substituting
+  the old `ltx2_refhq` route. Playwright drove the real step-3000 template through
+  all 23 visible stages to `video-0019/ltx2_t2v_hq.mp4`: 121 H.264 frames at
+  512x768/25 fps, 554.58 s wall, 16,487.88 MiB sampled peak, console-clean UI,
+  live header phase/step text, and automatic video preview.
+- **Serenity web Canvas Invoke-parity and editing slice accepted (2026-07-20)**:
+  `serenity-server/canvas/` now uses a responsive three-panel landscape
+  workspace, typed entity/context actions, transform and lock-transparency
+  paint, modern shapes/gradient/lasso tools, v3 project round trips, staging,
+  a board-filtered gallery, and capability-driven fail-loud generation.
+  Edit modes now split the center into equal source/result panes and load source
+  images/videos through the native browser file picker. Krea2/Ideogram4 FlowEdit
+  graphs preserve all visible edit controls; Z-Image admits its bounded
+  init-image and `SetLatentNoiseMask` route, and Krea2 Raw/Turbo now admits the
+  complete Mojo-native damped LanPaint image sampler at exactly 1024x1024.
+  DynaEdit web execution remains fail-loud. The official `facebook/sam3` Transformers
+  model is dependency-isolated under `~/.serenity`, served by the idle-unloading
+  `serenity-sam3.service`, and enabled only while `/canvas/sam3/status` can reach
+  it. Every browser SAM inference now first calls `/canvas/sam3/prepare`, which
+  reaps an idle image worker and returns a visible conflict instead of racing an
+  active generation. This released a measured 20,608 MiB Krea2 worker before
+  SAM returned ten masks in 1.82s. Text, labeled-click, and exemplar masks were GPU-tested and the resulting
+  mask PNG visually inspected. Z-Image `job-0025` then consumed that mask through
+  explicit red-channel extraction: 1718/4096 latent pixels were preserved, the
+  masked region changed, the unmasked scene stayed anchored, and both worker and
+  server result manifests were written.
+  Reference Images Method=Style now opens the dedicated three-panel edit sheet:
+  current Canvas source at upper left, selected style at lower left, and a larger
+  1024x1024 result Canvas at right. A single pure-Mojo Qwen3-VL caption pass over
+  the paired analysis sheet supplies source/style descriptions to the selected
+  Krea2 Raw, Krea2 Turbo, or Ideogram4 FlowEdit graph; the style ref is explicitly excluded
+  from IP-Adapter injection. The Krea2 worker now dispatches both compiled
+  512x512 and 1024x1024 FlowEdit geometry and pads each of the four independent
+  Qwen contexts to a 256-token shared bucket. Playwright verified the layout and
+  Krea2 Raw 1024 request; real preflight found all local Krea2/Ideogram4
+  artifacts, and the rebuilt `qwen3vl_caption` binary completed a real GPU
+  `/v1/caption` request. Krea2 Turbo is now an explicit FlowEdit engine rather
+  than silently falling back to Raw: the UI selects an editable 8-step,
+  CFG-zero profile and the Mojo velocity path skips unused unconditional
+  forwards. The old Raw-like Turbo `job-0114` took ~362.6s and fragmented its
+  automatic mask; corrected `job-0115` took 74.53s total / 43.96s denoise and
+  corrected `job-0126` was visually coherent. A fully cold switch remains
+  138.35s. The worker now retains keyed FlowEdit context bins, source latent,
+  and matching int8 DiT: exact 1024x1024 Regenerate `job-0142` hit all three and
+  measured 52.56s Mojo / 57s HTTP. Changed-prompt `job-0143` released the 20.7
+  GiB DiT before the TE, reused only the source latent, rebuilt safely, and
+  measured 59.19s Mojo / 62s HTTP. Both outputs were visually inspected as
+  coherent full-frame watercolor edits. Nsight CUDA captures were produced,
+  but the installed 2023.4.4
+  importer hit the already-recorded `Wrong event order` failure. Real Raw acceptance job
+  `job-0054` completed the 28-step 1024x1024 user-style edit and preserved the
+  source subject, crossed-arm pose, dress, composition, and apartment while
+  applying the reference's anime linework and neon pink/cyan treatment. The
+  lower style-reference header now has an Entire image checkbox; it disables
+  the automatic change mask when checked; full-image is now the checked default.
+  The worker also emits per-step progress from inside the blocking FlowEdit
+  loop; `job-0058` exposed 1/4, 3/4, and 4/4 through the live job endpoint before
+  completion.
+  Z-Image's Rust control-plane per-job recycle was also removed because it
+  contradicted the Mojo backend's resident DiT/VAE lifecycle. Warm img2img
+  `job-0124` completed in 1.60s end-to-end and masked inpaint `job-0125` in
+  4.22s while preserving 1718/4096 latent mask pixels; SD3 still recycles. The
+  SAM-specific handshake preserves this measured-safe Z-Image worker: PID
+  462913 remained resident through SAM, then 16-step `job-0133` finished in
+  7.08s end-to-end.
+  Canvas now names this mode `Masked Edit - LanPaint` and reuses one
+  capability-filtered source/result/mask workspace across the admitted engines:
+  Krea2 Turbo 1024, Krea2 Raw 1024, and canonical Z-Image Base 1024. Selecting
+  an engine synchronizes the actual registered model and visible sampling
+  profile; the UI does not offer the registry-only Z-Image Turbo card as a
+  distinct engine because the current resident worker loads Base. Krea2 exposes
+  outer/inner steps, lambda, step size, beta, friction, prompt mode, early stop,
+  threshold, patience, blend overlap, and one optional compatible LoRA without
+  a hidden runner profile. Z-Image hides the inapplicable damped-inner-loop
+  controls while keeping its 4-step, CFG 1, denoise 0.65 masked path and shared
+  LoRA loader visible. The same selector inventories the upstream LanPaint
+  families as disabled entries. `WorkflowBuilder.buildLanPaintCandidate`
+  prepares the common source-encode, mask, damped-sampler, decode, and blend
+  tail for graph-ready image families while preserving their loaders,
+  conditioning, VAE, and LoRA chain. This does not weaken the gate: a family
+  remains disabled until a matching local model and its Mojo worker admit the
+  mask contract through `/v1/capabilities`. Missing weights are intentionally
+  left for the other machine; see
+  `docs/SERENITY_LANPAINT_MODEL_MATRIX_2026-07-22.md`. Future backends join the
+  same screen through the frontend engine registry plus `/v1/capabilities`, not
+  a copied Canvas implementation. Source and
+  mask export now neutralizes the Canvas viewport transform, so fit/pan/zoom
+  cannot shrink either upload into a black 1024px frame. Real Krea2 Turbo
+  FP8 acceptance `job-0215` completed all 8 outer steps with 5 damped inner
+  steps, decoded and feather-blended a 1024x1024 result, and was visually
+  inspected against the official LanPaint/Comfy oracle: the requested red glove
+  changed while the martini glass, lemon, drawings, and white background
+  remained anchored. It measured 347.971s total. The production worker now
+  consumes the existing Krea2 int8 sidecar as 20 resident plus 8 pinned-host
+  blocks, eliminating the 14-block BF16 disk reload on every one of the 43 DiT
+  evaluations. Real `job-0235` measured 152.572s inside the Mojo LanPaint
+  backend after a cold sidecar read; immediate rerun `job-0236` measured 66.859s
+  in that backend and about 110.6s request wall time because it still repeated
+  text encoding and base reconstruction. The worker now retains keyed prompt
+  bins, normalized source/blend pixels, and the matching int8 base across an
+  unchanged LanPaint Regenerate. Real first request `job-0240` measured 69.948s
+  inside Mojo and about 82.35s wall; identical cached `job-0241` showed all
+  three cache hits, reduced source/mask preparation to 0.225s, measured 58.986s
+  inside Mojo and about 60.76s wall, and produced the same SHA-256 as
+  `job-0235`, `job-0236`, and `job-0240`. All optimized artifacts were visually
+  inspected. The int8 result is sharp and follows the authored red-glove/cartoon
+  prompt, but it is not trajectory-equivalent to the accepted FP8/oracle image;
+  explicit int8 visual acceptance therefore remains the production parity gate.
+  Canvas dynamically hydrates `ltx2_dev_t2v_lora`, preserves the exact
+  512x768/121f/20-step/25-fps/seed-42 Res2S request, and routes it through the
+  pure-Mojo `ltx2_serenity_cli`; Rust remains only the web control plane and
+  pre-GPU registry validator. The step-3000 LoRA artifact `video-0020` and the
+  Canvas-submitted zero-trained-adapter base `video-0023` are valid 121-frame
+  H.264 movies with different SHA-256 hashes and visibly different decoded
+  trajectories. The live Playwright parity gate is
+  `scripts/check_serenity_canvas_invoke_parity.js`; the static admission gate is
+  `scripts/check_canvas_preflight_submit_contract.py`.
 - **Worker binaries**: output/bin has ZERO serenity_worker_* (the pre-split
   clone has 11). serve/ worker SOURCES are in the live tree via 3c2c8e4
   (07-10 unified cross-arch). Rebuild-on-demand, zimage first (freshest port).
@@ -2694,3 +2825,146 @@ work itself lives in the serenity-trainer + serenity-server trees).
   after later picker changes. The Playwright contract covers 17 discovered
   models and 13 templates, the three video backends, exact fixed profiles,
   request routing, gallery identity/scrolling, and zero browser errors.
+
+## 2026-07-21: Wan 2.2 + Wan 2.1 LoRA TRAINERS — all verticals RUN on real weights (Musubi-parity, 5080)
+
+Supersedes the "wan22 trainer blocked on data" note (2026-07-08): the 14B A14B
+weights were downloaded and all Wan LoRA trainers now run + are parity-certified
+against the **Musubi Tuner** oracle (`/home/alex/musubi-tuner`, not diffusers).
+NOTE: Musubi trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
+
+- **Entry point**: `training/train_wan22_real.mojo` — one loop, env-selected variant:
+  default = Wan2.2 T2V-A14B; `WAN22_I2V=1` = Wan2.2 I2V-A14B (36-ch);
+  `WAN21_MODEL=t2v_1.3b|t2v_14b` = Wan2.1 T2V; `WAN21_I2V=1` = Wan2.1 I2V-14B (CLIP).
+  Flow-match `x_t=(1-t)x0+t·noise`, target=`noise-x0`, MSE (musubi recipe cited).
+  Compile needs `-Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda` (offload loader).
+- **Dual high/low-noise expert** (Wan2.2 A14B): two resident bases + two streamed
+  loaders, per-step `use_high = t >= boundary` (T2V 0.875 / I2V 0.900); ONE shared
+  LoRA (musubi swaps base under the network). Env: `WAN22_DIT_HIGH_NOISE`,
+  `WAN22_TIMESTEP_BOUNDARY`, `WAN22_DUAL_EXPERT`. Peak VRAM ~5.9G streamed.
+- **`models/wan22/wan22_block.mojo`**: FFN LoRA added (10 targets: attn q/k/v/o×2 +
+  ffn.0/ffn.2). `wan22_i2v_block_lora_forward/backward[H,Dh,S,TXT,IMG]` = Wan2.1
+  `WanI2VCrossAttention` (k_img/v_img + norm_k_img; text-SDPA + img-SDPA share q,
+  ADD before o) — 12 targets. Certified vs musubi WanAttentionBlock cos≥0.999.
+- **`models/wan22/wan22_stack_lora.mojo`**: `wan22_i2v_stack_lora_{forward,backward}_offload`
+  (i2v block per layer, frozen context threaded once, 12/block LoRA); `Wan22I2VLoraSet`.
+  **LoRA save = ai-toolkit/ComfyUI format**: `_wan22_lora_prefixes` emits
+  `diffusion_model.blocks.N.<mod>.lora_A/lora_B.weight` (+ k_img/v_img for i2v-2.1).
+- **`models/wan22/weights.mojo`**: runtime patch_embed (in_dim 16/36 → 64/144 packed);
+  `detect_wan22_prefix` auto-detects bare (2.2, 2.1-14B) vs `model.diffusion_model.`
+  (2.1-1.3B) checkpoint keys; MLPProj (`img_emb.proj.{0,1,3,4}`) resident for i2v-2.1.
+- **`offload/wan22_plan.mojo`**: `prefix` param + `build_wan21_i2v_block_plan` (streams
+  cross_attn.{k_img,v_img,norm_k_img}). **`ops/activations.mojo`**: `gelu_exact` (erf)
+  for the CLIP MLPProj (musubi nn.GELU() default; NOT the ffn tanh-gelu).
+- **Data cache**: `models/wan22/parity/wan22_build_data_cache.py` (Musubi WanVAE 16-ch
+  + umt5; `--i2v` adds cond_y[20], `--i2v21` adds CLIP `clip[257,1280]` via the
+  onlyvisual xlm-roberta-vit-h-14). Mojo readers in the trainer patchify via patchify3d.
+- **Parity gates**: `models/wan22/parity/wan22_block_lora_{musubi_oracle.py,parity_musubi.mojo}`
+  (10-target T2V/2.2) + `wan22_i2v21_block_lora_{musubi_oracle.py,parity.mojo}`
+  (12-target i2v-2.1). Both PASS cos≥0.999. Oracle `.bin` dumps gitignored.
+- **Verified real-weight smokes** (own-gate): T2V-A14B (dual, 400 ad), I2V-A14B (dual@0.900,
+  400 ad), T2V-1.3B (300 ad, ~12s/step), T2V-14B (400 ad), I2V-14B-CLIP (480 ad).
+  All finite loss, LoRA saved diffusion_model.-prefixed. Perf ~106-144s/step (14B
+  streamed) — a lever, not correctness. `configs/wan22_{real_smoke_2step,dual_smoke_4step}.json`.
+- **Save↔load closed**: these ai-toolkit-format saves load back through the inference
+  loader `lora.mojo` `FMT_DIFFUSION_MODEL` with NO conversion (`_map_diffusion_model`
+  strips `diffusion_model.`). No Wan *inference* pipeline wires `LoraSet` yet — the
+  files are loadable but the Wan inference apply path is a follow-up.
+
+## 2026-07-21: LoRA LOADER (`lora.mojo`) — 5-format detect + LTX2LoraLoaderAdvanced per-stream
+
+The inference LoRA loader `serenitymojo/lora.mojo` (`LoraSet`) is the single
+merge-at-load / at-dequant apply path (INFERENCE-only; `training/lora_save.mojo` is
+its inverse). Auto-detects 5 key formats (`_detect_format`, `lora.mojo:192-237`):
+`FMT_KOHYA_SDXL`, `FMT_LTX2_DISTILLED` (AV cross-modal families, matched first),
+**`FMT_DIFFUSION_MODEL`** (`diffusion_model.<mod>.lora_A/lora_B.weight` = ai-toolkit/
+ComfyUI = what the Wan/Klein/LTX2 trainers save), `FMT_ZIMAGE_TRAINER`,
+`FMT_KLEIN_TRAINER` (split→fused QKV). Scale `(alpha/rank)·multiplier`; absent
+`.alpha` ⇒ `scale=multiplier`. Resident `merge_into*` SKIPS unmatched base keys
+(not fail-loud); LTX-2 at-dequant hooks (`apply_to_av_block`,
+`attach_ltx2_block_factors*`, `accumulate_ltx2_block_deltas*`, `apply_to_globals*`)
+ARE fail-closed. **KJNodes `LTX2LoraLoaderAdvanced`** (commit `4706f99`):
+`LoraStreamMults` = five per-stream strengths `video/video_to_audio/audio/
+audio_to_video/other`, `0.0`=drop; via env `LTX2_TRAINED_LORA_STREAMS_{i}`, the
+`ltx2_request_cli` per-row fields, and the Rust serve `LTX2LoraLoaderAdvanced` node
+(`serve/workflow_graph.mojo` + `graph/execute.rs`, category `KJNodes/ltxv`). Callers:
+Klein (`validation_sampler`), krea2 (`krea2_pipeline --lora`), LTX-2 runtime.
+Full API: `docs/MOJO_MODULES.md` "LoRA — lora.mojo" + `docs/SERENITYMOJO_MODULES.md`.
+
+## 2026-07-22: MageFlow pure-Mojo T2I + aspect-preserving image edit (5080 sync)
+
+- `models/dit/mageflow_dit.mojo` ports the Qwen-Image-family 12-block DiT with
+  image-only multi-axis RoPE. Component gates recorded block cosine 0.99999 and
+  full velocity cosine 0.99898.
+- `models/text_encoder/mageflow_qwen3vl.mojo` adds T2I post-norm context and
+  Qwen3-VL vision/deepstack edit conditioning. The recorded text/edit context
+  gates are 0.9998 and 0.99998.
+- `models/vae/mageflow_vae.mojo` supplies deterministic one-step encode and
+  decode and now supports non-square aspect-preserving shapes. Encode mean
+  cosine is 0.99999976; the square decode regression gate remains 1.0.
+- `pipeline/mageflow_pipeline.mojo` is the sequentially offloaded four-step
+  Turbo T2I capstone (recorded final-latent cosine 0.9942, visually matched).
+  `pipeline/mageflow_edit_pipeline.mojo` encodes the source as clean reference
+  tokens, concatenates them after pure-noise target tokens, steps the target
+  only, and decodes at the source aspect ratio (reference/final latent cosines
+  0.99979/0.99934, visually matched).
+- This sync adds Mojo pipelines and parity surfaces only. There is no server
+  worker, capability profile, model card, or Canvas engine yet; product routing
+  stays fail-closed until those surfaces and lifecycle gates are implemented.
+
+## 2026-07-22: MageFlow LoRA TRAINER — Base-targeted, block backward = qwenimage reuse (5080)
+
+LoRA-only training for Mage-Flow (trains on **Mage-Flow-Base**; full repo at
+`~/.serenity/models/checkpoints/Mage-Flow-Base`). The block backward is PURE
+REUSE: `models/qwenimage/qwenimage_block.mojo::double_block_lora_forward/backward`
+is byte-for-byte MageFlow's block; the text-not-roped delta is carried by the
+rope INPUT table (`build_mageflow_rope_tables` text-identity rows) through fwd
+AND bwd — zero block-math changes.
+
+- **Gate**: `models/mageflow/parity/mageflow_block_lora_{oracle.py,parity.mojo}` —
+  torch autograd over the REAL `MageFlowTransformerBlock` (real Turbo block-0
+  weights, fp64 oracle): 30/30 cos ≥ 0.999; rope cross-check vs the real
+  `MageFlowEmbedRope` cos = 1.0. Oracle LoRA B init randn×0.02 (B=0 degenerates dA).
+- **Surface**: `models/mageflow/{config,weights,mageflow_stack_lora}.mojo` —
+  12 blocks / 3072 / 24h / ctx 2560 / shift 6.0; 144 adapters (12 house targets
+  × 12 blocks); **OFFLOAD streaming** (TurboPlannedLoader; 8.2G resident too
+  tight on 16G — measured peak 5.9G synthetic / 3.8G real-cache).
+- **Trainer**: `training/train_mageflow_real.mojo` — logit-normal σ (shift 6.0),
+  `x_t=(1-σ)x0+σ·noise`, target=`noise−x0`, RAW-σ timestep, levers MSE, AdamW +
+  clip 1.0; saves ai-toolkit `diffusion_model.transformer_blocks.{i}.*.lora_A/B`
+  + `.state` (F32 adam moments). Configs `configs/mageflow_base_{smoke,real4}.json`.
+- **Cache**: `training/mageflow_cache_builder.mojo` — PURE-MOJO (Qwen3-VL text
+  cond + MageVAE encode, offload-staged) → `klein_dataset` layout at
+  `~/.serenity/mageflow_cache/40_woman` (round-trip stats digit-exact).
+- **Real-data smokes on Base**: 2-step + 4-step, finite σ-tracking losses,
+  ~7.5s/step. BUILD NOTE: **binary build required** (`mojo build
+  --target-accelerator sm_120 … -Xlinker -lcuda`; `mojo run` JIT can't resolve
+  `cuMemcpyHtoDAsync_v2`).
+
+### 2026-07-22 hardening: σ-decouple, resume, device-resident speed
+
+- **`train_timestep_shift`** (TrainConfig + reader + trainer): decouples the
+  TRAINING σ-draw from the inference `timestep_shift`. At shift 6.0 the
+  logit-normal draw has median σ≈0.86 — the low-σ detail regime is starved and
+  LoRA subjects converge with degraded faces. Production recipe:
+  `train_timestep_shift 1.0` + lr 1e-4 (inference keeps shift 6.0). Key absent
+  ⇒ legacy behavior (draw follows `timestep_shift`).
+- **Cold-exact resume**: `resume_state` / `start_step` / `warm_resume` config
+  keys; the loop runs `range(start_step, steps)` so AdamW bias-correction t,
+  warmup, cadences, data round-robin and the seed+step σ/noise streams continue
+  the uninterrupted sequence (sha256-identical continuation proven).
+- **Device-resident training**: 12 blocks pinned (~8.2G) with device
+  conductors mirroring the qwenimage offload seams; 0.44–0.45 s/step at 512²
+  (was 13.5 s/step streamed). Host `List[Float32]` parity fallback via
+  `MAGEFLOW_HOST_PATH=1`; fused AdamW opt-in `MAGEFLOW_FUSED_ADAMW=1` (ulp
+  drift, off by default). **pin_residents copy-stream race fixed**
+  (`turbo_planned_loader.mojo`): staging-buffer reuse now fences
+  `copy_stream.synchronize()`, not only `ctx.synchronize()`.
+- **In-train sampling + prompts**: 1024² 20-step CFG-5 renders at the sample
+  cadence; baked prompts are woman-explicit with re-measured KEEP token counts
+  (fail-loud vs the real Base tokenizer at runtime).
+- **Standalone LoRA inference driver**: `pipeline/mageflow_lora_infer.mojo`
+  (argv lora path + seed; 144-adapter fail-loud load; 4 prompts, ~21 s/render).
+- Production configs: `configs/mageflow_eri2_final.json` (shift-1 draw, lr
+  1e-4, 2000 steps), `configs/mageflow_eri2_resume3500.json` (cold-exact
+  2000→3500 continuation).

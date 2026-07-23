@@ -254,6 +254,7 @@ var ModelUtils = (function () {
         clampVideoDimension: clampVideoDimension,
         fetchAllModels: fetchAllModels,
         loadCapabilities: loadCapabilities,
+        backendForArch: backendForArch,
         aspectsForArch: aspectsForArch,
         loadObjectInfo: loadObjectInfo,
         clearCache: clearCache

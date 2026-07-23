@@ -24,6 +24,7 @@ VIDEO_API = REPO / "serenitymojo/serve/video_api.mojo"
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
+KREA2_BACKEND = REPO / "serenitymojo/serve/krea2_backend.mojo"
 IDEOGRAM4_BACKEND = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
 KLEIN_BACKEND = REPO / "serenitymojo/serve/klein_backend.mojo"
@@ -1551,6 +1552,21 @@ def check_family_surfaces() -> list[Check]:
             acceptance="Bounded Z-Image LanPaint_MaskBlend must no longer require init_image to already match output size when the base/original image can be resized with Comfy/PyTorch area semantics.",
         ),
         check_contains(
+            KREA2_BACKEND,
+            category="workflow",
+            label="Krea2 executes bounded complete LanPaint image inpaint",
+            needles=[
+                "Run the complete Krea2 LanPaint image-inpaint request in Mojo",
+                "krea2_sample_lanpaint_latent",
+                "load_lanpaint_latent_preserve_mask",
+                "load_lanpaint_pixel_blend_mask",
+                "apply_lanpaint_mask_blend_signed_chw",
+                "krea2 LanPaint worker admits image inpainting only",
+            ],
+            severity=P1,
+            acceptance="Krea2 Raw/Turbo executes the complete Mojo-native damped LanPaint inner loop at the bounded 1024x1024 image profile and applies the feathered final-pixel mask blend.",
+        ),
+        check_contains(
             QWEN_BACKEND,
             category="workflow",
             label="Qwen rejects ReferenceLatent metadata",
@@ -2011,21 +2027,20 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER,
             category="workflow",
-            label="LanPaint canvas daemon smoke runner",
+            label="Krea2 LanPaint Canvas preflight runner",
             needles=[
-                "serenity.lanpaint_canvas_daemon_smoke.v1",
-                "SDXL_Inpaint.json",
-                "comfy_ui_canvas_graph",
-                "LanPaint Comfy UI canvas",
-                "lanpaint_num_steps",
-                "lanpaint_prompt_mode",
-                "lanpaint_mask_blend_overlap",
-                "mask_image",
-                "stub",
-                "No-heavy product smoke",
+                "serenity.lanpaint_canvas_preflight.v2",
+                "serenity_worker_stub",
+                "LanPaint_KSamplerAdvanced",
+                "LanPaint_NumSteps",
+                "LanPaint_PromptMode",
+                "LanPaint_MaskBlend",
+                '"/v1/preflight"',
+                "inpaint_engine",
+                "No-heavy product preflight",
             ],
             severity=P1,
-            acceptance="A no-heavy product smoke proves visual LanPaint canvas lowering and metadata persistence through the daemon without claiming real denoise parity.",
+            acceptance="A no-heavy product preflight proves the exact Krea2 LanPaint Canvas graph lowers through the current Rust server and reaches production admission without allocating model weights.",
         ),
         check_contains(
             KLEIN_BACKEND,
@@ -2268,15 +2283,16 @@ KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE = (
 
 LANPAINT_ORACLE_SURFACE_ACCEPTANCE = (
     "A no-heavy checker pins representative LanPaint workflow exports, Python node semantics, "
-    "SetLatentNoiseMask noise-mask behavior, Mojo mask math substrate, the bounded Z-Image "
-    "LanPaint_MaskBlend final-pixel slice including its base-image area resize role, and the current fail-loud sampler boundary before "
-    "full LanPaint runtime parity is claimed."
+    "SetLatentNoiseMask behavior, Mojo flow/damped/overdamped primitives, the complete bounded "
+    "Krea2 worker and Canvas graph route, the separate Z-Image LanPaint_MaskBlend slice, and "
+    "the remaining fail-loud boundaries without claiming PyTorch RNG-trajectory bit identity."
 )
 
 LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE = (
-    "A no-heavy daemon product smoke posts a real LanPaint Comfy UI canvas to the stub backend, "
-    "lowers visual nodes/links through the typed graph executor, and proves mask/LanPaint metadata "
-    "survives into PNG genparams without claiming real mask-aware denoise."
+    "A no-heavy preflight starts the current Rust server with the CPU-only Mojo stub worker, posts "
+    "the exact 16-node Krea2 LanPaint Canvas graph, and proves graph lowering, capability admission, "
+    "artifact discovery, and authored controls agree; real execution remains covered by Mojo parity "
+    "and the decoded 1024x1024 artifact gate."
 )
 
 
@@ -3107,7 +3123,7 @@ def check_lanpaint_canvas_daemon_smoke_report(report_path: Path) -> Check:
             False,
             P1,
             "workflow",
-            "LanPaint canvas daemon smoke",
+            "Krea2 LanPaint Canvas preflight",
             f"missing report: {rel(report_path)}",
             rel(report_path),
             LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
@@ -3117,45 +3133,57 @@ def check_lanpaint_canvas_daemon_smoke_report(report_path: Path) -> Check:
             False,
             P1,
             "workflow",
-            "LanPaint canvas daemon smoke",
+            "Krea2 LanPaint Canvas preflight",
             "report not ready: " + json.dumps(report.get("blockers")),
             rel(report_path),
             LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
         )
-    job = dict_or_empty(report.get("job"))
-    png = dict_or_empty(report.get("png"))
-    genparams = dict_or_empty(png.get("genparams"))
+    if report.get("schema") != "serenity.lanpaint_canvas_preflight.v2":
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "Krea2 LanPaint Canvas preflight",
+            f"unexpected report schema: {report.get('schema')!r}",
+            rel(report_path),
+            LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
+        )
+    observed = dict_or_empty(report.get("observed"))
+    workflow = dict_or_empty(report.get("workflow"))
     expected = {
-        "workflow_source": "comfy_ui_canvas_graph",
-        "workflow_node_count": 11,
-        "workflow_edge_count": 17,
-        "model": "animagineXL40_v4Opt.safetensors",
-        "steps": 30,
-        "seed": 0,
-        "cfg": 5.0,
+        "admitted": True,
+        "model": "krea2-turbo",
+        "backend": "krea2",
+        "width": 1024,
+        "height": 1024,
+        "steps": 8,
+        "cfg": 1.0,
         "sampler": "euler",
-        "scheduler": "karras",
-        "lanpaint_num_steps": 5,
-        "lanpaint_prompt_mode": "Image First",
-        "lanpaint_mask_blend_overlap": 9,
+        "scheduler": "simple",
+        "has_init_image": True,
+        "has_mask_image": True,
+        "inpaint_supported": True,
+        "inpaint_engine": "lanpaint",
     }
     missing = [
-        f"genparams.{key}={value!r}"
+        f"observed.{key}={value!r}"
         for key, value in expected.items()
-        if genparams.get(key) != value
+        if observed.get(key) != value
     ]
-    if genparams.get("init_image") != genparams.get("mask_image"):
-        missing.append("init_image equals mask_image for SDXL LanPaint smoke")
-    if job.get("state") != "done":
-        missing.append("job.state='done'")
-    if not png.get("idat_sha256"):
-        missing.append("png.idat_sha256")
+    if workflow.get("node_count") != 16:
+        missing.append("workflow.node_count=16")
+    if workflow.get("sampler_type") != "LanPaint_KSamplerAdvanced":
+        missing.append("workflow.sampler_type='LanPaint_KSamplerAdvanced'")
+    if workflow.get("mask_channel") != "red":
+        missing.append("workflow.mask_channel='red'")
+    if workflow.get("blend_overlap") != 9:
+        missing.append("workflow.blend_overlap=9")
     if missing:
         return Check(
             False,
             P1,
             "workflow",
-            "LanPaint canvas daemon smoke",
+            "Krea2 LanPaint Canvas preflight",
             "missing evidence: " + ", ".join(missing),
             rel(report_path),
             LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
@@ -3164,8 +3192,8 @@ def check_lanpaint_canvas_daemon_smoke_report(report_path: Path) -> Check:
         True,
         PASS,
         "workflow",
-        "LanPaint canvas daemon smoke",
-        f"LanPaint canvas completed {job.get('id')} with PNG metadata",
+        "Krea2 LanPaint Canvas preflight",
+        "exact 16-node Canvas graph admitted as Krea2 LanPaint at 1024x1024",
         rel(report_path),
         LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
     )

@@ -18,10 +18,50 @@
 use serde::{Deserialize, Serialize};
 
 /// One LoRA overlay (ipc_codec encodes `{"name":..,"weight":..}` in the `lora` array).
+///
+/// The five per-stream strengths come from the KJNodes-style
+/// `LTX2LoraLoaderAdvanced` workflow node (LTX-2 joint AV DiT only). They
+/// default to 1.0 and are skipped at serialization when at the default, so
+/// plain rows stay byte-identical to the historical `{name, weight}` shape
+/// and the image-backend ipc_codec contract is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoraSpec {
     pub name: String,
     pub weight: f64,
+    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    pub video: f64,
+    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    pub video_to_audio: f64,
+    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    pub audio: f64,
+    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    pub audio_to_video: f64,
+    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    pub other: f64,
+}
+
+fn default_stream_strength() -> f64 {
+    1.0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_stream_strength(v: &f64) -> bool {
+    *v == 1.0
+}
+
+impl LoraSpec {
+    /// A plain `{name, weight}` overlay with all stream strengths at 1.0.
+    pub fn new(name: String, weight: f64) -> Self {
+        LoraSpec {
+            name,
+            weight,
+            video: 1.0,
+            video_to_audio: 1.0,
+            audio: 1.0,
+            audio_to_video: 1.0,
+            other: 1.0,
+        }
+    }
 }
 
 /// Everything a backend needs to run one generation job. Field NAMES, JSON TYPES,

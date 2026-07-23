@@ -98,7 +98,9 @@ from serenitymojo.models.upsampler.ltx2_upsampler import (
     LatentUpsampler, upsample_video,
 )
 from serenitymojo.image.png import save_png, ValueRange
-from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet
+from serenitymojo.lora import (
+    LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet, LoraStreamMults,
+)
 from serenitymojo.serve.product_manifest import (
     json_bool, json_escape, peak_vram_mib, write_text_file,
 )
@@ -165,7 +167,7 @@ def _lora_distilled() -> String:
 
 
 def _refhq_spatial_upscaler() -> String:
-    return env_or("LTX2_REFHQ_SPATIAL_UPSCALER", serenity_checkpoint(String("ltx-2.3-spatial-upscaler-x2-1.0.safetensors")))
+    return env_or("LTX2_REFHQ_SPATIAL_UPSCALER", serenity_checkpoint(String("ltx-2.3-spatial-upscaler-x2-1.1.safetensors")))
 
 
 def _refhq_lora_distilled() -> String:
@@ -523,6 +525,174 @@ struct _HQLoraStack(Movable):
             block_idx, block, LORA_DISTILLED_MULT, LORA_CAMERA_STATIC_MULT,
             LORA_DETAILER_MULT, ctx
         )
+
+
+# The request-driven Creator-HQ route intentionally has a different LoRA
+# contract from the legacy AudioSync stack above: official 2.3 support LoRA +
+# every authored trained overlay. Camera/detailer are not implicit request
+# substitutions and therefore are not loaded here.
+struct _RequestHQLoraStack(Movable):
+    var distilled: LoraSet
+    var trained: List[ArcPointer[LoraSet]]
+    var trained_mults: List[Float32]
+    var trained_streams: List[LoraStreamMults]
+
+    def __init__(
+        out self,
+        var distilled: LoraSet,
+        var trained: List[ArcPointer[LoraSet]],
+        var trained_mults: List[Float32],
+        var trained_streams: List[LoraStreamMults],
+    ):
+        self.distilled = distilled^
+        self.trained = trained^
+        self.trained_mults = trained_mults^
+        self.trained_streams = trained_streams^
+
+    @staticmethod
+    def _parse_streams(text: String, i: Int) raises -> LoraStreamMults:
+        """`LTX2_TRAINED_LORA_STREAMS_{i}` encoding: five comma-joined floats
+        `video,video_to_audio,audio,audio_to_video,other`, each in [0, 1]
+        (the KJ LTX2LoraLoaderAdvanced slider range)."""
+        var parts = text.split(String(","))
+        if len(parts) != 5:
+            raise Error(
+                String("LTX2_TRAINED_LORA_STREAMS_") + String(i)
+                + String(" must be 5 comma-joined floats")
+            )
+        var vals = List[Float32]()
+        for p in parts:
+            var v = Float32(Float64(String(p)))
+            if v < Float32(0.0) or v > Float32(1.0):
+                raise Error(
+                    String("LTX2_TRAINED_LORA_STREAMS_") + String(i)
+                    + String(" entries must be in [0, 1]")
+                )
+            vals.append(v)
+        return LoraStreamMults(vals[0], vals[1], vals[2], vals[3], vals[4])
+
+    @staticmethod
+    def load() raises -> _RequestHQLoraStack:
+        var trained = List[ArcPointer[LoraSet]]()
+        var trained_mults = List[Float32]()
+        var trained_streams = List[LoraStreamMults]()
+        var count_text = _env_str("LTX2_TRAINED_LORA_COUNT")
+        var count = 0
+        if count_text.byte_length() > 0:
+            count = atol(count_text)
+            if count < 0:
+                raise Error("LTX2_TRAINED_LORA_COUNT must be >= 0")
+        for i in range(count):
+            var path = _env_str(String("LTX2_TRAINED_LORA_") + String(i))
+            if path.byte_length() == 0:
+                raise Error(String("missing LTX2_TRAINED_LORA_") + String(i))
+            var mult_text = _env_str(
+                String("LTX2_TRAINED_LORA_MULT_") + String(i)
+            )
+            var mult = Float32(1.0)
+            if mult_text.byte_length() > 0:
+                mult = Float32(Float64(mult_text))
+            if mult < Float32(-10.0) or mult > Float32(10.0):
+                raise Error(
+                    String("LTX2_TRAINED_LORA_MULT_") + String(i)
+                    + String(" must be in [-10, 10]")
+                )
+            var streams_text = _env_str(
+                String("LTX2_TRAINED_LORA_STREAMS_") + String(i)
+            )
+            var streams = LoraStreamMults.identity()
+            if streams_text.byte_length() > 0:
+                streams = _RequestHQLoraStack._parse_streams(streams_text, i)
+            trained.append(ArcPointer(LoraSet.load(path)))
+            trained_mults.append(mult)
+            trained_streams.append(streams)
+        return _RequestHQLoraStack(
+            LoraSet.load(_refhq_lora_distilled()), trained^, trained_mults^,
+            trained_streams^,
+        )
+
+    def validate(self) raises:
+        if self.distilled.format != FMT_LTX2_DISTILLED:
+            raise Error("LTX2 request HQ: support LoRA is not LTX2 distilled format")
+        if self.distilled.num_lora_pairs_in_file() != self.distilled.num_mappings():
+            raise Error("LTX2 request HQ: support LoRA has unmapped pairs")
+        if len(self.trained) != len(self.trained_mults):
+            raise Error("LTX2 request HQ: trained LoRA path/weight count mismatch")
+        for i in range(len(self.trained)):
+            var pairs = self.trained[i][].num_lora_pairs_in_file()
+            if pairs == 0 or pairs != self.trained[i][].num_mappings():
+                raise Error(
+                    String("LTX2 request HQ: trained LoRA ") + String(i)
+                    + String(" has zero or unmapped pairs")
+                )
+
+    def print_summary(self):
+        print("  [lora] official LTX-2.3 support mappings:",
+              self.distilled.num_mappings(), "@ 0.25 stage1 / 0.5 stage2")
+        for i in range(len(self.trained)):
+            print("  [lora] authored overlay", i,
+                  self.trained[i][].num_mappings(), "mappings @",
+                  self.trained_mults[i])
+            if not self.trained_streams[i].is_identity():
+                print("  [lora]   streams v", self.trained_streams[i].video,
+                      "v2a", self.trained_streams[i].video_to_audio,
+                      "a", self.trained_streams[i].audio,
+                      "a2v", self.trained_streams[i].audio_to_video,
+                      "other", self.trained_streams[i].other)
+
+    def apply_to_globals(
+        self,
+        mut gw: Dict[String, ArcPointer[Tensor]],
+        distilled_mult: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        var total = self.distilled.apply_to_globals(gw, distilled_mult, ctx)
+        for i in range(len(self.trained)):
+            total += self.trained[i][].apply_to_globals_streamed(
+                gw, self.trained_mults[i], self.trained_streams[i], ctx
+            )
+        return total
+
+    def apply_to_av_block(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        distilled_mult: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        var deltas = LTX2BlockLoraDeltaSet()
+        _ = self.distilled.accumulate_ltx2_block_deltas(
+            block_idx, deltas, distilled_mult, ctx
+        )
+        for i in range(len(self.trained)):
+            _ = self.trained[i][].accumulate_ltx2_block_deltas_streamed(
+                block_idx, deltas, self.trained_mults[i],
+                self.trained_streams[i], ctx
+            )
+        return deltas.apply_to_av_block(block, ctx)
+
+    def preload_block_factors(mut self, ctx: DeviceContext) raises -> Int:
+        var total = self.distilled.preload_ltx2_block_factors(ctx)
+        for i in range(len(self.trained)):
+            total += self.trained[i][].preload_ltx2_block_factors(ctx)
+        return total
+
+    def attach_to_av_block(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        distilled_mult: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        var total = self.distilled.attach_ltx2_cached_block_factors(
+            block_idx, block, distilled_mult, ctx
+        )
+        for i in range(len(self.trained)):
+            total += self.trained[i][].attach_ltx2_cached_block_factors_streamed(
+                block_idx, block, self.trained_mults[i],
+                self.trained_streams[i], ctx
+            )
+        return total
 
 
 # ── shape helpers ──────────────────────────────────────────────────────────────
@@ -1428,6 +1598,19 @@ def _write_ltx2_result(
     body += String('  "conditioning_positive":"') + json_escape(context_path) + String('",\n')
     body += String('  "conditioning_negative":"') + json_escape(negative_context_path) + String('",\n')
     body += String('  "request_lora_count":') + String(request_lora_count) + String(",\n")
+    body += String('  "request_loras":[')
+    for i in range(request_lora_count):
+        if i > 0:
+            body += String(",")
+        var name = _env_str(String("LTX2_TRAINED_LORA_NAME_") + String(i))
+        var path = _env_str(String("LTX2_TRAINED_LORA_") + String(i))
+        var weight = _env_str(String("LTX2_TRAINED_LORA_MULT_") + String(i))
+        if weight.byte_length() == 0:
+            weight = String("1.0")
+        body += String('{"name":"') + json_escape(name)
+        body += String('","path":"') + json_escape(path)
+        body += String('","weight":') + weight + String("}")
+    body += String("],\n")
     body += String('  "dtype_contract":"fp8_transformer_bf16_activations_f32_reductions",\n')
     body += String('  "timings":{\n')
     body += String('    "load_seconds":') + String(load_seconds) + String(",\n")
@@ -1943,6 +2126,7 @@ def run_audiosync(
 
 
 def run_request_profile(
+    checkpoint: String,
     width: Int,
     height: Int,
     frames: Int,
@@ -1953,6 +2137,8 @@ def run_request_profile(
     scheduler: String,
     context_path: String,
     negative_context_path: String,
+    contexts_are_projected: Bool,
+    noise_fixture_path: String,
     include_audio: Bool,
     out_dir: String,
 ) raises:
@@ -1961,65 +2147,56 @@ def run_request_profile(
     Request values are never substituted. Unsupported geometry/sampler pairs
     fail before model loading so the UI can report the exact rejected values.
     """
+    if checkpoint != String("ltx-2.3-22b-dev-fp8") and (
+        checkpoint != String("ltx-2.3-22b-dev-fp8.safetensors")
+    ):
+        raise Error(
+            String("LTX2 request: unsupported compiled checkpoint '")
+            + checkpoint + String("'; verified checkpoint: ltx-2.3-22b-dev-fp8")
+        )
     var sampler_key = String(sampler.lower())
     var scheduler_key = String(scheduler.lower())
-    var distilled_euler = sampler_key == String("euler") and (
-        scheduler_key == String("ltx2_distilled")
-        or scheduler_key == String("distilled")
-    )
     var res2s = (
         sampler_key == String("res2s") or sampler_key == String("res_2s")
     ) and scheduler_key == String("ltx2")
-    if not distilled_euler and not res2s:
+    if not res2s:
         raise Error(
             String("LTX2 request: unsupported sampler/scheduler '")
             + sampler + String("/") + scheduler
-            + String("'; supported: euler/ltx2_distilled, res2s/ltx2")
+            + String("'; verified compiled profile: res2s/ltx2")
         )
     if context_path.byte_length() == 0:
         raise Error("LTX2 request: caps_positive conditioning path is required")
-    if steps <= 0:
-        raise Error("LTX2 request: steps must be > 0")
-    if fps <= 0.0:
-        raise Error("LTX2 request: fps must be > 0")
-    if distilled_euler:
-        var official = LTX2Scheduler.distilled()
-        if steps != official.num_steps:
-            raise Error(
-                String("LTX2 request: ltx2_distilled requires exactly ")
-                + String(official.num_steps) + String(" steps; request supplied ")
-                + String(steps)
-            )
-    if width != 768 or height != 512:
+    if negative_context_path.byte_length() == 0:
+        raise Error(
+            "LTX2 request: verified Creator-HQ profile requires negative conditioning"
+        )
+    if width != REQUEST_HQ_WIDTH or height != REQUEST_HQ_HEIGHT:
         raise Error(
             String("LTX2 request: unsupported compiled size ")
             + String(width) + String("x") + String(height)
-            + String("; available size: 768x512")
+            + String("; verified size: ") + String(REQUEST_HQ_WIDTH)
+            + String("x") + String(REQUEST_HQ_HEIGHT)
         )
-    var use_nag = negative_context_path.byte_length() > 0
-    if frames == 25:
-        run_single_p[
-            NUM_FRAMES_LONG, NF_LONG, NH, NW, S_V_LONG, S_A_LONG,
-            S_VPAD_LONG, S_APAD_LONG,
-        ](
-            True, out_dir, 0, True, include_audio, use_nag,
-            steps, seed, fps, context_path, negative_context_path,
-            distilled_euler,
+    if frames != REQUEST_HQ_NUM_FRAMES:
+        raise Error(
+            String("LTX2 request: unsupported compiled frame count ")
+            + String(frames) + String("; verified count: ")
+            + String(REQUEST_HQ_NUM_FRAMES)
         )
-        return
-    if frames == 97:
-        run_single_p[
-            NUM_FRAMES_AUDIOSYNC, NF_AUDIOSYNC, NH, NW, S_V_AUDIOSYNC,
-            S_A_AUDIOSYNC, S_VPAD_AUDIOSYNC, S_APAD_AUDIOSYNC,
-        ](
-            True, out_dir, 0, True, include_audio, use_nag,
-            steps, seed, fps, context_path, negative_context_path,
-            distilled_euler,
+    if steps != REQUEST_HQ_STEPS:
+        raise Error(
+            String("LTX2 request: unsupported step count ") + String(steps)
+            + String("; verified count: ") + String(REQUEST_HQ_STEPS)
         )
-        return
-    raise Error(
-        String("LTX2 request: unsupported compiled frame count ")
-        + String(frames) + String("; available counts: 25, 97")
+    if fps != REQUEST_HQ_FPS:
+        raise Error(
+            String("LTX2 request: unsupported FPS ") + String(fps)
+            + String("; verified FPS: ") + String(REQUEST_HQ_FPS)
+        )
+    run_request_hq(
+        context_path, negative_context_path, contexts_are_projected,
+        noise_fixture_path, out_dir, seed, include_audio
     )
 
 
@@ -2859,6 +3036,26 @@ comptime REFHQ_MOD_SCALE = Float32(3.0)
 comptime REFHQ_LORA_S1 = Float32(0.25)
 comptime REFHQ_LORA_S2 = Float32(0.5)
 
+# Exact compiled product profile recovered from the visually verified Eri2
+# step-3000 Creator run. Runtime requests must match these values; the adapter
+# rejects everything else instead of silently substituting this profile.
+comptime REQUEST_HQ_WIDTH = 512
+comptime REQUEST_HQ_HEIGHT = 768
+comptime REQUEST_HQ_NUM_FRAMES = 121
+comptime REQUEST_HQ_FPS = Float64(25.0)
+comptime REQUEST_HQ_STEPS = 20
+comptime REQUEST_HQ_NF = 16
+comptime REQUEST_HQ_NH1 = 12
+comptime REQUEST_HQ_NW1 = 8
+comptime REQUEST_HQ_S_V1 = REQUEST_HQ_NF * REQUEST_HQ_NH1 * REQUEST_HQ_NW1
+comptime REQUEST_HQ_S_A = 121
+comptime REQUEST_HQ_VPAD1 = 1536
+comptime REQUEST_HQ_APAD = 1024
+comptime REQUEST_HQ_NH2 = 24
+comptime REQUEST_HQ_NW2 = 16
+comptime REQUEST_HQ_S_V2 = REQUEST_HQ_NF * REQUEST_HQ_NH2 * REQUEST_HQ_NW2
+comptime REQUEST_HQ_VPAD2 = 6144
+
 
 # fps-aware video RoPE coord boxes (refhq runs the reference fps=25 profile;
 # the legacy paths keep the comptime FRAME_RATE=24 builder).
@@ -2906,6 +3103,23 @@ def _refhq_video_rope(
     nf: Int, nh: Int, nw: Int, s_v: Int, ctx: DeviceContext
 ) raises -> _RefhqRope:
     var vc = _build_video_coords_fps(nf, nh, nw, REFHQ_FPS)
+    var vtc = _video_temporal_coords_dims(vc, s_v)
+    var vrope = _compute_rope(
+        vc, 3, s_v, VD, _mp3(), ROPE_THETA, V_HEADS, STDtype.BF16, ctx
+    )
+    var cav = _compute_rope(
+        vtc, 1, s_v, CA_DIM, _mp1(), ROPE_THETA, V_HEADS, STDtype.BF16, ctx
+    )
+    return _RefhqRope(
+        _clone(vrope[0], ctx), _clone(vrope[1], ctx),
+        _clone(cav[0], ctx), _clone(cav[1], ctx),
+    )
+
+
+def _request_hq_video_rope(
+    nf: Int, nh: Int, nw: Int, s_v: Int, ctx: DeviceContext
+) raises -> _RefhqRope:
+    var vc = _build_video_coords_fps(nf, nh, nw, REQUEST_HQ_FPS)
     var vtc = _video_temporal_coords_dims(vc, s_v)
     var vrope = _compute_rope(
         vc, 3, s_v, VD, _mp3(), ROPE_THETA, V_HEADS, STDtype.BF16, ctx
@@ -2976,6 +3190,59 @@ def _refhq_forward_flat[
                               g.v_pout_b, VD, ctx)
     var a_vel = _output_stage(ahs, g.a_sst, mod.a_embedded, g.a_pout_w,
                               g.a_pout_b, AD, ctx)
+    return (v_vel^, a_vel^)
+
+
+# Creator-HQ forward with the request-owned trained-LoRA stack. The existing
+# refhq parity function above stays frozen for its historical one-LoRA gates.
+def _request_hq_forward_flat[
+    S_V_CT: Int, S_A_CT: Int, S_VPAD_CT: Int, S_APAD_CT: Int
+](
+    loras: _RequestHQLoraStack,
+    distilled_mult: Float32,
+    cfg: LTX2Config,
+    g: _Globals,
+    stream: LTX2BlockStream,
+    v_flat: Tensor, a_flat: Tensor,
+    enc: Tensor, aenc: Tensor,
+    mod: _Mod,
+    vr: _RefhqRope,
+    a_cos: Tensor, a_sin: Tensor, ca_a_cos: Tensor, ca_a_sin: Tensor,
+    skip_cross_modal: Bool,
+    verbose_lora: Bool,
+    ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor]:
+    var hs = _linear_b(v_flat, g.v_pin_w, g.v_pin_b, ctx)
+    var ahs = _linear_b(a_flat, g.a_pin_w, g.a_pin_b, ctx)
+    var n_lora_total = 0
+    for i in range(NUM_LAYERS):
+        var blk = stream.load_block_bf16(i, ctx)
+        var w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
+        n_lora_total += loras.attach_to_av_block(
+            i, w, distilled_mult, ctx
+        )
+        var outs = ltx2_block_forward_av[
+            S_V_CT, S_A_CT, N_TXT, S_VPAD_CT, S_APAD_CT
+        ](
+            w, hs, ahs, enc, aenc,
+            mod.v_temb, mod.a_temb, mod.v_ca_ss, mod.a_ca_ss,
+            mod.v_ca_gate, mod.a_ca_gate,
+            mod.v_prompt_ts, mod.a_prompt_ts,
+            vr.v_cos, vr.v_sin, a_cos, a_sin,
+            vr.ca_v_cos, vr.ca_v_sin, ca_a_cos, ca_a_sin, EPS, ctx,
+            skip_cross_modal,
+        )
+        var cloned = _clone_pair(outs[0], outs[1], ctx)
+        cloned^.move_into(hs, ahs)
+    if verbose_lora:
+        print("  [request-hq] dense LoRA applications:", n_lora_total,
+              " support multiplier:", distilled_mult)
+    var v_vel = _output_stage(
+        hs, g.v_sst, mod.v_embedded, g.v_pout_w, g.v_pout_b, VD, ctx
+    )
+    var a_vel = _output_stage(
+        ahs, g.a_sst, mod.a_embedded, g.a_pout_w, g.a_pout_b, AD, ctx
+    )
     return (v_vel^, a_vel^)
 
 
@@ -3897,6 +4164,467 @@ def run_refhq(
     lora = LoraSet.load(_refhq_lora_distilled())
 
     _refhq_decode_mux[REFHQ_NF, REFHQ_NH2, REFHQ_NW2](v_final, a_final, out_dir, ctx)
+
+
+# ── Exact request-driven Creator-HQ product path ─────────────────────────────
+def run_request_hq(
+    contexts_path: String,
+    negative_contexts_path: String,
+    contexts_are_projected: Bool,
+    noise_fixture_path: String,
+    out_dir: String,
+    seed: UInt64,
+    include_audio: Bool,
+) raises:
+    var total_t0 = perf_counter()
+    var load_seconds = Float64(0.0)
+    var conditioning_seconds = Float64(0.0)
+    var prepare_seconds = Float64(0.0)
+    var denoise_seconds = Float64(0.0)
+    var video_decode_seconds = Float64(0.0)
+    var audio_decode_seconds = Float64(0.0)
+    var mux_seconds = Float64(0.0)
+    var progress_total = REQUEST_HQ_STEPS + 3
+
+    _write_ltx2_status(
+        out_dir, String("running"), String("loading_model"), 0,
+        progress_total, String("Loading LTX2 dev model"),
+    )
+    var ctx = DeviceContext()
+    var mem0 = cu_mem_get_info()
+    var total_vram_bytes = mem0.total_bytes
+    var min_free_bytes = mem0.free_bytes
+    var cfg = LTX2Config.ltx2()
+    print("=== LTX-2.3 REQUEST HQ — VERIFIED CREATOR PROFILE ===")
+    print("  final:", REQUEST_HQ_WIDTH, "x", REQUEST_HQ_HEIGHT,
+          REQUEST_HQ_NUM_FRAMES, "frames @", REQUEST_HQ_FPS, "fps")
+    print("  stage1:", REQUEST_HQ_NF, "x", REQUEST_HQ_NH1, "x",
+          REQUEST_HQ_NW1, "S_V=", REQUEST_HQ_S_V1,
+          " stage2 S_V=", REQUEST_HQ_S_V2)
+    print("  sampler: guided res_2s", REQUEST_HQ_STEPS,
+          "steps + official 3-step stage2; seed:", seed)
+
+    var t0 = perf_counter()
+    var ck = ShardedSafeTensors.open(_refhq_ckpt_fp8())
+    var loras = _RequestHQLoraStack.load()
+    loras.validate()
+    loras.print_summary()
+    print("  [lora] preloading factor tensors once for the complete request")
+    var n_preloaded = loras.preload_block_factors(ctx)
+    print("  [lora] preloaded block factors:", n_preloaded)
+
+    print("  [load] stage-1 globals")
+    var gw = _load_global_weights_dict(ck, ctx)
+    var n_global = loras.apply_to_globals(gw, REFHQ_LORA_S1, ctx)
+    print("  [lora] stage-1 global deltas:", n_global)
+    var g = _Globals(
+        _clone(gw[String("patchify_proj.weight")][], ctx),
+        _load_global_bf16(ck, "patchify_proj.bias", ctx),
+        _clone(gw[String("audio_patchify_proj.weight")][], ctx),
+        _load_global_bf16(ck, "audio_patchify_proj.bias", ctx),
+        _clone(gw[String("proj_out.weight")][], ctx),
+        _load_global_bf16(ck, "proj_out.bias", ctx),
+        _clone(gw[String("audio_proj_out.weight")][], ctx),
+        _load_global_bf16(ck, "audio_proj_out.bias", ctx),
+        _load_global_bf16(ck, "scale_shift_table", ctx),
+        _load_global_bf16(ck, "audio_scale_shift_table", ctx),
+    )
+    ctx.synchronize()
+    load_seconds = perf_counter() - t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+
+    var conditioning_message = String("Loading projected conditioning") \
+        if contexts_are_projected else \
+        String("Projecting positive and negative conditioning")
+    _write_ltx2_status(
+        out_dir, String("running"), String("conditioning"), 0,
+        progress_total, conditioning_message,
+    )
+    t0 = perf_counter()
+    var pos_st = ShardedSafeTensors.open(contexts_path)
+    var neg_st = ShardedSafeTensors.open(negative_contexts_path)
+    var neg_v_key = String("neg_video_context")
+    var neg_a_key = String("neg_audio_context")
+    var neg_len_key = String("neg_video_len")
+    if not _st_has(neg_st, neg_v_key):
+        neg_v_key = String("video_context")
+        neg_a_key = String("audio_context")
+        neg_len_key = String("video_len")
+    if not _st_has(neg_st, neg_a_key):
+        raise Error("LTX2 request HQ: negative audio context is missing")
+    var enc: Tensor
+    var aenc: Tensor
+    var neg_enc: Tensor
+    var neg_aenc: Tensor
+    if contexts_are_projected:
+        print("  [ctx] consuming explicit post-connector cache")
+        enc = Tensor.from_view_as_bf16(
+            pos_st.tensor_view("video_context"), ctx
+        )
+        aenc = Tensor.from_view_as_bf16(
+            pos_st.tensor_view("audio_context"), ctx
+        )
+        neg_enc = Tensor.from_view_as_bf16(
+            neg_st.tensor_view(neg_v_key), ctx
+        )
+        neg_aenc = Tensor.from_view_as_bf16(
+            neg_st.tensor_view(neg_a_key), ctx
+        )
+    else:
+        var v_conn = LTX2ConnectorWeights.load(
+            _refhq_ckpt_fp8(), String("video_embeddings_connector"),
+            LTX2ConnectorConfig.video(), ctx,
+        )
+        var a_conn = LTX2ConnectorWeights.load(
+            _refhq_ckpt_fp8(), String("audio_embeddings_connector"),
+            LTX2ConnectorConfig.audio(), ctx,
+        )
+        var v_pre = Tensor.from_view_as_bf16(
+            pos_st.tensor_view("video_context"), ctx
+        )
+        var a_pre = Tensor.from_view_as_bf16(
+            pos_st.tensor_view("audio_context"), ctx
+        )
+        var vn_pre = Tensor.from_view_as_bf16(
+            neg_st.tensor_view(neg_v_key), ctx
+        )
+        var an_pre = Tensor.from_view_as_bf16(
+            neg_st.tensor_view(neg_a_key), ctx
+        )
+        var pos_valid = _load_ctx_len(pos_st, String("video_len"), ctx)
+        var neg_valid = _load_ctx_len(neg_st, neg_len_key, ctx)
+        print("  [ctx] valid rows pos/neg:", pos_valid, "/", neg_valid,
+              "of", N_TXT)
+        enc = ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](
+            v_conn, v_pre, ctx, valid_len=pos_valid
+        )
+        aenc = ltx2_connector_forward[N_TXT, A_HEADS, A_HDIM](
+            a_conn, a_pre, ctx, valid_len=pos_valid
+        )
+        neg_enc = ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](
+            v_conn, vn_pre, ctx, valid_len=neg_valid
+        )
+        neg_aenc = ltx2_connector_forward[N_TXT, A_HEADS, A_HDIM](
+            a_conn, an_pre, ctx, valid_len=neg_valid
+        )
+    ctx.synchronize()
+    conditioning_seconds = perf_counter() - t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+
+    _write_ltx2_status(
+        out_dir, String("running"), String("preparing"), 0,
+        progress_total, String("Preparing two-stage latents and scheduler"),
+    )
+    t0 = perf_counter()
+    var vr1 = _request_hq_video_rope(
+        REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1,
+        REQUEST_HQ_S_V1, ctx,
+    )
+    var vr2 = _request_hq_video_rope(
+        REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2,
+        REQUEST_HQ_S_V2, ctx,
+    )
+    var ac = _build_audio_coords_dims(REQUEST_HQ_S_A)
+    var arope = _compute_rope(
+        ac, 1, REQUEST_HQ_S_A, AD, _mp1(), ROPE_THETA, A_HEADS,
+        STDtype.BF16, ctx,
+    )
+    var caarope = _compute_rope(
+        ac, 1, REQUEST_HQ_S_A, CA_DIM, _mp1(), ROPE_THETA, A_HEADS,
+        STDtype.BF16, ctx,
+    )
+    var a_cos = _clone(arope[0], ctx)
+    var a_sin = _clone(arope[1], ctx)
+    var ca_a_cos = _clone(caarope[0], ctx)
+    var ca_a_sin = _clone(caarope[1], ctx)
+    var stream = LTX2BlockStream.open(_refhq_ckpt_fp8())
+    if stream.block_count() != NUM_LAYERS:
+        raise Error("LTX2 request HQ: stream block_count != 48")
+    var ns: NoiseSource
+    var video_x: Tensor
+    var audio_x: Tensor
+    if noise_fixture_path.byte_length() > 0:
+        print("  [noise] paired oracle fixture:", noise_fixture_path)
+        ns = NoiseSource.fixture(noise_fixture_path)
+        if not ns.has_key(String("init_video")) or not ns.has_key(String("init_audio")):
+            raise Error("LTX2 request HQ: noise fixture lacks init_video/init_audio")
+        video_x = cast_tensor(
+            ns.load_key_f32(String("init_video"), ctx), STDtype.BF16, ctx
+        )
+        audio_x = cast_tensor(
+            ns.load_key_f32(String("init_audio"), ctx), STDtype.BF16, ctx
+        )
+    else:
+        ns = NoiseSource.production(seed)
+        video_x = randn(
+            _sh3(1, REQUEST_HQ_S_V1, 128), seed, STDtype.BF16, ctx
+        )
+        audio_x = randn(
+            _sh3(1, REQUEST_HQ_S_A, 128), seed + 1, STDtype.BF16, ctx
+        )
+    var sig1 = _ltx2_scheduler_sigmas(
+        REQUEST_HQ_STEPS, REQUEST_HQ_S_V1
+    )
+    ctx.synchronize()
+    prepare_seconds = perf_counter() - t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+
+    print("  [Stage1] guided res_2s", REQUEST_HQ_STEPS,
+          "steps x 2 evaluations x 3 guidance passes")
+    var s1_eval = 0
+    var first_s1_eval = True
+    @parameter
+    def _den_s1(
+        vx: Tensor, ax: Tensor, sigma: Float32
+    ) raises -> Tuple[Tensor, Tensor]:
+        if s1_eval % 2 == 0:
+            var visible_step = s1_eval // 2 + 1
+            if visible_step > REQUEST_HQ_STEPS:
+                visible_step = REQUEST_HQ_STEPS
+            _write_ltx2_status(
+                out_dir, String("running"), String("denoising_stage1"),
+                visible_step, progress_total,
+                String("Stage 1 step ") + String(visible_step) + String(" of ")
+                + String(REQUEST_HQ_STEPS),
+            )
+        s1_eval += 1
+        var mod = _build_mod_dims(
+            ck, gw, sigma, REQUEST_HQ_S_V1, REQUEST_HQ_S_A, ctx
+        )
+        var c = _request_hq_forward_flat[
+            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+        ](
+            loras, REFHQ_LORA_S1, cfg, g, stream, vx, ax, enc, aenc,
+            mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+            first_s1_eval, ctx,
+        )
+        var u = _request_hq_forward_flat[
+            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+        ](
+            loras, REFHQ_LORA_S1, cfg, g, stream, vx, ax,
+            neg_enc, neg_aenc, mod, vr1, a_cos, a_sin, ca_a_cos,
+            ca_a_sin, False, False, ctx,
+        )
+        var m = _request_hq_forward_flat[
+            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+        ](
+            loras, REFHQ_LORA_S1, cfg, g, stream, vx, ax, enc, aenc,
+            mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, True, False, ctx,
+        )
+        first_s1_eval = False
+        var c_v = _refhq_x0(vx, c[0], sigma, ctx)
+        var u_v = _refhq_x0(vx, u[0], sigma, ctx)
+        var m_v = _refhq_x0(vx, m[0], sigma, ctx)
+        var c_a = _refhq_x0(ax, c[1], sigma, ctx)
+        var u_a = _refhq_x0(ax, u[1], sigma, ctx)
+        var m_a = _refhq_x0(ax, m[1], sigma, ctx)
+        return (
+            guider_calculate(
+                c_v, u_v, m_v, REFHQ_V_CFG, 0.0, REFHQ_V_RESCALE,
+                REFHQ_MOD_SCALE, ctx,
+            )^,
+            guider_calculate(
+                c_a, u_a, m_a, REFHQ_A_CFG, 0.0, REFHQ_A_RESCALE,
+                REFHQ_MOD_SCALE, ctx,
+            )^,
+        )
+
+    var s1_names = List[String]()
+    var s1_tensors = List[ArcPointer[Tensor]]()
+    t0 = perf_counter()
+    var s1_out = res2s_ref_loop[_den_s1](
+        sig1, video_x^, audio_x^, ns, String("s1"), s1_names,
+        s1_tensors, ctx,
+    )
+    video_x = s1_out[0].clone(ctx)
+    audio_x = s1_out[1].clone(ctx)
+    print("  [Stage1] complete")
+
+    _write_ltx2_status(
+        out_dir, String("running"), String("upscaling"),
+        REQUEST_HQ_STEPS, progress_total,
+        String("Upscaling stage-1 latents"),
+    )
+    var v_lat1 = _refhq_unpatchify_video(
+        video_x, REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1, ctx
+    )
+    var upscaled = _refhq_spatial_upscale_scoped(v_lat1, ctx)
+    _ = _stats(String("upscaled"), upscaled, ctx)
+
+    print("  [load] stage-2 globals")
+    gw = _load_global_weights_dict(ck, ctx)
+    var n_global2 = loras.apply_to_globals(gw, REFHQ_LORA_S2, ctx)
+    print("  [lora] stage-2 global deltas:", n_global2)
+    g = _Globals(
+        _clone(gw[String("patchify_proj.weight")][], ctx),
+        _load_global_bf16(ck, "patchify_proj.bias", ctx),
+        _clone(gw[String("audio_patchify_proj.weight")][], ctx),
+        _load_global_bf16(ck, "audio_patchify_proj.bias", ctx),
+        _clone(gw[String("proj_out.weight")][], ctx),
+        _load_global_bf16(ck, "proj_out.bias", ctx),
+        _clone(gw[String("audio_proj_out.weight")][], ctx),
+        _load_global_bf16(ck, "audio_proj_out.bias", ctx),
+        _load_global_bf16(ck, "scale_shift_table", ctx),
+        _load_global_bf16(ck, "audio_scale_shift_table", ctx),
+    )
+
+    var s2sig = ltx2_stage2_distilled_sigmas()
+    var s2_scale = s2sig[0]
+    var up_flat = cast_tensor(
+        _refhq_patchify_video(upscaled, REQUEST_HQ_S_V2, ctx),
+        STDtype.BF16, ctx,
+    )
+    var s2n_v: Tensor
+    var s2n_a: Tensor
+    if noise_fixture_path.byte_length() > 0:
+        if not ns.has_key(String("s2init_video")) or not ns.has_key(String("s2init_audio")):
+            raise Error("LTX2 request HQ: noise fixture lacks s2init video/audio")
+        s2n_v = ns.load_key_f32(String("s2init_video"), ctx)
+        s2n_a = ns.load_key_f32(String("s2init_audio"), ctx)
+    else:
+        s2n_v = randn(
+            _sh3(1, REQUEST_HQ_S_V2, 128), seed + 100, STDtype.BF16, ctx
+        )
+        s2n_a = randn(
+            _sh3(1, REQUEST_HQ_S_A, 128), seed + 101, STDtype.BF16, ctx
+        )
+    var vx2 = _refhq_noise_blend(up_flat, s2n_v, s2_scale, ctx)
+    var ax2 = _refhq_noise_blend(audio_x, s2n_a, s2_scale, ctx)
+    var s2_eval = 0
+    var first_s2_eval = True
+    @parameter
+    def _den_s2(
+        vx: Tensor, ax: Tensor, sigma: Float32
+    ) raises -> Tuple[Tensor, Tensor]:
+        if s2_eval % 2 == 0:
+            var stage2_step = s2_eval // 2 + 1
+            if stage2_step > 3:
+                stage2_step = 3
+            _write_ltx2_status(
+                out_dir, String("running"), String("denoising_stage2"),
+                REQUEST_HQ_STEPS + stage2_step, progress_total,
+                String("Stage 2 step ") + String(stage2_step)
+                + String(" of 3"),
+            )
+        s2_eval += 1
+        var mod = _build_mod_dims(
+            ck, gw, sigma, REQUEST_HQ_S_V2, REQUEST_HQ_S_A, ctx,
+            uniform_timestep=True,
+        )
+        var c = _request_hq_forward_flat[
+            REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
+            REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
+        ](
+            loras, REFHQ_LORA_S2, cfg, g, stream, vx, ax, enc, aenc,
+            mod, vr2, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+            first_s2_eval, ctx,
+        )
+        first_s2_eval = False
+        return (
+            _refhq_x0(vx, c[0], sigma, ctx),
+            _refhq_x0(ax, c[1], sigma, ctx),
+        )
+
+    var s2_names = List[String]()
+    var s2_tensors = List[ArcPointer[Tensor]]()
+    var s2_out = res2s_ref_loop[_den_s2](
+        s2sig, vx2^, ax2^, ns, String("s2"), s2_names, s2_tensors, ctx,
+    )
+    vx2 = s2_out[0].clone(ctx)
+    ax2 = s2_out[1].clone(ctx)
+    ctx.synchronize()
+    denoise_seconds = perf_counter() - t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+
+    var v_final = _refhq_unpatchify_video(
+        vx2, REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2, ctx
+    )
+    var a_final = _refhq_unpatchify_audio(ax2, REQUEST_HQ_S_A, ctx)
+    var f_names = List[String]()
+    var f_tensors = List[ArcPointer[Tensor]]()
+    f_names.append(String("video"))
+    f_tensors.append(ArcPointer[Tensor](cast_tensor(v_final, STDtype.BF16, ctx)))
+    f_names.append(String("audio"))
+    f_tensors.append(ArcPointer[Tensor](cast_tensor(a_final, STDtype.BF16, ctx)))
+    _refhq_save(
+        f_names^, f_tensors^, out_dir + "/final_latents.safetensors", ctx
+    )
+
+    # Drop the streamed transformer handle before loading the VAE.
+    stream = LTX2BlockStream.open(_refhq_ckpt_fp8())
+    _write_ltx2_status(
+        out_dir, String("running"), String("decoding_video"),
+        progress_total, progress_total, String("Decoding 121 video frames"),
+    )
+    t0 = perf_counter()
+    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var frames = decode_video[
+        1, 128, REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2
+    ](vae, cast_tensor(v_final, STDtype.BF16, ctx), ctx)
+    var fsh = frames.shape()
+    var n_frames_out = fsh[2]
+    if n_frames_out != REQUEST_HQ_NUM_FRAMES:
+        raise Error("LTX2 request HQ: VAE returned unexpected frame count")
+    for fr in range(n_frames_out):
+        var fslice = slice(frames, 2, fr, 1, ctx)
+        var fs = fslice.shape()
+        var chw = reshape(
+            fslice, _sh4(fs[0], fs[1], fs[3], fs[4]), ctx
+        )
+        save_png(
+            chw, out_dir + "/hq_frame" + _pad2(fr) + ".png", ctx,
+            ValueRange.SIGNED,
+        )
+    ctx.synchronize()
+    video_decode_seconds = perf_counter() - t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+
+    var wav_out = String("")
+    if include_audio:
+        _write_ltx2_status(
+            out_dir, String("running"), String("decoding_audio"),
+            progress_total, progress_total, String("Decoding audio"),
+        )
+        t0 = perf_counter()
+        wav_out = _refhq_decode_audio_wav(a_final, out_dir, ctx)
+        audio_decode_seconds = perf_counter() - t0
+
+    _write_ltx2_status(
+        out_dir, String("running"), String("muxing"), progress_total,
+        progress_total, String("Muxing video"),
+    )
+    var mp4_out = out_dir + "/ltx2_t2v_hq.mp4"
+    t0 = perf_counter()
+    if include_audio:
+        _mux_mp4(
+            out_dir, n_frames_out, wav_out, mp4_out, String("hq_frame"),
+            REQUEST_HQ_FPS,
+        )
+    else:
+        _mux_video_mp4(
+            out_dir, mp4_out, String("hq_frame"), REQUEST_HQ_FPS
+        )
+    mux_seconds = perf_counter() - t0
+    min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    _write_ltx2_result(
+        out_dir, mp4_out, fsh[4], fsh[3], n_frames_out, REQUEST_HQ_FPS,
+        REQUEST_HQ_STEPS, seed, include_audio, String("res2s"),
+        String("ltx2"), contexts_path, negative_contexts_path,
+        len(loras.trained), load_seconds, conditioning_seconds,
+        prepare_seconds, denoise_seconds, video_decode_seconds,
+        audio_decode_seconds, mux_seconds, perf_counter() - total_t0,
+        total_vram_bytes, min_free_bytes,
+    )
+    _write_ltx2_status(
+        out_dir, String("done"), String("done"), progress_total,
+        progress_total, String("Video ready"),
+    )
+    print("=== LTX-2.3 REQUEST HQ DONE ===")
+    print("  mp4:", mp4_out)
+    print("  frames:", n_frames_out)
 
 
 # ── STEP-1 EVAL-1 dump mode (divergence hunt): identical setup to run_refhq,

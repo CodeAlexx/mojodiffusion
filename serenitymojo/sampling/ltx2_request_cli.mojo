@@ -116,10 +116,14 @@ def _resolve_lora_path(name: String) raises -> String:
 struct ResolvedCaps(Copyable, Movable):
     var path: String
     var has_negative: Bool
+    var is_projected: Bool
 
-    def __init__(out self, path: String, has_negative: Bool):
+    def __init__(
+        out self, path: String, has_negative: Bool, is_projected: Bool = False
+    ):
         self.path = path.copy()
         self.has_negative = has_negative
+        self.is_projected = is_projected
 
 
 def _resolve_caps_sidecar(
@@ -132,7 +136,7 @@ def _resolve_caps_sidecar(
     if not _path_exists(authored_path):
         raise Error(String("LTX2 request: conditioning artifact not found: ") + authored_path)
     if not authored_path.endswith(String(".json")):
-        return ResolvedCaps(authored_path, False)
+        return ResolvedCaps(authored_path, False, False)
 
     var meta = loads(_read_text_file(authored_path))
     if not meta.is_object():
@@ -156,7 +160,18 @@ def _resolve_caps_sidecar(
             String("LTX2 request: sidecar tensor artifact not found: ")
             + tensor_path
         )
-    return ResolvedCaps(tensor_path, has_negative)
+    var is_projected = False
+    if meta.contains(String("conditioning_stage")):
+        if not meta[String("conditioning_stage")].is_string():
+            raise Error("LTX2 request: conditioning_stage must be a string")
+        var stage = meta[String("conditioning_stage")].as_string()
+        if stage == String("post_connector"):
+            is_projected = True
+        elif stage != String("pre_connector"):
+            raise Error(
+                "LTX2 request: conditioning_stage must be pre_connector or post_connector"
+            )
+    return ResolvedCaps(tensor_path, has_negative, is_projected)
 
 
 def _configure_loras(obj: JSONValue) raises:
@@ -186,8 +201,47 @@ def _configure_loras(obj: JSONValue) raises:
             _resolve_lora_path(name),
         )
         _setenv(
+            String("LTX2_TRAINED_LORA_NAME_") + String(i), name,
+        )
+        _setenv(
             String("LTX2_TRAINED_LORA_MULT_") + String(i), String(weight)
         )
+        # Optional per-stream strengths (KJ LTX2LoraLoaderAdvanced): each in
+        # [0, 1], default 1.0. Encoded for the runner as five comma-joined
+        # floats `video,video_to_audio,audio,audio_to_video,other` — only set
+        # when at least one differs from 1.0.
+        var stream_names = [
+            String("video"), String("video_to_audio"), String("audio"),
+            String("audio_to_video"), String("other"),
+        ]
+        var stream_vals = List[Float64]()
+        var any_stream = False
+        for ref sname in stream_names:
+            var v = Float64(1.0)
+            if row.contains(sname):
+                if not row[sname].is_number():
+                    raise Error(
+                        String("LTX2 request: lora[") + String(i)
+                        + String("].") + sname + String(" must be a number")
+                    )
+                v = row[sname].as_float()
+                if v < 0.0 or v > 1.0:
+                    raise Error(
+                        String("LTX2 request: lora[") + String(i)
+                        + String("].") + sname + String(" must be in [0, 1]")
+                    )
+                if v != 1.0:
+                    any_stream = True
+            stream_vals.append(v)
+        if any_stream:
+            var enc = String("")
+            for j in range(len(stream_vals)):
+                if j > 0:
+                    enc += String(",")
+                enc += String(stream_vals[j])
+            _setenv(
+                String("LTX2_TRAINED_LORA_STREAMS_") + String(i), enc
+            )
 
 
 def _run_request(request_path: String, out_dir: String) raises:
@@ -212,9 +266,14 @@ def _run_request(request_path: String, out_dir: String) raises:
     var neg_path = String("")
     var authored_neg = _optional_string(obj, String("caps_negative"))
     if authored_neg.byte_length() > 0:
-        neg_path = _resolve_caps_sidecar(
+        var neg_caps = _resolve_caps_sidecar(
             authored_neg, prompt, negative
-        ).path
+        )
+        neg_path = neg_caps.path.copy()
+        if neg_caps.is_projected != caps.is_projected:
+            raise Error(
+                "LTX2 request: positive/negative conditioning stages must match"
+            )
     elif caps.has_negative:
         neg_path = caps.path.copy()
     elif negative.byte_length() > 0:
@@ -225,9 +284,15 @@ def _run_request(request_path: String, out_dir: String) raises:
     var seed = _require_int(obj, String("seed"))
     if seed < 0:
         raise Error("LTX2 request: seed must be >= 0")
+    var noise_fixture = _optional_string(obj, String("noise_fixture"))
+    if noise_fixture.byte_length() > 0 and not _path_exists(noise_fixture):
+        raise Error(
+            String("LTX2 request: noise_fixture not found: ") + noise_fixture
+        )
     _configure_loras(obj)
     _mkdir(out_dir)
     run_request_profile(
+        _require_string(obj, String("checkpoint")),
         _require_int(obj, String("width")),
         _require_int(obj, String("height")),
         _require_int(obj, String("frames")),
@@ -238,6 +303,8 @@ def _run_request(request_path: String, out_dir: String) raises:
         _require_string(obj, String("scheduler")),
         caps.path,
         neg_path,
+        caps.is_projected,
+        noise_fixture,
         _optional_bool(obj, String("include_audio"), False),
         out_dir,
     )

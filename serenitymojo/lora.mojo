@@ -98,6 +98,50 @@ struct LoraMapping(Copyable, Movable):
     """Slot param: RowRange→len. (unused otherwise.)"""
 
 
+@fieldwise_init
+struct LoraStreamMults(Copyable, Movable, ImplicitlyCopyable):
+    """Per-stream LoRA strength multipliers for the LTX-2 joint AV DiT.
+
+    Mirrors KJNodes `LTX2LoraLoaderAdvanced` (ComfyUI-KJNodes
+    nodes/ltxv_nodes.py): each resolved module's alpha is multiplied by the
+    slider for its stream family, matched by substring with most-specific
+    precedence. A 0.0 slider drops the module entirely (KJ deletes the key).
+    """
+
+    var video: Float32
+    var video_to_audio: Float32
+    var audio: Float32
+    var audio_to_video: Float32
+    var other: Float32
+
+    @staticmethod
+    def identity() -> LoraStreamMults:
+        return LoraStreamMults(1.0, 1.0, 1.0, 1.0, 1.0)
+
+    def is_identity(self) -> Bool:
+        return (
+            self.video == Float32(1.0)
+            and self.video_to_audio == Float32(1.0)
+            and self.audio == Float32(1.0)
+            and self.audio_to_video == Float32(1.0)
+            and self.other == Float32(1.0)
+        )
+
+    def mult_for_key(self, key: String) -> Float32:
+        """KJ precedence, most specific first. `key` is a base_key (full or
+        block-local), e.g. `transformer_blocks.3.video_to_audio_attn.to_q.
+        weight` or `patchify_proj.weight`."""
+        if "video_to_audio_attn" in key:
+            return self.video_to_audio
+        if "audio_to_video_attn" in key:
+            return self.audio_to_video
+        if ("audio_attn" in key) or ("audio_ff.net" in key):
+            return self.audio
+        if ("attn" in key) or ("ff.net" in key):
+            return self.video
+        return self.other
+
+
 struct LTX2BlockLoraDeltaSet(Copyable, Movable):
     """Merged runtime LoRA deltas for one LTX-2 AV block.
 
@@ -825,6 +869,18 @@ struct LoraSet(Movable):
         multiplier: Float32,
         ctx: DeviceContext,
     ) raises -> Int:
+        return self.accumulate_ltx2_block_deltas_streamed(
+            block_idx, out, multiplier, LoraStreamMults.identity(), ctx
+        )
+
+    def accumulate_ltx2_block_deltas_streamed(
+        self,
+        block_idx: Int,
+        mut out: LTX2BlockLoraDeltaSet,
+        multiplier: Float32,
+        streams: LoraStreamMults,
+        ctx: DeviceContext,
+    ) raises -> Int:
         """Precompute and merge this LoRA file's block-level deltas into `out`.
 
         Deltas are materialized as BF16 because LTX-2 runtime block weights are
@@ -833,6 +889,10 @@ struct LoraSet(Movable):
         can call this against the same `out`; deltas targeting the same local
         weight are summed once, so runtime block application becomes one add per
         unique weight instead of one matrix product per LoRA module per eval.
+
+        `streams` scales each module's effective multiplier by its stream
+        family (KJ LTX2LoraLoaderAdvanced semantics); a 0.0 stream slider skips
+        the module AFTER fail-closed validation.
         """
         var n_applied = 0
         for ref m in self.mappings:
@@ -852,7 +912,10 @@ struct LoraSet(Movable):
                     + local
                     + "' (base_key=" + m.base_key + ") — fail-closed"
                 )
-            var scale = self._module_scale(m, multiplier, ctx)
+            var stream_mult = streams.mult_for_key(m.base_key)
+            if stream_mult == Float32(0.0):
+                continue
+            var scale = self._module_scale(m, multiplier * stream_mult, ctx)
             var delta = self._compute_delta(m, scale, STDtype.BF16, ctx)
             out.add_delta(local, delta^, ctx)
             n_applied += 1
@@ -863,6 +926,18 @@ struct LoraSet(Movable):
         block_idx: Int,
         mut block: LTX2AVBlockWeights,
         multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        return self.attach_ltx2_block_factors_streamed(
+            block_idx, block, multiplier, LoraStreamMults.identity(), ctx
+        )
+
+    def attach_ltx2_block_factors_streamed(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        multiplier: Float32,
+        streams: LoraStreamMults,
         ctx: DeviceContext,
     ) raises -> Int:
         """Attach factorized LoRA A/B tensors to an LTX-2 AV block.
@@ -900,7 +975,10 @@ struct LoraSet(Movable):
                     + local
                     + "' — fail-closed"
                 )
-            var scale = self._module_scale(m, multiplier, ctx)
+            var stream_mult = streams.mult_for_key(m.base_key)
+            if stream_mult == Float32(0.0):
+                continue
+            var scale = self._module_scale(m, multiplier * stream_mult, ctx)
             var a = self._load_lora_tensor(m.prefix + self.suffix_a, ctx)
             var b = self._load_lora_tensor(m.prefix + self.suffix_b, ctx)
             if a.dtype() != STDtype.BF16 and a.dtype() != STDtype.F16:
@@ -918,14 +996,29 @@ struct LoraSet(Movable):
         multiplier: Float32,
         ctx: DeviceContext,
     ) raises -> Int:
+        return self.attach_ltx2_cached_block_factors_streamed(
+            block_idx, block, multiplier, LoraStreamMults.identity(), ctx
+        )
+
+    def attach_ltx2_cached_block_factors_streamed(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        multiplier: Float32,
+        streams: LoraStreamMults,
+        ctx: DeviceContext,
+    ) raises -> Int:
         """Attach preloaded factorized LoRA tensors to a streamed LTX-2 block.
 
         Falls back to the legacy loader if callers did not preload, preserving
         existing smoke tests while giving the HQ path a non-pathological hot
-        loop.
+        loop. `streams` scales each factor's attach scale by its stream family
+        (KJ LTX2LoraLoaderAdvanced semantics); 0.0 skips after validation.
         """
         if not self.ltx2_factor_cache_ready:
-            return self.attach_ltx2_block_factors(block_idx, block, multiplier, ctx)
+            return self.attach_ltx2_block_factors_streamed(
+                block_idx, block, multiplier, streams, ctx
+            )
 
         var n_applied = 0
         for i in range(len(self.ltx2_factor_base_keys)):
@@ -948,11 +1041,14 @@ struct LoraSet(Movable):
                     + local
                     + "' — fail-closed"
                 )
+            var stream_mult = streams.mult_for_key(self.ltx2_factor_base_keys[i])
+            if stream_mult == Float32(0.0):
+                continue
             block.add_lora_factor_arc(
                 local,
                 self.ltx2_factor_a[i].copy(),
                 self.ltx2_factor_b[i].copy(),
-                self.ltx2_factor_base_scales[i] * multiplier,
+                self.ltx2_factor_base_scales[i] * multiplier * stream_mult,
             )
             n_applied += 1
         return n_applied
@@ -961,6 +1057,17 @@ struct LoraSet(Movable):
         self,
         mut gw: Dict[String, ArcPointer[Tensor]],
         multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        return self.apply_to_globals_streamed(
+            gw, multiplier, LoraStreamMults.identity(), ctx
+        )
+
+    def apply_to_globals_streamed(
+        self,
+        mut gw: Dict[String, ArcPointer[Tensor]],
+        multiplier: Float32,
+        streams: LoraStreamMults,
         ctx: DeviceContext,
     ) raises -> Int:
         """ADD every GLOBAL (non-block) LoRA delta onto the resident persistent
@@ -993,7 +1100,10 @@ struct LoraSet(Movable):
                     String("LTX2 global apply: A/B pair missing or conv for ")
                     + m.prefix
                 )
-            var scale = self._module_scale(m, multiplier, ctx)
+            var stream_mult = streams.mult_for_key(m.base_key)
+            if stream_mult == Float32(0.0):
+                continue
+            var scale = self._module_scale(m, multiplier * stream_mult, ctx)
             var base_dtype = gw[m.base_key][].dtype()
             var delta = self._compute_delta(m, scale, base_dtype, ctx)
             var merged = add(gw[m.base_key][], delta, ctx)

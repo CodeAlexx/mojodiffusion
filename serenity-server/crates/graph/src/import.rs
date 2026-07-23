@@ -369,6 +369,12 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             1 => Some("CLIP"),
             _ => None,
         },
+        "LTX2LoraLoaderAdvanced" => match slot {
+            0 => Some("MODEL"),
+            1 => Some("rank"),
+            2 => Some("loaded_keys_info"),
+            _ => None,
+        },
         "CLIPLoader" | "DualCLIPLoader" | "TripleCLIPLoader" => (slot == 0).then_some("CLIP"),
         "CLIPVisionLoader" => (slot == 0).then_some("CLIP_VISION"),
         "CLIPVisionEncode" => (slot == 0).then_some("CLIP_VISION_OUTPUT"),
@@ -951,6 +957,27 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
                 fields.insert("strength_clip".into(), json!(widget_float(widgets, 2, 1.0)));
             }
         }
+        "LTX2LoraLoaderAdvanced" => {
+            // KJ widget order (force_input `opt_lora_path` and the `blocks`
+            // socket are inputs, not widgets): lora_name, strength_model,
+            // video, video_to_audio, audio, audio_to_video, other.
+            fields.insert("lora_name".into(), json!(widget_string(widgets, 0, "")));
+            fields.insert(
+                "strength_model".into(),
+                json!(widget_float(widgets, 1, 1.0)),
+            );
+            fields.insert("video".into(), json!(widget_float(widgets, 2, 1.0)));
+            fields.insert(
+                "video_to_audio".into(),
+                json!(widget_float(widgets, 3, 1.0)),
+            );
+            fields.insert("audio".into(), json!(widget_float(widgets, 4, 1.0)));
+            fields.insert(
+                "audio_to_video".into(),
+                json!(widget_float(widgets, 5, 1.0)),
+            );
+            fields.insert("other".into(), json!(widget_float(widgets, 6, 1.0)));
+        }
         "CLIPTextEncode"
         | "CLIPTextEncodeFlux"
         | "TextEncodeQwenImageEdit"
@@ -1037,6 +1064,17 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
                 "LanPaint_NumSteps".into(),
                 json!(widget_int(widgets, 7, -1)),
             );
+            // These are fixed semantics of upstream LanPaint_KSampler (they
+            // are not widgets on the compact node). Materialize them into the
+            // typed request so the Mojo runner never substitutes a hidden
+            // sampling profile.
+            fields.insert("LanPaint_Lambda".into(), json!(16.0));
+            fields.insert("LanPaint_StepSize".into(), json!(0.2));
+            fields.insert("LanPaint_Beta".into(), json!(1.0));
+            fields.insert("LanPaint_Friction".into(), json!(15.0));
+            fields.insert("LanPaint_EarlyStop".into(), json!(1));
+            fields.insert("LanPaint_InnerThreshold".into(), json!(0.0));
+            fields.insert("LanPaint_InnerPatience".into(), json!(1));
             fields.insert(
                 "LanPaint_PromptMode".into(),
                 json!(widget_string(widgets, 8, "")),

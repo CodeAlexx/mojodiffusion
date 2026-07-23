@@ -1,0 +1,144 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LTXVLoader",
+      "pos": [100, 200],
+      "size": [300, 150],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "ltxv_model", "type": "LTXV_MODEL", "links": [1]}
+      ],
+      "properties": {},
+      "widgets_values": [
+        "ltx-2.3-22b-dev.safetensors",
+        "gemma-3-12b-it",
+        "bfloat16",
+        "",
+        "",
+        "",
+        1.0,
+        "auto",
+        "legacy_stagehand",
+        "ltx2_serenityfp8.safetensors"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [100, 450],
+      "size": [280, 80],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "image", "type": "IMAGE", "links": [3]}
+      ],
+      "properties": {},
+      "widgets_values": ["input.png"]
+    },
+    {
+      "id": 3,
+      "type": "LoadAudio",
+      "pos": [100, 600],
+      "size": [280, 80],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "audio", "type": "AUDIO", "links": [4]}
+      ],
+      "properties": {},
+      "widgets_values": ["input.mp3"]
+    },
+    {
+      "id": 4,
+      "type": "LTXVSampler",
+      "pos": [500, 100],
+      "size": [350, 480],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"name": "ltxv_model", "type": "LTXV_MODEL", "link": 1},
+        {"name": "guide_image", "type": "IMAGE", "link": 3},
+        {"name": "audio", "type": "AUDIO", "link": 4}
+      ],
+      "outputs": [
+        {"name": "frames", "type": "IMAGE", "links": null},
+        {"name": "video", "type": "VIDEO", "links": [2]},
+        {"name": "audio", "type": "AUDIO", "links": [5]}
+      ],
+      "properties": {},
+      "widgets_values": [
+        "A character performs to the beat with expressive motion and camera drift that follows the rhythm",
+        768,
+        512,
+        97,
+        25,
+        3.0,
+        42,
+        "worst quality, inconsistent motion, blurry, jittery, distorted",
+        24.0,
+        1.0,
+        "dev",
+        null,
+        1.0,
+        0,
+        null,
+        0.0,
+        4.0
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SaveVideo",
+      "pos": [950, 200],
+      "size": [280, 100],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"name": "video", "type": "VIDEO", "link": 2}
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "ltx23_sfp8_ia2v",
+        24.0,
+        "mp4"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "SaveAudioOpus",
+      "pos": [950, 380],
+      "size": [280, 80],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"name": "audio", "type": "AUDIO", "link": 5}
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": ["ltx23_sfp8_ia2v"]
+    }
+  ],
+  "links": [
+    {"id": 1, "origin_id": 1, "origin_slot": 0, "target_id": 4, "target_slot": 0, "type": "LTXV_MODEL"},
+    {"id": 2, "origin_id": 4, "origin_slot": 1, "target_id": 5, "target_slot": 0, "type": "VIDEO"},
+    {"id": 3, "origin_id": 2, "origin_slot": 0, "target_id": 4, "target_slot": 1, "type": "IMAGE"},
+    {"id": 4, "origin_id": 3, "origin_slot": 0, "target_id": 4, "target_slot": 2, "type": "AUDIO"},
+    {"id": 5, "origin_id": 4, "origin_slot": 2, "target_id": 6, "target_slot": 0, "type": "AUDIO"}
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

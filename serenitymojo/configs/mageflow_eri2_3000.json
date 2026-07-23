@@ -1,0 +1,22 @@
+{
+  "model_type": "mageflow",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/Mage-Flow-Base/transformer/diffusion_pytorch_model.safetensors",
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "learning_rate": 0.0004,
+  "lr_warmup_steps": 100,
+  "timestep_shift": 6.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 3000,
+  "save_every": 500,
+  "sample_every": 500,
+  "seed": 42,
+  "cache_dir": "/home/alex/.serenity/mageflow_cache/eri2_with_trigger_512",
+  "output_model_destination": "/home/alex/mojodiffusion/output/mageflow_eri2/mageflow_eri2_lora.safetensors",
+  "optimizer": {
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999
+  }
+}

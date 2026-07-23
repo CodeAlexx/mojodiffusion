@@ -11,6 +11,14 @@ var CanvasRefImages = (function () {
     var _refs = [];
     var _panelEl = null;
     var _nextId = 0;
+    var _compatibility = { supported: false, reason: 'Reference-image generation is not advertised by the selected backend' };
+    function notifyStyleSelected(ref) {
+        if (!ref || ref.method !== 'style')
+            return;
+        document.dispatchEvent(new CustomEvent('sf-style-reference-selected', {
+            detail: { ref: JSON.parse(JSON.stringify(ref)) }
+        }));
+    }
     function add(src) {
         var ref = {
             id: 'ref_' + (++_nextId),
@@ -22,6 +30,7 @@ var CanvasRefImages = (function () {
         };
         _refs.push(ref);
         renderPanel();
+        notifyStyleSelected(ref);
         return ref;
     }
     function remove(id) {
@@ -29,10 +38,31 @@ var CanvasRefImages = (function () {
         renderPanel();
     }
     function getAll() { return _refs; }
+    function serialize() { return JSON.parse(JSON.stringify(_refs)); }
+    function restore(refs) {
+        _refs = Array.isArray(refs) ? refs.map(function (ref) {
+            var range = Array.isArray(ref.stepRange) ? ref.stepRange : [0, 1];
+            return {
+                id: String(ref.id || ('ref_' + (++_nextId))),
+                src: String(ref.src || ''),
+                weight: Math.max(0, Math.min(2, Number(ref.weight == null ? 1 : ref.weight))),
+                method: String(ref.method || 'style'),
+                model: String(ref.model || 'ip-adapter'),
+                stepRange: [Math.max(0, Math.min(1, Number(range[0] || 0))), Math.max(0, Math.min(1, Number(range[1] == null ? 1 : range[1])))],
+                imageName: ref.imageName || ''
+            };
+        }).filter(function (ref) { return !!ref.src; }) : [];
+        _nextId = Math.max(_nextId, _refs.length);
+        renderPanel();
+    }
     function getForPayload() {
         return _refs.map(function (r) {
-            return { imageId: r.src, weight: r.weight, method: r.method, model: r.model };
+            return { imageId: r.src, weight: r.weight, method: r.method, model: r.model, stepRange: r.stepRange.slice() };
         });
+    }
+    function setCompatibility(supported, reason) {
+        _compatibility = { supported: supported === true, reason: String(reason || '') };
+        renderPanel();
     }
     function showPanel() {
         if (!_panelEl) {
@@ -52,9 +82,12 @@ var CanvasRefImages = (function () {
             return;
         var html = '<div class="ref-header">' +
             '<span class="ref-title">Reference Images</span>' +
-            '<button class="ref-add-btn" id="ref-add-btn">+ Add</button>' +
+            '<button class="ref-add-btn" id="ref-add-btn"' + (_compatibility.supported ? '' : ' title="Local project reference; generation is capability-gated"') + '>+ Add</button>' +
             '<input type="file" id="ref-file-input" accept="image/*" style="display:none" multiple>' +
             '</div>';
+        if (!_compatibility.supported) {
+            html += '<div class="ref-capability-note">Local project only: ' + escapeHtml(_compatibility.reason) + '</div>';
+        }
         if (_refs.length === 0) {
             html += '<div class="ref-empty">No reference images. Click + Add or drag & drop.</div>';
         }
@@ -69,12 +102,19 @@ var CanvasRefImages = (function () {
                 '<option value="composition"' + (ref.method === 'composition' ? ' selected' : '') + '>Composition</option>' +
                 '<option value="full"' + (ref.method === 'full' ? ' selected' : '') + '>Full</option>' +
                 '</select></div>' +
+                '<div class="ref-row"><span>Range</span><input type="range" class="ref-step-start" data-id="' + ref.id + '" min="0" max="1" step="0.05" value="' + ref.stepRange[0] + '"><span class="ref-range-val">' + ref.stepRange[0].toFixed(2) + '</span></div>' +
+                '<div class="ref-row"><span>to</span><input type="range" class="ref-step-end" data-id="' + ref.id + '" min="0" max="1" step="0.05" value="' + ref.stepRange[1] + '"><span class="ref-range-val">' + ref.stepRange[1].toFixed(2) + '</span></div>' +
                 '<button class="ref-remove" data-id="' + ref.id + '" title="Remove">&times;</button>' +
                 '</div>' +
                 '</div>';
         });
         _panelEl.innerHTML = html;
         bindPanelEvents();
+    }
+    function escapeHtml(value) {
+        var div = document.createElement('div');
+        div.textContent = value;
+        return div.innerHTML;
     }
     function bindPanelEvents() {
         var addBtn = document.getElementById('ref-add-btn');
@@ -112,8 +152,36 @@ var CanvasRefImages = (function () {
             select.addEventListener('change', function () {
                 var targetId = select.dataset.id;
                 var ref = _refs.find(function (r) { return r.id === targetId; });
-                if (ref)
+                if (ref) {
                     ref.method = select.value;
+                    notifyStyleSelected(ref);
+                }
+            });
+        });
+        document.querySelectorAll('.ref-thumb').forEach(function (el) {
+            el.addEventListener('click', function () {
+                var item = this.closest('.ref-item');
+                var ref = item && _refs.find(function (candidate) { return candidate.id === item.dataset.id; });
+                notifyStyleSelected(ref);
+            });
+        });
+        document.querySelectorAll('.ref-step-start, .ref-step-end').forEach(function (el) {
+            var input = el;
+            input.addEventListener('input', function () {
+                var ref = _refs.find(function (candidate) { return candidate.id === input.dataset.id; });
+                if (!ref)
+                    return;
+                var index = input.classList.contains('ref-step-start') ? 0 : 1;
+                ref.stepRange[index] = parseFloat(input.value);
+                if (ref.stepRange[0] > ref.stepRange[1]) {
+                    ref.stepRange[1 - index] = ref.stepRange[index];
+                    var peer = input.parentElement.parentElement.querySelector(index === 0 ? '.ref-step-end' : '.ref-step-start');
+                    if (peer)
+                        peer.value = String(ref.stepRange[1 - index]);
+                }
+                var label = input.parentElement.querySelector('.ref-range-val');
+                if (label)
+                    label.textContent = ref.stepRange[index].toFixed(2);
             });
         });
         // Remove buttons
@@ -127,7 +195,10 @@ var CanvasRefImages = (function () {
         add: add,
         remove: remove,
         getAll: getAll,
+        serialize: serialize,
+        restore: restore,
         getForPayload: getForPayload,
+        setCompatibility: setCompatibility,
         showPanel: showPanel,
     };
 })();
@@ -147,18 +218,39 @@ var CanvasContextMenu = (function () {
         var al = ctx.getActiveLayer();
         var type = al ? al.data.type : null;
         var items = [];
-        if (type === 'draw' || type === 'text') {
+        if (al) {
+            items.push({ label: 'Rename Layer', action: 'rename' });
+            items.push({ label: 'Transform Layer', action: 'transform' });
             items.push({ label: 'Duplicate Layer', action: 'duplicate' });
-            items.push({ label: 'Delete Layer', action: 'delete' });
+            items.push({ label: 'Bring Forward', action: 'forward' });
+            items.push({ label: 'Send Backward', action: 'backward' });
+            items.push({ label: al.data.locked ? 'Unlock Layer' : 'Lock Layer', action: 'togglelock' });
+            if (type === 'draw')
+                items.push({ label: al.data.lockTransparency ? 'Unlock Transparency' : 'Lock Transparency', action: 'toggle_transparency' });
+            items.push({ label: 'Copy Layer', action: 'copy' });
+            items.push({ label: 'Save Layer as PNG', action: 'save_layer' });
+            items.push({ label: 'Crop Bbox to Layer', action: 'crop_layer' });
+            items.push({ label: 'Run Current Workflow', action: 'run_workflow', divider: true });
+            items.push({ label: 'Add Adjustment / Filters', action: 'add_adjustment' });
+        }
+        if (type === 'draw' || type === 'text' || type === 'adjustment') {
+            if (type === 'draw') {
+                items.push({ label: 'Convert to Inpaint Mask', action: 'convert_mask' });
+                items.push({ label: 'Convert to Regional Guidance', action: 'convert_guidance' });
+            }
             items.push({ label: 'Merge Down', action: 'merge' });
             items.push({ label: 'Flatten Visible', action: 'flatten' });
-            items.push({ label: al.data.locked ? 'Unlock' : 'Lock', action: 'togglelock' });
+            items.push({ label: 'Delete Layer', action: 'delete', divider: true });
         }
         else if (type === 'mask') {
+            items.push({ label: 'Convert to Raster Layer', action: 'convert_draw' });
             items.push({ label: 'Invert Mask', action: 'invert_mask' });
             items.push({ label: 'Expand Mask (5px)', action: 'expand_mask' });
             items.push({ label: 'Shrink Mask (5px)', action: 'shrink_mask' });
             items.push({ label: 'Feather Mask (3px)', action: 'feather_mask' });
+            items.push({ label: 'Delete Layer', action: 'delete', divider: true });
+        }
+        else if (al) {
             items.push({ label: 'Delete Layer', action: 'delete', divider: true });
         }
         else {
@@ -198,8 +290,20 @@ var CanvasContextMenu = (function () {
             return;
         var al = _ctx.getActiveLayer();
         switch (action) {
+            case 'rename':
+                _ctx.renameActiveLayer();
+                break;
+            case 'transform':
+                _ctx.transformActiveLayer();
+                break;
             case 'duplicate':
                 _ctx.duplicateActiveLayer();
+                break;
+            case 'forward':
+                _ctx.moveActiveLayerForward();
+                break;
+            case 'backward':
+                _ctx.moveActiveLayerBackward();
                 break;
             case 'delete':
                 _ctx.deleteActiveLayer();
@@ -214,9 +318,34 @@ var CanvasContextMenu = (function () {
                 _ctx.flattenVisible();
                 break;
             case 'togglelock':
-                if (al) {
-                    al.data.locked = !al.data.locked;
-                }
+                _ctx.toggleActiveLayerLock();
+                break;
+            case 'toggle_transparency':
+                _ctx.toggleActiveLayerTransparency();
+                break;
+            case 'add_adjustment':
+                _ctx.addLayer('Adjustment', 'adjustment');
+                break;
+            case 'copy':
+                _ctx.copyActiveLayer();
+                break;
+            case 'save_layer':
+                _ctx.saveActiveLayer();
+                break;
+            case 'crop_layer':
+                _ctx.cropToActiveLayer();
+                break;
+            case 'run_workflow':
+                _ctx.runActiveLayerWorkflow();
+                break;
+            case 'convert_mask':
+                _ctx.convertActiveLayerTo('mask');
+                break;
+            case 'convert_guidance':
+                _ctx.convertActiveLayerTo('guidance');
+                break;
+            case 'convert_draw':
+                _ctx.convertActiveLayerTo('draw');
                 break;
             case 'invert_mask':
                 invertMask(_ctx);

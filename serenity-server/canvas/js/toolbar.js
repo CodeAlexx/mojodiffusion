@@ -189,12 +189,17 @@ class SFToolbar {
                 return;
             const value = Number(data && data.value != null ? data.value : 0);
             const max = Number(data && data.max != null ? data.max : 0);
+            const phase = data && data.phase ? String(data.phase) : '';
             if (max > 0 && value >= max) {
-                this._setWorkflowStatus('output', 'Denoise complete · decoding and saving…');
+                this._setWorkflowStatus('output', phase || 'Denoise complete · decoding and saving…');
                 this._applyWorkflowPhase('output');
             }
+            else if (value <= 0 && phase) {
+                this._setWorkflowStatus('loading', phase);
+                this._applyWorkflowPhase('loading');
+            }
             else {
-                this._setWorkflowStatus('running', 'Sampling · Step ' + value + ' / ' + max);
+                this._setWorkflowStatus('running', phase || ('Sampling · Step ' + value + ' / ' + max));
                 this._applyWorkflowPhase('sampling');
             }
         });
@@ -227,7 +232,12 @@ class SFToolbar {
             if (result.error) {
                 throw new Error(result.error);
             }
-            if (result.video_result) {
+            if (result.video_pending) {
+                this._activePromptId = result.prompt_id || this._activePromptId;
+                this._awaitingPrompt = false;
+                this._setWorkflowStatus('loading', 'Loading LTX2 model and conditioning…');
+            }
+            else if (result.video_result) {
                 const video = result.video_result;
                 let src = video.mp4_url || '';
                 if (!src && video.mp4 && video.video_id) {

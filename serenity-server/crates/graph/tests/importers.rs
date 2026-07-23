@@ -615,6 +615,77 @@ fn load_image_mask_alias_resolves_mask() {
 }
 
 #[test]
+fn zimage_canvas_inpaint_preserves_explicit_grayscale_mask_channel() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "replace the subject"}},
+        "3": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}},
+        "4": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["4", 0], "vae": ["1", 2]}},
+        "6": {"class_type": "LoadImage", "inputs": {"image": "grayscale-mask.png"}},
+        "7": {"class_type": "ImageToMask", "inputs": {"image": ["6", 0], "channel": "red"}},
+        "8": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["5", 0], "mask": ["7", 0]}},
+        "9": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 4, "cfg": 1.0, "sampler_name": "flowmatch_euler", "scheduler": "simple", "denoise": 0.65, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["8", 0]}},
+        "10": {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["1", 2]}},
+        "11": {"class_type": "SaveImage", "inputs": {"images": ["10", 0], "filename_prefix": "zimage_canvas_inpaint"}}
+    }});
+    lower_request(&mut req).expect("Z-Image Canvas inpaint graph must lower cleanly");
+    assert_eq!(req["init_image"].as_str(), Some("source.png"));
+    assert_eq!(req["mask_image"].as_str(), Some("grayscale-mask.png"));
+    assert_eq!(req["lanpaint_mask_channel"].as_str(), Some("red"));
+    assert_eq!(req["creativity"].as_f64(), Some(0.65));
+}
+
+#[test]
+fn krea2_canvas_lanpaint_advanced_graph_preserves_visible_controls() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2-turbo", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "Qwen/Qwen3-VL-4B-Instruct", "type": "krea2", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "replace the hand with a red leather glove"}},
+        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+        "6": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "7": {"class_type": "ImageResizeKJ", "inputs": {"image": ["6", 0], "width": 1024, "height": 1024, "keep_proportion": false, "divisible_by": 2}},
+        "8": {"class_type": "LoadImage", "inputs": {"image": "mask.png"}},
+        "9": {"class_type": "ImageResizeKJ", "inputs": {"image": ["8", 0], "width": 1024, "height": 1024, "keep_proportion": false, "divisible_by": 2}},
+        "10": {"class_type": "ImageToMask", "inputs": {"image": ["9", 0], "channel": "red"}},
+        "11": {"class_type": "VAEEncode", "inputs": {"pixels": ["7", 0], "vae": ["3", 0]}},
+        "12": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["11", 0], "mask": ["10", 0]}},
+        "13": {"class_type": "LanPaint_KSamplerAdvanced", "inputs": {
+            "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["12", 0],
+            "add_noise": "enable", "noise_seed": 42, "steps": 8, "cfg": 1.0,
+            "sampler_name": "euler", "scheduler": "simple", "start_at_step": 0, "end_at_step": 8,
+            "return_with_leftover_noise": "disable", "LanPaint_NumSteps": 5,
+            "LanPaint_Lambda": 16.0, "LanPaint_StepSize": 0.2, "LanPaint_Beta": 1.0,
+            "LanPaint_Friction": 15.0, "LanPaint_PromptMode": "Image First",
+            "LanPaint_EarlyStop": 1, "LanPaint_InnerThreshold": 0.0,
+            "LanPaint_InnerPatience": 1, "Inpainting_mode": "Image Inpainting"
+        }},
+        "14": {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["3", 0]}},
+        "15": {"class_type": "LanPaint_MaskBlend", "inputs": {"image1": ["7", 0], "image2": ["14", 0], "mask": ["10", 0], "blend_overlap": 9}},
+        "16": {"class_type": "SaveImage", "inputs": {"images": ["15", 0], "filename_prefix": "krea2_lanpaint"}}
+    }});
+    lower_request(&mut req).expect("Krea2 Canvas LanPaint graph must lower cleanly");
+    assert_eq!(req["model"].as_str(), Some("krea2-turbo"));
+    assert_eq!(req["width"].as_i64(), Some(1024));
+    assert_eq!(req["height"].as_i64(), Some(1024));
+    assert_eq!(req["init_image"].as_str(), Some("source.png"));
+    assert_eq!(req["mask_image"].as_str(), Some("mask.png"));
+    assert_eq!(req["lanpaint_mask_channel"].as_str(), Some("red"));
+    assert_eq!(req["creativity"].as_f64(), Some(1.0));
+    assert_eq!(req["lanpaint_num_steps"].as_i64(), Some(5));
+    assert_eq!(req["lanpaint_lambda"].as_f64(), Some(16.0));
+    assert_eq!(req["lanpaint_step_size"].as_f64(), Some(0.2));
+    assert_eq!(req["lanpaint_beta"].as_f64(), Some(1.0));
+    assert_eq!(req["lanpaint_friction"].as_f64(), Some(15.0));
+    assert_eq!(req["lanpaint_prompt_mode"].as_str(), Some("Image First"));
+    assert_eq!(req["lanpaint_mask_blend_overlap"].as_i64(), Some(9));
+    assert_eq!(req["lanpaint_early_stop"].as_i64(), Some(1));
+    assert_eq!(req["lanpaint_inner_threshold"].as_f64(), Some(0.0));
+    assert_eq!(req["lanpaint_inner_patience"].as_i64(), Some(1));
+}
+
+#[test]
 fn flux_guidance_scalar_wins_over_inert_ksampler_cfg() {
     let mut req = json!({"workflow": {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev", "weight_dtype": "default"}},
@@ -760,4 +831,89 @@ fn image_scale_by_is_rejected_loud() {
     let msg = format!("{err}");
     assert!(msg.contains("ImageScaleBy"), "msg = {msg}");
     assert!(msg.contains("not resolvable"), "msg = {msg}");
+}
+
+#[test]
+fn ltx2_lora_loader_advanced_lowers_stream_strengths() {
+    let mut req = json!({
+        "workflow": {
+            "1": {
+                "class_type": "LTXVLoader",
+                "inputs": {
+                    "checkpoint_path": "ltx-2.3-22b-dev.safetensors",
+                    "gemma_path": "gemma-3-12b-it",
+                    "dtype": "bfloat16"
+                }
+            },
+            "2": {
+                "class_type": "LTX2LoraLoaderAdvanced",
+                "inputs": {
+                    "model": ["1", 0],
+                    "lora_name": "my_ltx2_overlay.safetensors",
+                    "strength_model": 0.9,
+                    "video": 0.75,
+                    "audio_to_video": 0.5
+                }
+            },
+            "3": {
+                "class_type": "LTXVSampler",
+                "inputs": {
+                    "ltxv_model": ["2", 0],
+                    "prompt": "cinematic foggy forest",
+                    "width": 768,
+                    "height": 512,
+                    "num_frames": 97,
+                    "steps": 25,
+                    "cfg": 3.0,
+                    "seed": 42,
+                    "frame_rate": 24,
+                    "mode": "dev"
+                }
+            },
+            "4": {
+                "class_type": "SaveVideo",
+                "inputs": {
+                    "video": ["3", 1],
+                    "filename_prefix": "ltx2_lora_adv",
+                    "fps": 24,
+                    "format": "mp4"
+                }
+            }
+        }
+    });
+    lower_request(&mut req).expect("LTX2 advanced-LoRA video graph lowers");
+    assert_eq!(req["model"].as_str(), Some("ltx-2.3-22b-dev.safetensors"));
+    let lora = req["lora"].as_array().expect("lora array present");
+    assert_eq!(lora.len(), 1);
+    let row = &lora[0];
+    assert_eq!(row["name"].as_str(), Some("my_ltx2_overlay.safetensors"));
+    assert_eq!(row["weight"].as_f64(), Some(0.9));
+    assert_eq!(row["video"].as_f64(), Some(0.75));
+    assert_eq!(row["audio_to_video"].as_f64(), Some(0.5));
+    // Default-1.0 streams are omitted so plain rows stay `{name, weight}`.
+    assert!(row.get("video_to_audio").is_none());
+    assert!(row.get("audio").is_none());
+    assert!(row.get("other").is_none());
+}
+
+#[test]
+fn ltx2_lora_loader_advanced_blocks_input_is_rejected_loud() {
+    let mut req = json!({
+        "workflow": {
+            "1": { "class_type": "LTXVLoader", "inputs": { "checkpoint_path": "ltx-2.3-22b-dev.safetensors" } },
+            "2": {
+                "class_type": "LTX2LoraLoaderAdvanced",
+                "inputs": {
+                    "model": ["1", 0],
+                    "blocks": ["1", 0],
+                    "lora_name": "my_ltx2_overlay.safetensors"
+                }
+            }
+        }
+    });
+    let err = lower_request(&mut req).unwrap_err().to_string();
+    assert!(
+        err.contains("blocks input is not supported") || err.contains("unsupported workflow graph node type"),
+        "unexpected error: {err}"
+    );
 }

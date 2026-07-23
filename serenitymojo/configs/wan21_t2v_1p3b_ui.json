@@ -1,0 +1,22 @@
+{
+  "model_type": "wan21",
+  "wan_variant": "t2v_1.3b",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/wan2.1_t2v_1.3B_fp16.safetensors",
+  "network_algorithm": "lora",
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "learning_rate": 0.0001,
+  "max_steps": 2,
+  "save_every": 0,
+  "sample_every": 0,
+  "seed": 42,
+  "cache_dir": "/home/alex/.serenity/wan22_cache/40_woman",
+  "output_model_destination": "/home/alex/mojodiffusion/output/wan21_lora/wan21_t2v_1p3b_lora.safetensors",
+  "optimizer": {
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999
+  },
+  "_note": "Wan2.1 T2V 1.3B UI base config (serenity webui wan21 preset). P3 (2026-07-22): CONFIG-FIRST — wan_variant selects the Wan2.1 single-expert arm and checkpoint + cache_dir are consumed by the trainer directly, so this file alone reproduces the run. Env WAN21_MODEL / WAN21_DIT / WAN22_DATA_CACHE remain as overrides for legacy smoke scripts (env wins only when set)."
+}

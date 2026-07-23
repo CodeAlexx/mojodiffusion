@@ -1,0 +1,69 @@
+{
+    "1": {
+        "class_type": "LTXVLoader",
+        "inputs": {
+            "checkpoint_path": "ltx-2.3-22b-dev.safetensors",
+            "gemma_path": "gemma-3-12b-it",
+            "dtype": "bfloat16",
+            "quantization": "auto",
+            "backend": "legacy_stagehand"
+        },
+        "_meta": {"title": "Load LTX 2.3 Dev"}
+    },
+    "2": {
+        "class_type": "LoadImage",
+        "inputs": {
+            "image": "input.png"
+        },
+        "_meta": {"title": "Load Guide Image"}
+    },
+    "3": {
+        "class_type": "LoadAudio",
+        "inputs": {
+            "audio": "input.mp3"
+        },
+        "_meta": {"title": "Load Audio"}
+    },
+    "4": {
+        "class_type": "LTXVSampler",
+        "inputs": {
+            "ltxv_model": ["1", 0],
+            "prompt": "A character performs to the beat with expressive motion and camera drift that follows the rhythm",
+            "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
+            "width": 768,
+            "height": 512,
+            "num_frames": 97,
+            "steps": 25,
+            "cfg": 3.0,
+            "seed": 42,
+            "frame_rate": 24,
+            "stg_scale": 1.0,
+            "mode": "dev",
+            "guide_image": ["2", 0],
+            "guide_strength": 1.0,
+            "guide_frame_idx": 0,
+            "audio": ["3", 0],
+            "audio_start_time": 0.0,
+            "audio_duration": 4.0
+        },
+        "_meta": {"title": "Sample Image And Audio To Video"}
+    },
+    "5": {
+        "class_type": "SaveVideo",
+        "inputs": {
+            "video": ["4", 1],
+            "filename_prefix": "ltx23_ia2v",
+            "fps": 24,
+            "format": "mp4"
+        },
+        "_meta": {"title": "Save Video"}
+    },
+    "6": {
+        "class_type": "SaveAudioOpus",
+        "inputs": {
+            "audio": ["4", 2],
+            "filename_prefix": "ltx23_ia2v"
+        },
+        "_meta": {"title": "Save Audio"}
+    }
+}

@@ -13,7 +13,7 @@
 //!
 //! folder_paths + stagehand knobs persist in `<out_dir>/state/ui_settings.json`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxPath, Query, State};
@@ -90,38 +90,51 @@ fn extra_folder_paths(settings: &Value) -> Vec<String> {
 
 // ── GET /templates ───────────────────────────────────────────────────────────────
 
-/// Workflow templates under `<out_dir>/templates/` (created if missing). Returns a
-/// BARE ARRAY — the frontend (shell.js) reads `templates.length`, so an object
-/// wrapper would silently fall back to its hardcoded list. Each entry:
-/// `{name, path}` for `*.json` files (the file content is fetched separately).
-pub async fn get_templates(State(st): State<AppState>) -> Response {
-    let dir = st.out_dir.join("templates");
-    let _ = std::fs::create_dir_all(&dir);
-    let mut out: Vec<Value> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for ent in rd.flatten() {
-            let p = ent.path();
-            let fname = ent.file_name().to_string_lossy().into_owned();
-            if p.is_file() && fname.ends_with(".json") {
-                let name = fname.strip_suffix(".json").unwrap_or(&fname).to_string();
-                // `url` is what shell.js loadTemplate actually consumes (it
-                // only understands `url` or `file`; entries with only `path`
-                // silently no-op with "Template URL is missing"). Serve the
-                // content through the existing /out/*path static route.
-                out.push(json!({
-                    "name": name,
-                    "path": p.to_string_lossy(),
-                    "url": format!("/out/templates/{fname}"),
-                }));
-            }
+const BUILTIN_TEMPLATES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../canvas/workflows");
+
+fn collect_template_dir(entries: &mut BTreeMap<String, Value>, dir: &Path, url_prefix: &str) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        let filename = ent.file_name().to_string_lossy().into_owned();
+        if !path.is_file() || !filename.to_ascii_lowercase().ends_with(".json") {
+            continue;
         }
+        let name = filename
+            .strip_suffix(".json")
+            .unwrap_or(&filename)
+            .to_string();
+        entries.insert(
+            name.clone(),
+            json!({
+                "name": name,
+                "file": filename,
+                "path": path.to_string_lossy(),
+                "url": format!("{url_prefix}/{filename}"),
+            }),
+        );
     }
-    out.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
+}
+
+fn template_entries(builtin_dir: &Path, user_dir: &Path) -> Vec<Value> {
+    let mut entries = BTreeMap::new();
+    collect_template_dir(&mut entries, builtin_dir, "/workflows");
+    // A user-saved file with the same stem intentionally overrides its bundled
+    // counterpart without hiding any other built-in template.
+    collect_template_dir(&mut entries, user_dir, "/out/templates");
+    entries.into_values().collect()
+}
+
+/// Workflow templates bundled with the web canvas plus user templates under
+/// `<out_dir>/templates/`. Returns a BARE ARRAY because shell.js consumes it
+/// directly. The bundled files remain browser-fetchable through the canvas
+/// fallback; user files use the guarded `/out/templates/*` route.
+pub async fn get_templates(State(st): State<AppState>) -> Response {
+    let user_dir = st.out_dir.join("templates");
+    let _ = std::fs::create_dir_all(&user_dir);
+    let out = template_entries(Path::new(BUILTIN_TEMPLATES_DIR), &user_dir);
     json_ok(&Value::Array(out))
 }
 
@@ -381,5 +394,34 @@ mod tests {
         let reloaded = load_settings(&dir);
         assert_eq!(extra_folder_paths(&reloaded), vec!["/a/b", "/c/d"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn template_entries_merge_builtins_and_user_overrides() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "serenity_templates_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        let builtin = root.join("builtin");
+        let user = root.join("user");
+        std::fs::create_dir_all(&builtin).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(builtin.join("alpha.json"), b"{}").unwrap();
+        std::fs::write(builtin.join("beta.json"), b"{}").unwrap();
+        std::fs::write(user.join("beta.json"), b"{\"user\":true}").unwrap();
+        std::fs::write(user.join("notes.txt"), b"ignored").unwrap();
+
+        let entries = template_entries(&builtin, &user);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["name"], "alpha");
+        assert_eq!(entries[0]["url"], "/workflows/alpha.json");
+        assert_eq!(entries[1]["name"], "beta");
+        assert_eq!(entries[1]["url"], "/out/templates/beta.json");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -80,6 +80,7 @@ from serenitymojo.models.dit.krea2_dit import (
     _tile_rope_table, krea2_rmsnorm, krea2_rmsnorm_backward_dx,
     Krea2BlockResidentFp8, Krea2ResidentFp8,   # resident-fp8 structs moved here (no cycle)
     Krea2BlockResidentInt8, Krea2ResidentInt8, # resident-int8 structs (same reason)
+    Krea2HostInt8Inf, _krea2_host_i8_block_dev,
 )
 
 # ── reused backward arms (final-layer chain; all pre-built + gated elsewhere) ──
@@ -849,10 +850,9 @@ def build_krea2_resident_int8(
 # whose `int8` payload carries the resident int8 weight refs (refcount copies, no
 # device copy). The 5 small resident tensors are cloned as usual. The block's base
 # matmuls dispatch on `w.int8` presence → int8_linear_fwd/bwd.
-def _load_krea2_block_int8(
-    store: Krea2ResidentInt8, bi: Int, ctx: DeviceContext
+def _krea2_int8_bundle_to_weights(
+    b: Krea2BlockResidentInt8, ctx: DeviceContext
 ) raises -> Krea2BlockWeights:
-    ref b = store.blocks[bi]
     var w8 = List[TArc]()
     var scale = List[TArc]()
     for i in range(KREA2_FP8_KEYS):
@@ -871,6 +871,21 @@ def _load_krea2_block_int8(
         b.mod_lin.copy(),
         Optional[Krea2BlockInt8](payload^),
     )
+
+
+def _load_krea2_block_int8(
+    store: Krea2ResidentInt8, bi: Int, ctx: DeviceContext
+) raises -> Krea2BlockWeights:
+    return _krea2_int8_bundle_to_weights(store.blocks[bi], ctx)
+
+
+def _load_krea2_block_host_int8_inf(
+    store: Krea2HostInt8Inf, bi: Int, ctx: DeviceContext
+) raises -> Krea2BlockWeights:
+    if bi < store.first or bi - store.first >= len(store.blocks):
+        raise Error("Krea2HostInt8Inf block index is outside its covered range")
+    var bundle = _krea2_host_i8_block_dev(store, bi - store.first, ctx)
+    return _krea2_int8_bundle_to_weights(bundle^, ctx)
 
 
 # ── int8 W8A8 PINNED-HOST offload for the NON-resident blocks [K:nblocks] ──────
@@ -1473,6 +1488,11 @@ def krea2_stack_lora_forward_streamed[
         # int8 PINNED-HOST offload for the NON-resident blocks [K:nblocks]: H2D the
         # int8 bytes per step (no disk, no decode; MJ-1065). Replaces the disk stream
         # for bi >= K. Local store index = bi - (resident int8 block count).
+    host_i8_inf: Optional[Krea2HostInt8Inf] = Optional[Krea2HostInt8Inf](None),
+        # Inference-side pinned-host int8 store loaded verbatim from the shared
+        # Krea2 .int8cache sidecar. This is the same payload used by FlowEdit and
+        # prevents non-resident LanPaint blocks from falling back to BF16 disk
+        # reloads on every inner-model evaluation.
     save_tapes: Int = 0,
         # SAVED-TAPE hybrid: keep the first N blocks' slimmed backward tapes so
         # the backward skips their recompute-forward (see _slim_tape).
@@ -1532,6 +1552,13 @@ def krea2_stack_lora_forward_streamed[
             krea2_host_bf16_prefetch(host_bf16.value(), bi + 1)
         elif resident_i8 and bi < res_i8_count:
             wbi = _load_krea2_block_int8(resident_i8.value(), bi, ctx)
+        elif (
+            host_i8_inf and bi >= host_i8_inf.value().first
+            and bi - host_i8_inf.value().first < len(host_i8_inf.value().blocks)
+        ):
+            wbi = _load_krea2_block_host_int8_inf(
+                host_i8_inf.value(), bi, ctx
+            )
         elif host_i8 and bi - res_i8_count < len(host_i8.value().blocks):
             var li = bi - res_i8_count
             wbi = _load_krea2_block_host_int8_slot(host_i8.value(), li, ctx)

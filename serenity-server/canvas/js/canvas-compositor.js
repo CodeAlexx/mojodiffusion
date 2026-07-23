@@ -141,23 +141,24 @@ var Compositor = (function () {
                 var bb = ctx.boundingBox;
                 var bw = Math.round(bb.width());
                 var bh = Math.round(bb.height());
-                // Hide everything except this mask
-                ctx.uiLayer.hide();
-                ctx.backgroundLayer.hide();
-                ctx.canvasLayers.forEach(function (other) {
-                    if (other !== cl)
-                        other.konvaLayer.hide();
-                });
-                var maskDataURL = cl.konvaLayer.toDataURL({
-                    x: bb.x(), y: bb.y(), width: bw, height: bh, pixelRatio: 1,
-                });
-                // Restore
-                ctx.canvasLayers.forEach(function (other) {
-                    if (other.data.visible)
-                        other.konvaLayer.show();
-                });
-                ctx.uiLayer.show();
-                ctx.backgroundLayer.show();
+                // Export the mask layer directly so the stage background cannot
+                // be flattened into an opaque full-frame mask.
+                var oldPosition = { x: ctx.stage.x(), y: ctx.stage.y() };
+                var oldScale = { x: ctx.stage.scaleX(), y: ctx.stage.scaleY() };
+                var maskDataURL = '';
+                try {
+                    ctx.stage.position({ x: 0, y: 0 });
+                    ctx.stage.scale({ x: 1, y: 1 });
+                    ctx.stage.draw();
+                    maskDataURL = cl.konvaLayer.toDataURL({
+                        x: bb.x(), y: bb.y(), width: bw, height: bh, pixelRatio: 1,
+                    });
+                }
+                finally {
+                    ctx.stage.position(oldPosition);
+                    ctx.stage.scale(oldScale);
+                    ctx.stage.draw();
+                }
                 // Convert to B&W
                 var img = new window.Image();
                 img.onload = function () {
@@ -165,13 +166,12 @@ var Compositor = (function () {
                     offscreen.width = bw;
                     offscreen.height = bh;
                     var oc = offscreen.getContext('2d');
-                    oc.fillStyle = '#000000';
-                    oc.fillRect(0, 0, bw, bh);
+                    oc.clearRect(0, 0, bw, bh);
                     oc.drawImage(img, 0, 0, bw, bh);
                     var imageData = oc.getImageData(0, 0, bw, bh);
                     var d = imageData.data;
                     for (var i = 0; i < d.length; i += 4) {
-                        var hasContent = d[i] > 50 || d[i + 1] > 50 || d[i + 2] > 50 || d[i + 3] > 127;
+                        var hasContent = d[i + 3] > 127;
                         d[i] = hasContent ? 255 : 0;
                         d[i + 1] = hasContent ? 255 : 0;
                         d[i + 2] = hasContent ? 255 : 0;

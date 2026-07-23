@@ -46,6 +46,27 @@ from serenitymojo.models.wan22.wan22_stack_lora import Wan22StackBase
 comptime TArc = ArcPointer[Tensor]
 
 
+# ── Auto-detect the checkpoint key prefix ────────────────────────────────────
+# Wan2.2 checkpoints use BARE keys ("patch_embedding.weight"). Wan2.1 ComfyUI-
+# repackaged files (wan2.1_t2v_*_fp16.safetensors) prefix EVERY key with
+# "model.diffusion_model.". We probe the header for the patch_embedding sentinel
+# and return the detected prefix ("" for the bare 2.2 layout,
+# "model.diffusion_model." for the ComfyUI 2.1 layout). The SAME prefix must be
+# threaded into build_wan22_block_plan so block streaming matches the prefixed
+# block tensors. Default/absence of the prefix leaves every 2.2 path byte-
+# identical.
+def detect_wan22_prefix(st: SafeTensors) raises -> String:
+    if String("patch_embedding.weight") in st.tensors:
+        return String("")
+    if String("model.diffusion_model.patch_embedding.weight") in st.tensors:
+        return String("model.diffusion_model.")
+    raise Error(
+        String("detect_wan22_prefix: checkpoint header has neither ")
+        + "'patch_embedding.weight' (bare Wan2.2) nor "
+        + "'model.diffusion_model.patch_embedding.weight' (ComfyUI Wan2.1)"
+    )
+
+
 # ── Load a tensor from safetensors preserving checkpoint storage dtype ───────
 def _load_dev_preserve(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
@@ -55,40 +76,52 @@ def _load_dev_preserve(st: SafeTensors, name: String, ctx: DeviceContext) raises
 
 
 # ── Load the RESIDENT (frozen-base) tensors: embeddings, proj, head ──────────
-# patch_embedding.weight is stored as [5120, 16, 1, 2, 2] (a Conv3d kernel).
-# For the patch embed linear we need it flattened to [5120, 16*1*2*2] = [5120, 64].
-# The reshape is a byte no-op (contiguous row-major).
+# patch_embedding.weight is a Conv3d kernel [dim, in_ch, pf, ph, pw]. For the
+# patch-embed linear we flatten it to [dim, in_ch*pf*ph*pw] (a byte no-op —
+# contiguous row-major). in_ch is 16 for T2V-A14B (-> packed 64) and 36 for
+# I2V-A14B (noisy_latent 16 + y 20 -> packed 144). We read the ACTUAL stored
+# shape from the header and compute the packed width at runtime, so the same
+# loader serves both variants (all other keys are identical).
 def load_wan22_stack_base(
-    st: SafeTensors, ctx: DeviceContext,
+    st: SafeTensors, ctx: DeviceContext, prefix: String = String(""),
 ) raises -> Wan22StackBase:
-    # patch_embedding: reshape [5120,16,1,2,2] -> [5120,64]
-    var pe_w_raw = _load_dev_preserve(st, String("patch_embedding.weight"), ctx)
+    # `prefix` is "" for bare Wan2.2 keys and "model.diffusion_model." for the
+    # ComfyUI Wan2.1 layout (see detect_wan22_prefix). It is prepended to EVERY
+    # resident key so both checkpoint layouts load through the same code.
+    var pfx = prefix
+    # patch_embedding: reshape [dim, in_ch, pf, ph, pw] -> [dim, in_ch*pf*ph*pw]
+    var pe_info = st.tensor_info(pfx + "patch_embedding.weight")
+    var pe_out = pe_info.shape[0]                 # dim (5120)
+    var pe_packed = 1
+    for i in range(1, len(pe_info.shape)):        # in_ch * pf * ph * pw
+        pe_packed *= pe_info.shape[i]
+    var pe_w_raw = _load_dev_preserve(st, pfx + "patch_embedding.weight", ctx)
     var pe_shape = List[Int]()
-    pe_shape.append(5120)
-    pe_shape.append(64)
+    pe_shape.append(pe_out)
+    pe_shape.append(pe_packed)                    # 64 (T2V) or 144 (I2V)
     var pe_w = reshape(pe_w_raw^, pe_shape^, ctx)
-    var pe_b = _load_dev_preserve(st, String("patch_embedding.bias"), ctx)
+    var pe_b = _load_dev_preserve(st, pfx + "patch_embedding.bias", ctx)
 
     # text_embedding MLP: Linear -> GELU -> Linear  (frozen; produces context [TXT,dim])
-    var te0_w = _load_dev_preserve(st, String("text_embedding.0.weight"), ctx)
-    var te0_b = _load_dev_preserve(st, String("text_embedding.0.bias"), ctx)
-    var te2_w = _load_dev_preserve(st, String("text_embedding.2.weight"), ctx)
-    var te2_b = _load_dev_preserve(st, String("text_embedding.2.bias"), ctx)
+    var te0_w = _load_dev_preserve(st, pfx + "text_embedding.0.weight", ctx)
+    var te0_b = _load_dev_preserve(st, pfx + "text_embedding.0.bias", ctx)
+    var te2_w = _load_dev_preserve(st, pfx + "text_embedding.2.weight", ctx)
+    var te2_b = _load_dev_preserve(st, pfx + "text_embedding.2.bias", ctx)
 
     # time_embedding MLP: Linear -> SiLU -> Linear  (frozen; produces time features)
-    var tme0_w = _load_dev_preserve(st, String("time_embedding.0.weight"), ctx)
-    var tme0_b = _load_dev_preserve(st, String("time_embedding.0.bias"), ctx)
-    var tme2_w = _load_dev_preserve(st, String("time_embedding.2.weight"), ctx)
-    var tme2_b = _load_dev_preserve(st, String("time_embedding.2.bias"), ctx)
+    var tme0_w = _load_dev_preserve(st, pfx + "time_embedding.0.weight", ctx)
+    var tme0_b = _load_dev_preserve(st, pfx + "time_embedding.0.bias", ctx)
+    var tme2_w = _load_dev_preserve(st, pfx + "time_embedding.2.weight", ctx)
+    var tme2_b = _load_dev_preserve(st, pfx + "time_embedding.2.bias", ctx)
 
     # time_projection: SiLU -> Linear(dim -> 6*dim)  (frozen; produces per-token e0)
-    var tp1_w = _load_dev_preserve(st, String("time_projection.1.weight"), ctx)
-    var tp1_b = _load_dev_preserve(st, String("time_projection.1.bias"), ctx)
+    var tp1_w = _load_dev_preserve(st, pfx + "time_projection.1.weight", ctx)
+    var tp1_b = _load_dev_preserve(st, pfx + "time_projection.1.bias", ctx)
 
     # head: final linear + modulation
-    var hh_w = _load_dev_preserve(st, String("head.head.weight"), ctx)
-    var hh_b = _load_dev_preserve(st, String("head.head.bias"), ctx)
-    var hmod = _load_dev_preserve(st, String("head.modulation"), ctx)   # [1,2,5120]
+    var hh_w = _load_dev_preserve(st, pfx + "head.head.weight", ctx)
+    var hh_b = _load_dev_preserve(st, pfx + "head.head.bias", ctx)
+    var hmod = _load_dev_preserve(st, pfx + "head.modulation", ctx)   # [1,2,5120]
 
     return Wan22StackBase(
         TArc(pe_w^), TArc(pe_b^),

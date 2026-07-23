@@ -45,18 +45,47 @@ var SerenityAPI = (function () {
             var ltx = nodes[keys[i]];
             if (ltx && ltx.class_type === 'LTXVSampler') {
                 var li = ltx.inputs || {};
+                var loras = [];
+                var modelRef = li.ltxv_model || li.model;
+                var seen = {};
+                while (Array.isArray(modelRef) && modelRef.length > 0) {
+                    var modelId = String(modelRef[0]);
+                    if (seen[modelId]) break;
+                    seen[modelId] = true;
+                    var modelNode = nodes[modelId];
+                    if (!modelNode) break;
+                    var modelInputs = modelNode.inputs || {};
+                    if (modelNode.class_type === 'LoraLoaderModelOnly' ||
+                        modelNode.class_type === 'LoraLoader') {
+                        loras.push({
+                            name: modelInputs.lora_name || '',
+                            weight: modelInputs.strength_model
+                        });
+                    }
+                    modelRef = modelInputs.model;
+                }
+                loras.reverse();
                 return {
                     model: 'ltx2',
-                    runner: 'ltx2_refhq',
+                    runner: 'ltx2_mojo_request',
                     checkpoint: ltxCheckpoint,
+                    schema: 'serenity.genparams.v1',
                     prompt: li.prompt || '',
-                    negative_prompt: li.negative_prompt || '',
-                    steps: 15,
+                    negative: li.negative_prompt || '',
+                    steps: li.steps,
                     seed: li.seed,
                     width: li.width,
                     height: li.height,
                     frames: li.num_frames,
-                    fps: li.frame_rate
+                    fps: li.frame_rate,
+                    include_audio: li.include_audio === true,
+                    cfg: li.cfg,
+                    sampler: li.sampler,
+                    scheduler: li.scheduler,
+                    caps_positive: li.caps_positive || '',
+                    caps_negative: li.caps_negative || '',
+                    noise_fixture: li.noise_fixture || '',
+                    lora: loras
                 };
             }
         }
@@ -122,7 +151,11 @@ var SerenityAPI = (function () {
         var videoRequest = videoRequestFromWorkflow(workflow);
         if (videoRequest) {
             return postVideo(videoRequest).then(function (data) {
-                return { prompt_id: data.video_id || '', video_result: data };
+                return {
+                    prompt_id: data.prompt_id || data.video_id || '',
+                    video_pending: data.state === 'queued' || data.state === 'running',
+                    video_result: data
+                };
             });
         }
         return fetch('/prompt', {
@@ -177,7 +210,7 @@ var SerenityAPI = (function () {
     function interrupt() {
         return fetch('/interrupt', { method: 'POST' });
     }
-    function uploadImage(base64Data, prefix) {
+    function uploadImageDetails(base64Data, prefix) {
         return fetch('data:image/png;base64,' + base64Data)
             .then(function (r) { return r.blob(); })
             .then(function (blob) {
@@ -201,8 +234,11 @@ var SerenityAPI = (function () {
                 });
             }
             return resp.json();
-        })
-            .then(function (data) { return data.name; });
+        });
+    }
+    function uploadImage(base64Data, prefix) {
+        return uploadImageDetails(base64Data, prefix)
+            .then(function (data) { return data.path || data.name; });
     }
     function viewUrl(filename, subfolder, type) {
         return '/view?filename=' + encodeURIComponent(filename) +
@@ -215,6 +251,7 @@ var SerenityAPI = (function () {
         videoRequestFromWorkflow: videoRequestFromWorkflow,
         interrupt: interrupt,
         uploadImage: uploadImage,
+        uploadImageDetails: uploadImageDetails,
         viewUrl: viewUrl
     };
 })();

@@ -478,6 +478,93 @@ def gelu_exact(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
+# ── leaky_relu ───────────────────────────────────────────────────────────────
+#   leaky_relu(x) = x if x >= 0 else slope*x   (torch.nn.functional.leaky_relu)
+# Real-ESRGAN (RRDBNet/SRVGGNetCompact) uses negative_slope=0.2 throughout.
+@always_inline
+def _leaky_relu_f32(v: Float32, slope: Float32) -> Float32:
+    return v if v >= Float32(0.0) else slope * v
+
+
+def _leaky_relu_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+    slope: Float32,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float32]](x[i])
+        o[i] = rebind[o.element_type](_leaky_relu_f32(v, slope))
+
+
+def _leaky_relu_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    n: Int,
+    slope: Float32,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](_leaky_relu_f32(v, slope).cast[DType.bfloat16]())
+
+
+def _leaky_relu_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    n: Int,
+    slope: Float32,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](_leaky_relu_f32(v, slope).cast[DType.float16]())
+
+
+def leaky_relu(
+    x: Tensor, ctx: DeviceContext, negative_slope: Float32 = Float32(0.2)
+) raises -> Tensor:
+    """leaky_relu(x) = x if x>=0 else negative_slope*x, elementwise (default 0.2)."""
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_leaky_relu_kernel_f32, _leaky_relu_kernel_f32](
+            X, O, n, negative_slope, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_leaky_relu_kernel_bf16, _leaky_relu_kernel_bf16](
+            X, O, n, negative_slope, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_leaky_relu_kernel_f16, _leaky_relu_kernel_f16](
+            X, O, n, negative_slope, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
 # ── swiglu ─────────────────────────────────────────────────────────────────
 def _swiglu_kernel_f32(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],

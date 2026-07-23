@@ -29,6 +29,8 @@
 #   video_loss_weight | audio_loss_weight
 #   continue_last_backup | gradient_checkpointing | enable_async_offloading
 #   enable_activation_offloading | layer_offload_fraction
+#   dit_high_noise | dual_expert | i2v | wan_variant | timestep_boundary
+#     (P3 wan21/wan22 config-first keys; env WAN21_*/WAN22_* override when set)
 #
 # Mojo 1.0.0b1: `def` not `fn`; no Python.
 
@@ -858,6 +860,39 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             # fp8-resident disk sidecar toggle (default True in TrainConfig).
             # Only consulted when quantized_resident=="fp8_e4m3".
             cfg.fp8_cache = _read_bool(cur)
+        elif key == "resident_blocks":
+            # 16GB residency refit (P6 wave 2, 2026-07-22): cap on how many
+            # transformer blocks the driver pins device-resident (ltx2_av
+            # --resident_blocks semantics). -1/absent = driver comptime default;
+            # 0 = pin nothing (stream all); >0 = pin at most N blocks.
+            var n = Int(_read_scalar(cur).num)
+            if n < -1:
+                raise Error(
+                    String("train config: resident_blocks must be >= -1, got ")
+                    + String(n)
+                )
+            cfg.resident_blocks = n
+        elif key == "resume_state" or key == "resume_from_checkpoint":
+            # RESUME source: a `.state` sidecar (FULL: A/B + AdamW moments) or
+            # a PEFT .safetensors whose `.state` sibling the trainer resolves
+            # (trainer_resolve_resume_path). The webui overrides emit
+            # resume_state; "" / absent = fresh run.
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.resume_state = sc.s
+        elif key == "start_step" or key == "resume_step":
+            # GLOBAL optimizer steps already completed (loop resumes at this
+            # step index). -1/absent = derive from the artifact `_step{N}`.
+            var n = Int(_read_scalar(cur).num)
+            if n < -1:
+                raise Error(
+                    String("train config: start_step must be >= -1, got ")
+                    + String(n)
+                )
+            cfg.start_step = n
+        elif key == "warm_resume":
+            # True = A/B-only resume (AdamW moments zeroed; loud banner).
+            cfg.warm_resume = _read_bool(cur)
         elif key == "controlnet_layers":
             # T2.E ControlNet training (default-off 0). Fail loud on negatives.
             var n = Int(_read_scalar(cur).num)
@@ -937,6 +972,8 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.lora_alpha = Float32(_read_scalar(cur).num)
         elif key == "timestep_shift":
             cfg.timestep_shift = Float32(_read_scalar(cur).num)
+        elif key == "train_timestep_shift":
+            cfg.train_timestep_shift = Float32(_read_scalar(cur).num)
         elif key == "max_grad_norm" or key == "clip_grad_norm":
             cfg.max_grad_norm = Float32(_read_scalar(cur).num)
         elif key == "max_steps" or key == "max_train_steps":
@@ -1331,6 +1368,38 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.masked_prior_preservation_weight = Float32(_read_scalar(cur).num)
         elif key == "custom_conditioning_image":
             cfg.custom_conditioning_image = _read_bool(cur)
+        # ── P3 wan21/wan22 config-first keys (2026-07-22 env-retire). Paths
+        #    parse default-quiet; the variant enum + boundary range fail loud.
+        #    Env WAN21_*/WAN22_* still OVERRIDE these when set (driver-side). ──
+        elif key == "dit_high_noise":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.dit_high_noise = sc.s
+        elif key == "dual_expert":
+            # JSON bool/int → tri-state Int (absent keeps -1 = auto: dual iff
+            # the high-noise checkpoint exists — today's env-unset behavior).
+            cfg.dual_expert = 1 if _read_scalar(cur).num != 0.0 else 0
+        elif key == "i2v":
+            cfg.wan_i2v = _read_bool(cur)
+        elif key == "wan_variant":
+            var sc = _read_scalar(cur)
+            if not sc.is_string:
+                raise Error("JSON config: wan_variant must be a string")
+            if (
+                sc.s != String("")
+                and sc.s != String("t2v_1.3b")
+                and sc.s != String("t2v_14b")
+            ):
+                raise Error(
+                    String("JSON config: unknown wan_variant '") + sc.s
+                    + String("' (expected \"\"|t2v_1.3b|t2v_14b)")
+                )
+            cfg.wan_variant = sc.s
+        elif key == "timestep_boundary":
+            var tb = Float32(_read_scalar(cur).num)
+            if tb <= Float32(0.0) or tb >= Float32(1.0):
+                raise Error("JSON config: timestep_boundary must be in (0,1)")
+            cfg.timestep_boundary = tb
         else:
             _skip_value(cur)  # skip unknown top-level keys
 

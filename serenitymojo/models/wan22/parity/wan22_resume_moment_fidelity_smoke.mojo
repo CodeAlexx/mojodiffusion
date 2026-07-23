@@ -80,6 +80,8 @@ def _wan22_prefixes(num_blocks: Int) -> List[String]:
         out.append(b + "cross_attn.k")
         out.append(b + "cross_attn.v")
         out.append(b + "cross_attn.o")
+        out.append(b + "ffn.0")
+        out.append(b + "ffn.2")
     return out^
 
 
@@ -125,9 +127,9 @@ def main() raises:
     print("=== wan22 resume moment-fidelity gate (shared-state plumbing) ===")
     var ctx = DeviceContext()
 
-    # Small synthetic stack: 1 block, dim=8, rank=2 -> 8 adapters.
+    # Small synthetic stack: 1 block, dim=8, ffn=16, rank=2 -> 10 adapters.
     var num_blocks = 1
-    var lora = build_wan22_lora_set(num_blocks, 8, 2, Float32(4.0))
+    var lora = build_wan22_lora_set(num_blocks, 8, 16, 2, Float32(4.0))
     _seed(lora)
     print("seeded", len(lora.ad), "adapters with nonzero A/B + m/v")
 

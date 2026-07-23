@@ -232,23 +232,6 @@ function setupTemplatesDropdown() {
             return !template.preset || available.has(template.preset.model);
         });
     }
-    // The linked SerenityFlow pack predates the current product contracts
-    // (unsupported edits/LoRAs/14B video names and image-queue video routing).
-    // Preserve those files on disk, but do not advertise them as one-click
-    // production templates. Unknown names remain visible as user templates.
-    const legacyTemplateNames = new Set([
-        'flux1_dev_edit', 'flux1_dev_edit_lora', 'flux1_dev_t2i', 'flux1_dev_t2i_lora',
-        'flux2_dev_edit', 'flux2_dev_edit_lora', 'flux2_dev_t2i', 'flux2_dev_t2i_lora',
-        'klein4b_edit', 'klein4b_edit_lora', 'klein4b_t2i', 'klein4b_t2i_lora',
-        'klein9b_edit', 'klein9b_edit_lora', 'klein9b_t2i', 'klein9b_t2i_lora',
-        'ltx23_a2v', 'ltx23_i2v', 'ltx23_ia2v', 'ltx23_serenityfp8_a2v',
-        'ltx23_serenityfp8_i2v', 'ltx23_serenityfp8_ia2v', 'ltx23_serenityfp8_t2v',
-        'ltx23_t2v', 'qwen_edit', 'qwen_edit_lora', 'qwen_image_t2i',
-        'qwen_image_t2i_lora', 'sd35_large_t2i', 'sdxl_t2i', 'wan22_i2v',
-        'wan22_i2v_lora', 'wan22_t2v', 'wan22_t2v_lora', 'wan23_i2v',
-        'wan23_i2v_lora', 'wan23_t2v', 'wan23_t2v_lora', 'zimage_t2i',
-        'zimage_t2i_lora'
-    ]);
     function renderTemplates(templates) {
         list.innerHTML = '';
         if (!templates || templates.length === 0) {
@@ -350,12 +333,9 @@ function setupTemplatesDropdown() {
             return r.json();
         })
             .then(function (templates) {
-            var custom = (templates || []).filter(function (t) {
-                return !legacyTemplateNames.has(t.name || '');
-            });
             var merged = new Map();
             admittedFallbackTemplates().forEach(function (t) { merged.set(t.name, t); });
-            custom.forEach(function (t) { merged.set(t.name || t.file || t.url, t); });
+            (templates || []).forEach(function (t) { merged.set(t.name || t.file || t.url, t); });
             renderTemplates(Array.from(merged.values()));
         })
             .catch(function () {

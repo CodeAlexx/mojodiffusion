@@ -1551,6 +1551,39 @@ def record_ltx2v_video_block(
     return TArc(out_t^)
 
 
+# ── Wan2.2-A14B T2V block, COARSE (Phase 1). ONE composite node
+# OPK_WAN_T2V_BLOCK, single tracked edge (block input x). The block is
+# shape-preserving ([S,dim] in == out) so we re-box the INPUT carrier as the
+# output placeholder (NO record-side forward — apply_wan_t2v calls the WHOLE
+# wan22_block_lora_backward oracle on the saved WanSaved that rides
+# execute_wan_t2v_block's args, matching the hand-chain's saved-activation seam,
+# wan22_stack_lora.mojo:1029). saved=[] (nothing device is read by apply — the
+# per-block-invariant args ride execute); the 20 host-list LoRA grads +
+# d_context are captured out-of-band by execute (not leaves). The krea2/ltx2v
+# pattern (node.mojo:82,143 / :28-... OPK_WAN_T2V_BLOCK note).
+from serenitymojo.autograd_v2.node import (
+    OPK_WAN_T2V_BLOCK as _OPK_WAN_T2V, Edge as _EdgeWanT2v,
+)
+
+
+def record_wan_t2v_block(
+    mut g: Graph, x: TArc, x_id: Int, ctx: DeviceContext,
+) raises -> TArc:
+    # re-box the shape-preserving block input carrier as the output placeholder
+    # (fresh id; its buffer is never read — the engine seeds d_out from the
+    # caller, not this).
+    var out_t = Tensor(x[].buf.copy(), x[].shape(), x[].dtype())
+    out_t.set_id(g.fresh_tensor_id())
+    var edges = List[_EdgeWanT2v]()
+    edges.append(g.edge_for(x_id))              # route d_x back to the leaf
+    var out_ids = List[Int]()
+    out_ids.append(out_t.id)
+    _ = g.record(
+        _OPK_WAN_T2V, edges^, List[TArc](), List[Int](), List[Float32](), out_ids
+    )
+    return TArc(out_t^)
+
+
 # ── krea2 slab record variants (activation-checkpointing slab path, contract C8).
 # BYTE-IDENTICAL recording to the non-slab krea2 wrappers (same edges/saved/meta/
 # scalars, same C15 slots); only the forward op's allocation source is the slab.

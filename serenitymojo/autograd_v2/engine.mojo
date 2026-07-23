@@ -2353,3 +2353,170 @@ def execute_krea2_fg[
         lora_slots[3].copy(), lora_slots[4].copy(), lora_slots[5].copy(),
         lora_slots[6].copy(), lora_slots[7].copy(),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wan2.2-A14B T2V COARSE block driver (Phase 1; wan_block_graph.mojo). ONE
+# composite kind OPK_WAN_T2V_BLOCK: apply_wan_t2v calls the WHOLE
+# wan22_block_lora_backward oracle (models/wan22/wan22_block.mojo:1456) on the
+# saved WanSaved activations — bit-identical to the hand-chain stack backward by
+# construction (wan22_stack_lora.mojo:1029). execute_wan_t2v_block is
+# execute_ltx2v_block's engine VERBATIM (dep-count BFS, InputBuffer route,
+# ready-queue order, fired==reachable): the composite fires once → the block-input
+# d_x routes through the single (x) LEAF; the 20 host-list LoRA d_A/d_B pairs +
+# d_context + mod grads are captured OUT-OF-BAND (they are host List[Float32] and
+# cannot flow as TArc — see the OPK_WAN_T2V_BLOCK note, node.mojo) and the WHOLE
+# WanBlockLoraGrads is returned, NOT a Dict[Int,TArc]. The engine-routed d_x is a
+# pure F32 host→device→leaf→host round trip (bit-identical) and is authoritative
+# for the returned struct (the ltx2v d_hidden pattern). No StepSlab / no capture
+# (Phase 1 correctness only; slab+capture are later phases). comptime [H,Dh,S,TXT]
+# like the trainer; runtime dim/ffn ride execute's args.
+# ─────────────────────────────────────────────────────────────────────────────
+from serenitymojo.autograd_v2.node import OPK_WAN_T2V_BLOCK
+from serenitymojo.models.wan22.wan22_block import (
+    wan22_block_lora_backward as _wan_t2v_bwd,
+    WanBlockLoraGrads as _WanT2vGrads,
+    WanModVecs as _WanModVecs,
+    WanBlockWeights as _WanBlockWeights,
+    WanBlockLora as _WanBlockLora,
+    WanSaved as _WanSaved,
+)
+
+
+def apply_wan_t2v[H: Int, Dh: Int, S: Int, TXT: Int](
+    node: Node, d_out: TArc,
+    mv: _WanModVecs, w: _WanBlockWeights, lora: _WanBlockLora, saved: _WanSaved,
+    cos: Tensor, sin: Tensor, dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> _WanT2vGrads:
+    """Call the WHOLE wan22_block_lora_backward oracle on the saved WanSaved
+    activations (the hand-chain's saved-activation seam — NO forward recompute,
+    the wan trainer keeps full saved activations per block). Returns
+    WanBlockLoraGrads (base d_x/d_context/mod/frozen-weight grads + 20 host-list
+    LoRA d_A/d_B) — bit-identical to the hand-chain per-block backward. The seed
+    grad `d_out` (device F32) is read back to host for the oracle's host API (a
+    pure F32 device→host copy, bit-identical to the caller's d_out_h)."""
+    if node.kind != OPK_WAN_T2V_BLOCK:
+        raise Error("apply_wan_t2v: unexpected node kind")
+    var d_out_h = d_out[].to_host(ctx)
+    var bg = _wan_t2v_bwd[H, Dh, S, TXT](
+        d_out_h^, mv, w, lora, saved, cos, sin, dim, ffn, eps, ctx,
+    )
+    return bg^
+
+
+def execute_wan_t2v_block[H: Int, Dh: Int, S: Int, TXT: Int](
+    mut graph: Graph, root: Int, root_grad: TArc,
+    mv: _WanModVecs, w: _WanBlockWeights, lora: _WanBlockLora, saved: _WanSaved,
+    cos: Tensor, sin: Tensor, dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> _WanT2vGrads:
+    """execute_ltx2v_block's engine algorithm for the wan T2V graph: ONE composite
+    node + its x leaf. The composite fires once (the seeded root), produces
+    WanBlockLoraGrads; its d_x routes along the x edge into the LEAF (engine-driven);
+    the host-list LoRA grads + d_context are captured and returned whole. Single
+    root, single tracked edge → no multi-contribution fan-in (C15 trivial)."""
+    var n = len(graph.nodes)
+    if root < 0 or root >= n:
+        raise Error("execute_wan_t2v_block: root out of range")
+
+    # Step 1: dep-count BFS over edges from the root (engine.rs:230-277).
+    var dep = List[Int]()
+    var seen = List[Bool]()
+    var in_queue = List[Bool]()
+    for _ in range(n):
+        dep.append(0)
+        seen.append(False)
+        in_queue.append(False)
+    var stack = List[Int]()
+    stack.append(root)
+    var reachable = 0
+    while len(stack) > 0:
+        var nid = stack.pop()
+        if seen[nid]:
+            continue
+        seen[nid] = True
+        reachable += 1
+        for i in range(len(graph.nodes[nid].edges)):
+            var child = graph.nodes[nid].edges[i].node_idx
+            if child >= 0:
+                dep[child] += 1
+                stack.append(child)
+
+    # Step 2: per-node InputBuffers + seed the root (engine.rs:282-393).
+    var buffers = List[InputBuffer]()
+    for i in range(n):
+        buffers.append(InputBuffer(graph.nodes[i].contrib_counts, root_grad.copy()))
+    buffers[root].add(0, buffers[root].seed_slot(0), root_grad.copy(), ctx)
+    var ready = List[Int]()
+    dep[root] += 1
+    _dec_and_maybe_enqueue(dep, ready, in_queue, root)
+
+    # Step 3: drive the queue (engine.rs:437-570).
+    var captured = False
+    var captured_grads = Optional[_WanT2vGrads](None)
+    var d_x_result = TArc(Tensor(root_grad[].buf.copy(), root_grad[].shape(), root_grad[].dtype()))
+    var have_dx = False
+    var fired = 0
+    while len(ready) > 0:
+        var nid = _pop_best(ready, graph)
+        fired += 1
+        var num_in = graph.nodes[nid].num_inputs
+        var grads_in = List[TArc]()
+        for s in range(num_in):
+            if not buffers[nid].any_present(s):
+                raise Error(
+                    String("execute_wan_t2v_block: node ") + String(nid)
+                    + " missing grad slot " + String(s)
+                )
+            grads_in.append(buffers[nid].materialize(s, ctx))
+
+        if graph.nodes[nid].kind == OPK_LEAF:
+            # The x leaf carries the engine-routed block-input grad.
+            d_x_result = grads_in[0].copy()
+            have_dx = True
+            continue
+
+        if graph.nodes[nid].kind != OPK_WAN_T2V_BLOCK:
+            raise Error(
+                String("execute_wan_t2v_block: unexpected node kind ")
+                + String(graph.nodes[nid].kind)
+            )
+        if captured:
+            raise Error("execute_wan_t2v_block: more than one composite node fired")
+        var bg = apply_wan_t2v[H, Dh, S, TXT](
+            graph.nodes[nid], grads_in[0],
+            mv, w, lora, saved, cos, sin, dim, ffn, eps, ctx,
+        )
+        # Route the composite's single d_x edge into the leaf as a device F32
+        # carrier of the oracle's host d_x; stash the WHOLE grads out-of-band (the
+        # host LoRA lists + d_context cannot flow as TArc).
+        var d_x_dev = TArc(
+            Tensor.from_host(bg.base.d_x.copy(), [len(bg.base.d_x)], STDtypeEng.F32, ctx))
+        captured_grads = Optional[_WanT2vGrads](bg^)
+        captured = True
+        var n_edges = len(graph.nodes[nid].edges)
+        if n_edges != 1:
+            raise Error(
+                String("execute_wan_t2v_block: composite node must have exactly one edge, got ")
+                + String(n_edges)
+            )
+        var child = graph.nodes[nid].edges[0].node_idx
+        if child >= 0:
+            var slot = graph.nodes[nid].edges[0].input_nr
+            var cslot = graph.nodes[nid].edges[0].contrib_slot
+            buffers[child].add(slot, cslot, d_x_dev.copy(), ctx)
+            _dec_and_maybe_enqueue(dep, ready, in_queue, child)
+
+    if fired != reachable:
+        raise Error(
+            String("execute_wan_t2v_block: fired=") + String(fired)
+            + " != reachable=" + String(reachable) + " (dep-count exactness violated)"
+        )
+    if not captured:
+        raise Error("execute_wan_t2v_block: composite node never fired")
+    if not have_dx:
+        raise Error("execute_wan_t2v_block: x leaf never sank d_x")
+    # The engine-routed d_x (from the leaf) is the authoritative block grad;
+    # overwrite the (bit-identical) oracle d_x in the returned struct with it.
+    var out = captured_grads.value().copy()
+    out.base.d_x = d_x_result[].to_host(ctx)
+    return out^

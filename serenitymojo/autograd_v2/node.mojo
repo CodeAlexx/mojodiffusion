@@ -141,6 +141,27 @@ comptime OPK_LINEAR_DX = 26
 # placeholder (no record-side forward; apply's recompute is the SINGLE forward,
 # matching the hand-chain's 1-recompute+1-backward per block).
 comptime OPK_LTX2V_VIDEO_BLOCK = 27
+# ── Wan2.2-A14B T2V block, COARSE (Phase 1; wan_block_graph.mojo). ONE composite
+# kind/block, the OPK_LTX2V_VIDEO_BLOCK / OPK_KREA2_SINGLE_BLOCK precedent (:82,
+# :143). apply_wan_t2v calls the WHOLE wan22_block_lora_backward oracle
+# (models/wan22/wan22_block.mojo:1456) on the saved WanSaved activations — so every
+# internal >=3-way fold (e.g. d_sa_in_base = add(add(lb_saq_dx,lb_sak_dx),lb_sav_dx)
+# at wan22_block.mojo:1637, the sa_in LoRA fold :1638-1641) stays INSIDE the oracle
+# (C15 trivially satisfied at graph level; the block input x is the ONLY tracked
+# edge → its single contribution needs no fan-in fold). WHY coarse-composite and
+# NOT the Klein-style section kinds: the wan oracle produces its 20 LoRA d_A/d_B
+# AND d_x/d_context/mod grads as HOST List[Float32] (KleinLoraGrads via
+# klein_lora_bwd; d_out_h/x_h are host too) — host grads CANNOT flow through the
+# engine's TArc-only edge/Dict machinery, and carving the monolithic
+# wan22_block_lora_backward into device-tensor section seams would be NEW code
+# touching the oracle (violating C14 "call helpers whole / no new math"). So
+# execute_wan_t2v_block sinks the block-input d_x through the engine LEAF and
+# returns the WHOLE WanBlockLoraGrads (d_context + 20 host LoRA lists captured
+# out-of-band), NOT a Dict[Int,TArc]. Drop-in: same arg list + same returned grads
+# as the hand-chain wan22_block_lora_backward. saved=[]; the per-block-invariant
+# args (mv/w/lora/WanSaved/cos/sin/dim/ffn/eps) ride execute_wan_t2v_block's args.
+# One tracked edge (x). NO StepSlab / NO capture in Phase 1 (correctness only).
+comptime OPK_WAN_T2V_BLOCK = 28
 
 
 struct Edge(Copyable, Movable):

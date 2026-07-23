@@ -42,6 +42,7 @@ from std.math import sqrt, sin as _fsin, cos as _fcos
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.activations import silu, gelu
@@ -501,6 +502,19 @@ def _head_modvecs(
 def _block_f32(block: Block, key: String, ctx: DeviceContext) raises -> List[Float32]:
     if not (key in block):
         raise Error(String("wan22 offload block missing tensor: ") + key)
+    # Bernini-R fp8 per-block cache: the 10 2-D matrices stream as E4M3 bytes
+    # alongside a sibling per-output-row F32 scale "<key>.__fp8_scale" [out].
+    # Reconstruct the weight per-row (out = e4m3_decode * scale[out]) to BF16 —
+    # the EXACT dequant the certified Bernini inference stream uses
+    # (wan22_fp8_stream.load_block_bf16 / bernini_r_block_parity, E4M3>=.99) —
+    # then cast to the F32 host list the block fwd/bwd already consumes. BF16/F16
+    # checkpoints (no fp8) fall through to the plain cast unchanged (back-compat).
+    if block[key][].dtype() == STDtype.F8_E4M3:
+        var sname = key + String(".__fp8_scale")
+        if not (sname in block):
+            raise Error(String("wan22 fp8 block missing per-row scale: ") + sname)
+        var bf16 = fp8_e4m3_dequant_perrow_to_bf16(block[key][], block[sname][], ctx)
+        return cast_tensor(bf16, STDtype.F32, ctx).to_host(ctx)
     return cast_tensor(block[key][], STDtype.F32, ctx).to_host(ctx)
 
 

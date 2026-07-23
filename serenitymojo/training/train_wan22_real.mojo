@@ -218,6 +218,21 @@ def _file_exists(path: String) -> Bool:
     return True
 
 
+# ── Resident-base file for a checkpoint that may be an fp8 per-block CACHE DIR.
+# The Bernini-R E4M3 cache is a DIRECTORY (block_00..39.safetensors + shared
+# .safetensors + a model.safetensors.index.json sidecar). The 15 non-block
+# tensors (patch/text/time embeddings, time_projection, head) live in
+# shared.safetensors, so the resident base is loaded from there; the streaming
+# block loader still opens the DIR (ShardedSafeTensors resolves the index →
+# per-block fp8 shards). A monolithic .safetensors file has no shared.safetensors
+# sibling, so it is returned unchanged (back-compat with the fp16 Wan checkpoints).
+def _base_file_for(ckpt: String) -> String:
+    var shared = ckpt + String("/shared.safetensors")
+    if _file_exists(shared):
+        return shared
+    return ckpt
+
+
 # ── libc getenv: True iff env var is exactly "1" (sd35 trainer helper) ────────
 comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -1381,7 +1396,7 @@ def main() raises:
     # expert selection is a branch, not a re-open).
     var off_cfg = OffloadConfig.synchronous_single()
 
-    var base_st = SafeTensors.open(ckpt)
+    var base_st = SafeTensors.open(_base_file_for(ckpt))
     var base = load_wan22_stack_base(base_st, ctx)
     var plan_low = build_wan22_block_plan(NUM_BLOCKS)
     var loader = TurboPlannedLoader.open(ckpt, plan_low^, off_cfg, ctx, False)
@@ -1391,7 +1406,7 @@ def main() raises:
     # base + a streaming loader (blocks stream, so no extra 27 GB). `use_high` is
     # forced False in that case so the redundant loader is never stepped.
     var high_ckpt_eff = high_ckpt if dual_expert else ckpt
-    var high_base_st = SafeTensors.open(high_ckpt_eff)
+    var high_base_st = SafeTensors.open(_base_file_for(high_ckpt_eff))
     var high_base = load_wan22_stack_base(high_base_st, ctx)
     var plan_high = build_wan22_block_plan(NUM_BLOCKS)
     var loader_high = TurboPlannedLoader.open(high_ckpt_eff, plan_high^, off_cfg, ctx, False)
@@ -1491,7 +1506,16 @@ def main() raises:
                                          seed + UInt64(step) * 313 + 7)
         # Flow-match noising is on the 16-ch latent patch ONLY (x0 is [S,64]); y is
         # clean conditioning. target/loss stay on the 64-dim (16-ch) velocity.
-        var noise = _noise(S * IN_CH, seed * UInt64(2000003) + UInt64(step) * 104729 + 3)
+        # Smoke overfit pin: WAN22_FIXED_NOISE=1 drops the per-step term from the
+        # noise seed so every step draws the SAME noise. Combined with a 1-sample
+        # cache + WAN22_ALTERNATE_T equal pins (fixed t, single expert), the
+        # (x_t, target) pair is identical every step → the raw MSE must decrease
+        # monotonically, isolating the fwd/bwd/AdamW-LoRA update on the real Bernini
+        # fp8 weights (a clean loss-drop proof). Default OFF = the stochastic recipe.
+        var _noise_seed = seed * UInt64(2000003) + UInt64(step) * 104729 + 3
+        if _env_is_set(String("WAN22_FIXED_NOISE")):
+            _noise_seed = seed * UInt64(2000003) + 3
+        var noise = _noise(S * IN_CH, _noise_seed)
         var img_tokens = List[Float32]()
         var target = List[Float32]()
         for i in range(len(x0)):

@@ -97,6 +97,7 @@ struct JobParams(Copyable, Movable):
     var threshold_mask_value: Float64
     var threshold_mask_operator: String
     var lanpaint_mask_blend_overlap: Int
+    var lanpaint_context_expand: Int
     var lanpaint_num_steps: Int
     var lanpaint_lambda: Float64
     var lanpaint_step_size: Float64
@@ -189,6 +190,7 @@ struct JobParams(Copyable, Movable):
         self.threshold_mask_value = -1.0
         self.threshold_mask_operator = String("")
         self.lanpaint_mask_blend_overlap = -1
+        self.lanpaint_context_expand = -1
         self.lanpaint_num_steps = -1
         self.lanpaint_lambda = -1.0
         self.lanpaint_step_size = -1.0

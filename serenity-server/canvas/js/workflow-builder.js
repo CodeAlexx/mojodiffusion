@@ -113,6 +113,16 @@ var WorkflowBuilder = (function () {
         }
         return workflow;
     }
+    function buildEditModel(params) {
+        var arch = ModelUtils.detectArchFromFilename(params.model);
+        if (!params.initImageName)
+            throw new Error('Edit Models requires a source image');
+        if (arch === 'klein')
+            return buildKleinReferenceEdit(params);
+        if (arch === 'qwen' && /edit/i.test(String(params.model || '')))
+            return buildQwenImg2Img(params);
+        throw new Error('The selected model does not have a native image-edit graph');
+    }
     function buildInpaint(params) {
         var arch = ModelUtils.detectArchFromFilename(params.model);
         var w = ModelUtils.clampDimension(params.width);
@@ -196,14 +206,15 @@ var WorkflowBuilder = (function () {
         var steps = Math.max(1, Math.floor(Number(p.steps)));
         var cfg = Number(p.cfg);
         var innerSteps = Math.max(0, Math.floor(Number(p.lanpaintNumSteps == null ? 5 : p.lanpaintNumSteps)));
-        var lambda = Number(p.lanpaintLambda == null ? 16 : p.lanpaintLambda);
-        var stepSize = Number(p.lanpaintStepSize == null ? 0.2 : p.lanpaintStepSize);
+        var lambda = Number(p.lanpaintLambda == null ? 8 : p.lanpaintLambda);
+        var stepSize = Number(p.lanpaintStepSize == null ? 0.15 : p.lanpaintStepSize);
         var beta = Number(p.lanpaintBeta == null ? 1 : p.lanpaintBeta);
         var friction = Number(p.lanpaintFriction == null ? 15 : p.lanpaintFriction);
-        var earlyStop = Math.max(0, Math.floor(Number(p.lanpaintEarlyStop == null ? 0 : p.lanpaintEarlyStop)));
-        var innerThreshold = Number(p.lanpaintInnerThreshold == null ? 0.001 : p.lanpaintInnerThreshold);
-        var innerPatience = Math.max(0, Math.floor(Number(p.lanpaintInnerPatience == null ? 0 : p.lanpaintInnerPatience)));
+        var earlyStop = Math.max(0, Math.floor(Number(p.lanpaintEarlyStop == null ? 1 : p.lanpaintEarlyStop)));
+        var innerThreshold = Number(p.lanpaintInnerThreshold == null ? 0 : p.lanpaintInnerThreshold);
+        var innerPatience = Math.max(0, Math.floor(Number(p.lanpaintInnerPatience == null ? 1 : p.lanpaintInnerPatience)));
         var blendOverlap = Math.floor(Number(p.lanpaintBlendOverlap == null ? 9 : p.lanpaintBlendOverlap));
+        var contextExpand = Math.floor(Number(p.lanpaintContextExpand == null ? 0 : p.lanpaintContextExpand));
         var promptMode = String(p.lanpaintPromptMode || 'Image First');
         if (!Number.isFinite(cfg) || !Number.isFinite(lambda) || !Number.isFinite(stepSize) ||
             !Number.isFinite(beta) || !Number.isFinite(friction) || !Number.isFinite(innerThreshold))
@@ -214,6 +225,8 @@ var WorkflowBuilder = (function () {
             throw new Error('LanPaint prompt mode must be Image First or Prompt First');
         if (blendOverlap < 1 || blendOverlap > 51 || blendOverlap % 2 === 0)
             throw new Error('LanPaint mask blend overlap must be an odd value from 1 to 51');
+        if (contextExpand < 0 || contextExpand > 256)
+            throw new Error('LanPaint context expand must be from 0 to 256 image pixels');
         workflow[samplerId] = { class_type: 'LanPaint_KSamplerAdvanced', inputs: {
                 model: originalSampler.model,
                 positive: originalSampler.positive,
@@ -228,6 +241,7 @@ var WorkflowBuilder = (function () {
                 start_at_step: 0,
                 end_at_step: steps,
                 return_with_leftover_noise: 'disable',
+                LanPaint_ContextExpand: contextExpand,
                 LanPaint_NumSteps: innerSteps,
                 LanPaint_Lambda: lambda,
                 LanPaint_StepSize: stepSize,
@@ -270,6 +284,7 @@ var WorkflowBuilder = (function () {
         var innerThreshold = Number(p.lanpaintInnerThreshold);
         var innerPatience = Math.max(0, Math.floor(Number(p.lanpaintInnerPatience)));
         var blendOverlap = Math.floor(Number(p.lanpaintBlendOverlap));
+        var contextExpand = Math.floor(Number(p.lanpaintContextExpand == null ? 0 : p.lanpaintContextExpand));
         var promptMode = String(p.lanpaintPromptMode || 'Image First');
         if (!Number.isFinite(cfg) || !Number.isFinite(lambda) || !Number.isFinite(stepSize) ||
             !Number.isFinite(beta) || !Number.isFinite(friction) || !Number.isFinite(innerThreshold))
@@ -280,6 +295,8 @@ var WorkflowBuilder = (function () {
             throw new Error('Krea2 LanPaint prompt mode must be Image First or Prompt First');
         if (blendOverlap < 1 || blendOverlap > 51 || blendOverlap % 2 === 0)
             throw new Error('Krea2 LanPaint mask blend overlap must be an odd value from 1 to 51');
+        if (contextExpand < 0 || contextExpand > 256)
+            throw new Error('Krea2 LanPaint context expand must be from 0 to 256 image pixels');
         var negativeNode = String(p.negPrompt || '').trim().length > 0
             ? { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: p.negPrompt } }
             : { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['4', 0] } };
@@ -307,6 +324,7 @@ var WorkflowBuilder = (function () {
                     add_noise: 'enable', noise_seed: p.seed, steps: steps, cfg: cfg,
                     sampler_name: 'euler', scheduler: 'simple', start_at_step: 0, end_at_step: steps,
                     return_with_leftover_noise: 'disable',
+                    LanPaint_ContextExpand: contextExpand,
                     LanPaint_NumSteps: innerSteps, LanPaint_Lambda: lambda,
                     LanPaint_StepSize: stepSize, LanPaint_Beta: beta, LanPaint_Friction: friction,
                     LanPaint_PromptMode: promptMode, LanPaint_EarlyStop: earlyStop,
@@ -525,6 +543,64 @@ var WorkflowBuilder = (function () {
             '9': { class_type: 'SaveImage', inputs: { images: ['8', 0], filename_prefix: 'klein' } }
         };
     }
+    function buildKleinReferenceEdit(p) {
+        var w = ModelUtils.clampDimension(p.width);
+        var h = ModelUtils.clampDimension(p.height);
+        var seed = resolveSeed(p.seed);
+        var steps = p.steps || 35;
+        var cfg = p.cfg || 3.5;
+        var prompt = p.prompt || '';
+        var negPrompt = typeof p.negPrompt === 'string' ? p.negPrompt.trim() : '';
+        var clipName = resolveKleinClipName(p.model);
+        var megapixels = Math.max(0.0625, (w * h) / 1000000);
+        var negativeNode = negPrompt.length > 0
+            ? { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: negPrompt } }
+            : { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['8', 0] } };
+        return {
+            '1': { class_type: 'UNETLoader', inputs: { unet_name: p.model, weight_dtype: 'default' } },
+            '2': { class_type: 'CLIPLoader', inputs: { clip_name: clipName, type: 'klein', device: 'default' } },
+            '3': { class_type: 'VAELoader', inputs: { vae_name: 'flux2-vae.safetensors' } },
+            '4': { class_type: 'LoadImage', inputs: { image: p.initImageName } },
+            '5': { class_type: 'ImageScaleToTotalPixels', inputs: {
+                    image: ['4', 0],
+                    upscale_method: 'bicubic',
+                    megapixels: megapixels
+                } },
+            '6': { class_type: 'VAEEncode', inputs: { pixels: ['5', 0], vae: ['3', 0] } },
+            '7': { class_type: 'ReferenceLatent', inputs: { conditioning: ['8', 0], latent: ['6', 0] } },
+            '8': { class_type: 'CLIPTextEncode', inputs: { clip: ['2', 0], text: prompt } },
+            '9': negativeNode,
+            '10': { class_type: 'EmptyFlux2LatentImage', inputs: {
+                    width: w,
+                    height: h,
+                    batch_size: 1
+                } },
+            '11': { class_type: 'CFGGuider', inputs: {
+                    model: ['1', 0],
+                    positive: ['7', 0],
+                    negative: ['9', 0],
+                    cfg: cfg
+                } },
+            '12': { class_type: 'Flux2Scheduler', inputs: {
+                    model: ['1', 0],
+                    steps: steps
+                } },
+            '13': { class_type: 'RandomNoise', inputs: { noise_seed: seed } },
+            '14': { class_type: 'KSamplerSelect', inputs: { sampler_name: 'euler' } },
+            '15': { class_type: 'SamplerCustomAdvanced', inputs: {
+                    noise: ['13', 0],
+                    guider: ['11', 0],
+                    sampler: ['14', 0],
+                    sigmas: ['12', 0],
+                    latent_image: ['7', 0]
+                } },
+            '16': { class_type: 'VAEDecode', inputs: { samples: ['15', 0], vae: ['3', 0] } },
+            '17': { class_type: 'SaveImage', inputs: {
+                    images: ['16', 0],
+                    filename_prefix: matchesKleinSize(p.model, '4b') ? 'klein4b_edit' : 'klein9b_edit'
+                } }
+        };
+    }
     function buildChroma(p) {
         var w = ModelUtils.clampDimension(p.width);
         var h = ModelUtils.clampDimension(p.height);
@@ -659,7 +735,8 @@ var WorkflowBuilder = (function () {
     }
     function matchesKleinSize(modelName, size) {
         var lower = (modelName || '').toLowerCase();
-        return new RegExp('klein[^a-z0-9]*' + size).test(lower);
+        return lower.indexOf('klein') >= 0 &&
+            new RegExp('(^|[^a-z0-9])' + size + '([^a-z0-9]|$)').test(lower);
     }
     function buildQwen(p) {
         var w = ModelUtils.clampDimension(p.width);
@@ -913,6 +990,12 @@ var WorkflowBuilder = (function () {
                 throw new Error('LTX2 requires numeric ' + key);
             return value;
         }
+        function requiredText(key, label) {
+            var value = String(p[key] || '').trim();
+            if (!value)
+                throw new Error('LTX2 requires ' + (label || key));
+            return value;
+        }
         if (p.initImageName)
             throw new Error('The LTX2 Mojo request runner is text-to-video only');
         var w = ModelUtils.clampVideoDimension(requiredNumber('width'));
@@ -921,6 +1004,9 @@ var WorkflowBuilder = (function () {
         var frames = Math.floor(requiredNumber('frames'));
         var steps = Math.floor(requiredNumber('steps'));
         var fps = requiredNumber('fps');
+        var sampler = requiredText('sampler');
+        var scheduler = requiredText('scheduler');
+        var capsPositive = requiredText('capsPositive', 'prompt-matched conditioning');
         if (frames < 1 || steps < 1 || fps <= 0)
             throw new Error('LTX2 frames, steps, and FPS must be positive');
         var loaderInputs = {
@@ -937,9 +1023,9 @@ var WorkflowBuilder = (function () {
             steps: steps,
             seed: seed,
             frame_rate: fps,
-            sampler: p.sampler,
-            scheduler: p.scheduler,
-            caps_positive: p.capsPositive || '',
+            sampler: sampler,
+            scheduler: scheduler,
+            caps_positive: capsPositive,
             caps_negative: p.capsNegative || '',
             noise_fixture: p.noiseFixture || '',
             include_audio: p.includeAudio === true
@@ -1180,6 +1266,6 @@ var WorkflowBuilder = (function () {
         }
         return workflow;
     }
-    return { build: build, buildImg2Img: buildImg2Img, buildInpaint: buildInpaint, buildLanPaintCandidate: buildLanPaintCandidate, buildKrea2LanPaint: buildKrea2LanPaint, buildFlowEdit: buildFlowEdit, applyControlNetNodes: applyControlNetNodes, applyIPAdapterNodes: applyIPAdapterNodes };
+    return { build: build, buildImg2Img: buildImg2Img, buildEditModel: buildEditModel, buildInpaint: buildInpaint, buildLanPaintCandidate: buildLanPaintCandidate, buildKrea2LanPaint: buildKrea2LanPaint, buildFlowEdit: buildFlowEdit, applyControlNetNodes: applyControlNetNodes, applyIPAdapterNodes: applyIPAdapterNodes };
 })();
 //# sourceMappingURL=workflow-builder.js.map

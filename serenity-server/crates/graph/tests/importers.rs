@@ -655,7 +655,8 @@ fn krea2_canvas_lanpaint_advanced_graph_preserves_visible_controls() {
             "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["12", 0],
             "add_noise": "enable", "noise_seed": 42, "steps": 8, "cfg": 1.0,
             "sampler_name": "euler", "scheduler": "simple", "start_at_step": 0, "end_at_step": 8,
-            "return_with_leftover_noise": "disable", "LanPaint_NumSteps": 5,
+            "return_with_leftover_noise": "disable", "LanPaint_ContextExpand": 96,
+            "LanPaint_NumSteps": 5,
             "LanPaint_Lambda": 16.0, "LanPaint_StepSize": 0.2, "LanPaint_Beta": 1.0,
             "LanPaint_Friction": 15.0, "LanPaint_PromptMode": "Image First",
             "LanPaint_EarlyStop": 1, "LanPaint_InnerThreshold": 0.0,
@@ -680,6 +681,7 @@ fn krea2_canvas_lanpaint_advanced_graph_preserves_visible_controls() {
     assert_eq!(req["lanpaint_friction"].as_f64(), Some(15.0));
     assert_eq!(req["lanpaint_prompt_mode"].as_str(), Some("Image First"));
     assert_eq!(req["lanpaint_mask_blend_overlap"].as_i64(), Some(9));
+    assert_eq!(req["lanpaint_context_expand"].as_i64(), Some(96));
     assert_eq!(req["lanpaint_early_stop"].as_i64(), Some(1));
     assert_eq!(req["lanpaint_inner_threshold"].as_f64(), Some(0.0));
     assert_eq!(req["lanpaint_inner_patience"].as_i64(), Some(1));
@@ -913,7 +915,8 @@ fn ltx2_lora_loader_advanced_blocks_input_is_rejected_loud() {
     });
     let err = lower_request(&mut req).unwrap_err().to_string();
     assert!(
-        err.contains("blocks input is not supported") || err.contains("unsupported workflow graph node type"),
+        err.contains("blocks input is not supported")
+            || err.contains("unsupported workflow graph node type"),
         "unexpected error: {err}"
     );
 }

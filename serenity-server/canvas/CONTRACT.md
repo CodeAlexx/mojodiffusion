@@ -61,6 +61,12 @@ compatibility unless a separately reviewed contract migration changes them.
   model shape may be enforced and displayed, but source prompt, target prompt,
   step window, CFG, seed, mask settings, and selected engine are never replaced
   by a hidden profile.
+- `Edit Models` is the simple native one-image editing workspace: source image,
+  prompt, engine, and Generate. Klein 9B and Klein 4B submit one
+  `ReferenceLatent` source at 1024x1024 through their matching resident Mojo
+  runtime. Qwen Edit is visible but disabled until its image-aware runtime is
+  production-wired; it must never be routed through Klein or an img2img
+  fallback.
 - `Masked Edit - LanPaint` is one shared capability-driven workspace, not a
   separately duplicated screen per model. Its Engine selector enables only
   registered models whose server capability profile admits inpaint and whose
@@ -76,7 +82,9 @@ compatibility unless a separately reviewed contract migration changes them.
   reject unsupported schedules or controls before model load. Source pixels and
   painted-mask pixels are uploaded separately; Canvas pan, zoom, fit, and
   transparent mask-layer state must never be baked into either logical
-  1024x1024 export.
+  1024x1024 export. An optional image-pixel context expansion affects only the
+  sampler's denoise mask; the authored mask remains the final blend boundary so
+  pixels outside the user's selection stay source-identical.
 - Deferred image families use the shared
   `WorkflowBuilder.buildLanPaintCandidate` transform. It preserves the selected
   model's loaders, conditioning, VAE, and optional LoRA chain and replaces only
@@ -130,6 +138,13 @@ compatibility unless a separately reviewed contract migration changes them.
 - The active execution path uses a persistent, high-contrast state: amber for
   active nodes and connections, green for completed work, and red for failures.
   Completion coloring remains until the next workflow execution begins.
+- Canvas stages the exact graph it submits for the next Workflow-tab visit.
+  Tab switching must not rebuild that graph from unrelated Generate controls or
+  replace its selected edit engine, source image, mask, or LoRA chain.
+- LTX2 is exposed only through the verified server template. Before queueing,
+  the browser requires the admitted `res2s` sampler, `ltx2` scheduler, and
+  prompt-matched conditioning sidecar. Incomplete legacy fallbacks are forbidden,
+  and any submission rejection must clear the Generating state immediately.
 
 ## Verification
 

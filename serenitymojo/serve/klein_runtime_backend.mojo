@@ -49,10 +49,10 @@
 # Size support: 512 square plus the finite seven-shape 1MP product ladder (the
 # Klein attention shape N_IMG/S/LH/LW is comptime; klein_sample dispatches those
 # exact specializations). steps/cfg/seed honored at runtime. ONE LoRA at weight
-# 1.0 supported (the sampler's live
-# adapter path); >1 LoRA or weight != 1.0 rejected at admission. img2img /
-# ReferenceLatent edit are NOT wired here (use klein_backend.mojo's staged edit
-# path) and are rejected loudly.
+# 1.0 supported (the sampler's live adapter path); >1 LoRA or weight != 1.0 is
+# rejected at admission. Native ReferenceLatent edit accepts one 512x512 or
+# 1024x1024 source image for both 9B and 4B. The preserved two-reference legacy
+# path remains 512x512. Ordinary img2img is rejected loudly.
 #
 # Mojo 1.0.0b1: `def` not `fn`.
 
@@ -118,7 +118,7 @@ comptime LH_512 = 32
 comptime LW_512 = 32
 comptime N_IMG_512 = 1024
 comptime S_512 = N_IMG_512 + N_TXT
-# ReferenceLatent edit shapes (512² only — mirrors klein_sample_cli):
+# ReferenceLatent edit shapes (mirrors klein_sample_cli):
 # 1-ref = target + 1 reference block; 2-ref = target + 2 reference blocks.
 comptime N_EDIT_IMG_512 = 2 * N_IMG_512
 comptime S_EDIT_512 = N_EDIT_IMG_512 + N_TXT
@@ -128,6 +128,8 @@ comptime LH_1024 = 64
 comptime LW_1024 = 64
 comptime N_IMG_1024 = 4096
 comptime S_1024 = N_IMG_1024 + N_TXT
+comptime N_EDIT_IMG_1024 = 2 * N_IMG_1024
+comptime S_EDIT_1024 = N_EDIT_IMG_1024 + N_TXT
 
 comptime KRPHASE_IDLE = 0
 comptime KRPHASE_ENCODE = 1
@@ -427,23 +429,29 @@ struct KleinRuntimeBackend(GenBackend, Movable):
             )
         if params.variation_strength > 0.0:
             raise Error("klein_runtime: variation noise is not wired for this backend")
-        if params.init_image.byte_length() > 0 and params.reference_latent_count != 2:
+        if params.init_image.byte_length() > 0 and params.reference_latent_count == 0:
             raise Error(
                 "klein_runtime: init_image/img2img is not wired here (init_image"
-                " is only consumed as reference A of a 2-reference edit)"
+                " is consumed only by a ReferenceLatent edit)"
             )
-        # ReferenceLatent edit (Phase C2): 1-2 same-size 512² references via
-        # the parity-gated klein_sample_with_reference_latent(s2) samplers.
+        # ReferenceLatent edit: one 512² or 1024² source, or the legacy
+        # two-source 512² shape, via the parity-gated edit samplers.
         if params.reference_latent_count > 0:
             if params.reference_latent_count > 2:
                 raise Error(
                     "klein_runtime: at most 2 reference latents are compiled ("
                     + String(params.reference_latent_count) + " requested)"
                 )
-            if not (params.width == 512 and params.height == 512):
+            var one_reference_1024 = (
+                params.reference_latent_count == 1
+                and params.width == 1024
+                and params.height == 1024
+            )
+            var edit_512 = params.width == 512 and params.height == 512
+            if not (edit_512 or one_reference_1024):
                 raise Error(
-                    "klein_runtime: ReferenceLatent edit is compiled at 512x512"
-                    " only; resubmit at 512x512"
+                    "klein_runtime: ReferenceLatent edit admits one source at"
+                    " 512x512 or 1024x1024; two-source edit remains 512x512"
                 )
             if params.reference_image.byte_length() == 0:
                 raise Error("klein_runtime: reference_latent_count set but reference_image is empty")
@@ -650,6 +658,17 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         var enc = KleinVaeEncoder[512, 512].load(self.cfg[0][].vae, self.ctx)
         return enc.encode(image_t, self.ctx)
 
+    def _encode_reference_1024(mut self, path: String) raises -> Tensor:
+        _require_file(String("reference image"), path)
+        var img = decode_image_any(path)
+        var resized = resize_bilinear(img, 1024, 1024)
+        var host = image_to_signed_nchw(resized)
+        var image_t = Tensor.from_host(host, [1, 3, 1024, 1024], STDtype.F32, self.ctx)
+        print("[klein_runtime] reference", path, "(", img.width, "x", img.height,
+              ") -> 1024x1024 VAE encode")
+        var enc = KleinVaeEncoder[1024, 1024].load(self.cfg[0][].vae, self.ctx)
+        return enc.encode(image_t, self.ctx)
+
     def _sample_product_shape[
         LH_: Int, LW_: Int, N_IMG_: Int, S_: Int
     ](
@@ -696,24 +715,41 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         var pos = self.pos_txt[0][].clone(self.ctx)
         var neg = self.neg_txt[0][].clone(self.ctx)
 
-        # ── ReferenceLatent edit dispatch (validated 512²-only in start()). ──
+        # ── ReferenceLatent edit dispatch. ──
         if self.params.reference_latent_count == 1:
             var ref_path = self.params.reference_image.copy()
-            var ref_lat = self._encode_reference_512(ref_path)
-            if self.variant == String("9b"):
-                var _e = klein_sample_with_reference_latent[
-                    N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_9B, Dh
-                ](
-                    self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, ref_lat^, self.out_png, self.ctx,
-                )
+            if self.params.width == 1024 and self.params.height == 1024:
+                var ref_lat = self._encode_reference_1024(ref_path)
+                if self.variant == String("9b"):
+                    var _e = klein_sample_with_reference_latent[
+                        N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_9B, Dh
+                    ](
+                        self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
+                        seed, ref_lat^, self.out_png, self.ctx,
+                    )
+                else:
+                    var _e = klein_sample_with_reference_latent[
+                        N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_4B, Dh
+                    ](
+                        self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
+                        seed, ref_lat^, self.out_png, self.ctx,
+                    )
             else:
-                var _e = klein_sample_with_reference_latent[
-                    N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_4B, Dh
-                ](
-                    self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, ref_lat^, self.out_png, self.ctx,
-                )
+                var ref_lat = self._encode_reference_512(ref_path)
+                if self.variant == String("9b"):
+                    var _e = klein_sample_with_reference_latent[
+                        N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_9B, Dh
+                    ](
+                        self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
+                        seed, ref_lat^, self.out_png, self.ctx,
+                    )
+                else:
+                    var _e = klein_sample_with_reference_latent[
+                        N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_4B, Dh
+                    ](
+                        self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
+                        seed, ref_lat^, self.out_png, self.ctx,
+                    )
         elif self.params.reference_latent_count == 2:
             # Lowering contract (serenityflow__klein9b_edit golden): ref A rides
             # init_image, ref B rides reference_image.

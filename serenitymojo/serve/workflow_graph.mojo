@@ -1208,6 +1208,7 @@ def _workflow_copy_lanpaint_field_alias(
 def _workflow_copy_lanpaint_sampler_fields(
     mut obj: JSONValue, fields: JSONValue,
 ) raises:
+    _workflow_copy_lanpaint_field_alias(obj, fields, String("LanPaint_ContextExpand"), String("lanpaint_context_expand"))
     _workflow_copy_lanpaint_field_alias(obj, fields, String("LanPaint_NumSteps"), String("lanpaint_num_steps"))
     _workflow_copy_lanpaint_field_alias(obj, fields, String("LanPaint_Lambda"), String("lanpaint_lambda"))
     _workflow_copy_lanpaint_field_alias(obj, fields, String("LanPaint_StepSize"), String("lanpaint_step_size"))
@@ -3772,7 +3773,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "conditioning_mask_strength", "conditioning_mask_set_area_to_bounds",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
-            "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
+            "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_context_expand", "lanpaint_num_steps",
             "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
             "lanpaint_prompt_mode", "lanpaint_inpainting_mode", "lanpaint_add_noise",
             "lanpaint_noise_seed", "lanpaint_start_at_step", "lanpaint_end_at_step",
@@ -3803,7 +3804,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "conditioning_mask_strength", "conditioning_mask_set_area_to_bounds",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
-            "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
+            "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_context_expand", "lanpaint_num_steps",
             "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
             "lanpaint_prompt_mode", "lanpaint_inpainting_mode", "lanpaint_add_noise",
             "lanpaint_noise_seed", "lanpaint_start_at_step", "lanpaint_end_at_step",

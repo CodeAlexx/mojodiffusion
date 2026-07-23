@@ -786,15 +786,16 @@ def krea2_sample_lanpaint_latent[
         mu_override=Float32(1.15),
         use_mu_override=use_fixed_mu_1_15,
     )
-    var cfg_big = cfg_scale
-    if lanpaint_prompt_mode.lower().find("prompt first") >= 0:
-        cfg_big = Float32(-0.5)
+    # Upstream LanPaint's KSAMPLER forces cfg_BIG=1.0 for every FLUX model.
+    # Krea2 uses Comfy's FLUX model type, so the UI prompt-mode value must not
+    # override the known-region guidance branch here.
+    var cfg_big = Float32(1.0)
     print(
         "[krea2-lanpaint] damped steps=", sample_steps,
         " inner=", lanpaint_num_steps, " cfg=", cfg_scale,
         " cfg_big=", cfg_big, " lambda=", lanpaint_lambda,
         " step_size=", lanpaint_step_size, " beta=", lanpaint_beta,
-        " friction=", lanpaint_friction,
+        " friction=", lanpaint_friction, " mode=", lanpaint_prompt_mode,
     )
 
     for si in range(sample_steps):
@@ -928,8 +929,10 @@ def krea2_sample_lanpaint_latent[
                 )
             c_state = Optional[Tensor](c_new^)
 
-        # KSampler sees the advanced model-space x plus a denoised x0. Convert
-        # that pair back into the velocity used by Krea's outer Euler update.
+        # Match LanPaint's current Comfy Krea sampler contract. PaintMethod
+        # mutates the sampler input to this advanced x, predicts denoised x0,
+        # restores clean source x0 in the known region, and lets Euler derive
+        # the effective velocity from that (advanced x, denoised x0) pair.
         var advanced_x = mul_scalar(x_t, Float32(1.0) / vp_factor, ctx)
         var final_pair = krea2_predict_comfy_velocity_pair[
             LH, LW, LTMAX, LFULL

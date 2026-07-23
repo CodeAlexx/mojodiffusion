@@ -574,7 +574,11 @@ struct Krea2Backend(GenBackend, Movable):
             self.lanpaint_source_cache_valid = True
         var preserve_host = load_lanpaint_latent_preserve_mask(
             self.params.mask_image, self.params.lanpaint_mask_channel,
-            LW_, LH_,
+            LW_, LH_, self.params.lanpaint_context_expand,
+        )
+        print(
+            "[krea2-lanpaint] sampler context expand=",
+            self.params.lanpaint_context_expand, " image pixels",
         )
         var preserve_mask = Tensor.from_host(
             preserve_host.values, [1, 1, LH_, LW_], STDtype.F32, self.ctx

@@ -411,6 +411,7 @@ function _setModelBadge(modelName) {
 var WorkflowSync = (function () {
     var lastSyncedSignature = '';
     var suppressLoadedSync = false;
+    var stagedWorkflowPending = false;
 
     function valueRef(prompt, ref) {
         if (!Array.isArray(ref) || ref.length < 1)
@@ -603,12 +604,54 @@ var WorkflowSync = (function () {
         return true;
     }
 
+    /**
+     * Put an already-built product graph into the Workflow editor without
+     * translating it through Generate controls. The next visit to Workflow
+     * consumes this handoff so tab switching cannot replace the exact graph.
+     */
+    function stageWorkflow(workflow, options) {
+        if (!workflow || typeof workflow !== 'object' ||
+            typeof sfCanvas === 'undefined' || !sfCanvas ||
+            typeof loadWorkflow === 'undefined')
+            return false;
+        suppressLoadedSync = true;
+        try {
+            loadWorkflow(sfCanvas, workflow, sfCanvas.nodeInfo);
+        }
+        finally {
+            suppressLoadedSync = false;
+        }
+        stagedWorkflowPending = true;
+        options = options || {};
+        if (options.name) {
+            var nameInput = document.getElementById('workflow-name');
+            if (nameInput)
+                nameInput.value = options.name;
+            if (typeof workflowMeta !== 'undefined')
+                workflowMeta.name = options.name;
+        }
+        return true;
+    }
+
+    function hasStagedWorkflow() {
+        return stagedWorkflowPending;
+    }
+
+    function consumeStagedWorkflow() {
+        var hadPending = stagedWorkflowPending;
+        stagedWorkflowPending = false;
+        return hadPending;
+    }
+
     return {
         extract: extract,
         markSynced: markSynced,
         onWorkflowLoaded: onWorkflowLoaded,
         syncGenerateFromCanvas: syncGenerateFromCanvas,
-        syncWorkflowFromGenerate: syncWorkflowFromGenerate
+        syncWorkflowFromGenerate: syncWorkflowFromGenerate,
+        stageWorkflow: stageWorkflow,
+        hasStagedWorkflow: hasStagedWorkflow,
+        consumeStagedWorkflow: consumeStagedWorkflow
     };
 })();
 //# sourceMappingURL=workflow.js.map

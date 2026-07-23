@@ -89,6 +89,21 @@ const KLEIN9B_FLUX2: BlockProfileSpec = BlockProfileSpec {
     turbo_hot_path: false,
 };
 
+const KLEIN4B_FLUX2: BlockProfileSpec = BlockProfileSpec {
+    profile: "klein4b_flux2_dit",
+    family: "flux2",
+    source: "serenitymojo/configs/klein4b.json",
+    block_count: Some(25),
+    block_kinds: &[("double_stream", 5), ("single_stream", 20)],
+    tensor_count_hint: None,
+    byte_count_hint_per_block: None,
+    byte_count_hint_total: None,
+    storage_dtype: "BF16",
+    offload_policy: "planned_loader_turbo_candidate",
+    vmm_handle_available: true,
+    turbo_hot_path: false,
+};
+
 const FLUX1_DEV: BlockProfileSpec = BlockProfileSpec {
     profile: "flux1_dev_dit",
     family: "flux",
@@ -254,6 +269,8 @@ pub(crate) fn local_block_profile(model: &str) -> Value {
     let m = model.trim().to_ascii_lowercase();
     if m.contains("qwen") {
         QWEN_IMAGE.to_json()
+    } else if m.contains("klein") && m.contains("4b") {
+        KLEIN4B_FLUX2.to_json()
     } else if m.contains("klein")
         || m.contains("flux2")
         || m.contains("flux-2")

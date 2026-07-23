@@ -146,6 +146,102 @@ function checkpoint(message) {
     "Krea2 Turbo FlowEdit did not select the Turbo checkpoint");
   assert(turboFlowedit["8"].inputs.width === 1024 && turboFlowedit["8"].inputs.height === 1024,
     "Krea2 Turbo FlowEdit did not preserve the 1024 compiled geometry");
+
+  await page.selectOption("#cv-edit-mode", "edit_models");
+  await page.dispatchEvent("#cv-edit-mode", "change");
+  const editModelsLayout = await page.evaluate(() => {
+    const bbox = CanvasTab.getCompositorContext().boundingBox;
+    return {
+      modeLabel: document.querySelector('#cv-edit-mode option[value="edit_models"]').textContent,
+      engine: document.querySelector("#cv-edit-model-engine").value,
+      engines: Array.from(document.querySelector("#cv-edit-model-engine").options).map((option) => ({
+        value: option.value,
+        label: option.textContent,
+        disabled: option.disabled,
+      })),
+      model: CanvasTab.getCompositorContext().genState.model,
+      sourceVisible: getComputedStyle(document.querySelector("#cv-source-pane")).display !== "none",
+      sectionVisible: getComputedStyle(document.querySelector("#cv-edit-model-section")).display !== "none",
+      advancedHidden: getComputedStyle(document.querySelector("#cv-advanced-generation-settings")).display === "none",
+      modelHidden: getComputedStyle(document.querySelector("#cv-model-row")).display === "none",
+      lorasHidden: getComputedStyle(document.querySelector("#cv-lora-section")).display === "none",
+      lanpaintHidden: getComputedStyle(document.querySelector("#cv-lanpaint-section")).display === "none",
+      width: bbox.width(),
+      height: bbox.height(),
+      button: document.querySelector("#cv-generate-btn").textContent,
+    };
+  });
+  assert(editModelsLayout.modeLabel === "Edit Models", `native edit mode label changed: ${editModelsLayout.modeLabel}`);
+  assert(editModelsLayout.engine === "klein9b" && /klein.*9b/i.test(editModelsLayout.model),
+    `Edit Models did not default to Klein 9B: ${JSON.stringify(editModelsLayout)}`);
+  assert(editModelsLayout.sourceVisible && editModelsLayout.sectionVisible &&
+    editModelsLayout.advancedHidden && editModelsLayout.modelHidden &&
+    editModelsLayout.lorasHidden && editModelsLayout.lanpaintHidden,
+  `Edit Models is not the simple source + engine + prompt surface: ${JSON.stringify(editModelsLayout)}`);
+  assert(editModelsLayout.width === 1024 && editModelsLayout.height === 1024 &&
+    editModelsLayout.button === "Generate Edit",
+  `Edit Models did not initialize at 1024x1024: ${JSON.stringify(editModelsLayout)}`);
+  const enabledEditModels = editModelsLayout.engines.filter((engine) => !engine.disabled).map((engine) => engine.value);
+  assert(JSON.stringify(enabledEditModels) === JSON.stringify(["klein9b", "klein4b"]),
+    `Edit Models enabled engines changed: ${JSON.stringify(editModelsLayout.engines)}`);
+  const qwenEditOption = editModelsLayout.engines.find((engine) => engine.value === "qwen_edit");
+  assert(qwenEditOption && qwenEditOption.disabled && /conditioning|runtime/i.test(qwenEditOption.label),
+    `Qwen Edit must stay visible but fail-loud until image conditioning is real: ${JSON.stringify(qwenEditOption)}`);
+
+  const nativeEditGraphs = await page.evaluate(() => [
+    ["flux-2-klein-base-9b", "Qwen/Qwen3-8B"],
+    ["flux-2-klein-base-4b", "qwen_3_4b.safetensors"],
+  ].map(([model, clip]) => ({
+    model,
+    clip,
+    workflow: WorkflowBuilder.buildEditModel({
+      model,
+      prompt: "change her coat to red",
+      initImageName: "/tmp/source.png",
+      width: 1024,
+      height: 1024,
+      steps: 35,
+      cfg: 3.5,
+      seed: 42,
+    }),
+  })));
+  for (const { model, clip, workflow } of nativeEditGraphs) {
+    const referenceNodes = Object.values(workflow).filter((node) => node.class_type === "ReferenceLatent");
+    assert(workflow["1"].inputs.unet_name === model &&
+      workflow["2"].inputs.clip_name === clip &&
+      workflow["4"].inputs.image === "/tmp/source.png" &&
+      workflow["8"].inputs.text === "change her coat to red",
+    `${model} edit graph did not preserve the selected model, source, and prompt`);
+    assert(referenceNodes.length === 1 &&
+      workflow["15"].inputs.latent_image[0] === "7" &&
+      workflow["10"].inputs.width === 1024 && workflow["10"].inputs.height === 1024,
+    `${model} edit graph does not match the single-source ReferenceLatent contract`);
+    const preflight = await page.evaluate(async (graph) => {
+      const response = await fetch("/v1/preflight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow: graph }),
+      });
+      return { status: response.status, body: await response.json() };
+    }, workflow);
+    assert(preflight.status === 200 && preflight.body.admitted === true,
+      `${model} native edit failed real server preflight: ${JSON.stringify(preflight.body)}`);
+  }
+  const qwenEditGraph = await page.evaluate(() => WorkflowBuilder.buildEditModel({
+    model: "qwen_image_edit_2511_bf16",
+    prompt: "change the background to a beach",
+    initImageName: "/tmp/source.png",
+    width: 1024,
+    height: 1024,
+    steps: 20,
+    cfg: 1,
+    denoise: 0.75,
+    seed: 42,
+  }));
+  assert(Object.values(qwenEditGraph).some((node) => node.class_type === "TextEncodeQwenImageEditPlus"),
+    "Qwen Edit graph authoring lost its image-aware conditioning node");
+  checkpoint("simple Edit Models layout and Klein ReferenceLatent preflight passed");
+
   const inpaint = await page.evaluate(() => WorkflowBuilder.buildInpaint({
     model: "zimage_base",
     prompt: "replace the background",
@@ -200,8 +296,8 @@ function checkpoint(message) {
     .map((engine) => engine.value);
   const expectedDeferredMaskedEditEngines = [
     "zimage_turbo_1024", "ideogram4_1024", "anima_1024",
-    "flux2_klein_1024", "flux2_dev_1024", "qwen_image_1024",
-    "qwen_image_edit_1024", "flux1_dev_1024", "sdxl_1024",
+    "flux2_dev_1024", "qwen_image_1024",
+    "flux1_dev_1024", "sdxl_1024",
     "sd35_1024", "hunyuan_1024", "wan22_t2i_1024", "hidream_1024",
     "sd15_512",
   ];
@@ -211,10 +307,8 @@ function checkpoint(message) {
     const models = [
       "ideogram4_fp8_scaled.safetensors",
       "anima.safetensors",
-      "flux-2-klein-base-9b.safetensors",
       "flux2-dev.safetensors",
       "qwen-image-2512.safetensors",
-      "qwen-image-edit-2509.safetensors",
       "flux1-dev.safetensors",
       "sdxl-base-1.0.safetensors",
       "sd3.5-large.safetensors",
@@ -553,6 +647,28 @@ function checkpoint(message) {
     "Style conditioning is not source-anchored before the rendering style");
   assert(!Object.values(styleWorkflow).some((node) => /IPAdapter/i.test(node.class_type)),
     "Style reference was incorrectly duplicated as an IP-Adapter branch");
+  const stagedWorkflow = await page.evaluate(() => ({
+    pending: WorkflowSync.hasStagedWorkflow(),
+    name: document.querySelector("#workflow-name").value,
+    prompt: serializeWorkflow(sfCanvas).prompt,
+  }));
+  assert(stagedWorkflow.pending, "Canvas did not stage its submitted graph for the Workflow tab");
+  assert(stagedWorkflow.name === "Canvas - Style Transfer",
+    "Canvas did not label the staged Workflow graph");
+  assert(Object.values(stagedWorkflow.prompt).some((node) => node.class_type === "Krea2FlowEdit"),
+    "Workflow editor did not receive the exact Canvas Style graph");
+  await page.evaluate(() => switchTab("workflows"));
+  await page.waitForFunction(() =>
+    getComputedStyle(document.querySelector("#panel-workflows")).display === "flex");
+  const visibleWorkflow = await page.evaluate(() => ({
+    pending: WorkflowSync.hasStagedWorkflow(),
+    prompt: serializeWorkflow(sfCanvas).prompt,
+  }));
+  assert(!visibleWorkflow.pending, "Workflow tab did not consume the Canvas graph handoff");
+  assert(Object.values(visibleWorkflow.prompt).some((node) => node.class_type === "Krea2FlowEdit"),
+    "Opening Workflow replaced the staged Canvas graph with the Generate graph");
+  await page.evaluate(() => switchTab("canvas"));
+  checkpoint("submitted Canvas graph remains visible in Workflow");
   const stylePreflight = await page.evaluate(async (workflow) => {
     const response = await fetch("/v1/preflight", {
       method: "POST",
@@ -652,7 +768,46 @@ function checkpoint(message) {
   assert(ltx.lora.length === 1 && ltx.lora[0].name === "ltx2_eri2_step3000" && ltx.lora[0].weight === 1,
     "Canvas did not preserve the verified LTX2 LoRA");
   assert(ltx.prompt.includes("vrtlEri2"), "Canvas lost the trained identity trigger");
+  await page.selectOption("#cv-sampler", "euler");
+  await page.dispatchEvent("#cv-sampler", "change");
+  await page.click("#cv-generate-btn");
+  const rejectedLtxState = await page.evaluate(() => ({
+    error: document.querySelector("#cv-error-banner").textContent,
+    buttonDisabled: document.querySelector("#cv-generate-btn").disabled,
+    buttonText: document.querySelector("#cv-generate-btn").textContent,
+  }));
+  assert(/requires the compiled Res2S sampler/.test(rejectedLtxState.error) &&
+    !rejectedLtxState.buttonDisabled,
+    `Rejected LTX2 sampler left Canvas stuck generating: ${JSON.stringify(rejectedLtxState)}`);
+  await page.selectOption("#cv-sampler", "res2s");
+  await page.dispatchEvent("#cv-sampler", "change");
   checkpoint("LTX2 and LoRA request passed");
+
+  await page.click('.nav-btn[data-tab="workflows"]');
+  await page.waitForSelector("#btn-templates");
+  await page.click("#btn-templates");
+  await page.waitForSelector(".wf-template-item");
+  const workflowTemplateLabels = await page.locator(".wf-template-item").allTextContents();
+  assert(!workflowTemplateLabels.some((label) => label.includes("LTX 2.3 Dev · Text to Video")),
+    `Workflow still exposes the incomplete hardcoded LTX2 fallback: ${JSON.stringify(workflowTemplateLabels)}`);
+  const verifiedLtxTemplate = page.locator(".wf-template-item").filter({ hasText: "ltx2_dev_t2v_lora" });
+  assert(await verifiedLtxTemplate.count() === 1,
+    `Workflow did not expose exactly one verified LTX2 template: ${JSON.stringify(workflowTemplateLabels)}`);
+  await verifiedLtxTemplate.click();
+  await page.waitForFunction(() => {
+    if (typeof sfCanvas === "undefined" || !sfCanvas) return false;
+    return Object.values(serializeWorkflow(sfCanvas).prompt)
+      .some((node) => node.class_type === "LTXVSampler");
+  });
+  const workflowLtx = await page.evaluate(() =>
+    SerenityAPI.videoRequestFromWorkflow(serializeWorkflow(sfCanvas).prompt));
+  assert(workflowLtx && workflowLtx.sampler === "res2s" && workflowLtx.scheduler === "ltx2",
+    `Workflow lost the verified LTX2 sampler profile: ${JSON.stringify(workflowLtx)}`);
+  assert(workflowLtx.caps_positive && workflowLtx.lora.length === 1 &&
+    workflowLtx.lora[0].name === "ltx2_eri2_step3000",
+    `Workflow lost LTX2 conditioning or LoRA: ${JSON.stringify(workflowLtx)}`);
+  checkpoint("Workflow exposes only the complete LTX2 template");
+  await page.click('.nav-btn[data-tab="canvas"]');
 
   let lanpaintSmoke = null;
   const lanpaintSmokeSource = process.env.SERENITY_CANVAS_LANPAINT_SMOKE_SOURCE;
@@ -732,7 +887,7 @@ function checkpoint(message) {
   const screenshot = process.env.SERENITY_CANVAS_SCREENSHOT || "/tmp/serenity-canvas-invoke-parity.png";
   await page.screenshot({ path: screenshot, fullPage: true });
   checkpoint("screenshot captured");
-  console.log(JSON.stringify({ layout, editLayout, flowedit, inpaint, zimageMaskedLayout, zimageInpaintPreflight, maskedEditScreenshot, samResult, editScreenshot, dyna, styleLayout, stylePreflight, styleScreenshot, transparency, boardState, ltx, lanpaintSmoke, screenshot }, null, 2));
+  console.log(JSON.stringify({ layout, editLayout, flowedit, inpaint, zimageMaskedLayout, zimageInpaintPreflight, maskedEditScreenshot, samResult, editScreenshot, dyna, styleLayout, stylePreflight, styleScreenshot, transparency, boardState, ltx, workflowLtx, lanpaintSmoke, screenshot }, null, 2));
   await browser.close();
 })().catch((error) => {
   console.error(error.stack || error);

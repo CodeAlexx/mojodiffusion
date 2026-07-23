@@ -35,16 +35,23 @@ function setMode(mode) {
 }
 function switchTab(tabId) {
     var previousTab = localStorage.getItem('sf-active-tab') || 'generate';
+    var hasStagedWorkflow = tabId === 'workflows' &&
+        typeof WorkflowSync !== 'undefined' &&
+        WorkflowSync.hasStagedWorkflow &&
+        WorkflowSync.hasStagedWorkflow();
     if (previousTab === 'workflows' && tabId !== 'workflows' &&
         typeof WorkflowSync !== 'undefined') {
         WorkflowSync.syncGenerateFromCanvas();
     }
     if (tabId === 'workflows' && previousTab !== 'workflows' &&
+        !hasStagedWorkflow &&
         typeof GenerateTab !== 'undefined' && typeof WorkflowSync !== 'undefined') {
         GenerateTab.init();
         if (GenerateTab.getParams)
             WorkflowSync.syncWorkflowFromGenerate(GenerateTab.getParams());
     }
+    if (hasStagedWorkflow && WorkflowSync.consumeStagedWorkflow)
+        WorkflowSync.consumeStagedWorkflow();
     // Update icon rail active state
     document.querySelectorAll('.nav-btn').forEach(function (btn) {
         btn.classList.toggle('active', btn.dataset.tab === tabId);
@@ -96,7 +103,11 @@ function switchTab(tabId) {
     }
     // Resize Konva stage when workflows tab becomes visible
     if (tabId === 'workflows') {
-        requestAnimationFrame(resizeWorkflowStage);
+        requestAnimationFrame(function () {
+            resizeWorkflowStage();
+            if (hasStagedWorkflow && typeof sfCanvas !== 'undefined' && sfCanvas && sfCanvas.fitView)
+                sfCanvas.fitView(true);
+        });
     }
     // Persist
     localStorage.setItem('sf-active-tab', tabId);
@@ -218,7 +229,6 @@ function setupTemplatesDropdown() {
         { name: 'SenseNova · Text to Image', preset: { model: 'sensenova_u1', prompt: 'a silver robot watering orange flowers in a greenhouse', steps: 30, cfg: 4, scheduler: 'euler' } },
         { name: 'Wan 2.2 5B · Text to Video', preset: { model: 'Wan2.2-TI2V-5B-Mojo', prompt: 'two anthropomorphic cats in comfortable boxing gear and bright gloves fight intensely on a spotlighted stage, cinematic lighting, dynamic camera movement', width: 832, height: 480, steps: 50, cfg: 5, scheduler: 'uni_pc', frames: 121, fps: 24 } },
         { name: 'Bernini-R · Text to Video', preset: { model: 'Bernini-R-Diffusers', prompt: 'a woman in a flowing red coat walks through a rain-soaked neon city at night, cinematic tracking shot, natural motion, detailed reflections, atmospheric depth', width: 848, height: 480, steps: 40, cfg: 4, scheduler: 'uni_pc', frames: 81, fps: 16 } },
-        { name: 'LTX 2.3 Dev · Text to Video', preset: { model: 'ltx-2.3-22b-dev-fp8', prompt: 'a red balloon drifting over a wildflower meadow, gentle camera movement', width: 1920, height: 1088, steps: 15, cfg: 3, scheduler: 'euler', frames: 121, fps: 24 } },
     ];
     function admittedFallbackTemplates() {
         // A preset is one-click production UI, so it must never advertise a

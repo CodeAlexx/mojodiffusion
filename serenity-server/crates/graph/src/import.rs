@@ -91,6 +91,7 @@ pub const FLAT_PARAM_KEYS: &[&str] = &[
     "threshold_mask_operator",
     "lanpaint_mask_channel",
     "lanpaint_mask_blend_overlap",
+    "lanpaint_context_expand",
     "lanpaint_num_steps",
     "lanpaint_lambda",
     "lanpaint_step_size",

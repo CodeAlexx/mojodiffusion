@@ -72,6 +72,7 @@ def encode_start(p: JobParams) raises -> String:
     o.set("threshold_mask_value", JSONValue.from_float(p.threshold_mask_value))
     o.set("threshold_mask_operator", JSONValue.from_string(p.threshold_mask_operator))
     o.set("lanpaint_mask_blend_overlap", JSONValue.from_int(p.lanpaint_mask_blend_overlap))
+    o.set("lanpaint_context_expand", JSONValue.from_int(p.lanpaint_context_expand))
     o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))
     o.set("lanpaint_lambda", JSONValue.from_float(p.lanpaint_lambda))
     o.set("lanpaint_step_size", JSONValue.from_float(p.lanpaint_step_size))
@@ -191,6 +192,8 @@ def decode_start(obj: JSONValue) raises -> JobParams:
         p.threshold_mask_operator = obj["threshold_mask_operator"].as_string()
     if obj.contains("lanpaint_mask_blend_overlap") and not obj["lanpaint_mask_blend_overlap"].is_null():
         p.lanpaint_mask_blend_overlap = Int(obj["lanpaint_mask_blend_overlap"].as_float())
+    if obj.contains("lanpaint_context_expand") and not obj["lanpaint_context_expand"].is_null():
+        p.lanpaint_context_expand = Int(obj["lanpaint_context_expand"].as_float())
     if obj.contains("lanpaint_num_steps") and not obj["lanpaint_num_steps"].is_null():
         p.lanpaint_num_steps = Int(obj["lanpaint_num_steps"].as_float())
     if obj.contains("lanpaint_lambda") and not obj["lanpaint_lambda"].is_null():

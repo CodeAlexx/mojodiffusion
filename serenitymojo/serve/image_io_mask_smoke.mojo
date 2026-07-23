@@ -103,7 +103,9 @@ def main() raises:
     _check_int("preserve active count", mask_active_count(preserve), 4)
     _check_close("preserve mean", mask_mean(preserve), 1.0, 1.0e-6)
 
-    var latent_preserve = load_lanpaint_latent_preserve_mask(path, String("load_image_mask"), 2, 2)
+    var latent_preserve = load_lanpaint_latent_preserve_mask(
+        path, String("load_image_mask"), 2, 2, 0
+    )
     _check_close("full pipeline preserve[0]", latent_preserve.values[0], 0.0, 1.0e-6)
     _check_close("full pipeline preserve[1]", latent_preserve.values[1], 1.0, 1.0e-6)
     var comfy_preserve = load_comfy_latent_preserve_mask(path, String("load_image_mask"), 2, 2)

@@ -85,6 +85,85 @@ struct ComfyMaskImage(Copyable, Movable):
         self.values = values^
 
 
+struct LanPaintCropBox(Copyable, Movable):
+    var x: Int
+    var y: Int
+    var width: Int
+    var height: Int
+
+    def __init__(out self, x: Int, y: Int, width: Int, height: Int):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+
+
+def lanpaint_mask_crop_box(
+    mask: ComfyMaskImage, context_pixels: Int
+) raises -> LanPaintCropBox:
+    """Square crop around the authored mask with explicit image-pixel context."""
+    if context_pixels < 0:
+        raise Error("LanPaint crop context must be non-negative")
+    var min_x = mask.width
+    var min_y = mask.height
+    var max_x = -1
+    var max_y = -1
+    for y in range(mask.height):
+        for x in range(mask.width):
+            if mask.values[y * mask.width + x] > 0.5:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+    if max_x < min_x or max_y < min_y:
+        raise Error("LanPaint authored mask is empty")
+    var content_w = max_x - min_x + 1
+    var content_h = max_y - min_y + 1
+    var side = max(content_w, content_h) + 2 * context_pixels
+    side = min(side, min(mask.width, mask.height))
+    var center_x = (min_x + max_x + 1) // 2
+    var center_y = (min_y + max_y + 1) // 2
+    var x0 = center_x - side // 2
+    var y0 = center_y - side // 2
+    x0 = max(0, min(x0, mask.width - side))
+    y0 = max(0, min(y0, mask.height - side))
+    return LanPaintCropBox(x0, y0, side, side)
+
+
+def crop_comfy_mask(
+    mask: ComfyMaskImage, crop: LanPaintCropBox
+) raises -> ComfyMaskImage:
+    if (
+        crop.x < 0 or crop.y < 0 or crop.width <= 0 or crop.height <= 0
+        or crop.x + crop.width > mask.width
+        or crop.y + crop.height > mask.height
+    ):
+        raise Error("LanPaint mask crop is outside the source")
+    var out = List[Float32](capacity=crop.width * crop.height)
+    for y in range(crop.height):
+        for x in range(crop.width):
+            out.append(mask.values[(crop.y + y) * mask.width + crop.x + x])
+    return ComfyMaskImage(crop.width, crop.height, out^)
+
+
+def crop_image_rgb(img: Image, crop: LanPaintCropBox) raises -> Image:
+    if (
+        crop.x < 0 or crop.y < 0 or crop.width <= 0 or crop.height <= 0
+        or crop.x + crop.width > img.width
+        or crop.y + crop.height > img.height
+    ):
+        raise Error("LanPaint image crop is outside the source")
+    var out = Image.new(crop.width, crop.height, 3)
+    var px: List[Int] = [0, 0, 0]
+    for y in range(crop.height):
+        for x in range(crop.width):
+            image_rgb_at(img, crop.x + x, crop.y + y, px)
+            out.set(x, y, 0, UInt8(px[0]))
+            out.set(x, y, 1, UInt8(px[1]))
+            out.set(x, y, 2, UInt8(px[2]))
+    return out^
+
+
 def _image_alpha_at(img: Image, x: Int, y: Int) raises -> Float32:
     if img.channels < 4:
         return -1.0
@@ -245,18 +324,58 @@ def comfy_mask_to_preserve_mask(mask: ComfyMaskImage) raises -> ComfyMaskImage:
     return ComfyMaskImage(mask.width, mask.height, out^)
 
 
+def dilate_lanpaint_denoise_mask(
+    mask: ComfyMaskImage, radius_x: Int, radius_y: Int
+) raises -> ComfyMaskImage:
+    """Expand a hard LanPaint denoise mask without changing its final blend mask.
+
+    This is the sampler-context mask: structural edits can expose surrounding
+    geometry to LanPaint while the separately loaded image-space blend mask
+    still limits which generated pixels are committed to the final image.
+    """
+    if radius_x < 0 or radius_y < 0:
+        raise Error("LanPaint context expansion radii must be non-negative")
+    if radius_x == 0 and radius_y == 0:
+        return ComfyMaskImage(mask.width, mask.height, mask.values.copy())
+    var out = List[Float32](capacity=mask.width * mask.height)
+    for y in range(mask.height):
+        for x in range(mask.width):
+            var max_v: Float32 = 0.0
+            for sy in range(max(0, y - radius_y), min(mask.height, y + radius_y + 1)):
+                for sx in range(max(0, x - radius_x), min(mask.width, x + radius_x + 1)):
+                    var v = mask.values[sy * mask.width + sx]
+                    if v > max_v:
+                        max_v = v
+            out.append(max_v)
+    return ComfyMaskImage(mask.width, mask.height, out^)
+
+
 def load_lanpaint_latent_preserve_mask(
-    path: String, channel: String, latent_width: Int, latent_height: Int
+    path: String, channel: String, latent_width: Int, latent_height: Int,
+    context_expand_pixels: Int,
 ) raises -> ComfyMaskImage:
     """Load the mask shape LanPaint uses inside sampling.
 
     Pipeline: Comfy source mask -> nearest-exact latent resize -> hard
-    denoise_mask > 0.5 -> invert to preserve-mask.
+    denoise_mask > 0.5 -> optional context expansion -> invert to preserve-mask.
+    Expansion is specified in source-image pixels and scaled to latent pixels.
     """
+    if context_expand_pixels < 0:
+        raise Error("LanPaint context expand must be non-negative")
     var raw = decode_comfy_mask(path, channel)
     var resized = resize_mask_nearest_exact(raw, latent_width, latent_height)
     var hard = binarize_lanpaint_denoise_mask(resized)
-    return comfy_mask_to_preserve_mask(hard)
+    var radius_x = 0
+    var radius_y = 0
+    if context_expand_pixels > 0:
+        radius_x = (
+            context_expand_pixels * latent_width + raw.width - 1
+        ) // raw.width
+        radius_y = (
+            context_expand_pixels * latent_height + raw.height - 1
+        ) // raw.height
+    var expanded = dilate_lanpaint_denoise_mask(hard, radius_x, radius_y)
+    return comfy_mask_to_preserve_mask(expanded)
 
 
 def smooth_lanpaint_blend_mask(mask: ComfyMaskImage, blend_overlap: Int) raises -> ComfyMaskImage:
@@ -327,6 +446,66 @@ def load_lanpaint_pixel_blend_mask(
     var raw = decode_comfy_mask(path, channel)
     var resized = resize_mask_nearest_exact(raw, width, height)
     return smooth_lanpaint_blend_mask(resized, blend_overlap)
+
+
+def apply_lanpaint_crop_blend_signed_chw(
+    base: List[Float32], painted_crop: List[Float32],
+    mask: ComfyMaskImage, crop: LanPaintCropBox,
+    painted_width: Int, painted_height: Int,
+) raises -> List[Float32]:
+    """Resize the generated crop back into its source box and blend by the
+    original full-image authored mask."""
+    var full_plane = mask.width * mask.height
+    var painted_plane = painted_width * painted_height
+    if len(base) != 3 * full_plane or len(painted_crop) != 3 * painted_plane:
+        raise Error("LanPaint crop blend image/mask size mismatch")
+    var out = base.copy()
+    for y in range(crop.height):
+        var fy = (
+            (Float64(y) + 0.5) * Float64(painted_height)
+            / Float64(crop.height) - 0.5
+        )
+        var y0 = Int(floor(fy))
+        var wy = Float32(fy - Float64(y0))
+        if y0 < 0:
+            y0 = 0
+            wy = 0.0
+        elif y0 >= painted_height - 1:
+            y0 = painted_height - 1
+            wy = 0.0
+        var y1 = min(painted_height - 1, y0 + 1)
+        var dy = crop.y + y
+        for x in range(crop.width):
+            var dx = crop.x + x
+            var m = mask.values[dy * mask.width + dx]
+            if m <= 0.0:
+                continue
+            var fx = (
+                (Float64(x) + 0.5) * Float64(painted_width)
+                / Float64(crop.width) - 0.5
+            )
+            var x0 = Int(floor(fx))
+            var wx = Float32(fx - Float64(x0))
+            if x0 < 0:
+                x0 = 0
+                wx = 0.0
+            elif x0 >= painted_width - 1:
+                x0 = painted_width - 1
+                wx = 0.0
+            var x1 = min(painted_width - 1, x0 + 1)
+            var dst = dy * mask.width + dx
+            for c in range(3):
+                var p00 = painted_crop[c * painted_plane + y0 * painted_width + x0]
+                var p01 = painted_crop[c * painted_plane + y0 * painted_width + x1]
+                var p10 = painted_crop[c * painted_plane + y1 * painted_width + x0]
+                var p11 = painted_crop[c * painted_plane + y1 * painted_width + x1]
+                var top = p00 * (1.0 - wx) + p01 * wx
+                var bottom = p10 * (1.0 - wx) + p11 * wx
+                var value = top * (1.0 - wy) + bottom * wy
+                out[c * full_plane + dst] = (
+                    base[c * full_plane + dst] * (1.0 - m) + value * m
+                )
+    return out^
 
 
 def apply_lanpaint_mask_blend_signed_chw(

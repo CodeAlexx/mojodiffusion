@@ -20,6 +20,9 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 LANPAINT_NODES = Path("/home/alex/LanPaint/src/LanPaint/nodes.py")
+LANPAINT_CORE = Path("/home/alex/LanPaint/src/LanPaint/lanpaint.py")
+WAN2GP_LANPAINT = Path("/home/alex/Wan2GP/shared/inpainting/lanpaint.py")
+WAN2GP_FLUX_SAMPLING = Path("/home/alex/Wan2GP/models/flux/sampling.py")
 SERENITYFLOW_LATENT = Path("/home/alex/serenityflow-v2/serenityflow/nodes/latent.py")
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
@@ -393,6 +396,41 @@ def run() -> dict[str, Any]:
     )
     blockers.extend(lanpaint_blockers)
 
+    lanpaint_core, lanpaint_core_blockers = contains_all(
+        LANPAINT_CORE,
+        [
+            "input_x = x",
+            "out = out * (1-latent_mask) + self.latent_image * latent_mask",
+            "input_x.copy_(x)",
+        ],
+    )
+    blockers.extend(lanpaint_core_blockers)
+
+    wan2gp_lanpaint, wan2gp_lanpaint_blockers = contains_all(
+        WAN2GP_LANPAINT,
+        [
+            "class LanPaint():",
+            "Lambda = 8",
+            "StepSize = 0.15",
+            "if IS_FLUX:",
+            "cfg_BIG = 1.0",
+            "noisy_image  = self.latent_image  * (1.0 - sigma) + self.noise * sigma",
+        ],
+    )
+    blockers.extend(wan2gp_lanpaint_blockers)
+
+    wan2gp_flux, wan2gp_flux_blockers = contains_all(
+        WAN2GP_FLUX_SAMPLING,
+        [
+            "img = lanpaint_proc(",
+            "pred, neg_pred = run_model(img, true_cfg_scale)",
+            "img += step_size * pred",
+            "latent_noise_factor = t_prev",
+            "noisy_image  = original_image_latents  * (1.0 - latent_noise_factor) + randn * latent_noise_factor",
+        ],
+    )
+    blockers.extend(wan2gp_flux_blockers)
+
     serenityflow_latent, serenityflow_blockers = contains_all(
         SERENITYFLOW_LATENT,
         [
@@ -430,10 +468,26 @@ def run() -> dict[str, Any]:
             "lanpaint_overdamped_advance",
             "lanpaint_num_steps",
             "use_fixed_mu_1_15",
+            "var cfg_big = Float32(1.0)",
+            "var advanced_x = mul_scalar",
+            "var final_x0 = sub(",
+            "var denoised = mask_blend(",
+            "preserve_mask, source_latent, final_x0",
+            "var effective_v = mul_scalar(",
+            "sub(advanced_x, denoised, ctx)",
             "progress_fd",
         ],
     )
     blockers.extend(krea2_sampler_blockers)
+
+    krea2_sampler_forbidden, krea2_sampler_forbidden_blockers = forbid_all(
+        KREA2_INFER,
+        [
+            "cfg_big = Float32(-0.5)",
+            "preserve_mask, known_noised_next, advanced_next",
+        ],
+    )
+    blockers.extend(krea2_sampler_forbidden_blockers)
 
     krea2_worker, krea2_worker_blockers = contains_all(
         KREA2_BACKEND,
@@ -591,6 +645,9 @@ def run() -> dict[str, Any]:
         "blockers": blockers,
         "oracle": {
             "lanpaint_nodes": lanpaint_py,
+            "lanpaint_core": lanpaint_core,
+            "wan2gp_lanpaint": wan2gp_lanpaint,
+            "wan2gp_flux_sampling": wan2gp_flux,
             "pytorch_area_resize": area_resize_oracle,
             "serenityflow_set_latent_noise_mask": serenityflow_latent,
             "workflows": workflow_evidence,
@@ -599,6 +656,7 @@ def run() -> dict[str, Any]:
             "inpaint_math_substrate": mojo_inpaint,
             "inpaint_parity_gate": parity_gate,
             "krea2_complete_sampler": krea2_sampler,
+            "krea2_removed_bad_handoff": krea2_sampler_forbidden,
             "krea2_worker_route": krea2_worker,
             "canvas_krea2_route": canvas_route,
             "mask_io_boundary": mask_io,

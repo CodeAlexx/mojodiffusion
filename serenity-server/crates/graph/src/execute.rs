@@ -246,6 +246,12 @@ fn copy_lanpaint_alias(out: &mut JsonValue, fields: &JsonValue, src_key: &str, d
 
 /// `_workflow_copy_lanpaint_sampler_fields` (Mojo 982).
 fn copy_lanpaint_sampler_fields(out: &mut JsonValue, fields: &JsonValue) {
+    copy_lanpaint_alias(
+        out,
+        fields,
+        "LanPaint_ContextExpand",
+        "lanpaint_context_expand",
+    );
     copy_lanpaint_alias(out, fields, "LanPaint_NumSteps", "lanpaint_num_steps");
     copy_lanpaint_alias(out, fields, "LanPaint_Lambda", "lanpaint_lambda");
     copy_lanpaint_alias(out, fields, "LanPaint_StepSize", "lanpaint_step_size");

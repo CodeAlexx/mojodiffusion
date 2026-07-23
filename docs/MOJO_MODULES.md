@@ -642,6 +642,26 @@ edits: see sections C and D of the parity-ported doc.
   yet registered as Serenity server workers or Canvas engines; the UI must not
   route to them until capability, request, and worker lifecycle wiring exists.
 
+## Serenity Canvas editing runtime (2026-07-23)
+
+- `serve/klein_runtime_backend.mojo` is the resident pure-Mojo product runtime
+  for FLUX.2 Klein 9B and 4B. In addition to text-to-image it now accepts one
+  native `ReferenceLatent` source at 512x512 or 1024x1024, VAE-encodes that
+  source in the worker, and dispatches the matching compiled 4B/9B edit shape.
+  Ordinary img2img remains rejected, and the older two-reference path remains
+  bounded to 512x512.
+- `serve/image_io.mojo` keeps LanPaint's authored final-blend mask distinct from
+  its optional expanded sampler-context mask. This lets structural edits expose
+  surrounding geometry during denoising without committing generated pixels
+  outside the user's painted region. The same module owns crop, hard-mask,
+  preserve-mask, and source-preserving blend primitives.
+- `serve/krea2_backend.mojo` forwards the explicit image-pixel context expansion
+  to the latent preserve-mask loader. `models/krea2/krea2_infer.mojo` uses
+  upstream LanPaint's FLUX `cfg_BIG=1.0` contract instead of changing that
+  branch based on the UI prompt-mode label.
+- Rust remains the capability/request control plane; image editing, reference
+  VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
+
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 
 Gates for the process-isolated **worker** runtime (`serve/`): they exercise the

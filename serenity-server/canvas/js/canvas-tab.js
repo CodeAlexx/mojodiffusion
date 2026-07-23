@@ -75,6 +75,7 @@ var CanvasTab = (function () {
         includeAudio: false,
         editMode: 'create',
         editEngine: 'krea2_raw_1024',
+        editModelEngine: 'klein9b',
         editSourcePrompt: '',
         editSourceNegative: '',
         editNmax: 24,
@@ -87,12 +88,13 @@ var CanvasTab = (function () {
         styleEntireImage: true,
         lanpaintEngine: 'krea2_turbo_1024',
         lanpaintNumSteps: 5,
-        lanpaintLambda: 16,
-        lanpaintStepSize: 0.2,
+        lanpaintLambda: 8,
+        lanpaintStepSize: 0.15,
         lanpaintBeta: 1,
         lanpaintFriction: 15,
         lanpaintPromptMode: 'Image First',
         lanpaintBlendOverlap: 9,
+        lanpaintContextExpand: 0,
         lanpaintEarlyStop: 1,
         lanpaintInnerThreshold: 0,
         lanpaintInnerPatience: 1
@@ -110,6 +112,32 @@ var CanvasTab = (function () {
     var STYLE_SOURCE_WORD_LIMIT = 80;
     var STYLE_DESCRIPTION_WORD_LIMIT = 35;
     var STYLE_USER_DIRECTION_WORD_LIMIT = 20;
+    // Native instruction-edit models use one deliberately small Canvas surface:
+    // source image + instruction + engine. Each engine resolves to an installed
+    // checkpoint and a production-admitted model-specific graph.
+    var EDIT_MODEL_ENGINES = [
+        {
+            id: 'klein9b', label: 'Klein 9B', backend: 'flux2', arch: 'klein',
+            modelIncludes: ['klein', '9b'], modelExcludes: ['fp8'],
+            preferredModels: ['flux-2-klein-base-9b'],
+            implemented: true,
+            profile: { steps: 35, cfg: 3.5, denoise: 1.0, sampler: 'euler', scheduler: 'flux2' }
+        },
+        {
+            id: 'klein4b', label: 'Klein 4B', backend: 'flux2', arch: 'klein',
+            modelIncludes: ['klein', '4b'], modelExcludes: ['fp8'],
+            preferredModels: ['flux-2-klein-base-4b'],
+            implemented: true,
+            profile: { steps: 35, cfg: 3.5, denoise: 1.0, sampler: 'euler', scheduler: 'flux2' }
+        },
+        {
+            id: 'qwen_edit', label: 'Qwen Edit', backend: 'qwenimage', arch: 'qwen',
+            modelIncludes: ['qwen', 'edit'], modelExcludes: ['fp8'],
+            preferredModels: ['qwen_image_edit_2511_bf16'],
+            implemented: false,
+            blocked: 'image-aware Qwen Edit conditioning is not production-wired'
+        }
+    ];
     // One shared masked-edit workspace serves every product-admitted backend.
     // The registry owns only UI routing and visible presets; server capabilities
     // remain authoritative about which entries are actually offered.
@@ -151,12 +179,6 @@ var CanvasTab = (function () {
             profile: { steps: 30, cfg: 5.0, denoise: 1.0, sampler: 'euler', scheduler: 'simple' }
         },
         {
-            id: 'flux2_klein_1024', label: 'Flux.2 Klein · 1024', backend: 'flux2', arch: 'klein',
-            width: 1024, height: 1024, lanpaint: true, maxLoras: null, implemented: false, graphReady: true,
-            blocked: 'Mojo LanPaint route not wired',
-            profile: { steps: 35, cfg: 3.5, denoise: 1.0, sampler: 'euler', scheduler: 'simple' }
-        },
-        {
             id: 'flux2_dev_1024', label: 'Flux.2 Dev · 1024', backend: 'flux', arch: 'flux',
             width: 1024, height: 1024, lanpaint: true, maxLoras: null, implemented: false, graphReady: true,
             modelIncludes: ['flux2'], blocked: 'Model absent; Mojo LanPaint route not wired',
@@ -166,12 +188,6 @@ var CanvasTab = (function () {
             id: 'qwen_image_1024', label: 'Qwen Image · 1024', backend: 'qwenimage', arch: 'qwen',
             width: 1024, height: 1024, lanpaint: true, maxLoras: null, implemented: false, graphReady: true,
             modelExcludes: ['edit'], preferredModels: ['qwen-image-2512'], blocked: 'Mojo LanPaint route not wired',
-            profile: { steps: 20, cfg: 1.0, denoise: 1.0, sampler: 'euler', scheduler: 'simple' }
-        },
-        {
-            id: 'qwen_image_edit_1024', label: 'Qwen Image Edit · 1024', backend: 'qwenimage', arch: 'qwen',
-            width: 1024, height: 1024, lanpaint: true, maxLoras: null, implemented: false, graphReady: true,
-            modelIncludes: ['edit'], blocked: 'Mojo masked-edit route not wired',
             profile: { steps: 20, cfg: 1.0, denoise: 1.0, sampler: 'euler', scheduler: 'simple' }
         },
         {
@@ -214,6 +230,118 @@ var CanvasTab = (function () {
             profile: { steps: 30, cfg: 7.0, denoise: 1.0, sampler: 'euler', scheduler: 'simple' }
         }
     ];
+    function editModelEngineDefinition(engine) {
+        return EDIT_MODEL_ENGINES.find(function (candidate) { return candidate.id === engine; }) || null;
+    }
+    function editModelBackendProfile(definition) {
+        if (!definition || !canvasCapabilities || !Array.isArray(canvasCapabilities.backends))
+            return null;
+        return canvasCapabilities.backends.find(function (profile) {
+            return profile && profile.backend === definition.backend;
+        }) || null;
+    }
+    function editModelBackendAdmitted(definition) {
+        var profile = editModelBackendProfile(definition);
+        var edit = profile && profile.features && profile.features.instruction_edit;
+        return !!(profile && profile.production_status === 'admitted' && edit && edit.supported === true);
+    }
+    function editModelScore(definition, modelName) {
+        var name = String(modelName || '').toLowerCase();
+        if (ModelUtils.detectArchFromFilename(modelName) !== definition.arch)
+            return -1;
+        if ((definition.modelIncludes || []).some(function (needle) { return name.indexOf(needle) < 0; }))
+            return -1;
+        if ((definition.modelExcludes || []).some(function (needle) { return name.indexOf(needle) >= 0; }))
+            return -1;
+        var preferred = (definition.preferredModels || []).indexOf(name);
+        return preferred >= 0 ? 100 - preferred : 50;
+    }
+    function findCanvasModelForEditModelEngine(definition) {
+        if (!definition || !els.model)
+            return null;
+        return Array.from(els.model.options || []).map(function (option) {
+            return { option: option, score: editModelScore(definition, option.value) };
+        }).filter(function (candidate) { return candidate.score >= 0; })
+            .sort(function (a, b) { return b.score - a.score; })[0] || null;
+    }
+    function editModelUnavailableReason(definition) {
+        var model = findCanvasModelForEditModelEngine(definition);
+        var profile = editModelBackendProfile(definition);
+        var edit = profile && profile.features && profile.features.instruction_edit;
+        if (!model)
+            return 'model not installed';
+        if (definition.implemented !== true)
+            return definition.blocked || 'runtime not wired';
+        return (edit && edit.reason) || 'backend does not admit native editing';
+    }
+    function populateEditModelEngineOptions() {
+        if (!els.editModelEngine)
+            return [];
+        var available = EDIT_MODEL_ENGINES.filter(function (definition) {
+            return definition.implemented === true &&
+                editModelBackendAdmitted(definition) &&
+                !!findCanvasModelForEditModelEngine(definition);
+        });
+        els.editModelEngine.innerHTML = '';
+        available.forEach(function (definition) {
+            var option = document.createElement('option');
+            option.value = definition.id;
+            option.textContent = definition.label;
+            els.editModelEngine.appendChild(option);
+        });
+        EDIT_MODEL_ENGINES.filter(function (definition) {
+            return available.indexOf(definition) < 0;
+        }).forEach(function (definition) {
+            var reason = editModelUnavailableReason(definition);
+            var option = document.createElement('option');
+            option.value = definition.id;
+            option.textContent = definition.label + ' — ' + reason;
+            option.title = reason;
+            option.disabled = true;
+            els.editModelEngine.appendChild(option);
+        });
+        if (available.length === 0) {
+            els.editModelEngine.disabled = true;
+            return available;
+        }
+        els.editModelEngine.disabled = false;
+        if (!available.some(function (definition) { return definition.id === genState.editModelEngine; }))
+            genState.editModelEngine = available[0].id;
+        els.editModelEngine.value = genState.editModelEngine;
+        return available;
+    }
+    function applyEditModelEngineProfile(engine) {
+        var definition = editModelEngineDefinition(engine);
+        if (!definition || !definition.profile)
+            return false;
+        var profile = definition.profile;
+        genState.steps = profile.steps;
+        genState.cfg = profile.cfg;
+        genState.denoise = profile.denoise;
+        genState.sampler = profile.sampler;
+        genState.scheduler = profile.scheduler;
+        els.steps.value = String(profile.steps);
+        els.stepsRange.value = String(profile.steps);
+        els.cfg.value = String(profile.cfg);
+        els.cfgRange.value = String(profile.cfg);
+        els.denoise.value = String(profile.denoise);
+        els.denoiseVal.textContent = Number(profile.denoise).toFixed(2);
+        els.sampler.value = profile.sampler;
+        els.scheduler.value = profile.scheduler;
+        return true;
+    }
+    function syncCanvasModelFromEditModelEngine() {
+        var definition = editModelEngineDefinition(genState.editModelEngine);
+        var match = findCanvasModelForEditModelEngine(definition);
+        if (!definition || !match)
+            return false;
+        els.model.value = match.option.value;
+        genState.model = match.option.value;
+        genState.arch = definition.arch;
+        updateTopbarModel(match.option.value);
+        updateCanvasUIForArch(definition.arch);
+        return true;
+    }
     function maskedEditEngineDefinition(engine) {
         return MASKED_EDIT_ENGINES.find(function (candidate) { return candidate.id === engine; }) || null;
     }
@@ -306,7 +434,7 @@ var CanvasTab = (function () {
             els.lanpaintControls.style.display = usesLanPaint ? '' : 'none';
         if (els.maskedEditHelper) {
             els.maskedEditHelper.textContent = usesLanPaint ?
-                'Every LanPaint value is submitted to the Mojo sampler. Unsupported values fail before model loading.' :
+                'Describe the requested change in Prompt. The vision captioner writes a complete positive target description before the Mojo LanPaint sampler runs; every visible LanPaint value is submitted unchanged.' :
                 'Z-Image uses its Mojo-native mask-aware denoise path. Steps, CFG, denoise, prompt, seed, mask, and LoRAs remain visible request controls.';
         }
         if (els.denoise)
@@ -1079,6 +1207,7 @@ var CanvasTab = (function () {
             '<div class="cv-setting-row"><span class="cv-setting-label">Mode</span>' +
             '<select id="cv-edit-mode" class="cv-select">' +
             '<option value="create">Create / canvas</option>' +
+            '<option value="edit_models">Edit Models</option>' +
             '<option value="flowedit">Image edit — FlowEdit</option>' +
             '<option value="style">Style transfer — FlowEdit</option>' +
             '<option value="inpaint">Masked Edit - LanPaint</option>' +
@@ -1103,6 +1232,12 @@ var CanvasTab = (function () {
             '<label>Warmup<input id="cv-edit-mask-warmup" type="number" min="0" max="150" value="4"></label></div>' +
             '<label class="cv-check-row"><input id="cv-edit-auto-mask" type="checkbox" checked> Automatic change mask</label></details>' +
             '</div>' +
+            '<div id="cv-edit-model-section" class="cv-edit-settings" style="display:none">' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Engine</span>' +
+            '<select id="cv-edit-model-engine" class="cv-select">' +
+            '<option disabled selected>Loading edit models...</option></select></div>' +
+            '<div class="cv-helper-text">Load one source image, describe the change, and generate a 1024 × 1024 edit.</div>' +
+            '</div>' +
             '<div id="cv-lanpaint-section" class="cv-edit-settings" style="display:none">' +
             '<div class="cv-setting-row"><span class="cv-setting-label">Engine</span>' +
             '<select id="cv-lanpaint-engine" class="cv-select">' +
@@ -1110,12 +1245,13 @@ var CanvasTab = (function () {
             '<details id="cv-lanpaint-controls" class="cv-edit-advanced" open><summary>LanPaint controls</summary>' +
             '<div class="cv-edit-grid">' +
             '<label>Inner steps<input id="cv-lanpaint-inner-steps" type="number" min="0" max="64" value="5"></label>' +
-            '<label>Lambda<input id="cv-lanpaint-lambda" type="number" min="0.01" max="100" step="0.1" value="16"></label>' +
-            '<label>Step size<input id="cv-lanpaint-step-size" type="number" min="0.001" max="5" step="0.01" value="0.2"></label>' +
+            '<label>Lambda<input id="cv-lanpaint-lambda" type="number" min="0.01" max="100" step="0.1" value="8"></label>' +
+            '<label>Step size<input id="cv-lanpaint-step-size" type="number" min="0.001" max="5" step="0.01" value="0.15"></label>' +
             '<label>Beta<input id="cv-lanpaint-beta" type="number" min="0.01" max="100" step="0.1" value="1"></label>' +
             '<label>Friction<input id="cv-lanpaint-friction" type="number" min="0.01" max="100" step="0.1" value="15"></label>' +
             '<label>Prompt mode<select id="cv-lanpaint-prompt-mode" class="cv-select"><option value="Image First">Image First</option><option value="Prompt First">Prompt First</option></select></label>' +
             '<label>Blend overlap<input id="cv-lanpaint-blend-overlap" type="number" min="1" max="51" step="2" value="9"></label>' +
+            '<label>Context expand<input id="cv-lanpaint-context-expand" type="number" min="0" max="256" step="8" value="0"></label>' +
             '<label>Early stop<input id="cv-lanpaint-early-stop" type="number" min="0" max="64" value="1"></label>' +
             '<label>Inner threshold<input id="cv-lanpaint-inner-threshold" type="number" min="0" max="100" step="0.01" value="0"></label>' +
             '<label>Inner patience<input id="cv-lanpaint-inner-patience" type="number" min="0" max="64" value="1"></label>' +
@@ -1123,8 +1259,9 @@ var CanvasTab = (function () {
             '<div id="cv-masked-edit-helper" class="cv-helper-text">Loading masked-edit capabilities...</div>' +
             '</div>' +
             '<div id="cv-edit-runtime-note" class="cv-capability-note" style="display:none"></div>' +
-            '<label class="cv-setting-label" style="margin-bottom:2px">Prompt</label>' +
-            '<textarea id="cv-prompt" class="cv-textarea" rows="3" placeholder="Describe the content..."></textarea>' +
+            '<label class="cv-setting-label" style="margin-bottom:2px">Prompt / requested change</label>' +
+            '<textarea id="cv-prompt" class="cv-textarea" rows="3" placeholder="Describe the content or requested change..."></textarea>' +
+            '<div id="cv-advanced-generation-settings">' +
             '<label class="cv-setting-label" style="margin-bottom:2px">Negative</label>' +
             '<textarea id="cv-negative" class="cv-textarea cv-textarea-compact" rows="2" placeholder="Content to avoid..."></textarea>' +
             '<div id="cv-denoise-row" class="cv-setting-row" style="margin-top:4px">' +
@@ -1181,6 +1318,7 @@ var CanvasTab = (function () {
             '<div class="cv-helper-text">The Mojo runner validates these exact values and rejects unsupported compiled profiles before model loading.</div>' +
             '</div>' +
             '</div>' +
+            '</div>' +
             '<div id="cv-model-row"><label class="cv-setting-label" style="margin-top:4px">Model</label>' +
             '<select id="cv-model" class="cv-select"><option disabled selected>Loading models...</option></select></div>' +
             '<div id="cv-capability-note" class="cv-capability-note" style="display:none"></div>' +
@@ -1208,6 +1346,8 @@ var CanvasTab = (function () {
         els.prompt = document.getElementById('cv-prompt');
         els.editMode = document.getElementById('cv-edit-mode');
         els.editEngine = document.getElementById('cv-edit-engine');
+        els.editModelSection = document.getElementById('cv-edit-model-section');
+        els.editModelEngine = document.getElementById('cv-edit-model-engine');
         els.editSourcePrompt = document.getElementById('cv-edit-source-prompt');
         els.editNmax = document.getElementById('cv-edit-nmax');
         els.editNmin = document.getElementById('cv-edit-nmin');
@@ -1228,6 +1368,7 @@ var CanvasTab = (function () {
         els.lanpaintFriction = document.getElementById('cv-lanpaint-friction');
         els.lanpaintPromptMode = document.getElementById('cv-lanpaint-prompt-mode');
         els.lanpaintBlendOverlap = document.getElementById('cv-lanpaint-blend-overlap');
+        els.lanpaintContextExpand = document.getElementById('cv-lanpaint-context-expand');
         els.lanpaintEarlyStop = document.getElementById('cv-lanpaint-early-stop');
         els.lanpaintInnerThreshold = document.getElementById('cv-lanpaint-inner-threshold');
         els.lanpaintInnerPatience = document.getElementById('cv-lanpaint-inner-patience');
@@ -1272,6 +1413,7 @@ var CanvasTab = (function () {
         els.fpsRange = document.getElementById('cv-fps-range');
         els.durationHint = document.getElementById('cv-duration-hint');
         els.ltx2Section = document.getElementById('cv-ltx2-section');
+        els.advancedGenerationSettings = document.getElementById('cv-advanced-generation-settings');
         els.capsPositive = document.getElementById('cv-caps-positive');
         els.capsNegative = document.getElementById('cv-caps-negative');
         els.noiseFixture = document.getElementById('cv-noise-fixture');
@@ -1938,15 +2080,21 @@ var CanvasTab = (function () {
         var mode = genState.editMode;
         var editing = mode !== 'create';
         var flowEditing = mode === 'flowedit' || mode === 'style';
-        var engineDrivenEditing = flowEditing || mode === 'inpaint';
+        var nativeModelEditing = mode === 'edit_models';
+        var engineDrivenEditing = flowEditing || nativeModelEditing || mode === 'inpaint';
         var maskedEditEngine = maskedEditEngineDefinition(genState.lanpaintEngine);
         els.editWorkspace.classList.toggle('edit-active', editing);
         els.editWorkspace.classList.toggle('style-active', mode === 'style');
         els.sourcePane.style.display = editing ? 'flex' : 'none';
         els.flowEditSection.style.display = (mode === 'flowedit' || mode === 'style') ? 'block' : 'none';
+        els.editModelSection.style.display = nativeModelEditing ? 'block' : 'none';
         els.lanpaintSection.style.display = mode === 'inpaint' ? 'block' : 'none';
+        if (els.advancedGenerationSettings)
+            els.advancedGenerationSettings.style.display = nativeModelEditing ? 'none' : 'block';
         if (els.modelRow)
             els.modelRow.style.display = engineDrivenEditing ? 'none' : 'block';
+        if (els.loraSection)
+            els.loraSection.style.display = nativeModelEditing ? 'none' : '';
         els.denoise.disabled = mode === 'inpaint' && (!maskedEditEngine || maskedEditEngine.lanpaint);
         els.sampler.disabled = mode === 'inpaint';
         els.scheduler.disabled = mode === 'inpaint';
@@ -1955,7 +2103,8 @@ var CanvasTab = (function () {
             option.disabled = mode === 'style';
         });
         els.editRuntimeNote.style.display = 'none';
-        els.resultPaneTitle.textContent = mode === 'inpaint' ? 'Result + mask' : (mode === 'style' ? 'Result · 1024 × 1024' : (editing ? 'Result' : 'Canvas'));
+        els.resultPaneTitle.textContent = mode === 'inpaint' ? 'Result + mask' :
+            ((mode === 'style' || nativeModelEditing) ? 'Result · 1024 × 1024' : (editing ? 'Result' : 'Canvas'));
         els.importBtn.textContent = editing ? (mode === 'dynaedit' ? 'Load source video' : 'Load source image') : 'Import Image';
         els.importFile.accept = mode === 'dynaedit' ? 'video/*' : 'image/*';
         if (mode !== 'style')
@@ -1972,6 +2121,28 @@ var CanvasTab = (function () {
             }
             els.generateBtn.textContent = 'Run FlowEdit';
             els.editRuntimeNote.textContent = 'Pure-Mojo FlowEdit. Krea2 Raw and Turbo have compiled 512×512 and 1024×1024 profiles; Ideogram4 is 1024×1024.';
+            els.editRuntimeNote.style.display = 'block';
+        }
+        else if (nativeModelEditing) {
+            populateEditModelEngineOptions();
+            applyEditModelEngineProfile(genState.editModelEngine);
+            if (boundingBox) {
+                boundingBox.width(1024);
+                boundingBox.height(1024);
+                updateHandles();
+                updateSizeLabel();
+                updateBboxInputs();
+                stage.batchDraw();
+            }
+            els.generateBtn.textContent = 'Generate Edit';
+            if (!syncCanvasModelFromEditModelEngine()) {
+                els.editRuntimeNote.textContent = 'No production-admitted installed model matches the selected edit engine.';
+            }
+            else {
+                var editDefinition = editModelEngineDefinition(genState.editModelEngine);
+                els.editRuntimeNote.textContent = editDefinition.label +
+                    ' uses its native image-reference edit path at 1024 × 1024.';
+            }
             els.editRuntimeNote.style.display = 'block';
         }
         else if (mode === 'style') {
@@ -3179,6 +3350,11 @@ var CanvasTab = (function () {
                 applyFlowEditEngineProfile(genState.editEngine);
                 syncCanvasModelFromFlowEditEngine();
             }
+            else if (nextMode === 'edit_models') {
+                populateEditModelEngineOptions();
+                applyEditModelEngineProfile(genState.editModelEngine);
+                syncCanvasModelFromEditModelEngine();
+            }
             updateEditWorkspace();
         });
         els.editEngine.addEventListener('change', function () {
@@ -3197,6 +3373,15 @@ var CanvasTab = (function () {
             }
             updateEditWorkspace();
         });
+        els.editModelEngine.addEventListener('change', function () {
+            genState.editModelEngine = this.value;
+            if (!applyEditModelEngineProfile(this.value) || !syncCanvasModelFromEditModelEngine()) {
+                showError('The selected edit model is not available on this machine');
+                return;
+            }
+            updateEditWorkspace();
+            resetView();
+        });
         els.lanpaintEngine.addEventListener('change', function () {
             genState.lanpaintEngine = this.value;
             if (!syncCanvasModelFromLanPaintEngine()) {
@@ -3214,6 +3399,7 @@ var CanvasTab = (function () {
         els.lanpaintFriction.addEventListener('input', function () { genState.lanpaintFriction = Number(this.value); });
         els.lanpaintPromptMode.addEventListener('change', function () { genState.lanpaintPromptMode = this.value; });
         els.lanpaintBlendOverlap.addEventListener('input', function () { genState.lanpaintBlendOverlap = Math.floor(Number(this.value)); });
+        els.lanpaintContextExpand.addEventListener('input', function () { genState.lanpaintContextExpand = Math.max(0, Math.floor(Number(this.value))); });
         els.lanpaintEarlyStop.addEventListener('input', function () { genState.lanpaintEarlyStop = Math.max(0, parseInt(this.value) || 0); });
         els.lanpaintInnerThreshold.addEventListener('input', function () { genState.lanpaintInnerThreshold = Number(this.value); });
         els.lanpaintInnerPatience.addEventListener('input', function () { genState.lanpaintInnerPatience = Math.max(0, parseInt(this.value) || 0); });
@@ -3856,6 +4042,7 @@ var CanvasTab = (function () {
             capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
             noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
             editMode: genState.editMode, editEngine: genState.editEngine,
+            editModelEngine: genState.editModelEngine,
             styleEntireImage: genState.styleEntireImage,
             lanpaintEngine: genState.lanpaintEngine,
             lanpaintNumSteps: genState.lanpaintNumSteps,
@@ -3865,6 +4052,7 @@ var CanvasTab = (function () {
             lanpaintFriction: genState.lanpaintFriction,
             lanpaintPromptMode: genState.lanpaintPromptMode,
             lanpaintBlendOverlap: genState.lanpaintBlendOverlap,
+            lanpaintContextExpand: genState.lanpaintContextExpand,
             lanpaintEarlyStop: genState.lanpaintEarlyStop,
             lanpaintInnerThreshold: genState.lanpaintInnerThreshold,
             lanpaintInnerPatience: genState.lanpaintInnerPatience,
@@ -3960,6 +4148,7 @@ var CanvasTab = (function () {
                 genState.includeAudio = state.genSettings.includeAudio === true;
                 genState.editMode = state.genSettings.editMode || genState.editMode;
                 genState.editEngine = state.genSettings.editEngine || genState.editEngine;
+                genState.editModelEngine = state.genSettings.editModelEngine || genState.editModelEngine;
                 genState.styleEntireImage = state.genSettings.styleEntireImage === true;
                 genState.lanpaintEngine = state.genSettings.lanpaintEngine || genState.lanpaintEngine;
                 genState.lanpaintNumSteps = Number.isFinite(Number(state.genSettings.lanpaintNumSteps)) ? Number(state.genSettings.lanpaintNumSteps) : genState.lanpaintNumSteps;
@@ -3969,6 +4158,7 @@ var CanvasTab = (function () {
                 genState.lanpaintFriction = Number.isFinite(Number(state.genSettings.lanpaintFriction)) ? Number(state.genSettings.lanpaintFriction) : genState.lanpaintFriction;
                 genState.lanpaintPromptMode = state.genSettings.lanpaintPromptMode || genState.lanpaintPromptMode;
                 genState.lanpaintBlendOverlap = Number.isFinite(Number(state.genSettings.lanpaintBlendOverlap)) ? Number(state.genSettings.lanpaintBlendOverlap) : genState.lanpaintBlendOverlap;
+                genState.lanpaintContextExpand = Number.isFinite(Number(state.genSettings.lanpaintContextExpand)) ? Number(state.genSettings.lanpaintContextExpand) : genState.lanpaintContextExpand;
                 genState.lanpaintEarlyStop = Number.isFinite(Number(state.genSettings.lanpaintEarlyStop)) ? Number(state.genSettings.lanpaintEarlyStop) : genState.lanpaintEarlyStop;
                 genState.lanpaintInnerThreshold = Number.isFinite(Number(state.genSettings.lanpaintInnerThreshold)) ? Number(state.genSettings.lanpaintInnerThreshold) : genState.lanpaintInnerThreshold;
                 genState.lanpaintInnerPatience = Number.isFinite(Number(state.genSettings.lanpaintInnerPatience)) ? Number(state.genSettings.lanpaintInnerPatience) : genState.lanpaintInnerPatience;
@@ -4018,6 +4208,8 @@ var CanvasTab = (function () {
                     els.styleEntireImage.checked = genState.styleEntireImage;
                 if (els.editMode)
                     els.editMode.value = genState.editMode;
+                if (els.editModelEngine)
+                    els.editModelEngine.value = genState.editModelEngine;
                 if (els.lanpaintEngine)
                     els.lanpaintEngine.value = genState.lanpaintEngine;
                 if (els.lanpaintNumSteps)
@@ -4034,6 +4226,8 @@ var CanvasTab = (function () {
                     els.lanpaintPromptMode.value = genState.lanpaintPromptMode;
                 if (els.lanpaintBlendOverlap)
                     els.lanpaintBlendOverlap.value = String(genState.lanpaintBlendOverlap);
+                if (els.lanpaintContextExpand)
+                    els.lanpaintContextExpand.value = String(genState.lanpaintContextExpand);
                 if (els.lanpaintEarlyStop)
                     els.lanpaintEarlyStop.value = String(genState.lanpaintEarlyStop);
                 if (els.lanpaintInnerThreshold)
@@ -4133,6 +4327,15 @@ var CanvasTab = (function () {
                 'No admitted masked-edit engine is available.';
             els.capabilityNote.style.display = 'block';
         }
+        else if (genState.editMode === 'edit_models') {
+            var editDefinition = editModelEngineDefinition(genState.editModelEngine);
+            var instructionEdit = canvasFeature('instruction_edit');
+            els.capabilityNote.textContent = editDefinition ?
+                editDefinition.label + ': ' +
+                    (instructionEdit.note || instructionEdit.reason || 'native instruction editing') :
+                'No edit model is selected.';
+            els.capabilityNote.style.display = 'block';
+        }
         else if (genState.arch === 'ltxv') {
             els.capabilityNote.textContent = 'Mojo text-to-video request profile; Canvas pixels are not consumed.';
             els.capabilityNote.style.display = 'block';
@@ -4154,7 +4357,8 @@ var CanvasTab = (function () {
                 els.capabilityNote.style.display = unsupported.length ? 'block' : 'none';
             }
         }
-        var loraSupported = genState.arch === 'ltxv' || canvasFeature('lora').supported;
+        var loraSupported = genState.editMode !== 'edit_models' &&
+            (genState.arch === 'ltxv' || canvasFeature('lora').supported);
         els.loraSection.style.display = loraSupported ? 'flex' : 'none';
         var controlItem = document.querySelector('.cv-layer-type-item[data-type="control"]');
         if (controlItem) {
@@ -4445,9 +4649,12 @@ var CanvasTab = (function () {
             genState.model = pick.name;
             updateTopbarModel(pick.name);
             updateCanvasUIForArch(ModelUtils.detectArchFromFilename(pick.name));
+            populateEditModelEngineOptions();
             populateMaskedEditEngineOptions();
             if (genState.editMode === 'flowedit' || genState.editMode === 'style')
                 syncCanvasModelFromFlowEditEngine();
+            else if (genState.editMode === 'edit_models')
+                syncCanvasModelFromEditModelEngine();
             else if (genState.editMode === 'inpaint')
                 syncCanvasModelFromLanPaintEngine();
         })
@@ -4504,7 +4711,8 @@ var CanvasTab = (function () {
         // Update generate button label
         els.generateBtn.textContent = genState.editMode === 'style' ? 'Apply reference style' :
             (genState.editMode === 'flowedit' ? 'Run FlowEdit' :
-                (genState.editMode === 'inpaint' ? 'Edit masked area' : (isVideo ? 'Generate Video' : 'Generate')));
+                (genState.editMode === 'edit_models' ? 'Generate Edit' :
+                    (genState.editMode === 'inpaint' ? 'Edit masked area' : (isVideo ? 'Generate Video' : 'Generate'))));
         if (arch === 'bernini') {
             genState.width = 848;
             genState.height = 480;
@@ -4682,6 +4890,10 @@ var CanvasTab = (function () {
             startStyleFlowEditGeneration();
             return;
         }
+        if (genState.editMode === 'edit_models') {
+            startEditModelGeneration();
+            return;
+        }
         if (!genState.model) {
             showError('No model selected');
             return;
@@ -4694,12 +4906,22 @@ var CanvasTab = (function () {
             showError('LTX2 requires a prompt-matched conditioning artifact path');
             return;
         }
+        if (genState.arch === 'ltxv' &&
+            (genState.sampler !== 'res2s' || genState.scheduler !== 'ltx2')) {
+            showError('LTX2 requires the compiled Res2S sampler with the LTX2 scheduler');
+            return;
+        }
         setCanvasGenerating(true);
         var isVideo = isVideoArch();
         var maskedEditEngine = genState.editMode === 'inpaint' ? maskedEditEngineDefinition(genState.lanpaintEngine) : null;
         checkBboxContent().then(function (hasContent) {
             var maskLayerInfo = getMaskLayer();
             var hasMask = maskLayerInfo && maskLayerInfo.konvaLayer.getChildren().length > 0;
+            if (genState.editMode === 'inpaint' && !hasContent) {
+                showError('Load or select an image before starting the masked edit');
+                setCanvasGenerating(false);
+                return;
+            }
             if (genState.editMode === 'inpaint' && !hasMask) {
                 showError('Paint or generate a mask before starting the inpaint');
                 setCanvasGenerating(false);
@@ -4710,7 +4932,14 @@ var CanvasTab = (function () {
                 setCanvasGenerating(false);
                 return;
             }
-            var featureError = validateCanvasGenerationFeatures(hasContent, hasMask);
+            // Create/canvas is text-to-image. Existing result layers are output
+            // placement context, not an implicit img2img request. Explicit
+            // source-consuming modes (FlowEdit/style/inpaint) own editing.
+            var consumesCanvasSource = genState.editMode === 'inpaint';
+            var featureError = validateCanvasGenerationFeatures(
+                consumesCanvasSource && hasContent,
+                consumesCanvasSource && hasMask
+            );
             if (featureError) {
                 showError(featureError);
                 setCanvasGenerating(false);
@@ -4762,13 +4991,14 @@ var CanvasTab = (function () {
                     friction: genState.lanpaintFriction,
                     promptMode: genState.lanpaintPromptMode,
                     blendOverlap: genState.lanpaintBlendOverlap,
+                    contextExpand: genState.lanpaintContextExpand,
                     earlyStop: genState.lanpaintEarlyStop,
                     innerThreshold: genState.lanpaintInnerThreshold,
                     innerPatience: genState.lanpaintInnerPatience
                 } : null,
                 submittedAt: new Date().toISOString()
             };
-            if (!hasContent) {
+            if (genState.editMode === 'create' || !hasContent) {
                 queueWorkflow(WorkflowBuilder.build({
                     model: genState.model || '', prompt: genState.prompt,
                     width: bw, height: bh,
@@ -4803,8 +5033,31 @@ var CanvasTab = (function () {
             else if (hasMask && !isVideo) {
                 // Inpaint: export both init image and mask
                 exportBoundingBoxRegion().then(function (initBase64) {
-                    return uploadInitImage(initBase64).then(function (initName) {
-                        return exportMaskAsBW().then(function (maskExport) {
+                    return uploadInitImage(initBase64);
+                }).then(function (initName) {
+                    if (!maskedEditEngine || !maskedEditEngine.lanpaint) {
+                        return {
+                            initName: initName,
+                            sourceDescription: '',
+                            targetDescription: genState.prompt
+                        };
+                    }
+                    if (typeof CanvasStatusBar !== 'undefined')
+                        CanvasStatusBar.updateGenStatus('Describing masked target');
+                    return prepareMaskedEditTargetCaption(initName, genState.prompt).then(function (captions) {
+                        captions.initName = initName;
+                        return captions;
+                    });
+                }).then(function (prepared) {
+                    if (pendingCanvasMetadata) {
+                        pendingCanvasMetadata.maskedEditInstruction = genState.prompt;
+                        pendingCanvasMetadata.maskedEditSourcePrompt = prepared.sourceDescription;
+                        pendingCanvasMetadata.maskedEditTargetPrompt = prepared.fullTargetDescription || prepared.targetDescription;
+                        pendingCanvasMetadata.maskedEditRegionalPrompt = prepared.targetDescription;
+                    }
+                    if (typeof CanvasStatusBar !== 'undefined')
+                        CanvasStatusBar.updateGenStatus('Preparing mask');
+                    return exportMaskAsBW().then(function (maskExport) {
                             if (!maskExport || !maskExport.base64)
                                 throw new Error('The painted mask could not be exported');
                             if (maskExport.coverage <= 0)
@@ -4813,8 +5066,8 @@ var CanvasTab = (function () {
                                 throw new Error('The mask unexpectedly covers the entire image; clear it and paint the edit area again');
                             return uploadInitImage(maskExport.base64).then(function (maskName) {
                                 queueWorkflow(WorkflowBuilder.buildInpaint({
-                                    model: genState.model || '', prompt: genState.prompt,
-                                    negPrompt: genState.negative, initImageName: initName, maskImageName: maskName,
+                                    model: genState.model || '', prompt: prepared.targetDescription,
+                                    negPrompt: genState.negative, initImageName: prepared.initName, maskImageName: maskName,
                                     width: bw, height: bh,
                                     steps: genState.steps, cfg: genState.cfg,
                                     guidance: genState.guidance, denoise: maskedEditEngine && maskedEditEngine.lanpaint ? 1.0 : genState.denoise, seed: seed,
@@ -4827,6 +5080,7 @@ var CanvasTab = (function () {
                                     lanpaintFriction: genState.lanpaintFriction,
                                     lanpaintPromptMode: genState.lanpaintPromptMode,
                                     lanpaintBlendOverlap: genState.lanpaintBlendOverlap,
+                                    lanpaintContextExpand: genState.lanpaintContextExpand,
                                     lanpaintEarlyStop: genState.lanpaintEarlyStop,
                                     lanpaintInnerThreshold: genState.lanpaintInnerThreshold,
                                     lanpaintInnerPatience: genState.lanpaintInnerPatience,
@@ -4834,7 +5088,6 @@ var CanvasTab = (function () {
                                 }));
                             });
                         });
-                    });
                 }).catch(function (err) {
                     showError('Inpaint failed: ' + err.message);
                     setCanvasGenerating(false);
@@ -4858,6 +5111,70 @@ var CanvasTab = (function () {
                     setCanvasGenerating(false);
                 });
             }
+        }).catch(function (error) {
+            if (!canvasGenerating)
+                return;
+            showError('Generation failed: ' + (error && error.message ? error.message : String(error)));
+            setCanvasGenerating(false);
+        });
+    }
+    function startEditModelGeneration() {
+        if (!editSourceDataUrl || editSourceIsVideo) {
+            showError('Load a source image for Edit Models');
+            return;
+        }
+        if (!genState.prompt.trim()) {
+            showError('Describe the requested change in Prompt');
+            return;
+        }
+        var definition = editModelEngineDefinition(genState.editModelEngine);
+        if (!definition || definition.implemented !== true || !editModelBackendAdmitted(definition)) {
+            showError(definition ? editModelUnavailableReason(definition) : 'Choose an edit model');
+            return;
+        }
+        if (!syncCanvasModelFromEditModelEngine()) {
+            showError('The selected edit model is not installed');
+            return;
+        }
+        var seed = genState.seed === -1 ? Math.floor(Math.random() * 4294967296) : genState.seed;
+        setCanvasGenerating(true);
+        if (typeof CanvasStatusBar !== 'undefined')
+            CanvasStatusBar.updateGenStatus('Preparing source image');
+        imageDataUrlAsPngBase64(editSourceDataUrl).then(function (base64) {
+            return SerenityAPI.uploadImageDetails(base64, 'edit_model_source');
+        }).then(function (upload) {
+            pendingCanvasMetadata = {
+                prompt: genState.prompt,
+                model: genState.model,
+                arch: genState.arch,
+                editMode: 'edit_models',
+                editEngine: definition.id,
+                width: 1024,
+                height: 1024,
+                steps: genState.steps,
+                cfg: genState.cfg,
+                seed: seed,
+                sourceImage: upload.path,
+                submittedAt: new Date().toISOString()
+            };
+            if (typeof CanvasStatusBar !== 'undefined')
+                CanvasStatusBar.updateGenStatus('Queueing ' + definition.label);
+            queueWorkflow(WorkflowBuilder.buildEditModel({
+                model: genState.model,
+                prompt: genState.prompt,
+                negPrompt: '',
+                initImageName: upload.path,
+                width: 1024,
+                height: 1024,
+                steps: genState.steps,
+                cfg: genState.cfg,
+                denoise: genState.denoise,
+                seed: seed,
+                batch: 1
+            }));
+        }).catch(function (error) {
+            showError('Edit preparation failed: ' + error.message);
+            setCanvasGenerating(false);
         });
     }
     function startFlowEditGeneration() {
@@ -5043,6 +5360,41 @@ var CanvasTab = (function () {
                 'Do not mention an edit, request, source image, or instruction. Keep each description at most 110 words.',
             320
         ).then(parseFlowEditCaptionPair);
+    }
+    function prepareMaskedEditTargetCaption(imagePath, editInstruction) {
+        var instruction = String(editInstruction || '').trim();
+        return captionUploadedImage(
+            imagePath,
+            'Analyze the visible source image and apply this requested change conceptually: ' + JSON.stringify(instruction) +
+                '. The text may be a short edit command or a complete desired result; infer the intended final visible state. ' +
+                'Return only valid compact JSON with three string fields: {"source":"complete source image description","target":"complete target image description","masked_target":"concise positive description of the desired content inside the painted region"}. ' +
+                'Keep source and target parallel in detail and ordering. The complete target must preserve every unchanged subject, identity, pose, composition, framing, clothing, lighting, and background detail. ' +
+                'For masked_target, state the changed subject and desired visible result first, then only the medium, lighting, and nearby context needed to render that region. Do not dilute it with unrelated background details. ' +
+                'Express the requested change as a positive, present-tense visible state. Do not mention an edit, request, source image, instruction, removal, absence, negation, or use phrases such as "no" or "without". ' +
+                'Return only the JSON. Keep source and target at most 110 words and masked_target at most 35 words.',
+            320
+        ).then(function (caption) {
+            var text = String(caption || '').trim();
+            var start = text.indexOf('{');
+            var end = text.lastIndexOf('}');
+            if (start >= 0 && end > start) {
+                try {
+                    var parsed = JSON.parse(text.slice(start, end + 1));
+                    var source = String(parsed.source || '').trim();
+                    var fullTarget = String(parsed.target || '').trim();
+                    var maskedTarget = String(parsed.masked_target || '').trim();
+                    if (source && fullTarget) {
+                        return {
+                            sourceDescription: source,
+                            targetDescription: maskedTarget || fullTarget,
+                            fullTargetDescription: fullTarget
+                        };
+                    }
+                }
+                catch (_) { }
+            }
+            throw new Error('The visual analyzer did not return the required masked-edit JSON');
+        });
     }
     function ideogramFlowEditCaption(description) {
         return JSON.stringify({
@@ -5263,7 +5615,7 @@ var CanvasTab = (function () {
         // Style mode consumes the selected reference through the FlowEdit
         // target-conditioning analysis above. It must not also inject that
         // image as an unrelated IP-Adapter branch into the FlowEdit graph.
-        if (genState.editMode === 'style')
+        if (genState.editMode === 'style' || genState.editMode === 'edit_models')
             return [];
         return CanvasRefImages.getAll().filter(function (ref) { return !!ref.src; }).map(function (ref) {
             return {
@@ -5295,8 +5647,9 @@ var CanvasTab = (function () {
     }
     function queueWorkflow(workflow) {
         // Apply ControlNet and IP-Adapter nodes if layers exist
-        var controlLayers = collectControlLayers();
-        var ipaLayers = collectIPALayers();
+        var exactNativeEdit = genState.editMode === 'edit_models';
+        var controlLayers = exactNativeEdit ? [] : collectControlLayers();
+        var ipaLayers = exactNativeEdit ? [] : collectIPALayers();
         var prepare = Promise.resolve();
         if (controlLayers.length > 0 || ipaLayers.length > 0) {
             prepare = Promise.all([
@@ -5314,6 +5667,19 @@ var CanvasTab = (function () {
             });
         }
         prepare.then(function () {
+            if (typeof WorkflowSync !== 'undefined' && WorkflowSync.stageWorkflow) {
+                var modeNames = {
+                    create: 'Create',
+                    edit_models: 'Edit Models',
+                    flowedit: 'FlowEdit',
+                    style: 'Style Transfer',
+                    inpaint: 'Masked Edit - LanPaint',
+                    dynaedit: 'DynaEdit'
+                };
+                WorkflowSync.stageWorkflow(workflow, {
+                    name: 'Canvas - ' + (modeNames[genState.editMode] || 'Workflow')
+                });
+            }
             return SerenityAPI.postPrompt(workflow, {
                 prompt: genState.prompt,
                 model: pendingCanvasMetadata && pendingCanvasMetadata.model || genState.model,
@@ -5352,6 +5718,8 @@ var CanvasTab = (function () {
                 els.generateBtn.textContent = 'Run FlowEdit';
             else if (genState.editMode === 'style')
                 els.generateBtn.textContent = 'Apply reference style';
+            else if (genState.editMode === 'edit_models')
+                els.generateBtn.textContent = 'Generate Edit';
             else if (genState.editMode === 'inpaint')
                 els.generateBtn.textContent = 'Inpaint masked area';
             else if (genState.editMode === 'dynaedit')

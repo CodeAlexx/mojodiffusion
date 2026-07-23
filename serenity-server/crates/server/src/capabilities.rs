@@ -77,19 +77,12 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
             reason: "Z-Image L2P has Mojo smoke/runtime pieces, but no production serenity-server worker route yet",
         });
     }
-    if m.contains("klein") && m.contains("4b") {
-        return Some(BlockedModelInfo {
-            backend: "flux2",
-            production_status: "blocked",
-            reason: "Klein/Flux2 4B is known to the runtime docs, but only the 9B txt2img route has current Rust-server product evidence",
-        });
-    }
     if (m.contains("flux2") || m.contains("flux-2") || m.contains("flux_2")) && !m.contains("klein")
     {
         return Some(BlockedModelInfo {
             backend: "flux2",
             production_status: "blocked",
-            reason: "Flux2 generation is admitted only for the bounded Klein 9B txt2img route; generic Flux2 model names remain blocked",
+            reason: "Flux2 generation is admitted only for the bounded Klein 9B and 4B routes; generic Flux2 model names remain blocked",
         });
     }
     // Flux.1-dev: the 2026-06-17 22.3 GiB OOM block was against the old
@@ -429,7 +422,7 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             multiple: 64,
             square_only: false,
             admitted_shapes,
-            note: "Klein 9B dispatches 512x512 plus the compiled seven-shape 1MP image aspect ladder",
+            note: "The Klein 9B and 4B worker dispatches 512x512 plus the compiled seven-shape 1MP image aspect ladder",
         },
         ModelFamily::Sensenova => ResolutionPolicy {
             mode: "shape_dispatch",
@@ -548,6 +541,7 @@ pub(crate) fn has_text(value: &str) -> bool {
 
 fn has_lanpaint_params(params: &JobParams) -> bool {
     params.lanpaint_mask_blend_overlap >= 0
+        || params.lanpaint_context_expand >= 0
         || params.lanpaint_num_steps >= 0
         || params.lanpaint_lambda >= 0.0
         || params.lanpaint_step_size >= 0.0
@@ -580,6 +574,11 @@ fn validate_krea_lanpaint(params: &JobParams) -> Result<(), String> {
     }
     if params.lanpaint_num_steps < 0 {
         return Err("krea2 LanPaint requires lanpaint_num_steps >= 0".to_string());
+    }
+    if !(0..=256).contains(&params.lanpaint_context_expand) {
+        return Err(
+            "krea2 LanPaint context expand must be an image-pixel value in 0..=256".to_string(),
+        );
     }
     for (name, value) in [
         ("lanpaint_lambda", params.lanpaint_lambda),
@@ -873,9 +872,10 @@ fn request_model_is_krea2(obj: &JsonValue) -> bool {
     model_family(request_model_name(obj)) == Ok(ModelFamily::Krea2)
 }
 
-/// Klein ReferenceLatent edit: the klein worker's edit mode consumes
-/// reference_image (+ init_image as ref A when count==2). Only this shape is
-/// carved out of the raw image-conditioning/img2img rejections below.
+/// Klein ReferenceLatent edit: the product route consumes one reference_image;
+/// the preserved two-reference legacy graph additionally carries ref A in
+/// init_image. Only these bounded shapes are carved out of the raw
+/// image-conditioning/img2img rejections below.
 fn request_is_klein_reference_edit(obj: &JsonValue) -> bool {
     let model = request_model_name(obj).to_ascii_lowercase();
     let count = obj
@@ -1089,6 +1089,7 @@ pub(crate) fn reject_disabled_raw_surfaces(obj: &JsonValue) -> Result<(), String
         map,
         &[
             "lanpaint_mask_blend_overlap",
+            "lanpaint_context_expand",
             "lanpaint_num_steps",
             "lanpaint_lambda",
             "lanpaint_step_size",
@@ -1339,8 +1340,9 @@ pub(crate) fn validate_generate_prequeue(
             "serenity-server currently admits one image per /v1/generate job; batch fanout must be wired before exposing images>1".to_string(),
         );
     }
-    // Klein ReferenceLatent edits carry ref A in init_image (count==2 contract);
-    // that admitted shape is exempt from the img2img rejection.
+    // Klein ReferenceLatent edits carry the product source in reference_image.
+    // The preserved count==2 legacy contract additionally carries ref A in
+    // init_image; both bounded shapes are exempt from the img2img rejection.
     let klein_ref_edit = (params.model.to_ascii_lowercase().contains("klein")
         || params.model.to_ascii_lowercase().contains("flux2"))
         && (1..=2).contains(&params.reference_latent_count);
@@ -1652,8 +1654,32 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
             "engine": "flowedit",
             "note": if family == ModelFamily::Krea2 { "compiled 512x512 and 1024x1024 FlowEdit" } else { "compiled 1024x1024 FlowEdit with structured JSON captions" },
         })
+    } else if family == ModelFamily::Flux2 {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "engine": "reference_latent",
+            "sizes": [[1024, 1024]],
+            "source_images": 1,
+            "note": "Klein 9B and 4B native ReferenceLatent instruction edit",
+        })
     } else {
-        unsupported_feature("FlowEdit is admitted only by the Krea2 and Ideogram4 Mojo workers")
+        unsupported_feature(
+            "instruction editing is admitted by Krea2/Ideogram4 FlowEdit and Klein ReferenceLatent",
+        )
+    };
+    let image_conditioning = if family == ModelFamily::Flux2 {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "engine": "reference_latent",
+            "max_reference_images": 1,
+            "note": "one source image is VAE-encoded and attached to the positive conditioning as target-plus-reference image tokens",
+        })
+    } else {
+        unsupported_feature(
+            "image conditioning is not admitted in the current production /v1/generate route",
+        )
     };
 
     json!({
@@ -1673,7 +1699,7 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
             "sizes": size_limits_for_family(family),
             "resolution": resolution_policy_json(family),
             "one_image_per_job": true,
-            "txt2img_only": !matches!(family, ModelFamily::ZImage | ModelFamily::Krea2),
+            "txt2img_only": !matches!(family, ModelFamily::ZImage | ModelFamily::Krea2 | ModelFamily::Flux2),
             "runtime_dependency_on_external_repos": false,
         },
         "samplers": {
@@ -1693,7 +1719,7 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
             "image_to_image": image_to_image,
             "inpaint": inpaint,
             "instruction_edit": instruction_edit,
-            "image_conditioning": unsupported_feature("image conditioning is not admitted in the current production /v1/generate route"),
+            "image_conditioning": image_conditioning,
             "vae_override": unsupported_feature("VAE override is not production-wired for /v1/generate"),
             "hires_two_pass": unsupported_feature("hires two-pass depends on img2img refine and is disabled"),
             "refiner": unsupported_feature("refiner is not production-admitted in this route"),
@@ -2069,6 +2095,7 @@ mod tests {
             ("threshold_mask_value", json!(-1)),
             ("threshold_mask_operator", json!("")),
             ("lanpaint_mask_blend_overlap", json!(-1)),
+            ("lanpaint_context_expand", json!(-1)),
             ("lanpaint_num_steps", json!(-1)),
             ("lanpaint_lambda", json!(-1)),
             ("lanpaint_step_size", json!(-1)),
@@ -2226,6 +2253,7 @@ mod tests {
             "lanpaint_inpainting_mode": "Image Inpainting",
             "lanpaint_early_stop": 1,
             "lanpaint_mask_blend_overlap": 9,
+            "lanpaint_context_expand": 96,
             "denoise": 1.0
         });
         reject_disabled_raw_surfaces(&raw).unwrap();
@@ -2254,6 +2282,7 @@ mod tests {
         params.lanpaint_inner_threshold = 0.0;
         params.lanpaint_inner_patience = 1;
         params.lanpaint_mask_blend_overlap = 9;
+        params.lanpaint_context_expand = 96;
         assert_eq!(
             validate_generate_prequeue(&params, 1.0).unwrap(),
             ModelFamily::Krea2
@@ -2281,9 +2310,17 @@ mod tests {
 
         let krea2 = capability_for_family(ModelFamily::Krea2);
         let ideogram4 = capability_for_family(ModelFamily::Ideogram4);
+        let flux2 = capability_for_family(ModelFamily::Flux2);
         let sdxl = capability_for_family(ModelFamily::Sdxl);
         assert_eq!(krea2["features"]["instruction_edit"]["supported"], true);
         assert_eq!(ideogram4["features"]["instruction_edit"]["supported"], true);
+        assert_eq!(flux2["features"]["instruction_edit"]["supported"], true);
+        assert_eq!(
+            flux2["features"]["instruction_edit"]["engine"],
+            "reference_latent"
+        );
+        assert_eq!(flux2["features"]["image_conditioning"]["supported"], true);
+        assert_eq!(flux2["limits"]["txt2img_only"], false);
         assert_eq!(sdxl["features"]["instruction_edit"]["supported"], false);
         assert_eq!(sdxl["features"]["image_to_image"]["supported"], false);
     }
@@ -2459,5 +2496,10 @@ mod tests {
         let distilled = capability_profile_for_model("flux-2-klein-9b");
         assert_eq!(distilled["defaults"]["steps"], 4);
         assert_eq!(distilled["defaults"]["cfg"], 1.0);
+
+        let four_b = capability_profile_for_model("flux-2-klein-base-4b");
+        assert_eq!(four_b["backend"], "flux2");
+        assert_eq!(four_b["production_status"], "admitted");
+        assert_eq!(four_b["features"]["instruction_edit"]["supported"], true);
     }
 }

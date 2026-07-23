@@ -28,15 +28,30 @@ use serde::{Deserialize, Serialize};
 pub struct LoraSpec {
     pub name: String,
     pub weight: f64,
-    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    #[serde(
+        default = "default_stream_strength",
+        skip_serializing_if = "is_default_stream_strength"
+    )]
     pub video: f64,
-    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    #[serde(
+        default = "default_stream_strength",
+        skip_serializing_if = "is_default_stream_strength"
+    )]
     pub video_to_audio: f64,
-    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    #[serde(
+        default = "default_stream_strength",
+        skip_serializing_if = "is_default_stream_strength"
+    )]
     pub audio: f64,
-    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    #[serde(
+        default = "default_stream_strength",
+        skip_serializing_if = "is_default_stream_strength"
+    )]
     pub audio_to_video: f64,
-    #[serde(default = "default_stream_strength", skip_serializing_if = "is_default_stream_strength")]
+    #[serde(
+        default = "default_stream_strength",
+        skip_serializing_if = "is_default_stream_strength"
+    )]
     pub other: f64,
 }
 
@@ -116,6 +131,7 @@ pub struct JobParams {
     pub threshold_mask_value: f64,
     pub threshold_mask_operator: String,
     pub lanpaint_mask_blend_overlap: i64,
+    pub lanpaint_context_expand: i64,
     pub lanpaint_num_steps: i64,
     pub lanpaint_lambda: f64,
     pub lanpaint_step_size: f64,
@@ -214,6 +230,7 @@ impl Default for JobParams {
             threshold_mask_value: -1.0,
             threshold_mask_operator: String::new(),
             lanpaint_mask_blend_overlap: -1,
+            lanpaint_context_expand: -1,
             lanpaint_num_steps: -1,
             lanpaint_lambda: -1.0,
             lanpaint_step_size: -1.0,

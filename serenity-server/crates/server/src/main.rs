@@ -303,9 +303,8 @@ struct GenerateRequest {
     /// Lowered LoRA overlays — `lower_request` writes the `lora` array.
     #[serde(default, rename = "lora", alias = "loras")]
     loras: Option<Vec<LoraSpec>>,
-    // ── ReferenceLatent edit (lowered by ReferenceLatent graph nodes; klein).
-    //    NOTE: these lowered keys were silently dropped here since Part I —
-    //    the klein edit path was never reachable through /v1/generate. ──
+    // ── ReferenceLatent edit (lowered by ReferenceLatent graph nodes; Klein).
+    //    The resident Mojo Klein worker consumes these bounded edit fields. ──
     #[serde(default)]
     reference_image: Option<String>,
     #[serde(default)]
@@ -379,6 +378,8 @@ struct GenerateRequest {
     threshold_mask_operator: Option<String>,
     #[serde(default)]
     lanpaint_mask_blend_overlap: Option<i64>,
+    #[serde(default)]
+    lanpaint_context_expand: Option<i64>,
     #[serde(default)]
     lanpaint_num_steps: Option<i64>,
     #[serde(default)]
@@ -860,7 +861,12 @@ fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
     }
 
     if m.contains("flux2") || m.contains("flux-2") || m.contains("flux_2") || m.contains("klein") {
-        let root = repository_path("models/klein9b");
+        let is_four_b = m.contains("klein") && m.contains("4b");
+        let root = repository_path(if is_four_b {
+            "models/klein4b"
+        } else {
+            "models/klein9b"
+        });
         let specs = vec![
             artifact_file(
                 "Klein/Flux2 checkpoint",
@@ -873,7 +879,11 @@ fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
             ),
         ];
         return Some(LocalArtifactManifest {
-            profile: "klein9b_flux2",
+            profile: if is_four_b {
+                "klein4b_flux2"
+            } else {
+                "klein9b_flux2"
+            },
             family: "flux2",
             root,
             production_entry: "serenitymojo/serve/klein_runtime_backend.mojo",
@@ -1409,6 +1419,9 @@ fn params_from_generate_request(
     }
     if let Some(v) = req.lanpaint_mask_blend_overlap {
         params.lanpaint_mask_blend_overlap = v;
+    }
+    if let Some(v) = req.lanpaint_context_expand {
+        params.lanpaint_context_expand = v;
     }
     if let Some(v) = req.lanpaint_num_steps {
         params.lanpaint_num_steps = v;
@@ -3748,6 +3761,7 @@ mod endpoint_tests {
             ("anima", "anima", "serenity_worker_anima"),
             ("sd3.5-large", "sd3", "serenity_worker_sd3"),
             ("klein-9b", "flux2", "serenity_worker_klein"),
+            ("klein-4b", "flux2", "serenity_worker_klein"),
             ("sensenova-u1", "sensenova", "serenity_worker_sensenova"),
         ];
 
@@ -3761,7 +3775,7 @@ mod endpoint_tests {
     #[test]
     fn worker_dispatch_rejects_blocked_model_families() {
         let current = PathBuf::from("/tmp/serenity-bin/serenity_worker_zimage");
-        for model in ["qwen-image-edit", "klein-4b", "flux2-dev", "microsoft-lens"] {
+        for model in ["qwen-image-edit", "flux2-dev", "microsoft-lens"] {
             assert!(
                 worker_for_model(&current, model).is_err(),
                 "blocked model must not dispatch: {model}"
@@ -3895,6 +3909,7 @@ mod endpoint_tests {
             "mask_image": "/tmp/source.png",
             "lanpaint_mask_channel": "load_image_mask",
             "lanpaint_mask_blend_overlap": 9,
+            "lanpaint_context_expand": 96,
             "lanpaint_num_steps": 5,
             "lanpaint_lambda": 16.0,
             "lanpaint_step_size": 0.2,
@@ -3910,6 +3925,7 @@ mod endpoint_tests {
         let (params, hires_scale, _) =
             params_from_generate_request(req, "job-krea-lanpaint", "/tmp/out");
         assert_eq!(params.lanpaint_mask_blend_overlap, 9);
+        assert_eq!(params.lanpaint_context_expand, 96);
         assert_eq!(params.lanpaint_num_steps, 5);
         assert_eq!(params.lanpaint_lambda, 16.0);
         assert_eq!(params.lanpaint_step_size, 0.2);
@@ -3935,6 +3951,7 @@ mod endpoint_tests {
             ("sd3.5-large", ModelFamily::Sd3),
             ("flux1-dev", ModelFamily::Flux),
             ("klein-9b", ModelFamily::Flux2),
+            ("klein-4b", ModelFamily::Flux2),
             ("sensenova-u1", ModelFamily::Sensenova),
             ("krea2", ModelFamily::Krea2),
             ("chroma", ModelFamily::Chroma),
@@ -3952,10 +3969,10 @@ mod endpoint_tests {
 
     #[test]
     fn production_validator_blocks_unadmitted_or_out_of_scope_features() {
-        let mut params = valid_t2i_params("klein-4b");
+        let mut params = valid_t2i_params("flux2-dev");
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
-            .contains("Klein/Flux2"));
+            .contains("generic Flux2 model names remain blocked"));
 
         params = valid_t2i_params("klein-9b");
         params.width = 768;
@@ -4019,7 +4036,9 @@ mod endpoint_tests {
             .contains("admitted product shapes"));
 
         params = valid_t2i_params("qwen-image");
-        params.loras.push(LoraSpec::new("adapter.safetensors".to_string(), 1.0));
+        params
+            .loras
+            .push(LoraSpec::new("adapter.safetensors".to_string(), 1.0));
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
             .contains("LoRA"));
@@ -4132,13 +4151,13 @@ mod endpoint_tests {
 
     #[test]
     fn workflow_lifted_prequeue_rejections_keep_route_context() {
-        let mut params = valid_t2i_params("klein-4b");
+        let mut params = valid_t2i_params("flux2-dev");
         params.width = 1024;
         params.height = 1024;
         params.steps = 20;
         let lowered_workflow = json!({
-            "model": "klein-4b",
-            "prompt": "workflow blocked klein-4b",
+            "model": "flux2-dev",
+            "prompt": "workflow blocked generic flux2",
             "workflow_route_kind": "image",
             "workflow_plan": {
                 "schema": "serenity.workflow_plan.v1",
@@ -4174,7 +4193,7 @@ mod endpoint_tests {
         assert!(generate["error"]
             .as_str()
             .unwrap_or("")
-            .contains("only the 9B txt2img route"));
+            .contains("generic Flux2 model names remain blocked"));
     }
 
     #[test]
@@ -4209,6 +4228,24 @@ mod endpoint_tests {
         assert_eq!(
             report["artifact_profile"]["storage_policy"]["runtime_dependency_on_external_repos"],
             false
+        );
+
+        let params_4b = valid_t2i_params("klein-4b");
+        let report_4b = generate_preflight_report(&params_4b, 1.0);
+        assert_eq!(report_4b["artifact_profile"]["profile"], "klein4b_flux2");
+        assert!(report_4b["artifact_profile"]["root"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("/models/klein4b"));
+        assert_eq!(report_4b["block_profile"]["profile"], "klein4b_flux2_dit");
+        assert_eq!(report_4b["block_profile"]["block_count"], 25);
+        assert_eq!(
+            report_4b["block_profile"]["block_kinds"]["double_stream"],
+            5
+        );
+        assert_eq!(
+            report_4b["block_profile"]["block_kinds"]["single_stream"],
+            20
         );
     }
 

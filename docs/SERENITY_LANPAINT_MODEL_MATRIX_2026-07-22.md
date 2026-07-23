@@ -18,6 +18,11 @@ entries. This makes missing work visible without routing a request through a
 different checkpoint or claiming that a graph-only port is production-ready.
 No model artifacts were downloaded while implementing this inventory.
 
+Klein 9B, Klein 4B, and Qwen Edit are intentionally not LanPaint engines.
+They belong to the separate, simple Canvas `Edit Models` mode. Klein uses its
+native one-image `ReferenceLatent` edit path; Qwen Edit remains disabled until
+its native image-aware runtime is production-wired.
+
 ## Current matrix
 
 | Canvas engine | Graph authoring | Mojo/runtime status | UI status |
@@ -28,10 +33,8 @@ No model artifacts were downloaded while implementing this inventory.
 | Z-Image Turbo 1024 | LanPaint candidate graph ready | Current resident worker loads Base, not Turbo | Disabled |
 | Ideogram4 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
 | Anima 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
-| Flux.2 Klein 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
 | Flux.2 Dev 1024 | LanPaint candidate graph ready | Backend/model gate not implemented here | Disabled |
 | Qwen Image 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
-| Qwen Image Edit 1024 | Image-conditioned LanPaint candidate graph ready | Product edit/mask backend not admitted | Disabled |
 | Flux.1 Dev 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
 | SDXL 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
 | SD 3.5 1024 | LanPaint candidate graph ready | Backend rejects mask and LanPaint controls | Disabled |
@@ -78,10 +81,41 @@ The graph/UI gate is covered by:
 node scripts/check_serenity_canvas_invoke_parity.js
 ```
 
-That browser test verifies the enabled-engine set, the complete disabled
-upstream inventory, graph tails for every graph-ready deferred image family,
-Krea2 and Z-Image preflight, Z-Image LoRA rewiring, and the shared 1024x1024
-Canvas layout.
+That browser test verifies the enabled-engine set, the disabled LanPaint
+inventory, graph tails for every graph-ready deferred image family, Krea2 and
+Z-Image preflight, Z-Image LoRA rewiring, the separate Edit Models contract,
+and the shared 1024x1024 Canvas layout.
+
+## Native Edit Models lane
+
+Klein and Qwen Edit do not pass through LanPaint. Canvas provides one compact
+`Edit Models` lane with only a source image, prompt, engine, and Generate:
+
+| Engine | Native graph/runtime | Current status |
+|---|---|---|
+| Klein 9B | One-source `ReferenceLatent`, resident pure-Mojo 9B worker | Enabled; real 1024 output `job-0370.png` |
+| Klein 4B | One-source `ReferenceLatent`, resident pure-Mojo 4B worker | Enabled; real 1024 output `job-0369.png` |
+| Qwen Edit | Image-aware Qwen edit graph | Visible but disabled until its native worker route is complete |
+
+Both Klein jobs decoded as 1024x1024 RGB images, preserved the source
+composition, and applied the requested red-coat edit. The measured completion
+times were 377.048 seconds for 9B and 163.008 seconds for 4B, with approximately
+22.1 GiB peak GPU memory. These are correctness artifacts, not production speed
+claims; any optimization pass must use Nsight Systems and preserve the decoded
+result.
+
+Canvas stages the exact submitted edit or LanPaint graph for the Workflow tab,
+so choosing to inspect the workflow cannot replace it with the Generate tab's
+model or controls.
+
+## Sampler context versus final blend
+
+`LanPaint_ContextExpand` is measured in source-image pixels and expands only
+the denoise/sampler mask. The separately loaded authored mask remains the final
+blend boundary. This allows the sampler to see nearby geometry for structural
+edits while preserving source pixels outside the user's painted selection.
+Krea2 also follows upstream LanPaint's FLUX `cfg_BIG=1.0` contract for both
+Image First and Prompt First modes.
 
 ## Mask export contract and 2026-07-22 repair
 

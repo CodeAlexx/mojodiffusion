@@ -518,42 +518,68 @@ def _block_f32(block: Block, key: String, ctx: DeviceContext) raises -> List[Flo
     return cast_tensor(block[key][], STDtype.F32, ctx).to_host(ctx)
 
 
+# Device-native per-block loader (LEVER 1). Returns the frozen base weight as a
+# bf16 DEVICE TArc WITHOUT the device->F32->host round-trip _block_f32 does (which
+# then re-`from_host`s to device bf16 in the WanBlockWeights ctor — a full per-step
+# host round-trip per tensor). fp8 path: the EXACT per-row dequant fp8->bf16 the
+# certified Bernini stream uses (wan22_fp8_stream / bernini_r_block_parity), kept
+# on device. non-fp8 path: cast to bf16 on device (cast_tensor always materializes
+# a fresh device buffer — no aliasing with the streamed block). The result is
+# BIT-IDENTICAL to TArc(from_host(_block_f32(...), BF16)) because bf16->F32->bf16
+# is lossless. Feeds WanBlockWeights.from_device / WanI2VBlockWeights.from_device.
+def _block_bf16_dev(block: Block, key: String, ctx: DeviceContext) raises -> TArc:
+    if not (key in block):
+        raise Error(String("wan22 offload block missing tensor: ") + key)
+    if block[key][].dtype() == STDtype.F8_E4M3:
+        var sname = key + String(".__fp8_scale")
+        if not (sname in block):
+            raise Error(String("wan22 fp8 block missing per-row scale: ") + sname)
+        return TArc(fp8_e4m3_dequant_perrow_to_bf16(block[key][], block[sname][], ctx))
+    return TArc(cast_tensor(block[key][], STDtype.BF16, ctx))
+
+
 def _wan22_block_weights_from_block(
     block: Block, prefix: String, dim: Int, ffn: Int, hd: Int, ctx: DeviceContext,
 ) raises -> WanBlockWeights:
     var bp = prefix + "."
-    return WanBlockWeights(
+    # LEVER 1: device-native base load (no F32 host round-trip). from_device stores
+    # the already-bf16-device tensors directly; bit-identical to the from_host path.
+    # dim/ffn/hd unused here (tensors carry their own device shapes) — kept for the
+    # caller signature / back-compat.
+    _ = dim
+    _ = ffn
+    _ = hd
+    return WanBlockWeights.from_device(
         # self-attn weights
-        _block_f32(block, bp + String("self_attn.q.weight"), ctx),
-        _block_f32(block, bp + String("self_attn.k.weight"), ctx),
-        _block_f32(block, bp + String("self_attn.v.weight"), ctx),
-        _block_f32(block, bp + String("self_attn.o.weight"), ctx),
-        _block_f32(block, bp + String("self_attn.q.bias"), ctx),
-        _block_f32(block, bp + String("self_attn.k.bias"), ctx),
-        _block_f32(block, bp + String("self_attn.v.bias"), ctx),
-        _block_f32(block, bp + String("self_attn.o.bias"), ctx),
-        _block_f32(block, bp + String("self_attn.norm_q.weight"), ctx),
-        _block_f32(block, bp + String("self_attn.norm_k.weight"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.q.weight"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.k.weight"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.v.weight"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.o.weight"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.q.bias"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.k.bias"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.v.bias"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.o.bias"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.norm_q.weight"), ctx),
+        _block_bf16_dev(block, bp + String("self_attn.norm_k.weight"), ctx),
         # cross-attn weights
-        _block_f32(block, bp + String("cross_attn.q.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.k.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.v.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.o.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.q.bias"), ctx),
-        _block_f32(block, bp + String("cross_attn.k.bias"), ctx),
-        _block_f32(block, bp + String("cross_attn.v.bias"), ctx),
-        _block_f32(block, bp + String("cross_attn.o.bias"), ctx),
-        _block_f32(block, bp + String("cross_attn.norm_q.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.norm_k.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.q.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.k.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.v.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.o.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.q.bias"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.k.bias"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.v.bias"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.o.bias"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.norm_q.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.norm_k.weight"), ctx),
         # norm3 (affine LN before cross-attn)
-        _block_f32(block, bp + String("norm3.weight"), ctx),
-        _block_f32(block, bp + String("norm3.bias"), ctx),
+        _block_bf16_dev(block, bp + String("norm3.weight"), ctx),
+        _block_bf16_dev(block, bp + String("norm3.bias"), ctx),
         # ffn
-        _block_f32(block, bp + String("ffn.0.weight"), ctx),
-        _block_f32(block, bp + String("ffn.0.bias"), ctx),
-        _block_f32(block, bp + String("ffn.2.weight"), ctx),
-        _block_f32(block, bp + String("ffn.2.bias"), ctx),
-        dim, ffn, hd, ctx,
+        _block_bf16_dev(block, bp + String("ffn.0.weight"), ctx),
+        _block_bf16_dev(block, bp + String("ffn.0.bias"), ctx),
+        _block_bf16_dev(block, bp + String("ffn.2.weight"), ctx),
+        _block_bf16_dev(block, bp + String("ffn.2.bias"), ctx),
     )
 
 
@@ -1578,14 +1604,15 @@ def _wan22_i2v_block_weights_from_block(
 ) raises -> WanI2VBlockWeights:
     var base = _wan22_block_weights_from_block(block, prefix, dim, ffn, hd, ctx)
     var bp = prefix + "."
-    return WanI2VBlockWeights(
+    # LEVER 1: device-native base load (no F32 host round-trip). dim unused here.
+    _ = dim
+    return WanI2VBlockWeights.from_device(
         base^,
-        _block_f32(block, bp + String("cross_attn.k_img.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.k_img.bias"), ctx),
-        _block_f32(block, bp + String("cross_attn.v_img.weight"), ctx),
-        _block_f32(block, bp + String("cross_attn.v_img.bias"), ctx),
-        _block_f32(block, bp + String("cross_attn.norm_k_img.weight"), ctx),
-        dim, ctx,
+        _block_bf16_dev(block, bp + String("cross_attn.k_img.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.k_img.bias"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.v_img.weight"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.v_img.bias"), ctx),
+        _block_bf16_dev(block, bp + String("cross_attn.norm_k_img.weight"), ctx),
     )
 
 

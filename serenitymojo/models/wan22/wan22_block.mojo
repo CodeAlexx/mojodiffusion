@@ -1428,13 +1428,31 @@ def wan22_block_lora_forward[
     return WanBlockForward(x_out^, saved^)
 
 
+# ── frozen-base projection d_x (LoRA training discards base d_w/d_b) ──────────
+# For a FROZEN base linear in the LoRA backward, only d_x flows up the chain; the
+# base d_w/d_b that `linear_backward` computes are to_host'd and then discarded by
+# the stack (LoRA-only training). `linear_backward_dx` skips the d_w matmul + d_b
+# colsum + their readback. `linear_backward` returns d_x cast to x.dtype(), and it
+# ENFORCES grad_y.dtype()==x.dtype() (non-mixed), so casting the F32 dx-only result
+# to grad_y.dtype() reproduces the exact stored d_x (same GEMM, same cast) —
+# BYTE-IDENTICAL. In this LoRA context x/weight/grad_y are all bf16.
+def _base_dx(
+    grad_y: Tensor, weight: Tensor, M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var dx_f32 = linear_backward_dx(grad_y, weight, M, in_f, out_f, ctx)
+    if grad_y.dtype() == STDtype.F32:
+        return dx_f32^
+    return cast_tensor(dx_f32^, grad_y.dtype(), ctx)
+
+
 # ── BACKWARD of one Wan2.2 block WITH LoRA ────────────────────────────────────
 # Mirrors wan22_block_backward but ALSO runs the 8 attention-projection LoRA
 # backwards and folds each LoRA d_x contribution into the base projection-input
-# grad (so d_x/d_context include the LoRA branch). The base weight grads are the
-# FROZEN-W grads (still reported for completeness). The LoRA backward needs each
-# projection's saved input (host) + its output grad (host); both are available
-# from the base reverse chain.
+# grad (so d_x/d_context include the LoRA branch). The base weight grads are
+# FROZEN (LoRA-only training) — their d_w/d_b are discarded, so the base
+# projections use the d_x-only `_base_dx` path (Lever 2). The LoRA backward needs
+# each projection's saved input (host) + its output grad (host); both are
+# available from the base reverse chain.
 def wan22_block_lora_backward[
     H: Int, Dh: Int, S: Int, TXT: Int
 ](
@@ -1475,25 +1493,25 @@ def wan22_block_lora_backward[
     var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
     # ffn.2: base frozen weight grads (reported) + LoRA d_A/d_B + LoRA d_x fold-in.
-    var lb_ffn2 = linear_backward(gb_ffn2.d_y, lsv_ffn_act, w.ffn2_w[], S, ffn, dim, ctx)
-    var d_ffn2_w = lb_ffn2.d_w.to_host(ctx)
-    var d_ffn2_b = lb_ffn2.d_b.to_host(ctx)
+    var lb_ffn2_dx = _base_dx(gb_ffn2.d_y, w.ffn2_w[], S, ffn, dim, ctx)
+    var d_ffn2_w = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ffn2_b = List[Float32]()
     var d_ffn_out_h = gb_ffn2.d_y.to_host(ctx)   # output grad of the ffn.2 proj
     var ffn2_g = _lora_bwd_opt(lora.ffn2, d_ffn_out_h, ffn_act_h, S, ffn, ctx)
-    # ffn_act grad = base(lb_ffn2.d_x) + LoRA d_x(ffn2)   [S,ffn]
-    var d_ffn_act = add(lb_ffn2.d_x, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
+    # ffn_act grad = base(lb_ffn2_dx) + LoRA d_x(ffn2)   [S,ffn]
+    var d_ffn_act = add(lb_ffn2_dx, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
     var lsv_ffn_h = _tbf16(saved.ffn_h.copy(), [S, ffn], ctx)
     var d_ffn_h = gelu_backward(d_ffn_act, lsv_ffn_h, ctx)
     var lsv_ffn_in = _tbf16(saved.ffn_in.copy(), [S, dim], ctx)
     var ffn_in_h = lsv_ffn_in.to_host(ctx)       # ffn.0 LoRA input [S,dim]
     # ffn.0: base frozen weight grads (reported) + LoRA d_A/d_B + LoRA d_x fold-in.
-    var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.ffn0_w[], S, dim, ffn, ctx)
-    var d_ffn0_w = lb_ffn0.d_w.to_host(ctx)
-    var d_ffn0_b = lb_ffn0.d_b.to_host(ctx)
+    var lb_ffn0_dx = _base_dx(d_ffn_h, w.ffn0_w[], S, dim, ffn, ctx)
+    var d_ffn0_w = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ffn0_b = List[Float32]()
     var d_ffn_h_h = d_ffn_h.to_host(ctx)         # output grad of the ffn.0 proj
     var ffn0_g = _lora_bwd_opt(lora.ffn0, d_ffn_h_h, ffn_in_h, S, dim, ctx)
-    # ffn_in grad = base(lb_ffn0.d_x) + LoRA d_x(ffn0)   [S,dim]
-    var d_ffn_in = add(lb_ffn0.d_x, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
+    # ffn_in grad = base(lb_ffn0_dx) + LoRA d_x(ffn0)   [S,dim]
+    var d_ffn_in = add(lb_ffn0_dx, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
     var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
     var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
@@ -1506,12 +1524,12 @@ def wan22_block_lora_backward[
     # ════════════════ Cross-attention backward (LoRA q/k/v/o) ════════════════
     # ca_out = linear(ca_att, ca_wo, ca_bo) + LoRA(ca_o, ca_att)
     var d_ca_out_h = d_x_ca[].to_host(ctx)          # output grad of ca_out proj
-    var lb_cao = linear_backward(d_x_ca[], sv_lora_ca_att, w.ca_wo[], S, dim, dim, ctx)
-    var d_ca_wo = lb_cao.d_w.to_host(ctx)
-    var d_ca_bo = lb_cao.d_b.to_host(ctx)
+    var lb_cao_dx = _base_dx(d_x_ca[], w.ca_wo[], S, dim, dim, ctx)
+    var d_ca_wo = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ca_bo = List[Float32]()
     var ca_o_g = _lora_bwd_opt(lora.ca_o, d_ca_out_h, ca_att_h, S, dim, ctx)
-    # ca_att input grad = base (lb_cao.d_x bf16) + LoRA d_x (host F32 -> bf16)
-    var d_ca_att = add(lb_cao.d_x, _t16(ca_o_g.d_x.copy(), [S, dim], ctx), ctx)
+    # ca_att input grad = base (lb_cao_dx bf16) + LoRA d_x (host F32 -> bf16)
+    var d_ca_att = add(lb_cao_dx, _t16(ca_o_g.d_x.copy(), [S, dim], ctx), ctx)
     var d_ca_att4 = reshape(d_ca_att, [1, S, H, Dh], ctx)
 
     var lsv_ca_q_rms = _tbf16(saved.ca_q_rms.copy(), [1, S, H, Dh], ctx)
@@ -1534,22 +1552,22 @@ def wan22_block_lora_backward[
     var d_cak_h = rb_cak_dx.to_host(ctx)
     var d_cav_h = d_cav_flat.to_host(ctx)
 
-    var lb_caq = linear_backward(rb_caq_dx, sv_lora_ca_n3, w.ca_wq[], S, dim, dim, ctx)
-    var lb_cak = linear_backward(rb_cak_dx, sv_lora_context, w.ca_wk[], TXT, dim, dim, ctx)
-    var lb_cav = linear_backward(d_cav_flat, sv_lora_context, w.ca_wv[], TXT, dim, dim, ctx)
-    var d_ca_wq = lb_caq.d_w.to_host(ctx)
-    var d_ca_bq = lb_caq.d_b.to_host(ctx)
-    var d_ca_wk = lb_cak.d_w.to_host(ctx)
-    var d_ca_bk = lb_cak.d_b.to_host(ctx)
-    var d_ca_wv = lb_cav.d_w.to_host(ctx)
-    var d_ca_bv = lb_cav.d_b.to_host(ctx)
+    var lb_caq_dx = _base_dx(rb_caq_dx, w.ca_wq[], S, dim, dim, ctx)
+    var lb_cak_dx = _base_dx(rb_cak_dx, w.ca_wk[], TXT, dim, dim, ctx)
+    var lb_cav_dx = _base_dx(d_cav_flat, w.ca_wv[], TXT, dim, dim, ctx)
+    var d_ca_wq = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ca_bq = List[Float32]()
+    var d_ca_wk = List[Float32]()
+    var d_ca_bk = List[Float32]()
+    var d_ca_wv = List[Float32]()
+    var d_ca_bv = List[Float32]()
     var ca_q_g = _lora_bwd_opt(lora.ca_q, d_caq_h, n3_h, S, dim, ctx)
     var ca_k_g = _lora_bwd_opt(lora.ca_k, d_cak_h, context_h, TXT, dim, ctx)
     var ca_v_g = _lora_bwd_opt(lora.ca_v, d_cav_h, context_h, TXT, dim, ctx)
     # n3 grad = base d_x(caq) + LoRA d_x(ca_q)
-    var d_n3_in = add(lb_caq.d_x, _t16(ca_q_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_n3_in = add(lb_caq_dx, _t16(ca_q_g.d_x.copy(), [S, dim], ctx), ctx)
     # context grad = base(cak+cav) + LoRA(ca_k + ca_v)
-    var d_ctx_base = add(lb_cak.d_x, lb_cav.d_x, ctx)
+    var d_ctx_base = add(lb_cak_dx, lb_cav_dx, ctx)
     var d_ctx_lora = add(
         _t16(ca_k_g.d_x.copy(), [TXT, dim], ctx), _t16(ca_v_g.d_x.copy(), [TXT, dim], ctx), ctx
     )
@@ -1569,11 +1587,11 @@ def wan22_block_lora_backward[
     var d_gate_sa = gb_sa.d_gate.to_host(ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
     var d_sa_out_h = gb_sa.d_y.to_host(ctx)
-    var lb_sao = linear_backward(gb_sa.d_y, sv_lora_sa_att, w.sa_wo[], S, dim, dim, ctx)
-    var d_sa_wo = lb_sao.d_w.to_host(ctx)
-    var d_sa_bo = lb_sao.d_b.to_host(ctx)
+    var lb_sao_dx = _base_dx(gb_sa.d_y, w.sa_wo[], S, dim, dim, ctx)
+    var d_sa_wo = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_sa_bo = List[Float32]()
     var sa_o_g = _lora_bwd_opt(lora.sa_o, d_sa_out_h, sa_att_h, S, dim, ctx)
-    var d_sa_att = add(lb_sao.d_x, _t16(sa_o_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_sa_att = add(lb_sao_dx, _t16(sa_o_g.d_x.copy(), [S, dim], ctx), ctx)
     var d_sa_att4 = reshape(d_sa_att, [1, S, H, Dh], ctx)
 
     var lsv_sa_q_rope = _tbf16(saved.sa_q_rope.copy(), [1, S, H, Dh], ctx)
@@ -1603,20 +1621,20 @@ def wan22_block_lora_backward[
     var d_sak_h = rb_sak_dx.to_host(ctx)
     var d_sav_h = d_sav_flat.to_host(ctx)
 
-    var lb_saq = linear_backward(rb_saq_dx, sv_lora_sa_in, w.sa_wq[], S, dim, dim, ctx)
-    var lb_sak = linear_backward(rb_sak_dx, sv_lora_sa_in, w.sa_wk[], S, dim, dim, ctx)
-    var lb_sav = linear_backward(d_sav_flat, sv_lora_sa_in, w.sa_wv[], S, dim, dim, ctx)
-    var d_sa_wq = lb_saq.d_w.to_host(ctx)
-    var d_sa_bq = lb_saq.d_b.to_host(ctx)
-    var d_sa_wk = lb_sak.d_w.to_host(ctx)
-    var d_sa_bk = lb_sak.d_b.to_host(ctx)
-    var d_sa_wv = lb_sav.d_w.to_host(ctx)
-    var d_sa_bv = lb_sav.d_b.to_host(ctx)
+    var lb_saq_dx = _base_dx(rb_saq_dx, w.sa_wq[], S, dim, dim, ctx)
+    var lb_sak_dx = _base_dx(rb_sak_dx, w.sa_wk[], S, dim, dim, ctx)
+    var lb_sav_dx = _base_dx(d_sav_flat, w.sa_wv[], S, dim, dim, ctx)
+    var d_sa_wq = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_sa_bq = List[Float32]()
+    var d_sa_wk = List[Float32]()
+    var d_sa_bk = List[Float32]()
+    var d_sa_wv = List[Float32]()
+    var d_sa_bv = List[Float32]()
     var sa_q_g = _lora_bwd_opt(lora.sa_q, d_saq_h, sa_in_h, S, dim, ctx)
     var sa_k_g = _lora_bwd_opt(lora.sa_k, d_sak_h, sa_in_h, S, dim, ctx)
     var sa_v_g = _lora_bwd_opt(lora.sa_v, d_sav_h, sa_in_h, S, dim, ctx)
     # sa_in grad = base(q+k+v) + LoRA(q+k+v)
-    var d_sa_in_base = add(add(lb_saq.d_x, lb_sak.d_x, ctx), lb_sav.d_x, ctx)
+    var d_sa_in_base = add(add(lb_saq_dx, lb_sak_dx, ctx), lb_sav_dx, ctx)
     var d_sa_in_lora = add(
         add(_t16(sa_q_g.d_x.copy(), [S, dim], ctx), _t16(sa_k_g.d_x.copy(), [S, dim], ctx), ctx),
         _t16(sa_v_g.d_x.copy(), [S, dim], ctx), ctx,
@@ -2271,22 +2289,22 @@ def wan22_i2v_block_lora_backward[
     var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
     var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
-    var lb_ffn2 = linear_backward(gb_ffn2.d_y, lsv_ffn_act, w.base.ffn2_w[], S, ffn, dim, ctx)
-    var d_ffn2_w = lb_ffn2.d_w.to_host(ctx)
-    var d_ffn2_b = lb_ffn2.d_b.to_host(ctx)
+    var lb_ffn2_dx = _base_dx(gb_ffn2.d_y, w.base.ffn2_w[], S, ffn, dim, ctx)
+    var d_ffn2_w = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ffn2_b = List[Float32]()
     var d_ffn_out_h = gb_ffn2.d_y.to_host(ctx)
     var ffn2_g = _lora_bwd_opt(lora.base.ffn2, d_ffn_out_h, ffn_act_h, S, ffn, ctx)
-    var d_ffn_act = add(lb_ffn2.d_x, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
+    var d_ffn_act = add(lb_ffn2_dx, _t16(ffn2_g.d_x.copy(), [S, ffn], ctx), ctx)
     var lsv_ffn_h = _tbf16(saved.base.ffn_h.copy(), [S, ffn], ctx)
     var d_ffn_h = gelu_backward(d_ffn_act, lsv_ffn_h, ctx)
     var lsv_ffn_in = _tbf16(saved.base.ffn_in.copy(), [S, dim], ctx)
     var ffn_in_h = lsv_ffn_in.to_host(ctx)
-    var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.base.ffn0_w[], S, dim, ffn, ctx)
-    var d_ffn0_w = lb_ffn0.d_w.to_host(ctx)
-    var d_ffn0_b = lb_ffn0.d_b.to_host(ctx)
+    var lb_ffn0_dx = _base_dx(d_ffn_h, w.base.ffn0_w[], S, dim, ffn, ctx)
+    var d_ffn0_w = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ffn0_b = List[Float32]()
     var d_ffn_h_h = d_ffn_h.to_host(ctx)
     var ffn0_g = _lora_bwd_opt(lora.base.ffn0, d_ffn_h_h, ffn_in_h, S, dim, ctx)
-    var d_ffn_in = add(lb_ffn0.d_x, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_ffn_in = add(lb_ffn0_dx, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
     var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.base.ffn_ln.copy(), [S, dim], ctx)
     var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
@@ -2299,12 +2317,12 @@ def wan22_i2v_block_lora_backward[
     # ════════════════ DUAL cross-attention backward (LoRA q/k/v/o + k_img/v_img)
     # ca_out = linear(ca_att_sum, ca_wo, ca_bo) + LoRA(ca_o); ca_att_sum = x_txt+x_img
     var d_ca_out_h = d_x_ca[].to_host(ctx)
-    var lb_cao = linear_backward(d_x_ca[], sv_lora_ca_att, w.base.ca_wo[], S, dim, dim, ctx)
-    var d_ca_wo = lb_cao.d_w.to_host(ctx)
-    var d_ca_bo = lb_cao.d_b.to_host(ctx)
+    var lb_cao_dx = _base_dx(d_x_ca[], w.base.ca_wo[], S, dim, dim, ctx)
+    var d_ca_wo = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ca_bo = List[Float32]()
     var ca_o_g = _lora_bwd_opt(lora.base.ca_o, d_ca_out_h, ca_att_h, S, dim, ctx)
     # grad of the SUM (o-input); the add sends this SAME grad to BOTH branches.
-    var d_ca_att = add(lb_cao.d_x, _t16(ca_o_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_ca_att = add(lb_cao_dx, _t16(ca_o_g.d_x.copy(), [S, dim], ctx), ctx)
     var d_ca_att4_txt = reshape(d_ca_att, [1, S, H, Dh], ctx)
     var d_ca_att4_img = reshape(d_ca_att, [1, S, H, Dh], ctx)
 
@@ -2347,36 +2365,36 @@ def wan22_i2v_block_lora_backward[
     var d_imgv_h = d_imgv_flat.to_host(ctx)
 
     # projection linears (base frozen weight grads + LoRA)
-    var lb_caq = linear_backward(rb_caq_dx, sv_lora_ca_n3, w.base.ca_wq[], S, dim, dim, ctx)
-    var lb_cak = linear_backward(rb_cak_dx, sv_lora_context, w.base.ca_wk[], TXT, dim, dim, ctx)
-    var lb_cav = linear_backward(d_cav_flat, sv_lora_context, w.base.ca_wv[], TXT, dim, dim, ctx)
-    var lb_imgk = linear_backward(rb_imgk_dx, sv_lora_img_ctx, w.ca_wk_img[], IMG, dim, dim, ctx)
-    var lb_imgv = linear_backward(d_imgv_flat, sv_lora_img_ctx, w.ca_wv_img[], IMG, dim, dim, ctx)
-    var d_ca_wq = lb_caq.d_w.to_host(ctx)
-    var d_ca_bq = lb_caq.d_b.to_host(ctx)
-    var d_ca_wk = lb_cak.d_w.to_host(ctx)
-    var d_ca_bk = lb_cak.d_b.to_host(ctx)
-    var d_ca_wv = lb_cav.d_w.to_host(ctx)
-    var d_ca_bv = lb_cav.d_b.to_host(ctx)
-    var d_ca_wk_img = lb_imgk.d_w.to_host(ctx)
-    var d_ca_bk_img = lb_imgk.d_b.to_host(ctx)
-    var d_ca_wv_img = lb_imgv.d_w.to_host(ctx)
-    var d_ca_bv_img = lb_imgv.d_b.to_host(ctx)
+    var lb_caq_dx = _base_dx(rb_caq_dx, w.base.ca_wq[], S, dim, dim, ctx)
+    var lb_cak_dx = _base_dx(rb_cak_dx, w.base.ca_wk[], TXT, dim, dim, ctx)
+    var lb_cav_dx = _base_dx(d_cav_flat, w.base.ca_wv[], TXT, dim, dim, ctx)
+    var lb_imgk_dx = _base_dx(rb_imgk_dx, w.ca_wk_img[], IMG, dim, dim, ctx)
+    var lb_imgv_dx = _base_dx(d_imgv_flat, w.ca_wv_img[], IMG, dim, dim, ctx)
+    var d_ca_wq = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_ca_bq = List[Float32]()
+    var d_ca_wk = List[Float32]()
+    var d_ca_bk = List[Float32]()
+    var d_ca_wv = List[Float32]()
+    var d_ca_bv = List[Float32]()
+    var d_ca_wk_img = List[Float32]()
+    var d_ca_bk_img = List[Float32]()
+    var d_ca_wv_img = List[Float32]()
+    var d_ca_bv_img = List[Float32]()
     var ca_q_g = _lora_bwd_opt(lora.base.ca_q, d_caq_h, n3_h, S, dim, ctx)
     var ca_k_g = _lora_bwd_opt(lora.base.ca_k, d_cak_h, context_txt_h, TXT, dim, ctx)
     var ca_v_g = _lora_bwd_opt(lora.base.ca_v, d_cav_h, context_txt_h, TXT, dim, ctx)
     var img_k_g = _lora_bwd_opt(lora.img_k, d_imgk_h, context_img_h, IMG, dim, ctx)
     var img_v_g = _lora_bwd_opt(lora.img_v, d_imgv_h, context_img_h, IMG, dim, ctx)
     # n3 grad = base d_x(caq) + LoRA d_x(ca_q)
-    var d_n3_in = add(lb_caq.d_x, _t16(ca_q_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_n3_in = add(lb_caq_dx, _t16(ca_q_g.d_x.copy(), [S, dim], ctx), ctx)
     # TEXT context grad = base(cak+cav) + LoRA(ca_k + ca_v)
-    var d_ctx_base = add(lb_cak.d_x, lb_cav.d_x, ctx)
+    var d_ctx_base = add(lb_cak_dx, lb_cav_dx, ctx)
     var d_ctx_lora = add(
         _t16(ca_k_g.d_x.copy(), [TXT, dim], ctx), _t16(ca_v_g.d_x.copy(), [TXT, dim], ctx), ctx
     )
     var d_context_t = TArc(add(d_ctx_base, d_ctx_lora, ctx))
     # IMAGE context grad = base(imgk+imgv) + LoRA(img_k + img_v)
-    var d_imgctx_base = add(lb_imgk.d_x, lb_imgv.d_x, ctx)
+    var d_imgctx_base = add(lb_imgk_dx, lb_imgv_dx, ctx)
     var d_imgctx_lora = add(
         _t16(img_k_g.d_x.copy(), [IMG, dim], ctx), _t16(img_v_g.d_x.copy(), [IMG, dim], ctx), ctx
     )
@@ -2395,11 +2413,11 @@ def wan22_i2v_block_lora_backward[
     var d_gate_sa = gb_sa.d_gate.to_host(ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
     var d_sa_out_h = gb_sa.d_y.to_host(ctx)
-    var lb_sao = linear_backward(gb_sa.d_y, sv_lora_sa_att, w.base.sa_wo[], S, dim, dim, ctx)
-    var d_sa_wo = lb_sao.d_w.to_host(ctx)
-    var d_sa_bo = lb_sao.d_b.to_host(ctx)
+    var lb_sao_dx = _base_dx(gb_sa.d_y, w.base.sa_wo[], S, dim, dim, ctx)
+    var d_sa_wo = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_sa_bo = List[Float32]()
     var sa_o_g = _lora_bwd_opt(lora.base.sa_o, d_sa_out_h, sa_att_h, S, dim, ctx)
-    var d_sa_att = add(lb_sao.d_x, _t16(sa_o_g.d_x.copy(), [S, dim], ctx), ctx)
+    var d_sa_att = add(lb_sao_dx, _t16(sa_o_g.d_x.copy(), [S, dim], ctx), ctx)
     var d_sa_att4 = reshape(d_sa_att, [1, S, H, Dh], ctx)
 
     var lsv_sa_q_rope = _tbf16(saved.base.sa_q_rope.copy(), [1, S, H, Dh], ctx)
@@ -2427,19 +2445,19 @@ def wan22_i2v_block_lora_backward[
     var d_sak_h = rb_sak_dx.to_host(ctx)
     var d_sav_h = d_sav_flat.to_host(ctx)
 
-    var lb_saq = linear_backward(rb_saq_dx, sv_lora_sa_in, w.base.sa_wq[], S, dim, dim, ctx)
-    var lb_sak = linear_backward(rb_sak_dx, sv_lora_sa_in, w.base.sa_wk[], S, dim, dim, ctx)
-    var lb_sav = linear_backward(d_sav_flat, sv_lora_sa_in, w.base.sa_wv[], S, dim, dim, ctx)
-    var d_sa_wq = lb_saq.d_w.to_host(ctx)
-    var d_sa_bq = lb_saq.d_b.to_host(ctx)
-    var d_sa_wk = lb_sak.d_w.to_host(ctx)
-    var d_sa_bk = lb_sak.d_b.to_host(ctx)
-    var d_sa_wv = lb_sav.d_w.to_host(ctx)
-    var d_sa_bv = lb_sav.d_b.to_host(ctx)
+    var lb_saq_dx = _base_dx(rb_saq_dx, w.base.sa_wq[], S, dim, dim, ctx)
+    var lb_sak_dx = _base_dx(rb_sak_dx, w.base.sa_wk[], S, dim, dim, ctx)
+    var lb_sav_dx = _base_dx(d_sav_flat, w.base.sa_wv[], S, dim, dim, ctx)
+    var d_sa_wq = List[Float32]()   # frozen base — discarded (Lever 2)
+    var d_sa_bq = List[Float32]()
+    var d_sa_wk = List[Float32]()
+    var d_sa_bk = List[Float32]()
+    var d_sa_wv = List[Float32]()
+    var d_sa_bv = List[Float32]()
     var sa_q_g = _lora_bwd_opt(lora.base.sa_q, d_saq_h, sa_in_h, S, dim, ctx)
     var sa_k_g = _lora_bwd_opt(lora.base.sa_k, d_sak_h, sa_in_h, S, dim, ctx)
     var sa_v_g = _lora_bwd_opt(lora.base.sa_v, d_sav_h, sa_in_h, S, dim, ctx)
-    var d_sa_in_base = add(add(lb_saq.d_x, lb_sak.d_x, ctx), lb_sav.d_x, ctx)
+    var d_sa_in_base = add(add(lb_saq_dx, lb_sak_dx, ctx), lb_sav_dx, ctx)
     var d_sa_in_lora = add(
         add(_t16(sa_q_g.d_x.copy(), [S, dim], ctx), _t16(sa_k_g.d_x.copy(), [S, dim], ctx), ctx),
         _t16(sa_v_g.d_x.copy(), [S, dim], ctx), ctx,

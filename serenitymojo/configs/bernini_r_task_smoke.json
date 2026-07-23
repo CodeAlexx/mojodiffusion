@@ -1,0 +1,17 @@
+{
+  "model_type": "wan22",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/Bernini-R-Diffusers/serenity_fp8_e4m3_de8c462/low",
+  "network_algorithm": "lora",
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "learning_rate": 0.0002,
+  "timestep_shift": 3.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 5,
+  "save_every": 0,
+  "sample_every": 0,
+  "seed": 42,
+  "cache_dir": "/home/alex/.serenity/wan22_cache/40_woman_1sample",
+  "output_model_destination": "/home/alex/mojodiffusion/output/bernini_r_lora/bernini_r_task_smoke.safetensors",
+  "optimizer": { "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+}

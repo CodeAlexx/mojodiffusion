@@ -795,3 +795,150 @@ def sample_timestep_logit_normal_scaled(seed: UInt64, std: Float32) -> Float32:
     if t > Float64(1.0):
         t = Float64(1.0)
     return Float32(t)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BERNINI-R timestep sampling — logit_normal + mode weighting schemes.
+#
+# Mirrors bernini/training/data.py::compute_density_for_timestep_sampling + the
+# NoiseScheduler.get_noise_sigma path + models/scheduler.py::FlowMatchScheduler
+# EXACTLY (verified against /home/alex/Bernini):
+#
+#   density u:
+#     logit_normal : u = sigmoid(normal(logit_mean, logit_std))
+#                       = sigmoid(logit_mean + logit_std * N(0,1))     (data.py:84)
+#     mode         : raw = U(0,1);
+#                    u = 1 - raw - mode_scale*(cos(pi*raw/2)^2 - 1 + raw)
+#                                                                       (data.py:86-87)
+#   rejection: keep u only if tmin <= u <= tmax (data.py:90), else redraw.
+#     tmin/tmax are per-shift boundary fractions of the noise window
+#     [noise_tmin, noise_tmax] = [0.875, 1.0] (bernini_renderer_high.yaml).
+#
+#   sigma lookup (data.py:153-155 + FlowMatchScheduler):
+#     idx   = int(u * 1000)                              (timestep_id)
+#     sl    = linspace(1, 0, 1001)[:-1][idx] = 1 - idx/1000   (extra_one_step)
+#     sigma = shift * sl / (1 + (shift - 1) * sl)         (scheduler.sigmas[idx])
+#
+# The RNG stream is Mojo's deterministic ChaCha12 (not torch's CPU generator), so
+# this is DISTRIBUTION-LEVEL parity (moments + histogram), plus BIT-exact parity
+# on the deterministic pieces (mode density(raw), shifted_sigma(idx), window).
+# ─────────────────────────────────────────────────────────────────────────────
+comptime _PI64 = Float64(3.14159265358979323846264338327950288)
+
+
+# Deterministic closed forms (bit-exact gate vs the torch oracle) ──────────────
+def bernini_mode_density_from_raw(raw: Float64, mode_scale: Float64) -> Float64:
+    """u = 1 - raw - mode_scale*(cos(pi*raw/2)^2 - 1 + raw). data.py:86-87."""
+    var c = cos(_PI64 * raw / Float64(2.0))
+    return Float64(1.0) - raw - mode_scale * (c * c - Float64(1.0) + raw)
+
+
+def bernini_logit_normal_density_from_z(
+    z: Float64, logit_mean: Float64, logit_std: Float64
+) -> Float64:
+    """u = sigmoid(logit_mean + logit_std*z), z ~ N(0,1). data.py:84."""
+    return _sigmoid64(logit_mean + logit_std * z)
+
+
+def bernini_shifted_sigma(shift: Float64, idx: Int) -> Float64:
+    """scheduler.sigmas[idx] for a training FlowMatchScheduler(shift, extra_one_step).
+
+    sl = 1 - idx/1000 (linspace(1,0,1001)[:-1]); sigma = shift*sl/(1+(shift-1)*sl).
+    """
+    var sl = Float64(1.0) - Float64(idx) / Float64(1000.0)
+    return shift * sl / (Float64(1.0) + (shift - Float64(1.0)) * sl)
+
+
+def bernini_shift2boundary_idx(shift: Float64, target: Float64) -> Int:
+    """argmin_i |shifted_sigma(shift, i) - target| over i in [0, 999].
+
+    Replicates shift2boundary(shift) + find_nearest_boundary(sigmas, target)
+    (data.py:61-68). num_steps=1000, denoising_strength=1, sigma_min=0."""
+    var best_i = 0
+    var best_d = Float64(1.0e30)
+    for i in range(1000):
+        var sh = bernini_shifted_sigma(shift, i)
+        var d = sh - target
+        if d < Float64(0.0):
+            d = -d
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+@fieldwise_init
+struct BerniniWindow(Copyable, Movable):
+    var tmin: Float64
+    var tmax: Float64
+
+
+def bernini_task_window(
+    shift: Float64, noise_tmin: Float64, noise_tmax: Float64
+) -> BerniniWindow:
+    """Per-shift rejection window (tmin, tmax) on the density u.
+
+    b1 = boundary_idx(noise_tmin)/1000 ; b2 = boundary_idx(noise_tmax)/1000
+    tmin = min(b1,b2) ; tmax = max(b1,b2)  (NoiseScheduler.__init__ :120-130)."""
+    var b1 = Float64(bernini_shift2boundary_idx(shift, noise_tmin)) / Float64(1000.0)
+    var b2 = Float64(bernini_shift2boundary_idx(shift, noise_tmax)) / Float64(1000.0)
+    var lo = b1 if b1 < b2 else b2
+    var hi = b1 if b1 > b2 else b2
+    return BerniniWindow(lo, hi)
+
+
+def _advance_seed(s: UInt64) -> UInt64:
+    # Distinct-stream advance for the rejection loop (not a torch replay).
+    return s * UInt64(6364136223846793005) + UInt64(1442695040888963407)
+
+
+def bernini_density_draw(
+    is_mode: Bool, seed: UInt64,
+    logit_mean: Float64, logit_std: Float64, mode_scale: Float64,
+) -> Float64:
+    """One raw density draw u (pre-rejection) for the selected weighting."""
+    if is_mode:
+        var ks = _expand_key(seed)
+        var w0 = _chacha12_word_from_key(
+            ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6], ks[7], UInt64(0), 0
+        )
+        var raw = _standard_f64(w0)
+        return bernini_mode_density_from_raw(raw, mode_scale)
+    var ks2 = _expand_key(seed)
+    var d = _standard_normal_at(
+        ks2[0], ks2[1], ks2[2], ks2[3], ks2[4], ks2[5], ks2[6], ks2[7], UInt64(0)
+    )
+    return bernini_logit_normal_density_from_z(d.z, logit_mean, logit_std)
+
+
+def bernini_sample_sigma(
+    is_mode: Bool, shift: Float64, seed: UInt64,
+    logit_mean: Float64, logit_std: Float64, mode_scale: Float64,
+    win: BerniniWindow,
+) -> Float32:
+    """Full Bernini training-sigma draw: rejection-sample u into [tmin,tmax],
+    then idx=int(u*1000) -> sigma=shifted_sigma(shift,idx).
+
+    Returns the flow-match noise coefficient sigma in [noise_tmin, noise_tmax]
+    (~[0.875, 1.0] for the high-noise expert)."""
+    var s = seed
+    var u = Float64(0.5)
+    var accepted = False
+    for _ in range(100000):
+        u = bernini_density_draw(is_mode, s, logit_mean, logit_std, mode_scale)
+        s = _advance_seed(s)
+        if u >= win.tmin and u <= win.tmax:
+            accepted = True
+            break
+    if not accepted:
+        # Degenerate-window fallback: clamp the last draw into the window.
+        if u < win.tmin:
+            u = win.tmin
+        if u > win.tmax:
+            u = win.tmax
+    var idx = Int(u * Float64(1000.0))
+    if idx < 0:
+        idx = 0
+    if idx > 999:
+        idx = 999
+    return Float32(bernini_shifted_sigma(shift, idx))

@@ -1,55 +1,39 @@
 # serenitymojo/training/train_bernini_r_cond.mojo
 #
-# BERNINI-R Tier-2b: the reference-CONDITIONING training path.
-# Pure Mojo + MAX, GPU, block-swap offload. Sequence-concat of CLEAN conditioning
-# latents (each with its own source-id RoPE) AHEAD of the noised TARGET, full
-# self-attention over the packed sequence, velocity-MSE loss on the TARGET region
-# ONLY. This completes the reference-guided renderer.
+# BERNINI-R conditioning trainer — the reference-guided renderer, ALL 12 tasks.
+# Pure Mojo + MAX, GPU, block-swap offload. Sequence-concat of N CLEAN
+# conditioning latents (each with its own source-id RoPE) AHEAD of the noised
+# TARGET, full self-attention over the packed sequence, velocity-MSE loss on the
+# TARGET region ONLY.
 #
 # ── This file is the ASSEMBLY + LOOP only. It reimplements NO block/stack math ──
 # It REUSES verbatim:
-#   * the certified Wan2.2-A14B LoRA engine
-#     (models/wan22/wan22_stack_lora.mojo::wan22_stack_lora_forward_offload /
-#      _backward_offload / wan22_lora_adamw_step / save_wan22_lora) — the block
-#     runs over WHATEVER sequence + cos/sin it is given, so a packed
-#     [conditioning | target] sequence needs no new kernel;
-#   * the Tier-2a source-id RoPE
-#     (models/wan22/bernini_src_id_rope.mojo::build_bernini_src_id_rope) — builds
-#     the per-segment src-id rope tables concatenated along the token axis;
-#   * the proven patchify (ops/patchify3d) and safetensors reader.
+#   * the certified Wan2.2-A14B LoRA engine (wan22_stack_lora) — the block runs
+#     over WHATEVER sequence + cos/sin it is given, so a packed
+#     [cond_1 | ... | cond_N | target] sequence needs no new kernel;
+#   * the Tier-2a source-id RoPE (bernini_src_id_rope.build_bernini_src_id_rope);
+#   * the proven patchify (ops/patchify3d) and safetensors reader;
+#   * the Bernini timestep samplers (schedule.bernini_sample_sigma — logit_normal
+#     + mode density, per-shift window) and EMA (schedule.ema_update math).
 #
-# ── Bernini packing ORDER (matched; cite Bernini/bernini/training/data.py) ─────
-#   encode_renderer_messages (:171-190) walks the conversation IN ORDER, appending
-#   a vae entry per image/video message; `has_loss` marks the GENERATION target.
-#   pack_vae_latents (:255-278) then, for each entry in that order:
-#     source_id = 0 if vae_mask(=target) else idx+1
-#     - conditioning (vae_mask False): patchify the CLEAN latent, source_id=idx+1,
-#       NO noise, NO target_velocity.
-#     - target (vae_mask True): x_t=(1-σ)x0+σ·noise, source_id=0, target=noise-x0.
-#   and cats input_vae_latents / input_vae_rope in that SAME order. In a renderer
-#   sample the reference messages precede the generation message, so the packed
-#   order is  [conditioning refs (src_id 1,2,…, clean) | target (src_id 0, noised)]
-#   with the target the trailing contiguous region. vae_latents_mask (:270) marks
-#   exactly those trailing target tokens → the loss slice here.
+# ── The 12 tasks (task -> recipe in training/bernini_tasks.mojo) ────────────────
+#   task selected by env BERNINI_TASK (default "t2v"). The recipe fixes:
+#     shift (3/4/5), weighting (logit_normal image / mode video), n_cond segments.
+#   n_cond=0  (t2i/t2v)  -> Tier-1 T2V path (packed == target, src_id=0).
+#   n_cond>=1            -> N CLEAN conditioning segments src_id 1..N packed AHEAD
+#                           of the target (src_id 0), Bernini pack_vae_latents order.
+#   BERNINI_NO_COND=1 forces n_cond=0 regardless of task (regression switch).
 #
-#   The whole packed sample shares ONE timestep (data.py:365 noise_timestep is a
-#   scalar; transformer_wan.py:551-557 expands ONE temb over every token) — so the
-#   existing stack, which applies one t_model's AdaLN to all S tokens, matches
-#   Bernini bit-for-bit; the conditioning tokens receive the target's timestep
-#   modulation exactly as Bernini does.
+#   Each packed sample shares ONE timestep (data.py:365) applied to all tokens —
+#   matches the certified stack's single-temb AdaLN bit-for-bit.
 #
-# ── Regression to Tier-1 T2V ───────────────────────────────────────────────────
-#   With ZERO conditioning segments the packed sequence is just the target
-#   (source_id=0). build_bernini_src_id_rope over one src_id=0 segment is
-#   BIT-IDENTICAL to wan22_build_rope (Tier-2a identity property), S_packed =
-#   S_target, and the loop is byte-for-byte the Tier-1 path. Env BERNINI_NO_COND=1
-#   exercises this regression from the same binary.
-#
-# ── BUILD / RUN ────────────────────────────────────────────────────────────────
-#   cd /home/alex/mojodiffusion
-#   rm -f serenitymojo.mojopkg
-#   pixi run mojo run -I . serenitymojo/training/train_bernini_r_cond.mojo [config.json]
-#   Default config: serenitymojo/configs/bernini_r_t2v_cond_smoke.json
+# ── BUILD (binary; JIT can't resolve the driver calls) ─────────────────────────
+#   cd /home/alex/mojodiffusion; rm -f serenitymojo.mojopkg
+#   pixi run mojo build --optimization-level 2 --target-accelerator sm_120 \
+#     -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda \
+#     serenitymojo/training/train_bernini_r_cond.mojo -o output/bin/train_bernini_r_cond
+# ── RUN ────────────────────────────────────────────────────────────────────────
+#   BERNINI_TASK=i2v output/bin/train_bernini_r_cond [config.json]
 #
 # Mojo 1.0.0b1, NVIDIA GPU (sm_120 / 16GB).
 
@@ -87,6 +71,19 @@ from serenitymojo.models.wan22.bernini_src_id_rope import (
     BerniniRopeSegment, build_bernini_src_id_rope,
 )
 
+# REUSE: the Bernini timestep samplers (logit_normal + mode, per-shift window).
+from serenitymojo.training.schedule import (
+    BerniniWindow, bernini_task_window, bernini_sample_sigma,
+)
+
+# REUSE: the LoRA adapter carrier (to build the EMA-shadow set for saving).
+from serenitymojo.training.train_step import LoraAdapter
+
+# The per-task recipe table (shift / weighting / n_cond / prompt) + smoke geometry.
+from serenitymojo.training.bernini_tasks import (
+    BerniniTaskRecipe, bernini_recipe_for, BerniniCondSeg, bernini_smoke_cond_segments,
+)
+
 
 # ── A14B architecture (comptime; the wired engine's dims — same as Tier-1) ─────
 comptime H = 40
@@ -101,35 +98,25 @@ comptime NUM_BLOCKS = 40
 comptime EPS = Float32(1.0e-6)
 comptime ROPE_THETA = Float32(10000.0)
 
-# ── Packed-sequence smoke geometry ─────────────────────────────────────────────
-# TARGET latent [16,1,32,32] -> patchify(1,2,2) -> grid (1,16,16) -> S_TGT=256.
-# One CONDITIONING reference latent [16,1,16,16] -> grid (1,8,8) -> S_COND=64,
-# source_id=1 (a distinct, smaller reference resolution — exercises fractional-
-# capable src-id rope with a different grid AND a nonzero id). Both patchify to
-# IN_CH=64 so the SAME [5120,64] patch-embed serves both.
-# Packed order [cond | target]:  S_PACKED = S_COND + S_TGT.
+# ── Target geometry (fixed): latent [16,1,32,32] -> patchify(1,2,2) -> (1,16,16). ─
 comptime TGT_FG = 1
 comptime TGT_HG = 16
 comptime TGT_WG = 16
 comptime S_TGT = TGT_FG * TGT_HG * TGT_WG          # 256 target tokens
-
-comptime COND_FG = 1
-comptime COND_HG = 8
-comptime COND_WG = 8
-comptime S_COND = COND_FG * COND_HG * COND_WG      # 64 conditioning tokens
-
-comptime S_PACKED = S_COND + S_TGT                 # 320 packed tokens
-comptime S_TGT_ONLY = S_TGT                        # regression (no-cond) length
 comptime TXT = 512                                 # umt5 cross-attn kv length
-
-comptime COND_SRC_ID = Float32(1.0)                # first (only) reference id
 comptime TGT_SRC_ID = Float32(0.0)                 # target == stock wan rope
+
+# Bernini noise window (bernini_renderer_high.yaml).
+comptime NOISE_TMIN = Float64(0.875)
+comptime NOISE_TMAX = Float64(1.0)
+comptime LOGIT_MEAN = Float64(0.5)
+comptime LOGIT_STD = Float64(1.0)
+comptime MODE_SCALE = Float64(1.29)
 
 # ── optimizer / recipe defaults (config overrides where present) ───────────────
 comptime DEFAULT_LR = Float32(2.0e-4)
 comptime DEFAULT_MAX_GRAD_NORM = Float32(1.0)
-comptime DEFAULT_DISCRETE_FLOW_SHIFT = Float32(3.0)
-comptime DEFAULT_SIGMOID_SCALE = Float32(1.0)
+comptime DEFAULT_EMA_DECAY = Float32(0.9999)       # bernini_renderer_high.yaml ema_decay
 comptime DEFAULT_CKPT_LOW =
     "/home/alex/.serenity/models/checkpoints/Bernini-R-Diffusers/serenity_fp8_e4m3_de8c462/low"
 comptime DEFAULT_CONFIG =
@@ -165,8 +152,27 @@ def _env_is_set(name: String) -> Bool:
     return ret[0] == UInt8(49) and ret[1] == UInt8(0)
 
 
-# Resident-base file for an fp8 per-block CACHE DIR (shared.safetensors sibling)
-# vs a monolithic checkpoint (returned unchanged). Same rule as train_wan22_real.
+# Read an env var STRING value (empty String if unset). Small fixed buffer read.
+def _env_str(name: String) -> String:
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cname = _EnvPtr(unsafe_from_address=Int(buf))
+    var ret = external_call["getenv", _EnvPtr](cname)
+    buf.free()
+    if Int(ret) == 0:
+        return String("")
+    var out = String("")
+    var i = 0
+    while ret[i] != 0:
+        out += chr(Int(ret[i]))
+        i += 1
+    return out
+
+
 def _base_file_for(ckpt: String) -> String:
     var shared = ckpt + String("/shared.safetensors")
     if _file_exists(shared):
@@ -206,10 +212,6 @@ def _randn(seed: UInt64) -> Float32:
     return r * _fcos(ang)
 
 
-def _sigmoid(x: Float32) -> Float32:
-    return Float32(1.0) / (Float32(1.0) + exp(-x))
-
-
 def _noise(n: Int, seed: UInt64) -> List[Float32]:
     var out = List[Float32]()
     for i in range(n):
@@ -222,23 +224,6 @@ def _synth(n: Int, seed: UInt64) -> List[Float32]:
     for i in range(n):
         out.append(_randn(seed * UInt64(1099511628211) + UInt64(i) * 3 + 5))
     return out^
-
-
-# musubi timestep sampler (both modes) — identical math to train_wan22_real.
-def _sample_t(
-    shift_mode: Bool, step: Int, seed: UInt64,
-    sigmoid_scale: Float32, discrete_flow_shift: Float32,
-) -> Float32:
-    var base = seed * UInt64(6364136223846793005) + UInt64(step) * UInt64(7919) + 17
-    if not shift_mode:
-        var t = _u01(base)
-        t = Float32(1.0) - t
-        return t
-    var z = _randn(base)
-    var t = _sigmoid(z * sigmoid_scale)
-    var num = t * discrete_flow_shift
-    var den = Float32(1.0) + (discrete_flow_shift - Float32(1.0)) * t
-    return num / den
 
 
 # global grad clip over all LoRA d_A/d_B (musubi max_grad_norm).
@@ -260,7 +245,6 @@ def _clip(mut grads: Wan22LoraGradSet, max_norm: Float32) -> Float32:
     return gn
 
 
-# sum |d_A|+|d_B| over all adapters (nonzero-grad witness).
 def _grad_abs_sum(grads: Wan22LoraGradSet) -> Float32:
     var s = Float32(0.0)
     for i in range(len(grads.d_a)):
@@ -271,13 +255,14 @@ def _grad_abs_sum(grads: Wan22LoraGradSet) -> Float32:
     return s
 
 
-# ── Load a CLEAN latent [16,1,fh,fw] and patchify(1,2,2) -> [S, IN_CH] flat. ──
-# Used for the real cached target latent. Returns (flat [S*IN_CH], std, mean).
+# ── Load a CLEAN latent [16, ff, fh, fw] and patchify(1,2,2) -> [S, IN_CH] flat. ─
+# ff = temporal frames (1 for images, >1 for video conditioning). Returns
+# (flat [S*IN_CH]) and writes std/mean of the source latent.
 def _patchify_latent(
-    vals: List[Float32], fh: Int, fw: Int, ctx: DeviceContext,
+    vals: List[Float32], ff: Int, fh: Int, fw: Int, ctx: DeviceContext,
     mut out_std: Float32, mut out_mean: Float32,
 ) raises -> List[Float32]:
-    var n = 16 * 1 * fh * fw
+    var n = 16 * ff * fh * fw
     if len(vals) != n:
         raise Error("latent numel mismatch in _patchify_latent")
     var s = Float64(0.0)
@@ -293,7 +278,7 @@ def _patchify_latent(
     out_std = Float32(sqrt(varp))
     var shp = List[Int]()
     shp.append(16)
-    shp.append(1)
+    shp.append(ff)
     shp.append(fh)
     shp.append(fw)
     var t = Tensor.from_host(vals.copy(), shp^, STDtype.F32, ctx)
@@ -321,25 +306,57 @@ def _load_cache_target(
     var vals = List[Float32]()
     for i in range(nlat):
         vals.append(fp[i])
-    return _patchify_latent(vals^, 32, 32, ctx, out_std, out_mean)
+    return _patchify_latent(vals^, 1, 32, 32, ctx, out_std, out_mean)
+
+
+# ── Save an EMA-shadow LoRA sibling (host F32 ema_a/ema_b -> PEFT safetensors). ─
+def _save_ema_sibling(
+    lora: Wan22LoraSet, ema_a: List[List[Float32]], ema_b: List[List[Float32]],
+    path: String, ctx: DeviceContext,
+) raises -> Int:
+    var ad = List[LoraAdapter]()
+    for i in range(len(lora.ad)):
+        var na = len(ema_a[i])
+        var nb = len(ema_b[i])
+        var za = List[Float32]()
+        var va = List[Float32]()
+        for _ in range(na):
+            za.append(Float32(0.0))
+            va.append(Float32(0.0))
+        var zb = List[Float32]()
+        var vb = List[Float32]()
+        for _ in range(nb):
+            zb.append(Float32(0.0))
+            vb.append(Float32(0.0))
+        ad.append(LoraAdapter(
+            ema_a[i].copy(), ema_b[i].copy(),
+            lora.ad[i].rank, lora.ad[i].in_f, lora.ad[i].out_f, lora.ad[i].scale,
+            za^, va^, zb^, vb^,
+        ))
+    var ema_set = Wan22LoraSet(ad^, lora.num_blocks, lora.rank)
+    return save_wan22_lora(ema_set, path, ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # The step loop, comptime-monomorphized on the packed sequence length SEQ.
-# SEQ = S_PACKED (cond+target) in conditioned mode, or S_TGT_ONLY in the no-cond
-# regression. The TARGET region is ALWAYS the trailing S_TGT tokens
-# (offset = SEQ - S_TGT; = 0 when there is no conditioning). cond_tokens is empty
-# in no-cond mode, so the prepend is a no-op and model_in is exactly SEQ*IN_CH.
+# SEQ = S_TGT + sum(conditioning tokens). The TARGET region is ALWAYS the trailing
+# S_TGT tokens (offset = SEQ - S_TGT; = 0 when there is no conditioning).
+# cond_tokens is empty in no-cond mode, so the prepend is a no-op.
+#
+# Timestep policy: overfit-pin (pin_sigma fixed, from the TASK's Bernini sampler)
+# for a crisp 1-sample monotone drop, or per-step Bernini re-draw when stochastic.
+# EMA (decay=ema_decay) shadows the LoRA params each step; saved as a sibling.
 # ══════════════════════════════════════════════════════════════════════════════
 def _train_loop[SEQ: Int](
     base: Wan22StackBase, mut loader: TurboPlannedLoader, mut lora: Wan22LoraSet,
     cos_h: List[Float32], sin_h: List[Float32],
     cond_tokens: List[Float32], txt_tokens: List[Float32],
     cache_dir: String, use_cache: Bool,
-    steps: Int, seed: UInt64, stochastic: Bool, shift_mode: Bool,
-    discrete_flow_shift: Float32, lr: Float32, max_grad_norm: Float32,
+    steps: Int, seed: UInt64, stochastic: Bool,
+    is_mode: Bool, shift: Float64, win: BerniniWindow, pin_sigma: Float32,
+    lr: Float32, max_grad_norm: Float32,
     beta1: Float32, beta2: Float32, opt_eps: Float32, weight_decay: Float32,
-    out_path: String, no_cond: Bool, ctx: DeviceContext,
+    ema_decay: Float32, out_path: String, no_cond: Bool, ctx: DeviceContext,
 ) raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -347,16 +364,31 @@ def _train_loop[SEQ: Int](
     var have_first = False
     var train_start = perf_counter_ns()
 
+    # ── EMA shadow init (host F32, mirrors each adapter's live BF16 a/b) ─────────
+    var ema_a = List[List[Float32]]()
+    var ema_b = List[List[Float32]]()
+    for i in range(len(lora.ad)):
+        var a = List[Float32]()
+        for j in range(len(lora.ad[i].a)):
+            a.append(Float32(lora.ad[i].a[j]))
+        ema_a.append(a^)
+        var b = List[Float32]()
+        for j in range(len(lora.ad[i].b)):
+            b.append(Float32(lora.ad[i].b[j]))
+        ema_b.append(b^)
+
     print("")
-    print("step  t        target_MSE       grad_norm    grad_absum    sec")
+    print("step  sigma     target_MSE       grad_norm    grad_absum    sec")
     for step in range(steps):
         var t0 = perf_counter_ns()
 
-        # timestep: overfit pin (fixed) or musubi sampler.
-        var t = Float32(0.5)
+        # timestep sigma: overfit pin (fixed pair) or Bernini per-step re-draw.
+        var t = pin_sigma
         if stochastic:
-            t = _sample_t(shift_mode, step, seed,
-                          DEFAULT_SIGMOID_SCALE, discrete_flow_shift)
+            t = bernini_sample_sigma(
+                is_mode, shift, seed + UInt64(step) * UInt64(2654435761) + 1,
+                LOGIT_MEAN, LOGIT_STD, MODE_SCALE, win,
+            )
 
         # ── TARGET clean latent x0 [S_TGT, IN_CH] ───────────────────────────────
         var tgt_std = Float32(0.0)
@@ -366,12 +398,11 @@ def _train_loop[SEQ: Int](
             x0 = _load_cache_target(cache_dir, 0, ctx, tgt_std, tgt_mean)
         else:
             var tl = _synth(16 * 1 * 32 * 32, seed * 13 + 1)
-            x0 = _patchify_latent(tl^, 32, 32, ctx, tgt_std, tgt_mean)
+            x0 = _patchify_latent(tl^, 1, 32, 32, ctx, tgt_std, tgt_mean)
         if len(x0) != S_TGT * IN_CH:
             raise Error("target patch len != S_TGT*IN_CH")
         if step == 0:
-            print("  [data] target latent std=", tgt_std, " mean=", tgt_mean,
-                  " (round-trip gate; must match torch)")
+            print("  [data] target latent std=", tgt_std, " mean=", tgt_mean)
 
         # ── flow-match noise on the TARGET only (conditioning is clean) ──────────
         var noise_seed = seed * UInt64(2000003) + 3
@@ -385,7 +416,7 @@ def _train_loop[SEQ: Int](
             tgt_in.append((Float32(1.0) - t) * x0[i] + t * noise[i])
             target.append(noise[i] - x0[i])
 
-        # ── ASSEMBLE the packed model input [cond(clean) | target(noised)] ───────
+        # ── ASSEMBLE the packed model input [cond_1..N (clean) | target(noised)] ─
         var model_in = List[Float32]()
         for i in range(len(cond_tokens)):     # empty in no-cond mode
             model_in.append(cond_tokens[i])
@@ -438,6 +469,15 @@ def _train_loop[SEQ: Int](
         var gn = _clip(grads, max_grad_norm)
         wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
                               beta1, beta2, opt_eps, weight_decay)
+
+        # ── EMA shadow: ema = decay*ema + (1-decay)*live (host F32) ──────────────
+        var one_m = Float32(1.0) - ema_decay
+        for i in range(len(lora.ad)):
+            for j in range(len(lora.ad[i].a)):
+                ema_a[i][j] = ema_decay * ema_a[i][j] + one_m * Float32(lora.ad[i].a[j])
+            for j in range(len(lora.ad[i].b)):
+                ema_b[i][j] = ema_decay * ema_b[i][j] + one_m * Float32(lora.ad[i].b[j])
+
         var secs = Float64(perf_counter_ns() - t0) / 1.0e9
         print(step, "  ", t, "  ", loss, "  ", gn, "  ", absum, "  ", secs)
         if grads.nonfinite_lora_grads != 0:
@@ -449,17 +489,20 @@ def _train_loop[SEQ: Int](
     meta.append(Float32(Int(seed)))
     var state_path = out_path + String(".state")
     var nstate = save_wan22_lora_state(lora, state_path, ctx, meta^)
+    var ema_path = out_path + String(".ema.safetensors")
+    var nema = _save_ema_sibling(lora, ema_a, ema_b, ema_path, ctx)
     print("")
     print("[save] wrote", npairs, "PEFT pairs ->", out_path)
     print("[save] wrote", nstate, "state tensors ->", state_path)
+    print("[save] wrote", nema, "EMA (decay=", ema_decay, ") PEFT pairs ->", ema_path)
     print("trained steps=", steps, " first target_MSE=", first_loss,
           " last=", last_loss, " min=", min_loss,
           " total sec=", Float64(perf_counter_ns() - train_start) / 1.0e9)
     if no_cond:
-        print("RESULT: bernini-r NO-COND regression ran (Tier-1 T2V path; packed==target).")
+        print("RESULT: bernini-r NO-COND (Tier-1 T2V; packed==target) ran.")
     else:
-        print("RESULT: bernini-r Tier-2b CONDITIONED LoRA trainer ran (packed [cond|target],",
-              "src-id rope, velocity-MSE on target region only; real fp8 base).")
+        print("RESULT: bernini-r CONDITIONED (packed [cond_1..N | target], src-id rope,",
+              "velocity-MSE on target region only; real fp8 base) ran.")
 
 
 def main() raises:
@@ -473,13 +516,15 @@ def main() raises:
         raise Error(String("config not found: ") + config_path)
     var cfg = read_model_config(config_path)
 
-    # regression switch: BERNINI_NO_COND=1 -> zero conditioning segments (Tier-1).
-    var no_cond = _env_is_set(String("BERNINI_NO_COND"))
-    # overfit smoke pins (default ON for this smoke trainer): fixed t + fixed noise
-    # so a 1-sample loop makes an identical (x_t, target) pair every step and the
-    # target-region MSE must fall monotonically. BERNINI_STOCHASTIC=1 -> musubi.
+    # ── task selection ──────────────────────────────────────────────────────────
+    var task = _env_str(String("BERNINI_TASK"))
+    if task.byte_length() == 0:
+        task = String("t2v")
+    var recipe = bernini_recipe_for(task)
+
+    # regression switch: BERNINI_NO_COND=1 -> force n_cond=0 (Tier-1) for any task.
+    var no_cond = _env_is_set(String("BERNINI_NO_COND")) or recipe.n_cond == 0
     var stochastic = _env_is_set(String("BERNINI_STOCHASTIC"))
-    var shift_mode = _env_is_set(String("WAN22_SHIFT_TIMESTEPS"))
 
     var rank = cfg.lora_rank if cfg.lora_rank > 0 else 16
     var alpha = cfg.lora_alpha if cfg.lora_alpha > Float32(0.0) else Float32(16.0)
@@ -493,8 +538,8 @@ def main() raises:
     var opt_eps = cfg.eps if cfg.eps > Float32(0.0) else Float32(1.0e-8)
     var weight_decay = cfg.weight_decay if cfg.weight_decay >= Float32(0.0) \
         else Float32(0.01)
-    var discrete_flow_shift = cfg.timestep_shift if cfg.timestep_shift > Float32(0.0) \
-        else DEFAULT_DISCRETE_FLOW_SHIFT
+
+    var ema_decay = DEFAULT_EMA_DECAY
 
     var ckpt = cfg.checkpoint if cfg.checkpoint.byte_length() > 0 \
         else String(DEFAULT_CKPT_LOW)
@@ -505,25 +550,48 @@ def main() raises:
             "/home/alex/mojodiffusion/output/bernini_r_lora/bernini_r_cond_lora.safetensors"
         )
 
-    var seq_len = S_TGT_ONLY if no_cond else S_PACKED
+    # ── recipe -> shift / weighting / window ────────────────────────────────────
+    var shift = recipe.shift
+    var is_mode = recipe.is_mode
+    var win = bernini_task_window(shift, NOISE_TMIN, NOISE_TMAX)
+    # overfit-pin sigma: one deterministic Bernini draw for the whole run.
+    var pin_sigma = bernini_sample_sigma(
+        is_mode, shift, seed, LOGIT_MEAN, LOGIT_STD, MODE_SCALE, win
+    )
 
-    print("==== Bernini-R Tier-2b CONDITIONED LoRA trainer (reference-guided renderer) ====")
+    # ── conditioning segments (skip when no_cond) ───────────────────────────────
+    var segs = List[BerniniCondSeg]()
+    if not no_cond:
+        segs = bernini_smoke_cond_segments(task)
+    var n_cond_tokens = 0
+    for i in range(len(segs)):
+        n_cond_tokens += segs[i].f * segs[i].h * segs[i].w
+    var seq_len = S_TGT + n_cond_tokens
+
+    print("==== Bernini-R CONDITIONED LoRA trainer (12-task renderer) ====")
+    print("TASK:", task, "  shift=", shift,
+          "  weighting=", ("mode(video)" if is_mode else "logit_normal(image)"),
+          "  n_cond=", len(segs), "(", recipe.cond_kind, ")")
+    print("system_prompt:", recipe.system_prompt)
+    print("timestep window (u in [tmin,tmax]): tmin=", win.tmin, " tmax=", win.tmax,
+          "  pin_sigma=", pin_sigma)
     if no_cond:
-        print("MODE: NO-COND regression (Tier-1 T2V; packed == target, src_id=0 == stock wan rope)")
-        print("packed sequence: [target(", S_TGT, ", src_id=0)]  S=", seq_len)
+        print("MODE: NO-COND (Tier-1 T2V; packed == target, src_id=0 == stock wan rope)")
     else:
-        print("MODE: CONDITIONED  packed order [cond | target] (Bernini pack_vae_latents)")
-        print("packed sequence: [cond(", S_COND, ", src_id=", COND_SRC_ID,
-              ", CLEAN) | target(", S_TGT, ", src_id=", TGT_SRC_ID, ", noised)]  S=", seq_len)
+        print("MODE: CONDITIONED  packed order [cond_1..N | target] (pack_vae_latents)")
+    for i in range(len(segs)):
+        print("  cond seg", i, "src_id=", i + 1, " grid(f,h,w)=(", segs[i].f, ",",
+              segs[i].h, ",", segs[i].w, ") kind=", segs[i].kind,
+              " tokens=", segs[i].f * segs[i].h * segs[i].w)
+    print("packed sequence: cond=", n_cond_tokens, " + target=", S_TGT, " = S=", seq_len)
     print("arch: dim=", DIM, " blocks=", NUM_BLOCKS, " heads=", H, " head_dim=", Dh,
           " ffn=", FFN, " in_ch=", IN_CH, " out_ch=", OUT_CH, " TXT=", TXT)
     print("lora: rank=", rank, " alpha=", alpha, " (10/block: 8 attn + ffn.0 + ffn.2)")
-    print("optim: lr=", lr, " max_grad_norm=", max_grad_norm, " betas=(", beta1, ",", beta2,
-          ") eps=", opt_eps, " wd=", weight_decay)
+    print("optim: lr=", lr, " max_grad_norm=", max_grad_norm, " ema_decay=", ema_decay)
     if stochastic:
-        print("timestep/noise: STOCHASTIC musubi (per-step t + noise)")
+        print("timestep/noise: STOCHASTIC Bernini per-step (sigma re-drawn each step)")
     else:
-        print("timestep/noise: OVERFIT PIN (fixed t=0.5 + fixed noise; identical pair/step)")
+        print("timestep/noise: OVERFIT PIN (fixed sigma=pin_sigma + fixed noise)")
     print("steps:", steps, " seed:", seed)
     print("ckpt (low):", ckpt)
 
@@ -532,15 +600,13 @@ def main() raises:
         print("")
         print("[bernini-r] fp8 base not present, skipping real step:")
         print("        ", ckpt)
-        print("        (config/geometry/packing + the S=", seq_len,
+        print("        (recipe/geometry/packing + the S=", seq_len,
               "monomorphization type-checked; re-run once the fp8 cache lands.)")
         print("RESULT: bernini-r cond trainer wired OK (weights-absent path, exit 0)")
         return
 
     # ══════════════════════════════════════════════════════════════════════════
     # REAL WEIGHTED STEP — build resident base + block-swap loader (single low expert).
-    # Dual high/low switching is orthogonal and already certified in Tier-1; the
-    # conditioned smoke pins the LOW expert for a crisp overfit.
     # ══════════════════════════════════════════════════════════════════════════
     print("")
     print("[bernini-r] fp8 base present — building resident base + block-swap loader")
@@ -555,25 +621,42 @@ def main() raises:
     var lora = build_wan22_lora_set(NUM_BLOCKS, DIM, FFN, rank, alpha)
     print("[lora] adapters:", wan22_total_adapters(lora))
 
-    # ── build the PACKED source-id RoPE for the segments [cond | target] ────────
-    # Each segment carries its own src-id rope (Tier-2a); concatenated along tokens
-    # in packing order. Target src_id=0 => that region is bit-identical to stock
-    # wan rope. NO-COND regression => single src_id=0 segment == Tier-1 rope.
-    var segments = List[BerniniRopeSegment]()
-    if not no_cond:
-        segments.append(BerniniRopeSegment(COND_FG, COND_HG, COND_WG, COND_SRC_ID))
-    segments.append(BerniniRopeSegment(TGT_FG, TGT_HG, TGT_WG, TGT_SRC_ID))
-    var rope = build_bernini_src_id_rope(segments, Dh, ROPE_THETA, STDtype.F32, ctx)
-    var cos_h = rope[0].to_host(ctx)   # [S_PACKED * Dh/2]
-    var sin_h = rope[1].to_host(ctx)   # [S_PACKED * Dh/2]
+    # ── build the PACKED source-id RoPE for [cond_1..N (src 1..N) | target (0)] ──
+    var rope_segments = List[BerniniRopeSegment]()
+    for i in range(len(segs)):
+        rope_segments.append(
+            BerniniRopeSegment(segs[i].f, segs[i].h, segs[i].w, Float32(i + 1))
+        )
+    rope_segments.append(BerniniRopeSegment(TGT_FG, TGT_HG, TGT_WG, TGT_SRC_ID))
+    var rope = build_bernini_src_id_rope(rope_segments, Dh, ROPE_THETA, STDtype.F32, ctx)
+    var cos_h = rope[0].to_host(ctx)   # [seq_len * Dh/2]
+    var sin_h = rope[1].to_host(ctx)
     var expect_rope = seq_len * (Dh // 2)
     if len(cos_h) != expect_rope or len(sin_h) != expect_rope:
         raise Error("packed rope length != seq_len*Dh/2 — segment/geometry mismatch")
-    print("[rope] packed src-id rope built: segments=", len(segments),
+    print("[rope] packed src-id rope built: segments=", len(rope_segments),
           " rows=", seq_len, " cols(Dh/2)=", Dh // 2)
 
-    # ── data: real cached TARGET latent (round-trip gate) + synthetic CLEAN cond +
-    #    synthetic text. Conditioning latent is NEVER noised.
+    # ── conditioning tokens: N CLEAN patchified latents concatenated in order ────
+    var cond_tokens = List[Float32]()
+    for i in range(len(segs)):
+        var seg = segs[i].copy()
+        var cs = Float32(0.0)
+        var cm = Float32(0.0)
+        var cl = _synth(16 * seg.f * (seg.h * 2) * (seg.w * 2),
+                        seed * 7 + UInt64(101 + i * 13))
+        var toks = _patchify_latent(cl^, seg.f, seg.h * 2, seg.w * 2, ctx, cs, cm)
+        var want = seg.f * seg.h * seg.w * IN_CH
+        if len(toks) != want:
+            raise Error("conditioning seg patch len mismatch")
+        for j in range(len(toks)):
+            cond_tokens.append(toks[j])
+        print("[data] cond seg", i, "(clean, src_id=", i + 1, "): std=", cs,
+              " mean=", cm, " tokens=", seg.f * seg.h * seg.w)
+    if len(cond_tokens) != n_cond_tokens * IN_CH:
+        raise Error("total cond tokens mismatch")
+
+    # ── data: real cached TARGET latent when present, else synthetic ─────────────
     var cache_dir = cfg.dataset_cache_dir
     var use_cache = False
     if cache_dir.byte_length() > 0 and _file_exists(
@@ -582,39 +665,38 @@ def main() raises:
         use_cache = True
     if use_cache:
         print("[data] REAL cached target latent:", cache_dir,
-              " + synthetic CLEAN conditioning + synthetic text")
+              " (synthetic conditioning + synthetic text)")
     else:
         print("[data] SYNTHETIC target/conditioning/text (no cache_dir sample_0)")
 
-    # Fixed CLEAN conditioning latent [16,1,16,16] -> patchify -> [S_COND, IN_CH].
-    var cond_std = Float32(0.0)
-    var cond_mean = Float32(0.0)
-    var cond_tokens = List[Float32]()
-    if not no_cond:
-        var cond_latent = _synth(16 * 1 * COND_HG * 2 * COND_WG * 2, seed * 7 + 101)
-        cond_tokens = _patchify_latent(
-            cond_latent^, COND_HG * 2, COND_WG * 2, ctx, cond_std, cond_mean
-        )
-        if len(cond_tokens) != S_COND * IN_CH:
-            raise Error("conditioning patch len != S_COND*IN_CH")
-        print("[data] conditioning (clean, src_id=", COND_SRC_ID, "): std=", cond_std,
-              " mean=", cond_mean, " tokens=", S_COND)
-
-    # synthetic text (Tier-2b conditions on the VAE references; text kept synthetic).
     var txt_tokens = _synth(TXT * TEXT_DIM, seed * 777 + 9)
 
     # ── comptime dispatch on the packed sequence length ──────────────────────────
-    if no_cond:
-        _train_loop[S_TGT_ONLY](
-            base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, shift_mode,
-            discrete_flow_shift, lr, max_grad_norm, beta1, beta2, opt_eps,
-            weight_decay, out_path, no_cond, ctx,
-        )
+    if seq_len == 256:
+        _train_loop[256](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
+            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
+            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
+            ema_decay, out_path, no_cond, ctx)
+    elif seq_len == 320:
+        _train_loop[320](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
+            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
+            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
+            ema_decay, out_path, no_cond, ctx)
+    elif seq_len == 384:
+        _train_loop[384](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
+            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
+            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
+            ema_decay, out_path, no_cond, ctx)
+    elif seq_len == 448:
+        _train_loop[448](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
+            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
+            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
+            ema_decay, out_path, no_cond, ctx)
+    elif seq_len == 512:
+        _train_loop[512](base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
+            cache_dir, use_cache, steps, seed, stochastic, is_mode, shift, win,
+            pin_sigma, lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay,
+            ema_decay, out_path, no_cond, ctx)
     else:
-        _train_loop[S_PACKED](
-            base, loader, lora, cos_h, sin_h, cond_tokens, txt_tokens,
-            cache_dir, use_cache, steps, seed, stochastic, shift_mode,
-            discrete_flow_shift, lr, max_grad_norm, beta1, beta2, opt_eps,
-            weight_decay, out_path, no_cond, ctx,
-        )
+        raise Error(String("unsupported packed seq_len ") + String(seq_len) +
+                    String(" (task ") + task + String("); add a monomorphization"))

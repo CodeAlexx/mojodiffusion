@@ -2968,3 +2968,41 @@ AND bwd — zero block-math changes.
 - Production configs: `configs/mageflow_eri2_final.json` (shift-1 draw, lr
   1e-4, 2000 steps), `configs/mageflow_eri2_resume3500.json` (cold-exact
   2000→3500 continuation).
+
+## 2026-07-23: BERNINI-R full 12-task conditioning trainer (5080)
+
+Built on the Tier-2b conditioning mechanism (28190c8). ONE trainer binary now
+covers ALL 12 renderer tasks (t2i/t2v · i2i/r2i/r2v · v2v/i2v/vi2v/vr2v/vrc2v/
+mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
+
+- **`training/schedule.mojo`** — Bernini timestep sampling (mirrors
+  data.py::compute_density_for_timestep_sampling + FlowMatchScheduler): closed
+  forms `bernini_mode_density_from_raw` (u = 1-raw-mode_scale·(cos(πraw/2)²-1+raw)),
+  `bernini_logit_normal_density_from_z` (sigmoid(mean+std·z)), `bernini_shifted_sigma`
+  (shift·sl/(1+(shift-1)·sl), sl=1-idx/1000), `bernini_shift2boundary_idx` +
+  `bernini_task_window` (per-shift rejection window from noise [0.875,1.0]), and
+  `bernini_sample_sigma` (rejection-draw u→idx→shifted σ). ChaCha12 host RNG.
+- **`training/bernini_tasks.mojo`** — per-task recipe table `bernini_recipe_for`
+  (shift 3/4/5, weighting logit_normal[image]/mode[video], n_cond, system_prompt
+  from data.py) + `bernini_smoke_cond_segments` (per-task cond-segment geometry).
+  Verified against bernini_renderer_high.yaml.
+- **`training/train_bernini_r_cond.mojo`** — task dispatch: reads BERNINI_TASK →
+  recipe → builds N clean conditioning segments (src_id 1..N) + target (src_id 0),
+  packed src-id rope, Bernini σ-sampler (pin for overfit / per-step re-draw when
+  BERNINI_STOCHASTIC), certified wan22 A14B LoRA fwd/bwd, velocity-MSE on the
+  trailing target region only. Monomorphized on packed S ∈ {256,320,384,448,512}.
+  **EMA 0.9999** (bernini config ema_decay) host-F32 shadow of the LoRA params,
+  saved as `<out>.ema.safetensors` sibling. BERNINI_NO_COND=1 forces Tier-1.
+- **G1 parity** (`models/wan22/parity/bernini_timestep_{oracle.py,parity.mojo}`):
+  windows bit-exact (shift3 [0,0.3] / shift4 [0,0.364] / shift5 [0,0.417]);
+  deterministic anchors (mode/logit density, shifted_sigma) identical to 1e-10;
+  200k-sample σ moments within ~1e-4 (e.g. mode-shift5 mean 0.93358 vs 0.93369).
+- **G2 real-weight smokes** (real Bernini-R fp8 low, lr 2e-4, 5 steps, overfit
+  pin): t2v S=256 MSE 1.315→1.158 · i2v S=320 (1 img cond) 1.317→1.157 · v2v
+  S=384 (1 video cond) 1.314→1.156 · vi2v S=448 (video+image, src_id 1,2)
+  1.310→1.155; all grads finite/nonzero, ~42–50 s/step, 400 LoRA + 400 EMA
+  pairs saved. Binaries: `output/bin/train_bernini_r_cond`,
+  `output/bin/bernini_timestep_parity`.
+- OPEN follow-ups: condition dropout 0.1 (text/img/video), mv2v true N-scaling
+  (smoke uses N=2), real multi-task cache builder + umt5 system-prompt tokens
+  (renderer trains on VAE latents; text currently synthetic).

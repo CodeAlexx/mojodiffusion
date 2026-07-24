@@ -174,6 +174,22 @@ function runChecked(command, args) {
         "saved project preview video was paused while timeline was playing",
       );
       await page.click("#ve-btn-play");
+      await page.locator(".ve-media-card").first().click();
+      const restoredProgramPreview = page.waitForResponse((response) => {
+        if (!response.url().endsWith("/video_edit/preview") || response.status() !== 200) {
+          return false;
+        }
+        try {
+          return response.request().postDataJSON().project_id === inspectProjectId;
+        } catch (_) {
+          return false;
+        }
+      }, { timeout: 30000 });
+      await page.locator('.ve-monitor-tab[data-monitor="program"]').click();
+      await restoredProgramPreview;
+      await page.locator('.ve-dock-tab[data-dock="properties"]').click();
+      assert(await page.locator(".ve-props-panel").isVisible(),
+        "saved project clip parameters are not visible in Properties");
       assert(
         !diagnostics.tracks.some((track) => track.clips.some(
           (clip) => ["Intro", "Scene 1", "Overlay", "Music.mp3"].includes(clip.label)
@@ -201,6 +217,8 @@ function runChecked(command, args) {
           timeline_toolbar_buttons:
             await page.locator("#ve-edit-toolbar .ve-edit-btn").count(),
           persistent_dock_tabs: diagnostics.dockTabCount,
+          properties_parameter_controls:
+            await page.locator(".ve-props-panel input, .ve-props-panel select").count(),
         },
         thumbnail_clip_count: diagnostics.thumbnailClipIds.length,
         tracks: diagnostics.tracks,
@@ -365,8 +383,11 @@ function runChecked(command, args) {
     });
     assert(scopePixels > 100, `scope pixels=${scopePixels}`);
     await page.locator('.ve-dock-tab[data-dock="filters"]').click();
+    assert(await page.locator(".ve-filter-catalog").isVisible(),
+      "filter catalog did not open");
+    await page.locator('.ve-dock-tab[data-dock="properties"]').click();
     assert(await page.locator(".ve-props-panel").isVisible(),
-      "filter dock did not restore the selected clip");
+      "properties dock did not restore clip parameters");
     await page.click("#ve-edit-marker");
     assert((await page.evaluate(
       () => window.VideoEditTab.getDiagnostics().markerFrames,

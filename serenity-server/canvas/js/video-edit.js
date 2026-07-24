@@ -927,16 +927,10 @@ var VideoEditTab = (function () {
 
         if (dockTab === 'filters') {
             if (!info || info.track.type !== 'video') {
-                content.innerHTML = '<div class="ve-dock-empty">Select a video clip to edit its filter stack.</div>';
+                content.innerHTML = '<div class="ve-dock-empty">Select a video clip to manage its filter stack.</div>';
                 return;
             }
-            if (!info.clip.effects) info.clip.effects = [];
-            var panel = document.createElement('div');
-            panel.className = 've-props-panel';
-            propsPanelEl = panel;
-            propsPanelClipId = info.clip.id;
-            content.appendChild(panel);
-            renderPropertiesPanelContent(panel, info.clip);
+            renderFilterCatalog(content, info.clip);
             return;
         }
 
@@ -981,30 +975,25 @@ var VideoEditTab = (function () {
             return;
         }
 
-        var heading = document.createElement('div');
-        heading.className = 've-dock-heading';
-        heading.textContent = 'PROPERTIES';
-        content.appendChild(heading);
         if (!info) {
-            content.insertAdjacentHTML('beforeend',
-                '<div class="ve-dock-empty">Select a clip to see source details and editing actions.</div>');
+            content.innerHTML =
+                '<div class="ve-dock-heading">PROPERTIES</div>' +
+                '<div class="ve-dock-empty">Select a clip to edit its parameters and settings.</div>';
             return;
         }
         var clip = info.clip;
-        var details = document.createElement('div');
-        details.className = 've-property-summary';
-        details.innerHTML =
-            '<strong></strong>' +
-            '<span>' + info.track.type.toUpperCase() + '</span>' +
-            '<span>' + frameToTimecode(clip.endFrame - clip.startFrame) + '</span>' +
-            '<span>' + (clip.source_fps || FPS) + ' FPS</span>';
-        details.querySelector('strong').textContent = clip.label || 'Untitled';
-        content.appendChild(details);
         if (info.track.type === 'video') {
+            if (!clip.effects) clip.effects = [];
+            var panel = document.createElement('div');
+            panel.className = 've-props-panel';
+            propsPanelEl = panel;
+            propsPanelClipId = clip.id;
+            content.appendChild(panel);
+            renderPropertiesPanelContent(panel, clip);
+
             var actions = document.createElement('div');
             actions.className = 've-dock-actions';
             [
-                ['Filters', function () { dockTab = 'filters'; renderDock(); }],
                 ['Retake', function () { enterRetakeMode(clip.id); }],
                 ['Restore Faces', function () { showFaceRestoreDialog(clip.id); }],
                 ['Upscale', function () { showEsrganDialog(clip.id); }],
@@ -1016,8 +1005,127 @@ var VideoEditTab = (function () {
                 button.addEventListener('click', action[1]);
                 actions.appendChild(button);
             });
-            content.appendChild(actions);
+            panel.appendChild(actions);
+            return;
         }
+
+        var heading = document.createElement('div');
+        heading.className = 've-dock-heading';
+        heading.textContent = 'PROPERTIES';
+        content.appendChild(heading);
+        var details = document.createElement('div');
+        details.className = 've-property-summary';
+        details.innerHTML =
+            '<strong></strong>' +
+            '<span>' + info.track.type.toUpperCase() + '</span>' +
+            '<span>' + frameToTimecode(clip.endFrame - clip.startFrame) + '</span>' +
+            '<span>' + (clip.source_fps || FPS) + ' FPS</span>';
+        details.querySelector('strong').textContent = clip.label || 'Untitled';
+        content.appendChild(details);
+    }
+
+    function addFilterFromCatalog(clip, type) {
+        if (!clip.effects) clip.effects = [];
+        var reg = EFFECT_REGISTRY[type];
+        if (!reg) return;
+        var existing = clip.effects.find(function (effect) {
+            return effect.type === type;
+        });
+        if (!existing) {
+            pushUndo();
+            clip.effects.push({
+                type: type,
+                enabled: true,
+                params: JSON.parse(JSON.stringify(reg.defaults || {})),
+            });
+            renderTimeline();
+            scheduleAutosave();
+            updatePreviewDebounced();
+        }
+        dockTab = 'properties';
+        renderDock();
+    }
+
+    function renderFilterCatalog(content, clip) {
+        if (!clip.effects) clip.effects = [];
+        var wrapper = document.createElement('div');
+        wrapper.className = 've-filter-catalog';
+        wrapper.innerHTML =
+            '<div class="ve-dock-heading">FILTER STACK</div>' +
+            '<div class="ve-filter-count"></div>' +
+            '<input class="ve-filter-search" type="search" placeholder="Search filters">' +
+            '<div class="ve-filter-applied"></div>' +
+            '<div class="ve-dock-heading">ADD FILTER</div>' +
+            '<div class="ve-filter-options"></div>';
+        content.appendChild(wrapper);
+
+        var count = wrapper.querySelector('.ve-filter-count');
+        count.textContent = clip.effects.length + ' active filter(s)';
+        var applied = wrapper.querySelector('.ve-filter-applied');
+        if (!clip.effects.length) {
+            applied.innerHTML = '<div class="ve-filter-empty">No filters applied.</div>';
+        } else {
+            clip.effects.forEach(function (effect, index) {
+                var row = document.createElement('div');
+                row.className = 've-filter-row';
+                var enabled = document.createElement('input');
+                enabled.type = 'checkbox';
+                enabled.checked = effect.enabled !== false;
+                enabled.addEventListener('change', function () {
+                    pushUndo();
+                    effect.enabled = enabled.checked;
+                    renderTimeline();
+                    scheduleAutosave();
+                    updatePreviewDebounced();
+                });
+                var name = document.createElement('button');
+                name.textContent = EFFECT_REGISTRY[effect.type]
+                    ? EFFECT_REGISTRY[effect.type].name
+                    : effect.type;
+                name.addEventListener('click', function () {
+                    dockTab = 'properties';
+                    renderDock();
+                });
+                var remove = document.createElement('button');
+                remove.textContent = '\u00D7';
+                remove.title = 'Remove filter';
+                remove.addEventListener('click', function () {
+                    pushUndo();
+                    clip.effects.splice(index, 1);
+                    renderFilterCatalog(content, clip);
+                    wrapper.remove();
+                    renderTimeline();
+                    scheduleAutosave();
+                    updatePreviewDebounced();
+                });
+                row.appendChild(enabled);
+                row.appendChild(name);
+                row.appendChild(remove);
+                applied.appendChild(row);
+            });
+        }
+
+        var options = wrapper.querySelector('.ve-filter-options');
+        function populateOptions(query) {
+            options.innerHTML = '';
+            Object.keys(EFFECT_REGISTRY).forEach(function (type) {
+                var reg = EFFECT_REGISTRY[type];
+                if (query && reg.name.toLowerCase().indexOf(query) < 0) return;
+                var button = document.createElement('button');
+                button.textContent = '+ ' + reg.name;
+                button.disabled = clip.effects.some(function (effect) {
+                    return effect.type === type;
+                });
+                button.addEventListener('click', function () {
+                    addFilterFromCatalog(clip, type);
+                });
+                options.appendChild(button);
+            });
+        }
+        populateOptions('');
+        wrapper.querySelector('.ve-filter-search').addEventListener('input', function () {
+            populateOptions(this.value.trim().toLowerCase());
+        });
     }
 
     function updateScopes() {
@@ -2867,7 +2975,7 @@ var VideoEditTab = (function () {
 
         selectedClipIds.clear();
         selectedClipIds.add(clipId);
-        dockTab = 'filters';
+        dockTab = 'properties';
         renderTimeline();
         renderMediaBin();
         renderDock();
@@ -2894,8 +3002,8 @@ var VideoEditTab = (function () {
             addEffectDropdownEl.parentNode.removeChild(addEffectDropdownEl);
         }
         addEffectDropdownEl = null;
-        if (dockTab === 'filters') {
-            dockTab = 'properties';
+        if (dockTab === 'properties') {
+            dockTab = 'filters';
             renderDock();
         }
     }

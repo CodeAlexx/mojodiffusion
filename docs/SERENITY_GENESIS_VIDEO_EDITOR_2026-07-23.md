@@ -81,8 +81,10 @@ editor without launching or embedding egui:
 - a persistent media bin on the left with thumbnail cards, Source-monitor
   selection, and add-at-playhead actions;
 - a central Program/Source monitor with native-clock transport and timecode;
-- a persistent right dock with Properties, the real clip filter stack, a live
-  frame histogram, and a track mixer with persisted mute controls;
+- a persistent right dock where Filters manages the applied stack and catalog,
+  Properties exposes the selected clip's effect parameters, LUT, transition,
+  and AI actions, Scopes shows a live frame histogram, and Audio provides a
+  track mixer with persisted mute controls;
 - a dedicated timeline toolbar for split, razor-all, lift, ripple delete,
   copy, paste, duplicate, markers, snapping, track creation, and zoom-to-fit;
 - multitrack headers with visibility, mute, and lock controls plus video

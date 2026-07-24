@@ -94,11 +94,16 @@ from serenitymojo.models.wan22.wan22_stack_lora import (
     Wan22StackBase, Wan22LoraSet, Wan22LoraGradSet, Wan22StackForward,
     build_wan22_lora_set, wan22_total_adapters,
     wan22_stack_lora_forward_offload, wan22_stack_lora_backward_offload,
+    wan22_stack_lora_backward_offload_devnative, Wan22LoraDeviceGradSet,
     wan22_lora_adamw_step, save_wan22_lora, save_wan22_lora_state,
     Wan22I2VLoraSet, Wan22I2VLoraGradSet, Wan22I2VStackForward,
     build_wan22_i2v_lora_set, wan22_i2v_total_adapters,
     wan22_i2v_stack_lora_forward_offload, wan22_i2v_stack_lora_backward_offload,
     wan22_i2v_lora_adamw_step, save_wan22_i2v_lora, save_wan22_i2v_lora_state,
+)
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
+    fused_lora_adamw_plain_step_resident_device_grads,
 )
 from serenitymojo.offload.wan22_plan import (
     build_wan22_block_plan, build_wan21_i2v_block_plan,
@@ -1463,6 +1468,16 @@ def main() raises:
     var have_first = False
     var train_start = perf_counter_ns()
 
+    # Phase 1c device-native path (env WAN22_DEVNATIVE=1): device-resident LoRA
+    # grads + resident AdamW (dev_p IS the live params), killing the per-step host
+    # grad round-trips (~25k memcpys) of the offload path. dev_state is always
+    # inited (cheap); the last step syncs dev_p -> lora.ad so save sees fresh weights.
+    var use_devnative = _env_is_set(String("WAN22_DEVNATIVE"))
+    var n_adapters = wan22_total_adapters(lora)
+    var dev_state = lora_adamw_plain_device_state_init(lora.ad, 0, n_adapters, ctx)
+    if use_devnative:
+        print("[wan22] DEVNATIVE: resident device grads + AdamW (no host round-trip)")
+
     print("")
     print("step  expert    t        MSE            grad_norm     sec")
     for step in range(steps):
@@ -1591,28 +1606,51 @@ def main() raises:
         last_loss = loss
 
         # Backward through the SAME active expert (base+loader) that ran forward;
-        # AdamW steps the SHARED LoRA (identical to single-expert).
-        var grads: Wan22LoraGradSet
-        if use_high:
-            grads = wan22_stack_lora_backward_offload[H, Dh, S, TXT](
-                d_out, model_in.copy(), txt_tokens.copy(),
-                high_base, loader_high, lora, cos.copy(), sin.copy(), fwd,
-                DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+        # AdamW steps the SHARED LoRA. WAN22_DEVNATIVE: device-resident grads +
+        # resident AdamW (no host round-trip); else the host-list offload path.
+        var gn: Float32 = Float32(0.0)
+        if use_devnative:
+            var dgrads: Wan22LoraDeviceGradSet
+            if use_high:
+                dgrads = wan22_stack_lora_backward_offload_devnative[H, Dh, S, TXT](
+                    d_out, model_in.copy(), txt_tokens.copy(),
+                    high_base, loader_high, lora, cos.copy(), sin.copy(), fwd,
+                    DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                )
+            else:
+                dgrads = wan22_stack_lora_backward_offload_devnative[H, Dh, S, TXT](
+                    d_out, model_in.copy(), txt_tokens.copy(),
+                    base, loader, lora, cos.copy(), sin.copy(), fwd,
+                    DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                )
+            var sync_now = step == steps - 1
+            gn = fused_lora_adamw_plain_step_resident_device_grads(
+                dev_state, lora.ad, dgrads.grad_indices, dgrads.d_a, dgrads.d_b,
+                step + 1, lr, beta1, beta2, opt_eps, weight_decay, ctx,
+                Float32(1.0), sync_now, max_grad_norm,
             )
         else:
-            grads = wan22_stack_lora_backward_offload[H, Dh, S, TXT](
-                d_out, model_in.copy(), txt_tokens.copy(),
-                base, loader, lora, cos.copy(), sin.copy(), fwd,
-                DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
-            )
-        var gn = _clip(grads, max_grad_norm)
-        wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
-                              beta1, beta2, opt_eps, weight_decay)
+            var grads: Wan22LoraGradSet
+            if use_high:
+                grads = wan22_stack_lora_backward_offload[H, Dh, S, TXT](
+                    d_out, model_in.copy(), txt_tokens.copy(),
+                    high_base, loader_high, lora, cos.copy(), sin.copy(), fwd,
+                    DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                )
+            else:
+                grads = wan22_stack_lora_backward_offload[H, Dh, S, TXT](
+                    d_out, model_in.copy(), txt_tokens.copy(),
+                    base, loader, lora, cos.copy(), sin.copy(), fwd,
+                    DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                )
+            gn = _clip(grads, max_grad_norm)
+            wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
+                                  beta1, beta2, opt_eps, weight_decay)
+            if grads.nonfinite_lora_grads != 0:
+                print("  !! nonfinite lora grads =", grads.nonfinite_lora_grads)
         var secs = Float64(perf_counter_ns() - t0) / 1.0e9
         var expert = String("HIGH") if use_high else String("LOW ")
         print(step, " ", expert, " ", t, "  ", loss, "  ", gn, "  ", secs)
-        if grads.nonfinite_lora_grads != 0:
-            print("  !! nonfinite lora grads =", grads.nonfinite_lora_grads)
 
     # ── save PEFT weights + full resume state (A/B + AdamW moments) ────────────
     var npairs = save_wan22_lora(lora, out_path, ctx)

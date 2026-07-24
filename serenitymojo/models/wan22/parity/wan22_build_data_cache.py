@@ -53,7 +53,7 @@ from safetensors.torch import save_file
 I2V21 = "--i2v21" in sys.argv[1:]
 I2V = ("--i2v" in sys.argv[1:]) or I2V21
 
-DATASET = "/mnt/disk2/datasets/40_woman"
+DATASET = os.environ.get("WAN_CACHE_DATASET", "/mnt/disk2/datasets/40_woman")
 VAE_PATH = "/home/alex/.serenity/models/checkpoints/SCAIL-2/Wan2.1_VAE.pth"
 UMT5_DIR = "/home/alex/.serenity/models/checkpoints/SCAIL-2/umt5-xxl"
 UMT5_WEIGHTS = os.path.join(UMT5_DIR, "models_t5_umt5-xxl-enc-bf16.pth")
@@ -66,9 +66,11 @@ elif I2V:
     OUT_DIR = "/home/alex/.serenity/wan22_cache/40_woman_i2v"
 else:
     OUT_DIR = "/home/alex/.serenity/wan22_cache/40_woman"
+# env overrides (default-preserving: absent => byte-identical 40_woman path)
+OUT_DIR = os.environ.get("WAN_CACHE_OUT", OUT_DIR)
 
-N_SAMPLES = 8
-RES = 256
+N_SAMPLES = int(os.environ.get("WAN_CACHE_N", "8"))
+RES = int(os.environ.get("WAN_CACHE_RES", "256"))
 TEXT_LEN = 512
 TEXT_DIM = 4096
 Z_DIM = 16

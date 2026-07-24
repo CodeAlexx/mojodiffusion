@@ -81,6 +81,9 @@ from serenitymojo.models.scail2.scail2_stack_train_full import (
 )
 from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.training.schedule import sample_timestep_logit_normal
+from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 
 
 comptime _CStr = UnsafePointer[UInt8, MutExternalOrigin]
@@ -127,6 +130,14 @@ def _sync_alloc():
         _cstr(String("MODULAR_DEVICE_CONTEXT_SYNC_MODE")),
         _cstr(String("true")), Int32(1),
     )
+
+
+def _file_exists(path: String) -> Bool:
+    var fd = sys_open(path, O_RDONLY, Int32(0))
+    if fd < 0:
+        return False
+    _ = sys_close(fd)
+    return True
 
 
 def _load_view(path: String, key: String, ctx: DeviceContext) raises -> Tensor:
@@ -214,6 +225,7 @@ def _scail2_train_config() -> TrainConfig:
     var cfg = TrainConfig.default()
     cfg.name = String("scail2")
     cfg.checkpoint = String(CACHE_DIR)
+    cfg.cache_dir = String(RUN_DIR)
     cfg.d_model = DIM
     cfg.n_heads = HEADS
     cfg.head_dim = HEAD_DIM
@@ -241,23 +253,47 @@ def main() raises:
     _sync_alloc()
     var ctx = DeviceContext()
 
-    var cfg = _scail2_train_config()
-    # optional argv override of the step count (quick timing probes / gate reruns)
-    var steps = cfg.max_steps
+    # ── config-first (mirrors train_bernini_r_cond): argv shape is
+    #    `binary [config.json] [steps]` (serenity-trainer config_runner). If argv[1]
+    #    is a real file it is the config JSON (steps optional at argv[2]); otherwise
+    #    argv[1] is a bare legacy step count and the hardcoded defaults stand. ─────
+    var cfg = _scail2_train_config()            # scail2 defaults (paths + recipe)
     var args = argv()
+    var steps_override = -1
     if len(args) > 1:
-        steps = atol(String(args[1]))
-    var lr = cfg.lr
-    var rank = cfg.lora_rank
-    var alpha = cfg.lora_alpha
-    var max_grad_norm = cfg.max_grad_norm
-    var beta1 = cfg.beta1
-    var beta2 = cfg.beta2
-    var opt_eps = cfg.eps
-    var wd = cfg.weight_decay
-    var shift = cfg.timestep_shift
+        if _file_exists(String(args[1])):
+            cfg = read_model_config(String(args[1]))
+            if len(args) > 2:
+                steps_override = atol(String(args[2]))
+        else:
+            steps_override = atol(String(args[1]))   # legacy argv-step (back-compat)
+
+    # SCAIL-2 is a VIDEO model — LoRA/LoCon ONLY; reject LoKr/LoHa/DoRA/OFT FAIL-LOUD
+    # (same guard as train_wan22_real; no Lycoris on video models).
+    require_lora_or_locon_linear(cfg, "scail2")
+
+    # ── per-field fallbacks: a missing/zero config key keeps the scail2 default
+    #    (the previously hardcoded literal) so the bare argv-step invocation and a
+    #    partial config both stay valid. ──────────────────────────────────────────
+    var ckpt = cfg.checkpoint if cfg.checkpoint.byte_length() > 0 else String(CACHE_DIR)
+    var run_dir = cfg.cache_dir if (cfg.cache_dir.byte_length() > 0
+        and cfg.cache_dir != String("workspace-cache/run")) else String(RUN_DIR)
+    var lr = cfg.lr if cfg.lr > Float32(0.0) else Float32(1.0e-3)
+    var rank = cfg.lora_rank if cfg.lora_rank > 0 else 8
+    var alpha = cfg.lora_alpha if cfg.lora_alpha > Float32(0.0) else Float32(8.0)
+    var max_grad_norm = cfg.max_grad_norm if cfg.max_grad_norm > Float32(0.0) \
+        else Float32(1.0)
+    var shift = cfg.timestep_shift if cfg.timestep_shift > Float32(0.0) \
+        else Float32(1.0)
+    var beta1 = cfg.beta1 if cfg.beta1 > Float32(0.0) else Float32(0.9)
+    var beta2 = cfg.beta2 if cfg.beta2 > Float32(0.0) else Float32(0.999)
+    var opt_eps = cfg.eps if cfg.eps > Float32(0.0) else Float32(1.0e-8)
+    var wd = cfg.weight_decay if cfg.weight_decay >= Float32(0.0) else Float32(0.01)
     var seed = cfg.seed
     var save_every = cfg.save_every
+    var steps = cfg.max_steps if cfg.max_steps > 0 else 80
+    if steps_override >= 0:
+        steps = steps_override
 
     print("==== SCAIL-2 i2v LoRA TRAINER (CHUNK 4) — REAL 14B, FLASH, overfit gate ====")
     print("arch: dim=", DIM, " ffn=", FFN, " blocks=", NUM_LAYERS, " heads=", HEADS,
@@ -269,12 +305,12 @@ def main() raises:
     print("optim: lr=", lr, " max_grad_norm=", max_grad_norm, " betas=(", beta1, ",",
           beta2, ") wd=", wd, " eps=", opt_eps)
     print("timestep: logit-normal + qwen-shift(", shift, ")  steps=", steps, " seed=", seed)
-    print("ckpt:", CACHE_DIR)
+    print("ckpt:", ckpt)
     print("")
 
     # ── frozen shared weights + head/embed/conditioning host ──
-    var dit = Scail2StreamedDiT.open(CACHE_DIR, ctx)
-    var stream = Scail2A14BFP8Stream.open(CACHE_DIR)
+    var dit = Scail2StreamedDiT.open(ckpt, ctx)
+    var stream = Scail2A14BFP8Stream.open(ckpt)
     # HOST-RESIDENT fp8 base: read all 40 frozen blocks into host RAM ONCE so the
     # streaming fwd/bwd serve them per step with no disk I/O (was ~500 s/step,
     # almost entirely per-step re-reads). Bit-identical to the disk dequant path.
@@ -284,33 +320,33 @@ def main() raises:
     print("")
 
     # ── real staged latents (cropped to the reduced grid) ──
-    var ref5 = _load_view(RUN_DIR + String("/reference.safetensors"),
+    var ref5 = _load_view(run_dir + String("/reference.safetensors"),
                           String("reference_latent"), ctx)
     var ref4 = reshape(ref5, [CHANNELS, 1, 64, 112], ctx)
     var ref_crop = _crop4(ref4, 1, H_LAT, W_LAT, ctx)              # [16,1,64,112]
 
-    var pose5 = _load_view(RUN_DIR + String("/pose.safetensors"),
+    var pose5 = _load_view(run_dir + String("/pose.safetensors"),
                            String("pose_latent"), ctx)
     var pose4 = reshape(pose5, [CHANNELS, 17, 32, 56], ctx)
     var pose_crop = _crop4(pose4, FT, H_LAT // 2, W_LAT // 2, ctx) # [16,1,32,56]
 
-    var vid4 = _load_view(RUN_DIR + String("/latent_replacement_1step.safetensors"),
+    var vid4 = _load_view(run_dir + String("/latent_replacement_1step.safetensors"),
                           String("latent"), ctx)                   # [16,17,64,112]
     var x0 = _crop4(vid4, FT, H_LAT, W_LAT, ctx)                   # [16,1,64,112]
     var x0_h = x0.to_host(ctx)
 
-    var refm = _load_view(RUN_DIR + String("/stage.safetensors"),
+    var refm = _load_view(run_dir + String("/stage.safetensors"),
                           String("ref_masks"), ctx)
     var ref_masks = _crop4(refm, FT + 1, H_LAT, W_LAT, ctx)        # [28,2,64,112]
-    var drvm = _load_view(RUN_DIR + String("/stage.safetensors"),
+    var drvm = _load_view(run_dir + String("/stage.safetensors"),
                           String("driving_masks"), ctx)
     var driving_masks = _crop4(drvm, FT, H_LAT // 2, W_LAT // 2, ctx)  # [28,1,32,56]
 
     # text (pos) + clip conditioning (real) — FROZEN
-    var pos = _load_view(RUN_DIR + String("/text.safetensors"),
+    var pos = _load_view(run_dir + String("/text.safetensors"),
                          String("pos_embed"), ctx)
     var pos2 = reshape(pos, [TXT, 4096], ctx)
-    var clip = _load_view(RUN_DIR + String("/clip.safetensors"),
+    var clip = _load_view(run_dir + String("/clip.safetensors"),
                           String("clip_context"), ctx)
 
     # ── frozen ref/pose 20-ch marker packing (1.0 = ref / pose) built ONCE ──
@@ -486,7 +522,7 @@ def main() raises:
 
         # ── periodic save ──
         if save_every > 0 and (step + 1) % save_every == 0:
-            var sp = String(RUN_DIR) + String("/scail2_lora_real_step") \
+            var sp = run_dir + String("/scail2_lora_real_step") \
                 + String(step + 1) + String(".safetensors")
             var npairs_ck = save_scail2_lora(lora, sp, ctx)
             print("  [save] step", step + 1, "->", npairs_ck, "PEFT pairs", sp)

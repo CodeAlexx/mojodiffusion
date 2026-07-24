@@ -71,9 +71,13 @@ The integrated routes are:
 | `GET /video_edit/cache/:name` | serves generated thumbnail assets |
 
 The adapter reverses browser track order into Genesis's compositor order and
-maps source offsets, fades, typed video/audio/text tracks, subtitles,
-transitions, LUTs, brightness, contrast, saturation, hue, gamma, blur,
-sharpen, denoise, glow, vignette, speed, and horizontal/vertical flips.
+maps source offsets, typed video/audio/text tracks, subtitles, transitions,
+track state, and the native Genesis clip-property object. The native object is
+merged over a freshly constructed `GenesisClip`, preserving every upstream
+identity default while explicitly protecting `media`, `src_in`, `len`, `t0`,
+`track`, `seq`, and `group` from browser retargeting. This exposes the current
+render-field model instead of translating only the original thirteen legacy
+browser effects.
 
 The browser uses the same primary workspace organization as the native Genesis
 editor without launching or embedding egui:
@@ -81,10 +85,19 @@ editor without launching or embedding egui:
 - a persistent media bin on the left with thumbnail cards, Source-monitor
   selection, and add-at-playhead actions;
 - a central Program/Source monitor with native-clock transport and timecode;
-- a persistent right dock where Filters manages the applied stack and catalog,
-  Properties exposes the selected clip's effect parameters, LUT, transition,
-  and AI actions, Scopes shows a live frame histogram, and Audio provides a
-  track mixer with persisted mute controls;
+- a persistent four-tab right dock:
+  - **Properties** exposes 142 controls covering PiP/blend, fades,
+    speed/reverse, gain and audio FX/graphic EQ, grading, color wheels, white
+    balance, transform/blur, curves, HSL/levels, stylization, distortion,
+    geometry, 360 reframe, shape mask, selective color, look/LUT, chroma key,
+    title text, transitions, keyframes, clip operations, program grade, and
+    export;
+  - **Filters** derives a real active stack from Genesis identity values and
+    provides 25 searchable add/reset groups;
+  - **Scopes** calculates RGB histogram, luma waveform, vectorscope, and RGB
+    parade from the current composited program frame;
+  - **Audio** shows a decoded source waveform and a track mixer whose
+    level/pan/mute/solo values reach the Genesis worker;
 - a dedicated timeline toolbar for split, razor-all, lift, ripple delete,
   copy, paste, duplicate, markers, snapping, track creation, and zoom-to-fit;
 - multitrack headers with visibility, mute, and lock controls plus video
@@ -109,9 +122,11 @@ Imported media carries its probed source FPS and duration into the timeline.
 Saved project width, height, and FPS are restored when the browser opens the
 project. The Genesis adapter converts between the browser timeline clock and
 each clip's source clock, while `gcompose` stamps encoded frames with the
-requested rational FPS rather than a fixed 30 FPS clock. Effect add, remove,
-enable, disable, slider, and LUT changes request a fresh Genesis preview and
-disabled effects are excluded before they reach the compositor.
+requested rational FPS rather than a fixed 30 FPS clock. Native property,
+filter, mixer, transition, keyframe, and LUT changes persist with the browser
+project and request a fresh Genesis preview. Export carries the selected
+browser format/resolution/FPS/quality plus native GOP, preset, audio bitrate,
+and audio codec depth settings.
 
 The top toolbar exposes direct `+ Video`, `+ Music`, Save, undo/redo, Retake,
 and Render actions.
@@ -146,20 +161,22 @@ Observed gates:
 
 - `gcompose --serve` initialized OpenCL and passed its startup self-check;
 - the browser `+ Video` action imported and probed exactly 121 frames at 25 FPS;
+- the exact saved project exposed 142 native Genesis controls, 25 searchable
+  native filter groups, four calculated video scopes, and two mixer strips;
 - the Genesis-style workspace exposed the media bin, Program/Source monitors,
-  twelve real timeline actions, four persistent dock tabs, a non-empty live
-  histogram, and a two-track mixer;
+  twelve real timeline actions, and four persistent dock tabs;
 - marker, snap off/on, copy/paste/undo, and mixer mute/unmute interactions all
   changed editor state and returned to the expected state;
 - the timeline loaded a visible thumbnail strip, playback reached frame 15,
   the video clock reached 0.61 seconds, and the large-preview pixel hash
   changed while playback remained active;
-- Clip Properties added Saturation and set it to zero;
-- the edited preview pixels differed from the original, disabling the effect
-  restored the original pixel hash, and re-enabling restored the edited hash;
+- native Clip Properties set `sat` to zero through the Genesis property
+  payload; the edited preview pixels differed from the original, removing the
+  derived active filter restored the exact original pixel hash, and applying
+  the property again restored the edited hash;
 - the browser `+ Music` action imported a real 5.8-second WAV as 145
   25-FPS timeline frames and loaded at least 170 non-silent waveform buckets;
-- the browser-persisted project retained the enabled zero-saturation effect;
+- the browser-persisted project retained native `genesis.sat = 0`;
 - browser selection export produced H.264 at exactly 512x768, 25 FPS, 121
   frames, and 4.842 seconds plus stereo 48 kHz AAC; `volumedetect` measured the
   exported audio at -36.1 dB mean, proving the music was not a silent stream;
@@ -175,11 +192,11 @@ Observed gates:
 
 The machine-readable result and visual evidence are written to:
 
-- `output/checks/genesis_browser/result.json`;
-- `output/checks/genesis_browser/editor.png`;
-- `output/checks/genesis_browser/export-contact.png`.
-- `output/checks/genesis_browser/saved-project-result.json`;
-- `output/checks/genesis_browser/saved-project.png`.
+- `output/checks/genesis_browser/native-properties-e2e-pass/result.json`;
+- `output/checks/genesis_browser/native-properties-e2e-pass/editor.png`;
+- `output/checks/genesis_browser/native-properties-e2e-pass/export-contact.png`;
+- `output/checks/genesis_browser/native-four-tab-final/saved-project-result.json`;
+- `output/checks/genesis_browser/native-four-tab-final/saved-project.png`.
 
 Generated test projects, previews, exports, profiles, and installed binaries
 remain beneath ignored `output/` or `/tmp`; source control contains the code,

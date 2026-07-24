@@ -13,7 +13,7 @@
     flex: 0 0 52%;
     min-height: 320px;
     display: grid;
-    grid-template-columns: 232px minmax(460px, 1fr) 330px;
+    grid-template-columns: 232px minmax(460px, 1fr) 390px;
     background: #111117;
     border-bottom: 1px solid #31313f;
     overflow: hidden;
@@ -1150,6 +1150,326 @@
     font-size: 14px;
     color: #fff;
 }
+
+.ve-genesis-properties-header {
+    min-height: 42px;
+    margin: -12px -12px 10px;
+    padding: 9px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid #30303d;
+    background: #1d1d26;
+}
+
+.ve-genesis-properties-header strong {
+    display: block;
+    color: #b9bac8;
+    font-size: 10px;
+    letter-spacing: .08em;
+}
+
+.ve-genesis-properties-header span {
+    display: block;
+    max-width: 250px;
+    margin-top: 3px;
+    overflow: hidden;
+    color: #858697;
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ve-genesis-properties-header button,
+.ve-genesis-reset,
+.ve-genesis-button-row button,
+.ve-keyframe-button {
+    border: 1px solid #3b3c4c;
+    border-radius: 4px;
+    background: #292a35;
+    color: #bcbcca;
+    cursor: pointer;
+}
+
+.ve-genesis-properties-header button {
+    padding: 5px 7px;
+    font-size: 9px;
+}
+
+.ve-genesis-section {
+    margin: 7px 0;
+    border: 1px solid #30313d;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #1c1d25;
+}
+
+.ve-genesis-section > summary {
+    padding: 8px 9px;
+    color: #aaaabb;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .035em;
+    cursor: pointer;
+    user-select: none;
+}
+
+.ve-genesis-section[open] > summary {
+    color: #e4e4ec;
+    border-bottom: 1px solid #30313d;
+    background: #22232d;
+}
+
+.ve-genesis-section-body {
+    padding: 7px;
+}
+
+.ve-genesis-control {
+    min-height: 28px;
+    display: grid;
+    grid-template-columns: minmax(82px, 1fr) minmax(82px, 1.55fr) 56px auto auto;
+    align-items: center;
+    gap: 5px;
+}
+
+.ve-genesis-control > label {
+    overflow: hidden;
+    color: #9b9baa;
+    font-size: 10px;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+}
+
+.ve-genesis-control input[type="range"] {
+    min-width: 0;
+    width: 100%;
+    accent-color: #3ba7d8;
+}
+
+.ve-genesis-control input[type="number"],
+.ve-genesis-control input[type="text"],
+.ve-genesis-control select,
+.ve-genesis-control textarea {
+    min-width: 0;
+    padding: 4px 5px;
+    border: 1px solid #343542;
+    border-radius: 4px;
+    outline: 0;
+    background: #12131a;
+    color: #d8d8e0;
+    font: 10px 'JetBrains Mono', 'Consolas', monospace;
+}
+
+.ve-genesis-control input[type="number"] {
+    width: 56px;
+    box-sizing: border-box;
+}
+
+.ve-genesis-control input[type="checkbox"] {
+    grid-column: 2;
+    justify-self: start;
+    accent-color: #3ba7d8;
+}
+
+.ve-genesis-control input[type="color"] {
+    width: 54px;
+    height: 25px;
+    padding: 1px;
+    border: 1px solid #40414d;
+    border-radius: 4px;
+    background: #20212a;
+}
+
+.ve-genesis-control select {
+    grid-column: 2 / span 3;
+}
+
+.ve-genesis-control-wide {
+    grid-template-columns: 82px 1fr;
+}
+
+.ve-genesis-control-wide textarea {
+    min-height: 52px;
+    resize: vertical;
+}
+
+.ve-genesis-label-row {
+    margin-bottom: 6px;
+    grid-template-columns: 82px 1fr;
+}
+
+.ve-genesis-label-row input {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.ve-genesis-suffix {
+    min-width: 0;
+    color: #717282;
+    font-size: 9px;
+}
+
+.ve-keyframe-button {
+    width: 24px;
+    height: 23px;
+    padding: 0;
+    color: #f0a646;
+    font-size: 9px;
+}
+
+.ve-genesis-reset {
+    margin-top: 6px;
+    padding: 5px 7px;
+    color: #8f90a0;
+    font-size: 9px;
+}
+
+.ve-genesis-reset:hover,
+.ve-genesis-button-row button:hover,
+.ve-keyframe-button:hover,
+.ve-genesis-properties-header button:hover {
+    border-color: #3ba7d8;
+    color: #fff;
+}
+
+.ve-genesis-button-row {
+    margin-top: 7px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.ve-genesis-button-row button {
+    padding: 6px 8px;
+    font-size: 9px;
+}
+
+.ve-genesis-button-row button:disabled {
+    opacity: .35;
+    cursor: default;
+}
+
+.ve-genesis-binding-status {
+    margin: 10px 0 2px;
+    padding: 8px;
+    border: 1px solid rgba(65, 191, 142, .26);
+    border-radius: 5px;
+    background: rgba(65, 191, 142, .07);
+    color: #73cfa8;
+    font-size: 9px;
+    line-height: 1.45;
+}
+
+.ve-filter-category {
+    grid-column: 1 / -1;
+    padding: 8px 1px 2px;
+    color: #707181;
+    font-size: 9px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+
+.ve-audio-scope,
+.ve-scope-grid canvas {
+    display: block;
+    width: calc(100% - 24px);
+    height: auto;
+    margin: 0 12px;
+    border: 1px solid #30313d;
+    border-radius: 5px;
+    background: #0c0d13;
+}
+
+.ve-audio-mixer-strip {
+    margin: 0 12px 9px;
+    padding: 9px;
+    border: 1px solid #30313d;
+    border-radius: 6px;
+    background: #20212a;
+}
+
+.ve-audio-mixer-strip.ve-audio-dimmed {
+    opacity: .42;
+}
+
+.ve-audio-mixer-head {
+    display: grid;
+    grid-template-columns: 55px 1fr;
+    align-items: center;
+    gap: 7px;
+}
+
+.ve-audio-mixer-head strong {
+    overflow: hidden;
+    color: #dddde7;
+    font-size: 10px;
+    text-overflow: ellipsis;
+}
+
+.ve-audio-meter {
+    height: 6px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #111219;
+}
+
+.ve-audio-meter span {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, #45c993 0 72%, #e6c54b 72% 90%, #eb6565 90%);
+}
+
+.ve-audio-mixer-control {
+    margin-top: 6px;
+    display: grid;
+    grid-template-columns: 55px 1fr 34px;
+    align-items: center;
+    gap: 5px;
+    color: #858697;
+    font-size: 9px;
+}
+
+.ve-audio-mixer-control input {
+    min-width: 0;
+    accent-color: #43c99a;
+}
+
+.ve-audio-mixer-control span {
+    color: #a9aab7;
+    font: 9px 'JetBrains Mono', 'Consolas', monospace;
+    text-align: right;
+}
+
+.ve-audio-mixer-buttons {
+    margin-top: 7px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 5px;
+}
+
+.ve-audio-mixer-buttons button {
+    width: 30px;
+    height: 24px;
+    border: 1px solid #3a3b47;
+    border-radius: 4px;
+    background: #292a34;
+    color: #9192a0;
+}
+
+.ve-audio-mixer-buttons button.ve-active {
+    border-color: #e9b34b;
+    background: rgba(233, 179, 75, .16);
+    color: #ffd481;
+}
+
+.ve-scope-grid section {
+    padding-bottom: 6px;
+}
+
+.ve-scope-grid .ve-dock-heading {
+    padding-bottom: 5px;
+}
 .ve-props-close {
     position: absolute;
     top: 8px;
@@ -1161,7 +1481,7 @@
 
 @media (max-width: 1450px) {
     #ve-workspace {
-        grid-template-columns: 190px minmax(420px, 1fr) 285px;
+        grid-template-columns: 190px minmax(420px, 1fr) 340px;
     }
 
     #ve-media-grid {

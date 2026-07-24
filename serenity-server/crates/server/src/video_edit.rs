@@ -237,14 +237,8 @@ fn migrate_legacy_demo_project(
                 cursor += timeline_frames;
 
                 if has_video && first_video_size.is_none() {
-                    let width = probe
-                        .get("width")
-                        .and_then(JsonValue::as_i64)
-                        .unwrap_or(0);
-                    let height = probe
-                        .get("height")
-                        .and_then(JsonValue::as_i64)
-                        .unwrap_or(0);
+                    let width = probe.get("width").and_then(JsonValue::as_i64).unwrap_or(0);
+                    let height = probe.get("height").and_then(JsonValue::as_i64).unwrap_or(0);
                     if width > 0 && height > 0 {
                         first_video_size = Some((width, height));
                     }
@@ -255,10 +249,7 @@ fn migrate_legacy_demo_project(
         let mut kept_video = false;
         let mut kept_audio = false;
         tracks.retain(|track| {
-            let track_type = track
-                .get("type")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
+            let track_type = track.get("type").and_then(JsonValue::as_str).unwrap_or("");
             let has_clips = track
                 .get("clips")
                 .and_then(JsonValue::as_array)
@@ -522,6 +513,71 @@ fn apply_web_effects(clip: &mut GenesisClip, value: &JsonValue) {
     }
 }
 
+/// Overlay the browser's native Genesis property payload onto a freshly-built
+/// Genesis clip. The browser is allowed to edit render/effect fields, but the
+/// timeline adapter remains authoritative for media identity and placement.
+///
+/// Starting from the serialized `GenesisClip::video` value preserves every
+/// non-zero identity default in the upstream model and means newly-added
+/// Genesis fields automatically remain backwards compatible.
+fn apply_web_genesis_properties(clip: &mut GenesisClip, value: &JsonValue) {
+    let Some(properties) = value.get("genesis").and_then(JsonValue::as_object) else {
+        return;
+    };
+    let Ok(mut merged) = serde_json::to_value(&*clip) else {
+        return;
+    };
+    let Some(target) = merged.as_object_mut() else {
+        return;
+    };
+    for (key, field) in properties {
+        if matches!(
+            key.as_str(),
+            "media" | "src_in" | "len" | "t0" | "track" | "seq" | "group"
+        ) {
+            continue;
+        }
+        target.insert(key.clone(), field.clone());
+    }
+    if let Ok(updated) = serde_json::from_value::<GenesisClip>(merged) {
+        *clip = updated;
+    }
+}
+
+fn apply_web_genesis_project(project: &mut GenesisProject, web: &JsonValue) {
+    let Some(properties) = web.get("genesis").and_then(JsonValue::as_object) else {
+        return;
+    };
+    let Ok(mut merged) = serde_json::to_value(&*project) else {
+        return;
+    };
+    let Some(target) = merged.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "bright",
+        "contrast",
+        "sat",
+        "bright_kf",
+        "contrast_kf",
+        "sat_kf",
+        "opacity_kf",
+        "gain_kf",
+        "pip_kf",
+        "export",
+        "kf_interp",
+        "export_in",
+        "export_out",
+    ] {
+        if let Some(field) = properties.get(key) {
+            target.insert(key.to_string(), field.clone());
+        }
+    }
+    if let Ok(updated) = serde_json::from_value::<GenesisProject>(merged) {
+        *project = updated;
+    }
+}
+
 fn web_project_to_genesis(
     state: &AppState,
     project_id: Option<&str>,
@@ -583,6 +639,14 @@ fn web_project_to_genesis(
                 .get("locked")
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false);
+            if let Some(mixer) = track.get("genesis") {
+                genesis_track.gain = value_f32(mixer.get("gain"), 1.0).clamp(0.0, 2.0);
+                genesis_track.pan = value_f32(mixer.get("pan"), 0.0).clamp(-1.0, 1.0);
+                genesis_track.solo = mixer
+                    .get("solo")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+            }
             project.tracks.push(genesis_track);
             track_map[web_index] = Some(index as u8);
         }
@@ -654,6 +718,7 @@ fn web_project_to_genesis(
             genesis_clip.fade_in = value_i64(clip.get("fade_in"), 0).max(0);
             genesis_clip.fade_out = value_i64(clip.get("fade_out"), 0).max(0);
             apply_web_effects(&mut genesis_clip, clip);
+            apply_web_genesis_properties(&mut genesis_clip, clip);
             let source_fps = value_f32(clip.get("source_fps"), web_fps).clamp(1.0, 120.0);
             genesis_clip.speed *= source_fps / web_fps;
             project.clips.push(genesis_clip);
@@ -691,6 +756,7 @@ fn web_project_to_genesis(
     project.export.out_h = height;
     project.export.fps_num = fps.clamp(1, u32::MAX as u64) as u32;
     project.export.fps_den = 1;
+    apply_web_genesis_project(&mut project, web);
     Ok(project)
 }
 
@@ -1456,6 +1522,8 @@ pub struct ExportRequest {
     range_end_frame: Option<i64>,
     #[serde(default)]
     lut_path: Option<String>,
+    #[serde(default)]
+    genesis_export: Option<JsonValue>,
 }
 
 fn default_export_format() -> String {
@@ -1510,6 +1578,22 @@ pub async fn post_export(
         _ => "mpeg4",
     }
     .to_string();
+    if let Some(native) = request
+        .genesis_export
+        .as_ref()
+        .and_then(JsonValue::as_object)
+    {
+        if let Ok(mut merged) = serde_json::to_value(&project.export) {
+            if let Some(target) = merged.as_object_mut() {
+                for (key, value) in native {
+                    target.insert(key.clone(), value.clone());
+                }
+                if let Ok(updated) = serde_json::from_value(merged) {
+                    project.export = updated;
+                }
+            }
+        }
+    }
     if let Some(lut_path) = request.lut_path.as_deref().filter(|path| !path.is_empty()) {
         for clip in &mut project.clips {
             clip.look = 2;
@@ -1648,6 +1732,57 @@ mod tests {
 
         assert_eq!(clip.sat, 1.0);
         assert_eq!(clip.contrast, 1.25);
+    }
+
+    #[test]
+    fn native_properties_reach_genesis_without_retargeting_clip() {
+        let mut clip = GenesisClip::video(7, 12, 90, 2, "test");
+        apply_web_genesis_properties(
+            &mut clip,
+            &json!({
+                "genesis": {
+                    "media": 99,
+                    "t0": 999,
+                    "track": 8,
+                    "sat": 0.25,
+                    "rot": 14.0,
+                    "curve": [0.0, 0.2, 0.55, 0.8, 1.0],
+                    "audio_fx": {
+                        "eq_low_db": 3.0,
+                        "eq_mid_db": 0.0,
+                        "eq_high_db": -2.0,
+                        "pan": -0.2,
+                        "compress": true,
+                        "gate": false,
+                        "normalize": false,
+                        "reverb": 0.0,
+                        "delay_ms": 0.0,
+                        "delay_decay": 0.5,
+                        "pitch": 0.0,
+                        "lowpass_hz": 0.0,
+                        "highpass_hz": 0.0,
+                        "tremolo": 0.0,
+                        "bass_db": 0.0,
+                        "treble_db": 0.0,
+                        "notch_hz": 0.0,
+                        "chorus": 0.0,
+                        "flanger": 0.0,
+                        "phaser": 0.0,
+                        "limiter": 0.0,
+                        "geq": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(clip.media, 7);
+        assert_eq!(clip.t0, 12);
+        assert_eq!(clip.track, 2);
+        assert_eq!(clip.sat, 0.25);
+        assert_eq!(clip.rot, 14.0);
+        assert_eq!(clip.curve[2], 0.55);
+        assert_eq!(clip.audio_fx.eq_low_db, 3.0);
+        assert!(clip.audio_fx.compress);
     }
 
     #[test]

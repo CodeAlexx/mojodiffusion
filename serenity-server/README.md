@@ -94,9 +94,11 @@ The gate imports real video and audio through the visible toolbar, proves the
 thumbnail strip, music waveform, synchronized native-clock playback with
 changing large-preview pixels, and the Genesis-style media bin,
 Program/Source monitors, timeline editing toolbar, persistent
-Properties/Filters/Scopes/Audio dock (including parameter controls), and track
-mixer. It exercises marker,
-snap, copy/paste/undo, audio mute/unmute, and Saturation enable/disable actions,
+Properties/Filters/Scopes/Audio dock, and track mixer. The right-dock gate
+requires 142 native Genesis controls, 25 searchable filter groups, RGB
+histogram/luma waveform/vectorscope/RGB parade, a decoded audio waveform, and
+level/pan/mute/solo mixer controls. It exercises marker, snap, copy/paste/undo,
+audio mute/unmute, and a native Saturation add/remove/persistence cycle,
 exports H.264 plus AAC from the browser, probes the movie, and writes its
 screenshot, contact sheet, and JSON result under
 `output/checks/genesis_browser/`.

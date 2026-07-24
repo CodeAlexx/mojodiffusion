@@ -190,6 +190,29 @@ function runChecked(command, args) {
       await page.locator('.ve-dock-tab[data-dock="properties"]').click();
       assert(await page.locator(".ve-props-panel").isVisible(),
         "saved project clip parameters are not visible in Properties");
+      const nativePropertyControls = await page.locator(
+        ".ve-props-panel .ve-genesis-control",
+      ).count();
+      assert(nativePropertyControls >= 100,
+        `native Genesis property controls=${nativePropertyControls}`);
+      await page.locator('.ve-dock-tab[data-dock="filters"]').click();
+      assert(await page.locator(".ve-genesis-filter-catalog").isVisible(),
+        "saved project native filter catalog is missing");
+      const nativeFilterCount = await page.locator(
+        ".ve-filter-options button",
+      ).count();
+      assert(nativeFilterCount >= 20,
+        `native Genesis filter catalog entries=${nativeFilterCount}`);
+      await page.locator('.ve-dock-tab[data-dock="scopes"]').click();
+      assert(await page.locator(".ve-scope-grid canvas").count() === 4,
+        "saved project does not expose all four scopes");
+      await page.locator('.ve-dock-tab[data-dock="audio"]').click();
+      const mixerTrackCount = await page.locator(".ve-audio-mixer-strip").count();
+      assert(mixerTrackCount >= 1,
+        `saved project mixer tracks=${mixerTrackCount}`);
+      assert(await page.locator("#ve-audio-waveform").isVisible(),
+        "saved project audio waveform scope is missing");
+      await page.locator('.ve-dock-tab[data-dock="properties"]').click();
       assert(
         !diagnostics.tracks.some((track) => track.clips.some(
           (clip) => ["Intro", "Scene 1", "Overlay", "Music.mp3"].includes(clip.label)
@@ -217,8 +240,10 @@ function runChecked(command, args) {
           timeline_toolbar_buttons:
             await page.locator("#ve-edit-toolbar .ve-edit-btn").count(),
           persistent_dock_tabs: diagnostics.dockTabCount,
-          properties_parameter_controls:
-            await page.locator(".ve-props-panel input, .ve-props-panel select").count(),
+          properties_parameter_controls: nativePropertyControls,
+          native_filter_catalog_entries: nativeFilterCount,
+          live_scopes: 4,
+          audio_mixer_tracks: mixerTrackCount,
         },
         thumbnail_clip_count: diagnostics.thumbnailClipIds.length,
         tracks: diagnostics.tracks,
@@ -343,35 +368,36 @@ function runChecked(command, args) {
     const baseHash = await readCanvasHash();
 
     assert(await page.locator(".ve-props-panel").isVisible(), "video import did not expose edits");
-    await page.locator(".ve-add-effect-btn").click();
-    const addPreview = waitForPreview();
-    await page.getByText("Saturation", { exact: true }).click();
-    await addPreview;
-
     const effectSlider = page.locator(
-      '.ve-effect-card input[type="range"]',
-    ).first();
+      '.ve-genesis-control[data-property="sat"] input[type="range"]',
+    );
+    assert(await effectSlider.count() === 1,
+      "native Genesis Saturation property is missing");
     const changedPreview = waitForPreview();
     await effectSlider.evaluate((element) => {
       element.value = "0";
       element.dispatchEvent(new Event("input", { bubbles: true }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await changedPreview;
     const effectHash = await readCanvasHash();
     assert(effectHash !== baseHash, "saturation edit did not change the Genesis preview");
 
-    const enabledCheckbox = page.locator(
-      '.ve-effect-card input[type="checkbox"]',
-    ).first();
+    await page.locator('.ve-dock-tab[data-dock="filters"]').click();
+    assert(await page.locator(".ve-genesis-filter-catalog").isVisible(),
+      "native Genesis filter catalog did not open");
+    const enabledCheckbox = page.locator(".ve-filter-applied .ve-filter-row input").first();
     const disabledPreview = waitForPreview();
-    await enabledCheckbox.uncheck();
+    await enabledCheckbox.click();
     await disabledPreview;
     const disabledHash = await readCanvasHash();
-    assert(disabledHash === baseHash, "disabled effect still changed the Genesis preview");
+    assert(disabledHash === baseHash, "removed native filter still changed the Genesis preview");
 
+    await page.locator('.ve-dock-tab[data-dock="properties"]').click();
     const reenabledPreview = waitForPreview();
-    await enabledCheckbox.check();
+    await effectSlider.evaluate((element) => {
+      element.value = "0";
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    });
     await reenabledPreview;
     const reenabledHash = await readCanvasHash();
     assert(reenabledHash === effectHash, "re-enabled effect did not restore edited pixels");
@@ -388,8 +414,25 @@ function runChecked(command, args) {
       return lit;
     });
     assert(scopePixels > 100, `scope pixels=${scopePixels}`);
+    for (const selector of [
+      "#ve-scope-waveform",
+      "#ve-scope-vectorscope",
+      "#ve-scope-parade",
+    ]) {
+      const lit = await page.locator(selector).evaluate((canvas) => {
+        const pixels = canvas.getContext("2d").getImageData(
+          0, 0, canvas.width, canvas.height,
+        ).data;
+        let count = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 60) count++;
+        }
+        return count;
+      });
+      assert(lit > 100, `${selector} pixels=${lit}`);
+    }
     await page.locator('.ve-dock-tab[data-dock="filters"]').click();
-    assert(await page.locator(".ve-filter-catalog").isVisible(),
+    assert(await page.locator(".ve-genesis-filter-catalog").isVisible(),
       "filter catalog did not open");
     await page.locator('.ve-dock-tab[data-dock="properties"]').click();
     assert(await page.locator(".ve-props-panel").isVisible(),
@@ -451,13 +494,18 @@ function runChecked(command, args) {
       window.VideoEditTab?.getDiagnostics?.().waveformClipIds.length === 1
     ), { timeout: 30000 });
     await page.locator('.ve-dock-tab[data-dock="audio"]').click();
-    assert(await page.locator(".ve-audio-strip").count() >= 2,
+    assert(await page.locator(".ve-audio-mixer-strip").count() >= 2,
       "audio mixer did not expose video and music tracks");
-    const muteButton = page.locator(".ve-audio-strip button").last();
+    assert(await page.locator("#ve-audio-waveform").isVisible(),
+      "audio waveform scope is missing");
+    const muteButton = page.locator(".ve-audio-mixer-strip").last()
+      .locator(".ve-audio-mixer-buttons button").first();
     await muteButton.click();
-    assert(await muteButton.textContent() === "Muted", "audio track did not mute");
+    assert(await muteButton.evaluate((button) => button.classList.contains("ve-active")),
+      "audio track did not mute");
     await muteButton.click();
-    assert(await muteButton.textContent() === "Mute", "audio track did not unmute");
+    assert(!await muteButton.evaluate((button) => button.classList.contains("ve-active")),
+      "audio track did not unmute");
 
     const previewHashBeforePlayback = await readCanvasHash();
     await page.click("#ve-btn-play");
@@ -548,13 +596,11 @@ function runChecked(command, args) {
       `${baseUrl}/video_edit/projects/${projectId}`,
     );
     const savedProject = await saved.json();
-    const savedEffect = savedProject.tracks?.[0]?.clips?.[0]?.effects?.[0];
+    const savedGenesis = savedProject.tracks?.[0]?.clips?.[0]?.genesis;
     const savedMusic = savedProject.tracks
       ?.find((track) => track.type === "audio")
       ?.clips?.[0];
-    assert(savedEffect?.type === "saturation", "browser effect was not persisted");
-    assert(savedEffect?.enabled === true, "persisted browser effect is disabled");
-    assert(savedEffect?.params?.value === 0, "persisted saturation value is not zero");
+    assert(savedGenesis?.sat === 0, "native Genesis saturation was not persisted");
     assert(savedMusic?.source_path, "music clip was not persisted");
     assert(savedMusic.endFrame - savedMusic.startFrame === audioMedia.duration_frames,
       "music duration was not persisted");
@@ -585,7 +631,7 @@ function runChecked(command, args) {
           await page.locator("#ve-edit-toolbar .ve-edit-btn").count(),
         persistent_dock_tabs: layoutDiagnostics.dockTabCount,
         live_scope_pixels: scopePixels,
-        audio_mixer_tracks: await page.locator(".ve-audio-strip").count(),
+        audio_mixer_tracks: await page.locator(".ve-audio-mixer-strip").count(),
         marker_action: true,
         snap_toggle: true,
         copy_paste_undo: true,

@@ -38,6 +38,305 @@ var VideoEditTab = (function () {
         flip_v:     { name: 'Flip V',     category: 'utility', defaults: {}, range: {} },
     };
 
+    // Native Genesis property payload. Field names and identity defaults mirror
+    // vendor/genesis/web/src/model.rs so the browser can drive the same render
+    // path as the desktop editor without flattening the model into legacy FX.
+    var GENESIS_CLIP_DEFAULTS = {
+        look: 0, look_amt: 1, lut: '',
+        fade_in: 0, fade_out: 0,
+        px: 0, py: 0, pw: 1, ph: 1,
+        gain: 1,
+        bright: 0, contrast: 1, sat: 1,
+        lift: [0, 0, 0], gamma: [1, 1, 1], gain_rgb: [1, 1, 1],
+        wb_temp: 0, wb_tint: 0,
+        rot: 0, scale: 1, blur: 0,
+        audio_fx: {
+            eq_low_db: 0, eq_mid_db: 0, eq_high_db: 0, pan: 0,
+            compress: false, gate: false, normalize: false,
+            reverb: 0, delay_ms: 0, delay_decay: 0.5, pitch: 0,
+            lowpass_hz: 0, highpass_hz: 0, tremolo: 0,
+            bass_db: 0, treble_db: 0, notch_hz: 0, chorus: 0,
+            flanger: 0, phaser: 0, limiter: 0,
+            geq: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        chroma: {
+            enabled: false, key: [0, 1, 0],
+            similarity: 0.4, smoothness: 0.1, spill: 0,
+        },
+        title: { text: '', size_frac: 0.1, x: 0.05, y: 0.05, rgb: [1, 1, 1] },
+        curve: [0, 0.25, 0.5, 0.75, 1],
+        vignette: 0, sharpen: 0, flip: 0, fx: 0,
+        hsl: [0, 1, 0], levels: [0, 1, 1],
+        mosaic: 0, gmap_amt: 0, gmap_lo: [0, 0, 0], gmap_hi: [1, 1, 1],
+        denoise: 0, glow_amt: 0, glow_thr: 0.7, rgbshift: 0,
+        halftone: 0, emboss: 0, edge: 0,
+        grain: 0, scratches: 0, diffusion: 0,
+        wave: 0, swirl: 0, threshold: 0,
+        lens: 0, crop: 0, glitch: 0,
+        eq360: false, eq_yaw: 0, eq_pitch: 0, eq_fov: 90,
+        speed: 1, reverse: false,
+        blend_mode: 0,
+        mask_shape: 0, mask_cx: 0.5, mask_cy: 0.5,
+        mask_rw: 0.5, mask_rh: 0.5, mask_feather: 0, mask_invert: false,
+        mirror_x: 0, kaleido: 0, dither: 0,
+        sel_band: 0, sel_hshift: 0, sel_sat: 1,
+        sol_thr: 0, temp: 0,
+    };
+
+    var GENESIS_PROJECT_DEFAULTS = {
+        bright: 0, contrast: 1, sat: 1,
+        bright_kf: [], contrast_kf: [], sat_kf: [], opacity_kf: [],
+        gain_kf: [], pip_kf: [],
+        kf_interp: 'Linear',
+        export_in: -1, export_out: -1,
+        export: {
+            out_w: 1280, out_h: 856, fps_num: 30, fps_den: 1,
+            rate_mode: 0, rate_value: 4000000, crf: 23,
+            vcodec: 'mpeg4', gop: 0, preset: '', abitrate: 0, acodec: '',
+        },
+    };
+
+    var GENESIS_FILTER_CATALOG = [
+        { name: 'Brightness / Contrast / Saturation', category: 'Color', paths: ['bright', 'contrast', 'sat'], add: { bright: 0.1 } },
+        { name: 'Color Wheels (Lift / Gamma / Gain)', category: 'Color', paths: ['lift', 'gamma', 'gain_rgb'], add: { 'gamma.0': 1.1, 'gamma.1': 1.1, 'gamma.2': 1.1 } },
+        { name: 'White Balance', category: 'Color', paths: ['wb_temp', 'wb_tint'], add: { wb_temp: 0.2 } },
+        { name: 'Curves', category: 'Color', paths: ['curve'], add: { 'curve.2': 0.55 } },
+        { name: 'HSL Adjust', category: 'Color', paths: ['hsl'], add: { 'hsl.0': 15 } },
+        { name: 'Levels', category: 'Color', paths: ['levels'], add: { 'levels.0': 0.05, 'levels.1': 0.95 } },
+        { name: 'Selective Color', category: 'Color', paths: ['sel_band', 'sel_hshift', 'sel_sat'], add: { sel_band: 1 } },
+        { name: 'Solarize / Temperature', category: 'Color', paths: ['sol_thr', 'temp'], add: { sol_thr: 0.5 } },
+        { name: 'Transform', category: 'Geometry', paths: ['rot', 'scale'], add: { scale: 1.1 } },
+        { name: 'Gaussian Blur', category: 'Geometry', paths: ['blur'], add: { blur: 2 } },
+        { name: 'Lens / Crop / Glitch', category: 'Geometry', paths: ['lens', 'crop', 'glitch'], add: { lens: 0.15 } },
+        { name: '360 Reframe', category: 'Geometry', paths: ['eq360', 'eq_yaw', 'eq_pitch', 'eq_fov'], add: { eq360: true } },
+        { name: 'Shape Mask', category: 'Geometry', paths: ['mask_shape', 'mask_cx', 'mask_cy', 'mask_rw', 'mask_rh', 'mask_feather', 'mask_invert'], add: { mask_shape: 1 } },
+        { name: 'Vignette', category: 'Stylize', paths: ['vignette'], add: { vignette: 0.5 } },
+        { name: 'Sharpen', category: 'Stylize', paths: ['sharpen'], add: { sharpen: 0.5 } },
+        { name: 'Flip / Mirror', category: 'Stylize', paths: ['flip'], add: { flip: 1 } },
+        { name: 'Simple FX', category: 'Stylize', paths: ['fx'], add: { fx: 1 } },
+        { name: 'Mosaic / Gradient Map', category: 'Stylize', paths: ['mosaic', 'gmap_amt', 'gmap_lo', 'gmap_hi'], add: { mosaic: 8 } },
+        { name: 'Denoise / Glow / RGB Shift', category: 'Stylize', paths: ['denoise', 'glow_amt', 'glow_thr', 'rgbshift'], add: { denoise: 0.5 } },
+        { name: 'Halftone / Emboss / Edge', category: 'Stylize', paths: ['halftone', 'emboss', 'edge'], add: { halftone: 4 } },
+        { name: 'Old Film', category: 'Stylize', paths: ['grain', 'scratches', 'diffusion'], add: { grain: 0.3 } },
+        { name: 'Wave / Swirl / Threshold', category: 'Distort', paths: ['wave', 'swirl', 'threshold'], add: { wave: 4 } },
+        { name: 'Mirror / Kaleidoscope / Dither', category: 'Distort', paths: ['mirror_x', 'kaleido', 'dither'], add: { mirror_x: 1 } },
+        { name: 'Chroma Key', category: 'Composite', paths: ['chroma.enabled', 'chroma.key', 'chroma.similarity', 'chroma.smoothness', 'chroma.spill'], add: { 'chroma.enabled': true } },
+        { name: 'Look (VHS / LUT3D)', category: 'Composite', paths: ['look', 'look_amt', 'lut'], add: { look: 1 } },
+    ];
+
+    function gpRange(path, label, min, max, step, suffix, keyable) {
+        return { type: 'range', path: path, label: label, min: min, max: max, step: step, suffix: suffix || '', keyable: !!keyable };
+    }
+    function gpToggle(path, label) {
+        return { type: 'toggle', path: path, label: label };
+    }
+    function gpChoice(path, label, choices) {
+        return { type: 'choice', path: path, label: label, choices: choices };
+    }
+
+    var GENESIS_PROPERTY_SECTIONS = [
+        {
+            name: 'PiP / Composite',
+            open: true,
+            controls: [
+                gpRange('px', 'X', 0, 1, 0.01, '', true),
+                gpRange('py', 'Y', 0, 1, 0.01, '', true),
+                gpRange('pw', 'Width', 0.05, 1, 0.01, '', true),
+                gpRange('ph', 'Height', 0.05, 1, 0.01, '', true),
+                gpChoice('blend_mode', 'Blend', [
+                    [0, 'Normal'], [1, 'Multiply'], [2, 'Screen'], [3, 'Overlay'],
+                    [4, 'Add'], [5, 'Darken'], [6, 'Lighten'], [7, 'Difference'],
+                ]),
+            ],
+        },
+        {
+            name: 'Fades / Speed',
+            open: true,
+            controls: [
+                gpRange('fade_in', 'Fade in', 0, 300, 1, 'f'),
+                gpRange('fade_out', 'Fade out', 0, 300, 1, 'f'),
+                gpRange('speed', 'Speed', 0.05, 8, 0.05, 'x'),
+                gpToggle('reverse', 'Reverse playback'),
+            ],
+        },
+        {
+            name: 'Audio',
+            controls: [
+                gpRange('gain', 'Gain', 0, 4, 0.01, 'x'),
+                gpRange('audio_fx.eq_low_db', 'EQ Low', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.eq_mid_db', 'EQ Mid', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.eq_high_db', 'EQ High', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.pan', 'Pan L ↔ R', -1, 1, 0.01),
+                gpToggle('audio_fx.compress', 'Compressor'),
+                gpToggle('audio_fx.gate', 'Noise gate'),
+                gpToggle('audio_fx.normalize', 'Normalize loudness'),
+                gpRange('audio_fx.reverb', 'Reverb', 0, 1, 0.01),
+                gpRange('audio_fx.delay_ms', 'Delay', 0, 2000, 1, ' ms'),
+                gpRange('audio_fx.delay_decay', 'Delay decay', 0, 0.95, 0.01),
+                gpRange('audio_fx.pitch', 'Pitch', -24, 24, 0.1, ' semitones'),
+                gpRange('audio_fx.lowpass_hz', 'Low pass', 0, 20000, 10, ' Hz'),
+                gpRange('audio_fx.highpass_hz', 'High pass', 0, 20000, 10, ' Hz'),
+                gpRange('audio_fx.tremolo', 'Tremolo', 0, 0.95, 0.01),
+                gpRange('audio_fx.bass_db', 'Bass', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.treble_db', 'Treble', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.notch_hz', 'Notch', 0, 20000, 10, ' Hz'),
+                gpRange('audio_fx.chorus', 'Chorus', 0, 1, 0.01),
+                gpRange('audio_fx.flanger', 'Flanger', 0, 1, 0.01),
+                gpRange('audio_fx.phaser', 'Phaser', 0, 1, 0.01),
+                gpRange('audio_fx.limiter', 'Limiter', 0, 1, 0.01),
+                gpRange('audio_fx.geq.0', '31 Hz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.1', '62 Hz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.2', '125 Hz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.3', '250 Hz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.4', '500 Hz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.5', '1 kHz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.6', '2 kHz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.7', '4 kHz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.8', '8 kHz', -24, 24, 0.5, ' dB'),
+                gpRange('audio_fx.geq.9', '16 kHz', -24, 24, 0.5, ' dB'),
+            ],
+        },
+        {
+            name: 'Clip Grade',
+            open: true,
+            controls: [
+                gpRange('bright', 'Brightness', -1, 1, 0.01, '', true),
+                gpRange('contrast', 'Contrast', 0, 2, 0.01, '', true),
+                gpRange('sat', 'Saturation', 0, 2, 0.01, '', true),
+            ],
+        },
+        {
+            name: 'Color Wheels',
+            controls: [
+                gpRange('lift.0', 'Lift R', -1, 1, 0.01),
+                gpRange('lift.1', 'Lift G', -1, 1, 0.01),
+                gpRange('lift.2', 'Lift B', -1, 1, 0.01),
+                gpRange('gamma.0', 'Gamma R', 0.05, 2, 0.01),
+                gpRange('gamma.1', 'Gamma G', 0.05, 2, 0.01),
+                gpRange('gamma.2', 'Gamma B', 0.05, 2, 0.01),
+                gpRange('gain_rgb.0', 'Gain R', 0, 4, 0.01),
+                gpRange('gain_rgb.1', 'Gain G', 0, 4, 0.01),
+                gpRange('gain_rgb.2', 'Gain B', 0, 4, 0.01),
+                gpRange('wb_temp', 'Temperature', -1, 1, 0.01),
+                gpRange('wb_tint', 'Tint', -1, 1, 0.01),
+            ],
+        },
+        {
+            name: 'Transform / Blur',
+            controls: [
+                gpRange('rot', 'Rotation', -180, 180, 0.1, '°', true),
+                gpRange('scale', 'Scale', 0.1, 4, 0.01, 'x', true),
+                gpRange('blur', 'Gaussian blur', 0, 20, 0.1, ' σ', true),
+            ],
+        },
+        {
+            name: 'Curve / Utility',
+            controls: [
+                gpRange('curve.0', 'Black', 0, 1, 0.01),
+                gpRange('curve.1', 'Shadow', 0, 1, 0.01),
+                gpRange('curve.2', 'Mid', 0, 1, 0.01),
+                gpRange('curve.3', 'Highlight', 0, 1, 0.01),
+                gpRange('curve.4', 'White', 0, 1, 0.01),
+                gpRange('vignette', 'Vignette', 0, 1, 0.01),
+                gpRange('sharpen', 'Sharpen', 0, 2, 0.01),
+                gpChoice('flip', 'Flip', [[0, 'None'], [1, 'Horizontal'], [2, 'Vertical'], [3, 'Both']]),
+                gpChoice('fx', 'Simple FX', [[0, 'None'], [1, 'Invert'], [2, 'Sepia'], [3, 'Grayscale'], [4, 'Posterize']]),
+            ],
+        },
+        {
+            name: 'HSL / Levels',
+            controls: [
+                gpRange('hsl.0', 'Hue shift', -180, 180, 1, '°'),
+                gpRange('hsl.1', 'Saturation', 0, 2, 0.01),
+                gpRange('hsl.2', 'Lightness', -1, 1, 0.01),
+                gpRange('levels.0', 'Input black', 0, 1, 0.01),
+                gpRange('levels.1', 'Input white', 0, 1, 0.01),
+                gpRange('levels.2', 'Gamma', 0.1, 4, 0.01),
+            ],
+        },
+        {
+            name: 'Stylize',
+            controls: [
+                gpRange('mosaic', 'Mosaic', 0, 64, 1, ' px'),
+                gpRange('gmap_amt', 'Gradient map', 0, 1, 0.01),
+                { type: 'color', path: 'gmap_lo', label: 'Shadows' },
+                { type: 'color', path: 'gmap_hi', label: 'Highlights' },
+                gpRange('denoise', 'Denoise', 0, 1, 0.01),
+                gpRange('glow_amt', 'Glow amount', 0, 1, 0.01),
+                gpRange('glow_thr', 'Glow threshold', 0, 1, 0.01),
+                gpRange('rgbshift', 'RGB shift', 0, 32, 0.1, ' px'),
+                gpRange('halftone', 'Halftone', 0, 32, 1, ' px'),
+                gpRange('emboss', 'Emboss', 0, 1, 0.01),
+                gpRange('edge', 'Edge / Sketch', 0, 1, 0.01),
+                gpRange('grain', 'Film grain', 0, 1, 0.01),
+                gpRange('scratches', 'Scratches', 0, 1, 0.01),
+                gpRange('diffusion', 'Diffusion', 0, 16, 0.1, ' px'),
+            ],
+        },
+        {
+            name: 'Distort / Geometry',
+            controls: [
+                gpRange('wave', 'Wave', 0, 64, 0.1, ' px'),
+                gpRange('swirl', 'Swirl', -6.28, 6.28, 0.01, ' rad'),
+                gpRange('threshold', 'Threshold', 0, 1, 0.01),
+                gpRange('lens', 'Lens', -1, 1, 0.01),
+                gpRange('crop', 'Crop', 0, 0.49, 0.01),
+                gpRange('glitch', 'Glitch', 0, 64, 0.1, ' px'),
+                gpToggle('eq360', '360 equirectangular'),
+                gpRange('eq_yaw', 'Yaw', -180, 180, 1, '°'),
+                gpRange('eq_pitch', 'Pitch', -90, 90, 1, '°'),
+                gpRange('eq_fov', 'Field of view', 20, 160, 1, '°'),
+            ],
+        },
+        {
+            name: 'Mask',
+            controls: [
+                gpChoice('mask_shape', 'Shape', [[0, 'None'], [1, 'Rectangle'], [2, 'Ellipse']]),
+                gpRange('mask_cx', 'Center X', 0, 1, 0.01),
+                gpRange('mask_cy', 'Center Y', 0, 1, 0.01),
+                gpRange('mask_rw', 'Width', 0, 0.5, 0.01),
+                gpRange('mask_rh', 'Height', 0, 0.5, 0.01),
+                gpRange('mask_feather', 'Feather', 0, 1, 0.01),
+                gpToggle('mask_invert', 'Invert mask'),
+            ],
+        },
+        {
+            name: 'Distort 3 / Selective Color',
+            controls: [
+                gpToggle('mirror_x', 'Mirror X'),
+                gpRange('kaleido', 'Kaleidoscope', 0, 24, 1, ' segments'),
+                gpRange('dither', 'Dither', 0, 1, 0.01),
+                gpChoice('sel_band', 'Color band', [[0, 'None'], [1, 'Reds'], [2, 'Yellows'], [3, 'Greens'], [4, 'Cyans'], [5, 'Blues'], [6, 'Magentas']]),
+                gpRange('sel_hshift', 'Band hue shift', -1, 1, 0.01),
+                gpRange('sel_sat', 'Band saturation', 0, 2, 0.01),
+                gpRange('sol_thr', 'Solarize', 0, 1, 0.01),
+                gpRange('temp', 'Temperature', -1, 1, 0.01),
+            ],
+        },
+        {
+            name: 'Look / Chroma Key',
+            controls: [
+                gpChoice('look', 'Look', [[0, 'None'], [1, 'VHS'], [2, 'LUT3D']]),
+                gpRange('look_amt', 'Look mix', 0, 1, 0.01),
+                gpToggle('chroma.enabled', 'Enable chroma key'),
+                { type: 'color', path: 'chroma.key', label: 'Key color' },
+                gpRange('chroma.similarity', 'Similarity', 0, 1, 0.01),
+                gpRange('chroma.smoothness', 'Smoothness', 0, 1, 0.01),
+                gpRange('chroma.spill', 'Spill suppression', 0, 1, 0.01),
+            ],
+        },
+        {
+            name: 'Title / Text',
+            controls: [
+                { type: 'textarea', path: 'title.text', label: 'Text' },
+                gpRange('title.size_frac', 'Size', 0.02, 0.5, 0.01),
+                gpRange('title.x', 'X', 0, 1, 0.01),
+                gpRange('title.y', 'Y', 0, 1, 0.01),
+                { type: 'color', path: 'title.rgb', label: 'Color' },
+            ],
+        },
+    ];
+
     var TRANSITION_TYPES = [
         { type: 'none', name: 'None' },
         { type: 'fade', name: 'Fade' },
@@ -161,6 +460,7 @@ var VideoEditTab = (function () {
     var propsPanelEl = null;
     var propsPanelClipId = null;
     var addEffectDropdownEl = null;
+    var genesisFilterClipboard = null;
 
     // --- V7 State: RIFE Interpolation ---
     var activeRifeJobId = null;
@@ -357,7 +657,8 @@ var VideoEditTab = (function () {
             width: project.width || 1280,
             height: project.height || 720,
             markers: project.markers || [],
-            tracks: project.tracks
+            tracks: project.tracks,
+            genesis: ensureGenesisProjectState(),
         };
         fetch(getApiBase() + '/video_edit/projects/' + projectId, {
             method: 'PUT',
@@ -374,6 +675,7 @@ var VideoEditTab = (function () {
         project.width = clamp(Math.round(Number(data.width) || 1280), 16, 8192);
         project.height = clamp(Math.round(Number(data.height) || 720), 16, 8192);
         project.markers = Array.isArray(data.markers) ? data.markers : [];
+        project.genesis = mergeIdentityDefaults(data.genesis, GENESIS_PROJECT_DEFAULTS);
         FPS = project.fps;
         if (Array.isArray(data.tracks)) {
             project.tracks = data.tracks;
@@ -446,7 +748,8 @@ var VideoEditTab = (function () {
                 width: project.width,
                 height: project.height,
                 markers: project.markers,
-                tracks: project.tracks
+                tracks: project.tracks,
+                genesis: ensureGenesisProjectState(),
             })
         })
         .then(function (r) { return r.json(); })
@@ -925,6 +1228,481 @@ var VideoEditTab = (function () {
         renderDock();
     }
 
+    function cloneJson(value) {
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function mergeIdentityDefaults(target, defaults) {
+        if (!target || typeof target !== 'object' || Array.isArray(target)) {
+            target = {};
+        }
+        Object.keys(defaults).forEach(function (key) {
+            var fallback = defaults[key];
+            if (target[key] === undefined || target[key] === null) {
+                target[key] = cloneJson(fallback);
+            } else if (
+                fallback && typeof fallback === 'object' && !Array.isArray(fallback) &&
+                target[key] && typeof target[key] === 'object' && !Array.isArray(target[key])
+            ) {
+                target[key] = mergeIdentityDefaults(target[key], fallback);
+            }
+        });
+        return target;
+    }
+
+    function ensureGenesisClipState(clip) {
+        clip.genesis = mergeIdentityDefaults(clip.genesis, GENESIS_CLIP_DEFAULTS);
+        // Preserve the legacy timeline fields while the native payload becomes
+        // authoritative for Genesis rendering.
+        if (clip.fade_in !== undefined && clip.genesis.fade_in === 0) clip.genesis.fade_in = clip.fade_in;
+        if (clip.fade_out !== undefined && clip.genesis.fade_out === 0) clip.genesis.fade_out = clip.fade_out;
+        return clip.genesis;
+    }
+
+    function ensureGenesisProjectState() {
+        project.genesis = mergeIdentityDefaults(project.genesis, GENESIS_PROJECT_DEFAULTS);
+        if (!project.genesis.export.out_w) project.genesis.export.out_w = project.width || 1280;
+        if (!project.genesis.export.out_h) project.genesis.export.out_h = project.height || 720;
+        if (!project.genesis.export.fps_num) project.genesis.export.fps_num = FPS;
+        return project.genesis;
+    }
+
+    function getPathValue(root, path) {
+        var parts = path.split('.');
+        var value = root;
+        for (var i = 0; i < parts.length; i++) {
+            if (value === undefined || value === null) return undefined;
+            value = value[parts[i]];
+        }
+        return value;
+    }
+
+    function setPathValue(root, path, value) {
+        var parts = path.split('.');
+        var target = root;
+        for (var i = 0; i < parts.length - 1; i++) {
+            var key = parts[i];
+            if (target[key] === undefined || target[key] === null) {
+                target[key] = /^\d+$/.test(parts[i + 1]) ? [] : {};
+            }
+            target = target[key];
+        }
+        target[parts[parts.length - 1]] = value;
+    }
+
+    function genesisDefaultValue(path) {
+        return cloneJson(getPathValue(GENESIS_CLIP_DEFAULTS, path));
+    }
+
+    function valuesEqual(left, right) {
+        return JSON.stringify(left) === JSON.stringify(right);
+    }
+
+    function commitGenesisEdit() {
+        renderTimeline();
+        scheduleAutosave();
+        updatePreviewDebounced();
+        if (dockTab === 'scopes') updateScopes();
+    }
+
+    function genesisClipIndex(clipId) {
+        var index = 0;
+        for (var ti = 0; ti < project.tracks.length; ti++) {
+            var track = project.tracks[ti];
+            if (track.type === 'text') continue;
+            for (var ci = 0; ci < track.clips.length; ci++) {
+                if (track.clips[ci].id === clipId) return index;
+                if (track.clips[ci].source_path) index++;
+            }
+        }
+        return -1;
+    }
+
+    function keyGenesisClipParameter(clip, path) {
+        var registry = {
+            px: 0, py: 1, pw: 2, ph: 3,
+            bright: 4, contrast: 5, sat: 6, blur: 7, rot: 8, scale: 9,
+        };
+        if (registry[path] === undefined) return;
+        var clipIndex = genesisClipIndex(clip.id);
+        if (clipIndex < 0) return;
+        var state = ensureGenesisProjectState();
+        var local = Math.max(0, currentFrame - (clip.startFrame || 0));
+        var key = {
+            clip: clipIndex,
+            par: registry[path],
+            t_local: local,
+            v: Number(getPathValue(ensureGenesisClipState(clip), path)),
+            interp: state.kf_interp || 'Linear',
+        };
+        var existing = state.pip_kf.findIndex(function (candidate) {
+            return candidate.clip === key.clip && candidate.par === key.par && candidate.t_local === key.t_local;
+        });
+        pushUndo();
+        if (existing >= 0) state.pip_kf[existing] = key;
+        else state.pip_kf.push(key);
+        scheduleAutosave();
+        renderDock();
+    }
+
+    function createGenesisControl(clip, descriptor) {
+        var state = ensureGenesisClipState(clip);
+        var row = document.createElement('div');
+        row.className = 've-genesis-control';
+        row.dataset.property = descriptor.path;
+
+        var label = document.createElement('label');
+        label.textContent = descriptor.label;
+        row.appendChild(label);
+
+        if (descriptor.type === 'range') {
+            var slider = document.createElement('input');
+            slider.type = 'range';
+            slider.min = descriptor.min;
+            slider.max = descriptor.max;
+            slider.step = descriptor.step;
+            slider.value = getPathValue(state, descriptor.path);
+
+            var numeric = document.createElement('input');
+            numeric.type = 'number';
+            numeric.min = descriptor.min;
+            numeric.max = descriptor.max;
+            numeric.step = descriptor.step;
+            numeric.value = slider.value;
+            numeric.title = descriptor.label + (descriptor.suffix || '');
+
+            var suffix = document.createElement('span');
+            suffix.className = 've-genesis-suffix';
+            suffix.textContent = descriptor.suffix || '';
+
+            var apply = function (raw) {
+                var value = Number(raw);
+                if (!Number.isFinite(value)) return;
+                value = clamp(value, Number(descriptor.min), Number(descriptor.max));
+                if (descriptor.step >= 1) value = Math.round(value);
+                setPathValue(state, descriptor.path, value);
+                slider.value = value;
+                numeric.value = value;
+                if (descriptor.path === 'fade_in') clip.fade_in = value;
+                if (descriptor.path === 'fade_out') clip.fade_out = value;
+                commitGenesisEdit();
+            };
+            slider.addEventListener('pointerdown', pushUndo, { once: true });
+            slider.addEventListener('input', function () { apply(slider.value); });
+            numeric.addEventListener('focus', function () { pushUndo(); }, { once: true });
+            numeric.addEventListener('change', function () { apply(numeric.value); });
+            row.appendChild(slider);
+            row.appendChild(numeric);
+            row.appendChild(suffix);
+
+            if (descriptor.keyable) {
+                var keyButton = document.createElement('button');
+                keyButton.className = 've-keyframe-button';
+                keyButton.textContent = '◆';
+                keyButton.title = 'Key ' + descriptor.label + ' at playhead';
+                keyButton.addEventListener('click', function () {
+                    keyGenesisClipParameter(clip, descriptor.path);
+                });
+                row.appendChild(keyButton);
+            }
+        } else if (descriptor.type === 'toggle') {
+            var checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = !!getPathValue(state, descriptor.path);
+            checkbox.addEventListener('change', function () {
+                pushUndo();
+                var value = checkbox.checked;
+                if (descriptor.path === 'mirror_x') value = value ? 1 : 0;
+                setPathValue(state, descriptor.path, value);
+                commitGenesisEdit();
+            });
+            row.appendChild(checkbox);
+        } else if (descriptor.type === 'choice') {
+            var select = document.createElement('select');
+            descriptor.choices.forEach(function (choice) {
+                var option = document.createElement('option');
+                option.value = choice[0];
+                option.textContent = choice[1];
+                if (String(choice[0]) === String(getPathValue(state, descriptor.path))) option.selected = true;
+                select.appendChild(option);
+            });
+            select.addEventListener('change', function () {
+                pushUndo();
+                var sample = descriptor.choices[0][0];
+                setPathValue(state, descriptor.path, typeof sample === 'number' ? Number(select.value) : select.value);
+                commitGenesisEdit();
+            });
+            row.appendChild(select);
+        } else if (descriptor.type === 'textarea') {
+            var textarea = document.createElement('textarea');
+            textarea.rows = 3;
+            textarea.value = getPathValue(state, descriptor.path) || '';
+            textarea.addEventListener('focus', function () { pushUndo(); }, { once: true });
+            textarea.addEventListener('input', function () {
+                setPathValue(state, descriptor.path, textarea.value);
+                commitGenesisEdit();
+            });
+            row.classList.add('ve-genesis-control-wide');
+            row.appendChild(textarea);
+        } else if (descriptor.type === 'color') {
+            var color = document.createElement('input');
+            color.type = 'color';
+            var rgb = getPathValue(state, descriptor.path) || [0, 0, 0];
+            color.value = '#' + rgb.map(function (component) {
+                return Math.round(clamp(Number(component), 0, 1) * 255).toString(16).padStart(2, '0');
+            }).join('');
+            color.addEventListener('change', function () {
+                pushUndo();
+                var hex = color.value;
+                setPathValue(state, descriptor.path, [
+                    parseInt(hex.slice(1, 3), 16) / 255,
+                    parseInt(hex.slice(3, 5), 16) / 255,
+                    parseInt(hex.slice(5, 7), 16) / 255,
+                ]);
+                commitGenesisEdit();
+            });
+            row.appendChild(color);
+        }
+        return row;
+    }
+
+    function renderGenesisSection(panel, clip, section) {
+        var details = document.createElement('details');
+        details.className = 've-genesis-section';
+        details.open = !!section.open;
+        var summary = document.createElement('summary');
+        summary.textContent = section.name;
+        details.appendChild(summary);
+        var body = document.createElement('div');
+        body.className = 've-genesis-section-body';
+        section.controls.forEach(function (descriptor) {
+            body.appendChild(createGenesisControl(clip, descriptor));
+        });
+        var reset = document.createElement('button');
+        reset.className = 've-genesis-reset';
+        reset.textContent = 'Reset ' + section.name;
+        reset.addEventListener('click', function () {
+            pushUndo();
+            var state = ensureGenesisClipState(clip);
+            section.controls.forEach(function (descriptor) {
+                setPathValue(state, descriptor.path, genesisDefaultValue(descriptor.path));
+            });
+            if (section.name === 'Fades / Speed') {
+                clip.fade_in = 0;
+                clip.fade_out = 0;
+            }
+            commitGenesisEdit();
+            renderPropertiesPanelContent(panel, clip);
+        });
+        body.appendChild(reset);
+        details.appendChild(body);
+        panel.appendChild(details);
+    }
+
+    function addProjectGradeKey(path, value) {
+        var state = ensureGenesisProjectState();
+        var trackName = path + '_kf';
+        var key = { t: currentFrame, v: Number(value), interp: state.kf_interp || 'Linear' };
+        var index = state[trackName].findIndex(function (candidate) { return candidate.t === currentFrame; });
+        if (index >= 0) state[trackName][index] = key;
+        else state[trackName].push(key);
+        state[trackName].sort(function (a, b) { return a.t - b.t; });
+    }
+
+    function renderGenesisProjectBlocks(panel) {
+        var state = ensureGenesisProjectState();
+        var details = document.createElement('details');
+        details.className = 've-genesis-section';
+        details.open = false;
+        details.innerHTML = '<summary>Program Grade / Keyframes</summary>';
+        var body = document.createElement('div');
+        body.className = 've-genesis-section-body';
+        [
+            ['bright', 'Brightness', -1, 1, 0.01],
+            ['contrast', 'Contrast', 0, 2, 0.01],
+            ['sat', 'Saturation', 0, 2, 0.01],
+        ].forEach(function (spec) {
+            var row = document.createElement('div');
+            row.className = 've-genesis-control';
+            var label = document.createElement('label');
+            label.textContent = spec[1];
+            var range = document.createElement('input');
+            range.type = 'range';
+            range.min = spec[2];
+            range.max = spec[3];
+            range.step = spec[4];
+            range.value = state[spec[0]];
+            var value = document.createElement('input');
+            value.type = 'number';
+            value.step = spec[4];
+            value.value = range.value;
+            var key = document.createElement('button');
+            key.className = 've-keyframe-button';
+            key.textContent = '◆';
+            range.addEventListener('input', function () {
+                state[spec[0]] = Number(range.value);
+                value.value = range.value;
+                commitGenesisEdit();
+            });
+            value.addEventListener('change', function () {
+                state[spec[0]] = Number(value.value);
+                range.value = value.value;
+                commitGenesisEdit();
+            });
+            key.addEventListener('click', function () {
+                pushUndo();
+                addProjectGradeKey(spec[0], state[spec[0]]);
+                scheduleAutosave();
+                renderDock();
+            });
+            row.appendChild(label);
+            row.appendChild(range);
+            row.appendChild(value);
+            row.appendChild(key);
+            body.appendChild(row);
+        });
+        var interp = document.createElement('select');
+        [
+            'Discrete', 'Linear', 'Smooth', 'SmoothNatural', 'SmoothLoose', 'SmoothTight',
+            'SineIn', 'SineOut', 'SineInOut', 'QuadIn', 'QuadOut', 'QuadInOut',
+            'CubicIn', 'CubicOut', 'CubicInOut', 'QuartIn', 'QuartOut', 'QuartInOut',
+            'QuintIn', 'QuintOut', 'QuintInOut', 'ExpoIn', 'ExpoOut', 'ExpoInOut',
+            'CircIn', 'CircOut', 'CircInOut', 'BackIn', 'BackOut', 'BackInOut',
+            'ElasticIn', 'ElasticOut', 'ElasticInOut', 'BounceIn', 'BounceOut', 'BounceInOut',
+        ].forEach(function (name) {
+            var option = document.createElement('option');
+            option.value = name;
+            option.textContent = name.replace(/([a-z])([A-Z])/g, '$1 $2');
+            if (name === state.kf_interp) option.selected = true;
+            interp.appendChild(option);
+        });
+        interp.addEventListener('change', function () {
+            state.kf_interp = interp.value;
+            scheduleAutosave();
+        });
+        var interpRow = document.createElement('div');
+        interpRow.className = 've-genesis-control';
+        interpRow.innerHTML = '<label>Keyframe interpolation</label>';
+        interpRow.appendChild(interp);
+        body.appendChild(interpRow);
+        details.appendChild(body);
+        panel.appendChild(details);
+
+        var exportDetails = document.createElement('details');
+        exportDetails.className = 've-genesis-section';
+        exportDetails.innerHTML = '<summary>Export</summary>';
+        var exportBody = document.createElement('div');
+        exportBody.className = 've-genesis-section-body';
+        [
+            ['out_w', 'Width', 16, 7680, 2],
+            ['out_h', 'Height', 16, 4320, 2],
+            ['fps_num', 'FPS numerator', 1, 240000, 1],
+            ['fps_den', 'FPS denominator', 1, 1001, 1],
+            ['rate_value', 'Bitrate / CRF value', 0, 50000000, 1],
+            ['crf', 'CRF', 0, 51, 1],
+            ['gop', 'GOP', 0, 600, 1],
+            ['abitrate', 'Audio bitrate', 0, 320000, 1000],
+        ].forEach(function (spec) {
+            var row = document.createElement('div');
+            row.className = 've-genesis-control';
+            var label = document.createElement('label');
+            label.textContent = spec[1];
+            var input = document.createElement('input');
+            input.type = 'number';
+            input.min = spec[2];
+            input.max = spec[3];
+            input.step = spec[4];
+            input.value = state.export[spec[0]];
+            input.addEventListener('change', function () {
+                state.export[spec[0]] = Number(input.value);
+                scheduleAutosave();
+            });
+            row.appendChild(label);
+            row.appendChild(input);
+            exportBody.appendChild(row);
+        });
+        [
+            ['rate_mode', 'Rate control', [[0, 'Bitrate'], [1, 'Quality (CRF)']]],
+            ['vcodec', 'Video codec', [['mpeg4', 'mpeg4'], ['libx264', 'H.264'], ['libx265', 'H.265']]],
+            ['preset', 'Encoder preset', [['', 'Default'], ['ultrafast', 'ultrafast'], ['veryfast', 'veryfast'], ['medium', 'medium'], ['slow', 'slow'], ['slower', 'slower'], ['veryslow', 'veryslow']]],
+            ['acodec', 'Audio codec', [['', 'Default'], ['aac', 'AAC'], ['libmp3lame', 'MP3'], ['ac3', 'AC-3'], ['pcm_s16le', 'PCM']]],
+        ].forEach(function (spec) {
+            var row = document.createElement('div');
+            row.className = 've-genesis-control';
+            var label = document.createElement('label');
+            label.textContent = spec[1];
+            var select = document.createElement('select');
+            spec[2].forEach(function (choice) {
+                var option = document.createElement('option');
+                option.value = choice[0];
+                option.textContent = choice[1];
+                if (String(choice[0]) === String(state.export[spec[0]])) option.selected = true;
+                select.appendChild(option);
+            });
+            select.addEventListener('change', function () {
+                state.export[spec[0]] = typeof spec[2][0][0] === 'number' ? Number(select.value) : select.value;
+                scheduleAutosave();
+            });
+            row.appendChild(label);
+            row.appendChild(select);
+            exportBody.appendChild(row);
+        });
+        var region = document.createElement('div');
+        region.className = 've-genesis-button-row';
+        [
+            ['Set IN @ playhead', function () { state.export_in = currentFrame; }],
+            ['Set OUT @ playhead', function () { state.export_out = currentFrame; }],
+            ['Clear region', function () { state.export_in = -1; state.export_out = -1; }],
+            ['Open Export', showExportDialog],
+        ].forEach(function (action) {
+            var button = document.createElement('button');
+            button.textContent = action[0];
+            button.addEventListener('click', function () {
+                action[1]();
+                scheduleAutosave();
+            });
+            region.appendChild(button);
+        });
+        exportBody.appendChild(region);
+        exportDetails.appendChild(exportBody);
+        panel.appendChild(exportDetails);
+    }
+
+    function renderGenesisLutPicker(panel, clip) {
+        var state = ensureGenesisClipState(clip);
+        var details = document.createElement('details');
+        details.className = 've-genesis-section';
+        details.innerHTML = '<summary>LUT Library</summary>';
+        var body = document.createElement('div');
+        body.className = 've-genesis-section-body';
+        var select = document.createElement('select');
+        select.className = 've-lut-select';
+        select.innerHTML = '<option value="">None</option>';
+        fetch(getApiBase() + '/video_edit/luts')
+            .then(function (response) { return response.json(); })
+            .then(function (luts) {
+                luts.forEach(function (lut) {
+                    var option = document.createElement('option');
+                    option.value = lut.path;
+                    option.textContent = lut.name;
+                    if (state.lut === lut.path || clip.lut_path === lut.path) option.selected = true;
+                    select.appendChild(option);
+                });
+            })
+            .catch(function () {});
+        select.addEventListener('change', function () {
+            pushUndo();
+            state.lut = select.value;
+            state.look = select.value ? 2 : 0;
+            clip.lut_path = select.value || null;
+            clip.lut_name = select.selectedOptions[0] ? select.selectedOptions[0].textContent : null;
+            commitGenesisEdit();
+        });
+        body.appendChild(select);
+        details.appendChild(body);
+        panel.appendChild(details);
+    }
+
     function renderDock() {
         var content = document.getElementById('ve-dock-content');
         if (!content) return;
@@ -943,47 +1721,17 @@ var VideoEditTab = (function () {
                 content.innerHTML = '<div class="ve-dock-empty">Select a video clip to manage its filter stack.</div>';
                 return;
             }
-            renderFilterCatalog(content, info.clip);
+            renderGenesisFilterCatalog(content, info.clip);
             return;
         }
 
         if (dockTab === 'audio') {
-            var audioTracks = project.tracks.filter(function (track) {
-                return track.type === 'audio' || track.type === 'video';
-            });
-            var heading = document.createElement('div');
-            heading.className = 've-dock-heading';
-            heading.textContent = 'TRACK MIXER';
-            content.appendChild(heading);
-            audioTracks.forEach(function (track) {
-                var strip = document.createElement('div');
-                strip.className = 've-audio-strip';
-                var name = document.createElement('strong');
-                name.textContent = track.name;
-                var mute = document.createElement('button');
-                mute.textContent = track.muted ? 'Muted' : 'Mute';
-                mute.className = track.muted ? 've-active' : '';
-                mute.addEventListener('click', function () {
-                    track.muted = !track.muted;
-                    renderDock();
-                    renderTimeline();
-                    scheduleAutosave();
-                });
-                var clips = document.createElement('span');
-                clips.textContent = track.clips.length + ' clip(s)';
-                strip.appendChild(name);
-                strip.appendChild(clips);
-                strip.appendChild(mute);
-                content.appendChild(strip);
-            });
+            renderAudioDock(content, info);
             return;
         }
 
         if (dockTab === 'scopes') {
-            content.innerHTML =
-                '<div class="ve-dock-heading">LIVE HISTOGRAM</div>' +
-                '<canvas id="ve-scope-histogram" width="288" height="150"></canvas>' +
-                '<div class="ve-scope-note">Updates from the current program frame.</div>';
+            renderScopesDock(content);
             updateScopes();
             return;
         }
@@ -1149,6 +1897,107 @@ var VideoEditTab = (function () {
         renderDock();
     }
 
+    function genesisFilterActive(state, filter) {
+        return filter.paths.some(function (path) {
+            return !valuesEqual(getPathValue(state, path), genesisDefaultValue(path));
+        });
+    }
+
+    function resetGenesisFilter(state, filter) {
+        filter.paths.forEach(function (path) {
+            setPathValue(state, path, genesisDefaultValue(path));
+        });
+    }
+
+    function renderGenesisFilterCatalog(content, clip) {
+        var state = ensureGenesisClipState(clip);
+        var wrapper = document.createElement('div');
+        wrapper.className = 've-filter-catalog ve-genesis-filter-catalog';
+        wrapper.innerHTML =
+            '<div class="ve-dock-heading">FILTER STACK</div>' +
+            '<div class="ve-filter-count"></div>' +
+            '<div class="ve-filter-applied"></div>' +
+            '<div class="ve-dock-heading">ADD FILTER</div>' +
+            '<input class="ve-filter-search" type="search" placeholder="Search 25 native Genesis filters">' +
+            '<div class="ve-filter-options"></div>';
+        content.appendChild(wrapper);
+
+        function renderCatalog(query) {
+            var active = GENESIS_FILTER_CATALOG.filter(function (filter) {
+                return genesisFilterActive(state, filter);
+            });
+            wrapper.querySelector('.ve-filter-count').textContent =
+                active.length + ' active native filter' + (active.length === 1 ? '' : 's');
+            var stack = wrapper.querySelector('.ve-filter-applied');
+            stack.innerHTML = '';
+            if (!active.length) {
+                stack.innerHTML = '<div class="ve-filter-empty">No filters applied. The clip is on the identity render path.</div>';
+            }
+            active.forEach(function (filter) {
+                var row = document.createElement('div');
+                row.className = 've-filter-row';
+                var enabled = document.createElement('input');
+                enabled.type = 'checkbox';
+                enabled.checked = true;
+                enabled.title = 'Active in Genesis render';
+                var name = document.createElement('button');
+                name.textContent = filter.name;
+                name.addEventListener('click', function () {
+                    dockTab = 'properties';
+                    renderDock();
+                });
+                var remove = document.createElement('button');
+                remove.textContent = '×';
+                remove.title = 'Reset/remove filter';
+                var removeFilter = function () {
+                    pushUndo();
+                    resetGenesisFilter(state, filter);
+                    commitGenesisEdit();
+                    renderCatalog(query);
+                };
+                enabled.addEventListener('change', removeFilter);
+                remove.addEventListener('click', removeFilter);
+                row.appendChild(enabled);
+                row.appendChild(name);
+                row.appendChild(remove);
+                stack.appendChild(row);
+            });
+
+            var options = wrapper.querySelector('.ve-filter-options');
+            options.innerHTML = '';
+            var lastCategory = '';
+            GENESIS_FILTER_CATALOG.forEach(function (filter) {
+                if (query && filter.name.toLowerCase().indexOf(query) < 0 && filter.category.toLowerCase().indexOf(query) < 0) return;
+                if (filter.category !== lastCategory) {
+                    var category = document.createElement('div');
+                    category.className = 've-filter-category';
+                    category.textContent = filter.category;
+                    options.appendChild(category);
+                    lastCategory = filter.category;
+                }
+                var button = document.createElement('button');
+                var isActive = genesisFilterActive(state, filter);
+                button.textContent = (isActive ? '✓ ' : '+ ') + filter.name;
+                button.disabled = isActive;
+                button.addEventListener('click', function () {
+                    pushUndo();
+                    Object.keys(filter.add).forEach(function (path) {
+                        setPathValue(state, path, filter.add[path]);
+                    });
+                    commitGenesisEdit();
+                    renderCatalog(query);
+                });
+                options.appendChild(button);
+            });
+        }
+
+        var search = wrapper.querySelector('.ve-filter-search');
+        search.addEventListener('input', function () {
+            renderCatalog(search.value.trim().toLowerCase());
+        });
+        renderCatalog('');
+    }
+
     function renderFilterCatalog(content, clip) {
         if (!clip.effects) clip.effects = [];
         var wrapper = document.createElement('div');
@@ -1231,34 +2080,302 @@ var VideoEditTab = (function () {
         });
     }
 
+    function ensureTrackMixerState(track) {
+        track.genesis = mergeIdentityDefaults(track.genesis, { gain: 1, pan: 0, solo: false });
+        return track.genesis;
+    }
+
+    function activeWaveformForTrack(track) {
+        for (var i = 0; i < track.clips.length; i++) {
+            var clip = track.clips[i];
+            if (currentFrame >= clip.startFrame && currentFrame < clip.endFrame) {
+                loadWaveform(clip);
+                return { clip: clip, data: waveformCache.get(clip.id) || null };
+            }
+        }
+        return null;
+    }
+
+    function drawAudioWaveform(canvas, data) {
+        var ctx = canvas.getContext('2d');
+        var width = canvas.width;
+        var height = canvas.height;
+        ctx.fillStyle = '#0f1018';
+        ctx.fillRect(0, 0, width, height);
+        ctx.strokeStyle = '#282b39';
+        ctx.beginPath();
+        ctx.moveTo(0, height / 2);
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+        if (!data || !data.peaks || !data.peaks.length) {
+            ctx.fillStyle = '#67697a';
+            ctx.font = '10px sans-serif';
+            ctx.fillText('No decoded audio at playhead', 10, height / 2 - 8);
+            return;
+        }
+        var peaks = data.peaks;
+        ctx.strokeStyle = '#55d6c2';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (var x = 0; x < width; x++) {
+            var index = Math.min(peaks.length - 1, Math.floor(x / width * peaks.length));
+            var peak = Math.min(1, Math.abs(Number(peaks[index]) || 0));
+            var y = peak * (height / 2 - 3);
+            ctx.moveTo(x + 0.5, height / 2 - y);
+            ctx.lineTo(x + 0.5, height / 2 + y);
+        }
+        ctx.stroke();
+    }
+
+    function trackLevelAtPlayhead(track, active) {
+        if (!active || !active.data || !active.data.peaks || !active.data.peaks.length) return 0;
+        var clip = active.clip;
+        var fraction = (currentFrame - clip.startFrame) / Math.max(1, clip.endFrame - clip.startFrame);
+        var index = clamp(Math.floor(fraction * active.data.peaks.length), 0, active.data.peaks.length - 1);
+        return Math.min(1, Math.abs(Number(active.data.peaks[index]) || 0));
+    }
+
+    function renderAudioDock(content, selectedInfo) {
+        var heading = document.createElement('div');
+        heading.className = 've-dock-heading';
+        heading.textContent = 'PROGRAM AUDIO';
+        content.appendChild(heading);
+
+        var scope = document.createElement('canvas');
+        scope.id = 've-audio-waveform';
+        scope.className = 've-audio-scope';
+        scope.width = 288;
+        scope.height = 92;
+        content.appendChild(scope);
+
+        var selectedActive = selectedInfo && selectedInfo.clip
+            ? { clip: selectedInfo.clip, data: waveformCache.get(selectedInfo.clip.id) || null }
+            : null;
+        if (selectedInfo && selectedInfo.clip) loadWaveform(selectedInfo.clip);
+        if (!selectedActive || !selectedActive.data || !selectedActive.data.peaks || !selectedActive.data.peaks.length) {
+            for (var waveformTrackIndex = project.tracks.length - 1; waveformTrackIndex >= 0; waveformTrackIndex--) {
+                var candidateWaveform = activeWaveformForTrack(project.tracks[waveformTrackIndex]);
+                if (candidateWaveform && candidateWaveform.data && candidateWaveform.data.peaks && candidateWaveform.data.peaks.length) {
+                    selectedActive = candidateWaveform;
+                    break;
+                }
+            }
+        }
+        drawAudioWaveform(scope, selectedActive ? selectedActive.data : null);
+
+        var note = document.createElement('div');
+        note.className = 've-scope-note';
+        note.textContent = selectedActive && selectedActive.clip
+            ? 'Decoded source waveform · ' + (selectedActive.clip.label || 'selected clip')
+            : 'Select a clip to inspect its decoded waveform.';
+        content.appendChild(note);
+
+        var mixerHeading = document.createElement('div');
+        mixerHeading.className = 've-dock-heading';
+        mixerHeading.textContent = 'TRACK MIXER';
+        content.appendChild(mixerHeading);
+
+        var anySolo = project.tracks.some(function (track) {
+            return ensureTrackMixerState(track).solo;
+        });
+        project.tracks.slice().reverse().forEach(function (track) {
+            if (track.type === 'text') return;
+            var mixer = ensureTrackMixerState(track);
+            var active = activeWaveformForTrack(track);
+            var level = trackLevelAtPlayhead(track, active) * mixer.gain;
+            var strip = document.createElement('div');
+            strip.className = 've-audio-mixer-strip';
+            if (anySolo && !mixer.solo) strip.classList.add('ve-audio-dimmed');
+
+            var top = document.createElement('div');
+            top.className = 've-audio-mixer-head';
+            var name = document.createElement('strong');
+            name.textContent = track.name;
+            var meter = document.createElement('div');
+            meter.className = 've-audio-meter';
+            var meterFill = document.createElement('span');
+            meterFill.style.width = Math.round(clamp(level, 0, 1) * 100) + '%';
+            meter.appendChild(meterFill);
+            top.appendChild(name);
+            top.appendChild(meter);
+            strip.appendChild(top);
+
+            [
+                ['gain', 'Level', 0, 2, 0.01],
+                ['pan', 'Pan L ↔ R', -1, 1, 0.01],
+            ].forEach(function (spec) {
+                var row = document.createElement('div');
+                row.className = 've-audio-mixer-control';
+                var label = document.createElement('label');
+                label.textContent = spec[1];
+                var input = document.createElement('input');
+                input.type = 'range';
+                input.min = spec[2];
+                input.max = spec[3];
+                input.step = spec[4];
+                input.value = mixer[spec[0]];
+                var value = document.createElement('span');
+                value.textContent = Number(input.value).toFixed(2);
+                input.addEventListener('pointerdown', pushUndo, { once: true });
+                input.addEventListener('input', function () {
+                    mixer[spec[0]] = Number(input.value);
+                    value.textContent = Number(input.value).toFixed(2);
+                    scheduleAutosave();
+                    updatePreviewDebounced();
+                });
+                row.appendChild(label);
+                row.appendChild(input);
+                row.appendChild(value);
+                strip.appendChild(row);
+            });
+
+            var buttons = document.createElement('div');
+            buttons.className = 've-audio-mixer-buttons';
+            [
+                ['M', !!track.muted, function () { track.muted = !track.muted; }],
+                ['S', !!mixer.solo, function () { mixer.solo = !mixer.solo; }],
+            ].forEach(function (action) {
+                var button = document.createElement('button');
+                button.textContent = action[0];
+                button.classList.toggle('ve-active', action[1]);
+                button.addEventListener('click', function () {
+                    pushUndo();
+                    action[2]();
+                    scheduleAutosave();
+                    renderTimeline();
+                    renderDock();
+                    updatePreviewDebounced();
+                });
+                buttons.appendChild(button);
+            });
+            strip.appendChild(buttons);
+            content.appendChild(strip);
+        });
+    }
+
+    function renderScopesDock(content) {
+        content.innerHTML =
+            '<div class="ve-scope-grid">' +
+                '<section><div class="ve-dock-heading">RGB HISTOGRAM</div><canvas id="ve-scope-histogram" width="288" height="124"></canvas></section>' +
+                '<section><div class="ve-dock-heading">LUMA WAVEFORM</div><canvas id="ve-scope-waveform" width="288" height="124"></canvas></section>' +
+                '<section><div class="ve-dock-heading">VECTORSCOPE</div><canvas id="ve-scope-vectorscope" width="288" height="164"></canvas></section>' +
+                '<section><div class="ve-dock-heading">RGB PARADE</div><canvas id="ve-scope-parade" width="288" height="124"></canvas></section>' +
+            '</div>' +
+            '<div class="ve-scope-note">All four scopes are calculated from the current composited Genesis program frame.</div>';
+    }
+
+    function scopeBackground(canvas) {
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#0c0d13';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = '#252836';
+        ctx.lineWidth = 1;
+        for (var i = 1; i < 4; i++) {
+            ctx.beginPath();
+            ctx.moveTo(0, i * canvas.height / 4);
+            ctx.lineTo(canvas.width, i * canvas.height / 4);
+            ctx.stroke();
+        }
+        return ctx;
+    }
+
     function updateScopes() {
         if (dockTab !== 'scopes' || !previewCanvas) return;
-        var scope = document.getElementById('ve-scope-histogram');
-        if (!scope) return;
-        var ctx = scope.getContext('2d');
+        var histogram = document.getElementById('ve-scope-histogram');
+        var waveform = document.getElementById('ve-scope-waveform');
+        var vectorscope = document.getElementById('ve-scope-vectorscope');
+        var parade = document.getElementById('ve-scope-parade');
+        if (!histogram || !waveform || !vectorscope || !parade) return;
         var source;
         try {
             source = previewCtx.getImageData(0, 0, previewCanvas.width, previewCanvas.height);
         } catch (_) {
             return;
         }
-        var bins = new Uint32Array(64);
+        var binsR = new Uint32Array(64);
+        var binsG = new Uint32Array(64);
+        var binsB = new Uint32Array(64);
         var pixels = source.data;
         for (var i = 0; i < pixels.length; i += 16) {
-            var luma = Math.round(0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]);
-            bins[Math.min(63, Math.floor(luma / 4))]++;
+            binsR[Math.min(63, Math.floor(pixels[i] / 4))]++;
+            binsG[Math.min(63, Math.floor(pixels[i + 1] / 4))]++;
+            binsB[Math.min(63, Math.floor(pixels[i + 2] / 4))]++;
         }
-        var max = Math.max.apply(null, Array.from(bins)) || 1;
-        ctx.clearRect(0, 0, scope.width, scope.height);
-        ctx.fillStyle = '#101017';
-        ctx.fillRect(0, 0, scope.width, scope.height);
-        var gradient = ctx.createLinearGradient(0, scope.height, 0, 0);
-        gradient.addColorStop(0, '#5551dd');
-        gradient.addColorStop(1, '#62d8ff');
-        ctx.fillStyle = gradient;
-        bins.forEach(function (value, index) {
-            var h = value / max * (scope.height - 16);
-            ctx.fillRect(index * (scope.width / 64), scope.height - h, scope.width / 64 - 1, h);
+        var hctx = scopeBackground(histogram);
+        var max = Math.max.apply(null, Array.from(binsR).concat(Array.from(binsG), Array.from(binsB))) || 1;
+        [
+            [binsR, 'rgba(255,82,99,.70)'],
+            [binsG, 'rgba(71,232,158,.62)'],
+            [binsB, 'rgba(82,156,255,.70)'],
+        ].forEach(function (series) {
+            hctx.strokeStyle = series[1];
+            hctx.beginPath();
+            series[0].forEach(function (count, index) {
+                var x = index / 63 * histogram.width;
+                var y = histogram.height - count / max * (histogram.height - 6);
+                if (index === 0) hctx.moveTo(x, y);
+                else hctx.lineTo(x, y);
+            });
+            hctx.stroke();
+        });
+
+        var wctx = scopeBackground(waveform);
+        wctx.globalCompositeOperation = 'lighter';
+        wctx.fillStyle = 'rgba(110,235,225,.10)';
+        var sourceWidth = source.width;
+        var sourceHeight = source.height;
+        for (var sy = 0; sy < sourceHeight; sy += 4) {
+            for (var sx = 0; sx < sourceWidth; sx += 4) {
+                var wi = (sy * sourceWidth + sx) * 4;
+                var luma = 0.2126 * pixels[wi] + 0.7152 * pixels[wi + 1] + 0.0722 * pixels[wi + 2];
+                wctx.fillRect(
+                    Math.floor(sx / sourceWidth * waveform.width),
+                    Math.floor((1 - luma / 255) * (waveform.height - 1)),
+                    2, 2
+                );
+            }
+        }
+        wctx.globalCompositeOperation = 'source-over';
+
+        var vctx = scopeBackground(vectorscope);
+        var radius = Math.min(vectorscope.width, vectorscope.height) * 0.42;
+        var cx = vectorscope.width / 2;
+        var cy = vectorscope.height / 2;
+        vctx.strokeStyle = '#414658';
+        vctx.beginPath();
+        vctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        vctx.stroke();
+        vctx.globalCompositeOperation = 'lighter';
+        for (var vi = 0; vi < pixels.length; vi += 64) {
+            var r = pixels[vi] / 255;
+            var g = pixels[vi + 1] / 255;
+            var b = pixels[vi + 2] / 255;
+            var u = -0.14713 * r - 0.28886 * g + 0.436 * b;
+            var v = 0.615 * r - 0.51499 * g - 0.10001 * b;
+            vctx.fillStyle = 'rgba(' + pixels[vi] + ',' + pixels[vi + 1] + ',' + pixels[vi + 2] + ',.14)';
+            vctx.fillRect(cx + u * radius * 2, cy - v * radius * 2, 2, 2);
+        }
+        vctx.globalCompositeOperation = 'source-over';
+
+        var pctx = scopeBackground(parade);
+        var channelWidth = parade.width / 3;
+        [
+            [0, 'rgba(255,82,99,.10)'],
+            [1, 'rgba(71,232,158,.10)'],
+            [2, 'rgba(82,156,255,.10)'],
+        ].forEach(function (channel) {
+            pctx.fillStyle = channel[1];
+            for (var py = 0; py < sourceHeight; py += 5) {
+                for (var px = 0; px < sourceWidth; px += 5) {
+                    var pi = (py * sourceWidth + px) * 4;
+                    var value = pixels[pi + channel[0]];
+                    pctx.fillRect(
+                        channel[0] * channelWidth + px / sourceWidth * channelWidth,
+                        (1 - value / 255) * (parade.height - 1),
+                        2, 2
+                    );
+                }
+            }
         });
     }
 
@@ -2768,6 +3885,19 @@ var VideoEditTab = (function () {
         var extMap = { h264: '.mp4', prores: '.mov', vp9: '.webm' };
         var filename = 'export_' + (projectId || 'video') + '_' + Date.now() + (extMap[fmt] || '.mp4');
 
+        var nativeExport = cloneJson(ensureGenesisProjectState().export);
+        nativeExport.out_w = w;
+        nativeExport.out_h = h;
+        nativeExport.fps_num = fps;
+        nativeExport.fps_den = 1;
+        nativeExport.rate_mode = 1;
+        nativeExport.crf = { lossless: 0, high: 18, medium: 23, low: 28 }[quality] || 20;
+        nativeExport.rate_value = nativeExport.crf;
+        nativeExport.vcodec = {
+            h264: 'libx264',
+            prores: 'prores_ks',
+            vp9: 'libvpx-vp9',
+        }[fmt] || 'mpeg4';
         var body = {
             project_id: projectId,
             format: fmt,
@@ -2777,6 +3907,7 @@ var VideoEditTab = (function () {
             quality: quality,
             include_audio: includeAudio,
             output_filename: filename,
+            genesis_export: nativeExport,
         };
         if (lutPath) body.lut_path = lutPath;
 
@@ -3112,6 +4243,191 @@ var VideoEditTab = (function () {
     }
 
     function renderPropertiesPanelContent(panel, clip) {
+        panel.innerHTML = '';
+        var state = ensureGenesisClipState(clip);
+
+        var header = document.createElement('div');
+        header.className = 've-genesis-properties-header';
+        var title = document.createElement('div');
+        title.innerHTML = '<strong>PROPERTIES</strong><span></span>';
+        title.querySelector('span').textContent =
+            (clip.label || 'Untitled clip') + ' · t' + (clip.startFrame || 0) +
+            ' · len ' + Math.max(1, (clip.endFrame || 1) - (clip.startFrame || 0));
+        var resetAll = document.createElement('button');
+        resetAll.textContent = 'Reset all';
+        resetAll.addEventListener('click', function () {
+            pushUndo();
+            clip.genesis = cloneJson(GENESIS_CLIP_DEFAULTS);
+            clip.fade_in = 0;
+            clip.fade_out = 0;
+            clip.effects = [];
+            clip.lut_path = null;
+            clip.lut_name = null;
+            commitGenesisEdit();
+            renderPropertiesPanelContent(panel, clip);
+        });
+        header.appendChild(title);
+        header.appendChild(resetAll);
+        panel.appendChild(header);
+
+        var labelRow = document.createElement('div');
+        labelRow.className = 've-genesis-control ve-genesis-label-row';
+        var label = document.createElement('label');
+        label.textContent = 'Clip label';
+        var labelInput = document.createElement('input');
+        labelInput.type = 'text';
+        labelInput.value = clip.label || '';
+        labelInput.addEventListener('change', function () {
+            pushUndo();
+            clip.label = labelInput.value.trim() || 'Untitled clip';
+            renderTimeline();
+            renderMediaBin();
+            scheduleAutosave();
+        });
+        labelRow.appendChild(label);
+        labelRow.appendChild(labelInput);
+        panel.appendChild(labelRow);
+
+        GENESIS_PROPERTY_SECTIONS.forEach(function (section) {
+            renderGenesisSection(panel, clip, section);
+        });
+        renderGenesisLutPicker(panel, clip);
+
+        var transition = document.createElement('details');
+        transition.className = 've-genesis-section';
+        transition.innerHTML = '<summary>Transition In</summary>';
+        var transitionBody = document.createElement('div');
+        transitionBody.className = 've-genesis-section-body';
+        var transitionRow = document.createElement('div');
+        transitionRow.className = 've-genesis-control';
+        transitionRow.innerHTML = '<label>Type</label>';
+        var transitionSelect = document.createElement('select');
+        var transitionType = clip.transition_in ? clip.transition_in.type : 'none';
+        TRANSITION_TYPES.forEach(function (entry) {
+            var option = document.createElement('option');
+            option.value = entry.type;
+            option.textContent = entry.name;
+            if (entry.type === transitionType) option.selected = true;
+            transitionSelect.appendChild(option);
+        });
+        transitionSelect.addEventListener('change', function () {
+            pushUndo();
+            clip.transition_in = transitionSelect.value === 'none'
+                ? null
+                : { type: transitionSelect.value, duration: clip.transition_in ? clip.transition_in.duration : 15 };
+            scheduleAutosave();
+            renderTimeline();
+            updatePreviewDebounced();
+            renderPropertiesPanelContent(panel, clip);
+        });
+        transitionRow.appendChild(transitionSelect);
+        transitionBody.appendChild(transitionRow);
+        if (clip.transition_in) {
+            var durationRow = document.createElement('div');
+            durationRow.className = 've-genesis-control';
+            durationRow.innerHTML = '<label>Duration</label>';
+            var durationRange = document.createElement('input');
+            durationRange.type = 'range';
+            durationRange.min = 2;
+            durationRange.max = 120;
+            durationRange.step = 1;
+            durationRange.value = clip.transition_in.duration || 15;
+            var durationValue = document.createElement('input');
+            durationValue.type = 'number';
+            durationValue.min = 2;
+            durationValue.max = 120;
+            durationValue.value = durationRange.value;
+            var applyDuration = function (value) {
+                clip.transition_in.duration = clamp(Math.round(Number(value) || 15), 2, 120);
+                durationRange.value = clip.transition_in.duration;
+                durationValue.value = clip.transition_in.duration;
+                renderTimeline();
+                scheduleAutosave();
+                updatePreviewDebounced();
+            };
+            durationRange.addEventListener('pointerdown', pushUndo, { once: true });
+            durationRange.addEventListener('input', function () { applyDuration(durationRange.value); });
+            durationValue.addEventListener('change', function () {
+                pushUndo();
+                applyDuration(durationValue.value);
+            });
+            durationRow.appendChild(durationRange);
+            durationRow.appendChild(durationValue);
+            transitionBody.appendChild(durationRow);
+        }
+        transition.appendChild(transitionBody);
+        panel.appendChild(transition);
+
+        var clipEditing = document.createElement('details');
+        clipEditing.className = 've-genesis-section';
+        clipEditing.innerHTML = '<summary>Clip Editing</summary>';
+        var editBody = document.createElement('div');
+        editBody.className = 've-genesis-section-body';
+        var editActions = document.createElement('div');
+        editActions.className = 've-genesis-button-row';
+        [
+            ['Detach audio', function () {
+                var audioTrack = project.tracks.find(function (track) { return track.type === 'audio'; });
+                if (!audioTrack) audioTrack = addTrack('audio', true);
+                pushUndo();
+                var detached = cloneJson(clip);
+                detached.id = generateClipId();
+                detached.label = (clip.label || 'Clip') + ' · audio';
+                audioTrack.clips.push(detached);
+                state.gain = 0;
+                recalcTotalFrames();
+                renderTimeline();
+                scheduleAutosave();
+            }],
+            ['Copy filters', function () {
+                genesisFilterClipboard = cloneJson(state);
+                renderPropertiesPanelContent(panel, clip);
+            }],
+            ['Paste filters', function () {
+                if (!genesisFilterClipboard) return;
+                pushUndo();
+                clip.genesis = cloneJson(genesisFilterClipboard);
+                commitGenesisEdit();
+                renderPropertiesPanelContent(panel, clip);
+            }],
+            ['Lower third', function () {
+                pushUndo();
+                state.title.size_frac = 0.07;
+                state.title.x = 0.06;
+                state.title.y = 0.78;
+                state.title.rgb = [1, 1, 1];
+                commitGenesisEdit();
+                renderPropertiesPanelContent(panel, clip);
+            }],
+            ['Clear title', function () {
+                pushUndo();
+                state.title = cloneJson(GENESIS_CLIP_DEFAULTS.title);
+                commitGenesisEdit();
+                renderPropertiesPanelContent(panel, clip);
+            }],
+        ].forEach(function (action) {
+            var button = document.createElement('button');
+            button.textContent = action[0];
+            if (action[0] === 'Paste filters') button.disabled = !genesisFilterClipboard;
+            button.addEventListener('click', action[1]);
+            editActions.appendChild(button);
+        });
+        editBody.appendChild(editActions);
+        clipEditing.appendChild(editBody);
+        panel.appendChild(clipEditing);
+
+        renderGenesisProjectBlocks(panel);
+
+        var status = document.createElement('div');
+        status.className = 've-genesis-binding-status';
+        status.textContent =
+            GENESIS_PROPERTY_SECTIONS.reduce(function (count, section) {
+                return count + section.controls.length;
+            }, 0) + ' native Genesis parameters · live preview + saved project + export';
+        panel.appendChild(status);
+    }
+
+    function renderLegacyPropertiesPanelContent(panel, clip) {
         panel.innerHTML = '';
 
         // Header

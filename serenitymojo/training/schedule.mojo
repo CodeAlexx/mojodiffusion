@@ -306,6 +306,40 @@ def sample_timestep_logit_normal_win(
     return sample_timestep_logit_normal(seed, shift, lo, hi)
 
 
+def flux1_mu_train(image_seq_len: Int) -> Float64:
+    """BFL FLUX.1 linear mu: 0.5 @ 256 tokens, 1.15 @ 4096 tokens. Verbatim port
+    of sampling/flux1_dev.mojo:flux1_mu (the inference oracle) so dynamic-shift
+    training matches inference bit-for-bit. seq_len<=0 => base_shift 0.5."""
+    if image_seq_len <= 0:
+        return Float64(0.5)
+    var x1 = Float64(256.0)
+    var y1 = Float64(0.5)
+    var x2 = Float64(4096.0)
+    var y2 = Float64(1.15)
+    var m = (y2 - y1) / (x2 - x1)
+    var b = y1 - m * x1
+    return m * Float64(image_seq_len) + b
+
+
+def dynamic_shift_from_seqlen(image_seq_len: Int) -> Float32:
+    """Resolution-dependent flow-match shift = exp(flux1_mu(seq_len)). Passed as
+    `shift` to sample_timestep_logit_normal it reproduces the BFL flux1_time_shift
+    remap exactly (em/(em+1/t-1) == shift*t/(1+(shift-1)*t)), matching
+    sampling/flux1_dev.mojo:flux1_dynamic_shift."""
+    return Float32(exp(flux1_mu_train(image_seq_len)))
+
+
+def effective_train_shift(
+    dynamic_on: Bool, fixed_shift: Float32, image_seq_len: Int
+) -> Float32:
+    """Shift a trainer feeds the timestep sampler: resolution-adaptive dynamic
+    shift when dynamic_timestep_shifting is on, else the fixed (config) shift —
+    so default-off (dynamic_on=False) is byte-identical to the pre-T4 path."""
+    if dynamic_on:
+        return dynamic_shift_from_seqlen(image_seq_len)
+    return fixed_shift
+
+
 def _uniform_index(seed: UInt64, high_exclusive: Int) -> Int:
     if high_exclusive <= 1:
         return 0

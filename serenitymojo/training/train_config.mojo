@@ -280,6 +280,9 @@ struct TrainConfig(Copyable, Movable):
     # OneTrainer learning_rate_scaler: 0=NONE 1=LINEAR 2=SQRT. Scales cfg.lr by
     # batch*grad_accum at config-load; NONE => unscaled = byte-identical.
     var lr_scaler: Int
+    # OneTrainer dynamic_timestep_shifting: resolution-adaptive flow-match shift
+    # (exp(flux1_mu(seq_len))) instead of the fixed timestep_shift. False => fixed.
+    var dynamic_timestep_shifting: Bool
 
     # ── caption dropout (Wave 2B item 2d; default-off == 0 == never drop) ──
     # With prob>0, each step draws a uniform and (if draw<prob) swaps the
@@ -671,6 +674,7 @@ struct TrainConfig(Copyable, Movable):
             min_noising_strength=Float32(-1.0),  # -1 = unset => sampler default
             max_noising_strength=Float32(-1.0),
             lr_scaler=0,                          # NONE (unscaled) default
+            dynamic_timestep_shifting=False,      # fixed timestep_shift default
             caption_dropout_prob=Float32(0.0),   # never drop (default-off)
             text_encoder_dropout_prob=Float32(0.0),   # reference trainer TE1 dropout (default-off)
             text_encoder_2_dropout_prob=Float32(0.0),  # reference trainer TE2 dropout (default-off)
@@ -782,7 +786,7 @@ struct TrainConfig(Copyable, Movable):
         timestep_distribution: Int, timestep_noising_weight: Float32,
         timestep_noising_bias: Float32,
         min_noising_strength: Float32, max_noising_strength: Float32,
-        lr_scaler: Int,
+        lr_scaler: Int, dynamic_timestep_shifting: Bool,
         caption_dropout_prob: Float32,
         offset_noise_weight: Float32, offset_noise_prob: Float32,
         input_perturbation: Float32,
@@ -988,6 +992,7 @@ struct TrainConfig(Copyable, Movable):
         self.min_noising_strength = min_noising_strength
         self.max_noising_strength = max_noising_strength
         self.lr_scaler = lr_scaler
+        self.dynamic_timestep_shifting = dynamic_timestep_shifting
         self.caption_dropout_prob = caption_dropout_prob
         self.text_encoder_dropout_prob = text_encoder_dropout_prob
         self.text_encoder_2_dropout_prob = text_encoder_2_dropout_prob

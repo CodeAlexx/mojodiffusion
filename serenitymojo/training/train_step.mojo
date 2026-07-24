@@ -34,6 +34,7 @@ from serenitymojo.training.schedule import (
     flow_match_noise_target,
     sample_timestep_logit_normal,
     sample_timestep_logit_normal_win,
+    effective_train_shift,
 )
 from serenitymojo.training.train_config import TrainConfig
 
@@ -402,8 +403,10 @@ def run_synthetic(cfg: TrainConfig, ctx: DeviceContext) raises:
 
     for it in range(n_iters):
         var t_step = it + 1
+        var _eff_shift = effective_train_shift(
+            c.dynamic_timestep_shifting, c.timestep_shift, _M)
         var sigma = sample_timestep_logit_normal_win(
-            UInt64(it + 1), c.timestep_shift,
+            UInt64(it + 1), _eff_shift,
             c.min_noising_strength, c.max_noising_strength)
         var latent = Tensor.from_host(
             _randn(_M * _D, UInt64(200 + it), 1.0), [1, _M, _D], STDtype.F32, ctx)

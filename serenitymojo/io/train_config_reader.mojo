@@ -1155,6 +1155,8 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             if not scs.is_string:
                 raise Error("JSON config: learning_rate_scaler must be a string")
             cfg.lr_scaler = _lr_scaler_int(scs.s)
+        elif key == "dynamic_timestep_shifting" or key == "dynamic_shift":
+            cfg.dynamic_timestep_shifting = _read_bool(cur)
         elif key == "lr_warmup_steps" or key == "learning_rate_warmup_steps":
             cfg.lr_warmup_steps = Int(_read_scalar(cur).num)
         elif key == "optimizer_warmup_steps":

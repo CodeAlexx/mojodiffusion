@@ -80,7 +80,7 @@ from serenitymojo.models.scail2.scail2_stack_train_full import (
     scail2_head_video_backward,
 )
 from serenitymojo.training.train_config import TrainConfig
-from serenitymojo.training.schedule import sample_timestep_logit_normal, sample_timestep_logit_normal_win
+from serenitymojo.training.schedule import sample_timestep_logit_normal, sample_timestep_logit_normal_win, effective_train_shift
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
 from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
@@ -422,8 +422,10 @@ def main() raises:
         var t_step = perf_counter()
 
         # ── sample timestep + build the flow-match target on the VIDEO latent ──
+        var eff_shift = effective_train_shift(
+            cfg.dynamic_timestep_shifting, shift, video_rows)
         var t = sample_timestep_logit_normal_win(
-            seed * UInt64(1000003) + UInt64(step) * UInt64(101) + 7, shift,
+            seed * UInt64(1000003) + UInt64(step) * UInt64(101) + 7, eff_shift,
             cfg.min_noising_strength, cfg.max_noising_strength
         )
         var timestep = t * Float32(1000.0)

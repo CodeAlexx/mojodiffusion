@@ -280,6 +280,7 @@ var VideoEditTab = (function () {
         selectedClipIds.clear();
         recalcTotalFrames();
         renderTimeline();
+        updateEditButton();
         refreshPropertiesPanel();
         scheduleAutosave();
     }
@@ -291,6 +292,7 @@ var VideoEditTab = (function () {
         selectedClipIds.clear();
         recalcTotalFrames();
         renderTimeline();
+        updateEditButton();
         refreshPropertiesPanel();
         scheduleAutosave();
     }
@@ -367,11 +369,21 @@ var VideoEditTab = (function () {
         if (Array.isArray(data.tracks)) {
             project.tracks = data.tracks;
         }
+        thumbnailCache.clear();
+        thumbnailLoading.clear();
+        waveformCache.clear();
+        waveformLoading.clear();
+        stopAllAudio();
+        audioElements.clear();
+        selectedClipIds.clear();
+        currentFrame = 0;
+        scrollOffsetX = 0;
         recalcTotalFrames();
         currentFrame = clamp(currentFrame, 0, totalFrames);
         updateTimecodeDisplay();
         renderTimeline();
         updatePreview();
+        updateEditButton();
     }
 
     function loadOrCreateProject() {
@@ -429,6 +441,9 @@ var VideoEditTab = (function () {
                     '<button id="ve-btn-file" class="ve-tb-btn" title="File" style="font-size:11px;width:auto;padding:0 8px;">File</button>' +
                     '<div id="ve-file-dropdown" class="ve-file-dropdown" style="display:none"></div>' +
                 '</div>' +
+                '<button id="ve-btn-import-video" class="ve-tb-btn ve-tb-btn-label" title="Import a video">+ Video</button>' +
+                '<button id="ve-btn-import-music" class="ve-tb-btn ve-tb-btn-label" title="Add music or audio">+ Music</button>' +
+                '<button id="ve-btn-edit-clip" class="ve-tb-btn ve-tb-btn-label" title="Edit the selected video clip" disabled>Edit Clip</button>' +
                 '<button id="ve-btn-start" class="ve-tb-btn" title="Go to start (Home)">&#9198;</button>' +
                 '<button id="ve-btn-play" class="ve-tb-btn" title="Play/Pause (Space)">&#9654;</button>' +
                 '<button id="ve-btn-stop" class="ve-tb-btn" title="Stop">&#9632;</button>' +
@@ -449,6 +464,20 @@ var VideoEditTab = (function () {
         var btnStart = document.getElementById('ve-btn-start');
         var btnEnd = document.getElementById('ve-btn-end');
         var zoomSlider = document.getElementById('ve-zoom-slider');
+        var btnImportVideo = document.getElementById('ve-btn-import-video');
+        var btnImportMusic = document.getElementById('ve-btn-import-music');
+        var btnEditClip = document.getElementById('ve-btn-edit-clip');
+
+        if (btnImportVideo) btnImportVideo.addEventListener('click', function () {
+            openMediaPicker('video');
+        });
+        if (btnImportMusic) btnImportMusic.addEventListener('click', function () {
+            openMediaPicker('audio');
+        });
+        if (btnEditClip) btnEditClip.addEventListener('click', function () {
+            if (selectedClipIds.size !== 1) return;
+            openPropertiesPanel(selectedClipIds.values().next().value);
+        });
 
         var btnRetake = document.getElementById('ve-btn-retake');
         if (btnRetake) btnRetake.addEventListener('click', function () {
@@ -608,6 +637,7 @@ var VideoEditTab = (function () {
         selectedClipIds.clear();
         recalcTotalFrames();
         renderTimeline();
+        updateEditButton();
         scheduleAutosave();
     }
 
@@ -700,6 +730,18 @@ var VideoEditTab = (function () {
             });
         });
         renderTimeline();
+        updateEditButton();
+    }
+
+    function updateEditButton() {
+        var button = document.getElementById('ve-btn-edit-clip');
+        if (!button) return;
+        var editable = false;
+        if (selectedClipIds.size === 1) {
+            var info = findClipById(selectedClipIds.values().next().value);
+            editable = !!(info && info.track.type === 'video' && info.clip.source_path);
+        }
+        button.disabled = !editable;
     }
 
     // ===== Preview Player =====
@@ -712,14 +754,25 @@ var VideoEditTab = (function () {
             '<canvas id="ve-preview-canvas"></canvas>' +
             '<div id="ve-preview-subtitle"></div>' +
             '<div id="ve-preview-overlay"><span id="ve-preview-tc">00:00:00</span></div>' +
-            '<span id="ve-preview-placeholder">No clip at playhead</span>';
+            '<div id="ve-preview-placeholder" class="ve-preview-empty">' +
+                '<strong>No video at the playhead</strong>' +
+                '<span>Import a video, then select it to edit effects.</span>' +
+                '<div><button id="ve-empty-import-video">Import Video</button>' +
+                '<button id="ve-empty-import-music">Add Music</button></div>' +
+            '</div>';
 
         previewVideo = document.getElementById('ve-preview-video');
         previewCanvas = document.getElementById('ve-preview-canvas');
         previewCtx = previewCanvas ? previewCanvas.getContext('2d') : null;
         previewTcEl = document.getElementById('ve-preview-tc');
+        document.getElementById('ve-empty-import-video').addEventListener('click', function () {
+            openMediaPicker('video');
+        });
+        document.getElementById('ve-empty-import-music').addEventListener('click', function () {
+            openMediaPicker('audio');
+        });
 
-        // Size canvas to 16:9 within container
+        // Size canvas to the current project aspect within the preview container.
         resizePreview();
     }
 
@@ -728,12 +781,14 @@ var VideoEditTab = (function () {
         var container = document.getElementById('ve-preview');
         if (!container) return;
         var rect = container.getBoundingClientRect();
-        // Fit 16:9 inside container
+        var aspect = (project.width > 0 && project.height > 0)
+            ? project.width / project.height
+            : 16 / 9;
         var targetW = rect.width;
-        var targetH = rect.width * 9 / 16;
+        var targetH = rect.width / aspect;
         if (targetH > rect.height) {
             targetH = rect.height;
-            targetW = rect.height * 16 / 9;
+            targetW = rect.height * aspect;
         }
         previewCanvas.width = Math.round(targetW);
         previewCanvas.height = Math.round(targetH);
@@ -941,7 +996,12 @@ var VideoEditTab = (function () {
                 fps: clip.source_fps || FPS,
             }),
         })
-        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (r) {
+            if (r.ok) return r.json();
+            return r.text().then(function (body) {
+                throw new Error(body || ('thumbnail status ' + r.status));
+            });
+        })
         .then(function (data) {
             thumbnailLoading.delete(clip.id);
             if (!data || !data.sprite_url) return;
@@ -959,8 +1019,9 @@ var VideoEditTab = (function () {
                 renderTracks();
             };
         })
-        .catch(function () {
+        .catch(function (err) {
             thumbnailLoading.delete(clip.id);
+            console.warn('Thumbnail load failed for ' + (clip.label || clip.id) + ':', err);
         });
     }
 
@@ -1016,7 +1077,8 @@ var VideoEditTab = (function () {
                         }
                         audioElements.set(clip.id, audio);
                     }
-                    var sourceTime = (currentFrame - clip.startFrame + (clip.source_start || 0)) / FPS;
+                    var sourceTime = (currentFrame - clip.startFrame) / FPS +
+                        (clip.source_start || 0) / (clip.source_fps || FPS);
                     // Correct drift > 0.1s
                     if (Math.abs(audio.currentTime - sourceTime) > 0.1) {
                         audio.currentTime = sourceTime;
@@ -1469,7 +1531,8 @@ var VideoEditTab = (function () {
             return;
         }
         dd.innerHTML =
-            '<div class="ve-ctx-item" data-action="import-video">Import Video/Audio...</div>' +
+            '<div class="ve-ctx-item" data-action="import-video">Import Video...</div>' +
+            '<div class="ve-ctx-item" data-action="import-audio">Add Music/Audio...</div>' +
             '<div class="ve-ctx-sep"></div>' +
             '<div class="ve-ctx-item" data-action="import-srt">Import SRT...</div>' +
             '<div class="ve-ctx-item" data-action="export-srt">Export SRT</div>' +
@@ -1499,24 +1562,35 @@ var VideoEditTab = (function () {
     }
 
     var videoFileInput = null;
+    var audioFileInput = null;
+
+    function openMediaPicker(kind) {
+        var isAudio = kind === 'audio';
+        var input = isAudio ? audioFileInput : videoFileInput;
+        if (!input) {
+            input = document.createElement('input');
+            input.type = 'file';
+            input.accept = isAudio ? 'audio/*' : 'video/*';
+            input.multiple = true;
+            input.style.display = 'none';
+            input.dataset.mediaKind = kind;
+            document.body.appendChild(input);
+            input.addEventListener('change', function () {
+                var files = Array.from(input.files || []);
+                files.forEach(importMediaFile);
+                input.value = '';
+            });
+            if (isAudio) audioFileInput = input;
+            else videoFileInput = input;
+        }
+        input.click();
+    }
 
     function handleFileAction(action) {
         if (action === 'import-video') {
-            if (!videoFileInput) {
-                videoFileInput = document.createElement('input');
-                videoFileInput.type = 'file';
-                videoFileInput.accept = 'video/*,audio/*';
-                videoFileInput.multiple = true;
-                videoFileInput.style.display = 'none';
-                document.body.appendChild(videoFileInput);
-                videoFileInput.addEventListener('change', function () {
-                    for (var i = 0; i < videoFileInput.files.length; i++) {
-                        importMediaFile(videoFileInput.files[i]);
-                    }
-                    videoFileInput.value = '';
-                });
-            }
-            videoFileInput.click();
+            openMediaPicker('video');
+        } else if (action === 'import-audio') {
+            openMediaPicker('audio');
         } else if (action === 'import-srt') {
             if (!srtFileInput) {
                 srtFileInput = document.createElement('input');
@@ -1557,19 +1631,26 @@ var VideoEditTab = (function () {
     function importMediaFile(file) {
         if (!projectId) return;
         var form = new FormData();
+        form.append('project_fps', String(FPS));
         form.append('file', file);
         fetch(getApiBase() + '/video_edit/projects/' + projectId + '/import_clip', {
             method: 'POST',
             body: form,
         })
-        .then(function (r) { return r.json(); })
+        .then(function (r) {
+            return r.json().then(function (body) {
+                if (!r.ok) throw new Error(body.error || ('import status ' + r.status));
+                return body;
+            });
+        })
         .then(function (data) {
             if (data.error) {
                 alert('Import failed: ' + data.error);
                 return;
             }
             // Determine track type from file
-            var isAudio = file.type && file.type.startsWith('audio');
+            var isAudio = data.media_type === 'audio' ||
+                (file.type && file.type.startsWith('audio'));
             var trackType = isAudio ? 'audio' : 'video';
             var trackColor = isAudio ? '#2a9d5c' : '#4a7dff';
 
@@ -1592,16 +1673,22 @@ var VideoEditTab = (function () {
             pushUndo();
             var sourceFps = clamp(Math.round(Number(data.source_fps) || FPS), 1, 120);
             var sourceFrames = Math.max(1, Math.round(Number(data.duration_frames) || sourceFps));
-            if (endFrame === 0 && !project.tracks.some(function (candidateTrack) {
+            var isFirstMedia = endFrame === 0 && !project.tracks.some(function (candidateTrack) {
                 return candidateTrack.clips.some(function (candidateClip) {
                     return !!candidateClip.source_path;
                 });
-            })) {
+            });
+            if (isFirstMedia && !isAudio) {
                 FPS = sourceFps;
                 project.fps = sourceFps;
+                if (Number(data.width) > 0 && Number(data.height) > 0) {
+                    project.width = Math.round(Number(data.width));
+                    project.height = Math.round(Number(data.height));
+                    resizePreview();
+                }
             }
             var dur = Math.max(1, Math.round(sourceFrames * FPS / sourceFps));
-            track.clips.push({
+            var newClip = {
                 id: data.clip_id || generateClipId(),
                 startFrame: endFrame,
                 endFrame: endFrame + dur,
@@ -1609,19 +1696,25 @@ var VideoEditTab = (function () {
                 color: trackColor,
                 source_path: data.source_path,
                 source_fps: sourceFps,
-            });
+                source_frames: sourceFrames,
+                duration_seconds: Number(data.duration_seconds) || dur / FPS,
+                has_audio: !!data.has_audio,
+                media_type: isAudio ? 'audio' : 'video',
+            };
+            track.clips.push(newClip);
+            selectedClipIds.clear();
+            selectedClipIds.add(newClip.id);
+            currentFrame = newClip.startFrame;
             recalcTotalFrames();
             renderTimeline();
             scheduleAutosave();
             updatePreview();
+            updateEditButton();
+            if (!isAudio) openPropertiesPanel(newClip.id);
 
-            // Scroll to show new clip
-            var clipEndPx = (endFrame + dur) * pixelsPerFrame;
-            var viewWidth = stage ? stage.width() - TRACK_HEADER_WIDTH : 500;
-            if (clipEndPx > scrollOffsetX + viewWidth) {
-                scrollOffsetX = Math.max(0, clipEndPx - viewWidth + 100);
-                renderTimeline();
-            }
+            // Keep the selected clip's beginning and the playhead on screen.
+            scrollOffsetX = Math.max(0, endFrame * pixelsPerFrame - 40);
+            renderTimeline();
         })
         .catch(function (err) {
             alert('Import failed: ' + (err.message || err));
@@ -3573,17 +3666,18 @@ var VideoEditTab = (function () {
                         var thumbX = 0;
                         var sec = 0;
                         var sourceStartSec = (clip.source_start || 0) / (clip.source_fps || FPS);
+                        var thumbSlotW = Math.max(24, FPS * pixelsPerFrame);
                         while (thumbX < clipW && sec < tc.frameCount) {
                             var spriteIdx = Math.min(Math.floor(sourceStartSec + sec), tc.frameCount - 1);
                             group.add(new Konva.Image({
                                 x: thumbX - rectOffset, y: 0,
-                                width: tc.thumbW, height: tc.thumbH,
+                                width: Math.min(thumbSlotW, clipW - thumbX), height: clipH,
                                 image: tc.img,
                                 crop: { x: spriteIdx * tc.thumbW, y: 0, width: tc.thumbW, height: tc.thumbH },
-                                opacity: 0.45,
+                                opacity: 0.72,
                                 listening: false,
                             }));
-                            thumbX += tc.thumbW;
+                            thumbX += thumbSlotW;
                             sec++;
                         }
                     }
@@ -3592,6 +3686,14 @@ var VideoEditTab = (function () {
                     if (hasWaveform && (track.type === 'audio' || track.type === 'video')) {
                         var wd = waveformCache.get(clip.id);
                         var midY = clipH / 2;
+                        if (!wd.displayMax) {
+                            wd.displayMax = Math.max(
+                                0.01,
+                                wd.peaks.reduce(function (maxValue, value) {
+                                    return Math.max(maxValue, Math.abs(value || 0));
+                                }, 0)
+                            );
+                        }
                         var sourceStartSample = Math.floor(
                             (clip.source_start || 0) / (clip.source_fps || FPS) * wd.sample_rate
                         );
@@ -3603,12 +3705,14 @@ var VideoEditTab = (function () {
                         for (var px = 0; px < clipW; px += step) {
                             var sIdx = sourceStartSample + Math.floor(px / clipW * samplesInClip);
                             if (sIdx >= wd.peaks.length) break;
-                            var amp = wd.peaks[sIdx] || 0;
+                            var amp = Math.min(1, Math.abs(wd.peaks[sIdx] || 0) / wd.displayMax);
                             var barH = amp * (clipH * 0.8) / 2;
                             // Top line
                             group.add(new Konva.Line({
                                 points: [px - rectOffset, midY - barH, px - rectOffset, midY + barH],
-                                stroke: 'rgba(255,255,255,0.45)',
+                                stroke: track.type === 'audio'
+                                    ? 'rgba(216,255,242,0.9)'
+                                    : 'rgba(255,255,255,0.55)',
                                 strokeWidth: Math.max(1, step - 1),
                                 listening: false,
                             }));
@@ -4255,6 +4359,7 @@ var VideoEditTab = (function () {
                 }
 
                 renderTimeline();
+                updateEditButton();
 
                 // Start drag
                 startDrag(clipId, pos.x, pos.y);
@@ -4266,6 +4371,7 @@ var VideoEditTab = (function () {
                 if (!e.evt.ctrlKey && !e.evt.metaKey) {
                     selectedClipIds.clear();
                     renderTimeline();
+                    updateEditButton();
                 }
             }
         });
@@ -4386,6 +4492,7 @@ var VideoEditTab = (function () {
                     selectedClipIds.clear();
                     selectedClipIds.add(clipId);
                     renderTimeline();
+                    updateEditButton();
                 }
 
                 contextTargetClipId = clipId;
@@ -4626,6 +4733,7 @@ var VideoEditTab = (function () {
         if (!selectedClipIds.has(clipId)) {
             selectedClipIds.clear();
             selectedClipIds.add(clipId);
+            updateEditButton();
         }
 
         collectSnapPoints();
@@ -4752,6 +4860,7 @@ var VideoEditTab = (function () {
             closeSubtitleEditor();
             selectedClipIds.clear();
             renderTimeline();
+            updateEditButton();
             return;
         }
 
@@ -4897,13 +5006,14 @@ var VideoEditTab = (function () {
         scheduleAutosave();
         updatePreview();
 
-        // Scroll to show new clip
-        var clipEndPx = newClip.endFrame * pixelsPerFrame;
-        var viewWidth = stage ? stage.width() - TRACK_HEADER_WIDTH : 500;
-        if (clipEndPx > scrollOffsetX + viewWidth) {
-            scrollOffsetX = Math.max(0, clipEndPx - viewWidth + 100);
-            renderTimeline();
-        }
+        selectedClipIds.clear();
+        selectedClipIds.add(newClip.id);
+        currentFrame = newClip.startFrame;
+        scrollOffsetX = Math.max(0, newClip.startFrame * pixelsPerFrame - 40);
+        renderTimeline();
+        updatePreview();
+        updateEditButton();
+        openPropertiesPanel(newClip.id);
     }
 
     return {
@@ -4914,6 +5024,34 @@ var VideoEditTab = (function () {
         resize: resize,
         _initialized: false,
         getActiveProjectId: function () { return projectId; },
+        getDiagnostics: function () {
+            return {
+                projectId: projectId,
+                fps: FPS,
+                width: project.width,
+                height: project.height,
+                currentFrame: currentFrame,
+                isPlaying: isPlaying,
+                thumbnailClipIds: Array.from(thumbnailCache.keys()),
+                waveformClipIds: Array.from(waveformCache.keys()),
+                tracks: project.tracks.map(function (track) {
+                    return {
+                        id: track.id,
+                        type: track.type,
+                        clips: track.clips.map(function (clip) {
+                            return {
+                                id: clip.id,
+                                label: clip.label,
+                                startFrame: clip.startFrame,
+                                endFrame: clip.endFrame,
+                                source_path: clip.source_path || '',
+                                source_fps: clip.source_fps || FPS,
+                            };
+                        }),
+                    };
+                }),
+            };
+        },
         loadProject: loadProject,
         addClipFromExternal: addClipFromExternal,
     };

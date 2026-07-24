@@ -89,6 +89,21 @@ requested rational FPS rather than a fixed 30 FPS clock. Effect add, remove,
 enable, disable, slider, and LUT changes request a fresh Genesis preview and
 disabled effects are excluded before they reach the compositor.
 
+The toolbar exposes direct `+ Video`, `+ Music`, and `Edit Clip` actions.
+Importing the first video adopts its probed dimensions and FPS, selects it,
+keeps its start and the playhead visible, opens Clip Properties, and loads a
+one-thumbnail-per-second strip. Audio-only import derives frames from the audio
+stream duration and the browser's live project FPS, so it cannot collapse to
+one frame or race a delayed autosave. Music loads into the Audio track with a
+normalized waveform, follows playback, and is included in export.
+
+Projects created by the retired demo build are detected by the exact six
+source-less placeholder IDs and labels. The server removes only those known
+placeholders, probes every retained real media file, reflows the real clips
+from frame zero, and saves the migrated project. Real media is never matched by
+the migration. The affected local project was backed up as
+`project.pre-video-editor-fix-2026-07-24.json` before migration.
+
 ## Verification evidence
 
 The repeatable browser acceptance gate is:
@@ -97,7 +112,7 @@ The repeatable browser acceptance gate is:
 pixi run check-genesis-video-editor
 ```
 
-Verification on 2026-07-23 used the real LTX-2.3 512x768, 121-frame, 25 FPS
+Verification on 2026-07-24 used the real LTX-2.3 512x768, 121-frame, 25 FPS
 MP4 at:
 
 `output/serenity_ui_out/video-0409/ltx2_t2v_hq.mp4`
@@ -105,17 +120,22 @@ MP4 at:
 Observed gates:
 
 - `gcompose --serve` initialized OpenCL and passed its startup self-check;
-- import probed exactly 121 frames at 25 FPS;
-- Chromium opened the saved project at 512x768 and loaded the real Genesis
-  preview;
+- the browser `+ Video` action imported and probed exactly 121 frames at 25 FPS;
+- the timeline loaded a visible thumbnail strip and playback reached frame 3;
 - Clip Properties added Saturation and set it to zero;
 - the edited preview pixels differed from the original, disabling the effect
   restored the original pixel hash, and re-enabling restored the edited hash;
+- the browser `+ Music` action imported a real 5.8-second WAV as 145
+  25-FPS timeline frames and loaded at least 170 non-silent waveform buckets;
 - the browser-persisted project retained the enabled zero-saturation effect;
-- browser export produced H.264 at exactly 512x768, 25 FPS, 12 frames, and
-  0.48 seconds, with no duplicate-timestamp frame loss;
-- frames 0, 6, and 11 were assembled into a contact sheet and visually
+- browser selection export produced H.264 at exactly 512x768, 25 FPS, 121
+  frames, and 4.842 seconds plus stereo 48 kHz AAC; `volumedetect` measured the
+  exported audio at -36.1 dB mean, proving the music was not a silent stream;
+- frames 0, 60, and 120 were assembled into a contact sheet and visually
   inspected for both motion and the grayscale edit;
+- the migrated user project `project-1784862262957-402` separately opened with
+  183,260 visible preview pixels, real media at frame zero, a thumbnail strip,
+  no legacy fake clips, and no browser/API errors;
 - Playwright recorded no failed HTTP requests, page exceptions, or browser
   console errors.
 
@@ -124,6 +144,8 @@ The machine-readable result and visual evidence are written to:
 - `output/checks/genesis_browser/result.json`;
 - `output/checks/genesis_browser/editor.png`;
 - `output/checks/genesis_browser/export-contact.png`.
+- `output/checks/genesis_browser/saved-project-result.json`;
+- `output/checks/genesis_browser/saved-project.png`.
 
 Generated test projects, previews, exports, profiles, and installed binaries
 remain beneath ignored `output/` or `/tmp`; source control contains the code,

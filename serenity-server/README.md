@@ -90,10 +90,17 @@ run the real browser edit/export acceptance gate:
 pixi run check-genesis-video-editor
 ```
 
-The gate imports the source, opens Video Edit in Chromium, changes Saturation
-through Clip Properties, proves enabling and disabling changes the rendered
-pixels, exports from the browser, probes the movie, and writes its screenshot,
+The gate imports real video and audio through the visible toolbar, proves the
+thumbnail strip, music waveform, playback, and Clip Properties, changes
+Saturation, proves enabling and disabling changes the rendered pixels, exports
+H.264 plus AAC from the browser, probes the movie, and writes its screenshot,
 contact sheet, and JSON result under `output/checks/genesis_browser/`.
+
+To inspect a particular persisted project through the same browser gate:
+
+```bash
+GENESIS_INSPECT_PROJECT_ID=project-id pixi run check-genesis-video-editor
+```
 
 Mojo worker builds are separate, GPU-architecture-specific operations. Never
 run a broad `pixi run build-*` merely to debug the browser. Identify the exact

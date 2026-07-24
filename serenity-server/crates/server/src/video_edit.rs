@@ -111,6 +111,188 @@ fn write_project(state: &AppState, id: &str, mut value: JsonValue) -> Result<Jso
     Ok(value)
 }
 
+fn is_legacy_demo_clip(clip: &JsonValue) -> bool {
+    if clip
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|source| !source.is_empty())
+    {
+        return false;
+    }
+    matches!(
+        (
+            clip.get("id").and_then(JsonValue::as_str),
+            clip.get("label").and_then(JsonValue::as_str)
+        ),
+        (Some("clip-1"), Some("Intro"))
+            | (Some("clip-2"), Some("Scene 1"))
+            | (Some("clip-3"), Some("Overlay"))
+            | (Some("clip-4"), Some("Music.mp3"))
+            | (Some("clip-5"), Some("Hello world"))
+            | (Some("clip-6"), Some("Second line"))
+    )
+}
+
+fn migrate_legacy_demo_project(
+    state: &AppState,
+    id: &str,
+    mut project: JsonValue,
+) -> Result<(JsonValue, bool), String> {
+    let has_legacy_demo = project
+        .get("tracks")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|tracks| {
+            tracks.iter().any(|track| {
+                track
+                    .get("clips")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|clips| clips.iter().any(is_legacy_demo_clip))
+            })
+        });
+    if !has_legacy_demo {
+        return Ok((project, false));
+    }
+
+    let project_fps = project
+        .get("fps")
+        .and_then(JsonValue::as_f64)
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .unwrap_or(30.0)
+        .clamp(1.0, 120.0);
+    let mut first_video_size = None;
+    if let Some(tracks) = project.get_mut("tracks").and_then(JsonValue::as_array_mut) {
+        for track in tracks.iter_mut() {
+            let track_type = track
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string();
+            let Some(clips) = track.get_mut("clips").and_then(JsonValue::as_array_mut) else {
+                continue;
+            };
+            clips.retain(|clip| !is_legacy_demo_clip(clip));
+
+            let mut cursor = 0_i64;
+            for clip in clips.iter_mut() {
+                let Some(source) = clip
+                    .get("source_path")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let resolved = resolve_source_path(state, Some(id), &source)?;
+                let probe = crate::video::probe_video_path(&resolved.to_string_lossy())?;
+                let has_video = probe
+                    .get("has_video")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let has_audio = probe
+                    .get("has_audio")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let duration = probe
+                    .get("duration")
+                    .and_then(JsonValue::as_f64)
+                    .filter(|duration| duration.is_finite() && *duration > 0.0)
+                    .or_else(|| {
+                        probe
+                            .get("audio_duration")
+                            .and_then(JsonValue::as_f64)
+                            .filter(|duration| duration.is_finite() && *duration > 0.0)
+                    })
+                    .unwrap_or(1.0 / project_fps);
+                let source_fps = if has_video {
+                    probe
+                        .get("fps")
+                        .and_then(JsonValue::as_f64)
+                        .filter(|fps| fps.is_finite() && *fps > 0.0)
+                        .unwrap_or(project_fps)
+                } else {
+                    project_fps
+                };
+                let source_frames = if has_video {
+                    probe
+                        .get("frame_count")
+                        .and_then(JsonValue::as_i64)
+                        .filter(|frames| *frames > 0)
+                        .unwrap_or_else(|| (duration * source_fps).round() as i64)
+                } else {
+                    (duration * source_fps).round() as i64
+                }
+                .max(1);
+                let timeline_frames = (duration * project_fps).round().max(1.0) as i64;
+
+                clip["startFrame"] = json!(cursor);
+                clip["endFrame"] = json!(cursor + timeline_frames);
+                clip["source_fps"] = json!(source_fps);
+                clip["source_frames"] = json!(source_frames);
+                clip["duration_seconds"] = json!(duration);
+                clip["has_audio"] = json!(has_audio);
+                clip["media_type"] = json!(if track_type == "audio" || !has_video {
+                    "audio"
+                } else {
+                    "video"
+                });
+                cursor += timeline_frames;
+
+                if has_video && first_video_size.is_none() {
+                    let width = probe
+                        .get("width")
+                        .and_then(JsonValue::as_i64)
+                        .unwrap_or(0);
+                    let height = probe
+                        .get("height")
+                        .and_then(JsonValue::as_i64)
+                        .unwrap_or(0);
+                    if width > 0 && height > 0 {
+                        first_video_size = Some((width, height));
+                    }
+                }
+            }
+        }
+
+        let mut kept_video = false;
+        let mut kept_audio = false;
+        tracks.retain(|track| {
+            let track_type = track
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let has_clips = track
+                .get("clips")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|clips| !clips.is_empty());
+            match track_type {
+                "video" => {
+                    if has_clips || !kept_video {
+                        kept_video = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "audio" => {
+                    if has_clips || !kept_audio {
+                        kept_audio = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => has_clips,
+            }
+        });
+    }
+    if let Some((width, height)) = first_video_size {
+        project["width"] = json!(width);
+        project["height"] = json!(height);
+    }
+    project["editor_schema_version"] = json!(2);
+    project["legacy_demo_removed"] = json!(true);
+    Ok((project, true))
+}
+
 fn ensure_genesis_environment(state: &AppState) {
     GENESIS_ENV_READY.get_or_init(|| {
         if std::env::var_os("SERENITY_GENESIS_WORKER").is_none() {
@@ -154,7 +336,14 @@ pub async fn post_projects(
 
 pub async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match read_project(&state, &id) {
-        Ok(project) => Json(project).into_response(),
+        Ok(project) => match migrate_legacy_demo_project(&state, &id, project) {
+            Ok((project, true)) => match write_project(&state, &id, project) {
+                Ok(project) => Json(project).into_response(),
+                Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            },
+            Ok((project, false)) => Json(project).into_response(),
+            Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        },
         Err(e) => json_error(StatusCode::NOT_FOUND, e),
     }
 }
@@ -917,12 +1106,23 @@ pub async fn post_import_clip(
     }
 
     let mut saved: Option<(PathBuf, String)> = None;
+    let mut project_fps_hint: Option<f64> = None;
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
             Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("multipart: {e}")),
         };
+        if field.name() == Some("project_fps") {
+            project_fps_hint = field
+                .text()
+                .await
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|fps| fps.is_finite() && *fps > 0.0)
+                .map(|fps| fps.clamp(1.0, 120.0));
+            continue;
+        }
         if field.name() != Some("file") {
             continue;
         }
@@ -969,31 +1169,95 @@ pub async fn post_import_clip(
     let Some((path, stored_name)) = saved else {
         return json_error(StatusCode::BAD_REQUEST, "multipart file field is required");
     };
-    let probe_path = path.to_string_lossy().into_owned();
-    let (duration_frames, source_fps) = tokio::task::spawn_blocking(move || {
-        let probe = crate::video::probe_video_path(&probe_path).ok();
-        let frames = probe
-            .as_ref()
-            .and_then(|value| value.get("frame_count"))
-            .and_then(JsonValue::as_i64)
-            .filter(|frames| *frames > 0)
-            .or_else(|| genesis_web::worker::media_frames(&probe_path))
-            .unwrap_or(1);
-        let fps = probe
-            .as_ref()
-            .and_then(|value| value.get("fps"))
-            .and_then(JsonValue::as_f64)
+    let project_fps = project_fps_hint.unwrap_or_else(|| {
+        read_project(&state, &id)
+            .ok()
+            .and_then(|project| project.get("fps").and_then(JsonValue::as_f64))
             .filter(|fps| fps.is_finite() && *fps > 0.0)
-            .unwrap_or(30.0);
-        (frames, fps)
-    })
-    .await
-    .unwrap_or((1, 30.0));
+            .unwrap_or(30.0)
+            .clamp(1.0, 120.0)
+    });
+    let probe_path = path.to_string_lossy().into_owned();
+    let (duration_frames, source_fps, media_type, width, height, has_audio, duration_seconds) =
+        tokio::task::spawn_blocking(move || {
+            let probe = crate::video::probe_video_path(&probe_path).ok();
+            let has_video = probe
+                .as_ref()
+                .and_then(|value| value.get("has_video"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let has_audio = probe
+                .as_ref()
+                .and_then(|value| value.get("has_audio"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let duration = probe
+                .as_ref()
+                .and_then(|value| value.get("duration"))
+                .and_then(JsonValue::as_f64)
+                .filter(|duration| duration.is_finite() && *duration > 0.0)
+                .or_else(|| {
+                    probe
+                        .as_ref()
+                        .and_then(|value| value.get("audio_duration"))
+                        .and_then(JsonValue::as_f64)
+                        .filter(|duration| duration.is_finite() && *duration > 0.0)
+                })
+                .unwrap_or(1.0 / project_fps);
+            let fps = if has_video {
+                probe
+                    .as_ref()
+                    .and_then(|value| value.get("fps"))
+                    .and_then(JsonValue::as_f64)
+                    .filter(|fps| fps.is_finite() && *fps > 0.0)
+                    .unwrap_or(project_fps)
+            } else {
+                project_fps
+            };
+            let frames = if has_video {
+                probe
+                    .as_ref()
+                    .and_then(|value| value.get("frame_count"))
+                    .and_then(JsonValue::as_i64)
+                    .filter(|frames| *frames > 0)
+                    .or_else(|| genesis_web::worker::media_frames(&probe_path))
+                    .unwrap_or_else(|| (duration * fps).round() as i64)
+            } else {
+                (duration * fps).round() as i64
+            }
+            .max(1);
+            let width = probe
+                .as_ref()
+                .and_then(|value| value.get("width"))
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            let height = probe
+                .as_ref()
+                .and_then(|value| value.get("height"))
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            (
+                frames,
+                fps,
+                if has_video { "video" } else { "audio" },
+                width,
+                height,
+                has_audio,
+                duration,
+            )
+        })
+        .await
+        .unwrap_or((1, project_fps, "audio", 0, 0, false, 1.0 / project_fps));
     Json(json!({
         "clip_id": format!("clip-{}", now_millis()),
         "source_path": format!("{id}/media/{stored_name}"),
         "duration_frames": duration_frames.max(1),
-        "source_fps": source_fps
+        "duration_seconds": duration_seconds,
+        "source_fps": source_fps,
+        "media_type": media_type,
+        "width": width,
+        "height": height,
+        "has_audio": has_audio
     }))
     .into_response()
 }
@@ -1133,8 +1397,22 @@ pub async fn post_waveform(
     let fps = request.fps.clamp(1.0, 120.0);
     let render_path = path.to_string_lossy().into_owned();
     let result = tokio::task::spawn_blocking(move || {
-        let frames = genesis_web::worker::media_frames(&render_path).unwrap_or(1);
-        let duration_seconds = frames as f64 / fps;
+        let probe = crate::video::probe_video_path(&render_path).ok();
+        let duration_seconds = probe
+            .as_ref()
+            .and_then(|value| value.get("duration"))
+            .and_then(JsonValue::as_f64)
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+            .or_else(|| {
+                probe
+                    .as_ref()
+                    .and_then(|value| value.get("audio_duration"))
+                    .and_then(JsonValue::as_f64)
+                    .filter(|duration| duration.is_finite() && *duration > 0.0)
+            })
+            .unwrap_or_else(|| {
+                genesis_web::worker::media_frames(&render_path).unwrap_or(1) as f64 / fps
+            });
         let buckets =
             ((duration_seconds * samples_per_second as f64).ceil() as usize).clamp(1, 100_000);
         let peaks = genesis_web::worker::audio_envelope(&render_path, buckets)
@@ -1370,5 +1648,22 @@ mod tests {
 
         assert_eq!(clip.sat, 1.0);
         assert_eq!(clip.contrast, 1.25);
+    }
+
+    #[test]
+    fn legacy_demo_detection_never_removes_real_media() {
+        assert!(is_legacy_demo_clip(&json!({
+            "id": "clip-4",
+            "label": "Music.mp3"
+        })));
+        assert!(!is_legacy_demo_clip(&json!({
+            "id": "clip-4",
+            "label": "Music.mp3",
+            "source_path": "project-1/media/real-music.mp3"
+        })));
+        assert!(!is_legacy_demo_clip(&json!({
+            "id": "clip-user",
+            "label": "Intro"
+        })));
     }
 }

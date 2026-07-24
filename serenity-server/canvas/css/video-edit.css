@@ -53,6 +53,39 @@
     user-select: none;
 }
 
+.ve-preview-empty {
+    position: absolute;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    color: #a8a8ba !important;
+}
+
+.ve-preview-empty strong {
+    color: #ececf5;
+    font-size: 15px;
+}
+
+.ve-preview-empty span {
+    font-size: 12px;
+}
+
+.ve-preview-empty button {
+    margin: 4px;
+    padding: 7px 12px;
+    border: 1px solid rgba(124, 122, 255, 0.55);
+    border-radius: 6px;
+    background: rgba(108, 106, 245, 0.18);
+    color: #e9e9ff;
+    cursor: pointer;
+}
+
+.ve-preview-empty button:hover {
+    background: rgba(108, 106, 245, 0.32);
+}
+
 /* ===== Toolbar ===== */
 #ve-toolbar {
     flex: 0 0 auto;
@@ -86,6 +119,18 @@
 
 .ve-tb-btn:hover {
     background: rgba(255, 255, 255, 0.08);
+}
+
+.ve-tb-btn-label {
+    width: auto;
+    padding: 0 9px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.ve-tb-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
 }
 
 .ve-tb-btn.ve-active {

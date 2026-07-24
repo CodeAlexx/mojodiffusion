@@ -20,6 +20,8 @@ var GenerateTab = (function () {
         generating: false,
         currentImage: null,
         currentIsVideo: false,
+        currentVideoFrames: null,
+        currentVideoFps: null,
         gallery: [],
         arch: 'sd15',
         frames: 121,
@@ -1303,7 +1305,13 @@ var GenerateTab = (function () {
                         label = promptEl.value.slice(0, 30).trim() || 'Generated';
                     }
                 } catch (e) {}
-                var durationFrames = state.currentIsVideo ? (30 * 5) : (30 * 3);
+                var timelineFps = Math.max(
+                    1,
+                    Math.min(120, Math.round(Number(state.currentVideoFps || state.fps) || 30))
+                );
+                var durationFrames = state.currentIsVideo
+                    ? Math.max(1, Math.round(Number(state.currentVideoFrames) || Number(state.frames) || timelineFps))
+                    : timelineFps * 3;
 
                 // Resolve /view URL to a real filesystem path before passing to timeline
                 var viewUrl = state.currentImage;
@@ -1313,7 +1321,7 @@ var GenerateTab = (function () {
                     urlObj.searchParams.forEach(function (v, k) { params[k] = v; });
                 } catch (e) {
                     // Not a URL — pass as-is (may be a direct path)
-                    VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames);
+                    VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames, timelineFps);
                     if (typeof switchTab === 'function') switchTab('video-edit');
                     return;
                 }
@@ -1331,19 +1339,19 @@ var GenerateTab = (function () {
                     .then(function (r) { return r.json(); })
                     .then(function (data) {
                         if (data.path) {
-                            VideoEditTab.addClipFromExternal(data.path, label, durationFrames);
+                            VideoEditTab.addClipFromExternal(data.path, label, durationFrames, timelineFps);
                         } else {
                             // Fallback: use the URL as-is
-                            VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames);
+                            VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames, timelineFps);
                         }
                         if (typeof switchTab === 'function') switchTab('video-edit');
                     })
                     .catch(function () {
-                        VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames);
+                        VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames, timelineFps);
                         if (typeof switchTab === 'function') switchTab('video-edit');
                     });
                 } else {
-                    VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames);
+                    VideoEditTab.addClipFromExternal(viewUrl, label, durationFrames, timelineFps);
                     if (typeof switchTab === 'function') switchTab('video-edit');
                 }
             });
@@ -2072,7 +2080,7 @@ var GenerateTab = (function () {
                 }
                 if (!src)
                     throw new Error('video completed without an MP4 URL');
-                displayVideo(src);
+                displayVideo(src, video);
                 addToGallery(src, true, {
                     prompt: submission.prompt,
                     model: submission.model,
@@ -2083,6 +2091,8 @@ var GenerateTab = (function () {
                     scheduler: 'mojo-video',
                     width: video.width || submission.width,
                     height: video.height || submission.height,
+                    frame_count: video.frame_count != null ? video.frame_count : video.frames,
+                    fps: video.fps,
                     arch: submission.arch
                 });
                 state.pendingBatch = 0;
@@ -2142,9 +2152,13 @@ var GenerateTab = (function () {
         els.actionBar.style.display = 'flex';
         els.empty.style.display = 'none';
     }
-    function displayVideo(src) {
+    function displayVideo(src, metadata) {
         state.currentImage = src;
         state.currentIsVideo = true;
+        state.currentVideoFrames = Number(
+            metadata && (metadata.frame_count != null ? metadata.frame_count : metadata.frames)
+        ) || Number(state.frames) || null;
+        state.currentVideoFps = Number(metadata && metadata.fps) || Number(state.fps) || null;
         els.previewVideo.src = src;
         els.previewVideo.style.display = 'block';
         els.previewImg.style.display = 'none';
@@ -2154,6 +2168,8 @@ var GenerateTab = (function () {
     function clearPreview() {
         state.currentImage = null;
         state.currentIsVideo = false;
+        state.currentVideoFrames = null;
+        state.currentVideoFps = null;
         els.previewImg.style.display = 'none';
         els.previewImg.removeAttribute('src');
         els.previewVideo.style.display = 'none';
@@ -2186,6 +2202,8 @@ var GenerateTab = (function () {
             scheduler: value('scheduler', state.scheduler),
             width: value('width', state.width),
             height: value('height', state.height),
+            frame_count: value('frame_count', state.currentVideoFrames),
+            fps: value('fps', state.currentVideoFps),
             arch: value('arch', state.arch),
             timestamp: Date.now(),
             starred: false
@@ -2272,6 +2290,8 @@ var GenerateTab = (function () {
             scheduler: meta.scheduler || params.scheduler || '',
             width: meta.width != null ? meta.width : params.width,
             height: meta.height != null ? meta.height : params.height,
+            frame_count: meta.frame_count != null ? meta.frame_count : params.frames,
+            fps: meta.fps != null ? meta.fps : params.fps,
             arch: arch
         };
     }
@@ -2836,7 +2856,7 @@ var GenerateTab = (function () {
         }
         // Display the clicked item in preview
         if (item.isVideo) {
-            displayVideo(item.src);
+            displayVideo(item.src, item);
         }
         else {
             displayImage(item.src);

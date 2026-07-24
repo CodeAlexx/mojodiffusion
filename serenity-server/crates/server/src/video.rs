@@ -3654,7 +3654,7 @@ fn fps_from_rate(rate: &str) -> f64 {
     rate.parse::<f64>().unwrap_or(0.0)
 }
 
-fn probe_video_path(mp4: &str) -> Result<Value, String> {
+pub(crate) fn probe_video_path(mp4: &str) -> Result<Value, String> {
     if mp4.contains('\n') || mp4.contains('\r') {
         return Err("cannot probe MP4: invalid video path".to_string());
     }

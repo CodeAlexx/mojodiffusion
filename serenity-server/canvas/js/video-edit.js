@@ -34,7 +34,6 @@ var VideoEditTab = (function () {
         glow:       { name: 'Glow',       category: 'stylize', defaults: { radius: 10 }, range: { radius: [1, 40, 1] } },
         vignette:   { name: 'Vignette',   category: 'stylize', defaults: { angle: 0.4 }, range: { angle: [0, 1, 0.05] } },
         speed:      { name: 'Speed',      category: 'utility', defaults: { rate: 1 }, range: { rate: [0.25, 4, 0.25] } },
-        opacity:    { name: 'Opacity',    category: 'utility', defaults: { value: 1 }, range: { value: [0, 1, 0.05] } },
         flip_h:     { name: 'Flip H',     category: 'utility', defaults: {}, range: {} },
         flip_v:     { name: 'Flip V',     category: 'utility', defaults: {}, range: {} },
     };
@@ -191,33 +190,17 @@ var VideoEditTab = (function () {
     // --- Default project data ---
     var project = {
         fps: 30,
+        width: 1280,
+        height: 720,
         name: 'Untitled Project',
         tracks: [
             {
                 id: 'track-1', name: 'Video 1', type: 'video',
-                clips: [
-                    { id: 'clip-1', startFrame: 0, endFrame: 150, label: 'Intro', color: '#4a7dff' },
-                    { id: 'clip-2', startFrame: 180, endFrame: 450, label: 'Scene 1', color: '#4a7dff' }
-                ]
+                clips: []
             },
             {
-                id: 'track-2', name: 'Video 2', type: 'video',
-                clips: [
-                    { id: 'clip-3', startFrame: 90, endFrame: 300, label: 'Overlay', color: '#7b4aff' }
-                ]
-            },
-            {
-                id: 'track-3', name: 'Audio', type: 'audio',
-                clips: [
-                    { id: 'clip-4', startFrame: 0, endFrame: 900, label: 'Music.mp3', color: '#2a9d5c' }
-                ]
-            },
-            {
-                id: 'track-4', name: 'Subtitles', type: 'text',
-                clips: [
-                    { id: 'clip-5', startFrame: 30, endFrame: 120, label: 'Hello world', color: '#d4a72c' },
-                    { id: 'clip-6', startFrame: 200, endFrame: 350, label: 'Second line', color: '#d4a72c' }
-                ]
+                id: 'track-2', name: 'Audio', type: 'audio',
+                clips: []
             }
         ]
     };
@@ -375,6 +358,22 @@ var VideoEditTab = (function () {
         });
     }
 
+    function applyLoadedProject(data) {
+        project.name = data.name || 'Untitled Project';
+        project.fps = clamp(Math.round(Number(data.fps) || 30), 1, 120);
+        project.width = clamp(Math.round(Number(data.width) || 1280), 16, 8192);
+        project.height = clamp(Math.round(Number(data.height) || 720), 16, 8192);
+        FPS = project.fps;
+        if (Array.isArray(data.tracks)) {
+            project.tracks = data.tracks;
+        }
+        recalcTotalFrames();
+        currentFrame = clamp(currentFrame, 0, totalFrames);
+        updateTimecodeDisplay();
+        renderTimeline();
+        updatePreview();
+    }
+
     function loadOrCreateProject() {
         // Try loading last project ID from localStorage
         var savedId = localStorage.getItem('ve-project-id');
@@ -386,14 +385,7 @@ var VideoEditTab = (function () {
                 })
                 .then(function (data) {
                     projectId = data.id;
-                    project.name = data.name || 'Untitled Project';
-                    project.fps = data.fps || 30;
-                    if (data.tracks && data.tracks.length > 0) {
-                        project.tracks = data.tracks;
-                    }
-                    recalcTotalFrames();
-                    renderTimeline();
-                    updatePreview();
+                    applyLoadedProject(data);
                 })
                 .catch(function () {
                     // Project not found, create new
@@ -411,6 +403,8 @@ var VideoEditTab = (function () {
             body: JSON.stringify({
                 name: project.name,
                 fps: project.fps,
+                width: project.width,
+                height: project.height,
                 tracks: project.tracks
             })
         })
@@ -799,8 +793,8 @@ var VideoEditTab = (function () {
         }
 
         var sourceOffset = clip.source_start || 0;
-        var frameInSource = currentFrame - clip.startFrame + sourceOffset;
-        var timeInSource = frameInSource / FPS;
+        var sourceFps = clip.source_fps || FPS;
+        var timeInSource = sourceOffset / sourceFps + (currentFrame - clip.startFrame) / FPS;
 
         // Load video source if clip changed
         if (previewActiveClipId !== clip.id && previewVideo) {
@@ -944,6 +938,7 @@ var VideoEditTab = (function () {
             body: JSON.stringify({
                 source_path: clip.source_path,
                 height: TRACK_HEIGHT - 12,
+                fps: clip.source_fps || FPS,
             }),
         })
         .then(function (r) { return r.ok ? r.json() : null; })
@@ -981,6 +976,7 @@ var VideoEditTab = (function () {
             body: JSON.stringify({
                 source_path: clip.source_path,
                 samples_per_second: 30,
+                fps: clip.source_fps || FPS,
             }),
         })
         .then(function (r) { return r.ok ? r.json() : null; })
@@ -1594,7 +1590,17 @@ var VideoEditTab = (function () {
             });
 
             pushUndo();
-            var dur = data.duration_frames || (FPS * 5);
+            var sourceFps = clamp(Math.round(Number(data.source_fps) || FPS), 1, 120);
+            var sourceFrames = Math.max(1, Math.round(Number(data.duration_frames) || sourceFps));
+            if (endFrame === 0 && !project.tracks.some(function (candidateTrack) {
+                return candidateTrack.clips.some(function (candidateClip) {
+                    return !!candidateClip.source_path;
+                });
+            })) {
+                FPS = sourceFps;
+                project.fps = sourceFps;
+            }
+            var dur = Math.max(1, Math.round(sourceFrames * FPS / sourceFps));
             track.clips.push({
                 id: data.clip_id || generateClipId(),
                 startFrame: endFrame,
@@ -1602,10 +1608,12 @@ var VideoEditTab = (function () {
                 label: file.name.replace(/\.[^.]+$/, '').slice(0, 30),
                 color: trackColor,
                 source_path: data.source_path,
+                source_fps: sourceFps,
             });
             recalcTotalFrames();
             renderTimeline();
             scheduleAutosave();
+            updatePreview();
 
             // Scroll to show new clip
             var clipEndPx = (endFrame + dur) * pixelsPerFrame;
@@ -1759,7 +1767,7 @@ var VideoEditTab = (function () {
                 '<div class="ve-export-row"><label>Resolution</label>' +
                     '<select id="ve-exp-res"><option value="project">' + (project.width || 1280) + 'x' + (project.height || 720) + '</option><option value="1920x1080">1920x1080</option><option value="1280x720">1280x720</option><option value="854x480">854x480</option></select></div>' +
                 '<div class="ve-export-row"><label>FPS</label>' +
-                    '<input type="number" id="ve-exp-fps" value="' + FPS + '" min="1" max="60" style="width:60px"></div>' +
+                    '<input type="number" id="ve-exp-fps" value="' + FPS + '" min="1" max="120" readonly title="Genesis exports at the project timeline FPS" style="width:60px"></div>' +
                 '<div class="ve-export-row"><label>Quality</label>' +
                     '<select id="ve-exp-quality"><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="lossless">Lossless</option></select></div>' +
                 '<div class="ve-export-row"><label>Color Grade</label>' +
@@ -2253,7 +2261,9 @@ var VideoEditTab = (function () {
             cb.onchange = function () {
                 pushUndo();
                 eff.enabled = cb.checked;
+                renderTimeline();
                 scheduleAutosave();
+                updatePreviewDebounced();
             };
             lbl.appendChild(cb);
             lbl.appendChild(document.createTextNode(' ' + reg.name));
@@ -2267,6 +2277,7 @@ var VideoEditTab = (function () {
                 renderPropertiesPanelContent(panel, clip);
                 renderTimeline();
                 scheduleAutosave();
+                updatePreviewDebounced();
             };
 
             cardHeader.appendChild(lbl);
@@ -2299,10 +2310,12 @@ var VideoEditTab = (function () {
                     var v = parseFloat(slider.value);
                     eff.params[key] = v;
                     valDisplay.textContent = v.toFixed(range[2] < 1 ? 2 : 0);
+                    updatePreviewDebounced();
                 };
                 slider.onchange = function () {
                     pushUndo();
                     scheduleAutosave();
+                    updatePreviewDebounced();
                 };
 
                 row.appendChild(paramLabel);
@@ -2367,6 +2380,7 @@ var VideoEditTab = (function () {
             }
             renderTimeline();
             scheduleAutosave();
+            updatePreviewDebounced();
         };
 
         // Upload new .cube file
@@ -2426,7 +2440,7 @@ var VideoEditTab = (function () {
             lutSection.appendChild(previewRow);
 
             // Fetch original frame
-            var seekSec = (clip.source_start || 0) / FPS;
+            var seekSec = (clip.source_start || 0) / (clip.source_fps || FPS);
             fetch(getApiBase() + '/video_edit/preview_effect', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2570,6 +2584,7 @@ var VideoEditTab = (function () {
                     renderPropertiesPanelContent(panel, clip);
                     renderTimeline();
                     scheduleAutosave();
+                    updatePreviewDebounced();
                 };
                 dropdown.appendChild(itemEl);
             });
@@ -3557,7 +3572,7 @@ var VideoEditTab = (function () {
                         var tc = thumbnailCache.get(clip.id);
                         var thumbX = 0;
                         var sec = 0;
-                        var sourceStartSec = (clip.source_start || 0) / FPS;
+                        var sourceStartSec = (clip.source_start || 0) / (clip.source_fps || FPS);
                         while (thumbX < clipW && sec < tc.frameCount) {
                             var spriteIdx = Math.min(Math.floor(sourceStartSec + sec), tc.frameCount - 1);
                             group.add(new Konva.Image({
@@ -3577,7 +3592,9 @@ var VideoEditTab = (function () {
                     if (hasWaveform && (track.type === 'audio' || track.type === 'video')) {
                         var wd = waveformCache.get(clip.id);
                         var midY = clipH / 2;
-                        var sourceStartSample = Math.floor((clip.source_start || 0) / FPS * wd.sample_rate);
+                        var sourceStartSample = Math.floor(
+                            (clip.source_start || 0) / (clip.source_fps || FPS) * wd.sample_rate
+                        );
                         var clipDurFrames = clip.endFrame - clip.startFrame;
                         var samplesInClip = Math.floor(clipDurFrames / FPS * wd.sample_rate);
                         var wfPoints = [];
@@ -4824,19 +4841,24 @@ var VideoEditTab = (function () {
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (data) {
                 if (!data) return;
-                project.name = data.name || 'Untitled Project';
-                project.fps = data.fps || 30;
-                if (data.tracks && data.tracks.length > 0) {
-                    project.tracks = data.tracks;
-                }
-                recalcTotalFrames();
-                renderTimeline();
+                applyLoadedProject(data);
             })
             .catch(function () {});
     }
 
-    function addClipFromExternal(sourcePath, label, durationFrames) {
+    function addClipFromExternal(sourcePath, label, durationFrames, sourceFps) {
         if (!projectId) return;
+
+        var hasMedia = project.tracks.some(function (candidateTrack) {
+            return candidateTrack.clips.some(function (candidateClip) {
+                return !!candidateClip.source_path;
+            });
+        });
+        var normalizedSourceFps = clamp(Math.round(Number(sourceFps) || FPS), 1, 120);
+        if (!hasMedia) {
+            FPS = normalizedSourceFps;
+            project.fps = normalizedSourceFps;
+        }
 
         // Find first video track or create one
         var track = null;
@@ -4855,7 +4877,11 @@ var VideoEditTab = (function () {
         });
 
         pushUndo();
-        var dur = durationFrames || (FPS * 5);
+        var sourceFrames = Math.max(
+            1,
+            Math.round(Number(durationFrames) || normalizedSourceFps)
+        );
+        var dur = Math.max(1, Math.round(sourceFrames * FPS / normalizedSourceFps));
         var newClip = {
             id: generateClipId(),
             startFrame: endFrame,
@@ -4863,11 +4889,13 @@ var VideoEditTab = (function () {
             label: label || 'Generated',
             color: '#4a7dff',
             source_path: sourcePath,
+            source_fps: normalizedSourceFps,
         };
         track.clips.push(newClip);
         recalcTotalFrames();
         renderTimeline();
         scheduleAutosave();
+        updatePreview();
 
         // Scroll to show new clip
         var clipEndPx = newClip.endFrame * pixelsPerFrame;

@@ -81,29 +81,49 @@ The browser video element remains an immediate fallback until the composited
 PNG arrives. Export uses status polling and shows a terminal path in the
 existing dialog; it does not depend on an unrelated WebSocket event.
 
+Imported media carries its probed source FPS and duration into the timeline.
+Saved project width, height, and FPS are restored when the browser opens the
+project. The Genesis adapter converts between the browser timeline clock and
+each clip's source clock, while `gcompose` stamps encoded frames with the
+requested rational FPS rather than a fixed 30 FPS clock. Effect add, remove,
+enable, disable, slider, and LUT changes request a fresh Genesis preview and
+disabled effects are excluded before they reach the compositor.
+
 ## Verification evidence
 
-Verification on 2026-07-23 used the pinned LTX-2.3 512x768, 121-frame MP4 at:
+The repeatable browser acceptance gate is:
 
-`output/nsys/ltx2_request_int4_512x768_121f/render-factorized/ltx2_t2v_hq.mp4`
+```bash
+pixi run check-genesis-video-editor
+```
+
+Verification on 2026-07-23 used the real LTX-2.3 512x768, 121-frame, 25 FPS
+MP4 at:
+
+`output/serenity_ui_out/video-0409/ltx2_t2v_hq.mp4`
 
 Observed gates:
 
 - `gcompose --serve` initialized OpenCL and passed its startup self-check;
-- project create/update/load succeeded;
-- frame 0 rendered to a valid 1280x856 RGBA PNG and was visually inspected;
-- media range `bytes=0-99` returned HTTP 206 and exactly 100 bytes;
-- thumbnails returned five 64x36 cells for the 4.84-second source;
-- the audio-less source returned 121 zero peaks and the correct 4.033-second
-  30 FPS timeline duration;
-- a three-frame 320x480 H.264 video-only export completed and `ffprobe`
-  reported exactly three video frames and no audio stream;
-- `.cube` upload/list/preview produced a valid Genesis-rendered PNG;
-- clip import returned the correct 121-frame media length;
-- a Playwright browser smoke loaded the Video Edit tab at 1920x1080, displayed
-  the real composed frame and thumbnails, showed
-  `Genesis - Rust/C - Ready`, completed an export through UI polling, and
-  recorded no page errors, console errors, or failed requests.
+- import probed exactly 121 frames at 25 FPS;
+- Chromium opened the saved project at 512x768 and loaded the real Genesis
+  preview;
+- Clip Properties added Saturation and set it to zero;
+- the edited preview pixels differed from the original, disabling the effect
+  restored the original pixel hash, and re-enabling restored the edited hash;
+- the browser-persisted project retained the enabled zero-saturation effect;
+- browser export produced H.264 at exactly 512x768, 25 FPS, 12 frames, and
+  0.48 seconds, with no duplicate-timestamp frame loss;
+- frames 0, 6, and 11 were assembled into a contact sheet and visually
+  inspected for both motion and the grayscale edit;
+- Playwright recorded no failed HTTP requests, page exceptions, or browser
+  console errors.
+
+The machine-readable result and visual evidence are written to:
+
+- `output/checks/genesis_browser/result.json`;
+- `output/checks/genesis_browser/editor.png`;
+- `output/checks/genesis_browser/export-contact.png`.
 
 Generated test projects, previews, exports, profiles, and installed binaries
 remain beneath ignored `output/` or `/tmp`; source control contains the code,

@@ -407,7 +407,8 @@ static LAST_SPAWN_FAIL_MS: AtomicU64 = AtomicU64::new(0);
 /// press while one playback is already in flight is dropped (no-op) rather than stacking another
 /// detached thread that would block on the worker mutex and then spawn a duplicate `paplay`. This
 /// dedups rapid presses and bounds the number of concurrent background players to one.
-static PLAYBACK_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PLAYBACK_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Stop-edge coordination flag (findings #7 + #8). `stop_playback` sets this true; `play_program`
 /// clears it at the moment it dispatches a fresh audition. The detached assembly thread checks it
@@ -592,7 +593,7 @@ fn spawn_worker() -> Option<WorkerProc> {
 fn read_reply(proc: &mut WorkerProc) -> Option<String> {
     match proc.rx.recv_timeout(REPLY_TIMEOUT) {
         Ok(WorkerLine::Line(l)) => Some(l),
-        Ok(WorkerLine::Eof) => None,             // worker closed stdout (crashed/exited).
+        Ok(WorkerLine::Eof) => None, // worker closed stdout (crashed/exited).
         Err(RecvTimeoutError::Timeout) => {
             eprintln!("gcompose: worker reply timed out after {REPLY_TIMEOUT:?} (wedged worker?)");
             None
@@ -740,7 +741,10 @@ fn command_with_restart(req: &str) -> Option<String> {
         // The worker is genuinely BROKEN (dead/unresponsive): drop it so the next attempt spawns
         // clean. Only a real worker death reaches here now — an ERR no longer restarts.
         *guard = None;
-        eprintln!("gcompose command attempt {} failed; restarting worker", attempt + 1);
+        eprintln!(
+            "gcompose command attempt {} failed; restarting worker",
+            attempt + 1
+        );
     }
 
     // All in-call attempts exhausted: arm the cooldown so subsequent misses in this same repaint
@@ -825,7 +829,10 @@ pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
         // fast a little sooner.
         *guard = None;
         mark_spawn_fail();
-        eprintln!("gcompose serve attempt {} failed; restarting worker", attempt + 1);
+        eprintln!(
+            "gcompose serve attempt {} failed; restarting worker",
+            attempt + 1
+        );
     }
     None
 }
@@ -896,7 +903,10 @@ pub fn scope(project: &Project, t: i64, kind: u8) -> Option<Vec<u8>> {
         // Either PREVIEW or SCOPE failed: drop (kills) the worker so the next loop spawns clean.
         *guard = None;
         mark_spawn_fail();
-        eprintln!("gcompose scope attempt {} failed; restarting worker", attempt + 1);
+        eprintln!(
+            "gcompose scope attempt {} failed; restarting worker",
+            attempt + 1
+        );
     }
     None
 }
@@ -974,7 +984,10 @@ pub fn scope_all(project: &Project, t: i64) -> Option<[Vec<u8>; 3]> {
         // clean and re-composes from scratch.
         *guard = None;
         mark_spawn_fail();
-        eprintln!("gcompose scope_all attempt {} failed; restarting worker", attempt + 1);
+        eprintln!(
+            "gcompose scope_all attempt {} failed; restarting worker",
+            attempt + 1
+        );
     }
     None
 }
@@ -1395,7 +1408,10 @@ fn fold_white_balance(
 /// `small_hash` over the keys), distinct prefix so a compound temp never collides with a thumb/title
 /// raster. The temp holds a single GVW×GVH×4 RGBA frame, so resolve_frame always reads it at frame 0.
 fn subseq_temp_path(clip_idx: usize, inner_t: i64) -> String {
-    format!("/tmp/genesis_subseq_{:x}.rgba", small_hash(&format!("{clip_idx}|{inner_t}")))
+    format!(
+        "/tmp/genesis_subseq_{:x}.rgba",
+        small_hash(&format!("{clip_idx}|{inner_t}"))
+    )
 }
 
 /// P49 — pre-render every VISIBLE COMPOUND clip's sub-sequence frame at outer frame `t` into its
@@ -1432,7 +1448,7 @@ fn prerender_compound_clips(project: &Project, t: i64) {
             continue;
         }
         let inner = src_frame_at(c, t); // SAME inner the temp key + resolve_frame swap use.
-        // The transient one-level sub-timeline view (None if seq is out of range → leave no file).
+                                        // The transient one-level sub-timeline view (None if seq is out of range → leave no file).
         let Some(view) = project.subseq_view(c.seq as usize) else {
             continue;
         };
@@ -1475,7 +1491,11 @@ fn src_frame_at(c: &crate::model::Clip, t: i64) -> i64 {
         return c.src_in;
     }
     let local = t - c.t0;
-    let span = if c.reverse { (c.len - 1 - local).max(0) } else { local };
+    let span = if c.reverse {
+        (c.len - 1 - local).max(0)
+    } else {
+        local
+    };
     let s = (c.speed as f64).clamp(0.05, 16.0);
     c.src_in + (span as f64 * s).round() as i64
 }
@@ -1527,7 +1547,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // default V1/V2 this is base=V1, over=V2, no extras — byte-identical to before.
     let mut base_tv: Option<(&crate::model::Clip, usize, u8)> = None; // lowest visible video
     for (i, c) in project.clips.iter().enumerate() {
-        if t >= c.t0 && t < c.end() && !project.is_audio(c.track) && !project.is_hidden(c.track)
+        if t >= c.t0
+            && t < c.end()
+            && !project.is_audio(c.track)
+            && !project.is_hidden(c.track)
             && base_tv.is_none_or(|(_, _, bt)| c.track <= bt)
         {
             base_tv = Some((c, i, c.track)); // <= => last-wins on a tie (transition overlap)
@@ -1536,8 +1559,11 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     let mut over_tv: Option<(&crate::model::Clip, usize, u8)> = None; // lowest visible video ABOVE base
     if let Some((_, _, bt)) = base_tv {
         for (i, c) in project.clips.iter().enumerate() {
-            if t >= c.t0 && t < c.end() && c.track > bt
-                && !project.is_audio(c.track) && !project.is_hidden(c.track)
+            if t >= c.t0
+                && t < c.end()
+                && c.track > bt
+                && !project.is_audio(c.track)
+                && !project.is_hidden(c.track)
                 && over_tv.is_none_or(|(_, _, ot)| c.track <= ot)
             {
                 over_tv = Some((c, i, c.track));
@@ -1629,27 +1655,35 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
             let (px, py, pw, ph) = project.pip_at(idx, t_local);
             let op = project.opacity_at(t).clamp(0.0, 1.0);
             let inner = src_frame_at(c, t);
-            (format!("RAW:{}", subseq_temp_path(idx, inner)), 0, op, px, py, pw, ph)
+            (
+                format!("RAW:{}", subseq_temp_path(idx, inner)),
+                0,
+                op,
+                px,
+                py,
+                pw,
+                ph,
+            )
         } else {
-        match project.media.get(c.media) {
-            Some(p) => {
-                let frame = src_frame_at(c, t) as i32;
-                // Clip-LOCAL frame for the PiP keyframe track: t - over_clip.t0 (matches Mojo's
-                // pip_lf / qlf = the frame offset into the overlay clip). pip_at returns the clip's
-                // static px/py/pw/ph when this clip has no PiP keyframes, so this is a drop-in
-                // upgrade of the previous static `(c.px, c.py, c.pw, c.ph)`.
-                let t_local = t - c.t0;
-                let (px, py, pw, ph) = project.pip_at(idx, t_local);
-                // OPACITY KEYFRAME (P1): the base overlay opacity (1.0) is scaled by the keyframed
-                // opacity_kf at this timeline frame. An empty opacity_kf track → 1.0 (unchanged), so
-                // composites without an opacity animation behave exactly as before; a keyframed fade
-                // now drops `op` toward 0, fading the V2 overlay out in preview + render. Clamp to a
-                // sane [0,1] so a stray keyframe value can't push the composite weight out of range.
-                let op = project.opacity_at(t).clamp(0.0, 1.0);
-                (p.clone(), frame.max(0), op, px, py, pw, ph)
+            match project.media.get(c.media) {
+                Some(p) => {
+                    let frame = src_frame_at(c, t) as i32;
+                    // Clip-LOCAL frame for the PiP keyframe track: t - over_clip.t0 (matches Mojo's
+                    // pip_lf / qlf = the frame offset into the overlay clip). pip_at returns the clip's
+                    // static px/py/pw/ph when this clip has no PiP keyframes, so this is a drop-in
+                    // upgrade of the previous static `(c.px, c.py, c.pw, c.ph)`.
+                    let t_local = t - c.t0;
+                    let (px, py, pw, ph) = project.pip_at(idx, t_local);
+                    // OPACITY KEYFRAME (P1): the base overlay opacity (1.0) is scaled by the keyframed
+                    // opacity_kf at this timeline frame. An empty opacity_kf track → 1.0 (unchanged), so
+                    // composites without an opacity animation behave exactly as before; a keyframed fade
+                    // now drops `op` toward 0, fading the V2 overlay out in preview + render. Clamp to a
+                    // sane [0,1] so a stray keyframe value can't push the composite weight out of range.
+                    let op = project.opacity_at(t).clamp(0.0, 1.0);
+                    (p.clone(), frame.max(0), op, px, py, pw, ph)
+                }
+                None => ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0),
             }
-            None => ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0),
-        }
         }
     } else {
         ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0)
@@ -1674,9 +1708,13 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // model.rs. P37: ck_spill is sourced from the SAME overlay clip's `chroma.spill`, exactly mirroring
     // how ck_sim/ck_smooth are sourced; the disabled/no-overlay arm sends 0.0 (off) for byte-identity.
     let (ck_on, ck_key, ck_sim, ck_smooth, ck_spill) = match (s0, s1) {
-        (Some(_), Some((c, _))) if c.chroma.enabled && op > 0.0 => {
-            (1, c.chroma.key, c.chroma.similarity, c.chroma.smoothness, c.chroma.spill)
-        }
+        (Some(_), Some((c, _))) if c.chroma.enabled && op > 0.0 => (
+            1,
+            c.chroma.key,
+            c.chroma.similarity,
+            c.chroma.smoothness,
+            c.chroma.spill,
+        ),
         // No overlay / chroma disabled: identity (engine skips keying). Defaults mirror ChromaKey.
         _ => (0, [0.0, 1.0, 0.0], 0.4, 0.1, 0.0),
     };
@@ -1717,26 +1755,36 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // P30: rot/scale/blur are KEYFRAME-DRIVEN when the base clip has keys for them (the lift/gamma/
     // gain color-wheels stay static — not in the curated keyframeable set). par 7=blur, 8=rot,
     // 9=scale, each falling back to the static field so an un-keyframed clip is byte-identical.
-    let (mut lift, mut gamma, mut gain_rgb, mut rot, mut scale, mut blur) = match (base_clip, base_idx)
-    {
-        (Some(c), Some(idx)) => {
-            let (l, g, gn) = fold_white_balance(c.lift, c.gamma, c.gain_rgb, c.wb_temp, c.wb_tint);
-            let tl = t - c.t0;
-            (
-                l,
-                g,
-                gn,
-                project.clip_param_at(idx, 8, tl, c.rot),
-                project.clip_param_at(idx, 9, tl, c.scale),
-                project.clip_param_at(idx, 7, tl, c.blur),
-            )
-        }
-        _ => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0.0, 1.0, 0.0),
-    };
+    let (mut lift, mut gamma, mut gain_rgb, mut rot, mut scale, mut blur) =
+        match (base_clip, base_idx) {
+            (Some(c), Some(idx)) => {
+                let (l, g, gn) =
+                    fold_white_balance(c.lift, c.gamma, c.gain_rgb, c.wb_temp, c.wb_tint);
+                let tl = t - c.t0;
+                (
+                    l,
+                    g,
+                    gn,
+                    project.clip_param_at(idx, 8, tl, c.rot),
+                    project.clip_param_at(idx, 9, tl, c.scale),
+                    project.clip_param_at(idx, 7, tl, c.blur),
+                )
+            }
+            _ => (
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                0.0,
+                1.0,
+                0.0,
+            ),
+        };
 
     // PER-CLIP master tone CURVE (P5) from the BASE clip; identity ([0,.25,.5,.75,1]) for a gap so an
     // un-curved clip / gap is a no-op (the engine skips the kernel on identity).
-    let curve: [f32; 5] = base_clip.map(|c| c.curve).unwrap_or([0.0, 0.25, 0.5, 0.75, 1.0]);
+    let curve: [f32; 5] = base_clip
+        .map(|c| c.curve)
+        .unwrap_or([0.0, 0.25, 0.5, 0.75, 1.0]);
 
     // PER-CLIP STYLIZE / UTILITY filters (P6) from the BASE clip; IDENTITY (0/0/0/0) for a gap so an
     // un-stylized clip / gap is a no-op (the engine skips each kernel at its no-op default). `mut`
@@ -1763,7 +1811,12 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // color) in the transition block below.
     let (mut mosaic, mut gmap_amt, mut gmap_lo, mut gmap_hi) = match base_clip {
         Some(c) => (c.mosaic, c.gmap_amt, c.gmap_lo, c.gmap_hi),
-        None => (0_u32, 0.0_f32, [0.0_f32, 0.0_f32, 0.0_f32], [1.0_f32, 1.0_f32, 1.0_f32]),
+        None => (
+            0_u32,
+            0.0_f32,
+            [0.0_f32, 0.0_f32, 0.0_f32],
+            [1.0_f32, 1.0_f32, 1.0_f32],
+        ),
     };
 
     // PER-CLIP P9 FX FILTERS (DENOISE + GLOW + RGB-SHIFT) from the BASE clip; IDENTITY
@@ -1833,19 +1886,26 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // bool and rides as a 1/0 integer flag. `mut` because an active transition overrides them to the
     // OUTGOING clip's values (they fade out with the look/grade/curve/stylize/color/stylize-2/fx/
     // stylize-4/old-film/distort/geometric/360-reframe) in the transition block below.
-    let (mut mask_shape, mut mask_cx, mut mask_cy, mut mask_rw, mut mask_rh, mut mask_feather, mut mask_invert) =
-        match base_clip {
-            Some(c) => (
-                c.mask_shape as i32,
-                c.mask_cx,
-                c.mask_cy,
-                c.mask_rw,
-                c.mask_rh,
-                c.mask_feather,
-                if c.mask_invert { 1 } else { 0 },
-            ),
-            None => (0_i32, 0.5_f32, 0.5_f32, 0.5_f32, 0.5_f32, 0.0_f32, 0_i32),
-        };
+    let (
+        mut mask_shape,
+        mut mask_cx,
+        mut mask_cy,
+        mut mask_rw,
+        mut mask_rh,
+        mut mask_feather,
+        mut mask_invert,
+    ) = match base_clip {
+        Some(c) => (
+            c.mask_shape as i32,
+            c.mask_cx,
+            c.mask_cy,
+            c.mask_rw,
+            c.mask_rh,
+            c.mask_feather,
+            if c.mask_invert { 1 } else { 0 },
+        ),
+        None => (0_i32, 0.5_f32, 0.5_f32, 0.5_f32, 0.5_f32, 0.0_f32, 0_i32),
+    };
 
     // PER-CLIP P38 DISTORT (MIRROR + KALEIDOSCOPE + DITHER) from the BASE clip; IDENTITY
     // (mirror_x 0, kaleido 0, dither 0) for a gap so an un-distorted clip / gap is a byte-exact
@@ -1935,7 +1995,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                     if let (Some(out_clip), Some(inc)) =
                         (project.clips.get(out_idx), project.clips.get(in_idx))
                     {
-                        match (project.media.get(out_clip.media), project.media.get(inc.media)) {
+                        match (
+                            project.media.get(out_clip.media),
+                            project.media.get(inc.media),
+                        ) {
                             (Some(op), Some(ip)) if clean(op) && clean(ip) => {
                                 let prog = tr.progress(t);
                                 // OUTGOING -> slot 0 base (forced for the whole window). Clamp into
@@ -1960,7 +2023,8 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 // falling back to its static fields → un-keyframed = byte-identical.
                                 let otl = t - out_clip.t0;
                                 cbright = project.clip_param_at(out_idx, 4, otl, out_clip.bright);
-                                ccontrast = project.clip_param_at(out_idx, 5, otl, out_clip.contrast);
+                                ccontrast =
+                                    project.clip_param_at(out_idx, 5, otl, out_clip.contrast);
                                 csat = project.clip_param_at(out_idx, 6, otl, out_clip.sat);
                                 // The P2 color-wheels (white-balanced) + transform + blur ALSO
                                 // travel with the OUTGOING clip while it fades out (matching the
@@ -2649,7 +2713,12 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
 /// P5 STAGE 2: assemble the PREVIEW line sequence folding >2 video layers into `final_out`. Step 0 =
 /// the full base+over composite (`build_request`, redirected to a temp); each extra layer is then
 /// pip'd over the accumulated temp, ping-ponging two temp files, the LAST writing `final_out`.
-fn build_layer_pipeline(project: &Project, t: i64, layers: &[usize], final_out: &str) -> Option<Vec<String>> {
+fn build_layer_pipeline(
+    project: &Project,
+    t: i64,
+    layers: &[usize],
+    final_out: &str,
+) -> Option<Vec<String>> {
     const TMP: [&str; 2] = ["/tmp/genesis_layer0.rgba", "/tmp/genesis_layer1.rgba"];
     let mut lines = Vec::new();
     let base = resolve_frame(project, t)?;
@@ -2772,7 +2841,10 @@ fn run_pipeline(lines: &[String], final_out: &str) -> Option<Vec<u8>> {
             }
         }
         *guard = None;
-        eprintln!("gcompose pipeline attempt {} failed; restarting worker", attempt + 1);
+        eprintln!(
+            "gcompose pipeline attempt {} failed; restarting worker",
+            attempt + 1
+        );
     }
     None
 }
@@ -2898,7 +2970,12 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
                 Some(mut lines) => {
                     lines.push(build_enc_raw(RENDER_FOLD));
                     // fold frame: the program composite is in RENDER_FOLD; the caption folds over it.
-                    enc_frames.push(build_frame_with_subtitle(project, t, lines, Some(RENDER_FOLD)));
+                    enc_frames.push(build_frame_with_subtitle(
+                        project,
+                        t,
+                        lines,
+                        Some(RENDER_FOLD),
+                    ));
                 }
                 None => return false,
             }
@@ -2915,15 +2992,19 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     // offset by -region_start (so a clip at the region start lands at audio t=0) and drops clips that
     // fall entirely outside [region_start, region_end). With region_start==0 && region_end==total
     // (the default) the offset is -0 and no clip is dropped → the SAME AUDIO lines as before.
-    let audio_lines = build_audio_lines(project, region_start, region_end);
+    let ex = &project.export;
+    let timeline_fps = if ex.fps_num == 0 {
+        RENDER_FPS as f64
+    } else {
+        ex.fps_num as f64 / ex.fps_den.max(1) as f64
+    };
+    let audio_lines = build_audio_lines(project, region_start, region_end, timeline_fps);
 
     // Program-audio accumulator duration in seconds = the REGION length (sizes the worker buffer so
     // the rendered audio is exactly the output/region length, matching the region-length video).
-    // Computed from the TIMELINE fps (RENDER_FPS=30, the rate clips are sampled), NOT the output fps:
-    // the audio buffer is wall-clock seconds and each composed frame is stamped at its (region-local)
-    // timeline time, so audio/video stay synced regardless of the chosen OUTPUT framerate. For the
-    // whole-timeline default this is `total / RENDER_FPS` exactly (byte-identical). Same per attempt.
-    let total_s = (region_end - region_start) as f64 / RENDER_FPS as f64;
+    // Browser projects are sampled at their saved/exported fps. Keep the audio accumulator and the
+    // encoder timestamps on that same clock; using a fixed 30 fps clock dropped frames at 16/24/25.
+    let total_s = (region_end - region_start) as f64 / timeline_fps;
 
     // EXPORT CONTROLS (Triad-B P1): the OPEN line now carries the output resolution, fps, rate mode +
     // value, and codec from `project.export` — decoupling the ENCODER dims from the fixed GVW×GVH
@@ -2931,10 +3012,13 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     // (1280×856 @ 30/1, mpeg4, 4 Mbit/s bitrate, rate_mode 0) reproduce today's behavior so existing
     // render gates pass unchanged. A vcodec containing whitespace would shift the fixed-arity OPEN
     // parse, so it is sanitized to the default here (codec names are single-token in practice).
-    let ex = &project.export;
     let out_w = if ex.out_w == 0 { PVW as u32 } else { ex.out_w };
     let out_h = if ex.out_h == 0 { PVH as u32 } else { ex.out_h };
-    let fps_num = if ex.fps_num == 0 { RENDER_FPS as u32 } else { ex.fps_num };
+    let fps_num = if ex.fps_num == 0 {
+        RENDER_FPS as u32
+    } else {
+        ex.fps_num
+    };
     let fps_den = if ex.fps_den == 0 { 1 } else { ex.fps_den };
     let rate_mode = if ex.rate_mode > 1 { 0 } else { ex.rate_mode };
     // In bitrate mode (0) a non-positive value falls back to the 4 Mbit/s default; in CRF mode (1) the
@@ -3031,7 +3115,11 @@ enum RenderOutcome {
 ///   - AUDIO Err     → skip just this clip's audio, continue (worker alive)
 ///   - CLOSE Broken  → drop+mark, return Retry           (worker died finalising)
 ///   - CLOSE Err     → return Abort                      (encoder finish error; worker alive)
-fn render_attempt(open_req: &str, enc_frames: &[Vec<String>], audio_lines: &[String]) -> RenderOutcome {
+fn render_attempt(
+    open_req: &str,
+    enc_frames: &[Vec<String>],
+    audio_lines: &[String],
+) -> RenderOutcome {
     // Acquire the worker for the WHOLE attempt (finding #1): one lock hold spanning OPEN→CLOSE, so
     // no concurrent preview/thumbnail can interleave on the worker's pipes mid-render.
     let slot = worker_slot();
@@ -3081,27 +3169,27 @@ fn render_attempt(open_req: &str, enc_frames: &[Vec<String>], audio_lines: &[Str
     // <=2 layers it is just the single ENC. All lines run in order on the held worker.
     for frame_lines in enc_frames {
         for req in frame_lines {
-        let status = match guard.as_mut() {
-            Some(proc) => try_command_status(proc, req),
-            None => CmdStatus::Broken, // proc vanished (a prior Broken cleared it): worker died.
-        };
-        match status {
-            CmdStatus::Done(_) => {}
-            CmdStatus::Err => {
-                // Deterministic encoder error: tear the half-open encoder down NOW (finding #8) so
-                // its partial mp4 is dropped immediately, then Abort (retry would just fail again).
-                eprintln!("[render] ENC error (worker alive) at: {req}");
-                abort_held(&mut *guard);
-                return RenderOutcome::Abort;
+            let status = match guard.as_mut() {
+                Some(proc) => try_command_status(proc, req),
+                None => CmdStatus::Broken, // proc vanished (a prior Broken cleared it): worker died.
+            };
+            match status {
+                CmdStatus::Done(_) => {}
+                CmdStatus::Err => {
+                    // Deterministic encoder error: tear the half-open encoder down NOW (finding #8) so
+                    // its partial mp4 is dropped immediately, then Abort (retry would just fail again).
+                    eprintln!("[render] ENC error (worker alive) at: {req}");
+                    abort_held(&mut *guard);
+                    return RenderOutcome::Abort;
+                }
+                CmdStatus::Broken => {
+                    // Worker died mid-video: try a best-effort teardown on whatever's left (usually a
+                    // no-op since the proc is gone), then ask the caller to respawn + retry from OPEN.
+                    eprintln!("[render] ENC worker-death at: {req}");
+                    abort_held(&mut *guard);
+                    return RenderOutcome::Retry;
+                }
             }
-            CmdStatus::Broken => {
-                // Worker died mid-video: try a best-effort teardown on whatever's left (usually a
-                // no-op since the proc is gone), then ask the caller to respawn + retry from OPEN.
-                eprintln!("[render] ENC worker-death at: {req}");
-                abort_held(&mut *guard);
-                return RenderOutcome::Retry;
-            }
-        }
         }
     }
 
@@ -3244,7 +3332,7 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
     let mut audio_lines: Vec<String> = Vec::new();
     // P27: prepend the master gain envelope (element 0) so it is sent right after the MEAS opener and
     // before the AUDIO lines, so the meter reflects the gained mix (empty gain_kf → None → no change).
-    if let Some(env) = build_gainenv_line(project) {
+    if let Some(env) = build_gainenv_line(project, RENDER_FPS as f64) {
         audio_lines.push(env);
     }
     {
@@ -3404,15 +3492,23 @@ fn read_levels(proc: &mut WorkerProc) -> Option<AudioLevels> {
     match try_command_status(proc, &req) {
         CmdStatus::Done(payload) => {
             // The worker echoes the out path on DONE; trust our own path if it echoed empty.
-            let read_path = if payload.is_empty() { LEVELS_OUT } else { payload.as_str() };
+            let read_path = if payload.is_empty() {
+                LEVELS_OUT
+            } else {
+                payload.as_str()
+            };
             let bytes = std::fs::read(read_path).ok()?;
             if bytes.len() != 16 {
                 return None; // exactly 4 f32 expected.
             }
-            let f = |i: usize| {
-                f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
-            };
-            Some(AudioLevels { peak_l: f(0), peak_r: f(4), rms_l: f(8), rms_r: f(12) })
+            let f =
+                |i: usize| f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+            Some(AudioLevels {
+                peak_l: f(0),
+                peak_r: f(4),
+                rms_l: f(8),
+                rms_r: f(12),
+            })
         }
         CmdStatus::Err | CmdStatus::Broken => None,
     }
@@ -3467,7 +3563,7 @@ pub fn program_spectrum(project: &Project, start_frame: i64) -> Option<Vec<f32>>
     let mut audio_lines: Vec<String> = Vec::new();
     // P27: prepend the master gain envelope (element 0) so it is sent right after the MEAS opener and
     // before the AUDIO lines, so the spectrum reflects the gained mix (empty gain_kf → None → no change).
-    if let Some(env) = build_gainenv_line(project) {
+    if let Some(env) = build_gainenv_line(project, RENDER_FPS as f64) {
         audio_lines.push(env);
     }
     {
@@ -3610,7 +3706,11 @@ fn read_spectrum(proc: &mut WorkerProc) -> Option<Vec<f32>> {
     match try_command_status(proc, &req) {
         CmdStatus::Done(payload) => {
             // The worker echoes the out path on DONE; trust our own path if it echoed empty.
-            let read_path = if payload.is_empty() { SPECTRUM_OUT } else { payload.as_str() };
+            let read_path = if payload.is_empty() {
+                SPECTRUM_OUT
+            } else {
+                payload.as_str()
+            };
             let bytes = std::fs::read(read_path).ok()?;
             if bytes.len() != SPECTRUM_BINS * 4 {
                 return None; // exactly SPECTRUM_BINS f32 expected.
@@ -3674,7 +3774,7 @@ pub fn program_samples(project: &Project, start_frame: i64) -> Option<Vec<f32>> 
     let mut audio_lines: Vec<String> = Vec::new();
     // P27: prepend the master gain envelope (element 0) so it is sent right after the MEAS opener and
     // before the AUDIO lines, so the waveform reflects the gained mix (empty gain_kf → None → no change).
-    if let Some(env) = build_gainenv_line(project) {
+    if let Some(env) = build_gainenv_line(project, RENDER_FPS as f64) {
         audio_lines.push(env);
     }
     {
@@ -3817,7 +3917,11 @@ fn read_samples(proc: &mut WorkerProc) -> Option<Vec<f32>> {
     match try_command_status(proc, &req) {
         CmdStatus::Done(payload) => {
             // The worker echoes the out path on DONE; trust our own path if it echoed empty.
-            let read_path = if payload.is_empty() { SAMPLES_OUT } else { payload.as_str() };
+            let read_path = if payload.is_empty() {
+                SAMPLES_OUT
+            } else {
+                payload.as_str()
+            };
             let bytes = std::fs::read(read_path).ok()?;
             if bytes.len() != SAMPLES_N * 4 {
                 return None; // exactly SAMPLES_N f32 expected.
@@ -3884,7 +3988,7 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
     let mut audio_lines: Vec<String> = Vec::new();
     // P27: prepend the master gain envelope (element 0) so it is sent right after the WAVE opener and
     // before the AUDIO lines (empty gain_kf → None → byte-identical playback).
-    if let Some(env) = build_gainenv_line(project) {
+    if let Some(env) = build_gainenv_line(project, RENDER_FPS as f64) {
         audio_lines.push(env);
     }
     {
@@ -3914,8 +4018,8 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             // clip plays from the source frame under the playhead at dst_offset 0. For a clip wholly
             // after the playhead, src_in/len are unchanged and dst_offset is its forward distance.
             let head_skip = (start - c.t0).max(0); // frames of this clip already behind the playhead
-            // (P24 makes the source in-point speed-scaled, computed below; the plain eff_src_in is no
-            // longer the sent value — kept unprefixed-free to avoid an unused binding.)
+                                                   // (P24 makes the source in-point speed-scaled, computed below; the plain eff_src_in is no
+                                                   // longer the sent value — kept unprefixed-free to avoid an unused binding.)
             let _eff_src_in = c.src_in + head_skip; // frames
             let eff_len = c.len - head_skip; // frames remaining to play
             if eff_len <= 0 {
@@ -4255,9 +4359,17 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 /// e.g. 1.0->[1.0] (caller skips when ~1), 4.0->[2.0,2.0], 0.25->[0.5,0.5], 1.5->[1.5].
 fn atempo_factors(mut s: f64) -> Vec<f64> {
     let mut out = Vec::new();
-    if !(s.is_finite()) || s <= 0.0 { return vec![1.0]; }
-    while s > 2.0 { out.push(2.0); s /= 2.0; }
-    while s < 0.5 { out.push(0.5); s *= 2.0; }
+    if !(s.is_finite()) || s <= 0.0 {
+        return vec![1.0];
+    }
+    while s > 2.0 {
+        out.push(2.0);
+        s /= 2.0;
+    }
+    while s < 0.5 {
+        out.push(0.5);
+        s *= 2.0;
+    }
     out.push(s);
     out
 }
@@ -4508,7 +4620,7 @@ fn track_is_audible(project: &Project, t: u8) -> bool {
 ///
 /// Emitted as element 0 of every audio-line list so it is sent right after the session opener
 /// (OPEN/MEAS/WAVE) and BEFORE the AUDIO lines — the per-clip mix can then read the installed envelope.
-fn build_gainenv_line(project: &Project) -> Option<String> {
+fn build_gainenv_line(project: &Project, fps: f64) -> Option<String> {
     if project.gain_kf.is_empty() {
         return None; // identity: no envelope → no line.
     }
@@ -4516,7 +4628,7 @@ fn build_gainenv_line(project: &Project) -> Option<String> {
     let packed = project
         .gain_kf
         .iter()
-        .map(|k| format!("{}:{}", k.t as f64 / RENDER_FPS as f64, k.v))
+        .map(|k| format!("{}:{}", k.t as f64 / fps, k.v))
         .collect::<Vec<String>>()
         .join(",");
     Some(format!("GAINENV {packed}"))
@@ -4559,20 +4671,24 @@ fn build_gainenv_line(project: &Project) -> Option<String> {
 /// clip is dropped, no clip is head/tail-trimmed (every clip lies inside [0,total)), and the -0 shift
 /// is a no-op → the SAME AUDIO lines as before (byte-identical). The head-trim math mirrors the
 /// `program_levels` meter path (P24-aware: the sent source in-point + duration are speed-scaled).
-fn build_audio_lines(project: &Project, region_start: i64, region_end: i64) -> Vec<String> {
+fn build_audio_lines(
+    project: &Project,
+    region_start: i64,
+    region_end: i64,
+    fps: f64,
+) -> Vec<String> {
     // Sort clip indices by timeline start for deterministic, readable output (order-independent now
     // that the worker positions by dst_offset). Stable on t0; ties keep the project's clip order.
     let mut idx: Vec<usize> = (0..project.clips.len()).collect();
     idx.sort_by_key(|&i| project.clips[i].t0);
 
-    let fps = RENDER_FPS as f64;
     // P27 MASTER GAIN ENVELOPE: when the project carries a master-gain automation track, the FIRST
     // element of the returned Vec is the single GAINENV line (see `build_gainenv_line`). Every
     // consumer iterates this Vec verbatim AFTER the session opener (OPEN/MEAS/WAVE) and BEFORE the
     // AUDIO lines, so the engine installs the per-sample gain envelope on the active accumulator
     // before any clip is mixed. An EMPTY `gain_kf` prepends NOTHING → byte-identical to pre-P27.
     let mut lines = Vec::new();
-    if let Some(env) = build_gainenv_line(project) {
+    if let Some(env) = build_gainenv_line(project, fps) {
         lines.push(env);
     }
     for i in idx {
@@ -5044,10 +5160,18 @@ pub fn thumbnail(media_path: &str, frame: i64, w: usize, h: usize) -> Option<Vec
     // one token; the engine dec_path's it before opening the decoder. The out token is a hashed
     // /tmp path (no whitespace) → enc_path is identity, wrapped for symmetry. Space-free paths are
     // byte-identical to before.
-    let req = format!("THUMB {} {frame} {w} {h} {}", enc_path(media_path), enc_path(&out));
+    let req = format!(
+        "THUMB {} {frame} {w} {h} {}",
+        enc_path(media_path),
+        enc_path(&out)
+    );
     let payload = command_with_restart(&req)?;
     // Worker echoes the out path on DONE; trust our own path if it echoes empty.
-    let read_path = if payload.is_empty() { out.clone() } else { payload };
+    let read_path = if payload.is_empty() {
+        out.clone()
+    } else {
+        payload
+    };
     let bytes = std::fs::read(&read_path).ok()?;
     if bytes.len() == w * h * 4 {
         Some(bytes)
@@ -5070,7 +5194,11 @@ pub fn audio_envelope(media_path: &str, buckets: usize) -> Option<Vec<f32>> {
     // byte-identical to before.
     let req = format!("ENV {} {buckets} {}", enc_path(media_path), enc_path(&out));
     let payload = command_with_restart(&req)?;
-    let read_path = if payload.is_empty() { out.clone() } else { payload };
+    let read_path = if payload.is_empty() {
+        out.clone()
+    } else {
+        payload
+    };
     let bytes = std::fs::read(&read_path).ok()?;
     if bytes.len() != buckets * 4 {
         return None;
@@ -5084,7 +5212,13 @@ pub fn audio_envelope(media_path: &str, buckets: usize) -> Option<Vec<f32>> {
 
 /// P46 AUDIO ALIGN — decode a clip's source range `[start_s, start_s+dur_s)` to MONO @ `sr`,
 /// returning exactly `n` f32 samples (zero-padded), via the worker's CLIPAUD command. None on failure.
-pub fn clip_audio(media_path: &str, start_s: f64, dur_s: f64, sr: i32, n: usize) -> Option<Vec<f32>> {
+pub fn clip_audio(
+    media_path: &str,
+    start_s: f64,
+    dur_s: f64,
+    sr: i32,
+    n: usize,
+) -> Option<Vec<f32>> {
     if n == 0 || sr <= 0 {
         return None;
     }
@@ -5098,7 +5232,11 @@ pub fn clip_audio(media_path: &str, start_s: f64, dur_s: f64, sr: i32, n: usize)
         enc_path(&out)
     );
     let payload = command_with_restart(&req)?;
-    let read_path = if payload.is_empty() { out.clone() } else { payload };
+    let read_path = if payload.is_empty() {
+        out.clone()
+    } else {
+        payload
+    };
     let bytes = std::fs::read(&read_path).ok()?;
     if bytes.len() != n * 4 {
         return None;
@@ -5137,7 +5275,10 @@ pub fn align_audio_offset_frames(project: &Project, ref_idx: usize, mov_idx: usi
     };
     let a = dec(&rpath, rc.src_in, rc.len)?;
     let b = dec(&mpath, mc.src_in, mc.len)?;
-    let max_lag = a.len().max(b.len()).min((SR as f64 * MAX_OFFSET_S) as usize);
+    let max_lag = a
+        .len()
+        .max(b.len())
+        .min((SR as f64 * MAX_OFFSET_S) as usize);
     let lag = crate::model::cross_correlation_offset(&a, &b, max_lag); // +lag = b lags a (samples)
     let lag_frames = (lag as f64 / SR as f64 * RENDER_FPS as f64).round() as i64;
     Some(-lag_frames) // shift the moving clip EARLIER by its lag to sync to the reference
@@ -5146,12 +5287,18 @@ pub fn align_audio_offset_frames(project: &Project, ref_idx: usize, mov_idx: usi
 /// A stable-ish temp path for a thumbnail of `path` @ `frame` at `w×h`. Hashing the inputs keeps
 /// concurrent THUMB requests for different media/frames from clobbering each other's output file.
 fn thumb_temp_path(path: &str, frame: i64, w: usize, h: usize) -> String {
-    format!("/tmp/genesis_thumb_{:x}.rgba", small_hash(&format!("{path}|{frame}|{w}|{h}")))
+    format!(
+        "/tmp/genesis_thumb_{:x}.rgba",
+        small_hash(&format!("{path}|{frame}|{w}|{h}"))
+    )
 }
 
 /// A temp path for the envelope of `path` @ `buckets`.
 fn env_temp_path(path: &str, buckets: usize) -> String {
-    format!("/tmp/genesis_env_{:x}.f32", small_hash(&format!("{path}|{buckets}")))
+    format!(
+        "/tmp/genesis_env_{:x}.f32",
+        small_hash(&format!("{path}|{buckets}"))
+    )
 }
 
 /// Percent-encode whitespace (and the escape char itself) in a single wire PATH TOKEN so a path

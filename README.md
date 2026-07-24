@@ -20,8 +20,8 @@ Its current measured state is:
   and preserves driving-video audio through Serenity Studio `/v1/video`;
 - the request-driven pure-Mojo LTX-2.3 path accepts the UI's selected quant
   mode and LoRA list; its resident SVD-int4/factorized-LoRA profile produced a
-  visually inspected 512x768, 121-frame movie in 377.07 seconds, 26.2% faster
-  end to end than the measured FP8 baseline;
+  visually inspected 512x768, 121-frame movie in 52.36 seconds, with an
+  Nsight-guided cold HQ121 decode reduction from 25.95 to 7.32 seconds;
 - Serenity's browser Video Edit tab uses the separately vendored Genesis
   Rust/C/FFmpeg/OpenCL compositor for timeline preview, media analysis, LUT
   previews, and export; it does not launch Genesis's native UI or call Mojo;
@@ -47,6 +47,7 @@ The isolated Genesis video worker can also be rebuilt without touching Mojo:
 
 ```bash
 pixi run build-genesis-video-editor
+pixi run check-genesis-video-editor
 ```
 
 The broader, sequential compile matrix is intentionally expensive:

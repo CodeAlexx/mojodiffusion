@@ -227,7 +227,9 @@ fn serve() {
     // broken-init into a fast, clean respawn; it cannot catch the hard mid-run segfault (that is the
     // client's render-retry job).
     if !gpu.self_check() {
-        eprintln!("FAIL: OpenCL self-check failed in --serve (init ok but compose round-trip broken)");
+        eprintln!(
+            "FAIL: OpenCL self-check failed in --serve (init ok but compose round-trip broken)"
+        );
         std::process::exit(5);
     }
 
@@ -549,7 +551,9 @@ fn open_render(
     };
     let vcodec = f[8];
     if out_w == 0 || out_h == 0 || fps_num <= 0 || fps_den <= 0 || vcodec.is_empty() {
-        eprintln!("[gcompose] bad OPEN dims/fps/codec: {out_w}x{out_h} {fps_num}/{fps_den} {vcodec}");
+        eprintln!(
+            "[gcompose] bad OPEN dims/fps/codec: {out_w}x{out_h} {fps_num}/{fps_den} {vcodec}"
+        );
         return false;
     }
     // Timeline duration in seconds; sizes the program-audio accumulator. A non-finite/negative
@@ -599,7 +603,9 @@ fn open_render(
     let bitrate = if rate_mode == 1 { 0 } else { rate_value };
     // P25: pass <gop>/<preset> through to config_video (applied on the codec context before open;
     // gop<=0 / "" preset are no-ops → identity with pre-P25).
-    if !e.config_video(vcodec, in_w, in_h, out_w, out_h, fps_num, fps_den, bitrate, gop, preset) {
+    if !e.config_video(
+        vcodec, in_w, in_h, out_w, out_h, fps_num, fps_den, bitrate, gop, preset,
+    ) {
         eprintln!("[gcompose] config_video failed (codec={vcodec} out={out_w}x{out_h} fps={fps_num}/{fps_den})");
         return false;
     }
@@ -610,7 +616,9 @@ fn open_render(
         // P25: the CRF path re-opens the codec, so the gop/preset must be re-applied here or they'd
         // be lost (the gate uses CRF mode for the GOP test). gop<=0 / "" preset are no-ops.
         if !e.set_quality(crf, gop, preset) {
-            eprintln!("[gcompose] set_quality(crf={crf}) failed; encoding at codec-default quality");
+            eprintln!(
+                "[gcompose] set_quality(crf={crf}) failed; encoding at codec-default quality"
+            );
         }
     }
     // Program audio (Slice A): configure an aac stream (2ch @ 48000, 128 kbps) matching
@@ -625,7 +633,12 @@ fn open_render(
     // environment would lose the ability to render video at all (a regression vs wave-2). The
     // encoder header is then written without an audio stream, and AUDIO commands reply ERR.
     // P25: <abitrate> bits/s drives the aac stream; <=0 keeps the legacy hardcoded 128000 (identity).
-    *enc_audio_ok = e.config_audio(acodec, 2, 48_000, if abitrate > 0 { abitrate } else { 128_000 });
+    *enc_audio_ok = e.config_audio(
+        acodec,
+        2,
+        48_000,
+        if abitrate > 0 { abitrate } else { 128_000 },
+    );
     if !*enc_audio_ok {
         eprintln!("[gcompose] config_audio failed; rendering video-only (no aac stream)");
     }
@@ -635,14 +648,10 @@ fn open_render(
     }
 
     *enc = Some(e);
-    // ENC timestamps frames at TIMELINE time (enc_count / TIMELINE_FPS), NOT the declared OUTPUT fps:
-    // the UI sends one ENC per TIMELINE frame (sampled at TIMELINE_FPS=30) and sizes the audio
-    // accumulator in wall-clock seconds, so stamping at the timeline rate keeps audio+video synced and
-    // the render duration correct regardless of the chosen output framerate. The OUTPUT fps_num/den
-    // is what the encoder DECLARES (config_video → stream avg_frame_rate, which ffprobe reports); it
-    // does not change how many frames are produced this slice (true fps RESAMPLING is a follow-up —
-    // P1 wires the declared output rate + scaled resolution without re-timing the timeline sampling).
-    *enc_fps = TIMELINE_FPS;
+    // Serenity sends one ENC for each browser-timeline frame and uses the same fps in OPEN. Stamp
+    // those frames at the declared rate. The old fixed 30 fps stamp produced duplicate PTS values
+    // (and silently dropped frames) whenever a 16/24/25 fps project was exported.
+    *enc_fps = fps_num as f64 / fps_den as f64;
     *enc_count = 0;
 
     // Allocate the program-audio accumulator for this render's full timeline duration (silence).
@@ -775,7 +784,7 @@ fn enc_frame(
             f[7].parse::<f32>().ok()?,  // px
             f[8].parse::<f32>().ok()?,  // py
             f[9].parse::<f32>().ok()?,  // pw
-            f[10].parse::<f32>().ok()?,  // ph
+            f[10].parse::<f32>().ok()?, // ph
             f[11].parse::<f32>().ok()?, // bright
             f[12].parse::<f32>().ok()?, // contrast
             f[13].parse::<f32>().ok()?, // sat
@@ -841,7 +850,18 @@ fn enc_frame(
         ))
     })();
     let (
-        lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b, rot, scale, blur,
+        lift_r,
+        lift_g,
+        lift_b,
+        gamma_r,
+        gamma_g,
+        gamma_b,
+        gain_r,
+        gain_g,
+        gain_b,
+        rot,
+        scale,
+        blur,
     ) = match p2 {
         Some(v) => v,
         None => return false,
@@ -1127,27 +1147,110 @@ fn enc_frame(
     // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
     // missing/failed LUT degrades to no look). Then run the same transition→composite→look the
     // preview uses, downloading f32 for the encoder.
-    let (lk, la, ln) =
-        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, &lut_path);
+    let (lk, la, ln) = resolve_look(
+        gpu,
+        lut_cache,
+        last_uploaded_lut,
+        look_kind,
+        look_amt,
+        &lut_path,
+    );
     // P4: chroma key only matters with an active overlay (it keys the OVER buffer); force ck_on=0 when
     // the overlay is disabled (no over clip / failed decode → eff_op==0) so we never key a stale slot.
     let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
     let (frame, _fin) = gpu.compose_trans_f32(
-        eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
-        contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill, curve,
-        vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
-        mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
-        denoise, glow_amt, glow_thr, rgbshift,
-        halftone, emboss, edge,
-        grain, scratches, diffusion,
-        wave, swirl, threshold,
-        lens, crop, glitch,
-        eq360, eq_yaw, eq_pitch, eq_fov,
-        mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
-        mirror_x, kaleido, dither,
-        sel_band, sel_hshift, sel_sat,
-        sol_thr, temp, fade,
+        eff_tt,
+        trans_prog,
+        trans_param,
+        eff_op,
+        over_blend,
+        px,
+        py,
+        pw,
+        ph,
+        cbright,
+        ccontrast,
+        csat,
+        bright,
+        contrast,
+        sat,
+        lk,
+        la,
+        ln,
+        lift_r,
+        lift_g,
+        lift_b,
+        gamma_r,
+        gamma_g,
+        gamma_b,
+        gain_r,
+        gain_g,
+        gain_b,
+        rot,
+        scale,
+        blur,
+        eff_ck_on,
+        ck_r,
+        ck_g,
+        ck_b,
+        ck_sim,
+        ck_smooth,
+        ck_spill,
+        curve,
+        vig,
+        sharp,
+        flip,
+        fx,
+        hue,
+        sat_hsl,
+        light,
+        inb,
+        inw,
+        gam,
+        mosaic,
+        gmap_amt,
+        glo_r,
+        glo_g,
+        glo_b,
+        ghi_r,
+        ghi_g,
+        ghi_b,
+        denoise,
+        glow_amt,
+        glow_thr,
+        rgbshift,
+        halftone,
+        emboss,
+        edge,
+        grain,
+        scratches,
+        diffusion,
+        wave,
+        swirl,
+        threshold,
+        lens,
+        crop,
+        glitch,
+        eq360,
+        eq_yaw,
+        eq_pitch,
+        eq_fov,
+        mask_shape,
+        mask_cx,
+        mask_cy,
+        mask_rw,
+        mask_rh,
+        mask_feather,
+        mask_invert,
+        mirror_x,
+        kaleido,
+        dither,
+        sel_band,
+        sel_hshift,
+        sel_sat,
+        sol_thr,
+        temp,
+        fade,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1206,14 +1309,22 @@ const PROG_CH: usize = 2;
 /// In-place iterative radix-2 Cooley-Tukey FFT. `re`/`im` must have a power-of-two length.
 fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
-    if n <= 1 { return; }
+    if n <= 1 {
+        return;
+    }
     // bit-reversal permutation
     let mut j = 0usize;
     for i in 1..n {
         let mut bit = n >> 1;
-        while j & bit != 0 { j ^= bit; bit >>= 1; }
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
         j |= bit;
-        if i < j { re.swap(i, j); im.swap(i, j); }
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
     }
     // butterflies
     let mut len = 2usize;
@@ -1228,22 +1339,19 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
                 let b = i + k + len / 2;
                 let tr = cur_r * re[b] - cur_i * im[b];
                 let ti = cur_r * im[b] + cur_i * re[b];
-                re[b] = re[a] - tr; im[b] = im[a] - ti;
-                re[a] += tr; im[a] += ti;
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
                 let nr = cur_r * wr - cur_i * wi;
-                cur_i = cur_r * wi + cur_i * wr; cur_r = nr;
+                cur_i = cur_r * wi + cur_i * wr;
+                cur_r = nr;
             }
             i += len;
         }
         len <<= 1;
     }
 }
-
-/// Timeline sampling rate (frames per second) the UI composes at — one ENC per timeline frame. ENC
-/// timestamps frames at `enc_count / TIMELINE_FPS` so the render duration is timeline-true and stays
-/// synced with the seconds-positioned program audio, INDEPENDENT of the export's declared output fps
-/// (which only sets the stream's reported framerate). Matches worker.rs `RENDER_FPS`.
-const TIMELINE_FPS: f64 = 30.0;
 
 /// The timeline-synced program-audio accumulator (Slice A).
 ///
@@ -1264,7 +1372,11 @@ struct ProgAudio {
 
 impl Default for ProgAudio {
     fn default() -> Self {
-        ProgAudio { buf: Vec::new(), active: false, gain_env: Vec::new() }
+        ProgAudio {
+            buf: Vec::new(),
+            active: false,
+            gain_env: Vec::new(),
+        }
     }
 }
 
@@ -1395,9 +1507,13 @@ impl ProgAudio {
     /// Magnitude spectrum of the accumulator: Hann-windowed 4096-sample mono mix → radix-2 FFT →
     /// magnitude of the first N/2 bins, grouped LINEARLY (peak-hold) into `nbins` bars over [0, sr/2].
     fn spectrum(&self, nbins: usize) -> Vec<f32> {
-        if nbins == 0 { return Vec::new(); }
+        if nbins == 0 {
+            return Vec::new();
+        }
         let mut out = vec![0.0f32; nbins];
-        if self.buf.is_empty() { return out; }
+        if self.buf.is_empty() {
+            return out;
+        }
         const N: usize = 4096; // FFT window (power of two)
         let frames = self.buf.len() / PROG_CH;
         let take = frames.min(N);
@@ -1405,7 +1521,11 @@ impl ProgAudio {
         let mut im = vec![0.0f32; N];
         for i in 0..take {
             let l = self.buf[i * PROG_CH];
-            let r = if PROG_CH > 1 { self.buf[i * PROG_CH + 1] } else { l };
+            let r = if PROG_CH > 1 {
+                self.buf[i * PROG_CH + 1]
+            } else {
+                l
+            };
             let s = 0.5 * (l + r);
             // Hann window
             let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (N as f32 - 1.0)).cos();
@@ -1416,7 +1536,9 @@ impl ProgAudio {
         for k in 0..half {
             let mag = (re[k] * re[k] + im[k] * im[k]).sqrt();
             let bar = (k * nbins) / half; // linear FFT-bin → display-bar
-            if bar < nbins && mag > out[bar] { out[bar] = mag; }
+            if bar < nbins && mag > out[bar] {
+                out[bar] = mag;
+            }
         }
         out
     }
@@ -1424,15 +1546,21 @@ impl ProgAudio {
     /// Time-domain oscilloscope: the LEFT channel of the first min(4096, frames) accumulator frames,
     /// DECIMATED to `n` points (raw amplitude ~[-1,1]). Empty/zero -> zeros.
     fn samples(&self, n: usize) -> Vec<f32> {
-        if n == 0 { return Vec::new(); }
+        if n == 0 {
+            return Vec::new();
+        }
         let mut out = vec![0.0f32; n];
-        if self.buf.is_empty() { return out; }
+        if self.buf.is_empty() {
+            return out;
+        }
         let frames = self.buf.len() / PROG_CH;
         let win = frames.min(4096);
-        if win == 0 { return out; }
+        if win == 0 {
+            return out;
+        }
         for k in 0..n {
-            let fr = (k * win) / n;            // decimate the window to n points
-            out[k] = self.buf[fr * PROG_CH];   // LEFT channel (interleaved)
+            let fr = (k * win) / n; // decimate the window to n points
+            out[k] = self.buf[fr * PROG_CH]; // LEFT channel (interleaved)
         }
         out
     }
@@ -1441,14 +1569,24 @@ impl ProgAudio {
 /// Linear-interpolated master gain at absolute timeline time `t` seconds from a sorted (sec,gain)
 /// envelope. Empty → 1.0; clamp to the first/last key value outside the range; linear between keys.
 fn eval_gain_env(env: &[(f64, f32)], t: f64) -> f32 {
-    if env.is_empty() { return 1.0; }
-    if t <= env[0].0 { return env[0].1; }
-    if t >= env[env.len() - 1].0 { return env[env.len() - 1].1; }
+    if env.is_empty() {
+        return 1.0;
+    }
+    if t <= env[0].0 {
+        return env[0].1;
+    }
+    if t >= env[env.len() - 1].0 {
+        return env[env.len() - 1].1;
+    }
     for w in env.windows(2) {
         let (t0, v0) = w[0];
         let (t1, v1) = w[1];
         if t >= t0 && t <= t1 {
-            let r = if t1 > t0 { ((t - t0) / (t1 - t0)) as f32 } else { 0.0 };
+            let r = if t1 > t0 {
+                ((t - t0) / (t1 - t0)) as f32
+            } else {
+                0.0
+            };
             return v0 + (v1 - v0) * r;
         }
     }
@@ -1594,7 +1732,10 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
         || src_in_s < 0.0
         || dst_off_s < 0.0
         || !gain.is_finite()
-        || !(fade_in_s.is_finite() && fade_out_s.is_finite() && clip_len_s.is_finite() && range_local_s.is_finite())
+        || !(fade_in_s.is_finite()
+            && fade_out_s.is_finite()
+            && clip_len_s.is_finite()
+            && range_local_s.is_finite())
     {
         eprintln!("[gcompose] bad AUDIO src_in={src_in_s} dur={dur_s} dst={dst_off_s} gain={gain} fi={fade_in_s} fo={fade_out_s} cl={clip_len_s} rl={range_local_s}");
         return false;
@@ -1605,7 +1746,11 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     // Capacity: dur seconds * sr * ch, + a codec-frame of slack, clamped to AUDIO_CAP_MAX (finding
     // #4: saturating math + clamp keeps the `as c_int` narrowing lossless and positive).
     let want = (dur_s * PROG_SR as f64).ceil();
-    let want = if want.is_finite() && want >= 0.0 { want as usize } else { 0 };
+    let want = if want.is_finite() && want >= 0.0 {
+        want as usize
+    } else {
+        0
+    };
     let cap = want
         .saturating_mul(PROG_CH)
         .saturating_add(8192)
@@ -1688,7 +1833,11 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     // Destination sample-per-channel offset. Round to nearest frame; the accumulator's mix() drops
     // anything past the end so an offset at/after the timeline end is a harmless no-op.
     let dst_frame = (dst_off_s * PROG_SR as f64).round();
-    let dst_frame = if dst_frame.is_finite() && dst_frame >= 0.0 { dst_frame as usize } else { 0 };
+    let dst_frame = if dst_frame.is_finite() && dst_frame >= 0.0 {
+        dst_frame as usize
+    } else {
+        0
+    };
     prog.mix(&samples, dst_frame);
     true
 }
@@ -2245,7 +2394,7 @@ fn handle_request(
     let look_kind: i32 = f[13].parse().ok()?;
     let look_amt: f32 = f[14].parse().ok()?;
     let lut_path = dec_path(f[15]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
-    // Wave 8 TRANSITION fields.
+                                    // Wave 8 TRANSITION fields.
     let trans_kind: i32 = f[16].parse().ok()?;
     let trans_prog: f32 = f[17].parse().ok()?;
     let trans_param: f32 = f[18].parse().ok()?;
@@ -2456,28 +2605,111 @@ fn handle_request(
     // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
     // missing/failed LUT degrades to no look). Then run the OpenCL pipeline (transition or base-copy
     // first; PiP over; grade; LOOK). `fin` tells us which buffer the frame ended in (OUTB / LOOKB).
-    let (lk, la, ln) =
-        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, &lut_path);
+    let (lk, la, ln) = resolve_look(
+        gpu,
+        lut_cache,
+        last_uploaded_lut,
+        look_kind,
+        look_amt,
+        &lut_path,
+    );
     // P4: the chroma key only matters when there IS an active overlay (it keys the OVER buffer). If
     // the overlay was disabled (no over clip / failed decode → eff_op==0), force ck_on=0 so we never
     // key a stale/irrelevant slot-1 buffer — identical output either way (pip ignores over at op=0).
     let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
     let (out, fin) = gpu.compose_trans(
-        eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
-        contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill, curve,
-        vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
-        mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
-        denoise, glow_amt, glow_thr, rgbshift,
-        halftone, emboss, edge,
-        grain, scratches, diffusion,
-        wave, swirl, threshold,
-        lens, crop, glitch,
-        eq360, eq_yaw, eq_pitch, eq_fov,
-        mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
-        mirror_x, kaleido, dither,
-        sel_band, sel_hshift, sel_sat,
-        sol_thr, temp, fade,
+        eff_tt,
+        trans_prog,
+        trans_param,
+        eff_op,
+        over_blend,
+        px,
+        py,
+        pw,
+        ph,
+        cbright,
+        ccontrast,
+        csat,
+        bright,
+        contrast,
+        sat,
+        lk,
+        la,
+        ln,
+        lift_r,
+        lift_g,
+        lift_b,
+        gamma_r,
+        gamma_g,
+        gamma_b,
+        gain_r,
+        gain_g,
+        gain_b,
+        rot,
+        scale,
+        blur,
+        eff_ck_on,
+        ck_r,
+        ck_g,
+        ck_b,
+        ck_sim,
+        ck_smooth,
+        ck_spill,
+        curve,
+        vig,
+        sharp,
+        flip,
+        fx,
+        hue,
+        sat_hsl,
+        light,
+        inb,
+        inw,
+        gam,
+        mosaic,
+        gmap_amt,
+        glo_r,
+        glo_g,
+        glo_b,
+        ghi_r,
+        ghi_g,
+        ghi_b,
+        denoise,
+        glow_amt,
+        glow_thr,
+        rgbshift,
+        halftone,
+        emboss,
+        edge,
+        grain,
+        scratches,
+        diffusion,
+        wave,
+        swirl,
+        threshold,
+        lens,
+        crop,
+        glitch,
+        eq360,
+        eq_yaw,
+        eq_pitch,
+        eq_fov,
+        mask_shape,
+        mask_cx,
+        mask_cy,
+        mask_rw,
+        mask_rh,
+        mask_feather,
+        mask_invert,
+        mirror_x,
+        kaleido,
+        dither,
+        sel_band,
+        sel_hshift,
+        sel_sat,
+        sol_thr,
+        temp,
+        fade,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

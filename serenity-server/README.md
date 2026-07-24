@@ -83,6 +83,18 @@ For an output directory directly under the repository's `output/` directory,
 the server resolves that worker automatically. An unusual deployment can set
 `SERENITY_GENESIS_WORKER` and `SERENITY_GENESIS_ASSETS` explicitly.
 
+With the server running on port 7811 and the verified LTX source movie present,
+run the real browser edit/export acceptance gate:
+
+```bash
+pixi run check-genesis-video-editor
+```
+
+The gate imports the source, opens Video Edit in Chromium, changes Saturation
+through Clip Properties, proves enabling and disabling changes the rendered
+pixels, exports from the browser, probes the movie, and writes its screenshot,
+contact sheet, and JSON result under `output/checks/genesis_browser/`.
+
 Mojo worker builds are separate, GPU-architecture-specific operations. Never
 run a broad `pixi run build-*` merely to debug the browser. Identify the exact
 missing worker and use its existing `pixi.toml` or

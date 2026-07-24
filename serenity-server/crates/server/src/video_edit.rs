@@ -300,6 +300,13 @@ fn apply_web_effects(clip: &mut GenesisClip, value: &JsonValue) {
         return;
     };
     for effect in effects {
+        if effect
+            .get("enabled")
+            .and_then(JsonValue::as_bool)
+            .is_some_and(|enabled| !enabled)
+        {
+            continue;
+        }
         let kind = effect.get("type").and_then(JsonValue::as_str).unwrap_or("");
         let params = effect.get("params").unwrap_or(&JsonValue::Null);
         match kind {
@@ -350,6 +357,11 @@ fn web_project_to_genesis(
     project.sat = 1.0;
 
     let mut track_map: Vec<Option<u8>> = vec![None; web_tracks.len()];
+    let web_fps = web
+        .get("fps")
+        .and_then(JsonValue::as_f64)
+        .unwrap_or(30.0)
+        .clamp(1.0, 120.0) as f32;
     // Browser tracks are top-to-bottom; Genesis tracks are bottom-to-top.
     for (web_index, track) in web_tracks.iter().enumerate().rev() {
         let kind = match track.get("type").and_then(JsonValue::as_str) {
@@ -453,6 +465,8 @@ fn web_project_to_genesis(
             genesis_clip.fade_in = value_i64(clip.get("fade_in"), 0).max(0);
             genesis_clip.fade_out = value_i64(clip.get("fade_out"), 0).max(0);
             apply_web_effects(&mut genesis_clip, clip);
+            let source_fps = value_f32(clip.get("source_fps"), web_fps).clamp(1.0, 120.0);
+            genesis_clip.speed *= source_fps / web_fps;
             project.clips.push(genesis_clip);
 
             if let Some(transition) = clip.get("transition_in") {
@@ -956,16 +970,30 @@ pub async fn post_import_clip(
         return json_error(StatusCode::BAD_REQUEST, "multipart file field is required");
     };
     let probe_path = path.to_string_lossy().into_owned();
-    let duration_frames = tokio::task::spawn_blocking(move || {
-        genesis_web::worker::media_frames(&probe_path).unwrap_or(150)
+    let (duration_frames, source_fps) = tokio::task::spawn_blocking(move || {
+        let probe = crate::video::probe_video_path(&probe_path).ok();
+        let frames = probe
+            .as_ref()
+            .and_then(|value| value.get("frame_count"))
+            .and_then(JsonValue::as_i64)
+            .filter(|frames| *frames > 0)
+            .or_else(|| genesis_web::worker::media_frames(&probe_path))
+            .unwrap_or(1);
+        let fps = probe
+            .as_ref()
+            .and_then(|value| value.get("fps"))
+            .and_then(JsonValue::as_f64)
+            .filter(|fps| fps.is_finite() && *fps > 0.0)
+            .unwrap_or(30.0);
+        (frames, fps)
     })
     .await
-    .unwrap_or(150)
-    .max(1);
+    .unwrap_or((1, 30.0));
     Json(json!({
         "clip_id": format!("clip-{}", now_millis()),
         "source_path": format!("{id}/media/{stored_name}"),
-        "duration_frames": duration_frames
+        "duration_frames": duration_frames.max(1),
+        "source_fps": source_fps
     }))
     .into_response()
 }
@@ -975,10 +1003,16 @@ pub struct ThumbnailRequest {
     source_path: String,
     #[serde(default = "default_thumbnail_height")]
     height: u32,
+    #[serde(default = "default_media_fps")]
+    fps: f64,
 }
 
 fn default_thumbnail_height() -> u32 {
     36
+}
+
+fn default_media_fps() -> f64 {
+    30.0
 }
 
 pub async fn post_thumbnails(
@@ -991,10 +1025,12 @@ pub async fn post_thumbnails(
         Err(e) => return json_error(StatusCode::NOT_FOUND, e),
     };
     let height = request.height.clamp(16, 120);
+    let fps = request.fps.clamp(1.0, 120.0);
     let width = ((height as f32) * 16.0 / 9.0).round().max(16.0) as u32;
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     height.hash(&mut hasher);
+    fps.to_bits().hash(&mut hasher);
     let cache_name = format!("thumbs-{:016x}.png", hasher.finish());
     let cache_dir = state.out_dir.join("video_editor_cache");
     let cache_path = cache_dir.join(&cache_name);
@@ -1021,11 +1057,12 @@ pub async fn post_thumbnails(
     let render_path = path.to_string_lossy().into_owned();
     let result = tokio::task::spawn_blocking(move || {
         let total_frames = genesis_web::worker::media_frames(&render_path).unwrap_or(1);
-        let seconds = ((total_frames + 29) / 30).max(1) as usize;
+        let seconds = ((total_frames as f64 / fps).ceil() as usize).max(1);
         let count = seconds.min(MAX_THUMBNAILS);
         let mut sprite = RgbaImage::new(width * count as u32, height);
         for index in 0..count {
-            let source_frame = (index as i64 * 30).min(total_frames.saturating_sub(1));
+            let source_frame =
+                ((index as f64 * fps).round() as i64).min(total_frames.saturating_sub(1));
             let rgba = genesis_web::worker::thumbnail(
                 &render_path,
                 source_frame,
@@ -1075,6 +1112,8 @@ pub struct WaveformRequest {
     source_path: String,
     #[serde(default = "default_samples_per_second")]
     samples_per_second: usize,
+    #[serde(default = "default_media_fps")]
+    fps: f64,
 }
 
 fn default_samples_per_second() -> usize {
@@ -1091,10 +1130,11 @@ pub async fn post_waveform(
         Err(e) => return json_error(StatusCode::NOT_FOUND, e),
     };
     let samples_per_second = request.samples_per_second.clamp(1, 120);
+    let fps = request.fps.clamp(1.0, 120.0);
     let render_path = path.to_string_lossy().into_owned();
     let result = tokio::task::spawn_blocking(move || {
         let frames = genesis_web::worker::media_frames(&render_path).unwrap_or(1);
-        let duration_seconds = frames as f64 / 30.0;
+        let duration_seconds = frames as f64 / fps;
         let buckets =
             ((duration_seconds * samples_per_second as f64).ceil() as usize).clamp(1, 100_000);
         let peaks = genesis_web::worker::audio_envelope(&render_path, buckets)
@@ -1301,4 +1341,34 @@ pub async fn get_status(State(state): State<AppState>) -> Response {
         "worker_ready": worker.is_file()
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_browser_effects_do_not_reach_genesis() {
+        let mut clip = GenesisClip::video(0, 0, 1, 0, "test");
+        apply_web_effects(
+            &mut clip,
+            &json!({
+                "effects": [
+                    {
+                        "type": "saturation",
+                        "enabled": false,
+                        "params": { "value": 0.0 }
+                    },
+                    {
+                        "type": "contrast",
+                        "enabled": true,
+                        "params": { "value": 1.25 }
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(clip.sat, 1.0);
+        assert_eq!(clip.contrast, 1.25);
+    }
 }

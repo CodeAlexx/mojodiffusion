@@ -392,6 +392,19 @@ var VideoEditTab = (function () {
         scrollOffsetX = 0;
         recalcTotalFrames();
         currentFrame = clamp(currentFrame, 0, totalFrames);
+        var initialClip = findActiveClipAtFrame(currentFrame);
+        if (!initialClip) {
+            for (var trackIndex = 0; trackIndex < project.tracks.length && !initialClip; trackIndex++) {
+                if (project.tracks[trackIndex].clips.length) {
+                    initialClip = project.tracks[trackIndex].clips[0];
+                }
+            }
+        }
+        if (initialClip) {
+            selectedClipIds.add(initialClip.id);
+            sourceMonitorClipId = initialClip.id;
+        }
+        dockTab = 'properties';
         updateTimecodeDisplay();
         renderTimeline();
         updatePreview();
@@ -976,9 +989,7 @@ var VideoEditTab = (function () {
         }
 
         if (!info) {
-            content.innerHTML =
-                '<div class="ve-dock-heading">PROPERTIES</div>' +
-                '<div class="ve-dock-empty">Select a clip to edit its parameters and settings.</div>';
+            renderProjectProperties(content);
             return;
         }
         var clip = info.clip;
@@ -1022,6 +1033,98 @@ var VideoEditTab = (function () {
             '<span>' + (clip.source_fps || FPS) + ' FPS</span>';
         details.querySelector('strong').textContent = clip.label || 'Untitled';
         content.appendChild(details);
+    }
+
+    function renderProjectProperties(content) {
+        var panel = document.createElement('div');
+        panel.className = 've-props-panel ve-project-properties';
+        var heading = document.createElement('h3');
+        heading.textContent = 'Project Properties';
+        panel.appendChild(heading);
+
+        function addRow(label, input) {
+            var row = document.createElement('div');
+            row.className = 've-props-row';
+            var caption = document.createElement('label');
+            caption.textContent = label;
+            row.appendChild(caption);
+            row.appendChild(input);
+            panel.appendChild(row);
+        }
+
+        var name = document.createElement('input');
+        name.type = 'text';
+        name.value = project.name || 'Untitled Project';
+        name.addEventListener('change', function () {
+            project.name = name.value.trim() || 'Untitled Project';
+            scheduleAutosave();
+        });
+        addRow('Name', name);
+
+        var width = document.createElement('input');
+        width.type = 'number';
+        width.min = '16';
+        width.max = '8192';
+        width.value = project.width;
+        width.addEventListener('change', function () {
+            project.width = clamp(Math.round(Number(width.value) || project.width), 16, 8192);
+            width.value = project.width;
+            resizePreview();
+            updatePreview();
+            scheduleAutosave();
+        });
+        addRow('Width', width);
+
+        var height = document.createElement('input');
+        height.type = 'number';
+        height.min = '16';
+        height.max = '8192';
+        height.value = project.height;
+        height.addEventListener('change', function () {
+            project.height = clamp(Math.round(Number(height.value) || project.height), 16, 8192);
+            height.value = project.height;
+            resizePreview();
+            updatePreview();
+            scheduleAutosave();
+        });
+        addRow('Height', height);
+
+        var fps = document.createElement('input');
+        fps.type = 'text';
+        fps.value = FPS + ' FPS';
+        fps.readOnly = true;
+        addRow('Timeline', fps);
+
+        var summary = document.createElement('div');
+        summary.className = 've-project-summary';
+        var clipCount = project.tracks.reduce(function (total, track) {
+            return total + track.clips.length;
+        }, 0);
+        summary.innerHTML =
+            '<span><strong>' + project.tracks.length + '</strong> tracks</span>' +
+            '<span><strong>' + clipCount + '</strong> clips</span>' +
+            '<span><strong>' + frameToTimecode(totalFrames) + '</strong> duration</span>';
+        panel.appendChild(summary);
+
+        var note = document.createElement('div');
+        note.className = 've-project-id';
+        note.textContent = projectId ? 'Project ' + projectId : 'Unsaved project';
+        panel.appendChild(note);
+
+        var actions = document.createElement('div');
+        actions.className = 've-dock-actions';
+        [
+            ['+ Video', function () { openMediaPicker('video'); }],
+            ['+ Music', function () { openMediaPicker('audio'); }],
+            ['Render', showExportDialog],
+        ].forEach(function (action) {
+            var button = document.createElement('button');
+            button.textContent = action[0];
+            button.addEventListener('click', action[1]);
+            actions.appendChild(button);
+        });
+        panel.appendChild(actions);
+        content.appendChild(panel);
     }
 
     function addFilterFromCatalog(clip, type) {

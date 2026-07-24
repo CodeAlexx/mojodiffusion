@@ -1278,14 +1278,53 @@
     color: #999;
     min-width: 60px;
 }
-.ve-props-row input[type="text"] {
+.ve-props-row input[type="text"],
+.ve-props-row input[type="number"] {
     flex: 1;
+    min-width: 0;
     background: #1a1a28;
     border: 1px solid #3a3a5c;
     border-radius: 4px;
     color: #e0e0e0;
     padding: 4px 8px;
     font-size: 12px;
+}
+
+.ve-props-row input[readonly] {
+    color: #888899;
+}
+
+.ve-project-summary {
+    margin-top: 12px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 5px;
+}
+
+.ve-project-summary span {
+    padding: 8px 4px;
+    border: 1px solid #343443;
+    border-radius: 5px;
+    background: #20202a;
+    color: #858596;
+    font-size: 9px;
+    text-align: center;
+}
+
+.ve-project-summary strong {
+    display: block;
+    margin-bottom: 3px;
+    color: #dcdce6;
+    font-size: 11px;
+}
+
+.ve-project-id {
+    padding: 10px 2px 2px;
+    overflow: hidden;
+    color: #656577;
+    font: 9px 'JetBrains Mono', 'Consolas', monospace;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .ve-props-row select {
     flex: 1;

@@ -101,6 +101,9 @@ exports H.264 plus AAC from the browser, probes the movie, and writes its
 screenshot, contact sheet, and JSON result under
 `output/checks/genesis_browser/`.
 
+Properties auto-opens the clip under the playhead when a project loads and
+falls back to editable project settings when there is no clip selection.
+
 To inspect a particular persisted project through the same browser gate:
 
 ```bash

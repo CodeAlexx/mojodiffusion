@@ -278,6 +278,12 @@ function runChecked(command, args) {
     await page.waitForFunction(() => (
       window.VideoEditTab?.getActiveProjectId?.() !== null
     ));
+    assert(await page.locator(".ve-project-properties").isVisible(),
+      "empty project did not show project settings in Properties");
+    assert(
+      await page.locator(".ve-project-properties input").count() >= 4,
+      "project Properties is missing settings controls",
+    );
     await page.click("#ve-btn-import-video");
     const videoImport = page.waitForResponse((response) => (
       response.url().includes(`/video_edit/projects/${projectId}/import_clip`)
@@ -584,6 +590,7 @@ function runChecked(command, args) {
         snap_toggle: true,
         copy_paste_undo: true,
         audio_mute_toggle: true,
+        project_properties_without_selection: true,
       },
       effect: "saturation=0",
       effect_pixels_changed: effectHash !== baseHash,

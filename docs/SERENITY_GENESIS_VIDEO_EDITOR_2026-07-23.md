@@ -90,6 +90,11 @@ editor without launching or embedding egui:
 - multitrack headers with visibility, mute, and lock controls plus video
   thumbnail strips and duration-correct audio waveforms.
 
+Project load selects the first clip under the playhead so Properties is useful
+immediately. If no clip is selected, Properties remains populated with project
+name, canvas width/height, timeline FPS, track/clip counts, duration, project
+ID, media import actions, and Render; it never becomes an empty dock.
+
 Preview requests are serialized in the browser. Scrubbing while a frame is in
 flight retains only one pending request, preventing a process/request storm.
 Paused and scrubbed frames use the Genesis compositor so effects are exact.

@@ -1064,6 +1064,47 @@ struct QwenImageDitOffloaded(Movable):
 
         return self._finish[N_IMG](img, temb, ctx)
 
+    def forward_masked[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor,
+        timestep: Float32,
+        real_txt_len: Int,
+        frame: Int,
+        h_latent: Int,
+        w_latent: Int,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """Single-stream forward WITH the text pad-mask — the CFG-free path.
+        Identical to `forward()` but masks padded text positions
+        [real_txt_len, N_TXT) out of joint attention (-1e4 bias), so a padded
+        encoder input matches the unpadded result. Used by the CFG-free few-step
+        (Flash / DMD2-distilled) sampler — one branch per step instead of two.
+        """
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+        var img = self._prepare_img(hidden_states, ctx)
+        var txt = self._prepare_txt(encoder_hidden_states, ctx)
+        var temb = self._prepare_temb(timestep, ctx)
+        var dtype = self.shared._w(String("img_in.weight")).dtype()
+        var rope = build_qwenimage_rope_tables(
+            frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
+        )
+        self.loader.set_config(OffloadConfig.single_pass())
+        self.loader.prefetch_with_ctx(0, ctx)
+        for i in range(cfg.num_layers):
+            var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
+            var tmp = self._block_model(handle.block)
+            tmp._block_forward[N_IMG, N_TXT, S](
+                i, img, txt, temb, rope[0], rope[1], real_txt_len, ctx
+            )
+            self.loader.mark_active_block_done(ctx)
+
+        return self._finish[N_IMG](img, temb, ctx)
+
     def forward_cfg[
         N_IMG: Int, N_TXT: Int, S: Int
     ](

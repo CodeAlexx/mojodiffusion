@@ -61,6 +61,12 @@ from serenitymojo.models.wan22.wan22_stack_lora import (
     build_wan22_lora_set, wan22_total_adapters,
     wan22_stack_lora_forward_offload, wan22_stack_lora_backward_offload,
     wan22_lora_adamw_step, save_wan22_lora, save_wan22_lora_state,
+    # WAN_DEVNATIVE (Phase-1b device-native path)
+    Wan22LoraDeviceGradSet, wan22_stack_lora_backward_offload_devnative,
+    wan22_lora_adamw_state_init,
+)
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState, fused_lora_adamw_plain_step_resident_device_grads,
 )
 from serenitymojo.offload.wan22_plan import build_wan22_block_plan
 from serenitymojo.offload.plan import OffloadConfig
@@ -727,7 +733,9 @@ def _run_one_step[SEQ: Int](
     drop_text: Bool, drop_img: Bool, drop_video: Bool,
     lr: Float32, max_grad_norm: Float32,
     beta1: Float32, beta2: Float32, opt_eps: Float32, weight_decay: Float32,
-    ema_decay: Float32, ctx: DeviceContext,
+    ema_decay: Float32,
+    mut adamw_state: Optional[LoraAdamWPlainDeviceState], wan_devnative: Bool,
+    ctx: DeviceContext,
 ) raises -> StepOut:
     # timestep sigma: overfit pin (per-sample fixed) or Bernini per-step re-draw.
     var t = smp.pin_sigma
@@ -807,15 +815,37 @@ def _run_one_step[SEQ: Int](
     if len(d_out) != nout:
         raise Error("d_out len != stack out len")
 
-    var grads = wan22_stack_lora_backward_offload[H, Dh, SEQ, TXT](
-        d_out, model_in.copy(), txt_in.copy(),
-        base, loader, lora, smp.cos_h.copy(), smp.sin_h.copy(), fwd,
-        DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
-    )
-    var absum = _grad_abs_sum(grads)
-    var gn = _clip(grads, max_grad_norm)
-    wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
-                          beta1, beta2, opt_eps, weight_decay)
+    var absum = Float32(0.0)
+    var gn = Float32(0.0)
+    var nonfinite_grads = 0
+
+    if wan_devnative:
+        # ── DEVICE-NATIVE path: recompute + device grads -> resident device-grad
+        #    AdamW (no host grad round-trip). grad-norm/clip done on device inside
+        #    the optimizer; params sync back to the host LoRA mirror each step so
+        #    the (host-LoRA) forward stays current. ──
+        var dgrads = wan22_stack_lora_backward_offload_devnative[H, Dh, SEQ, TXT](
+            d_out, model_in.copy(), txt_in.copy(),
+            base, loader, lora, smp.cos_h.copy(), smp.sin_h.copy(), fwd,
+            DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+        )
+        gn = fused_lora_adamw_plain_step_resident_device_grads(
+            adamw_state.value(), lora.ad, dgrads.grad_indices,
+            dgrads.d_a, dgrads.d_b, step + 1, lr,
+            beta1, beta2, opt_eps, weight_decay, ctx,
+            Float32(1.0), True, max_grad_norm,
+        )
+    else:
+        var grads = wan22_stack_lora_backward_offload[H, Dh, SEQ, TXT](
+            d_out, model_in.copy(), txt_in.copy(),
+            base, loader, lora, smp.cos_h.copy(), smp.sin_h.copy(), fwd,
+            DIM, FFN, IN_CH, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+        )
+        absum = _grad_abs_sum(grads)
+        gn = _clip(grads, max_grad_norm)
+        nonfinite_grads = grads.nonfinite_lora_grads
+        wan22_lora_adamw_step(lora, grads, step + 1, lr, ctx,
+                              beta1, beta2, opt_eps, weight_decay)
 
     # ── EMA shadow: ema = decay*ema + (1-decay)*live (host F32) ──────────────────
     var one_m = Float32(1.0) - ema_decay
@@ -825,7 +855,7 @@ def _run_one_step[SEQ: Int](
         for j in range(len(lora.ad[i].b)):
             ema_b[i][j] = ema_decay * ema_b[i][j] + one_m * Float32(lora.ad[i].b[j])
 
-    return StepOut(loss, gn, absum, grads.nonfinite_lora_grads, t)
+    return StepOut(loss, gn, absum, nonfinite_grads, t)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -861,6 +891,18 @@ def _train_run(
             b.append(Float32(lora.ad[i].b[j]))
         ema_b.append(b^)
 
+    # WAN_DEVNATIVE (Phase-1b): device-native recompute backward + resident
+    # device-grad AdamW. Runtime env flag — BOTH paths are always compiled and the
+    # host hand-chain stays the DEFAULT (env unset -> off). The resident optimizer
+    # state (device P/M/V) is initialized once here and reused every step.
+    var wan_devnative = _env_is_set("WAN_DEVNATIVE")
+    var adamw_state = Optional[LoraAdamWPlainDeviceState](None)
+    if wan_devnative:
+        print("[bernini-r] WAN_DEVNATIVE=1 — device-native backward + resident device-grad AdamW")
+        adamw_state = Optional[LoraAdamWPlainDeviceState](
+            wan22_lora_adamw_state_init(lora, ctx)
+        )
+
     print("")
     print("step  smp  task     seq  sigma      target_MSE      grad_norm    grad_absum   sec")
     for step in range(steps):
@@ -882,23 +924,28 @@ def _train_run(
         if seq == 256:
             r = _run_one_step[256](samples[s], base, loader, lora, ema_a, ema_b,
                 step, s, seed, stochastic, drop_text, drop_img, drop_video,
-                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay,
+                adamw_state, wan_devnative, ctx)
         elif seq == 320:
             r = _run_one_step[320](samples[s], base, loader, lora, ema_a, ema_b,
                 step, s, seed, stochastic, drop_text, drop_img, drop_video,
-                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay,
+                adamw_state, wan_devnative, ctx)
         elif seq == 384:
             r = _run_one_step[384](samples[s], base, loader, lora, ema_a, ema_b,
                 step, s, seed, stochastic, drop_text, drop_img, drop_video,
-                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay,
+                adamw_state, wan_devnative, ctx)
         elif seq == 448:
             r = _run_one_step[448](samples[s], base, loader, lora, ema_a, ema_b,
                 step, s, seed, stochastic, drop_text, drop_img, drop_video,
-                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay,
+                adamw_state, wan_devnative, ctx)
         elif seq == 512:
             r = _run_one_step[512](samples[s], base, loader, lora, ema_a, ema_b,
                 step, s, seed, stochastic, drop_text, drop_img, drop_video,
-                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay, ctx)
+                lr, max_grad_norm, beta1, beta2, opt_eps, weight_decay, ema_decay,
+                adamw_state, wan_devnative, ctx)
         else:
             raise Error(String("unsupported packed seq_len ") + String(seq) +
                         String(" (sample ") + String(s) +

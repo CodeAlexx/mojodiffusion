@@ -65,6 +65,7 @@ from serenitymojo.models.wan22.wan22_block import (
     WanBlockDirectLycorisGrads, WanDirectProjectionGrad,
     WAN_DIRECT_ALGO_DORA, WAN_DIRECT_ALGO_OFT,
     wan22_block_lora_forward, wan22_block_lora_backward,
+    wan22_block_lora_backward_devnative, WanBlockLoraDeviceGrads,
     wan22_block_direct_lycoris_forward, wan22_block_direct_lycoris_backward,
     WanI2VBlockWeights, WanI2VBlockLora, WanI2VBlockLoraGrads, WanI2VSaved,
     wan22_i2v_block_lora_forward, wan22_i2v_block_lora_backward,
@@ -77,6 +78,7 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     fused_lora_adamw_plain_step,
     LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
     fused_lora_adamw_plain_step_resident,
+    fused_lora_adamw_plain_step_resident_device_grads,
 )
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, save_lora_train_state, load_lora_train_state,
@@ -378,6 +380,10 @@ struct Wan22StackForward(Movable):
     var e_head_f32: List[Float32]         # [S, dim] (F32 host)
     var head_shift: List[Float32]         # [S, dim]
     var head_scale: List[Float32]         # [S, dim]
+    # per-block F32 INPUT tape (block-0 input = embedded img seq; block i = block
+    # i-1's F32 output). Populated by the plain-LoRA forward for the WAN_DEVNATIVE
+    # RECOMPUTE backward; empty on the direct-DoRA/OFT forwards (they don't use it).
+    var block_inputs: List[List[Float32]]
 
     def __init__(
         out self,
@@ -389,6 +395,7 @@ struct Wan22StackForward(Movable):
         var e_head_f32: List[Float32],
         var head_shift: List[Float32],
         var head_scale: List[Float32],
+        var block_inputs: List[List[Float32]] = List[List[Float32]](),
     ):
         self.out = out^
         self.block_saved = block_saved^
@@ -398,6 +405,7 @@ struct Wan22StackForward(Movable):
         self.e_head_f32 = e_head_f32^
         self.head_shift = head_shift^
         self.head_scale = head_scale^
+        self.block_inputs = block_inputs^
 
 
 # ── Sinusoidal timestep embedding (matches wan22_dit.mojo::timestep_embedding) ─
@@ -759,6 +767,8 @@ def wan22_stack_lora_forward_offload[
     # ── stream 40 WanAttentionBlocks ──
     var block_saved = List[WanSaved]()
     var block_modvecs = List[WanModVecs]()
+    # per-block F32 INPUT tape for the WAN_DEVNATIVE recompute backward.
+    var block_inputs = List[List[Float32]]()
 
     for bi in range(num_blocks):
         var handle = loader.await_block(bi, ctx)
@@ -780,6 +790,7 @@ def wan22_stack_lora_forward_offload[
 
         # LoRA-augmented forward.
         var bl = _wan_block_lora_for(lora, bi)
+        block_inputs.append(img.copy())
         var fwd = wan22_block_lora_forward[H, Dh, S, TXT](
             img.copy(), context_emb.copy(), mv, w, bl, cos_t, sin_t, dim, ffn, eps, ctx,
         )
@@ -801,6 +812,7 @@ def wan22_stack_lora_forward_offload[
         out^, block_saved^, block_modvecs^,
         img^, context_emb^,
         e_head^, head_shift^, head_scale^,
+        block_inputs^,
     )
 
 
@@ -1085,6 +1097,143 @@ def wan22_stack_lora_backward_offload[
         d_a_flat^, d_b_flat^,
         d_img_tokens^, d_txt_tokens^,
         nonfinite,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WAN_DEVNATIVE loader-based backward: same head-backward + streamed conductor
+# seam as wan22_stack_lora_backward_offload, but the reverse BLOCK loop RECOMPUTES
+# each block from its saved F32 input (saved.block_inputs) and runs the DEVICE-
+# NATIVE block backward (wan22_block_lora_backward_devnative). The block d_x stays
+# a device BF16 Tensor threaded block->block (no to_host in the loop), and each
+# block's 10 device LoRA grads (F32 TArc) accumulate into a device grad set that
+# feeds the resident device-grad AdamW directly (no host grad list). The input-
+# projection backward is skipped (frozen, discarded in LoRA training).
+# ══════════════════════════════════════════════════════════════════════════════
+def wan22_stack_lora_backward_offload_devnative[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, lora: Wan22LoraSet,
+    cos: List[Float32], sin: List[Float32],
+    saved: Wan22StackForward,
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22LoraDeviceGradSet:
+    var num_blocks = lora.num_blocks
+    var n_adapters = wan22_total_adapters(lora)
+
+    if len(saved.block_inputs) != num_blocks:
+        raise Error(
+            "wan22_stack_lora_backward_offload_devnative: forward tape missing block_inputs"
+            " (use wan22_stack_lora_forward_offload)"
+        )
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
+
+    # ── head backward (proj_out -> modulate -> LN_no_affine) — verbatim clone of
+    #    the offload backward's head chain, producing d_x_img [S,dim] host F32. ──
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.norm_backward import layer_norm_backward_dx
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var ones = List[Float32]()
+    for _ in range(dim):
+        ones.append(Float32(1.0))
+    var zeros = List[Float32]()
+    for _ in range(dim):
+        zeros.append(Float32(0.0))
+    var ln_x_img = layer_norm(
+        _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), _t(zeros^, [dim], ctx), eps, ctx,
+    ).to_host(ctx)
+    var scale_d = _t(saved.head_scale.copy(), [S, dim], ctx)
+    var shift_d = _t(saved.head_shift.copy(), [S, dim], ctx)
+    from serenitymojo.ops.tensor_algebra import add_scalar as _add_scalar
+    var sc1 = _add_scalar(scale_d, Float32(1.0), ctx)
+    var ln_x_t = _t(ln_x_img.copy(), [S, dim], ctx)
+    var modulated = mul(ln_x_t, sc1, ctx)
+    modulated = add(modulated, shift_d, ctx)
+    var lbh = linear_backward(
+        _t_like(d_out, [S, out_ch], base.hh_w[], ctx),
+        _cast_like(modulated, base.hh_w[], ctx), base.hh_w[],
+        S, dim, out_ch, ctx,
+    )
+    var d_modulated = lbh.d_x.to_host(ctx)
+    var mbh = modulate_backward(
+        _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
+        _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_ln_img = mbh.d_x.to_host(ctx)
+    var lnbh = layer_norm_backward_dx(
+        _t(d_ln_img, [S, dim], ctx), _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), eps, ctx,
+    )
+    var d_x_img = lnbh.to_host(ctx)   # [S, dim] — enters last block output
+
+    # ── dense per-adapter device grad slots (all 10/block filled) ──
+    var da_opt = List[Optional[TArc]]()
+    var db_opt = List[Optional[TArc]]()
+    for _ in range(n_adapters):
+        da_opt.append(Optional[TArc]())
+        db_opt.append(Optional[TArc]())
+
+    # seed the reverse chain with the head-grad as a device BF16 tensor.
+    var d_out_dev = Tensor.from_host(d_x_img.copy(), [S, dim], STDtype.BF16, ctx)
+
+    # ── stream blocks in REVERSE (recompute + device-native) ──
+    var bi = num_blocks - 1
+    while bi >= 0:
+        var handle = loader.await_block(bi, ctx)
+        if bi > 0:
+            loader.prefetch_with_ctx(bi - 1, ctx)
+
+        var mv = saved.block_modvecs[bi].copy()
+        var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var bl = _wan_block_lora_for(lora, bi)
+
+        # RECOMPUTE this block's forward from its F32 input (one device tape live).
+        var rc = wan22_block_lora_forward[H, Dh, S, TXT](
+            saved.block_inputs[bi].copy(), saved.context_emb.copy(),
+            mv, w, bl, cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+        var gd = wan22_block_lora_backward_devnative[H, Dh, S, TXT](
+            d_out_dev, mv, w, bl, rc.saved, cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+        d_out_dev = gd.d_x.clone(ctx)
+        var bbase = _lora_block_base(bi)
+        for slot in range(WAN_LORA_SLOTS):
+            if gd.d_a[slot]:
+                da_opt[bbase + slot] = Optional[TArc](gd.d_a[slot].value().copy())
+                db_opt[bbase + slot] = Optional[TArc](gd.d_b[slot].value().copy())
+
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    # flatten dense slots -> ascending device grad lists + dense grad indices.
+    var d_a = List[TArc]()
+    var d_b = List[TArc]()
+    var grad_indices = List[Int]()
+    for i in range(n_adapters):
+        if not da_opt[i]:
+            raise Error(
+                "wan22_stack_lora_backward_offload_devnative: missing device grad slot "
+                + String(i)
+            )
+        d_a.append(da_opt[i].value().copy())
+        d_b.append(db_opt[i].value().copy())
+        grad_indices.append(i)
+
+    var d_x_tokens = d_out_dev.to_host(ctx)
+    return Wan22LoraDeviceGradSet(
+        d_a^, d_b^, grad_indices^, d_x_tokens^, n_adapters,
     )
 
 
@@ -1947,3 +2096,240 @@ def save_wan22_i2v_lora_state(
     for i in range(n):
         named.append(NamedLora(prefixes[i], lora.ad[i].copy()))
     return save_lora_train_state(named, path, ctx, meta^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE-1b — device-native, LOADER-FREE block-stack (zimage-style rebuild).
+#
+# These mirror the SCAIL-2 loader-free stack (models/scail2/scail2_stack_lora.mojo)
+# for the Wan2.2 T2V block (10-slot plain LoRA, no img_k/img_v). They operate on an
+# explicit List[WanBlockWeights] + per-block WanModVecs (NO TurboPlannedLoader / no
+# head / no embed), so a small same-process gate can compare:
+#   (1) host recompute  ==  host save-all   (bit) — proves the recompute discipline;
+#   (2) device-native   ==  host recompute  (bit) — proves the device tape.
+#
+# Everything here is behind the WAN_DEVNATIVE comptime flag at the trainer seam; the
+# functions themselves are always compiled (gate-don't-delete, C13) and are pure
+# additions — no existing path is touched.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── loader-free forward tape: keep BOTH the per-block F32 INPUT tape (recompute)
+#    and the save-all WanSaved tape (so one process can gate recompute==save-all). ─
+struct Wan22BlockStackForward(Movable):
+    var x_out: List[Float32]                 # [S,dim] F32 final block-stack output
+    var block_inputs: List[List[Float32]]    # per-block F32 input sequence (recompute tape)
+    var block_saved: List[WanSaved]          # per-block saved activations (save-all tape)
+
+    def __init__(
+        out self, var x_out: List[Float32],
+        var block_inputs: List[List[Float32]], var block_saved: List[WanSaved],
+    ):
+        self.x_out = x_out^
+        self.block_inputs = block_inputs^
+        self.block_saved = block_saved^
+
+
+# ── device-resident LoRA grad set (10 slots/block, F32 device tensors) ────────
+# d_a[i]/d_b[i] are the flat adapter-order (block bi -> i = bi*10 + slot) device
+# grads; grad_indices are the matching absolute adapter indices (0..n-1, dense).
+# Feeds fused_lora_adamw_plain_step_resident_device_grads with NO host round-trip.
+struct Wan22LoraDeviceGradSet(Movable):
+    var d_a: List[TArc]            # [n_adapters] F32 [rank,in]  device
+    var d_b: List[TArc]            # [n_adapters] F32 [out,rank] device
+    var grad_indices: List[Int]    # [n_adapters] absolute adapter indices (dense)
+    var d_x_tokens: List[Float32]  # [S,dim] F32 input-sequence grad (host readback)
+    var num_adapters: Int
+
+    def __init__(
+        out self, var d_a: List[TArc], var d_b: List[TArc],
+        var grad_indices: List[Int], var d_x_tokens: List[Float32],
+        num_adapters: Int,
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.grad_indices = grad_indices^
+        self.d_x_tokens = d_x_tokens^
+        self.num_adapters = num_adapters
+
+
+# ── loader-free forward (records both tapes) ──────────────────────────────────
+def wan22_blockstack_lora_forward[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    var sequence: List[Float32],
+    modvecs: List[WanModVecs],
+    context: List[Float32],
+    weights: List[WanBlockWeights], lora: Wan22LoraSet,
+    cos: Tensor, sin: Tensor,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22BlockStackForward:
+    var num_layers = lora.num_blocks
+    var x = sequence^
+    var block_inputs = List[List[Float32]]()
+    var block_saved = List[WanSaved]()
+    for bi in range(num_layers):
+        block_inputs.append(x.copy())
+        var bl = _wan_block_lora_for(lora, bi)
+        var fwd = wan22_block_lora_forward[H, Dh, S, TXT](
+            x.copy(), context.copy(), modvecs[bi].copy(), weights[bi], bl,
+            cos, sin, dim, ffn, eps, ctx,
+        )
+        block_saved.append(fwd.saved.copy())
+        x = fwd.x_out.copy()
+    return Wan22BlockStackForward(x^, block_inputs^, block_saved^)
+
+
+# ── scatter one block's 10 host LoRA grads into the flat accumulators ──────────
+def _wan_scatter_block_host_grads(
+    mut d_a: List[List[Float32]], mut d_b: List[List[Float32]],
+    bbase: Int, bg: WanBlockLoraGrads,
+) raises -> Int:
+    d_a[bbase + W_SA_Q] = bg.sa_q_da.copy(); d_b[bbase + W_SA_Q] = bg.sa_q_db.copy()
+    d_a[bbase + W_SA_K] = bg.sa_k_da.copy(); d_b[bbase + W_SA_K] = bg.sa_k_db.copy()
+    d_a[bbase + W_SA_V] = bg.sa_v_da.copy(); d_b[bbase + W_SA_V] = bg.sa_v_db.copy()
+    d_a[bbase + W_SA_O] = bg.sa_o_da.copy(); d_b[bbase + W_SA_O] = bg.sa_o_db.copy()
+    d_a[bbase + W_CA_Q] = bg.ca_q_da.copy(); d_b[bbase + W_CA_Q] = bg.ca_q_db.copy()
+    d_a[bbase + W_CA_K] = bg.ca_k_da.copy(); d_b[bbase + W_CA_K] = bg.ca_k_db.copy()
+    d_a[bbase + W_CA_V] = bg.ca_v_da.copy(); d_b[bbase + W_CA_V] = bg.ca_v_db.copy()
+    d_a[bbase + W_CA_O] = bg.ca_o_da.copy(); d_b[bbase + W_CA_O] = bg.ca_o_db.copy()
+    d_a[bbase + W_FFN0] = bg.ffn0_da.copy(); d_b[bbase + W_FFN0] = bg.ffn0_db.copy()
+    d_a[bbase + W_FFN2] = bg.ffn2_da.copy(); d_b[bbase + W_FFN2] = bg.ffn2_db.copy()
+    var nf = 0
+    nf += _nonfinite(bg.sa_q_da) + _nonfinite(bg.sa_q_db)
+    nf += _nonfinite(bg.sa_k_da) + _nonfinite(bg.sa_k_db)
+    nf += _nonfinite(bg.sa_v_da) + _nonfinite(bg.sa_v_db)
+    nf += _nonfinite(bg.sa_o_da) + _nonfinite(bg.sa_o_db)
+    nf += _nonfinite(bg.ca_q_da) + _nonfinite(bg.ca_q_db)
+    nf += _nonfinite(bg.ca_k_da) + _nonfinite(bg.ca_k_db)
+    nf += _nonfinite(bg.ca_v_da) + _nonfinite(bg.ca_v_db)
+    nf += _nonfinite(bg.ca_o_da) + _nonfinite(bg.ca_o_db)
+    nf += _nonfinite(bg.ffn0_da) + _nonfinite(bg.ffn0_db)
+    nf += _nonfinite(bg.ffn2_da) + _nonfinite(bg.ffn2_db)
+    return nf
+
+
+# ── loader-free HOST backward (recompute flag; save-all when False) ───────────
+# The oracle for both device-native and the recompute-discipline gate. `recompute`
+# = True regenerates each block's WanSaved from its F32 input; False consumes the
+# save-all tape. Returns the same Wan22LoraGradSet the offload path returns.
+def wan22_blockstack_lora_backward[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    var d_out: List[Float32],
+    modvecs: List[WanModVecs],
+    context: List[Float32],
+    weights: List[WanBlockWeights], lora: Wan22LoraSet,
+    cos: Tensor, sin: Tensor,
+    fwd_state: Wan22BlockStackForward,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+    recompute: Bool = True,
+) raises -> Wan22LoraGradSet:
+    var num_layers = lora.num_blocks
+    var n_adapters = wan22_total_adapters(lora)
+    var d_a = List[List[Float32]]()
+    var d_b = List[List[Float32]]()
+    for _ in range(n_adapters):
+        d_a.append(List[Float32]())
+        d_b.append(List[Float32]())
+    var nonfinite = 0
+    var d_cur = d_out^
+
+    var bi = num_layers - 1
+    while bi >= 0:
+        var bl = _wan_block_lora_for(lora, bi)
+        if recompute:
+            var rc = wan22_block_lora_forward[H, Dh, S, TXT](
+                fwd_state.block_inputs[bi].copy(), context.copy(),
+                modvecs[bi].copy(), weights[bi], bl, cos, sin,
+                dim, ffn, eps, ctx,
+            )
+            var bg = wan22_block_lora_backward[H, Dh, S, TXT](
+                d_cur.copy(), modvecs[bi].copy(), weights[bi], bl, rc.saved,
+                cos, sin, dim, ffn, eps, ctx,
+            )
+            d_cur = bg.base.d_x.copy()
+            nonfinite += _wan_scatter_block_host_grads(d_a, d_b, _lora_block_base(bi), bg)
+        else:
+            var bg = wan22_block_lora_backward[H, Dh, S, TXT](
+                d_cur.copy(), modvecs[bi].copy(), weights[bi], bl,
+                fwd_state.block_saved[bi], cos, sin, dim, ffn, eps, ctx,
+            )
+            d_cur = bg.base.d_x.copy()
+            nonfinite += _wan_scatter_block_host_grads(d_a, d_b, _lora_block_base(bi), bg)
+        bi -= 1
+
+    return Wan22LoraGradSet(d_a^, d_b^, d_cur^, _zeros_f32(TXT * dim), nonfinite)
+
+
+# ── loader-free DEVICE-NATIVE backward (recompute; device grads threaded) ─────
+# Mirrors wan22_blockstack_lora_backward (recompute=True) but calls the device-
+# native block backward wan22_block_lora_backward_devnative: d_x stays a device
+# BF16 Tensor threaded block->block (no to_host inside the loop), and each block's
+# 10 device LoRA grads (F32 TArc) accumulate into the flat device grad set. Only
+# the final input-sequence grad + per-adapter grads leave as device tensors; the
+# single d_x_tokens readback at the end is for parity/inspection.
+def wan22_blockstack_lora_backward_devnative[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out: List[Float32],
+    modvecs: List[WanModVecs],
+    context: List[Float32],
+    weights: List[WanBlockWeights], lora: Wan22LoraSet,
+    cos: Tensor, sin: Tensor,
+    fwd_state: Wan22BlockStackForward,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22LoraDeviceGradSet:
+    var num_layers = lora.num_blocks
+    var n_adapters = wan22_total_adapters(lora)
+
+    # dense per-adapter device grad slots (all 10/block are filled by plain LoRA).
+    var da_opt = List[Optional[TArc]]()
+    var db_opt = List[Optional[TArc]]()
+    for _ in range(n_adapters):
+        da_opt.append(Optional[TArc]())
+        db_opt.append(Optional[TArc]())
+
+    # seed the reverse chain with the output grad as a device BF16 tensor (== the
+    # oracle's _ta16 upload of d_out_h).
+    var d_out_dev = Tensor.from_host(d_out.copy(), [S, dim], STDtype.BF16, ctx)
+
+    var bi = num_layers - 1
+    while bi >= 0:
+        var bl = _wan_block_lora_for(lora, bi)
+        # RECOMPUTE this block's forward from its F32 input (one device tape live).
+        var rc = wan22_block_lora_forward[H, Dh, S, TXT](
+            fwd_state.block_inputs[bi].copy(), context.copy(),
+            modvecs[bi].copy(), weights[bi], bl, cos, sin, dim, ffn, eps, ctx,
+        )
+        var gd = wan22_block_lora_backward_devnative[H, Dh, S, TXT](
+            d_out_dev, modvecs[bi].copy(), weights[bi], bl, rc.saved,
+            cos, sin, dim, ffn, eps, ctx,
+        )
+        # d_x(bi) -> d_out(bi-1), device BF16, no host round-trip.
+        d_out_dev = gd.d_x.clone(ctx)
+        # scatter this block's 10 device grads into flat adapter order.
+        var bbase = _lora_block_base(bi)
+        for slot in range(WAN_LORA_SLOTS):
+            if gd.d_a[slot]:
+                da_opt[bbase + slot] = Optional[TArc](gd.d_a[slot].value().copy())
+                db_opt[bbase + slot] = Optional[TArc](gd.d_b[slot].value().copy())
+        bi -= 1
+
+    # flatten dense slots -> ascending device grad lists + dense grad indices.
+    var d_a = List[TArc]()
+    var d_b = List[TArc]()
+    var grad_indices = List[Int]()
+    for i in range(n_adapters):
+        if not da_opt[i]:
+            raise Error(
+                "wan22_blockstack_lora_backward_devnative: missing device grad slot "
+                + String(i)
+            )
+        d_a.append(da_opt[i].value().copy())
+        d_b.append(db_opt[i].value().copy())
+        grad_indices.append(i)
+
+    var d_x_tokens = d_out_dev.to_host(ctx)
+    return Wan22LoraDeviceGradSet(
+        d_a^, d_b^, grad_indices^, d_x_tokens^, n_adapters,
+    )

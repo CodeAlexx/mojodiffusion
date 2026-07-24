@@ -85,6 +85,7 @@ var SerenityAPI = (function () {
                     fps: li.frame_rate,
                     include_audio: li.include_audio === true,
                     cfg: li.cfg,
+                    guidance_mode: li.mode || 'distilled',
                     sampler: li.sampler,
                     scheduler: li.scheduler,
                     caps_positive: li.caps_positive || '',

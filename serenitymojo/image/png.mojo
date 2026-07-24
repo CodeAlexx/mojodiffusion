@@ -33,7 +33,11 @@
 # Mojo 1.0.0b1.
 
 from std.gpu.host import DeviceContext
+from std.gpu import global_idx, grid_dim, block_dim
 from std.memory import alloc
+from std.utils.index import IndexList
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.ffi import (
     sys_open,
@@ -44,6 +48,9 @@ from serenitymojo.io.ffi import (
     O_CREAT,
     O_TRUNC,
 )
+
+comptime _RGB_DYN1 = Layout.row_major(-1)
+comptime _RGB_BLOCK = 256
 
 
 # ── value-range mapping ─────────────────────────────────────────────────────
@@ -306,3 +313,252 @@ def save_png(
     obuf.free()
     if done != nbytes:
         raise Error(String("save_png: short write to ") + path)
+
+
+def save_rgb24_frame(
+    image: Tensor,
+    path: String,
+    frame_index: Int,
+    ctx: DeviceContext,
+    value_range: ValueRange = ValueRange.SIGNED,
+) raises:
+    """Append one `[1,3,H,W]` frame to a seekable RGB24 video stream.
+
+    The first frame truncates the destination; later frames use `pwrite` at
+    `frame_index * H * W * 3`. Unlike `save_png`, this performs only the
+    required CHW-to-HWC quantization and one file write. Video pipelines can
+    feed the resulting raw stream directly to ffmpeg without constructing,
+    checksumming, writing, and rereading one PNG container per frame.
+    """
+    var shape = image.shape()
+    if len(shape) != 4 or shape[0] != 1 or shape[1] != 3:
+        raise Error(
+            String("save_rgb24_frame: expected [1,3,H,W] got shape len ")
+            + String(len(shape))
+        )
+    if frame_index < 0:
+        raise Error("save_rgb24_frame: frame_index must be >= 0")
+    var height = shape[2]
+    var width = shape[3]
+    if height <= 0 or width <= 0:
+        raise Error("save_rgb24_frame: zero-sized image")
+
+    var host = image.to_host(ctx)
+    var plane = height * width
+    if len(host) != 3 * plane:
+        raise Error(
+            String("save_rgb24_frame: to_host returned ")
+            + String(len(host))
+            + " values, expected "
+            + String(3 * plane)
+        )
+
+    var nbytes = 3 * plane
+    var obuf = alloc[UInt8](nbytes)
+    for y in range(height):
+        var row_base = y * width
+        for x in range(width):
+            var pixel = row_base + x
+            var out = 3 * pixel
+            obuf[out] = _quantize(host[pixel], value_range)
+            obuf[out + 1] = _quantize(host[plane + pixel], value_range)
+            obuf[out + 2] = _quantize(host[2 * plane + pixel], value_range)
+
+    var flags = O_WRONLY | O_CREAT
+    if frame_index == 0:
+        flags |= O_TRUNC
+    var fd = sys_open(path, flags, Int32(0o644))
+    if fd < 0:
+        obuf.free()
+        raise Error(String("save_rgb24_frame: cannot open for write: ") + path)
+    var bp = BytePtr(unsafe_from_address=Int(obuf))
+    var frame_offset = frame_index * nbytes
+    var done = 0
+    while done < nbytes:
+        var got = sys_pwrite(
+            fd, bp + done, nbytes - done, frame_offset + done
+        )
+        if got <= 0:
+            break
+        done += got
+    _ = sys_close(fd)
+    obuf.free()
+    if done != nbytes:
+        raise Error(String("save_rgb24_frame: short write to ") + path)
+
+
+def _rgb24_from_bcthw_f32(
+    x: LayoutTensor[DType.float32, _RGB_DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
+    frames: Int,
+    height: Int,
+    width: Int,
+    range_tag: Int,
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var plane = height * width
+    while i < n:
+        var channel = i % 3
+        var pixel = i // 3
+        var xy = pixel % plane
+        var frame = pixel // plane
+        var src = (channel * frames + frame) * plane + xy
+        var v = Float32(rebind[Scalar[DType.float32]](x[src]))
+        var scaled = (
+            (v + Float32(1.0)) * Float32(127.5)
+            if range_tag == 0 else v * Float32(255.0)
+        )
+        if scaled < Float32(0.0):
+            scaled = Float32(0.0)
+        elif scaled > Float32(255.0):
+            scaled = Float32(255.0)
+        o[i] = rebind[o.element_type](
+            Scalar[DType.uint8](Int(scaled + Float32(0.5)))
+        )
+        i += stride
+
+
+def _rgb24_from_bcthw_bf16(
+    x: LayoutTensor[DType.bfloat16, _RGB_DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
+    frames: Int,
+    height: Int,
+    width: Int,
+    range_tag: Int,
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var plane = height * width
+    while i < n:
+        var channel = i % 3
+        var pixel = i // 3
+        var xy = pixel % plane
+        var frame = pixel // plane
+        var src = (channel * frames + frame) * plane + xy
+        var v = Float32(rebind[Scalar[DType.bfloat16]](x[src]))
+        var scaled = (
+            (v + Float32(1.0)) * Float32(127.5)
+            if range_tag == 0 else v * Float32(255.0)
+        )
+        if scaled < Float32(0.0):
+            scaled = Float32(0.0)
+        elif scaled > Float32(255.0):
+            scaled = Float32(255.0)
+        o[i] = rebind[o.element_type](
+            Scalar[DType.uint8](Int(scaled + Float32(0.5)))
+        )
+        i += stride
+
+
+def _rgb24_from_bcthw_f16(
+    x: LayoutTensor[DType.float16, _RGB_DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
+    frames: Int,
+    height: Int,
+    width: Int,
+    range_tag: Int,
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var plane = height * width
+    while i < n:
+        var channel = i % 3
+        var pixel = i // 3
+        var xy = pixel % plane
+        var frame = pixel // plane
+        var src = (channel * frames + frame) * plane + xy
+        var v = Float32(rebind[Scalar[DType.float16]](x[src]))
+        var scaled = (
+            (v + Float32(1.0)) * Float32(127.5)
+            if range_tag == 0 else v * Float32(255.0)
+        )
+        if scaled < Float32(0.0):
+            scaled = Float32(0.0)
+        elif scaled > Float32(255.0):
+            scaled = Float32(255.0)
+        o[i] = rebind[o.element_type](
+            Scalar[DType.uint8](Int(scaled + Float32(0.5)))
+        )
+        i += stride
+
+
+def save_rgb24_video(
+    video: Tensor,
+    path: String,
+    ctx: DeviceContext,
+    value_range: ValueRange = ValueRange.SIGNED,
+) raises:
+    """Write `[1,3,F,H,W]` as contiguous frame-major RGB24.
+
+    CHW-to-HWC reordering, clamping, and float-to-u8 conversion run in one GPU
+    kernel. The complete byte stream then crosses the PCIe boundary once and
+    is written once, avoiding 121 synchronized scalar CPU conversion loops.
+    """
+    var shape = video.shape()
+    if len(shape) != 5 or shape[0] != 1 or shape[1] != 3:
+        raise Error(
+            String("save_rgb24_video: expected [1,3,F,H,W] got shape len ")
+            + String(len(shape))
+        )
+    var frames = shape[2]
+    var height = shape[3]
+    var width = shape[4]
+    if frames <= 0 or height <= 0 or width <= 0:
+        raise Error("save_rgb24_video: zero-sized video")
+
+    var n = frames * height * width * 3
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n)
+    var rl = RuntimeLayout[_RGB_DYN1].row_major(IndexList[1](n))
+    var o = LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr(), rl
+    )
+    var grid = (n + _RGB_BLOCK - 1) // _RGB_BLOCK
+    var range_tag = value_range.tag
+    var dtype = video.dtype().to_mojo_dtype()
+    if dtype == DType.float32:
+        var x = LayoutTensor[DType.float32, _RGB_DYN1, MutAnyOrigin](
+            video.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_rgb24_from_bcthw_f32, _rgb24_from_bcthw_f32](
+            x, o, frames, height, width, range_tag, n,
+            grid_dim=grid, block_dim=_RGB_BLOCK,
+        )
+    elif dtype == DType.bfloat16:
+        var x = LayoutTensor[DType.bfloat16, _RGB_DYN1, MutAnyOrigin](
+            video.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_rgb24_from_bcthw_bf16, _rgb24_from_bcthw_bf16](
+            x, o, frames, height, width, range_tag, n,
+            grid_dim=grid, block_dim=_RGB_BLOCK,
+        )
+    elif dtype == DType.float16:
+        var x = LayoutTensor[DType.float16, _RGB_DYN1, MutAnyOrigin](
+            video.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_rgb24_from_bcthw_f16, _rgb24_from_bcthw_f16](
+            x, o, frames, height, width, range_tag, n,
+            grid_dim=grid, block_dim=_RGB_BLOCK,
+        )
+    else:
+        raise Error("save_rgb24_video: unsupported input dtype")
+
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](n)
+    ctx.enqueue_copy(dst_buf=host, src_buf=out_buf)
+    ctx.synchronize()
+    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, Int32(0o644))
+    if fd < 0:
+        raise Error(String("save_rgb24_video: cannot open for write: ") + path)
+    var hp = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
+    var done = 0
+    while done < n:
+        var got = sys_pwrite(fd, hp + done, n - done, done)
+        if got <= 0:
+            break
+        done += got
+    _ = sys_close(fd)
+    if done != n:
+        raise Error(String("save_rgb24_video: short write to ") + path)

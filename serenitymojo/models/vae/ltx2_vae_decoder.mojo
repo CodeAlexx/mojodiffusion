@@ -254,6 +254,7 @@ struct LTX2VaeDecoderWeights(Movable):
         return conv3d_fcqrs_cudnn(
             x_pad, w_fcqrs, Optional[Tensor](bias^),
             1, 1, 1, 0, HALF_PAD, HALF_PAD, ctx,
+            low_startup=True,
         )
 
     def _conv3d_named(

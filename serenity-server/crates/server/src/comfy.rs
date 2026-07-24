@@ -441,7 +441,7 @@ pub async fn get_object_info() -> Response {
                 "width": int(768,16,4096),
                 "height": int(512,16,4096),
                 "num_frames": int(97,1,4096),
-                "steps": int(25,1,1000),
+                "steps": int(8,1,20),
                 "cfg": fl(3.0,0.0,100.0),
                 "seed": int(0,0,281474976710655),
                 "frame_rate": int(24,1,240),

@@ -745,11 +745,13 @@ function checkpoint(message) {
       width: bbox.width(),
       height: bbox.height(),
       steps: Number(document.querySelector("#cv-steps").value),
+      cfg: Number(document.querySelector("#cv-cfg").value),
       seed: Number(document.querySelector("#cv-seed").value),
       frames: Number(document.querySelector("#cv-frames").value),
       fps: Number(document.querySelector("#cv-fps").value),
       sampler: document.querySelector("#cv-sampler").value,
       scheduler: document.querySelector("#cv-scheduler").value,
+      ltx2Mode: document.querySelector("#cv-ltx2-mode").value,
       capsPositive: document.querySelector("#cv-caps-positive").value,
       capsNegative: document.querySelector("#cv-caps-negative").value,
       noiseFixture: document.querySelector("#cv-noise-fixture").value,
@@ -763,12 +765,13 @@ function checkpoint(message) {
   });
   assert(ltx.runner === "ltx2_mojo_request", "Canvas did not select the pure-Mojo LTX2 runner");
   assert(ltx.width === 512 && ltx.height === 768 && ltx.frames === 121, "Canvas substituted LTX2 geometry");
-  assert(ltx.steps === 20 && ltx.fps === 25 && ltx.seed === 42, "Canvas substituted the authored LTX2 schedule");
-  assert(ltx.sampler === "res2s" && ltx.scheduler === "ltx2", "Canvas substituted the LTX2 sampler profile");
+  assert(ltx.steps === 8 && ltx.fps === 25 && ltx.seed === 42, "Canvas substituted the authored LTX2 schedule");
+  assert(ltx.guidance_mode === "distilled", "Canvas substituted the LTX2 guidance mode");
+  assert(ltx.sampler === "euler" && ltx.scheduler === "ltx2_distilled", "Canvas substituted the LTX2 sampler profile");
   assert(ltx.lora.length === 1 && ltx.lora[0].name === "ltx2_eri2_step3000" && ltx.lora[0].weight === 1,
     "Canvas did not preserve the verified LTX2 LoRA");
   assert(ltx.prompt.includes("vrtlEri2"), "Canvas lost the trained identity trigger");
-  await page.selectOption("#cv-sampler", "euler");
+  await page.selectOption("#cv-sampler", "res2s");
   await page.dispatchEvent("#cv-sampler", "change");
   await page.click("#cv-generate-btn");
   const rejectedLtxState = await page.evaluate(() => ({
@@ -776,10 +779,10 @@ function checkpoint(message) {
     buttonDisabled: document.querySelector("#cv-generate-btn").disabled,
     buttonText: document.querySelector("#cv-generate-btn").textContent,
   }));
-  assert(/requires the compiled Res2S sampler/.test(rejectedLtxState.error) &&
+  assert(/requires Euler, the LTX2 Distilled scheduler, and 8 steps/.test(rejectedLtxState.error) &&
     !rejectedLtxState.buttonDisabled,
     `Rejected LTX2 sampler left Canvas stuck generating: ${JSON.stringify(rejectedLtxState)}`);
-  await page.selectOption("#cv-sampler", "res2s");
+  await page.selectOption("#cv-sampler", "euler");
   await page.dispatchEvent("#cv-sampler", "change");
   checkpoint("LTX2 and LoRA request passed");
 
@@ -801,7 +804,9 @@ function checkpoint(message) {
   });
   const workflowLtx = await page.evaluate(() =>
     SerenityAPI.videoRequestFromWorkflow(serializeWorkflow(sfCanvas).prompt));
-  assert(workflowLtx && workflowLtx.sampler === "res2s" && workflowLtx.scheduler === "ltx2",
+  assert(workflowLtx && workflowLtx.guidance_mode === "distilled" &&
+    workflowLtx.sampler === "euler" && workflowLtx.scheduler === "ltx2_distilled" &&
+    workflowLtx.steps === 8,
     `Workflow lost the verified LTX2 sampler profile: ${JSON.stringify(workflowLtx)}`);
   assert(workflowLtx.caps_positive && workflowLtx.lora.length === 1 &&
     workflowLtx.lora[0].name === "ltx2_eri2_step3000",

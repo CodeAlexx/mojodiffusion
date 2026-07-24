@@ -96,8 +96,8 @@ file is "where does X live". First target: Z-Image text→image.
 | `serve/klein_runtime_backend.mojo` | Resident pure-Mojo FLUX.2 Klein 9B/4B worker. Supports text-to-image plus one-source native `ReferenceLatent` editing at 512x512 or 1024x1024; two-source legacy edit remains 512x512 and ordinary img2img fails loudly. | ✅ real 1024 edit artifacts for 4B + 9B |
 | `serve/image_io.mojo` | Shared worker image/mask I/O, including alpha/luminance LanPaint masks, separately expanded sampler-context masks, crop helpers, and final source-preserving blend primitives. | ✅ CPU mask smoke + browser/real-job gates |
 | `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
-| `sampling/ltx2_request_cli.mojo` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and pre/post-connector conditioning sidecars, resolves every requested LoRA and scale, accepts the request's `model_quant`, preserves an exact request copy, then calls only an exact admitted compiled video profile. Emits atomic `status.json` and consumes no Python or Rust product runtime. | 🟠 experimental; 512x768 121f step-3000 LoRA artifact visually accepted |
-| `pipeline/ltx2_t2v_av_hq.mojo` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. The admitted HQ request path consumes runtime seed/FPS/steps/conditioning/audio/LoRA selection/quant mode and fail-loud validates its compiled 512x768, 121-frame, 20-step res2s/ltx2 profile before model load. The SVD-int4 path keeps the 48-block base slab resident and streams factorized per-block LoRA factors without materializing dense deltas. Writes atomic progress and result manifests with timings, output geometry, frame count, duration, dtype contract, quant mode, and sampled peak VRAM. | 🟠 experimental; int4 121f gate: 377.07s total / 342.38s denoise / 18,571 MiB peak, 26.2% total faster than the 511.09s FP8 baseline |
+| `sampling/ltx2_request_cli.mojo` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and pre/post-connector conditioning sidecars, resolves every requested LoRA and scale, accepts the request's `model_quant`, preserves an exact request copy, and dispatches either the exact Creator fast-distilled Euler profile or bounded dev CFG-star profile. Emits atomic `status.json` and consumes no Python or Rust product runtime. | 🟠 experimental; real Canvas `video-0409` passed at 512x768/121f with the step-3000 LoRA |
+| `pipeline/ltx2_t2v_av_hq.mojo` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. The admitted HQ request path consumes runtime seed/FPS/steps/conditioning/audio/LoRA selection/quant/guidance mode and fail-loud validates Creator distilled (`euler` + `ltx2_distilled`, exactly 8 stage-1 evaluations) or dev (`res2s` + `ltx2`, 1-20 steps) before model load. Stage 2 uses the official 3-step distilled schedule. The SVD-int4 path keeps the 48-block base slab resident and streams factorized per-block LoRA factors without materializing dense deltas. Writes atomic progress and result manifests with executed sampler/scheduler, timings, geometry, frame count, duration, dtype contract, quant mode, and sampled peak VRAM. | 🟠 experimental; live Canvas `video-0409`: 52.36s total / 41.06s denoise / 7.42s decode; visually inspected 121f H.264 |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
 | `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder` + `load_ideogram4_vae_decoder` (AutoencoderKLFlux2, latent_ch 32, scale 1/shift 0, has_pqc). | ✅ Flux2 decode cos 0.99995 |
@@ -105,7 +105,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/vae/decoder2d.mojo` | Shared 2D-VAE kit: `ResnetBlock`, `AttnBlock`, `Upsample`, NCHW↔NHWC. | ✅ |
 | `models/vae/vae_ops.mojo` | VAE-local glue: `clone`, `reshape`, `add`. | ✅ |
 | `models/vae/upsample.mojo` | `upsample_nearest2x_nhwc` (2D nearest 2×). | ✅ |
-| `models/vae/conv3d.mojo` | `conv3d_fcqrs_cudnn` (NDHWC + FCQRS/OIDHW) for LTX2 video/audio VAE, latent upsampler, LingBot VAE encode, **wan22 VAE decode**, and **qwenimage VAE encode+decode** fast paths; `conv3d` (NDHWC/QRSCF) remains the generic naive wrapper. | ✅ |
+| `models/vae/conv3d.mojo` + `ops/cudnn_conv3d.mojo` | `conv3d_fcqrs_cudnn` (NDHWC + FCQRS/OIDHW) for LTX2 video/audio VAE, latent upsampler, LingBot VAE encode, **wan22 VAE decode**, and **qwenimage VAE encode+decode** fast paths. The opt-in `low_startup` BF16 route uses the local cuDNN v7-heuristic shim; LTX2 video decode and its latent upsampler enable it for deterministic fresh-process algorithm selection while non-LTX proven consumers retain the SDK path. LTX2 HQ121 cold decode fell from 25.95s to 7.32s and produced byte-identical RGB video. `conv3d` (NDHWC/QRSCF) remains the generic naive wrapper. | ✅ |
 | `models/vae/wan22_decoder.mojo` | `Wan22VaeImageDecoder[LH,LW]`: Wan2.2 high-compression VAE decode (latent→RGB), reuses conv3d block library. Rank-5 convs now load FCQRS (`_load_conv3d_fcqrs`) and use `conv3d_fcqrs_cudnn` (cuDNN) → **7.3× decode** (513s→71s/13f), cos 0.99998/PSNR 51dB vs naive. | ✅ |
 | `models/vae/wan22_vae_encoder.mojo` | `Wan22VaeImageEncoder[H,W]`: Wan2.2 high-compression VAE encode (RGB→latent mu, image mode T=1), REUSES the decoder block library + patchify2/AvgDown3D/downsample2d. | ✅ cos 0.99998 (64²&256²) |
 | `models/vae/qwenimage_{encoder,decoder}.mojo` | Qwen-Image (Wan2.1-family) image-mode VAE used by krea2/anima/giger3. **cuDNN conv default** (task #16): weights kept RAW OIDHW==FCQRS → `conv3d_fcqrs_cudnn` (decoder also drops its per-call host QRSCF transpose). 512² encode 5.93→0.51s (11.6×), decode 9.41→0.84s (11.2×); A/B enc cos 0.999996, dec PSNR 62dB (`pipeline/qwenimage_cudnn_gate.mojo`). Naive fallback: env `QWENVAE_NAIVE_CONV=1` or `load(..., use_cudnn_opt)`. | ✅ gate 2026-07-14 |
@@ -114,7 +114,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `sampling/sdxl_euler.mojo` | SDXL scaled-linear beta sigmas/timesteps, textbook CFG, eps-prediction Euler step. | ✅ scalar smoke |
 | `sampling/acestep_flow_match.mojo` | ACE-Step rectified-flow (Euler ODE) sampler: reuses `build_sigma_schedule`, textbook CFG, `xt - vt*dt` step. Step-parity gate cos=1.0 vs canonical generate_audio. | ✅ step-parity |
 | `sampling/ideogram4_schedule.mojo` | Ideogram-4 logit-normal Euler schedule: `ideogram4_logitnormal`, `ideogram4_schedule_mean`, `make_step_intervals`, `_ndtri` (Acklam, host scalar F64). | ✅ exact (0.0 max-abs) |
-| `image/png.mojo` | `save_png` (CHW float → 8-bit RGB PNG, stored-deflate); `crc32`/`adler32`. | ✅ |
+| `image/png.mojo` | `save_png` (CHW float → 8-bit RGB PNG, stored-deflate), plus GPU RGB24 frame/video conversion and one raw-video write for direct ffmpeg mux; `crc32`/`adler32`. | ✅ RGB24 smoke + byte-identical LTX2 movie |
 
 **Dev/test harnesses** (not API-documented; run/probe scaffolding):
 `ops_smoke.mojo`, `ops_smoke2.mojo`, `ops/random_smoke.mojo`,
@@ -2614,6 +2614,14 @@ work itself lives in the serenity-trainer + serenity-server trees).
   all 23 visible stages to `video-0019/ltx2_t2v_hq.mp4`: 121 H.264 frames at
   512x768/25 fps, 554.58 s wall, 16,487.88 MiB sampled peak, console-clean UI,
   live header phase/step text, and automatic video preview.
+  The active template now defaults to the compiled Creator fast-distilled route:
+  `guidance_mode=distilled`, Euler, `ltx2_distilled`, 8 stage-1 evaluations,
+  followed by the official 3-step stage 2. Rust and Canvas reject inconsistent
+  sampler/scheduler/step combinations before GPU allocation. The same fixed-seed
+  step-3000 request completed through the real browser as `video-0409` in 52.36
+  seconds (41.06 denoise, 7.42 video decode). Its 121-frame H.264 artifact was
+  visually inspected at frames 0/30/60/90/120, and its final latents, RGB frame
+  stream, and MP4 are byte-identical to pre-optimization `video-0406`.
 - **Serenity web Canvas Invoke-parity and editing slice accepted (2026-07-20)**:
   `serenity-server/canvas/` now uses a responsive three-panel landscape
   workspace, typed entity/context actions, transform and lock-transparency

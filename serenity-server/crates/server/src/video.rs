@@ -1098,6 +1098,7 @@ fn readiness_doc() -> Value {
                     "authored_fields": [
                         "prompt", "negative", "width", "height", "frames",
                         "steps", "seed", "fps", "sampler", "scheduler",
+                        "guidance_mode",
                         "caps_positive", "caps_negative", "noise_fixture",
                         "include_audio", "lora", "quant"
                     ],
@@ -1413,6 +1414,7 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         "sampler",
         "scheduler",
         "caps_positive",
+        "guidance_mode",
     ];
     for key in required_strings {
         let value = body.get(key).and_then(Value::as_str).unwrap_or("").trim();
@@ -1442,6 +1444,28 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
                 slab.display()
             ));
         }
+    }
+    let guidance_mode = body["guidance_mode"].as_str().unwrap_or("");
+    if !matches!(guidance_mode, "distilled" | "dev") {
+        return Err(format!(
+            "LTX2 guidance_mode must be 'distilled' or 'dev'; got '{guidance_mode}'"
+        ));
+    }
+    let sampler = body["sampler"].as_str().unwrap_or("");
+    let scheduler = body["scheduler"].as_str().unwrap_or("");
+    let steps = body.get("steps").and_then(Value::as_i64).unwrap_or(0);
+    match guidance_mode {
+        "distilled" if sampler != "euler" || scheduler != "ltx2_distilled" || steps != 8 => {
+            return Err(format!(
+                "LTX2 distilled mode requires sampler=euler, scheduler=ltx2_distilled, and steps=8; got sampler={sampler}, scheduler={scheduler}, steps={steps}"
+            ));
+        }
+        "dev" if sampler != "res2s" || scheduler != "ltx2" || !(1..=20).contains(&steps) => {
+            return Err(format!(
+                "LTX2 dev mode requires sampler=res2s, scheduler=ltx2, and steps in [1, 20]; got sampler={sampler}, scheduler={scheduler}, steps={steps}"
+            ));
+        }
+        _ => {}
     }
     for key in ["width", "height", "frames", "steps", "seed"] {
         if body.get(key).and_then(Value::as_i64).is_none() {
@@ -3944,13 +3968,14 @@ mod tests {
             "checkpoint": LTX2_REFHQ_CHECKPOINT,
             "quant": "fp8",
             "prompt": "vrtlEri2 turns toward camera",
-            "sampler": "res2s",
-            "scheduler": "ltx2",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
             "caps_positive": caps,
             "width": 512,
             "height": 768,
             "frames": 121,
-            "steps": 20,
+            "steps": 8,
             "seed": 42,
             "fps": 25.0,
             "include_audio": false,
@@ -3966,13 +3991,14 @@ mod tests {
             "checkpoint": LTX2_REFHQ_CHECKPOINT,
             "quant": "fp8",
             "prompt": "vrtlEri2 turns toward camera",
-            "sampler": "res2s",
-            "scheduler": "ltx2",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
             "caps_positive": "/definitely/missing/ltx2-conditioning.json",
             "width": 512,
             "height": 768,
             "frames": 121,
-            "steps": 20,
+            "steps": 8,
             "seed": 42,
             "fps": 25.0,
             "include_audio": false,
@@ -3981,6 +4007,30 @@ mod tests {
         assert!(validate_ltx2_mojo_request(&request)
             .unwrap_err()
             .contains("conditioning artifact not found"));
+    }
+
+    #[test]
+    fn ltx2_mojo_request_preflight_rejects_mismatched_distilled_sampler_before_gpu() {
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "vrtlEri2 turns toward camera",
+            "sampler": "res2s",
+            "scheduler": "ltx2",
+            "guidance_mode": "distilled",
+            "caps_positive": "/not/reached",
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+        });
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("distilled mode requires sampler=euler"));
     }
 
     #[test]

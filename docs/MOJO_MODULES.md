@@ -471,14 +471,22 @@ loads the resident 48-block SVD-int4 slab and streams factorized LoRA A/B
 matrices per block; it does not allocate dense LoRA deltas. The pipeline publishes
 atomic `status.json` phase/step snapshots plus `result.json` with the MP4 path,
 executed geometry/schedule, timings, frame count/duration, dtype contract, and
-sampled peak VRAM. Current readiness is experimental: the 2026-07-23 request
-gate produced a visually inspected 512x768, 121-frame, 25 FPS step-3000-LoRA
-movie in 377.07 seconds at 18,571 MiB sampled peak VRAM. The matching FP8
-request took 511.09 seconds, so int4 reduced end-to-end time by 26.2% and
-denoise time by 28.2%. Nsight Systems still attributes the largest GPU share
-to BF16 CUTLASS GEMM; factorized linear/bias kernels and int4 dequantization are
-the next measured optimization targets. Audio acceptance remains a separate
-gate.
+sampled peak VRAM. It accepts the exact Creator fast-distilled route
+(`guidance_mode=distilled`, Euler, `ltx2_distilled`, 8 stage-1 evaluations)
+or the bounded dev CFG-star route (`res2s`, `ltx2`, 1-20 steps); invalid mixtures
+fail before loading the model. Current readiness is experimental: the 2026-07-23
+real Canvas gate `video-0409` produced a visually inspected 512x768, 121-frame,
+25 FPS step-3000-LoRA movie in 52.36 seconds (41.06 denoise, 7.42 decode).
+Nsight Systems identified fresh-process cuDNN Conv3d FindEx as 18.6 seconds of
+avoidable decode startup. `ops/cudnn_conv3d.mojo` and
+`ops/cshim/cudnn_conv3d.cpp` now use the non-executing cuDNN v7 heuristic with
+a bounded reusable workspace. LTX2 enables this route for its latent upsampler
+and video decoder while non-LTX Conv3d consumers retain their proven SDK path.
+Isolated cold HQ121 decode fell from 25.95 to 7.32 seconds, while the final
+latent, RGB stream, and MP4 hashes stayed exactly unchanged. Factorized LoRA
+streaming remains the next measured denoise target;
+audio acceptance remains a separate gate. Build the production request runner
+with the memory-safe `pixi run build-ltx2-request` task (`-O2 -j 1`).
 
 ---
 

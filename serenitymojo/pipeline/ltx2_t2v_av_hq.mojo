@@ -97,7 +97,7 @@ from serenitymojo.models.vocoder.ltx2_vocoder import LTX2VocoderWithBWE
 from serenitymojo.models.upsampler.ltx2_upsampler import (
     LatentUpsampler, upsample_video,
 )
-from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.image.png import save_png, save_rgb24_video, ValueRange
 from serenitymojo.lora import (
     LoraSet, FMT_LTX2_DISTILLED, LTX2BlockLoraDeltaSet, LoraStreamMults,
 )
@@ -2143,6 +2143,7 @@ def run_request_profile(
     fps: Float64,
     sampler: String,
     scheduler: String,
+    guidance_mode: String,
     context_path: String,
     negative_context_path: String,
     contexts_are_projected: Bool,
@@ -2172,11 +2173,20 @@ def run_request_profile(
     var res2s = (
         sampler_key == String("res2s") or sampler_key == String("res_2s")
     ) and scheduler_key == String("ltx2")
-    if not res2s:
+    var distilled_euler = sampler_key == String("euler") and (
+        scheduler_key == String("ltx2_distilled")
+    )
+    if guidance_mode == String("distilled") and not distilled_euler:
         raise Error(
-            String("LTX2 request: unsupported sampler/scheduler '")
+            String("LTX2 request: distilled guidance requires euler/")
+            + String("ltx2_distilled; got ") + sampler + String("/")
+            + scheduler
+        )
+    if guidance_mode == String("dev") and not res2s:
+        raise Error(
+            String("LTX2 request: dev guidance requires res2s/ltx2; got '")
             + sampler + String("/") + scheduler
-            + String("'; verified compiled profile: res2s/ltx2")
+            + String("'")
         )
     if context_path.byte_length() == 0:
         raise Error("LTX2 request: caps_positive conditioning path is required")
@@ -2197,10 +2207,24 @@ def run_request_profile(
             + String(frames) + String("; verified count: ")
             + String(REQUEST_HQ_NUM_FRAMES)
         )
-    if steps != REQUEST_HQ_STEPS:
+    if guidance_mode == String("distilled") and steps != 8:
+        raise Error(
+            String("LTX2 request: distilled Euler requires exactly 8 steps; got ")
+            + String(steps)
+        )
+    if guidance_mode == String("dev") and (
+        steps < 1 or steps > REQUEST_HQ_STEPS
+    ):
         raise Error(
             String("LTX2 request: unsupported step count ") + String(steps)
-            + String("; verified count: ") + String(REQUEST_HQ_STEPS)
+            + String("; compiled range: 1..") + String(REQUEST_HQ_STEPS)
+        )
+    if guidance_mode != String("distilled") and (
+        guidance_mode != String("dev")
+    ):
+        raise Error(
+            String("LTX2 request: unsupported guidance_mode '")
+            + guidance_mode + String("'; use distilled or dev")
         )
     if fps != REQUEST_HQ_FPS:
         raise Error(
@@ -2209,7 +2233,8 @@ def run_request_profile(
         )
     run_request_hq(
         context_path, negative_context_path, contexts_are_projected,
-        noise_fixture_path, out_dir, seed, include_audio, quant
+        noise_fixture_path, out_dir, seed, include_audio, quant, steps,
+        guidance_mode,
     )
 
 
@@ -4195,6 +4220,8 @@ def run_request_hq(
     seed: UInt64,
     include_audio: Bool,
     quant: String,
+    steps: Int,
+    guidance_mode: String,
 ) raises:
     var total_t0 = perf_counter()
     var load_seconds = Float64(0.0)
@@ -4204,7 +4231,7 @@ def run_request_hq(
     var video_decode_seconds = Float64(0.0)
     var audio_decode_seconds = Float64(0.0)
     var mux_seconds = Float64(0.0)
-    var progress_total = REQUEST_HQ_STEPS + 3
+    var progress_total = steps + 3
 
     _write_ltx2_status(
         out_dir, String("running"), String("loading_model"), 0,
@@ -4221,8 +4248,11 @@ def run_request_hq(
     print("  stage1:", REQUEST_HQ_NF, "x", REQUEST_HQ_NH1, "x",
           REQUEST_HQ_NW1, "S_V=", REQUEST_HQ_S_V1,
           " stage2 S_V=", REQUEST_HQ_S_V2)
-    print("  sampler: guided res_2s", REQUEST_HQ_STEPS,
-          "steps + official 3-step stage2; seed:", seed)
+    print("  sampler:",
+          "Creator fast-distilled Euler" if guidance_mode == String("distilled")
+          else "dev CFG-star res_2s", steps,
+          "steps + official 3-step stage2; guidance:", guidance_mode,
+          "seed:", seed)
 
     var t0 = perf_counter()
     var ck = ShardedSafeTensors.open(_refhq_ckpt_fp8())
@@ -4399,14 +4429,18 @@ def run_request_hq(
             _sh3(1, REQUEST_HQ_S_A, 128), seed + 1, STDtype.BF16, ctx
         )
     var sig1 = _ltx2_scheduler_sigmas(
-        REQUEST_HQ_STEPS, REQUEST_HQ_S_V1
+        steps, REQUEST_HQ_S_V1
     )
     ctx.synchronize()
     prepare_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
-    print("  [Stage1] guided res_2s", REQUEST_HQ_STEPS,
-          "steps x 2 evaluations x 3 guidance passes")
+    if guidance_mode == String("distilled"):
+        print("  [Stage1] Creator fast-distilled Euler", steps,
+              "steps x 1 evaluation")
+    else:
+        print("  [Stage1] dev CFG-star res_2s", steps,
+              "steps x 2 evaluations x 3 passes")
     var s1_eval = 0
     var first_s1_eval = True
     @parameter
@@ -4415,13 +4449,13 @@ def run_request_hq(
     ) raises -> Tuple[Tensor, Tensor]:
         if s1_eval % 2 == 0:
             var visible_step = s1_eval // 2 + 1
-            if visible_step > REQUEST_HQ_STEPS:
-                visible_step = REQUEST_HQ_STEPS
+            if visible_step > steps:
+                visible_step = steps
             _write_ltx2_status(
                 out_dir, String("running"), String("denoising_stage1"),
                 visible_step, progress_total,
                 String("Stage 1 step ") + String(visible_step) + String(" of ")
-                + String(REQUEST_HQ_STEPS),
+                + String(steps),
             )
         s1_eval += 1
         var mod = _build_mod_dims(
@@ -4469,20 +4503,45 @@ def run_request_hq(
             )^,
         )
 
-    var s1_names = List[String]()
-    var s1_tensors = List[ArcPointer[Tensor]]()
     t0 = perf_counter()
-    var s1_out = res2s_ref_loop[_den_s1](
-        sig1, video_x^, audio_x^, ns, String("s1"), s1_names,
-        s1_tensors, ctx,
-    )
-    video_x = s1_out[0].clone(ctx)
-    audio_x = s1_out[1].clone(ctx)
+    if guidance_mode == String("distilled"):
+        var s1_sched = LTX2Scheduler.distilled()
+        for step in range(s1_sched.num_steps):
+            var sigma = s1_sched.sigma(step)
+            _write_ltx2_status(
+                out_dir, String("running"), String("denoising_stage1"),
+                step + 1, progress_total,
+                String("Stage 1 step ") + String(step + 1) + String(" of ")
+                + String(s1_sched.num_steps),
+            )
+            var mod = _build_mod_dims(
+                ck, gw, sigma, REQUEST_HQ_S_V1, REQUEST_HQ_S_A, ctx
+            )
+            var c = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+            ](
+                loras, REFHQ_LORA_S1, cfg, g, stream, video_x, audio_x,
+                enc, aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin,
+                False, first_s1_eval, True, ctx,
+            )
+            first_s1_eval = False
+            video_x = s1_sched.step(video_x, c[0], step, ctx)
+            audio_x = s1_sched.step(audio_x, c[1], step, ctx)
+    else:
+        var s1_names = List[String]()
+        var s1_tensors = List[ArcPointer[Tensor]]()
+        var s1_out = res2s_ref_loop[_den_s1](
+            sig1, video_x^, audio_x^, ns, String("s1"), s1_names,
+            s1_tensors, ctx,
+        )
+        video_x = s1_out[0].clone(ctx)
+        audio_x = s1_out[1].clone(ctx)
     print("  [Stage1] complete")
 
     _write_ltx2_status(
         out_dir, String("running"), String("upscaling"),
-        REQUEST_HQ_STEPS, progress_total,
+        steps, progress_total,
         String("Upscaling stage-1 latents"),
     )
     var v_lat1 = _refhq_unpatchify_video(
@@ -4542,7 +4601,7 @@ def run_request_hq(
                 stage2_step = 3
             _write_ltx2_status(
                 out_dir, String("running"), String("denoising_stage2"),
-                REQUEST_HQ_STEPS + stage2_step, progress_total,
+                steps + stage2_step, progress_total,
                 String("Stage 2 step ") + String(stage2_step)
                 + String(" of 3"),
             )
@@ -4565,13 +4624,40 @@ def run_request_hq(
             _refhq_x0(ax, c[1], sigma, ctx),
         )
 
-    var s2_names = List[String]()
-    var s2_tensors = List[ArcPointer[Tensor]]()
-    var s2_out = res2s_ref_loop[_den_s2](
-        s2sig, vx2^, ax2^, ns, String("s2"), s2_names, s2_tensors, ctx,
-    )
-    vx2 = s2_out[0].clone(ctx)
-    ax2 = s2_out[1].clone(ctx)
+    if guidance_mode == String("distilled"):
+        print("  [Stage2] Creator fast-distilled Euler 3 steps x 1 evaluation")
+        var s2_sched = LTX2Scheduler.stage2()
+        for step in range(s2_sched.num_steps):
+            var sigma = s2_sched.sigma(step)
+            _write_ltx2_status(
+                out_dir, String("running"), String("denoising_stage2"),
+                steps + step + 1, progress_total,
+                String("Stage 2 step ") + String(step + 1)
+                + String(" of ") + String(s2_sched.num_steps),
+            )
+            var mod = _build_mod_dims(
+                ck, gw, sigma, REQUEST_HQ_S_V2, REQUEST_HQ_S_A, ctx,
+                uniform_timestep=True,
+            )
+            var c = _request_hq_forward_flat[
+                REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
+            ](
+                loras, REFHQ_LORA_S2, cfg, g, stream, vx2, ax2, enc, aenc,
+                mod, vr2, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+                first_s2_eval, True, ctx,
+            )
+            first_s2_eval = False
+            vx2 = s2_sched.step(vx2, c[0], step, ctx)
+            ax2 = s2_sched.step(ax2, c[1], step, ctx)
+    else:
+        var s2_names = List[String]()
+        var s2_tensors = List[ArcPointer[Tensor]]()
+        var s2_out = res2s_ref_loop[_den_s2](
+            s2sig, vx2^, ax2^, ns, String("s2"), s2_names, s2_tensors, ctx,
+        )
+        vx2 = s2_out[0].clone(ctx)
+        ax2 = s2_out[1].clone(ctx)
     ctx.synchronize()
     denoise_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
@@ -4605,16 +4691,8 @@ def run_request_hq(
     var n_frames_out = fsh[2]
     if n_frames_out != REQUEST_HQ_NUM_FRAMES:
         raise Error("LTX2 request HQ: VAE returned unexpected frame count")
-    for fr in range(n_frames_out):
-        var fslice = slice(frames, 2, fr, 1, ctx)
-        var fs = fslice.shape()
-        var chw = reshape(
-            fslice, _sh4(fs[0], fs[1], fs[3], fs[4]), ctx
-        )
-        save_png(
-            chw, out_dir + "/hq_frame" + _pad2(fr) + ".png", ctx,
-            ValueRange.SIGNED,
-        )
+    var raw_video = out_dir + "/hq_frames.rgb"
+    save_rgb24_video(frames, raw_video, ctx, ValueRange.SIGNED)
     ctx.synchronize()
     video_decode_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
@@ -4636,20 +4714,27 @@ def run_request_hq(
     var mp4_out = out_dir + "/ltx2_t2v_hq.mp4"
     t0 = perf_counter()
     if include_audio:
-        _mux_mp4(
-            out_dir, n_frames_out, wav_out, mp4_out, String("hq_frame"),
-            REQUEST_HQ_FPS,
+        _mux_raw_mp4(
+            raw_video, fsh[4], fsh[3], wav_out, mp4_out, REQUEST_HQ_FPS,
         )
     else:
-        _mux_video_mp4(
-            out_dir, mp4_out, String("hq_frame"), REQUEST_HQ_FPS
+        _mux_raw_video_mp4(
+            raw_video, fsh[4], fsh[3], mp4_out, REQUEST_HQ_FPS
         )
     mux_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    var executed_sampler = (
+        String("euler") if guidance_mode == String("distilled")
+        else String("res2s")
+    )
+    var executed_scheduler = (
+        String("ltx2_distilled") if guidance_mode == String("distilled")
+        else String("ltx2")
+    )
     _write_ltx2_result(
         out_dir, mp4_out, fsh[4], fsh[3], n_frames_out, REQUEST_HQ_FPS,
-        REQUEST_HQ_STEPS, seed, include_audio, String("res2s"),
-        String("ltx2"), quant, contexts_path, negative_contexts_path,
+        steps, seed, include_audio, executed_sampler,
+        executed_scheduler, quant, contexts_path, negative_contexts_path,
         len(loras.trained), load_seconds, conditioning_seconds,
         prepare_seconds, denoise_seconds, video_decode_seconds,
         audio_decode_seconds, mux_seconds, perf_counter() - total_t0,
@@ -5250,6 +5335,20 @@ def _mux_video_mp4(
         print("  [mux] WARNING: ffmpeg returned", rc, "(frames still saved)")
 
 
+def _mux_raw_video_mp4(
+    raw_video: String, width: Int, height: Int, mp4: String,
+    fps: Float64 = 24.0,
+) raises:
+    var cmd = String("ffmpeg -y -f rawvideo -pixel_format rgb24 -video_size ")
+    cmd += String(width) + String("x") + String(height)
+    cmd += String(" -framerate ") + String(fps) + String(" -i ") + raw_video
+    cmd += " -c:v libx264 -pix_fmt yuv420p -movflags +faststart " + mp4
+    cmd += " >/dev/null 2>&1"
+    var rc = sys_system(cmd)
+    if rc != 0:
+        print("  [mux] WARNING: ffmpeg returned", rc, "(raw video still saved)")
+
+
 def _mux_mp4(
     out_dir: String, n_frames: Int, wav: String, mp4: String,
     frame_prefix: String, fps: Float64 = 24.0,
@@ -5261,3 +5360,22 @@ def _mux_mp4(
     var rc = sys_system(cmd)
     if rc != 0:
         print("  [mux] WARNING: ffmpeg returned", rc, "(frames+wav still saved)")
+
+
+def _mux_raw_mp4(
+    raw_video: String, width: Int, height: Int, wav: String, mp4: String,
+    fps: Float64 = 24.0,
+) raises:
+    var cmd = String("ffmpeg -y -f rawvideo -pixel_format rgb24 -video_size ")
+    cmd += String(width) + String("x") + String(height)
+    cmd += String(" -framerate ") + String(fps) + String(" -i ") + raw_video
+    cmd += String(" -i ") + wav
+    cmd += " -c:v libx264 -pix_fmt yuv420p -af apad -c:a aac -shortest"
+    cmd += " -movflags +faststart " + mp4
+    cmd += " >/dev/null 2>&1"
+    var rc = sys_system(cmd)
+    if rc != 0:
+        print(
+            "  [mux] WARNING: ffmpeg returned", rc,
+            "(raw video+wav still saved)",
+        )

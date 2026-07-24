@@ -44,6 +44,7 @@ var CanvasTab = (function () {
     var canvasGenerating = false;
     var pendingCanvasPromptId = '';
     var pendingCanvasMetadata = null;
+    var pendingVideoPollToken = 0;
     var layerIdCounter = 0;
     var activeHandle = null;
     var handleStartBox = null;
@@ -73,6 +74,7 @@ var CanvasTab = (function () {
         capsNegative: '',
         noiseFixture: '',
         includeAudio: false,
+        ltx2Mode: 'distilled',
         editMode: 'create',
         editEngine: 'krea2_raw_1024',
         editModelEngine: 'klein9b',
@@ -1307,6 +1309,11 @@ var CanvasTab = (function () {
             '<div id="cv-duration-hint" class="cv-duration-hint"></div>' +
             '<div id="cv-ltx2-section" class="cv-ltx2-section" style="display:none">' +
             '<div class="cv-section-title" style="margin-top:8px">LTX2 Mojo request</div>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Guidance</span>' +
+            '<select id="cv-ltx2-mode" class="cv-select">' +
+            '<option value="distilled">Fast distilled (single pass)</option>' +
+            '<option value="dev">Dev CFG-star (quality, 3 pass)</option>' +
+            '</select></div>' +
             '<label class="cv-setting-label cv-path-label" for="cv-caps-positive">Conditioning</label>' +
             '<input id="cv-caps-positive" class="cv-path-input" type="text" placeholder="Server path to prompt-matched conditioning JSON or safetensors">' +
             '<label class="cv-setting-label cv-path-label" for="cv-caps-negative">Negative conditioning</label>' +
@@ -1413,6 +1420,7 @@ var CanvasTab = (function () {
         els.fpsRange = document.getElementById('cv-fps-range');
         els.durationHint = document.getElementById('cv-duration-hint');
         els.ltx2Section = document.getElementById('cv-ltx2-section');
+        els.ltx2Mode = document.getElementById('cv-ltx2-mode');
         els.advancedGenerationSettings = document.getElementById('cv-advanced-generation-settings');
         els.capsPositive = document.getElementById('cv-caps-positive');
         els.capsNegative = document.getElementById('cv-caps-negative');
@@ -3418,6 +3426,7 @@ var CanvasTab = (function () {
         els.capsNegative.addEventListener('input', function () { genState.capsNegative = this.value.trim(); });
         els.noiseFixture.addEventListener('input', function () { genState.noiseFixture = this.value.trim(); });
         els.includeAudio.addEventListener('change', function () { genState.includeAudio = this.checked; });
+        els.ltx2Mode.addEventListener('change', function () { genState.ltx2Mode = this.value; });
         els.loraAdd.addEventListener('click', addCanvasLora);
         els.loadLtx2Template.addEventListener('click', loadLtx2TemplateProfile);
         els.seed.addEventListener('input', function () {
@@ -4041,6 +4050,7 @@ var CanvasTab = (function () {
             model: genState.model, arch: genState.arch, frames: genState.frames, fps: genState.fps,
             capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
             noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+            ltx2Mode: genState.ltx2Mode,
             editMode: genState.editMode, editEngine: genState.editEngine,
             editModelEngine: genState.editModelEngine,
             styleEntireImage: genState.styleEntireImage,
@@ -4146,6 +4156,7 @@ var CanvasTab = (function () {
                 genState.capsNegative = state.genSettings.capsNegative || '';
                 genState.noiseFixture = state.genSettings.noiseFixture || '';
                 genState.includeAudio = state.genSettings.includeAudio === true;
+                genState.ltx2Mode = state.genSettings.ltx2Mode || 'distilled';
                 genState.editMode = state.genSettings.editMode || genState.editMode;
                 genState.editEngine = state.genSettings.editEngine || genState.editEngine;
                 genState.editModelEngine = state.genSettings.editModelEngine || genState.editModelEngine;
@@ -4204,6 +4215,8 @@ var CanvasTab = (function () {
                     els.noiseFixture.value = genState.noiseFixture;
                 if (els.includeAudio)
                     els.includeAudio.checked = genState.includeAudio;
+                if (els.ltx2Mode)
+                    els.ltx2Mode.value = genState.ltx2Mode;
                 if (els.styleEntireImage)
                     els.styleEntireImage.checked = genState.styleEntireImage;
                 if (els.editMode)
@@ -4571,6 +4584,7 @@ var CanvasTab = (function () {
             genState.capsNegative = String(samplerValues.caps_negative || '');
             genState.noiseFixture = String(samplerValues.noise_fixture || '');
             genState.includeAudio = samplerValues.include_audio === true;
+            genState.ltx2Mode = String(samplerValues.mode || 'distilled');
             canvasLoras = nodes.filter(function (node) {
                 return node.type === 'LoraLoader' || node.type === 'LoraLoaderModelOnly';
             }).map(function (node) {
@@ -4601,6 +4615,7 @@ var CanvasTab = (function () {
             els.capsNegative.value = genState.capsNegative;
             els.noiseFixture.value = genState.noiseFixture;
             els.includeAudio.checked = genState.includeAudio;
+            els.ltx2Mode.value = genState.ltx2Mode;
             if (boundingBox) {
                 boundingBox.width(ModelUtils.clampVideoDimension(Number(samplerValues.width)));
                 boundingBox.height(ModelUtils.clampVideoDimension(Number(samplerValues.height)));
@@ -4689,11 +4704,11 @@ var CanvasTab = (function () {
         if (isLtx2) {
             setCanvasSelectOptions(els.sampler, [
                 { value: 'res2s', label: 'Res2S' },
-                { value: 'euler', label: 'Euler (not compiled)' }
+                { value: 'euler', label: 'Euler (fast distilled)' }
             ], 'res2s');
             setCanvasSelectOptions(els.scheduler, [
                 { value: 'ltx2', label: 'LTX2' },
-                { value: 'ltx2_distilled', label: 'LTX2 Distilled (not compiled)' }
+                { value: 'ltx2_distilled', label: 'LTX2 Distilled (8 steps)' }
             ], 'ltx2');
         }
         else {
@@ -4906,10 +4921,16 @@ var CanvasTab = (function () {
             showError('LTX2 requires a prompt-matched conditioning artifact path');
             return;
         }
-        if (genState.arch === 'ltxv' &&
-            (genState.sampler !== 'res2s' || genState.scheduler !== 'ltx2')) {
-            showError('LTX2 requires the compiled Res2S sampler with the LTX2 scheduler');
-            return;
+        if (genState.arch === 'ltxv') {
+            var validLtx2Sampler = genState.ltx2Mode === 'distilled'
+                ? genState.sampler === 'euler' && genState.scheduler === 'ltx2_distilled' && genState.steps === 8
+                : genState.sampler === 'res2s' && genState.scheduler === 'ltx2' && genState.steps >= 1 && genState.steps <= 20;
+            if (!validLtx2Sampler) {
+                showError(genState.ltx2Mode === 'distilled'
+                    ? 'Fast distilled LTX2 requires Euler, the LTX2 Distilled scheduler, and 8 steps'
+                    : 'Dev LTX2 requires Res2S, the LTX2 scheduler, and 1–20 steps');
+                return;
+            }
         }
         setCanvasGenerating(true);
         var isVideo = isVideoArch();
@@ -5007,7 +5028,8 @@ var CanvasTab = (function () {
                     negPrompt: genState.negative, sampler: genState.sampler, scheduler: genState.scheduler, batch: genState.batch,
                     frames: genState.frames, fps: genState.fps, loras: activeLoras,
                     capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
-                    noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio
+                    noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                    ltx2Mode: genState.ltx2Mode
                 }));
             }
             else if (isVideo) {
@@ -5023,7 +5045,8 @@ var CanvasTab = (function () {
                         negPrompt: genState.negative, sampler: genState.sampler, scheduler: genState.scheduler, batch: genState.batch,
                         frames: genState.frames, fps: genState.fps, loras: activeLoras,
                         capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
-                        noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio
+                        noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                        ltx2Mode: genState.ltx2Mode
                     }));
                 }).catch(function (err) {
                     showError('Video init upload failed: ' + err.message);
@@ -5696,12 +5719,92 @@ var CanvasTab = (function () {
                 pendingCanvasMetadata.promptId = pendingCanvasPromptId;
             if (typeof CanvasStatusBar !== 'undefined')
                 CanvasStatusBar.updateGenStatus('queued');
+            if (result && result.video_pending && result.video_result)
+                pollVideoJob(result.video_result);
         })
             .catch(function (err) {
             showError('Failed to queue: ' + err.message);
             pendingCanvasPromptId = '';
             setCanvasGenerating(false);
         });
+    }
+    function stagePolledVideo(videoId, manifest) {
+        if (!canvasGenerating || pendingCanvasPromptId !== videoId)
+            return;
+        var artifact = String(manifest.artifact_path || '');
+        var filename = artifact.split('/').pop();
+        if (!filename)
+            throw new Error('LTX2 result did not contain an artifact filename');
+        canvasResultMetadata(videoId).then(function (metadata) {
+            var result = {
+                src: '/out/' + encodeURIComponent(videoId) + '/' + encodeURIComponent(filename),
+                isVideo: true,
+                filename: filename,
+                metadata: JSON.parse(JSON.stringify(metadata))
+            };
+            hideCanvasPreview();
+            if (typeof CanvasStaging !== 'undefined')
+                CanvasStaging.activate([result], getToolContext());
+            else
+                showCanvasPreview(result.src, true);
+            setCanvasGenerating(false);
+            if (typeof CanvasStatusBar !== 'undefined')
+                CanvasStatusBar.updateGenStatus('staging');
+            pendingCanvasPromptId = '';
+            pendingVideoPollToken++;
+            loadCanvasGallery();
+        });
+    }
+    function pollVideoJob(job) {
+        var videoId = String(job.prompt_id || job.video_id || pendingCanvasPromptId || '');
+        var statusUrl = String(job.status_url || ('/out/' + encodeURIComponent(videoId) + '/status.json'));
+        var resultUrl = String(job.result_url || ('/out/' + encodeURIComponent(videoId) + '/result.json'));
+        var token = ++pendingVideoPollToken;
+        function poll() {
+            if (token !== pendingVideoPollToken || !canvasGenerating || pendingCanvasPromptId !== videoId)
+                return;
+            fetch(statusUrl, { cache: 'no-store' }).then(function (response) {
+                if (!response.ok)
+                    throw new Error('status HTTP ' + response.status);
+                return response.json();
+            }).then(function (status) {
+                if (token !== pendingVideoPollToken)
+                    return;
+                var step = Number(status.step) || 0;
+                var total = Number(status.total) || 0;
+                var phase = String(status.message || status.phase || 'LTX2 running');
+                els.progressBar.style.width = (total > 0 ? Math.max(0, Math.min(100, step / total * 100)) : 4) + '%';
+                els.progressLabel.textContent = phase + (total > 0 ? ' · Step ' + step + ' / ' + total : '');
+                els.progressLabel.classList.add('visible');
+                if (typeof CanvasStatusBar !== 'undefined')
+                    CanvasStatusBar.updateGenStatus(phase);
+                if (status.state === 'failed' || status.state === 'error')
+                    throw new Error(phase);
+                if (status.state !== 'done') {
+                    setTimeout(poll, 500);
+                    return;
+                }
+                return fetch(resultUrl, { cache: 'no-store' }).then(function (response) {
+                    if (!response.ok)
+                        throw new Error('result HTTP ' + response.status);
+                    return response.json();
+                }).then(function (manifest) {
+                    stagePolledVideo(videoId, manifest);
+                });
+            }).catch(function (error) {
+                if (token !== pendingVideoPollToken)
+                    return;
+                if (/HTTP 404/.test(error.message)) {
+                    setTimeout(poll, 500);
+                    return;
+                }
+                showError('Video generation failed: ' + error.message);
+                pendingVideoPollToken++;
+                pendingCanvasPromptId = '';
+                setCanvasGenerating(false);
+            });
+        }
+        setTimeout(poll, 250);
     }
     function setCanvasGenerating(v) {
         canvasGenerating = v;
@@ -6081,6 +6184,7 @@ var CanvasTab = (function () {
                 if (typeof CanvasStatusBar !== 'undefined')
                     CanvasStatusBar.updateGenStatus('staging');
                 pendingCanvasPromptId = '';
+                pendingVideoPollToken++;
                 loadCanvasGallery();
             });
         });
@@ -6104,6 +6208,7 @@ var CanvasTab = (function () {
             if (typeof CanvasStatusBar !== 'undefined')
                 CanvasStatusBar.updateGenStatus('error');
             pendingCanvasPromptId = '';
+            pendingVideoPollToken++;
         });
         SerenityWS.on('execution_interrupted', function (data) {
             if (!isPendingCanvasEvent(data))
@@ -6112,6 +6217,7 @@ var CanvasTab = (function () {
             if (typeof CanvasStatusBar !== 'undefined')
                 CanvasStatusBar.updateGenStatus('interrupted');
             pendingCanvasPromptId = '';
+            pendingVideoPollToken++;
         });
         // Stagehand telemetry → VRAM display
         SerenityWS.on('stagehand_telemetry', function (data) {

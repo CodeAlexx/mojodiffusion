@@ -377,14 +377,16 @@ def _drop_first_frame(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 # ════════════════════════════════════════════════════════════════════════════
 def _conv3d_k3(x: Tensor, w: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     return conv3d_fcqrs_cudnn(
-        x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 1, 1, 1, ctx
+        x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 1, 1, 1, ctx,
+        low_startup=True,
     )
 
 
 # Per-frame Conv2d as depth-1 conv3d (Q=1, stride_d=1, pad_d=0), spatial k3/pad1.
 def _conv2d_perframe(x: Tensor, w: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     return conv3d_fcqrs_cudnn(
-        x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 0, 1, 1, ctx
+        x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 0, 1, 1, ctx,
+        low_startup=True,
     )
 
 

@@ -26,7 +26,7 @@ fi
 
 "${CXX:-g++}" -shared -fPIC -std=c++17 -O2 \
   -I "$frontend" -I "$cudnn_root/include" -I "$cuda_include" \
-  cudnn_sdpa.cpp cudnn_sdpa_bwd.cpp cudnn_conv2d.cpp cublas_gemm.cpp \
+  cudnn_sdpa.cpp cudnn_sdpa_bwd.cpp cudnn_conv2d.cpp cudnn_conv3d.cpp cublas_gemm.cpp \
   -L lib/cudnn_stubs -lcudnn -L "$cuda_root/lib" -lcudart -lnvrtc -lcublas -lcublasLt \
   -Wl,-rpath,"$cudnn_rpath" -Wl,-rpath,"$cuda_rpath" \
   -Wno-deprecated-declarations -Wno-unused-parameter -Wno-unused-variable \

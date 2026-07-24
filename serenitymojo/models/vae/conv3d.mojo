@@ -48,6 +48,7 @@ from layout.runtime_layout import RuntimeLayout
 from nn.conv.conv import conv3d_gpu_naive_ndhwc_qrscf, conv3d_cudnn
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cudnn_conv3d import cudnn_conv3d_bf16_ndhwc
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -118,6 +119,7 @@ def conv3d_fcqrs_cudnn(
     pad_h: Int,
     pad_w: Int,
     ctx: DeviceContext,
+    low_startup: Bool = False,
 ) raises -> Tensor:
     """cuDNN conv3d for NDHWC input and FCQRS filter.
 
@@ -156,6 +158,20 @@ def conv3d_fcqrs_cudnn(
     var wo = (wi + 2 * pad_w - s) // stride_w + 1
 
     var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.bfloat16 and low_startup:
+        return cudnn_conv3d_bf16_ndhwc(
+            x,
+            weight,
+            bias,
+            stride_d,
+            stride_h,
+            stride_w,
+            pad_d,
+            pad_h,
+            pad_w,
+            ctx,
+        )
+
     var out_n = n * do_ * ho * wo * cout
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](
         out_n * x.dtype().byte_size()
@@ -182,19 +198,6 @@ def conv3d_fcqrs_cudnn(
             out_buf.unsafe_ptr().bitcast[Float32](), out_rl
         )
         conv3d_cudnn[DType.float32, DType.float32, DType.float32](
-            X, F, O, stride, dilation, padding, 1, ctx
-        )
-    elif dt == DType.bfloat16:
-        var X = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
-        )
-        var F = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), filt_rl
-        )
-        var O = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        conv3d_cudnn[DType.bfloat16, DType.bfloat16, DType.bfloat16](
             X, F, O, stride, dilation, padding, 1, ctx
         )
     else:

@@ -296,6 +296,14 @@ def _run_request(request_path: String, out_dir: String) raises:
             String("LTX2 request: quant must be fp8 or int4; got '")
             + quant + String("'")
         )
+    var guidance_mode = _require_string(
+        obj, String("guidance_mode")
+    ).lower()
+    if guidance_mode != String("distilled") and guidance_mode != String("dev"):
+        raise Error(
+            String("LTX2 request: guidance_mode must be distilled or dev; got '")
+            + guidance_mode + String("'")
+        )
     _mkdir(out_dir)
     run_request_profile(
         _require_string(obj, String("checkpoint")),
@@ -308,6 +316,7 @@ def _run_request(request_path: String, out_dir: String) raises:
         _require_number(obj, String("fps")),
         _require_string(obj, String("sampler")),
         _require_string(obj, String("scheduler")),
+        guidance_mode,
         caps.path,
         neg_path,
         caps.is_projected,

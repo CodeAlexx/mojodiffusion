@@ -16,6 +16,7 @@ from math import exp, log, sin, cos, sqrt
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 
+from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear_bias, linear
@@ -502,9 +503,8 @@ struct Block0Weights(Movable):
         self.mlp_txt_proj_out_w = mlp_txt_proj_out_w^
 
 
-def load_block0(st: SafeTensors, ctx: DeviceContext) raises -> Block0Weights:
-    """Stream all `blocks.0.` weights (bf16) into a Block0Weights."""
-    comptime P = "blocks.0."
+def _load_block_separate(st: SafeTensors, P: String, ctx: DeviceContext) raises -> Block0Weights:
+    """Blocks 0-9: SEPARATE `.vid`/`.txt` weights (28 tensors)."""
     return Block0Weights(
         load_bias(st, P + "attn.proj_qkv.vid.weight", ctx),
         load_bias(st, P + "attn.proj_qkv.txt.weight", ctx),
@@ -535,6 +535,82 @@ def load_block0(st: SafeTensors, ctx: DeviceContext) raises -> Block0Weights:
         load_bias(st, P + "mlp.txt.proj_in_gate.weight", ctx),
         load_bias(st, P + "mlp.txt.proj_out.weight", ctx),
     )
+
+
+def _load_block_shared(st: SafeTensors, P: String, ctx: DeviceContext) raises -> Block0Weights:
+    """Blocks 10-31: SHARED `.all` weights (14 tensors). vid AND txt use the SAME
+    `.all` tensor; since Block0Weights holds separate vid/txt fields (each consumed
+    by the constructor), clone each `.all` tensor once for the txt field. mmdit_block
+    then runs unchanged — both streams read identical weights."""
+    var qkv = load_bias(st, P + "attn.proj_qkv.all.weight", ctx)
+    var nq = load_bias(st, P + "attn.norm_q.all.weight", ctx)
+    var nk = load_bias(st, P + "attn.norm_k.all.weight", ctx)
+    var pow = load_bias(st, P + "attn.proj_out.all.weight", ctx)
+    var pob = load_bias(st, P + "attn.proj_out.all.bias", ctx)
+    var a_as = load_bias(st, P + "ada.all.attn_scale", ctx)
+    var a_ash = load_bias(st, P + "ada.all.attn_shift", ctx)
+    var a_ag = load_bias(st, P + "ada.all.attn_gate", ctx)
+    var a_ms = load_bias(st, P + "ada.all.mlp_scale", ctx)
+    var a_msh = load_bias(st, P + "ada.all.mlp_shift", ctx)
+    var a_mg = load_bias(st, P + "ada.all.mlp_gate", ctx)
+    var m_in = load_bias(st, P + "mlp.all.proj_in.weight", ctx)
+    var m_ing = load_bias(st, P + "mlp.all.proj_in_gate.weight", ctx)
+    var m_out = load_bias(st, P + "mlp.all.proj_out.weight", ctx)
+    # Args evaluate left-to-right: each `.clone(ctx)` (vid field) is read BEFORE
+    # the corresponding `^` move (txt field), so ordering is safe.
+    return Block0Weights(
+        qkv.clone(ctx), qkv^,                              # proj_qkv vid, txt
+        nq.clone(ctx), nq^,                                # norm_q vid, txt
+        nk.clone(ctx), nk^,                                # norm_k vid, txt
+        pow.clone(ctx), pob.clone(ctx),                    # proj_out vid weight, bias
+        pow^, pob^,                                        # proj_out txt weight, bias
+        a_as.clone(ctx), a_ash.clone(ctx), a_ag.clone(ctx),  # ada vid attn s/sh/g
+        a_ms.clone(ctx), a_msh.clone(ctx), a_mg.clone(ctx),  # ada vid mlp s/sh/g
+        a_as^, a_ash^, a_ag^,                              # ada txt attn s/sh/g
+        a_ms^, a_msh^, a_mg^,                              # ada txt mlp s/sh/g
+        m_in.clone(ctx), m_ing.clone(ctx), m_out.clone(ctx),  # mlp vid in/gate/out
+        m_in^, m_ing^, m_out^,                             # mlp txt in/gate/out
+    )
+
+
+def load_block(st: SafeTensors, i: Int, ctx: DeviceContext) raises -> Block0Weights:
+    """Generalized block loader. i<10 -> separate `.vid`/`.txt`; i>=10 -> shared
+    `.all` (cloned into both vid/txt fields so mmdit_block is unchanged)."""
+    var P = String("blocks.") + String(i) + String(".")
+    if i < 10:
+        return _load_block_separate(st, P, ctx)
+    return _load_block_shared(st, P, ctx)
+
+
+def load_block0(st: SafeTensors, ctx: DeviceContext) raises -> Block0Weights:
+    """Stream all `blocks.0.` weights (bf16) into a Block0Weights."""
+    return load_block(st, 0, ctx)
+
+
+def dit_stack(
+    vid: Tensor,          # [256,2560] bf16  (block-0 vid input)
+    txt: Tensor,          # [58,2560]  bf16  (block-0 txt input)
+    emb: Tensor,          # [1,15360]  bf16  (AdaSingle emb, shared by all blocks)
+    vid_freqs: Tensor,    # [256,126]  F32   (IDENTICAL rope angles for all blocks)
+    txt_freqs: Tensor,    # [232,126]  F32   (IDENTICAL rope angles for all blocks)
+    blocks: List[ArcPointer[Block0Weights]],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Run all 32 SeedVR2-3B MMDiT blocks in sequence, returning the final vid
+    [256,2560]. The SAME emb + vid_freqs/txt_freqs feed every block (window
+    structure is uniform for this input); mmdit_block/apply_rope3d BORROW these,
+    so no per-block cloning of freqs is needed. vid/txt are re-bound each block
+    via a cheap clone of the returned tuple element (256/58 x 2560 bf16). Blocks
+    are held as ArcPointer (Block0Weights is Movable-not-Copyable, so a plain
+    List of it is rejected); deref with `[]` to borrow into mmdit_block."""
+    var cur_vid = vid.clone(ctx)
+    var cur_txt = txt.clone(ctx)
+    var n = len(blocks)
+    for i in range(n):
+        var pair = mmdit_block(cur_vid, cur_txt, emb, vid_freqs, txt_freqs, blocks[i][], ctx)
+        cur_vid = pair[0].clone(ctx)
+        cur_txt = pair[1].clone(ctx)
+    return cur_vid^
 
 
 def _emb_col(emb2d: Tensor, c: Int, ctx: DeviceContext) raises -> Tensor:
@@ -641,3 +717,63 @@ def mmdit_block(
     var vid_o = add(vm, vid_a, ctx)                    # residual
     var txt_o = add(tm, txt_a, ctx)
     return (vid_o^, txt_o^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (G) dit_out_tail — the NaDiT OUTPUT TAIL (SeedVR nadit.forward:232-236 + NaPatchOut).
+#   vid_out_norm -> vid_out_ada -> vid_out.proj -> unpatchify -> latent [1024,16].
+#
+#   vid_out_norm : RMSNorm WITH affine weight [2560], eps=1e-5, over dim 2560.
+#   vid_out_ada  : AdaSingle single-layer modulation. The shipped single-layer ada
+#     is shape-inconsistent for this config, so the SELF-CONSISTENT block-style rule
+#     is used (identical to the block AdaSingle already implemented, and the rule the
+#     oracle was generated with): emb [1,15360] -> [2560,6], col 0=shift,1=scale,2=gate
+#     of the ATTN slot; mode "in": vid*(scaleA+out_scale)+(shiftA+out_shift).
+#   vid_out.proj : Linear 2560 -> 64 (+ bias).
+#   unpatchify   : NaPatchOut, the EXACT inverse of vid_in's (1,2,2) fold.
+#     Input [256,64] is the grid [T=4, Ho=8, Wo=8, 64]; the 64 chans = (t=1,h=2,w=2,c=16),
+#     index = ((h_sub*2 + w_sub)*16 + c). rearrange "T H W (t h w c) -> (T t)(H h)(W w) c"
+#     -> [4,16,16,16] -> [1024,16]. Mirrors vid_in inverted:
+#       1. reshape [256,64] -> [4,8,8,2,2,16]   (T, Ho, Wo, h_sub, w_sub, c) — inverse
+#          of vid_in step-3: the trailing 64 splits row-major into (h_sub, w_sub, c).
+#       2. permute [0,1,3,2,4,5] -> [4,8,2,8,2,16] = (T, Ho, h_sub, Wo, w_sub, c). This
+#          swap of positions 2<->3 is an involution — the SAME perm vid_in used to move
+#          the sub-axes out; here it moves them back interleaved with Ho/Wo.
+#       3. reshape -> [1024,16]: flattening (T,Ho,h_sub,Wo,w_sub) yields token index
+#          T*256 + (Ho*2+h_sub)*16 + (Wo*2+w_sub) = T*Hfull*Wfull + hfull*Wfull + wfull,
+#          i.e. the [(T t)(H h)(W w)] frame-major grid, EXACTLY inverting vid_in's fold.
+# ═══════════════════════════════════════════════════════════════════════════════
+def dit_out_tail(
+    vid: Tensor,        # [256,2560] bf16  (block-31 vid output)
+    emb: Tensor,        # [1,15360]  bf16  (AdaSingle emb)
+    norm_w: Tensor,     # vid_out_norm.weight   [2560]
+    ada_shift: Tensor,  # vid_out_ada.out_shift [2560]
+    ada_scale: Tensor,  # vid_out_ada.out_scale [2560]
+    proj_w: Tensor,     # vid_out.proj.weight   [64,2560]
+    proj_b: Tensor,     # vid_out.proj.bias     [64]
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """SeedVR NaDiT output tail. Returns the final latent [1024,16] (bf16)."""
+    # 1. RMSNorm WITH affine weight (eps=1e-5, over 2560).
+    var normed = rms_norm(vid, norm_w, Float32(1e-5), ctx)          # [256,2560]
+
+    # 2. AdaSingle "in": attn-slot shift(col0)/scale(col1); B terms = out_shift/out_scale.
+    var emb2d = reshape(emb, [2560, 6], ctx)
+    var shiftA = _emb_col(emb2d, 0, ctx)                            # [2560]
+    var scaleA = _emb_col(emb2d, 1, ctx)                            # [2560]
+    var moded = _mod_in(normed, scaleA, ada_scale, shiftA, ada_shift, ctx)  # [256,2560]
+
+    # 3. proj 2560 -> 64 (+ bias).
+    var proj = linear_bias(moded, proj_w, proj_b, ctx)             # [256,64]
+
+    # 4. unpatchify [256,64] -> [1024,16] (inverse of vid_in's (1,2,2) fold).
+    var g6 = reshape(proj, [4, 8, 8, 2, 2, 16], ctx)               # T,Ho,Wo,h,w,c
+    var perm = List[Int]()
+    perm.append(0)
+    perm.append(1)
+    perm.append(3)
+    perm.append(2)
+    perm.append(4)
+    perm.append(5)
+    var permd = permute(g6, perm, ctx)                            # T,Ho,h,Wo,w,c
+    return reshape(permd, [1024, 16], ctx)

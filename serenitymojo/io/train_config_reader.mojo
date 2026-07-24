@@ -35,6 +35,7 @@
 # Mojo 1.0.0b1: `def` not `fn`; no Python.
 
 from std.collections import List
+from math import sqrt
 from serenitymojo.io.json_header import _Cursor, _parse_string, _skip_value
 from serenitymojo.training.train_config import (
     TrainConfig,
@@ -541,6 +542,21 @@ def _lr_scheduler_int(s: String) raises -> Int:
     raise Error(
         String("JSON config: unknown lr_scheduler '") + s
         + "' (expected constant|linear|cosine|cosine_with_restarts|polynomial|rex)"
+    )
+
+
+def _lr_scaler_int(s: String) raises -> Int:
+    # OneTrainer LearningRateScaler: NONE 0 / LINEAR 1 / SQRT 2. LINEAR scales
+    # cfg.lr by batch*grad_accum, SQRT by sqrt(batch*grad_accum), NONE unscaled.
+    if s == "none" or s == "NONE":
+        return 0
+    elif s == "linear" or s == "LINEAR":
+        return 1
+    elif s == "sqrt" or s == "SQRT":
+        return 2
+    raise Error(
+        String("JSON config: unknown learning_rate_scaler '") + s
+        + "' (expected none|linear|sqrt)"
     )
 
 
@@ -1134,6 +1150,11 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             if not sc.is_string:
                 raise Error("JSON config: lr_scheduler/learning_rate_scheduler must be a string")
             cfg.lr_scheduler = _lr_scheduler_int(sc.s)
+        elif key == "learning_rate_scaler" or key == "lr_scaler":
+            var scs = _read_scalar(cur)
+            if not scs.is_string:
+                raise Error("JSON config: learning_rate_scaler must be a string")
+            cfg.lr_scaler = _lr_scaler_int(scs.s)
         elif key == "lr_warmup_steps" or key == "learning_rate_warmup_steps":
             cfg.lr_warmup_steps = Int(_read_scalar(cur).num)
         elif key == "optimizer_warmup_steps":
@@ -1419,6 +1440,17 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             String("JSON config: expected ',' or '}' at top level at byte ")
             + String(cur.pos)
         )
+
+    # OneTrainer learning_rate_scaler (post-parse: needs lr+batch+grad_accum all
+    # read). NONE leaves cfg.lr untouched => byte-identical. LINEAR/SQRT scale by
+    # the effective batch (batch*grad_accum), matching OT's setup-time LR scaling.
+    if cfg.lr_scaler != 0:
+        var ga = cfg.grad_accum_steps if cfg.grad_accum_steps > 0 else 1
+        var eff = Float64(cfg.batch_size) * Float64(ga)
+        if cfg.lr_scaler == 1:  # LINEAR
+            cfg.lr = Float32(Float64(cfg.lr) * eff)
+        elif cfg.lr_scaler == 2:  # SQRT
+            cfg.lr = Float32(Float64(cfg.lr) * sqrt(eff))
 
     cfg.validate_training_method_config()
     cfg.validate_offload_checkpoint_config()

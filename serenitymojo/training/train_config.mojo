@@ -277,6 +277,9 @@ struct TrainConfig(Copyable, Movable):
     # => the sampler uses its built-in [1/1000, 1] default (byte-identical, C13).
     var min_noising_strength: Float32
     var max_noising_strength: Float32
+    # OneTrainer learning_rate_scaler: 0=NONE 1=LINEAR 2=SQRT. Scales cfg.lr by
+    # batch*grad_accum at config-load; NONE => unscaled = byte-identical.
+    var lr_scaler: Int
 
     # ── caption dropout (Wave 2B item 2d; default-off == 0 == never drop) ──
     # With prob>0, each step draws a uniform and (if draw<prob) swaps the
@@ -667,6 +670,7 @@ struct TrainConfig(Copyable, Movable):
             timestep_noising_bias=Float32(0.0),
             min_noising_strength=Float32(-1.0),  # -1 = unset => sampler default
             max_noising_strength=Float32(-1.0),
+            lr_scaler=0,                          # NONE (unscaled) default
             caption_dropout_prob=Float32(0.0),   # never drop (default-off)
             text_encoder_dropout_prob=Float32(0.0),   # reference trainer TE1 dropout (default-off)
             text_encoder_2_dropout_prob=Float32(0.0),  # reference trainer TE2 dropout (default-off)
@@ -778,6 +782,7 @@ struct TrainConfig(Copyable, Movable):
         timestep_distribution: Int, timestep_noising_weight: Float32,
         timestep_noising_bias: Float32,
         min_noising_strength: Float32, max_noising_strength: Float32,
+        lr_scaler: Int,
         caption_dropout_prob: Float32,
         offset_noise_weight: Float32, offset_noise_prob: Float32,
         input_perturbation: Float32,
@@ -982,6 +987,7 @@ struct TrainConfig(Copyable, Movable):
         self.timestep_noising_bias = timestep_noising_bias
         self.min_noising_strength = min_noising_strength
         self.max_noising_strength = max_noising_strength
+        self.lr_scaler = lr_scaler
         self.caption_dropout_prob = caption_dropout_prob
         self.text_encoder_dropout_prob = text_encoder_dropout_prob
         self.text_encoder_2_dropout_prob = text_encoder_2_dropout_prob

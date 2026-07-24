@@ -463,3 +463,174 @@ def decode_seedvr2_vae(latent: Tensor, st: SafeTensors, ctx: DeviceContext) rais
     var co_w = load_bias(st, "decoder.conv_out.weight", ctx)
     var co_b = load_bias(st, "decoder.conv_out.bias", ctx)
     return causal_conv3d[3, 3, 3](h, co_w, co_b^, ctx)         # 128 -> 3
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENCODER (Encoder3D.forward) — the decoder's mirror. Only NEW primitive is the
+# strided causal DOWNSAMPLE conv; resnet/mid/GN/conv primitives are reused as-is.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── downsample3d ──────────────────────────────────────────────────────────────
+# SeedVR `Downsample3D` + `InflatedCausalConv3d` (attn_video_vae.py:215,
+# inflated_layers.py:50). spatial_down=True always here; TEMPORAL_DOWN selects
+# the temporal kernel/stride. Semantics reproduced EXACTLY:
+#   1. TEMPORAL causal left-pad: iff TEMPORAL_DOWN (kernel_t=3, temporal_padding=1
+#      → extend_head times=2): prepend 2 copies of frame[0] along D (first-frame
+#      replicate, SAME as causal_conv3d). If NOT TEMPORAL_DOWN (kernel_t=1): none.
+#   2. SPATIAL asymmetric pad BEFORE the conv == `F.pad(x,(0,1,0,1))`: zero-pad W
+#      on the RIGHT by 1 and H on the BOTTOM by 1 (top/left unpadded). x is NCDHW
+#      [N,C,D,H,W]; append a zero row at H-max (axis 3) then a zero col at W-max
+#      (axis 4), each built via mul_scalar(slice(...),0.0) then concat.
+#   3. Strided conv (conv3d_fcqrs_cudnn): stride_d=temporal_ratio (2 if
+#      TEMPORAL_DOWN else 1), stride_h=stride_w=2, ALL pads 0 (temporal + spatial
+#      pads already applied manually). Kernel size is read from the weight shape
+#      (OIDHW): (3,3,3) if TEMPORAL_DOWN else (1,3,3).
+#
+# x_ncdhw: NCDHW [N,C,D,H,W]. conv_w: OIDHW [Cout,Cin,KD,3,3]. conv_b: [Cout]
+# (consumed by the cuDNN helper). returns NCDHW [N,Cout,Do,H/2,W/2].
+def downsample3d[
+    TEMPORAL_DOWN: Bool
+](x_ncdhw: Tensor, conv_w: Tensor, var conv_b: Tensor, ctx: DeviceContext) raises -> Tensor:
+    var xs = x_ncdhw.shape()
+    if len(xs) != 5:
+        raise Error("seedvr2 downsample3d: x must be rank-5 NCDHW [N,C,D,H,W]")
+
+    # 1) SPATIAL asymmetric pad (0,1,0,1): H bottom +1 (axis 3), W right +1 (axis
+    #    4), ZEROS. Zero slabs = a 1-wide slice scaled by 0.0, appended (concat).
+    var zero_h = mul_scalar(slice(x_ncdhw, 3, 0, 1, ctx), Float32(0.0), ctx)  # [N,C,D,1,W]
+    var xh = concat(3, ctx, x_ncdhw, zero_h)                                  # [N,C,D,H+1,W]
+    var zero_w = mul_scalar(slice(xh, 4, 0, 1, ctx), Float32(0.0), ctx)       # [N,C,D,H+1,1]
+    var xhw = concat(4, ctx, xh, zero_w)                                      # [N,C,D,H+1,W+1]
+
+    # 2) NCDHW [N,C,D,H,W] -> NDHWC [N,D,H,W,C]: permute (0,2,3,4,1).
+    var to_ndhwc = List[Int]()
+    to_ndhwc.append(0); to_ndhwc.append(2); to_ndhwc.append(3)
+    to_ndhwc.append(4); to_ndhwc.append(1)
+    var x = permute(xhw, to_ndhwc^, ctx)                                      # [N,D,H+1,W+1,C]
+
+    # 3) TEMPORAL causal left-pad: prepend 2 copies of frame[0] (axis 1 in NDHWC)
+    #    iff TEMPORAL_DOWN. `first` computed once from the original first frame and
+    #    prepended twice (both are copies of original frame[0]) — matches
+    #    causal_conv3d's KD-1 replicate loop for KD=3.
+    var x_pad = x^
+    comptime if TEMPORAL_DOWN:
+        var first = slice(x_pad, 1, 0, 1, ctx)   # [N,1,H+1,W+1,C]
+        x_pad = concat(1, ctx, first, x_pad)     # prepend copy #1
+        x_pad = concat(1, ctx, first, x_pad)     # prepend copy #2
+
+    # 4) strided conv: stride_d = temporal_ratio, stride_h=stride_w=2, pads all 0.
+    comptime stride_d = 2 if TEMPORAL_DOWN else 1
+    var y = conv3d_fcqrs_cudnn(
+        x_pad, conv_w, Optional[Tensor](conv_b^),
+        stride_d, 2, 2, 0, 0, 0, ctx,
+    )   # NDHWC [N,Do,Ho,Wo,Cout]
+
+    # 5) NDHWC [N,Do,Ho,Wo,Cout] -> NCDHW [N,Cout,Do,Ho,Wo]: permute (0,4,1,2,3).
+    var to_ncdhw = List[Int]()
+    to_ncdhw.append(0); to_ncdhw.append(4)
+    to_ncdhw.append(1); to_ncdhw.append(2); to_ncdhw.append(3)
+    return permute(y, to_ncdhw^, ctx)
+
+
+# ── down_block3d (DownEncoderBlock3D.forward) ─────────────────────────────────
+# 2 resnets in sequence (NOTE: 2, not 3 like the decoder up_block), then ONE
+# downsampler if present. HAS_SHORTCUT gates resnet 0's channel change; HAS_DOWN
+# gates the downsampler; TEMPORAL_DOWN selects its temporal kernel/stride.
+def down_block3d[
+    HAS_SHORTCUT: Bool, HAS_DOWN: Bool, TEMPORAL_DOWN: Bool
+](h_in: Tensor, st: SafeTensors, block_idx: Int, ctx: DeviceContext) raises -> Tensor:
+    var base = String("encoder.down_blocks.") + String(block_idx)
+    var h = _resnet3d_st(h_in, st, base + ".resnets.0", HAS_SHORTCUT, ctx)
+    h = _resnet3d_st(h, st, base + ".resnets.1", False, ctx)
+
+    comptime if HAS_DOWN:
+        var dw = load_bias(st, base + ".downsamplers.0.conv.weight", ctx)
+        var db = load_bias(st, base + ".downsamplers.0.conv.bias", ctx)
+        h = downsample3d[TEMPORAL_DOWN](h, dw, db^, ctx)
+
+    return h^
+
+
+# ── encoder_mid_block3d (UNetMidBlock3D.forward) ──────────────────────────────
+# IDENTICAL structure to decoder `mid_block3d`, but streams `encoder.mid_block.*`
+# weights (the decoder primitive hardcodes the `decoder.` prefix, so this parallel
+# copy feeds the encoder prefix without touching the verified decoder function).
+#   h = resnet_block3d(resnets.0)(h)                     # 512->512 no shortcut
+#   FOLD  NCDHW[N,C,D,H,W] -> NCHW[N*D,C,H,W]  (permute 0,2,1,3,4 then merge N,D)
+#   h = mid_attention(attentions.0)(h)                   # per-frame single-head
+#   UNFOLD NCHW[N*D,C,H,W] -> NCDHW[N,C,D,H,W] (reshape then permute 0,2,1,3,4)
+#   h = resnet_block3d(resnets.1)(h)                     # 512->512 no shortcut
+def encoder_mid_block3d(h_in: Tensor, st: SafeTensors, ctx: DeviceContext) raises -> Tensor:
+    var h = _resnet3d_st(h_in, st, "encoder.mid_block.resnets.0", False, ctx)
+
+    var sh = h.shape()
+    var N = sh[0]; var C = sh[1]; var D = sh[2]; var H = sh[3]; var W = sh[4]
+
+    # FOLD: permute(0,2,1,3,4) -> [N,D,C,H,W]; reshape merge (N,D) -> [N*D,C,H,W].
+    var to_ndchw = List[Int]()
+    to_ndchw.append(0); to_ndchw.append(2); to_ndchw.append(1)
+    to_ndchw.append(3); to_ndchw.append(4)
+    var hndchw = permute(h, to_ndchw^, ctx)              # [N,D,C,H,W]
+    var mf = List[Int]()
+    mf.append(N * D); mf.append(C); mf.append(H); mf.append(W)
+    var hf = reshape(hndchw, mf^, ctx)                   # [N*D,C,H,W]
+
+    var ap = String("encoder.mid_block.attentions.0")
+    var gn_w = load_bias(st, ap + ".group_norm.weight", ctx)
+    var gn_b = load_bias(st, ap + ".group_norm.bias", ctx)
+    var q_w = load_bias(st, ap + ".to_q.weight", ctx)
+    var q_b = load_bias(st, ap + ".to_q.bias", ctx)
+    var k_w = load_bias(st, ap + ".to_k.weight", ctx)
+    var k_b = load_bias(st, ap + ".to_k.bias", ctx)
+    var v_w = load_bias(st, ap + ".to_v.weight", ctx)
+    var v_b = load_bias(st, ap + ".to_v.bias", ctx)
+    var o_w = load_bias(st, ap + ".to_out.0.weight", ctx)
+    var o_b = load_bias(st, ap + ".to_out.0.bias", ctx)
+    var ha = mid_attention(hf, gn_w, gn_b, q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b, ctx)
+
+    # UNFOLD: reshape [N*D,C,H,W] -> [N,D,C,H,W]; permute(0,2,1,3,4) -> [N,C,D,H,W].
+    var mu = List[Int]()
+    mu.append(N); mu.append(D); mu.append(C); mu.append(H); mu.append(W)
+    var hu5 = reshape(ha, mu^, ctx)                      # [N,D,C,H,W]
+    var to_ncdhw = List[Int]()
+    to_ncdhw.append(0); to_ncdhw.append(2); to_ncdhw.append(1)
+    to_ncdhw.append(3); to_ncdhw.append(4)
+    var hback = permute(hu5, to_ncdhw^, ctx)             # [N,C,D,H,W]
+
+    return _resnet3d_st(hback, st, "encoder.mid_block.resnets.1", False, ctx)
+
+
+# ── encode_seedvr2_vae: full Encoder3D forward e2e ────────────────────────────
+# video: NCDHW [1,3,13,128,128] -> returns latent (posterior MEAN) [1,16,4,16,16].
+#   h = causal_conv3d[3,3,3](conv_in, video)     # 3 -> 128
+#   h = down_block(0)  # resnets 128->128 (no sc); down spatial-only  (kernel 1,3,3)
+#   h = down_block(1)  # resnet0 128->256 (SC), 256->256; down temporal+spatial
+#   h = down_block(2)  # resnet0 256->512 (SC), 512->512; down temporal+spatial
+#   h = down_block(3)  # resnets 512->512 (no sc); NO downsampler
+#   h = mid_block                                 # resnet0 + attn + resnet1 (512)
+#   h = SiLU(GroupNorm-32(conv_norm_out, h))      # 512 ch, eps 1e-6, per-frame
+#   h = causal_conv3d[3,3,3](conv_out, h)         # 512 -> 32 (double_z)
+#   latent = h[:, :16]                            # posterior mean = first 16 chs
+def encode_seedvr2_vae(video: Tensor, st: SafeTensors, ctx: DeviceContext) raises -> Tensor:
+    var ci_w = load_bias(st, "encoder.conv_in.weight", ctx)
+    var ci_b = load_bias(st, "encoder.conv_in.bias", ctx)
+    var h = causal_conv3d[3, 3, 3](video, ci_w, ci_b^, ctx)   # 3 -> 128
+
+    h = down_block3d[False, True, False](h, st, 0, ctx)  # 128->128, down spatial only
+    h = down_block3d[True, True, True](h, st, 1, ctx)    # 128->256, down temporal+spatial
+    h = down_block3d[True, True, True](h, st, 2, ctx)    # 256->512, down temporal+spatial
+    h = down_block3d[False, False, False](h, st, 3, ctx) # 512->512, no downsampler
+
+    h = encoder_mid_block3d(h, st, ctx)
+
+    var no_w = load_bias(st, "encoder.conv_norm_out.weight", ctx)
+    var no_b = load_bias(st, "encoder.conv_norm_out.bias", ctx)
+    h = _group_norm_per_frame(h, no_w, no_b, ctx)      # GN-32, 512 ch, eps 1e-6
+    h = silu(h, ctx)
+
+    var co_w = load_bias(st, "encoder.conv_out.weight", ctx)
+    var co_b = load_bias(st, "encoder.conv_out.bias", ctx)
+    h = causal_conv3d[3, 3, 3](h, co_w, co_b^, ctx)    # 512 -> 32 (double_z)
+
+    # posterior MEAN = first 16 channels (double_z splits mean|logvar). slice axis 1.
+    return slice(h, 1, 0, 16, ctx)                     # [1,16,4,16,16]

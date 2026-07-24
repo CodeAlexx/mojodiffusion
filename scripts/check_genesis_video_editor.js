@@ -195,6 +195,19 @@ function runChecked(command, args) {
       ).count();
       assert(nativePropertyControls >= 100,
         `native Genesis property controls=${nativePropertyControls}`);
+      const clipEditing = page.locator("details.ve-genesis-section")
+        .filter({ has: page.locator("summary", { hasText: "Clip Editing" }) });
+      assert(await clipEditing.count() === 1,
+        "saved project Clip Editing section is missing");
+      const replacementCount = await clipEditing.locator("select option").count();
+      assert(replacementCount >= 1,
+        `saved project replacement media choices=${replacementCount}`);
+      const trackRows = await page.locator(".ve-genesis-track-row").count();
+      assert(trackRows === diagnostics.tracks.length,
+        `saved project property track rows=${trackRows}`);
+      assert(await page.locator("details.ve-genesis-section")
+        .filter({ has: page.locator("summary", { hasText: "Subtitles" }) })
+        .count() === 1, "saved project Subtitles section is missing");
       await page.locator('.ve-dock-tab[data-dock="filters"]').click();
       assert(await page.locator(".ve-genesis-filter-catalog").isVisible(),
         "saved project native filter catalog is missing");
@@ -241,6 +254,9 @@ function runChecked(command, args) {
             await page.locator("#ve-edit-toolbar .ve-edit-btn").count(),
           persistent_dock_tabs: diagnostics.dockTabCount,
           properties_parameter_controls: nativePropertyControls,
+          replacement_media_choices: replacementCount,
+          property_track_rows: trackRows,
+          subtitles_section: true,
           native_filter_catalog_entries: nativeFilterCount,
           live_scopes: 4,
           audio_mixer_tracks: mixerTrackCount,
@@ -368,6 +384,17 @@ function runChecked(command, args) {
     const baseHash = await readCanvasHash();
 
     assert(await page.locator(".ve-props-panel").isVisible(), "video import did not expose edits");
+    const clipEditing = page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "Clip Editing" }) });
+    assert(await clipEditing.count() === 1, "Clip Editing section is missing");
+    assert(await clipEditing.locator("select option").count() >= 1,
+      "replacement-media selector is empty");
+    const propertyTrackRows = await page.locator(".ve-genesis-track-row").count();
+    assert(propertyTrackRows === layoutDiagnostics.tracks.length,
+      `property track rows=${propertyTrackRows}`);
+    assert(await page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "Subtitles" }) })
+      .count() === 1, "Subtitles section is missing");
     const effectSlider = page.locator(
       '.ve-genesis-control[data-property="sat"] input[type="range"]',
     );
@@ -498,6 +525,20 @@ function runChecked(command, args) {
       "audio mixer did not expose video and music tracks");
     assert(await page.locator("#ve-audio-waveform").isVisible(),
       "audio waveform scope is missing");
+    const audioWaveformSignalPixels = await page.locator("#ve-audio-waveform")
+      .evaluate((canvas) => {
+        const pixels = canvas.getContext("2d").getImageData(
+          0, 0, canvas.width, canvas.height,
+        ).data;
+        let signal = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (pixels[index + 1] > 100 && pixels[index + 2] > 80
+            && pixels[index + 1] > pixels[index] + 25) signal++;
+        }
+        return signal;
+      });
+    assert(audioWaveformSignalPixels > 100,
+      `decoded audio waveform signal pixels=${audioWaveformSignalPixels}`);
     const muteButton = page.locator(".ve-audio-mixer-strip").last()
       .locator(".ve-audio-mixer-buttons button").first();
     await muteButton.click();
@@ -636,7 +677,11 @@ function runChecked(command, args) {
         snap_toggle: true,
         copy_paste_undo: true,
         audio_mute_toggle: true,
+        decoded_audio_waveform_signal_pixels: audioWaveformSignalPixels,
         project_properties_without_selection: true,
+        replacement_media: true,
+        property_track_rows: propertyTrackRows,
+        subtitle_editor: true,
       },
       effect: "saturation=0",
       effect_pixels_changed: effectHash !== baseHash,

@@ -86,12 +86,12 @@ editor without launching or embedding egui:
   selection, and add-at-playhead actions;
 - a central Program/Source monitor with native-clock transport and timecode;
 - a persistent four-tab right dock:
-  - **Properties** exposes 142 controls covering PiP/blend, fades,
+  - **Properties** exposes 143 controls covering PiP/blend, fades,
     speed/reverse, gain and audio FX/graphic EQ, grading, color wheels, white
     balance, transform/blur, curves, HSL/levels, stylization, distortion,
     geometry, 360 reframe, shape mask, selective color, look/LUT, chroma key,
     title text, transitions, keyframes, clip operations, program grade, and
-    export;
+    export, replacement media, clip grouping, track management, and subtitles;
   - **Filters** derives a real active stack from Genesis identity values and
     provides 25 searchable add/reset groups;
   - **Scopes** calculates RGB histogram, luma waveform, vectorscope, and RGB
@@ -161,8 +161,10 @@ Observed gates:
 
 - `gcompose --serve` initialized OpenCL and passed its startup self-check;
 - the browser `+ Video` action imported and probed exactly 121 frames at 25 FPS;
-- the exact saved project exposed 142 native Genesis controls, 25 searchable
-  native filter groups, four calculated video scopes, and two mixer strips;
+- the exact saved project exposed 143 native Genesis controls, two real
+  replacement-media choices, two track-management rows, a subtitle editor,
+  25 searchable native filter groups, four calculated video scopes, and two
+  mixer strips;
 - the Genesis-style workspace exposed the media bin, Program/Source monitors,
   twelve real timeline actions, and four persistent dock tabs;
 - marker, snap off/on, copy/paste/undo, and mixer mute/unmute interactions all
@@ -192,11 +194,11 @@ Observed gates:
 
 The machine-readable result and visual evidence are written to:
 
-- `output/checks/genesis_browser/native-properties-e2e-pass/result.json`;
-- `output/checks/genesis_browser/native-properties-e2e-pass/editor.png`;
-- `output/checks/genesis_browser/native-properties-e2e-pass/export-contact.png`;
-- `output/checks/genesis_browser/native-four-tab-final/saved-project-result.json`;
-- `output/checks/genesis_browser/native-four-tab-final/saved-project.png`.
+- `output/checks/genesis_browser/native-properties-e2e-followup/result.json`;
+- `output/checks/genesis_browser/native-properties-e2e-followup/editor.png`;
+- `output/checks/genesis_browser/native-properties-e2e-followup/export-contact.png`;
+- `output/checks/genesis_browser/native-four-tab-final-followup/saved-project-result.json`;
+- `output/checks/genesis_browser/native-four-tab-final-followup/saved-project.png`.
 
 Generated test projects, previews, exports, profiles, and installed binaries
 remain beneath ignored `output/` or `/tmp`; source control contains the code,

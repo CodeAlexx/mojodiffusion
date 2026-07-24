@@ -1666,6 +1666,150 @@ var VideoEditTab = (function () {
         exportBody.appendChild(region);
         exportDetails.appendChild(exportBody);
         panel.appendChild(exportDetails);
+
+        var tracksDetails = document.createElement('details');
+        tracksDetails.className = 've-genesis-section';
+        tracksDetails.innerHTML = '<summary>Tracks</summary>';
+        var tracksBody = document.createElement('div');
+        tracksBody.className = 've-genesis-section-body';
+        var addTrackButtons = document.createElement('div');
+        addTrackButtons.className = 've-genesis-button-row';
+        [
+            ['+ Video', function () { addTrack('video'); }],
+            ['+ Audio', function () { addTrack('audio'); }],
+        ].forEach(function (action) {
+            var button = document.createElement('button');
+            button.textContent = action[0];
+            button.addEventListener('click', action[1]);
+            addTrackButtons.appendChild(button);
+        });
+        tracksBody.appendChild(addTrackButtons);
+        project.tracks.slice().reverse().forEach(function (track) {
+            var row = document.createElement('div');
+            row.className = 've-genesis-track-row';
+            var name = document.createElement('input');
+            name.type = 'text';
+            name.value = track.name;
+            name.addEventListener('change', function () {
+                pushUndo();
+                track.name = name.value.trim() || track.name;
+                renderTimeline();
+                scheduleAutosave();
+            });
+            row.appendChild(name);
+            [
+                ['V', 'Visible', 'hidden', true],
+                ['M', 'Mute', 'muted', false],
+                ['L', 'Lock', 'locked', false],
+            ].forEach(function (spec) {
+                var label = document.createElement('label');
+                label.title = spec[1];
+                var checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = spec[3] ? !track[spec[2]] : !!track[spec[2]];
+                checkbox.addEventListener('change', function () {
+                    pushUndo();
+                    track[spec[2]] = spec[3] ? !checkbox.checked : checkbox.checked;
+                    renderTimeline();
+                    scheduleAutosave();
+                    updatePreviewDebounced();
+                });
+                label.appendChild(checkbox);
+                label.appendChild(document.createTextNode(spec[0]));
+                row.appendChild(label);
+            });
+            tracksBody.appendChild(row);
+        });
+        tracksDetails.appendChild(tracksBody);
+        panel.appendChild(tracksDetails);
+
+        var subtitlesDetails = document.createElement('details');
+        subtitlesDetails.className = 've-genesis-section';
+        subtitlesDetails.innerHTML = '<summary>Subtitles</summary>';
+        var subtitlesBody = document.createElement('div');
+        subtitlesBody.className = 've-genesis-section-body';
+        var subtitleActions = document.createElement('div');
+        subtitleActions.className = 've-genesis-button-row';
+        [
+            ['Import SRT…', function () { handleFileAction('import-srt'); }],
+            ['Export SRT', exportSRT],
+            ['Add cue @ playhead', function () {
+                pushUndo();
+                var textTrack = project.tracks.find(function (track) { return track.type === 'text'; });
+                if (!textTrack) {
+                    textTrack = {
+                        id: 'track-text-' + Date.now(),
+                        name: 'Subtitles',
+                        type: 'text',
+                        clips: [],
+                    };
+                    project.tracks.push(textTrack);
+                }
+                textTrack.clips.push({
+                    id: generateClipId(),
+                    label: '',
+                    startFrame: currentFrame,
+                    endFrame: currentFrame + (FPS * 2),
+                });
+                recalcTotalFrames();
+                resize();
+                renderTimeline();
+                scheduleAutosave();
+                refreshPropertiesPanel();
+            }],
+        ].forEach(function (action) {
+            var button = document.createElement('button');
+            button.textContent = action[0];
+            button.addEventListener('click', action[1]);
+            subtitleActions.appendChild(button);
+        });
+        subtitlesBody.appendChild(subtitleActions);
+        var subtitleClips = [];
+        project.tracks.forEach(function (track) {
+            if (track.type !== 'text') return;
+            track.clips.forEach(function (clip, index) {
+                subtitleClips.push({ track: track, clip: clip, index: index });
+            });
+        });
+        if (!subtitleClips.length) {
+            var empty = document.createElement('div');
+            empty.className = 've-genesis-inline-status';
+            empty.textContent = 'No subtitles — import an SRT or add a cue.';
+            subtitlesBody.appendChild(empty);
+        }
+        subtitleClips.forEach(function (entry) {
+            var card = document.createElement('div');
+            card.className = 've-genesis-subtitle-row';
+            var timing = document.createElement('div');
+            timing.textContent = frameToTimecode(entry.clip.startFrame) + ' – ' + frameToTimecode(entry.clip.endFrame);
+            var remove = document.createElement('button');
+            remove.textContent = '×';
+            remove.title = 'Delete cue';
+            remove.addEventListener('click', function () {
+                pushUndo();
+                entry.track.clips.splice(entry.index, 1);
+                renderTimeline();
+                scheduleAutosave();
+                refreshPropertiesPanel();
+            });
+            timing.appendChild(remove);
+            var textarea = document.createElement('textarea');
+            textarea.rows = 2;
+            textarea.value = entry.clip.label || '';
+            textarea.placeholder = 'Caption text';
+            textarea.addEventListener('change', function () {
+                pushUndo();
+                entry.clip.label = textarea.value;
+                renderTimeline();
+                scheduleAutosave();
+                updatePreviewDebounced();
+            });
+            card.appendChild(timing);
+            card.appendChild(textarea);
+            subtitlesBody.appendChild(card);
+        });
+        subtitlesDetails.appendChild(subtitlesBody);
+        panel.appendChild(subtitlesDetails);
     }
 
     function renderGenesisLutPicker(panel, clip) {
@@ -2096,6 +2240,12 @@ var VideoEditTab = (function () {
         return null;
     }
 
+    function waveformHasSignal(active) {
+        return !!(active && active.data && active.data.peaks && active.data.peaks.some(function (peak) {
+            return Math.abs(Number(peak) || 0) > 0.0001;
+        }));
+    }
+
     function drawAudioWaveform(canvas, data) {
         var ctx = canvas.getContext('2d');
         var width = canvas.width;
@@ -2152,13 +2302,20 @@ var VideoEditTab = (function () {
             ? { clip: selectedInfo.clip, data: waveformCache.get(selectedInfo.clip.id) || null }
             : null;
         if (selectedInfo && selectedInfo.clip) loadWaveform(selectedInfo.clip);
-        if (!selectedActive || !selectedActive.data || !selectedActive.data.peaks || !selectedActive.data.peaks.length) {
+        if (!waveformHasSignal(selectedActive)) {
+            var loadedFallback = null;
             for (var waveformTrackIndex = project.tracks.length - 1; waveformTrackIndex >= 0; waveformTrackIndex--) {
                 var candidateWaveform = activeWaveformForTrack(project.tracks[waveformTrackIndex]);
-                if (candidateWaveform && candidateWaveform.data && candidateWaveform.data.peaks && candidateWaveform.data.peaks.length) {
+                if (!loadedFallback && candidateWaveform && candidateWaveform.data) {
+                    loadedFallback = candidateWaveform;
+                }
+                if (waveformHasSignal(candidateWaveform)) {
                     selectedActive = candidateWaveform;
                     break;
                 }
+            }
+            if (!waveformHasSignal(selectedActive) && loadedFallback) {
+                selectedActive = loadedFallback;
             }
         }
         drawAudioWaveform(scope, selectedActive ? selectedActive.data : null);
@@ -4363,9 +4520,71 @@ var VideoEditTab = (function () {
         clipEditing.innerHTML = '<summary>Clip Editing</summary>';
         var editBody = document.createElement('div');
         editBody.className = 've-genesis-section-body';
+        var replacementRow = document.createElement('div');
+        replacementRow.className = 've-genesis-control';
+        replacementRow.innerHTML = '<label>Replace media</label>';
+        var replacementSelect = document.createElement('select');
+        var replacementSeen = new Set();
+        project.tracks.forEach(function (track) {
+            track.clips.forEach(function (candidate) {
+                if (!candidate.source_path || replacementSeen.has(candidate.source_path)) return;
+                replacementSeen.add(candidate.source_path);
+                var option = document.createElement('option');
+                option.value = candidate.id;
+                option.textContent = candidate.label || candidate.source_path.split('/').pop();
+                if (candidate.source_path === clip.source_path) option.selected = true;
+                replacementSelect.appendChild(option);
+            });
+        });
+        replacementSelect.addEventListener('change', function () {
+            var replacement = findClipById(replacementSelect.value);
+            if (!replacement || replacement.clip.source_path === clip.source_path) return;
+            pushUndo();
+            [
+                'source_path', 'source_fps', 'source_start', 'source_width',
+                'source_height', 'media_type', 'duration_seconds',
+            ].forEach(function (key) {
+                if (replacement.clip[key] !== undefined) clip[key] = replacement.clip[key];
+            });
+            thumbnailCache.delete(clip.id);
+            waveformCache.delete(clip.id);
+            loadThumbnails(clip);
+            loadWaveform(clip);
+            renderTimeline();
+            renderMediaBin();
+            scheduleAutosave();
+            updatePreview();
+        });
+        replacementRow.appendChild(replacementSelect);
+        editBody.appendChild(replacementRow);
         var editActions = document.createElement('div');
         editActions.className = 've-genesis-button-row';
         [
+            ['Group', function () {
+                if (selectedClipIds.size < 2) return;
+                pushUndo();
+                var groupId = 'group-' + Date.now();
+                selectedClipIds.forEach(function (clipId) {
+                    var grouped = findClipById(clipId);
+                    if (grouped) grouped.clip.group_id = groupId;
+                });
+                scheduleAutosave();
+                renderTimeline();
+                renderPropertiesPanelContent(panel, clip);
+            }],
+            ['Ungroup', function () {
+                if (!clip.group_id) return;
+                pushUndo();
+                var groupId = clip.group_id;
+                project.tracks.forEach(function (track) {
+                    track.clips.forEach(function (candidate) {
+                        if (candidate.group_id === groupId) delete candidate.group_id;
+                    });
+                });
+                scheduleAutosave();
+                renderTimeline();
+                renderPropertiesPanelContent(panel, clip);
+            }],
             ['Detach audio', function () {
                 var audioTrack = project.tracks.find(function (track) { return track.type === 'audio'; });
                 if (!audioTrack) audioTrack = addTrack('audio', true);
@@ -4409,10 +4628,19 @@ var VideoEditTab = (function () {
             var button = document.createElement('button');
             button.textContent = action[0];
             if (action[0] === 'Paste filters') button.disabled = !genesisFilterClipboard;
+            if (action[0] === 'Ungroup') button.disabled = !clip.group_id;
             button.addEventListener('click', action[1]);
             editActions.appendChild(button);
         });
         editBody.appendChild(editActions);
+        var groupStatus = document.createElement('div');
+        groupStatus.className = 've-genesis-inline-status';
+        groupStatus.textContent = clip.group_id
+            ? 'Grouped · ' + clip.group_id
+            : selectedClipIds.size > 1
+                ? selectedClipIds.size + ' clips selected — Group is ready.'
+                : 'Ungrouped · Ctrl/Cmd-click another timeline clip to group.';
+        editBody.appendChild(groupStatus);
         clipEditing.appendChild(editBody);
         panel.appendChild(clipEditing);
 
@@ -6543,6 +6771,16 @@ var VideoEditTab = (function () {
                     if (!selectedClipIds.has(clipId)) {
                         selectedClipIds.clear();
                         selectedClipIds.add(clipId);
+                    }
+                    if (targetInfo && targetInfo.clip.group_id) {
+                        var linkedGroup = targetInfo.clip.group_id;
+                        project.tracks.forEach(function (candidateTrack) {
+                            candidateTrack.clips.forEach(function (candidateClip) {
+                                if (candidateClip.group_id === linkedGroup) {
+                                    selectedClipIds.add(candidateClip.id);
+                                }
+                            });
+                        });
                     }
                 }
 

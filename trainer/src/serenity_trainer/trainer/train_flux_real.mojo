@@ -22,7 +22,7 @@
 #   5. noisy = noise*sigma + latent_packed*(1-sigma)      (train_flux.rs:797-799)
 #      target = noise - latent_packed   (rectified-flow)  (train_flux.rs:802)
 #   6. flux_stack_lora_forward_offload(noisy_img_tokens, t5_txt_tokens,
-#        timestep=t_model*1000, guidance=GUIDANCE*1000, vector=clip_pool) -> pred [N_IMG,64]
+#        timestep=t_model*1000, guidance=guidance_scale*1000, vector=clip_pool) -> pred [N_IMG,64]
 #   7. loss = MSE(pred, target); d_loss = (2/N)(pred - target)
 #   8. flux_stack_lora_backward_offload -> LoRA grads; global-norm clip(1.0)
 #   9. flux_lora_adamw_step; print shared progress display
@@ -200,7 +200,6 @@ comptime RANK = 16
 comptime ALPHA = Float32(1.0)          # reference trainer config default lora_alpha (preset unset)
 comptime LR = Float32(3.0e-4)          # reference trainer preset learning_rate 0.0003
 comptime TIMESTEP_SHIFT = Float32(1.0)
-comptime GUIDANCE = Float32(1.0)       # reference trainer config default guidance_scale (preset unset)
 comptime VAE_SHIFT = Float32(0.1159)
 comptime VAE_SCALE = Float32(0.3611)
 comptime NUM_TRAIN_TIMESTEPS = 1000
@@ -225,7 +224,7 @@ comptime DEFAULT_RUN_STEPS = 5
 # VAE for the sample decode (FLUX ae). The unpack uses the VAE in-channel count
 # LAT_C (16); the packed patch dim is LAT_C*4 == IN_CH (64). HT/WT (32) are the
 # patchified half-grid (IMG_H2/IMG_W2 in the inference CLI). Sample defaults match
-# the gated inference CLI (steps 20, guidance == the trainer's GUIDANCE).
+# the gated inference CLI (steps 20, guidance == the trainer's guidance_scale).
 comptime VAE_PATH = "/home/alex/.serenity/models/vaes/ae.safetensors"
 comptime SAMPLE_STEPS = 20
 comptime SAMPLE_SEED = UInt64(0xF10A_5A91)
@@ -837,7 +836,7 @@ def main() raises:
     print("  tokens: N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
     print("  recipe: rank=", train_cfg.lora_rank, " alpha=", train_cfg.lora_alpha,
           " lr=", train_cfg.lr, " shift=", train_cfg.timestep_shift,
-          " guidance=", GUIDANCE, " vae_shift=", VAE_SHIFT, " vae_scale=", VAE_SCALE)
+          " guidance=", train_cfg.guidance_scale, " vae_shift=", VAE_SHIFT, " vae_scale=", VAE_SCALE)
     print("  run_steps=", run_steps, " config_max_steps=", train_cfg.max_steps)
     print(
         "  cadence: save_every=", train_cfg.save_every,
@@ -1071,8 +1070,9 @@ def main() raises:
         print("[Flux-oft] vec L1 at init =", carrier_zero_init)
 
     # guidance is pre-scaled *1000 (BFL time_factor; same as timestep).
+    # config-driven (transformer.guidance_scale); default 1.0 = the old hardcode.
     var guidance_list = List[Float32]()
-    guidance_list.append(GUIDANCE * Float32(1000.0))
+    guidance_list.append(train_cfg.guidance_scale * Float32(1000.0))
     var guidance = Optional[List[Float32]](guidance_list^)
 
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
@@ -1677,7 +1677,7 @@ def main() raises:
                 ](
                     base, loader, lora,
                     txt_tokens.copy(), clip_pool.copy(), cos.copy(), sin.copy(),
-                    GUIDANCE, SAMPLE_STEPS, SAMPLE_SEED + UInt64(k),
+                    train_cfg.guidance_scale, SAMPLE_STEPS, SAMPLE_SEED + UInt64(k),
                     D, FMLP, TXT_CH, T_DIM, VEC_DIM, EPS, ctx,
                 )
                 var sample_png = (

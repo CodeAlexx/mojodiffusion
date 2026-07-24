@@ -1157,6 +1157,8 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.lr_scaler = _lr_scaler_int(scs.s)
         elif key == "dynamic_timestep_shifting" or key == "dynamic_shift":
             cfg.dynamic_timestep_shifting = _read_bool(cur)
+        elif key == "guidance_scale" or key == "transformer_guidance_scale":
+            cfg.guidance_scale = Float32(_read_scalar(cur).num)
         elif key == "lr_warmup_steps" or key == "learning_rate_warmup_steps":
             cfg.lr_warmup_steps = Int(_read_scalar(cur).num)
         elif key == "optimizer_warmup_steps":

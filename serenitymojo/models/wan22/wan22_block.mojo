@@ -917,6 +917,7 @@ def wan22_block_backward[
 
 from serenitymojo.models.klein.lora_block import (
     LoraAdapter, klein_lora_fwd, klein_lora_bwd, KleinLoraGrads,
+    lora_adapter_to_device, LoraAdapterDevice,
 )
 from serenitymojo.training.dora_adapter import DoRAGrads
 from serenitymojo.training.oft_serenity_trainer import OFTOTGrads
@@ -1070,6 +1071,108 @@ def _lora_bwd_opt(
             z.append(0.0)
         return KleinLoraGrads(_empty(), _empty(), z^)
     return klein_lora_bwd(d_y_h, x_h, lo.value(), M, ctx)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DEVICE-NATIVE LoRA BACKWARD (Phase-1 WAN_DEVNATIVE)
+#
+# BIT-IDENTICAL device-resident sibling of _lora_bwd_opt/klein_lora_bwd: the
+# LoRA d_A/d_B/d_x_lo stay on the GPU as Tensors (no to_host/from_host round
+# trip). Every host round trip in klein_lora_bwd is a to_host (bf16->F32 widen)
+# followed by a from_host (F32->bf16 narrow) that is a no-op for the bf16 value,
+# OR a to_host of a grad that stays F32. So keeping tensors resident with the
+# SAME op/dtype sequence and SAME GEMM calls reproduces the host chain byte-for-
+# byte (Wan is math-mode/deterministic). d_A/d_B leave as F32 tensors (== the
+# to_host widening of the bf16 linear_backward d_w); d_x_lo stays bf16.
+# ═══════════════════════════════════════════════════════════════════════════
+struct WanLoraDevGrad(Copyable, Movable):
+    var present: Bool
+    var d_a: TArc   # [rank,in_f] F32  (1-elem placeholder when absent)
+    var d_b: TArc   # [out_f,rank] F32
+    var d_x: TArc   # [M,in_f]   bf16  (LoRA contribution to projection input grad)
+
+    def __init__(
+        out self, present: Bool, var d_a: TArc, var d_b: TArc, var d_x: TArc
+    ):
+        self.present = present
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x = d_x^
+
+
+# Device-native, bit-identical port of klein_lora_bwd. d_contrib [M,out_f] is
+# the projection-output grad (any dtype; cast to F32 to mirror klein's to_host
+# widening); x_bf [M,in_f] is the BF16 saved projection input. Absent adapter
+# returns a zero bf16 d_x (folding it is a bf16 no-op, matching the oracle which
+# always folds the zero branch) and present=False so the flat grad slot is empty.
+def _wan_lora_bwd_device(
+    lo: Optional[LoraAdapter], d_contrib: Tensor, x_bf: Tensor,
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> WanLoraDevGrad:
+    if not lo:
+        var zh = List[Float32]()
+        for _ in range(M * in_f):
+            zh.append(0.0)
+        var z = Tensor.from_host(zh^, [M, in_f], STDtype.BF16, ctx)
+        var p1 = Tensor.from_host([Float32(0.0)], [1], STDtype.F32, ctx)
+        var p2 = Tensor.from_host([Float32(0.0)], [1], STDtype.F32, ctx)
+        return WanLoraDevGrad(False, TArc(p1^), TArc(p2^), TArc(z^))
+    var ld = lora_adapter_to_device(lo.value(), ctx)   # a,b BF16 device
+    # t = x @ Aᵀ  (bf16 GEMM), then the bf16 round-trip (== to_host->from_host).
+    var nb = Optional[Tensor](None)
+    var t = linear(x_bf, ld.a[], nb^, ctx)
+    var t_bf = cast_tensor(t, STDtype.BF16, ctx)
+    # d_dy = bf16( scale · F32(d_contrib) )  (F32 mul is IEEE-exact host==device).
+    var d_contrib_f32 = cast_tensor(d_contrib, STDtype.F32, ctx)
+    var d_dy_f32 = mul_scalar(d_contrib_f32, ld.scale, ctx)
+    var d_dy_bf = cast_tensor(d_dy_f32, STDtype.BF16, ctx)
+    # dy = t @ Bᵀ  →  d_B (d_w) and d_t (d_x); all-bf16 linear_backward.
+    var lbB = linear_backward(d_dy_bf, t_bf, ld.b[], M, ld.rank, ld.out_f, ctx)
+    var d_b_f32 = cast_tensor(lbB.d_w, STDtype.F32, ctx)   # widen bf16 d_w -> F32
+    # t = x @ Aᵀ  →  d_A (d_w) and d_x_lo (d_x); reuse lbB.d_x (bf16) as d_t.
+    var lbA = linear_backward(lbB.d_x, x_bf, ld.a[], M, ld.in_f, ld.rank, ctx)
+    var d_a_f32 = cast_tensor(lbA.d_w, STDtype.F32, ctx)   # widen bf16 d_w -> F32
+    var d_x_lo = lbA.d_x.clone(ctx)
+    return WanLoraDevGrad(True, TArc(d_a_f32^), TArc(d_b_f32^), TArc(d_x_lo^))
+
+
+# Fold a LoRA branch's d_x contribution into the base projection-input grad,
+# device-side. Matches the oracle `add(base, _t16(g.d_x))` (bf16 add). Absent
+# adapters add a zero d_x (bf16 x+0 == x exactly) — same result as the oracle.
+def _fold_lora_dx(base: Tensor, g: WanLoraDevGrad, ctx: DeviceContext) raises -> Tensor:
+    return add(base, g.d_x[], ctx)
+
+
+# Device-native block LoRA grads: d_x/d_context stay on device (TArc between
+# blocks); 10 adapters' d_A/d_B are device F32 Optionals (None == absent slot).
+# Slot order matches W_SA_Q..W_FFN2 (0..9) in wan22_stack_lora.
+struct WanBlockLoraDeviceGrads(Movable):
+    var d_x: Tensor                 # [S,dim]   bf16
+    var d_context: Tensor           # [TXT,dim] bf16
+    var d_a: List[Optional[TArc]]   # 10 slots, F32 [rank,in]
+    var d_b: List[Optional[TArc]]   # 10 slots, F32 [out,rank]
+
+    def __init__(
+        out self, var d_x: Tensor, var d_context: Tensor,
+        var d_a: List[Optional[TArc]], var d_b: List[Optional[TArc]],
+    ):
+        self.d_x = d_x^
+        self.d_context = d_context^
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+# Push one adapter's device grads into the flat 10-slot Optional lists.
+def _push_dev_slot(
+    mut d_a: List[Optional[TArc]], mut d_b: List[Optional[TArc]],
+    g: WanLoraDevGrad,
+) raises:
+    if g.present:
+        d_a.append(Optional[TArc](g.d_a.copy()))
+        d_b.append(Optional[TArc](g.d_b.copy()))
+    else:
+        d_a.append(Optional[TArc]())
+        d_b.append(Optional[TArc]())
 
 
 # Host-side frozen W_orig/bias for the eight direct DoRA/OFT attention
@@ -1678,6 +1781,155 @@ def wan22_block_lora_backward[
         ffn0_g.d_a.copy(), ffn0_g.d_b.copy(),
         ffn2_g.d_a.copy(), ffn2_g.d_b.copy(),
     )
+
+
+# ── DEVICE-NATIVE BACKWARD of one Wan2.2 block WITH LoRA (WAN_DEVNATIVE) ──────
+# Bit-identical device-resident sibling of wan22_block_lora_backward: the base
+# reverse arms are byte-for-byte the same (they were already Tensor->Tensor); the
+# only change is the LoRA path — _lora_bwd_opt (host klein_lora_bwd + to_host of
+# d_A/d_B/d_x_lo, then _t16 re-upload of d_x) is replaced by _wan_lora_bwd_device
+# (grads stay device) + _fold_lora_dx (device add). d_x/d_context leave as device
+# Tensors (no final to_host). Frozen base weight/mod grads are discarded (they are
+# discarded by the stack anyway) so this returns ONLY the training-relevant grads.
+def wan22_block_lora_backward_devnative[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out: Tensor, mv: WanModVecs, w: WanBlockWeights,
+    lora: WanBlockLora, saved: WanSaved, cos: Tensor, sin: Tensor,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> WanBlockLoraDeviceGrads:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t16(_ones(dim), [dim], ctx)
+    var cos_e = _expand_rope_per_head(cos, S, H, Dh // 2, ctx)
+    var sin_e = _expand_rope_per_head(sin, S, H, Dh // 2, ctx)
+
+    # projection-input saved activations, resident BF16 (== oracle _tbf16 uploads,
+    # minus the to_host round trip the host LoRA backward needed).
+    var sv_lora_sa_in = _tbf16(saved.sa_in.copy(), [S, dim], ctx)
+    var sv_lora_sa_att = _tbf16(saved.sa_att.copy(), [S, dim], ctx)
+    var sv_lora_ca_n3 = _tbf16(saved.ca_n3.copy(), [S, dim], ctx)
+    var sv_lora_context = _tbf16(saved.context.copy(), [TXT, dim], ctx)
+    var sv_lora_ca_att = _tbf16(saved.ca_att.copy(), [S, dim], ctx)
+
+    # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
+    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
+    var ffn_out_rc = linear(lsv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out, ffn_out_rc, gate_ffn_t, ctx)
+    var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
+    var lb_ffn2_dx = _base_dx(gb_ffn2.d_y, w.ffn2_w[], S, ffn, dim, ctx)
+    var ffn2_g = _wan_lora_bwd_device(lora.ffn2, gb_ffn2.d_y, lsv_ffn_act, S, ffn, dim, ctx)
+    var d_ffn_act = _fold_lora_dx(lb_ffn2_dx, ffn2_g, ctx)
+    var lsv_ffn_h = _tbf16(saved.ffn_h.copy(), [S, ffn], ctx)
+    var d_ffn_h = gelu_backward(d_ffn_act, lsv_ffn_h, ctx)
+    var lsv_ffn_in = _tbf16(saved.ffn_in.copy(), [S, dim], ctx)
+    var lb_ffn0_dx = _base_dx(d_ffn_h, w.ffn0_w[], S, dim, ffn, ctx)
+    var ffn0_g = _wan_lora_bwd_device(lora.ffn0, d_ffn_h, lsv_ffn_in, S, dim, ffn, ctx)
+    var d_ffn_in = _fold_lora_dx(lb_ffn0_dx, ffn0_g, ctx)
+    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
+    var lsv_x_ca = _tbf16(saved.x_ca.copy(), [S, dim], ctx)
+    var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, lsv_x_ca, ones_t, eps, ctx)
+    var d_x_ca = TArc(add(d_x_ca_resid[], lnb_ffn, ctx))
+
+    # ════════════════ Cross-attention backward (LoRA q/k/v/o) ════════════════
+    var lb_cao_dx = _base_dx(d_x_ca[], w.ca_wo[], S, dim, dim, ctx)
+    var ca_o_g = _wan_lora_bwd_device(lora.ca_o, d_x_ca[], sv_lora_ca_att, S, dim, dim, ctx)
+    var d_ca_att = _fold_lora_dx(lb_cao_dx, ca_o_g, ctx)
+    var d_ca_att4 = reshape(d_ca_att, [1, S, H, Dh], ctx)
+
+    var lsv_ca_q_rms = _tbf16(saved.ca_q_rms.copy(), [1, S, H, Dh], ctx)
+    var lsv_ca_k_rms = _tbf16(saved.ca_k_rms.copy(), [1, TXT, H, Dh], ctx)
+    var lsv_ca_v = _tbf16(saved.ca_v.copy(), [1, TXT, H, Dh], ctx)
+    var csb = sdpa_backward_rect[1, S, TXT, H, Dh](
+        lsv_ca_q_rms, lsv_ca_k_rms, lsv_ca_v, d_ca_att4, scale, ctx,
+    )
+    var d_caq_rms_flat = reshape(csb.d_q, [S, dim], ctx)
+    var lsv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [S, dim], ctx)
+    var rb_caq_dx = rms_norm_backward_dx(d_caq_rms_flat, lsv_ca_q_pre, w.ca_qn[], eps, ctx)
+    var d_cak_rms_flat = reshape(csb.d_k, [TXT, dim], ctx)
+    var lsv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [TXT, dim], ctx)
+    var rb_cak_dx = rms_norm_backward_dx(d_cak_rms_flat, lsv_ca_k_pre, w.ca_kn[], eps, ctx)
+    var d_cav_flat = reshape(csb.d_v, [TXT, dim], ctx)
+
+    var lb_caq_dx = _base_dx(rb_caq_dx, w.ca_wq[], S, dim, dim, ctx)
+    var lb_cak_dx = _base_dx(rb_cak_dx, w.ca_wk[], TXT, dim, dim, ctx)
+    var lb_cav_dx = _base_dx(d_cav_flat, w.ca_wv[], TXT, dim, dim, ctx)
+    var ca_q_g = _wan_lora_bwd_device(lora.ca_q, rb_caq_dx, sv_lora_ca_n3, S, dim, dim, ctx)
+    var ca_k_g = _wan_lora_bwd_device(lora.ca_k, rb_cak_dx, sv_lora_context, TXT, dim, dim, ctx)
+    var ca_v_g = _wan_lora_bwd_device(lora.ca_v, d_cav_flat, sv_lora_context, TXT, dim, dim, ctx)
+    var d_n3_in = _fold_lora_dx(lb_caq_dx, ca_q_g, ctx)
+    var d_ctx_base = add(lb_cak_dx, lb_cav_dx, ctx)
+    var d_ctx_lora = add(ca_k_g.d_x[], ca_v_g.d_x[], ctx)
+    var d_context_t = TArc(add(d_ctx_base, d_ctx_lora, ctx))
+
+    var lsv_x_sa = _tbf16(saved.x_sa.copy(), [S, dim], ctx)
+    var lnb_n3_dx = layer_norm_backward_dx(d_n3_in, lsv_x_sa, w.n3_w[], eps, ctx)
+    var d_x_sa = TArc(add(lnb_n3_dx, d_x_ca[], ctx))
+
+    # ════════════════ Self-attention backward (LoRA q/k/v/o) ════════════════
+    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var sa_out_rc = linear(sv_lora_sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
+    var lb_sao_dx = _base_dx(gb_sa.d_y, w.sa_wo[], S, dim, dim, ctx)
+    var sa_o_g = _wan_lora_bwd_device(lora.sa_o, gb_sa.d_y, sv_lora_sa_att, S, dim, dim, ctx)
+    var d_sa_att = _fold_lora_dx(lb_sao_dx, sa_o_g, ctx)
+    var d_sa_att4 = reshape(d_sa_att, [1, S, H, Dh], ctx)
+
+    var lsv_sa_q_rope = _tbf16(saved.sa_q_rope.copy(), [1, S, H, Dh], ctx)
+    var lsv_sa_k_rope = _tbf16(saved.sa_k_rope.copy(), [1, S, H, Dh], ctx)
+    var lsv_sa_v = _tbf16(saved.sa_v.copy(), [1, S, H, Dh], ctx)
+    var ssb = sdpa_backward[1, S, H, Dh](
+        lsv_sa_q_rope, lsv_sa_k_rope, lsv_sa_v, d_sa_att4, scale, ctx,
+    )
+    var ssb_dq_f32 = cast_tensor(ssb.d_q, STDtype.F32, ctx)
+    var ssb_dk_f32 = cast_tensor(ssb.d_k, STDtype.F32, ctx)
+    var d_q_rms = rope_backward(ssb_dq_f32, cos_e, sin_e, True, ctx)
+    var d_k_rms = rope_backward(ssb_dk_f32, cos_e, sin_e, True, ctx)
+    var d_q_rms_b = cast_tensor(d_q_rms, STDtype.BF16, ctx)
+    var d_q_rms_flat = reshape(d_q_rms_b, [S, dim], ctx)
+    var lsv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [S, dim], ctx)
+    var rb_saq_dx = rms_norm_backward_dx(d_q_rms_flat, lsv_sa_q_pre, w.sa_qn[], eps, ctx)
+    var d_k_rms_b = cast_tensor(d_k_rms, STDtype.BF16, ctx)
+    var d_k_rms_flat = reshape(d_k_rms_b, [S, dim], ctx)
+    var lsv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [S, dim], ctx)
+    var rb_sak_dx = rms_norm_backward_dx(d_k_rms_flat, lsv_sa_k_pre, w.sa_kn[], eps, ctx)
+    var d_sav_flat = reshape(ssb.d_v, [S, dim], ctx)
+
+    var lb_saq_dx = _base_dx(rb_saq_dx, w.sa_wq[], S, dim, dim, ctx)
+    var lb_sak_dx = _base_dx(rb_sak_dx, w.sa_wk[], S, dim, dim, ctx)
+    var lb_sav_dx = _base_dx(d_sav_flat, w.sa_wv[], S, dim, dim, ctx)
+    var sa_q_g = _wan_lora_bwd_device(lora.sa_q, rb_saq_dx, sv_lora_sa_in, S, dim, dim, ctx)
+    var sa_k_g = _wan_lora_bwd_device(lora.sa_k, rb_sak_dx, sv_lora_sa_in, S, dim, dim, ctx)
+    var sa_v_g = _wan_lora_bwd_device(lora.sa_v, d_sav_flat, sv_lora_sa_in, S, dim, dim, ctx)
+    var d_sa_in_base = add(add(lb_saq_dx, lb_sak_dx, ctx), lb_sav_dx, ctx)
+    var d_sa_in_lora = add(add(sa_q_g.d_x[], sa_k_g.d_x[], ctx), sa_v_g.d_x[], ctx)
+    var d_sa_in = TArc(add(d_sa_in_base, d_sa_in_lora, ctx))
+
+    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var lsv_sa_ln = _tbf16(saved.sa_ln.copy(), [S, dim], ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var lsv_x = _tbf16(saved.x.copy(), [S, dim], ctx)
+    var lnb_sa = layer_norm_backward_dx(mb_sa.d_ln, lsv_x, ones_t, eps, ctx)
+    var d_x = add(lnb_sa, d_x_resid[], ctx)
+
+    # scatter 10 adapters into flat slot order (W_SA_Q..W_FFN2 == 0..9)
+    var d_a = List[Optional[TArc]]()
+    var d_b = List[Optional[TArc]]()
+    _push_dev_slot(d_a, d_b, sa_q_g)
+    _push_dev_slot(d_a, d_b, sa_k_g)
+    _push_dev_slot(d_a, d_b, sa_v_g)
+    _push_dev_slot(d_a, d_b, sa_o_g)
+    _push_dev_slot(d_a, d_b, ca_q_g)
+    _push_dev_slot(d_a, d_b, ca_k_g)
+    _push_dev_slot(d_a, d_b, ca_v_g)
+    _push_dev_slot(d_a, d_b, ca_o_g)
+    _push_dev_slot(d_a, d_b, ffn0_g)
+    _push_dev_slot(d_a, d_b, ffn2_g)
+
+    return WanBlockLoraDeviceGrads(d_x^, d_context_t[].clone(ctx), d_a^, d_b^)
 
 
 # ── FORWARD of one Wan2.2 block WITH DIRECT DoRA/OFT ─────────────────────────

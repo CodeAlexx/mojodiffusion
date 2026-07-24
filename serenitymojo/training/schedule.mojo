@@ -250,19 +250,29 @@ def _sigmoid64(x: Float64) -> Float64:
 # ─────────────────────────────────────────────────────────────────────────────
 # T6.1 — Timestep sampling: logit-normal then qwen-shift remap.
 # ─────────────────────────────────────────────────────────────────────────────
-def sample_timestep_logit_normal(seed: UInt64, shift: Float32) -> Float32:
+def sample_timestep_logit_normal(
+    seed: UInt64,
+    shift: Float32,
+    min_noising_strength: Float64 = Float64(1.0) / Float64(1000.0),
+    max_noising_strength: Float64 = Float64(1.0),
+) -> Float32:
     """Sample one training timestep: t = sigmoid(N(0,1)) then qwen-shift remap.
 
     Matches the EDv2 qwenimage trainer default path EXACTLY:
       - `TimestepDistribution::LogitNormal` with weight=0 (scale=1.0), bias=0
         degenerates to `t = sigmoid(N(0,1))` (timestep_dist.rs:181-189).
       - `apply_qwen_shift(t, shift)` = `shift*t / (1 + (shift-1)*t)`, clamped to
-        [1/1000, 1] (train_qwenimage.rs:411-414).
+        [min_noising_strength, max_noising_strength] (train_qwenimage.rs:411-414).
     With shift=1.0 (SerenityTrainer qwen preset default) the remap is the identity, so
-    the output is exactly sigmoid(N(0,1)) clamped to [1/1000, 1].
+    the output is exactly sigmoid(N(0,1)) clamped to the strength window.
+
+    The clamp bounds are config-driven (min/max_noising_strength, the OneTrainer
+    noising-strength window). The DEFAULTS are the exact F64 expressions the clamp
+    used when it was hardcoded — `1/1000` and `1` — so a config that omits them (or
+    passes the defaults) is byte-identical to the pre-config path (C13).
 
     `seed` selects the deterministic draw (caller advances it per step). Returns
-    sigma in [1/1000, 1].
+    sigma in [min_noising_strength, max_noising_strength].
     """
     var ks = _expand_key(seed)
     var d = _standard_normal_at(
@@ -271,12 +281,29 @@ def sample_timestep_logit_normal(seed: UInt64, shift: Float32) -> Float32:
     var t = _sigmoid64(d.z)  # logit-normal, scale=1, bias=0
     var shift64 = Float64(shift)
     var shifted = shift64 * t / (Float64(1.0) + (shift64 - Float64(1.0)) * t)
-    # clamp to [1/1000, 1] (train_qwenimage.rs apply_qwen_shift).
-    if shifted < Float64(1.0) / Float64(1000.0):
-        shifted = Float64(1.0) / Float64(1000.0)
-    if shifted > Float64(1.0):
-        shifted = Float64(1.0)
+    # clamp to [min_noising_strength, max_noising_strength]; defaults = the old
+    # hardcoded apply_qwen_shift window (train_qwenimage.rs), byte-for-byte.
+    if shifted < min_noising_strength:
+        shifted = min_noising_strength
+    if shifted > max_noising_strength:
+        shifted = max_noising_strength
     return Float32(shifted)
+
+
+def sample_timestep_logit_normal_win(
+    seed: UInt64, shift: Float32, min_s: Float32, max_s: Float32
+) -> Float32:
+    """Config-threaded logit-normal draw: `min_s`/`max_s` are the TrainConfig
+    min/max_noising_strength (sentinel -1 = unset). An unset bound falls back to
+    the built-in [1/1000, 1] window computed in F64, so an all-unset config is
+    byte-identical to the 2-arg path (C13). A set bound overrides it."""
+    var lo = Float64(1.0) / Float64(1000.0)
+    var hi = Float64(1.0)
+    if min_s >= Float32(0.0):
+        lo = Float64(min_s)
+    if max_s >= Float32(0.0):
+        hi = Float64(max_s)
+    return sample_timestep_logit_normal(seed, shift, lo, hi)
 
 
 def _uniform_index(seed: UInt64, high_exclusive: Int) -> Int:

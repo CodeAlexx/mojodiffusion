@@ -1190,6 +1190,10 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.timestep_noising_weight = Float32(_read_scalar(cur).num)
         elif key == "timestep_noising_bias" or key == "noising_bias":
             cfg.timestep_noising_bias = Float32(_read_scalar(cur).num)
+        elif key == "min_noising_strength":
+            cfg.min_noising_strength = Float32(_read_scalar(cur).num)
+        elif key == "max_noising_strength":
+            cfg.max_noising_strength = Float32(_read_scalar(cur).num)
         # ── Wave 2B: caption dropout ──
         elif key == "caption_dropout_prob":
             cfg.caption_dropout_prob = Float32(_read_scalar(cur).num)

@@ -93,6 +93,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.training.schedule import (
     sample_timestep_logit_normal, flow_match_noise_target,
+    sample_timestep_logit_normal_win,
 )
 from serenitymojo.training.levers import levers_loss_grad
 from serenitymojo.training.klein_dataset import (
@@ -835,7 +836,9 @@ def main() raises:
         var t0 = perf_counter_ns()
 
         # sigma stream: seed + step (levers.mojo:104 stream convention).
-        var sigma = sample_timestep_logit_normal(seed + UInt64(step), train_shift)
+        var sigma = sample_timestep_logit_normal_win(
+            seed + UInt64(step), train_shift,
+            cfg.min_noising_strength, cfg.max_noising_strength)
 
         var x0: List[Float32]
         var txt_raw: List[Float32]

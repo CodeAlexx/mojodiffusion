@@ -218,8 +218,9 @@ def weighted_combined_loss(
     mse_strength: Float32,
     mae_strength: Float32,
     huber_strength: Float32,
+    log_cosh_strength: Float32 = Float32(0.0),
 ) raises -> Float32:
-    var base = combined_loss_value(pred, target, mse_strength, mae_strength, huber_strength)
+    var base = combined_loss_value(pred, target, mse_strength, mae_strength, huber_strength, log_cosh_strength)
     var w = apply_loss_weight(sigma, min_snr_gamma, debiased, True)
     return base * w
 

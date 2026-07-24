@@ -1181,6 +1181,8 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.loss_mae_strength = Float32(_read_scalar(cur).num)
         elif key == "loss_huber_strength" or key == "huber_strength":
             cfg.loss_huber_strength = Float32(_read_scalar(cur).num)
+        elif key == "loss_log_cosh_strength" or key == "log_cosh_strength":
+            cfg.loss_log_cosh_strength = Float32(_read_scalar(cur).num)
         # ── T1.A: torch-semantics loss fn + flow min-SNR-γ (levers.mojo) ──
         elif key == "loss_fn":
             var sc = _read_scalar(cur)

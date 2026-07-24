@@ -245,6 +245,7 @@ struct TrainConfig(Copyable, Movable):
     var loss_mse_strength: Float32
     var loss_mae_strength: Float32
     var loss_huber_strength: Float32
+    var loss_log_cosh_strength: Float32   # combined-loss log-cosh term (default 0)
 
     # ── T1.A loss levers (default-off == the trainers' existing MSE math) ──
     # loss_fn: LOSS_FN_MSE | LOSS_FN_HUBER | LOSS_FN_SMOOTH_L1 (torch
@@ -664,6 +665,7 @@ struct TrainConfig(Copyable, Movable):
             loss_mse_strength=Float32(1.0),  # MSE-only (default-off)
             loss_mae_strength=Float32(0.0),
             loss_huber_strength=Float32(0.0),
+            loss_log_cosh_strength=Float32(0.0),
             loss_fn=LOSS_FN_MSE,             # T1.A: mse (default-off)
             huber_delta=Float32(1.0),
             smooth_l1_beta=Float32(1.0),
@@ -784,6 +786,7 @@ struct TrainConfig(Copyable, Movable):
         lr_scheduler: Int, lr_warmup_steps: Int, lr_min_factor: Float32, lr_cycles: Float32,
         min_snr_gamma: Float32, debiased: Bool,
         loss_mse_strength: Float32, loss_mae_strength: Float32, loss_huber_strength: Float32,
+        loss_log_cosh_strength: Float32,
         loss_fn: Int, huber_delta: Float32, smooth_l1_beta: Float32,
         min_snr_gamma_flow: Float32,
         timestep_bias_strategy: Int, timestep_bias_multiplier: Float32,
@@ -984,6 +987,7 @@ struct TrainConfig(Copyable, Movable):
         self.loss_mse_strength = loss_mse_strength
         self.loss_mae_strength = loss_mae_strength
         self.loss_huber_strength = loss_huber_strength
+        self.loss_log_cosh_strength = loss_log_cosh_strength
         self.loss_fn = loss_fn
         self.huber_delta = huber_delta
         self.smooth_l1_beta = smooth_l1_beta

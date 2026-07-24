@@ -19,7 +19,7 @@
 #
 # Mojo 1.0.0b1.
 
-from std.math import sqrt
+from std.math import sqrt, exp, log, tanh
 
 
 comptime _SIGMA_FLOOR = Float32(1.0e-8)
@@ -127,11 +127,21 @@ def _huber1_elem(x: Float32) -> Float32:
     return sq + lin
 
 
+def _log_cosh_elem(x: Float32) -> Float32:
+    """log(cosh(x)), overflow-stable: |x| + log(1 + exp(-2|x|)) - log(2). grad =
+    tanh(x). exp(-2|x|) in (0,1] so no overflow. log_cosh_s=0 => term never
+    contributes (byte-identical to the pre-log-cosh combined loss)."""
+    var ax = abs(x)
+    return ax + log(Float32(1.0) + exp(Float32(-2.0) * ax)) - log(Float32(2.0))
+
+
 def combined_loss_value(
     pred: List[Float32], target: List[Float32],
     mse_s: Float32, mae_s: Float32, huber_s: Float32,
+    log_cosh_s: Float32 = Float32(0.0),
 ) raises -> Float32:
-    """Combined MSE+MAE+Huber loss value (mean-reduced). Mirrors loss_weight.rs:162."""
+    """Combined MSE+MAE+Huber+log-cosh loss value (mean-reduced). Mirrors
+    loss_weight.rs:162; the log-cosh term (default 0) is additive on top."""
     var n = len(pred)
     if len(target) != n:
         raise Error("combined_loss_value: pred/target len mismatch")
@@ -140,24 +150,29 @@ def combined_loss_value(
     var sum_sq = Float32(0.0)
     var sum_abs = Float32(0.0)
     var sum_hub = Float32(0.0)
+    var sum_lc = Float32(0.0)
     for i in range(n):
         var x = pred[i] - target[i]
         sum_sq += x * x
         sum_abs += abs(x)
         sum_hub += _huber1_elem(x)
+        sum_lc += _log_cosh_elem(x)
     var invn = Float32(1.0) / Float32(n)
-    return mse_s * (sum_sq * invn) + mae_s * (sum_abs * invn) + huber_s * (sum_hub * invn)
+    return (mse_s * (sum_sq * invn) + mae_s * (sum_abs * invn)
+            + huber_s * (sum_hub * invn) + log_cosh_s * (sum_lc * invn))
 
 
 @always_inline
 def combined_loss_grad_elem(
-    x: Float32, n: Int, mse_s: Float32, mae_s: Float32, huber_s: Float32
+    x: Float32, n: Int, mse_s: Float32, mae_s: Float32, huber_s: Float32,
+    log_cosh_s: Float32 = Float32(0.0),
 ) -> Float32:
     """d(combined_loss)/d(pred_i), x = pred_i - target_i. (Wave 2A item 2c.)
 
-    = mse_s*2x/N + mae_s*sign(x)/N + huber_s*clamp(x,-1,1)/N.
+    = mse_s*2x/N + mae_s*sign(x)/N + huber_s*clamp(x,-1,1)/N + log_cosh_s*tanh(x)/N.
     The Huber term's grad is clamp(x,-1,1) (= x for |x|<=1 else sign(x)), the
-    derivative of the closed-form δ=1 Huber; identical to huber_backward(δ=1)."""
+    derivative of the closed-form δ=1 Huber; identical to huber_backward(δ=1).
+    log-cosh's grad is exactly tanh(x) (default log_cosh_s=0 => byte-identical)."""
     var invn = Float32(1.0) / Float32(n)
     var sgn = Float32(0.0)
     if x > Float32(0.0):
@@ -169,4 +184,5 @@ def combined_loss_grad_elem(
         clamped = Float32(1.0)
     elif clamped < Float32(-1.0):
         clamped = Float32(-1.0)
-    return (mse_s * Float32(2.0) * x + mae_s * sgn + huber_s * clamped) * invn
+    return (mse_s * Float32(2.0) * x + mae_s * sgn + huber_s * clamped
+            + log_cosh_s * tanh(x)) * invn

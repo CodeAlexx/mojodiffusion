@@ -565,6 +565,106 @@ def leaky_relu(
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
+# ── prelu ────────────────────────────────────────────────────────────────────
+#   prelu(x)[.., c] = x if x >= 0 else alpha[c]*x   (torch.nn.PReLU, per-channel)
+# alpha is a length-C F32 vector; C = x's innermost (NHWC channel) dim. Same
+# math as leaky_relu but the negative slope is looked up per channel. Scalar
+# math in F32; alpha is always F32 (PReLU params are tiny — no dtype branch).
+def _prelu_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+    C: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float32]](x[i])
+        var s = rebind[Scalar[DType.float32]](a[i % C])
+        o[i] = rebind[o.element_type](v if v >= Float32(0.0) else s * v)
+
+
+def _prelu_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    n: Int,
+    C: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
+        var s = rebind[Scalar[DType.float32]](a[i % C])
+        var r = v if v >= Float32(0.0) else s * v
+        o[i] = rebind[o.element_type](r.cast[DType.bfloat16]())
+
+
+def _prelu_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    n: Int,
+    C: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
+        var s = rebind[Scalar[DType.float32]](a[i % C])
+        var r = v if v >= Float32(0.0) else s * v
+        o[i] = rebind[o.element_type](r.cast[DType.float16]())
+
+
+def prelu(x: Tensor, alpha: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """prelu(x)[..,c] = x if x>=0 else alpha[c]*x (per-channel; alpha is F32 [C])."""
+    var sh = x.shape()
+    var C = sh[len(sh) - 1]
+    if alpha.dtype().to_mojo_dtype() != DType.float32:
+        raise Error("prelu: alpha must be F32")
+    if alpha.numel() != C:
+        raise Error("prelu: alpha length must equal channel count (last NHWC dim)")
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var al = RuntimeLayout[_DYN1].row_major(IndexList[1](C))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        alpha.buf.unsafe_ptr().bitcast[Float32](), al
+    )
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_prelu_kernel_f32, _prelu_kernel_f32](
+            X, A, O, n, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_prelu_kernel_bf16, _prelu_kernel_bf16](
+            X, A, O, n, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_prelu_kernel_f16, _prelu_kernel_f16](
+            X, A, O, n, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
 # ── swiglu ─────────────────────────────────────────────────────────────────
 def _swiglu_kernel_f32(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],

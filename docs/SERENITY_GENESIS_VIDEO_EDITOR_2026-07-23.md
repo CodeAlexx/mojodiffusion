@@ -61,10 +61,11 @@ The integrated routes are:
 | `POST /video_edit/projects/:id/import_clip` | imports media and probes its frame count |
 | `POST /video_edit/preview` | renders a composed/effected timeline frame through Genesis |
 | `POST /video_edit/preview_effect` | renders one source frame with browser effect controls |
-| `GET/POST /video_edit/luts[/upload]` | lists or imports `.cube` LUTs |
+| `GET/POST /video_edit/luts[/upload]` | discovers grouped `.cube` libraries or imports a LUT |
 | `POST /video_edit/luts/preview` | renders a LUT comparison frame |
 | `POST /video_edit/thumbnails` | creates cached per-second thumbnail sprites |
 | `POST /video_edit/waveform` | returns audio peaks or a duration-correct flat envelope |
+| `POST /video_edit/audio_analysis` | returns assembled stereo levels, 256 spectrum bins, and 256 program samples |
 | `POST /video_edit/export` | starts an asynchronous Genesis render |
 | `GET /video_edit/export/:id` | supplies browser-polled terminal export state |
 | `GET /video_edit/media/*path` | serves project/absolute media with byte ranges |
@@ -90,14 +91,16 @@ editor without launching or embedding egui:
     speed/reverse, gain and audio FX/graphic EQ, grading, color wheels, white
     balance, transform/blur, curves, HSL/levels, stylization, distortion,
     geometry, 360 reframe, shape mask, selective color, look/LUT, chroma key,
-    title text, transitions, keyframes, clip operations, program grade, and
-    export, replacement media, clip grouping, track management, and subtitles;
+    title text, transitions, keyframes, clip operations, program grade, named
+    export presets, replacement media, clip grouping, removable track
+    management, subtitles, a grouped LUT library, and a second track mixer;
   - **Filters** derives a real active stack from Genesis identity values and
     provides 25 searchable add/reset groups;
   - **Scopes** calculates RGB histogram, luma waveform, vectorscope, and RGB
     parade from the current composited program frame;
-  - **Audio** shows a decoded source waveform and a track mixer whose
-    level/pan/mute/solo values reach the Genesis worker;
+  - **Audio** shows Genesis-assembled program stereo meters, spectrum and
+    time-domain waveform alongside the decoded source envelope and a track
+    mixer whose level/pan/mute/solo values reach the Genesis worker;
 - a dedicated timeline toolbar for split, razor-all, lift, ripple delete,
   copy, paste, duplicate, markers, snapping, track creation, and zoom-to-fit;
 - multitrack headers with visibility, mute, and lock controls plus video
@@ -127,6 +130,21 @@ filter, mixer, transition, keyframe, and LUT changes persist with the browser
 project and request a fresh Genesis preview. Export carries the selected
 browser format/resolution/FPS/quality plus native GOP, preset, audio bitrate,
 and audio codec depth settings.
+
+LUT discovery is relocatable and deduplicated by canonical file path. The
+server always includes the per-output upload directory, discovers the
+repository-adjacent `MojoMedia/luts` and `serenityflow-v2/output/luts`
+libraries when present, and accepts additional path lists through
+`SERENITY_VIDEO_LUT_DIRS` plus the compatible `GENESIS_LUT_DIR` variable. The
+UI groups choices by source, displays library/LUT counts, imports `.cube` files
+into Serenity uploads, and provides a real clear action. Missing optional
+directories are skipped and no absolute home path is compiled into the server.
+
+Two native Genesis commands remain outside the current browser project schema:
+compound sub-sequences and automatic audio alignment. Serenity does not show
+decorative buttons for either command. They require representing upstream
+`subseqs` and selected native clip indices in the browser adapter before they
+can be truthfully wired.
 
 The top toolbar exposes direct `+ Video`, `+ Music`, Save, undo/redo, Retake,
 and Render actions.
@@ -163,8 +181,9 @@ Observed gates:
 - the browser `+ Video` action imported and probed exactly 121 frames at 25 FPS;
 - the exact saved project exposed 143 native Genesis controls, two real
   replacement-media choices, two track-management rows, a subtitle editor,
-  25 searchable native filter groups, four calculated video scopes, and two
-  mixer strips;
+  25 searchable native filter groups, four calculated video scopes, two
+  mixer strips, named export/resolution presets, program-grade key actions,
+  and removable track controls;
 - the Genesis-style workspace exposed the media bin, Program/Source monitors,
   twelve real timeline actions, and four persistent dock tabs;
 - marker, snap off/on, copy/paste/undo, and mixer mute/unmute interactions all
@@ -178,6 +197,13 @@ Observed gates:
   the property again restored the edited hash;
 - the browser `+ Music` action imported a real 5.8-second WAV as 145
   25-FPS timeline frames and loaded at least 170 non-silent waveform buckets;
+- LUT discovery exposed 40 real files in three grouped libraries on the test
+  machine (41 selector choices including `None`); applying `Warm Cinematic`
+  changed the rendered preview hash and clearing it restored the exact base
+  pixels;
+- the program-audio API returned audible stereo levels, 256 spectrum bins, and
+  256 waveform samples, and Playwright measured non-background pixels in both
+  corresponding canvases;
 - the browser-persisted project retained native `genesis.sat = 0`;
 - browser selection export produced H.264 at exactly 512x768, 25 FPS, 121
   frames, and 4.842 seconds plus stereo 48 kHz AAC; `volumedetect` measured the
@@ -198,7 +224,10 @@ The machine-readable result and visual evidence are written to:
 - `output/checks/genesis_browser/native-properties-e2e-followup/editor.png`;
 - `output/checks/genesis_browser/native-properties-e2e-followup/export-contact.png`;
 - `output/checks/genesis_browser/native-four-tab-final-followup/saved-project-result.json`;
-- `output/checks/genesis_browser/native-four-tab-final-followup/saved-project.png`.
+- `output/checks/genesis_browser/native-four-tab-final-followup/saved-project.png`;
+- `output/checks/genesis_browser/native-lut-audio-parity/result.json`;
+- `output/checks/genesis_browser/native-lut-audio-parity/editor.png`;
+- `output/checks/genesis_browser/native-lut-audio-parity/export-contact.png`.
 
 Generated test projects, previews, exports, profiles, and installed binaries
 remain beneath ignored `output/` or `/tmp`; source control contains the code,

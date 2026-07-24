@@ -4739,6 +4739,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/video_edit/thumbnails", post(video_edit::post_thumbnails))
         .route("/video_edit/waveform", post(video_edit::post_waveform))
+        .route(
+            "/video_edit/audio_analysis",
+            post(video_edit::post_audio_analysis)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/video_edit/export", post(video_edit::post_export))
         .route("/video_edit/export/:id", get(video_edit::get_export))
         .route("/video_edit/media/*path", get(video_edit::get_media))

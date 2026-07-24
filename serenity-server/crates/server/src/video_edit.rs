@@ -6,7 +6,7 @@
 //! - `genesis-gcompose` is a separate Rust/C/FFmpeg/OpenCL process;
 //! - no Mojo code or native Genesis window participates in this path.
 
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -922,44 +922,162 @@ fn lut_dir(state: &AppState) -> PathBuf {
     state.out_dir.join("video_luts")
 }
 
+fn lut_library_dirs(state: &AppState) -> Vec<(String, PathBuf)> {
+    let mut dirs = vec![("Serenity uploads".to_string(), lut_dir(state))];
+
+    for (variable, label) in [
+        ("SERENITY_VIDEO_LUT_DIRS", "Configured"),
+        ("GENESIS_LUT_DIR", "Genesis"),
+    ] {
+        if let Some(value) = std::env::var_os(variable) {
+            for path in std::env::split_paths(&value) {
+                let source = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(label);
+                dirs.push((source.to_string(), path));
+            }
+        }
+    }
+
+    // Discover adjacent workspace libraries from Serenity's configured output
+    // root. This stays relocatable: no user/home path is compiled into the
+    // server, and explicit environment directories above always work on other
+    // machines.
+    if let Some(output_root) = state.out_dir.parent() {
+        if let Some(repo_root) = output_root.parent() {
+            dirs.push(("Project".to_string(), repo_root.join("luts")));
+            dirs.push(("Project assets".to_string(), repo_root.join("assets/luts")));
+            if let Some(workspace_root) = repo_root.parent() {
+                dirs.push((
+                    "MojoMedia".to_string(),
+                    workspace_root.join("MojoMedia/luts"),
+                ));
+                dirs.push((
+                    "SerenityFlow".to_string(),
+                    workspace_root.join("serenityflow-v2/output/luts"),
+                ));
+            }
+        }
+    }
+    dirs
+}
+
 pub async fn get_luts(State(state): State<AppState>) -> Response {
-    let dir = lut_dir(&state);
-    if let Err(e) = fs::create_dir_all(&dir) {
+    let upload_dir = lut_dir(&state);
+    if let Err(e) = fs::create_dir_all(&upload_dir) {
         return json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("create LUT directory: {e}"),
         );
     }
     let mut luts = Vec::new();
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read LUT directory: {e}"),
-            )
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("cube") {
+    let mut seen_dirs = HashSet::new();
+    let mut seen_files = HashSet::new();
+    for (source, dir) in lut_library_dirs(&state) {
+        let Ok(canonical_dir) = dir.canonicalize() else {
+            continue;
+        };
+        if !canonical_dir.is_dir() || !seen_dirs.insert(canonical_dir.clone()) {
             continue;
         }
-        let name = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("LUT");
-        luts.push(json!({
-            "name": name,
-            "path": path.to_string_lossy()
-        }));
+        let Ok(entries) = fs::read_dir(&canonical_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_cube = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cube"));
+            if !is_cube {
+                continue;
+            }
+            let Ok(canonical_path) = path.canonicalize() else {
+                continue;
+            };
+            if !canonical_path.is_file() || !seen_files.insert(canonical_path.clone()) {
+                continue;
+            }
+            let name = canonical_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("LUT");
+            luts.push(json!({
+                "name": name,
+                "path": canonical_path.to_string_lossy(),
+                "source": source
+            }));
+        }
     }
     luts.sort_by(|a, b| {
-        a.get("name")
-            .and_then(JsonValue::as_str)
-            .cmp(&b.get("name").and_then(JsonValue::as_str))
+        (
+            a.get("source").and_then(JsonValue::as_str),
+            a.get("name").and_then(JsonValue::as_str),
+        )
+            .cmp(&(
+                b.get("source").and_then(JsonValue::as_str),
+                b.get("name").and_then(JsonValue::as_str),
+            ))
     });
     Json(luts).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ProgramAudioRequest {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    project: Option<JsonValue>,
+    frame: i64,
+}
+
+pub async fn post_audio_analysis(
+    State(state): State<AppState>,
+    Json(request): Json<ProgramAudioRequest>,
+) -> Response {
+    ensure_genesis_environment(&state);
+    let web = match request.project {
+        Some(value) => value,
+        None => {
+            let Some(id) = request.project_id.as_deref() else {
+                return json_error(StatusCode::BAD_REQUEST, "project or project_id is required");
+            };
+            match read_project(&state, id) {
+                Ok(value) => value,
+                Err(e) => return json_error(StatusCode::NOT_FOUND, e),
+            }
+        }
+    };
+    let project = match web_project_to_genesis(&state, request.project_id.as_deref(), &web) {
+        Ok(project) => project,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
+    };
+    let frame = request.frame.max(0);
+    match tokio::task::spawn_blocking(move || {
+        let levels = genesis_web::worker::program_levels(&project, frame);
+        let spectrum = genesis_web::worker::program_spectrum(&project, frame);
+        let samples = genesis_web::worker::program_samples(&project, frame);
+        json!({
+            "levels": levels.map(|value| json!({
+                "peak_l": value.peak_l,
+                "peak_r": value.peak_r,
+                "rms_l": value.rms_l,
+                "rms_r": value.rms_r
+            })),
+            "spectrum": spectrum,
+            "samples": samples
+        })
+    })
+    .await
+    {
+        Ok(analysis) => Json(analysis).into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Genesis program-audio analysis task failed: {e}"),
+        ),
+    }
 }
 
 pub async fn post_lut_upload(State(state): State<AppState>, mut multipart: Multipart) -> Response {

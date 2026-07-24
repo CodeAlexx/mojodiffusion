@@ -430,6 +430,7 @@ var VideoEditTab = (function () {
 
     var waveformCache = new Map();    // clipId -> { peaks[], sample_rate, duration_seconds }
     var waveformLoading = new Set();  // clipIds currently loading
+    var programAudioAnalysisSequence = 0;
 
     var audioElements = new Map();    // clipId -> HTMLAudioElement
 
@@ -1509,6 +1510,25 @@ var VideoEditTab = (function () {
         state[trackName].sort(function (a, b) { return a.t - b.t; });
     }
 
+    function projectMasterGainAt(frame) {
+        var keys = ensureGenesisProjectState().gain_kf.slice().sort(function (a, b) {
+            return a.t - b.t;
+        });
+        if (!keys.length) return 1;
+        if (frame <= keys[0].t) return Number(keys[0].v);
+        if (frame >= keys[keys.length - 1].t) return Number(keys[keys.length - 1].v);
+        for (var index = 1; index < keys.length; index++) {
+            if (frame > keys[index].t) continue;
+            var left = keys[index - 1];
+            var right = keys[index];
+            if (left.interp === 'Discrete') return Number(left.v);
+            var amount = (frame - left.t) / Math.max(1, right.t - left.t);
+            if (left.interp === 'Smooth') amount = amount * amount * (3 - 2 * amount);
+            return Number(left.v) + (Number(right.v) - Number(left.v)) * amount;
+        }
+        return 1;
+    }
+
     function renderGenesisProjectBlocks(panel) {
         var state = ensureGenesisProjectState();
         var details = document.createElement('details');
@@ -1561,6 +1581,53 @@ var VideoEditTab = (function () {
             row.appendChild(key);
             body.appendChild(row);
         });
+        var gradeActions = document.createElement('div');
+        gradeActions.className = 've-genesis-button-row';
+        [
+            ['Reset grade', function () {
+                pushUndo();
+                state.bright = 0;
+                state.contrast = 1;
+                state.sat = 1;
+                commitGenesisEdit();
+                renderPropertiesPanelContent(panel, findClipById(propsPanelClipId).clip);
+            }],
+            ['Key grade @ playhead', function () {
+                pushUndo();
+                ['bright', 'contrast', 'sat'].forEach(function (path) {
+                    addProjectGradeKey(path, state[path]);
+                });
+                scheduleAutosave();
+                renderPropertiesPanelContent(panel, findClipById(propsPanelClipId).clip);
+            }],
+            ['Key master gain @ playhead', function () {
+                pushUndo();
+                var value = projectMasterGainAt(currentFrame);
+                var key = { t: currentFrame, v: value, interp: 'Linear' };
+                var index = state.gain_kf.findIndex(function (candidate) {
+                    return candidate.t === currentFrame;
+                });
+                if (index >= 0) state.gain_kf[index] = key;
+                else state.gain_kf.push(key);
+                state.gain_kf.sort(function (a, b) { return a.t - b.t; });
+                scheduleAutosave();
+                renderPropertiesPanelContent(panel, findClipById(propsPanelClipId).clip);
+            }],
+        ].forEach(function (action) {
+            var button = document.createElement('button');
+            button.textContent = action[0];
+            button.addEventListener('click', action[1]);
+            gradeActions.appendChild(button);
+        });
+        body.appendChild(gradeActions);
+        var keyCounts = document.createElement('div');
+        keyCounts.className = 've-genesis-inline-status';
+        keyCounts.textContent =
+            'Keys · B ' + state.bright_kf.length +
+            ' · C ' + state.contrast_kf.length +
+            ' · S ' + state.sat_kf.length +
+            ' · G ' + state.gain_kf.length;
+        body.appendChild(keyCounts);
         var interp = document.createElement('select');
         [
             'Discrete', 'Linear', 'Smooth', 'SmoothNatural', 'SmoothLoose', 'SmoothTight',
@@ -1593,6 +1660,51 @@ var VideoEditTab = (function () {
         exportDetails.innerHTML = '<summary>Export</summary>';
         var exportBody = document.createElement('div');
         exportBody.className = 've-genesis-section-body';
+        var namedPresets = document.createElement('div');
+        namedPresets.className = 've-genesis-button-row ve-genesis-preset-row';
+        [
+            ['YouTube 1080p', 1920, 1080, 30, 1, 1, 21, 'libx264'],
+            ['YouTube 720p', 1280, 720, 30, 1, 1, 23, 'libx264'],
+            ['H.265 1080p', 1920, 1080, 30, 1, 1, 24, 'libx265'],
+            ['Default 1280×856', 1280, 856, 30, 1, 0, 4000000, 'mpeg4'],
+        ].forEach(function (preset) {
+            var button = document.createElement('button');
+            button.textContent = preset[0];
+            button.addEventListener('click', function () {
+                state.export.out_w = preset[1];
+                state.export.out_h = preset[2];
+                state.export.fps_num = preset[3];
+                state.export.fps_den = preset[4];
+                state.export.rate_mode = preset[5];
+                state.export.rate_value = preset[6];
+                if (preset[5] === 1) state.export.crf = preset[6];
+                state.export.vcodec = preset[7];
+                scheduleAutosave();
+                renderPropertiesPanelContent(panel, findClipById(propsPanelClipId).clip);
+            });
+            namedPresets.appendChild(button);
+        });
+        exportBody.appendChild(namedPresets);
+        var resolutionPresets = document.createElement('div');
+        resolutionPresets.className = 've-genesis-button-row ve-genesis-preset-row';
+        [
+            ['1280×856', 1280, 856],
+            ['1920×1080', 1920, 1080],
+            ['1280×720', 1280, 720],
+            ['854×480', 854, 480],
+            ['640×480', 640, 480],
+        ].forEach(function (preset) {
+            var button = document.createElement('button');
+            button.textContent = preset[0];
+            button.addEventListener('click', function () {
+                state.export.out_w = preset[1];
+                state.export.out_h = preset[2];
+                scheduleAutosave();
+                renderPropertiesPanelContent(panel, findClipById(propsPanelClipId).clip);
+            });
+            resolutionPresets.appendChild(button);
+        });
+        exportBody.appendChild(resolutionPresets);
         [
             ['out_w', 'Width', 16, 7680, 2],
             ['out_h', 'Height', 16, 4320, 2],
@@ -1718,10 +1830,44 @@ var VideoEditTab = (function () {
                 label.appendChild(document.createTextNode(spec[0]));
                 row.appendChild(label);
             });
+            if (project.tracks.length > 1) {
+                var remove = document.createElement('button');
+                remove.className = 've-genesis-track-remove';
+                remove.textContent = '×';
+                remove.title = 'Remove track and its clips';
+                remove.addEventListener('click', function () {
+                    if (track.clips.length && !window.confirm(
+                        'Remove "' + track.name + '" and its ' + track.clips.length + ' clip(s)?'
+                    )) return;
+                    pushUndo();
+                    track.clips.forEach(function (clip) {
+                        selectedClipIds.delete(clip.id);
+                    });
+                    var index = project.tracks.indexOf(track);
+                    if (index >= 0) project.tracks.splice(index, 1);
+                    recalcTotalFrames();
+                    resize();
+                    renderTimeline();
+                    renderMediaBin();
+                    scheduleAutosave();
+                    updatePreviewDebounced();
+                    renderDock();
+                });
+                row.appendChild(remove);
+            }
             tracksBody.appendChild(row);
         });
         tracksDetails.appendChild(tracksBody);
         panel.appendChild(tracksDetails);
+
+        var mixerDetails = document.createElement('details');
+        mixerDetails.className = 've-genesis-section';
+        mixerDetails.innerHTML = '<summary>Audio Mixer</summary>';
+        var mixerBody = document.createElement('div');
+        mixerBody.className = 've-genesis-section-body ve-genesis-mixer-body';
+        appendTrackMixer(mixerBody);
+        mixerDetails.appendChild(mixerBody);
+        panel.appendChild(mixerDetails);
 
         var subtitlesDetails = document.createElement('details');
         subtitlesDetails.className = 've-genesis-section';
@@ -1812,6 +1958,41 @@ var VideoEditTab = (function () {
         panel.appendChild(subtitlesDetails);
     }
 
+    function loadGenesisLutOptions(select, selectedPath, status) {
+        return fetch(getApiBase() + '/video_edit/luts')
+            .then(function (response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+            .then(function (luts) {
+                select.innerHTML = '<option value="">None</option>';
+                var groups = new Map();
+                luts.forEach(function (lut) {
+                    var source = lut.source || 'Library';
+                    var group = groups.get(source);
+                    if (!group) {
+                        group = document.createElement('optgroup');
+                        group.label = source;
+                        groups.set(source, group);
+                        select.appendChild(group);
+                    }
+                    var option = document.createElement('option');
+                    option.value = lut.path;
+                    option.textContent = lut.name;
+                    if (selectedPath === lut.path) option.selected = true;
+                    group.appendChild(option);
+                });
+                status.textContent = luts.length
+                    ? luts.length + ' LUTs · ' + groups.size + ' libraries'
+                    : 'No LUTs discovered. Upload a .cube or configure SERENITY_VIDEO_LUT_DIRS.';
+                return luts;
+            })
+            .catch(function (error) {
+                status.textContent = 'LUT discovery failed: ' + error.message;
+                throw error;
+            });
+    }
+
     function renderGenesisLutPicker(panel, clip) {
         var state = ensureGenesisClipState(clip);
         var details = document.createElement('details');
@@ -1822,17 +2003,10 @@ var VideoEditTab = (function () {
         var select = document.createElement('select');
         select.className = 've-lut-select';
         select.innerHTML = '<option value="">None</option>';
-        fetch(getApiBase() + '/video_edit/luts')
-            .then(function (response) { return response.json(); })
-            .then(function (luts) {
-                luts.forEach(function (lut) {
-                    var option = document.createElement('option');
-                    option.value = lut.path;
-                    option.textContent = lut.name;
-                    if (state.lut === lut.path || clip.lut_path === lut.path) option.selected = true;
-                    select.appendChild(option);
-                });
-            })
+        var status = document.createElement('div');
+        status.className = 've-genesis-inline-status';
+        status.textContent = 'Discovering LUT libraries…';
+        loadGenesisLutOptions(select, state.lut || clip.lut_path || '', status)
             .catch(function () {});
         select.addEventListener('change', function () {
             pushUndo();
@@ -1843,6 +2017,55 @@ var VideoEditTab = (function () {
             commitGenesisEdit();
         });
         body.appendChild(select);
+        var buttons = document.createElement('div');
+        buttons.className = 've-genesis-button-row';
+        var upload = document.createElement('button');
+        upload.textContent = 'Upload .cube…';
+        upload.addEventListener('click', function () {
+            var input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.cube';
+            input.addEventListener('change', function () {
+                if (!input.files || !input.files[0]) return;
+                var form = new FormData();
+                form.append('file', input.files[0]);
+                fetch(getApiBase() + '/video_edit/luts/upload', {
+                    method: 'POST',
+                    body: form,
+                })
+                .then(function (response) { return response.json(); })
+                .then(function (lut) {
+                    if (lut.error) throw new Error(lut.error);
+                    pushUndo();
+                    state.lut = lut.path;
+                    state.look = 2;
+                    clip.lut_path = lut.path;
+                    clip.lut_name = lut.name;
+                    commitGenesisEdit();
+                    renderPropertiesPanelContent(panel, clip);
+                })
+                .catch(function (error) {
+                    status.textContent = 'LUT upload failed: ' + error.message;
+                });
+            });
+            input.click();
+        });
+        var clear = document.createElement('button');
+        clear.textContent = 'Clear LUT';
+        clear.disabled = !(state.lut || clip.lut_path);
+        clear.addEventListener('click', function () {
+            pushUndo();
+            state.lut = '';
+            state.look = 0;
+            clip.lut_path = null;
+            clip.lut_name = null;
+            commitGenesisEdit();
+            renderPropertiesPanelContent(panel, clip);
+        });
+        buttons.appendChild(upload);
+        buttons.appendChild(clear);
+        body.appendChild(buttons);
+        body.appendChild(status);
         details.appendChild(body);
         panel.appendChild(details);
     }
@@ -2285,53 +2508,121 @@ var VideoEditTab = (function () {
         return Math.min(1, Math.abs(Number(active.data.peaks[index]) || 0));
     }
 
-    function renderAudioDock(content, selectedInfo) {
-        var heading = document.createElement('div');
-        heading.className = 've-dock-heading';
-        heading.textContent = 'PROGRAM AUDIO';
-        content.appendChild(heading);
+    function drawProgramSpectrum(canvas, bins) {
+        var ctx = canvas.getContext('2d');
+        var width = canvas.width;
+        var height = canvas.height;
+        ctx.fillStyle = '#0f1018';
+        ctx.fillRect(0, 0, width, height);
+        if (!Array.isArray(bins) || !bins.length) return;
+        var max = bins.reduce(function (value, bin) {
+            return Math.max(value, Math.abs(Number(bin) || 0));
+        }, 0);
+        if (max <= 0) return;
+        var barWidth = width / bins.length;
+        bins.forEach(function (bin, index) {
+            var fraction = clamp((Number(bin) || 0) / max, 0, 1);
+            var hue = 155 + (index / bins.length) * 70;
+            ctx.fillStyle = 'hsl(' + hue + ' 65% 55%)';
+            ctx.fillRect(
+                index * barWidth,
+                height - fraction * (height - 4),
+                Math.max(1, barWidth - 0.5),
+                fraction * (height - 4)
+            );
+        });
+    }
 
-        var scope = document.createElement('canvas');
-        scope.id = 've-audio-waveform';
-        scope.className = 've-audio-scope';
-        scope.width = 288;
-        scope.height = 92;
-        content.appendChild(scope);
+    function drawProgramSamples(canvas, samples) {
+        var ctx = canvas.getContext('2d');
+        var width = canvas.width;
+        var height = canvas.height;
+        ctx.fillStyle = '#0f1018';
+        ctx.fillRect(0, 0, width, height);
+        ctx.strokeStyle = '#282b39';
+        ctx.beginPath();
+        ctx.moveTo(0, height / 2);
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+        if (!Array.isArray(samples) || samples.length < 2) return;
+        ctx.strokeStyle = '#73d3aa';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        samples.forEach(function (sample, index) {
+            var x = index / (samples.length - 1) * width;
+            var y = height / 2 - clamp(Number(sample) || 0, -1, 1) * (height / 2 - 3);
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    }
 
-        var selectedActive = selectedInfo && selectedInfo.clip
-            ? { clip: selectedInfo.clip, data: waveformCache.get(selectedInfo.clip.id) || null }
-            : null;
-        if (selectedInfo && selectedInfo.clip) loadWaveform(selectedInfo.clip);
-        if (!waveformHasSignal(selectedActive)) {
-            var loadedFallback = null;
-            for (var waveformTrackIndex = project.tracks.length - 1; waveformTrackIndex >= 0; waveformTrackIndex--) {
-                var candidateWaveform = activeWaveformForTrack(project.tracks[waveformTrackIndex]);
-                if (!loadedFallback && candidateWaveform && candidateWaveform.data) {
-                    loadedFallback = candidateWaveform;
-                }
-                if (waveformHasSignal(candidateWaveform)) {
-                    selectedActive = candidateWaveform;
-                    break;
-                }
-            }
-            if (!waveformHasSignal(selectedActive) && loadedFallback) {
-                selectedActive = loadedFallback;
-            }
+    function renderProgramAudioMeters(container, levels) {
+        container.innerHTML = '';
+        if (!levels) {
+            container.innerHTML = '<div class="ve-genesis-inline-status">No assembled program audio at the playhead.</div>';
+            return;
         }
-        drawAudioWaveform(scope, selectedActive ? selectedActive.data : null);
+        [
+            ['L', Number(levels.peak_l), Number(levels.rms_l)],
+            ['R', Number(levels.peak_r), Number(levels.rms_r)],
+        ].forEach(function (channel) {
+            var row = document.createElement('div');
+            row.className = 've-program-meter-row';
+            var label = document.createElement('strong');
+            label.textContent = channel[0];
+            var track = document.createElement('div');
+            track.className = 've-program-meter-track';
+            var rms = document.createElement('span');
+            rms.className = 've-program-meter-rms';
+            rms.style.width = Math.round(clamp((channel[2] + 90) / 90, 0, 1) * 100) + '%';
+            var peak = document.createElement('i');
+            peak.style.left = Math.round(clamp((channel[1] + 90) / 90, 0, 1) * 100) + '%';
+            track.appendChild(rms);
+            track.appendChild(peak);
+            var value = document.createElement('code');
+            value.textContent = channel[1].toFixed(1) + ' / ' + channel[2].toFixed(1) + ' dB';
+            row.appendChild(label);
+            row.appendChild(track);
+            row.appendChild(value);
+            container.appendChild(row);
+        });
+    }
 
-        var note = document.createElement('div');
-        note.className = 've-scope-note';
-        note.textContent = selectedActive && selectedActive.clip
-            ? 'Decoded source waveform · ' + (selectedActive.clip.label || 'selected clip')
-            : 'Select a clip to inspect its decoded waveform.';
-        content.appendChild(note);
+    function loadProgramAudioAnalysis(meters, spectrum, waveform, status) {
+        var sequence = ++programAudioAnalysisSequence;
+        fetch(getApiBase() + '/video_edit/audio_analysis', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                project_id: projectId,
+                project: project,
+                frame: currentFrame,
+            }),
+        })
+        .then(function (response) {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.json();
+        })
+        .then(function (analysis) {
+            if (sequence !== programAudioAnalysisSequence || !meters.isConnected) return;
+            renderProgramAudioMeters(meters, analysis.levels);
+            drawProgramSpectrum(spectrum, analysis.spectrum);
+            drawProgramSamples(waveform, analysis.samples);
+            status.textContent = analysis.levels || (analysis.samples && analysis.samples.length)
+                ? 'Genesis assembled-program analysis · post gain / pan / mute / solo / clip FX'
+                : 'No assembled program audio at this playhead.';
+        })
+        .catch(function (error) {
+            if (sequence !== programAudioAnalysisSequence || !meters.isConnected) return;
+            renderProgramAudioMeters(meters, null);
+            drawProgramSpectrum(spectrum, null);
+            drawProgramSamples(waveform, null);
+            status.textContent = 'Program-audio analysis failed: ' + error.message;
+        });
+    }
 
-        var mixerHeading = document.createElement('div');
-        mixerHeading.className = 've-dock-heading';
-        mixerHeading.textContent = 'TRACK MIXER';
-        content.appendChild(mixerHeading);
-
+    function appendTrackMixer(content) {
         var anySolo = project.tracks.some(function (track) {
             return ensureTrackMixerState(track).solo;
         });
@@ -2408,6 +2699,92 @@ var VideoEditTab = (function () {
             strip.appendChild(buttons);
             content.appendChild(strip);
         });
+    }
+
+    function renderAudioDock(content, selectedInfo) {
+        var heading = document.createElement('div');
+        heading.className = 've-dock-heading';
+        heading.textContent = 'PROGRAM AUDIO METERS';
+        content.appendChild(heading);
+
+        var programMeters = document.createElement('div');
+        programMeters.className = 've-program-meters';
+        programMeters.innerHTML = '<div class="ve-genesis-inline-status">Measuring assembled program audio…</div>';
+        content.appendChild(programMeters);
+
+        var spectrumHeading = document.createElement('div');
+        spectrumHeading.className = 've-dock-heading';
+        spectrumHeading.textContent = 'AUDIO SPECTRUM';
+        content.appendChild(spectrumHeading);
+        var programSpectrum = document.createElement('canvas');
+        programSpectrum.id = 've-audio-spectrum';
+        programSpectrum.className = 've-audio-scope';
+        programSpectrum.width = 288;
+        programSpectrum.height = 92;
+        content.appendChild(programSpectrum);
+
+        var waveformHeading = document.createElement('div');
+        waveformHeading.className = 've-dock-heading';
+        waveformHeading.textContent = 'AUDIO WAVEFORM';
+        content.appendChild(waveformHeading);
+        var programWaveform = document.createElement('canvas');
+        programWaveform.id = 've-audio-program-waveform';
+        programWaveform.className = 've-audio-scope';
+        programWaveform.width = 288;
+        programWaveform.height = 92;
+        content.appendChild(programWaveform);
+
+        var programStatus = document.createElement('div');
+        programStatus.className = 've-scope-note';
+        programStatus.textContent = 'Loading Genesis assembled-program analysis…';
+        content.appendChild(programStatus);
+
+        var sourceHeading = document.createElement('div');
+        sourceHeading.className = 've-dock-heading';
+        sourceHeading.textContent = 'SOURCE ENVELOPE';
+        content.appendChild(sourceHeading);
+        var scope = document.createElement('canvas');
+        scope.id = 've-audio-waveform';
+        scope.className = 've-audio-scope';
+        scope.width = 288;
+        scope.height = 92;
+        content.appendChild(scope);
+
+        var selectedActive = selectedInfo && selectedInfo.clip
+            ? { clip: selectedInfo.clip, data: waveformCache.get(selectedInfo.clip.id) || null }
+            : null;
+        if (selectedInfo && selectedInfo.clip) loadWaveform(selectedInfo.clip);
+        if (!waveformHasSignal(selectedActive)) {
+            var loadedFallback = null;
+            for (var waveformTrackIndex = project.tracks.length - 1; waveformTrackIndex >= 0; waveformTrackIndex--) {
+                var candidateWaveform = activeWaveformForTrack(project.tracks[waveformTrackIndex]);
+                if (!loadedFallback && candidateWaveform && candidateWaveform.data) {
+                    loadedFallback = candidateWaveform;
+                }
+                if (waveformHasSignal(candidateWaveform)) {
+                    selectedActive = candidateWaveform;
+                    break;
+                }
+            }
+            if (!waveformHasSignal(selectedActive) && loadedFallback) {
+                selectedActive = loadedFallback;
+            }
+        }
+        drawAudioWaveform(scope, selectedActive ? selectedActive.data : null);
+
+        var note = document.createElement('div');
+        note.className = 've-scope-note';
+        note.textContent = selectedActive && selectedActive.clip
+            ? 'Decoded source waveform · ' + (selectedActive.clip.label || 'selected clip')
+            : 'Select a clip to inspect its decoded waveform.';
+        content.appendChild(note);
+
+        var mixerHeading = document.createElement('div');
+        mixerHeading.className = 've-dock-heading';
+        mixerHeading.textContent = 'TRACK MIXER';
+        content.appendChild(mixerHeading);
+        appendTrackMixer(content);
+        loadProgramAudioAnalysis(programMeters, programSpectrum, programWaveform, programStatus);
     }
 
     function renderScopesDock(content) {

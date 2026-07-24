@@ -1370,7 +1370,7 @@
 
 .ve-genesis-track-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) repeat(3, auto);
+    grid-template-columns: minmax(0, 1fr) repeat(4, auto);
     align-items: center;
     gap: 7px;
     margin-top: 6px;
@@ -1407,6 +1407,30 @@
 
 .ve-genesis-track-row input[type="checkbox"] {
     accent-color: #3ba7d8;
+}
+
+.ve-genesis-track-remove {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid #3a3b47;
+    border-radius: 4px;
+    background: #292a34;
+    color: #999aa8;
+    cursor: pointer;
+}
+
+.ve-genesis-track-remove:hover {
+    border-color: #e06767;
+    color: #f28a8a;
+}
+
+.ve-genesis-preset-row {
+    margin: 0 0 7px;
+}
+
+.ve-genesis-mixer-body .ve-audio-mixer-strip {
+    margin: 0 0 7px;
 }
 
 .ve-genesis-subtitle-row {
@@ -1461,6 +1485,55 @@
     border: 1px solid #30313d;
     border-radius: 5px;
     background: #0c0d13;
+}
+
+.ve-program-meters {
+    margin: 0 12px 9px;
+    padding: 8px;
+    border: 1px solid #30313d;
+    border-radius: 5px;
+    background: #171820;
+}
+
+.ve-program-meter-row {
+    display: grid;
+    grid-template-columns: 13px minmax(0, 1fr) 78px;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0;
+}
+
+.ve-program-meter-row strong {
+    color: #c7c8d4;
+    font-size: 9px;
+}
+
+.ve-program-meter-track {
+    position: relative;
+    height: 10px;
+    overflow: hidden;
+    border-radius: 2px;
+    background: #101117;
+}
+
+.ve-program-meter-rms {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, #49c98b 0 72%, #dfc24d 72% 90%, #e76464 90%);
+}
+
+.ve-program-meter-track i {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #fff;
+}
+
+.ve-program-meter-row code {
+    color: #9293a2;
+    font: 8px 'JetBrains Mono', 'Consolas', monospace;
+    text-align: right;
 }
 
 .ve-audio-mixer-strip {
@@ -1753,6 +1826,9 @@
     padding: 5px 8px;
     font-size: 13px;
     margin-top: 4px;
+}
+.ve-genesis-section .ve-lut-select {
+    font-size: 10px;
 }
 .ve-lut-preview-row {
     display: flex;

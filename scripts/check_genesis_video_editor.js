@@ -395,6 +395,48 @@ function runChecked(command, args) {
     assert(await page.locator("details.ve-genesis-section")
       .filter({ has: page.locator("summary", { hasText: "Subtitles" }) })
       .count() === 1, "Subtitles section is missing");
+    assert(await page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "Audio Mixer" }) })
+      .count() === 1, "Properties Audio Mixer section is missing");
+    const exportSection = page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "Export" }) });
+    await exportSection.locator("summary").click();
+    assert(await exportSection.getByRole("button", { name: "YouTube 1080p", exact: true }).count() === 1,
+      "native export preset controls are missing");
+    const gradeSection = page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "Program Grade / Keyframes" }) });
+    await gradeSection.locator("summary").click();
+    assert(await gradeSection.getByRole("button", { name: "Key grade @ playhead", exact: true }).count() === 1,
+      "native program-grade key action is missing");
+    const tracksSection = page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "Tracks" }) });
+    await tracksSection.locator("summary").click();
+    assert(await tracksSection.locator(".ve-genesis-track-remove").count() >= 1,
+      "track removal control is missing");
+
+    const lutSection = page.locator("details.ve-genesis-section")
+      .filter({ has: page.locator("summary", { hasText: "LUT Library" }) });
+    await lutSection.locator("summary").click();
+    const lutSelect = lutSection.locator(".ve-lut-select");
+    await page.waitForFunction(() => (
+      document.querySelectorAll("details.ve-genesis-section .ve-lut-select option").length >= 41
+    ), { timeout: 10000 });
+    const lutOptionCount = await lutSelect.locator("option").count();
+    const lutLibraryCount = await lutSelect.locator("optgroup").count();
+    assert(lutOptionCount >= 41, `LUT options=${lutOptionCount}`);
+    assert(lutLibraryCount >= 3, `LUT libraries=${lutLibraryCount}`);
+    const lutPreview = waitForPreview();
+    await lutSelect.selectOption({ label: "Warm Cinematic" });
+    await lutPreview;
+    const lutHash = await readCanvasHash();
+    assert(lutHash !== baseHash, "Warm Cinematic LUT did not change Genesis preview pixels");
+    const clearLutPreview = waitForPreview();
+    await lutSelect.selectOption("");
+    await clearLutPreview;
+    const clearedLutHash = await readCanvasHash();
+    assert(clearedLutHash === baseHash,
+      "clearing the LUT did not restore the exact original Genesis pixels");
+
     const effectSlider = page.locator(
       '.ve-genesis-control[data-property="sat"] input[type="range"]',
     );
@@ -518,11 +560,38 @@ function runChecked(command, args) {
       `music waveform samples=${waveform.peaks?.length}`);
     assert(Math.max(...waveform.peaks) > 0.01, "music waveform is silent");
     await page.waitForFunction(() => (
-      window.VideoEditTab?.getDiagnostics?.().waveformClipIds.length === 1
+      window.VideoEditTab?.getDiagnostics?.().waveformClipIds.length >= 1
+    ), { timeout: 30000 });
+    const programAudioReady = page.waitForResponse((response) => (
+      response.url().endsWith("/video_edit/audio_analysis")
+      && response.request().method() === "POST"
+      && response.status() === 200
     ), { timeout: 30000 });
     await page.locator('.ve-dock-tab[data-dock="audio"]').click();
+    const programAudio = await (await programAudioReady).json();
+    assert(programAudio.levels?.peak_l > -80,
+      `program audio peak=${programAudio.levels?.peak_l}`);
+    assert(programAudio.spectrum?.length === 256,
+      `program spectrum bins=${programAudio.spectrum?.length}`);
+    assert(programAudio.samples?.length === 256,
+      `program waveform samples=${programAudio.samples?.length}`);
     assert(await page.locator(".ve-audio-mixer-strip").count() >= 2,
       "audio mixer did not expose video and music tracks");
+    assert(await page.locator(".ve-program-meter-row").count() === 2,
+      "program audio did not expose stereo meters");
+    for (const selector of ["#ve-audio-spectrum", "#ve-audio-program-waveform"]) {
+      const signalPixels = await page.locator(selector).evaluate((canvas) => {
+        const pixels = canvas.getContext("2d").getImageData(
+          0, 0, canvas.width, canvas.height,
+        ).data;
+        let signal = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 180) signal++;
+        }
+        return signal;
+      });
+      assert(signalPixels > 20, `${selector} signal pixels=${signalPixels}`);
+    }
     assert(await page.locator("#ve-audio-waveform").isVisible(),
       "audio waveform scope is missing");
     const audioWaveformSignalPixels = await page.locator("#ve-audio-waveform")
@@ -682,6 +751,13 @@ function runChecked(command, args) {
         replacement_media: true,
         property_track_rows: propertyTrackRows,
         subtitle_editor: true,
+        lut_options: lutOptionCount,
+        lut_libraries: lutLibraryCount,
+        lut_pixels_changed: lutHash !== baseHash,
+        lut_clear_restored_base: clearedLutHash === baseHash,
+        program_audio_levels: true,
+        program_audio_spectrum_bins: programAudio.spectrum.length,
+        program_audio_waveform_samples: programAudio.samples.length,
       },
       effect: "saturation=0",
       effect_pixels_changed: effectHash !== baseHash,

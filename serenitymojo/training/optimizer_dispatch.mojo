@@ -207,7 +207,7 @@ def optimizer_dispatch_for_identifier(identifier: String) -> OptimizerDispatch:
             backend=OPT_BACKEND_UNSUPPORTED,
             state_kind=OPT_STATE_UNSUPPORTED,
             status=OPT_STATUS_UNSUPPORTED,
-            note="SerenityTrainer schedule-free AdamW/SGD backends are not implemented",
+            note="schedule-free AdamW IS implemented via training/levers.mojo (adamw_schedulefree.mojo); this optimizer_dispatch classification map is stale/informational — levers is the live path",
         )
     elif identifier == "ADAMW_8BIT" or identifier == "ADAM_8BIT" or identifier == "LION_8BIT":
         return OptimizerDispatch(
@@ -216,7 +216,7 @@ def optimizer_dispatch_for_identifier(identifier: String) -> OptimizerDispatch:
             backend=OPT_BACKEND_UNSUPPORTED,
             state_kind=OPT_STATE_UNSUPPORTED,
             status=OPT_STATUS_UNSUPPORTED,
-            note="8-bit optimizer-state backend is not implemented",
+            note="ADAMW_8BIT IS implemented via training/levers.mojo (adamw8bit.mojo, bnb-parity gated); this classification map is stale/informational — levers is the live path",
         )
     elif identifier == "ADAMW_ADV" or identifier == "LION_ADV" or identifier == "PRODIGY_ADV":
         return OptimizerDispatch(

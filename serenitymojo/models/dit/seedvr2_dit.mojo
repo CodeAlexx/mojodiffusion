@@ -22,8 +22,9 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear_bias, linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import silu, swiglu
-from serenitymojo.ops.tensor_algebra import reshape, permute, slice, concat, add, mul, mul_scalar, full_device
+from serenitymojo.ops.tensor_algebra import reshape, permute, slice, concat, add, mul, mul_scalar, full_device, gather_rows
 from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.softmax import softmax_lastdim
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.sdxl.real_weights import load_bias
 
@@ -1042,6 +1043,331 @@ def compute_dit_freqs(txt_len: Int, ctx: DeviceContext) raises -> Tuple[Tensor, 
     var vid_freqs = Tensor.from_host(vid_vals, vshp^, STDtype.F32, ctx)
     var txt_freqs = Tensor.from_host(txt_vals, tshp^, STDtype.F32, ctx)
     return (vid_freqs^, txt_freqs^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (H'') GENERAL arbitrary-resolution window path — SeedVR make_720Pwindows_bysize.
+#   Replicates NaSwinAttention window partitioning for ANY post-patch grid (T,H,W),
+#   producing windows of UNEVEN count/size (vs the hardcoded 4x(1,8,8) fast path).
+#   num_windows = (4,3,3).  See window_gen_oracle.py.
+# ═══════════════════════════════════════════════════════════════════════════════
+comptime _SCALE_NUM = 45 * 80  # 3600 (720P reference token budget H*W)
+
+
+def _ceil_div(a: Int, b: Int) -> Int:
+    """ceil(a/b) for a>=0, b>0."""
+    return (a + b - 1) // b
+
+
+def _round_half_even(x: Float64) -> Int:
+    """Python round(): round-half-to-even. x assumed >= 0."""
+    var fl = Int(x)                 # trunc toward zero == floor for x>=0
+    var diff = x - Float64(fl)
+    if diff < 0.5:
+        return fl
+    if diff > 0.5:
+        return fl + 1
+    # exactly .5 -> nearest even
+    if fl % 2 == 0:
+        return fl
+    return fl + 1
+
+
+struct WindowPlan(Copyable, Movable):
+    """Host-computed window partition for the SeedVR general attention path.
+    wf/wh/ww hold per-window (f,h,w) shapes; counts[w] = f*h*w. partition maps
+    windowed index -> original flat index (windowed[i] = vid[partition[i]]);
+    reverse is argsort(partition) so out[j] = windowed_out[reverse[j]]."""
+
+    var wf: List[Int]
+    var wh: List[Int]
+    var ww: List[Int]
+    var counts: List[Int]
+    var partition: List[Int]
+    var reverse: List[Int]
+    var win_count: Int
+    var L: Int
+
+    def __init__(
+        out self,
+        var wf: List[Int],
+        var wh: List[Int],
+        var ww: List[Int],
+        var counts: List[Int],
+        var partition: List[Int],
+        var reverse: List[Int],
+        win_count: Int,
+        L: Int,
+    ):
+        self.wf = wf^
+        self.wh = wh^
+        self.ww = ww^
+        self.counts = counts^
+        self.partition = partition^
+        self.reverse = reverse^
+        self.win_count = win_count
+        self.L = L
+
+
+def compute_windows(T: Int, H: Int, W: Int) raises -> WindowPlan:
+    """SeedVR make_720Pwindows_bysize(num_windows=(4,3,3)) — NON-shifted.
+    Returns a WindowPlan with per-window shapes, counts, and the flat
+    partition/reverse index maps (all host Int math)."""
+    var rnt = 4
+    var rnh = 3
+    var rnw = 3
+    var scale = sqrt(Float64(_SCALE_NUM) / Float64(H * W))
+    var rH = _round_half_even(Float64(H) * scale)
+    var rW = _round_half_even(Float64(W) * scale)
+    var wh = _ceil_div(rH, rnh)
+    var ww = _ceil_div(rW, rnw)
+    var tmin = T
+    if tmin > 30:
+        tmin = 30
+    var wt = _ceil_div(tmin, rnt)
+    var nt = _ceil_div(T, wt)
+    var nh = _ceil_div(H, wh)
+    var nw = _ceil_div(W, ww)
+
+    var wf = List[Int]()
+    var whs = List[Int]()
+    var wws = List[Int]()
+    var counts = List[Int]()
+    var partition = List[Int]()
+    # ORDER: for iw, for ih, for it (matches oracle make_windows loop nesting).
+    for iw in range(nw):
+        for ih in range(nh):
+            for it in range(nt):
+                var t0 = it * wt
+                var t1 = (it + 1) * wt
+                if t1 > T:
+                    t1 = T
+                var h0 = ih * wh
+                var h1 = (ih + 1) * wh
+                if h1 > H:
+                    h1 = H
+                var w0 = iw * ww
+                var w1 = (iw + 1) * ww
+                if w1 > W:
+                    w1 = W
+                if t1 > t0 and h1 > h0 and w1 > w0:
+                    var f = t1 - t0
+                    var hh = h1 - h0
+                    var wwd = w1 - w0
+                    wf.append(f)
+                    whs.append(hh)
+                    wws.append(wwd)
+                    counts.append(f * hh * wwd)
+                    for tt in range(t0, t1):
+                        for hp in range(h0, h1):
+                            for wp in range(w0, w1):
+                                partition.append(tt * H * W + hp * W + wp)
+
+    var L = len(partition)
+    # reverse = argsort(partition). partition is a permutation of 0..L-1, so
+    # reverse[partition[i]] = i  ->  reverse[j] = i s.t. partition[i] = j.
+    var reverse = List[Int]()
+    for _j in range(L):
+        reverse.append(0)
+    for i in range(L):
+        reverse[partition[i]] = i
+
+    var win_count = len(counts)
+    return WindowPlan(wf^, whs^, wws^, counts^, partition^, reverse^, win_count, L)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (H''') compute_dit_freqs_general — axial-3D RoPE tables for the GENERAL windows.
+#   vid: L=sum(f*h*w) tokens in WINDOWED order; per token in window (f,h,w) at
+#        local (ft,fh,fw): row = ax1(txt_len+ft) ++ ax1(fh) ++ ax1(fw)  (each 42).
+#   txt: Ntxt=win_count*txt_len; per window per l in 0..txt_len: ax1(l) tiled x3.
+#   ax1 identical to compute_dit_freqs (inv[i]=1/10000^(2i/42), repeat-interleave).
+#   For the fixed 4x(1,8,8) grid + txt_len=58 this reduces to compute_dit_freqs.
+# ═══════════════════════════════════════════════════════════════════════════════
+def compute_dit_freqs_general(
+    plan: WindowPlan, txt_len: Int, ctx: DeviceContext
+) raises -> Tuple[Tensor, Tensor]:
+    """(vid_freqs [L,126], txt_freqs [win_count*txt_len,126]) F32 axial tables."""
+    var lnbase = log(Float64(10000.0))
+    var inv = List[Float64]()
+    for i in range(21):
+        inv.append(1.0 / exp((2.0 * Float64(i) / 42.0) * lnbase))
+
+    # VID [L,126] windowed order: window (f,h,w) -> ft,fh,fw (t outer, h, w inner)
+    var vid_vals = List[Float32]()
+    for w in range(plan.win_count):
+        var f = plan.wf[w]
+        var hh = plan.wh[w]
+        var wwd = plan.ww[w]
+        for ft in range(f):
+            for fh in range(hh):
+                for fw in range(wwd):
+                    var tp = Float64(txt_len + ft)
+                    for i in range(21):
+                        var v = Float32(tp * inv[i])
+                        vid_vals.append(v)
+                        vid_vals.append(v)
+                    for i in range(21):
+                        var v = Float32(Float64(fh) * inv[i])
+                        vid_vals.append(v)
+                        vid_vals.append(v)
+                    for i in range(21):
+                        var v = Float32(Float64(fw) * inv[i])
+                        vid_vals.append(v)
+                        vid_vals.append(v)
+
+    # TXT [win_count*txt_len,126]: per window, l in 0..txt_len, ax1(l) tiled x3
+    var txt_vals = List[Float32]()
+    for _w in range(plan.win_count):
+        for l in range(txt_len):
+            for _rep in range(3):
+                for i in range(21):
+                    var v = Float32(Float64(l) * inv[i])
+                    txt_vals.append(v)
+                    txt_vals.append(v)
+
+    var vshp = List[Int]()
+    vshp.append(plan.L)
+    vshp.append(126)
+    var tshp = List[Int]()
+    tshp.append(plan.win_count * txt_len)
+    tshp.append(126)
+    var vid_freqs = Tensor.from_host(vid_vals, vshp^, STDtype.F32, ctx)
+    var txt_freqs = Tensor.from_host(txt_vals, tshp^, STDtype.F32, ctx)
+    return (vid_freqs^, txt_freqs^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (E'') window_attn_projout_general — arbitrary-resolution NaSwinAttention tail.
+#   vid q/k/v arrive in ORIGINAL grid order [L,20,128]; gathered to windowed order
+#   by plan.partition, roped with the WINDOWED vid_freqs, then attended PER WINDOW
+#   (windows have DIFFERENT sizes -> runtime manual multi-head attention, like the
+#   VAE mid_attention but 20 heads). txt is tiled win_count x and roped with
+#   txt_freqs. Each window's joint sequence = [c_w vid ; txt_len txt]; split -> vid
+#   scattered back (gather by reverse), txt mean-pooled over windows. Per-stream
+#   proj_out (+bias). Returns (vid_out [L,2560], txt_out [txt_len,2560]) bf16.
+# ═══════════════════════════════════════════════════════════════════════════════
+def window_attn_projout_general(
+    vid_q: Tensor,          # [L,20,128] bf16  (ORIGINAL grid order, post qk-norm)
+    vid_k: Tensor,          # [L,20,128] bf16
+    vid_v: Tensor,          # [L,20,128] bf16  (un-normed value)
+    txt_q: Tensor,          # [txt_len,20,128] bf16  (single copy, post qk-norm)
+    txt_k: Tensor,          # [txt_len,20,128] bf16
+    txt_v: Tensor,          # [txt_len,20,128] bf16  (un-normed value)
+    plan: WindowPlan,
+    txt_len: Int,
+    projout_vid_w: Tensor,  # [2560,2560]
+    projout_vid_b: Tensor,  # [2560]
+    projout_txt_w: Tensor,  # [2560,2560]
+    projout_txt_b: Tensor,  # [2560]
+    ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor]:
+    var HEADS = 20
+    var HD = 128
+    var INNER = HEADS * HD  # 2560
+    var L = plan.L
+    var NW = plan.win_count
+
+    # ── window_partition: gather vid q/k/v ORIGINAL -> WINDOWED order ────────────
+    # windowed[i] = vid[partition[i]]. gather_rows works on rank-2, so flatten the
+    # (H,D) axes, gather rows, reshape back to [L,20,128].
+    var vq2 = reshape(vid_q, [L, INNER], ctx)
+    var vk2 = reshape(vid_k, [L, INNER], ctx)
+    var vv2 = reshape(vid_v, [L, INNER], ctx)
+    var wq = reshape(gather_rows(vq2, plan.partition, ctx), [L, HEADS, HD], ctx)
+    var wk = reshape(gather_rows(vk2, plan.partition, ctx), [L, HEADS, HD], ctx)
+    var wv = reshape(gather_rows(vv2, plan.partition, ctx), [L, HEADS, HD], ctx)
+
+    # ── freqs (windowed vid order + per-window txt) ─────────────────────────────
+    var freqs = compute_dit_freqs_general(plan, txt_len, ctx)  # (vid[L,126], txt[NW*txt_len,126])
+
+    # ── rope vid (windowed) ─────────────────────────────────────────────────────
+    var wq_r = apply_rope3d(wq, freqs[0], ctx)
+    var wk_r = apply_rope3d(wk, freqs[0], ctx)
+    # wv is NOT roped (value).
+
+    # ── txt tiled win_count x, then rope with txt_freqs ─────────────────────────
+    # All windows share identical txt_freqs, so the win_count copies are identical
+    # after rope; we build the tiled buffer explicitly to match the freqs layout.
+    var tq_tiled = txt_q.clone(ctx)
+    var tk_tiled = txt_k.clone(ctx)
+    var tv_tiled = txt_v.clone(ctx)
+    for _w in range(1, NW):
+        tq_tiled = concat(0, ctx, tq_tiled, txt_q)
+        tk_tiled = concat(0, ctx, tk_tiled, txt_k)
+        tv_tiled = concat(0, ctx, tv_tiled, txt_v)
+    var tq_r = apply_rope3d(tq_tiled, freqs[1], ctx)  # [NW*txt_len,20,128]
+    var tk_r = apply_rope3d(tk_tiled, freqs[1], ctx)
+    # tv_tiled is the (tiled) un-roped value.
+
+    var scale = Float32(1.0) / Float32(sqrt(Float64(HD)))
+
+    # ── PER-WINDOW runtime multi-head attention ─────────────────────────────────
+    var windowed_out = vid_q.clone(ctx)   # placeholder [L,20,128], overwritten
+    var txt_acc = txt_q.clone(ctx)        # placeholder [txt_len,20,128]
+    var have_txt_acc = False
+    var offset = 0
+    for w in range(NW):
+        var c_w = plan.counts[w]
+        var S_w = c_w + txt_len
+
+        # joint q/k/v for this window: [vid c_w ; txt txt_len] -> [S_w,20,128]
+        var vqw = slice(wq_r, 0, offset, c_w, ctx)             # [c_w,20,128]
+        var vkw = slice(wk_r, 0, offset, c_w, ctx)
+        var vvw = slice(wv, 0, offset, c_w, ctx)
+        var tqw = slice(tq_r, 0, w * txt_len, txt_len, ctx)    # [txt_len,20,128]
+        var tkw = slice(tk_r, 0, w * txt_len, txt_len, ctx)
+        var tvw = slice(tv_tiled, 0, w * txt_len, txt_len, ctx)
+        var qw = concat(0, ctx, vqw, tqw)                      # [S_w,20,128]
+        var kw = concat(0, ctx, vkw, tkw)
+        var vw = concat(0, ctx, vvw, tvw)
+
+        # per-head attention, assembled into [S_w,20,128]
+        var head_out = qw.clone(ctx)   # placeholder, overwritten at h==0
+        for h in range(HEADS):
+            var qh = reshape(slice(qw, 1, h, 1, ctx), [S_w, HD], ctx)   # [S_w,128]
+            var kh = reshape(slice(kw, 1, h, 1, ctx), [S_w, HD], ctx)
+            var vh = reshape(slice(vw, 1, h, 1, ctx), [S_w, HD], ctx)
+            var scores = linear(qh, kh, None, ctx, True)               # qh @ khᵀ [S_w,S_w]
+            scores = mul_scalar(scores, scale, ctx)
+            var attn = softmax_lastdim(scores, ctx)                    # [S_w,S_w]
+            var oh = linear(attn, vh, None, ctx, False)                # attn @ vh [S_w,128]
+            var oh3 = reshape(oh, [S_w, 1, HD], ctx)                   # [S_w,1,128]
+            if h == 0:
+                head_out = oh3^
+            else:
+                head_out = concat(1, ctx, head_out, oh3)              # [S_w,h+1,128]
+
+        # split window output: vid part [c_w,20,128], txt part [txt_len,20,128]
+        var vid_part = slice(head_out, 0, 0, c_w, ctx)                 # [c_w,20,128]
+        var txt_part = slice(head_out, 0, c_w, txt_len, ctx)          # [txt_len,20,128]
+
+        # scatter vid part into windowed_out (windowed order is contiguous per win)
+        if w == 0:
+            windowed_out = vid_part^
+        else:
+            windowed_out = concat(0, ctx, windowed_out, vid_part)
+
+        # accumulate txt part for mean pool over windows
+        if not have_txt_acc:
+            txt_acc = txt_part^
+            have_txt_acc = True
+        else:
+            txt_acc = add(txt_acc, txt_part, ctx)
+
+        offset += c_w
+
+    # ── vid: windowed_out -> original order via reverse gather -> proj_out ───────
+    var wout2 = reshape(windowed_out, [L, INNER], ctx)                # [L,2560]
+    var vid_orig = gather_rows(wout2, plan.reverse, ctx)             # [L,2560] orig order
+    var vid_out = linear_bias(vid_orig, projout_vid_w, projout_vid_b, ctx)  # [L,2560]
+
+    # ── txt: mean over windows -> proj_out ──────────────────────────────────────
+    var txt_mean = mul_scalar(txt_acc, Float32(1.0) / Float32(NW), ctx)  # [txt_len,20,128]
+    var txt_2d = reshape(txt_mean, [txt_len, INNER], ctx)                 # [txt_len,2560]
+    var txt_out = linear_bias(txt_2d, projout_txt_w, projout_txt_b, ctx)  # [txt_len,2560]
+
+    return (vid_out^, txt_out^)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

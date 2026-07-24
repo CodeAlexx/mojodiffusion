@@ -395,6 +395,69 @@ def window_attn_projout(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# (E') window_attn_projout_g[TW] — TW-generalized window-joint attention + proj_out.
+#   Identical to window_attn_projout but the per-window txt count is the comptime
+#   param TW (58 for the positive CFG stream, 64 for the negative). Windows=4,
+#   each packs 64 vid + TW txt = (64+TW) joint tokens; sdpa_nomask[4,64+TW,20,128];
+#   txt mean-pool over the 4 windows -> [TW,2560]. window_attn_projout (TW=58)
+#   is left byte-identical so the verified winattn gate is untouched.
+# ═══════════════════════════════════════════════════════════════════════════════
+def window_attn_projout_g[TW: Int](
+    vid_q: Tensor,          # [256,20,128] bf16
+    vid_k: Tensor,          # [256,20,128] bf16
+    vid_v: Tensor,          # [256,20,128] bf16
+    txt_q: Tensor,          # [TW*4,20,128] bf16 (window-major)
+    txt_k: Tensor,          # [TW*4,20,128] bf16
+    txt_v: Tensor,          # [TW*4,20,128] bf16
+    projout_vid_w: Tensor,  # [2560,2560]
+    projout_vid_b: Tensor,  # [2560]
+    projout_txt_w: Tensor,  # [2560,2560]
+    projout_txt_b: Tensor,  # [2560]
+    ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor]:
+    """Window-joint attention + proj_out with comptime per-window txt count TW.
+    Returns (vid_out [256,2560], txt_out [TW,2560]) bf16."""
+    comptime NW = 4        # windows
+    comptime VW = 64       # vid tokens per window
+    comptime SW = VW + TW  # joint tokens per window (122 for TW=58, 128 for TW=64)
+    comptime HEADS = 20
+    comptime HD = 128
+    comptime INNER = HEADS * HD  # 2560
+
+    var vq4 = reshape(vid_q, [NW, VW, HEADS, HD], ctx)
+    var tq4 = reshape(txt_q, [NW, TW, HEADS, HD], ctx)
+    var qwin = concat(1, ctx, vq4, tq4)                      # [4,SW,20,128]
+
+    var vk4 = reshape(vid_k, [NW, VW, HEADS, HD], ctx)
+    var tk4 = reshape(txt_k, [NW, TW, HEADS, HD], ctx)
+    var kwin = concat(1, ctx, vk4, tk4)
+
+    var vv4 = reshape(vid_v, [NW, VW, HEADS, HD], ctx)
+    var tv4 = reshape(txt_v, [NW, TW, HEADS, HD], ctx)
+    var vwin = concat(1, ctx, vv4, tv4)
+
+    var scale = Float32(1.0) / Float32(sqrt(Float64(HD)))
+    var att = sdpa_nomask[NW, SW, HEADS, HD](qwin, kwin, vwin, scale, ctx)  # [4,SW,20,128]
+
+    # vid part = att[:, 0:64] -> [4,64,20,128] -> [256,2560] (window_reverse identity).
+    var vid_part = slice(att, 1, 0, VW, ctx)                 # [4,64,20,128]
+    var vid_2d = reshape(vid_part, [NW * VW, INNER], ctx)    # [256,2560]
+
+    # txt part = att[:, 64:64+TW] -> [4,TW,20,128], mean over the window axis.
+    var txt_part = slice(att, 1, VW, TW, ctx)                # [4,TW,20,128]
+    var acc = reshape(slice(txt_part, 0, 0, 1, ctx), [TW, HEADS, HD], ctx)
+    for w in range(1, NW):
+        var wslice = reshape(slice(txt_part, 0, w, 1, ctx), [TW, HEADS, HD], ctx)
+        acc = add(acc, wslice, ctx)
+    var txt_mean = mul_scalar(acc, Float32(1.0) / Float32(NW), ctx)  # [TW,20,128]
+    var txt_2d = reshape(txt_mean, [TW, INNER], ctx)                 # [TW,2560]
+
+    var vid_out = linear_bias(vid_2d, projout_vid_w, projout_vid_b, ctx)  # [256,2560]
+    var txt_out = linear_bias(txt_2d, projout_txt_w, projout_txt_b, ctx)  # [TW,2560]
+    return (vid_out^, txt_out^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # (F) Full MMDiT block — SeedVR NaMMSRTransformerBlock.forward (dual-stream,
 #     pre-norm DiT), composing the 3 verified attention sub-pieces (C,D,E) plus a
 #     SwiGLU MLP and AdaSingle modulation.  models/dit_v2/nablocks/mmsr_block.py.
@@ -720,6 +783,89 @@ def mmdit_block(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# (F') mmdit_block_g[TW] / dit_stack_g[TW] — TW-generalized block + stack.
+#   Identical to mmdit_block / dit_stack except the txt stream carries TW tokens
+#   per window and the joint attention uses window_attn_projout_g[TW]. txt_freqs
+#   must be [TW*4,126]. mmdit_block/dit_stack (TW=58) are left untouched so the
+#   fixed-58 full_dit_forward gate is unaffected.
+# ═══════════════════════════════════════════════════════════════════════════════
+def mmdit_block_g[TW: Int](
+    vid: Tensor,          # [256,2560] bf16
+    txt: Tensor,          # [TW,2560]  bf16
+    emb: Tensor,          # [1,15360]  bf16
+    vid_freqs: Tensor,    # [256,126]  F32
+    txt_freqs: Tensor,    # [TW*4,126] F32
+    w: Block0Weights,
+    ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor]:
+    """One SeedVR NaMMSRTransformerBlock forward with per-window txt count TW."""
+    var ones = full_device([2560], Float32(1.0), STDtype.BF16, ctx)
+
+    var emb2d = reshape(emb, [2560, 6], ctx)
+    var attn_shiftA = _emb_col(emb2d, 0, ctx)
+    var attn_scaleA = _emb_col(emb2d, 1, ctx)
+    var attn_gateA = _emb_col(emb2d, 2, ctx)
+    var mlp_shiftA = _emb_col(emb2d, 3, ctx)
+    var mlp_scaleA = _emb_col(emb2d, 4, ctx)
+    var mlp_gateA = _emb_col(emb2d, 5, ctx)
+
+    # ─── ATTN sub-block ────────────────────────────────────────────────────────
+    var va = rms_norm(vid, ones, Float32(1e-5), ctx)
+    var ta = rms_norm(txt, ones, Float32(1e-5), ctx)
+    va = _mod_in(va, attn_scaleA, w.ada_vid_attn_scale, attn_shiftA, w.ada_vid_attn_shift, ctx)
+    ta = _mod_in(ta, attn_scaleA, w.ada_txt_attn_scale, attn_shiftA, w.ada_txt_attn_shift, ctx)
+
+    var vqkv = attn_qkv_norm(va, w.proj_qkv_vid_w, w.norm_q_vid_w, w.norm_k_vid_w, ctx)
+    var tqkv = attn_qkv_norm(ta, w.proj_qkv_txt_w, w.norm_q_txt_w, w.norm_k_txt_w, ctx)
+    var vq = apply_rope3d(vqkv[0], vid_freqs, ctx)     # [256,20,128]
+    var vk = apply_rope3d(vqkv[1], vid_freqs, ctx)
+    var tq4 = apply_rope3d(_tile4(tqkv[0], ctx), txt_freqs, ctx)  # [TW*4,20,128]
+    var tk4 = apply_rope3d(_tile4(tqkv[1], ctx), txt_freqs, ctx)
+    var tv4 = _tile4(tqkv[2], ctx)                     # [TW*4,20,128]
+    var attn = window_attn_projout_g[TW](
+        vq, vk, vqkv[2], tq4, tk4, tv4,
+        w.proj_out_vid_w, w.proj_out_vid_b, w.proj_out_txt_w, w.proj_out_txt_b, ctx,
+    )
+    var va2 = _mod_gate(attn[0], attn_gateA, w.ada_vid_attn_gate, ctx)  # [256,2560]
+    var ta2 = _mod_gate(attn[1], attn_gateA, w.ada_txt_attn_gate, ctx)  # [TW,2560]
+    var vid_a = add(va2, vid, ctx)                     # residual
+    var txt_a = add(ta2, txt, ctx)
+
+    # ─── MLP sub-block ─────────────────────────────────────────────────────────
+    var vm = rms_norm(vid_a, ones, Float32(1e-5), ctx)
+    var tm = rms_norm(txt_a, ones, Float32(1e-5), ctx)
+    vm = _mod_in(vm, mlp_scaleA, w.ada_vid_mlp_scale, mlp_shiftA, w.ada_vid_mlp_shift, ctx)
+    tm = _mod_in(tm, mlp_scaleA, w.ada_txt_mlp_scale, mlp_shiftA, w.ada_txt_mlp_shift, ctx)
+    vm = _swiglu_mlp(vm, w.mlp_vid_proj_in_w, w.mlp_vid_proj_in_gate_w, w.mlp_vid_proj_out_w, ctx)
+    tm = _swiglu_mlp(tm, w.mlp_txt_proj_in_w, w.mlp_txt_proj_in_gate_w, w.mlp_txt_proj_out_w, ctx)
+    vm = _mod_gate(vm, mlp_gateA, w.ada_vid_mlp_gate, ctx)
+    tm = _mod_gate(tm, mlp_gateA, w.ada_txt_mlp_gate, ctx)
+    var vid_o = add(vm, vid_a, ctx)                    # residual
+    var txt_o = add(tm, txt_a, ctx)
+    return (vid_o^, txt_o^)
+
+
+def dit_stack_g[TW: Int](
+    vid: Tensor,          # [256,2560] bf16
+    txt: Tensor,          # [TW,2560]  bf16
+    emb: Tensor,          # [1,15360]  bf16
+    vid_freqs: Tensor,    # [256,126]  F32
+    txt_freqs: Tensor,    # [TW*4,126] F32
+    blocks: List[ArcPointer[Block0Weights]],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Run all 32 MMDiT blocks with per-window txt count TW; returns final vid [256,2560]."""
+    var cur_vid = vid.clone(ctx)
+    var cur_txt = txt.clone(ctx)
+    var n = len(blocks)
+    for i in range(n):
+        var pair = mmdit_block_g[TW](cur_vid, cur_txt, emb, vid_freqs, txt_freqs, blocks[i][], ctx)
+        cur_vid = pair[0].clone(ctx)
+        cur_txt = pair[1].clone(ctx)
+    return cur_vid^
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # (G) dit_out_tail — the NaDiT OUTPUT TAIL (SeedVR nadit.forward:232-236 + NaPatchOut).
 #   vid_out_norm -> vid_out_ada -> vid_out.proj -> unpatchify -> latent [1024,16].
 #
@@ -843,6 +989,62 @@ def compute_dit_freqs(ctx: DeviceContext) raises -> Tuple[Tensor, Tensor]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# (H') compute_dit_freqs(txt_len) — GENERALIZED axial-3D RoPE tables for CFG.
+#   Same math as compute_dit_freqs(ctx) but the txt length varies (pos=58, neg=64).
+#   The VID temporal position == txt_len (the vid temporal pos IS the txt-length
+#   offset), so ax1(txt_len) drives the vid [0:42] block. For txt_len=58 this
+#   reproduces compute_dit_freqs(ctx) exactly.
+#     VID [256,126]: token = win*64 + h*8 + w, row = ax1(txt_len) ++ ax1(h) ++ ax1(w)
+#     TXT [txt_len*4,126]: token = win*txt_len + l, row = ax1(l) tiled x3
+# ═══════════════════════════════════════════════════════════════════════════════
+def compute_dit_freqs(txt_len: Int, ctx: DeviceContext) raises -> Tuple[Tensor, Tensor]:
+    """(vid_freqs [256,126], txt_freqs [txt_len*4,126]) F32 axial-3D RoPE tables.
+    vid temporal position = txt_len; txt uses per-window length txt_len."""
+    var lnbase = log(Float64(10000.0))
+    var inv = List[Float64]()
+    for i in range(21):
+        inv.append(1.0 / exp((2.0 * Float64(i) / 42.0) * lnbase))
+
+    # VID [256,126]: win(4) x h(8) x w(8), row = ax1(txt_len) ++ ax1(h) ++ ax1(w)
+    var vid_vals = List[Float32]()
+    for _win in range(4):
+        for h in range(8):
+            for w in range(8):
+                for i in range(21):
+                    var v = Float32(Float64(txt_len) * inv[i])
+                    vid_vals.append(v)
+                    vid_vals.append(v)
+                for i in range(21):
+                    var v = Float32(Float64(h) * inv[i])
+                    vid_vals.append(v)
+                    vid_vals.append(v)
+                for i in range(21):
+                    var v = Float32(Float64(w) * inv[i])
+                    vid_vals.append(v)
+                    vid_vals.append(v)
+
+    # TXT [txt_len*4,126]: win(4) x l(txt_len), row = ax1(l) tiled x3
+    var txt_vals = List[Float32]()
+    for _win in range(4):
+        for l in range(txt_len):
+            for _rep in range(3):
+                for i in range(21):
+                    var v = Float32(Float64(l) * inv[i])
+                    txt_vals.append(v)
+                    txt_vals.append(v)
+
+    var vshp = List[Int]()
+    vshp.append(256)
+    vshp.append(126)
+    var tshp = List[Int]()
+    tshp.append(txt_len * 4)
+    tshp.append(126)
+    var vid_freqs = Tensor.from_host(vid_vals, vshp^, STDtype.F32, ctx)
+    var txt_freqs = Tensor.from_host(txt_vals, tshp^, STDtype.F32, ctx)
+    return (vid_freqs^, txt_freqs^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # (I) txt_in — Linear text-embedding entry:  txt_raw [58,5120] -> [58,2560].
 #   weight txt_in.weight [2560,5120], bias txt_in.bias [2560].
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -917,3 +1119,131 @@ def full_dit_forward(
         load_bias(st, "vid_out.proj.bias", ctx),
         ctx,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (K) DiTWeights + load_dit_weights + full_dit_forward_pre — PRELOADED weights.
+#   The sampler runs the DiT 16 times (8 steps x pos/neg CFG); reloading 6.8GB of
+#   weights per call is intolerable, so load_dit_weights streams ALL weights
+#   (non-block heads/tail + 32 blocks) ONCE into a DiTWeights, and
+#   full_dit_forward_pre reuses them (borrowed) for every call. Same math as
+#   full_dit_forward but with the TW-generalized freqs + block path so the CFG
+#   pos (txt_len=58) and neg (txt_len=64) streams share one code path.
+# ═══════════════════════════════════════════════════════════════════════════════
+struct DiTWeights(Movable):
+    """All non-block DiT weights (input heads + output tail) + the 32 blocks."""
+
+    var vin_w: Tensor        # vid_in.proj.weight  [2560,132]
+    var vin_b: Tensor        # vid_in.proj.bias    [2560]
+    var txt_w: Tensor        # txt_in.weight       [2560,5120]
+    var txt_b: Tensor        # txt_in.bias         [2560]
+    var ein_pin_w: Tensor    # emb_in.proj_in.weight  [2560,256]
+    var ein_pin_b: Tensor    # emb_in.proj_in.bias    [2560]
+    var ein_phid_w: Tensor   # emb_in.proj_hid.weight [2560,2560]
+    var ein_phid_b: Tensor   # emb_in.proj_hid.bias   [2560]
+    var ein_pout_w: Tensor   # emb_in.proj_out.weight [15360,2560]
+    var ein_pout_b: Tensor   # emb_in.proj_out.bias   [15360]
+    var tail_norm_w: Tensor  # vid_out_norm.weight   [2560]
+    var tail_ada_shift: Tensor  # vid_out_ada.out_shift [2560]
+    var tail_ada_scale: Tensor  # vid_out_ada.out_scale [2560]
+    var tail_proj_w: Tensor  # vid_out.proj.weight   [64,2560]
+    var tail_proj_b: Tensor  # vid_out.proj.bias     [64]
+    var blocks: List[ArcPointer[Block0Weights]]  # 32 MMDiT blocks
+
+    def __init__(
+        out self,
+        var vin_w: Tensor,
+        var vin_b: Tensor,
+        var txt_w: Tensor,
+        var txt_b: Tensor,
+        var ein_pin_w: Tensor,
+        var ein_pin_b: Tensor,
+        var ein_phid_w: Tensor,
+        var ein_phid_b: Tensor,
+        var ein_pout_w: Tensor,
+        var ein_pout_b: Tensor,
+        var tail_norm_w: Tensor,
+        var tail_ada_shift: Tensor,
+        var tail_ada_scale: Tensor,
+        var tail_proj_w: Tensor,
+        var tail_proj_b: Tensor,
+        var blocks: List[ArcPointer[Block0Weights]],
+    ):
+        self.vin_w = vin_w^
+        self.vin_b = vin_b^
+        self.txt_w = txt_w^
+        self.txt_b = txt_b^
+        self.ein_pin_w = ein_pin_w^
+        self.ein_pin_b = ein_pin_b^
+        self.ein_phid_w = ein_phid_w^
+        self.ein_phid_b = ein_phid_b^
+        self.ein_pout_w = ein_pout_w^
+        self.ein_pout_b = ein_pout_b^
+        self.tail_norm_w = tail_norm_w^
+        self.tail_ada_shift = tail_ada_shift^
+        self.tail_ada_scale = tail_ada_scale^
+        self.tail_proj_w = tail_proj_w^
+        self.tail_proj_b = tail_proj_b^
+        self.blocks = blocks^
+
+
+def load_dit_weights(st: SafeTensors, ctx: DeviceContext) raises -> DiTWeights:
+    """Stream the entire SeedVR2-3B DiT (heads + tail + 32 blocks) ONCE."""
+    var blocks = List[ArcPointer[Block0Weights]]()
+    for i in range(32):
+        blocks.append(ArcPointer(load_block(st, i, ctx)))
+    return DiTWeights(
+        load_bias(st, "vid_in.proj.weight", ctx),
+        load_bias(st, "vid_in.proj.bias", ctx),
+        load_bias(st, "txt_in.weight", ctx),
+        load_bias(st, "txt_in.bias", ctx),
+        load_bias(st, "emb_in.proj_in.weight", ctx),
+        load_bias(st, "emb_in.proj_in.bias", ctx),
+        load_bias(st, "emb_in.proj_hid.weight", ctx),
+        load_bias(st, "emb_in.proj_hid.bias", ctx),
+        load_bias(st, "emb_in.proj_out.weight", ctx),
+        load_bias(st, "emb_in.proj_out.bias", ctx),
+        load_bias(st, "vid_out_norm.weight", ctx),
+        load_bias(st, "vid_out_ada.out_shift", ctx),
+        load_bias(st, "vid_out_ada.out_scale", ctx),
+        load_bias(st, "vid_out.proj.weight", ctx),
+        load_bias(st, "vid_out.proj.bias", ctx),
+        blocks^,
+    )
+
+
+def full_dit_forward_pre(
+    vid_raw: Tensor,   # [T*H*W,33] = [1024,33] (bf16), grid channels-last
+    txt_raw: Tensor,   # [txt_len,5120] (bf16)
+    txt_len: Int,      # 58 (CFG pos) or 64 (CFG neg)
+    timestep: Float32, # scalar
+    w: DiTWeights,     # PRELOADED weights (borrowed, reused across all calls)
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """SeedVR2-3B NaDiT forward using PRELOADED weights + TW-generalized freqs/blocks.
+    Grid fixed at T=4,H=16,W=16 (vid_in patchifies -> 256 tokens). Returns [1024,16] bf16."""
+    var vid = vid_in(vid_raw, w.vin_w, w.vin_b, 4, 16, 16, ctx)   # [256,2560]
+    var txt = txt_in(txt_raw, w.txt_w, w.txt_b, ctx)              # [txt_len,2560]
+    var emb = emb_in(
+        timestep,
+        w.ein_pin_w, w.ein_pin_b,
+        w.ein_phid_w, w.ein_phid_b,
+        w.ein_pout_w, w.ein_pout_b,
+        ctx,
+    )                                                             # [1,15360]
+    var freqs = compute_dit_freqs(txt_len, ctx)  # (vid[256,126], txt[txt_len*4,126])
+
+    if txt_len == 58:
+        var vs = dit_stack_g[58](vid, txt, emb, freqs[0], freqs[1], w.blocks, ctx)
+        return dit_out_tail(
+            vs, emb, w.tail_norm_w, w.tail_ada_shift, w.tail_ada_scale,
+            w.tail_proj_w, w.tail_proj_b, ctx,
+        )
+    elif txt_len == 64:
+        var vs = dit_stack_g[64](vid, txt, emb, freqs[0], freqs[1], w.blocks, ctx)
+        return dit_out_tail(
+            vs, emb, w.tail_norm_w, w.tail_ada_shift, w.tail_ada_scale,
+            w.tail_proj_w, w.tail_proj_b, ctx,
+        )
+    else:
+        raise Error("full_dit_forward_pre: unsupported txt_len (want 58 or 64)")

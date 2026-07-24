@@ -75,6 +75,19 @@ maps source offsets, fades, typed video/audio/text tracks, subtitles,
 transitions, LUTs, brightness, contrast, saturation, hue, gamma, blur,
 sharpen, denoise, glow, vignette, speed, and horizontal/vertical flips.
 
+The browser uses the same primary workspace organization as the native Genesis
+editor without launching or embedding egui:
+
+- a persistent media bin on the left with thumbnail cards, Source-monitor
+  selection, and add-at-playhead actions;
+- a central Program/Source monitor with native-clock transport and timecode;
+- a persistent right dock with Properties, the real clip filter stack, a live
+  frame histogram, and a track mixer with persisted mute controls;
+- a dedicated timeline toolbar for split, razor-all, lift, ripple delete,
+  copy, paste, duplicate, markers, snapping, track creation, and zoom-to-fit;
+- multitrack headers with visibility, mute, and lock controls plus video
+  thumbnail strips and duration-correct audio waveforms.
+
 Preview requests are serialized in the browser. Scrubbing while a frame is in
 flight retains only one pending request, preventing a process/request storm.
 Paused and scrubbed frames use the Genesis compositor so effects are exact.
@@ -93,7 +106,8 @@ requested rational FPS rather than a fixed 30 FPS clock. Effect add, remove,
 enable, disable, slider, and LUT changes request a fresh Genesis preview and
 disabled effects are excluded before they reach the compositor.
 
-The toolbar exposes direct `+ Video`, `+ Music`, and `Edit Clip` actions.
+The top toolbar exposes direct `+ Video`, `+ Music`, Save, undo/redo, Retake,
+and Render actions.
 Importing the first video adopts its probed dimensions and FPS, selects it,
 keeps its start and the playhead visible, opens Clip Properties, and loads a
 one-thumbnail-per-second strip. Audio-only import derives frames from the audio
@@ -125,6 +139,11 @@ Observed gates:
 
 - `gcompose --serve` initialized OpenCL and passed its startup self-check;
 - the browser `+ Video` action imported and probed exactly 121 frames at 25 FPS;
+- the Genesis-style workspace exposed the media bin, Program/Source monitors,
+  twelve real timeline actions, four persistent dock tabs, a non-empty live
+  histogram, and a two-track mixer;
+- marker, snap off/on, copy/paste/undo, and mixer mute/unmute interactions all
+  changed editor state and returned to the expected state;
 - the timeline loaded a visible thumbnail strip, playback reached frame 15,
   the video clock reached 0.61 seconds, and the large-preview pixel hash
   changed while playback remained active;

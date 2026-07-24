@@ -10,9 +10,9 @@
 var VideoEditTab = (function () {
     // --- Constants ---
     var FPS = 30;
-    var TRACK_HEIGHT = 48;
+    var TRACK_HEIGHT = 62;
     var RULER_HEIGHT = 28;
-    var TRACK_HEADER_WIDTH = 120;
+    var TRACK_HEADER_WIDTH = 156;
     var MIN_PPF = 0.5;
     var MAX_PPF = 20;
     var DEFAULT_PPF = 4;
@@ -98,6 +98,11 @@ var VideoEditTab = (function () {
     // Snap state
     var snapPoints = [];
     var activeSnapFrame = null;
+    var snapEnabled = true;
+    var clipClipboard = [];
+    var monitorMode = 'program';
+    var sourceMonitorClipId = null;
+    var dockTab = 'properties';
 
     // Context menu
     var contextMenuEl = null;
@@ -193,6 +198,7 @@ var VideoEditTab = (function () {
         width: 1280,
         height: 720,
         name: 'Untitled Project',
+        markers: [],
         tracks: [
             {
                 id: 'track-1', name: 'Video 1', type: 'video',
@@ -321,6 +327,7 @@ var VideoEditTab = (function () {
     }
 
     function findSnap(frame) {
+        if (!snapEnabled) return null;
         var best = null;
         var bestDist = SNAP_THRESHOLD + 1;
         for (var i = 0; i < snapPoints.length; i++) {
@@ -349,6 +356,7 @@ var VideoEditTab = (function () {
             fps: project.fps,
             width: project.width || 1280,
             height: project.height || 720,
+            markers: project.markers || [],
             tracks: project.tracks
         };
         fetch(getApiBase() + '/video_edit/projects/' + projectId, {
@@ -365,6 +373,7 @@ var VideoEditTab = (function () {
         project.fps = clamp(Math.round(Number(data.fps) || 30), 1, 120);
         project.width = clamp(Math.round(Number(data.width) || 1280), 16, 8192);
         project.height = clamp(Math.round(Number(data.height) || 720), 16, 8192);
+        project.markers = Array.isArray(data.markers) ? data.markers : [];
         FPS = project.fps;
         if (Array.isArray(data.tracks)) {
             project.tracks = data.tracks;
@@ -375,6 +384,9 @@ var VideoEditTab = (function () {
         waveformLoading.clear();
         stopAllAudio();
         audioElements.clear();
+        previewActiveClipId = null;
+        sourceMonitorClipId = null;
+        monitorMode = 'program';
         selectedClipIds.clear();
         currentFrame = 0;
         scrollOffsetX = 0;
@@ -384,6 +396,9 @@ var VideoEditTab = (function () {
         renderTimeline();
         updatePreview();
         updateEditButton();
+        renderMediaBin();
+        renderDock();
+        updateMonitorTabs();
     }
 
     function loadOrCreateProject() {
@@ -417,6 +432,7 @@ var VideoEditTab = (function () {
                 fps: project.fps,
                 width: project.width,
                 height: project.height,
+                markers: project.markers,
                 tracks: project.tracks
             })
         })
@@ -437,27 +453,58 @@ var VideoEditTab = (function () {
         if (!toolbar) return;
         toolbar.innerHTML =
             '<div class="ve-toolbar-inner">' +
+                '<span class="ve-editor-title">Genesis Editor</span>' +
                 '<div style="position:relative">' +
-                    '<button id="ve-btn-file" class="ve-tb-btn" title="File" style="font-size:11px;width:auto;padding:0 8px;">File</button>' +
+                    '<button id="ve-btn-file" class="ve-tb-btn ve-tb-btn-label" title="Project and interchange actions">File</button>' +
                     '<div id="ve-file-dropdown" class="ve-file-dropdown" style="display:none"></div>' +
                 '</div>' +
-                '<button id="ve-btn-import-video" class="ve-tb-btn ve-tb-btn-label" title="Import a video">+ Video</button>' +
-                '<button id="ve-btn-import-music" class="ve-tb-btn ve-tb-btn-label" title="Add music or audio">+ Music</button>' +
-                '<button id="ve-btn-edit-clip" class="ve-tb-btn ve-tb-btn-label" title="Edit the selected video clip" disabled>Edit Clip</button>' +
-                '<button id="ve-btn-start" class="ve-tb-btn" title="Go to start (Home)">&#9198;</button>' +
-                '<button id="ve-btn-play" class="ve-tb-btn" title="Play/Pause (Space)">&#9654;</button>' +
-                '<button id="ve-btn-stop" class="ve-tb-btn" title="Stop">&#9632;</button>' +
-                '<button id="ve-btn-end" class="ve-tb-btn" title="Go to end (End)">&#9197;</button>' +
-                '<span id="ve-timecode" class="ve-timecode">00:00:00</span>' +
+                '<button id="ve-btn-import-video" class="ve-tb-btn ve-tb-btn-label" title="Import video into the media bin and timeline">+ Video</button>' +
+                '<button id="ve-btn-import-music" class="ve-tb-btn ve-tb-btn-label" title="Import music or audio">+ Music</button>' +
+                '<button id="ve-btn-save" class="ve-tb-btn ve-tb-btn-label" title="Save project now">Save</button>' +
+                '<span class="ve-toolbar-divider"></span>' +
+                '<button id="ve-btn-undo-top" class="ve-tb-btn" title="Undo (Ctrl+Z)">&#8630;</button>' +
+                '<button id="ve-btn-redo-top" class="ve-tb-btn" title="Redo (Ctrl+Shift+Z)">&#8631;</button>' +
                 '<span class="ve-spacer"></span>' +
-                '<button id="ve-btn-retake" class="ve-tb-btn" title="Retake Selection" style="font-size:11px;width:auto;padding:0 8px;">Retake</button>' +
-                '<span class="ve-spacer"></span>' +
-                '<span id="ve-zoom-label" class="ve-zoom-label">100%</span>' +
-                '<input id="ve-zoom-slider" type="range" min="5" max="2000" value="400" class="ve-zoom-slider">' +
-                '<span id="ve-duration" class="ve-timecode">' + frameToTimecode(totalFrames) + '</span>' +
                 '<span id="ve-engine-status" class="ve-engine-status">Genesis: checking...</span>' +
-                '<button id="ve-btn-export" class="ve-tb-btn" title="Export" style="font-size:11px;width:auto;padding:0 8px;">Export</button>' +
+                '<button id="ve-btn-retake" class="ve-tb-btn ve-tb-btn-label" title="Generate a replacement for the selected region">Retake</button>' +
+                '<button id="ve-btn-export" class="ve-tb-btn ve-tb-btn-label ve-primary-action" title="Render and export">Render</button>' +
             '</div>';
+
+        var transport = document.getElementById('ve-monitor-transport');
+        if (transport) {
+            transport.innerHTML =
+                '<button id="ve-btn-start" class="ve-transport-btn" title="Go to start (Home)">&#9198;</button>' +
+                '<button id="ve-btn-rewind" class="ve-transport-btn" title="Back one second">&#9664;&#9664;</button>' +
+                '<button id="ve-btn-play" class="ve-transport-btn ve-play-btn" title="Play/Pause (Space)">&#9654;</button>' +
+                '<button id="ve-btn-stop" class="ve-transport-btn" title="Stop">&#9632;</button>' +
+                '<button id="ve-btn-forward" class="ve-transport-btn" title="Forward one second">&#9654;&#9654;</button>' +
+                '<button id="ve-btn-end" class="ve-transport-btn" title="Go to end (End)">&#9197;</button>' +
+                '<span id="ve-timecode" class="ve-monitor-timecode">00:00:00</span>' +
+                '<span class="ve-timecode-divider">/</span>' +
+                '<span id="ve-duration" class="ve-monitor-timecode">' + frameToTimecode(totalFrames) + '</span>';
+        }
+
+        var editToolbar = document.getElementById('ve-edit-toolbar');
+        if (editToolbar) {
+            editToolbar.innerHTML =
+                '<span class="ve-edit-toolbar-title">TIMELINE</span>' +
+                '<button id="ve-edit-split" class="ve-edit-btn" title="Split selected clip at playhead">Split</button>' +
+                '<button id="ve-edit-razor" class="ve-edit-btn" title="Split every clip crossing the playhead">Razor all</button>' +
+                '<button id="ve-edit-lift" class="ve-edit-btn" title="Delete selection and leave the gap">Lift</button>' +
+                '<button id="ve-edit-ripple" class="ve-edit-btn" title="Delete selection and close the gap">Ripple</button>' +
+                '<button id="ve-edit-copy" class="ve-edit-btn" title="Copy selection">Copy</button>' +
+                '<button id="ve-edit-paste" class="ve-edit-btn" title="Paste at playhead">Paste</button>' +
+                '<button id="ve-edit-duplicate" class="ve-edit-btn" title="Duplicate selection">Duplicate</button>' +
+                '<span class="ve-toolbar-divider"></span>' +
+                '<button id="ve-edit-marker" class="ve-edit-btn" title="Toggle marker at playhead">Marker</button>' +
+                '<button id="ve-edit-snap" class="ve-edit-btn ve-active" title="Toggle snapping">Snap</button>' +
+                '<button id="ve-edit-add-video" class="ve-edit-btn" title="Add video track">+V</button>' +
+                '<button id="ve-edit-add-audio" class="ve-edit-btn" title="Add audio track">+A</button>' +
+                '<span class="ve-spacer"></span>' +
+                '<button id="ve-edit-zoom-fit" class="ve-edit-btn" title="Fit the complete project in the timeline">Fit</button>' +
+                '<span id="ve-zoom-label" class="ve-zoom-label">100%</span>' +
+                '<input id="ve-zoom-slider" type="range" min="5" max="2000" value="400" class="ve-zoom-slider">';
+        }
 
         var btnPlay = document.getElementById('ve-btn-play');
         var btnStop = document.getElementById('ve-btn-stop');
@@ -466,7 +513,6 @@ var VideoEditTab = (function () {
         var zoomSlider = document.getElementById('ve-zoom-slider');
         var btnImportVideo = document.getElementById('ve-btn-import-video');
         var btnImportMusic = document.getElementById('ve-btn-import-music');
-        var btnEditClip = document.getElementById('ve-btn-edit-clip');
 
         if (btnImportVideo) btnImportVideo.addEventListener('click', function () {
             openMediaPicker('video');
@@ -474,10 +520,12 @@ var VideoEditTab = (function () {
         if (btnImportMusic) btnImportMusic.addEventListener('click', function () {
             openMediaPicker('audio');
         });
-        if (btnEditClip) btnEditClip.addEventListener('click', function () {
-            if (selectedClipIds.size !== 1) return;
-            openPropertiesPanel(selectedClipIds.values().next().value);
+        document.getElementById('ve-btn-save').addEventListener('click', function () {
+            saveProject();
+            setGenesisStatus('Project saved', false);
         });
+        document.getElementById('ve-btn-undo-top').addEventListener('click', undo);
+        document.getElementById('ve-btn-redo-top').addEventListener('click', redo);
 
         var btnRetake = document.getElementById('ve-btn-retake');
         if (btnRetake) btnRetake.addEventListener('click', function () {
@@ -491,6 +539,12 @@ var VideoEditTab = (function () {
         var btnFile = document.getElementById('ve-btn-file');
         if (btnFile) btnFile.addEventListener('click', toggleFileMenu);
         if (btnPlay) btnPlay.addEventListener('click', togglePlayback);
+        document.getElementById('ve-btn-rewind').addEventListener('click', function () {
+            seekTimelineFrame(currentFrame - FPS);
+        });
+        document.getElementById('ve-btn-forward').addEventListener('click', function () {
+            seekTimelineFrame(currentFrame + FPS);
+        });
         if (btnStop) btnStop.addEventListener('click', function () {
             stopPlayback();
             currentFrame = 0;
@@ -527,6 +581,39 @@ var VideoEditTab = (function () {
             });
         }
 
+        document.getElementById('ve-edit-split').addEventListener('click', splitSelectedAtPlayhead);
+        document.getElementById('ve-edit-razor').addEventListener('click', razorAllAtPlayhead);
+        document.getElementById('ve-edit-lift').addEventListener('click', deleteSelectedClips);
+        document.getElementById('ve-edit-ripple').addEventListener('click', rippleDeleteSelectedClips);
+        document.getElementById('ve-edit-copy').addEventListener('click', copySelectedClips);
+        document.getElementById('ve-edit-paste').addEventListener('click', pasteClipsAtPlayhead);
+        document.getElementById('ve-edit-duplicate').addEventListener('click', duplicateSelectedClips);
+        document.getElementById('ve-edit-marker').addEventListener('click', toggleMarkerAtPlayhead);
+        document.getElementById('ve-edit-snap').addEventListener('click', function () {
+            snapEnabled = !snapEnabled;
+            this.classList.toggle('ve-active', snapEnabled);
+            renderTimeline();
+        });
+        document.getElementById('ve-edit-add-video').addEventListener('click', function () {
+            addTrack('video');
+        });
+        document.getElementById('ve-edit-add-audio').addEventListener('click', function () {
+            addTrack('audio');
+        });
+        document.getElementById('ve-edit-zoom-fit').addEventListener('click', zoomTimelineToFit);
+
+        document.querySelectorAll('.ve-monitor-tab').forEach(function (tab) {
+            tab.addEventListener('click', function () {
+                setMonitorMode(tab.dataset.monitor);
+            });
+        });
+        document.querySelectorAll('.ve-dock-tab').forEach(function (tab) {
+            tab.addEventListener('click', function () {
+                dockTab = tab.dataset.dock;
+                renderDock();
+            });
+        });
+
         fetch(getApiBase() + '/video_edit/status')
             .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('status ' + r.status)); })
             .then(function (data) {
@@ -544,6 +631,424 @@ var VideoEditTab = (function () {
                     status.classList.add('ve-engine-error');
                 }
             });
+    }
+
+    function seekTimelineFrame(frame) {
+        stopPlayback();
+        currentFrame = clamp(Math.round(frame), 0, totalFrames);
+        updateTimecodeDisplay();
+        renderPlayhead();
+        updatePreview();
+    }
+
+    function splitSelectedAtPlayhead() {
+        Array.from(selectedClipIds).forEach(function (clipId) {
+            var info = findClipById(clipId);
+            if (info) splitClipAtPlayhead(clipId, info.track.id);
+        });
+    }
+
+    function razorAllAtPlayhead() {
+        var targets = [];
+        project.tracks.forEach(function (track) {
+            track.clips.forEach(function (clip) {
+                if (currentFrame > clip.startFrame && currentFrame < clip.endFrame) {
+                    targets.push({ clipId: clip.id, trackId: track.id });
+                }
+            });
+        });
+        targets.forEach(function (target) {
+            splitClipAtPlayhead(target.clipId, target.trackId);
+        });
+    }
+
+    function rippleDeleteSelectedClips() {
+        if (!selectedClipIds.size) return;
+        pushUndo();
+        project.tracks.forEach(function (track) {
+            var removed = track.clips
+                .filter(function (clip) { return selectedClipIds.has(clip.id); })
+                .map(function (clip) {
+                    return {
+                        start: clip.startFrame,
+                        end: clip.endFrame,
+                        duration: clip.endFrame - clip.startFrame,
+                    };
+                })
+                .sort(function (a, b) { return a.start - b.start; });
+            if (!removed.length) return;
+            track.clips = track.clips.filter(function (clip) {
+                return !selectedClipIds.has(clip.id);
+            });
+            track.clips.forEach(function (clip) {
+                var shift = removed.reduce(function (sum, gap) {
+                    return sum + (gap.end <= clip.startFrame ? gap.duration : 0);
+                }, 0);
+                clip.startFrame -= shift;
+                clip.endFrame -= shift;
+            });
+        });
+        selectedClipIds.clear();
+        closePropertiesPanel();
+        recalcTotalFrames();
+        renderTimeline();
+        renderMediaBin();
+        renderDock();
+        updateEditButton();
+        scheduleAutosave();
+        updatePreview();
+    }
+
+    function copySelectedClips() {
+        if (!selectedClipIds.size) return;
+        var selected = [];
+        project.tracks.forEach(function (track) {
+            track.clips.forEach(function (clip) {
+                if (selectedClipIds.has(clip.id)) {
+                    selected.push({
+                        trackType: track.type,
+                        clip: JSON.parse(JSON.stringify(clip)),
+                    });
+                }
+            });
+        });
+        var firstFrame = selected.reduce(function (min, item) {
+            return Math.min(min, item.clip.startFrame);
+        }, Infinity);
+        clipClipboard = selected.map(function (item) {
+            item.offset = item.clip.startFrame - firstFrame;
+            return item;
+        });
+        setGenesisStatus(clipClipboard.length + ' clip(s) copied', false);
+    }
+
+    function pasteClipsAtPlayhead() {
+        if (!clipClipboard.length) return;
+        pushUndo();
+        selectedClipIds.clear();
+        clipClipboard.forEach(function (item) {
+            var track = project.tracks.find(function (candidate) {
+                return candidate.type === item.trackType;
+            });
+            if (!track) {
+                track = addTrack(item.trackType, true);
+            }
+            var pasted = JSON.parse(JSON.stringify(item.clip));
+            var duration = pasted.endFrame - pasted.startFrame;
+            pasted.id = generateClipId();
+            pasted.startFrame = currentFrame + item.offset;
+            pasted.endFrame = pasted.startFrame + duration;
+            pasted.label = (pasted.label || 'Clip') + ' copy';
+            track.clips.push(pasted);
+            selectedClipIds.add(pasted.id);
+        });
+        recalcTotalFrames();
+        renderTimeline();
+        renderMediaBin();
+        renderDock();
+        updateEditButton();
+        scheduleAutosave();
+        updatePreview();
+    }
+
+    function duplicateSelectedClips() {
+        Array.from(selectedClipIds).forEach(function (clipId) {
+            var info = findClipById(clipId);
+            if (info) duplicateClip(clipId, info.track.id);
+        });
+    }
+
+    function toggleMarkerAtPlayhead() {
+        if (!project.markers) project.markers = [];
+        var index = project.markers.indexOf(currentFrame);
+        if (index >= 0) project.markers.splice(index, 1);
+        else project.markers.push(currentFrame);
+        project.markers.sort(function (a, b) { return a - b; });
+        renderTimeline();
+        scheduleAutosave();
+    }
+
+    function zoomTimelineToFit() {
+        if (!stage) return;
+        pixelsPerFrame = clamp(
+            (stage.width() - TRACK_HEADER_WIDTH - 20) / Math.max(1, totalFrames),
+            MIN_PPF,
+            MAX_PPF
+        );
+        scrollOffsetX = 0;
+        updateZoomDisplay();
+        renderTimeline();
+    }
+
+    function selectedVideoClip() {
+        if (selectedClipIds.size === 1) {
+            var info = findClipById(selectedClipIds.values().next().value);
+            if (info && info.track.type === 'video') return info.clip;
+        }
+        return null;
+    }
+
+    function setMonitorMode(mode) {
+        if (mode === 'source') {
+            var selected = selectedVideoClip();
+            if (selected) sourceMonitorClipId = selected.id;
+            if (!sourceMonitorClipId) {
+                var active = findActiveClipAtFrame(currentFrame);
+                if (active) sourceMonitorClipId = active.id;
+            }
+            if (!sourceMonitorClipId) return;
+        }
+        monitorMode = mode === 'source' ? 'source' : 'program';
+        previewActiveClipId = null;
+        updateMonitorTabs();
+        updatePreview();
+    }
+
+    function updateMonitorTabs() {
+        document.querySelectorAll('.ve-monitor-tab').forEach(function (tab) {
+            tab.classList.toggle('ve-active', tab.dataset.monitor === monitorMode);
+        });
+    }
+
+    function renderMediaBin() {
+        var grid = document.getElementById('ve-media-grid');
+        var count = document.getElementById('ve-media-count');
+        if (!grid) return;
+        grid.innerHTML = '';
+        var media = [];
+        var seen = new Set();
+        project.tracks.forEach(function (track) {
+            track.clips.forEach(function (clip) {
+                if (!clip.source_path || seen.has(clip.source_path)) return;
+                seen.add(clip.source_path);
+                media.push({ clip: clip, type: track.type });
+            });
+        });
+        if (count) count.textContent = String(media.length);
+        if (!media.length) {
+            grid.innerHTML =
+                '<div class="ve-media-empty">No media yet<br><button id="ve-media-empty-add">+ Add media</button></div>';
+            var emptyAdd = document.getElementById('ve-media-empty-add');
+            if (emptyAdd) emptyAdd.addEventListener('click', function () {
+                openMediaPicker('video');
+            });
+            return;
+        }
+        media.forEach(function (item) {
+            var card = document.createElement('div');
+            card.className = 've-media-card';
+            card.dataset.clipId = item.clip.id;
+            if (sourceMonitorClipId === item.clip.id) card.classList.add('ve-selected');
+
+            var thumb = document.createElement('div');
+            thumb.className = 've-media-thumb';
+            var cached = thumbnailCache.get(item.clip.id);
+            if (cached && cached.img) {
+                thumb.style.backgroundImage = 'url("' + cached.img.src + '")';
+                thumb.style.backgroundSize = 'auto 100%';
+                thumb.style.backgroundPosition = 'left center';
+            } else if (item.type === 'audio') {
+                thumb.classList.add('ve-audio-thumb');
+                thumb.textContent = '\u266B';
+            } else {
+                thumb.textContent = 'VIDEO';
+                if (!thumbnailLoading.has(item.clip.id)) loadThumbnails(item.clip);
+            }
+
+            var label = document.createElement('div');
+            label.className = 've-media-label';
+            label.textContent = item.clip.label || 'Untitled';
+            var meta = document.createElement('div');
+            meta.className = 've-media-meta';
+            meta.textContent = item.type.toUpperCase() + ' \u00B7 ' +
+                frameToTimecode(item.clip.endFrame - item.clip.startFrame);
+            var add = document.createElement('button');
+            add.className = 've-media-add-timeline';
+            add.textContent = '+ Timeline';
+            add.title = 'Add this media at the playhead';
+            add.addEventListener('click', function (event) {
+                event.stopPropagation();
+                addMediaToTimeline(item.clip, item.type);
+            });
+            card.appendChild(thumb);
+            card.appendChild(label);
+            card.appendChild(meta);
+            card.appendChild(add);
+            card.addEventListener('click', function () {
+                sourceMonitorClipId = item.clip.id;
+                selectedClipIds.clear();
+                selectedClipIds.add(item.clip.id);
+                currentFrame = item.clip.startFrame;
+                renderTimeline();
+                updateEditButton();
+                renderDock();
+                setMonitorMode('source');
+                renderMediaBin();
+            });
+            grid.appendChild(card);
+        });
+    }
+
+    function addMediaToTimeline(sourceClip, trackType) {
+        var track = project.tracks.find(function (candidate) {
+            return candidate.type === trackType;
+        });
+        if (!track) track = addTrack(trackType, true);
+        pushUndo();
+        var clone = JSON.parse(JSON.stringify(sourceClip));
+        var duration = clone.endFrame - clone.startFrame;
+        clone.id = generateClipId();
+        clone.startFrame = currentFrame;
+        clone.endFrame = currentFrame + duration;
+        clone.label = (clone.label || 'Clip') + ' copy';
+        track.clips.push(clone);
+        selectedClipIds.clear();
+        selectedClipIds.add(clone.id);
+        recalcTotalFrames();
+        renderTimeline();
+        updateEditButton();
+        scheduleAutosave();
+        renderMediaBin();
+        renderDock();
+    }
+
+    function renderDock() {
+        var content = document.getElementById('ve-dock-content');
+        if (!content) return;
+        document.querySelectorAll('.ve-dock-tab').forEach(function (tab) {
+            tab.classList.toggle('ve-active', tab.dataset.dock === dockTab);
+        });
+        propsPanelEl = null;
+        propsPanelClipId = null;
+        content.innerHTML = '';
+        var info = selectedClipIds.size === 1
+            ? findClipById(selectedClipIds.values().next().value)
+            : null;
+
+        if (dockTab === 'filters') {
+            if (!info || info.track.type !== 'video') {
+                content.innerHTML = '<div class="ve-dock-empty">Select a video clip to edit its filter stack.</div>';
+                return;
+            }
+            if (!info.clip.effects) info.clip.effects = [];
+            var panel = document.createElement('div');
+            panel.className = 've-props-panel';
+            propsPanelEl = panel;
+            propsPanelClipId = info.clip.id;
+            content.appendChild(panel);
+            renderPropertiesPanelContent(panel, info.clip);
+            return;
+        }
+
+        if (dockTab === 'audio') {
+            var audioTracks = project.tracks.filter(function (track) {
+                return track.type === 'audio' || track.type === 'video';
+            });
+            var heading = document.createElement('div');
+            heading.className = 've-dock-heading';
+            heading.textContent = 'TRACK MIXER';
+            content.appendChild(heading);
+            audioTracks.forEach(function (track) {
+                var strip = document.createElement('div');
+                strip.className = 've-audio-strip';
+                var name = document.createElement('strong');
+                name.textContent = track.name;
+                var mute = document.createElement('button');
+                mute.textContent = track.muted ? 'Muted' : 'Mute';
+                mute.className = track.muted ? 've-active' : '';
+                mute.addEventListener('click', function () {
+                    track.muted = !track.muted;
+                    renderDock();
+                    renderTimeline();
+                    scheduleAutosave();
+                });
+                var clips = document.createElement('span');
+                clips.textContent = track.clips.length + ' clip(s)';
+                strip.appendChild(name);
+                strip.appendChild(clips);
+                strip.appendChild(mute);
+                content.appendChild(strip);
+            });
+            return;
+        }
+
+        if (dockTab === 'scopes') {
+            content.innerHTML =
+                '<div class="ve-dock-heading">LIVE HISTOGRAM</div>' +
+                '<canvas id="ve-scope-histogram" width="288" height="150"></canvas>' +
+                '<div class="ve-scope-note">Updates from the current program frame.</div>';
+            updateScopes();
+            return;
+        }
+
+        var heading = document.createElement('div');
+        heading.className = 've-dock-heading';
+        heading.textContent = 'PROPERTIES';
+        content.appendChild(heading);
+        if (!info) {
+            content.insertAdjacentHTML('beforeend',
+                '<div class="ve-dock-empty">Select a clip to see source details and editing actions.</div>');
+            return;
+        }
+        var clip = info.clip;
+        var details = document.createElement('div');
+        details.className = 've-property-summary';
+        details.innerHTML =
+            '<strong></strong>' +
+            '<span>' + info.track.type.toUpperCase() + '</span>' +
+            '<span>' + frameToTimecode(clip.endFrame - clip.startFrame) + '</span>' +
+            '<span>' + (clip.source_fps || FPS) + ' FPS</span>';
+        details.querySelector('strong').textContent = clip.label || 'Untitled';
+        content.appendChild(details);
+        if (info.track.type === 'video') {
+            var actions = document.createElement('div');
+            actions.className = 've-dock-actions';
+            [
+                ['Filters', function () { dockTab = 'filters'; renderDock(); }],
+                ['Retake', function () { enterRetakeMode(clip.id); }],
+                ['Restore Faces', function () { showFaceRestoreDialog(clip.id); }],
+                ['Upscale', function () { showEsrganDialog(clip.id); }],
+                ['Deflicker', function () { showDeflickerDialog(clip.id); }],
+                ['Enhance Audio', function () { showAudioEnhanceDialog(clip.id); }],
+            ].forEach(function (action) {
+                var button = document.createElement('button');
+                button.textContent = action[0];
+                button.addEventListener('click', action[1]);
+                actions.appendChild(button);
+            });
+            content.appendChild(actions);
+        }
+    }
+
+    function updateScopes() {
+        if (dockTab !== 'scopes' || !previewCanvas) return;
+        var scope = document.getElementById('ve-scope-histogram');
+        if (!scope) return;
+        var ctx = scope.getContext('2d');
+        var source;
+        try {
+            source = previewCtx.getImageData(0, 0, previewCanvas.width, previewCanvas.height);
+        } catch (_) {
+            return;
+        }
+        var bins = new Uint32Array(64);
+        var pixels = source.data;
+        for (var i = 0; i < pixels.length; i += 16) {
+            var luma = Math.round(0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]);
+            bins[Math.min(63, Math.floor(luma / 4))]++;
+        }
+        var max = Math.max.apply(null, Array.from(bins)) || 1;
+        ctx.clearRect(0, 0, scope.width, scope.height);
+        ctx.fillStyle = '#101017';
+        ctx.fillRect(0, 0, scope.width, scope.height);
+        var gradient = ctx.createLinearGradient(0, scope.height, 0, 0);
+        gradient.addColorStop(0, '#5551dd');
+        gradient.addColorStop(1, '#62d8ff');
+        ctx.fillStyle = gradient;
+        bins.forEach(function (value, index) {
+            var h = value / max * (scope.height - 16);
+            ctx.fillRect(index * (scope.width / 64), scope.height - h, scope.width / 64 - 1, h);
+        });
     }
 
     function buildContextMenu() {
@@ -637,8 +1142,11 @@ var VideoEditTab = (function () {
         selectedClipIds.clear();
         recalcTotalFrames();
         renderTimeline();
+        renderMediaBin();
+        renderDock();
         updateEditButton();
         scheduleAutosave();
+        updatePreview();
     }
 
     function splitClipAtPlayhead(clipId, trackId) {
@@ -649,19 +1157,23 @@ var VideoEditTab = (function () {
         if (currentFrame <= clip.startFrame || currentFrame >= clip.endFrame) return;
 
         pushUndo();
-        var newClip = {
-            id: generateClipId(),
-            startFrame: currentFrame,
-            endFrame: clip.endFrame,
-            label: clip.label + ' (R)',
-            color: clip.color,
-            effects: clip.effects ? JSON.parse(JSON.stringify(clip.effects)) : [],
-            transition_in: null,
-        };
+        var newClip = JSON.parse(JSON.stringify(clip));
+        newClip.id = generateClipId();
+        newClip.startFrame = currentFrame;
+        newClip.endFrame = clip.endFrame;
+        newClip.label = clip.label + ' (R)';
+        newClip.transition_in = null;
+        if (clip.source_path) {
+            var timelineOffset = currentFrame - clip.startFrame;
+            newClip.source_start = (clip.source_start || 0) +
+                Math.round(timelineOffset * (clip.source_fps || FPS) / FPS);
+        }
         clip.endFrame = currentFrame;
         clip.label = clip.label.replace(/ \([LR]\)$/, '') + ' (L)';
         info.track.clips.splice(info.clipIndex + 1, 0, newClip);
         renderTimeline();
+        renderMediaBin();
+        renderDock();
         scheduleAutosave();
     }
 
@@ -671,33 +1183,34 @@ var VideoEditTab = (function () {
         pushUndo();
         var clip = info.clip;
         var duration = clip.endFrame - clip.startFrame;
-        var newClip = {
-            id: generateClipId(),
-            startFrame: clip.endFrame,
-            endFrame: clip.endFrame + duration,
-            label: clip.label + ' copy',
-            color: clip.color,
-            effects: clip.effects ? JSON.parse(JSON.stringify(clip.effects)) : [],
-            transition_in: clip.transition_in ? JSON.parse(JSON.stringify(clip.transition_in)) : null,
-        };
+        var newClip = JSON.parse(JSON.stringify(clip));
+        newClip.id = generateClipId();
+        newClip.startFrame = clip.endFrame;
+        newClip.endFrame = clip.endFrame + duration;
+        newClip.label = clip.label + ' copy';
         info.track.clips.push(newClip);
         recalcTotalFrames();
         renderTimeline();
+        renderMediaBin();
         scheduleAutosave();
     }
 
-    function addTrack() {
-        pushUndo();
-        var num = project.tracks.filter(function (t) { return t.type === 'video'; }).length + 1;
-        project.tracks.push({
+    function addTrack(type, skipUndo) {
+        type = type === 'audio' ? 'audio' : 'video';
+        if (!skipUndo) pushUndo();
+        var num = project.tracks.filter(function (t) { return t.type === type; }).length + 1;
+        var track = {
             id: 'track-' + Date.now(),
-            name: 'Video ' + num,
-            type: 'video',
+            name: type === 'audio' ? 'Audio ' + num : 'Video ' + num,
+            type: type,
             clips: []
-        });
+        };
+        project.tracks.push(track);
         recalcTotalFrames();
         resize();
-        scheduleAutosave();
+        renderDock();
+        if (!skipUndo) scheduleAutosave();
+        return track;
     }
 
     function addPlaceholderClip(trackId, frame) {
@@ -735,13 +1248,18 @@ var VideoEditTab = (function () {
 
     function updateEditButton() {
         var button = document.getElementById('ve-btn-edit-clip');
-        if (!button) return;
         var editable = false;
         if (selectedClipIds.size === 1) {
             var info = findClipById(selectedClipIds.values().next().value);
             editable = !!(info && info.track.type === 'video' && info.clip.source_path);
         }
-        button.disabled = !editable;
+        if (button) button.disabled = !editable;
+        ['ve-edit-split', 've-edit-lift', 've-edit-ripple', 've-edit-copy', 've-edit-duplicate']
+            .forEach(function (id) {
+                var control = document.getElementById(id);
+                if (control) control.disabled = selectedClipIds.size === 0;
+            });
+        renderDock();
     }
 
     // ===== Preview Player =====
@@ -798,7 +1316,7 @@ var VideoEditTab = (function () {
         // Topmost video clip at frame (track 0 = top of timeline = highest priority)
         for (var i = 0; i < project.tracks.length; i++) {
             var track = project.tracks[i];
-            if (track.type !== 'video') continue;
+            if (track.type !== 'video' || track.hidden) continue;
             for (var j = 0; j < track.clips.length; j++) {
                 var clip = track.clips[j];
                 if (frame >= clip.startFrame && frame < clip.endFrame) {
@@ -832,6 +1350,7 @@ var VideoEditTab = (function () {
         var dy = (previewCanvas.height - dh) / 2;
         previewCtx.drawImage(previewVideo, dx, dy, dw, dh);
         renderSubtitleOverlay();
+        updateScopes();
     }
 
     function loadPreviewVideo(clip, timeInSource) {
@@ -862,7 +1381,9 @@ var VideoEditTab = (function () {
         if (!previewCtx || !previewCanvas) return;
         var placeholder = document.getElementById('ve-preview-placeholder');
 
-        var clip = findActiveClipAtFrame(currentFrame);
+        var clip = monitorMode === 'source' && sourceMonitorClipId
+            ? (findClipById(sourceMonitorClipId) || {}).clip
+            : findActiveClipAtFrame(currentFrame);
 
         if (!clip) {
             // Invalidate a compositor reply that was requested for an older playhead.
@@ -902,7 +1423,11 @@ var VideoEditTab = (function () {
 
         var sourceOffset = clip.source_start || 0;
         var sourceFps = clip.source_fps || FPS;
-        var timeInSource = sourceOffset / sourceFps + (currentFrame - clip.startFrame) / FPS;
+        var sourceTimelineFrame = monitorMode === 'source'
+            ? clamp(currentFrame, clip.startFrame, clip.endFrame - 1)
+            : currentFrame;
+        var timeInSource = sourceOffset / sourceFps +
+            (sourceTimelineFrame - clip.startFrame) / FPS;
 
         loadPreviewVideo(clip, timeInSource);
 
@@ -950,6 +1475,13 @@ var VideoEditTab = (function () {
 
         // Subtitle overlay
         renderSubtitleOverlay();
+
+        if (monitorMode === 'source') {
+            genesisPreviewSequence++;
+            genesisPreviewPending = false;
+            setGenesisStatus('Source monitor', false);
+            return;
+        }
 
         // The browser video element above is an immediate fallback. Genesis replaces it
         // with the actual composited/effected timeline frame when the worker replies.
@@ -1013,6 +1545,7 @@ var VideoEditTab = (function () {
                     dh
                 );
                 renderSubtitleOverlay();
+                updateScopes();
             }
             bitmap.close();
             setGenesisStatus('Genesis · Rust/C · Ready', false);
@@ -1078,6 +1611,7 @@ var VideoEditTab = (function () {
                     frameCount: data.frame_count,
                 });
                 renderTracks();
+                renderMediaBin();
             };
         })
         .catch(function (err) {
@@ -1107,6 +1641,7 @@ var VideoEditTab = (function () {
             if (!data || !data.peaks) return;
             waveformCache.set(clip.id, data);
             renderTracks();
+            if (dockTab === 'audio') renderDock();
         })
         .catch(function () {
             waveformLoading.delete(clip.id);
@@ -1121,7 +1656,7 @@ var VideoEditTab = (function () {
                 if (!clip.source_path) return;
                 if (track.type !== 'audio' && track.type !== 'video') return;
 
-                var shouldPlay = isPlaying &&
+                var shouldPlay = isPlaying && !track.muted &&
                     currentFrame >= clip.startFrame &&
                     currentFrame < clip.endFrame;
 
@@ -1768,6 +2303,7 @@ var VideoEditTab = (function () {
             currentFrame = newClip.startFrame;
             recalcTotalFrames();
             renderTimeline();
+            renderMediaBin();
             scheduleAutosave();
             updatePreview();
             updateEditButton();
@@ -2304,6 +2840,19 @@ var VideoEditTab = (function () {
             }
         }
 
+        (project.markers || []).forEach(function (markerFrame) {
+            var markerX = TRACK_HEADER_WIDTH + (markerFrame * pixelsPerFrame) - scrollOffsetX;
+            if (markerX < TRACK_HEADER_WIDTH || markerX > stage.width()) return;
+            rulerLayer.add(new Konva.RegularPolygon({
+                x: markerX,
+                y: 6,
+                sides: 3,
+                radius: 6,
+                fill: '#ffd166',
+                rotation: 180,
+            }));
+        });
+
         rulerLayer.batchDraw();
     }
 
@@ -2316,24 +2865,12 @@ var VideoEditTab = (function () {
         // Don't open for text/subtitle or audio-only clips
         if (info.track.type === 'text' || info.track.type === 'audio') return;
 
-        propsPanelClipId = clipId;
-        var clip = info.clip;
-
-        // Initialize effects array if missing
-        if (!clip.effects) clip.effects = [];
-        if (!clip.transition_in) clip.transition_in = null;
-
-        // Remove existing panel
-        closePropertiesPanel();
-
-        var panel = document.createElement('div');
-        panel.className = 've-props-panel';
-        propsPanelEl = panel;
-
-        renderPropertiesPanelContent(panel, clip);
-
-        var container = document.getElementById('panel-video-edit');
-        container.appendChild(panel);
+        selectedClipIds.clear();
+        selectedClipIds.add(clipId);
+        dockTab = 'filters';
+        renderTimeline();
+        renderMediaBin();
+        renderDock();
     }
 
     function refreshPropertiesPanel() {
@@ -2357,6 +2894,10 @@ var VideoEditTab = (function () {
             addEffectDropdownEl.parentNode.removeChild(addEffectDropdownEl);
         }
         addEffectDropdownEl = null;
+        if (dockTab === 'filters') {
+            dockTab = 'properties';
+            renderDock();
+        }
     }
 
     function renderPropertiesPanelContent(panel, clip) {
@@ -3670,10 +4211,56 @@ var VideoEditTab = (function () {
                     fill: '#1a1a2e'
                 }));
                 timelineLayer.add(new Konva.Text({
-                    x: 10, y: y + 16,
+                    x: 10, y: y + 8,
                     text: track.name,
                     fontSize: 12, fill: '#ccc', fontFamily: 'sans-serif'
                 }));
+                [
+                    {
+                        x: 10,
+                        text: track.hidden ? '\u25CB' : '\u25C9',
+                        title: 'visibility',
+                        toggle: function () { track.hidden = !track.hidden; },
+                    },
+                    {
+                        x: 42,
+                        text: track.muted ? 'M\u00D7' : 'M',
+                        title: 'mute',
+                        toggle: function () { track.muted = !track.muted; },
+                    },
+                    {
+                        x: 76,
+                        text: track.locked ? '\u25A0' : '\u25A1',
+                        title: 'lock',
+                        toggle: function () { track.locked = !track.locked; },
+                    },
+                ].forEach(function (control) {
+                    var button = new Konva.Text({
+                        x: control.x,
+                        y: y + 34,
+                        width: 26,
+                        height: 18,
+                        align: 'center',
+                        text: control.text,
+                        fontSize: 11,
+                        fill: control.title === 'mute' && track.muted ? '#ff8a8a' : '#9b9bab',
+                        fontFamily: 'sans-serif',
+                        name: 'trackControl',
+                    });
+                    button.on('mousedown', function (event) {
+                        event.cancelBubble = true;
+                    });
+                    button.on('click', function (event) {
+                        event.cancelBubble = true;
+                        pushUndo();
+                        control.toggle();
+                        renderTimeline();
+                        renderDock();
+                        scheduleAutosave();
+                        updatePreview();
+                    });
+                    timelineLayer.add(button);
+                });
 
                 // Separator
                 timelineLayer.add(new Konva.Line({
@@ -3697,6 +4284,7 @@ var VideoEditTab = (function () {
                     var group = new Konva.Group({
                         x: Math.max(clipX, TRACK_HEADER_WIDTH),
                         y: clipY,
+                        opacity: track.hidden ? 0.34 : 1,
                         clipFunc: function (ctx) {
                             ctx.rect(0, 0, visibleW, clipH);
                         }
@@ -3755,11 +4343,14 @@ var VideoEditTab = (function () {
                                 }, 0)
                             );
                         }
+                        var peaksPerSecond = wd.duration_seconds > 0
+                            ? wd.peaks.length / wd.duration_seconds
+                            : 30;
                         var sourceStartSample = Math.floor(
-                            (clip.source_start || 0) / (clip.source_fps || FPS) * wd.sample_rate
+                            (clip.source_start || 0) / (clip.source_fps || FPS) * peaksPerSecond
                         );
                         var clipDurFrames = clip.endFrame - clip.startFrame;
-                        var samplesInClip = Math.floor(clipDurFrames / FPS * wd.sample_rate);
+                        var samplesInClip = Math.floor(clipDurFrames / FPS * peaksPerSecond);
                         var wfPoints = [];
                         // Draw every 2px for performance
                         var step = Math.max(2, Math.floor(clipW / 300));
@@ -4404,9 +4995,12 @@ var VideoEditTab = (function () {
 
             if (clipId) {
                 var targetName = target.name ? target.name() : '';
+                var targetInfo = findClipById(clipId);
+                var targetLocked = !!(targetInfo && targetInfo.track.locked);
 
                 // Trim handle check (only works with Konva target)
                 if (targetName === 'trimLeft' || targetName === 'trimRight') {
+                    if (targetLocked) return;
                     startTrim(clipId, trackId, targetName === 'trimLeft' ? 'left' : 'right', pos.x);
                     return;
                 }
@@ -4429,7 +5023,7 @@ var VideoEditTab = (function () {
                 updateEditButton();
 
                 // Start drag
-                startDrag(clipId, pos.x, pos.y);
+                if (!targetLocked) startDrag(clipId, pos.x, pos.y);
                 return;
             }
 
@@ -4987,16 +5581,46 @@ var VideoEditTab = (function () {
         if (!panel) return;
 
         panel.innerHTML =
-            '<div id="ve-preview"></div>' +
             '<div id="ve-toolbar"></div>' +
+            '<div id="ve-workspace">' +
+                '<aside id="ve-media-panel">' +
+                    '<div class="ve-panel-heading"><span>MEDIA</span><span id="ve-media-count">0</span></div>' +
+                    '<button id="ve-media-add" class="ve-wide-action">+ Add media</button>' +
+                    '<div class="ve-bin-row"><span>Bin</span><strong>Project Media</strong></div>' +
+                    '<div id="ve-media-grid"></div>' +
+                '</aside>' +
+                '<section id="ve-monitor-shell">' +
+                    '<div id="ve-monitor-tabs">' +
+                        '<button class="ve-monitor-tab ve-active" data-monitor="program">Program</button>' +
+                        '<button class="ve-monitor-tab" data-monitor="source">Source</button>' +
+                    '</div>' +
+                    '<div id="ve-preview"></div>' +
+                    '<div id="ve-monitor-transport"></div>' +
+                '</section>' +
+                '<aside id="ve-dock">' +
+                    '<div id="ve-dock-tabs">' +
+                        '<button class="ve-dock-tab ve-active" data-dock="properties">Properties</button>' +
+                        '<button class="ve-dock-tab" data-dock="filters">Filters</button>' +
+                        '<button class="ve-dock-tab" data-dock="scopes">Scopes</button>' +
+                        '<button class="ve-dock-tab" data-dock="audio">Audio</button>' +
+                    '</div>' +
+                    '<div id="ve-dock-content"></div>' +
+                '</aside>' +
+            '</div>' +
+            '<div id="ve-edit-toolbar"></div>' +
             '<div id="ve-timeline-container">' +
                 '<div id="ve-timeline-canvas"></div>' +
             '</div>';
 
         initPreview();
         buildToolbar();
+        document.getElementById('ve-media-add').addEventListener('click', function () {
+            openMediaPicker('video');
+        });
         buildContextMenu();
         initKonva();
+        renderMediaBin();
+        renderDock();
         renderTimeline();
         updateTimecodeDisplay();
         updateZoomDisplay();
@@ -5099,10 +5723,17 @@ var VideoEditTab = (function () {
                 height: project.height,
                 currentFrame: currentFrame,
                 isPlaying: isPlaying,
+                monitorMode: monitorMode,
+                sourceMonitorClipId: sourceMonitorClipId,
+                dockTab: dockTab,
+                markerFrames: (project.markers || []).slice(),
+                snapEnabled: snapEnabled,
                 previewVideoTime: previewVideo ? previewVideo.currentTime : 0,
                 previewVideoPaused: previewVideo ? previewVideo.paused : true,
                 thumbnailClipIds: Array.from(thumbnailCache.keys()),
                 waveformClipIds: Array.from(waveformCache.keys()),
+                mediaCardCount: document.querySelectorAll('.ve-media-card').length,
+                dockTabCount: document.querySelectorAll('.ve-dock-tab').length,
                 tracks: project.tracks.map(function (track) {
                     return {
                         id: track.id,

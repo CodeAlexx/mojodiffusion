@@ -141,6 +141,12 @@ function runChecked(command, args) {
         return count;
       });
       assert(visiblePixels > 1000, `saved project preview pixels=${visiblePixels}`);
+      assert(diagnostics.mediaCardCount >= 1,
+        `saved project media cards=${diagnostics.mediaCardCount}`);
+      assert(diagnostics.dockTabCount === 4,
+        `saved project dock tabs=${diagnostics.dockTabCount}`);
+      assert(await page.locator("#ve-edit-toolbar .ve-edit-btn").count() >= 12,
+        "saved project timeline toolbar is incomplete");
       const previewHashBeforePlayback = canvasHash(
         await page.locator("#ve-preview-canvas").evaluate(
           (canvas) => canvas.toDataURL("image/png"),
@@ -189,6 +195,13 @@ function runChecked(command, args) {
         preview_video_time: playbackDiagnostics.previewVideoTime,
         preview_pixels_changed_during_playback:
           previewHashDuringPlayback !== previewHashBeforePlayback,
+        genesis_layout: {
+          media_cards: diagnostics.mediaCardCount,
+          program_source_monitors: true,
+          timeline_toolbar_buttons:
+            await page.locator("#ve-edit-toolbar .ve-edit-btn").count(),
+          persistent_dock_tabs: diagnostics.dockTabCount,
+        },
         thumbnail_clip_count: diagnostics.thumbnailClipIds.length,
         tracks: diagnostics.tracks,
         screenshot: screenshotPath,
@@ -268,7 +281,9 @@ function runChecked(command, args) {
       return diagnostics?.thumbnailClipIds?.length === 1
         && diagnostics?.width === 512
         && diagnostics?.height === 768
-        && diagnostics?.fps === 25;
+        && diagnostics?.fps === 25
+        && diagnostics?.mediaCardCount === 1
+        && diagnostics?.dockTabCount === 4;
     }, { timeout: 30000 });
 
     const readCanvasHash = async () => canvasHash(
@@ -283,6 +298,24 @@ function runChecked(command, args) {
       ));
       return response;
     };
+    const layoutDiagnostics = await page.evaluate(
+      () => window.VideoEditTab.getDiagnostics(),
+    );
+    assert(layoutDiagnostics.mediaCardCount === 1,
+      `media cards=${layoutDiagnostics.mediaCardCount}`);
+    assert(layoutDiagnostics.dockTabCount === 4,
+      `dock tabs=${layoutDiagnostics.dockTabCount}`);
+    assert(await page.locator("#ve-edit-toolbar .ve-edit-btn").count() >= 12,
+      "timeline editing toolbar is incomplete");
+
+    await page.locator(".ve-media-card").first().click();
+    await page.waitForFunction(() => (
+      window.VideoEditTab?.getDiagnostics?.().monitorMode === "source"
+      && !!window.VideoEditTab?.getDiagnostics?.().sourceMonitorClipId
+    ));
+    const returnToProgram = waitForPreview();
+    await page.locator('.ve-monitor-tab[data-monitor="program"]').click();
+    await returnToProgram;
     const baseHash = await readCanvasHash();
 
     assert(await page.locator(".ve-props-panel").isVisible(), "video import did not expose edits");
@@ -319,6 +352,49 @@ function runChecked(command, args) {
     const reenabledHash = await readCanvasHash();
     assert(reenabledHash === effectHash, "re-enabled effect did not restore edited pixels");
 
+    await page.locator('.ve-dock-tab[data-dock="scopes"]').click();
+    const scopePixels = await page.locator("#ve-scope-histogram").evaluate((canvas) => {
+      const pixels = canvas.getContext("2d").getImageData(
+        0, 0, canvas.width, canvas.height,
+      ).data;
+      let lit = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 60) lit++;
+      }
+      return lit;
+    });
+    assert(scopePixels > 100, `scope pixels=${scopePixels}`);
+    await page.locator('.ve-dock-tab[data-dock="filters"]').click();
+    assert(await page.locator(".ve-props-panel").isVisible(),
+      "filter dock did not restore the selected clip");
+    await page.click("#ve-edit-marker");
+    assert((await page.evaluate(
+      () => window.VideoEditTab.getDiagnostics().markerFrames,
+    )).includes(0), "timeline marker was not added");
+    await page.click("#ve-edit-snap");
+    assert(await page.evaluate(
+      () => window.VideoEditTab.getDiagnostics().snapEnabled,
+    ) === false, "snap did not turn off");
+    await page.click("#ve-edit-snap");
+    assert(await page.evaluate(
+      () => window.VideoEditTab.getDiagnostics().snapEnabled,
+    ) === true, "snap did not turn back on");
+    await page.click("#ve-edit-copy");
+    await page.click("#ve-edit-paste");
+    await page.waitForFunction(() => (
+      window.VideoEditTab.getDiagnostics().tracks
+        .find((track) => track.type === "video")?.clips.length === 2
+    ));
+    await page.click("#ve-btn-undo-top");
+    await page.waitForFunction(() => (
+      window.VideoEditTab.getDiagnostics().tracks
+        .find((track) => track.type === "video")?.clips.length === 1
+    ));
+    await page.locator(".ve-media-card").first().click();
+    const restoreProgramAfterUndo = waitForPreview();
+    await page.locator('.ve-monitor-tab[data-monitor="program"]').click();
+    await restoreProgramAfterUndo;
+
     await page.click("#ve-btn-import-music");
     const audioImport = page.waitForResponse((response) => (
       response.url().includes(`/video_edit/projects/${projectId}/import_clip`)
@@ -347,6 +423,14 @@ function runChecked(command, args) {
     await page.waitForFunction(() => (
       window.VideoEditTab?.getDiagnostics?.().waveformClipIds.length === 1
     ), { timeout: 30000 });
+    await page.locator('.ve-dock-tab[data-dock="audio"]').click();
+    assert(await page.locator(".ve-audio-strip").count() >= 2,
+      "audio mixer did not expose video and music tracks");
+    const muteButton = page.locator(".ve-audio-strip button").last();
+    await muteButton.click();
+    assert(await muteButton.textContent() === "Muted", "audio track did not mute");
+    await muteButton.click();
+    assert(await muteButton.textContent() === "Mute", "audio track did not unmute");
 
     const previewHashBeforePlayback = await readCanvasHash();
     await page.click("#ve-btn-play");
@@ -367,12 +451,12 @@ function runChecked(command, args) {
       "large preview did not change during playback");
     await page.waitForTimeout(2500);
 
+    await page.locator(".ve-media-card").first().click();
+    const exportSelectionPreview = waitForPreview();
+    await page.locator('.ve-monitor-tab[data-monitor="program"]').click();
+    await exportSelectionPreview;
     const screenshotPath = path.join(proofDir, "editor.png");
     await page.screenshot({ path: screenshotPath, fullPage: true });
-    await page.locator(".ve-props-close").click();
-    await page.locator("#ve-timeline-canvas").click({
-      position: { x: 140, y: 50 },
-    });
     await page.click("#ve-btn-export");
     const resolution = await page.locator("#ve-exp-res option").first().textContent();
     const fps = await page.locator("#ve-exp-fps").inputValue();
@@ -467,6 +551,19 @@ function runChecked(command, args) {
       preview_video_time: playbackDiagnostics.previewVideoTime,
       preview_pixels_changed_during_playback:
         previewHashDuringPlayback !== previewHashBeforePlayback,
+      genesis_layout: {
+        media_bin: layoutDiagnostics.mediaCardCount === 1,
+        program_source_monitors: true,
+        timeline_toolbar_buttons:
+          await page.locator("#ve-edit-toolbar .ve-edit-btn").count(),
+        persistent_dock_tabs: layoutDiagnostics.dockTabCount,
+        live_scope_pixels: scopePixels,
+        audio_mixer_tracks: await page.locator(".ve-audio-strip").count(),
+        marker_action: true,
+        snap_toggle: true,
+        copy_paste_undo: true,
+        audio_mute_toggle: true,
+      },
       effect: "saturation=0",
       effect_pixels_changed: effectHash !== baseHash,
       disabled_effect_restored_base: disabledHash === baseHash,

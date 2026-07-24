@@ -224,6 +224,65 @@ var SerenityAPI = (function () {
             return data;
         });
     }
+    function postGenerate(request, metadata) {
+        var meta = metadata || {};
+        var body = JSON.stringify(request || {});
+        function decodeResponse(resp) {
+            return resp.text().then(function (responseBody) {
+                var data = {};
+                try { data = JSON.parse(responseBody); }
+                catch (e) { data = { error: responseBody || ('HTTP ' + resp.status) }; }
+                if (!resp.ok) {
+                    var detail = data.detail || data.error;
+                    if (detail && typeof detail === 'object')
+                        detail = detail.message || JSON.stringify(detail);
+                    throw new Error(detail || ('HTTP ' + resp.status));
+                }
+                return data;
+            });
+        }
+        return fetch('/v1/preflight', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body
+        }).then(decodeResponse).then(function (preflight) {
+            if (preflight.admitted === false)
+                throw new Error(preflight.error || preflight.reason || 'Generation request was not admitted');
+            return fetch('/v1/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: body
+            });
+        }).then(decodeResponse).then(function (data) {
+            return {
+                prompt_id: data.prompt_id || data.job_id || '',
+                job_id: data.job_id || data.prompt_id || ''
+            };
+        }).then(function (data) {
+            if (typeof QueueTab !== 'undefined' && QueueTab.registerPending) {
+                QueueTab.registerPending({
+                    promptId: data.prompt_id,
+                    prompt: meta.prompt || request.prompt || '',
+                    model: meta.model || request.model || '',
+                    queuedAt: Date.now(),
+                    batchLabel: meta.batchLabel || '',
+                    promptData: {
+                        params: request,
+                        prompt: meta.prompt || request.prompt || '',
+                        model: meta.model || request.model || '',
+                        width: request.width || null,
+                        height: request.height || null,
+                        seed: request.seed != null ? request.seed : null,
+                        sampler: request.sampler || null,
+                        scheduler: request.scheduler || null,
+                        steps: request.steps || null,
+                        cfg: request.cfg != null ? request.cfg : null
+                    }
+                });
+            }
+            return data;
+        });
+    }
     function interrupt() {
         return fetch('/interrupt', { method: 'POST' });
     }
@@ -264,6 +323,7 @@ var SerenityAPI = (function () {
     }
     return {
         postPrompt: postPrompt,
+        postGenerate: postGenerate,
         postVideo: postVideo,
         videoRequestFromWorkflow: videoRequestFromWorkflow,
         interrupt: interrupt,

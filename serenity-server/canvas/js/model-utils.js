@@ -146,6 +146,13 @@ var ModelUtils = (function () {
         // Skip diffusers subdirectory components (e.g. capybara/transformer/model.safetensors)
         if (/\/transformer\//.test(name))
             return false;
+        // Qwen-VL files are text/vision encoders, not diffusion backbones.
+        // Qwen Image Edit checkpoints belong to Canvas' Edit Models surface,
+        // not the text-to-image Generate picker.
+        if (/qwen[^/]*(?:vl|vision.*language)/.test(lower))
+            return false;
+        if (/qwen[^/]*image[^/]*edit|qwen[^/]*edit[^/]*image/.test(lower))
+            return false;
         return true;
     }
     function fetchAllModels() {

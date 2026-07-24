@@ -111,6 +111,38 @@ and JSON result under
 Properties auto-opens the clip under the playhead when a project loads and
 falls back to editable project settings when there is no clip selection.
 
+## Verify the Swarm-style image Generate screen
+
+Generate is an image-only, capability-driven workspace modeled on SwarmUI's
+working layout: filterable parameters on the left, a large result viewer in the
+center, Current Batch on the right, the prompt and Generate action below the
+viewer, and History/Presets/Models/LoRAs in the lower library. Video and
+inpainting remain on their dedicated Serenity screens and must not appear in
+Generate.
+
+The browser preflights and then submits the same flat request directly to
+`/v1/generate`. It exposes only controls admitted by the selected model's
+`/v1/capabilities` profile, including
+compiled resolution choices, sampler and noise scheduler, CFG or distilled
+guidance, seed, batch count, compatible LoRAs, variation seed where the worker
+implements it, and init image plus creativity where img2img is admitted.
+Unsupported VAE override, refiner, ControlNet, upscale, hires, video, and mask
+fields are deliberately absent rather than decorative.
+
+With the server running, execute the focused browser contract:
+
+```bash
+SERENITY_BASE_URL=http://127.0.0.1:7811 \
+  node scripts/check_serenity_swarm_generate_ui.js
+```
+
+The gate verifies the three-column layout and library, image-only model
+filtering, Z-Image's sampler/scheduler and init-image surfaces, parameter
+filtering, exact sampler handoff into Workflow, identical preflight/generate
+bodies, and the flat `/v1/generate` request. The full design and current
+real-generation evidence are recorded in
+`../docs/SERENITY_SWARM_GENERATE_UI_2026-07-24.md`.
+
 To inspect a particular persisted project through the same browser gate:
 
 ```bash

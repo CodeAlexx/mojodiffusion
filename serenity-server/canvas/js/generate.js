@@ -15,8 +15,14 @@ var GenerateTab = (function () {
         steps: 20,
         cfg: 7.0,
         guidance: 3.5,
-        scheduler: 'euler',
+        sampler: 'euler',
+        scheduler: 'simple',
         seed: -1,
+        variationSeed: 0,
+        variationStrength: 0,
+        initImagePath: '',
+        initImageName: '',
+        creativity: 0.5,
         generating: false,
         currentImage: null,
         currentIsVideo: false,
@@ -177,17 +183,17 @@ var GenerateTab = (function () {
             return;
         panel.innerHTML = '';
         var layout = document.createElement('div');
-        layout.className = 'gen-layout';
+        layout.className = 'gen-layout gen-swarm-layout';
         // Left panel
         var left = document.createElement('div');
-        left.className = 'gen-left';
+        left.className = 'gen-left gen-swarm-parameters';
         left.id = 'gen-left-panel';
-        left.innerHTML = buildLeftHTML();
+        left.innerHTML = buildSwarmLeftHTML();
         layout.appendChild(left);
         // Center panel
         var center = document.createElement('div');
-        center.className = 'gen-center';
-        center.innerHTML = buildTopToolbarHTML() + buildCenterHTML();
+        center.className = 'gen-center gen-swarm-stage';
+        center.innerHTML = buildSwarmTopToolbarHTML() + buildCenterHTML();
         layout.appendChild(center);
         // Floating side toolbar (inside center so it positions relative to center)
         var floatBar = document.createElement('div');
@@ -197,12 +203,168 @@ var GenerateTab = (function () {
         center.appendChild(floatBar);
         // Right panel
         var right = document.createElement('div');
-        right.className = 'gen-right';
+        right.className = 'gen-right gen-swarm-batch-panel';
         right.id = 'gen-right-panel';
-        right.innerHTML = buildRightHTML();
+        right.innerHTML = buildSwarmBatchHTML();
         layout.appendChild(right);
+        var promptDock = document.createElement('div');
+        promptDock.className = 'gen-swarm-prompt-dock';
+        promptDock.innerHTML = buildSwarmPromptHTML();
+        layout.appendChild(promptDock);
+        var library = document.createElement('div');
+        library.className = 'gen-swarm-library';
+        library.innerHTML = buildSwarmLibraryHTML();
+        layout.appendChild(library);
         panel.appendChild(layout);
         cacheElements();
+    }
+
+    function swarmGroup(id, title, body, open, help) {
+        return '<section class="gen-swarm-group gen-param-group" data-param-search="' +
+            (title + ' ' + (help || '')).toLowerCase() + '">' +
+            '<button type="button" id="' + id + '" class="gen-accordion-header gen-swarm-group-title' +
+            (open ? '' : ' closed') + '">' +
+            '<span><i data-lucide="chevron-down"></i>' + title + '</span>' +
+            (help ? '<span class="gen-swarm-help" title="' + help.replace(/"/g, '&quot;') + '">?</span>' : '') +
+            '</button>' +
+            '<div id="' + id.replace('-header', '-body') + '" class="gen-accordion-body gen-swarm-group-body' +
+            (open ? '' : ' closed') + '">' + body + '</div></section>';
+    }
+
+    function buildSwarmLeftHTML() {
+        var modelBody =
+            '<div class="gen-param-row" data-param-search="model checkpoint search">' +
+            '<label class="gen-label" for="gen-model-search">Model</label>' +
+            '<div class="gen-model-row"><div class="gen-model-picker-wrap" id="gen-model-picker-wrap">' +
+            '<input type="text" id="gen-model-search" class="gen-select gen-model-search-input" placeholder="Loading image models..." autocomplete="off">' +
+            '<div id="gen-model-dropdown" class="gen-model-dropdown" style="display:none"><div id="gen-model-dropdown-list" class="gen-model-dropdown-list"></div></div>' +
+            '</div><button id="gen-model-refresh" class="gen-model-action-btn" title="Refresh local models"><i data-lucide="refresh-cw"></i></button></div>' +
+            '<input type="hidden" id="gen-model" value=""><div id="gen-model-warn" class="gen-model-warning"></div></div>';
+        var coreBody =
+            '<div class="gen-setting-row gen-param-row" id="gen-batch-section" data-param-search="images batch count">' +
+            '<label class="gen-setting-label" for="gen-batch">Images</label><input id="gen-batch" type="number" class="gen-number-input" min="1" max="8" value="1">' +
+            '<span class="gen-batch-hint">queued as separate jobs</span></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="seed random reuse">' +
+            '<label class="gen-setting-label" for="gen-seed">Seed</label><input id="gen-seed" type="number" class="gen-number-input" value="-1">' +
+            '<button id="gen-seed-shuffle" class="gen-seed-btn" title="Random seed">↻</button>' +
+            '<button id="gen-seed-prev" class="gen-seed-btn" title="Reuse previous seed">↶</button>' +
+            '<button id="gen-seed-random-toggle" class="gen-toggle on" title="Random seed"></button></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="steps sampling iterations">' +
+            '<label class="gen-setting-label" for="gen-steps">Steps</label><input type="range" id="gen-steps-range" class="gen-range" min="1" max="100" value="20">' +
+            '<input type="number" id="gen-steps" class="gen-number-input" min="1" max="500" value="20"></div>' +
+            '<div class="gen-setting-row gen-param-row" id="gen-cfg-row" data-param-search="cfg classifier free guidance">' +
+            '<label class="gen-setting-label" for="gen-cfg">CFG Scale</label><input type="range" id="gen-cfg-range" class="gen-range" min="0" max="20" step="0.1" value="7">' +
+            '<input type="number" id="gen-cfg" class="gen-number-input" min="0" max="200" step="0.1" value="7"></div>' +
+            '<div class="gen-setting-row gen-param-row" id="gen-guidance-row" style="display:none" data-param-search="distilled guidance">' +
+            '<label class="gen-setting-label" for="gen-guidance">Guidance</label><input type="range" id="gen-guidance-range" class="gen-range" min="0" max="20" step="0.1" value="3.5">' +
+            '<input type="number" id="gen-guidance" class="gen-number-input" min="0" max="200" step="0.1" value="3.5"></div>';
+        var variationBody =
+            '<div class="gen-setting-row gen-param-row" data-param-search="variation seed">' +
+            '<label class="gen-setting-label" for="gen-variation-seed">Variation Seed</label><input id="gen-variation-seed" type="number" class="gen-number-input" value="0">' +
+            '<button id="gen-variation-shuffle" class="gen-seed-btn" title="Random variation seed">↻</button></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="variation strength">' +
+            '<label class="gen-setting-label" for="gen-variation-strength">Strength</label><input id="gen-variation-strength-range" type="range" class="gen-range" min="0" max="1" step="0.01" value="0">' +
+            '<input id="gen-variation-strength" type="number" class="gen-number-input" min="0" max="1" step="0.01" value="0"></div>';
+        var resolutionBody =
+            '<div class="gen-param-row" data-param-search="aspect resolution size width height">' +
+            '<div class="gen-aspect-row"><label class="gen-label" for="gen-aspect-dropdown">Aspect</label>' +
+            '<select id="gen-aspect-dropdown" class="gen-select">' + buildAspectOptions() + '</select>' +
+            '<button id="gen-swap-btn" class="gen-aspect-action" title="Swap admitted dimensions"><i data-lucide="arrow-left-right"></i></button>' +
+            '<button id="gen-optimal-btn" class="gen-aspect-action" title="Restore model default"><i data-lucide="sparkles"></i></button>' +
+            '<button id="gen-aspect-lock" class="gen-aspect-action" style="display:none" aria-hidden="true"></button></div>' +
+            '<div class="gen-dim-row"><span class="gen-dim-label">Width</span><input type="range" id="gen-width-slider" class="gen-range" min="256" max="2048" step="64" value="1024" disabled>' +
+            '<input type="number" id="gen-custom-width" class="gen-number-input" value="1024" disabled></div>' +
+            '<div class="gen-dim-row"><span class="gen-dim-label">Height</span><input type="range" id="gen-height-slider" class="gen-range" min="256" max="2048" step="64" value="1024" disabled>' +
+            '<input type="number" id="gen-custom-height" class="gen-number-input" value="1024" disabled></div>' +
+            '<div id="gen-aspect-preview" class="gen-aspect-preview"><span>1024×1024</span></div></div>';
+        var samplingBody =
+            '<div class="gen-param-row" data-param-search="sampler algorithm"><label class="gen-label" for="gen-sampler">Sampler</label><select id="gen-sampler" class="gen-select"></select></div>' +
+            '<div class="gen-param-row" data-param-search="scheduler noise schedule"><label class="gen-label" for="gen-scheduler">Scheduler</label><select id="gen-scheduler" class="gen-select"></select></div>';
+        var initBody =
+            '<div class="gen-param-row" data-param-search="init image image to image source denoise creativity">' +
+            '<div id="gen-init-drop" class="gen-init-drop"><input id="gen-init-image-input" type="file" accept="image/*">' +
+            '<div id="gen-init-empty"><i data-lucide="image-plus"></i><span>Choose or drop a source image</span></div>' +
+            '<img id="gen-init-preview" alt="Init image preview" style="display:none"></div>' +
+            '<div id="gen-init-name" class="gen-init-name">No source image</div>' +
+            '<button id="gen-init-clear" type="button" class="gen-small-btn" disabled>Clear image</button>' +
+            '<div class="gen-setting-row"><label class="gen-setting-label" for="gen-creativity">Creativity</label>' +
+            '<input id="gen-creativity-range" type="range" class="gen-range" min="0" max="1" step="0.01" value="0.5">' +
+            '<input id="gen-creativity" type="number" class="gen-number-input" min="0" max="1" step="0.01" value="0.5"></div></div>';
+        var loraBody =
+            '<div id="gen-lora-capability" class="gen-capability-note"></div><div id="gen-lora-list" class="gen-lora-list"></div>' +
+            '<select id="gen-lora-picker" class="gen-lora-dropdown"><option disabled selected>No compatible LoRAs loaded</option></select>';
+        return '<div class="gen-swarm-parameter-head"><div><strong>Parameters</strong><span id="gen-arch-badge" class="gen-arch-badge">IMAGE</span></div>' +
+            '<button id="gen-quick-reset" type="button" class="gen-small-btn" title="Reset selected model defaults">Reset</button></div>' +
+            '<div class="gen-swarm-filter"><i data-lucide="search"></i><input id="gen-param-filter" type="search" placeholder="Filter parameters..."></div>' +
+            '<div class="gen-swarm-param-scroll">' +
+            swarmGroup('gen-settings-header', 'Model', modelBody, true, 'Select an installed image model. Video models are intentionally excluded here.') +
+            swarmGroup('gen-core-header', 'Core Parameters', coreBody, true, 'The controls used by every admitted image backend.') +
+            '<section id="gen-variation-section">' + swarmGroup('gen-variation-header', 'Variation Seed', variationBody, false, 'Blend deterministic secondary noise into supported model families.') + '</section>' +
+            swarmGroup('gen-image-header', 'Resolution', resolutionBody, false, 'Only compiled, production-admitted shapes are listed.') +
+            swarmGroup('gen-sampling-header', 'Sampling', samplingBody, false, 'Sampler and scheduler values come from the selected backend capability report.') +
+            '<section id="gen-init-section">' + swarmGroup('gen-init-header', 'Init Image', initBody, false, 'Image-to-image is shown only when the selected backend admits it.') + '</section>' +
+            '<section id="gen-lora-section">' + swarmGroup('gen-lora-header', 'LoRAs', loraBody, false, 'Only backend-admitted LoRA counts are allowed.') + '</section>' +
+            '</div>' +
+            '<div id="gen-left-progress" class="gen-progress gen-left-progress"><div id="gen-left-progress-bar" class="gen-progress-bar"></div></div>' +
+            '<div id="gen-left-progress-label" class="gen-left-progress-label"></div>' +
+            '<div hidden aria-hidden="true"><div id="gen-video-section"></div><div id="gen-scail2-section"></div>' +
+            '<input id="gen-seconds" value="1"><input id="gen-fps" value="1"><input id="gen-fps-range" value="1">' +
+            '<div id="gen-duration-hint"></div></div>';
+    }
+
+    function buildSwarmTopToolbarHTML() {
+        return '<div class="gen-swarm-topbar">' +
+            '<div class="gen-swarm-model-info"><span id="gen-model-badge" class="gen-model-badge"></span><span id="gen-runtime-label">Serenity image runtime</span></div>' +
+            '<div class="gen-swarm-quick-tools"><button id="gen-toolbar-copy" class="gen-toolbar-btn" title="Copy current image URL"><i data-lucide="copy"></i></button>' +
+            '<button id="gen-toolbar-delete" class="gen-toolbar-btn" title="Clear preview"><i data-lucide="trash-2"></i></button>' +
+            '<button id="gen-toolbar-toggle-gallery" class="gen-toolbar-btn active" title="Toggle batch panel"><i data-lucide="panel-right"></i></button></div></div>';
+    }
+
+    function buildSwarmPromptHTML() {
+        return '<div class="gen-swarm-prompts"><div class="gen-swarm-prompt-main">' +
+            '<div class="gen-prompt-label-row"><label class="gen-label" for="gen-prompt">Prompt</label><span id="gen-token-count" class="gen-token-count">~0 tokens</span></div>' +
+            '<textarea id="gen-prompt" class="gen-textarea gen-swarm-prompt-textarea" rows="3" placeholder="Describe the image you want..."></textarea>' +
+            '<div class="gen-swarm-prompt-options"><label class="gen-label" for="gen-style-preset">Style</label><select id="gen-style-preset" class="gen-select">' + buildStyleOptions() + '</select>' +
+            '<div id="gen-style-preview" class="gen-style-preview" style="display:none"></div></div></div>' +
+            '<div id="gen-neg-section" class="gen-swarm-negative"><label class="gen-label" for="gen-neg-prompt">Negative Prompt</label>' +
+            '<textarea id="gen-neg-prompt" class="gen-textarea" rows="3" placeholder="What to avoid..."></textarea></div></div>' +
+            '<div class="gen-swarm-generate-column"><button id="gen-btn" class="gen-btn"><i data-lucide="wand-2"></i><span>Generate</span></button>' +
+            '<div class="gen-toolbar-batch"><label for="gen-toolbar-batch-input">Images</label><input type="number" id="gen-toolbar-batch-input" class="gen-toolbar-batch-input" min="1" max="8" value="1">' +
+            '<button id="gen-toolbar-batch-up" title="Increase batch">+</button><button id="gen-toolbar-batch-down" title="Decrease batch">−</button></div></div>';
+    }
+
+    function buildSwarmBatchHTML() {
+        return '<div class="gen-swarm-batch-head"><strong>Current Batch</strong><span id="gen-batch-status">Idle</span></div>' +
+            '<div id="gen-batch-strip" class="gen-swarm-batch-strip"><div class="gen-swarm-batch-empty">New results appear here</div></div>';
+    }
+
+    function buildSwarmLibraryHTML() {
+        return '<div class="gen-swarm-library-tabs">' +
+            '<button class="gen-library-tab active" data-library="history">History</button>' +
+            '<button class="gen-library-tab" data-library="presets">Presets</button>' +
+            '<button class="gen-library-tab" data-library="models">Models</button>' +
+            '<button class="gen-library-tab" data-library="loras">LoRAs</button>' +
+            '<div class="gen-library-spacer"></div>' +
+            '<button id="gen-gallery-upload-btn" class="gen-gallery-subtab-btn" title="Import image into history"><i data-lucide="upload"></i></button>' +
+            '<input type="file" id="gen-gallery-upload-input" accept="image/*" multiple style="display:none">' +
+            '<button id="gen-gallery-search-btn" class="gen-gallery-subtab-btn" title="Search history"><i data-lucide="search"></i></button>' +
+            '<input id="gen-gallery-search-input" class="gen-gallery-search" type="text" placeholder="Search history...">' +
+            '<button id="gen-gallery-settings-btn" class="gen-gallery-subtab-btn" title="History display settings"><i data-lucide="settings"></i></button>' +
+            '<button id="gen-gallery-clear" class="gen-gallery-clear">Clear</button></div>' +
+            '<div id="gen-gallery-popover" class="gen-gallery-popover"><div class="gen-popover-row"><span class="gen-popover-label">Thumbnail size</span>' +
+            '<input type="range" id="gen-thumb-size-slider" class="gen-range gen-popover-slider" min="45" max="200" step="5" value="90"><span id="gen-thumb-size-val">90</span></div>' +
+            '<div class="gen-popover-row"><span class="gen-popover-label">Newest first</span><button id="gen-sort-direction-toggle" class="gen-toggle on"></button><span id="gen-sort-direction-label">Newest</span></div>' +
+            '<div class="gen-popover-row"><span class="gen-popover-label">Starred first</span><button id="gen-starred-first-toggle" class="gen-toggle"></button></div>' +
+            '<div class="gen-popover-row"><span class="gen-popover-label">Auto-switch new</span><button id="gen-auto-switch-toggle" class="gen-toggle on"></button></div></div>' +
+            '<div class="gen-library-panel active" data-library-panel="history"><div id="gen-images-content"><div class="gen-gallery-grid-wrap">' +
+            '<div id="gen-gallery-grid" class="gen-gallery-grid"></div><div id="gen-selection-badge" class="gen-selection-badge"></div></div></div>' +
+            '<div id="gen-bulk-bar" class="gen-bulk-bar"><button id="gen-bulk-star" class="gen-bulk-btn">Star All</button><button id="gen-bulk-unstar" class="gen-bulk-btn">Unstar All</button>' +
+            '<button id="gen-bulk-download" class="gen-bulk-btn">Download</button><button id="gen-bulk-delete" class="gen-bulk-btn destructive">Delete</button></div>' +
+            '<div id="gen-gallery-pagination" class="gen-gallery-pagination"><button id="gen-page-prev" disabled>&lt; Prev</button><span id="gen-page-info">Page 1</span><button id="gen-page-next">Next &gt;</button></div></div>' +
+            '<div class="gen-library-panel" data-library-panel="presets"><div class="gen-preset-toolbar"><input id="gen-preset-name" class="gen-select" placeholder="Preset name">' +
+            '<button id="gen-preset-save" class="gen-small-btn">Save current</button></div><div id="gen-preset-list" class="gen-library-card-grid"></div></div>' +
+            '<div class="gen-library-panel" data-library-panel="models"><div id="gen-library-models" class="gen-library-card-grid"></div></div>' +
+            '<div class="gen-library-panel" data-library-panel="loras"><div id="gen-library-loras" class="gen-library-card-grid"></div></div>';
     }
     function buildLeftHTML() {
         return '' +
@@ -712,6 +874,7 @@ var GenerateTab = (function () {
         els.guidanceRow = document.getElementById('gen-guidance-row');
         els.guidance = document.getElementById('gen-guidance');
         els.guidanceRange = document.getElementById('gen-guidance-range');
+        els.sampler = document.getElementById('gen-sampler');
         els.scheduler = document.getElementById('gen-scheduler');
         els.seed = document.getElementById('gen-seed');
         els.seedShuffle = document.getElementById('gen-seed-shuffle');
@@ -739,6 +902,8 @@ var GenerateTab = (function () {
         els.aspectPreview = document.getElementById('gen-aspect-preview');
         els.modelBadge = document.getElementById('gen-model-badge');
         els.toolbarBatchInput = document.getElementById('gen-toolbar-batch-input');
+        els.batchStrip = document.getElementById('gen-batch-strip');
+        els.batchStatus = document.getElementById('gen-batch-status');
     }
     // ── Aspect Preview Box ──
     function updateAspectPreview() {
@@ -991,9 +1156,35 @@ var GenerateTab = (function () {
             els.cfg.value = this.value;
         });
         // Scheduler
+        if (els.sampler) {
+            els.sampler.addEventListener('change', function () {
+                state.sampler = this.value;
+            });
+        }
         els.scheduler.addEventListener('change', function () {
             state.scheduler = this.value;
         });
+        bindSliderPair('gen-variation-strength-range', 'gen-variation-strength', function (v) {
+            state.variationStrength = Math.max(0, Math.min(1, parseFloat(v) || 0));
+        });
+        var variationSeed = document.getElementById('gen-variation-seed');
+        if (variationSeed) {
+            variationSeed.addEventListener('input', function () {
+                state.variationSeed = Math.max(0, parseInt(this.value) || 0);
+            });
+        }
+        var variationShuffle = document.getElementById('gen-variation-shuffle');
+        if (variationShuffle) {
+            variationShuffle.addEventListener('click', function () {
+                state.variationSeed = Math.floor(Math.random() * 4294967296);
+                if (variationSeed)
+                    variationSeed.value = String(state.variationSeed);
+            });
+        }
+        bindSliderPair('gen-creativity-range', 'gen-creativity', function (v) {
+            state.creativity = Math.max(0, Math.min(1, parseFloat(v) || 0));
+        });
+        bindInitImage();
         // Model searchable picker
         bindModelPicker();
         // Model refresh button
@@ -1538,6 +1729,275 @@ var GenerateTab = (function () {
                 }
             });
         }
+        bindSwarmControls();
+    }
+    function bindInitImage() {
+        var input = document.getElementById('gen-init-image-input');
+        var drop = document.getElementById('gen-init-drop');
+        var clear = document.getElementById('gen-init-clear');
+        if (!input || !drop)
+            return;
+        function upload(file) {
+            if (!file || !/^image\//.test(file.type || '')) {
+                showError('Choose a readable image file');
+                return;
+            }
+            var form = new FormData();
+            form.append('image', file, file.name || 'init.png');
+            var preview = document.getElementById('gen-init-preview');
+            var empty = document.getElementById('gen-init-empty');
+            var name = document.getElementById('gen-init-name');
+            if (preview) {
+                preview.src = URL.createObjectURL(file);
+                preview.style.display = 'block';
+            }
+            if (empty)
+                empty.style.display = 'none';
+            if (name)
+                name.textContent = 'Uploading ' + (file.name || 'image') + '…';
+            fetch('/upload/image', { method: 'POST', body: form })
+                .then(function (resp) {
+                return resp.text().then(function (body) {
+                    var data = {};
+                    try { data = JSON.parse(body); }
+                    catch (e) { data = { error: body }; }
+                    if (!resp.ok)
+                        throw new Error(data.error || data.detail || ('HTTP ' + resp.status));
+                    return data;
+                });
+            })
+                .then(function (data) {
+                state.initImagePath = data.path || data.name || '';
+                state.initImageName = data.name || file.name || state.initImagePath;
+                if (!state.initImagePath)
+                    throw new Error('upload returned no image path');
+                if (name)
+                    name.textContent = state.initImageName;
+                if (clear)
+                    clear.disabled = false;
+            })
+                .catch(function (err) {
+                clearInitImage();
+                showError('Init image upload failed: ' + err.message);
+            });
+        }
+        input.addEventListener('change', function () {
+            upload(this.files && this.files[0]);
+        });
+        ['dragenter', 'dragover'].forEach(function (eventName) {
+            drop.addEventListener(eventName, function (event) {
+                event.preventDefault();
+                drop.classList.add('dragover');
+            });
+        });
+        ['dragleave', 'drop'].forEach(function (eventName) {
+            drop.addEventListener(eventName, function (event) {
+                event.preventDefault();
+                drop.classList.remove('dragover');
+            });
+        });
+        drop.addEventListener('drop', function (event) {
+            upload(event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0]);
+        });
+        if (clear)
+            clear.addEventListener('click', clearInitImage);
+    }
+    function clearInitImage() {
+        state.initImagePath = '';
+        state.initImageName = '';
+        var input = document.getElementById('gen-init-image-input');
+        var preview = document.getElementById('gen-init-preview');
+        var empty = document.getElementById('gen-init-empty');
+        var name = document.getElementById('gen-init-name');
+        var clear = document.getElementById('gen-init-clear');
+        if (input)
+            input.value = '';
+        if (preview) {
+            if (preview.src && preview.src.indexOf('blob:') === 0)
+                URL.revokeObjectURL(preview.src);
+            preview.removeAttribute('src');
+            preview.style.display = 'none';
+        }
+        if (empty)
+            empty.style.display = '';
+        if (name)
+            name.textContent = 'No source image';
+        if (clear)
+            clear.disabled = true;
+    }
+    function bindSwarmControls() {
+        ['gen-core', 'gen-variation', 'gen-sampling', 'gen-init', 'gen-lora'].forEach(function (prefix) {
+            bindAccordion(prefix + '-header', prefix + '-body');
+        });
+        var filter = document.getElementById('gen-param-filter');
+        if (filter) {
+            filter.addEventListener('input', function () {
+                var query = this.value.trim().toLowerCase();
+                document.querySelectorAll('#gen-left-panel .gen-param-group').forEach(function (group) {
+                    var haystack = group.getAttribute('data-param-search') || '';
+                    var rows = Array.prototype.slice.call(group.querySelectorAll('.gen-param-row'));
+                    var groupMatch = !query || haystack.indexOf(query) >= 0;
+                    var rowMatch = false;
+                    rows.forEach(function (row) {
+                        var visible = !query || groupMatch ||
+                            (row.getAttribute('data-param-search') || '').indexOf(query) >= 0 ||
+                            row.textContent.toLowerCase().indexOf(query) >= 0;
+                        row.style.display = visible ? '' : 'none';
+                        rowMatch = rowMatch || visible;
+                    });
+                    group.style.display = (!query || groupMatch || rowMatch) ? '' : 'none';
+                    if (query && (groupMatch || rowMatch)) {
+                        var body = group.querySelector('.gen-swarm-group-body');
+                        var header = group.querySelector('.gen-swarm-group-title');
+                        if (body) body.classList.remove('closed');
+                        if (header) header.classList.remove('closed');
+                    }
+                });
+            });
+        }
+        var reset = document.getElementById('gen-quick-reset');
+        if (reset) {
+            reset.addEventListener('click', function () {
+                state.variationSeed = 0;
+                state.variationStrength = 0;
+                clearInitImage();
+                updateUIForArch(state.arch);
+                var variationSeed = document.getElementById('gen-variation-seed');
+                var variationStrength = document.getElementById('gen-variation-strength');
+                var variationRange = document.getElementById('gen-variation-strength-range');
+                if (variationSeed) variationSeed.value = '0';
+                if (variationStrength) variationStrength.value = '0';
+                if (variationRange) variationRange.value = '0';
+            });
+        }
+        document.querySelectorAll('.gen-library-tab').forEach(function (button) {
+            button.addEventListener('click', function () {
+                var target = this.dataset.library;
+                document.querySelectorAll('.gen-library-tab').forEach(function (tab) {
+                    tab.classList.toggle('active', tab.dataset.library === target);
+                });
+                document.querySelectorAll('.gen-library-panel').forEach(function (panel) {
+                    panel.classList.toggle('active', panel.dataset.libraryPanel === target);
+                });
+                if (target === 'presets')
+                    loadGenerationPresets();
+                if (target === 'models')
+                    renderModelLibrary();
+                if (target === 'loras')
+                    renderLoraLibrary();
+            });
+        });
+        var presetSave = document.getElementById('gen-preset-save');
+        if (presetSave) {
+            presetSave.addEventListener('click', function () {
+                var input = document.getElementById('gen-preset-name');
+                var name = input ? input.value.trim() : '';
+                if (!name) {
+                    showError('Enter a preset name');
+                    return;
+                }
+                fetch('/v1/presets', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name, params: getParams() })
+                }).then(function (resp) {
+                    if (!resp.ok)
+                        return resp.text().then(function (text) { throw new Error(text || ('HTTP ' + resp.status)); });
+                    return resp.json();
+                }).then(function () {
+                    if (input) input.value = '';
+                    loadGenerationPresets();
+                }).catch(function (err) {
+                    showError('Preset save failed: ' + err.message);
+                });
+            });
+        }
+    }
+    function loadGenerationPresets() {
+        fetch('/v1/presets', { cache: 'no-store' })
+            .then(function (resp) {
+            if (!resp.ok)
+                throw new Error('HTTP ' + resp.status);
+            return resp.json();
+        })
+            .then(function (doc) {
+            var list = document.getElementById('gen-preset-list');
+            if (!list)
+                return;
+            list.innerHTML = '';
+            var presets = Array.isArray(doc.presets) ? doc.presets : [];
+            if (!presets.length) {
+                list.innerHTML = '<div class="gen-library-empty">No saved presets</div>';
+                return;
+            }
+            presets.forEach(function (preset) {
+                var card = document.createElement('div');
+                card.className = 'gen-library-card';
+                var title = document.createElement('strong');
+                title.textContent = preset.name || 'Unnamed';
+                var load = document.createElement('button');
+                load.className = 'gen-small-btn';
+                load.textContent = 'Load';
+                load.addEventListener('click', function () { applyParams(preset.params || {}); });
+                var del = document.createElement('button');
+                del.className = 'gen-small-btn destructive';
+                del.textContent = 'Delete';
+                del.addEventListener('click', function () {
+                    fetch('/v1/presets/' + encodeURIComponent(preset.name), { method: 'DELETE' })
+                        .then(function (resp) {
+                        if (!resp.ok)
+                            throw new Error('HTTP ' + resp.status);
+                        loadGenerationPresets();
+                    }).catch(function (err) { showError('Preset delete failed: ' + err.message); });
+                });
+                card.appendChild(title);
+                card.appendChild(load);
+                card.appendChild(del);
+                list.appendChild(card);
+            });
+        })
+            .catch(function (err) {
+            showError('Preset load failed: ' + err.message);
+        });
+    }
+    function renderModelLibrary() {
+        var list = document.getElementById('gen-library-models');
+        if (!list)
+            return;
+        list.innerHTML = '';
+        (state.allModels || []).forEach(function (model) {
+            var card = document.createElement('button');
+            card.className = 'gen-library-card gen-library-model-card';
+            card.type = 'button';
+            card.textContent = model.name;
+            card.title = model.name;
+            card.classList.toggle('active', model.name === state.model);
+            card.addEventListener('click', function () { selectModel(model.name); renderModelLibrary(); });
+            list.appendChild(card);
+        });
+        if (!list.children.length)
+            list.innerHTML = '<div class="gen-library-empty">No admitted image models found</div>';
+    }
+    function renderLoraLibrary() {
+        var list = document.getElementById('gen-library-loras');
+        var picker = document.getElementById('gen-lora-picker');
+        if (!list)
+            return;
+        list.innerHTML = '';
+        if (picker) {
+            Array.prototype.slice.call(picker.options).forEach(function (option, index) {
+                if (index === 0 || !option.value)
+                    return;
+                var card = document.createElement('button');
+                card.className = 'gen-library-card gen-library-model-card';
+                card.type = 'button';
+                card.textContent = option.textContent;
+                card.addEventListener('click', function () { addLora(option.value); });
+                list.appendChild(card);
+            });
+        }
+        if (!list.children.length)
+            list.innerHTML = '<div class="gen-library-empty">No local LoRAs found</div>';
     }
     function bindAccordion(headerId, bodyId) {
         var header = document.getElementById(headerId);
@@ -1599,11 +2059,52 @@ var GenerateTab = (function () {
         };
         return defaults[arch] || { w: 1024, h: 1024 };
     }
+    function activeCapabilityProfile(arch) {
+        var resolvedArch = arch || state.arch;
+        var backend = ModelUtils.backendForArch(resolvedArch);
+        if (!backend || !state.capabilities || !Array.isArray(state.capabilities.backends))
+            return null;
+        return state.capabilities.backends.find(function (entry) {
+            return entry && entry.backend === backend;
+        }) || null;
+    }
+    function featureSupported(profile, name) {
+        return !!(profile && profile.features && profile.features[name] &&
+            profile.features[name].supported === true);
+    }
+    function variationSupportedForArch(arch) {
+        // These are the worker implementations that actually blend secondary
+        // noise. Other families reject or ignore the fields and must not expose
+        // the control.
+        return ['zimage', 'sdxl', 'sd3', 'flux', 'chroma'].indexOf(arch) >= 0;
+    }
+    function displaySamplerName(name) {
+        var names = {
+            euler: 'Euler',
+            flowmatch_euler: 'FlowMatch Euler',
+            dpmpp_2m: 'DPM++ 2M',
+            uni_pc: 'UniPC',
+            uni_pc_bh2: 'UniPC BH2'
+        };
+        return names[name] || String(name || '').replace(/_/g, ' ');
+    }
+    function displaySchedulerName(name) {
+        var names = {
+            simple: 'Simple',
+            normal: 'Normal',
+            sgm_uniform: 'SGM Uniform',
+            ideogram_logitnormal: 'Ideogram Logit-Normal',
+            flux2: 'FLUX.2'
+        };
+        return names[name] || String(name || '').replace(/_/g, ' ');
+    }
     // ── Model Loading ──
     function loadModels() {
         Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities()])
             .then(function (loaded) {
-            var models = loaded[0];
+            var models = loaded[0].filter(function (model) {
+                return !ModelUtils.isVideoModel(model.name);
+            });
             state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');
@@ -1627,6 +2128,11 @@ var GenerateTab = (function () {
             }
             els.model.value = pick.name;
             state.model = pick.name;
+            var globalBadge = document.querySelector('#topbar .model-badge');
+            if (globalBadge) {
+                globalBadge.textContent = pick.name;
+                globalBadge.title = pick.name;
+            }
             if (els.modelSearch) {
                 els.modelSearch.value = pick.name;
                 els.modelSearch.placeholder = 'Search models...';
@@ -1679,8 +2185,13 @@ var GenerateTab = (function () {
             .catch(function () { });
     }
     function setPreviewModelBadges(model, arch) {
-        var resolvedModel = model || '';
-        var resolvedArch = (resolvedModel && ModelUtils.detectArchFromFilename(resolvedModel)) || arch || 'other';
+        // These badges describe the active request controls. Result-specific
+        // identity is rendered in the metadata panel and must not silently
+        // rewrite the selected model when an older History item is viewed.
+        var resolvedModel = state.model || model || '';
+        var resolvedArch = state.arch ||
+            (resolvedModel && ModelUtils.detectArchFromFilename(resolvedModel)) ||
+            arch || 'other';
         var archBadge = document.getElementById('gen-arch-badge');
         if (archBadge) {
             var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
@@ -1696,6 +2207,10 @@ var GenerateTab = (function () {
     }
     // ── Arch-aware UI ──
     function updateUIForArch(arch) {
+        updateSwarmUIForArch(arch);
+        return;
+        /* Legacy layout logic retained below only for source-map compatibility.
+           The Swarm-style Generate surface uses the capability-driven path. */
         state.arch = arch;
         var isFlux = arch === 'flux' || arch === 'klein';
         var noNegative = isFlux || arch === 'ideogram4' || arch === 'sensenova';
@@ -1841,6 +2356,139 @@ var GenerateTab = (function () {
             updateDurationHint();
         }
     }
+    function updateSwarmUIForArch(arch) {
+        state.arch = arch;
+        var profile = activeCapabilityProfile(arch);
+        if (!profile) {
+            if (els.modelWarn) {
+                els.modelWarn.textContent = 'This model family is not admitted by the image runtime';
+                els.modelWarn.classList.add('visible');
+            }
+            return;
+        }
+        if (els.modelWarn)
+            els.modelWarn.classList.remove('visible');
+        var defaults = profile.defaults || {};
+        // Krea publishes one backend profile but has distinct Raw and Turbo
+        // checkpoint defaults. Keep the checkpoint identity visible and exact.
+        if (arch === 'krea2' && /turbo/i.test(state.model || '')) {
+            defaults = Object.assign({}, defaults, { steps: 8, cfg: 0.0 });
+        }
+        state.steps = Number(defaults.steps) || 20;
+        state.cfg = Number(defaults.cfg);
+        if (!Number.isFinite(state.cfg))
+            state.cfg = 4.5;
+        state.sampler = defaults.sampler || 'euler';
+        state.scheduler = defaults.scheduler || 'simple';
+        if (els.steps) els.steps.value = String(state.steps);
+        if (els.stepsRange) els.stepsRange.value = String(state.steps);
+        if (els.cfg) els.cfg.value = String(state.cfg);
+        if (els.cfgRange) els.cfgRange.value = String(state.cfg);
+        if (els.cfg) els.cfg.min = '0';
+        if (els.cfgRange) els.cfgRange.min = '0';
+        var samplers = profile.samplers || {};
+        var supportedSamplers = Array.isArray(samplers.supported_samplers)
+            ? samplers.supported_samplers : [state.sampler];
+        var supportedSchedulers = Array.isArray(samplers.supported_schedulers)
+            ? samplers.supported_schedulers : [state.scheduler];
+        if (els.sampler) {
+            els.sampler.innerHTML = '';
+            supportedSamplers.forEach(function (name) {
+                var option = document.createElement('option');
+                option.value = name;
+                option.textContent = displaySamplerName(name);
+                els.sampler.appendChild(option);
+            });
+            if (supportedSamplers.indexOf(state.sampler) < 0)
+                state.sampler = supportedSamplers[0] || 'euler';
+            els.sampler.value = state.sampler;
+        }
+        if (els.scheduler) {
+            els.scheduler.innerHTML = '';
+            supportedSchedulers.forEach(function (name) {
+                var option = document.createElement('option');
+                option.value = name;
+                option.textContent = displaySchedulerName(name);
+                els.scheduler.appendChild(option);
+            });
+            if (supportedSchedulers.indexOf(state.scheduler) < 0)
+                state.scheduler = supportedSchedulers[0] || 'simple';
+            els.scheduler.value = state.scheduler;
+        }
+        var negativeSupported = featureSupported(profile, 'negative_prompt');
+        if (els.negSection)
+            els.negSection.style.display = negativeSupported ? '' : 'none';
+        if (!negativeSupported) {
+            state.negPrompt = '';
+            if (els.negPrompt) els.negPrompt.value = '';
+        }
+        if (els.cfgRow)
+            els.cfgRow.style.display = featureSupported(profile, 'cfg') ? 'flex' : 'none';
+        if (els.guidanceRow)
+            els.guidanceRow.style.display = 'none';
+        var variationSection = document.getElementById('gen-variation-section');
+        if (variationSection)
+            variationSection.style.display = variationSupportedForArch(arch) ? '' : 'none';
+        if (!variationSupportedForArch(arch))
+            state.variationStrength = 0;
+        var initSection = document.getElementById('gen-init-section');
+        var imageToImage = featureSupported(profile, 'image_to_image');
+        if (initSection)
+            initSection.style.display = imageToImage ? '' : 'none';
+        if (!imageToImage)
+            clearInitImage();
+        var loraFeature = profile.features && profile.features.lora;
+        var loraSupported = !!(loraFeature && loraFeature.supported);
+        var loraSection = document.getElementById('gen-lora-section');
+        if (loraSection)
+            loraSection.style.display = loraSupported ? '' : 'none';
+        var loraNote = document.getElementById('gen-lora-capability');
+        var maxLoras = loraFeature && loraFeature.max_count;
+        if (loraNote)
+            loraNote.textContent = maxLoras == null
+                ? 'Multiple LoRAs supported'
+                : ('Maximum ' + maxLoras + ' LoRA' + (maxLoras === 1 ? '' : 's'));
+        if (!loraSupported) {
+            state.loras = [];
+            renderLoraList();
+        } else if (Number.isInteger(maxLoras) && state.loras.length > maxLoras) {
+            state.loras = state.loras.slice(0, maxLoras);
+            renderLoraList();
+        }
+        if (els.btn)
+            els.btn.innerHTML = '<i data-lucide="wand-2"></i><span>Generate</span>';
+        setPreviewModelBadges(state.model, arch);
+        var runtimeLabel = document.getElementById('gen-runtime-label');
+        if (runtimeLabel)
+            runtimeLabel.textContent = profile.backend + ' · Mojo image worker · admitted';
+        var aspects = getActiveAspects();
+        if (els.aspectDropdown) {
+            els.aspectDropdown.innerHTML = buildAspectOptions();
+        }
+        if (aspects.length) {
+            var defaultWidth = Number(defaults.width);
+            var defaultHeight = Number(defaults.height);
+            var selected = aspects.find(function (size) {
+                return size.w === defaultWidth && size.h === defaultHeight;
+            }) || aspects[0];
+            state.width = selected.w;
+            state.height = selected.h;
+            syncDimensionInputs();
+            syncAspectDropdown();
+            updateAspectPreview();
+        }
+        var swap = document.getElementById('gen-swap-btn');
+        if (swap) {
+            swap.style.display = aspects.some(function (size) {
+                return aspects.some(function (other) {
+                    return size.w === other.h && size.h === other.w;
+                });
+            }) ? '' : 'none';
+        }
+        renderModelLibrary();
+        if (typeof lucide !== 'undefined')
+            lucide.createIcons({ nameAttr: 'data-lucide' });
+    }
     function updateDurationHint() {
         if (!els.durationHint)
             return;
@@ -1876,6 +2524,17 @@ var GenerateTab = (function () {
     function addLora(name) {
         if (state.loras.some(function (l) { return l.name === name; }))
             return;
+        var profile = activeCapabilityProfile();
+        var feature = profile && profile.features && profile.features.lora;
+        if (!feature || feature.supported !== true) {
+            showError('The selected model does not admit LoRA overlays');
+            return;
+        }
+        var maxCount = feature.max_count;
+        if (Number.isInteger(maxCount) && state.loras.length >= maxCount) {
+            showError('The selected model admits at most ' + maxCount + ' LoRA' + (maxCount === 1 ? '' : 's'));
+            return;
+        }
         state.loras.push({ name: name, strength: 1.0, enabled: true });
         renderLoraList();
     }
@@ -1958,7 +2617,9 @@ var GenerateTab = (function () {
             steps: state.steps,
             cfg: state.cfg,
             guidance: state.guidance,
+            sampler: state.sampler,
             scheduler: state.scheduler,
+            noiseScheduler: state.scheduler,
             seed: state.seed,
             frames: state.frames,
             fps: state.fps,
@@ -1992,6 +2653,47 @@ var GenerateTab = (function () {
             infillMethod: state.infillMethod
         });
     }
+    function buildGenerateRequest(seed) {
+        var finalPrompt = state.prompt;
+        if (state.stylePreset && state.stylePreset !== 'none') {
+            for (var i = 0; i < stylePresets.length; i++) {
+                if (stylePresets[i].id === state.stylePreset) {
+                    finalPrompt += stylePresets[i].suffix;
+                    break;
+                }
+            }
+        }
+        var request = {
+            model: state.model || '',
+            prompt: finalPrompt,
+            width: state.width,
+            height: state.height,
+            steps: state.steps,
+            seed: seed,
+            sampler: state.sampler || 'euler',
+            scheduler: state.scheduler || 'simple',
+            cfg: state.cfg,
+            images: 1
+        };
+        var profile = activeCapabilityProfile();
+        if (featureSupported(profile, 'negative_prompt') && state.negPrompt)
+            request.negative = state.negPrompt;
+        if (variationSupportedForArch(state.arch) && state.variationStrength > 0) {
+            request.variation_seed = state.variationSeed;
+            request.variation_strength = state.variationStrength;
+        }
+        if (featureSupported(profile, 'image_to_image') && state.initImagePath) {
+            request.init_image = state.initImagePath;
+            request.creativity = state.creativity;
+        }
+        var enabledLoras = state.loras.filter(function (lora) { return lora.enabled !== false; });
+        if (enabledLoras.length) {
+            request.lora = enabledLoras.map(function (lora) {
+                return { name: lora.name, weight: Number(lora.strength) };
+            });
+        }
+        return request;
+    }
     // ── Generate ──
     function generate() {
         if (state.generating)
@@ -2003,25 +2705,6 @@ var GenerateTab = (function () {
         if (!state.prompt.trim()) {
             showError('Enter a prompt');
             return;
-        }
-        if (ModelUtils.detectArchFromFilename(state.model) === 'scail2') {
-            if (state.mediaUploadsInFlight > 0) {
-                showError('Wait for the SCAIL-2 media uploads to finish');
-                return;
-            }
-            var missingScail2 = [];
-            if (!state.referenceImagePath) missingScail2.push('reference image');
-            if (!state.referenceMaskPath) missingScail2.push('reference mask');
-            if (!state.drivingVideoPath) missingScail2.push('driving video');
-            if (!state.drivingMaskVideoPath) missingScail2.push('driving mask video');
-            if (missingScail2.length) {
-                showError('SCAIL-2 requires: ' + missingScail2.join(', '));
-                return;
-            }
-            if (state.additionalReferenceImagePaths.length !== state.additionalReferenceMaskPaths.length) {
-                showError('Each additional SCAIL-2 reference requires one paired mask');
-                return;
-            }
         }
         // Save to prompt history
         pushPromptHistory(state.prompt);
@@ -2040,7 +2723,7 @@ var GenerateTab = (function () {
             // in their completion handler would mislabel the gallery item if
             // the user selected another model while the render was running.
             submissions.push({
-                workflow: buildWorkflow(),
+                request: buildGenerateRequest(state.seed),
                 prompt: state.prompt,
                 model: state.model,
                 seed: state.seed,
@@ -2064,39 +2747,14 @@ var GenerateTab = (function () {
                 if (typeof lucide !== 'undefined')
                     lucide.createIcons({ nameAttr: 'data-lucide' });
             }
-            SerenityAPI.postPrompt(submission.workflow, {
+            SerenityAPI.postGenerate(submission.request, {
                 prompt: submission.prompt,
                 model: submission.model,
                 batchLabel: batchN > 1 ? ('(' + (i + 1) + '/' + batchN + ')') : ''
             })
                 .then(function (result) {
-                if (!result || !result.video_result)
-                    return;
-                var video = result.video_result;
-                var src = video.mp4_url || '';
-                if (!src && video.mp4 && video.video_id) {
-                    var name = String(video.mp4).split('/').pop();
-                    src = '/out/' + encodeURIComponent(video.video_id) + '/' + encodeURIComponent(name);
-                }
-                if (!src)
-                    throw new Error('video completed without an MP4 URL');
-                displayVideo(src, video);
-                addToGallery(src, true, {
-                    prompt: submission.prompt,
-                    model: submission.model,
-                    seed: submission.seed,
-                    steps: video.steps != null ? video.steps : submission.steps,
-                    cfg: submission.cfg,
-                    guidance: video.guidance != null ? video.guidance : submission.guidance,
-                    scheduler: 'mojo-video',
-                    width: video.width || submission.width,
-                    height: video.height || submission.height,
-                    frame_count: video.frame_count != null ? video.frame_count : video.frames,
-                    fps: video.fps,
-                    arch: submission.arch
-                });
-                state.pendingBatch = 0;
-                setGenerating(false);
+                if (!result || !result.prompt_id)
+                    throw new Error('server did not return a job id');
             })
                 .catch(function (err) {
                 queueFailed = true;
@@ -2121,6 +2779,10 @@ var GenerateTab = (function () {
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
         els.btn.classList.toggle('generating', v);
+        if (els.batchStatus)
+            els.batchStatus.textContent = v
+                ? ('Running · ' + Math.max(1, state.pendingBatch) + ' queued')
+                : 'Idle';
         if (v) {
             els.progress.classList.add('active');
             els.progressBar.style.width = '100%';
@@ -2199,6 +2861,7 @@ var GenerateTab = (function () {
             steps: value('steps', state.steps),
             cfg: value('cfg', state.cfg),
             guidance: value('guidance', state.guidance),
+            sampler: value('sampler', state.sampler),
             scheduler: value('scheduler', state.scheduler),
             width: value('width', state.width),
             height: value('height', state.height),
@@ -2287,6 +2950,7 @@ var GenerateTab = (function () {
             // FLUX lowers its distilled guidance into JobParams.cfg. Preserve
             // that executed value under the UI's Guidance label too.
             guidance: arch === 'flux' ? executedCfg : params.guidance,
+            sampler: meta.sampler || params.sampler || '',
             scheduler: meta.scheduler || params.scheduler || '',
             width: meta.width != null ? meta.width : params.width,
             height: meta.height != null ? meta.height : params.height,
@@ -2518,6 +3182,11 @@ var GenerateTab = (function () {
             els.modelSearch.value = name;
         closeModelDropdown();
         updateUIForArch(ModelUtils.detectArchFromFilename(name));
+        var globalBadge = document.querySelector('#topbar .model-badge');
+        if (globalBadge) {
+            globalBadge.textContent = name;
+            globalBadge.title = name;
+        }
     }
     function renderModelDropdown() {
         if (!els.modelDropdownList)
@@ -2814,8 +3483,41 @@ var GenerateTab = (function () {
             prevBtn.disabled = state.galleryPage <= 0;
         if (nextBtn)
             nextBtn.disabled = state.galleryPage >= totalPages - 1;
+        renderBatchStrip();
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
+    }
+    function renderBatchStrip() {
+        if (!els.batchStrip)
+            return;
+        els.batchStrip.innerHTML = '';
+        var recent = state.gallery.slice(0, 12);
+        if (!recent.length) {
+            els.batchStrip.innerHTML = '<div class="gen-swarm-batch-empty">New results appear here</div>';
+            return;
+        }
+        recent.forEach(function (item) {
+            if (item.isVideo)
+                return;
+            var button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'gen-swarm-batch-thumb';
+            var image = document.createElement('img');
+            image.src = item.src;
+            image.alt = item.prompt || 'Generated image';
+            button.appendChild(image);
+            var caption = document.createElement('span');
+            caption.textContent = (item.width && item.height)
+                ? (item.width + '×' + item.height)
+                : 'Image';
+            button.appendChild(caption);
+            button.addEventListener('click', function () {
+                var index = state.gallery.indexOf(item);
+                if (index >= 0)
+                    handleThumbClick(index, {});
+            });
+            els.batchStrip.appendChild(button);
+        });
     }
     function applyThumbSize() {
         if (!els.galleryGrid)
@@ -2926,8 +3628,10 @@ var GenerateTab = (function () {
         var fullPairs = [];
         if (item.prompt)
             fullPairs.push('<span class="gen-metadata-key">Full Prompt:</span> <span class="gen-metadata-val">' + escapeHtml(item.prompt) + '</span>');
+        if (item.sampler)
+            fullPairs.push('<span class="gen-metadata-key">Sampler:</span> <span class="gen-metadata-val">' + escapeHtml(item.sampler) + '</span>');
         if (item.scheduler)
-            fullPairs.push('<span class="gen-metadata-key">Scheduler:</span> <span class="gen-metadata-val">' + item.scheduler + '</span>');
+            fullPairs.push('<span class="gen-metadata-key">Scheduler:</span> <span class="gen-metadata-val">' + escapeHtml(item.scheduler) + '</span>');
         if (item.guidance && item.arch !== 'flux')
             fullPairs.push('<span class="gen-metadata-key">Guidance:</span> <span class="gen-metadata-val">' + item.guidance + '</span>');
         if (item.arch)
@@ -3307,13 +4011,15 @@ var GenerateTab = (function () {
             steps: state.steps,
             cfg: state.cfg,
             guidance: state.guidance,
+            sampler: state.sampler,
             scheduler: state.scheduler,
+            noiseScheduler: state.scheduler,
             seed: state.seed,
-            frames: state.frames,
-            fps: state.fps,
-            scail2Mode: state.scail2Mode,
-            additionalReferenceImagePaths: state.additionalReferenceImagePaths.slice(),
-            additionalReferenceMaskPaths: state.additionalReferenceMaskPaths.slice(),
+            variationSeed: state.variationSeed,
+            variationStrength: state.variationStrength,
+            creativity: state.creativity,
+            batchCount: state.batchCount,
+            stylePreset: state.stylePreset,
             loras: state.loras.map(function (lora) {
                 return { name: lora.name, strength: lora.strength, enabled: lora.enabled !== false };
             })
@@ -3337,18 +4043,31 @@ var GenerateTab = (function () {
             state.prompt = params.prompt;
         if (typeof params.negPrompt === 'string')
             state.negPrompt = params.negPrompt;
-        ['width', 'height', 'steps', 'cfg', 'guidance', 'seed', 'frames', 'fps'].forEach(function (key) {
+        ['width', 'height', 'steps', 'cfg', 'guidance', 'seed', 'variationSeed',
+            'variationStrength', 'creativity', 'batchCount'].forEach(function (key) {
             if (params[key] != null && Number.isFinite(Number(params[key])))
                 state[key] = Number(params[key]);
         });
-        if (typeof params.scheduler === 'string' && params.scheduler)
-            state.scheduler = params.scheduler;
-        if (params.scail2Mode === 'animation' || params.scail2Mode === 'replacement')
-            state.scail2Mode = params.scail2Mode;
-        if (Array.isArray(params.additionalReferenceImagePaths))
-            state.additionalReferenceImagePaths = params.additionalReferenceImagePaths.slice(0, 3);
-        if (Array.isArray(params.additionalReferenceMaskPaths))
-            state.additionalReferenceMaskPaths = params.additionalReferenceMaskPaths.slice(0, 3);
+        var profile = activeCapabilityProfile();
+        var supportedSamplers = profile && profile.samplers &&
+            Array.isArray(profile.samplers.supported_samplers)
+            ? profile.samplers.supported_samplers : [];
+        var supportedSchedulers = profile && profile.samplers &&
+            Array.isArray(profile.samplers.supported_schedulers)
+            ? profile.samplers.supported_schedulers : [];
+        if (typeof params.sampler === 'string' && supportedSamplers.indexOf(params.sampler) >= 0)
+            state.sampler = params.sampler;
+        if (typeof params.scheduler === 'string' && params.scheduler) {
+            if (supportedSchedulers.indexOf(params.scheduler) >= 0)
+                state.scheduler = params.scheduler;
+            else if (supportedSamplers.indexOf(params.scheduler) >= 0)
+                state.sampler = params.scheduler;
+        }
+        if (typeof params.noiseScheduler === 'string' &&
+            supportedSchedulers.indexOf(params.noiseScheduler) >= 0)
+            state.scheduler = params.noiseScheduler;
+        if (typeof params.stylePreset === 'string')
+            state.stylePreset = params.stylePreset;
         if (Array.isArray(params.loras)) {
             state.loras = params.loras.map(function (lora) {
                 return {
@@ -3378,23 +4097,30 @@ var GenerateTab = (function () {
             els.guidance.value = String(state.guidance);
         if (els.guidanceRange)
             els.guidanceRange.value = String(state.guidance);
+        if (els.sampler)
+            els.sampler.value = state.sampler;
         if (els.scheduler)
             els.scheduler.value = state.scheduler;
         if (els.seed)
             els.seed.value = String(state.seed);
-        if (els.fpsInput)
-            els.fpsInput.value = String(state.fps);
-        if (els.fpsRange)
-            els.fpsRange.value = String(state.fps);
-        if (els.scail2Mode)
-            els.scail2Mode.value = state.scail2Mode;
-        state.seconds = Math.max(1, Math.round(Math.max(0, state.frames - 1) / Math.max(1, state.fps)));
-        if (els.secondsInput)
-            els.secondsInput.value = String(state.seconds);
+        var variationSeed = document.getElementById('gen-variation-seed');
+        var variationStrength = document.getElementById('gen-variation-strength');
+        var variationRange = document.getElementById('gen-variation-strength-range');
+        var creativity = document.getElementById('gen-creativity');
+        var creativityRange = document.getElementById('gen-creativity-range');
+        var batch = document.getElementById('gen-batch');
+        var style = document.getElementById('gen-style-preset');
+        if (variationSeed) variationSeed.value = String(state.variationSeed);
+        if (variationStrength) variationStrength.value = String(state.variationStrength);
+        if (variationRange) variationRange.value = String(state.variationStrength);
+        if (creativity) creativity.value = String(state.creativity);
+        if (creativityRange) creativityRange.value = String(state.creativity);
+        if (batch) batch.value = String(state.batchCount);
+        if (els.toolbarBatchInput) els.toolbarBatchInput.value = String(state.batchCount);
+        if (style) style.value = state.stylePreset;
         syncDimensionInputs();
         syncAspectDropdown();
         updateAspectPreview();
-        updateDurationHint();
         updateTokenCount();
         updateStylePreview();
         closeModelDropdown();

@@ -38,6 +38,24 @@ compatibility unless a separately reviewed contract migration changes them.
 - Prompt editors expose a practical multiline viewport and remain vertically
   resizable so longer prompts can be edited without relying on horizontal
   scrolling or a single-line-height control.
+- Generate is the image-only Swarm-style workspace: a filterable grouped
+  parameter rail, dominant result viewer, Current Batch, bottom prompt action,
+  and History/Presets/Models/LoRAs library. Video and inpainting controls and
+  model entries do not appear there; their dedicated tabs retain ownership.
+- Generate submits a flat capability-admitted `/v1/generate` request rather
+  than translating through the legacy `/prompt` graph adapter. Browser
+  preflight and generation receive the exact same serialized body. The selected
+  image model, compiled shape, prompt, negative prompt when supported, steps,
+  CFG or guidance, seed, sampler, noise scheduler, variation, init image,
+  creativity, batch, and compatible LoRAs are preserved exactly. Controls the
+  selected worker does not admit remain absent instead of silently ignored.
+- Generate presets are durable server presets, model and LoRA library cards
+  operate on the same active state as the parameter rail, uploaded init images
+  are represented by the returned server path, and gallery/current-batch
+  metadata records the executed sampler separately from the noise scheduler.
+- A Generate-to-Workflow handoff writes the selected sampler and noise
+  scheduler into the staged sampler node. Legacy saved workflows that used one
+  combined scheduler value remain loadable.
 - Create mode keeps the Canvas dominant. Ordinary edit modes use two equal
   center panes: immutable source preview and editable result/mask Canvas. Style
   mode uses stacked source/style previews on the left and a larger result Canvas

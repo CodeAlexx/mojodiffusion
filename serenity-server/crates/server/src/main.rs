@@ -286,6 +286,10 @@ struct GenerateRequest {
     scheduler: Option<String>,
     #[serde(default)]
     cfg: Option<f64>,
+    #[serde(default)]
+    variation_seed: Option<i64>,
+    #[serde(default)]
+    variation_strength: Option<f64>,
     // ── workflow-lowered extras (present only after lower_request) ──
     #[serde(default)]
     sigma_shift: Option<f64>,
@@ -1294,6 +1298,12 @@ fn params_from_generate_request(
         params.cfg = v;
     } else if let Some(f) = family_defaults {
         params.cfg = capabilities::default_cfg_for_model(&params.model, f);
+    }
+    if let Some(v) = req.variation_seed {
+        params.variation_seed = v;
+    }
+    if let Some(v) = req.variation_strength {
+        params.variation_strength = v;
     }
     if let Some(v) = req.sigma_shift {
         params.sigma_shift = v;
@@ -3892,6 +3902,20 @@ mod endpoint_tests {
         let (params, _, _) = params_from_generate_request(req, "job-krea-turbo", "/tmp/out");
         assert_eq!(params.steps, 8);
         assert_eq!(params.cfg, 0.0);
+    }
+
+    #[test]
+    fn generate_request_forwards_swarm_variation_controls() {
+        let req: GenerateRequest = serde_json::from_value(json!({
+            "model": "zimage_base",
+            "prompt": "a lighthouse in sea fog",
+            "variation_seed": 424242,
+            "variation_strength": 0.35
+        }))
+        .unwrap();
+        let (params, _, _) = params_from_generate_request(req, "job-zimage-variation", "/tmp/out");
+        assert_eq!(params.variation_seed, 424242);
+        assert_eq!(params.variation_strength, 0.35);
     }
 
     #[test]

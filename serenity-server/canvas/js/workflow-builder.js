@@ -77,6 +77,28 @@ var WorkflowBuilder = (function () {
                 workflow = buildSD15(params);
                 break;
         }
+        // Generate exposes sampler and noise schedule as separate Swarm-style
+        // controls. Builders retain legacy combined-scheduler compatibility,
+        // then this final pass makes a staged Workflow graph match the exact
+        // admitted values chosen in Generate.
+        if (params.sampler || params.noiseScheduler) {
+            var requestedSampler = params.sampler || '';
+            var requestedScheduler = params.noiseScheduler || '';
+            Object.keys(workflow).forEach(function (id) {
+                var node = workflow[id];
+                if (!node || !node.inputs)
+                    return;
+                if (node.class_type === 'KSampler' || node.class_type === 'KSamplerAdvanced') {
+                    if (requestedSampler)
+                        node.inputs.sampler_name = requestedSampler;
+                    if (requestedScheduler)
+                        node.inputs.scheduler = requestedScheduler;
+                }
+                else if (node.class_type === 'KSamplerSelect' && requestedSampler) {
+                    node.inputs.sampler_name = requestedSampler;
+                }
+            });
+        }
         if (params.loras && params.loras.length > 0) {
             workflow = injectLoRAs(workflow, params.loras);
         }

@@ -2045,3 +2045,553 @@
     color: var(--shell-text-muted);
     font-size: 12px;
 }
+
+/* ── Swarm-style image generation workspace ─────────────────────────────── */
+.gen-layout.gen-swarm-layout {
+    display: grid;
+    grid-template-columns: minmax(340px, 390px) minmax(420px, 1fr) 250px;
+    grid-template-rows: minmax(330px, 1fr) auto 230px;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--shell-bg-base);
+}
+.gen-swarm-layout .gen-swarm-parameters {
+    grid-column: 1;
+    grid-row: 1 / 4;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    gap: 0;
+    overflow: hidden;
+    background: #171920;
+}
+.gen-swarm-parameter-head {
+    height: 48px;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--shell-border);
+    flex: 0 0 auto;
+}
+.gen-swarm-parameter-head > div {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--shell-text);
+    font-size: 13px;
+}
+.gen-swarm-filter {
+    margin: 10px 12px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    background: #101117;
+    flex: 0 0 auto;
+}
+.gen-swarm-filter svg {
+    width: 15px;
+    color: var(--shell-text-muted);
+}
+.gen-swarm-filter input {
+    min-width: 0;
+    flex: 1;
+    border: 0;
+    outline: 0;
+    color: var(--shell-text);
+    background: transparent;
+    font: 12px var(--shell-font);
+}
+.gen-swarm-param-scroll {
+    min-height: 0;
+    overflow-y: auto;
+    border-top: 1px solid var(--shell-border);
+}
+.gen-swarm-group {
+    border-bottom: 1px solid var(--shell-border);
+}
+.gen-swarm-group .gen-swarm-group-title {
+    width: 100%;
+    min-height: 38px;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #1c1f27;
+    color: var(--shell-text);
+    font: 600 12px var(--shell-font);
+    cursor: pointer;
+}
+.gen-swarm-group-title > span:first-child {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+.gen-swarm-group-title svg {
+    width: 14px;
+    transition: transform 120ms ease;
+}
+.gen-swarm-group-title.closed svg {
+    transform: rotate(-90deg);
+}
+.gen-swarm-help {
+    width: 17px;
+    height: 17px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #555b6b;
+    border-radius: 50%;
+    color: #a6acbb;
+    font-size: 10px;
+}
+.gen-swarm-group-body {
+    padding: 10px 12px 12px;
+    background: #15171d;
+}
+.gen-swarm-group-body.closed {
+    display: none;
+}
+.gen-swarm-group-body .gen-param-row + .gen-param-row {
+    margin-top: 10px;
+}
+.gen-swarm-group-body .gen-setting-row {
+    min-height: 30px;
+    gap: 8px;
+}
+.gen-swarm-group-body .gen-setting-label {
+    width: 94px;
+    min-width: 94px;
+    color: #b7bbc6;
+    font-size: 12px;
+}
+.gen-swarm-group-body .gen-number-input {
+    width: 72px;
+}
+.gen-swarm-group-body .gen-range {
+    min-width: 70px;
+}
+.gen-swarm-group-body .gen-label {
+    color: #b7bbc6;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 12px;
+}
+.gen-swarm-group-body .gen-aspect-row {
+    display: grid;
+    grid-template-columns: 54px minmax(0, 1fr) auto auto;
+    align-items: center;
+}
+.gen-swarm-group-body .gen-aspect-row .gen-label {
+    margin: 0;
+}
+.gen-swarm-group-body .gen-dim-row {
+    margin-top: 8px;
+}
+.gen-swarm-group-body .gen-aspect-preview {
+    width: auto !important;
+    height: 28px !important;
+    margin-top: 8px;
+    border-radius: 4px;
+}
+.gen-capability-note,
+.gen-init-name {
+    margin: 7px 0;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gen-small-btn {
+    padding: 5px 9px;
+    border: 1px solid var(--shell-border);
+    border-radius: 5px;
+    background: #282b35;
+    color: var(--shell-text);
+    font: 11px var(--shell-font);
+    cursor: pointer;
+}
+.gen-small-btn:hover:not(:disabled) {
+    background: #343845;
+    border-color: #666d80;
+}
+.gen-small-btn:disabled {
+    opacity: .4;
+    cursor: default;
+}
+.gen-small-btn.destructive {
+    color: #ff8b8b;
+}
+.gen-init-drop {
+    height: 108px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border: 1px dashed #555b6b;
+    border-radius: 7px;
+    background: #0f1116;
+}
+.gen-init-drop.dragover {
+    border-color: var(--shell-accent);
+    background: rgba(102, 115, 255, .1);
+}
+.gen-init-drop input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+    z-index: 2;
+}
+#gen-init-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 7px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+}
+#gen-init-empty svg {
+    width: 25px;
+}
+.gen-init-drop img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+.gen-swarm-layout .gen-swarm-stage {
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 0;
+    min-height: 0;
+    border-right: 1px solid var(--shell-border);
+}
+.gen-swarm-topbar {
+    width: 100%;
+    height: 40px;
+    padding: 0 9px 0 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--shell-border);
+    background: #171920;
+    flex: 0 0 auto;
+}
+.gen-swarm-model-info,
+.gen-swarm-quick-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+.gen-swarm-model-info {
+    color: var(--shell-text-muted);
+    font-size: 10px;
+}
+.gen-swarm-model-info .gen-model-badge {
+    display: inline-block !important;
+    max-width: 270px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gen-swarm-stage .gen-center-content {
+    padding: 12px;
+}
+.gen-swarm-stage .gen-preview-img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+.gen-swarm-stage #gen-preview-video,
+.gen-swarm-stage #gen-to-timeline {
+    display: none !important;
+}
+.gen-swarm-layout .gen-floating-toolbar {
+    display: none;
+}
+.gen-swarm-layout .gen-swarm-batch-panel {
+    grid-column: 3;
+    grid-row: 1;
+    width: auto;
+    min-width: 0;
+    background: #171920;
+}
+.gen-swarm-batch-head {
+    height: 40px;
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--shell-border);
+    color: var(--shell-text);
+    font-size: 11px;
+}
+.gen-swarm-batch-head span {
+    color: var(--shell-text-muted);
+    font-size: 10px;
+}
+.gen-swarm-batch-strip {
+    padding: 8px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px;
+    overflow-y: auto;
+    align-content: start;
+}
+.gen-swarm-batch-thumb {
+    min-width: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 1px solid #373b48;
+    border-radius: 5px;
+    background: #101117;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+}
+.gen-swarm-batch-thumb:hover {
+    border-color: var(--shell-accent);
+}
+.gen-swarm-batch-thumb img {
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    display: block;
+}
+.gen-swarm-batch-thumb span {
+    display: block;
+    padding: 4px;
+    font-size: 9px;
+    white-space: nowrap;
+}
+.gen-swarm-batch-empty,
+.gen-library-empty {
+    grid-column: 1 / -1;
+    padding: 20px 10px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    text-align: center;
+}
+.gen-swarm-prompt-dock {
+    grid-column: 2 / 4;
+    grid-row: 2;
+    min-height: 146px;
+    padding: 9px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 150px;
+    gap: 9px;
+    border-top: 1px solid var(--shell-border);
+    border-bottom: 1px solid var(--shell-border);
+    background: #14161c;
+}
+.gen-swarm-prompts {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, .42fr);
+    gap: 8px;
+}
+.gen-swarm-prompt-main,
+.gen-swarm-negative {
+    min-width: 0;
+    padding: 7px;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    background: #0f1116;
+}
+.gen-swarm-prompt-textarea,
+.gen-swarm-negative .gen-textarea {
+    min-height: 60px;
+    max-height: 100px;
+    resize: vertical;
+    background: transparent;
+    border: 0;
+    padding: 3px 2px;
+}
+.gen-swarm-prompt-options {
+    display: grid;
+    grid-template-columns: auto 150px minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+}
+.gen-swarm-prompt-options .gen-label {
+    margin: 0;
+}
+.gen-swarm-prompt-options .gen-select {
+    padding: 5px 9px;
+}
+.gen-swarm-prompt-options .gen-style-preview {
+    max-height: 30px;
+    margin: 0;
+    overflow: hidden;
+}
+.gen-swarm-generate-column {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+.gen-swarm-generate-column .gen-btn {
+    flex: 1;
+    min-height: 82px;
+    border-radius: 7px;
+    font-size: 15px;
+}
+.gen-swarm-generate-column .gen-toolbar-batch {
+    width: 100%;
+    height: 32px;
+    display: grid;
+    grid-template-columns: 1fr 45px 28px 28px;
+    gap: 3px;
+}
+.gen-swarm-generate-column .gen-toolbar-batch label {
+    align-self: center;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+}
+.gen-swarm-generate-column .gen-toolbar-batch input,
+.gen-swarm-generate-column .gen-toolbar-batch button {
+    width: auto;
+    height: 30px;
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    background: #20232b;
+    color: var(--shell-text);
+}
+.gen-swarm-library {
+    grid-column: 2 / 4;
+    grid-row: 3;
+    min-width: 0;
+    min-height: 0;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    background: #171920;
+}
+.gen-swarm-library-tabs {
+    min-height: 38px;
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    border-bottom: 1px solid var(--shell-border);
+}
+.gen-library-tab {
+    align-self: stretch;
+    padding: 0 13px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    color: var(--shell-text-muted);
+    font: 11px var(--shell-font);
+    cursor: pointer;
+}
+.gen-library-tab.active {
+    color: var(--shell-text);
+    border-bottom-color: var(--shell-accent);
+}
+.gen-library-spacer {
+    flex: 1;
+}
+.gen-swarm-library .gen-gallery-search {
+    width: 0;
+}
+.gen-swarm-library .gen-gallery-search.open {
+    width: 180px;
+}
+.gen-library-panel {
+    display: none;
+    min-height: 0;
+    flex: 1;
+    overflow: auto;
+}
+.gen-library-panel.active {
+    display: flex;
+    flex-direction: column;
+}
+.gen-library-panel .gen-gallery-grid-wrap {
+    min-height: 0;
+    flex: 1;
+}
+.gen-library-panel .gen-gallery-grid {
+    height: 100%;
+    display: grid;
+    grid-auto-flow: column;
+    grid-template-rows: 1fr !important;
+    grid-template-columns: none !important;
+    grid-auto-columns: minmax(90px, 125px);
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+.gen-library-panel .gen-thumb-wrap {
+    width: 100%;
+    height: 100%;
+    max-height: 145px;
+}
+.gen-library-panel .gen-gallery-pagination {
+    min-height: 28px;
+}
+.gen-library-card-grid {
+    padding: 10px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 8px;
+    overflow: auto;
+}
+.gen-library-card {
+    min-height: 44px;
+    padding: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    background: #20232b;
+    color: var(--shell-text);
+    font: 11px var(--shell-font);
+}
+.gen-library-model-card {
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gen-library-model-card:hover,
+.gen-library-model-card.active {
+    border-color: var(--shell-accent);
+    background: rgba(102, 115, 255, .12);
+}
+.gen-preset-toolbar {
+    padding: 8px 10px 0;
+    display: flex;
+    gap: 6px;
+}
+.gen-preset-toolbar .gen-select {
+    max-width: 280px;
+    background-image: none;
+}
+.gen-swarm-library .gen-gallery-popover {
+    top: 39px;
+    right: 8px;
+}
+
+@media (max-width: 1250px) {
+    .gen-layout.gen-swarm-layout {
+        grid-template-columns: 340px minmax(380px, 1fr) 210px;
+    }
+    .gen-swarm-prompts {
+        grid-template-columns: 1fr;
+    }
+    .gen-swarm-negative {
+        display: none;
+    }
+}

@@ -502,6 +502,8 @@ var WorkflowSync = (function () {
                 params.steps = Number(sinputs.steps);
                 params.cfg = Number(sinputs.cfg);
                 params.seed = Number(sinputs.seed);
+                params.sampler = sinputs.sampler || 'euler';
+                params.noiseScheduler = sinputs.scheduler || 'simple';
                 params.scheduler = 'euler';
             }
             else {
@@ -512,6 +514,8 @@ var WorkflowSync = (function () {
                 params.steps = Number(sinputs.steps);
                 params.cfg = Number(sinputs.cfg);
                 params.seed = Number(sinputs.seed != null ? sinputs.seed : sinputs.noise_seed);
+                params.sampler = sinputs.sampler_name || 'euler';
+                params.noiseScheduler = sinputs.scheduler || 'simple';
                 params.scheduler = combinedScheduler(sinputs);
                 var latent = valueRef(nodes, sinputs.latent_image);
                 if (latent && latent.inputs) {
@@ -544,7 +548,9 @@ var WorkflowSync = (function () {
         return JSON.stringify({
             model: p.model || '', prompt: p.prompt || '', negPrompt: p.negPrompt || '',
             width: Number(p.width), height: Number(p.height), steps: Number(p.steps),
-            cfg: Number(p.cfg), guidance: Number(p.guidance), scheduler: p.scheduler || '',
+            cfg: Number(p.cfg), guidance: Number(p.guidance),
+            sampler: p.sampler || '', scheduler: p.scheduler || '',
+            noiseScheduler: p.noiseScheduler || '',
             seed: Number(p.seed), frames: Number(p.frames), fps: Number(p.fps),
             loras: Array.isArray(p.loras) ? p.loras.map(function (l) {
                 return { name: l.name || '', strength: Number(l.strength), enabled: l.enabled !== false };

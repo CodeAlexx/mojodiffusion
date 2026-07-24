@@ -62,7 +62,8 @@
 #   pixi run mojo run -I . serenitymojo/training/train_wan22_real.mojo \
 #       [config.json]
 # Default config: serenitymojo/configs/wan22_direct_dora_1step_smoke.json
-# (its network_algorithm=dora is IGNORED here — this loop trains plain attn LoRA).
+# (video model = LoRA/LoCon only; network_algorithm=dora/oft/lokr/loha now FAIL-LOUD
+#  via require_lora_or_locon_linear rather than silently training plain LoRA).
 
 from std.gpu.host import DeviceContext
 from std.collections import List
@@ -82,6 +83,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.patchify3d import patchify3d
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 
 # PROVEN inference-geometry RoPE (3-axis interleaved) — reused EXACTLY, not
 # reimplemented (models/dit/wan22_dit.mojo).
@@ -170,7 +172,7 @@ comptime DUAL_EXPERT_BOUNDARY = Float32(0.875)  # DUAL-EXPERT-TODO boundary
 comptime DEFAULT_CKPT =
     "/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors"
 comptime DEFAULT_CONFIG =
-    "serenitymojo/configs/wan22_direct_dora_1step_smoke.json"
+    "serenitymojo/configs/wan22_real_smoke_2step.json"
 
 # ── Wan 2.1 T2V (single-expert) checkpoints — original Wan keys (blocks.N.*,
 #    patch_embedding, text_embedding, time_embedding, time_projection, head).
@@ -1175,6 +1177,13 @@ def main() raises:
     if len(args) > 1:
         config_path = String(args[1])
     var cfg = read_model_config(config_path)
+
+    # Wan is a VIDEO model — LoRA/LoCon ONLY. LoKr/LoHa/DoRA/OFT are NOT wired
+    # here (this loop trains plain attn LoRA); reject them FAIL-LOUD rather than
+    # silently training LoRA under a Lycoris config (Alex 2026-07-23: no Lycoris
+    # on video models). Image models (krea2/zimage/klein/flux/qwenimage/sd35/
+    # chroma/ernie/ideogram4) carry their own direct-Lycoris dispatch.
+    require_lora_or_locon_linear(cfg, "wan22")
 
     # ── WAN 2.1 I2V-14B DISPATCH (env WAN21_I2V=1; env-only test arm) ─────────
     # The DUAL cross-attn (WanI2VCrossAttention) variant. Checked BEFORE the

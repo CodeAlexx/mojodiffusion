@@ -809,6 +809,55 @@ var VideoEditTab = (function () {
         return null;
     }
 
+    function previewMediaUrl(sourcePath) {
+        if (sourcePath.indexOf('/') === 0 || sourcePath.indexOf('\\') >= 0) {
+            return getApiBase() + '/video_edit/media/' +
+                encodeURIComponent(sourcePath.split('/video_projects/').pop() || sourcePath);
+        }
+        return getApiBase() + '/video_edit/media/' + sourcePath;
+    }
+
+    function drawPreviewVideoFrame() {
+        if (!previewVideo || !previewCtx || !previewCanvas || previewVideo.readyState < 2) {
+            return;
+        }
+        previewCtx.fillStyle = '#111';
+        previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
+        var vw = previewVideo.videoWidth || previewCanvas.width;
+        var vh = previewVideo.videoHeight || previewCanvas.height;
+        var scale = Math.min(previewCanvas.width / vw, previewCanvas.height / vh);
+        var dw = vw * scale;
+        var dh = vh * scale;
+        var dx = (previewCanvas.width - dw) / 2;
+        var dy = (previewCanvas.height - dh) / 2;
+        previewCtx.drawImage(previewVideo, dx, dy, dw, dh);
+        renderSubtitleOverlay();
+    }
+
+    function loadPreviewVideo(clip, timeInSource) {
+        if (!previewVideo) return;
+        var clipChanged = previewActiveClipId !== clip.id;
+        if (!clipChanged) return;
+
+        previewVideo.pause();
+        previewVideo.src = previewMediaUrl(clip.source_path);
+        previewActiveClipId = clip.id;
+        previewVideo.load();
+        previewVideo.onloadedmetadata = function () {
+            if (previewActiveClipId !== clip.id) return;
+            var duration = Number.isFinite(previewVideo.duration)
+                ? previewVideo.duration
+                : timeInSource;
+            previewVideo.currentTime = clamp(timeInSource, 0, Math.max(0, duration - 0.001));
+            if (isPlaying) {
+                previewVideo.play().catch(function () {});
+            }
+        };
+        previewVideo.onloadeddata = function () {
+            if (previewActiveClipId === clip.id) drawPreviewVideoFrame();
+        };
+    }
+
     function updatePreview() {
         if (!previewCtx || !previewCanvas) return;
         var placeholder = document.getElementById('ve-preview-placeholder');
@@ -818,6 +867,8 @@ var VideoEditTab = (function () {
         if (!clip) {
             // Invalidate a compositor reply that was requested for an older playhead.
             genesisPreviewSequence++;
+            genesisPreviewPending = false;
+            if (previewVideo) previewVideo.pause();
             // Black frame — no clip at playhead
             previewCtx.fillStyle = '#111';
             previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
@@ -833,6 +884,8 @@ var VideoEditTab = (function () {
         // Placeholder clip (no source file) — show color card with label
         if (!clip.source_path) {
             genesisPreviewSequence++;
+            genesisPreviewPending = false;
+            if (previewVideo) previewVideo.pause();
             previewActiveClipId = clip.id;
             previewCtx.fillStyle = clip.color || '#333';
             previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
@@ -851,35 +904,43 @@ var VideoEditTab = (function () {
         var sourceFps = clip.source_fps || FPS;
         var timeInSource = sourceOffset / sourceFps + (currentFrame - clip.startFrame) / FPS;
 
-        // Load video source if clip changed
-        if (previewActiveClipId !== clip.id && previewVideo) {
-            var relPath = clip.source_path;
-            if (relPath.indexOf('/') === 0 || relPath.indexOf('\\') >= 0) {
-                previewVideo.src = getApiBase() + '/video_edit/media/' + encodeURIComponent(relPath.split('/video_projects/').pop() || relPath);
-            } else {
-                previewVideo.src = getApiBase() + '/video_edit/media/' + relPath;
+        loadPreviewVideo(clip, timeInSource);
+
+        if (isPlaying) {
+            // Playback must follow the browser's native media clock. Seeking on every
+            // animation frame and queueing a compositor render made the large preview
+            // lag far behind the timeline. Genesis still renders the exact effected
+            // frame whenever playback is paused or the playhead is scrubbed.
+            genesisPreviewSequence++;
+            genesisPreviewPending = false;
+            if (previewVideo && previewVideo.readyState >= 1) {
+                var drift = Math.abs(previewVideo.currentTime - timeInSource);
+                if (drift > 0.25) {
+                    previewVideo.currentTime = timeInSource;
+                }
+                if (previewVideo.paused) {
+                    previewVideo.play().catch(function () {});
+                }
+                drawPreviewVideoFrame();
             }
-            previewActiveClipId = clip.id;
-            previewVideo.load();
+            if (previewTcEl) previewTcEl.textContent = frameToTimecode(currentFrame);
+            renderSubtitleOverlay();
+            setGenesisStatus('Playback · live', false);
+            return;
         }
 
+        if (previewVideo) {
+            previewVideo.pause();
+        }
         if (previewVideo && previewVideo.readyState >= 1) {
-            previewVideo.currentTime = timeInSource;
             previewVideo.onseeked = function () {
-                if (previewCtx && previewCanvas) {
-                    previewCtx.fillStyle = '#111';
-                    previewCtx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
-                    // Center the video frame
-                    var vw = previewVideo.videoWidth || previewCanvas.width;
-                    var vh = previewVideo.videoHeight || previewCanvas.height;
-                    var scale = Math.min(previewCanvas.width / vw, previewCanvas.height / vh);
-                    var dw = vw * scale;
-                    var dh = vh * scale;
-                    var dx = (previewCanvas.width - dw) / 2;
-                    var dy = (previewCanvas.height - dh) / 2;
-                    previewCtx.drawImage(previewVideo, dx, dy, dw, dh);
-                }
+                drawPreviewVideoFrame();
             };
+            if (Math.abs(previewVideo.currentTime - timeInSource) > (0.5 / sourceFps)) {
+                previewVideo.currentTime = timeInSource;
+            } else {
+                drawPreviewVideoFrame();
+            }
         }
 
         // Update timecode overlay
@@ -4251,12 +4312,18 @@ var VideoEditTab = (function () {
         isPlaying = false;
         if (animFrameId) cancelAnimationFrame(animFrameId);
         animFrameId = null;
+        if (previewVideo) previewVideo.pause();
         stopAllAudio();
         updatePlayButton();
     }
 
     function togglePlayback() {
-        isPlaying ? stopPlayback() : startPlayback();
+        if (isPlaying) {
+            stopPlayback();
+            updatePreview();
+        } else {
+            startPlayback();
+        }
     }
 
     // ===== Event Handling =====
@@ -5032,6 +5099,8 @@ var VideoEditTab = (function () {
                 height: project.height,
                 currentFrame: currentFrame,
                 isPlaying: isPlaying,
+                previewVideoTime: previewVideo ? previewVideo.currentTime : 0,
+                previewVideoPaused: previewVideo ? previewVideo.paused : true,
                 thumbnailClipIds: Array.from(thumbnailCache.keys()),
                 waveformClipIds: Array.from(waveformCache.keys()),
                 tracks: project.tracks.map(function (track) {

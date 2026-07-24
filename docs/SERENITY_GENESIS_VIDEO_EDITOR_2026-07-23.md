@@ -77,9 +77,13 @@ sharpen, denoise, glow, vignette, speed, and horizontal/vertical flips.
 
 Preview requests are serialized in the browser. Scrubbing while a frame is in
 flight retains only one pending request, preventing a process/request storm.
-The browser video element remains an immediate fallback until the composited
-PNG arrives. Export uses status polling and shows a terminal path in the
-existing dialog; it does not depend on an unrelated WebSocket event.
+Paused and scrubbed frames use the Genesis compositor so effects are exact.
+Active playback instead follows the browser's native media clock and draws its
+decoded frames directly; it does not seek the video or queue a server render
+on every animation frame. This keeps the large preview synchronized with the
+timeline while preserving exact Genesis previews at rest. Export uses status
+polling and shows a terminal path in the existing dialog; it does not depend on
+an unrelated WebSocket event.
 
 Imported media carries its probed source FPS and duration into the timeline.
 Saved project width, height, and FPS are restored when the browser opens the
@@ -121,7 +125,9 @@ Observed gates:
 
 - `gcompose --serve` initialized OpenCL and passed its startup self-check;
 - the browser `+ Video` action imported and probed exactly 121 frames at 25 FPS;
-- the timeline loaded a visible thumbnail strip and playback reached frame 3;
+- the timeline loaded a visible thumbnail strip, playback reached frame 15,
+  the video clock reached 0.61 seconds, and the large-preview pixel hash
+  changed while playback remained active;
 - Clip Properties added Saturation and set it to zero;
 - the edited preview pixels differed from the original, disabling the effect
   restored the original pixel hash, and re-enabling restored the edited hash;
@@ -135,7 +141,9 @@ Observed gates:
   inspected for both motion and the grayscale edit;
 - the migrated user project `project-1784862262957-402` separately opened with
   183,260 visible preview pixels, real media at frame zero, a thumbnail strip,
-  no legacy fake clips, and no browser/API errors;
+  no legacy fake clips, and no browser/API errors; its playback gate reached
+  frame 24 while the video clock reached 0.78 seconds and the large preview
+  changed pixels;
 - Playwright recorded no failed HTTP requests, page exceptions, or browser
   console errors.
 

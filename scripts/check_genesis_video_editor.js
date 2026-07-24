@@ -72,12 +72,20 @@ function runChecked(command, args) {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
   const requestFailures = [];
+  const cancelledMediaRequests = [];
   const pageErrors = [];
   const consoleErrors = [];
   page.on("requestfailed", (request) => {
-    requestFailures.push(
-      `${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`,
-    );
+    const failure = `${request.method()} ${request.url()} ${request.failure()?.errorText || ""}`;
+    if (
+      request.method() === "GET"
+      && request.url().includes("/video_edit/media/")
+      && request.failure()?.errorText === "net::ERR_ABORTED"
+    ) {
+      cancelledMediaRequests.push(failure);
+    } else {
+      requestFailures.push(failure);
+    }
   });
   page.on("response", (response) => {
     if (response.status() >= 400) {
@@ -133,6 +141,33 @@ function runChecked(command, args) {
         return count;
       });
       assert(visiblePixels > 1000, `saved project preview pixels=${visiblePixels}`);
+      const previewHashBeforePlayback = canvasHash(
+        await page.locator("#ve-preview-canvas").evaluate(
+          (canvas) => canvas.toDataURL("image/png"),
+        ),
+      );
+      await page.click("#ve-btn-play");
+      await page.waitForFunction(() => {
+        const state = window.VideoEditTab?.getDiagnostics?.();
+        return state?.currentFrame >= 24 && state?.previewVideoTime >= 0.5;
+      }, { timeout: 5000 });
+      const playbackDiagnostics = await page.evaluate(
+        () => window.VideoEditTab.getDiagnostics(),
+      );
+      const previewHashDuringPlayback = canvasHash(
+        await page.locator("#ve-preview-canvas").evaluate(
+          (canvas) => canvas.toDataURL("image/png"),
+        ),
+      );
+      assert(
+        previewHashDuringPlayback !== previewHashBeforePlayback,
+        "saved project large preview did not change during playback",
+      );
+      assert(
+        playbackDiagnostics.previewVideoPaused === false,
+        "saved project preview video was paused while timeline was playing",
+      );
+      await page.click("#ve-btn-play");
       assert(
         !diagnostics.tracks.some((track) => track.clips.some(
           (clip) => ["Intro", "Scene 1", "Overlay", "Music.mp3"].includes(clip.label)
@@ -150,10 +185,15 @@ function runChecked(command, args) {
         status: "PASS",
         project_id: inspectProjectId,
         visible_preview_pixels: visiblePixels,
+        playback_frame_reached: playbackDiagnostics.currentFrame,
+        preview_video_time: playbackDiagnostics.previewVideoTime,
+        preview_pixels_changed_during_playback:
+          previewHashDuringPlayback !== previewHashBeforePlayback,
         thumbnail_clip_count: diagnostics.thumbnailClipIds.length,
         tracks: diagnostics.tracks,
         screenshot: screenshotPath,
         request_failures: requestFailures,
+        cancelled_media_requests: cancelledMediaRequests,
         page_errors: pageErrors,
         console_errors: consoleErrors,
       };
@@ -308,15 +348,23 @@ function runChecked(command, args) {
       window.VideoEditTab?.getDiagnostics?.().waveformClipIds.length === 1
     ), { timeout: 30000 });
 
+    const previewHashBeforePlayback = await readCanvasHash();
     await page.click("#ve-btn-play");
     await page.waitForFunction(() => (
-      window.VideoEditTab?.getDiagnostics?.().currentFrame >= 3
+      window.VideoEditTab?.getDiagnostics?.().currentFrame >= 15
+      && window.VideoEditTab?.getDiagnostics?.().previewVideoTime >= 0.4
     ), { timeout: 5000 });
-    const playbackFrame = await page.evaluate(
-      () => window.VideoEditTab.getDiagnostics().currentFrame,
+    const playbackDiagnostics = await page.evaluate(
+      () => window.VideoEditTab.getDiagnostics(),
     );
+    const previewHashDuringPlayback = await readCanvasHash();
     await page.click("#ve-btn-play");
-    assert(playbackFrame >= 3, `playback frame=${playbackFrame}`);
+    assert(playbackDiagnostics.currentFrame >= 15,
+      `playback frame=${playbackDiagnostics.currentFrame}`);
+    assert(playbackDiagnostics.previewVideoPaused === false,
+      "preview video was paused while timeline was playing");
+    assert(previewHashDuringPlayback !== previewHashBeforePlayback,
+      "large preview did not change during playback");
     await page.waitForTimeout(2500);
 
     const screenshotPath = path.join(proofDir, "editor.png");
@@ -415,7 +463,10 @@ function runChecked(command, args) {
       music_duration: audioMedia.duration_seconds,
       thumbnail_strip_ready: true,
       waveform_ready: true,
-      playback_frame_reached: playbackFrame,
+      playback_frame_reached: playbackDiagnostics.currentFrame,
+      preview_video_time: playbackDiagnostics.previewVideoTime,
+      preview_pixels_changed_during_playback:
+        previewHashDuringPlayback !== previewHashBeforePlayback,
       effect: "saturation=0",
       effect_pixels_changed: effectHash !== baseHash,
       disabled_effect_restored_base: disabledHash === baseHash,
@@ -431,6 +482,7 @@ function runChecked(command, args) {
       screenshot: screenshotPath,
       contact_sheet: contactSheet,
       request_failures: requestFailures,
+      cancelled_media_requests: cancelledMediaRequests,
       page_errors: pageErrors,
       console_errors: consoleErrors,
     };

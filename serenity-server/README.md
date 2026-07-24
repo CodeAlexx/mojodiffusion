@@ -91,10 +91,11 @@ pixi run check-genesis-video-editor
 ```
 
 The gate imports real video and audio through the visible toolbar, proves the
-thumbnail strip, music waveform, playback, and Clip Properties, changes
-Saturation, proves enabling and disabling changes the rendered pixels, exports
-H.264 plus AAC from the browser, probes the movie, and writes its screenshot,
-contact sheet, and JSON result under `output/checks/genesis_browser/`.
+thumbnail strip, music waveform, synchronized native-clock playback with
+changing large-preview pixels, and Clip Properties, changes Saturation, proves
+enabling and disabling changes the rendered pixels, exports H.264 plus AAC from
+the browser, probes the movie, and writes its screenshot, contact sheet, and
+JSON result under `output/checks/genesis_browser/`.
 
 To inspect a particular persisted project through the same browser gate:
 

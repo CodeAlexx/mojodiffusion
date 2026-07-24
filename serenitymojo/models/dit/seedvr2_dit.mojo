@@ -904,7 +904,17 @@ def dit_out_tail(
     # 1. RMSNorm WITH affine weight (eps=1e-5, over 2560).
     var normed = rms_norm(vid, norm_w, Float32(1e-5), ctx)          # [256,2560]
 
-    # 2. AdaSingle "in": attn-slot shift(col0)/scale(col1); B terms = out_shift/out_scale.
+    # 2. AdaSingle "in" (out layer). NOTE: the shipped SeedVR2-3B vid_out_ada is
+    #    an UPSTREAM BUG — verified: models/dit_v2/modulation.py on both github
+    #    (ByteDance-Seed/SeedVR) AND the live HF Space crash here (AdaSingle asserts
+    #    emb_dim==6*dim, i.e. 2 layers, but layers=["out"] makes l=1 -> the emb
+    #    factorizes to 5120 vs the 2560 out_scale/out_shift params: RuntimeError).
+    #    The consistent reconstruction (the emb_dim==6*dim / l=2 design + idx=
+    #    layers.index("out")=0) reads the FIRST slot: shift=col0, scale=col1. That
+    #    is deterministic (no arbitrary choice) and is what the trained params
+    #    expect. B terms = out_shift/out_scale. The full pipeline is gated against
+    #    a torch reference using this same reconstruction (only op not gatable vs
+    #    the unmodified model, because the unmodified model cannot run this op).
     var emb2d = reshape(emb, [2560, 6], ctx)
     var shiftA = _emb_col(emb2d, 0, ctx)                            # [2560]
     var scaleA = _emb_col(emb2d, 1, ctx)                            # [2560]
@@ -1783,6 +1793,9 @@ def dit_out_tail_general(
     [T*(2*Ho)*(2*Wo), 16] (bf16). For (T,Ho,Wo)=(4,8,8) reproduces dit_out_tail."""
     var normed = rms_norm(vid, norm_w, Float32(1e-5), ctx)          # [L,2560]
 
+    # AdaSingle "in" — first-slot reconstruction of the upstream vid_out_ada bug
+    # (see dit_out_tail for the full note: shipped SeedVR crashes here; this is the
+    # deterministic emb_dim==6*dim / idx-0 reconstruction, shift=col0 scale=col1).
     var emb2d = reshape(emb, [2560, 6], ctx)
     var shiftA = _emb_col(emb2d, 0, ctx)
     var scaleA = _emb_col(emb2d, 1, ctx)

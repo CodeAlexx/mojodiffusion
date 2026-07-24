@@ -1176,6 +1176,97 @@ def compute_windows(T: Int, H: Int, W: Int) raises -> WindowPlan:
     return WindowPlan(wf^, whs^, wws^, counts^, partition^, reverse^, win_count, L)
 
 
+def _ceil_f(x: Float64) -> Int:
+    """ceil(x) for x >= 0. Int(x) truncates toward zero == floor for x>=0."""
+    var f = Int(x)
+    if Float64(f) == x:
+        return f
+    return f + 1
+
+
+def compute_windows_shifted(T: Int, H: Int, W: Int) raises -> WindowPlan:
+    """SeedVR make_shifted_720Pwindows_bysize(num_windows=(4,3,3)) — SHIFTED
+    (odd DiT layers, window_method 720pswin_by_size_bysize). Same wh/ww/wt sizing
+    as compute_windows, but with a half-window shift (st/sh/sw in {0.0,0.5}) that
+    adds one boundary window per shifted axis and truncates the edges. `int()` in
+    the reference truncates toward zero — Int(Float64) in Mojo does the same
+    (verified: Int(-0.5)=0, Int(-10.4)=-10), so window bounds use Int() directly.
+    Returns a WindowPlan (partition/reverse/shapes) in the SAME iw,ih,it order."""
+    var rnt = 4
+    var rnh = 3
+    var rnw = 3
+    var scale = sqrt(Float64(_SCALE_NUM) / Float64(H * W))
+    var rH = _round_half_even(Float64(H) * scale)
+    var rW = _round_half_even(Float64(W) * scale)
+    var wh = _ceil_div(rH, rnh)
+    var ww = _ceil_div(rW, rnw)
+    var tmin = T
+    if tmin > 30:
+        tmin = 30
+    var wt = _ceil_div(tmin, rnt)
+
+    # shift sizes (Float64 0.0 or 0.5): 0.5 iff the window is smaller than the axis.
+    var st = 0.5 if wt < T else 0.0
+    var sh = 0.5 if wh < H else 0.0
+    var sw = 0.5 if ww < W else 0.0
+
+    # window counts: +1 boundary window on each shifted axis, else 1.
+    var nt = (_ceil_f((Float64(T) - st) / Float64(wt)) + 1) if st > 0.0 else 1
+    var nh = (_ceil_f((Float64(H) - sh) / Float64(wh)) + 1) if sh > 0.0 else 1
+    var nw = (_ceil_f((Float64(W) - sw) / Float64(ww)) + 1) if sw > 0.0 else 1
+
+    var wf = List[Int]()
+    var whs = List[Int]()
+    var wws = List[Int]()
+    var counts = List[Int]()
+    var partition = List[Int]()
+    # ORDER: for iw, for ih, for it (matches make_shifted_720Pwindows_bysize).
+    for iw in range(nw):
+        for ih in range(nh):
+            for it in range(nt):
+                # bounds via int()==trunc-toward-zero (Int(Float64)); edges clamped.
+                var t0 = Int((Float64(it) - st) * Float64(wt))
+                if t0 < 0:
+                    t0 = 0
+                var t1 = Int((Float64(it) - st + 1.0) * Float64(wt))
+                if t1 > T:
+                    t1 = T
+                var h0 = Int((Float64(ih) - sh) * Float64(wh))
+                if h0 < 0:
+                    h0 = 0
+                var h1 = Int((Float64(ih) - sh + 1.0) * Float64(wh))
+                if h1 > H:
+                    h1 = H
+                var w0 = Int((Float64(iw) - sw) * Float64(ww))
+                if w0 < 0:
+                    w0 = 0
+                var w1 = Int((Float64(iw) - sw + 1.0) * Float64(ww))
+                if w1 > W:
+                    w1 = W
+                if t1 > t0 and h1 > h0 and w1 > w0:
+                    var f = t1 - t0
+                    var hh = h1 - h0
+                    var wwd = w1 - w0
+                    wf.append(f)
+                    whs.append(hh)
+                    wws.append(wwd)
+                    counts.append(f * hh * wwd)
+                    for tt in range(t0, t1):
+                        for hp in range(h0, h1):
+                            for wp in range(w0, w1):
+                                partition.append(tt * H * W + hp * W + wp)
+
+    var L = len(partition)
+    var reverse = List[Int]()
+    for _j in range(L):
+        reverse.append(0)
+    for i in range(L):
+        reverse[partition[i]] = i
+
+    var win_count = len(counts)
+    return WindowPlan(wf^, whs^, wws^, counts^, partition^, reverse^, win_count, L)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # (H''') compute_dit_freqs_general — axial-3D RoPE tables for the GENERAL windows.
 #   vid: L=sum(f*h*w) tokens in WINDOWED order; per token in window (f,h,w) at
@@ -1573,3 +1664,175 @@ def full_dit_forward_pre(
         )
     else:
         raise Error("full_dit_forward_pre: unsupported txt_len (want 58 or 64)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (L) GRID-GENERAL forward — arbitrary post-patch grid (T,Ho,Wo), uneven windows.
+#   mmdit_block_general: like mmdit_block but the joint attention runs the general
+#   window path (window_attn_projout_general does its OWN partition + rope + per-
+#   window attention from the given WindowPlan, so no pre-rope here). Even layers
+#   use the non-shifted plan, odd layers the shifted plan (720pwin/720pswin).
+#   dit_out_tail_general: dit_out_tail with a grid-parametric unpatchify.
+# ═══════════════════════════════════════════════════════════════════════════════
+def mmdit_block_general(
+    vid: Tensor,          # [L,2560]  bf16  (L = T*Ho*Wo)
+    txt: Tensor,          # [txt_len,2560] bf16 (single copy)
+    emb: Tensor,          # [1,15360] bf16 (AdaSingle emb)
+    plan: WindowPlan,     # window partition for THIS layer (even=non-shift, odd=shift)
+    txt_len: Int,         # per-window txt token count
+    w: Block0Weights,
+    ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor]:
+    """One SeedVR NaMMSRTransformerBlock forward on the GENERAL window path.
+    Identical to mmdit_block (RMSNorm/AdaSingle/attn/swiglu/residuals) except the
+    attention uses window_attn_projout_general(plan, txt_len), which internally
+    partitions vid to windowed order, ropes (windowed vid + tiled txt), runs
+    per-window joint attention, scatters vid back, and mean-pools txt. So q/k are
+    passed UN-roped here (the general fn ropes). Returns (vid[L,2560], txt[txt_len,2560])."""
+    var ones = full_device([2560], Float32(1.0), STDtype.BF16, ctx)
+
+    var emb2d = reshape(emb, [2560, 6], ctx)
+    var attn_shiftA = _emb_col(emb2d, 0, ctx)
+    var attn_scaleA = _emb_col(emb2d, 1, ctx)
+    var attn_gateA = _emb_col(emb2d, 2, ctx)
+    var mlp_shiftA = _emb_col(emb2d, 3, ctx)
+    var mlp_scaleA = _emb_col(emb2d, 4, ctx)
+    var mlp_gateA = _emb_col(emb2d, 5, ctx)
+
+    # ─── ATTN sub-block ────────────────────────────────────────────────────────
+    var va = rms_norm(vid, ones, Float32(1e-5), ctx)
+    var ta = rms_norm(txt, ones, Float32(1e-5), ctx)
+    va = _mod_in(va, attn_scaleA, w.ada_vid_attn_scale, attn_shiftA, w.ada_vid_attn_shift, ctx)
+    ta = _mod_in(ta, attn_scaleA, w.ada_txt_attn_scale, attn_shiftA, w.ada_txt_attn_shift, ctx)
+
+    var vqkv = attn_qkv_norm(va, w.proj_qkv_vid_w, w.norm_q_vid_w, w.norm_k_vid_w, ctx)  # (q,k,v) [L,20,128]
+    var tqkv = attn_qkv_norm(ta, w.proj_qkv_txt_w, w.norm_q_txt_w, w.norm_k_txt_w, ctx)  # (q,k,v) [txt_len,20,128]
+    # window_attn_projout_general handles partition + rope + per-window attention.
+    var attn = window_attn_projout_general(
+        vqkv[0], vqkv[1], vqkv[2],
+        tqkv[0], tqkv[1], tqkv[2],
+        plan, txt_len,
+        w.proj_out_vid_w, w.proj_out_vid_b, w.proj_out_txt_w, w.proj_out_txt_b, ctx,
+    )
+    var va2 = _mod_gate(attn[0], attn_gateA, w.ada_vid_attn_gate, ctx)  # [L,2560]
+    var ta2 = _mod_gate(attn[1], attn_gateA, w.ada_txt_attn_gate, ctx)  # [txt_len,2560]
+    var vid_a = add(va2, vid, ctx)                     # residual
+    var txt_a = add(ta2, txt, ctx)
+
+    # ─── MLP sub-block ─────────────────────────────────────────────────────────
+    var vm = rms_norm(vid_a, ones, Float32(1e-5), ctx)
+    var tm = rms_norm(txt_a, ones, Float32(1e-5), ctx)
+    vm = _mod_in(vm, mlp_scaleA, w.ada_vid_mlp_scale, mlp_shiftA, w.ada_vid_mlp_shift, ctx)
+    tm = _mod_in(tm, mlp_scaleA, w.ada_txt_mlp_scale, mlp_shiftA, w.ada_txt_mlp_shift, ctx)
+    vm = _swiglu_mlp(vm, w.mlp_vid_proj_in_w, w.mlp_vid_proj_in_gate_w, w.mlp_vid_proj_out_w, ctx)
+    tm = _swiglu_mlp(tm, w.mlp_txt_proj_in_w, w.mlp_txt_proj_in_gate_w, w.mlp_txt_proj_out_w, ctx)
+    vm = _mod_gate(vm, mlp_gateA, w.ada_vid_mlp_gate, ctx)
+    tm = _mod_gate(tm, mlp_gateA, w.ada_txt_mlp_gate, ctx)
+    var vid_o = add(vm, vid_a, ctx)                    # residual
+    var txt_o = add(tm, txt_a, ctx)
+    return (vid_o^, txt_o^)
+
+
+def dit_stack_general(
+    vid: Tensor,          # [L,2560] bf16 (L = T*H*W post-patch)
+    txt: Tensor,          # [txt_len,2560] bf16
+    emb: Tensor,          # [1,15360] bf16
+    T: Int,               # POST-patch grid T
+    H: Int,               # POST-patch grid H
+    W: Int,               # POST-patch grid W
+    txt_len: Int,
+    blocks: List[ArcPointer[Block0Weights]],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Run all 32 MMDiT blocks on the GENERAL window path. Even layers use the
+    NON-shifted plan (compute_windows), odd layers the SHIFTED plan
+    (compute_windows_shifted) — matching window_method 16*[720pwin,720pswin].
+    Both plans depend only on (T,H,W), computed once and reused across their
+    layers. window_attn_projout_general recomputes freqs per call from the plan."""
+    var plan_even = compute_windows(T, H, W)
+    var plan_odd = compute_windows_shifted(T, H, W)
+    var cur_vid = vid.clone(ctx)
+    var cur_txt = txt.clone(ctx)
+    var n = len(blocks)
+    for i in range(n):
+        if i % 2 == 1:
+            var pair = mmdit_block_general(cur_vid, cur_txt, emb, plan_odd, txt_len, blocks[i][], ctx)
+            cur_vid = pair[0].clone(ctx)
+            cur_txt = pair[1].clone(ctx)
+        else:
+            var pair = mmdit_block_general(cur_vid, cur_txt, emb, plan_even, txt_len, blocks[i][], ctx)
+            cur_vid = pair[0].clone(ctx)
+            cur_txt = pair[1].clone(ctx)
+    return cur_vid^
+
+
+def dit_out_tail_general(
+    vid: Tensor,        # [L,2560] bf16  (L = T*Ho*Wo, block-31 vid output)
+    emb: Tensor,        # [1,15360]  bf16
+    norm_w: Tensor,     # vid_out_norm.weight   [2560]
+    ada_shift: Tensor,  # vid_out_ada.out_shift [2560]
+    ada_scale: Tensor,  # vid_out_ada.out_scale [2560]
+    proj_w: Tensor,     # vid_out.proj.weight   [64,2560]
+    proj_b: Tensor,     # vid_out.proj.bias     [64]
+    T: Int,             # POST-patch grid T
+    Ho: Int,            # POST-patch grid H
+    Wo: Int,            # POST-patch grid W
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """dit_out_tail with a grid-parametric unpatchify. Returns latent
+    [T*(2*Ho)*(2*Wo), 16] (bf16). For (T,Ho,Wo)=(4,8,8) reproduces dit_out_tail."""
+    var normed = rms_norm(vid, norm_w, Float32(1e-5), ctx)          # [L,2560]
+
+    var emb2d = reshape(emb, [2560, 6], ctx)
+    var shiftA = _emb_col(emb2d, 0, ctx)
+    var scaleA = _emb_col(emb2d, 1, ctx)
+    var moded = _mod_in(normed, scaleA, ada_scale, shiftA, ada_shift, ctx)  # [L,2560]
+
+    var proj = linear_bias(moded, proj_w, proj_b, ctx)             # [L,64]
+
+    # unpatchify [L,64] -> [T*2Ho*2Wo,16] : reshape (T,Ho,Wo,2,2,16) ->
+    # permute [0,1,3,2,4,5] -> (T,Ho,2,Wo,2,16) -> reshape [T*2Ho*2Wo,16].
+    var g6 = reshape(proj, [T, Ho, Wo, 2, 2, 16], ctx)
+    var perm = List[Int]()
+    perm.append(0)
+    perm.append(1)
+    perm.append(3)
+    perm.append(2)
+    perm.append(4)
+    perm.append(5)
+    var permd = permute(g6, perm, ctx)
+    return reshape(permd, [T * (2 * Ho) * (2 * Wo), 16], ctx)
+
+
+def full_dit_forward_general(
+    vid_raw: Tensor,   # [T*H*W, 33]  (bf16), PRE-patch grid channels-last
+    txt_raw: Tensor,   # [txt_len, 5120]  (bf16)
+    txt_len: Int,      # per-window txt token count (58)
+    timestep: Float32, # scalar (= 500.0)
+    T: Int,            # PRE-patch grid T
+    H: Int,            # PRE-patch grid H
+    W: Int,            # PRE-patch grid W
+    w: DiTWeights,     # PRELOADED DiT weights (borrowed)
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """SeedVR2-3B NaDiT full forward at ARBITRARY resolution (grid-general window
+    path). vid_in patchifies the PRE-patch grid (T,H,W) with (1,2,2) -> post-patch
+    (T, H/2, W/2); the 32-block stack + tail run on that grid. Returns latent
+    [T*H*W, 16] (bf16)."""
+    var vid = vid_in(vid_raw, w.vin_w, w.vin_b, T, H, W, ctx)     # [T*(H/2)*(W/2),2560]
+    var txt = txt_in(txt_raw, w.txt_w, w.txt_b, ctx)             # [txt_len,2560]
+    var emb = emb_in(
+        timestep,
+        w.ein_pin_w, w.ein_pin_b,
+        w.ein_phid_w, w.ein_phid_b,
+        w.ein_pout_w, w.ein_pout_b,
+        ctx,
+    )                                                            # [1,15360]
+
+    var Ho = H // 2
+    var Wo = W // 2
+    var vs = dit_stack_general(vid, txt, emb, T, Ho, Wo, txt_len, w.blocks, ctx)  # [T*Ho*Wo,2560]
+    return dit_out_tail_general(
+        vs, emb, w.tail_norm_w, w.tail_ada_shift, w.tail_ada_scale,
+        w.tail_proj_w, w.tail_proj_b, T, Ho, Wo, ctx,
+    )

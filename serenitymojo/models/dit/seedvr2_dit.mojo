@@ -777,3 +777,143 @@ def dit_out_tail(
     perm.append(5)
     var permd = permute(g6, perm, ctx)                            # T,Ho,h,Wo,w,c
     return reshape(permd, [1024, 16], ctx)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (H) compute_dit_freqs — axial-3D RoPE angle tables for the fixed gated grid.
+#   Post-patch grid T=4, H=8, W=8 (256 vid tokens), 4 temporal windows, txt_len=58.
+#   Computed on HOST in F32 (Float64 math for the inverse freqs), uploaded as F32
+#   tensors (apply_rope3d consumes F32 freqs). Matches the model's freqs exactly
+#   (validated vs freqs_ref: vid/txt max err ~2.7e-6 — F32 rounding only).
+#
+#   inv[i] = 1.0 / 10000^((2i)/42)         for i in 0..20        (21 inverse freqs)
+#   ax1(pos) -> [42]: for i in 0..20: v = pos*inv[i]; out[2i]=v, out[2i+1]=v (repeat x2)
+#   VID [256,126]: token = win*64 + h*8 + w (win 0..3, h 0..7, w 0..7)
+#       [0:42]  = ax1(58)   (temporal pos = txt_len offset 58, const for all vid)
+#       [42:84] = ax1(h)
+#       [84:126]= ax1(w)
+#   TXT [232,126]: token = win*58 + l (win 0..3, l 0..57)
+#       a = ax1(l); [0:42]=a, [42:84]=a, [84:126]=a   (tile x3)
+# ═══════════════════════════════════════════════════════════════════════════════
+def compute_dit_freqs(ctx: DeviceContext) raises -> Tuple[Tensor, Tensor]:
+    """(vid_freqs [256,126], txt_freqs [232,126]) F32 axial-3D RoPE angle tables."""
+    # 21 inverse freqs (Float64 accuracy): inv[i] = 1/10000^((2i)/42)
+    var lnbase = log(Float64(10000.0))
+    var inv = List[Float64]()
+    for i in range(21):
+        inv.append(1.0 / exp((2.0 * Float64(i) / 42.0) * lnbase))
+
+    # VID [256,126]: win(4) x h(8) x w(8), row = ax1(58) ++ ax1(h) ++ ax1(w)
+    var vid_vals = List[Float32]()
+    for _win in range(4):
+        for h in range(8):
+            for w in range(8):
+                for i in range(21):
+                    var v = Float32(58.0 * inv[i])
+                    vid_vals.append(v)
+                    vid_vals.append(v)
+                for i in range(21):
+                    var v = Float32(Float64(h) * inv[i])
+                    vid_vals.append(v)
+                    vid_vals.append(v)
+                for i in range(21):
+                    var v = Float32(Float64(w) * inv[i])
+                    vid_vals.append(v)
+                    vid_vals.append(v)
+
+    # TXT [232,126]: win(4) x l(58), row = ax1(l) tiled x3
+    var txt_vals = List[Float32]()
+    for _win in range(4):
+        for l in range(58):
+            for _rep in range(3):
+                for i in range(21):
+                    var v = Float32(Float64(l) * inv[i])
+                    txt_vals.append(v)
+                    txt_vals.append(v)
+
+    var vshp = List[Int]()
+    vshp.append(256)
+    vshp.append(126)
+    var tshp = List[Int]()
+    tshp.append(232)
+    tshp.append(126)
+    var vid_freqs = Tensor.from_host(vid_vals, vshp^, STDtype.F32, ctx)
+    var txt_freqs = Tensor.from_host(txt_vals, tshp^, STDtype.F32, ctx)
+    return (vid_freqs^, txt_freqs^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (I) txt_in — Linear text-embedding entry:  txt_raw [58,5120] -> [58,2560].
+#   weight txt_in.weight [2560,5120], bias txt_in.bias [2560].
+# ═══════════════════════════════════════════════════════════════════════════════
+def txt_in(
+    txt_raw: Tensor,   # [58, 5120]  (bf16)
+    proj_w: Tensor,    # txt_in.weight  [2560, 5120]
+    proj_b: Tensor,    # txt_in.bias    [2560]
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """SeedVR NaDiT txt_in Linear (+bias): [58,5120] -> [58,2560] (bf16)."""
+    return linear_bias(txt_raw, proj_w, proj_b, ctx)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (J) full_dit_forward — the WHOLE SeedVR2-3B NaDiT forward with COMPUTED freqs.
+#   vid_in + txt_in + emb_in -> compute_dit_freqs -> 32-block dit_stack -> tail.
+#   Loads all DiT weights (non-block + 32 blocks) from an open SafeTensors handle.
+#   Returns the final latent [1024,16] (bf16).
+# ═══════════════════════════════════════════════════════════════════════════════
+def full_dit_forward(
+    vid_raw: Tensor,   # [T*H*W, 33] = [1024,33] (bf16), grid channels-last
+    txt_raw: Tensor,   # [58, 5120]  (bf16)
+    timestep: Float32, # scalar (= 500.0)
+    T: Int,            # pre-patch grid T (=4)
+    H: Int,            # pre-patch grid H (=16)
+    W: Int,            # pre-patch grid W (=16)
+    st: SafeTensors,   # open seedvr2_dit.safetensors (bf16)
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """SeedVR2-3B NaDiT full forward -> latent [1024,16] (bf16)."""
+    # ── input embeddings ────────────────────────────────────────────────────────
+    var vid = vid_in(
+        vid_raw,
+        load_bias(st, "vid_in.proj.weight", ctx),
+        load_bias(st, "vid_in.proj.bias", ctx),
+        T, H, W, ctx,
+    )                                                          # [256,2560]
+    var txt = txt_in(
+        txt_raw,
+        load_bias(st, "txt_in.weight", ctx),
+        load_bias(st, "txt_in.bias", ctx),
+        ctx,
+    )                                                          # [58,2560]
+    var emb = emb_in(
+        timestep,
+        load_bias(st, "emb_in.proj_in.weight", ctx),
+        load_bias(st, "emb_in.proj_in.bias", ctx),
+        load_bias(st, "emb_in.proj_hid.weight", ctx),
+        load_bias(st, "emb_in.proj_hid.bias", ctx),
+        load_bias(st, "emb_in.proj_out.weight", ctx),
+        load_bias(st, "emb_in.proj_out.bias", ctx),
+        ctx,
+    )                                                          # [1,15360]
+
+    # ── computed axial-3D RoPE angle tables (F32) ───────────────────────────────
+    var freqs = compute_dit_freqs(ctx)                         # (vid[256,126], txt[232,126])
+
+    # ── 32 MMDiT blocks ─────────────────────────────────────────────────────────
+    var blocks = List[ArcPointer[Block0Weights]]()
+    for i in range(32):
+        blocks.append(ArcPointer(load_block(st, i, ctx)))
+    var vid_stack = dit_stack(vid, txt, emb, freqs[0], freqs[1], blocks, ctx)  # [256,2560]
+
+    # ── output tail -> latent [1024,16] ─────────────────────────────────────────
+    return dit_out_tail(
+        vid_stack,
+        emb,
+        load_bias(st, "vid_out_norm.weight", ctx),
+        load_bias(st, "vid_out_ada.out_shift", ctx),
+        load_bias(st, "vid_out_ada.out_scale", ctx),
+        load_bias(st, "vid_out.proj.weight", ctx),
+        load_bias(st, "vid_out.proj.bias", ctx),
+        ctx,
+    )

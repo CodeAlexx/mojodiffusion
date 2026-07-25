@@ -1477,6 +1477,30 @@ def main() raises:
               NUM_BLOCKS * (2 if dual_expert else 1),
               "block loads/step now free (the rest keep streaming)")
 
+    # ── fp8 HOST-pinned tail (env WAN22_FP8_HOST_GB, default 0 = off) ──────────
+    # Kills the DOUBLE-STAGING cost for whatever the device budget could not hold.
+    # Each block is staged TWICE per step (forward + recompute backward), and each
+    # staging is a ~50 ms HOST memcpy out of the mmap page cache into the loader's
+    # pinned slab. Blocks pinned in HOST RAM skip that memcpy: await_block H2Ds
+    # straight from pinned memory and dequants with the SAME kernel, so the Block
+    # is BIT-IDENTICAL to both the streamed and the device-resident path.
+    # Runs AFTER the device pin and skips anything already device-resident, so the
+    # device budget takes blocks [0,N) and this absorbs the tail.
+    # Host cost ~350 MB/block (~14 GB for a full expert) vs the ~27 GB/expert BF16
+    # store the design declines — fp8 halves it, so the tails fit in ~49 GB free.
+    var fp8_host_gb = _env_f32(String("WAN22_FP8_HOST_GB"))
+    if fp8_host_gb > Float32(0.0):
+        var hbudget = Int(Float64(fp8_host_gb) * 1024.0 * 1024.0 * 1024.0)
+        var h_low = loader.pin_residents_fp8_host_prequantized(hbudget, ctx)
+        print("[wan22] fp8-HOST LOW: pinned", h_low, "/", NUM_BLOCKS,
+              "blocks (budget", fp8_host_gb, "GB)")
+        var h_high = 0
+        if dual_expert:
+            h_high = loader_high.pin_residents_fp8_host_prequantized(hbudget, ctx)
+            print("[wan22] fp8-HOST HIGH: pinned", h_high, "/", NUM_BLOCKS, "blocks")
+        print("[wan22] fp8-HOST TOTAL:", h_low + h_high, "blocks now stage from"
+              " pinned RAM (no mmap memcpy)")
+
     # build_wan22_lora_set creates 10 adapters/block: the 8 ATTENTION projections
     # (self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}) + ffn.0 (dim->ffn) + ffn.2
     # (ffn->dim), matching Musubi's wrapped-linear set (parity-gated cos>=0.999).

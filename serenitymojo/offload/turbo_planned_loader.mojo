@@ -759,6 +759,97 @@ struct TurboPlannedLoader(Movable):
             pinned += 1
         return pinned
 
+    def pin_residents_fp8_host_prequantized(
+        mut self, budget_bytes: Int, ctx: DeviceContext
+    ) raises -> Int:
+        """HOST-pinned sibling of `pin_residents_fp8_prequantized` for an
+        ALREADY-FP8 checkpoint (E4M3 [out,in] + `<key>.__fp8_scale` F32 [out]).
+
+        Same corruption trap as the device path: `pin_residents_fp8_host`
+        quantizes FROM BF16 and gates on `tv.dtype == STDtype.BF16`, so against an
+        already-fp8 cache every big weight falls to the small-tensor branch and is
+        read by `from_view_as_bf16` — 1-byte fp8 reinterpreted as 2-byte bf16.
+        This variant copies the on-disk bytes VERBATIM into pinned host buffers.
+
+        WHY: the per-block staging cost is a ~50 ms HOST memcpy of the block's
+        bytes out of the mmap page cache into the loader's pinned staging slab
+        (measured: `prefetch_next_with_ctx` 50.2 ms/block, ~350 MB at ~7 GB/s).
+        Blocks pinned HERE skip that entirely — `await_block`'s fp8h branch H2Ds
+        straight from already-pinned host memory and dequants with the SAME
+        `fp8_e4m3_dequant_perrow_to_bf16` the streamed and device-resident paths
+        use, so the Block is BIT-IDENTICAL to both.
+
+        Use AFTER `pin_residents_fp8_prequantized`: this skips any prefix already
+        device-resident, so the device budget takes blocks [0,N) and this absorbs
+        the tail. Host cost is ~350 MB/block (~14 GB for a whole 14B expert),
+        versus the ~27 GB/expert BF16 store the wan trainer deliberately declines
+        (`train_wan22_real.mojo` design note) — fp8 halves it, so both experts'
+        tails fit in host RAM. Returns the number of blocks pinned."""
+        var used = 0
+        var pinned = 0
+        var scale_suffix = String(".__fp8_scale")
+        for i in range(self._plan.count()):
+            self._assert_raw_copy_dtype_safe(i)
+            var p = self._plan.normalized_prefix(i)
+            if (
+                self._fp8h_slot(p) >= 0 or self._fp8_slot(p) >= 0
+                or self._resident_slot(p) >= 0
+            ):
+                continue          # already resident somewhere — leave it alone
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                raise Error(
+                    String("pin_residents_fp8_host_prequantized: no tensors for prefix: ") + p
+                )
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            var tensors = List[_HostFp8Tensor]()
+            var block_bytes = 0
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                if nm.endswith(scale_suffix):
+                    continue      # consumed with its parent weight
+                var tv = self._turbo.sharded.tensor_view(nm)
+                if tv.dtype == STDtype.F8_E4M3:
+                    var sname = nm + scale_suffix
+                    var stv = self._turbo.sharded.tensor_view(sname)
+                    var bytes = Tensor.from_view_raw(tv, ctx)   # keeps F8_E4M3
+                    var scale = Tensor.from_view(stv, ctx)      # F32 [out]
+                    var bh = ctx.enqueue_create_host_buffer[DType.uint8](bytes.nbytes())
+                    var sh_h = ctx.enqueue_create_host_buffer[DType.uint8](scale.nbytes())
+                    ctx.enqueue_copy(bh, bytes.buf)
+                    ctx.enqueue_copy(sh_h, scale.buf)
+                    ctx.synchronize()
+                    block_bytes += bytes.nbytes() + scale.nbytes()
+                    tensors.append(_HostFp8Tensor(
+                        nm, True,
+                        HArc(bh^), bytes.nbytes(), bytes.shape(), bytes.dtype(),
+                        HArc(sh_h^), scale.nbytes(), scale.shape(),
+                    ))
+                else:
+                    var t = Tensor.from_view_as_bf16(tv, ctx)
+                    var bh = ctx.enqueue_create_host_buffer[DType.uint8](t.nbytes())
+                    var dummy = ctx.enqueue_create_host_buffer[DType.uint8](1)
+                    ctx.enqueue_copy(bh, t.buf)
+                    ctx.synchronize()
+                    block_bytes += t.nbytes()
+                    tensors.append(_HostFp8Tensor(
+                        nm, False,
+                        HArc(bh^), t.nbytes(), t.shape(), t.dtype(),
+                        HArc(dummy^), 1, List[Int](),
+                    ))
+            if used + block_bytes > budget_bytes:
+                break             # plan-order contiguous; partial pin is legal
+            self._fp8h_prefixes.append(p)
+            self._fp8h_blocks.append(tensors^)
+            used += block_bytes
+            pinned += 1
+        return pinned
+
     def pin_residents_int8(mut self, budget_bytes: Int, ctx: DeviceContext) raises -> Int:
         """Pin plan blocks (in plan order) permanently on device as int8-resident:
         each sizeable 2-D BF16 matmul weight is quantized ONCE to int8 [N,K] + a

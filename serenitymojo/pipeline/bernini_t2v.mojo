@@ -27,6 +27,7 @@ from std.sys import argv
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.lora import LoraSet
 from serenitymojo.models.wan22.wan22_a14b_streamed_dit import Wan22A14BStreamedDiT
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -154,12 +155,19 @@ def _run_expert(
     timesteps: List[Float32],
     mut scheduler: UniPcMultistepScheduler,
     mut apg_state: BerniniAPGMomentum,
+    lora_path: String,
+    lora_mult: Float32,
     ctx: DeviceContext,
 ) raises -> Tensor:
     if start_step >= end_step:
         return x_in^
     print("  loading", phase_name, "expert stream:", cache_dir)
     var model = Wan22A14BStreamedDiT.open(cache_dir, ctx)
+    # Trained-LoRA overlay, attached PER EXPERT: one shared adapter re-applied to
+    # whichever base is live, mirroring how the trainer swaps the base under a
+    # single LoRA. "-"/"" renders the base model.
+    if lora_path != String("-") and lora_path != String(""):
+        model.set_lora(LoraSet.load(lora_path), lora_mult)
     var x = x_in^
     for step in range(start_step, end_step):
         var timestep = timesteps[step]
@@ -185,7 +193,8 @@ def main() raises:
     if len(args) < 5:
         raise Error(
             "usage: bernini_t2v <conds.safetensors> <high_cache_dir> "
-            "<low_cache_dir> <out_latent.safetensors> [steps=40] [seed=42]"
+            "<low_cache_dir> <out_latent.safetensors> [steps=40] [seed=42] "
+            "[lora.safetensors|-] [lora_mult=1.0]"
         )
     var conds_path = String(args[1])
     var high_cache = String(args[2])
@@ -197,6 +206,12 @@ def main() raises:
     var seed = UInt64(42)
     if len(args) >= 7:
         seed = UInt64(atol(String(args[6])))
+    var lora_path = String("-")
+    if len(args) >= 8:
+        lora_path = String(args[7])
+    var lora_mult = Float32(1.0)
+    if len(args) >= 9:
+        lora_mult = Float32(atof(String(args[8])))
     if steps < 1:
         raise Error("Bernini steps must be >= 1")
 
@@ -236,13 +251,15 @@ def main() raises:
     )
     x = _run_expert(
         high_cache, String("high-noise"), 0, switch_step, OMEGA_HIGH,
-        x^, pos, neg, pos_len, neg_len, sigmas, timesteps, scheduler, apg_state, ctx,
+        x^, pos, neg, pos_len, neg_len, sigmas, timesteps, scheduler, apg_state,
+        lora_path, lora_mult, ctx,
     )
     # `_run_expert` returned, so its high model/shared/block state is destroyed
     # before the low expert is opened.
     x = _run_expert(
         low_cache, String("low-noise"), switch_step, steps, OMEGA_LOW,
-        x^, pos, neg, pos_len, neg_len, sigmas, timesteps, scheduler, apg_state, ctx,
+        x^, pos, neg, pos_len, neg_len, sigmas, timesteps, scheduler, apg_state,
+        lora_path, lora_mult, ctx,
     )
 
     var names = List[String]()

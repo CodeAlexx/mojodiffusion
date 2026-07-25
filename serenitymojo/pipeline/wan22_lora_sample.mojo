@@ -1,27 +1,26 @@
-# Wan2.2-A14B single-image LoRA sampler — 256px, dual expert, trained-LoRA overlay.
+# Wan2.2-A14B LoRA sampler — PLAIN WAN INFERENCE, 1024px, dual expert.
 #
-# WHY THIS EXISTS: the wan22 LoRA trainer had no way to look at what it trained.
-# `bernini_t2v` renders the A14B but is compiled for 848x480x81 VIDEO and takes no
-# LoRA; `wan22_t2v` is the TI2V-5B model, a different network entirely. This is the
-# image-shaped sibling of `bernini_t2v`, at the SAME geometry the trainer uses, with
-# the LoRA overlay wired in.
+# ⚠ THIS IS THE WAN RECIPE, NOT BERNINI. An earlier version of this file copied
+# `bernini_t2v`'s sampler (bernini_apg + bernini_unipc, omega 4.0/3.2, eta 0.5,
+# norm 50). That is the Bernini-R RENDERER recipe — correct for the stock Bernini
+# model, wrong for a Wan-trained LoRA, because APG projects and renormalizes the
+# velocity against a momentum buffer instead of simply integrating it.
 #
-# GEOMETRY IS THE POINT: latent [16,1,32,32] -> S=256 tokens is exactly what
-# `train_wan22_real.mojo` trains on (it hardcodes that shape), so a sample here is
-# drawn at the resolution the adapter actually saw.
-#
-# Denoise and decode live in ONE process here — unlike the 848x480x81 pair, where
-# they must be split so the two experts and the F32 VAE never co-reside. At 256px a
-# frame is 1/85th the pixels, and each expert is still released before the next
-# opens (`_run_expert` returns), so the VAE only ever meets an empty device.
+# The loop below mirrors `pipeline/wan22_t2v.mojo::_denoise_scoped` — the repo's
+# gated Wan inference — op for op:
+#     scheduler = UniPcMultistepScheduler(1000, steps, shift, 2)
+#     t         = sigma * 1000
+#     v         = (1-g)*v_uncond + g*v_cond          (plain CFG, g = 5.0 native)
+#     x         = scheduler.step(v, x)
+# The only deltas are the A14B spine (`Wan22A14BStreamedDiT`, which computes the
+# cond/uncond pair in ONE pass over each streamed block) and the dual-expert switch
+# at sigma >= boundary, matching how the trainer picks its expert.
 #
 # argv:
 #   wan22_lora_sample <conds.safetensors> <high_cache> <low_cache> <out_dir>
 #                     [lora.safetensors|-] [lora_mult=1.0] [steps=30] [seed=42]
 #
-# conds.safetensors comes from `wan22_encode_prompt` (pos_embed/neg_embed/pos_len/
-# neg_len). Pass `-` for the LoRA to render the BASE model — that is your
-# before/after reference.
+# conds.safetensors comes from `wan22_encode_prompt`. `-` renders the base model.
 #
 # Mojo 1.0.0b1, NVIDIA.
 
@@ -40,39 +39,38 @@ from serenitymojo.models.lingbotvideo.vae_encoder import _latents_mean, _latents
 from serenitymojo.models.wan22.wan22_a14b_streamed_dit import Wan22A14BStreamedDiT
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import mul, reshape
-from serenitymojo.sampling.bernini_apg import BerniniAPGMomentum, bernini_apg_guidance
-from serenitymojo.sampling.bernini_unipc import (
-    build_bernini_unipc_sigma_schedule,
-    build_bernini_unipc_timesteps,
-)
+from serenitymojo.ops.tensor_algebra import add, mul, mul_scalar, reshape
 from serenitymojo.sampling.unipc import UniPcMultistepScheduler
 from serenitymojo.tensor import Tensor
 
 
-# ── geometry: ONE 256x256 frame == the trainer's latent [16,1,32,32] ──
-comptime HEIGHT = 256
-comptime WIDTH = 256
+# ── geometry: ONE 1024x1024 frame -> latent [16,1,128,128], S=4096 ──
+# STANDING ORDER (Alex): samples are 1024 minimum. Sampling resolution is
+# independent of training resolution — the DiT builds rope from FG/HG/WG at call
+# time. Do not shrink this to "match" the training grid.
+comptime HEIGHT = 1024
+comptime WIDTH = 1024
 comptime FRAMES = 1
 comptime T_LAT = (FRAMES - 1) // 4 + 1        # 1
-comptime H_LAT = HEIGHT // 8                   # 32
-comptime W_LAT = WIDTH // 8                    # 32
+comptime H_LAT = HEIGHT // 8                   # 128
+comptime W_LAT = WIDTH // 8                    # 128
 comptime FG = T_LAT                            # 1
-comptime HG = H_LAT // 2                       # 16
-comptime WG = W_LAT // 2                       # 16
-comptime S = FG * HG * WG                      # 256  <- matches training
+comptime HG = H_LAT // 2                       # 64
+comptime WG = W_LAT // 2                       # 64
+comptime S = FG * HG * WG                      # 4096
 comptime TXT = 512
 comptime CTXL = 512
 comptime TEXT_DIM = 4096
 comptime NH = 40
 comptime HD = 128
 comptime CHANNELS = 16
-comptime LATENT_NUMEL = CHANNELS * T_LAT * H_LAT * W_LAT   # 16384
-comptime BOUNDARY = Float32(875.0)
-comptime OMEGA_HIGH = Float32(4.0)
-comptime OMEGA_LOW = Float32(3.2)
-comptime APG_ETA = Float32(0.5)
-comptime APG_NORM = Float32(50.0)
+comptime LATENT_NUMEL = CHANNELS * T_LAT * H_LAT * W_LAT
+comptime NUM_TRAIN_TIMESTEPS = Float32(1000.0)
+# Expert switch on the raw sigma, exactly as the trainer selects it
+# (train_wan22_real.mojo: `use_high = dual_expert and (t >= boundary)`).
+comptime BOUNDARY = Float32(0.875)
+comptime SHIFT = 3.0              # musubi Wan2.2 T2V flow shift
+comptime GUIDANCE_DEFAULT = Float32(5.0)  # wan22_t2v native CFG
 
 
 def _load_embed(
@@ -110,52 +108,17 @@ def _zero_pad_rows(embed: Tensor, valid: Int, ctx: DeviceContext) raises -> Tens
     return mul(embed, mask, ctx)
 
 
-def _apg_velocity(
-    x: Tensor, v_cond: Tensor, v_uncond: Tensor, sigma: Float32, omega: Float32,
-    mut state: BerniniAPGMomentum, ctx: DeviceContext,
-) raises -> Tensor:
-    """Verbatim the bernini_t2v APG step at this geometry (pipeline/bernini_t2v.mojo:106)."""
-    if sigma <= 0.0:
-        raise Error("wan22 APG requires a positive current sigma")
-    var xh = x.to_host(ctx)
-    var ch = cast_tensor(v_cond, STDtype.F32, ctx).to_host(ctx)
-    var uh = cast_tensor(v_uncond, STDtype.F32, ctx).to_host(ctx)
-    if len(xh) != LATENT_NUMEL or len(ch) != LATENT_NUMEL or len(uh) != LATENT_NUMEL:
-        raise Error("wan22 APG latent shape mismatch")
-    var x_cond = List[Float32]()
-    var x_uncond = List[Float32]()
-    x_cond.resize(LATENT_NUMEL, 0.0)
-    x_uncond.resize(LATENT_NUMEL, 0.0)
-    for i in range(LATENT_NUMEL):
-        x_cond[i] = xh[i] - sigma * ch[i]
-        x_uncond[i] = xh[i] - sigma * uh[i]
-    var guided_x = bernini_apg_guidance(
-        x_cond^, x_uncond^, omega, state, APG_ETA, APG_NORM,
-        1, CHANNELS, T_LAT, H_LAT, W_LAT,
-    )
-    var guided_v = List[Float32]()
-    guided_v.resize(LATENT_NUMEL, 0.0)
-    for i in range(LATENT_NUMEL):
-        guided_v[i] = (xh[i] - guided_x[i]) / sigma
-    return Tensor.from_host(
-        guided_v, [CHANNELS, T_LAT, H_LAT, W_LAT], STDtype.F32, ctx
-    )
-
-
 def _run_expert(
     cache_dir: String, phase_name: String, start_step: Int, end_step: Int,
-    omega: Float32, var x_in: Tensor, pos: Tensor, neg: Tensor,
-    pos_len: Int, neg_len: Int, lora_path: String, lora_mult: Float32,
-    sigmas: List[Float64], timesteps: List[Float32],
-    mut scheduler: UniPcMultistepScheduler, mut apg_state: BerniniAPGMomentum,
-    ctx: DeviceContext,
+    var x_in: Tensor, pos: Tensor, neg: Tensor, pos_len: Int, neg_len: Int,
+    lora_path: String, lora_mult: Float32, sigmas: List[Float64],
+    mut scheduler: UniPcMultistepScheduler, guidance: Float32, ctx: DeviceContext,
 ) raises -> Tensor:
-    """One expert's contiguous step range. Scoped so the model dies on return —
-    the dual-expert residency contract from bernini_t2v.
+    """One expert's contiguous step range of the WAN UniPC + CFG loop.
 
-    The LoRA is loaded PER EXPERT (inside this scope) on purpose: one shared adapter
-    trained across both experts, re-attached to whichever base is live, mirroring how
-    the trainer swaps the base under a single LoRA."""
+    Scoped so the model dies on return (dual-expert residency contract). The LoRA is
+    attached per expert: ONE shared adapter re-applied to whichever base is live,
+    mirroring how the trainer swaps the base under a single LoRA."""
     if start_step >= end_step:
         return x_in^
     print("  loading", phase_name, "expert stream:", cache_dir)
@@ -163,18 +126,22 @@ def _run_expert(
     if lora_path != String("-") and lora_path != String(""):
         model.set_lora(LoraSet.load(lora_path), lora_mult)
     var x = x_in^
-    for step in range(start_step, end_step):
-        var timestep = timesteps[step]
+    for i in range(start_step, end_step):
+        var t = Float32(sigmas[i]) * NUM_TRAIN_TIMESTEPS
         var pair = model.forward_cfg_pair[FG, HG, WG, S, TXT, CTXL, NH, HD](
-            cast_tensor(x, STDtype.BF16, ctx), timestep, pos, neg,
-            pos_len, neg_len, ctx,
+            cast_tensor(x, STDtype.BF16, ctx), t, pos, neg, pos_len, neg_len, ctx,
         )
-        var velocity = _apg_velocity(
-            x, pair.cond, pair.uncond, Float32(sigmas[step]), omega, apg_state, ctx,
+        # plain CFG, verbatim wan22_t2v.mojo:210-215
+        var vc = cast_tensor(pair.cond, STDtype.F32, ctx)
+        var vu = cast_tensor(pair.uncond, STDtype.F32, ctx)
+        var v = add(
+            mul_scalar(vu, Float32(1.0) - guidance, ctx),
+            mul_scalar(vc, guidance, ctx),
+            ctx,
         )
-        x = scheduler.step(velocity, x, ctx)
-        print("  ", phase_name, " step", step + 1, "/", len(timesteps),
-              " sigma=", sigmas[step], " t=", timestep)
+        x = scheduler.step(v, x, ctx)
+        print("  ", phase_name, " step", i + 1, "/", len(sigmas),
+              " sigma=", sigmas[i], " t=", t)
     print("  releasing", phase_name, "expert")
     return x^
 
@@ -202,14 +169,24 @@ def main() raises:
     var seed = UInt64(42)
     if len(args) >= 9:
         seed = UInt64(atol(String(args[8])))
+    # [dual_expert=0] — see the ORACLE note at the schedule below. Default 0.
+    var dual_expert = False
+    if len(args) >= 10:
+        dual_expert = atol(String(args[9])) != 0
+    # [guidance] — CFG multiplies the cond/uncond DIFFERENCE, so a strongly-fit LoRA
+    # that widens that gap gets amplified by it. Exposed so the interaction is
+    # measurable instead of assumed.
+    var guidance = GUIDANCE_DEFAULT
+    if len(args) >= 11:
+        guidance = Float32(atof(String(args[10])))
     if steps < 1:
         raise Error("wan22 sample steps must be >= 1")
 
-    print("=== Wan2.2-A14B LoRA sample (256px, dual expert) ===")
+    print("=== Wan2.2-A14B LoRA sample — PLAIN WAN recipe (UniPC + CFG) ===")
     print("  geometry:", WIDTH, "x", HEIGHT, "; latent [", CHANNELS, T_LAT,
-          H_LAT, W_LAT, "]; tokens=", S, " (== the trainer's S)")
-    print("  steps=", steps, " seed=", seed, " lora=", lora_path,
-          " mult=", lora_mult)
+          H_LAT, W_LAT, "]; tokens=", S)
+    print("  steps=", steps, " seed=", seed, " shift=", SHIFT,
+          " lora=", lora_path, " mult=", lora_mult)
 
     var ctx = DeviceContext()
     var conds = ShardedSafeTensors.open(conds_path)
@@ -221,48 +198,63 @@ def main() raises:
     neg = _zero_pad_rows(neg, neg_len, ctx)
     print("  conditioning valid rows: pos=", pos_len, " neg=", neg_len)
 
-    var sigmas = build_bernini_unipc_sigma_schedule(steps, 5.0, 1000)
-    var timesteps = build_bernini_unipc_timesteps(steps, 5.0, 1000)
-    var switch_step = steps
-    for i in range(steps):
-        if timesteps[i] < BOUNDARY:
-            switch_step = i
-            break
-    print("  expert split: high steps=", switch_step,
-          " low steps=", steps - switch_step, " boundary t=", BOUNDARY)
+    # The repo's gated Wan scheduler — same construction as wan22_t2v.mojo:197.
+    var scheduler = UniPcMultistepScheduler(1000, steps, Float64(SHIFT), 2)
+    var sigmas = scheduler.sigmas()
+    # ══ ORACLE: MUSUBI SAMPLES WITH THE LOW-NOISE EXPERT ONLY ══
+    # wan_train_network.py:224-226
+    #     if self.high_low_training:
+    #         self.next_model_is_high_noise = False  # We use low noise model to sample
+    #         self.swap_high_low_weights(args, accelerator, model)
+    # The high/low switch is a TRAINING-only mechanism. Sampling runs entirely on the
+    # low-noise expert.
+    #
+    # This is not cosmetic. MEASURED with the trained eri2 adapter
+    # (models/wan22/parity/wan22_train_vs_infer_block_parity.mojo): the LoRA shifts
+    # the LOW block output norm by +1.7% but the HIGH block by +8.8% — compounded
+    # over 40 blocks that is ~2x versus ~28x. Because HIGH would run the FIRST steps,
+    # a dual-expert sampler blows the latent up before the low expert ever sees it,
+    # which is exactly the pure-noise render we observed. The adapter is shared but
+    # only saw the high expert in 11.5% of training steps.
+    var switch_step = 0
+    if dual_expert:
+        switch_step = steps
+        for i in range(steps):
+            if Float32(sigmas[i]) < BOUNDARY:
+                switch_step = i
+                break
+        print("  ⚠ dual_expert=1 — NOT the musubi sampling recipe; high steps=",
+              switch_step)
+    else:
+        print("  expert: LOW only for all", steps, "steps (musubi recipe)")
 
-    var scheduler = UniPcMultistepScheduler.from_sigmas(sigmas.copy(), 2)
-    var apg_state = BerniniAPGMomentum(0.0)
     var x = randn([CHANNELS, T_LAT, H_LAT, W_LAT], seed, STDtype.F32, ctx)
+    # switch_step == 0 in the musubi recipe, so this is a no-op and the high expert
+    # is never even opened.
     x = _run_expert(
-        high_cache, String("high-noise"), 0, switch_step, OMEGA_HIGH,
-        x^, pos, neg, pos_len, neg_len, lora_path, lora_mult,
-        sigmas, timesteps, scheduler, apg_state, ctx,
+        high_cache, String("high-noise"), 0, switch_step,
+        x^, pos, neg, pos_len, neg_len, lora_path, lora_mult, sigmas, scheduler, guidance, ctx,
     )
     x = _run_expert(
-        low_cache, String("low-noise"), switch_step, steps, OMEGA_LOW,
-        x^, pos, neg, pos_len, neg_len, lora_path, lora_mult,
-        sigmas, timesteps, scheduler, apg_state, ctx,
+        low_cache, String("low-noise"), switch_step, steps,
+        x^, pos, neg, pos_len, neg_len, lora_path, lora_mult, sigmas, scheduler, guidance, ctx,
     )
 
-    # ── decode: both experts are destroyed, so the VAE has the device to itself ──
-    # z = normalized_latent * std + mean (the gated Wan VAE encoder contract, the
-    # same denormalization bernini_decode.mojo:57-66 applies).
+    # ── decode: both experts destroyed, VAE has the device to itself ──
     var host = x.to_host(ctx)
     if len(host) != LATENT_NUMEL:
         raise Error("wan22 sample latent numel mismatch")
     var means = _latents_mean()
     var stds = _latents_std()
-    var channel_stride = T_LAT * H_LAT * W_LAT
+    var stride = T_LAT * H_LAT * W_LAT
     var zhost = List[Float32]()
     zhost.resize(LATENT_NUMEL, 0.0)
     for i in range(LATENT_NUMEL):
-        var channel = (i // channel_stride) % CHANNELS
-        zhost[i] = host[i] * stds[channel] + means[channel]
+        var c = (i // stride) % CHANNELS
+        zhost[i] = host[i] * stds[c] + means[c]
     var z = Tensor.from_host(
         zhost, [1, CHANNELS, T_LAT, H_LAT, W_LAT], STDtype.F32, ctx
     )
-
     var vae_path = String(
         "/mnt/disk1/models/lingbot-video-moe/vae/diffusion_pytorch_model.safetensors"
     )

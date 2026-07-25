@@ -35,6 +35,10 @@
 # Mojo 0.26.x+: def not fn; Tensor move-only; TArc carriers.
 
 from std.gpu.host import DeviceContext
+from std.time import perf_counter_ns
+from std.ffi import external_call
+from std.memory import alloc
+from std.builtin.type_aliases import MutExternalOrigin
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.math import sqrt, sin as _fsin, cos as _fcos
@@ -464,6 +468,26 @@ def _time_features(
 # e0_flat: F32 [S * 6 * dim] from time chain.
 # block_mod: F32 [1 * 6 * dim] from the streamed block (cast from BF16).
 # Result: WanModVecs (each field is F32 [S*dim]).
+comptime _WanEnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+def _wan_phase_dbg() -> Bool:
+    """WAN22_PHASE_TIMERS=1 — per-block host/GPU split inside the stack loops.
+    Same external_call getenv the trainer uses (train_wan22_real.mojo:248); the
+    std.os getenv overload does not lower in this build."""
+    var name = String("WAN22_PHASE_TIMERS")
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cname = _WanEnvPtr(unsafe_from_address=Int(buf))
+    var ret = external_call["getenv", _WanEnvPtr](cname)
+    buf.free()
+    return Int(ret) != 0
+
+
 def _block_modvecs_dev(
     e0_t: Tensor, bmod_t: Tensor, S: Int, dim: Int, ctx: DeviceContext,
 ) raises -> WanModVecs:
@@ -824,14 +848,18 @@ def wan22_stack_lora_forward_offload[
     var e0_t = Tensor.from_host(e0_flat.copy(), [S, 6, dim], STDtype.F32, ctx)
 
     for bi in range(num_blocks):
+        var _t_pre = perf_counter_ns()
         var handle = loader.await_block(bi, ctx)
+        var _t_aw = perf_counter_ns()
         loader.prefetch_next_with_ctx(bi, ctx)
+        var _t_blk0 = perf_counter_ns()
 
         # Load block modulation [1, 6, dim] BF16 -> F32 host.
         var bp = handle.prefix + "."
         var mod_key = bp + String("modulation")
         if not (mod_key in handle.block):
             raise Error(String("wan22 block missing modulation: ") + mod_key)
+        var _t_await = perf_counter_ns()
         var block_mod_t = cast_tensor(handle.block[mod_key][], STDtype.F32, ctx)
 
         # Build per-token modulation vectors. The HOST builder is a pure-CPU
@@ -845,8 +873,10 @@ def wan22_stack_lora_forward_offload[
         else:
             mv = _block_modvecs(e0_flat, block_mod_t.to_host(ctx), bi, S, dim)
 
+        var _t_mv = perf_counter_ns()
         # Load block weights.
         var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var _t_w = perf_counter_ns()
 
         # LoRA-augmented forward. `x_h`/`context_h` are READ (borrowed) args — the
         # old `.copy()`s were pure waste: [S,dim]=1.31M + [TXT,dim]=2.6M host floats
@@ -860,6 +890,14 @@ def wan22_stack_lora_forward_offload[
 
         # save_acts=False (recompute backward drivers): the 23-list per-block host
         # tape is never read, so it is neither BUILT (above) nor COPIED here.
+        var _t_fwd = perf_counter_ns()
+        if _wan_phase_dbg() and bi < 3:
+            print("    [blk", bi, "] AWAIT=", Float64(_t_aw - _t_pre) / 1.0e6,
+                  " prefetch=", Float64(_t_blk0 - _t_aw) / 1.0e6,
+                  " mod=", Float64(_t_await - _t_blk0) / 1.0e6,
+                  " modvecs=", Float64(_t_mv - _t_await) / 1.0e6,
+                  " weights=", Float64(_t_w - _t_mv) / 1.0e6,
+                  " blockfwd=", Float64(_t_fwd - _t_w) / 1.0e6, "ms")
         if save_acts:
             block_saved.append(fwd.saved.copy())
         block_modvecs.append(mv.copy())

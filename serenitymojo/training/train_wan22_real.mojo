@@ -1505,6 +1505,10 @@ def main() raises:
     # Device modvec builder: replaces a pure-CPU broadcast-add loop measured at
     # 2.586 s/step (32% of the step). BIT-EQUAL (same F32 adds, on GPU).
     var use_device_modvecs = use_devpath
+    # WAN22_PHASE_TIMERS=1: per-step wall-clock split (data / forward / backward+opt).
+    # nsys CPU sampling is unavailable on this box, so this is how host time is
+    # localized. Prints only; no effect on the computation.
+    var phase_timers = _env_is_set(String("WAN22_PHASE_TIMERS"))
     var n_adapters = wan22_total_adapters(lora)
     var dev_state = lora_adamw_plain_device_state_init(lora.ad, 0, n_adapters, ctx)
     if use_graph:
@@ -1610,6 +1614,7 @@ def main() raises:
         var t_model = t * Float32(1000.0) + Float32(1.0)
 
         # Feed the ACTIVE expert's (base, loader) into the SHARED LoRA engine.
+        var t_data_done = perf_counter_ns()
         var fwd: Wan22StackForward
         if use_high:
             fwd = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
@@ -1628,6 +1633,7 @@ def main() raises:
                 use_device_modvecs,
             )
 
+        var t_fwd_done = perf_counter_ns()
         # plain per-element MSE then mean; d_out = 2*(pred-target)/N (weighting None).
         var nout = len(fwd.out)
         var loss = Float32(0.0)
@@ -1701,6 +1707,11 @@ def main() raises:
                                   beta1, beta2, opt_eps, weight_decay)
             if grads.nonfinite_lora_grads != 0:
                 print("  !! nonfinite lora grads =", grads.nonfinite_lora_grads)
+        var t_bwd_done = perf_counter_ns()
+        if phase_timers:
+            print("  [phase] data=", Float64(t_data_done - t0) / 1.0e9,
+                  " fwd=", Float64(t_fwd_done - t_data_done) / 1.0e9,
+                  " bwd+opt=", Float64(t_bwd_done - t_fwd_done) / 1.0e9, "s")
         var secs = Float64(perf_counter_ns() - t0) / 1.0e9
         var expert = String("HIGH") if use_high else String("LOW ")
         print(step, " ", expert, " ", t, "  ", loss, "  ", gn, "  ", secs)

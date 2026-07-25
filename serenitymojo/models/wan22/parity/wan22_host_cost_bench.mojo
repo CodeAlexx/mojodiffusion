@@ -27,6 +27,9 @@ from std.collections import List
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.models.wan22.wan22_block import _t16, _expand_rope_per_head
+from serenitymojo.models.klein.lora_block import lora_adapter_to_device
+from serenitymojo.training.train_step import LoraAdapter
 
 comptime S = 256
 comptime DIM = 5120
@@ -95,6 +98,53 @@ def main() raises:
     print("B) to_host[S,dim] x40 =", ms_b, "ms   per-call=", ms_b / 40.0,
           "ms   [warm_len=", len(wh), " n=", n, "]")
 
+    # ── C) _t16: List[Float32] -> BF16 device (every modvec/mod tensor upload) ──
+    var lst = _randn(S * DIM, 11)
+    var wt = _t16(lst, [S, DIM], ctx)
+    ctx.synchronize()
+    var t2 = perf_counter_ns()
+    for _ in range(40):
+        var tt = _t16(lst, [S, DIM], ctx)
+        n += Int(tt.numel() > 0)
+    ctx.synchronize()
+    var ms_c = Float64(perf_counter_ns() - t2) / 1.0e6
+    print("C) _t16[S,dim] F32list->BF16dev x40 =", ms_c, "ms  per-call=", ms_c / 40.0,
+          "ms   [warm=", wt.numel(), "]")
+
+    # ── D) _expand_rope_per_head at real dims (2 per block: cos + sin) ──
+    var tbl = Tensor.from_host(_randn(S * 64, 12), [S, 64], STDtype.F32, ctx)
+    var we = _expand_rope_per_head(tbl, S, 40, 64, ctx)
+    ctx.synchronize()
+    var t3 = perf_counter_ns()
+    for _ in range(80):          # 2 per block x 40 blocks = one step
+        var e = _expand_rope_per_head(tbl, S, 40, 64, ctx)
+        n += Int(e.numel() > 0)
+    ctx.synchronize()
+    var ms_d = Float64(perf_counter_ns() - t3) / 1.0e6
+    print("D) _expand_rope_per_head x80 (one step) =", ms_d, "ms  per-call=",
+          ms_d / 80.0, "ms   [warm=", we.numel(), "]")
+
+    # ── E) lora_adapter_to_device (400/step: 10 proj x 40 blocks) ──
+    var zr = List[Float32]()
+    for _ in range(16 * DIM):
+        zr.append(0.0)
+    var ad = LoraAdapter(_randn(16 * DIM, 13), _randn(DIM * 16, 14), 16, DIM, DIM,
+                         Float32(1.0), zr.copy(), zr.copy(), zr.copy(), zr.copy())
+    var wd2 = lora_adapter_to_device(ad, ctx)
+    ctx.synchronize()
+    var t4 = perf_counter_ns()
+    for _ in range(400):
+        var d2 = lora_adapter_to_device(ad, ctx)
+        n += Int(d2.rank > 0)
+    ctx.synchronize()
+    var ms_e = Float64(perf_counter_ns() - t4) / 1.0e6
+    print("E) lora_adapter_to_device x400 (one step) =", ms_e, "ms  per-call=",
+          ms_e / 400.0, "ms   [warm rank=", wd2.rank, "]")
+
     print("")
-    print("Step budget check: measured step = 8.1 s, of which nsys attributes")
-    print("~1.3 s CUDA API + ~0.7 s GPU. A) above is the per-step modvec cost.")
+    print("Step is now 5.638 s: nsys attributes ~1.34 s CUDA API + ~0.70 s GPU,")
+    print("leaving ~3.6 s/step unaccounted host. Per-step totals above:")
+    print("  C x (12 per block x 40) =", ms_c / 40.0 * 480.0 / 1000.0, "s   (6 fwd + 6 graph)")
+    print("  D (one step)            =", ms_d / 1000.0, "s")
+    print("  E (one step)            =", ms_e / 1000.0, "s")
+    print("  _ = ", n)

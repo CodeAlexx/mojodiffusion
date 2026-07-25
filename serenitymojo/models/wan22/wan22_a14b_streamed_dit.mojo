@@ -21,6 +21,7 @@ from serenitymojo.models.dit.wan22_dit import (
     wan22_mod_pre,
 )
 from serenitymojo.models.wan22.wan22_fp8_stream import Wan22A14BFP8Stream
+from serenitymojo.lora import LoraSet
 from serenitymojo.ops.activations import gelu, silu
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.embeddings import timestep_embedding
@@ -46,6 +47,10 @@ struct Wan22A14BStreamedDiT(Movable):
     var weights: Dict[String, TArc]
     var stream: Wan22A14BFP8Stream
     var config: Wan22Config
+    # Optional trained-LoRA overlay, applied per block right after the E4M3
+    # dequant (see `_apply_block_lora`). None = the plain base model.
+    var lora: Optional[LoraSet]
+    var lora_mult: Float32
 
     @staticmethod
     def open(cache_dir: String, ctx: DeviceContext) raises -> Wan22A14BStreamedDiT:
@@ -59,6 +64,64 @@ struct Wan22A14BStreamedDiT(Movable):
         self.weights = weights^
         self.stream = stream^
         self.config = Wan22Config.t2v_a14b()
+        self.lora = Optional[LoraSet](None)
+        self.lora_mult = Float32(1.0)
+
+    def set_lora(mut self, var lora: LoraSet, multiplier: Float32) raises:
+        """Attach a trained LoRA (the trainer's `diffusion_model.…lora_A/lora_B`
+        artifact, loaded with `LoraSet.load`) to every block forward.
+
+        Fail-loud on a LoRA that matches nothing: a silently-inert overlay renders
+        the BASE model and looks like "the LoRA did not train", which is the single
+        most expensive way for this to go wrong."""
+        var hits = 0
+        for ref m in lora.mappings:
+            if m.base_key.startswith(String("blocks.")):
+                hits += 1
+        if hits == 0:
+            raise Error(
+                String("Wan22A14BStreamedDiT.set_lora: none of the ")
+                + String(len(lora.mappings))
+                + " LoRA modules target a `blocks.N.…` key — wrong model or wrong"
+                " key format (expected the wan22 trainer's diffusion_model.blocks.*)"
+            )
+        print("[lora] attached", hits, "wan22 block modules (multiplier",
+              multiplier, ", format", lora.format_name(), ")")
+        self.lora = Optional[LoraSet](lora^)
+        self.lora_mult = multiplier
+
+    def _apply_block_lora(
+        self, mut block: Dict[String, TArc], bi: Int, ctx: DeviceContext,
+    ) raises -> Int:
+        """Fold this block's LoRA deltas into the freshly dequantized BF16 weights.
+
+        The seam matters: `load_block_bf16` hands back block-LOCAL keys
+        (`self_attn.q.weight`) while `LoraSet` mappings carry FULL keys
+        (`blocks.7.self_attn.q.weight`), so we strip `blocks.{bi}.` here. This is the
+        krea2 `_blk_w8` pattern (models/dit/krea2_dit.mojo:1822) — overlay AFTER the
+        E4M3 dequant, never on the fp8 bytes.
+
+        Merge form (materialize [out,in] and add) rather than krea2's low-rank side
+        cache: at rank 16 the delta is built once per block per step and the block is
+        already resident in BF16, so this keeps the change to one place. If sampling
+        turns out to be too slow, `build_krea2_lora_side_cache` is the faster shape."""
+        if not self.lora:
+            return 0
+        ref ls = self.lora.value()
+        var prefix = String("blocks.") + String(bi) + String(".")
+        var applied = 0
+        for ref m in ls.mappings:
+            if not m.base_key.startswith(prefix):
+                continue
+            var local = String(m.base_key.removeprefix(prefix))
+            if local not in block:
+                continue
+            ref w = block[local][]
+            var scale = ls._module_scale(m, self.lora_mult, ctx)
+            var delta = ls._compute_delta(m, scale, w.dtype(), ctx)
+            block[local] = TArc(add(w, delta, ctx))
+            applied += 1
+        return applied
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         if name not in self.weights:
@@ -203,8 +266,12 @@ struct Wan22A14BStreamedDiT(Movable):
             FG, HG, WG, DH, cfg.rope_theta, dtype, ctx
         )
 
+        var lora_applied = 0
         for bi in range(cfg.num_layers):
             var block = self.stream.load_block_bf16(bi, ctx)
+            # LoRA overlay on the dequantized block, BEFORE either forward — both
+            # the cond and uncond pass must see the same adapted weights.
+            lora_applied += self._apply_block_lora(block, bi, ctx)
             img_cond = wan22_block_forward[S, TXT, H, DH](
                 img_cond, time[0], text_cond, rope[0], rope[1], block, cfg, ctx,
                 cond_valid,
@@ -212,6 +279,13 @@ struct Wan22A14BStreamedDiT(Movable):
             img_uncond = wan22_block_forward[S, TXT, H, DH](
                 img_uncond, time[0], text_uncond, rope[0], rope[1], block, cfg, ctx,
                 uncond_valid,
+            )
+
+        if self.lora and lora_applied == 0:
+            raise Error(
+                "Wan22A14BStreamedDiT: a LoRA is attached but ZERO modules matched"
+                " any streamed block weight — the render would silently be the base"
+                " model. Check the key namespace of the LoRA file."
             )
 
         var cond = self._head[FG, HG, WG, S](

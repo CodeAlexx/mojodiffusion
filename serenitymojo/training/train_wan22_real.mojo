@@ -1801,13 +1801,22 @@ def main() raises:
                     base, loader, lora, cos.copy(), sin.copy(), fwd,
                     DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
                 )
-            # dev_p IS the live param on this path, so it must be synced back to
-            # lora.ad on any step whose weights get written out — the last step and
-            # every checkpoint step. Without this a mid-run checkpoint would save
-            # stale host weights.
-            var sync_now = (step == steps - 1) or (
-                save_every > 0 and (step + 1) % save_every == 0
-            )
+            # ⚠ MUST BE EVERY STEP — this is a CORRECTNESS requirement, not a save
+            # cadence. The forward reads the HOST adapters: the stack does
+            # `_wan_block_lora_for(lora, bi)` -> `lora.ad[...]` (wan22_stack_lora.mojo:296)
+            # and `lora_adapter_to_device` uploads those host values
+            # (klein/lora_block.mojo:84). The resident AdamW only writes dev_p and
+            # touches lora.ad when this flag is set, so syncing on a cadence means the
+            # forward trains against a LoRA frozen at its last sync.
+            #
+            # MEASURED with the old `step == steps - 1`: over 500 steps the loss was
+            # DEAD FLAT (mean 2.146 / 2.221 / 2.160 / 2.140 / 2.147 per 100-step
+            # window) and grad_norm sat at ~0.02 — because B starts at 0, so an
+            # un-synced LoRA contributes exactly nothing and the model is the frozen
+            # base. At the first sync grad_norm jumped 0.018 -> 4.46 and the loss
+            # finally moved (1.859, then 1.803). The optimizer was working the whole
+            # time; the forward just never saw it.
+            var sync_now = True
             gn = fused_lora_adamw_plain_step_resident_device_grads(
                 dev_state, lora.ad, dgrads.grad_indices, dgrads.d_a, dgrads.d_b,
                 step + 1, lr, beta1, beta2, opt_eps, weight_decay, ctx,

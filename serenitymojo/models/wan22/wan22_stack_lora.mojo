@@ -524,6 +524,37 @@ def _block_modvecs_dev(
     )
 
 
+def _block_modvecs_dev16(
+    e0_t: Tensor, bmod_t: Tensor, S: Int, dim: Int, ctx: DeviceContext,
+) raises -> WanModVecs:
+    """FULLY-DEVICE modvec builder — the vectors never touch host memory.
+
+    `_block_modvecs_dev` (above) already does the arithmetic on GPU but then
+    `to_host`s all six, and every consumer immediately re-uploads them as BF16
+    (`_t16`). This builds the same six vectors and hands them back AS BF16 device
+    tensors (`WanModVecs` device mode), so both the readback and the re-upload are
+    gone. Measured at the real dims
+    (models/wan22/parity/wan22_modvecs_split_bench.mojo, S=256/dim=5120/40 blocks):
+    readback 0.211 s/step + 0.101 s/step per consumer pass, against 0.011 s/step
+    for the add+slices that remain. The forward and the graph recompute are both
+    consumers, so this is ~0.41 s of a 2.05 s step.
+
+    BIT-EQUAL to the host-mode path: identical F32 broadcast add (IEEE add is
+    deterministic elementwise), then the SAME `.cast[bfloat16]()` rounding that
+    `Tensor.from_host(..., BF16)` applies per element in `_t16` — only WHERE it
+    runs differs. The cast is done ONCE on the whole [S,6,dim] before slicing
+    (one kernel instead of six; elementwise, so slicing order is irrelevant).
+    Gated in `models/wan22/parity/wan22_modvecs_dev_parity.mojo`."""
+    var e_all = add(e0_t, bmod_t, ctx)                    # [S,6,dim] F32
+    var e16 = cast_tensor(e_all, STDtype.BF16, ctx)       # [S,6,dim] BF16
+    var dev = List[TArc]()
+    for j in range(6):
+        var sl = slice(e16, 1, j, 1, ctx)                 # [S,1,dim]
+        dev.append(TArc(reshape(sl, [S, dim], ctx)))
+    # oracle field order: shift_sa, scale_sa, gate_sa, shift_ffn, scale_ffn, gate_ffn
+    return WanModVecs(dev^)
+
+
 def _block_modvecs(
     e0_flat: List[Float32], block_mod_h: List[Float32],
     bi: Int, S: Int, dim: Int,
@@ -814,8 +845,14 @@ def wan22_stack_lora_forward_offload[
     device_lora: Bool = False,
     batched_cross: Bool = False,
     device_modvecs: Bool = False,
+    device_modvecs_t: Bool = False,
 ) raises -> Wan22StackForward:
-    """`save_acts=False` omits the per-block save-all HOST activation tape
+    """`device_modvecs_t=True` (implies `device_modvecs`) keeps the six AdaLN
+    vectors as BF16 DEVICE tensors for their whole life instead of reading them
+    back and letting each consumer re-upload them — see `_block_modvecs_dev16`.
+    Default False = the host-list representation, byte-identical (C13).
+
+    `save_acts=False` omits the per-block save-all HOST activation tape
     (`block_saved`). ONLY the host offload backward (this file, `…_backward_offload`)
     reads it; the devnative and autograd_v2 graph drivers RECOMPUTE each block from
     `block_inputs`, so for them the tape is ~5.5 GB/step of host list traffic
@@ -866,7 +903,11 @@ def wan22_stack_lora_forward_offload[
         # broadcast-add loop measured at 64.66 ms/block = 2.586 s/step (32% of the
         # step); the device builder is the same arithmetic on GPU, bit-equal.
         var mv: WanModVecs
-        if device_modvecs:
+        if device_modvecs_t:
+            mv = _block_modvecs_dev16(
+                e0_t, reshape(block_mod_t, [1, 6, dim], ctx), S, dim, ctx,
+            )
+        elif device_modvecs:
             mv = _block_modvecs_dev(
                 e0_t, reshape(block_mod_t, [1, 6, dim], ctx), S, dim, ctx,
             )

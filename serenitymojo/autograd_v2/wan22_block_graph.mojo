@@ -48,7 +48,8 @@ from serenitymojo.autograd_v2.ops_record import (
 )
 from serenitymojo.models.wan22.wan22_block import (
     WanModVecs, WanBlockWeights, WanBlockLora, _ta16, _ones, _zeros,
-    _expand_rope_per_head,
+    _expand_rope_per_head, _mv16,
+    MV_SHIFT_SA, MV_SCALE_SA, MV_GATE_SA, MV_SHIFT_FFN, MV_SCALE_FFN, MV_GATE_FFN,
 )
 from serenitymojo.models.klein.lora_block import LoraAdapter
 
@@ -112,9 +113,9 @@ def wan22_ffn_section_graph_backward[
     _ = g.leaf(b2)
 
     # AdaLN mod vectors + no-affine LN gamma/beta (the oracle's per-token tensors).
-    var scale_ffn = _ta16(mv.scale_ffn.copy(), [S, DIM], ctx)
-    var shift_ffn = _ta16(mv.shift_ffn.copy(), [S, DIM], ctx)
-    var gate_ffn = _ta16(mv.gate_ffn.copy(), [S, DIM], ctx)
+    var scale_ffn = _mv16(mv, MV_SCALE_FFN, [S, DIM], ctx)
+    var shift_ffn = _mv16(mv, MV_SHIFT_FFN, [S, DIM], ctx)
+    var gate_ffn = _mv16(mv, MV_GATE_FFN, [S, DIM], ctx)
     var ones = _ta16(_ones(DIM), [DIM], ctx)
     var zeros = _ta16(_zeros(DIM), [DIM], ctx)
 
@@ -249,12 +250,12 @@ def wan22_block_lora_graph_backward[
         b_ids.append(g.fresh_tensor_id())
 
     # frozen per-token AdaLN vectors + the no-affine LN gamma/beta
-    var shift_sa = _ta16(mv.shift_sa, [S, dim], ctx)
-    var scale_sa = _ta16(mv.scale_sa, [S, dim], ctx)
-    var gate_sa = _ta16(mv.gate_sa, [S, dim], ctx)
-    var shift_ffn = _ta16(mv.shift_ffn, [S, dim], ctx)
-    var scale_ffn = _ta16(mv.scale_ffn, [S, dim], ctx)
-    var gate_ffn = _ta16(mv.gate_ffn, [S, dim], ctx)
+    var shift_sa = _mv16(mv, MV_SHIFT_SA, [S, dim], ctx)
+    var scale_sa = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
+    var gate_sa = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
+    var shift_ffn = _mv16(mv, MV_SHIFT_FFN, [S, dim], ctx)
+    var scale_ffn = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
+    var gate_ffn = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
     var ones = _ta16(_ones(dim), [dim], ctx)
     var zeros = _ta16(_zeros(dim), [dim], ctx)
 

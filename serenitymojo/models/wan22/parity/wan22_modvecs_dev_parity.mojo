@@ -27,9 +27,10 @@ from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.tensor_algebra import reshape
-from serenitymojo.models.wan22.wan22_block import WanModVecs
+from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.models.wan22.wan22_block import WanModVecs, _t16
 from serenitymojo.models.wan22.wan22_stack_lora import (
-    _block_modvecs, _block_modvecs_dev,
+    _block_modvecs, _block_modvecs_dev, _block_modvecs_dev16,
 )
 
 comptime S = 256
@@ -87,6 +88,31 @@ def main() raises:
         if dev.shift_sa[i] != 0.0:
             nz += 1
     print("teeth: shift_sa nonzero=", nz, "/", len(dev.shift_sa), " (must be > 0)")
+
+    # ── device-mode (BF16 tensors, `_block_modvecs_dev16`) vs what the consumers
+    # upload today (`_t16` of the host list) ──
+    # This is the gate for the "hold the modvecs as device tensors" path. It is NOT
+    # a CPU-vs-GPU numerics claim: both sides apply the SAME `.cast[bfloat16]()` to
+    # the SAME F32 values, one in `Tensor.from_host`'s pack loop and one in the
+    # cast kernel, so anything but n_mismatch=0 is a real bug (wrong slice mapping,
+    # wrong order, or a cast that is not round-to-nearest-even on one side).
+    # Compared as F32-widened BF16 so the check sees the stored bf16 bits exactly.
+    var dev16 = _block_modvecs_dev16(e0_t, bmod_t, S, DIM, ctx)
+    if not dev16.on_device():
+        raise Error("dev16 builder did not return device mode")
+    var names = ["shift_sa", "scale_sa", "gate_sa", "shift_ffn", "scale_ffn", "gate_ffn"]
+    var nz16 = 0
+    for j in range(6):
+        var want = cast_tensor(_t16(host.host_vec(j), [S, DIM], ctx), STDtype.F32, ctx).to_host(ctx)
+        var got = cast_tensor(dev16.dev[j][], STDtype.F32, ctx).to_host(ctx)
+        _cmp(String("bf16 dev vs _t16: ") + names[j], got, want, allok)
+        if j == 0:
+            for i in range(len(got)):
+                if got[i] != 0.0:
+                    nz16 += 1
+    print("teeth: bf16 shift_sa nonzero=", nz16, "/", S * DIM, " (must be > 0)")
+    if nz16 == 0:
+        allok = False
 
     # ── timing: one step's worth (40 blocks) each ──
     var t0 = perf_counter_ns()

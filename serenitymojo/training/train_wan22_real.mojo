@@ -1578,6 +1578,14 @@ def main() raises:
     # Device modvec builder: replaces a pure-CPU broadcast-add loop measured at
     # 2.586 s/step (32% of the step). BIT-EQUAL (same F32 adds, on GPU).
     var use_device_modvecs = use_devpath
+    # WAN22_DEV_MODVECS16=1: keep the six AdaLN vectors as BF16 DEVICE tensors for
+    # their whole life instead of reading them back and re-uploading them in every
+    # consumer. Benched (wan22_modvecs_split_bench.mojo) at 0.211 s/step of readback
+    # + 0.101 s/step per consumer pass (forward AND graph recompute both consume)
+    # against 0.011 s/step of actual arithmetic. BIT-EQUAL — same broadcast add,
+    # same `.cast[bfloat16]()`. Opt-in so the two representations can be A/B'd on
+    # the same build; requires a device path (the host offload backward is untouched).
+    var use_device_modvecs_t = use_devpath and _env_is_set(String("WAN22_DEV_MODVECS16"))
     # WAN22_PHASE_TIMERS=1: per-step wall-clock split (data / forward / backward+opt).
     # nsys CPU sampling is unavailable on this box, so this is how host time is
     # localized. Prints only; no effect on the computation.
@@ -1695,7 +1703,7 @@ def main() raises:
                 high_base, loader_high, lora, cos.copy(), sin.copy(),
                 DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
                 save_block_acts, use_device_lora, use_batched_cross,
-                use_device_modvecs,
+                use_device_modvecs, use_device_modvecs_t,
             )
         else:
             fwd = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
@@ -1703,7 +1711,7 @@ def main() raises:
                 base, loader, lora, cos.copy(), sin.copy(),
                 DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
                 save_block_acts, use_device_lora, use_batched_cross,
-                use_device_modvecs,
+                use_device_modvecs, use_device_modvecs_t,
             )
 
         var t_fwd_done = perf_counter_ns()

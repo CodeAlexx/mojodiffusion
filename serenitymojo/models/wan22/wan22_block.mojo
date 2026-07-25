@@ -210,6 +210,27 @@ def wan_gate_residual_backward(
 # ── per-token AdaLN modulation vectors (each [S,dim] FLAT host list, S*dim) ───
 # order matches model.py chunk(6): shift_sa, scale_sa, gate_sa, shift_ffn,
 # scale_ffn, gate_ffn.
+#
+# TWO REPRESENTATIONS, one struct. HOST mode (`dev` empty) is the original: six
+# F32 host lists that every consumer immediately uploads as BF16 via `_t16`.
+# DEVICE mode (`dev` = 6 BF16 [S,dim] TArc, host lists left EMPTY) skips that
+# round trip entirely — see `_block_modvecs_dev16` (wan22_stack_lora.mojo) and
+# `_mv16` below. Consumers never branch: they all go through `_mv16`.
+#
+# WHY: measured at the real dims (models/wan22/parity/wan22_modvecs_split_bench.mojo,
+# S=256/dim=5120/40 blocks) the arithmetic is only 0.011 s/step, but the six
+# `to_host` calls cost **0.211 s/step** and each consumer pass then pays
+# **0.101 s/step** to re-upload — with the forward and the graph recompute both
+# consuming, ~0.41 s of a 2.05 s step was spent marshalling a value that is born
+# on device and dies on device. See memory `no-cpu-compute`.
+comptime MV_SHIFT_SA = 0
+comptime MV_SCALE_SA = 1
+comptime MV_GATE_SA = 2
+comptime MV_SHIFT_FFN = 3
+comptime MV_SCALE_FFN = 4
+comptime MV_GATE_FFN = 5
+
+
 struct WanModVecs(Copyable, Movable):
     var shift_sa: List[Float32]
     var scale_sa: List[Float32]
@@ -217,6 +238,8 @@ struct WanModVecs(Copyable, Movable):
     var shift_ffn: List[Float32]
     var scale_ffn: List[Float32]
     var gate_ffn: List[Float32]
+    # DEVICE mode: 6 BF16 [S,dim] tensors in MV_* order, or empty for HOST mode.
+    var dev: List[TArc]
 
     def __init__(
         out self,
@@ -229,6 +252,54 @@ struct WanModVecs(Copyable, Movable):
         self.shift_ffn = shift_ffn^
         self.scale_ffn = scale_ffn^
         self.gate_ffn = gate_ffn^
+        self.dev = List[TArc]()
+
+    def __init__(out self, var dev: List[TArc]) raises:
+        """DEVICE mode. `dev` must hold exactly 6 BF16 [S,dim] tensors in MV_* order;
+        the host lists stay empty and MUST NOT be read (use `_mv16`)."""
+        if len(dev) != 6:
+            raise Error(
+                String("WanModVecs(device): expected 6 vectors, got ") + String(len(dev))
+            )
+        self.shift_sa = List[Float32]()
+        self.scale_sa = List[Float32]()
+        self.gate_sa = List[Float32]()
+        self.shift_ffn = List[Float32]()
+        self.scale_ffn = List[Float32]()
+        self.gate_ffn = List[Float32]()
+        self.dev = dev^
+
+    def on_device(self) -> Bool:
+        return len(self.dev) == 6
+
+    def host_vec(self, i: Int) raises -> List[Float32]:
+        """The i-th vector as a host list — HOST mode only (device mode raises)."""
+        if i == MV_SHIFT_SA:
+            return self.shift_sa.copy()
+        if i == MV_SCALE_SA:
+            return self.scale_sa.copy()
+        if i == MV_GATE_SA:
+            return self.gate_sa.copy()
+        if i == MV_SHIFT_FFN:
+            return self.shift_ffn.copy()
+        if i == MV_SCALE_FFN:
+            return self.scale_ffn.copy()
+        if i == MV_GATE_FFN:
+            return self.gate_ffn.copy()
+        raise Error(String("WanModVecs.host_vec: bad index ") + String(i))
+
+
+# The ONE accessor every consumer uses for a modulation vector. DEVICE mode hands
+# back the tensor that is already there; HOST mode does exactly what the old
+# `_t16(mv.<field>.copy(), [S,dim], ctx)` did, so both modes are byte-identical
+# (the BF16 rounding is the same `.cast[bfloat16]()` either way — gated in
+# models/wan22/parity/wan22_modvecs_dev_parity.mojo).
+def _mv16(
+    mv: WanModVecs, i: Int, var shape: List[Int], ctx: DeviceContext
+) raises -> TArc:
+    if mv.on_device():
+        return mv.dev[i]
+    return TArc(_t16(mv.host_vec(i), shape^, ctx))
 
 
 # ── block trainable weights (DEVICE-RESIDENT TArc, uploaded ONCE) ─────────────
@@ -502,19 +573,19 @@ def wan22_block_forward[
     var context = _ta16(context_h, [TXT, dim], ctx)
 
     # per-token AdaLN vectors as bf16 device tensors [S,dim]
-    var shift_sa = _t16(mv.shift_sa.copy(), [S, dim], ctx)
-    var scale_sa = _t16(mv.scale_sa.copy(), [S, dim], ctx)
-    var gate_sa = _t16(mv.gate_sa.copy(), [S, dim], ctx)
-    var shift_ffn = _t16(mv.shift_ffn.copy(), [S, dim], ctx)
-    var scale_ffn = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
-    var gate_ffn = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var shift_sa = _mv16(mv, MV_SHIFT_SA, [S, dim], ctx)
+    var scale_sa = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
+    var gate_sa = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
+    var shift_ffn = _mv16(mv, MV_SHIFT_FFN, [S, dim], ctx)
+    var scale_ffn = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
+    var gate_ffn = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
 
     # rope tables: cast to bf16 so rope_interleaved runs on bf16 q/k.
     var cos16 = cast_tensor(cos, STDtype.BF16, ctx)
     var sin16 = cast_tensor(sin, STDtype.BF16, ctx)
 
     # ── self-attention ──
-    var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
+    var sa_mp = wan_mod_pre(x[], scale_sa[], shift_sa[], ones_t, zeros_t, eps, ctx)
     var q_flat = linear(sa_mp.o[], w.sa_wq[], Optional[Tensor](_clone_t(w.sa_bq[], ctx)), ctx)
     var k_flat = linear(sa_mp.o[], w.sa_wk[], Optional[Tensor](_clone_t(w.sa_bk[], ctx)), ctx)
     var v_flat = linear(sa_mp.o[], w.sa_wv[], Optional[Tensor](_clone_t(w.sa_bv[], ctx)), ctx)
@@ -532,7 +603,7 @@ def wan22_block_forward[
     var att4 = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v4, scale, ctx)
     var sa_att = _from_bshd(att4^, S, dim, ctx)
     var sa_out = linear(sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
-    var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
+    var x_sa = wan_gated_residual(x[], sa_out, gate_sa[], ctx)
 
     # ── cross-attention (to text, distinct q-len S vs kv-len TXT) ──
     var n3 = layer_norm(x_sa, w.n3_w[], w.n3_b[], eps, ctx)
@@ -552,11 +623,11 @@ def wan22_block_forward[
     var x_ca = add(x_sa, ca_out, ctx)            # UNGATED residual
 
     # ── FFN ──
-    var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
+    var ffn_mp = wan_mod_pre(x_ca, scale_ffn[], shift_ffn[], ones_t, zeros_t, eps, ctx)
     var ffn_h = linear(ffn_mp.o[], w.ffn0_w[], Optional[Tensor](_clone_t(w.ffn0_b[], ctx)), ctx)
     var ffn_act = gelu(ffn_h, ctx)
     var ffn_out = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
+    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn[], ctx)
 
     var x_out = x_final.to_host(ctx)
     var saved = WanSaved(
@@ -729,12 +800,12 @@ def wan22_block_backward[
 
     # ════════════════ FFN backward ════════════════
     # x_final = x_ca + gate_ffn * ffn_out   (per-token gated residual)
-    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var gate_ffn_t = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
     # d_gate_ffn = go*ffn_out, d_y(=d_ffn_out)=go*gate_ffn, d_x(branch to x_ca)=go.
     # ffn_out is not saved -> recompute ffn_out = linear(ffn_act, ffn2_w)+ffn2_b.
     var sv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
     var ffn_out_rc = linear(sv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t[], ctx)
     var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))  # branch into x_ca via residual
 
@@ -754,9 +825,9 @@ def wan22_block_backward[
     var d_ffn0_b = lb_ffn0.d_b.to_host(ctx)
 
     # ffn_in = mod_pre(x_ca): ffn_in = ffn_ln*(1+scale_ffn)+shift_ffn
-    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var scale_ffn_t = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
     var sv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
-    var mb_ffn = wan_modulate_backward(lb_ffn0.d_x, sv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(lb_ffn0.d_x, sv_ffn_ln, scale_ffn_t[], ctx)
     var d_scale_ffn = mb_ffn.d_scale.to_host(ctx)
     var d_shift_ffn = mb_ffn.d_shift.to_host(ctx)
 
@@ -819,10 +890,10 @@ def wan22_block_backward[
 
     # ════════════════ Self-attention backward ════════════════
     # x_sa = x + gate_sa * sa_out  (per-token gated residual)
-    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var gate_sa_t = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
     var sv_sa_att = _tbf16(saved.sa_att.copy(), [S, dim], ctx)
     var sa_out_rc = linear(sv_sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
-    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t[], ctx)
     var d_gate_sa = gb_sa.d_gate.to_host(ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))   # branch into block input x
 
@@ -875,9 +946,9 @@ def wan22_block_backward[
     var d_sa_in = TArc(add(add(lb_saq.d_x, lb_sak.d_x, ctx), lb_sav.d_x, ctx))
 
     # sa_in = mod_pre(x): sa_in = sa_ln*(1+scale_sa)+shift_sa
-    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var scale_sa_t = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
     var sv_sa_ln = _tbf16(saved.sa_ln.copy(), [S, dim], ctx)
-    var mb_sa = wan_modulate_backward(d_sa_in[], sv_sa_ln, scale_sa_t, ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], sv_sa_ln, scale_sa_t[], ctx)
     var d_scale_sa = mb_sa.d_scale.to_host(ctx)
     var d_shift_sa = mb_sa.d_shift.to_host(ctx)
 
@@ -1522,18 +1593,18 @@ def wan22_block_lora_forward[
     var context = _ta16(context_h, [TXT, dim], ctx)
     var context_host = context_h.copy()
 
-    var shift_sa = _t16(mv.shift_sa.copy(), [S, dim], ctx)
-    var scale_sa = _t16(mv.scale_sa.copy(), [S, dim], ctx)
-    var gate_sa = _t16(mv.gate_sa.copy(), [S, dim], ctx)
-    var shift_ffn = _t16(mv.shift_ffn.copy(), [S, dim], ctx)
-    var scale_ffn = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
-    var gate_ffn = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var shift_sa = _mv16(mv, MV_SHIFT_SA, [S, dim], ctx)
+    var scale_sa = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
+    var gate_sa = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
+    var shift_ffn = _mv16(mv, MV_SHIFT_FFN, [S, dim], ctx)
+    var scale_ffn = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
+    var gate_ffn = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
 
     var cos16 = cast_tensor(cos, STDtype.BF16, ctx)
     var sin16 = cast_tensor(sin, STDtype.BF16, ctx)
 
     # ── self-attention (LoRA on q/k/v/o) ──
-    var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
+    var sa_mp = wan_mod_pre(x[], scale_sa[], shift_sa[], ones_t, zeros_t, eps, ctx)
     # host readback ONLY needed by the host LoRA path (device_lora=False).
     var sa_in_h = List[Float32]()
     if not device_lora:
@@ -1562,7 +1633,7 @@ def wan22_block_lora_forward[
         sa_att_h = sa_att.to_host(ctx)
     var sa_out_base = linear(sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
     var sa_out = _add_lora_delta_dev(sa_out_base, sa_att, lora.sa_o, S, ctx) if device_lora else _add_lora_delta(sa_out_base, sa_att_h, lora.sa_o, S, ctx)
-    var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
+    var x_sa = wan_gated_residual(x[], sa_out, gate_sa[], ctx)
 
     # ── cross-attention (LoRA on q/k/v/o) ──
     var n3 = layer_norm(x_sa, w.n3_w[], w.n3_b[], eps, ctx)
@@ -1600,7 +1671,7 @@ def wan22_block_lora_forward[
     # ── FFN (LoRA on ffn.0 / ffn.2) ──
     # ffn.0 LoRA input = post-modulation FFN input (ffn_mp.o) [S,dim]; out [S,ffn].
     # ffn.2 LoRA input = GELU output (ffn_act) [S,ffn]; out [S,dim].
-    var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
+    var ffn_mp = wan_mod_pre(x_ca, scale_ffn[], shift_ffn[], ones_t, zeros_t, eps, ctx)
     var ffn_in_h = List[Float32]()
     if not device_lora:
         ffn_in_h = ffn_mp.o[].to_host(ctx)
@@ -1612,7 +1683,7 @@ def wan22_block_lora_forward[
         ffn_act_h = ffn_act.to_host(ctx)
     var ffn_out_base = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
     var ffn_out = _add_lora_delta_dev(ffn_out_base, ffn_act, lora.ffn2, S, ctx) if device_lora else _add_lora_delta(ffn_out_base, ffn_act_h, lora.ffn2, S, ctx)
-    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
+    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn[], ctx)
 
     var x_out = x_final.to_host(ctx)
     # save_acts=False: the caller is a RECOMPUTE backward driver (devnative /
@@ -1692,13 +1763,13 @@ def wan22_block_lora_backward[
     var d_out = _ta16(d_out_h, [S, dim], ctx)
 
     # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
-    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var gate_ffn_t = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
     var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
     var ffn_act_h = lsv_ffn_act.to_host(ctx)     # ffn.2 LoRA input [S,ffn]
     # ffn_out base recompute (base-only is fine: d_gate uses the FULL ffn_out but
     # gate_ffn is frozen/discarded; d_y=go*gate and d_x=go don't depend on it).
     var ffn_out_rc = linear(lsv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t[], ctx)
     var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
     # ffn.2: base frozen weight grads (reported) + LoRA d_A/d_B + LoRA d_x fold-in.
@@ -1721,9 +1792,9 @@ def wan22_block_lora_backward[
     var ffn0_g = _lora_bwd_opt(lora.ffn0, d_ffn_h_h, ffn_in_h, S, dim, ctx)
     # ffn_in grad = base(lb_ffn0_dx) + LoRA d_x(ffn0)   [S,dim]
     var d_ffn_in = add(lb_ffn0_dx, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
-    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var scale_ffn_t = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
-    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t[], ctx)
     var d_scale_ffn = mb_ffn.d_scale.to_host(ctx)
     var d_shift_ffn = mb_ffn.d_shift.to_host(ctx)
     var lsv_x_ca = _tbf16(saved.x_ca.copy(), [S, dim], ctx)
@@ -1790,9 +1861,9 @@ def wan22_block_lora_backward[
     var d_x_sa = TArc(add(lnb_n3_dx, d_x_ca[], ctx))
 
     # ════════════════ Self-attention backward (LoRA q/k/v/o) ════════════════
-    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var gate_sa_t = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
     var sa_out_rc = linear(sv_lora_sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
-    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t[], ctx)
     var d_gate_sa = gb_sa.d_gate.to_host(ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
     var d_sa_out_h = gb_sa.d_y.to_host(ctx)
@@ -1850,9 +1921,9 @@ def wan22_block_lora_backward[
     )
     var d_sa_in = TArc(add(d_sa_in_base, d_sa_in_lora, ctx))
 
-    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var scale_sa_t = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
     var lsv_sa_ln = _tbf16(saved.sa_ln.copy(), [S, dim], ctx)
-    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t[], ctx)
     var d_scale_sa = mb_sa.d_scale.to_host(ctx)
     var d_shift_sa = mb_sa.d_shift.to_host(ctx)
     var lsv_x = _tbf16(saved.x.copy(), [S, dim], ctx)
@@ -1918,10 +1989,10 @@ def wan22_block_lora_backward_devnative[
     var sv_lora_ca_att = _tbf16(saved.ca_att.copy(), [S, dim], ctx)
 
     # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
-    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var gate_ffn_t = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
     var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
     var ffn_out_rc = linear(lsv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var gb_ffn2 = wan_gate_residual_backward(d_out, ffn_out_rc, gate_ffn_t, ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out, ffn_out_rc, gate_ffn_t[], ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
     var lb_ffn2_dx = _base_dx(gb_ffn2.d_y, w.ffn2_w[], S, ffn, dim, ctx)
     var ffn2_g = _wan_lora_bwd_device(lora.ffn2, gb_ffn2.d_y, lsv_ffn_act, S, ffn, dim, ctx)
@@ -1932,9 +2003,9 @@ def wan22_block_lora_backward_devnative[
     var lb_ffn0_dx = _base_dx(d_ffn_h, w.ffn0_w[], S, dim, ffn, ctx)
     var ffn0_g = _wan_lora_bwd_device(lora.ffn0, d_ffn_h, lsv_ffn_in, S, dim, ffn, ctx)
     var d_ffn_in = _fold_lora_dx(lb_ffn0_dx, ffn0_g, ctx)
-    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var scale_ffn_t = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
-    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t[], ctx)
     var lsv_x_ca = _tbf16(saved.x_ca.copy(), [S, dim], ctx)
     var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, lsv_x_ca, ones_t, eps, ctx)
     var d_x_ca = TArc(add(d_x_ca_resid[], lnb_ffn, ctx))
@@ -1975,9 +2046,9 @@ def wan22_block_lora_backward_devnative[
     var d_x_sa = TArc(add(lnb_n3_dx, d_x_ca[], ctx))
 
     # ════════════════ Self-attention backward (LoRA q/k/v/o) ════════════════
-    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var gate_sa_t = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
     var sa_out_rc = linear(sv_lora_sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
-    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t[], ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
     var lb_sao_dx = _base_dx(gb_sa.d_y, w.sa_wo[], S, dim, dim, ctx)
     var sa_o_g = _wan_lora_bwd_device(lora.sa_o, gb_sa.d_y, sv_lora_sa_att, S, dim, dim, ctx)
@@ -2014,9 +2085,9 @@ def wan22_block_lora_backward_devnative[
     var d_sa_in_lora = add(add(sa_q_g.d_x[], sa_k_g.d_x[], ctx), sa_v_g.d_x[], ctx)
     var d_sa_in = TArc(add(d_sa_in_base, d_sa_in_lora, ctx))
 
-    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var scale_sa_t = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
     var lsv_sa_ln = _tbf16(saved.sa_ln.copy(), [S, dim], ctx)
-    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t[], ctx)
     var lsv_x = _tbf16(saved.x.copy(), [S, dim], ctx)
     var lnb_sa = layer_norm_backward_dx(mb_sa.d_ln, lsv_x, ones_t, eps, ctx)
     var d_x = add(lnb_sa, d_x_resid[], ctx)
@@ -2057,18 +2128,18 @@ def wan22_block_direct_lycoris_forward[
     var x = _ta16(x_h, [S, dim], ctx)
     var context = _ta16(context_h, [TXT, dim], ctx)
 
-    var shift_sa = _t16(mv.shift_sa.copy(), [S, dim], ctx)
-    var scale_sa = _t16(mv.scale_sa.copy(), [S, dim], ctx)
-    var gate_sa = _t16(mv.gate_sa.copy(), [S, dim], ctx)
-    var shift_ffn = _t16(mv.shift_ffn.copy(), [S, dim], ctx)
-    var scale_ffn = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
-    var gate_ffn = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var shift_sa = _mv16(mv, MV_SHIFT_SA, [S, dim], ctx)
+    var scale_sa = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
+    var gate_sa = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
+    var shift_ffn = _mv16(mv, MV_SHIFT_FFN, [S, dim], ctx)
+    var scale_ffn = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
+    var gate_ffn = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
 
     var cos16 = cast_tensor(cos, STDtype.BF16, ctx)
     var sin16 = cast_tensor(sin, STDtype.BF16, ctx)
 
     # ── self-attention (direct DoRA/OFT on q/k/v/o) ──
-    var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
+    var sa_mp = wan_mod_pre(x[], scale_sa[], shift_sa[], ones_t, zeros_t, eps, ctx)
     var q_flat = _direct_proj_fwd_tensor_device(
         direct, WDIR_SA_Q, sa_mp.o[], w.sa_wq[], w.sa_bq[],
         direct_w.sa_wq, direct_w.sa_bq, S, dim, ctx,
@@ -2098,7 +2169,7 @@ def wan22_block_direct_lycoris_forward[
         direct, WDIR_SA_O, sa_att, w.sa_wo[], w.sa_bo[],
         direct_w.sa_wo, direct_w.sa_bo, S, dim, ctx,
     )
-    var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
+    var x_sa = wan_gated_residual(x[], sa_out, gate_sa[], ctx)
 
     # ── cross-attention (direct DoRA/OFT on q/k/v/o) ──
     var n3 = layer_norm(x_sa, w.n3_w[], w.n3_b[], eps, ctx)
@@ -2130,11 +2201,11 @@ def wan22_block_direct_lycoris_forward[
     var x_ca = add(x_sa, ca_out, ctx)
 
     # ── FFN (no adapter) ──
-    var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
+    var ffn_mp = wan_mod_pre(x_ca, scale_ffn[], shift_ffn[], ones_t, zeros_t, eps, ctx)
     var ffn_h = linear(ffn_mp.o[], w.ffn0_w[], Optional[Tensor](_clone_t(w.ffn0_b[], ctx)), ctx)
     var ffn_act = gelu(ffn_h, ctx)
     var ffn_out = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
+    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn[], ctx)
 
     var x_out = x_final.to_host(ctx)
     var saved = WanSaved(
@@ -2176,19 +2247,19 @@ def wan22_block_direct_lycoris_backward[
     var d_out = _ta16(d_out_h, [S, dim], ctx)
 
     # ════════════════ FFN backward (no adapter) ════════════════
-    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var gate_ffn_t = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
     var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
     var ffn_out_rc = linear(lsv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t[], ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
     var lb_ffn2 = linear_backward(gb_ffn2.d_y, lsv_ffn_act, w.ffn2_w[], S, ffn, dim, ctx)
     var lsv_ffn_h = _tbf16(saved.ffn_h.copy(), [S, ffn], ctx)
     var d_ffn_h = gelu_backward(lb_ffn2.d_x, lsv_ffn_h, ctx)
     var lsv_ffn_in = _tbf16(saved.ffn_in.copy(), [S, dim], ctx)
     var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.ffn0_w[], S, dim, ffn, ctx)
-    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var scale_ffn_t = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
-    var mb_ffn = wan_modulate_backward(lb_ffn0.d_x, lsv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(lb_ffn0.d_x, lsv_ffn_ln, scale_ffn_t[], ctx)
     var lsv_x_ca = _tbf16(saved.x_ca.copy(), [S, dim], ctx)
     var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, lsv_x_ca, ones_t, eps, ctx)
     var d_x_ca = TArc(add(d_x_ca_resid[], lnb_ffn, ctx))
@@ -2242,12 +2313,12 @@ def wan22_block_direct_lycoris_backward[
     var d_x_sa = TArc(add(lnb_n3_dx, d_x_ca[], ctx))
 
     # ════════════════ Self-attention backward (direct q/k/v/o) ═══════════════
-    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var gate_sa_t = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
     var sa_out_rc = _direct_proj_fwd_tensor_device(
         direct, WDIR_SA_O, sv_direct_sa_att, w.sa_wo[], w.sa_bo[],
         direct_w.sa_wo, direct_w.sa_bo, S, dim, ctx,
     )
-    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t[], ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
     var sa_o_g = _direct_proj_bwd_device(
         direct, WDIR_SA_O, gb_sa.d_y, sv_direct_sa_att, w.sa_wo[],
@@ -2294,9 +2365,9 @@ def wan22_block_direct_lycoris_backward[
         ctx,
     ))
 
-    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var scale_sa_t = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
     var lsv_sa_ln = _tbf16(saved.sa_ln.copy(), [S, dim], ctx)
-    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t[], ctx)
     var lsv_x = _tbf16(saved.x.copy(), [S, dim], ctx)
     var lnb_sa = layer_norm_backward_dx(mb_sa.d_ln, lsv_x, ones_t, eps, ctx)
     var d_x = add(lnb_sa, d_x_resid[], ctx)
@@ -2499,18 +2570,18 @@ def wan22_i2v_block_lora_forward[
     var context_txt_host = context_txt_h.copy()
     var context_img_host = context_img_h.copy()
 
-    var shift_sa = _t16(mv.shift_sa.copy(), [S, dim], ctx)
-    var scale_sa = _t16(mv.scale_sa.copy(), [S, dim], ctx)
-    var gate_sa = _t16(mv.gate_sa.copy(), [S, dim], ctx)
-    var shift_ffn = _t16(mv.shift_ffn.copy(), [S, dim], ctx)
-    var scale_ffn = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
-    var gate_ffn = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var shift_sa = _mv16(mv, MV_SHIFT_SA, [S, dim], ctx)
+    var scale_sa = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
+    var gate_sa = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
+    var shift_ffn = _mv16(mv, MV_SHIFT_FFN, [S, dim], ctx)
+    var scale_ffn = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
+    var gate_ffn = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
 
     var cos16 = cast_tensor(cos, STDtype.BF16, ctx)
     var sin16 = cast_tensor(sin, STDtype.BF16, ctx)
 
     # ── self-attention (LoRA on q/k/v/o) — identical to the base block ──
-    var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
+    var sa_mp = wan_mod_pre(x[], scale_sa[], shift_sa[], ones_t, zeros_t, eps, ctx)
     var sa_in_h = sa_mp.o[].to_host(ctx)
     var q_base = linear(sa_mp.o[], w.base.sa_wq[], Optional[Tensor](_clone_t(w.base.sa_bq[], ctx)), ctx)
     var k_base = linear(sa_mp.o[], w.base.sa_wk[], Optional[Tensor](_clone_t(w.base.sa_bk[], ctx)), ctx)
@@ -2534,7 +2605,7 @@ def wan22_i2v_block_lora_forward[
     var sa_att_h = sa_att.to_host(ctx)
     var sa_out_base = linear(sa_att, w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx)
     var sa_out = _add_lora_delta(sa_out_base, sa_att_h, lora.base.sa_o, S, ctx)
-    var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
+    var x_sa = wan_gated_residual(x[], sa_out, gate_sa[], ctx)
 
     # ── DUAL cross-attention (text + image; shared query) ──
     var n3 = layer_norm(x_sa, w.base.n3_w[], w.base.n3_b[], eps, ctx)
@@ -2575,7 +2646,7 @@ def wan22_i2v_block_lora_forward[
     var x_ca = add(x_sa, ca_out, ctx)
 
     # ── FFN (LoRA on ffn.0 / ffn.2) — identical to the base block ──
-    var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
+    var ffn_mp = wan_mod_pre(x_ca, scale_ffn[], shift_ffn[], ones_t, zeros_t, eps, ctx)
     var ffn_in_h = ffn_mp.o[].to_host(ctx)
     var ffn_h_base = linear(ffn_mp.o[], w.base.ffn0_w[], Optional[Tensor](_clone_t(w.base.ffn0_b[], ctx)), ctx)
     var ffn_h = _add_lora_delta(ffn_h_base, ffn_in_h, lora.base.ffn0, S, ctx)
@@ -2583,7 +2654,7 @@ def wan22_i2v_block_lora_forward[
     var ffn_act_h = ffn_act.to_host(ctx)
     var ffn_out_base = linear(ffn_act, w.base.ffn2_w[], Optional[Tensor](_clone_t(w.base.ffn2_b[], ctx)), ctx)
     var ffn_out = _add_lora_delta(ffn_out_base, ffn_act_h, lora.base.ffn2, S, ctx)
-    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
+    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn[], ctx)
 
     var x_out = x_final.to_host(ctx)
     var base_saved = WanSaved(
@@ -2640,11 +2711,11 @@ def wan22_i2v_block_lora_backward[
     var d_out = _ta16(d_out_h, [S, dim], ctx)
 
     # ════════════════ FFN backward (LoRA on ffn.0 / ffn.2) ════════════════
-    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var gate_ffn_t = _mv16(mv, MV_GATE_FFN, [S, dim], ctx)
     var lsv_ffn_act = _tbf16(saved.base.ffn_act.copy(), [S, ffn], ctx)
     var ffn_act_h = lsv_ffn_act.to_host(ctx)
     var ffn_out_rc = linear(lsv_ffn_act, w.base.ffn2_w[], Optional[Tensor](_clone_t(w.base.ffn2_b[], ctx)), ctx)
-    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t[], ctx)
     var d_gate_ffn = gb_ffn2.d_gate.to_host(ctx)
     var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
     var lb_ffn2_dx = _base_dx(gb_ffn2.d_y, w.base.ffn2_w[], S, ffn, dim, ctx)
@@ -2663,9 +2734,9 @@ def wan22_i2v_block_lora_backward[
     var d_ffn_h_h = d_ffn_h.to_host(ctx)
     var ffn0_g = _lora_bwd_opt(lora.base.ffn0, d_ffn_h_h, ffn_in_h, S, dim, ctx)
     var d_ffn_in = add(lb_ffn0_dx, _t16(ffn0_g.d_x.copy(), [S, dim], ctx), ctx)
-    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var scale_ffn_t = _mv16(mv, MV_SCALE_FFN, [S, dim], ctx)
     var lsv_ffn_ln = _tbf16(saved.base.ffn_ln.copy(), [S, dim], ctx)
-    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t, ctx)
+    var mb_ffn = wan_modulate_backward(d_ffn_in, lsv_ffn_ln, scale_ffn_t[], ctx)
     var d_scale_ffn = mb_ffn.d_scale.to_host(ctx)
     var d_shift_ffn = mb_ffn.d_shift.to_host(ctx)
     var lsv_x_ca = _tbf16(saved.base.x_ca.copy(), [S, dim], ctx)
@@ -2765,9 +2836,9 @@ def wan22_i2v_block_lora_backward[
     var d_x_sa = TArc(add(lnb_n3_dx, d_x_ca[], ctx))
 
     # ════════════════ Self-attention backward (LoRA q/k/v/o) — base arm ════════
-    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var gate_sa_t = _mv16(mv, MV_GATE_SA, [S, dim], ctx)
     var sa_out_rc = linear(sv_lora_sa_att, w.base.sa_wo[], Optional[Tensor](_clone_t(w.base.sa_bo[], ctx)), ctx)
-    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t[], ctx)
     var d_gate_sa = gb_sa.d_gate.to_host(ctx)
     var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
     var d_sa_out_h = gb_sa.d_y.to_host(ctx)
@@ -2822,9 +2893,9 @@ def wan22_i2v_block_lora_backward[
     )
     var d_sa_in = TArc(add(d_sa_in_base, d_sa_in_lora, ctx))
 
-    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var scale_sa_t = _mv16(mv, MV_SCALE_SA, [S, dim], ctx)
     var lsv_sa_ln = _tbf16(saved.base.sa_ln.copy(), [S, dim], ctx)
-    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t[], ctx)
     var d_scale_sa = mb_sa.d_scale.to_host(ctx)
     var d_shift_sa = mb_sa.d_shift.to_host(ctx)
     var lsv_x = _tbf16(saved.base.x.copy(), [S, dim], ctx)

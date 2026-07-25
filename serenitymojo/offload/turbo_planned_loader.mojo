@@ -240,6 +240,39 @@ def _copy_block_plan(plan: BlockPlan) -> BlockPlan:
     return out^
 
 
+struct Fp8hStage(Movable):
+    """The double-buffered device staging slabs for overlapped fp8-host blocks.
+
+    Held behind an `ArcPointer` so SEVERAL loaders can share ONE set of slabs. That
+    matters for dual-expert models: only ONE expert runs per step, so a per-loader
+    pair leaves the other expert's slabs (~640 MB at wan2.2 A14B block sizes) idle
+    for the whole run — and on a 16 GB card that memory is worth ~2 more
+    device-resident blocks, which are measurably worth more than their VRAM
+    (HANDOFF_WAN_SPEED_2026-07-24D §4.3).
+
+    ⚠ **Slots are keyed by `<tag>|<prefix>`, never by prefix alone.** Two experts are
+    separate checkpoints with IDENTICAL block naming, so a bare-prefix key would
+    report HIGH's `blocks.7` as a hit for LOW's `blocks.7` and silently compute with
+    the wrong expert's weights. Each loader supplies its own `tag`."""
+
+    var devs: List[DeviceBuffer[DType.uint8]]   # 2 persistent slabs
+    var evs: List[DeviceEvent]                  # per-slot copy-done (copy stream)
+    var cds: List[DeviceEvent]                  # per-slot compute-done (default stream)
+    var cd_rec: List[Bool]                      # compute-done recorded flags
+    var slot_key: List[String]                  # staged "<tag>|<prefix>" per slot
+    var active: Int                             # slot compute is reading
+    var capacity: Int                           # slab bytes (max fp8h block seen)
+
+    def __init__(out self):
+        self.devs = List[DeviceBuffer[DType.uint8]]()
+        self.evs = List[DeviceEvent]()
+        self.cds = List[DeviceEvent]()
+        self.cd_rec = List[Bool]()
+        self.slot_key = List[String]()
+        self.active = 0
+        self.capacity = 0
+
+
 struct TurboPlannedLoader(Movable):
     """Plan-aware async wrapper over TurboBlockLoader.
 
@@ -324,13 +357,8 @@ struct TurboPlannedLoader(Movable):
     # 508.6 ms/step of H2D against 859.2 ms/step of kernels with a union of
     # 1367.9 ms — i.e. **0% overlap, perfectly serialized**. Off by default so
     # every existing fp8h caller keeps the byte-identical inline path (C13).
-    var _f8h_devs: List[DeviceBuffer[DType.uint8]]   # 2 persistent slabs
-    var _f8h_evs: List[DeviceEvent]                  # per-slot copy-done (copy stream)
-    var _f8h_cds: List[DeviceEvent]                  # per-slot compute-done (default stream)
-    var _f8h_cd_rec: List[Bool]                      # compute-done recorded flags
-    var _f8h_slot_prefix: List[String]               # staged prefix per slot ("" = empty)
-    var _f8h_active: Int                             # slot compute is reading
-    var _f8h_capacity: Int                           # slab bytes (max fp8h block)
+    var _f8h: ArcPointer[Fp8hStage]                  # slabs (own by default; may be shared)
+    var _f8h_tag: String                             # slot-key namespace (see Fp8hStage)
     var _f8h_overlap: Bool                           # opt-in switch
 
     @staticmethod
@@ -418,13 +446,8 @@ struct TurboPlannedLoader(Movable):
         self._i8h_slot_prefix = List[String]()
         self._i8h_active = 0
         self._i8h_capacity = 0
-        self._f8h_devs = List[DeviceBuffer[DType.uint8]]()
-        self._f8h_evs = List[DeviceEvent]()
-        self._f8h_cds = List[DeviceEvent]()
-        self._f8h_cd_rec = List[Bool]()
-        self._f8h_slot_prefix = List[String]()
-        self._f8h_active = 0
-        self._f8h_capacity = 0
+        self._f8h = ArcPointer[Fp8hStage](Fp8hStage())
+        self._f8h_tag = String("")
         self._f8h_overlap = False
 
     def _resident_slot(self, norm_prefix: String) -> Int:
@@ -1204,6 +1227,30 @@ struct TurboPlannedLoader(Movable):
         inline path is what every existing fp8h caller has been running."""
         self._f8h_overlap = on
 
+    def fp8h_stage(self) -> ArcPointer[Fp8hStage]:
+        """This loader's staging slabs, for handing to a sibling via
+        `share_fp8h_stage` (dual-expert: one pair of slabs for both experts)."""
+        return self._f8h.copy()
+
+    def share_fp8h_stage(
+        mut self, var stage: ArcPointer[Fp8hStage], var tag: String
+    ) raises:
+        """Adopt `stage` as this loader's staging slabs and namespace its slots under
+        `tag`. Every loader sharing a stage MUST pass a DISTINCT tag — slots are keyed
+        `<tag>|<prefix>` precisely because two experts name their blocks identically
+        (see Fp8hStage). Call before the first prefetch/await."""
+        if len(tag) == 0:
+            raise Error(
+                "share_fp8h_stage: a non-empty tag is required — sharing slabs with"
+                " an empty tag would let two experts' identical block prefixes"
+                " collide in the same slot"
+            )
+        self._f8h = stage^
+        self._f8h_tag = tag^
+
+    def _f8h_key(self, prefix: String) -> String:
+        return self._f8h_tag + String("|") + prefix
+
     def _f8h_layout(self, hslot: Int) raises -> List[Int]:
         """Byte offsets of block `hslot`'s tensors inside a staging slab, followed
         by the slab total as the LAST element. Layout order == the `_fp8h_blocks`
@@ -1223,27 +1270,31 @@ struct TurboPlannedLoader(Movable):
         return offs^
 
     def _f8h_ensure(mut self, ctx: DeviceContext) raises:
-        """Allocate the two persistent staging slabs (max fp8h block) + events."""
+        """Allocate the two persistent staging slabs (max fp8h block) + events.
+
+        Grows to the largest block ANY sharer needs: a shared stage is sized by
+        whichever loader calls this with the biggest block, and the reallocation
+        invalidates both slots (contents are gone), so slot keys are cleared."""
         var maxb = 0
         for i in range(len(self._fp8h_blocks)):
             var offs = self._f8h_layout(i)
             var tot = offs[len(offs) - 1]
             if tot > maxb:
                 maxb = tot
-        if maxb > self._f8h_capacity:
-            self._f8h_devs = List[DeviceBuffer[DType.uint8]]()
-            self._f8h_devs.append(ctx.enqueue_create_buffer[DType.uint8](maxb))
-            self._f8h_devs.append(ctx.enqueue_create_buffer[DType.uint8](maxb))
+        if maxb > self._f8h[].capacity:
+            self._f8h[].devs = List[DeviceBuffer[DType.uint8]]()
+            self._f8h[].devs.append(ctx.enqueue_create_buffer[DType.uint8](maxb))
+            self._f8h[].devs.append(ctx.enqueue_create_buffer[DType.uint8](maxb))
             ctx.synchronize()  # materialize allocs before raw CUDA copies target them
-            self._f8h_capacity = maxb
-            self._f8h_slot_prefix = [String(""), String("")]
-            self._f8h_active = 0
-        if len(self._f8h_evs) == 0:
-            self._f8h_evs.append(ctx.create_event[disable_timing=True]())
-            self._f8h_evs.append(ctx.create_event[disable_timing=True]())
-            self._f8h_cds.append(ctx.create_event[disable_timing=True]())
-            self._f8h_cds.append(ctx.create_event[disable_timing=True]())
-            self._f8h_cd_rec = [False, False]
+            self._f8h[].capacity = maxb
+            self._f8h[].slot_key = [String(""), String("")]
+            self._f8h[].active = 0
+        if len(self._f8h[].evs) == 0:
+            self._f8h[].evs.append(ctx.create_event[disable_timing=True]())
+            self._f8h[].evs.append(ctx.create_event[disable_timing=True]())
+            self._f8h[].cds.append(ctx.create_event[disable_timing=True]())
+            self._f8h[].cds.append(ctx.create_event[disable_timing=True]())
+            self._f8h[].cd_rec = [False, False]
 
     def _f8h_prefetch(mut self, hslot: Int, ctx: DeviceContext) raises:
         """Stage fp8-host block `hslot` into the idle slab on the turbo COPY STREAM
@@ -1258,15 +1309,15 @@ struct TurboPlannedLoader(Movable):
         Slot-reuse hazard (this write vs the previous tenant's still-running kernels)
         is fenced on the slot's compute-done event, exactly as `_i8h_prefetch` does."""
         self._f8h_ensure(ctx)
-        var p = self._fp8h_prefixes[hslot].copy()
-        if self._f8h_slot_prefix[0] == p or self._f8h_slot_prefix[1] == p:
+        var p = self._f8h_key(self._fp8h_prefixes[hslot])
+        if self._f8h[].slot_key[0] == p or self._f8h[].slot_key[1] == p:
             return  # already staged (idempotent — hit / paired re-await)
-        var slot = 1 - self._f8h_active  # idle slot (compute reads the other)
-        if self._f8h_cd_rec[slot]:
-            self._turbo.copy_stream.enqueue_wait_for(self._f8h_cds[slot])
-            self._f8h_cd_rec[slot] = False
+        var slot = 1 - self._f8h[].active  # idle slot (compute reads the other)
+        if self._f8h[].cd_rec[slot]:
+            self._turbo.copy_stream.enqueue_wait_for(self._f8h[].cds[slot])
+            self._f8h[].cd_rec[slot] = False
         var offs = self._f8h_layout(hslot)
-        var base = UInt64(Int(self._f8h_devs[slot].unsafe_ptr()))
+        var base = UInt64(Int(self._f8h[].devs[slot].unsafe_ptr()))
         for t in range(len(self._fp8h_blocks[hslot])):
             ref rt = self._fp8h_blocks[hslot][t]
             _h2d_dma_copy(
@@ -1282,8 +1333,8 @@ struct TurboPlannedLoader(Movable):
                     rt.scale_nbytes,
                     self._turbo.copy_stream,
                 )
-        self._turbo.copy_stream.record_event(self._f8h_evs[slot])
-        self._f8h_slot_prefix[slot] = p^
+        self._turbo.copy_stream.record_event(self._f8h[].evs[slot])
+        self._f8h[].slot_key[slot] = p^
 
     def block_count(self) -> Int:
         return self._plan.count()
@@ -1396,9 +1447,10 @@ struct TurboPlannedLoader(Movable):
             ctx.stream().record_event(self._i8h_cds[self._i8h_active])
             self._i8h_cd_rec[self._i8h_active] = True
         # Same double-buffer contract for the overlapped fp8-host slabs.
-        if self._f8h_overlap and len(self._f8h_cds) == 2:
-            ctx.stream().record_event(self._f8h_cds[self._f8h_active])
-            self._f8h_cd_rec[self._f8h_active] = True
+        if self._f8h_overlap and len(self._f8h[].cds) == 2:
+            var a = self._f8h[].active
+            ctx.stream().record_event(self._f8h[].cds[a])
+            self._f8h[].cd_rec[a] = True
 
     def print_telemetry(self):
         """Print the underlying turbo loader counters.
@@ -1563,36 +1615,37 @@ struct TurboPlannedLoader(Movable):
             # Block out — only the copy's stream and timing changed.
             self._dispatch_pending(ctx)
             self._f8h_ensure(ctx)
+            var okey = self._f8h_key(load_prefix)
             var oslot = -1
-            if self._f8h_slot_prefix[0] == load_prefix:
+            if self._f8h[].slot_key[0] == okey:
                 oslot = 0
-            elif self._f8h_slot_prefix[1] == load_prefix:
+            elif self._f8h[].slot_key[1] == okey:
                 oslot = 1
             if oslot < 0:
-                # miss (cold start / non-sequential visit): stage now — correct,
-                # just unoverlapped, exactly like the int8h miss path.
+                # miss (cold start / non-sequential visit / expert switch): stage now
+                # — correct, just unoverlapped, exactly like the int8h miss path.
                 self._f8h_prefetch(hslot, ctx)
-                if self._f8h_slot_prefix[0] == load_prefix:
+                if self._f8h[].slot_key[0] == okey:
                     oslot = 0
-                elif self._f8h_slot_prefix[1] == load_prefix:
+                elif self._f8h[].slot_key[1] == okey:
                     oslot = 1
                 if oslot < 0:
                     raise Error(
                         String("TurboPlannedLoader.await_block: fp8h block ")
                         + "not staged: " + load_prefix
                     )
-            ctx.stream().enqueue_wait_for(self._f8h_evs[oslot])
-            self._f8h_active = oslot
+            ctx.stream().enqueue_wait_for(self._f8h[].evs[oslot])
+            self._f8h[].active = oslot
             var ooffs = self._f8h_layout(hslot)
             var oblock = Block()
             for t in range(len(self._fp8h_blocks[hslot])):
                 ref rt = self._fp8h_blocks[hslot][t]
-                var wsub = self._f8h_devs[oslot].create_sub_buffer[DType.uint8](
+                var wsub = self._f8h[].devs[oslot].create_sub_buffer[DType.uint8](
                     ooffs[2 * t], rt.bytes_nbytes
                 )
                 var wt = Tensor(wsub^, rt.bytes_shape.copy(), rt.bytes_dtype)
                 if rt.is_fp8:
-                    var ssub = self._f8h_devs[oslot].create_sub_buffer[DType.uint8](
+                    var ssub = self._f8h[].devs[oslot].create_sub_buffer[DType.uint8](
                         ooffs[2 * t + 1], rt.scale_nbytes
                     )
                     var st = Tensor(ssub^, rt.scale_shape.copy(), STDtype.F32)

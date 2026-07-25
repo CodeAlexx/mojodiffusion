@@ -1508,9 +1508,27 @@ def main() raises:
         # same bytes, same dequant kernel — only the stream and timing change.
         if _env_is_set(String("WAN22_FP8H_OVERLAP")):
             loader.set_fp8h_overlap(True)
+            var share_slabs = _env_is_set(String("WAN22_FP8H_SHARE_SLABS"))
             if dual_expert:
                 loader_high.set_fp8h_overlap(True)
-            print("[wan22] fp8-HOST: OVERLAPPED staging ON (copy stream, double-buffered)")
+                # WAN22_FP8H_SHARE_SLABS=1: ONE pair of slabs for BOTH experts. Only
+                # one expert runs per step, so a pair each leaves ~550 MB idle all run.
+                # ⚠ MEASURED A NET LOSS — see the handoff's dead-end list. It does free
+                # the memory (peak 14854 → 14300 MiB) but costs 0.08 s/step at equal
+                # residency, and spending the freed VRAM on more resident blocks does
+                # not buy it back (best shared 1.500 s/step at 7.0 GB / 15186 MiB vs
+                # best unshared 1.450 at 6.0 GB / 14854 MiB — slower AND larger).
+                # Kept, off by default, for cards or models where the slabs are the
+                # binding constraint rather than the pipeline depth.
+                # Slots are keyed "<tag>|<prefix>" and the tags MUST differ: the two
+                # experts are separate checkpoints that name their blocks identically,
+                # so a bare prefix key would let HIGH's blocks.7 answer LOW's blocks.7.
+                if share_slabs:
+                    loader_high.share_fp8h_stage(loader.fp8h_stage(), String("high"))
+                    loader.share_fp8h_stage(loader.fp8h_stage(), String("low"))
+            print("[wan22] fp8-HOST: OVERLAPPED staging ON (copy stream, double-buffered"
+                  + (String("; slabs SHARED across experts)") if (dual_expert and share_slabs)
+                     else String(")")))
 
     # build_wan22_lora_set creates 10 adapters/block: the 8 ATTENTION projections
     # (self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}) + ffn.0 (dim->ffn) + ffn.2

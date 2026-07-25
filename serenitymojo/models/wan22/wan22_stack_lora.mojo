@@ -464,6 +464,42 @@ def _time_features(
 # e0_flat: F32 [S * 6 * dim] from time chain.
 # block_mod: F32 [1 * 6 * dim] from the streamed block (cast from BF16).
 # Result: WanModVecs (each field is F32 [S*dim]).
+def _block_modvecs_dev(
+    e0_t: Tensor, bmod_t: Tensor, S: Int, dim: Int, ctx: DeviceContext,
+) raises -> WanModVecs:
+    """DEVICE sibling of `_block_modvecs` (below) — same result, same return type,
+    drop-in at any call site.
+
+    `_block_modvecs` is a pure-CPU nested loop (S*dim iterations × 6 `append`s)
+    computing what is just a broadcast add, `e[s,j,d] = e0[s,j,d] + bmod[j,d]`.
+    MEASURED at the real dims (S=256, dim=5120,
+    models/wan22/parity/wan22_host_cost_bench.mojo): **64.66 ms per call × 40
+    blocks = 2.586 s/step**, i.e. ~32% of the (post-LoRA-fix) 8.4 s step — the
+    largest single remaining host cost, and a direct violation of the
+    host-is-a-parking-lot-not-a-CPU rule.
+
+    Here the same arithmetic is one broadcast `add` on device ([1,6,dim] over
+    [S,6,dim]) plus 6 slices. BIT-EQUAL by construction: both sides do the SAME
+    F32 elementwise add in the SAME order (IEEE add is deterministic elementwise);
+    only WHERE it runs differs. Gated in
+    `models/wan22/parity/wan22_modvecs_dev_parity.mojo`.
+
+    Still returns host `List[Float32]`s because every consumer signature takes
+    `WanModVecs` — the to_host of 6 × [S,dim] costs ~0.59 ms each (same bench),
+    so ~3.5 ms/block vs the 64.66 ms loop. Making WanModVecs hold device tensors
+    (deleting the readback AND the consumers' re-uploads) is the follow-up."""
+    var e_all = add(e0_t, bmod_t, ctx)            # [S,6,dim] F32, broadcast over S
+    var out = List[List[Float32]]()
+    for j in range(6):
+        var sl = slice(e_all, 1, j, 1, ctx)       # [S,1,dim]
+        out.append(reshape(sl, [S, dim], ctx).to_host(ctx))
+    # oracle field order: shift_sa, scale_sa, gate_sa, shift_ffn, scale_ffn, gate_ffn
+    return WanModVecs(
+        out[0].copy(), out[1].copy(), out[2].copy(),
+        out[3].copy(), out[4].copy(), out[5].copy(),
+    )
+
+
 def _block_modvecs(
     e0_flat: List[Float32], block_mod_h: List[Float32],
     bi: Int, S: Int, dim: Int,
@@ -753,6 +789,7 @@ def wan22_stack_lora_forward_offload[
     save_acts: Bool = True,
     device_lora: Bool = False,
     batched_cross: Bool = False,
+    device_modvecs: Bool = False,
 ) raises -> Wan22StackForward:
     """`save_acts=False` omits the per-block save-all HOST activation tape
     (`block_saved`). ONLY the host offload backward (this file, `…_backward_offload`)
@@ -782,6 +819,10 @@ def wan22_stack_lora_forward_offload[
     # per-block F32 INPUT tape for the WAN_DEVNATIVE recompute backward.
     var block_inputs = List[List[Float32]]()
 
+    # e0 uploaded ONCE per step for the device modvec builder ([S,6,dim] F32,
+    # ~31 MB, one HtoD) — it originates on device inside _time_features anyway.
+    var e0_t = Tensor.from_host(e0_flat.copy(), [S, 6, dim], STDtype.F32, ctx)
+
     for bi in range(num_blocks):
         var handle = loader.await_block(bi, ctx)
         loader.prefetch_next_with_ctx(bi, ctx)
@@ -792,10 +833,17 @@ def wan22_stack_lora_forward_offload[
         if not (mod_key in handle.block):
             raise Error(String("wan22 block missing modulation: ") + mod_key)
         var block_mod_t = cast_tensor(handle.block[mod_key][], STDtype.F32, ctx)
-        var block_mod_h = block_mod_t.to_host(ctx)   # [1*6*dim]
 
-        # Build per-token modulation vectors.
-        var mv = _block_modvecs(e0_flat, block_mod_h, bi, S, dim)
+        # Build per-token modulation vectors. The HOST builder is a pure-CPU
+        # broadcast-add loop measured at 64.66 ms/block = 2.586 s/step (32% of the
+        # step); the device builder is the same arithmetic on GPU, bit-equal.
+        var mv: WanModVecs
+        if device_modvecs:
+            mv = _block_modvecs_dev(
+                e0_t, reshape(block_mod_t, [1, 6, dim], ctx), S, dim, ctx,
+            )
+        else:
+            mv = _block_modvecs(e0_flat, block_mod_t.to_host(ctx), bi, S, dim)
 
         # Load block weights.
         var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)

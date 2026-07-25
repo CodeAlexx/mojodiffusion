@@ -1502,6 +1502,9 @@ def main() raises:
     # capture time, where the per-head loop's per-head slices/permutes (allocating
     # ops) and the node count actually matter for StepSlab/replay.
     var use_batched_cross = False
+    # Device modvec builder: replaces a pure-CPU broadcast-add loop measured at
+    # 2.586 s/step (32% of the step). BIT-EQUAL (same F32 adds, on GPU).
+    var use_device_modvecs = use_devpath
     var n_adapters = wan22_total_adapters(lora)
     var dev_state = lora_adamw_plain_device_state_init(lora.ad, 0, n_adapters, ctx)
     if use_graph:
@@ -1614,6 +1617,7 @@ def main() raises:
                 high_base, loader_high, lora, cos.copy(), sin.copy(),
                 DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
                 save_block_acts, use_device_lora, use_batched_cross,
+                use_device_modvecs,
             )
         else:
             fwd = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
@@ -1621,6 +1625,7 @@ def main() raises:
                 base, loader, lora, cos.copy(), sin.copy(),
                 DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
                 save_block_acts, use_device_lora, use_batched_cross,
+                use_device_modvecs,
             )
 
         # plain per-element MSE then mean; d_out = 2*(pred-target)/N (weighting None).

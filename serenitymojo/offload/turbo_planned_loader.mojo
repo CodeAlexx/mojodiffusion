@@ -597,6 +597,85 @@ struct TurboPlannedLoader(Movable):
             ctx.synchronize()  # fence this block's transient BF16 before the next
         return pinned
 
+    def pin_residents_fp8_prequantized(
+        mut self, budget_bytes: Int, ctx: DeviceContext
+    ) raises -> Int:
+        """Pin plan blocks (plan order) as fp8-resident from an ALREADY-FP8
+        checkpoint — the Bernini-R `serenity_fp8_e4m3_*` per-block cache, whose
+        big 2-D weights are stored as `F8_E4M3 [out,in]` beside a sibling
+        `<key>.__fp8_scale` `F32 [out]`, with small tensors BF16.
+
+        WHY THIS EXISTS (do not use `pin_residents_fp8` on such a checkpoint):
+        that sibling QUANTIZES from BF16 and gates on `tv.dtype == STDtype.BF16`.
+        Against an already-fp8 cache every big weight FAILS that test and falls to
+        the small-tensor branch, which calls `from_view_as_bf16` on E4M3 bytes —
+        reinterpreting 1-byte fp8 as 2-byte bf16. That is silent corruption, not
+        an error. Here the bytes and the scale are pinned VERBATIM
+        (`from_view_raw` preserves F8_E4M3; the F32 scale rides along), so
+        `await_block`'s fp8-resident branch dequants them with the SAME
+        `fp8_e4m3_dequant_perrow_to_bf16` the streamed path uses via
+        `_block_bf16_dev` → the resident Block is BIT-IDENTICAL to the streamed one.
+
+        `budget_bytes` caps the resident bytes and pinning is PLAN-ORDER
+        CONTIGUOUS: blocks [0, pinned) are resident and the remainder keep
+        streaming, so a partial pin is legal here (unlike MJ-1065's all-or-nothing
+        fp8 mode). `prefetch_with_ctx` early-returns for every pinned block, so
+        each one converts a per-block staging stall into a free lookup. Returns
+        the number of blocks pinned."""
+        var used = 0
+        var pinned = 0
+        var scale_suffix = String(".__fp8_scale")
+        for i in range(self._plan.count()):
+            self._assert_raw_copy_dtype_safe(i)
+            var p = self._plan.normalized_prefix(i)
+            if self._fp8_slot(p) >= 0 or self._resident_slot(p) >= 0:
+                continue
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                raise Error(
+                    String("pin_residents_fp8_prequantized: no tensors for prefix: ") + p
+                )
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            var tensors = List[_ResidentFp8Tensor]()
+            var block_bytes = 0
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                if nm.endswith(scale_suffix):
+                    continue          # consumed with its parent weight below
+                var tv = self._turbo.sharded.tensor_view(nm)
+                if tv.dtype == STDtype.F8_E4M3:
+                    var sname = nm + scale_suffix
+                    var stv = self._turbo.sharded.tensor_view(sname)
+                    var bytes = Tensor.from_view_raw(tv, ctx)   # keeps F8_E4M3
+                    var scale = Tensor.from_view(stv, ctx)      # F32 [out]
+                    block_bytes += (
+                        bytes.numel() * bytes.dtype().byte_size()
+                        + scale.numel() * scale.dtype().byte_size()
+                    )
+                    tensors.append(
+                        _ResidentFp8Tensor(nm, True, TArc(bytes^), TArc(scale^))
+                    )
+                else:
+                    var t = Tensor.from_view_as_bf16(tv, ctx)
+                    block_bytes += t.numel() * t.dtype().byte_size()
+                    var arc = TArc(t^)
+                    tensors.append(
+                        _ResidentFp8Tensor(nm, False, arc.copy(), arc)
+                    )
+            if used + block_bytes > budget_bytes:
+                break                 # partial pin: the rest keep streaming
+            self._fp8_prefixes.append(p)
+            self._fp8_blocks.append(tensors^)
+            used += block_bytes
+            pinned += 1
+            ctx.synchronize()
+        return pinned
+
     def pin_residents_fp8_host(
         mut self, budget_bytes: Int, ctx: DeviceContext
     ) raises -> Int:

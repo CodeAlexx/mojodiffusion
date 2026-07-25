@@ -269,6 +269,18 @@ def _env_is_set(name: String) -> Bool:
 #    The smoke timestep pins (WAN22_ALTERNATE_T / WAN22_T_LOW / WAN22_T_HIGH /
 #    WAN22_SHIFT_TIMESTEPS) stay env-only (test pins). Same pattern as
 #    ltx2_t2v_av_hq.mojo::_env_str.
+def _env_f32(name: String) -> Float32:
+    """Numeric env knob (returns 0.0 when unset/unparseable) — used for
+    WAN22_FP8_RESIDENT_GB."""
+    var v = _env_str(name)
+    if v.byte_length() == 0:
+        return Float32(0.0)
+    try:
+        return Float32(Float64(v))
+    except:
+        return Float32(0.0)
+
+
 def _env_str(name: String) -> String:
     var n = name.byte_length()
     var buf = alloc[UInt8](n + 1)
@@ -1427,6 +1439,43 @@ def main() raises:
     var loader_high = TurboPlannedLoader.open(high_ckpt_eff, plan_high^, off_cfg, ctx, False)
     if dual_expert:
         print("[wan22] high-noise expert base + loader ready (streaming, no host store)")
+
+    # ── fp8 PARTIAL RESIDENCY (env WAN22_FP8_RESIDENT_GB, default 0 = off) ──────
+    # MEASURED (WAN22_PHASE_TIMERS): loader.prefetch_next_with_ctx blocks ~50 ms
+    # per block, and the forward AND the recompute backward each stream all 40
+    # blocks => ~4 s of a 5.6 s step is weight staging, vs 15.5 ms/block for ALL
+    # the transformer math. `prefetch_with_ctx` EARLY-RETURNS for any pinned block
+    # (turbo_planned_loader.mojo), so each pinned block turns that stall into a
+    # free lookup.
+    #
+    # Uses pin_residents_fp8_PREQUANTIZED — this checkpoint is ALREADY fp8
+    # (F8_E4M3 [out,in] + `<key>.__fp8_scale` F32 [out]). The plain
+    # pin_residents_fp8 quantizes FROM BF16 and would reinterpret the E4M3 bytes
+    # as bf16 (silent corruption). The prequantized pin holds the bytes+scale
+    # verbatim and await_block dequants with the SAME kernel the streamed path
+    # uses => resident blocks are BIT-IDENTICAL to streamed ones.
+    #
+    # Pinning is PLAN-ORDER CONTIGUOUS, so a partial pin is fine: blocks
+    # [0,pinned) resident, the rest stream. FULL residency is IMPOSSIBLE here —
+    # the fp8 checkpoint is ~14 GB PER EXPERT on a 16 GB card. Budget goes to the
+    # LOW expert first: only one expert runs per step (use_high = t >= boundary)
+    # and LOW is the common case.
+    var fp8_res_gb = _env_f32(String("WAN22_FP8_RESIDENT_GB"))
+    if fp8_res_gb > Float32(0.0):
+        var budget = Int(Float64(fp8_res_gb) * 1024.0 * 1024.0 * 1024.0)
+        var n_low = loader.pin_residents_fp8_prequantized(budget, ctx)
+        print("[wan22] fp8-resident LOW: pinned", n_low, "/", NUM_BLOCKS,
+              "blocks (budget", fp8_res_gb, "GB)")
+        var n_high = 0
+        if dual_expert:
+            var used_gb = Float32(n_low) * Float32(0.35)   # ~350 MB/fp8 block
+            var rem = budget - Int(Float64(used_gb) * 1024.0 * 1024.0 * 1024.0)
+            if rem > 0:
+                n_high = loader_high.pin_residents_fp8_prequantized(rem, ctx)
+            print("[wan22] fp8-resident HIGH: pinned", n_high, "/", NUM_BLOCKS, "blocks")
+        print("[wan22] fp8-resident TOTAL:", n_low + n_high, "of",
+              NUM_BLOCKS * (2 if dual_expert else 1),
+              "block loads/step now free (the rest keep streaming)")
 
     # build_wan22_lora_set creates 10 adapters/block: the 8 ATTENTION projections
     # (self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}) + ffn.0 (dim->ffn) + ffn.2

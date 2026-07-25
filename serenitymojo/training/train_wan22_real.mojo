@@ -80,7 +80,13 @@ from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.patchify3d import patchify3d
+from serenitymojo.ops.patchify3d import patchify3d, unpatchify3d
+from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.ops.tensor_algebra import reshape
+from serenitymojo.io.ffi import sys_system
+from serenitymojo.image.png import ValueRange, save_png
+from serenitymojo.models.lingbotvideo.vae_decoder import LingBotWanVaeDecoder
+from serenitymojo.models.lingbotvideo.vae_encoder import _latents_mean, _latents_std
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
@@ -374,6 +380,154 @@ def _noise(n: Int, seed: UInt64) -> List[Float32]:
     for i in range(n):
         out.append(_randn(seed + UInt64(i) * 2 + 1))
     return out^
+
+
+# ── IN-TRAIN SAMPLING (cfg.sample_every > 0 + WAN22_SAMPLE_CONDS) ─────────────
+# Renders the trained LoRA at the sample cadence using the trainer's OWN live base,
+# loaders and adapters — the mageflow/anima pattern (no second model load, no file
+# round-trip, no overlay). Three deliberate choices:
+#
+# 1. TEXT CONDS COME FROM A FILE, not a text encoder in this process. umt5-xxl is
+#    ~11 GB; co-residing it with two A14B experts on a 16 GB card is an OOM. Encode
+#    once with `wan22_encode_prompt` and point WAN22_SAMPLE_CONDS at the artifact.
+#    This is the same process-separation the rest of the Wan stack uses.
+# 2. THE SAMPLER IS THE MODEL'S OWN FLOW-MATCH PARAMETERIZATION, not an imported
+#    scheduler. Training defines x_t = (1-t)*x0 + t*noise with the model predicting
+#    v = noise - x0 = dx/dt, so integrating t: 1 -> 0 with x -= dt*v is exactly the
+#    inverse of the training objective. A preview that used a different scheduler
+#    would be measuring the scheduler as much as the LoRA.
+# 3. IT RUNS IN PATCHIFIED [S, IN_CH] SPACE, the trainer's native representation,
+#    and only unpatchifies once at the end for the VAE.
+comptime SAMPLE_STEPS = 30
+comptime SAMPLE_CFG = Float32(5.0)
+comptime SAMPLE_LAT_C = 16          # Wan2.1 VAE latent channels
+comptime SAMPLE_LAT_H = 32          # 256px / 8
+comptime SAMPLE_LAT_W = 32
+comptime SAMPLE_VAE = (
+    "/mnt/disk1/models/lingbot-video-moe/vae/diffusion_pytorch_model.safetensors"
+)
+
+
+def _pad4(v: Int) -> String:
+    var t = String(v)
+    while t.byte_length() < 4:
+        t = String("0") + t
+    return t^
+
+
+def _load_sample_conds(
+    path: String, txt: Int, text_dim: Int, ctx: DeviceContext,
+) raises -> List[List[Float32]]:
+    """pos/neg [TXT,4096] host lists from a `wan22_encode_prompt` artifact."""
+    var st = ShardedSafeTensors.open(path)
+    var out = List[List[Float32]]()
+    for ref key in [String("pos_embed"), String("neg_embed")]:
+        if key not in st.names():
+            raise Error(
+                String("WAN22_SAMPLE_CONDS file is missing '") + key
+                + String("' — produce it with `wan22_encode_prompt <pos> <neg> <out>`")
+            )
+        var t = Tensor.from_view_as_bf16(st.tensor_view(key), ctx)
+        if t.numel() != txt * text_dim:
+            raise Error(
+                String("WAN22_SAMPLE_CONDS '") + key + String("' numel ")
+                + String(t.numel()) + String(" != ") + String(txt * text_dim)
+            )
+        out.append(cast_tensor(t, STDtype.F32, ctx).to_host(ctx))
+    return out^
+
+
+def _wan22_sample_png[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    tag: String, out_png: String,
+    pos: List[Float32], neg: List[Float32],
+    base: Wan22StackBase, mut loader: TurboPlannedLoader,
+    base_high: Wan22StackBase, mut loader_high: TurboPlannedLoader,
+    dual_expert: Bool, boundary: Float32,
+    lora: Wan22LoraSet, cos: List[Float32], sin: List[Float32],
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int, freq_dim: Int,
+    eps: Float32, n_steps: Int, cfg_scale: Float32, shift: Float32, seed: UInt64,
+    save_acts: Bool, device_lora: Bool, batched_cross: Bool,
+    device_modvecs: Bool, device_modvecs_t: Bool,
+    ctx: DeviceContext,
+) raises:
+    var t_start = perf_counter_ns()
+    var n = S * in_ch
+    var x = _noise(n, seed * UInt64(7919) + 17)      # t = 1: pure noise
+
+    # shift-mapped descending t schedule, t: 1 -> 0 (same map the trainer's
+    # "shift" timestep mode uses, so preview and training agree on where t lives).
+    var ts = List[Float32]()
+    for i in range(n_steps + 1):
+        var u = Float32(n_steps - i) / Float32(n_steps)
+        ts.append((u * shift) / (Float32(1.0) + (shift - Float32(1.0)) * u))
+
+    for i in range(n_steps):
+        var t = ts[i]
+        var dt = ts[i] - ts[i + 1]
+        var t_model = t * Float32(1000.0) + Float32(1.0)
+        var use_high = dual_expert and (t >= boundary)
+
+        var fc: Wan22StackForward
+        var fu: Wan22StackForward
+        if use_high:
+            fc = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
+                x.copy(), pos.copy(), t_model, base_high, loader_high, lora,
+                cos.copy(), sin.copy(), dim, ffn, in_ch, text_dim, out_ch,
+                freq_dim, eps, ctx, save_acts, device_lora, batched_cross,
+                device_modvecs, device_modvecs_t,
+            )
+            fu = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
+                x.copy(), neg.copy(), t_model, base_high, loader_high, lora,
+                cos.copy(), sin.copy(), dim, ffn, in_ch, text_dim, out_ch,
+                freq_dim, eps, ctx, save_acts, device_lora, batched_cross,
+                device_modvecs, device_modvecs_t,
+            )
+        else:
+            fc = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
+                x.copy(), pos.copy(), t_model, base, loader, lora,
+                cos.copy(), sin.copy(), dim, ffn, in_ch, text_dim, out_ch,
+                freq_dim, eps, ctx, save_acts, device_lora, batched_cross,
+                device_modvecs, device_modvecs_t,
+            )
+            fu = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
+                x.copy(), neg.copy(), t_model, base, loader, lora,
+                cos.copy(), sin.copy(), dim, ffn, in_ch, text_dim, out_ch,
+                freq_dim, eps, ctx, save_acts, device_lora, batched_cross,
+                device_modvecs, device_modvecs_t,
+            )
+        # CFG on the velocity, then one Euler step DOWN the flow-match path.
+        for j in range(n):
+            var v = fu.out[j] + cfg_scale * (fc.out[j] - fu.out[j])
+            x[j] = x[j] - dt * v
+
+    # ── patch space -> latent -> pixels ──
+    var xt = Tensor.from_host(x^, [S, in_ch], STDtype.F32, ctx)
+    var lat = unpatchify3d(
+        xt, SAMPLE_LAT_C, 1, SAMPLE_LAT_H, SAMPLE_LAT_W, 1, 2, 2, ctx
+    )
+    var host = lat.to_host(ctx)
+    # z = normalized_latent * std + mean (the gated Wan VAE encoder contract).
+    var means = _latents_mean()
+    var stds = _latents_std()
+    var stride = SAMPLE_LAT_H * SAMPLE_LAT_W
+    var zhost = List[Float32]()
+    zhost.resize(len(host), Float32(0.0))
+    for i in range(len(host)):
+        var c = (i // stride) % SAMPLE_LAT_C
+        zhost[i] = host[i] * stds[c] + means[c]
+    var z = Tensor.from_host(
+        zhost, [1, SAMPLE_LAT_C, 1, SAMPLE_LAT_H, SAMPLE_LAT_W], STDtype.F32, ctx
+    )
+    # VAE is loaded and dropped per sample point — it must not co-reside with the
+    # experts for the other 99% of the run.
+    var dec = LingBotWanVaeDecoder[SAMPLE_LAT_H, SAMPLE_LAT_W].load(SAMPLE_VAE, ctx)
+    var video = dec.decode_video(z, ctx)
+    var frame = reshape(video, [1, 3, SAMPLE_LAT_H * 8, SAMPLE_LAT_W * 8], ctx)
+    save_png(frame, out_png, ctx, ValueRange.SIGNED)
+    print("  [sample]", tag, "->", out_png,
+          " (", Float64(perf_counter_ns() - t_start) / 1.0e9, "s )")
 
 
 # CACHE-TODO: synthetic x0 in patch space [S, IN_CH]. Real path: load the cached
@@ -1368,6 +1522,20 @@ def main() raises:
     # 0 disables and only the end-of-run save happens (the previous behavior).
     var save_every = cfg.save_every
     var ckpt_stem = String(out_path.removesuffix(String(".safetensors")))
+    # In-train sampling: cadence from cfg.sample_every, conds from a
+    # `wan22_encode_prompt` artifact named by WAN22_SAMPLE_CONDS (see
+    # `_wan22_sample_png` for why the text encoder is NOT loaded in this process).
+    var sample_every = cfg.sample_every
+    var sample_conds_path = _env_str(String("WAN22_SAMPLE_CONDS"))
+    var samples_dir = String(out_path.removesuffix(String(".safetensors"))) + String("_samples")
+    if sample_every > 0 and sample_conds_path.byte_length() == 0:
+        print("[sample] sample_every =", sample_every,
+              "but WAN22_SAMPLE_CONDS is unset — sampling DISABLED."
+              " Encode a prompt first: wan22_encode_prompt <pos> <neg> <conds.safetensors>")
+        sample_every = 0
+    if sample_every > 0:
+        _ = sys_system(String("mkdir -p '") + samples_dir + String("'"))
+        print("[sample] every", sample_every, "steps + at start ->", samples_dir)
     if save_every > 0:
         print("[save] periodic checkpoints every", save_every, "steps ->",
               ckpt_stem + String("-<step>.safetensors"))
@@ -1609,6 +1777,14 @@ def main() raises:
     var cos = rope[0].copy()
     var sin = rope[1].copy()
 
+    var sample_pos = List[Float32]()
+    var sample_neg = List[Float32]()
+    if sample_every > 0:
+        var sc = _load_sample_conds(sample_conds_path, TXT, TEXT_DIM, ctx)
+        sample_pos = sc[0].copy()
+        sample_neg = sc[1].copy()
+        print("[sample] conds loaded from", sample_conds_path)
+
     # ── REAL DATA CACHE (P3: config cache_dir/dataset_cache_dir; env
     #    WAN22_DATA_CACHE OVERRIDES when set). When the resolved dir is
     #    non-empty + has sample_*.safetensors, x0/text come from the cache
@@ -1697,6 +1873,24 @@ def main() raises:
 
     print("")
     print("step  expert    t        MSE            grad_norm     sec")
+    # sample AT START (fresh runs only — a resumed segment already has its earlier
+    # points on disk). This is the base-model reference later points compare against.
+    var sample_shift = discrete_flow_shift
+    if sample_every > 0 and start_step == 0:
+        var tag = String("step0000_start")
+        try:
+            _wan22_sample_png[H, Dh, S, TXT](
+                    tag, samples_dir + String("/") + tag + String(".png"),
+                    sample_pos, sample_neg, base, loader, high_base, loader_high,
+                    dual_expert, boundary, lora, cos.copy(), sin.copy(),
+                    DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS,
+                    SAMPLE_STEPS, SAMPLE_CFG, sample_shift, seed,
+                    False, use_device_lora, use_batched_cross,
+                    use_device_modvecs, use_device_modvecs_t, ctx,
+                )
+        except e:
+            print("  [sample] FAILED at start:", e, "— training continues")
+
     for step in range(start_step, steps):
         var t0 = perf_counter_ns()
 
@@ -1926,6 +2120,24 @@ def main() raises:
             cmeta.append(Float32(Int(seed)))
             var nst = save_wan22_lora_state(lora, ck + String(".state"), ctx, cmeta^)
             print("  [ckpt] step", step + 1, "->", ck, "(", nck, "pairs,", nst, "state )")
+
+        # ── sample at the cadence. Placed next to the checkpoint so an image and
+        # the exact weights that produced it are written at the same step.
+        if sample_every > 0 and (step + 1) % sample_every == 0:
+            var tag = String("step") + _pad4(step + 1)
+            try:
+                _wan22_sample_png[H, Dh, S, TXT](
+                    tag, samples_dir + String("/") + tag + String(".png"),
+                    sample_pos, sample_neg, base, loader, high_base, loader_high,
+                    dual_expert, boundary, lora, cos.copy(), sin.copy(),
+                    DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS,
+                    SAMPLE_STEPS, SAMPLE_CFG, sample_shift, seed,
+                    False, use_device_lora, use_batched_cross,
+                    use_device_modvecs, use_device_modvecs_t, ctx,
+                )
+            except e:
+                print("  [sample] FAILED at step", step + 1, ":", e,
+                      "— training continues")
 
     # ── save PEFT weights + full resume state (A/B + AdamW moments) ────────────
     var npairs = save_wan22_lora(lora, out_path, ctx)

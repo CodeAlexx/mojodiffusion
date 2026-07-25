@@ -1356,6 +1356,15 @@ def main() raises:
     if out_path.byte_length() == 0:
         out_path = String("/home/alex/mojodiffusion/output/wan22_lora/wan22_low_noise_lora.safetensors")
 
+    # Periodic checkpoints: `save_every` steps -> "<out_path minus .safetensors>-<step>.safetensors"
+    # (+ a .state sibling), so every checkpoint is both samplable and resumable.
+    # 0 disables and only the end-of-run save happens (the previous behavior).
+    var save_every = cfg.save_every
+    var ckpt_stem = String(out_path.removesuffix(String(".safetensors")))
+    if save_every > 0:
+        print("[save] periodic checkpoints every", save_every, "steps ->",
+              ckpt_stem + String("-<step>.safetensors"))
+
     if i2v_mode:
         print("VARIANT: I2V-A14B  (in=36ch: noisy_latent 16 + y 20 [mask 4 + img_latent 16])")
     else:
@@ -1792,7 +1801,13 @@ def main() raises:
                     base, loader, lora, cos.copy(), sin.copy(), fwd,
                     DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
                 )
-            var sync_now = step == steps - 1
+            # dev_p IS the live param on this path, so it must be synced back to
+            # lora.ad on any step whose weights get written out — the last step and
+            # every checkpoint step. Without this a mid-run checkpoint would save
+            # stale host weights.
+            var sync_now = (step == steps - 1) or (
+                save_every > 0 and (step + 1) % save_every == 0
+            )
             gn = fused_lora_adamw_plain_step_resident_device_grads(
                 dev_state, lora.ad, dgrads.grad_indices, dgrads.d_a, dgrads.d_b,
                 step + 1, lr, beta1, beta2, opt_eps, weight_decay, ctx,
@@ -1825,6 +1840,21 @@ def main() raises:
         var secs = Float64(perf_counter_ns() - t0) / 1.0e9
         var expert = String("HIGH") if use_high else String("LOW ")
         print(step, " ", expert, " ", t, "  ", loss, "  ", gn, "  ", secs)
+
+        # ── periodic checkpoint (config `save_every`, 0 = only at the end) ──
+        # Writes the SAME two artifacts the final save writes, suffixed with the
+        # step, so any checkpoint can be sampled or resumed from. On the device
+        # paths the live params are the device copies, so sync them back into
+        # lora.ad first — the same sync the final save relies on at the last step.
+        if save_every > 0 and (step + 1) % save_every == 0 and (step + 1) < steps:
+            var tag = String("-") + String(step + 1)
+            var ck = ckpt_stem + tag + String(".safetensors")
+            var nck = save_wan22_lora(lora, ck, ctx)
+            var cmeta = List[Float32]()
+            cmeta.append(Float32(step + 1))
+            cmeta.append(Float32(Int(seed)))
+            var nst = save_wan22_lora_state(lora, ck + String(".state"), ctx, cmeta^)
+            print("  [ckpt] step", step + 1, "->", ck, "(", nck, "pairs,", nst, "state )")
 
     # ── save PEFT weights + full resume state (A/B + AdamW moments) ────────────
     var npairs = save_wan22_lora(lora, out_path, ctx)

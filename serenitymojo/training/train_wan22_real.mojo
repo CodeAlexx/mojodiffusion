@@ -95,6 +95,7 @@ from serenitymojo.models.wan22.wan22_stack_lora import (
     build_wan22_lora_set, wan22_total_adapters,
     wan22_stack_lora_forward_offload, wan22_stack_lora_backward_offload,
     wan22_stack_lora_backward_offload_devnative, Wan22LoraDeviceGradSet,
+    wan22_stack_lora_backward_offload_graph,
     wan22_lora_adamw_step, save_wan22_lora, save_wan22_lora_state,
     Wan22I2VLoraSet, Wan22I2VLoraGradSet, Wan22I2VStackForward,
     build_wan22_i2v_lora_set, wan22_i2v_total_adapters,
@@ -1472,10 +1473,40 @@ def main() raises:
     # grads + resident AdamW (dev_p IS the live params), killing the per-step host
     # grad round-trips (~25k memcpys) of the offload path. dev_state is always
     # inited (cheap); the last step syncs dev_p -> lora.ad so save sees fresh weights.
+    # Phase 2 autograd_v2 graph path (env WAN22_V2_GRAPH=1): the per-block backward
+    # is the FINE-GRAINED engine graph (recompute through record_* wrappers) instead
+    # of the hand-chain save-all tape + devnative backward. Same device-grad output
+    # type, so it reuses the devnative consumer (resident AdamW) verbatim. Per-block
+    # BIT-gated vs devnative on all 10 LoRA slots
+    # (autograd_v2/tests/wan_block_graph_parity.mojo). Default OFF (C13).
     var use_devnative = _env_is_set(String("WAN22_DEVNATIVE"))
+    var use_graph = _env_is_set(String("WAN22_V2_GRAPH"))
+    var use_devpath = use_devnative or use_graph
+    # The recompute backward drivers (devnative, graph) re-derive every activation
+    # from the block input and NEVER read the forward's save-all host tape — only
+    # the host offload backward does. Skipping it removes ~5.5 GB/step of host list
+    # traffic (23 lists/block built + copied, 40 blocks). Pure omission: the forward
+    # OUTPUT is byte-identical, so this cannot move loss or grads.
+    var save_block_acts = not use_devpath
+    # Device-resident LoRA forward (no host round trip) — benched 26x, BIT-EQUAL
+    # (models/wan22/parity/wan22_lora_fwd_hostvsdev_bench.mojo). Enabled with the
+    # device paths; the host offload path keeps the old forward byte-identical (C13).
+    var use_device_lora = use_devpath
+    # Batched cross-attention (kills the per-head loop: ~28.8k launches/step).
+    # ⚠ VALUE-CLASS numerics change (~1e-3), unlike device_lora which is bit-equal.
+    # OFF BY DEFAULT — MEASURED 8.167 → 8.103 s/step = 0.8%, i.e. removing 36% of the
+    # step's kernel launches bought under 1%: this step is NOT launch-bound (nsys:
+    # ~1.6 s/step CUDA API + ~0.69 s/step GPU out of a 14 s step). Not worth shifting
+    # the numerics of a chassis shared with scail2/bernini for 0.8%. The flag, the
+    # batched path and the both-modes gate stay in place: revisit at CUDA-graph
+    # capture time, where the per-head loop's per-head slices/permutes (allocating
+    # ops) and the node count actually matter for StepSlab/replay.
+    var use_batched_cross = False
     var n_adapters = wan22_total_adapters(lora)
     var dev_state = lora_adamw_plain_device_state_init(lora.ad, 0, n_adapters, ctx)
-    if use_devnative:
+    if use_graph:
+        print("[wan22] V2_GRAPH: autograd_v2 fine-grained block backward + resident AdamW")
+    elif use_devnative:
         print("[wan22] DEVNATIVE: resident device grads + AdamW (no host round-trip)")
 
     print("")
@@ -1582,12 +1613,14 @@ def main() raises:
                 model_in.copy(), txt_tokens.copy(), t_model,
                 high_base, loader_high, lora, cos.copy(), sin.copy(),
                 DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                save_block_acts, use_device_lora, use_batched_cross,
             )
         else:
             fwd = wan22_stack_lora_forward_offload[H, Dh, S, TXT](
                 model_in.copy(), txt_tokens.copy(), t_model,
                 base, loader, lora, cos.copy(), sin.copy(),
                 DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                save_block_acts, use_device_lora, use_batched_cross,
             )
 
         # plain per-element MSE then mean; d_out = 2*(pred-target)/N (weighting None).
@@ -1609,9 +1642,24 @@ def main() raises:
         # AdamW steps the SHARED LoRA. WAN22_DEVNATIVE: device-resident grads +
         # resident AdamW (no host round-trip); else the host-list offload path.
         var gn: Float32 = Float32(0.0)
-        if use_devnative:
+        if use_devpath:
             var dgrads: Wan22LoraDeviceGradSet
-            if use_high:
+            if use_graph:
+                if use_high:
+                    dgrads = wan22_stack_lora_backward_offload_graph[H, Dh, S, TXT](
+                        d_out, model_in.copy(), txt_tokens.copy(),
+                        high_base, loader_high, lora, cos.copy(), sin.copy(), fwd,
+                        DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                        use_batched_cross,
+                    )
+                else:
+                    dgrads = wan22_stack_lora_backward_offload_graph[H, Dh, S, TXT](
+                        d_out, model_in.copy(), txt_tokens.copy(),
+                        base, loader, lora, cos.copy(), sin.copy(), fwd,
+                        DIM, FFN, in_ch_eff, TEXT_DIM, OUT_CH, FREQ_DIM, EPS, ctx,
+                        use_batched_cross,
+                    )
+            elif use_high:
                 dgrads = wan22_stack_lora_backward_offload_devnative[H, Dh, S, TXT](
                     d_out, model_in.copy(), txt_tokens.copy(),
                     high_base, loader_high, lora, cos.copy(), sin.copy(), fwd,

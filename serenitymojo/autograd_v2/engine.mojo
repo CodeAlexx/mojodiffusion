@@ -45,6 +45,15 @@ from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 # sum), sigmoid_backward (sg'=s(1-s)), _linear_bwd_dx (base + host-grad LoRA).
 from serenitymojo.ops.gqa_backward import repeat_kv_backward, repeat_kv_backward_slab
 from serenitymojo.ops.activation_backward import sigmoid_backward, sigmoid_backward_slab
+# Wan2.2 fine-grained backward helpers (Phase 2): the OPK_WAN_* / OPK_GELU arms
+# call these EXACT oracle helpers whole (wan22_block.mojo) — no new math (C14).
+from serenitymojo.ops.activation_backward import gelu_backward as _wan_gelu_backward
+from serenitymojo.models.wan22.wan22_block import (
+    wan_modulate_backward as _wan_modulate_backward,
+    wan_gate_residual_backward as _wan_gate_residual_backward,
+    _base_dx as _wan_base_dx,
+    _wan_lora_bwd_device_from_tensors as _wan_lora_bwd_from_tensors,
+)
 from serenitymojo.ops.tensor_algebra import mul_slab as _ta_mul_slab_eng
 from serenitymojo.models.krea2.krea2_block import (
     krea2_rmsnorm_backward_dx as _k2_rmsnorm_backward_dx,
@@ -121,6 +130,13 @@ from serenitymojo.autograd_v2.node import (
     OPK_KREA2_RMS_NORM_DX,
     OPK_ROPE_HALFSPLIT,
     OPK_LINEAR_DX,
+    OPK_WAN_MOD_PRE,
+    OPK_GELU,
+    OPK_WAN_GATED_RESIDUAL,
+    OPK_WAN_PROJ_LORA,
+    OPK_LAYER_NORM_DX,
+    OPK_WAN_ROPE,
+    OPK_SDPA_RECT,
     _raw_add,
     _raw_add_slab,
     _raw_mul,
@@ -134,6 +150,7 @@ from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.autograd_v2.ops_record import (
     proj_lora_backward,
     sdpa_backward_dispatch,
+    sdpa_backward_rect_dispatch,
     proj_lora_backward_slab,
     sdpa_backward_dispatch_slab,
 )
@@ -370,6 +387,89 @@ def apply(node: Node, grads_in: List[TArc], ctx: DeviceContext) raises -> List[T
         )
         var out = List[TArc]()
         out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_WAN_MOD_PRE:
+        # saved [x, ln, scale, weight]; scalars [eps]. o = LN_no_affine(x)*
+        # (1+scale)+shift → d_x via the oracle's exact mb/lnb pair
+        # (wan22_block.mojo:1620/1624). d_scale/d_shift dropped (mod vecs frozen).
+        var mb = _wan_modulate_backward(g[], node.saved[1][], node.saved[2][], ctx)
+        var d_x = layer_norm_backward_dx(
+            mb.d_ln, node.saved[0][], node.saved[3][], node.scalars[0], ctx
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_GELU:
+        # saved [x] (pre-gelu ffn_h); backward = gelu_backward(go, x)
+        # (wan22_block.mojo:1607).
+        var d_x = _wan_gelu_backward(g[], node.saved[0][], ctx)
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_WAN_GATED_RESIDUAL:
+        # saved [y, gate]; o = x + gate*y → d_x=go, d_y=go*gate (d_gate dropped:
+        # gate frozen), the oracle's gb call (wan22_block.mojo:1595/1689). Edges
+        # [x, y] in that order.
+        var gb = _wan_gate_residual_backward(g[], node.saved[0][], node.saved[1][], ctx)
+        var out = List[TArc]()
+        out.append(arc_view(gb.d_x))
+        out.append(arc_view(gb.d_y))
+        return out^
+    elif node.kind == OPK_WAN_PROJ_LORA:
+        # saved [x, W] (+ [A_dev, B_dev] iff adapter present); meta [M,in,out,rank];
+        # scalars [scale]. Base d_x via _base_dx (frozen W, d_w/d_b discarded); the
+        # DEVICE LoRA bwd (from saved A/B tensors) gives device d_A/d_B/d_x_lo; d_x =
+        # add(base_dx, d_x_lo). Edges [x, A_leaf, B_leaf] → grads [d_x, d_A, d_B].
+        var base_dx = _wan_base_dx(
+            g[], node.saved[1][],
+            node.saved_meta[0], node.saved_meta[1], node.saved_meta[2], ctx,
+        )
+        if len(node.saved) >= 4:
+            var lg = _wan_lora_bwd_from_tensors(
+                node.saved[2][], node.saved[3][], node.scalars[0],
+                node.saved_meta[3], node.saved_meta[1], node.saved_meta[2],
+                g[], node.saved[0][], node.saved_meta[0], ctx,
+            )
+            var d_x = _raw_add(base_dx, lg.d_x[], ctx)
+            var out = List[TArc]()
+            out.append(TArc(d_x^))
+            out.append(lg.d_a.copy())
+            out.append(lg.d_b.copy())
+            return out^
+        var out = List[TArc]()
+        out.append(TArc(base_dx^))
+        return out^
+    elif node.kind == OPK_LAYER_NORM_DX:
+        # saved [x, weight]; scalars [eps]; frozen affine → dx only (the oracle's
+        # n3 backward, wan22_block.mojo:1681).
+        var d_x = layer_norm_backward_dx(
+            g[], node.saved[0][], node.saved[1][], node.scalars[0], ctx
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_WAN_ROPE:
+        # saved [cos_f32, sin_f32]; the oracle F32-cast dance (wan22_block.mojo:
+        # 1706-1711): cast go→F32, rope_backward(F32 tables, interleaved=True),
+        # cast→bf16.
+        var g_f32 = cast_tensor_eng(g[], STDtypeEng.F32, ctx)
+        var dx_f32 = rope_backward(g_f32, node.saved[0][], node.saved[1][], True, ctx)
+        var d_x = cast_tensor_eng(dx_f32, STDtypeEng.BF16, ctx)
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_SDPA_RECT:
+        # saved [q, k, v]; meta [B, Sq, Skv, H, Dh]; scalars [scale]. Rect cross-attn
+        # backward → d_q,d_k,d_v (wan22_block.mojo:1641). MATH-MODE deterministic.
+        var sb = sdpa_backward_rect_dispatch(
+            node.saved[0][], node.saved[1][], node.saved[2][], g[], node.scalars[0],
+            node.saved_meta[0], node.saved_meta[1], node.saved_meta[2],
+            node.saved_meta[3], node.saved_meta[4], ctx,
+        )
+        var out = List[TArc]()
+        out.append(sb.d_q.copy())
+        out.append(sb.d_k.copy())
+        out.append(sb.d_v.copy())
         return out^
     elif node.kind == OPK_LEAF:
         raise Error("apply: OPK_LEAF is sunk by the engine, never dispatched")

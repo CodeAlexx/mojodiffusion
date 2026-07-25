@@ -70,6 +70,9 @@ from serenitymojo.models.wan22.wan22_block import (
     WanI2VBlockWeights, WanI2VBlockLora, WanI2VBlockLoraGrads, WanI2VSaved,
     wan22_i2v_block_lora_forward, wan22_i2v_block_lora_backward,
 )
+from serenitymojo.autograd_v2.wan22_block_graph import (
+    wan22_block_lora_graph_backward, WanBlockGraphGrads,
+)
 from serenitymojo.models.klein.lora_block import KleinLoraGrads
 from serenitymojo.training.dora_adapter import DoRAGrads
 from serenitymojo.training.oft_serenity_trainer import OFTOTGrads
@@ -747,7 +750,16 @@ def wan22_stack_lora_forward_offload[
     cos: List[Float32], sin: List[Float32],
     dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
     freq_dim: Int, eps: Float32, ctx: DeviceContext,
+    save_acts: Bool = True,
+    device_lora: Bool = False,
+    batched_cross: Bool = False,
 ) raises -> Wan22StackForward:
+    """`save_acts=False` omits the per-block save-all HOST activation tape
+    (`block_saved`). ONLY the host offload backward (this file, `…_backward_offload`)
+    reads it; the devnative and autograd_v2 graph drivers RECOMPUTE each block from
+    `block_inputs`, so for them the tape is ~5.5 GB/step of host list traffic
+    (23 lists/block built, then `.copy()`d) for data nobody reads. Default True =
+    byte-identical to before (C13)."""
     var num_blocks = lora.num_blocks
 
     loader.prefetch_with_ctx(0, ctx)
@@ -788,14 +800,20 @@ def wan22_stack_lora_forward_offload[
         # Load block weights.
         var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
 
-        # LoRA-augmented forward.
+        # LoRA-augmented forward. `x_h`/`context_h` are READ (borrowed) args — the
+        # old `.copy()`s were pure waste: [S,dim]=1.31M + [TXT,dim]=2.6M host floats
+        # per block, ~157M element copies/step at 40 blocks.
         var bl = _wan_block_lora_for(lora, bi)
         block_inputs.append(img.copy())
         var fwd = wan22_block_lora_forward[H, Dh, S, TXT](
-            img.copy(), context_emb.copy(), mv, w, bl, cos_t, sin_t, dim, ffn, eps, ctx,
+            img, context_emb, mv, w, bl, cos_t, sin_t, dim, ffn, eps, ctx,
+            save_acts, device_lora, batched_cross,
         )
 
-        block_saved.append(fwd.saved.copy())
+        # save_acts=False (recompute backward drivers): the 23-list per-block host
+        # tape is never read, so it is neither BUILT (above) nor COPIED here.
+        if save_acts:
+            block_saved.append(fwd.saved.copy())
         block_modvecs.append(mv.copy())
         img = fwd.x_out.copy()
         loader.mark_active_block_done(ctx)
@@ -1225,6 +1243,160 @@ def wan22_stack_lora_backward_offload_devnative[
         if not da_opt[i]:
             raise Error(
                 "wan22_stack_lora_backward_offload_devnative: missing device grad slot "
+                + String(i)
+            )
+        d_a.append(da_opt[i].value().copy())
+        d_b.append(db_opt[i].value().copy())
+        grad_indices.append(i)
+
+    var d_x_tokens = d_out_dev.to_host(ctx)
+    return Wan22LoraDeviceGradSet(
+        d_a^, d_b^, grad_indices^, d_x_tokens^, n_adapters,
+    )
+
+
+def wan22_stack_lora_backward_offload_graph[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, lora: Wan22LoraSet,
+    cos: List[Float32], sin: List[Float32],
+    saved: Wan22StackForward,
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+    batched_cross: Bool = False,
+) raises -> Wan22LoraDeviceGradSet:
+    """autograd_v2 GRAPH twin of `wan22_stack_lora_backward_offload_devnative`
+    (this file :1113) — same signature, same conductor seam, same return type;
+    the per-block call is the ONLY difference (Phase 2, contract C13: the
+    devnative and host drivers stay compiled and reachable).
+
+    Per block the devnative driver does TWO calls — `wan22_block_lora_forward`
+    (a save-all host tape) then `wan22_block_lora_backward_devnative` (which
+    re-uploads those saved acts). The graph driver replaces BOTH with one
+    `wan22_block_lora_graph_backward`, which recomputes the block forward
+    THROUGH the record_* wrappers and drives the dependency-counted engine
+    backward — so the save-all host tape and its re-upload round trip are gone,
+    and the step becomes StepSlab-allocatable / CUDA-graph capturable (the
+    actual 15→~1.6 s/step lever; the ~52k host launches/step are what capture
+    collapses).
+
+    Gated BIT-EXACT per block against the devnative oracle on all 10 LoRA slots
+    (autograd_v2/tests/wan_block_graph_parity.mojo; d_x/d_context are a 4dp
+    value class by the C15 fan-in reassociation — see that gate's header).
+
+    MEMORY (16 GB): exactly ONE device tape is live at a time — the graph is
+    built, executed, and dropped inside each loop iteration, matching the
+    devnative driver's recompute discipline. `d_context` is computed by the
+    block graph but DISCARDED here, as the devnative driver does: this is
+    LoRA-only training and the text-encoder path is frozen.
+    """
+    var num_blocks = lora.num_blocks
+    var n_adapters = wan22_total_adapters(lora)
+
+    if len(saved.block_inputs) != num_blocks:
+        raise Error(
+            "wan22_stack_lora_backward_offload_graph: forward tape missing block_inputs"
+            " (use wan22_stack_lora_forward_offload)"
+        )
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S, Dh // 2], STDtype.F32, ctx)
+
+    # ── head backward (proj_out → modulate → LN_no_affine) — verbatim clone of
+    #    the devnative driver's head chain (:1140-1179). ──
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.norm_backward import layer_norm_backward_dx
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var ones = List[Float32]()
+    for _ in range(dim):
+        ones.append(Float32(1.0))
+    var zeros = List[Float32]()
+    for _ in range(dim):
+        zeros.append(Float32(0.0))
+    var ln_x_img = layer_norm(
+        _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), _t(zeros^, [dim], ctx), eps, ctx,
+    ).to_host(ctx)
+    var scale_d = _t(saved.head_scale.copy(), [S, dim], ctx)
+    var shift_d = _t(saved.head_shift.copy(), [S, dim], ctx)
+    from serenitymojo.ops.tensor_algebra import add_scalar as _add_scalar
+    var sc1 = _add_scalar(scale_d, Float32(1.0), ctx)
+    var ln_x_t = _t(ln_x_img.copy(), [S, dim], ctx)
+    var modulated = mul(ln_x_t, sc1, ctx)
+    modulated = add(modulated, shift_d, ctx)
+    var lbh = linear_backward(
+        _t_like(d_out, [S, out_ch], base.hh_w[], ctx),
+        _cast_like(modulated, base.hh_w[], ctx), base.hh_w[],
+        S, dim, out_ch, ctx,
+    )
+    var d_modulated = lbh.d_x.to_host(ctx)
+    var mbh = modulate_backward(
+        _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
+        _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_ln_img = mbh.d_x.to_host(ctx)
+    var lnbh = layer_norm_backward_dx(
+        _t(d_ln_img, [S, dim], ctx), _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), eps, ctx,
+    )
+    var d_x_img = lnbh.to_host(ctx)   # [S, dim] — enters last block output
+
+    # ── dense per-adapter device grad slots (all 10/block filled) ──
+    var da_opt = List[Optional[TArc]]()
+    var db_opt = List[Optional[TArc]]()
+    for _ in range(n_adapters):
+        da_opt.append(Optional[TArc]())
+        db_opt.append(Optional[TArc]())
+
+    var d_out_dev = Tensor.from_host(d_x_img.copy(), [S, dim], STDtype.BF16, ctx)
+
+    # ── stream blocks in REVERSE (graph recompute, one device tape live) ──
+    var bi = num_blocks - 1
+    while bi >= 0:
+        var handle = loader.await_block(bi, ctx)
+        if bi > 0:
+            loader.prefetch_with_ctx(bi - 1, ctx)
+
+        # mv is READ-ONLY here (handed straight to the graph fn) — no .copy():
+        # 6 x [S,dim] host lists per block = ~314M element copies/step at 40 blocks.
+        ref mv = saved.block_modvecs[bi]
+        var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var bl = _wan_block_lora_for(lora, bi)
+
+        # the block's saved INPUT is the graph's recompute source (bf16 upload,
+        # identical rounding to wan22_block_lora_forward's own _ta16, :1458).
+        var x_in = TArc(_t16(saved.block_inputs[bi].copy(), [S, dim], ctx))
+        var context_in = TArc(_t16(saved.context_emb.copy(), [TXT, dim], ctx))
+        var gg = wan22_block_lora_graph_backward[H, Dh, S, TXT](
+            d_out_dev, x_in, context_in, mv, w, bl, cos_t, sin_t,
+            dim, ffn, eps, ctx, batched_cross,
+        )
+        d_out_dev = gg.d_x[].clone(ctx)
+        var bbase = _lora_block_base(bi)
+        for slot in range(WAN_LORA_SLOTS):
+            if gg.d_a[slot]:
+                da_opt[bbase + slot] = Optional[TArc](gg.d_a[slot].value().copy())
+                db_opt[bbase + slot] = Optional[TArc](gg.d_b[slot].value().copy())
+
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    # flatten dense slots → ascending device grad lists + dense grad indices.
+    var d_a = List[TArc]()
+    var d_b = List[TArc]()
+    var grad_indices = List[Int]()
+    for i in range(n_adapters):
+        if not da_opt[i]:
+            raise Error(
+                "wan22_stack_lora_backward_offload_graph: missing device grad slot "
                 + String(i)
             )
         d_a.append(da_opt[i].value().copy())

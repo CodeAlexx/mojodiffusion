@@ -162,6 +162,66 @@ comptime OPK_LTX2V_VIDEO_BLOCK = 27
 # args (mv/w/lora/WanSaved/cos/sin/dim/ffn/eps) ride execute_wan_t2v_block's args.
 # One tracked edge (x). NO StepSlab / NO capture in Phase 1 (correctness only).
 comptime OPK_WAN_T2V_BLOCK = 28
+# ── Wan2.2-A14B T2V block, FINE-GRAINED (Phase 2; wan22_block_graph.mojo). The
+# per-op vocabulary that lets StepSlab statically allocate the wan block backward
+# and CUDA-graph capture/replay it (collapsing the ~52k host launches → ~2
+# cuGraphLaunch — the 15→~1.6 s/step lever). Each arm (engine.mojo apply()) calls
+# ONLY the EXACT parity-proven backward the wan oracle
+# (wan22_block_lora_backward[_devnative], wan22_block.mojo:1559/1794) calls — NO
+# new math (C2/C14). We deliberately do NOT reuse the zimage OPK_MODULATE /
+# OPK_RESIDUAL_GATE_DXDY kinds: those call modulate_backward /
+# gate_residual_backward_dxdy, DIFFERENT helpers than the wan oracle's
+# wan_modulate_backward / wan_gate_residual_backward, whose bf16 rounding could
+# diverge — so wan carries its OWN mod_pre / gated_residual kinds calling the
+# oracle helpers whole (correctness by construction).
+#  * OPK_WAN_MOD_PRE: o = LN_no_affine(x)*(1+scale)+shift, the per-token AdaLN
+#    pre (wan_mod_pre, wan22_block.mojo:143). Backward = wan_modulate_backward(go,
+#    ln, scale) → d_ln (d_scale/d_shift dropped: mod vecs frozen) then
+#    layer_norm_backward_dx(d_ln, x, weight, eps) → d_x — the oracle's exact
+#    mb_ffn/lnb_ffn pair (:1620/1624). saved=[x, ln, scale, weight]; scalars=[eps];
+#    one input edge (x). weight = the LN affine (ones vec for the AdaLN pre; the
+#    real n3 gamma is a separate affine LN handled by the same helper).
+#  * OPK_GELU: act = gelu(x) tanh-approx (wan22_block.mojo:1511). Backward =
+#    gelu_backward(go, x) (ops/activation_backward.mojo:532) — x is the PRE-gelu
+#    ffn_h. saved=[x]; one input edge.
+#  * OPK_WAN_GATED_RESIDUAL: o = x + gate*y, per-token gated residual
+#    (wan_gated_residual, wan22_block.mojo:155). Backward = wan_gate_residual_
+#    backward(go, y, gate) → d_x=go, d_y=go*gate (d_gate dropped: gate frozen) —
+#    the oracle's gb_ffn2/gb_sa call (:1595/1689). saved=[y, gate]; edges=[x, y].
+#  * OPK_WAN_PROJ_LORA: y = linear(x, W_frozen, bias_frozen) + LoRA(x). Backward =
+#    _base_dx(go, W) (dx-only, base d_w/d_b discarded — frozen) + the DEVICE LoRA
+#    backward _wan_lora_bwd_device(go, x_bf) → device d_A[rank,in] F32 /
+#    d_B[out,rank] F32 / d_x_lo[M,in] bf16 (wan22_block.mojo:1108, CERTIFIED
+#    bit-equal to host klein_lora_bwd in Phase 1c). Unlike the krea2/coarse host-
+#    list path, the device grads flow as CLEAN engine accumulator leaves (d_A/d_B),
+#    so the step stays capture-eligible (no host readback). d_x = _fold_lora_dx =
+#    add(_base_dx, d_x_lo). saved=[x_bf, W, A, B]; meta=[M, in_f, out_f, rank];
+#    scalars=[scale]; edges=[x, A_leaf, B_leaf]. bias is frozen (folded into no
+#    edge; d_x path ignores it). lora_slot<0 (absent adapter) → base d_x only.
+comptime OPK_WAN_MOD_PRE = 29
+comptime OPK_GELU = 30
+comptime OPK_WAN_GATED_RESIDUAL = 31
+comptime OPK_WAN_PROJ_LORA = 32
+# ── Wan attention vocabulary (Phase 2 slice 3). Same C14 discipline.
+#  * OPK_LAYER_NORM_DX: standalone AFFINE LayerNorm (cross-attn n3 = layer_norm(
+#    x_sa, n3_w, n3_b); wan22_block.mojo:1482). Frozen affine → dx only. Backward =
+#    layer_norm_backward_dx(go, x, weight, eps) (:1681). saved=[x, weight];
+#    scalars=[eps]; one input edge. (Distinct from OPK_WAN_MOD_PRE, which is the
+#    LN+modulate composite for the AdaLN pre.)
+#  * OPK_WAN_ROPE: rope_interleaved on the per-head q/k (wan22_block.mojo:1472). The
+#    oracle runs rope_backward in F32 (sdpa grads bf16 → cast F32 → rope_backward(
+#    F32 tables, interleaved=True) → cast bf16; :1706-1711) — so a plain OPK_ROPE
+#    (bf16) would NOT bit-match. This op saves F32 expanded per-head cos/sin tables
+#    and the arm does the exact F32-cast dance. saved=[cos_f32, sin_f32]; one edge.
+comptime OPK_LAYER_NORM_DX = 33
+comptime OPK_WAN_ROPE = 34
+#  * OPK_SDPA_RECT: rectangular cross-attn (caq_rms [1,S,H,Dh] × cak_rms/cav
+#    [1,TXT,H,Dh]; wan22_block.mojo:1497 _cross_attention). Backward =
+#    sdpa_backward_rect[B,Sq,Skv,H,Dh] → d_q,d_k,d_v (:1641). MATH-MODE
+#    deterministic (wan has no flash) → TRUE bit gate. saved=[q,k,v];
+#    meta=[B,Sq,Skv,H,Dh]; scalars=[scale]; edges=[q,k,v]. The arm dispatches
+#    runtime dims → comptime bucket via sdpa_backward_rect_dispatch (ops_record).
+comptime OPK_SDPA_RECT = 35
 
 
 struct Edge(Copyable, Movable):

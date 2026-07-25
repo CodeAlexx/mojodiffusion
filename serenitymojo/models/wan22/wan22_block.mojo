@@ -56,7 +56,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import gelu
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_cross_nomask
 from serenitymojo.ops.softmax import softmax_lastdim
 from serenitymojo.ops.tensor_algebra import (
     reshape, reshape_owned, reshape_in_place, slice, concat, add, sub, mul,
@@ -918,6 +918,7 @@ def wan22_block_backward[
 from serenitymojo.models.klein.lora_block import (
     LoraAdapter, klein_lora_fwd, klein_lora_bwd, KleinLoraGrads,
     lora_adapter_to_device, LoraAdapterDevice,
+    klein_lora_fwd_device_resident_unfused,
 )
 from serenitymojo.training.dora_adapter import DoRAGrads
 from serenitymojo.training.oft_serenity_trainer import OFTOTGrads
@@ -1061,6 +1062,27 @@ def _add_lora_delta(
 # output grad d_y_h [M,out] and saved input x_h [M,in], returns (d_A,d_B,d_x_lo).
 # d_x_lo is the LoRA branch's contribution to the projection input grad (must be
 # summed into the base path's d_x by the caller).
+def _add_lora_delta_dev(
+    y: Tensor, x: Tensor, lo: Optional[LoraAdapter], M: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    """DEVICE-RESIDENT twin of `_add_lora_delta` (above): y + LoRA(x) with the
+    activation staying on the GPU.
+
+    `_add_lora_delta` routes through `klein_lora_fwd`, which to_host's x, ping-pongs
+    both GEMM results through host memory, and scales in a host `for` loop over
+    M*out_f floats. Both versions run the SAME GEMMs ON THE GPU — the host chain
+    only marshals — so this is BIT-EQUAL, not a numerics change. MEASURED at the
+    real attention dims (M=256, in=out=5120, rank=16):
+    host 4.011 ms/call vs device 0.154 ms/call = 26x, n_mismatch=0/1310720 at
+    scale=1.0 AND 0.5 (models/wan22/parity/wan22_lora_fwd_hostvsdev_bench.mojo).
+    Uses the UNFUSED sibling deliberately — the fused kernel reassociates."""
+    if not lo:
+        return _clone_t(y, ctx)
+    var ld = lora_adapter_to_device(lo.value(), ctx)
+    var delta = klein_lora_fwd_device_resident_unfused(x, ld, M, ctx)
+    return add(y, delta, ctx)
+
+
 def _lora_bwd_opt(
     lo: Optional[LoraAdapter], d_y_h: List[Float32], x_h: List[Float32],
     M: Int, in_f: Int, ctx: DeviceContext,
@@ -1118,19 +1140,37 @@ def _wan_lora_bwd_device(
         var p2 = Tensor.from_host([Float32(0.0)], [1], STDtype.F32, ctx)
         return WanLoraDevGrad(False, TArc(p1^), TArc(p2^), TArc(z^))
     var ld = lora_adapter_to_device(lo.value(), ctx)   # a,b BF16 device
+    return _wan_lora_bwd_device_from_tensors(
+        ld.a[], ld.b[], ld.scale, ld.rank, ld.in_f, ld.out_f,
+        d_contrib, x_bf, M, ctx,
+    )
+
+
+# Device-tensor core of _wan_lora_bwd_device (Phase 2): the present-adapter body
+# with A/B already resident as BF16 device tensors (the shapes lora_adapter_to_
+# device produces: a [rank,in_f], b [out_f,rank]). _wan_lora_bwd_device delegates
+# here after uploading the host adapter, so this is BYTE-IDENTICAL to the pre-
+# refactor certified path (same ops, same order). The autograd_v2 OPK_WAN_PROJ_LORA
+# apply arm calls this DIRECTLY on the node's saved A/B device tensors — so the
+# fine-grained graph LoRA grads are bit-equal to the devnative oracle by
+# construction, and stay device-resident (capture-eligible, no host readback).
+def _wan_lora_bwd_device_from_tensors(
+    a_dev: Tensor, b_dev: Tensor, scale: Float32, rank: Int, in_f: Int, out_f: Int,
+    d_contrib: Tensor, x_bf: Tensor, M: Int, ctx: DeviceContext,
+) raises -> WanLoraDevGrad:
     # t = x @ Aᵀ  (bf16 GEMM), then the bf16 round-trip (== to_host->from_host).
     var nb = Optional[Tensor](None)
-    var t = linear(x_bf, ld.a[], nb^, ctx)
+    var t = linear(x_bf, a_dev, nb^, ctx)
     var t_bf = cast_tensor(t, STDtype.BF16, ctx)
     # d_dy = bf16( scale · F32(d_contrib) )  (F32 mul is IEEE-exact host==device).
     var d_contrib_f32 = cast_tensor(d_contrib, STDtype.F32, ctx)
-    var d_dy_f32 = mul_scalar(d_contrib_f32, ld.scale, ctx)
+    var d_dy_f32 = mul_scalar(d_contrib_f32, scale, ctx)
     var d_dy_bf = cast_tensor(d_dy_f32, STDtype.BF16, ctx)
     # dy = t @ Bᵀ  →  d_B (d_w) and d_t (d_x); all-bf16 linear_backward.
-    var lbB = linear_backward(d_dy_bf, t_bf, ld.b[], M, ld.rank, ld.out_f, ctx)
+    var lbB = linear_backward(d_dy_bf, t_bf, b_dev, M, rank, out_f, ctx)
     var d_b_f32 = cast_tensor(lbB.d_w, STDtype.F32, ctx)   # widen bf16 d_w -> F32
     # t = x @ Aᵀ  →  d_A (d_w) and d_x_lo (d_x); reuse lbB.d_x (bf16) as d_t.
-    var lbA = linear_backward(lbB.d_x, x_bf, ld.a[], M, ld.in_f, ld.rank, ctx)
+    var lbA = linear_backward(lbB.d_x, x_bf, a_dev, M, in_f, rank, ctx)
     var d_a_f32 = cast_tensor(lbA.d_w, STDtype.F32, ctx)   # widen bf16 d_w -> F32
     var d_x_lo = lbA.d_x.clone(ctx)
     return WanLoraDevGrad(True, TArc(d_a_f32^), TArc(d_b_f32^), TArc(d_x_lo^))
@@ -1426,13 +1466,54 @@ def _direct_proj_bwd_device(
 # projections. Saves the SAME WanSaved (the base saved activations) — but note
 # the saved q/k/v/att activations now INCLUDE the LoRA delta (the forward graph),
 # which is exactly what the base backward consumes.
+def _wan_saved_empty() -> WanSaved:
+    """An all-empty WanSaved for the `save_acts=False` forward (below). The
+    RECOMPUTE backward drivers (devnative, autograd_v2 graph) re-derive every
+    activation from the block INPUT, so for them the save-all tape is pure waste:
+    23 host lists per block (~34.6M BF16 elements = ~69 MB), which the stack
+    forward then `.copy()`s again — ~5.5 GB of host traffic per step at 40 blocks,
+    for a tape only the HOST offload backward (wan22_stack_lora.mojo:1045) reads."""
+    var e = List[BFloat16]()
+    return WanSaved(
+        e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(),
+        e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(),
+        e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(),
+        e.copy(), e^,
+    )
+
+
 def wan22_block_lora_forward[
     H: Int, Dh: Int, S: Int, TXT: Int
 ](
     x_h: List[Float32], context_h: List[Float32], mv: WanModVecs,
     w: WanBlockWeights, lora: WanBlockLora, cos: Tensor, sin: Tensor,
     dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+    save_acts: Bool = True,
+    device_lora: Bool = False,
+    batched_cross: Bool = False,
 ) raises -> WanBlockForward:
+    """`batched_cross=True` replaces the PER-HEAD cross-attention loop
+    (`_cross_attention`, this file :580) with the batched `sdpa_cross_nomask`.
+
+    ⚠ THIS ONE IS A NUMERICS CHANGE (unlike `device_lora`, which is bit-equal).
+    The per-head loop runs H separate slice/GEMM/softmax/transpose/GEMM chains and
+    the batched kernel does one matmul-backed pass, so the bf16 reduction order
+    differs → a ~1e-3 VALUE-CLASS difference, same acceptance class as the flash
+    SDPA change. Default False keeps every existing path byte-identical (C13).
+
+    WHY: at H=40 the loop is ~9 kernels/head = ~360 launches per call, and the call
+    runs twice per block per step (forward + graph recompute) → ~28.8k launches/step
+    of the measured ~80k. It was the single largest launch source in the step; the
+    softmax instance count in nsys (3,200/step = 40 heads × 40 blocks × 2 passes)
+    identified it exactly. Self-attn was already batched (`sdpa_nomask`).
+
+    NOTE the backward was ALREADY batched (`sdpa_backward_rect`), so this makes the
+    forward and backward consistent rather than mixing a looped fwd with a batched bwd.
+
+    `device_lora=True` runs all 10 LoRA projections through the DEVICE path
+    (`_add_lora_delta_dev`) instead of the host round trip, removing 10 large
+    `to_host` readbacks + 10 host scale-loops per block (400/step at 40 blocks,
+    benched 26x, BIT-EQUAL). Default False = byte-identical to before (C13)."""
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t16(_ones(dim), [dim], ctx)
     var zeros_t = _t16(_zeros(dim), [dim], ctx)
@@ -1453,13 +1534,16 @@ def wan22_block_lora_forward[
 
     # ── self-attention (LoRA on q/k/v/o) ──
     var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
-    var sa_in_h = sa_mp.o[].to_host(ctx)
+    # host readback ONLY needed by the host LoRA path (device_lora=False).
+    var sa_in_h = List[Float32]()
+    if not device_lora:
+        sa_in_h = sa_mp.o[].to_host(ctx)
     var q_base = linear(sa_mp.o[], w.sa_wq[], Optional[Tensor](_clone_t(w.sa_bq[], ctx)), ctx)
     var k_base = linear(sa_mp.o[], w.sa_wk[], Optional[Tensor](_clone_t(w.sa_bk[], ctx)), ctx)
     var v_base = linear(sa_mp.o[], w.sa_wv[], Optional[Tensor](_clone_t(w.sa_bv[], ctx)), ctx)
-    var q_flat = _add_lora_delta(q_base, sa_in_h, lora.sa_q, S, ctx)
-    var k_flat = _add_lora_delta(k_base, sa_in_h, lora.sa_k, S, ctx)
-    var v_flat = _add_lora_delta(v_base, sa_in_h, lora.sa_v, S, ctx)
+    var q_flat = _add_lora_delta_dev(q_base, sa_mp.o[], lora.sa_q, S, ctx) if device_lora else _add_lora_delta(q_base, sa_in_h, lora.sa_q, S, ctx)
+    var k_flat = _add_lora_delta_dev(k_base, sa_mp.o[], lora.sa_k, S, ctx) if device_lora else _add_lora_delta(k_base, sa_in_h, lora.sa_k, S, ctx)
+    var v_flat = _add_lora_delta_dev(v_base, sa_mp.o[], lora.sa_v, S, ctx) if device_lora else _add_lora_delta(v_base, sa_in_h, lora.sa_v, S, ctx)
     var q_rms_flat = rms_norm(q_flat, w.sa_qn[], eps, ctx)
     var k_rms_flat = rms_norm(k_flat, w.sa_kn[], eps, ctx)
     var q_pre = _to_bshd(q_flat^, S, H, Dh, ctx)
@@ -1473,20 +1557,24 @@ def wan22_block_lora_forward[
     var k_rope = rope_interleaved(k_rms, cos_e, sin_e, ctx)
     var att4 = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v4, scale, ctx)
     var sa_att = _from_bshd(att4^, S, dim, ctx)
-    var sa_att_h = sa_att.to_host(ctx)
+    var sa_att_h = List[Float32]()
+    if not device_lora:
+        sa_att_h = sa_att.to_host(ctx)
     var sa_out_base = linear(sa_att, w.sa_wo[], Optional[Tensor](_clone_t(w.sa_bo[], ctx)), ctx)
-    var sa_out = _add_lora_delta(sa_out_base, sa_att_h, lora.sa_o, S, ctx)
+    var sa_out = _add_lora_delta_dev(sa_out_base, sa_att, lora.sa_o, S, ctx) if device_lora else _add_lora_delta(sa_out_base, sa_att_h, lora.sa_o, S, ctx)
     var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
 
     # ── cross-attention (LoRA on q/k/v/o) ──
     var n3 = layer_norm(x_sa, w.n3_w[], w.n3_b[], eps, ctx)
-    var n3_h = n3.to_host(ctx)
+    var n3_h = List[Float32]()
+    if not device_lora:
+        n3_h = n3.to_host(ctx)
     var caq_base = linear(n3, w.ca_wq[], Optional[Tensor](_clone_t(w.ca_bq[], ctx)), ctx)
     var cak_base = linear(context[], w.ca_wk[], Optional[Tensor](_clone_t(w.ca_bk[], ctx)), ctx)
     var cav_base = linear(context[], w.ca_wv[], Optional[Tensor](_clone_t(w.ca_bv[], ctx)), ctx)
-    var caq_flat = _add_lora_delta(caq_base, n3_h, lora.ca_q, S, ctx)
-    var cak_flat = _add_lora_delta(cak_base, context_host, lora.ca_k, TXT, ctx)
-    var cav_flat = _add_lora_delta(cav_base, context_host, lora.ca_v, TXT, ctx)
+    var caq_flat = _add_lora_delta_dev(caq_base, n3, lora.ca_q, S, ctx) if device_lora else _add_lora_delta(caq_base, n3_h, lora.ca_q, S, ctx)
+    var cak_flat = _add_lora_delta_dev(cak_base, context[], lora.ca_k, TXT, ctx) if device_lora else _add_lora_delta(cak_base, context_host, lora.ca_k, TXT, ctx)
+    var cav_flat = _add_lora_delta_dev(cav_base, context[], lora.ca_v, TXT, ctx) if device_lora else _add_lora_delta(cav_base, context_host, lora.ca_v, TXT, ctx)
     var caq_rms_flat = rms_norm(caq_flat, w.ca_qn[], eps, ctx)
     var cak_rms_flat = rms_norm(cak_flat, w.ca_kn[], eps, ctx)
     var caq_pre = _to_bshd(caq_flat^, S, H, Dh, ctx)
@@ -1494,27 +1582,45 @@ def wan22_block_lora_forward[
     var cav4 = reshape(cav_flat^, [1, TXT, H, Dh], ctx)
     var caq_rms = _to_bshd(caq_rms_flat^, S, H, Dh, ctx)
     var cak_rms = reshape(cak_rms_flat^, [1, TXT, H, Dh], ctx)
-    var ca_att4 = _cross_attention[S, TXT, H, Dh](caq_rms, cak_rms, cav4, scale, ctx)
+    # batched (1 pass) vs the per-head loop (H×~9 kernels) — see the docstring.
+    # Both produce [1,S,H,Dh]≡[1,S,dim] row-major, so _from_bshd is unchanged.
+    var ca_att4 = sdpa_cross_nomask[1, S, TXT, H, Dh](
+        caq_rms, cak_rms, cav4, scale, ctx
+    ) if batched_cross else _cross_attention[S, TXT, H, Dh](
+        caq_rms, cak_rms, cav4, scale, ctx
+    )
     var ca_att = _from_bshd(ca_att4^, S, dim, ctx)
-    var ca_att_h = ca_att.to_host(ctx)
+    var ca_att_h = List[Float32]()
+    if not device_lora:
+        ca_att_h = ca_att.to_host(ctx)
     var ca_out_base = linear(ca_att, w.ca_wo[], Optional[Tensor](_clone_t(w.ca_bo[], ctx)), ctx)
-    var ca_out = _add_lora_delta(ca_out_base, ca_att_h, lora.ca_o, S, ctx)
+    var ca_out = _add_lora_delta_dev(ca_out_base, ca_att, lora.ca_o, S, ctx) if device_lora else _add_lora_delta(ca_out_base, ca_att_h, lora.ca_o, S, ctx)
     var x_ca = add(x_sa, ca_out, ctx)
 
     # ── FFN (LoRA on ffn.0 / ffn.2) ──
     # ffn.0 LoRA input = post-modulation FFN input (ffn_mp.o) [S,dim]; out [S,ffn].
     # ffn.2 LoRA input = GELU output (ffn_act) [S,ffn]; out [S,dim].
     var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
-    var ffn_in_h = ffn_mp.o[].to_host(ctx)
+    var ffn_in_h = List[Float32]()
+    if not device_lora:
+        ffn_in_h = ffn_mp.o[].to_host(ctx)
     var ffn_h_base = linear(ffn_mp.o[], w.ffn0_w[], Optional[Tensor](_clone_t(w.ffn0_b[], ctx)), ctx)
-    var ffn_h = _add_lora_delta(ffn_h_base, ffn_in_h, lora.ffn0, S, ctx)
+    var ffn_h = _add_lora_delta_dev(ffn_h_base, ffn_mp.o[], lora.ffn0, S, ctx) if device_lora else _add_lora_delta(ffn_h_base, ffn_in_h, lora.ffn0, S, ctx)
     var ffn_act = gelu(ffn_h, ctx)
-    var ffn_act_h = ffn_act.to_host(ctx)
+    var ffn_act_h = List[Float32]()
+    if not device_lora:
+        ffn_act_h = ffn_act.to_host(ctx)
     var ffn_out_base = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
-    var ffn_out = _add_lora_delta(ffn_out_base, ffn_act_h, lora.ffn2, S, ctx)
+    var ffn_out = _add_lora_delta_dev(ffn_out_base, ffn_act, lora.ffn2, S, ctx) if device_lora else _add_lora_delta(ffn_out_base, ffn_act_h, lora.ffn2, S, ctx)
     var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
 
     var x_out = x_final.to_host(ctx)
+    # save_acts=False: the caller is a RECOMPUTE backward driver (devnative /
+    # autograd_v2 graph) that re-derives every activation from the block input, so
+    # skip the 23 to_host_bf16 conversions entirely (see _wan_saved_empty above).
+    # Pure omission — the returned x_out is byte-identical either way.
+    if not save_acts:
+        return WanBlockForward(x_out^, _wan_saved_empty())
     var saved = WanSaved(
         x[].to_host_bf16(ctx),
         sa_mp.ln[].to_host_bf16(ctx), sa_mp.o[].to_host_bf16(ctx),

@@ -38,7 +38,7 @@ from serenitymojo.ops.elementwise import (
     modulate, residual_gate, modulate_slab, residual_gate_slab,
 )
 from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab, rope_halfsplit
-from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab, sdpa_cross_nomask
 from serenitymojo.ops.attention_flash import (
     sdpa_flash_train_fwd_f32, sdpa_flash_train_fwd,
     sdpa_flash_train_fwd_padmask_f32,
@@ -52,7 +52,7 @@ from serenitymojo.ops.tensor_algebra import add, add_slab
 from serenitymojo.ops.linalg_backward import (
     linear_backward_dx, linear_backward_dx_slab,
 )
-from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_slab
+from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_slab, sdpa_backward_rect
 from serenitymojo.models.zimage.lora_block import (
     ZImageLoraAdapterDevice,
     zimage_lora_apply_device,
@@ -111,8 +111,34 @@ from serenitymojo.autograd_v2.node import (
     OPK_KLEIN_SGL_OUT,
     OPK_ROPE_HALFSPLIT,
     OPK_LINEAR_DX,
+    OPK_WAN_MOD_PRE,
+    OPK_GELU,
+    OPK_WAN_GATED_RESIDUAL,
+    OPK_WAN_PROJ_LORA,
+    OPK_LAYER_NORM_DX,
+    OPK_WAN_ROPE,
+    OPK_SDPA_RECT,
 )
 from serenitymojo.autograd_v2.graph import Graph
+# Wan2.2 fine-grained forward ops (Phase 2). The record wrappers RE-RUN the exact
+# oracle forward (wan22_block.mojo) so recomputed activations bit-match the
+# hand-chain's saved ones; the backward arms (engine.mojo) call the oracle's own
+# helpers whole (C14).
+from serenitymojo.ops.activations import gelu as _wan_gelu
+from serenitymojo.ops.linear import linear as _wan_linear
+from serenitymojo.models.wan22.wan22_block import (
+    wan_mod_pre as _wan_mod_pre_fwd,
+    wan_gated_residual as _wan_gated_residual_fwd,
+)
+from serenitymojo.models.klein.lora_block import (
+    LoraAdapter as _WanLoraAdapter,
+    lora_adapter_to_device as _wan_lora_to_device,
+    klein_lora_fwd_device_resident_unfused as _wan_lora_fwd_device,
+)
+from serenitymojo.models.wan22.wan22_block import _clone_t as _wan_clone_t
+from serenitymojo.models.wan22.wan22_block import _add_lora_delta as _wan_add_lora_delta
+from serenitymojo.models.wan22.wan22_block import _cross_attention as _wan_cross_attention
+from serenitymojo.ops.tensor_algebra import add as _wan_add
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,10 +268,54 @@ def sdpa_backward_dispatch(
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )
+    # wan2.2-A14B self-attn (square) buckets: the real trainer shape (S=256,
+    # H=40, Dh=128) + the fine-grained whole-block gate's tiny block
+    # (S=5, H=24, Dh=8 — matches tests/wan_block_graph_parity.mojo).
+    # sdpa_backward at both shapes is already instantiated via the wan
+    # hand-chain self-attn backward (wan22_block.mojo:1902).
+    if B == 1 and S == 256 and H == 40 and Dh == 128:
+        var sb = sdpa_backward[1, 256, 40, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 5 and H == 24 and Dh == 8:
+        var sb = sdpa_backward[1, 5, 24, 8](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
     raise Error(
         String("sdpa_backward_dispatch: no comptime bucket for (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh)
         + ")"
+    )
+
+
+def sdpa_backward_rect_dispatch(
+    q: Tensor, k: Tensor, v: Tensor, d_out: Tensor, scale: Float32,
+    B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int,
+    ctx: DeviceContext,
+) raises -> SdpaGradArcs:
+    """Runtime-dims → comptime-bucket dispatch for sdpa_backward_rect[B,Sq,Skv,H,Dh]
+    (ops/attention_backward.mojo:1002) — the OPK_SDPA_RECT (wan cross-attn) arm.
+    Buckets: the real wan2.2-A14B shape (1,256,512,40,128) + the wan op-gate's
+    small shape. Unknown bucket raises (fail loud; add the bucket when a
+    trainer/gate needs it — sdpa_backward_rect at that shape is instantiated via
+    the wan hand-chain cross-attn backward)."""
+    if B == 1 and Sq == 256 and Skv == 512 and H == 40 and Dh == 128:
+        var sb = sdpa_backward_rect[1, 256, 512, 40, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v))
+    if B == 1 and Sq == 8 and Skv == 6 and H == 8 and Dh == 16:
+        var sb = sdpa_backward_rect[1, 8, 6, 8, 16](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v))
+    # whole-block gate bucket (tiny block S=5, TXT=4, H=24, Dh=8 —
+    # tests/wan_block_graph_parity.mojo).
+    if B == 1 and Sq == 5 and Skv == 4 and H == 24 and Dh == 8:
+        var sb = sdpa_backward_rect[1, 5, 4, 24, 8](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v))
+    raise Error(
+        String("sdpa_backward_rect_dispatch: no comptime bucket for (B,Sq,Skv,H,Dh)=(")
+        + String(B) + "," + String(Sq) + "," + String(Skv) + ","
+        + String(H) + "," + String(Dh) + ")"
     )
 
 
@@ -1582,6 +1652,247 @@ def record_wan_t2v_block(
         _OPK_WAN_T2V, edges^, List[TArc](), List[Int](), List[Float32](), out_ids
     )
     return TArc(out_t^)
+
+
+# ── Wan2.2 FINE-GRAINED per-op record wrappers (Phase 2, wan22_block_graph.mojo).
+# Each re-runs the EXACT oracle forward and records a node whose engine arm calls
+# the oracle's OWN backward helper (C14). NON-LoRA ops only (OPK_WAN_PROJ_LORA is
+# a separate slice touching the oracle's device-LoRA backward).
+def record_wan_mod_pre(
+    mut g: Graph, x: TArc, scale: TArc, shift: TArc, weight: TArc, bias: TArc,
+    eps: Float32, ctx: DeviceContext,
+) raises -> TArc:
+    """o = LN_no_affine(x)*(1+scale)+shift — the per-token AdaLN pre
+    (wan_mod_pre, wan22_block.mojo:143). Backward arm (OPK_WAN_MOD_PRE) =
+    wan_modulate_backward(go, ln, scale) → d_ln then layer_norm_backward_dx(d_ln,
+    x, weight, eps) → d_x (the oracle's mb/lnb pair, :1620/1624). scale/shift/
+    weight/bias FROZEN (mod vecs + LN affine untracked) → ONE tracked edge (x).
+    saved=[x, ln, scale, weight]; scalars=[eps]. `weight`/`bias` are the LN gamma/
+    beta (ones/zeros for the AdaLN pre)."""
+    var mp = _wan_mod_pre_fwd(x[], scale[], shift[], weight[], bias[], eps, ctx)
+    var y_t = Tensor(mp.o[].buf.copy(), mp.o[].shape(), mp.o[].dtype())
+    y_t.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(mp.ln.copy())
+    saved.append(scale.copy())
+    saved.append(weight.copy())
+    var scalars: List[Float32] = [eps]
+    var oids: List[Int] = [y_t.id]
+    _ = g.record(OPK_WAN_MOD_PRE, edges^, saved^, List[Int](), scalars^, oids)
+    return TArc(y_t^)
+
+
+def record_gelu(mut g: Graph, x: TArc, ctx: DeviceContext) raises -> TArc:
+    """act = gelu(x) tanh-approx (wan22_block.mojo:1511). Backward arm (OPK_GELU)
+    = gelu_backward(go, x) (ops/activation_backward.mojo:532); x is the PRE-gelu
+    ffn_h. saved=[x]; one input edge."""
+    var y = _wan_gelu(x[], ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_GELU, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_wan_gated_residual(
+    mut g: Graph, x: TArc, y_in: TArc, gate: TArc, ctx: DeviceContext
+) raises -> TArc:
+    """o = x + gate*y — per-token gated residual (wan_gated_residual,
+    wan22_block.mojo:155). Backward arm (OPK_WAN_GATED_RESIDUAL) =
+    wan_gate_residual_backward(go, y, gate) → d_x=go, d_y=go*gate (d_gate dropped:
+    gate frozen), the oracle's gb call (:1595/1689). Edges=[x, y]; saved=[y,
+    gate]."""
+    var o = _wan_gated_residual_fwd(x[], y_in[], gate[], ctx)
+    o.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(g.edge_for(y_in[].id))
+    var saved = List[TArc]()
+    saved.append(y_in.copy())
+    saved.append(gate.copy())
+    var oids: List[Int] = [o.id]
+    _ = g.record(
+        OPK_WAN_GATED_RESIDUAL, edges^, saved^, List[Int](), List[Float32](), oids
+    )
+    return TArc(o^)
+
+
+def record_wan_proj_lora(
+    mut g: Graph, x: TArc, w: TArc, bias: Optional[TArc],
+    lo: Optional[_WanLoraAdapter], a_param_id: Int, b_param_id: Int,
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> TArc:
+    """y = linear(x, W_frozen, bias_frozen) + LoRA(x) — the wan projection
+    (linear + _add_lora_delta, wan22_block.mojo:1457-1462). Backward arm
+    (OPK_WAN_PROJ_LORA) = _base_dx(go, W) (dx-only, base d_w/d_b discarded —
+    frozen) + the DEVICE LoRA backward _wan_lora_bwd_device_from_tensors(A, B, …)
+    → device d_A[rank,in]/d_B[out,rank]/d_x_lo; d_x = add(base_dx, d_x_lo). The
+    device grads flow as CLEAN engine leaves (capture-eligible). W + bias frozen
+    (no edges). saved=[x, W, A_dev, B_dev]; meta=[M, in_f, out_f, rank];
+    scalars=[scale]; edges=[x, A_leaf, B_leaf] when an adapter is present, else
+    [x] (base d_x only). The saved A_dev/B_dev are the SAME bf16 tensors
+    lora_adapter_to_device builds, so the arm's grads are bit-equal to the
+    devnative oracle by construction."""
+    # DEVICE-RESIDENT forward (no host round trip). The oracle's `_add_lora_delta`
+    # (wan22_block.mojo:~1330) routes the LoRA through `klein_lora_fwd`, which
+    # to_host's x, runs the two GEMMs with host↔device ping-pong, and scales in a
+    # host `for` loop over M*out_f floats. Both sides run the SAME GEMMs ON THE GPU
+    # — the host chain only marshals the results through host memory — so keeping
+    # them resident is BIT-EQUAL, not a numerics change. MEASURED at the real
+    # attention dims (M=256, in=out=5120, rank=16,
+    # models/wan22/parity/wan22_lora_fwd_hostvsdev_bench.mojo):
+    #   host 4.011 ms/call vs device 0.154 ms/call = 26x, n_mismatch=0/1310720 at
+    #   BOTH scale=1.0 and scale=0.5 (scale!=1 is where the host's F32-multiply-then-
+    #   narrow could have differed from a device bf16 mul — it does not).
+    # This is ALSO the capture blocker: the old to_host was a hard sync inside what
+    # must become a captured region. Uses the UNFUSED sibling deliberately — the
+    # fused kernel has a different accumulation order (its own accepted class).
+    var nb = Optional[Tensor](None)
+    if bias:
+        nb = Optional[Tensor](bias.value()[].clone(ctx))
+    var base = _wan_linear(x[], w[], nb^, ctx)
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(w.copy())
+    var rank = 0
+    var scale = Float32(0.0)
+    var y = _wan_clone_t(base, ctx)                     # no adapter → base alone
+    if lo:
+        var ld = _wan_lora_to_device(lo.value(), ctx)   # device A/B (fwd AND bwd arm)
+        var delta = _wan_lora_fwd_device(x[], ld, M, ctx)
+        y = _wan_add(base, delta, ctx)
+        saved.append(ld.a.copy())
+        saved.append(ld.b.copy())
+        edges.append(_leaf_edge(g, a_param_id))
+        edges.append(_leaf_edge(g, b_param_id))
+        rank = ld.rank
+        scale = ld.scale
+    y.set_id(g.fresh_tensor_id())
+    var meta: List[Int] = [M, in_f, out_f, rank]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_WAN_PROJ_LORA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
+
+
+def record_layer_norm_dx(
+    mut g: Graph, x: TArc, weight: TArc, bias: TArc, eps: Float32, ctx: DeviceContext
+) raises -> TArc:
+    """y = layer_norm(x, weight, bias, eps) with FROZEN affine — the cross-attn n3
+    (wan22_block.mojo:1482). Backward arm (OPK_LAYER_NORM_DX) = layer_norm_backward_
+    dx(go, x, weight, eps) (:1681), d_g/d_b discarded. saved=[x, weight];
+    scalars=[eps]; one input edge."""
+    var y = layer_norm(x[], weight[], bias[], eps, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(weight.copy())
+    var scalars: List[Float32] = [eps]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_LAYER_NORM_DX, edges^, saved^, List[Int](), scalars^, oids)
+    return TArc(y^)
+
+
+def record_wan_rope(
+    mut g: Graph, x: TArc, cos_f32: TArc, sin_f32: TArc, ctx: DeviceContext
+) raises -> TArc:
+    """y = rope_interleaved(x, cos, sin) on per-head q/k (wan22_block.mojo:1472).
+    The BACKWARD runs in F32 (the oracle's cast dance, :1706-1711): cast go→F32,
+    rope_backward(F32 tables, interleaved=True), cast→bf16. So this saves the F32
+    expanded per-head tables; the forward casts them to bf16 to match the oracle's
+    cos16/sin16 (cast commutes with the pure-tiling table expand → bit-equal).
+    saved=[cos_f32, sin_f32]; one input edge."""
+    var cos_bf = cast_tensor(cos_f32[], STDtype.BF16, ctx)
+    var sin_bf = cast_tensor(sin_f32[], STDtype.BF16, ctx)
+    var y = rope_interleaved(x[], cos_bf, sin_bf, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(cos_f32.copy())
+    saved.append(sin_f32.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_WAN_ROPE, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_sdpa_rect[
+    B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int
+](
+    mut g: Graph, q: TArc, k: TArc, v: TArc, scale: Float32, ctx: DeviceContext
+) raises -> TArc:
+    """att = sdpa_cross_nomask[B,Sq,Skv,H,Dh](q, k, v, scale) — rectangular
+    cross-attn (wan22_block.mojo:1497 _cross_attention). Backward arm
+    (OPK_SDPA_RECT) = sdpa_backward_rect via the runtime bucket dispatch; 3 output
+    grads d_q/d_k/d_v routed by edge order. saved [q,k,v]; meta [B,Sq,Skv,H,Dh];
+    scalars [scale]."""
+    var y = sdpa_cross_nomask[B, Sq, Skv, H, Dh](q[], k[], v[], scale, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q[].id))
+    edges.append(g.edge_for(k[].id))
+    edges.append(g.edge_for(v[].id))
+    var saved = List[TArc]()
+    saved.append(q.copy())
+    saved.append(k.copy())
+    saved.append(v.copy())
+    var meta: List[Int] = [B, Sq, Skv, H, Dh]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SDPA_RECT, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
+
+
+def record_wan_cross_attn[
+    S: Int, TXT: Int, H: Int, Dh: Int
+](
+    mut g: Graph, q: TArc, k: TArc, v: TArc, scale: Float32, ctx: DeviceContext
+) raises -> TArc:
+    """att = _cross_attention[S,TXT,H,Dh](q, k, v, scale) — the wan cross-attn
+    with the EXACT oracle forward (wan22_block.mojo:580, the per-head loop the
+    hand-chain forward calls at :1515), recorded under the SAME OPK_SDPA_RECT
+    kind (and therefore the SAME bit-gated backward arm) as `record_sdpa_rect`.
+
+    WHY a second wrapper instead of reusing `record_sdpa_rect`: that one's
+    forward is `sdpa_cross_nomask` (matmul-backed batched math), a DIFFERENT
+    kernel path from the oracle's per-head `_cross_attention`. The recomputed
+    `ca_att` is the SAVED INPUT of the ca_o projection, so the ca_o LoRA grad
+    (slot 7) reads it — an fwd that is merely close, not bit-equal, would show
+    up as a ca_o d_A/d_B mismatch in the whole-block gate. Calling the oracle
+    forward whole makes the recompute bit-match BY CONSTRUCTION (C14), instead
+    of assuming two kernels agree bit-for-bit.
+
+    The oracle returns [1,S,dim]; the node's output is a ZERO-COPY re-view as
+    [1,S,H,Dh] (dim == H*Dh, row-major → identical bytes) because that is the
+    shape the OPK_SDPA_RECT arm's `sdpa_backward_rect` expects for d_out, and
+    the shape the downstream `_from_bshd` reshape consumes.
+    saved [q,k,v]; meta [1,S,TXT,H,Dh]; scalars [scale]; edges [q,k,v]."""
+    var y_raw = _wan_cross_attention[S, TXT, H, Dh](q[], k[], v[], scale, ctx)
+    var y = Tensor(y_raw.buf.copy(), [1, S, H, Dh], y_raw.dtype())
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q[].id))
+    edges.append(g.edge_for(k[].id))
+    edges.append(g.edge_for(v[].id))
+    var saved = List[TArc]()
+    saved.append(q.copy())
+    saved.append(k.copy())
+    saved.append(v.copy())
+    var meta: List[Int] = [1, S, TXT, H, Dh]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SDPA_RECT, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
 
 
 # ── krea2 slab record variants (activation-checkpointing slab path, contract C8).

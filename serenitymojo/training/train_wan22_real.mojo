@@ -90,6 +90,12 @@ from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_line
 from serenitymojo.models.dit.wan22_dit import wan22_build_rope
 
 from serenitymojo.models.wan22.weights import load_wan22_stack_base, detect_wan22_prefix
+from serenitymojo.training.trainer_core import (
+    trainer_resolve_resume_path, trainer_warn_warm_resume,
+)
+from serenitymojo.training.lora_save import (
+    lora_train_state_has_moments, load_lora_train_state_meta,
+)
 from serenitymojo.models.wan22.wan22_stack_lora import (
     Wan22StackBase, Wan22LoraSet, Wan22LoraGradSet, Wan22StackForward,
     build_wan22_lora_set, wan22_total_adapters,
@@ -97,6 +103,7 @@ from serenitymojo.models.wan22.wan22_stack_lora import (
     wan22_stack_lora_backward_offload_devnative, Wan22LoraDeviceGradSet,
     wan22_stack_lora_backward_offload_graph,
     wan22_lora_adamw_step, save_wan22_lora, save_wan22_lora_state,
+    load_wan22_lora_state, load_wan22_lora_resume,
     Wan22I2VLoraSet, Wan22I2VLoraGradSet, Wan22I2VStackForward,
     build_wan22_i2v_lora_set, wan22_i2v_total_adapters,
     wan22_i2v_stack_lora_forward_offload, wan22_i2v_stack_lora_backward_offload,
@@ -1545,6 +1552,59 @@ def main() raises:
     var lora = build_wan22_lora_set(NUM_BLOCKS, DIM, FFN, rank, alpha)
     print("[lora] adapters:", wan22_total_adapters(lora))
 
+    # ── RESUME (config `resume_state` / `start_step` / `warm_resume`) ──────────
+    # Mirrors the mageflow contract (train_mageflow_real.mojo:621-646, :740-780).
+    # MUST run before the resident AdamW state is built below, because
+    # `lora_adamw_plain_device_state_init` seeds dev_m/dev_v from the host adapters
+    # — load first and the moments are restored, load after and they are zeros.
+    #
+    # Continuation is exact because every per-step stream is a pure function of
+    # `step`: the sigma draw is `_sample_t(shift_mode, step, seed, …)` and the data
+    # order is `step % n_cache`. Running `range(start_step, steps)` therefore
+    # continues the uninterrupted sequence rather than restarting it, and AdamW's
+    # bias correction keeps counting from `step + 1`.
+    var start_step = cfg.start_step
+    if start_step < 0:
+        start_step = 0
+    if cfg.resume_state.byte_length() > 0:
+        # Probe with the prefix the wan saver actually writes — `_wan22_lora_prefixes`
+        # emits `diffusion_model.blocks.N.…` (wan22_stack_lora.mojo:1866). Probing the
+        # bare `blocks.0.…` would never match, silently report "no moments", and
+        # downgrade every FULL resume to a warm one.
+        var probe = String("diffusion_model.blocks.0.self_attn.q")
+        var resolved = trainer_resolve_resume_path(cfg.resume_state, probe)
+        var has_moments = lora_train_state_has_moments(resolved, probe)
+        if cfg.warm_resume:
+            trainer_warn_warm_resume(String("wan22"), resolved)
+            lora = load_wan22_lora_resume(NUM_BLOCKS, DIM, rank, alpha, resolved, ctx)
+        elif not has_moments:
+            raise Error(
+                String("wan22 resume: '") + resolved + String("' has no AdamW moments"
+                " (it is a bare PEFT file). Resuming from it would restart the"
+                " optimizer with zeroed moments — pass warm_resume: true to accept"
+                " that explicitly, or point resume_state at the .state sidecar.")
+            )
+        else:
+            lora = load_wan22_lora_state(NUM_BLOCKS, DIM, rank, alpha, resolved, ctx)
+            var rmeta = load_lora_train_state_meta(resolved, ctx)
+            if len(rmeta) >= 2:
+                if Int(rmeta[0]) != start_step:
+                    print("  [resume] WARNING: checkpoint was written at step",
+                          Int(rmeta[0]), "but start_step is", start_step,
+                          "— the sigma/data streams will NOT line up with the"
+                          " uninterrupted run")
+                if Int(rmeta[1]) != Int(seed):
+                    print("  [resume] WARNING: checkpoint seed", Int(rmeta[1]),
+                          "!= configured seed", Int(seed))
+        print("[resume] loaded", wan22_total_adapters(lora), "adapters from", resolved,
+              "(", String("WARM, moments zeroed") if cfg.warm_resume
+              else String("FULL, moments restored"), ") — resuming at step", start_step)
+    if start_step >= steps:
+        raise Error(
+            String("wan22 resume: start_step ") + String(start_step)
+            + String(" >= max_steps ") + String(steps) + String(" — nothing to do")
+        )
+
     var rope = _build_rope_proven(ctx)
     var cos = rope[0].copy()
     var sin = rope[1].copy()
@@ -1637,10 +1697,12 @@ def main() raises:
 
     print("")
     print("step  expert    t        MSE            grad_norm     sec")
-    for step in range(steps):
+    for step in range(start_step, steps):
         var t0 = perf_counter_ns()
 
         # ── timestep + flow-match target (musubi: x_t=(1-t)x0+t*noise, tgt=noise-x0)
+        # `step` is the GLOBAL optimizer step, so on a resume the sigma draw and the
+        # `step % n_cache` data order continue the original sequence exactly.
         var t = _sample_t(shift_mode, step, seed,
                           DEFAULT_SIGMOID_SCALE, discrete_flow_shift)
         # smoke pin: force the expert branch deterministically (see alt_t above).

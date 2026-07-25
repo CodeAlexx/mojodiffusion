@@ -43,6 +43,16 @@ def _dev_ptr(t: Tensor) -> BytePtr:
     return BytePtr(unsafe_from_address=Int(t.buf.unsafe_ptr()))
 
 
+def sdpa_flash_reset_cache(ctx: DeviceContext) raises:
+    """Release completed cuDNN SDPA graphs/workspaces at a video step boundary."""
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_reset_cache", Int32](stream))
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_reset_cache: shim rc=") + String(rc)
+        )
+
+
 def _strides_bhnd(n_eff: Int, h: Int, dh: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
     """Element strides describing our [B, n_eff, H, Dh] contiguous memory as
     the shim's logical [B, H, N, D]: {n_eff*H*Dh, Dh, H*Dh, 1}."""

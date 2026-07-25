@@ -92,16 +92,26 @@ var SerenityAPI = (function () {
         // The current Wan builder uses standard Comfy nodes. Detect it by the
         // selected UNET name and translate only the bounded 5B T2V controls.
         var wan = false;
+        var wanA14b = false;
         var bernini = false;
         var sampler = null;
         var latent = null;
+        var videoLoras = [];
         for (var j = 0; j < keys.length; j++) {
             var node = nodes[keys[j]] || {};
             var inp = node.inputs || {};
             if (node.class_type === 'UNETLoader' && /bernini/i.test(inp.unet_name || ''))
                 bernini = true;
-            else if (node.class_type === 'UNETLoader' && /wan/i.test(inp.unet_name || ''))
+            else if (node.class_type === 'UNETLoader' && /wan/i.test(inp.unet_name || '')) {
                 wan = true;
+                wanA14b = /a14b/i.test(inp.unet_name || '');
+            }
+            if (node.class_type === 'LoraLoader' || node.class_type === 'LoraLoaderModelOnly') {
+                videoLoras.push({
+                    name: inp.lora_name || '',
+                    weight: Number(inp.strength_model == null ? 1 : inp.strength_model)
+                });
+            }
             if (node.class_type === 'KSampler')
                 sampler = node;
             if (node.class_type === 'EmptyLatentVideo')
@@ -115,17 +125,18 @@ var SerenityAPI = (function () {
                 return (nodes[String(ref[0])].inputs || {}).text || '';
             }
             return {
-                model: bernini ? 'bernini' : 'wan22',
+                model: bernini ? 'bernini' : (wanA14b ? 'wan22_a14b' : 'wan22'),
                 prompt: textFromRef(si.positive),
                 negative_prompt: textFromRef(si.negative),
                 width: latent ? ((latent.inputs || {}).width || (bernini ? 848 : 832)) : (bernini ? 848 : 832),
                 height: latent ? ((latent.inputs || {}).height || 480) : 480,
-                frames: latent ? ((latent.inputs || {}).length || (bernini ? 81 : 121)) : (bernini ? 81 : 121),
-                steps: si.steps || (bernini ? 40 : 50),
-                guidance: si.cfg || (bernini ? 4.0 : 5.0),
+                frames: latent ? ((latent.inputs || {}).length || ((bernini || wanA14b) ? 81 : 121)) : ((bernini || wanA14b) ? 81 : 121),
+                steps: si.steps || (bernini || wanA14b ? 40 : 50),
+                guidance: si.cfg || (bernini ? 4.0 : (wanA14b ? 3.0 : 5.0)),
                 seed: si.seed || 0,
-                fps: bernini ? 16 : 24,
-                quant: 'fp8'
+                fps: (bernini || wanA14b) ? 16 : 24,
+                quant: 'fp8',
+                lora: videoLoras
             };
         }
         return null;

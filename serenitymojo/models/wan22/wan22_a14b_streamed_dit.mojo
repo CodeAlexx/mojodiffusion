@@ -295,3 +295,50 @@ struct Wan22A14BStreamedDiT(Movable):
             img_uncond, time[1], dtype, ctx
         )
         return Wan22A14BPair(cond^, uncond^)
+
+    def forward_single[
+        FG: Int, HG: Int, WG: Int, S: Int, TXT: Int, CTXL: Int, H: Int, DH: Int
+    ](
+        mut self,
+        x_lat: Tensor,
+        timestep: Float32,
+        context: Tensor,
+        context_valid: Int,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """One streamed A14B prediction with one live token activation stream.
+
+        The paired path above minimizes block I/O, but retains conditional and
+        unconditional [S,5120] activations together. At 832x480x121 (S=48,360)
+        that leaves insufficient deterministic headroom on a 16 GiB GPU. This
+        path preserves the same block math while allowing the sampler to run CFG
+        as two sequential predictions and trim transients between them.
+        """
+        var cfg = self.config
+        var dtype = x_lat.dtype()
+        var img = self._patch[FG, HG, WG, S](x_lat, ctx)
+        var time = self._time[S](timestep, dtype, ctx)
+        var text = self._text[TXT, CTXL](context, dtype, ctx)
+        var rope = wan22_build_rope(
+            FG, HG, WG, DH, cfg.rope_theta, dtype, ctx
+        )
+
+        var lora_applied = 0
+        for bi in range(cfg.num_layers):
+            var block = self.stream.load_block_bf16(bi, ctx)
+            lora_applied += self._apply_block_lora(block, bi, ctx)
+            img = wan22_block_forward[S, TXT, H, DH](
+                img, time[0], text, rope[0], rope[1], block, cfg, ctx,
+                context_valid,
+            )
+
+        if self.lora and lora_applied == 0:
+            raise Error(
+                "Wan22A14BStreamedDiT: a LoRA is attached but ZERO modules matched"
+                " any streamed block weight — the render would silently be the base"
+                " model. Check the key namespace of the LoRA file."
+            )
+
+        return self._head[FG, HG, WG, S](
+            img, time[1], dtype, ctx
+        )

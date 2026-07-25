@@ -567,6 +567,7 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
         ("qwen-image-2512", "qwen-image"),
         ("ideogram-4-fp8", "ideogram4"),
         ("Wan2.2-TI2V-5B-Mojo", "wan2.2"),
+        ("wan2.2_t2v_a14b_fp8_e4m3", "wan2.2"),
     ] {
         let dir = format!("{checkpoints}/{name}");
         if dir_exists(&dir) {

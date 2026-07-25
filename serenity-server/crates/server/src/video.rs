@@ -83,6 +83,11 @@ fn model_path(path: &str) -> std::path::PathBuf {
 /// Wan2.2 two-process video: encode umt5 conds, then T2V (both under output/bin/).
 const WAN22_ENCODE: &str = "output/bin/wan22_encode_prompt";
 const WAN22_T2V: &str = "output/bin/wan22_t2v";
+const WAN22_A14B_LORA_T2V: &str = "output/bin/wan22_a14b_lora_t2v";
+const WAN22_A14B_HIGH: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/high";
+const WAN22_A14B_LOW: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/low";
+const WAN22_A14B_VAE: &str =
+    "/mnt/disk1/models/lingbot-video-moe/vae/diffusion_pytorch_model.safetensors";
 const WAN22_MODEL_ROOT: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo";
 const WAN22_ARTIFACT_MANIFEST: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/serenity_wan22_manifest.json";
@@ -154,8 +159,15 @@ const LTX2_INT4_SLAB: &str = "checkpoints/ltx-2.3-22b-distilled-svdint4-r32.safe
 const WAN22_FRAMES: i64 = 121;
 const WAN22_WIDTH: i64 = 832;
 const WAN22_HEIGHT: i64 = 480;
+const WAN22_FPS: i64 = 24;
 const WAN22_DEFAULT_STEPS: i64 = 50;
 const WAN22_DEFAULT_GUIDANCE: f64 = 5.0;
+const WAN22_A14B_FRAMES: i64 = 81;
+const WAN22_A14B_WIDTH: i64 = 832;
+const WAN22_A14B_HEIGHT: i64 = 480;
+const WAN22_A14B_FPS: i64 = 16;
+const WAN22_A14B_STEPS: i64 = 40;
+const WAN22_A14B_GUIDANCE: f64 = 3.0;
 
 /// Bernini-R reuses the admitted UMT5 producer, then runs bounded high/low
 /// A14B expert streams and the existing standard-Wan VAE in three isolated
@@ -643,6 +655,74 @@ fn wan22_missing() -> Vec<String> {
         }
     }
     m
+}
+
+fn wan22_a14b_cache_complete(path: &std::path::Path) -> bool {
+    nonempty_file(&path.join("shared.safetensors"))
+        && (0..40).all(|index| nonempty_file(&path.join(format!("block_{index:02}.safetensors"))))
+}
+
+fn wan22_a14b_missing() -> Vec<String> {
+    let mut missing = Vec::new();
+    for binary in [WAN22_ENCODE, WAN22_A14B_LORA_T2V] {
+        if !bin_x(binary) {
+            missing.push(binary.to_string());
+        }
+    }
+    for cache in [WAN22_A14B_HIGH, WAN22_A14B_LOW] {
+        let resolved = model_path(cache);
+        if !wan22_a14b_cache_complete(&resolved) {
+            missing.push(resolved.to_string_lossy().into_owned());
+        }
+    }
+    let vae = std::path::Path::new(WAN22_A14B_VAE);
+    if !nonempty_file(vae) {
+        missing.push(vae.to_string_lossy().into_owned());
+    }
+    missing
+}
+
+fn wan22_a14b_lora(body: &Value) -> Result<(std::path::PathBuf, f64, String), String> {
+    let rows = body
+        .get("lora")
+        .or_else(|| body.get("loras"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Wan2.2 A14B preview requires exactly one authored LoRA".to_string())?;
+    if rows.len() != 1 {
+        return Err("Wan2.2 A14B preview requires exactly one authored LoRA".to_string());
+    }
+    let row = rows[0]
+        .as_object()
+        .ok_or_else(|| "Wan2.2 A14B lora[0] must be an object".to_string())?;
+    let name = row.get("name").and_then(Value::as_str).unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("Wan2.2 A14B lora[0].name is required".to_string());
+    }
+    let weight = row
+        .get("weight")
+        .or_else(|| row.get("strength"))
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if !weight.is_finite() || !(-10.0..=10.0).contains(&weight) {
+        return Err("Wan2.2 A14B lora[0] weight must be finite in [-10, 10]".to_string());
+    }
+    let Some((path, arch)) = crate::models::lora_path_and_arch(name) else {
+        return Err(format!(
+            "Wan2.2 A14B LoRA not found in the model registry: {name}"
+        ));
+    };
+    if !path.is_file() {
+        return Err(format!(
+            "Wan2.2 A14B LoRA path is missing: {}",
+            path.display()
+        ));
+    }
+    if arch != "wan2.2" {
+        return Err(format!(
+            "Wan2.2 A14B LoRA '{name}' targets '{arch}', not wan2.2"
+        ));
+    }
+    Ok((path, weight, name.to_string()))
 }
 
 /// Read acceptance only from the machine-local evidence gate. The report is
@@ -1140,7 +1220,8 @@ pub async fn get_video() -> Response {
 }
 
 /// POST /v1/video — dispatch on `model`: `"ltx2"` (default) = the bounded LTX2
-/// staged smoke; `"wan22"` = Wan2.2; `"bernini"` = the gated Bernini-R;
+/// staged smoke; `"wan22"` = Wan2.2 5B; `"wan22_a14b"` = the bounded A14B
+/// LoRA preview; `"bernini"` = the gated Bernini-R;
 /// `"scail2"` = automatic character-animation orchestration.
 pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     let b: Value = serde_json::from_str::<Value>(&body)
@@ -1152,10 +1233,17 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("ltx2")
         .to_string();
-    if model != "ltx2" && model != "wan22" && model != "bernini" && model != "scail2" {
+    if model != "ltx2"
+        && model != "wan22"
+        && model != "wan22_a14b"
+        && model != "bernini"
+        && model != "scail2"
+    {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("unsupported video model '{model}'; use ltx2, wan22, bernini, or scail2"),
+            &format!(
+                "unsupported video model '{model}'; use ltx2, wan22, wan22_a14b, bernini, or scail2"
+            ),
         );
     }
     let is_ltx2_mojo_request =
@@ -1189,6 +1277,21 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Wan2.2 is installed but its machine-local high-quality product gate has not passed",
             );
+        }
+    }
+    if model == "wan22_a14b" {
+        let missing = wan22_a14b_missing();
+        if !missing.is_empty() {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "Wan2.2 A14B preview prerequisites missing: {}",
+                    missing.join(", ")
+                ),
+            );
+        }
+        if let Err(error) = validate_wan22_a14b_request(&b) {
+            return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
         }
     }
     if model == "bernini" {
@@ -1292,6 +1395,7 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     match model.as_str() {
         "ltx2" => post_video_ltx2(&st, &b),
         "wan22" => post_video_wan22(&st, &b),
+        "wan22_a14b" => post_video_wan22_a14b(&st, &b),
         "bernini" => post_video_bernini(&st, &b),
         "scail2" => post_video_scail2(&st, &b),
         _ => unreachable!("video model validated before GPU acquisition"),
@@ -1382,6 +1486,42 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         Some(_) => return Err("LTX2 'lora' must be an array".to_string()),
         None => return Err("LTX2 Mojo request requires the authored 'lora' array".to_string()),
     }
+    Ok(())
+}
+
+fn validate_wan22_a14b_request(body: &Value) -> Result<(), String> {
+    if body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("Wan2.2 A14B preview requires a non-empty prompt".to_string());
+    }
+    for (key, required) in [
+        ("width", WAN22_A14B_WIDTH),
+        ("height", WAN22_A14B_HEIGHT),
+        ("frames", WAN22_A14B_FRAMES),
+        ("steps", WAN22_A14B_STEPS),
+        ("fps", WAN22_A14B_FPS),
+    ] {
+        let actual = body.get(key).and_then(Value::as_i64).unwrap_or(required);
+        if actual != required {
+            return Err(format!(
+                "Wan2.2 A14B preview requires {key}={required}; requested {actual}"
+            ));
+        }
+    }
+    let guidance = body
+        .get("guidance")
+        .and_then(Value::as_f64)
+        .unwrap_or(WAN22_A14B_GUIDANCE);
+    if !guidance.is_finite() || (guidance - WAN22_A14B_GUIDANCE).abs() > f64::EPSILON {
+        return Err(format!(
+            "Wan2.2 A14B preview requires CFG {WAN22_A14B_GUIDANCE}"
+        ));
+    }
+    let _ = ltx2_seed(body)?;
+    let _ = wan22_a14b_lora(body)?;
     Ok(())
 }
 
@@ -2417,12 +2557,14 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         None
     };
     let artifact_ok = probe.as_ref().is_some_and(|value| {
-        value.get("muxing").and_then(Value::as_str) == Some("probe_ok")
-            && value.get("width").and_then(Value::as_i64) == Some(WAN22_WIDTH)
-            && value.get("height").and_then(Value::as_i64) == Some(WAN22_HEIGHT)
-            && value.get("frame_count").and_then(Value::as_i64) == Some(WAN22_FRAMES)
-            && value.get("fps").and_then(Value::as_f64) == Some(24.0)
-            && value.get("has_audio").and_then(Value::as_bool) == Some(false)
+        probe_matches_video_profile(
+            value,
+            WAN22_WIDTH,
+            WAN22_HEIGHT,
+            WAN22_FRAMES,
+            WAN22_FPS,
+            false,
+        )
     }) && frames_written == WAN22_FRAMES as usize;
     let parity_ok = wan22_product_gate_passed();
     json_resp(
@@ -2437,7 +2579,7 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
             "readiness_label": if parity_ok { "quality_profile_ready" } else { "product_gate_required" },
             "accepted_video_artifact": artifact_ok, "accepted_video_parity": parity_ok,
             "target_width": WAN22_WIDTH, "target_height": WAN22_HEIGHT, "frames": frames,
-            "frames_written": frames_written, "mux": mux, "fps": 24,
+            "frames_written": frames_written, "mux": mux, "fps": WAN22_FPS,
             "steps": steps, "seed": seed, "guidance": guidance, "quant": quant,
             "negative_prompt_source": if b.get("negative_prompt").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()) { "request" } else { "creator_default" },
             "encode_exit_code": enc_rc, "t2v_exit_code": t2v_rc,
@@ -2448,6 +2590,178 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
             "encode_seconds": enc_secs, "t2v_seconds": t2v_secs, "total_wall_seconds": total_wall,
             "encode_peak_vram_mib": encode_peak_vram_mib, "t2v_peak_vram_mib": t2v_peak_vram_mib,
             "note": "Wan2.2-TI2V-5B high-quality Mojo profile: official UMT5 conditioning and default negative prompt, cached FP8 E4M3 DiT, Flow-UniPC 50-step shift-5 sampling, tiled VAE decode, and verified 24 fps MP4 mux.",
+        }),
+    )
+}
+
+/// Bounded Wan2.2 T2V-A14B LoRA preview. This is intentionally separate from
+/// the accepted TI2V-5B profile: it runs the image-trained A14B adapter on the
+/// matching dual-expert base and returns a short MP4 for checkpoint evaluation.
+fn post_video_wan22_a14b(st: &AppState, b: &Value) -> Response {
+    if let Err(error) = validate_wan22_a14b_request(b) {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
+    }
+    let prompt = b["prompt"].as_str().unwrap_or("").trim().to_string();
+    let requested_negative = b
+        .get("negative_prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let negative = if requested_negative.is_empty() {
+        WAN22_DEFAULT_NEGATIVE.to_string()
+    } else {
+        requested_negative
+    };
+    let seed = match ltx2_seed(b) {
+        Ok(seed) => seed,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    let (lora_path, lora_weight, lora_name) = match wan22_a14b_lora(b) {
+        Ok(value) => value,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
+
+    let n = st
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let video_id = format!("video-{n:04}");
+    let out_dir = st.out_dir.join(&video_id);
+    let _ = std::fs::create_dir_all(&out_dir);
+    let conds = out_dir.join("wan22_a14b_conds.safetensors");
+    let encode_log = out_dir.join("wan22_a14b_encode.log");
+    let render_log = out_dir.join("wan22_a14b_t2v.log");
+    let conds_s = conds.to_string_lossy().into_owned();
+    let out_dir_s = out_dir.to_string_lossy().into_owned();
+
+    let encode_started = std::time::Instant::now();
+    let mut encode = wan22_command(&repo_path(WAN22_ENCODE));
+    encode.args([&prompt, &negative, &conds_s]);
+    let encode_result = run_logged_with_gpu_peak(&mut encode, &encode_log);
+    let encode_seconds = encode_started.elapsed().as_secs_f64();
+    let (encode_exit_code, encode_peak_vram_mib) = match encode_result {
+        Ok(measured) => measured,
+        Err(error) => {
+            let _ = std::fs::write(&encode_log, format!("spawn failed: {error}"));
+            (-1, None)
+        }
+    };
+    if encode_exit_code != 0 {
+        return json_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "schema": "serenity.video_result.v1",
+                "video_id": video_id,
+                "model": "wan22_a14b",
+                "state": "failed",
+                "failed_step": "encode",
+                "encode_exit_code": encode_exit_code,
+                "encode_log": encode_log.to_string_lossy(),
+                "out_dir": out_dir_s,
+                "error": "wan22_encode_prompt failed; inspect encode_log",
+            }),
+        );
+    }
+
+    let render_started = std::time::Instant::now();
+    let mut render = wan22_command(&repo_path(WAN22_A14B_LORA_T2V));
+    render
+        .arg(&conds_s)
+        .arg(model_path(WAN22_A14B_HIGH))
+        .arg(model_path(WAN22_A14B_LOW))
+        .arg(&out_dir_s)
+        .arg(&lora_path)
+        .arg(format!("{lora_weight}"))
+        .arg(WAN22_A14B_STEPS.to_string())
+        .arg(seed.to_string())
+        .arg("1")
+        .arg(format!("{WAN22_A14B_GUIDANCE}"))
+        .arg("12.0")
+        .arg("0")
+        .arg("4.0");
+    let render_result = run_logged_with_gpu_peak(&mut render, &render_log);
+    let render_seconds = render_started.elapsed().as_secs_f64();
+    let (render_exit_code, render_peak_vram_mib) = match render_result {
+        Ok(measured) => measured,
+        Err(error) => {
+            let _ = std::fs::write(&render_log, format!("spawn failed: {error}"));
+            (-1, None)
+        }
+    };
+    if render_exit_code != 0 {
+        return json_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "schema": "serenity.video_result.v1",
+                "video_id": video_id,
+                "model": "wan22_a14b",
+                "state": "failed",
+                "failed_step": "t2v",
+                "render_exit_code": render_exit_code,
+                "render_log": render_log.to_string_lossy(),
+                "out_dir": out_dir_s,
+                "error": "wan22_a14b_lora_t2v failed; inspect render_log",
+            }),
+        );
+    }
+
+    let mp4 = out_dir.join("wan22_a14b_lora_t2v.mp4");
+    let mp4_s = mp4.to_string_lossy().into_owned();
+    let probe = probe_video_path(&mp4_s).ok();
+    let artifact_ok = probe.as_ref().is_some_and(|value| {
+        probe_matches_video_profile(
+            value,
+            WAN22_A14B_WIDTH,
+            WAN22_A14B_HEIGHT,
+            WAN22_A14B_FRAMES,
+            WAN22_A14B_FPS,
+            false,
+        )
+    });
+    json_resp(
+        if artifact_ok {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+        &json!({
+            "schema": "serenity.video_result.v1",
+            "video_id": video_id,
+            "model": "wan22_a14b",
+            "backend": BACKEND_NAME,
+            "control_plane": "serenity-server",
+            "state": if artifact_ok { "complete" } else { "failed" },
+            "readiness_label": "experimental_lora_preview",
+            "accepted_video_artifact": artifact_ok,
+            "accepted_video_parity": false,
+            "width": WAN22_A14B_WIDTH,
+            "height": WAN22_A14B_HEIGHT,
+            "frames": WAN22_A14B_FRAMES,
+            "fps": WAN22_A14B_FPS,
+            "steps": WAN22_A14B_STEPS,
+            "seed": seed,
+            "guidance": WAN22_A14B_GUIDANCE,
+            "shift": 12.0,
+            "expert": "dual_expert_t2v_boundary_0.875",
+            "lora": [{"name": lora_name, "weight": lora_weight, "path": lora_path}],
+            "out_dir": out_dir_s,
+            "conds": conds_s,
+            "mp4": mp4_s,
+            "mp4_url": if artifact_ok {
+                format!("/out/{video_id}/wan22_a14b_lora_t2v.mp4")
+            } else {
+                String::new()
+            },
+            "probe": probe,
+            "encode_log": encode_log.to_string_lossy(),
+            "render_log": render_log.to_string_lossy(),
+            "encode_seconds": encode_seconds,
+            "render_seconds": render_seconds,
+            "total_wall_seconds": encode_seconds + render_seconds,
+            "encode_peak_vram_mib": encode_peak_vram_mib,
+            "render_peak_vram_mib": render_peak_vram_mib,
+            "note": "Bounded T2V-A14B LoRA checkpoint preview; not the accepted TI2V-5B product profile.",
         }),
     )
 }
@@ -3257,6 +3571,22 @@ fn post_video_scail2(st: &AppState, b: &Value) -> Response {
     )
 }
 
+fn probe_matches_video_profile(
+    probe: &Value,
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: i64,
+    has_audio: bool,
+) -> bool {
+    probe.get("muxing").and_then(Value::as_str) == Some("probe_ok")
+        && probe.get("width").and_then(Value::as_i64) == Some(width)
+        && probe.get("height").and_then(Value::as_i64) == Some(height)
+        && probe.get("frame_count").and_then(Value::as_i64) == Some(frames)
+        && probe.get("fps").and_then(Value::as_f64) == Some(fps as f64)
+        && probe.get("has_audio").and_then(Value::as_bool) == Some(has_audio)
+}
+
 fn fps_from_rate(rate: &str) -> f64 {
     // "num/den"
     if let Some((n, d)) = rate.split_once('/') {
@@ -3489,6 +3819,51 @@ mod tests {
         assert_eq!(fps_from_rate("24/1"), 24.0);
         assert_eq!(fps_from_rate("30000/1001"), 30000.0 / 1001.0);
         assert_eq!(fps_from_rate("0/0"), 0.0);
+    }
+
+    #[test]
+    fn wan22_profiles_accept_their_declared_fps() {
+        let a14b = json!({
+            "muxing": "probe_ok",
+            "width": WAN22_A14B_WIDTH,
+            "height": WAN22_A14B_HEIGHT,
+            "frame_count": WAN22_A14B_FRAMES,
+            "fps": WAN22_A14B_FPS as f64,
+            "has_audio": false,
+        });
+        assert!(probe_matches_video_profile(
+            &a14b,
+            WAN22_A14B_WIDTH,
+            WAN22_A14B_HEIGHT,
+            WAN22_A14B_FRAMES,
+            WAN22_A14B_FPS,
+            false,
+        ));
+        assert!(!probe_matches_video_profile(
+            &a14b,
+            WAN22_A14B_WIDTH,
+            WAN22_A14B_HEIGHT,
+            WAN22_A14B_FRAMES,
+            WAN22_FPS,
+            false,
+        ));
+
+        let wan22 = json!({
+            "muxing": "probe_ok",
+            "width": WAN22_WIDTH,
+            "height": WAN22_HEIGHT,
+            "frame_count": WAN22_FRAMES,
+            "fps": WAN22_FPS as f64,
+            "has_audio": false,
+        });
+        assert!(probe_matches_video_profile(
+            &wan22,
+            WAN22_WIDTH,
+            WAN22_HEIGHT,
+            WAN22_FRAMES,
+            WAN22_FPS,
+            false,
+        ));
     }
 
     #[test]

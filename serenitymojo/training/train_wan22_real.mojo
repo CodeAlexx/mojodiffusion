@@ -382,10 +382,120 @@ def _noise(n: Int, seed: UInt64) -> List[Float32]:
     return out^
 
 
-# ── IN-TRAIN SAMPLING (cfg.sample_every > 0 + WAN22_SAMPLE_CONDS) ─────────────
-# Renders the trained LoRA at the sample cadence using the trainer's OWN live base,
-# loaders and adapters — the mageflow/anima pattern (no second model load, no file
-# round-trip, no overlay). Three deliberate choices:
+# ── WAN PATCH-LAYOUT BRIDGE (loss/sampler correctness) ────────────────────────
+# The patch embed consumes each token in Conv3d/input order `(c, pf, ph, pw)`,
+# channel slowest. The trained head emits `(pf, ph, pw, c)`, channel fastest,
+# because Wan immediately reshapes/unpatchifies that output before comparing it
+# with the canonical latent-space velocity. `patchify3d` and `unpatchify3d` are
+# intentionally NOT literal inverses, so the trainer must bridge the two orders.
+#
+# Wan uses patch (1,2,2), hence patch volume 4. For token `s`, channel `c`, and
+# flattened patch coordinate `p`:
+#   input index = s*(C*4) + c*4 + p
+#   head  index = s*(C*4) + p*C + c
+comptime WAN_PATCH_VOLUME = 4
+
+
+def _wan_patch_input_to_head(
+    values: List[Float32], tokens: Int, channels: Int,
+) raises -> List[Float32]:
+    """Repack `(c,pf,ph,pw)` token rows to WAN head `(pf,ph,pw,c)` rows."""
+    if tokens <= 0 or channels <= 0:
+        raise Error("WAN patch repack: tokens and channels must be positive")
+    var packed = channels * WAN_PATCH_VOLUME
+    if len(values) != tokens * packed:
+        raise Error(
+            String("WAN patch input->head: len ") + String(len(values))
+            + String(" != tokens*channels*4 ") + String(tokens * packed)
+        )
+    var out = List[Float32]()
+    out.reserve(len(values))
+    for s in range(tokens):
+        for p in range(WAN_PATCH_VOLUME):
+            for c in range(channels):
+                out.append(values[s * packed + c * WAN_PATCH_VOLUME + p])
+    return out^
+
+
+def _wan_patch_head_to_input(
+    values: List[Float32], tokens: Int, channels: Int,
+) raises -> List[Float32]:
+    """Inverse repack: WAN head `(pf,ph,pw,c)` to input `(c,pf,ph,pw)`."""
+    if tokens <= 0 or channels <= 0:
+        raise Error("WAN patch repack: tokens and channels must be positive")
+    var packed = channels * WAN_PATCH_VOLUME
+    if len(values) != tokens * packed:
+        raise Error(
+            String("WAN patch head->input: len ") + String(len(values))
+            + String(" != tokens*channels*4 ") + String(tokens * packed)
+        )
+    var out = List[Float32]()
+    out.resize(len(values), Float32(0.0))
+    for s in range(tokens):
+        for p in range(WAN_PATCH_VOLUME):
+            for c in range(channels):
+                out[s * packed + c * WAN_PATCH_VOLUME + p] = (
+                    values[s * packed + p * channels + c]
+                )
+    return out^
+
+
+def _wan_patch_layout_self_gate() raises:
+    """Tiny exact non-degenerate guard for the loss-layout bridge."""
+    var input_order: List[Float32] = [
+        0.0, 1.0, 2.0, 3.0,
+        4.0, 5.0, 6.0, 7.0,
+        8.0, 9.0, 10.0, 11.0,
+    ]
+    var expected_head: List[Float32] = [
+        0.0, 4.0, 8.0,
+        1.0, 5.0, 9.0,
+        2.0, 6.0, 10.0,
+        3.0, 7.0, 11.0,
+    ]
+    var head = _wan_patch_input_to_head(input_order, 1, 3)
+    for i in range(len(head)):
+        if head[i] != expected_head[i]:
+            raise Error(
+                String("WAN patch layout gate: known mapping mismatch at ")
+                + String(i)
+            )
+    var roundtrip = _wan_patch_head_to_input(head, 1, 3)
+    for i in range(len(roundtrip)):
+        if roundtrip[i] != input_order[i]:
+            raise Error(
+                String("WAN patch layout gate: roundtrip mismatch at ")
+                + String(i)
+            )
+
+    # Permutation must preserve MSE when prediction and target are moved together.
+    var pred_head: List[Float32] = [
+        11.0, 9.0, 7.0, 5.0,
+        3.0, 1.0, 0.0, 2.0,
+        4.0, 6.0, 8.0, 10.0,
+    ]
+    var pred_input = _wan_patch_head_to_input(pred_head, 1, 3)
+    var mse_head = Float32(0.0)
+    var mse_input = Float32(0.0)
+    for i in range(len(head)):
+        var dh = pred_head[i] - head[i]
+        var di = pred_input[i] - input_order[i]
+        mse_head += dh * dh
+        mse_input += di * di
+    if mse_head != mse_input:
+        raise Error("WAN patch layout gate: MSE changed across permutation")
+    print("[gate] WAN patch input<->head mapping + MSE invariance: PASS")
+
+
+# ── LEGACY IN-TRAIN EULER PREVIEW (DISABLED BY MAIN PREFLIGHT) ─────────────────
+# Kept temporarily as a documented implementation reference while the
+# process-separated request/result manifest is built. `main` rejects every
+# sample_every>0 before DeviceContext because this training monomorphization is
+# S=256, the standing 1024px sampler needs S=4096, and production validation uses
+# the Musubi-aligned UniPC pipeline. The layout math below is nevertheless kept
+# correct so this dormant code cannot preserve the old channel-permutation bug.
+#
+# Historical design choices:
 #
 # 1. TEXT CONDS COME FROM A FILE, not a text encoder in this process. umt5-xxl is
 #    ~11 GB; co-residing it with two A14B experts on a 16 GB card is an OOM. Encode
@@ -401,8 +511,8 @@ def _noise(n: Int, seed: UInt64) -> List[Float32]:
 comptime SAMPLE_STEPS = 30
 comptime SAMPLE_CFG = Float32(5.0)
 comptime SAMPLE_LAT_C = 16          # Wan2.1 VAE latent channels
-comptime SAMPLE_LAT_H = 32          # 256px / 8
-comptime SAMPLE_LAT_W = 32
+comptime SAMPLE_LAT_H = 128         # 1024px / 8  (STANDING ORDER: samples are 1024)
+comptime SAMPLE_LAT_W = 128
 comptime SAMPLE_VAE = (
     "/mnt/disk1/models/lingbot-video-moe/vae/diffusion_pytorch_model.safetensors"
 )
@@ -452,8 +562,21 @@ def _wan22_sample_png[
     device_modvecs: Bool, device_modvecs_t: Bool,
     ctx: DeviceContext,
 ) raises:
+    if in_ch != out_ch or out_ch != SAMPLE_LAT_C * WAN_PATCH_VOLUME:
+        raise Error(
+            "WAN in-train Euler preview only has a T2V 16-channel layout bridge"
+        )
+    var sample_tokens = (
+        (SAMPLE_LAT_H // 2) * (SAMPLE_LAT_W // 2)
+    )
+    if S != sample_tokens:
+        raise Error(
+            String("WAN in-train preview token mismatch: training S=") + String(S)
+            + String(", 1024px sampling needs S=") + String(sample_tokens)
+            + String("; use process-separated pipeline/wan22_lora_sample")
+        )
     var t_start = perf_counter_ns()
-    var n = S * in_ch
+    var n = S * out_ch
     var x = _noise(n, seed * UInt64(7919) + 17)      # t = 1: pure noise
 
     # shift-mapped descending t schedule, t: 1 -> 0 (same map the trainer's
@@ -497,13 +620,20 @@ def _wan22_sample_png[
                 freq_dim, eps, ctx, save_acts, device_lora, batched_cross,
                 device_modvecs, device_modvecs_t,
             )
-        # CFG on the velocity, then one Euler step DOWN the flow-match path.
+        # CFG is in head-output order `(pf,ph,pw,c)`. Repack it to the input/state
+        # order `(c,pf,ph,pw)` before integrating the patchified latent.
+        var v_head = List[Float32]()
+        v_head.reserve(n)
         for j in range(n):
-            var v = fu.out[j] + cfg_scale * (fc.out[j] - fu.out[j])
-            x[j] = x[j] - dt * v
+            v_head.append(fu.out[j] + cfg_scale * (fc.out[j] - fu.out[j]))
+        var v_input = _wan_patch_head_to_input(v_head^, S, SAMPLE_LAT_C)
+        for j in range(n):
+            x[j] = x[j] - dt * v_input[j]
 
     # ── patch space -> latent -> pixels ──
-    var xt = Tensor.from_host(x^, [S, in_ch], STDtype.F32, ctx)
+    # `unpatchify3d` consumes the head's channel-fast order, not patch-embed order.
+    var x_head = _wan_patch_input_to_head(x^, S, SAMPLE_LAT_C)
+    var xt = Tensor.from_host(x_head^, [S, out_ch], STDtype.F32, ctx)
     var lat = unpatchify3d(
         xt, SAMPLE_LAT_C, 1, SAMPLE_LAT_H, SAMPLE_LAT_W, 1, 2, 2, ctx
     )
@@ -905,6 +1035,9 @@ def _run_wan21_train[H: Int](
         for i in range(len(x0)):
             img_tokens.append((Float32(1.0) - t) * x0[i] + t * noise[i])
             target.append(noise[i] - x0[i])
+        # fwd.out is the pre-unpatchify head layout `(pf,ph,pw,c)`, while x0/noise
+        # are patch-embed layout `(c,pf,ph,pw)`.
+        target = _wan_patch_input_to_head(target^, S, SAMPLE_LAT_C)
 
         var t_model = t * Float32(1000.0) + Float32(1.0)
 
@@ -1284,6 +1417,8 @@ def _run_wan21_i2v_train[H: Int](
         var target = List[Float32]()
         for i in range(len(x0)):
             target.append(noise[i] - x0[i])
+        # The I2V head still predicts only the 16-channel latent velocity.
+        target = _wan_patch_input_to_head(target^, S, SAMPLE_LAT_C)
         # 36-ch model input, packed per-token: noisy(16ch->64) ++ cond_y(20ch->80) = 144.
         var img_tokens = List[Float32]()
         for s in range(S):
@@ -1347,8 +1482,6 @@ def _run_wan21_i2v_train[H: Int](
 
 
 def main() raises:
-    var ctx = DeviceContext()
-
     # ── config (read FIRST — P3: config keys drive arm dispatch; the WAN21_*/
     #    WAN22_* env vars stay as overrides for the legacy smoke scripts) ──────
     var args = argv()
@@ -1356,6 +1489,21 @@ def main() raises:
     if len(args) > 1:
         config_path = String(args[1])
     var cfg = read_model_config(config_path)
+
+    # Pure-host correctness gate and fail-loud sampler preflight happen before
+    # DeviceContext/model allocation. The trainer is fixed at S=256, while the
+    # standing 1024px preview requires S=4096 and the production Musubi recipe is
+    # the process-separated UniPC sampler, not this legacy in-process Euler loop.
+    _wan_patch_layout_self_gate()
+    if cfg.sample_every > 0:
+        raise Error(
+            String("WAN sample_every>0 is unsupported in-process: training uses S=256, ")
+            + String("the required 1024px sampler uses S=4096, and validation must use ")
+            + String("the Musubi-aligned process-separated pipeline/wan22_lora_sample. ")
+            + String("Set sample_every=0 and sample saved checkpoints externally.")
+        )
+
+    var ctx = DeviceContext()
 
     # Wan is a VIDEO model — LoRA/LoCon ONLY. LoKr/LoHa/DoRA/OFT are NOT wired
     # here (this loop trains plain attn LoRA); reject them FAIL-LOUD rather than
@@ -1522,20 +1670,12 @@ def main() raises:
     # 0 disables and only the end-of-run save happens (the previous behavior).
     var save_every = cfg.save_every
     var ckpt_stem = String(out_path.removesuffix(String(".safetensors")))
-    # In-train sampling: cadence from cfg.sample_every, conds from a
-    # `wan22_encode_prompt` artifact named by WAN22_SAMPLE_CONDS (see
-    # `_wan22_sample_png` for why the text encoder is NOT loaded in this process).
+    # In-process sampling is rejected by the preflight before DeviceContext().
+    # Keep the legacy variables/calls dormant until a process-separated request/
+    # result manifest replaces them.
     var sample_every = cfg.sample_every
     var sample_conds_path = _env_str(String("WAN22_SAMPLE_CONDS"))
     var samples_dir = String(out_path.removesuffix(String(".safetensors"))) + String("_samples")
-    if sample_every > 0 and sample_conds_path.byte_length() == 0:
-        print("[sample] sample_every =", sample_every,
-              "but WAN22_SAMPLE_CONDS is unset — sampling DISABLED."
-              " Encode a prompt first: wan22_encode_prompt <pos> <neg> <conds.safetensors>")
-        sample_every = 0
-    if sample_every > 0:
-        _ = sys_system(String("mkdir -p '") + samples_dir + String("'"))
-        print("[sample] every", sample_every, "steps + at start ->", samples_dir)
     if save_every > 0:
         print("[save] periodic checkpoints every", save_every, "steps ->",
               ckpt_stem + String("-<step>.safetensors"))
@@ -1958,6 +2098,10 @@ def main() raises:
         for i in range(len(x0)):
             img_tokens.append((Float32(1.0) - t) * x0[i] + t * noise[i])
             target.append(noise[i] - x0[i])
+        # Musubi compares the unpatchified prediction with canonical velocity.
+        # This raw-stack loop therefore repacks the target to the head's c-fast
+        # output order before MSE/backward.
+        target = _wan_patch_input_to_head(target^, S, SAMPLE_LAT_C)
 
         # ── MODEL INPUT ────────────────────────────────────────────────────────
         # T2V: model input = the noised 16-ch latent patch [S,64].

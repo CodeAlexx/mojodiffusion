@@ -60,7 +60,7 @@ from serenitymojo.ops.fp8_quant import (
 )
 from serenitymojo.ops.tensor_algebra import (
     add, mul, add_scalar, mul_scalar, slice, reshape, permute, transpose,
-    full_device,
+    full_device, concat,
 )
 
 
@@ -260,6 +260,43 @@ def _wan22_sdpa_infer_rect[
     )
 
 
+def _wan22_sdpa_infer_rect_q5[
+    SQ: Int, SKV: Int, H: Int, DH: Int
+](
+    q: Tensor, k: Tensor, v: Tensor, scale: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Exact query-segmented cuDNN SDPA for the 48,360-token 16 GiB profile.
+
+    Each query row is independent and still attends every K/V row. Splitting
+    only axis 1 therefore preserves global attention while reducing cuDNN's
+    per-execution workspace. Five divides 48,360 exactly (9,672 rows/chunk).
+    """
+    comptime if SQ % 5 != 0:
+        raise Error("_wan22_sdpa_infer_rect_q5: SQ must be divisible by 5")
+    comptime Q = SQ // 5
+    var q0 = slice(q, 1, 0 * Q, Q, ctx)
+    var q1 = slice(q, 1, 1 * Q, Q, ctx)
+    var q2 = slice(q, 1, 2 * Q, Q, ctx)
+    var q3 = slice(q, 1, 3 * Q, Q, ctx)
+    var q4 = slice(q, 1, 4 * Q, Q, ctx)
+    var o0 = sdpa_flash_infer_fwd_rect[1, Q, SKV, H, DH](
+        q0, k, v, scale, ctx
+    )
+    var o1 = sdpa_flash_infer_fwd_rect[1, Q, SKV, H, DH](
+        q1, k, v, scale, ctx
+    )
+    var o2 = sdpa_flash_infer_fwd_rect[1, Q, SKV, H, DH](
+        q2, k, v, scale, ctx
+    )
+    var o3 = sdpa_flash_infer_fwd_rect[1, Q, SKV, H, DH](
+        q3, k, v, scale, ctx
+    )
+    var o4 = sdpa_flash_infer_fwd_rect[1, Q, SKV, H, DH](
+        q4, k, v, scale, ctx
+    )
+    return concat(1, ctx, o0, o1, o2, o3, o4)
+
+
 def _wan22_sdpa_infer_rect_masked[
     SQ: Int, SKV: Int, H: Int, DH: Int
 ](
@@ -335,7 +372,11 @@ def wan22_block_forward[
     # large grids (S>512) stream K/V via the tiled online-softmax SDPA so the
     # [B,H,S,S] scores are never materialized (math-mode would OOM at DH=128).
     var att: Tensor
-    comptime if S > 512:
+    comptime if S == 48360:
+        att = _wan22_sdpa_infer_rect_q5[S, S, H, DH](
+            q4, k4, v4, scale, ctx
+        )
+    elif S > 512:
         # tensor-core cuDNN flash (BSHD bf16, no-mask, real-len pad-masked to
         # S_PAD); replaces the scalar _sdpa_online path. Not bit-identical
         # (different reduction order) — gated cos>=0.99, not 0.999.
@@ -362,9 +403,14 @@ def wan22_block_forward[
     var _cav4 = _to_bshd(cav, TXT, H, DH, ctx)
     var ca_att: Tensor
     if text_valid == TXT:
-        ca_att = _wan22_sdpa_infer_rect[S, TXT, H, DH](
-            _caq4, _cak4, _cav4, scale, ctx
-        )
+        comptime if S == 48360:
+            ca_att = _wan22_sdpa_infer_rect_q5[S, TXT, H, DH](
+                _caq4, _cak4, _cav4, scale, ctx
+            )
+        else:
+            ca_att = _wan22_sdpa_infer_rect[S, TXT, H, DH](
+                _caq4, _cak4, _cav4, scale, ctx
+            )
     else:
         ca_att = _wan22_sdpa_infer_rect_masked[S, TXT, H, DH](
             _caq4, _cak4, _cav4, text_valid, scale, ctx

@@ -372,6 +372,44 @@ int build_graph_train(const SdpaKey& k, SdpaEntry& entry) {
 
 } // namespace
 
+// Explicit inference-job boundary for long, high-resolution video denoising.
+// cuDNN frontend graphs and their cudaMalloc workspaces are intentionally
+// process-global for normal image workloads, but repeated 32k+ token SDPA
+// executions can retain backend allocations until graph destruction. A Wan
+// video process calls this only after synchronizing a complete denoise step.
+extern "C" int flame_cudnn_sdpa_reset_cache(void* stream) {
+    cudaError_t sync = cudaStreamSynchronize((cudaStream_t)stream);
+    if (sync != cudaSuccess) {
+        fprintf(stderr, "[flame_cudnn_sdpa] reset synchronize failed: %s\n",
+                cudaGetErrorString(sync));
+        return -1;
+    }
+
+    std::scoped_lock lock(g_cache_mutex, g_cache_train_mutex);
+    auto release = [](auto& cache) {
+        for (auto& item : cache) {
+            auto& entry = item.second;
+            if (entry.workspace_buf) {
+                cudaFree(entry.workspace_buf);
+                entry.workspace_buf = nullptr;
+            }
+            if (entry.seq_len_q_buf) {
+                cudaFree(entry.seq_len_q_buf);
+                entry.seq_len_q_buf = nullptr;
+            }
+            if (entry.seq_len_kv_buf) {
+                cudaFree(entry.seq_len_kv_buf);
+                entry.seq_len_kv_buf = nullptr;
+            }
+            entry.graph.reset();
+        }
+        cache.clear();
+    };
+    release(g_cache);
+    release(g_cache_train);
+    return 0;
+}
+
 extern "C" int flame_cudnn_sdpa_bf16(
     const void* Q, const void* K, const void* V, void* O,
     int B, int H, int N_q, int N_kv, int D,

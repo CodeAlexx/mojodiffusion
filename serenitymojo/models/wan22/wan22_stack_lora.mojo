@@ -420,15 +420,34 @@ struct Wan22StackForward(Movable):
 def _sin_embed(t: Float32, S: Int, freq_dim: Int, theta: Float32 = Float32(10000.0)) -> List[Float32]:
     var half = freq_dim // 2
     var out = List[Float32]()
+    # ⚠ COS FIRST, THEN SIN. This ordering is the ORACLE's:
+    #   musubi wan/modules/model.py:37
+    #     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    # and it is what OUR OWN INFERENCE uses (ops/embeddings.mojo:73-75,
+    # "COS first (cols [0, half)), SIN second"), reached from the streamed DiT via
+    # timestep_embedding (wan22_a14b_streamed_dit.mojo:163).
+    #
+    # This function was SIN-first until 2026-07-25 while its docstring claimed it
+    # "matches wan22_dit.mojo::timestep_embedding". It did not. The two 256-vectors
+    # are near-orthogonal (cos ~0.12-0.18 over t in [1,1000]), so every AdaLN modvec
+    # in all 40 blocks was built from unrelated time conditioning — the trainer was
+    # optimizing against a de-conditioned base.
+    # The tells, both of which were measured and misread as healthy:
+    #   * base MSE 1.867 @ t=0.30 / 2.377 @ t=0.95, ABOVE var(target)=1+var(x0)~1.23
+    #     — i.e. worse than predicting zero, which is anti-correlation, not weakness;
+    #   * a trained LoRA scoring 0.179 @ t=0.30 and 0.178 @ t=0.95 — a flow-match loss
+    #     that does NOT vary with t means the model cannot read t.
+    # The Musubi BLOCK parity gate could never catch this: the block takes e0 as an
+    # INPUT, so the time embedding is upstream of every gate we had.
     for _ in range(S):
         for k in range(half):
             var freq = Float32(1.0) / (theta ** (Float32(k) / Float32(half)))
             var arg = t * freq
-            out.append(Float32(_fsin(Float64(arg))))
+            out.append(Float32(_fcos(Float64(arg))))
         for k in range(half):
             var freq = Float32(1.0) / (theta ** (Float32(k) / Float32(half)))
             var arg = t * freq
-            out.append(Float32(_fcos(Float64(arg))))
+            out.append(Float32(_fsin(Float64(arg))))
     return out^
 
 

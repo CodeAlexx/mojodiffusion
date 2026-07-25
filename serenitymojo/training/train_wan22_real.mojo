@@ -1500,6 +1500,17 @@ def main() raises:
             print("[wan22] fp8-HOST HIGH: pinned", h_high, "/", NUM_BLOCKS, "blocks")
         print("[wan22] fp8-HOST TOTAL:", h_low + h_high, "blocks now stage from"
               " pinned RAM (no mmap memcpy)")
+        # WAN22_FP8H_OVERLAP=1: stage those pinned blocks on the COPY STREAM during
+        # the previous block's compute instead of inline on the default stream at
+        # await. nsys measured the inline path at 508.6 ms/step of H2D with **0%
+        # overlap** (H2D union 508.6 + kernel union 859.2 = 1367.9 = exactly
+        # additive), so this is pure serialization, not bandwidth. Bit-identical:
+        # same bytes, same dequant kernel — only the stream and timing change.
+        if _env_is_set(String("WAN22_FP8H_OVERLAP")):
+            loader.set_fp8h_overlap(True)
+            if dual_expert:
+                loader_high.set_fp8h_overlap(True)
+            print("[wan22] fp8-HOST: OVERLAPPED staging ON (copy stream, double-buffered)")
 
     # build_wan22_lora_set creates 10 adapters/block: the 8 ATTENTION projections
     # (self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}) + ffn.0 (dim->ffn) + ffn.2

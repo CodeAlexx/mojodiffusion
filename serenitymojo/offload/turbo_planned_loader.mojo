@@ -317,6 +317,21 @@ struct TurboPlannedLoader(Movable):
     var _i8h_slot_prefix: List[String]               # staged prefix per slot ("" = empty)
     var _i8h_active: Int                             # slot compute is reading
     var _i8h_capacity: Int                           # slab bytes (max int8h block)
+    # ── fp8-host OVERLAPPED staging (opt-in, `set_fp8h_overlap`) ──────────────
+    # The same double-buffered slab machinery as int8h above, for the fp8h path.
+    # WHY: fp8h stages INLINE AT AWAIT on the DEFAULT stream (see await_block),
+    # so its H2D cannot overlap compute. nsys on the wan2.2 trainer measured
+    # 508.6 ms/step of H2D against 859.2 ms/step of kernels with a union of
+    # 1367.9 ms — i.e. **0% overlap, perfectly serialized**. Off by default so
+    # every existing fp8h caller keeps the byte-identical inline path (C13).
+    var _f8h_devs: List[DeviceBuffer[DType.uint8]]   # 2 persistent slabs
+    var _f8h_evs: List[DeviceEvent]                  # per-slot copy-done (copy stream)
+    var _f8h_cds: List[DeviceEvent]                  # per-slot compute-done (default stream)
+    var _f8h_cd_rec: List[Bool]                      # compute-done recorded flags
+    var _f8h_slot_prefix: List[String]               # staged prefix per slot ("" = empty)
+    var _f8h_active: Int                             # slot compute is reading
+    var _f8h_capacity: Int                           # slab bytes (max fp8h block)
+    var _f8h_overlap: Bool                           # opt-in switch
 
     @staticmethod
     def open(
@@ -403,6 +418,14 @@ struct TurboPlannedLoader(Movable):
         self._i8h_slot_prefix = List[String]()
         self._i8h_active = 0
         self._i8h_capacity = 0
+        self._f8h_devs = List[DeviceBuffer[DType.uint8]]()
+        self._f8h_evs = List[DeviceEvent]()
+        self._f8h_cds = List[DeviceEvent]()
+        self._f8h_cd_rec = List[Bool]()
+        self._f8h_slot_prefix = List[String]()
+        self._f8h_active = 0
+        self._f8h_capacity = 0
+        self._f8h_overlap = False
 
     def _resident_slot(self, norm_prefix: String) -> Int:
         for r in range(len(self._res_prefixes)):
@@ -1171,6 +1194,97 @@ struct TurboPlannedLoader(Movable):
         self._turbo.copy_stream.record_event(self._i8h_evs[slot])
         self._i8h_slot_prefix[slot] = p^
 
+    # ── fp8-host OVERLAPPED staging ──────────────────────────────────────────
+    def set_fp8h_overlap(mut self, on: Bool):
+        """Opt in to staging host-pinned fp8 blocks on the COPY STREAM during the
+        previous block's compute, instead of inline on the default stream at await.
+
+        Same bytes, same dequant kernel, same Block — only WHEN and ON WHICH STREAM
+        the H2D runs changes, so results are bit-identical. Default OFF (C13): the
+        inline path is what every existing fp8h caller has been running."""
+        self._f8h_overlap = on
+
+    def _f8h_layout(self, hslot: Int) raises -> List[Int]:
+        """Byte offsets of block `hslot`'s tensors inside a staging slab, followed
+        by the slab total as the LAST element. Layout order == the `_fp8h_blocks`
+        iteration order, two entries per tensor (bytes, scale), each 256-aligned.
+
+        ONE function computes this for both the prefetch (writer) and the await
+        (reader) so the two can never disagree about where a tensor landed."""
+        var offs = List[Int]()
+        var off = 0
+        for t in range(len(self._fp8h_blocks[hslot])):
+            ref rt = self._fp8h_blocks[hslot][t]
+            offs.append(off)
+            off += ((rt.bytes_nbytes + 255) // 256) * 256
+            offs.append(off)
+            off += ((rt.scale_nbytes + 255) // 256) * 256
+        offs.append(off)
+        return offs^
+
+    def _f8h_ensure(mut self, ctx: DeviceContext) raises:
+        """Allocate the two persistent staging slabs (max fp8h block) + events."""
+        var maxb = 0
+        for i in range(len(self._fp8h_blocks)):
+            var offs = self._f8h_layout(i)
+            var tot = offs[len(offs) - 1]
+            if tot > maxb:
+                maxb = tot
+        if maxb > self._f8h_capacity:
+            self._f8h_devs = List[DeviceBuffer[DType.uint8]]()
+            self._f8h_devs.append(ctx.enqueue_create_buffer[DType.uint8](maxb))
+            self._f8h_devs.append(ctx.enqueue_create_buffer[DType.uint8](maxb))
+            ctx.synchronize()  # materialize allocs before raw CUDA copies target them
+            self._f8h_capacity = maxb
+            self._f8h_slot_prefix = [String(""), String("")]
+            self._f8h_active = 0
+        if len(self._f8h_evs) == 0:
+            self._f8h_evs.append(ctx.create_event[disable_timing=True]())
+            self._f8h_evs.append(ctx.create_event[disable_timing=True]())
+            self._f8h_cds.append(ctx.create_event[disable_timing=True]())
+            self._f8h_cds.append(ctx.create_event[disable_timing=True]())
+            self._f8h_cd_rec = [False, False]
+
+    def _f8h_prefetch(mut self, hslot: Int, ctx: DeviceContext) raises:
+        """Stage fp8-host block `hslot` into the idle slab on the turbo COPY STREAM
+        so the H2D overlaps the CURRENT block's compute.
+
+        Unlike int8h (one packed pinned buffer per block → one whole-block DMA), the
+        fp8h pins keep a separate pinned buffer PER TENSOR, so this issues one async
+        copy per tensor into the slab at `_f8h_layout` offsets. They are all on the
+        copy stream and pipeline, so the overlap is the same; only the launch count
+        differs (repacking the pins into one buffer would cut that — a follow-up).
+
+        Slot-reuse hazard (this write vs the previous tenant's still-running kernels)
+        is fenced on the slot's compute-done event, exactly as `_i8h_prefetch` does."""
+        self._f8h_ensure(ctx)
+        var p = self._fp8h_prefixes[hslot].copy()
+        if self._f8h_slot_prefix[0] == p or self._f8h_slot_prefix[1] == p:
+            return  # already staged (idempotent — hit / paired re-await)
+        var slot = 1 - self._f8h_active  # idle slot (compute reads the other)
+        if self._f8h_cd_rec[slot]:
+            self._turbo.copy_stream.enqueue_wait_for(self._f8h_cds[slot])
+            self._f8h_cd_rec[slot] = False
+        var offs = self._f8h_layout(hslot)
+        var base = UInt64(Int(self._f8h_devs[slot].unsafe_ptr()))
+        for t in range(len(self._fp8h_blocks[hslot])):
+            ref rt = self._fp8h_blocks[hslot][t]
+            _h2d_dma_copy(
+                base + UInt64(offs[2 * t]),
+                rt.bytes_h[].unsafe_ptr(),
+                rt.bytes_nbytes,
+                self._turbo.copy_stream,
+            )
+            if rt.is_fp8:
+                _h2d_dma_copy(
+                    base + UInt64(offs[2 * t + 1]),
+                    rt.scale_h[].unsafe_ptr(),
+                    rt.scale_nbytes,
+                    self._turbo.copy_stream,
+                )
+        self._turbo.copy_stream.record_event(self._f8h_evs[slot])
+        self._f8h_slot_prefix[slot] = p^
+
     def block_count(self) -> Int:
         return self._plan.count()
 
@@ -1223,10 +1337,20 @@ struct TurboPlannedLoader(Movable):
             return
         self._assert_raw_copy_dtype_safe(index)
         var norm = self._plan.normalized_prefix(index)
+        # fp8-host with overlap enabled: this is the ONE case where a host-pinned
+        # block still wants staging work — the bytes live in pinned RAM and must
+        # cross PCIe. Doing it here (during the previous block's compute) instead
+        # of inline at await is the whole point. Overlap OFF keeps the early return.
+        var f8h_pre = self._fp8h_slot(norm)
+        if f8h_pre >= 0 and self._f8h_overlap:
+            if self._pending_idx == index:
+                self._pending_idx = -1
+            self._f8h_prefetch(f8h_pre, ctx)
+            return
         if (
             self._resident_slot(norm) >= 0
             or self._fp8_slot(norm) >= 0
-            or self._fp8h_slot(norm) >= 0
+            or f8h_pre >= 0
             or self._int8_slot(norm) >= 0
         ):
             return  # permanently device/host resident — no staging
@@ -1271,6 +1395,10 @@ struct TurboPlannedLoader(Movable):
         if len(self._i8h_cds) == 2:
             ctx.stream().record_event(self._i8h_cds[self._i8h_active])
             self._i8h_cd_rec[self._i8h_active] = True
+        # Same double-buffer contract for the overlapped fp8-host slabs.
+        if self._f8h_overlap and len(self._f8h_cds) == 2:
+            ctx.stream().record_event(self._f8h_cds[self._f8h_active])
+            self._f8h_cd_rec[self._f8h_active] = True
 
     def print_telemetry(self):
         """Print the underlying turbo loader counters.
@@ -1427,6 +1555,57 @@ struct TurboPlannedLoader(Movable):
         # (~half the bytes of bf16 streaming), dequant to BF16 on device. Same
         # Block shape as the streamed/fp8 paths; NO disk (MJ-1065).
         var hslot = self._fp8h_slot(load_prefix)
+        if hslot >= 0 and self._f8h_overlap:
+            # OVERLAPPED variant: the bytes were DMA'd into a persistent slab on the
+            # copy stream during the previous block's compute (_f8h_prefetch). The
+            # default stream only waits on the slot's copy-done event, then the SAME
+            # dequant runs over slab sub-buffer views. Identical bytes in, identical
+            # Block out — only the copy's stream and timing changed.
+            self._dispatch_pending(ctx)
+            self._f8h_ensure(ctx)
+            var oslot = -1
+            if self._f8h_slot_prefix[0] == load_prefix:
+                oslot = 0
+            elif self._f8h_slot_prefix[1] == load_prefix:
+                oslot = 1
+            if oslot < 0:
+                # miss (cold start / non-sequential visit): stage now — correct,
+                # just unoverlapped, exactly like the int8h miss path.
+                self._f8h_prefetch(hslot, ctx)
+                if self._f8h_slot_prefix[0] == load_prefix:
+                    oslot = 0
+                elif self._f8h_slot_prefix[1] == load_prefix:
+                    oslot = 1
+                if oslot < 0:
+                    raise Error(
+                        String("TurboPlannedLoader.await_block: fp8h block ")
+                        + "not staged: " + load_prefix
+                    )
+            ctx.stream().enqueue_wait_for(self._f8h_evs[oslot])
+            self._f8h_active = oslot
+            var ooffs = self._f8h_layout(hslot)
+            var oblock = Block()
+            for t in range(len(self._fp8h_blocks[hslot])):
+                ref rt = self._fp8h_blocks[hslot][t]
+                var wsub = self._f8h_devs[oslot].create_sub_buffer[DType.uint8](
+                    ooffs[2 * t], rt.bytes_nbytes
+                )
+                var wt = Tensor(wsub^, rt.bytes_shape.copy(), rt.bytes_dtype)
+                if rt.is_fp8:
+                    var ssub = self._f8h_devs[oslot].create_sub_buffer[DType.uint8](
+                        ooffs[2 * t + 1], rt.scale_nbytes
+                    )
+                    var st = Tensor(ssub^, rt.scale_shape.copy(), STDtype.F32)
+                    # dequant allocates its own output, so the slab views are read
+                    # only by this kernel; the BF16 smalls below stay as views and
+                    # are protected by the compute-done fence like int8h's.
+                    var w = fp8_e4m3_dequant_perrow_to_bf16(wt, st, ctx)
+                    oblock[rt.name] = ArcPointer(w^)
+                else:
+                    oblock[rt.name] = ArcPointer(wt^)
+            self._step += 1
+            return PlannedBlockHandle(index, prefix, oblock^)
+
         if hslot >= 0:
             self._dispatch_pending(ctx)
             var hblock = Block()

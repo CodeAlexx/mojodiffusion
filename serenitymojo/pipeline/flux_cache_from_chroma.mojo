@@ -35,8 +35,9 @@
 #
 # CLIP-L assets (staged 2026-07-08): weights /mnt/disk1/models/checkpoints/
 # flux1-aux/text_encoder/model.safetensors (196 text_model.* keys, BF16);
-# tokenizer.json from the SwarmUI ComfyUI stage (openai/clip-vit-large-patch14
-# BPE, vocab 49408, end_of_word_suffix "</w>").
+# tokenizer.json from Serenity's text-encoder assets
+# (openai/clip-vit-large-patch14 BPE, vocab 49408,
+# end_of_word_suffix "</w>").
 #
 # Run:
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
@@ -69,7 +70,7 @@ comptime SRC_DIR = "/home/alex/datasets/boxjana_chroma_edv2_512"
 comptime OUT_DIR = "/home/alex/mojodiffusion/output/cache/boxjana_flux_512"
 comptime MANIFEST = "/home/alex/mojodiffusion/output/cache/boxjana_flux_512_captions.tsv"
 comptime CLIP_PATH = "/mnt/disk1/models/checkpoints/flux1-aux/text_encoder/model.safetensors"
-comptime CLIP_TOK_JSON = "/home/alex/SwarmUI/dlbackend/ComfyUI/models/text_encoders/clip_l.tokenizer.json"
+comptime CLIP_TOK_JSON = "/home/alex/.serenity/models/text_encoders/clip_l.tokenizer.json"
 
 comptime CLIP_LEN = 77
 comptime CLIP_BOS = 49406

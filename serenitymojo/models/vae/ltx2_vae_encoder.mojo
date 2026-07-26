@@ -79,7 +79,7 @@ from serenitymojo.ops.tensor_algebra import (
 )
 from serenitymojo.ops.reduce import reduce_mean
 from serenitymojo.ops.pixelshuffle import space_to_depth_3d, patchify_3d
-from serenitymojo.models.vae.conv3d import conv3d
+from serenitymojo.models.vae.conv3d import conv3d_fcqrs_cudnn
 
 
 comptime IN_CH = 3
@@ -208,37 +208,6 @@ struct LTX2VaeEncoderWeights(Movable):
         var idx = self.name_to_idx[name]
         return self.weights[idx][]
 
-    # PyTorch conv3d weight OIDHW [Cout,Cin,kD,kH,kW] -> QRSCF [kD,kH,kW,Cin,Cout].
-    def _conv3d_w(self, name: String, ctx: DeviceContext) raises -> Tensor:
-        ref w = self._w(name)
-        var s = w.shape()
-        if len(s) != 5:
-            raise Error(String("LTX2 VAE Enc: conv weight not rank-5: ") + name)
-        var cout = s[0]
-        var cin = s[1]
-        var kd = s[2]
-        var kh = s[3]
-        var kw = s[4]
-        var host = w.to_host(ctx)  # F32, OIDHW order
-        var out = List[Float32]()
-        out.resize(cout * cin * kd * kh * kw, Float32(0.0))
-        for o in range(cout):
-            for ci in range(cin):
-                for d in range(kd):
-                    for r in range(kh):
-                        for c in range(kw):
-                            var oidhw = (
-                                (((o * cin + ci) * kd + d) * kh + r) * kw + c
-                            )
-                            var qrscf = (
-                                (((d * kh + r) * kw + c) * cin + ci) * cout + o
-                            )
-                            out[qrscf] = host[oidhw]
-        var osh = List[Int]()
-        osh.append(kd); osh.append(kh); osh.append(kw)
-        osh.append(cin); osh.append(cout)
-        return Tensor.from_host(out, osh^, w.dtype(), ctx)
-
     def _bias(self, name: String, ctx: DeviceContext) raises -> Tensor:
         ref b = self._w(name)
         var dev = ctx.enqueue_create_buffer[DType.uint8](b.nbytes())
@@ -259,7 +228,7 @@ struct LTX2VaeEncoderWeights(Movable):
     def _causal_conv3d(
         self,
         x: Tensor,
-        var w_qrscf: Tensor,
+        w_fcqrs: Tensor,
         var bias: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
@@ -272,17 +241,19 @@ struct LTX2VaeEncoderWeights(Movable):
         # left-pad: prepend TIME_PAD copies of the first frame (causal,
         # derived from kernel size; for k=3 TIME_PAD==2 → unchanged math).
         var x_pad = self._temporal_pad(x, TIME_PAD, ctx)
-        return conv3d(
-            x_pad, w_qrscf^, Optional[Tensor](bias^),
+        return conv3d_fcqrs_cudnn(
+            x_pad, w_fcqrs, Optional[Tensor](bias^),
             1, 1, 1, 0, HALF_PAD, HALF_PAD, ctx,
+            low_startup=True,
         )
 
     def _conv3d_named(
         self, x: Tensor, prefix: String, ctx: DeviceContext
     ) raises -> Tensor:
-        var w = self._conv3d_w(prefix + ".weight", ctx)
         var b = self._bias(prefix + ".bias", ctx)
-        return self._causal_conv3d(x, w^, b^, ctx)
+        return self._causal_conv3d(
+            x, self._w(prefix + ".weight"), b^, ctx
+        )
 
     # ── PixelNorm (RMS over channel/last NDHWC dim; ones gamma prefix) ────────
     def _pixel_norm(

@@ -1,7 +1,7 @@
 # Bernini-R APG parity against pinned ByteDance creator source.
 #
 # Oracle first:
-#   /home/alex/SwarmUI/dlbackend/ComfyUI/venv/bin/python \
+#   python3 \
 #     scripts/bernini_r_apg_oracle.py
 # Then:
 #   pixi run mojo run -I . serenitymojo/sampling/parity/bernini_apg_parity.mojo

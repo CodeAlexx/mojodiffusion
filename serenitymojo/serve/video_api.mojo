@@ -2,7 +2,7 @@
 #
 # This module owns the daemon-visible video readiness, MP4/A-V probing, and
 # bounded LTX2 smoke runner result manifest. It is still a product wiring gate,
-# not full SwarmUI video parity.
+# not full reference UI video parity.
 
 from std.ffi import external_call
 from std.memory import alloc
@@ -218,7 +218,7 @@ def video_readiness_doc(
         "non_acceptance_reason",
         JSONValue.from_string(
             String(
-                "bounded smoke wiring is not full SwarmUI video parity; artifact acceptance requires frame_count, duration, muxing, audio behavior, timings, and VRAM evidence"
+                "bounded smoke wiring is not full reference UI video parity; artifact acceptance requires frame_count, duration, muxing, audio behavior, timings, and VRAM evidence"
             )
         ),
     )

@@ -192,9 +192,9 @@ fn gallery_order_index(state: &Value, id: &str) -> i64 {
     -1
 }
 
-// ── output-path template (SwarmUI OutpathBuilder parity, §7) ─────────────────────
+// ── output-path template (reference UI OutpathBuilder parity, §7) ─────────────────────
 //
-// SwarmUI lets the output filename follow a template like `[model]-[seed]-[date]`
+// reference UI lets the output filename follow a template like `[model]-[seed]-[date]`
 // instead of the fixed `job-NNNN`. The REAL on-disk PNG is still `job-NNNN.png`
 // (the worker owns the write + the gallery scan keys on `job-*.png`), so the
 // template resolves a *display / suggested-output* name surfaced on every item as
@@ -515,7 +515,7 @@ fn item_from_png_state(
         Some(v) if v.is_object() => v.clone(),
         _ => json!({}),
     };
-    // Resolve the SwarmUI-style output filename (display/suggested name); the
+    // Resolve the Serenity output filename (display/suggested name); the
     // real PNG on disk is still job-NNNN.png. Empty template → the id (back-compat).
     let template = gallery_output_template(state);
     let output_name = if id.is_empty() {
@@ -1175,7 +1175,7 @@ pub async fn delete_item(State(st): State<AppState>, AxPath(id): AxPath<String>)
     )
 }
 
-// ── output-path template config (SwarmUI OutpathBuilder, §7) ─────────────────────
+// ── output-path template config (reference UI OutpathBuilder, §7) ─────────────────────
 
 /// `_set_gallery_template_doc` — set `output_path_template`, preserve the rest. An
 /// empty/whitespace template removes the field (== back to `job-NNNN` naming).

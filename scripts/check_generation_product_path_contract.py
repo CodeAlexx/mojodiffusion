@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""No-CUDA guard for SwarmUI product-path parity.
+"""No-CUDA guard for reference UI product-path parity.
 
 Default mode is a report and exits 0. Use --strict to fail on P0 product-path
-blockers, or --strict-all to fail on every remaining SwarmUI-level blocker.
+blockers, or --strict-all to fail on every remaining reference UI-level blocker.
 
 This checker does not run CUDA, generate images, or claim parity. It makes the
 current product-path gaps machine-readable so the daemon/UI path cannot quietly
-claim SwarmUI parity while image/video generation still lacks bounded runtime,
+claim reference UI parity while image/video generation still lacks bounded runtime,
 artifact, timing, VRAM, and UX integration evidence.
 """
 
@@ -23,11 +23,11 @@ from typing import Iterable
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_MOJO_LIBS = Path("/home/alex/MOJO-libs")
 
-AUDIT_DOC = REPO / "SWARMUI_PARITY_AUDIT_MOJOLIB_MOJODIFFUSION_2026-06-12.md"
-LEDGER_DOC = REPO / "serenitymojo/docs/SWARMUI_PRODUCT_PATH_LEDGER_2026-06-12.md"
-SAMPLER_MAP_DOC = REPO / "serenitymojo/docs/SWARMUI_SAMPLER_PARITY_MAP_2026-06-12.md"
-WORKFLOW_MAP_DOC = REPO / "serenitymojo/docs/COMFY_SWARM_WORKFLOW_PARITY_MAP_2026-06-12.md"
-MODEL_GALLERY_LORA_MAP_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
+AUDIT_DOC = REPO / "REFERENCE_UI_PARITY_AUDIT_MOJOLIB_MOJODIFFUSION_2026-06-12.md"
+LEDGER_DOC = REPO / "serenitymojo/docs/REFERENCE_UI_PRODUCT_PATH_LEDGER_2026-06-12.md"
+SAMPLER_MAP_DOC = REPO / "serenitymojo/docs/REFERENCE_UI_SAMPLER_PARITY_MAP_2026-06-12.md"
+WORKFLOW_MAP_DOC = REPO / "serenitymojo/docs/COMFY_REFERENCE_WORKFLOW_PARITY_MAP_2026-06-12.md"
+MODEL_GALLERY_LORA_MAP_DOC = REPO / "serenitymojo/docs/REFERENCE_UI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
 
 DAEMON = REPO / "serenitymojo/serve/serenity_daemon.mojo"
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
@@ -46,7 +46,7 @@ STUB_BACKEND = REPO / "serenitymojo/serve/stub_backend.mojo"
 ZIMAGE_DAEMON_PRODUCT_CHECK = REPO / "scripts/check_zimage_daemon_product_contract.py"
 MOJO_WEIGHT_SOURCE_CHECK = REPO / "scripts/check_mojo_inference_weight_sources.py"
 RUST_BLOCK_PROFILE_CHECK = REPO / "serenitymojo/offload/check_rust_block_profile_contract.py"
-SAMPLER_SURFACE_CHECK = REPO / "scripts/check_swarmui_sampler_surface.py"
+SAMPLER_SURFACE_CHECK = REPO / "scripts/check_sampler_surface.py"
 WORKFLOW_NODE_SURFACE_CHECK = REPO / "scripts/check_workflow_node_surface.py"
 MODEL_GALLERY_LORA_SURFACE_CHECK = REPO / "scripts/check_model_gallery_lora_surface.py"
 UI_GALLERY_REUSE_STATE_CHECK = REPO / "scripts/check_ui_gallery_reuse_state_contract.py"
@@ -252,12 +252,12 @@ def check_regex_absent(
     return Check(True, PASS, category, label, "blocker regex absent", rel(path), acceptance)
 
 
-def check_swarmui_audit_doc() -> list[Check]:
+def check_reference_ui_audit_doc() -> list[Check]:
     return [
         check_contains(
             AUDIT_DOC,
             category="docs",
-            label="SwarmUI parity audit exists",
+            label="reference UI parity audit exists",
             needles=[
                 "Image Model Generation Speed",
                 "Video / Audio",
@@ -269,7 +269,7 @@ def check_swarmui_audit_doc() -> list[Check]:
         check_contains(
             LEDGER_DOC,
             category="docs",
-            label="SwarmUI product-path ledger exists",
+            label="reference UI product-path ledger exists",
             needles=[
                 "Acceptance Gates",
                 "P0.1 Image Fast Path",
@@ -281,7 +281,7 @@ def check_swarmui_audit_doc() -> list[Check]:
         check_contains(
             SAMPLER_MAP_DOC,
             category="docs",
-            label="SwarmUI sampler parity map exists",
+            label="reference UI sampler parity map exists",
             needles=[
                 "`accepted_sampler_parity` must remain false",
                 "Qwen text-to-image is admitted only as a bounded 1024x1024 Euler/simple route",
@@ -293,7 +293,7 @@ def check_swarmui_audit_doc() -> list[Check]:
         check_contains(
             WORKFLOW_MAP_DOC,
             category="docs",
-            label="Comfy/Swarm workflow parity map exists",
+            label="Comfy/Reference workflow parity map exists",
             needles=[
                 "not an arbitrary ComfyUI graph executor",
                 "typed linked graph executor",
@@ -338,7 +338,7 @@ def check_specialized_surface_blockers() -> list[Check]:
             category="sampler",
             label="sampler registry discovery endpoint",
             needles=[
-                "swarmui_sampler_registry_json",
+                "serenity_sampler_registry_json",
                 'path == "/v1/samplers"',
                 "default_sampler_for_backend",
                 "default_scheduler_for_backend",
@@ -349,7 +349,7 @@ def check_specialized_surface_blockers() -> list[Check]:
         check_contains(
             SAMPLER_REGISTRY,
             category="sampler",
-            label="SwarmUI/Comfy sampler registry exists",
+            label="reference UI/Comfy sampler registry exists",
             needles=[
                 "serenity.samplers.v1",
                 "sampler_admission_for_backend",
@@ -361,7 +361,7 @@ def check_specialized_surface_blockers() -> list[Check]:
                 "accepted_sampler_parity",
             ],
             severity=P0,
-            acceptance="Daemon requests select from a SwarmUI/Comfy-compatible sampler/scheduler registry with fail-loud unsupported policy.",
+            acceptance="Daemon requests select from a reference UI/Comfy-compatible sampler/scheduler registry with fail-loud unsupported policy.",
         ),
         check_contains(
             REPO / "serenitymojo/serve/backend.mojo",
@@ -489,22 +489,22 @@ def check_specialized_surface_blockers() -> list[Check]:
         check_contains(
             VARIATION_NOISE,
             category="sampler",
-            label="Swarm variation noise helper exists",
+            label="Reference variation noise helper exists",
             needles=[
-                "swarm_variation_noise_chw",
+                "variation_noise_chw",
                 "acos",
                 "sin",
-                "SwarmKSampler-compatible slerp",
+                "ReferenceKSampler-compatible slerp",
             ],
             severity=P0,
-            acceptance="Variation noise has a pure-Mojo Swarm-style slerp helper instead of metadata-only handling.",
+            acceptance="Variation noise has a pure-Mojo Reference-style slerp helper instead of metadata-only handling.",
         ),
         check_contains(
             ZIMAGE_BACKEND,
             category="sampler",
             label="Z-Image applies variation noise",
             needles=[
-                "swarm_variation_noise_chw",
+                "variation_noise_chw",
                 "self.params.variation_seed + self.params.image_index",
                 '"variation_applied"',
             ],
@@ -516,7 +516,7 @@ def check_specialized_surface_blockers() -> list[Check]:
             category="sampler",
             label="Qwen helper keeps variation-noise wiring",
             needles=[
-                "swarm_variation_noise_chw",
+                "variation_noise_chw",
                 "self.params.variation_seed + self.params.image_index",
                 "variation_strength > 0.0",
             ],
@@ -551,7 +551,7 @@ def check_specialized_surface_blockers() -> list[Check]:
             label="workflow node surface checker exists",
             needles=[
                 "constrained_workflow_adapter_ready",
-                "arbitrary_comfy_swarm_graph_execution_ready",
+                "arbitrary_comfy_reference_graph_execution_ready",
                 "unsupported graph",
             ],
             severity=P1,
@@ -563,7 +563,7 @@ def check_specialized_surface_blockers() -> list[Check]:
             label="typed workflow graph replaces stale no-IR blocker",
             needles=["No graph IR"],
             severity=P1,
-            acceptance="A typed graph IR/topological executor exists for accepted Comfy/Swarm workflows.",
+            acceptance="A typed graph IR/topological executor exists for accepted Comfy/Reference workflows.",
         ),
         check_contains(
             MODEL_GALLERY_LORA_SURFACE_CHECK,
@@ -654,7 +654,7 @@ def check_specialized_surface_blockers() -> list[Check]:
                 report.get("ready") is True and report.get("claims_ux_parity") is True,
                 PASS if report.get("ready") is True and report.get("claims_ux_parity") is True else P1,
                 "models-gallery-lora",
-                "UI/gallery/reuse/state SwarmUI UX parity",
+                "UI/gallery/reuse/state reference UI UX parity",
                 (
                     "runtime report "
                     + f"checks={summary.get('checks')} passed={summary.get('passed')} "
@@ -717,7 +717,7 @@ def check_daemon_surface() -> list[Check]:
                 "GET  /v1/health",
             ],
             severity=P0,
-            acceptance="Daemon exposes the core single-user SwarmUI generation loop.",
+            acceptance="Daemon exposes the core single-user reference UI generation loop.",
         ),
         check_contains(
             DAEMON,
@@ -867,7 +867,7 @@ def check_daemon_surface() -> list[Check]:
                 "BANNED_RUNTIME_ROOTS",
                 "/home/alex/EriDiffusion",
                 "/home/alex/SerenityFlow",
-                "/home/alex/SwarmUI",
+                "/home/alex/reference UI",
                 "/home/alex/ComfyUI",
             ],
             severity=P0,
@@ -980,7 +980,7 @@ def check_model_gallery_surface() -> list[Check]:
             label="gallery item/read-params endpoint",
             needles=["/v1/gallery", "read_png_text"],
             severity=P1,
-            acceptance="SwarmUI-style gallery can list generated items and read params from arbitrary PNG files; indexed import is separately gated.",
+            acceptance="reference UI-style gallery can list generated items and read params from arbitrary PNG files; indexed import is separately gated.",
         ),
     ]
 
@@ -1359,7 +1359,7 @@ def check_prompt_queue_workflow() -> list[Check]:
             label="workflow graph bodies are implemented",
             needles=["'workflow' (graph body) is reserved and not implemented"],
             severity=P2,
-            acceptance="Workflow graph requests execute or fail with a documented feature gate outside SwarmUI parity claims.",
+            acceptance="Workflow graph requests execute or fail with a documented feature gate outside reference UI parity claims.",
         ),
         check_contains(
             DAEMON,
@@ -1388,10 +1388,10 @@ def check_docs_alignment() -> list[Check]:
             label="handoff states current bounded product evidence",
             needles=[
                 "tracked no-CUDA product gate evidence is",
-                "Full SwarmUI parity remains",
+                "Full reference UI parity remains",
             ],
             severity=P1,
-            acceptance="Handoff distinguishes current bounded product evidence from a full SwarmUI parity claim.",
+            acceptance="Handoff distinguishes current bounded product evidence from a full reference UI parity claim.",
         ),
         check_contains(
             SAMPLER_HARNESS_DOC,
@@ -1406,7 +1406,7 @@ def check_docs_alignment() -> list[Check]:
 
 def collect_checks(mojo_libs: Path) -> list[Check]:
     checks: list[Check] = []
-    checks.extend(check_swarmui_audit_doc())
+    checks.extend(check_reference_ui_audit_doc())
     checks.extend(check_foundation(mojo_libs))
     checks.extend(check_daemon_surface())
     checks.extend(check_model_gallery_surface())
@@ -1424,19 +1424,19 @@ def build_report(checks: list[Check]) -> dict[str, object]:
     p2 = [check for check in checks if not check.ok and check.severity == P2]
     known_all_level_blockers = [
         "Qwen full daemon generation remains parked until bounded VRAM/runtime evidence says it is safe.",
-        "LTX2 video remains a bounded DEV-smoke backend: MP4/timing/VRAM evidence exists, but full SwarmUI/HQ video parity still needs non-smoke quality, workflow, duration, audio, and option coverage.",
-        "Advanced Comfy/Swarm node families beyond the typed t2i graph remain unsupported.",
+        "LTX2 video remains a bounded DEV-smoke backend: MP4/timing/VRAM evidence exists, but full reference UI/HQ video parity still needs non-smoke quality, workflow, duration, audio, and option coverage.",
+        "Advanced Comfy/Reference node families beyond the typed t2i graph remain unsupported.",
         "Z-Image speed parity is not accepted until the denoise path has paired baseline and optimized CFG/main-stack evidence.",
         "Remaining image/video backends with direct sdpa_nomask/sdpa_nomask_tiled product call sites are not accepted for speed parity until routed to flash or a proven model-specific fast kernel.",
         "Ideogram4 has bounded artifact evidence, PNG metadata/gallery readback, a bounded fail-loud option gate, and cleared the Dh=256 fast-attention gate, but full parity still needs broader runtime, sampler, speed, quality, and UX evidence.",
     ]
     return {
-        "schema": "serenity.swarmui.product_path_readiness.v1",
+        "schema": "serenity.reference_ui.product_path_readiness.v1",
         "scope": "no-CUDA static product-path gate; no generation, no image comparison",
         "product_path_p0_ready": not p0,
         "tracked_product_path_p1_ready": not p0 and not p1,
         "tracked_product_path_ready": not p0 and not p1 and not p2,
-        "swarmui_all_levels_ready": False,
+        "reference_ui_all_levels_ready": False,
         "known_all_level_blockers": known_all_level_blockers,
         "summary": {
             "checks": len(checks),
@@ -1451,8 +1451,8 @@ def build_report(checks: list[Check]) -> dict[str, object]:
             "p2": [asdict(check) for check in p2],
         },
         "checks": [asdict(check) for check in checks],
-        "strict_command": "python3 scripts/check_swarmui_product_path_contract.py --strict",
-        "strict_all_command": "python3 scripts/check_swarmui_product_path_contract.py --strict-all",
+        "strict_command": "python3 scripts/check_generation_product_path_contract.py --strict",
+        "strict_all_command": "python3 scripts/check_generation_product_path_contract.py --strict-all",
     }
 
 
@@ -1463,37 +1463,37 @@ def print_text_report(report: dict[str, object]) -> None:
         assert isinstance(item, dict)
         status = "PASS" if item["ok"] else item["severity"]
         print(
-            "[swarmui-product] "
+            "[reference_ui-product] "
             f"{status} {item['category']}: {item['label']} "
             f"({item['path']}) - {item['detail']}"
         )
     summary = report["summary"]
     assert isinstance(summary, dict)
     print(
-        "[swarmui-product] summary "
+        "[reference_ui-product] summary "
         f"checks={summary['checks']} passed={summary['passed']} "
         f"p0={summary['p0_blockers']} p1={summary['p1_blockers']} "
         f"p2={summary['p2_blockers']}"
     )
     if report["product_path_p0_ready"]:
-        print("[swarmui-product] P0 product path: READY")
+        print("[reference_ui-product] P0 product path: READY")
     else:
-        print("[swarmui-product] P0 product path: BLOCKED")
+        print("[reference_ui-product] P0 product path: BLOCKED")
     if report["tracked_product_path_p1_ready"]:
-        print("[swarmui-product] tracked P0/P1 product gates: READY")
+        print("[reference_ui-product] tracked P0/P1 product gates: READY")
     else:
-        print("[swarmui-product] tracked P0/P1 product gates: BLOCKED")
-    if report["swarmui_all_levels_ready"]:
-        print("[swarmui-product] SwarmUI all-level parity: READY")
+        print("[reference_ui-product] tracked P0/P1 product gates: BLOCKED")
+    if report["reference_ui_all_levels_ready"]:
+        print("[reference_ui-product] reference UI all-level parity: READY")
     else:
-        print("[swarmui-product] SwarmUI all-level parity: BLOCKED")
+        print("[reference_ui-product] reference UI all-level parity: BLOCKED")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mojo-libs", type=Path, default=DEFAULT_MOJO_LIBS)
     parser.add_argument("--strict", action="store_true", help="exit 2 if P0 product-path blockers remain")
-    parser.add_argument("--strict-all", action="store_true", help="exit 2 if any SwarmUI-level blocker remains")
+    parser.add_argument("--strict-all", action="store_true", help="exit 2 if any reference UI-level blocker remains")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON report")
     parser.add_argument("--write-readiness", type=Path, help="write machine-readable readiness JSON")
     args = parser.parse_args()
@@ -1503,14 +1503,14 @@ def main() -> int:
     if args.write_readiness is not None:
         args.write_readiness.parent.mkdir(parents=True, exist_ok=True)
         args.write_readiness.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(f"[swarmui-product] wrote readiness report: {args.write_readiness}")
+        print(f"[reference_ui-product] wrote readiness report: {args.write_readiness}")
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print_text_report(report)
 
-    if args.strict_all and not report["swarmui_all_levels_ready"]:
+    if args.strict_all and not report["reference_ui_all_levels_ready"]:
         return 2
     if args.strict and not report["product_path_p0_ready"]:
         return 2

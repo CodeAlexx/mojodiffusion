@@ -1041,6 +1041,61 @@ struct Qwen3Tokenizer(Movable):
                     #  in vocab, so unmatched should never occur.)
         return ids^
 
+    def encode_gemma(self, text: String) raises -> List[Int]:
+        """Gemma-3 byte-fallback BPE used by LTX-2 prompt conditioning.
+
+        This deliberately reuses the same tokenizer.json vocab/merge parser
+        and BPE engine as Qwen3Tokenizer, but applies Gemma's tokenizer
+        contract instead of Qwen's byte-level pre-tokenizer:
+
+          Replace(" ", "▁") -> whole-string BPE -> byte fallback -> BOS(2).
+
+        `LTXVGemmaTokenizer` right-truncates after 1024 tokens and left-pads
+        later in the model wrapper.  The returned list is unpadded so callers
+        can retain the real token count and choose a compiled attention bucket.
+        """
+        var normalized = _str_to_cps(text)
+        var units = List[String]()
+        for ci in range(len(normalized)):
+            var cp = normalized[ci]
+            if cp == 0x20:
+                cp = 0x2581  # U+2581 LOWER ONE EIGHTH BLOCK
+            var one = List[Int]()
+            one.append(cp)
+            var key = _cps_to_key(one)
+            if key in self.vocab:
+                units.append(key)
+                continue
+
+            # byte_fallback=True: unknown Unicode symbols become the literal
+            # vocab tokens <0xHH>, one per UTF-8 byte.
+            var bytes = List[Int]()
+            _cp_to_utf8(cp, bytes)
+            for bi in range(len(bytes)):
+                var byte = bytes[bi]
+                var hi = (byte >> 4) & 0xF
+                var lo = byte & 0xF
+                var fallback = List[Int]()
+                fallback.append(0x3C)  # <
+                fallback.append(0x30)  # 0
+                fallback.append(0x78)  # x
+                fallback.append(0x30 + hi if hi < 10 else 0x41 + hi - 10)
+                fallback.append(0x30 + lo if lo < 10 else 0x41 + lo - 10)
+                fallback.append(0x3E)  # >
+                units.append(_cps_to_key(fallback))
+
+        var merged = self._bpe(units)
+        var ids = List[Int]()
+        ids.append(2)  # <bos>
+        for i in range(len(merged)):
+            if len(ids) >= 1024:
+                break
+            if merged[i] in self.vocab:
+                ids.append(self.vocab[merged[i]])
+            else:
+                ids.append(3)  # <unk>; should be unreachable with byte fallback
+        return ids^
+
     def _split_on_specials(self, text: String) raises -> List[_Segment]:
         # Find earliest-occurring special token at each scan position. Specials
         # are matched as literal substrings (normalized=false, special=true).

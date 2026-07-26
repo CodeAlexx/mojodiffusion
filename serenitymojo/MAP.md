@@ -96,8 +96,13 @@ file is "where does X live". First target: Z-Image text→image.
 | `serve/klein_runtime_backend.mojo` | Resident pure-Mojo FLUX.2 Klein 9B/4B worker. Supports text-to-image plus one-source native `ReferenceLatent` editing at 512x512 or 1024x1024; two-source legacy edit remains 512x512 and ordinary img2img fails loudly. | ✅ real 1024 edit artifacts for 4B + 9B |
 | `serve/image_io.mojo` | Shared worker image/mask I/O, including alpha/luminance LanPaint masks, separately expanded sampler-context masks, crop helpers, and final source-preserving blend primitives. | ✅ CPU mask smoke + browser/real-job gates |
 | `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
-| `sampling/ltx2_request_cli.mojo` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and pre/post-connector conditioning sidecars, resolves every requested LoRA and scale, accepts the request's `model_quant`, preserves an exact request copy, and dispatches either the exact Creator fast-distilled Euler profile or bounded dev CFG-star profile. Emits atomic `status.json` and consumes no Python or Rust product runtime. | 🟠 experimental; real Canvas `video-0409` passed at 512x768/121f with the step-3000 LoRA |
-| `pipeline/ltx2_t2v_av_hq.mojo` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. The admitted HQ request path consumes runtime seed/FPS/steps/conditioning/audio/LoRA selection/quant/guidance mode and fail-loud validates Creator distilled (`euler` + `ltx2_distilled`, exactly 8 stage-1 evaluations) or dev (`res2s` + `ltx2`, 1-20 steps) before model load. Stage 2 uses the official 3-step distilled schedule. The SVD-int4 path keeps the 48-block base slab resident and streams factorized per-block LoRA factors without materializing dense deltas. Writes atomic progress and result manifests with executed sampler/scheduler, timings, geometry, frame count, duration, dtype contract, quant mode, and sampled peak VRAM. | 🟠 experimental; live Canvas `video-0409`: 52.36s total / 41.06s denoise / 7.42s decode; visually inspected 121f H.264 |
+| `models/text_encoder/gemma3_ltx_streamed.mojo` | Pure-Mojo layer-streamed Gemma-3-12B FP8 text encoder for LTX2 positive/negative prompts. It preserves the 49-state FeatureExtractorV2 contract, exact Gemma RMSNorm/RoPE/padding semantics, and shares each streamed layer load across both prompts. | ✅ exact tokenizer IDs; context cosine 0.99923-0.99973 |
+| `pipeline/ltx2_encode_prompt.mojo` | Pure-Mojo automatic LTX2 prompt conditioner: tokenizes positive/negative text, runs streamed Gemma, packs the 49-state feature order, applies video/audio aggregate projections, and writes the six pre-connector safetensors consumed by the request CLI. The server caches by prompt, negative prompt, and conditioner digest and publishes tokenization plus 48-layer progress. | ✅ optimized real prompt 17.19s; no Python runtime |
+| `sampling/ltx2_request_cli.mojo` + `configs/ltx2_request_profiles.json` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and pre/post-connector conditioning sidecars, resolves every requested LoRA and scale, accepts the request's `model_quant`, preserves an exact request copy, and dispatches one of 21 exact AOT width/height/frame-count/FPS runners. Emits atomic `status.json`, hands final latents to a clean decode process, and consumes no Python product runtime. | 🟠 experimental; real 540p, 720p, 1920x1088/121f, and 960x544/481f artifacts passed; 20-second `video-0451` is coherent and exact with a verified 48 kHz stereo A/V mux, but its 19,621 MiB peak does not pass the 16GB 5080 gate |
+| `pipeline/ltx2_t2v_av_hq.mojo` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. The request path consumes runtime seed/FPS/steps/conditioning/audio/LoRA selection/quant/guidance mode and fail-loud validates Creator distilled (`euler` + `ltx2_distilled`, exactly 8 stage-1 evaluations) or dev (`res2s` + `ltx2`, 1-20 steps) before model load. Stage 2 uses the official 3-step distilled schedule. Fresh request decode uses the Desktop 512/64-pixel, 64/24-frame tiled contract for 121-frame 1080p landscape/portrait and all admitted 960x544 or 544x960 durations through 481 frames, streaming finalized PNG chunks instead of allocating the complete movie tensor. Audio decode resolves Creator's measured cuDNN 9.10.2 runtime ahead of the general Pixi runtime. Writes atomic progress and result manifests with executed sampler/scheduler, timings, geometry, frame count, duration, dtype contract, quant mode, and sampled peak VRAM. | 🟠 experimental; `video-0450` passed coherent 1920x1088/121f decode and `video-0451` passed coherent 960x544/481f decode plus a 20.032-second generated AAC track; stage-2 denoise still exceeds the 16GB 5080 target |
+| `models/realesrgan/rrdbnet.mojo` + `sampling/realesrgan_x4_cli.mojo` | Pure-Mojo Real-ESRGAN x4plus inference from the GitHub upscaler port. Product modes accept one image or a numbered frame sequence; frame mode loads the RRDBNet weights once and keeps them resident. Serenity's LTX2 post-process extracts native MP4 frames, reports per-frame progress, and remuxes exact 2x or 4x output. | 🟠 functional but experimental-slow; real image, two-frame resident batch, and server MP4 2x gates passed; measured 18.24s for one 960x544 frame |
+| `models/realesrgan/srvggnet.mojo` + `sampling/realesrgan_x4_cli.mojo` fast modes | Pure-Mojo compact SRVGG x4v3 product route from GitHub commit `853cddc`, including the per-channel PReLU kernel. Image and resident frame-sequence modes are wired into the same server/UI post-upscale contract. | ⚪ built and product-wired; local x4v3 weights absent, so readiness disables it without downloading |
+| `models/dit/seedvr2_dit.mojo` + `models/dit/seedvr2_sampler.mojo` + `models/vae/seedvr2_vae.mojo` | Imported pure-Mojo SeedVR2 source from GitHub for continued product work. The current general CLI consumes verification fixtures and emits demo PNGs rather than accepting/emitting a user video; absent local weights are not downloaded automatically. | ⚪ source-only; fail-loud and disabled in product readiness |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
 | `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder` + `load_ideogram4_vae_decoder` (AutoencoderKLFlux2, latent_ch 32, scale 1/shift 0, has_pqc). | ✅ Flux2 decode cos 0.99995 |
@@ -2074,7 +2079,7 @@ and Serenity's train_ltx2_real.mojo (env-overridable version cherry-picked from
 Serenity origin/loha-live-dispatch 39a76d6 — NOT on origin/main).
 - **ASSET RECOVERY (the real work; local disk beats the WiFi)**:
   - CKPT_FP8 = the OFFICIAL Lightricks/LTX-2.3-fp8 export, found COMPLETE at
-    SwarmUI/dlbackend/ComfyUI/models/checkpoints (byte-size + header identical
+    the local embedded ComfyUI checkpoint store (byte-size + header identical
     to HF; 8871 tensors, 1462 F8_E4M3 + weight_scale/input_scale sidecars,
     BUNDLES vae.* 170 keys, audio_vae, vocoder, text_embedding_projection in
     BF16) -> symlinked; NO local re-quantization needed (the campaign's
@@ -2092,7 +2097,7 @@ Serenity origin/loha-live-dispatch 39a76d6 — NOT on origin/main).
     LTX-2.3 file is a DIFFERENT layout (`upsampler.0.weight`) and FAILS the
     loader — ltx-2-spatial-upscaler-x2-1.0.safetensors from Lightricks/LTX-2 is
     the file the SPATIAL_UPSCALER symlink must point at (sha-verified).
-  - camera-static + detailer LoRAs found in SwarmUI/ComfyUI loras -> symlinked
+  - camera-static + detailer LoRAs found in the embedded ComfyUI LoRA store -> symlinked
     (the HQ stack opens them even in `base` mode).
 - **CONDITIONING DUMPS REGENERATED** (EriDiffusion is not on this box; format
   reverse-engineered from ltx_core @ /home/alex/LTX-2): the dumps are
@@ -2371,11 +2376,11 @@ instrumented; harness: scripts/ltx2_ref_step1_dump.py torch hooks +
   ltx2_step1_mojo,ltx2_step1_mojo_nolora} · torch ablation frames
   output/ltx2_hq_ref_{perturb,noisy05,noisy10,fixedbias02,realLoRA}/.
 ## 2026-07-08: AUDIT — replace ComfyUI's safetensors with serenity-safetensors? VERDICT: NOT-WORTH-IT
-- ComfyUI (SwarmUI-embedded, v0.5.7 current) ALREADY has: mmap via the HF
+- The audited embedded ComfyUI v0.5.7 checkout ALREADY has: mmap via the HF
   rust crate (+opt-in zero-copy aimdo mmap), pinned host memory
   (cudaHostRegister, 90% RAM budget), async multi-stream non-blocking H2D,
   native-dtype loading incl fp8 (F8_E4M3/E5M2 in utils.py:76), lazy casts
-  on the compute stream, block-level offload. SwarmUI drives it over HTTP
+  on the compute stream, block-level offload. Its host UI drives it over HTTP
   — never touches the load path.
 - Our io/safetensors.mojo is BY ITS OWN HEADER a faithful port of the same
   HF Rust MmapFile — mechanically identical, not superior. TurboPlannedLoader's

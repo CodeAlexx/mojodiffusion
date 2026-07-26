@@ -265,7 +265,7 @@ fn preview_data_uri(path: &Path) -> String {
 }
 
 /// First adjacent preview image for a model whose file path is `model_path`
-/// (full path incl. `.safetensors`). Probes the common SwarmUI/Civitai sidecar
+/// (full path incl. `.safetensors`). Probes the common reference UI/Civitai sidecar
 /// names in priority order: `<model>.preview.<ext>`, `<model>.<ext>`. Returns a
 /// `data:` URI or "".
 fn find_sidecar_preview(model_path: &str) -> String {

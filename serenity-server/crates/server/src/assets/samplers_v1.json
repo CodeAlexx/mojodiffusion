@@ -1,6 +1,6 @@
 {
   "schema": "serenity.samplers.v1",
-  "source": "local SwarmUI Comfy sampler catalog",
+  "source": "local reference UI Comfy sampler catalog",
   "accepted_sampler_parity": false,
   "catalog": {
     "samplers": [
@@ -94,7 +94,7 @@
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++/both-UniPC sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2/order<=3 over Comfy SigmaConvert. Generic uni_pc is not an alias for uni_pc_bh2."
+      "reason": "Z-Image daemon runs Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++/both-UniPC sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2/order<=3 over Comfy SigmaConvert. Generic uni_pc is not an alias for uni_pc_bh2."
     },
     {
       "backend": "qwenimage",

@@ -27,7 +27,7 @@ comptime PREFIX_CACHE = "/home/alex/.serenity/cache/qwen3magic_prefix_cache.safe
 
 def _system_prompt() -> String:
     # Ported verbatim from the KJ/Comfy "Ideogram4 Caption Prompt Template"
-    # ([SYSTEM] section) the user uses in SwarmUI/ComfyUI. Slim single-shot
+    # ([SYSTEM] section) the user uses in ComfyUI. Slim single-shot
     # magic prompt: natural-language idea -> structured JSON caption
     # (aspect_ratio / high_level_description / compositional_deconstruction).
     return String(

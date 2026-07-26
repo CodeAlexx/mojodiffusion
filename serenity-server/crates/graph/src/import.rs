@@ -394,6 +394,7 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             1 => Some("MASK"),
             _ => None,
         },
+        "LoadVideo" => (slot == 0).then_some("VIDEO"),
         "LoadAudio" => (slot == 0).then_some("AUDIO"),
         "ImageToMask" => (slot == 0).then_some("MASK"),
         "MaskToImage" => (slot == 0).then_some("IMAGE"),
@@ -987,6 +988,9 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
         }
         "LoadImage" | "LoadImageOutput" | "LoadImageMask" => {
             fields.insert("image".into(), json!(widget_string(widgets, 0, "")));
+        }
+        "LoadVideo" => {
+            fields.insert("video".into(), json!(widget_string(widgets, 0, "")));
         }
         "ImageScaleBy" => {
             // Comfy widget order: [upscale_method(combo), scale_by(float)].

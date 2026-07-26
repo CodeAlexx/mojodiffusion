@@ -11,12 +11,33 @@
 # unnecessary): PNG \x89PNG, JPEG \xFF\xD8, WebP RIFF....WEBP.
 
 from std.io.file import open
-from std.math import exp, floor
+from std.math import ceil, exp, floor
+from std.gpu.host import DeviceContext
+from std.gpu import global_idx, grid_dim, block_dim
+from std.utils.index import IndexList
+
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from image.buffer import Image
 from image.jpeg import decode_jpeg_bytes
 from image.png import decode_png_bytes
-from image.webp import decode_webp_bytes
+
+from serenitymojo.image.decode import decode_webp as decode_system_webp
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.ffi import (
+    BytePtr,
+    O_RDONLY,
+    file_size,
+    sys_close,
+    sys_open,
+    sys_pread,
+)
+from serenitymojo.tensor import Tensor
+
+
+comptime _VIDEO_DYN1 = Layout.row_major(-1)
+comptime _VIDEO_CONVERT_BLOCK = 256
 
 
 def _read_file_bytes(path: String) raises -> List[UInt8]:
@@ -47,10 +68,159 @@ def decode_image_any(path: String) raises -> Image:
         data[0] == 0x52 and data[1] == 0x49 and data[2] == 0x46 and data[3] == 0x46
         and data[8] == 0x57 and data[9] == 0x45 and data[10] == 0x42 and data[11] == 0x50
     ):
-        return decode_webp_bytes(data)
+        # MOJO-libs' WebP decoder only accepts lossless VP8L payloads. Browser
+        # uploads and gallery images are commonly ordinary lossy VP8 WebP, so
+        # route every WebP through our system-libwebp decoder and normalize it
+        # back into the shared Image representation.
+        var decoded = decode_system_webp(path)
+        var image = Image.new(decoded.width, decoded.height, 3)
+        for y in range(decoded.height):
+            for x in range(decoded.width):
+                var offset = (y * decoded.width + x) * 3
+                image.set(x, y, 0, decoded.rgb[offset])
+                image.set(x, y, 1, decoded.rgb[offset + 1])
+                image.set(x, y, 2, decoded.rgb[offset + 2])
+        return image^
     raise Error(
         String("init image format not supported (need png/jpeg/webp): ") + path
     )
+
+
+def raw_rgb24_video_to_signed_ncdhw_bf16(
+    path: String, frames: Int, width: Int, height: Int
+) raises -> List[BFloat16]:
+    """Load an exact-size ffmpeg RGB24 stream as signed BF16 NCDHW pixels.
+
+    The raw stream is frame-major HWC. LTX2's VAE consumes
+    ``[1, 3, frames, height, width]`` in ``[-1, 1]``. Validate the complete
+    byte count before allocating the tensor carrier so short/failed ffmpeg
+    transcodes cannot silently become partially conditioned videos.
+    """
+    if frames <= 0 or width <= 0 or height <= 0:
+        raise Error("raw RGB24 video dimensions must be positive")
+    var data = _read_file_bytes(path)
+    var plane = width * height
+    var expected = frames * plane * 3
+    if len(data) != expected:
+        raise Error(
+            String("raw RGB24 video byte count mismatch: expected ")
+            + String(expected) + String(", got ") + String(len(data))
+        )
+    var out = List[BFloat16]()
+    out.resize(expected, BFloat16(Float32(0.0)))
+    for t in range(frames):
+        var frame_offset = t * plane
+        for p in range(plane):
+            var src = (frame_offset + p) * 3
+            for c in range(3):
+                var dst = (c * frames + t) * plane + p
+                out[dst] = BFloat16(
+                    Float32(data[src + c]) / Float32(127.5) - Float32(1.0)
+                )
+    return out^
+
+
+def _rgb24_hwc_to_signed_ncdhw_bf16(
+    x: LayoutTensor[DType.uint8, _VIDEO_DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _VIDEO_DYN1, MutAnyOrigin],
+    frames: Int,
+    plane: Int,
+    n: Int,
+):
+    """GPU transpose and normalization for an ffmpeg RGB24 byte stream."""
+    var i = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < n:
+        var channel_plane = frames * plane
+        var channel = i // channel_plane
+        var channel_offset = i % channel_plane
+        var frame = channel_offset // plane
+        var pixel = channel_offset % plane
+        var src = (frame * plane + pixel) * 3 + channel
+        var byte = Int(rebind[Scalar[DType.uint8]](x[src]))
+        var value = (
+            Float32(byte) / Float32(127.5) - Float32(1.0)
+        )
+        o[i] = rebind[o.element_type](value.cast[DType.bfloat16]())
+        i += stride
+
+
+def raw_rgb24_video_to_signed_ncdhw_bf16_device(
+    path: String,
+    frames: Int,
+    width: Int,
+    height: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Read RGB24 directly into pinned memory and convert it on the GPU.
+
+    This avoids the old host-side 142-million-element BF16 transpose for a
+    121-frame 512x768 clip. The only CPU work is the file read; normalization
+    and HWC-to-NCDHW layout conversion happen in one GPU kernel.
+    """
+    if frames <= 0 or width <= 0 or height <= 0:
+        raise Error("raw RGB24 video dimensions must be positive")
+    var plane = width * height
+    var expected = frames * plane * 3
+    var fd = sys_open(path, O_RDONLY)
+    if fd < 0:
+        raise Error(String("raw RGB24 video not readable: ") + path)
+    var actual = file_size(fd)
+    if actual != expected:
+        _ = sys_close(fd)
+        raise Error(
+            String("raw RGB24 video byte count mismatch: expected ")
+            + String(expected) + String(", got ") + String(actual)
+        )
+
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](expected)
+    var dst = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
+    var done = 0
+    while done < expected:
+        var got = sys_pread(fd, dst + done, expected - done, done)
+        if got <= 0:
+            break
+        done += got
+    _ = sys_close(fd)
+    if done != expected:
+        raise Error(
+            String("raw RGB24 video short read: expected ")
+            + String(expected) + String(", got ") + String(done)
+        )
+
+    var raw_dev = ctx.enqueue_create_buffer[DType.uint8](expected)
+    ctx.enqueue_copy(dst_buf=raw_dev, src_buf=host)
+    var out_dev = ctx.enqueue_create_buffer[DType.uint8](expected * 2)
+    var rl = RuntimeLayout[_VIDEO_DYN1].row_major(IndexList[1](expected))
+    var x = LayoutTensor[DType.uint8, _VIDEO_DYN1, MutAnyOrigin](
+        raw_dev.unsafe_ptr(), rl
+    )
+    var o = LayoutTensor[DType.bfloat16, _VIDEO_DYN1, MutAnyOrigin](
+        out_dev.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var grid = (
+        expected + _VIDEO_CONVERT_BLOCK - 1
+    ) // _VIDEO_CONVERT_BLOCK
+    ctx.enqueue_function[
+        _rgb24_hwc_to_signed_ncdhw_bf16,
+        _rgb24_hwc_to_signed_ncdhw_bf16,
+    ](
+        x,
+        o,
+        frames,
+        plane,
+        expected,
+        grid_dim=grid,
+        block_dim=_VIDEO_CONVERT_BLOCK,
+    )
+    ctx.synchronize()
+    var shape = List[Int]()
+    shape.append(1)
+    shape.append(3)
+    shape.append(frames)
+    shape.append(height)
+    shape.append(width)
+    return Tensor(out_dev^, shape^, STDtype.BF16)
 
 
 def image_rgb_at(img: Image, x: Int, y: Int, mut rgb: List[Int]) raises:
@@ -644,4 +814,86 @@ def image_area_resize_to_signed_nchw(img: Image, width: Int, height: Int) raises
             out[0 * plane + off] = Float32((r_acc * inv_count) / 127.5 - 1.0)
             out[1 * plane + off] = Float32((g_acc * inv_count) / 127.5 - 1.0)
             out[2 * plane + off] = Float32((b_acc * inv_count) / 127.5 - 1.0)
+    return out^
+
+
+def image_bilinear_center_crop_to_signed_nchw(
+    img: Image, width: Int, height: Int
+) raises -> List[Float32]:
+    """Official LTX image-conditioning resize into signed NCHW.
+
+    This is the host-image equivalent of
+    `resize_and_center_crop(..., mode="bilinear", align_corners=False)`:
+    preserve aspect ratio while filling the requested rectangle, resize to the
+    ceil-rounded intermediate dimensions, then take the centered crop.
+    """
+    if width <= 0 or height <= 0:
+        raise Error(
+            "image_bilinear_center_crop_to_signed_nchw: target dimensions must be positive"
+        )
+    if img.width <= 0 or img.height <= 0:
+        raise Error(
+            "image_bilinear_center_crop_to_signed_nchw: source dimensions must be positive"
+        )
+
+    var scale_h = Float64(height) / Float64(img.height)
+    var scale_w = Float64(width) / Float64(img.width)
+    var scale = max(scale_h, scale_w)
+    var resized_h = Int(ceil(Float64(img.height) * scale))
+    var resized_w = Int(ceil(Float64(img.width) * scale))
+    var crop_top = (resized_h - height) // 2
+    var crop_left = (resized_w - width) // 2
+    var plane = width * height
+    var out = List[Float32](capacity=3 * plane)
+    for _ in range(3 * plane):
+        out.append(Float32(0.0))
+
+    var p00: List[Int] = [0, 0, 0]
+    var p01: List[Int] = [0, 0, 0]
+    var p10: List[Int] = [0, 0, 0]
+    var p11: List[Int] = [0, 0, 0]
+    for oy in range(height):
+        var ry = crop_top + oy
+        var src_y = (
+            (Float64(ry) + 0.5) * Float64(img.height)
+            / Float64(resized_h) - 0.5
+        )
+        var y0 = Int(floor(src_y))
+        var wy = Float32(src_y - Float64(y0))
+        if y0 < 0:
+            y0 = 0
+            wy = 0.0
+        elif y0 >= img.height - 1:
+            y0 = img.height - 1
+            wy = 0.0
+        var y1 = min(img.height - 1, y0 + 1)
+        for ox in range(width):
+            var rx = crop_left + ox
+            var src_x = (
+                (Float64(rx) + 0.5) * Float64(img.width)
+                / Float64(resized_w) - 0.5
+            )
+            var x0 = Int(floor(src_x))
+            var wx = Float32(src_x - Float64(x0))
+            if x0 < 0:
+                x0 = 0
+                wx = 0.0
+            elif x0 >= img.width - 1:
+                x0 = img.width - 1
+                wx = 0.0
+            var x1 = min(img.width - 1, x0 + 1)
+            image_rgb_at(img, x0, y0, p00)
+            image_rgb_at(img, x1, y0, p01)
+            image_rgb_at(img, x0, y1, p10)
+            image_rgb_at(img, x1, y1, p11)
+            var off = oy * width + ox
+            for c in range(3):
+                var top = (
+                    Float32(p00[c]) * (1.0 - wx) + Float32(p01[c]) * wx
+                )
+                var bottom = (
+                    Float32(p10[c]) * (1.0 - wx) + Float32(p11[c]) * wx
+                )
+                var value = top * (1.0 - wy) + bottom * wy
+                out[c * plane + off] = value / 127.5 - 1.0
     return out^

@@ -696,6 +696,7 @@ var VideoEditTab = (function () {
         recalcTotalFrames();
         currentFrame = clamp(currentFrame, 0, totalFrames);
         var initialClip = findActiveClipAtFrame(currentFrame);
+        var initialClipWasActive = !!initialClip;
         if (!initialClip) {
             for (var trackIndex = 0; trackIndex < project.tracks.length && !initialClip; trackIndex++) {
                 if (project.tracks[trackIndex].clips.length) {
@@ -706,6 +707,8 @@ var VideoEditTab = (function () {
         if (initialClip) {
             selectedClipIds.add(initialClip.id);
             sourceMonitorClipId = initialClip.id;
+            if (!initialClipWasActive)
+                currentFrame = Math.max(0, initialClip.startFrame || 0);
         }
         dockTab = 'properties';
         updateTimecodeDisplay();
@@ -1114,10 +1117,17 @@ var VideoEditTab = (function () {
                 if (active) sourceMonitorClipId = active.id;
             }
             if (!sourceMonitorClipId) return;
+            var sourceInfo = findClipById(sourceMonitorClipId);
+            if (sourceInfo && sourceInfo.track.type === 'video') {
+                selectedClipIds.clear();
+                selectedClipIds.add(sourceMonitorClipId);
+            }
         }
         monitorMode = mode === 'source' ? 'source' : 'program';
         previewActiveClipId = null;
         updateMonitorTabs();
+        renderTimeline();
+        updateEditButton();
         updatePreview();
     }
 
@@ -2082,6 +2092,10 @@ var VideoEditTab = (function () {
         var info = selectedClipIds.size === 1
             ? findClipById(selectedClipIds.values().next().value)
             : null;
+        if (!info && selectedClipIds.size === 0 &&
+            monitorMode === 'source' && sourceMonitorClipId) {
+            info = findClipById(sourceMonitorClipId);
+        }
 
         if (dockTab === 'filters') {
             if (!info || info.track.type !== 'video') {
@@ -6464,7 +6478,7 @@ var VideoEditTab = (function () {
                     }
 
                     // Render waveform on audio clips (or video clips with audio)
-                    if (hasWaveform && (track.type === 'audio' || track.type === 'video')) {
+                    if (hasWaveform && track.type === 'audio') {
                         var wd = waveformCache.get(clip.id);
                         var midY = clipH / 2;
                         if (!wd.displayMax) {
@@ -7867,6 +7881,7 @@ var VideoEditTab = (function () {
                 isPlaying: isPlaying,
                 monitorMode: monitorMode,
                 sourceMonitorClipId: sourceMonitorClipId,
+                selectedClipIds: Array.from(selectedClipIds),
                 dockTab: dockTab,
                 markerFrames: (project.markers || []).slice(),
                 snapEnabled: snapEnabled,

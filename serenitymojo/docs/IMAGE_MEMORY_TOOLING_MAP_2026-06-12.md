@@ -107,7 +107,7 @@ audit/tooling; runtime product paths remain Mojo.
 ### Z-Image
 
 Why it matters:
-- The SwarmUI audit names it as the first resident daemon/model target.
+- The reference product audit names it as the first resident daemon/model target.
 - It already has a product backend, metadata PNG output, resize/image tooling,
   result manifests, and the new flash SDPA product forward route.
 
@@ -140,7 +140,7 @@ Why they matter:
 What is still weak:
 - Some are cached-input or staged smoke paths rather than full raw prompt to
   production image paths.
-- They are not the first SwarmUI resident target in the current audit.
+- They are not the first resident target in the current product audit.
 
 ## Next Implementation Rule
 
@@ -148,7 +148,7 @@ Do not choose a model by name alone.
 
 For the next non-Qwen image slice, pick one of:
 
-1. Z-Image if the goal is SwarmUI product parity first:
+1. Z-Image if the goal is image-product parity first:
    resident image generation, metadata/gallery, real output timing, VRAM, and
    denoise fast-path evidence.
 2. Klein if the goal is specifically memory/offload mechanics:

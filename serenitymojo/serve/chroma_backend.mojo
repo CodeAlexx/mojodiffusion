@@ -87,7 +87,7 @@ from serenitymojo.sampling.flux1_dev import build_flux1_sigma_schedule
 from serenitymojo.sampling.sampler_registry import (
     normalize_sampler_name, normalize_scheduler_name,
 )
-from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
+from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.training.aspect_buckets import (
     DEFAULT_ASPECT_LADDER_LEN, DEFAULT_ASPECT_LADDER_X100,
     aspect_lat_h_units, aspect_lat_w_units,
@@ -623,7 +623,7 @@ struct ChromaBackend(GenBackend, Movable):
             )
             var base_h = noise.to_host(self.ctx)
             var var_h = vnoise.to_host(self.ctx)
-            var blended = swarm_variation_noise_chw(
+            var blended = variation_noise_chw(
                 base_h, var_h, LC, LH_, LW_,
                 self.params.variation_strength,
             )

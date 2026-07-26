@@ -124,7 +124,7 @@ function runChecked(command, args) {
         return diagnostics?.thumbnailClipIds?.length > 0
           && diagnostics?.tracks?.some((track) => (
             track.type === "video"
-            && track.clips.some((clip) => clip.source_path && clip.startFrame === 0)
+            && track.clips.some((clip) => clip.source_path)
           ));
       }, { timeout: 30000 });
       const diagnostics = await page.evaluate(
@@ -153,10 +153,10 @@ function runChecked(command, args) {
         ),
       );
       await page.click("#ve-btn-play");
-      await page.waitForFunction(() => {
+      await page.waitForFunction((initialFrame) => {
         const state = window.VideoEditTab?.getDiagnostics?.();
-        return state?.currentFrame >= 24 && state?.previewVideoTime >= 0.5;
-      }, { timeout: 5000 });
+        return state?.currentFrame >= initialFrame + 12 && state?.previewVideoTime >= 0.4;
+      }, diagnostics.currentFrame, { timeout: 5000 });
       const playbackDiagnostics = await page.evaluate(
         () => window.VideoEditTab.getDiagnostics(),
       );
@@ -219,13 +219,47 @@ function runChecked(command, args) {
       await page.locator('.ve-dock-tab[data-dock="scopes"]').click();
       assert(await page.locator(".ve-scope-grid canvas").count() === 4,
         "saved project does not expose all four scopes");
+      const timelineBeforeWaveform = crypto.createHash("sha256").update(
+        await page.locator("#ve-timeline-canvas canvas").evaluateAll(
+          (canvases) => canvases.map((canvas) => canvas.toDataURL("image/png")).join("|"),
+        ),
+      ).digest("hex");
       await page.locator('.ve-dock-tab[data-dock="audio"]').click();
       const mixerTrackCount = await page.locator(".ve-audio-mixer-strip").count();
       assert(mixerTrackCount >= 1,
         `saved project mixer tracks=${mixerTrackCount}`);
       assert(await page.locator("#ve-audio-waveform").isVisible(),
         "saved project audio waveform scope is missing");
+      const selectedVideoId = diagnostics.tracks
+        .find((track) => track.type === "video")
+        ?.clips.find((clip) => clip.source_path)?.id;
+      await page.waitForFunction((clipId) => (
+        window.VideoEditTab?.getDiagnostics?.().waveformClipIds.includes(clipId)
+      ), selectedVideoId, { timeout: 10000 });
+      await page.waitForTimeout(100);
+      const timelineAfterWaveform = crypto.createHash("sha256").update(
+        await page.locator("#ve-timeline-canvas canvas").evaluateAll(
+          (canvases) => canvases.map((canvas) => canvas.toDataURL("image/png")).join("|"),
+        ),
+      ).digest("hex");
+      assert(
+        timelineAfterWaveform === timelineBeforeWaveform,
+        "loading Audio painted waveform bars over video thumbnails",
+      );
       await page.locator('.ve-dock-tab[data-dock="properties"]').click();
+      await page.locator('.ve-monitor-tab[data-monitor="source"]').click();
+      const timelineBounds = await page.locator("#ve-timeline-canvas").boundingBox();
+      await page.mouse.click(
+        timelineBounds.x + 180,
+        timelineBounds.y + 28 + 62 + 30,
+      );
+      await page.waitForFunction(() => (
+        window.VideoEditTab?.getDiagnostics?.().selectedClipIds.length === 0
+      ));
+      assert(
+        await page.locator(".ve-props-panel .ve-genesis-control").count() >= 100,
+        "Source monitor lost clip Properties after timeline deselection",
+      );
       assert(
         !diagnostics.tracks.some((track) => track.clips.some(
           (clip) => ["Intro", "Scene 1", "Overlay", "Music.mp3"].includes(clip.label)

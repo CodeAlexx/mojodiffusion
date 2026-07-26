@@ -21,17 +21,43 @@ use crate::AppState;
 
 const RUNNER: &str = "output/bin/ltx2_video_smoke_runner";
 const LTX2_MOJO_REQUEST_RUNNER: &str = "output/bin/ltx2_serenity_cli";
+const REALESRGAN_X4_RUNNER: &str = "output/bin/serenity_realesrgan_x4";
+const REALESRGAN_X4_WEIGHTS: &str = "upscalers/realesrgan-x4plus/RealESRGAN_x4.safetensors";
+const REALESRGAN_FAST_X4_WEIGHTS: &str =
+    "upscalers/realesrgan-fast-x4v3/realesr-general-x4v3.safetensors";
+const SEEDVR2_PRODUCT_RUNNER: &str = "output/bin/seedvr2_upscale_video";
+const SEEDVR2_WEIGHTS: [&str; 3] = [
+    "upscalers/seedvr2-3b/seedvr2_vae.safetensors",
+    "upscalers/seedvr2-3b/seedvr2_dit.safetensors",
+    "upscalers/seedvr2-3b/seedvr2_text_emb.safetensors",
+];
+const LTX2_REQUEST_PROFILES_JSON: &str =
+    include_str!("../../../../serenitymojo/configs/ltx2_request_profiles.json");
+const LTX2_MOJO_CONDITIONER: &str = "output/bin/ltx2_encode_prompt";
+const LTX2_MOJO_CONTEXT_SCHEMA: &str = "serenity.ltx2.mojo_gemma3_context_cache.v1";
+const LTX2_GEMMA_FP8: &str =
+    "text_encoders/gemma-3-12b-it-fp8/gemma_3_12B_it_fp8_e4m3fn.safetensors";
+const LTX2_GEMMA_TOKENIZER: &str = "text_encoders/gemma-3-12b-it-standalone/tokenizer.json";
+const LTX2_CONDITIONING_CHECKPOINT: &str = "checkpoints/ltx-2.3-22b-distilled-fp8.safetensors";
 const LTX2_CSHIM: &str = "serenitymojo/ops/cshim/lib/libserenity_cudnn_sdpa.so";
 const LTX2_CONTEXT_PYTHON: &str = ".local/share/LTXDesktop/python/bin/python3";
 const LTX2_CONTEXT_SCRIPT: &str = "scripts/ltx2_refhq_contexts.py";
 const LTX2_CONTEXT_SCHEMA: &str = "serenity.ltx2.refhq_context_cache.v1";
 const LTX2_CREATOR_REVISION: &str = "780984275fd47128b02bef9b5c085404276866ee";
 const LTX2_REFHQ_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8";
+// Backward-compatible creator profile. New native LTX2 profiles are selected
+// from LTX2_REQUEST_PROFILES_JSON and dispatched to an exact AOT Mojo runner.
+const LTX2_REQUEST_WIDTH: i64 = 512;
+const LTX2_REQUEST_HEIGHT: i64 = 768;
+const LTX2_REQUEST_FRAMES: i64 = 121;
+const LTX2_REQUEST_FPS: f64 = 25.0;
 const LTX2_SAMPLER_PARITY_REPORT: &str = "output/checks/ltx2_sampler_parity.json";
 const LTX2_VAE_PARITY_REPORT: &str = "output/checks/ltx2_vae_frame_parity.json";
 const LTX2_AUDIO_PARITY_REPORT: &str = "output/checks/ltx2_audio_parity.json";
-const LTX2_CREATOR_CUDNN_LIB: &str =
-    ".local/share/LTXDesktop/python/lib/python3.13/site-packages/nvidia/cudnn/lib";
+const LTX2_CREATOR_CUDNN_LIB_CANDIDATES: [&str; 2] = [
+    "LTX-Desktop/backend/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
+    ".local/share/LTXDesktop/python/lib/python3.13/site-packages/nvidia/cudnn/lib",
+];
 const BACKEND_NAME: &str = "mojo";
 
 /// Resolve the checkout that built this server, with an explicit override for
@@ -128,9 +154,14 @@ fn mojo_ld_path() -> std::ffi::OsString {
 /// fresh process, so pin only that process to Creator's measured 9.10.2
 /// runtime; denoising and SDPA continue to use the general Mojo runtime.
 fn ltx2_decode_cudnn_lib() -> std::path::PathBuf {
-    std::env::var_os("LTX2_CREATOR_CUDNN_LIB")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home_path(LTX2_CREATOR_CUDNN_LIB))
+    if let Some(path) = std::env::var_os("LTX2_CREATOR_CUDNN_LIB") {
+        return std::path::PathBuf::from(path);
+    }
+    LTX2_CREATOR_CUDNN_LIB_CANDIDATES
+        .iter()
+        .map(|path| home_path(path))
+        .find(|path| nonempty_file(&path.join("libcudnn.so.9")))
+        .unwrap_or_else(|| home_path(LTX2_CREATOR_CUDNN_LIB_CANDIDATES[0]))
 }
 
 fn ltx2_decode_runtime_available() -> bool {
@@ -140,9 +171,12 @@ fn ltx2_decode_runtime_available() -> bool {
 fn ltx2_decode_ld_path() -> std::ffi::OsString {
     let root = repo_root();
     let mut parts = vec![
+        // This must precede Pixi's general cuDNN. The audio decoder's cshim is
+        // parity-gated to Creator's 9.10.2 runtime and the dynamic loader keeps
+        // the first libcudnn.so.9 loaded for the whole fresh decode process.
+        ltx2_decode_cudnn_lib(),
         root.join(".pixi/envs/default/lib"),
         root.join("serenitymojo/ops/cshim/lib"),
-        ltx2_decode_cudnn_lib(),
     ];
     if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
         parts.extend(std::env::split_paths(&existing));
@@ -244,6 +278,221 @@ fn bin_x(path: &str) -> bool {
     std::fs::metadata(abs)
         .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
         .unwrap_or(false)
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Ltx2RequestProfileRegistry {
+    schema: String,
+    checkpoint: String,
+    guidance_modes: Value,
+    profile_groups: Vec<Ltx2RequestProfileGroup>,
+    post_upscalers: Value,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Ltx2RequestProfileGroup {
+    id: String,
+    label: String,
+    width: i64,
+    height: i64,
+    fps: i64,
+    durations: Vec<f64>,
+    frames: Vec<i64>,
+    source: String,
+}
+
+#[derive(Clone, Debug)]
+struct Ltx2ResolvedRequestProfile {
+    group_id: String,
+    label: String,
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: i64,
+    duration: f64,
+    source: String,
+    runner: String,
+}
+
+fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
+    static REGISTRY: std::sync::OnceLock<Ltx2RequestProfileRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry: Ltx2RequestProfileRegistry = serde_json::from_str(LTX2_REQUEST_PROFILES_JSON)
+            .expect("embedded LTX2 request profile registry must be valid JSON");
+        assert_eq!(
+            registry.schema, "serenity.ltx2.request_profiles.v1",
+            "embedded LTX2 request profile registry schema mismatch"
+        );
+        assert!(
+            registry.profile_groups.iter().all(
+                |group| !group.frames.is_empty() && group.frames.len() == group.durations.len()
+            ),
+            "each embedded LTX2 profile group must pair frames with durations"
+        );
+        registry
+    })
+}
+
+fn ltx2_profile_runner_name(width: i64, height: i64, frames: i64, fps: i64) -> String {
+    format!("output/bin/ltx2_serenity_{width}x{height}_{frames}f_{fps}fps")
+}
+
+fn ltx2_resolved_profiles() -> Vec<Ltx2ResolvedRequestProfile> {
+    ltx2_request_profile_registry()
+        .profile_groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .frames
+                .iter()
+                .copied()
+                .zip(group.durations.iter().copied())
+                .map(|(frames, duration)| Ltx2ResolvedRequestProfile {
+                    group_id: group.id.clone(),
+                    label: group.label.clone(),
+                    width: group.width,
+                    height: group.height,
+                    frames,
+                    fps: group.fps,
+                    duration,
+                    source: group.source.clone(),
+                    runner: ltx2_profile_runner_name(group.width, group.height, frames, group.fps),
+                })
+        })
+        .collect()
+}
+
+fn ltx2_profile_runner_available(profile: &Ltx2ResolvedRequestProfile) -> bool {
+    bin_x(&profile.runner)
+        || (profile.width == LTX2_REQUEST_WIDTH
+            && profile.height == LTX2_REQUEST_HEIGHT
+            && profile.frames == LTX2_REQUEST_FRAMES
+            && profile.fps as f64 == LTX2_REQUEST_FPS
+            && bin_x(LTX2_MOJO_REQUEST_RUNNER))
+}
+
+fn ltx2_effective_profile_runner(profile: &Ltx2ResolvedRequestProfile) -> String {
+    if bin_x(&profile.runner) {
+        profile.runner.clone()
+    } else if profile.width == LTX2_REQUEST_WIDTH
+        && profile.height == LTX2_REQUEST_HEIGHT
+        && profile.frames == LTX2_REQUEST_FRAMES
+        && profile.fps as f64 == LTX2_REQUEST_FPS
+        && bin_x(LTX2_MOJO_REQUEST_RUNNER)
+    {
+        LTX2_MOJO_REQUEST_RUNNER.to_string()
+    } else {
+        profile.runner.clone()
+    }
+}
+
+fn ltx2_request_profile(
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: f64,
+) -> Option<Ltx2ResolvedRequestProfile> {
+    ltx2_resolved_profiles().into_iter().find(|profile| {
+        profile.width == width
+            && profile.height == height
+            && profile.frames == frames
+            && (profile.fps as f64 - fps).abs() <= f64::EPSILON
+    })
+}
+
+fn ltx2_profile_document(profile: &Ltx2ResolvedRequestProfile) -> Value {
+    json!({
+        "id": profile.group_id,
+        "label": profile.label,
+        "checkpoint": ltx2_request_profile_registry().checkpoint,
+        "width": profile.width,
+        "height": profile.height,
+        "frames": profile.frames,
+        "fps": profile.fps,
+        "duration": profile.duration,
+        "source": profile.source,
+        "runner": ltx2_effective_profile_runner(profile),
+        "available": ltx2_profile_runner_available(profile),
+        "output_format": "mp4",
+        "guidance_modes": ltx2_request_profile_registry().guidance_modes,
+    })
+}
+
+fn ltx2_post_upscaler_documents() -> Value {
+    let Some(rows) = ltx2_request_profile_registry().post_upscalers.as_array() else {
+        return json!([]);
+    };
+    Value::Array(
+        rows.iter()
+            .map(|row| {
+                let mut doc = row.clone();
+                let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+                let (available, missing) = match id {
+                    "realesrgan-x4plus" => {
+                        let mut missing = Vec::new();
+                        if !bin_x(REALESRGAN_X4_RUNNER) {
+                            missing.push(REALESRGAN_X4_RUNNER.to_string());
+                        }
+                        if !nonempty_file(&model_path(REALESRGAN_X4_WEIGHTS)) {
+                            missing.push(
+                                model_path(REALESRGAN_X4_WEIGHTS)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
+                        (missing.is_empty(), missing)
+                    }
+                    "realesrgan-fast-x4v3" => {
+                        let mut missing = Vec::new();
+                        if !bin_x(REALESRGAN_X4_RUNNER) {
+                            missing.push(REALESRGAN_X4_RUNNER.to_string());
+                        }
+                        if !nonempty_file(&model_path(REALESRGAN_FAST_X4_WEIGHTS)) {
+                            missing.push(
+                                model_path(REALESRGAN_FAST_X4_WEIGHTS)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
+                        (missing.is_empty(), missing)
+                    }
+                    "seedvr2-3b" => {
+                        let mut missing = Vec::new();
+                        if !bin_x(SEEDVR2_PRODUCT_RUNNER) {
+                            missing.push(SEEDVR2_PRODUCT_RUNNER.to_string());
+                        }
+                        for weight in SEEDVR2_WEIGHTS {
+                            if !nonempty_file(&model_path(weight)) {
+                                missing.push(model_path(weight).to_string_lossy().into_owned());
+                            }
+                        }
+                        // The checked-in GitHub CLI is still a fixture/demo
+                        // runner. Even if somebody drops weights next to it,
+                        // do not advertise a user-video route until the
+                        // dedicated product binary exists.
+                        missing.push("product user-video adapter is not implemented".to_string());
+                        (false, missing)
+                    }
+                    _ => (false, vec!["unknown post-upscaler".to_string()]),
+                };
+                if let Some(object) = doc.as_object_mut() {
+                    object.insert("available".to_string(), json!(available));
+                    let status = if id == "seedvr2-3b" {
+                        "source_only"
+                    } else if id == "realesrgan-x4plus" && available {
+                        "experimental_slow"
+                    } else if available {
+                        "ready"
+                    } else {
+                        "prerequisites_missing"
+                    };
+                    object.insert("status".to_string(), json!(status));
+                    object.insert("missing".to_string(), json!(missing));
+                }
+                doc
+            })
+            .collect(),
+    )
 }
 
 fn runner_available() -> bool {
@@ -429,6 +678,32 @@ fn ltx2_context_cache_valid(path: &std::path::Path) -> bool {
         && tensor_header_matches(&doc, "neg_audio_context", "BF16", &[1, 1024, 2048])
         && tensor_header_matches(&doc, "video_len", "F32", &[1])
         && tensor_header_matches(&doc, "neg_video_len", "F32", &[1])
+}
+
+fn ltx2_mojo_context_tensor_valid(path: &std::path::Path) -> bool {
+    let Some(doc) = safetensors_header(path) else {
+        return false;
+    };
+    tensor_header_matches(&doc, "video_context", "BF16", &[1, 1024, 4096])
+        && tensor_header_matches(&doc, "audio_context", "BF16", &[1, 1024, 2048])
+        && tensor_header_matches(&doc, "neg_video_context", "BF16", &[1, 1024, 4096])
+        && tensor_header_matches(&doc, "neg_audio_context", "BF16", &[1, 1024, 2048])
+        && tensor_header_matches(&doc, "video_len", "F32", &[1])
+        && tensor_header_matches(&doc, "neg_video_len", "F32", &[1])
+}
+
+fn ltx2_mojo_conditioning_missing() -> Vec<String> {
+    let candidates = [
+        repo_path(LTX2_MOJO_CONDITIONER),
+        model_path(LTX2_GEMMA_FP8),
+        model_path(LTX2_GEMMA_TOKENIZER),
+        model_path(LTX2_CONDITIONING_CHECKPOINT),
+    ];
+    candidates
+        .iter()
+        .filter(|path| !nonempty_file(path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Accept an oracle claim only from the measured report produced by the local
@@ -619,6 +894,250 @@ fn prepare_ltx2_refhq_context(
         serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
     )
     .map_err(|e| format!("ltx2_refhq: write conditioning manifest: {e}"))?;
+    Ok(Ltx2ContextCache {
+        path,
+        key,
+        hit: false,
+        encoder_seconds,
+        log_path,
+        manifest_path,
+    })
+}
+
+fn ltx2_mojo_context_key(prompt: &str, negative_prompt: &str, conditioner_sha256: &str) -> String {
+    let mut h = 0xcbf29ce484222325u64;
+    for part in [
+        LTX2_MOJO_CONTEXT_SCHEMA,
+        conditioner_sha256,
+        prompt,
+        negative_prompt,
+    ] {
+        for byte in part.as_bytes().iter().copied().chain(std::iter::once(0xff)) {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+fn write_ltx2_job_status(
+    out_dir: &std::path::Path,
+    state: &str,
+    phase: &str,
+    step: i64,
+    total: i64,
+    message: &str,
+) -> Result<(), String> {
+    let path = out_dir.join("status.json");
+    let tmp = out_dir.join("status.json.tmp");
+    let body = json!({
+        "schema": "serenity.ltx2.status.v1",
+        "state": state,
+        "phase": phase,
+        "step": step,
+        "total": total,
+        "message": message,
+    });
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|error| format!("serialize LTX2 status: {error}"))?;
+    std::fs::write(&tmp, bytes).map_err(|error| format!("write LTX2 status: {error}"))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("publish LTX2 status: {error}"))
+}
+
+fn ltx2_mojo_cache_manifest_valid(
+    path: &std::path::Path,
+    key: &str,
+    conditioner_sha256: &str,
+) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    doc.get("schema").and_then(Value::as_str) == Some(LTX2_MOJO_CONTEXT_SCHEMA)
+        && doc.get("cache_key").and_then(Value::as_str) == Some(key)
+        && doc.get("conditioner_sha256").and_then(Value::as_str) == Some(conditioner_sha256)
+}
+
+/// Run the Mojo-native Gemma-3 conditioner before loading the LTX denoiser.
+/// Both prompts share one layer stream; the resulting pre-connector contexts
+/// are cached by prompt, negative prompt, and conditioner binary digest.
+fn prepare_ltx2_mojo_context<F>(
+    out_root: &std::path::Path,
+    job_out_dir: &std::path::Path,
+    prompt: &str,
+    negative_prompt: &str,
+    publish: &F,
+) -> Result<Ltx2ContextCache, String>
+where
+    F: Fn(WorkerEvent),
+{
+    if prompt.trim().is_empty() {
+        return Err("LTX2 prompt is required".to_string());
+    }
+    let missing = ltx2_mojo_conditioning_missing();
+    if !missing.is_empty() {
+        return Err(format!(
+            "LTX2 automatic prompt conditioning is unavailable; missing: {}",
+            missing.join(", ")
+        ));
+    }
+    let conditioner = repo_path(LTX2_MOJO_CONDITIONER);
+    let conditioner_sha256 =
+        sha256sum(&conditioner).ok_or_else(|| "cannot hash LTX2 Mojo conditioner".to_string())?;
+    let key = ltx2_mojo_context_key(prompt, negative_prompt, &conditioner_sha256);
+    let cache_dir = out_root
+        .join("conditioning_cache")
+        .join("ltx2")
+        .join("mojo-gemma3-v1");
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("create LTX2 Mojo conditioning cache: {error}"))?;
+    let path = cache_dir.join(format!("{key}.safetensors"));
+    let log_path = cache_dir.join(format!("{key}.log"));
+    let manifest_path = cache_dir.join(format!("{key}.json"));
+    if ltx2_mojo_context_tensor_valid(&path)
+        && ltx2_mojo_cache_manifest_valid(&manifest_path, &key, &conditioner_sha256)
+    {
+        let message = "Prompt conditioning cache hit";
+        let _ = write_ltx2_job_status(job_out_dir, "running", "conditioning", 48, 48, message);
+        publish(WorkerEvent::Progress {
+            step: 48,
+            total: 48,
+            phase: message.to_string(),
+            preview: String::new(),
+        });
+        return Ok(Ltx2ContextCache {
+            path,
+            key,
+            hit: true,
+            encoder_seconds: 0.0,
+            log_path,
+            manifest_path,
+        });
+    }
+
+    let started = std::time::Instant::now();
+    let first_message = "Tokenizing LTX2 prompt";
+    let _ = write_ltx2_job_status(job_out_dir, "running", "conditioning", 0, 48, first_message);
+    publish(WorkerEvent::Progress {
+        step: 0,
+        total: 48,
+        phase: first_message.to_string(),
+        preview: String::new(),
+    });
+
+    let mut log = std::fs::File::create(&log_path)
+        .map_err(|error| format!("create LTX2 conditioner log: {error}"))?;
+    let stderr = log
+        .try_clone()
+        .map_err(|error| format!("clone LTX2 conditioner log: {error}"))?;
+    let mut command = std::process::Command::new(&conditioner);
+    command
+        .current_dir(repo_root())
+        .env("LD_LIBRARY_PATH", mojo_ld_path())
+        .arg(model_path(LTX2_GEMMA_FP8))
+        .arg(model_path(LTX2_GEMMA_TOKENIZER))
+        .arg(model_path(LTX2_CONDITIONING_CHECKPOINT))
+        .arg(&path)
+        .arg(prompt)
+        .arg(negative_prompt)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(stderr));
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("start LTX2 Mojo conditioner: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "capture LTX2 conditioner output".to_string())?;
+    let reader = std::io::BufReader::new(stdout);
+    for line in std::io::BufRead::lines(reader) {
+        let line = line.map_err(|error| format!("read LTX2 conditioner output: {error}"))?;
+        let _ = std::io::Write::write_all(&mut log, format!("{line}\n").as_bytes());
+        let Some(activity) = line.strip_prefix("LTX2_ACTIVITY ") else {
+            continue;
+        };
+        let (step, total, message) = if let Some(progress) =
+            activity.strip_prefix("encoding Gemma layer ")
+        {
+            let (step, total) = progress
+                .split_once('/')
+                .and_then(|(step, total)| {
+                    Some((
+                        step.trim().parse::<i64>().ok()?,
+                        total.trim().parse::<i64>().ok()?,
+                    ))
+                })
+                .unwrap_or((0, 48));
+            (
+                step,
+                total,
+                format!("Encoding LTX2 prompt · Gemma layer {step} / {total}"),
+            )
+        } else {
+            match activity {
+                "tokenizing prompt" => (0, 48, "Tokenizing LTX2 prompt".to_string()),
+                "loading Gemma text encoder" => (0, 48, "Loading Gemma text encoder".to_string()),
+                "projecting video and audio conditioning" => (
+                    48,
+                    48,
+                    "Projecting LTX2 video/audio conditioning".to_string(),
+                ),
+                "saving prompt conditioning" => {
+                    (48, 48, "Saving LTX2 prompt conditioning".to_string())
+                }
+                "conditioning complete" => {
+                    (48, 48, "LTX2 prompt conditioning complete".to_string())
+                }
+                other => (0, 48, other.to_string()),
+            }
+        };
+        let _ = write_ltx2_job_status(
+            job_out_dir,
+            "running",
+            "conditioning",
+            step,
+            total,
+            &message,
+        );
+        publish(WorkerEvent::Progress {
+            step,
+            total,
+            phase: message,
+            preview: String::new(),
+        });
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for LTX2 Mojo conditioner: {error}"))?;
+    let encoder_seconds = started.elapsed().as_secs_f64();
+    if !status.success() || !ltx2_mojo_context_tensor_valid(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "LTX2 Mojo prompt conditioning failed with {:?}; inspect {}",
+            status.code(),
+            log_path.display()
+        ));
+    }
+    let manifest = json!({
+        "schema": LTX2_MOJO_CONTEXT_SCHEMA,
+        "cache_key": key,
+        "conditioner": LTX2_MOJO_CONDITIONER,
+        "conditioner_sha256": conditioner_sha256,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "path": path.to_string_lossy(),
+        "log_path": log_path.to_string_lossy(),
+        "encoder_seconds": encoder_seconds,
+        "backend": "mojo",
+        "conditioning_stage": "pre_connector",
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+    )
+    .map_err(|error| format!("write LTX2 Mojo conditioning manifest: {error}"))?;
     Ok(Ltx2ContextCache {
         path,
         key,
@@ -995,7 +1514,29 @@ fn readiness_doc() -> Value {
     let ltx2_runner_ready = runner_available();
     let ltx2_decode_ready = ltx2_decode_runtime_available();
     let ltx2_legacy_ready = ltx2_runner_ready && ltx2_decode_ready;
-    let ltx2_request_ready = bin_x(LTX2_MOJO_REQUEST_RUNNER);
+    let ltx2_profiles = ltx2_resolved_profiles();
+    let ltx2_request_ready = ltx2_profiles.iter().any(ltx2_profile_runner_available);
+    let ltx2_profile_documents = ltx2_profiles
+        .iter()
+        .map(ltx2_profile_document)
+        .collect::<Vec<_>>();
+    let ltx2_default_profile = ltx2_profiles
+        .iter()
+        .find(|profile| {
+            profile.width == LTX2_REQUEST_WIDTH
+                && profile.height == LTX2_REQUEST_HEIGHT
+                && profile.frames == LTX2_REQUEST_FRAMES
+                && profile.fps as f64 == LTX2_REQUEST_FPS
+        })
+        .or_else(|| {
+            ltx2_profiles
+                .iter()
+                .find(|profile| ltx2_profile_runner_available(profile))
+        })
+        .map(ltx2_profile_document)
+        .unwrap_or(Value::Null);
+    let ltx2_conditioning_missing = ltx2_mojo_conditioning_missing();
+    let ltx2_auto_conditioning_ready = ltx2_conditioning_missing.is_empty();
     let ltx2_ready = ltx2_request_ready || ltx2_legacy_ready;
     let ltx2_sampler_parity = ltx2_parity_report_passed(
         LTX2_SAMPLER_PARITY_REPORT,
@@ -1089,7 +1630,8 @@ fn readiness_doc() -> Value {
                     "audio_parity_report": LTX2_AUDIO_PARITY_REPORT,
                 },
                 "ltx2_mojo_request": {
-                    "runner": LTX2_MOJO_REQUEST_RUNNER,
+                    "runner": "exact AOT runner selected from supported_profiles",
+                    "conditioning_runner": LTX2_MOJO_CONDITIONER,
                     "request_schema": "serenity.genparams.v1",
                     "status_schema": "serenity.ltx2.status.v1",
                     "result_schema": "serenity.ltx2.result.v1",
@@ -1100,9 +1642,20 @@ fn readiness_doc() -> Value {
                         "steps", "seed", "fps", "sampler", "scheduler",
                         "guidance_mode",
                         "caps_positive", "caps_negative", "noise_fixture",
-                        "include_audio", "lora", "quant"
+                        "image_path", "image_strength", "video_path",
+                        "video_strength",
+                        "include_audio", "lora", "quant", "post_upscale"
                     ],
-                    "requires_authored_conditioning": true,
+                    "requires_authored_conditioning": false,
+                    "automatic_conditioning": {
+                        "available": ltx2_auto_conditioning_ready,
+                        "backend": "mojo",
+                        "missing": ltx2_conditioning_missing,
+                        "manual_caps_override_supported": true,
+                    },
+                    "compiled_profile": ltx2_default_profile,
+                    "supported_profiles": ltx2_profile_documents,
+                    "post_upscalers": ltx2_post_upscaler_documents(),
                     "available": ltx2_request_ready,
                 },
             },
@@ -1213,7 +1766,7 @@ fn readiness_doc() -> Value {
             "bernini_r_t2v": bernini_product_accepted,
             "scail2_animation": scail2_product_accepted,
         },
-        "non_acceptance_reason": "bounded smoke wiring is not full SwarmUI video parity; artifact acceptance requires frame_count, duration, muxing, audio behavior, timings, and VRAM evidence",
+        "non_acceptance_reason": "bounded smoke wiring is not full reference UI video parity; artifact acceptance requires frame_count, duration, muxing, audio behavior, timings, and VRAM evidence",
         "probe_endpoint": "/v1/video/probe?path=<mp4>",
         "candidate_runners": runners,
     })
@@ -1254,14 +1807,28 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     let is_ltx2_mojo_request =
         model == "ltx2" && b.get("runner").and_then(Value::as_str) == Some("ltx2_mojo_request");
     if is_ltx2_mojo_request {
-        if !bin_x(LTX2_MOJO_REQUEST_RUNNER) {
-            return err_detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                &format!("missing executable {LTX2_MOJO_REQUEST_RUNNER}"),
-            );
-        }
         if let Err(error) = validate_ltx2_mojo_request(&b) {
             return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
+        }
+        let profile = ltx2_request_profile(
+            b["width"].as_i64().unwrap_or(0),
+            b["height"].as_i64().unwrap_or(0),
+            b["frames"].as_i64().unwrap_or(0),
+            b["fps"].as_f64().unwrap_or(0.0),
+        )
+        .expect("validated LTX2 request must resolve to an admitted profile");
+        if !ltx2_profile_runner_available(&profile) {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "LTX2 profile {}x{}, {} frames at {} FPS is supported but its exact Mojo runner is not built: {}",
+                    profile.width,
+                    profile.height,
+                    profile.frames,
+                    profile.fps,
+                    profile.runner,
+                ),
+            );
         }
     }
     // Fail closed before taking the GPU lease or evicting an idle image model.
@@ -1413,7 +1980,6 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         "prompt",
         "sampler",
         "scheduler",
-        "caps_positive",
         "guidance_mode",
     ];
     for key in required_strings {
@@ -1475,6 +2041,25 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     if !body.get("fps").map(Value::is_number).unwrap_or(false) {
         return Err("LTX2 Mojo request requires numeric 'fps'".to_string());
     }
+    let width = body["width"].as_i64().unwrap_or(0);
+    let height = body["height"].as_i64().unwrap_or(0);
+    let frames = body["frames"].as_i64().unwrap_or(0);
+    let fps = body["fps"].as_f64().unwrap_or(0.0);
+    if ltx2_request_profile(width, height, frames, fps).is_none() {
+        let supported = ltx2_resolved_profiles()
+            .iter()
+            .map(|profile| {
+                format!(
+                    "{}x{} {}f@{}",
+                    profile.width, profile.height, profile.frames, profile.fps
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "unsupported LTX2 native profile {width}x{height}, {frames} frames at {fps} FPS; admitted profiles: {supported}"
+        ));
+    }
     if !body
         .get("include_audio")
         .map(Value::is_boolean)
@@ -1482,14 +2067,81 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     {
         return Err("LTX2 Mojo request requires boolean 'include_audio'".to_string());
     }
-    let caps = body["caps_positive"].as_str().unwrap_or("");
-    if !std::path::Path::new(caps).is_file() {
+    let _ = ltx2_requested_post_upscale(body)?;
+    let caps = body
+        .get("caps_positive")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if caps.is_empty() {
+        let missing = ltx2_mojo_conditioning_missing();
+        if !missing.is_empty() {
+            return Err(format!(
+                "LTX2 automatic prompt conditioning is unavailable; missing: {}",
+                missing.join(", ")
+            ));
+        }
+    } else if !std::path::Path::new(caps).is_file() {
         return Err(format!("LTX2 conditioning artifact not found: {caps}"));
+    }
+    if let Some(caps_negative) = body.get("caps_negative").and_then(Value::as_str) {
+        if !caps_negative.trim().is_empty() && !std::path::Path::new(caps_negative.trim()).is_file()
+        {
+            return Err(format!(
+                "LTX2 negative conditioning artifact not found: {}",
+                caps_negative.trim()
+            ));
+        }
     }
     if let Some(noise) = body.get("noise_fixture").and_then(Value::as_str) {
         if !noise.is_empty() && !std::path::Path::new(noise).is_file() {
             return Err(format!("LTX2 noise fixture not found: {noise}"));
         }
+    }
+    let image_path = body
+        .get("image_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !image_path.is_empty() && !std::path::Path::new(image_path).is_file() {
+        return Err(format!("LTX2 I2V source image not found: {image_path}"));
+    }
+    let image_strength = body
+        .get("image_strength")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if body.get("image_strength").is_some_and(|value| !value.is_number()) {
+        return Err("LTX2 image_strength must be numeric".to_string());
+    }
+    if !(0.0..=1.0).contains(&image_strength) {
+        return Err("LTX2 image_strength must be in [0, 1]".to_string());
+    }
+    if image_path.is_empty() && body.get("image_strength").is_some() {
+        return Err("LTX2 image_strength requires image_path".to_string());
+    }
+    let video_path = body
+        .get("video_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !video_path.is_empty() && !std::path::Path::new(video_path).is_file() {
+        return Err(format!("LTX2 V2V source video not found: {video_path}"));
+    }
+    let video_strength = body
+        .get("video_strength")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if body.get("video_strength").is_some_and(|value| !value.is_number()) {
+        return Err("LTX2 video_strength must be numeric".to_string());
+    }
+    if !(0.0..=1.0).contains(&video_strength) {
+        return Err("LTX2 video_strength must be in [0, 1]".to_string());
+    }
+    if video_path.is_empty() && body.get("video_strength").is_some() {
+        return Err("LTX2 video_strength requires video_path".to_string());
+    }
+    if !image_path.is_empty() && !video_path.is_empty() {
+        return Err("LTX2 image_path and video_path are mutually exclusive".to_string());
     }
     match body.get("lora") {
         Some(Value::Array(rows)) => {
@@ -1568,16 +2220,287 @@ fn validate_wan22_a14b_request(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn ltx2_requested_post_upscale(body: &Value) -> Result<Option<(String, i64)>, String> {
+    let Some(value) = body.get("post_upscale") else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err("LTX2 post_upscale must be an object".to_string());
+    };
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .trim();
+    if id.is_empty() || id == "none" {
+        return Ok(None);
+    }
+    let factor = object
+        .get("factor")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "LTX2 post_upscale.factor must be an integer".to_string())?;
+    if !matches!(factor, 2 | 4) {
+        return Err(format!(
+            "LTX2 post-upscale factor must be 2 or 4; got {factor}"
+        ));
+    }
+    if matches!(id, "realesrgan-x4plus" | "realesrgan-fast-x4v3") {
+        let weights = if id == "realesrgan-fast-x4v3" {
+            REALESRGAN_FAST_X4_WEIGHTS
+        } else {
+            REALESRGAN_X4_WEIGHTS
+        };
+        let mut missing = Vec::new();
+        if !bin_x(REALESRGAN_X4_RUNNER) {
+            missing.push(repo_path(REALESRGAN_X4_RUNNER));
+        }
+        if !nonempty_file(&model_path(weights)) {
+            missing.push(model_path(weights));
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "Real-ESRGAN post-upscale is unavailable; missing: {}",
+                missing
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Ok(Some((id.to_string(), factor)));
+    }
+    if id == "seedvr2-3b" {
+        return Err(
+            "SeedVR2 source is present, but its GitHub CLI is still a fixture/demo \
+             runner and is not admitted for user-video post-upscale"
+                .to_string(),
+        );
+    }
+    Err(format!("unsupported LTX2 post-upscaler '{id}'"))
+}
+
+fn run_realesrgan_video_post_upscale<F>(
+    upscaler_id: &str,
+    native_artifact: &std::path::Path,
+    out_dir: &std::path::Path,
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: i64,
+    factor: i64,
+    mut progress: F,
+) -> Result<(std::path::PathBuf, Value), String>
+where
+    F: FnMut(i64, i64, &str),
+{
+    if !native_artifact.is_file() {
+        return Err(format!(
+            "native LTX2 artifact is missing: {}",
+            native_artifact.display()
+        ));
+    }
+    if !matches!(factor, 2 | 4) {
+        return Err(format!("unsupported Real-ESRGAN scale factor {factor}"));
+    }
+    let (mode, weights_path) = match upscaler_id {
+        "realesrgan-x4plus" => ("frames", model_path(REALESRGAN_X4_WEIGHTS)),
+        "realesrgan-fast-x4v3" => ("frames-fast", model_path(REALESRGAN_FAST_X4_WEIGHTS)),
+        _ => {
+            return Err(format!(
+                "unsupported Real-ESRGAN product runner '{upscaler_id}'"
+            ))
+        }
+    };
+    let stage_root = out_dir.join(upscaler_id);
+    let input_root = stage_root.join("input");
+    let output_root = stage_root.join("x4");
+    std::fs::create_dir_all(&input_root)
+        .and_then(|_| std::fs::create_dir_all(&output_root))
+        .map_err(|error| format!("cannot create Real-ESRGAN frame directories: {error}"))?;
+
+    let input_prefix = input_root.join("frame_");
+    let output_prefix = output_root.join("frame_");
+    let input_pattern = input_root.join("frame_%06d.png");
+    let output_pattern = output_root.join("frame_%06d.png");
+    progress(0, frames, "Extracting native frames for Real-ESRGAN");
+    let extract = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &native_artifact.to_string_lossy(),
+            "-vsync",
+            "0",
+            "-start_number",
+            "0",
+            "-frames:v",
+            &frames.to_string(),
+            &input_pattern.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|error| format!("cannot launch ffmpeg for post-upscale staging: {error}"))?;
+    if !extract.status.success() {
+        return Err(format!(
+            "ffmpeg could not extract native LTX2 frames: {}",
+            String::from_utf8_lossy(&extract.stderr).trim()
+        ));
+    }
+
+    let log_path = stage_root.join("runner.log");
+    let log = std::fs::File::create(&log_path)
+        .map_err(|error| format!("cannot create Real-ESRGAN log: {error}"))?;
+    let stderr = log
+        .try_clone()
+        .map_err(|error| format!("cannot clone Real-ESRGAN log: {error}"))?;
+    progress(0, frames, &format!("Loading pure-Mojo {upscaler_id}"));
+    let mut child = std::process::Command::new(repo_path(REALESRGAN_X4_RUNNER))
+        .current_dir(repo_root())
+        .env("LD_LIBRARY_PATH", mojo_ld_path())
+        .args([
+            mode,
+            &input_prefix.to_string_lossy(),
+            &output_prefix.to_string_lossy(),
+            &frames.to_string(),
+            &weights_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| format!("cannot launch pure-Mojo Real-ESRGAN: {error}"))?;
+    let mut completed = 0i64;
+    let status = loop {
+        let observed = std::fs::read_dir(&output_root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("frame_")
+                    && entry.path().extension().and_then(|value| value.to_str()) == Some("png")
+            })
+            .count() as i64;
+        if observed != completed {
+            completed = observed;
+            progress(
+                completed,
+                frames,
+                &format!("{upscaler_id} post-upscale frame {completed} of {frames}"),
+            );
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(error) => return Err(format!("cannot monitor pure-Mojo Real-ESRGAN: {error}")),
+        }
+    };
+    if !status.success() {
+        return Err(format!(
+            "pure-Mojo Real-ESRGAN failed; inspect {}",
+            log_path.display()
+        ));
+    }
+
+    let target_width = width * factor;
+    let target_height = height * factor;
+    let artifact = out_dir.join(format!("ltx2_t2v_hq_{factor}x.mp4"));
+    progress(frames, frames, "Muxing post-upscaled LTX2 video");
+    let mut mux = std::process::Command::new("ffmpeg");
+    mux.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-framerate",
+        &fps.to_string(),
+        "-start_number",
+        "0",
+        "-i",
+        &output_pattern.to_string_lossy(),
+        "-i",
+        &native_artifact.to_string_lossy(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+    ]);
+    if factor == 2 {
+        mux.args([
+            "-vf",
+            &format!("scale={target_width}:{target_height}:flags=lanczos"),
+        ]);
+    }
+    let mux_output = mux
+        .args([
+            "-frames:v",
+            &frames.to_string(),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            &artifact.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|error| format!("cannot launch ffmpeg for post-upscale mux: {error}"))?;
+    if !mux_output.status.success() {
+        return Err(format!(
+            "ffmpeg could not mux the post-upscaled LTX2 video: {}",
+            String::from_utf8_lossy(&mux_output.stderr).trim()
+        ));
+    }
+    let probe = probe_video_path(&artifact.to_string_lossy())?;
+    if probe.get("muxing").and_then(Value::as_str) != Some("probe_ok")
+        || probe.get("width").and_then(Value::as_i64) != Some(target_width)
+        || probe.get("height").and_then(Value::as_i64) != Some(target_height)
+        || probe.get("frame_count").and_then(Value::as_i64) != Some(frames)
+    {
+        return Err(format!(
+            "post-upscaled LTX2 artifact failed geometry/frame probe: {probe}"
+        ));
+    }
+    Ok((artifact, probe))
+}
+
 fn start_ltx2_mojo_request(
     st: &AppState,
     body: &Value,
     gpu: crate::gpu_lock::GpuGuard,
 ) -> Response {
+    let profile = match ltx2_request_profile(
+        body.get("width").and_then(Value::as_i64).unwrap_or(0),
+        body.get("height").and_then(Value::as_i64).unwrap_or(0),
+        body.get("frames").and_then(Value::as_i64).unwrap_or(0),
+        body.get("fps").and_then(Value::as_f64).unwrap_or(0.0),
+    ) {
+        Some(profile) if ltx2_profile_runner_available(&profile) => profile,
+        Some(profile) => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("missing exact LTX2 Mojo runner {}", profile.runner),
+            )
+        }
+        None => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "LTX2 request does not match an admitted native profile",
+            )
+        }
+    };
+    let request_runner = ltx2_effective_profile_runner(&profile);
     let quant = body
         .get("quant")
         .and_then(Value::as_str)
         .unwrap_or("fp8")
         .to_string();
+    let requested_post_upscale = match ltx2_requested_post_upscale(body) {
+        Ok(value) => value,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
     let int4_slab = (quant == "int4").then(|| model_path(LTX2_REFHQ_INT4_SLAB));
     let n = st
         .next_id
@@ -1613,6 +2536,21 @@ fn start_ltx2_mojo_request(
     let thread_video_id = video_id.clone();
     let thread_out_dir = out_dir.clone();
     let thread_request_path = request_path.clone();
+    let thread_out_root = st.out_dir.clone();
+    let thread_request_runner = request_runner.clone();
+    let thread_width = profile.width;
+    let thread_height = profile.height;
+    let thread_frames = profile.frames;
+    let thread_fps = profile.fps;
+    let thread_post_upscale = requested_post_upscale.clone();
+    let mut thread_request = body.clone();
+    if let Some(request) = thread_request.as_object_mut() {
+        // The denoiser always publishes exact final latents, exits, and lets a
+        // fresh invocation of the same profile binary own VAE decode. This is
+        // required for 720p+ on 24 GB and also prevents allocator fragmentation
+        // from making lower-resolution behavior depend on prior jobs.
+        request.insert("defer_decode".to_string(), json!(true));
+    }
     std::thread::spawn(move || {
         let _gpu = gpu;
         let publish = |event: WorkerEvent| {
@@ -1625,26 +2563,110 @@ fn start_ltx2_mojo_request(
             preview: String::new(),
         });
 
+        let authored_caps = thread_request
+            .get("caps_positive")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if authored_caps.is_empty() {
+            let prompt = thread_request
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let negative = thread_request
+                .get("negative")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match prepare_ltx2_mojo_context(
+                &thread_out_root,
+                &thread_out_dir,
+                &prompt,
+                &negative,
+                &publish,
+            ) {
+                Ok(cache) => {
+                    let path = cache.path.to_string_lossy().into_owned();
+                    if let Some(request) = thread_request.as_object_mut() {
+                        request.insert("caps_positive".to_string(), json!(path));
+                        request.insert("caps_negative".to_string(), json!(path));
+                        request.insert(
+                            "conditioning_cache".to_string(),
+                            json!({
+                                "backend": "mojo",
+                                "key": cache.key,
+                                "hit": cache.hit,
+                                "encoder_seconds": cache.encoder_seconds,
+                                "manifest": cache.manifest_path.to_string_lossy(),
+                            }),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "failed",
+                        "conditioning",
+                        0,
+                        48,
+                        &error,
+                    );
+                    publish(WorkerEvent::Failed { error });
+                    return;
+                }
+            }
+        } else {
+            let message = "Using authored LTX2 prompt conditioning";
+            let _ =
+                write_ltx2_job_status(&thread_out_dir, "running", "conditioning", 0, 0, message);
+            publish(WorkerEvent::Progress {
+                step: 0,
+                total: 0,
+                phase: message.to_string(),
+                preview: String::new(),
+            });
+        }
+        let request_bytes = match serde_json::to_vec_pretty(&thread_request) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let error = format!("cannot serialize resolved LTX2 request: {error}");
+                let _ =
+                    write_ltx2_job_status(&thread_out_dir, "failed", "conditioning", 0, 0, &error);
+                publish(WorkerEvent::Failed { error });
+                return;
+            }
+        };
+        if let Err(error) = std::fs::write(&thread_request_path, request_bytes) {
+            let error = format!("cannot write resolved LTX2 request: {error}");
+            let _ = write_ltx2_job_status(&thread_out_dir, "failed", "conditioning", 0, 0, &error);
+            publish(WorkerEvent::Failed { error });
+            return;
+        }
+
         let log_path = thread_out_dir.join("runner.log");
         let log = match std::fs::File::create(&log_path) {
             Ok(file) => file,
             Err(error) => {
-                publish(WorkerEvent::Failed {
-                    error: format!("cannot create LTX2 runner log: {error}"),
-                });
+                let error = format!("cannot create LTX2 runner log: {error}");
+                let _ =
+                    write_ltx2_job_status(&thread_out_dir, "failed", "runner_start", 0, 0, &error);
+                publish(WorkerEvent::Failed { error });
                 return;
             }
         };
         let stderr = match log.try_clone() {
             Ok(file) => file,
             Err(error) => {
-                publish(WorkerEvent::Failed {
-                    error: format!("cannot clone LTX2 runner log handle: {error}"),
-                });
+                let error = format!("cannot clone LTX2 runner log handle: {error}");
+                let _ =
+                    write_ltx2_job_status(&thread_out_dir, "failed", "runner_start", 0, 0, &error);
+                publish(WorkerEvent::Failed { error });
                 return;
             }
         };
-        let mut command = std::process::Command::new(repo_path(LTX2_MOJO_REQUEST_RUNNER));
+        let mut command = std::process::Command::new(repo_path(&thread_request_runner));
         command
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", mojo_ld_path())
@@ -1658,9 +2680,10 @@ fn start_ltx2_mojo_request(
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                publish(WorkerEvent::Failed {
-                    error: format!("cannot start LTX2 Mojo runner: {error}"),
-                });
+                let error = format!("cannot start LTX2 Mojo runner: {error}");
+                let _ =
+                    write_ltx2_job_status(&thread_out_dir, "failed", "runner_start", 0, 0, &error);
+                publish(WorkerEvent::Failed { error });
                 return;
             }
         };
@@ -1693,19 +2716,134 @@ fn start_ltx2_mojo_request(
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
                 Err(error) => {
-                    publish(WorkerEvent::Failed {
-                        error: format!("cannot monitor LTX2 Mojo runner: {error}"),
-                    });
+                    let error = format!("cannot monitor LTX2 Mojo runner: {error}");
+                    let _ =
+                        write_ltx2_job_status(&thread_out_dir, "failed", "runner", 0, 0, &error);
+                    publish(WorkerEvent::Failed { error });
                     break None;
                 }
             }
         };
+        let mut final_exit_status = exit_status;
+        let decode_handoff = thread_out_dir.join("decode_handoff.json");
+        let final_latents = thread_out_dir.join("final_latents.safetensors");
+        if final_exit_status
+            .as_ref()
+            .is_some_and(std::process::ExitStatus::success)
+            && decode_handoff.is_file()
+            && final_latents.is_file()
+        {
+            publish(WorkerEvent::Progress {
+                step: 0,
+                total: 0,
+                phase: "Releasing denoiser and starting fresh LTX2 decode".to_string(),
+                preview: String::new(),
+            });
+            let decode_log_path = thread_out_dir.join("decode.log");
+            let decode_log = match std::fs::File::create(&decode_log_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    let error = format!("cannot create LTX2 decode log: {error}");
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "failed",
+                        "decode_start",
+                        0,
+                        0,
+                        &error,
+                    );
+                    publish(WorkerEvent::Failed { error });
+                    return;
+                }
+            };
+            let decode_stderr = match decode_log.try_clone() {
+                Ok(file) => file,
+                Err(error) => {
+                    let error = format!("cannot clone LTX2 decode log handle: {error}");
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "failed",
+                        "decode_start",
+                        0,
+                        0,
+                        &error,
+                    );
+                    publish(WorkerEvent::Failed { error });
+                    return;
+                }
+            };
+            let mut decode = std::process::Command::new(repo_path(&thread_request_runner));
+            decode
+                .current_dir(repo_root())
+                .env("LD_LIBRARY_PATH", ltx2_decode_ld_path())
+                .arg("decode")
+                .arg(&thread_request_path)
+                .arg(&thread_out_dir)
+                .stdout(std::process::Stdio::from(decode_log))
+                .stderr(std::process::Stdio::from(decode_stderr));
+            let mut decode_child = match decode.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let error = format!("cannot start fresh LTX2 Mojo decode: {error}");
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "failed",
+                        "decode_start",
+                        0,
+                        0,
+                        &error,
+                    );
+                    publish(WorkerEvent::Failed { error });
+                    return;
+                }
+            };
+            final_exit_status = loop {
+                if let Ok(text) = std::fs::read_to_string(&status_path) {
+                    if text != last_status {
+                        if let Ok(status) = serde_json::from_str::<Value>(&text) {
+                            let step = status.get("step").and_then(Value::as_i64).unwrap_or(0);
+                            let total = status.get("total").and_then(Value::as_i64).unwrap_or(0);
+                            let message = status
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .or_else(|| status.get("phase").and_then(Value::as_str))
+                                .unwrap_or("LTX2 fresh decode running")
+                                .to_string();
+                            publish(WorkerEvent::Progress {
+                                step,
+                                total,
+                                phase: message,
+                                preview: String::new(),
+                            });
+                        }
+                        last_status = text;
+                    }
+                }
+                match decode_child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
+                    Err(error) => {
+                        let error = format!("cannot monitor fresh LTX2 Mojo decode: {error}");
+                        let _ = write_ltx2_job_status(
+                            &thread_out_dir,
+                            "failed",
+                            "decode",
+                            0,
+                            0,
+                            &error,
+                        );
+                        publish(WorkerEvent::Failed { error });
+                        break None;
+                    }
+                }
+            };
+        }
 
         let result_path = thread_out_dir.join("result.json");
-        let result = std::fs::read_to_string(&result_path)
+        let mut result = std::fs::read_to_string(&result_path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-        let succeeded = exit_status
+        let succeeded = final_exit_status
             .as_ref()
             .map(std::process::ExitStatus::success)
             .unwrap_or(false)
@@ -1726,6 +2864,134 @@ fn start_ltx2_mojo_request(
                 repo_root().join(authored)
             };
             if artifact.is_file() {
+                if let Some((upscaler, factor)) = thread_post_upscale.as_ref() {
+                    let message = format!("Starting {upscaler} {factor}x post-upscale");
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "running",
+                        "post_upscale",
+                        0,
+                        thread_frames,
+                        &message,
+                    );
+                    publish(WorkerEvent::Progress {
+                        step: 0,
+                        total: thread_frames,
+                        phase: message,
+                        preview: String::new(),
+                    });
+                    let started = std::time::Instant::now();
+                    match run_realesrgan_video_post_upscale(
+                        upscaler,
+                        &artifact,
+                        &thread_out_dir,
+                        thread_width,
+                        thread_height,
+                        thread_frames,
+                        thread_fps,
+                        *factor,
+                        |step, total, message| {
+                            let _ = write_ltx2_job_status(
+                                &thread_out_dir,
+                                "running",
+                                "post_upscale",
+                                step,
+                                total,
+                                message,
+                            );
+                            publish(WorkerEvent::Progress {
+                                step,
+                                total,
+                                phase: message.to_string(),
+                                preview: String::new(),
+                            });
+                        },
+                    ) {
+                        Ok((upscaled_artifact, probe)) => {
+                            if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                                doc.insert(
+                                    "native_artifact_path".to_string(),
+                                    json!(artifact.to_string_lossy()),
+                                );
+                                doc.insert(
+                                    "artifact_path".to_string(),
+                                    json!(upscaled_artifact.to_string_lossy()),
+                                );
+                                doc.insert(
+                                    "mp4_url".to_string(),
+                                    json!(format!(
+                                        "/out/{}/{}",
+                                        thread_video_id,
+                                        upscaled_artifact
+                                            .file_name()
+                                            .and_then(|value| value.to_str())
+                                            .unwrap_or("ltx2_post_upscale.mp4")
+                                    )),
+                                );
+                                doc.insert("width".to_string(), json!(thread_width * *factor));
+                                doc.insert("height".to_string(), json!(thread_height * *factor));
+                                doc.insert(
+                                    "post_upscale".to_string(),
+                                    json!({
+                                        "id": upscaler,
+                                        "factor": factor,
+                                        "backend": "mojo",
+                                        "runner": REALESRGAN_X4_RUNNER,
+                                        "seconds": started.elapsed().as_secs_f64(),
+                                        "probe": probe,
+                                    }),
+                                );
+                            }
+                            if let Some(doc) = result.as_ref() {
+                                if let Ok(bytes) = serde_json::to_vec_pretty(doc) {
+                                    let _ = std::fs::write(&result_path, bytes);
+                                }
+                            }
+                            let done_message =
+                                format!("{upscaler} {factor}x post-upscale complete");
+                            let _ = write_ltx2_job_status(
+                                &thread_out_dir,
+                                "done",
+                                "done",
+                                thread_frames,
+                                thread_frames,
+                                &done_message,
+                            );
+                            publish(WorkerEvent::Done {
+                                output_path: upscaled_artifact.to_string_lossy().into_owned(),
+                            });
+                            return;
+                        }
+                        Err(error) => {
+                            if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                                doc.insert("state".to_string(), json!("failed"));
+                                doc.insert("failed_step".to_string(), json!("post_upscale"));
+                                doc.insert("error".to_string(), json!(error));
+                            }
+                            if let Some(doc) = result.as_ref() {
+                                if let Ok(bytes) = serde_json::to_vec_pretty(doc) {
+                                    let _ = std::fs::write(&result_path, bytes);
+                                }
+                            }
+                            let error = result
+                                .as_ref()
+                                .and_then(|doc| doc.get("error"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("LTX2 post-upscale failed")
+                                .to_string();
+                            let _ = write_ltx2_job_status(
+                                &thread_out_dir,
+                                "failed",
+                                "post_upscale",
+                                0,
+                                thread_frames,
+                                &error,
+                            );
+                            publish(WorkerEvent::Failed { error });
+                            return;
+                        }
+                    }
+                }
                 publish(WorkerEvent::Done {
                     output_path: artifact.to_string_lossy().into_owned(),
                 });
@@ -1740,14 +3006,14 @@ fn start_ltx2_mojo_request(
                     .and_then(Value::as_str)
                     .map(str::to_string)
             });
-        publish(WorkerEvent::Failed {
-            error: status_error.unwrap_or_else(|| {
-                format!(
-                    "LTX2 Mojo runner failed; inspect {}",
-                    log_path.to_string_lossy()
-                )
-            }),
+        let error = status_error.unwrap_or_else(|| {
+            format!(
+                "LTX2 Mojo runner failed; inspect {}",
+                log_path.to_string_lossy()
+            )
         });
+        let _ = write_ltx2_job_status(&thread_out_dir, "failed", "runner", 0, 0, &error);
+        publish(WorkerEvent::Failed { error });
     });
 
     json_resp(
@@ -1758,6 +3024,8 @@ fn start_ltx2_mojo_request(
             "prompt_id": prompt_id,
             "model": "ltx2",
             "runner": "ltx2_mojo_request",
+            "profile_runner": request_runner,
+            "profile": ltx2_profile_document(&profile),
             "backend": "mojo",
             "quant": quant,
             "state": "queued",
@@ -3775,7 +5043,9 @@ mod tests {
         assert_eq!(d.get("endpoint").unwrap(), "/v1/video");
         // bin_x resolves against the active repo root, so runner presence is
         // machine-dependent (built on the dev boxes, absent on CI).
-        let ltx2_request_ready = bin_x(LTX2_MOJO_REQUEST_RUNNER);
+        let ltx2_request_ready = ltx2_resolved_profiles()
+            .iter()
+            .any(ltx2_profile_runner_available);
         let ltx2_ready =
             ltx2_request_ready || (runner_available() && ltx2_decode_runtime_available());
         let wan22_built = wan22_missing().is_empty();
@@ -3808,10 +5078,65 @@ mod tests {
             LTX2_CONTEXT_SCRIPT
         );
         let request_runner = &runners[1]["modes"]["ltx2_mojo_request"];
-        assert_eq!(request_runner["runner"], LTX2_MOJO_REQUEST_RUNNER);
+        assert_eq!(
+            request_runner["runner"],
+            "exact AOT runner selected from supported_profiles"
+        );
+        assert_eq!(
+            request_runner["supported_profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            21
+        );
+        let post_upscalers = request_runner["post_upscalers"].as_array().unwrap();
+        assert_eq!(post_upscalers.len(), 3);
+        let realesrgan = post_upscalers
+            .iter()
+            .find(|entry| entry["id"] == "realesrgan-x4plus")
+            .unwrap();
+        assert_eq!(
+            realesrgan["available"],
+            bin_x(REALESRGAN_X4_RUNNER) && nonempty_file(&model_path(REALESRGAN_X4_WEIGHTS))
+        );
+        if realesrgan["available"] == true {
+            assert_eq!(realesrgan["status"], "experimental_slow");
+        }
+        let realesrgan_fast = post_upscalers
+            .iter()
+            .find(|entry| entry["id"] == "realesrgan-fast-x4v3")
+            .unwrap();
+        assert_eq!(
+            realesrgan_fast["available"],
+            bin_x(REALESRGAN_X4_RUNNER) && nonempty_file(&model_path(REALESRGAN_FAST_X4_WEIGHTS))
+        );
+        let seedvr2 = post_upscalers
+            .iter()
+            .find(|entry| entry["id"] == "seedvr2-3b")
+            .unwrap();
+        let seedvr2_available = bin_x(SEEDVR2_PRODUCT_RUNNER)
+            && SEEDVR2_WEIGHTS
+                .iter()
+                .all(|weight| nonempty_file(&model_path(weight)));
+        assert_eq!(seedvr2["available"], false);
+        assert_eq!(seedvr2["status"], "source_only");
+        assert!(seedvr2["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "product user-video adapter is not implemented"));
+        if !seedvr2_available {
+            assert!(seedvr2["missing"].as_array().unwrap().len() > 1);
+        }
         assert_eq!(request_runner["asynchronous"], true);
         assert_eq!(request_runner["ui_progress"], true);
         assert_eq!(request_runner["available"], ltx2_request_ready);
+        assert_eq!(request_runner["requires_authored_conditioning"], false);
+        assert_eq!(request_runner["automatic_conditioning"]["backend"], "mojo");
+        assert_eq!(
+            request_runner["automatic_conditioning"]["available"],
+            ltx2_mojo_conditioning_missing().is_empty()
+        );
         assert_eq!(runners[2].get("model").unwrap(), "wan22_t2v");
         if !wan22_built {
             assert_eq!(runners[2].get("status").unwrap(), "prerequisites_missing");
@@ -3865,6 +5190,63 @@ mod tests {
             arms.get("scail2_animation").unwrap(),
             &(scail2_built && scail2_product_gate_passed())
         );
+    }
+
+    #[test]
+    fn realesrgan_video_post_upscale_product_smoke() {
+        if !bin_x(REALESRGAN_X4_RUNNER) || !nonempty_file(&model_path(REALESRGAN_X4_WEIGHTS)) {
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "serenity-realesrgan-video-smoke-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let native = root.join("native.mp4");
+        let fixture = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=24",
+                "-frames:v",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                &native.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let (artifact, probe) = run_realesrgan_video_post_upscale(
+            "realesrgan-x4plus",
+            &native,
+            &root,
+            160,
+            120,
+            2,
+            24,
+            2,
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert!(artifact.is_file());
+        assert_eq!(probe["width"], 320);
+        assert_eq!(probe["height"], 240);
+        assert_eq!(probe["frame_count"], 2);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -3983,6 +5365,216 @@ mod tests {
         });
         validate_ltx2_mojo_request(&request).unwrap();
         let _ = std::fs::remove_file(caps);
+    }
+
+    #[test]
+    fn ltx2_mojo_request_preflight_accepts_i2v_source_and_strength() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        );
+        let caps = std::env::temp_dir().join(format!("serenity-ltx2-i2v-caps-{suffix}.bin"));
+        let image = std::env::temp_dir().join(format!("serenity-ltx2-i2v-source-{suffix}.png"));
+        std::fs::write(&caps, b"conditioning fixture").unwrap();
+        std::fs::write(&image, b"image fixture").unwrap();
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "the subject turns toward camera",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+            "image_path": image,
+            "image_strength": 0.8,
+        });
+        validate_ltx2_mojo_request(&request).unwrap();
+        let _ = std::fs::remove_file(caps);
+        let _ = std::fs::remove_file(image);
+    }
+
+    #[test]
+    fn ltx2_mojo_request_preflight_rejects_invalid_i2v_source_before_gpu() {
+        let caps = std::env::temp_dir().join(format!(
+            "serenity-ltx2-i2v-invalid-caps-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&caps, b"conditioning fixture").unwrap();
+        let mut request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "the subject turns toward camera",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+            "image_path": "/definitely/missing/ltx2-source.png",
+            "image_strength": 1.0,
+        });
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("I2V source image not found"));
+        request["image_path"] = json!("");
+        request["image_strength"] = json!(1.5);
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("image_strength must be in [0, 1]"));
+        let _ = std::fs::remove_file(caps);
+    }
+
+    #[test]
+    fn ltx2_mojo_request_preflight_accepts_v2v_and_rejects_conflicting_sources() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        );
+        let caps = std::env::temp_dir().join(format!("serenity-ltx2-v2v-caps-{suffix}.bin"));
+        let video = std::env::temp_dir().join(format!("serenity-ltx2-v2v-source-{suffix}.mp4"));
+        let image = std::env::temp_dir().join(format!("serenity-ltx2-v2v-source-{suffix}.png"));
+        std::fs::write(&caps, b"conditioning fixture").unwrap();
+        std::fs::write(&video, b"video fixture").unwrap();
+        std::fs::write(&image, b"image fixture").unwrap();
+        let mut request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "restyle the source clip while preserving its motion",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+            "video_path": video,
+            "video_strength": 0.7,
+        });
+        validate_ltx2_mojo_request(&request).unwrap();
+        request["image_path"] = json!(image);
+        request["image_strength"] = json!(1.0);
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+        request.as_object_mut().unwrap().remove("image_path");
+        request.as_object_mut().unwrap().remove("image_strength");
+        request["video_strength"] = json!(1.5);
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("video_strength must be in [0, 1]"));
+        let _ = std::fs::remove_file(caps);
+        let _ = std::fs::remove_file(video);
+        let _ = std::fs::remove_file(image);
+    }
+
+    #[test]
+    fn ltx2_mojo_request_accepts_blank_conditioning_when_auto_encoder_is_available() {
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "a lighthouse on a rocky coast at sunset",
+            "negative": "watermark",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": "",
+            "caps_negative": "",
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+        });
+        let missing = ltx2_mojo_conditioning_missing();
+        let result = validate_ltx2_mojo_request(&request);
+        if missing.is_empty() {
+            result.unwrap();
+        } else {
+            assert!(result
+                .unwrap_err()
+                .contains("automatic prompt conditioning is unavailable"));
+        }
+    }
+
+    #[test]
+    fn ltx2_mojo_request_rejects_geometry_outside_published_profile_before_gpu() {
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "profile mismatch probe",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": "/not/reached",
+            "width": 1024,
+            "height": 1024,
+            "frames": LTX2_REQUEST_FRAMES,
+            "steps": 8,
+            "seed": 42,
+            "fps": LTX2_REQUEST_FPS,
+            "include_audio": false,
+            "lora": [],
+        });
+        let error = validate_ltx2_mojo_request(&request).unwrap_err();
+        assert!(error.contains("unsupported LTX2 native profile 1024x1024"));
+        assert!(!error.contains("conditioning artifact"));
+    }
+
+    #[test]
+    fn ltx2_mojo_request_accepts_every_registry_profile_before_artifact_checks() {
+        for profile in ltx2_resolved_profiles() {
+            let request = json!({
+                "checkpoint": LTX2_REFHQ_CHECKPOINT,
+                "quant": "fp8",
+                "prompt": "native profile contract probe",
+                "sampler": "euler",
+                "scheduler": "ltx2_distilled",
+                "guidance_mode": "distilled",
+                "caps_positive": "/not/reached",
+                "width": profile.width,
+                "height": profile.height,
+                "frames": profile.frames,
+                "steps": 8,
+                "seed": 42,
+                "fps": profile.fps,
+                "include_audio": false,
+                "lora": [],
+            });
+            let error = validate_ltx2_mojo_request(&request).unwrap_err();
+            assert!(
+                error.contains("conditioning artifact not found"),
+                "profile {}x{} {}f@{} was rejected before artifact validation: {error}",
+                profile.width,
+                profile.height,
+                profile.frames,
+                profile.fps,
+            );
+        }
     }
 
     #[test]

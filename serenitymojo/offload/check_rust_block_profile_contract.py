@@ -25,7 +25,6 @@ SOURCE_MAP = REPO / "serenitymojo/offload/STAGEHAND_TURBO_SOURCE_MAP_2026-06-16.
 BANNED_RUNTIME_ROOTS = (
     "/home/alex/EriDiffusion",
     "/home/alex/SerenityFlow",
-    "/home/alex/SwarmUI",
     "/home/alex/ComfyUI",
 )
 

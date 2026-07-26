@@ -38,21 +38,21 @@ def _column_dot(
     return _clamp_dot(dot / (sqrt(lo2) * sqrt(hi2)))
 
 
-def swarm_variation_noise_chw(
+def variation_noise_chw(
     base: List[Float32], variation: List[Float32], channels: Int, height: Int,
     width: Int, strength: Float64,
 ) raises -> List[Float32]:
-    """SwarmKSampler-compatible slerp over a CHW latent slice.
+    """Spherical interpolation over a CHW latent slice.
 
-    Swarm calls `slerp(var_seed_strength, base_noise, variation_noise)` after
-    removing the batch dimension. For image latents this normalizes along CHW
+    This applies `slerp(var_seed_strength, base_noise, variation_noise)` after
+    removing the batch dimension. For image latents it normalizes along CHW
     dim=1, i.e. each channel/column vector over height.
     """
     var total = channels * height * width
     if channels <= 0 or height <= 0 or width <= 0:
-        raise Error("swarm_variation_noise_chw: shape dimensions must be positive")
+        raise Error("variation_noise_chw: shape dimensions must be positive")
     if len(base) != total or len(variation) != total:
-        raise Error("swarm_variation_noise_chw: noise length does not match CHW shape")
+        raise Error("variation_noise_chw: noise length does not match CHW shape")
     if strength <= 0.0:
         return base.copy()
     if strength >= 1.0:
@@ -67,7 +67,7 @@ def swarm_variation_noise_chw(
             dot_count += 1
 
     if dot_count > 0 and dot_sum / Float64(dot_count) > 0.9995:
-        # Mirrors Swarm's near-identical-vector fallback exactly.
+        # Mirrors the reference implementation's near-identical-vector fallback exactly.
         for i in range(total):
             out[i] = Float32(Float64(base[i]) * strength + Float64(variation[i]) * (1.0 - strength))
         return out^

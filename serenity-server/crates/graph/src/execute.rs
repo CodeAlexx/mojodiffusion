@@ -451,6 +451,16 @@ fn image_path_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String>
     }
 }
 
+fn video_path_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String> {
+    match store.get(link.node_id, &link.port).map(|v| &v.payload) {
+        Some(ValuePayload::Video { path }) => Ok(path.clone()),
+        _ => Err(
+            GraphError::bad_request("workflow graph video handle missing source")
+                .with_node(link.node_id),
+        ),
+    }
+}
+
 fn image_mask_source_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String> {
     match store.get(link.node_id, &link.port).map(|v| &v.payload) {
         Some(ValuePayload::Image { mask_source, .. }) => {
@@ -995,7 +1005,7 @@ fn exec_node(
             exec_ksampler(node, links, store, out, saw_prompt)
         }
         "SerenityRefinerUpscaleIntent" => exec_refiner_upscale_intent(fields, out),
-        "LTXVSampler" => exec_ltxv_sampler(node, links, store, out),
+        "LTXVSampler" => exec_ltxv_sampler(node, links, store, out, saw_prompt),
         "KSamplerSelect" => {
             let mut sampler_name = wf_string(fields, "sampler_name");
             if sampler_name.is_empty() {
@@ -1179,6 +1189,25 @@ fn exec_node(
                     path: image_path,
                     source: Some("load_image_mask".to_string()),
                 },
+            )?;
+            Ok(Fire::Done)
+        }
+        "LoadVideo" => {
+            let mut video_path = wf_string(fields, "video");
+            if video_path.is_empty() {
+                video_path = wf_string(fields, "path");
+            }
+            if video_path.is_empty() {
+                return Err(
+                    GraphError::unsupported("workflow graph LoadVideo missing video path")
+                        .with_node(id),
+                );
+            }
+            add_value(
+                store,
+                id,
+                "VIDEO",
+                ValuePayload::Video { path: video_path },
             )?;
             Ok(Fire::Done)
         }

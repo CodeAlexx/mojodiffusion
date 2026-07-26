@@ -128,7 +128,10 @@ var SerenityWS = (function () {
         off: off,
         send: send,
         getClientId: getClientId,
-        isConnected: isConnected
+        isConnected: isConnected,
+        // Internal event injection used by deterministic browser regression
+        // gates. Production messages still enter through socket.onmessage.
+        _emit: emit
     };
 })();
 //# sourceMappingURL=ws.js.map

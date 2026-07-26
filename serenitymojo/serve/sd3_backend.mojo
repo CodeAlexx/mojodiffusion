@@ -115,7 +115,7 @@ from serenitymojo.ops.tensor_algebra import reshape, concat
 from serenitymojo.sampling.sd3_flow_match import (
     SD3FlowMatchScheduler, sd3_cfg, sd3_euler_step,
 )
-from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
+from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
@@ -834,7 +834,7 @@ struct Sd3Backend(GenBackend, Movable):
             )
             var base_h = noise.to_host(self.ctx)
             var var_h = vnoise.to_host(self.ctx)
-            var blended = swarm_variation_noise_chw(
+            var blended = variation_noise_chw(
                 base_h, var_h, LC, LH_, LW_, self.params.variation_strength
             )
             noise = Tensor.from_host(blended, nsh.copy(), STDtype.BF16, self.ctx)

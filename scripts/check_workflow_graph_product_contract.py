@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Product-path smoke for the supported typed Comfy/Swarm workflow graph subset.
+"""Product-path smoke for the supported typed Comfy/Reference workflow graph subset.
 
 This is a development checker. It starts the compiled Mojo daemon, submits a
 linked `workflow.nodes`/`workflow.edges` graph through `/v1/generate`, and
@@ -1059,14 +1059,14 @@ def ui_drop_comfy_ui_canvas_request() -> dict[str, Any]:
                 {
                     "id": 9,
                     "type": "MarkdownNote",
-                    "widgets_values": ["# Swarm note"],
+                    "widgets_values": ["# Reference note"],
                     "inputs": [],
                     "outputs": [],
                 },
                 {
                     "id": 10,
                     "type": "Note",
-                    "widgets_values": ["plain Swarm note"],
+                    "widgets_values": ["plain Reference note"],
                     "inputs": [],
                     "outputs": [],
                 },

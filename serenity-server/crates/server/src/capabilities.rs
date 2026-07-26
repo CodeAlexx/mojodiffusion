@@ -1547,6 +1547,12 @@ fn blocked_feature_set(reason: &str) -> JsonValue {
         "outpaint": unsupported_feature(reason),
         "controlnet": unsupported_feature(reason),
         "video": unsupported_feature(reason),
+        "advanced_sampling": {
+            "supported": false,
+            "policy": "fail_loud",
+            "reason": reason,
+            "parameters": {},
+        },
     })
 }
 
@@ -1596,6 +1602,35 @@ fn multi_lora_feature_for_family(family: ModelFamily) -> JsonValue {
         Some(1) => unsupported_feature("this backend admits at most one LoRA overlay per job"),
         _ => unsupported_feature("LoRA overlays are not production-wired for this backend"),
     }
+}
+
+fn advanced_sampling_feature_for_family(family: ModelFamily) -> JsonValue {
+    let sigma_shift = if matches!(family, ModelFamily::ZImage | ModelFamily::Ideogram4) {
+        json!({
+            "supported": true,
+            "policy": "admit",
+            "default": 3.0,
+            "min": 0.01,
+            "max": 100.0,
+            "step": 0.01,
+            "reason": "the selected Mojo worker applies sigma_shift when it constructs the flow schedule",
+        })
+    } else {
+        unsupported_feature("the selected Mojo worker does not admit a user sigma-shift override")
+    };
+    json!({
+        "supported": matches!(family, ModelFamily::ZImage | ModelFamily::Ideogram4),
+        "policy": "partial",
+        "parameters": {
+            "sigma_shift": sigma_shift,
+            "clip_skip": unsupported_feature("CLIP layer skipping is not production-admitted by this model runtime"),
+            "eta": unsupported_feature("sampler eta is not production-admitted by this model runtime"),
+            "sigma_min": unsupported_feature("custom sigma minimum is not production-admitted by this model runtime"),
+            "sigma_max": unsupported_feature("custom sigma maximum is not production-admitted by this model runtime"),
+            "restart_sampling": unsupported_feature("restart sampling is not production-admitted by this model runtime"),
+            "vae": unsupported_feature("VAE override is not production-wired for /v1/generate"),
+        },
+    })
 }
 
 fn capability_for_family(family: ModelFamily) -> JsonValue {
@@ -1727,6 +1762,7 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
             "outpaint": unsupported_feature("outpaint is not production-admitted in this route"),
             "controlnet": unsupported_feature("ControlNet is not production-admitted in this route"),
             "video": unsupported_feature("video models use separate bounded video endpoints/gates, not /v1/generate"),
+            "advanced_sampling": advanced_sampling_feature_for_family(family),
         },
     })
 }
@@ -1870,7 +1906,7 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
             }
         ],
         "non_claims": [
-            "Capabilities describe current product admission, not full SwarmUI/Comfy parity.",
+            "Capabilities describe current product admission, not full Comfy parity.",
             "accepted_sampler_parity remains false until each exposed sampler/scheduler pair has artifact, timing, and VRAM evidence.",
             "Unsupported features must remain hidden or disabled in the UI and fail before enqueue if posted directly."
         ],
@@ -1937,6 +1973,37 @@ mod tests {
         assert_eq!(sdxl["limits"]["resolution"]["mode"], "shape_dispatch");
         assert_eq!(sdxl["limits"]["sizes"].as_array().unwrap().len(), 7);
         assert_eq!(production_sizes_for_family(ModelFamily::Flux2).len(), 8);
+    }
+
+    #[test]
+    fn advanced_sampling_capabilities_publish_only_worker_honored_controls() {
+        let zimage = capability_for_family(ModelFamily::ZImage);
+        let zimage_advanced = &zimage["features"]["advanced_sampling"];
+        assert_eq!(zimage_advanced["supported"], json!(true));
+        assert_eq!(
+            zimage_advanced["parameters"]["sigma_shift"]["supported"],
+            json!(true)
+        );
+        assert_eq!(
+            zimage_advanced["parameters"]["sigma_shift"]["default"],
+            json!(3.0)
+        );
+        assert_eq!(
+            zimage_advanced["parameters"]["clip_skip"]["supported"],
+            json!(false)
+        );
+
+        let qwen = capability_for_family(ModelFamily::QwenImage);
+        let qwen_advanced = &qwen["features"]["advanced_sampling"];
+        assert_eq!(qwen_advanced["supported"], json!(false));
+        assert_eq!(
+            qwen_advanced["parameters"]["sigma_shift"]["supported"],
+            json!(false)
+        );
+        assert_eq!(
+            qwen_advanced["parameters"]["vae"]["supported"],
+            json!(false)
+        );
     }
 
     #[test]

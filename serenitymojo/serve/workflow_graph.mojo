@@ -2,7 +2,7 @@
 #
 # This is the daemon-side contract the SerenityUI graph editor can target:
 # `workflow.nodes` + `workflow.edges` describe a typed value graph, this module
-# validates and topologically executes the supported Comfy/Swarm t2i subset,
+# validates and topologically executes the supported Comfy t2i subset,
 # then writes the resulting backend fields onto the request object. Tensor
 # execution remains in the model backends; this module owns graph semantics,
 # typed handles, fail-loud unsupported nodes, and import adapters.
@@ -184,7 +184,7 @@ def _workflow_is_named_scheduler_node(type_id: String) -> Bool:
 def _workflow_worker_supports_sampler(name: String) -> Bool:
     """Gate against the zimage worker's supported sampler list.
 
-    Mirrors sampler_registry.swarmui_sampler_registry_json zimage_supported_samplers
+    Mirrors sampler_registry.serenity_sampler_registry_json zimage_supported_samplers
     /home/alex/mojodiffusion/serenitymojo/sampling/sampler_registry.mojo.
     """
     var n = String(name.lower())
@@ -202,7 +202,7 @@ def _workflow_worker_supports_sampler(name: String) -> Bool:
 def _workflow_worker_supports_scheduler(name: String) -> Bool:
     """Gate against the zimage worker's supported scheduler list.
 
-    Mirrors sampler_registry.swarmui_sampler_registry_json zimage_supported_schedulers.
+    Mirrors sampler_registry.serenity_sampler_registry_json zimage_supported_schedulers.
     """
     var n = String(name.lower())
     return (
@@ -1932,7 +1932,7 @@ def apply_comfy_ui_canvas_graph(mut obj: JSONValue, wf: JSONValue) raises:
 
 
 def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
-    """Typed topological executor for the supported Comfy/Swarm t2i subset."""
+    """Typed topological executor for the supported Comfy t2i subset."""
     if not wf.contains("nodes") or not wf["nodes"].is_array():
         raise Error("[501] workflow graph body needs nodes or params/genparams")
     if not wf.contains("edges") or not wf["edges"].is_array():
@@ -3723,7 +3723,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
 
 
 def apply_workflow_params(mut obj: JSONValue) raises:
-    """Map a Serenity/Comfy/Swarm workflow request to backend genparams.
+    """Map a Serenity/Comfy workflow request to backend genparams.
 
     Supported linked graph bodies run through `apply_typed_workflow_graph`.
     Field-only `params`/`genparams` bodies remain compatibility adapters, and

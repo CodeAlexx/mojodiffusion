@@ -72,7 +72,7 @@ from serenitymojo.sampling.sdxl_euler import (
     sdxl_initial_noise_sigma,
     sdxl_input_scale,
 )
-from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
+from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
@@ -626,7 +626,7 @@ struct SdxlBackend(GenBackend, Movable):
             )
             var base_h = noise.to_host(self.ctx)
             var var_h = vnoise.to_host(self.ctx)
-            var blended = swarm_variation_noise_chw(
+            var blended = variation_noise_chw(
                 base_h, var_h, 4, lh, lw, self.params.variation_strength
             )
             noise = Tensor.from_host(blended, nsh.copy(), STDtype.F32, self.ctx)

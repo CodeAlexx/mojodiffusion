@@ -194,6 +194,53 @@ def ltx2_desktop_decode_temporal_group[
     )
 
 
+def _decode_portrait_column[
+    F_CT: Int, W_CT: Int
+](
+    weights: LTX2VaeDecoderWeights,
+    latent: Tensor,
+    f0: Int,
+    w0: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Decode one 960px column using the transposed Desktop H=30 split."""
+    var column = _decode_tile[F_CT, 16, W_CT](
+        weights, latent, f0, 0, w0, ctx
+    )
+    var tile = _decode_tile[F_CT, 16, W_CT](
+        weights, latent, f0, 14, w0, ctx
+    )
+    return _creator_spatial_join(
+        column, tile, 3, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+
+
+def ltx2_desktop_decode_temporal_group_portrait[
+    F_CT: Int
+](
+    weights: LTX2VaeDecoderWeights,
+    latent: Tensor,
+    f0: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Decode one 544x960 group with the transposed Desktop 2x3 grid."""
+    var full = _decode_portrait_column[F_CT, 9](
+        weights, latent, f0, 0, ctx
+    )
+    var column = _decode_portrait_column[F_CT, 9](
+        weights, latent, f0, 7, ctx
+    )
+    full = _creator_spatial_join(
+        full, column, 4, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    column = _decode_portrait_column[F_CT, 3](
+        weights, latent, f0, 14, ctx
+    )
+    return _creator_spatial_join(
+        full, column, 4, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+
+
 def _decode_full_width_row[
     F_CT: Int, H_CT: Int
 ](
@@ -278,4 +325,81 @@ def ltx2_desktop_decode_temporal_group_full[
     )
     return _creator_spatial_join(
         full, row, 3, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+
+
+def _decode_full_height_column[
+    F_CT: Int, W_CT: Int
+](
+    weights: LTX2VaeDecoderWeights,
+    latent: Tensor,
+    f0: Int,
+    w0: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Decode one 1920px column using Creator/Desktop's measured H=60 split."""
+    var column = _decode_tile[F_CT, 16, W_CT](
+        weights, latent, f0, 0, w0, ctx
+    )
+    var tile = _decode_tile[F_CT, 16, W_CT](
+        weights, latent, f0, 14, w0, ctx
+    )
+    column = _creator_spatial_join(
+        column, tile, 3, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    tile = _decode_tile[F_CT, 16, W_CT](
+        weights, latent, f0, 28, w0, ctx
+    )
+    column = _creator_spatial_join(
+        column, tile, 3, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    tile = _decode_tile[F_CT, 16, W_CT](
+        weights, latent, f0, 42, w0, ctx
+    )
+    column = _creator_spatial_join(
+        column, tile, 3, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    tile = _decode_tile[F_CT, 4, W_CT](
+        weights, latent, f0, 56, w0, ctx
+    )
+    return _creator_spatial_join(
+        column, tile, 3, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+
+
+def ltx2_desktop_decode_temporal_group_full_portrait[
+    F_CT: Int
+](
+    weights: LTX2VaeDecoderWeights,
+    latent: Tensor,
+    f0: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Decode one 1088x1920 group with the transposed Desktop tile grid."""
+    var full = _decode_full_height_column[F_CT, 9](
+        weights, latent, f0, 0, ctx
+    )
+    var column = _decode_full_height_column[F_CT, 9](
+        weights, latent, f0, 7, ctx
+    )
+    full = _creator_spatial_join(
+        full, column, 4, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    column = _decode_full_height_column[F_CT, 9](
+        weights, latent, f0, 14, ctx
+    )
+    full = _creator_spatial_join(
+        full, column, 4, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    column = _decode_full_height_column[F_CT, 9](
+        weights, latent, f0, 21, ctx
+    )
+    full = _creator_spatial_join(
+        full, column, 4, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
+    )
+    column = _decode_full_height_column[F_CT, 6](
+        weights, latent, f0, 28, ctx
+    )
+    return _creator_spatial_join(
+        full, column, 4, LTX2_DESKTOP_SPATIAL_OVERLAP, ctx
     )

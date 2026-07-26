@@ -63,7 +63,7 @@ from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen_device
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
-from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
+from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.pipeline.qwenimage_sample_cli import (
     QwenCaps, encode_captions_from_strings,
     QWENIMAGE_DIR, DIT_DIR, VAE_DIR,
@@ -471,7 +471,7 @@ struct QwenImageBackend(GenBackend, Movable):
             )
             var base_h = noise.to_host(self.ctx)
             var var_h = vnoise.to_host(self.ctx)
-            var blended = swarm_variation_noise_chw(
+            var blended = variation_noise_chw(
                 base_h, var_h, 16, LH_, LW_, self.params.variation_strength
             )
             noise = Tensor.from_host(blended, nchw_shape^, STDtype.BF16, self.ctx)

@@ -428,13 +428,16 @@ matter to the training path.
 `zimage_dit.mojo:96-98` is `dim=3840, n_heads=30, head_dim=128` (the H=30 that
 the sdpa-bwd toy gate missed). Also: `klein_dit`, `flux1_dit`, `chroma_dit`,
 `anima_dit`, `ernie_image`, `qwenimage_dit`, `sd3_mmdit`, `sdxl_unet`,
-`hidream_o1`, `nucleus_dit`/`nucleus_moe`, `ltx2_dit`, `sensenova_u1`,
+`hidream_o1`, `nucleus_dit`/`nucleus_moe`, `ltx2_dit`, `seedvr2_dit`,
+`seedvr2_sampler`, `sensenova_u1`,
 `zimage_l2p_dit` (+ `_contract.mojo` shape contracts and `_probe.mojo` smokes
 per model). Status: **INFERENCE**.
 
 ### `models/text_encoder/` — conditioning
 `t5_encoder.mojo` (the real Z-Image T5 run depends on this), `clip_encoder`,
-`qwen3_encoder`, `qwen25vl_encoder`. `serenity_trainer_conditioning_contract.mojo`
+`qwen3_encoder`, `qwen25vl_encoder`, and `gemma3_ltx_streamed` (the
+layer-streamed Gemma-3-12B FP8 LTX2 conditioner).
+`serenity_trainer_conditioning_contract.mojo`
 is the no-CUDA SerenityTrainer conditioning/cache-readiness map for the target image
 models: tokenizer lengths, prompt/chat mode, mask/crop mode, hidden/pooled dims,
 cache-field names, runtime text/img ids, and dtype-boundary policy. Parity under
@@ -442,13 +445,15 @@ cache-field names, runtime text/img ids, and dtype-boundary policy. Parity under
 
 ### `models/vae/` — encode/decode
 `zimage_decoder`, `klein_decoder`, `ldm_decoder`, `conv3d`, `wan22_decoder`,
-`qwenimage_decoder`, `ltx2_*`, `vae_ops`, `upsample`, `decoder2d`. These are
+`qwenimage_decoder`, `ltx2_*`, `seedvr2_vae`, `vae_ops`, `upsample`,
+`decoder2d`. These are
 the forwards whose `conv2d`/`pool`/`upsample` backward partners live in
 `ops/conv2d_backward.mojo` + `ops/pool_backward.mojo`. Status: **INFERENCE**.
 
 ### Other inference subtrees
 `models/pid/`, `models/lens/`, `models/lance/`, `models/upsampler/`,
-`models/vocoder/`; plus `pipeline/` (end-to-end inference smokes),
+`models/vocoder/`, `models/realesrgan/` (RRDBNet x4plus and compact SRVGG
+x4v3 forwards); plus `pipeline/` (end-to-end inference smokes),
 `sampling/` (schedulers/flow-match samplers), `tokenizer/`, `offload/`
 (block-streaming loaders for 24 GB fit), `runtime/`, `registry/`,
 `components/`, `image/`. All **INFERENCE** — the training run borrows the
@@ -465,28 +470,40 @@ tensor algebra.
 `serenity.genparams.v1` video requests. It preserves the exact authored JSON,
 checks conditioning sidecar prompt identity, resolves an arbitrary LoRA list
 under the shared model root, carries the request's `model_quant`, and dispatches
-only exact compiled profiles through
-`pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The admitted `int4` path
-loads the resident 48-block SVD-int4 slab and streams factorized LoRA A/B
-matrices per block; it does not allocate dense LoRA deltas. The pipeline publishes
-atomic `status.json` phase/step snapshots plus `result.json` with the MP4 path,
-executed geometry/schedule, timings, frame count/duration, dtype contract, and
-sampled peak VRAM. It accepts the exact Creator fast-distilled route
-(`guidance_mode=distilled`, Euler, `ltx2_distilled`, 8 stage-1 evaluations)
-or the bounded dev CFG-star route (`res2s`, `ltx2`, 1-20 steps); invalid mixtures
-fail before loading the model. Current readiness is experimental: the 2026-07-23
-real Canvas gate `video-0409` produced a visually inspected 512x768, 121-frame,
-25 FPS step-3000-LoRA movie in 52.36 seconds (41.06 denoise, 7.42 decode).
-Nsight Systems identified fresh-process cuDNN Conv3d FindEx as 18.6 seconds of
-avoidable decode startup. `ops/cudnn_conv3d.mojo` and
-`ops/cshim/cudnn_conv3d.cpp` now use the non-executing cuDNN v7 heuristic with
-a bounded reusable workspace. LTX2 enables this route for its latent upsampler
-and video decoder while non-LTX Conv3d consumers retain their proven SDK path.
-Isolated cold HQ121 decode fell from 25.95 to 7.32 seconds, while the final
-latent, RGB stream, and MP4 hashes stayed exactly unchanged. Factorized LoRA
-streaming remains the next measured denoise target;
-audio acceptance remains a separate gate. Build the production request runner
-with the memory-safe `pixi run build-ltx2-request` task (`-O2 -j 1`).
+only profiles listed in `configs/ltx2_request_profiles.json` through
+`pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The registry currently
+admits 21 exact width/height/frame-count/FPS runners from 512x768/121f@25
+through 960x544/481f@24 and 1920x1088/121f@24. Unsupported tuples fail before
+model load; the UI must select from the published registry rather than round
+or substitute dimensions.
+
+When manual conditioning sidecars are blank,
+`pipeline/ltx2_encode_prompt.mojo` tokenizes both prompts and runs the streamed
+`models/text_encoder/gemma3_ltx_streamed.mojo` encoder once per layer pair. It
+writes the six prompt-matched pre-connector tensors and reports tokenization,
+all 48 Gemma layers, projections, and save progress to the server. The server
+caches those tensors by prompt pair and conditioner digest. Exact tokenizer
+IDs passed and real context cosine measured 0.99923-0.99973; the optimized
+reference prompt completed in 17.19 seconds without Python in the product path.
+
+The admitted `int4` route keeps the 48-block SVD-int4 base slab resident and
+streams factorized LoRA A/B matrices per block without allocating dense
+deltas. Atomic `status.json` and `result.json` publish the executed
+geometry/schedule, timings, frame count/duration, dtype contract, and sampled
+peak VRAM. Creator fast-distilled requests use Euler plus `ltx2_distilled`
+with eight stage-1 evaluations; bounded dev requests use `res2s` plus `ltx2`
+for 1-20 steps.
+
+Long and high-resolution decode uses the Desktop tiled VAE contract and streams
+completed PNG chunks instead of retaining the whole movie tensor. The
+960x544/481f product gate produced a coherent 20.041667-second H.264 video and
+an exact 48 kHz stereo A/V mux, but its 19,621 MiB peak is not accepted on a
+16 GB RTX 5080. `sampling/realesrgan_x4_cli.mojo` exposes the separately
+admitted 2x/4x post-upscale request: RRDB x4plus is functional but
+experimental-slow, while SRVGG x4v3 and the imported SeedVR2 source remain
+disabled when their local weights or complete user-video route are absent.
+Build the production request matrix with
+`pixi run bash scripts/build_ltx2_request_profiles.sh`.
 
 ---
 

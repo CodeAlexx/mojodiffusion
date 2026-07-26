@@ -70,6 +70,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
+from serenitymojo.ops.torch_bf16 import torch_bf16_eager_blend_with_f32_mask
 from serenitymojo.ops.tensor_algebra import add, sub, mul, mul_scalar
 from serenitymojo.sampling.ltx2_sampling import (
     res2s_coefficients,
@@ -88,8 +89,17 @@ def res2s_post_process_latent(
 ) raises -> Tensor:
     """denoised*mask + clean*(1-mask). Identity for the T2V all-ones mask.
 
-    clean*(1-mask) is expanded to clean - clean*mask (algebraically identical)
-    to stay on the existing elementwise op surface."""
+    The official mask is F32 even when latent storage is BF16. Preserve that
+    dtype boundary and the creator's eager F32 arithmetic for the I2V/V2V path.
+    The same-dtype branch remains for older parity fixtures."""
+    if (
+        denoised.dtype() == STDtype.BF16
+        and clean.dtype() == STDtype.BF16
+        and denoise_mask.dtype() == STDtype.F32
+    ):
+        return torch_bf16_eager_blend_with_f32_mask(
+            denoised, clean, denoise_mask, ctx
+        )
     var dm = mul(denoised, denoise_mask, ctx)
     var cm = sub(clean, mul(clean, denoise_mask, ctx), ctx)
     return add(dm, cm, ctx)

@@ -75,6 +75,8 @@ var CanvasTab = (function () {
         noiseFixture: '',
         includeAudio: false,
         ltx2Mode: 'distilled',
+        ltx2ProfileKey: '',
+        ltx2SourceStrength: 0.7,
         editMode: 'create',
         editEngine: 'krea2_raw_1024',
         editModelEngine: 'klein9b',
@@ -539,6 +541,7 @@ var CanvasTab = (function () {
     var availableCanvasLoras = [];
     var canvasLoras = [];
     var canvasCapabilities = null;
+    var canvasVideoStatus = null;
     var samAvailable = false;
     var GALLERY_BOARD_KEY = 'serenity-canvas-gallery-boards-v1';
     var galleryBoards = ['Uncategorized'];
@@ -1309,11 +1312,19 @@ var CanvasTab = (function () {
             '<div id="cv-duration-hint" class="cv-duration-hint"></div>' +
             '<div id="cv-ltx2-section" class="cv-ltx2-section" style="display:none">' +
             '<div class="cv-section-title" style="margin-top:8px">LTX2 Mojo request</div>' +
+            '<label class="cv-setting-label" for="cv-ltx2-profile">Native video profile</label>' +
+            '<select id="cv-ltx2-profile" class="cv-select"><option value="">Loading supported profiles...</option></select>' +
+            '<div id="cv-ltx2-profile-note" class="cv-helper-text">Resolution, frame count, and FPS are selected together so the request always matches an available Mojo runner.</div>' +
             '<div class="cv-setting-row"><span class="cv-setting-label">Guidance</span>' +
             '<select id="cv-ltx2-mode" class="cv-select">' +
             '<option value="distilled">Fast distilled (single pass)</option>' +
             '<option value="dev">Dev CFG-star (quality, 3 pass)</option>' +
             '</select></div>' +
+            '<div id="cv-ltx2-source-strength-row" class="cv-setting-row">' +
+            '<span class="cv-setting-label">Source strength</span>' +
+            '<input type="range" id="cv-ltx2-source-strength" class="cv-range" min="0" max="1" step="0.01" value="0.70">' +
+            '<span id="cv-ltx2-source-strength-val" class="cv-setting-value">0.70</span></div>' +
+            '<div class="cv-helper-text">Used when a source image or video is loaded. Higher values preserve more of the source.</div>' +
             '<label class="cv-setting-label cv-path-label" for="cv-caps-positive">Conditioning</label>' +
             '<input id="cv-caps-positive" class="cv-path-input" type="text" placeholder="Server path to prompt-matched conditioning JSON or safetensors">' +
             '<label class="cv-setting-label cv-path-label" for="cv-caps-negative">Negative conditioning</label>' +
@@ -1420,7 +1431,11 @@ var CanvasTab = (function () {
         els.fpsRange = document.getElementById('cv-fps-range');
         els.durationHint = document.getElementById('cv-duration-hint');
         els.ltx2Section = document.getElementById('cv-ltx2-section');
+        els.ltx2Profile = document.getElementById('cv-ltx2-profile');
+        els.ltx2ProfileNote = document.getElementById('cv-ltx2-profile-note');
         els.ltx2Mode = document.getElementById('cv-ltx2-mode');
+        els.ltx2SourceStrength = document.getElementById('cv-ltx2-source-strength');
+        els.ltx2SourceStrengthVal = document.getElementById('cv-ltx2-source-strength-val');
         els.advancedGenerationSettings = document.getElementById('cv-advanced-generation-settings');
         els.capsPositive = document.getElementById('cv-caps-positive');
         els.capsNegative = document.getElementById('cv-caps-negative');
@@ -1828,11 +1843,13 @@ var CanvasTab = (function () {
         container.addEventListener('drop', function (e) {
             e.preventDefault();
             var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-            if (!file || !file.type.startsWith('image/'))
+            if (!file)
                 return;
-            if (genState.editMode === 'create')
+            if (file.type.startsWith('video/') && genState.arch === 'ltxv')
+                loadEditSourceFile(file);
+            else if (file.type.startsWith('image/') && genState.editMode === 'create')
                 loadImageFile(file);
-            else
+            else if (file.type.startsWith('image/') || file.type.startsWith('video/'))
                 loadEditSourceFile(file);
         });
         // Right-click context menu
@@ -1844,7 +1861,22 @@ var CanvasTab = (function () {
         });
     }
     // ── Image loading ──
+    function setLtx2SourceStrength(value) {
+        genState.ltx2SourceStrength = Math.max(0, Math.min(1, Number(value)));
+        if (els.ltx2SourceStrength)
+            els.ltx2SourceStrength.value = String(genState.ltx2SourceStrength);
+        if (els.ltx2SourceStrengthVal)
+            els.ltx2SourceStrengthVal.textContent = genState.ltx2SourceStrength.toFixed(2);
+    }
     function loadImageFile(file) {
+        if (file && file.type.startsWith('video/')) {
+            loadEditSourceFile(file);
+            return;
+        }
+        if (!file || !file.type.startsWith('image/')) {
+            showError('Choose an image file');
+            return;
+        }
         var reader = new FileReader();
         reader.onload = function (ev) {
             editSourceFile = file;
@@ -1863,6 +1895,8 @@ var CanvasTab = (function () {
                 els.sourcePreview.src = editSourceDataUrl;
                 els.sourcePreview.style.display = 'block';
             }
+            if (genState.arch === 'ltxv')
+                setLtx2SourceStrength(1.0);
             addImageDataUrlToCanvas(editSourceDataUrl);
         };
         reader.readAsDataURL(file);
@@ -1898,7 +1932,9 @@ var CanvasTab = (function () {
         if (!file)
             return;
         var isVideo = file.type.startsWith('video/');
-        if (isVideo && genState.editMode !== 'dynaedit') {
+        var ltx2VideoSource = isVideo && genState.arch === 'ltxv' &&
+            genState.editMode === 'create';
+        if (isVideo && genState.editMode !== 'dynaedit' && !ltx2VideoSource) {
             showError('Image edit and inpaint require an image source');
             return;
         }
@@ -1915,12 +1951,16 @@ var CanvasTab = (function () {
             els.editSourcePrompt.value = '';
             els.sourceEmpty.style.display = 'none';
             if (isVideo) {
+                if (genState.arch === 'ltxv')
+                    setLtx2SourceStrength(0.7);
                 els.sourcePreview.removeAttribute('src');
                 els.sourcePreview.style.display = 'none';
                 els.sourceVideo.src = editSourceDataUrl;
                 els.sourceVideo.style.display = 'block';
             }
             else {
+                if (genState.arch === 'ltxv')
+                    setLtx2SourceStrength(1.0);
                 prefer1024FlowEditForNewImage();
                 els.sourceVideo.removeAttribute('src');
                 els.sourceVideo.style.display = 'none';
@@ -2090,10 +2130,11 @@ var CanvasTab = (function () {
         var flowEditing = mode === 'flowedit' || mode === 'style';
         var nativeModelEditing = mode === 'edit_models';
         var engineDrivenEditing = flowEditing || nativeModelEditing || mode === 'inpaint';
+        var ltx2SourceMode = mode === 'create' && genState.arch === 'ltxv';
         var maskedEditEngine = maskedEditEngineDefinition(genState.lanpaintEngine);
-        els.editWorkspace.classList.toggle('edit-active', editing);
+        els.editWorkspace.classList.toggle('edit-active', editing || ltx2SourceMode);
         els.editWorkspace.classList.toggle('style-active', mode === 'style');
-        els.sourcePane.style.display = editing ? 'flex' : 'none';
+        els.sourcePane.style.display = (editing || ltx2SourceMode) ? 'flex' : 'none';
         els.flowEditSection.style.display = (mode === 'flowedit' || mode === 'style') ? 'block' : 'none';
         els.editModelSection.style.display = nativeModelEditing ? 'block' : 'none';
         els.lanpaintSection.style.display = mode === 'inpaint' ? 'block' : 'none';
@@ -2112,9 +2153,16 @@ var CanvasTab = (function () {
         });
         els.editRuntimeNote.style.display = 'none';
         els.resultPaneTitle.textContent = mode === 'inpaint' ? 'Result + mask' :
-            ((mode === 'style' || nativeModelEditing) ? 'Result · 1024 × 1024' : (editing ? 'Result' : 'Canvas'));
-        els.importBtn.textContent = editing ? (mode === 'dynaedit' ? 'Load source video' : 'Load source image') : 'Import Image';
-        els.importFile.accept = mode === 'dynaedit' ? 'video/*' : 'image/*';
+            ((mode === 'style' || nativeModelEditing) ? 'Result · 1024 × 1024' :
+                ((editing || ltx2SourceMode) ? 'Result' : 'Canvas'));
+        els.importBtn.textContent = ltx2SourceMode ? 'Load source image / video' :
+            (editing ? (mode === 'dynaedit' ? 'Load source video' : 'Load source image') : 'Import Image');
+        els.importFile.accept = ltx2SourceMode ? 'image/*,video/*' :
+            (mode === 'dynaedit' ? 'video/*' : 'image/*');
+        if (els.sourceEmpty && ltx2SourceMode)
+            els.sourceEmpty.innerHTML = 'Drop an image or video here<br><small>or choose it from the file manager</small>';
+        else if (els.sourceEmpty)
+            els.sourceEmpty.innerHTML = 'Drop an image here<br><small>or choose it from the file manager</small>';
         if (mode !== 'style')
             styleModeInitialized = false;
         if (mode === 'flowedit') {
@@ -2889,11 +2937,14 @@ var CanvasTab = (function () {
         // Bbox only interactive in select mode — other tools need to click through it
         if (boundingBox) {
             var bboxInteractive = tool === 'select';
+            var resizeInteractive = bboxInteractive &&
+                !(genState.arch === 'ltxv' && activeCanvasLtx2Profiles().length > 0);
             boundingBox.draggable(bboxInteractive);
             boundingBox.listening(bboxInteractive);
             resizeHandles.forEach(function (h) {
-                h.draggable(bboxInteractive);
-                h.listening(bboxInteractive);
+                h.draggable(resizeInteractive);
+                h.listening(resizeInteractive);
+                h.opacity(resizeInteractive ? 1 : 0.45);
             });
         }
         if (tool === 'move')
@@ -3426,7 +3477,21 @@ var CanvasTab = (function () {
         els.capsNegative.addEventListener('input', function () { genState.capsNegative = this.value.trim(); });
         els.noiseFixture.addEventListener('input', function () { genState.noiseFixture = this.value.trim(); });
         els.includeAudio.addEventListener('change', function () { genState.includeAudio = this.checked; });
-        els.ltx2Mode.addEventListener('change', function () { genState.ltx2Mode = this.value; });
+        els.ltx2Profile.addEventListener('change', function () {
+            var key = this.value;
+            var profile = activeCanvasLtx2Profiles().find(function (candidate) {
+                return canvasLtx2ProfileKey(candidate) === key;
+            });
+            applyCanvasLtx2Profile(profile);
+        });
+        els.ltx2Mode.addEventListener('change', function () {
+            genState.ltx2Mode = this.value;
+            applyCanvasLtx2GuidanceMode();
+        });
+        els.ltx2SourceStrength.addEventListener('input', function () {
+            genState.ltx2SourceStrength = Math.max(0, Math.min(1, Number(this.value)));
+            els.ltx2SourceStrengthVal.textContent = genState.ltx2SourceStrength.toFixed(2);
+        });
         els.loraAdd.addEventListener('click', addCanvasLora);
         els.loadLtx2Template.addEventListener('click', loadLtx2TemplateProfile);
         els.seed.addEventListener('input', function () {
@@ -3766,6 +3831,11 @@ var CanvasTab = (function () {
         }
         if (bboxReset) {
             bboxReset.addEventListener('click', function () {
+                if (genState.arch === 'ltxv' && activeCanvasLtx2Profiles().length > 0) {
+                    applyCanvasLtx2Profile(preferredCanvasLtx2Profile());
+                    History.push();
+                    return;
+                }
                 var container = document.getElementById('canvas-stage-container');
                 if (!container)
                     return;
@@ -4050,7 +4120,8 @@ var CanvasTab = (function () {
             model: genState.model, arch: genState.arch, frames: genState.frames, fps: genState.fps,
             capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
             noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
-            ltx2Mode: genState.ltx2Mode,
+            ltx2Mode: genState.ltx2Mode, ltx2ProfileKey: genState.ltx2ProfileKey,
+            ltx2SourceStrength: genState.ltx2SourceStrength,
             editMode: genState.editMode, editEngine: genState.editEngine,
             editModelEngine: genState.editModelEngine,
             styleEntireImage: genState.styleEntireImage,
@@ -4157,6 +4228,10 @@ var CanvasTab = (function () {
                 genState.noiseFixture = state.genSettings.noiseFixture || '';
                 genState.includeAudio = state.genSettings.includeAudio === true;
                 genState.ltx2Mode = state.genSettings.ltx2Mode || 'distilled';
+                genState.ltx2ProfileKey = state.genSettings.ltx2ProfileKey || '';
+                genState.ltx2SourceStrength = Number.isFinite(Number(state.genSettings.ltx2SourceStrength)) ?
+                    Math.max(0, Math.min(1, Number(state.genSettings.ltx2SourceStrength))) :
+                    genState.ltx2SourceStrength;
                 genState.editMode = state.genSettings.editMode || genState.editMode;
                 genState.editEngine = state.genSettings.editEngine || genState.editEngine;
                 genState.editModelEngine = state.genSettings.editModelEngine || genState.editModelEngine;
@@ -4217,6 +4292,7 @@ var CanvasTab = (function () {
                     els.includeAudio.checked = genState.includeAudio;
                 if (els.ltx2Mode)
                     els.ltx2Mode.value = genState.ltx2Mode;
+                setLtx2SourceStrength(genState.ltx2SourceStrength);
                 if (els.styleEntireImage)
                     els.styleEntireImage.checked = genState.styleEntireImage;
                 if (els.editMode)
@@ -4350,7 +4426,7 @@ var CanvasTab = (function () {
             els.capabilityNote.style.display = 'block';
         }
         else if (genState.arch === 'ltxv') {
-            els.capabilityNote.textContent = 'Mojo text-to-video request profile; Canvas pixels are not consumed.';
+            els.capabilityNote.textContent = 'Mojo T2V/I2V/V2V request profile. Leave the source and Canvas empty for text-to-video, load an image to condition frame 0, or load a video to preserve its motion through full-video conditioning.';
             els.capabilityNote.style.display = 'block';
         }
         else {
@@ -4377,24 +4453,24 @@ var CanvasTab = (function () {
         if (controlItem) {
             var controlSupported = genState.arch !== 'ltxv' && canvasFeature('controlnet').supported;
             controlItem.classList.toggle('capability-unavailable', !controlSupported);
-            controlItem.title = controlSupported ? '' : (genState.arch === 'ltxv' ? 'LTX2 request runner is text-to-video only' : canvasFeatureReason('controlnet'));
+            controlItem.title = controlSupported ? '' : (genState.arch === 'ltxv' ? 'LTX2 I2V admits one frame-zero guide image; ControlNet is not admitted' : canvasFeatureReason('controlnet'));
         }
         var maskItem = document.querySelector('.cv-layer-type-item[data-type="mask"]');
         if (maskItem) {
             var inpaintSupported = genState.arch !== 'ltxv' && canvasFeature('inpaint').supported;
             maskItem.classList.toggle('capability-unavailable', !inpaintSupported);
-            maskItem.title = inpaintSupported ? '' : (genState.arch === 'ltxv' ? 'LTX2 request runner is text-to-video only' : canvasFeatureReason('inpaint'));
+            maskItem.title = inpaintSupported ? '' : (genState.arch === 'ltxv' ? 'LTX2 I2V does not admit a painted mask' : canvasFeatureReason('inpaint'));
         }
         if (typeof CanvasRefImages !== 'undefined' && CanvasRefImages.setCompatibility) {
             var refsSupported = genState.editMode === 'style' ||
                 (genState.arch !== 'ltxv' && canvasFeature('image_conditioning').supported);
             CanvasRefImages.setCompatibility(refsSupported, genState.editMode === 'style' ? '' :
-                (genState.arch === 'ltxv' ? 'LTX2 request runner is text-to-video only' : canvasFeatureReason('image_conditioning')));
+                (genState.arch === 'ltxv' ? 'Use the selected Canvas image as the LTX2 frame-zero guide' : canvasFeatureReason('image_conditioning')));
         }
     }
     function validateCanvasGenerationFeatures(hasContent, hasMask) {
         if (genState.arch === 'ltxv')
-            return hasContent ? 'The selected video runner is text-to-video only; clear the Canvas bounding box before generating' : '';
+            return hasMask ? 'LTX2 source conditioning does not admit a painted mask' : '';
         var loras = enabledCanvasLoras();
         if (loras.length > 0 && !canvasFeature('lora').supported)
             return canvasFeatureReason('lora');
@@ -4624,6 +4700,14 @@ var CanvasTab = (function () {
                 updateBboxInputs();
                 stage.batchDraw();
             }
+            var templateProfile = activeCanvasLtx2Profiles().find(function (profile) {
+                return Number(profile.width) === Number(samplerValues.width) &&
+                    Number(profile.height) === Number(samplerValues.height) &&
+                    Number(profile.frames) === Number(samplerValues.num_frames) &&
+                    Number(profile.fps) === Number(samplerValues.frame_rate);
+            });
+            if (templateProfile)
+                applyCanvasLtx2Profile(templateProfile);
             updateCanvasDurationHint();
             renderCanvasLoras();
         }).catch(function (error) {
@@ -4632,11 +4716,205 @@ var CanvasTab = (function () {
             els.loadLtx2Template.disabled = false;
         });
     }
+    function activeCanvasLtx2RequestMode() {
+        var candidates = canvasVideoStatus && canvasVideoStatus.candidate_runners;
+        if (!Array.isArray(candidates))
+            return null;
+        var runner = candidates.find(function (entry) {
+            return entry && entry.model === 'ltx2_t2v_av';
+        });
+        return runner && runner.modes && runner.modes.ltx2_mojo_request || null;
+    }
+    function activeCanvasLtx2Profiles() {
+        var mode = activeCanvasLtx2RequestMode();
+        var profiles = mode && Array.isArray(mode.supported_profiles)
+            ? mode.supported_profiles : [];
+        return profiles.filter(function (profile) {
+            return profile && profile.available === true;
+        });
+    }
+    function canvasLtx2ProfileKey(profile) {
+        if (!profile)
+            return '';
+        return [
+            Number(profile.width) + 'x' + Number(profile.height),
+            Number(profile.frames) + 'f',
+            Number(profile.fps) + 'fps'
+        ].join('_');
+    }
+    function exactCanvasLtx2Profile() {
+        if (!boundingBox)
+            return null;
+        var width = Math.round(boundingBox.width());
+        var height = Math.round(boundingBox.height());
+        return activeCanvasLtx2Profiles().find(function (profile) {
+            return Number(profile.width) === width &&
+                Number(profile.height) === height &&
+                Number(profile.frames) === Number(genState.frames) &&
+                Number(profile.fps) === Number(genState.fps);
+        }) || null;
+    }
+    function preferredCanvasLtx2Profile() {
+        var profiles = activeCanvasLtx2Profiles();
+        if (!profiles.length)
+            return null;
+        var exact = exactCanvasLtx2Profile();
+        if (exact)
+            return exact;
+        var selected = profiles.find(function (profile) {
+            return canvasLtx2ProfileKey(profile) === genState.ltx2ProfileKey;
+        });
+        if (selected)
+            return selected;
+        var mode = activeCanvasLtx2RequestMode();
+        var compiled = mode && mode.compiled_profile;
+        var compiledProfile = compiled && profiles.find(function (profile) {
+            return canvasLtx2ProfileKey(profile) === canvasLtx2ProfileKey(compiled);
+        });
+        if (compiledProfile)
+            return compiledProfile;
+        var currentWidth = boundingBox ? Math.max(1, boundingBox.width()) : 512;
+        var currentHeight = boundingBox ? Math.max(1, boundingBox.height()) : 768;
+        var currentRatio = currentWidth / currentHeight;
+        var currentArea = currentWidth * currentHeight;
+        return profiles.slice().sort(function (left, right) {
+            function score(profile) {
+                var ratio = Number(profile.width) / Number(profile.height);
+                var area = Number(profile.width) * Number(profile.height);
+                return Math.abs(Math.log(ratio / currentRatio)) * 3 +
+                    Math.abs(Math.log(area / currentArea)) * 0.25 +
+                    Math.abs(Number(profile.frames) - Number(genState.frames)) / 1000;
+            }
+            return score(left) - score(right);
+        })[0];
+    }
+    function setCanvasLtx2GeometryLocked(locked) {
+        var bboxW = document.getElementById('cv-bbox-w');
+        var bboxH = document.getElementById('cv-bbox-h');
+        var reason = 'LTX2 dimensions are selected with Native video profile so width, height, frames, and FPS stay on one compiled Mojo runner.';
+        [bboxW, bboxH].forEach(function (control) {
+            if (!control)
+                return;
+            control.disabled = locked;
+            control.title = locked ? reason : '';
+        });
+        resizeHandles.forEach(function (handle) {
+            var interactive = activeTool === 'select' && !locked;
+            handle.draggable(interactive);
+            handle.listening(interactive);
+            handle.opacity(locked ? 0.45 : 1);
+        });
+    }
+    function applyCanvasLtx2Profile(profile) {
+        if (!profile)
+            return false;
+        var width = Number(profile.width);
+        var height = Number(profile.height);
+        genState.frames = Number(profile.frames);
+        genState.fps = Number(profile.fps);
+        genState.ltx2ProfileKey = canvasLtx2ProfileKey(profile);
+        if (boundingBox) {
+            var centerX = boundingBox.x() + boundingBox.width() / 2;
+            var centerY = boundingBox.y() + boundingBox.height() / 2;
+            boundingBox.width(width);
+            boundingBox.height(height);
+            boundingBox.x(centerX - width / 2);
+            boundingBox.y(centerY - height / 2);
+            updateHandles();
+            updateSizeLabel();
+            updateBboxInputs();
+            if (stage)
+                stage.batchDraw();
+        }
+        if (els.framesInput)
+            els.framesInput.value = String(genState.frames);
+        if (els.framesRange)
+            els.framesRange.value = String(genState.frames);
+        if (els.fpsInput)
+            els.fpsInput.value = String(genState.fps);
+        if (els.fpsRange)
+            els.fpsRange.value = String(genState.fps);
+        if (els.ltx2Profile)
+            els.ltx2Profile.value = genState.ltx2ProfileKey;
+        if (els.ltx2ProfileNote) {
+            var duration = Number(profile.duration);
+            if (!Number.isFinite(duration) || duration <= 0)
+                duration = genState.frames / genState.fps;
+            els.ltx2ProfileNote.textContent =
+                width + '\u00d7' + height + ' \u00b7 ' + genState.frames +
+                ' frames \u00b7 ' + genState.fps + ' FPS \u00b7 ' +
+                Number(duration.toFixed(2)) + 's \u00b7 exact Mojo runner';
+        }
+        updateCanvasDurationHint();
+        return true;
+    }
+    function refreshCanvasLtx2ProfileControls() {
+        if (!els.ltx2Profile)
+            return;
+        var profiles = activeCanvasLtx2Profiles();
+        els.ltx2Profile.innerHTML = '';
+        if (!profiles.length) {
+            var unavailable = document.createElement('option');
+            unavailable.value = '';
+            unavailable.textContent = 'No compiled LTX2 profiles available';
+            els.ltx2Profile.appendChild(unavailable);
+            els.ltx2Profile.disabled = true;
+            if (els.ltx2ProfileNote)
+                els.ltx2ProfileNote.textContent = 'No executable native LTX2 profile runner was reported by the server.';
+            setCanvasLtx2GeometryLocked(false);
+            return;
+        }
+        profiles.forEach(function (profile) {
+            var option = document.createElement('option');
+            option.value = canvasLtx2ProfileKey(profile);
+            option.textContent = String(profile.label || 'LTX2') + ' \u00b7 ' +
+                profile.width + '\u00d7' + profile.height + ' \u00b7 ' +
+                profile.frames + 'f @ ' + profile.fps + ' FPS \u00b7 ' +
+                Number(profile.duration) + 's';
+            els.ltx2Profile.appendChild(option);
+        });
+        els.ltx2Profile.disabled = false;
+        applyCanvasLtx2Profile(preferredCanvasLtx2Profile());
+        setCanvasLtx2GeometryLocked(true);
+        [els.framesInput, els.framesRange, els.fpsInput, els.fpsRange].forEach(function (control) {
+            if (!control)
+                return;
+            control.disabled = true;
+            control.title = 'Choose a Native video profile to change resolution, duration, frame count, or FPS.';
+        });
+    }
+    function applyCanvasLtx2GuidanceMode() {
+        var mode = activeCanvasLtx2RequestMode();
+        var modes = mode && mode.guidance_modes || {};
+        var config = modes[genState.ltx2Mode] || {};
+        if (genState.ltx2Mode === 'distilled') {
+            genState.steps = Number(config.steps) || 8;
+            genState.sampler = String(config.sampler || 'euler');
+            genState.scheduler = String(config.scheduler || 'ltx2_distilled');
+        }
+        else {
+            genState.steps = Number(config.default_steps) || 15;
+            genState.sampler = String(config.sampler || 'res2s');
+            genState.scheduler = String(config.scheduler || 'ltx2');
+        }
+        els.steps.value = String(genState.steps);
+        els.stepsRange.value = String(genState.steps);
+        els.sampler.value = genState.sampler;
+        els.scheduler.value = genState.scheduler;
+    }
     function loadModels() {
-        Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities()])
+        var videoReadiness = fetch('/v1/video', { cache: 'no-store' })
+            .then(function (response) {
+                if (!response.ok)
+                    throw new Error('video readiness HTTP ' + response.status);
+                return response.json();
+            })
+            .catch(function () { return null; });
+        Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities(), videoReadiness])
             .then(function (loaded) {
             var models = loaded[0];
             canvasCapabilities = loaded[1];
+            canvasVideoStatus = loaded[2];
             models = models.filter(function (model) {
                 return ModelUtils.detectArchFromFilename(model.name) !== 'scail2';
             });
@@ -4705,13 +4983,22 @@ var CanvasTab = (function () {
             setCanvasSelectOptions(els.sampler, [
                 { value: 'res2s', label: 'Res2S' },
                 { value: 'euler', label: 'Euler (fast distilled)' }
-            ], 'res2s');
+            ], genState.ltx2Mode === 'distilled' ? 'euler' : 'res2s');
             setCanvasSelectOptions(els.scheduler, [
                 { value: 'ltx2', label: 'LTX2' },
                 { value: 'ltx2_distilled', label: 'LTX2 Distilled (8 steps)' }
-            ], 'ltx2');
+            ], genState.ltx2Mode === 'distilled' ? 'ltx2_distilled' : 'ltx2');
+            refreshCanvasLtx2ProfileControls();
+            applyCanvasLtx2GuidanceMode();
         }
         else {
+            setCanvasLtx2GeometryLocked(false);
+            [els.framesInput, els.framesRange, els.fpsInput, els.fpsRange].forEach(function (control) {
+                if (!control)
+                    return;
+                control.disabled = false;
+                control.title = '';
+            });
             setCanvasSelectOptions(els.sampler, [
                 { value: 'euler', label: 'Euler' },
                 { value: 'euler_ancestral', label: 'Euler Ancestral' },
@@ -4743,6 +5030,7 @@ var CanvasTab = (function () {
             updateCanvasDurationHint();
         renderCanvasLoras();
         updateCanvasCapabilityUI();
+        updateEditWorkspace();
     }
     function setCanvasSelectOptions(select, options, fallback) {
         var prior = select.value;
@@ -4917,11 +5205,11 @@ var CanvasTab = (function () {
             showError('Enter a prompt');
             return;
         }
-        if (genState.arch === 'ltxv' && !genState.capsPositive) {
-            showError('LTX2 requires a prompt-matched conditioning artifact path');
-            return;
-        }
         if (genState.arch === 'ltxv') {
+            if (!exactCanvasLtx2Profile()) {
+                showError('Choose a supported Native video profile. LTX2 resolution, frame count, and FPS must match one available compiled Mojo runner.');
+                return;
+            }
             var validLtx2Sampler = genState.ltx2Mode === 'distilled'
                 ? genState.sampler === 'euler' && genState.scheduler === 'ltx2_distilled' && genState.steps === 8
                 : genState.sampler === 'res2s' && genState.scheduler === 'ltx2' && genState.steps >= 1 && genState.steps <= 20;
@@ -4934,6 +5222,8 @@ var CanvasTab = (function () {
         }
         setCanvasGenerating(true);
         var isVideo = isVideoArch();
+        var hasLtx2VideoSource = genState.arch === 'ltxv' &&
+            editSourceIsVideo && !!editSourceFile;
         var maskedEditEngine = genState.editMode === 'inpaint' ? maskedEditEngineDefinition(genState.lanpaintEngine) : null;
         checkBboxContent().then(function (hasContent) {
             var maskLayerInfo = getMaskLayer();
@@ -4956,7 +5246,8 @@ var CanvasTab = (function () {
             // Create/canvas is text-to-image. Existing result layers are output
             // placement context, not an implicit img2img request. Explicit
             // source-consuming modes (FlowEdit/style/inpaint) own editing.
-            var consumesCanvasSource = genState.editMode === 'inpaint';
+            var consumesCanvasSource = genState.editMode === 'inpaint' ||
+                (genState.arch === 'ltxv' && (hasContent || hasLtx2VideoSource));
             var featureError = validateCanvasGenerationFeatures(
                 consumesCanvasSource && hasContent,
                 consumesCanvasSource && hasMask
@@ -5019,7 +5310,29 @@ var CanvasTab = (function () {
                 } : null,
                 submittedAt: new Date().toISOString()
             };
-            if (genState.editMode === 'create' || !hasContent) {
+            var ltx2V2V = genState.arch === 'ltxv' && isVideo && hasLtx2VideoSource;
+            var ltx2I2V = genState.arch === 'ltxv' && isVideo && hasContent && !ltx2V2V;
+            if (ltx2V2V) {
+                SerenityAPI.uploadMedia(editSourceFile).then(function (videoName) {
+                    queueWorkflow(WorkflowBuilder.build({
+                        model: genState.model || '', prompt: genState.prompt,
+                        initVideoName: videoName,
+                        videoStrength: genState.ltx2SourceStrength,
+                        width: bw, height: bh,
+                        steps: genState.steps, cfg: genState.cfg,
+                        guidance: genState.guidance, seed: seed,
+                        negPrompt: genState.negative, sampler: genState.sampler, scheduler: genState.scheduler, batch: genState.batch,
+                        frames: genState.frames, fps: genState.fps, loras: activeLoras,
+                        capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
+                        noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                        ltx2Mode: genState.ltx2Mode
+                    }));
+                }).catch(function (err) {
+                    showError('Video source upload failed: ' + err.message);
+                    setCanvasGenerating(false);
+                });
+            }
+            else if ((genState.editMode === 'create' && !ltx2I2V) || !hasContent) {
                 queueWorkflow(WorkflowBuilder.build({
                     model: genState.model || '', prompt: genState.prompt,
                     width: bw, height: bh,
@@ -5039,6 +5352,7 @@ var CanvasTab = (function () {
                     queueWorkflow(WorkflowBuilder.build({
                         model: genState.model || '', prompt: genState.prompt,
                         initImageName: imageName,
+                        imageStrength: genState.ltx2SourceStrength,
                         width: bw, height: bh,
                         steps: genState.steps, cfg: genState.cfg,
                         guidance: genState.guidance, seed: seed,

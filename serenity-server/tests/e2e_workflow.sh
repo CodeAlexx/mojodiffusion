@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e_workflow.sh — end-to-end harness for the SERVER-INTEGRATION seam: the Rust
-# control plane lowering a full Comfy/Swarm `workflow` graph before dispatching to
+# control plane lowering a full Comfy/Reference `workflow` graph before dispatching to
 # the UNCHANGED Mojo `output/bin/serenity_worker_stub` (ZERO GPU).
 #
 # This proves the POST /v1/generate handler's NEW behavior: when the request body

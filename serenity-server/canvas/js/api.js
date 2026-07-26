@@ -69,7 +69,7 @@ var SerenityAPI = (function () {
                     modelRef = modelInputs.model;
                 }
                 loras.reverse();
-                return {
+                var request = {
                     model: 'ltx2',
                     runner: 'ltx2_mojo_request',
                     checkpoint: ltxCheckpoint,
@@ -93,6 +93,33 @@ var SerenityAPI = (function () {
                     noise_fixture: li.noise_fixture || '',
                     lora: loras
                 };
+                if (Array.isArray(li.guide_image)) {
+                    var guideNode = nodes[String(li.guide_image[0])];
+                    var guidePath = guideNode && guideNode.inputs
+                        ? String(guideNode.inputs.image || guideNode.inputs.path || '').trim()
+                        : '';
+                    if (guidePath) {
+                        request.image_path = guidePath;
+                        request.image_strength = Number.isFinite(Number(li.guide_strength))
+                            ? Number(li.guide_strength)
+                            : 1.0;
+                    }
+                }
+                if (Array.isArray(li.guide_video)) {
+                    if (request.image_path)
+                        throw new Error('LTX2 workflow cannot use guide_image and guide_video together');
+                    var guideVideoNode = nodes[String(li.guide_video[0])];
+                    var guideVideoPath = guideVideoNode && guideVideoNode.inputs
+                        ? String(guideVideoNode.inputs.video || guideVideoNode.inputs.path || '').trim()
+                        : '';
+                    if (guideVideoPath) {
+                        request.video_path = guideVideoPath;
+                        request.video_strength = Number.isFinite(Number(li.guide_strength))
+                            ? Number(li.guide_strength)
+                            : 0.7;
+                    }
+                }
+                return request;
             }
         }
         // The current Wan builder uses standard Comfy nodes. Detect it by the
@@ -316,6 +343,29 @@ var SerenityAPI = (function () {
         return uploadImageDetails(base64Data, prefix)
             .then(function (data) { return data.path || data.name; });
     }
+    function uploadMedia(file) {
+        if (!file)
+            return Promise.reject(new Error('No media file selected'));
+        var form = new FormData();
+        form.append('file', file, file.name || 'source.mp4');
+        return fetch('/upload/media', { method: 'POST', body: form })
+            .then(function (resp) {
+            if (!resp.ok) {
+                return resp.text().then(function (body) {
+                    var msg = 'HTTP ' + resp.status;
+                    try {
+                        var data = JSON.parse(body);
+                        if (data && (data.detail || data.error))
+                            msg = data.detail || data.error;
+                    }
+                    catch (_) { }
+                    throw new Error(msg);
+                });
+            }
+            return resp.json();
+        })
+            .then(function (data) { return data.path || data.name; });
+    }
     function viewUrl(filename, subfolder, type) {
         return '/view?filename=' + encodeURIComponent(filename) +
             '&subfolder=' + encodeURIComponent(subfolder || '') +
@@ -329,6 +379,7 @@ var SerenityAPI = (function () {
         interrupt: interrupt,
         uploadImage: uploadImage,
         uploadImageDetails: uploadImageDetails,
+        uploadMedia: uploadMedia,
         viewUrl: viewUrl
     };
 })();

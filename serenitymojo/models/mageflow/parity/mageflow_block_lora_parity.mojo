@@ -16,7 +16,7 @@
 #      cos >= 0.999 — proving the text-identity rope through the BACKWARD too.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/OneTrainer/venv/bin/python \
+#   python3 \
 #       serenitymojo/models/mageflow/parity/mageflow_block_lora_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/mageflow/parity/mageflow_block_lora_parity.mojo

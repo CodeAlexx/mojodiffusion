@@ -3,8 +3,7 @@
 //! SHARED CONTRACT. Owned by the timeline/model team; consumed by worker + app + pool.
 //! Frame units are timeline frames (30 fps assumed for now).
 
-#[derive(Clone)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub media: usize,  // index into Project.media
     pub src_in: i64,   // source in-point (frames)
@@ -361,7 +360,13 @@ pub struct Title {
 
 impl Default for Title {
     fn default() -> Self {
-        Title { text: String::new(), size_frac: 0.1, x: 0.05, y: 0.05, rgb: [1.0, 1.0, 1.0] }
+        Title {
+            text: String::new(),
+            size_frac: 0.1,
+            x: 0.05,
+            y: 0.05,
+            rgb: [1.0, 1.0, 1.0],
+        }
     }
 }
 
@@ -377,7 +382,13 @@ impl Title {
     /// project that never builds one is byte-identical. `size_frac`/`x`/`y` are normalized as on the
     /// struct (font height / frame height; top-left anchor in [0,1]).
     pub fn lower_third(text: &str) -> Title {
-        Title { text: text.to_string(), size_frac: 0.07, x: 0.06, y: 0.78, rgb: [1.0, 1.0, 1.0] }
+        Title {
+            text: text.to_string(),
+            size_frac: 0.07,
+            x: 0.06,
+            y: 0.78,
+            rgb: [1.0, 1.0, 1.0],
+        }
     }
 }
 
@@ -398,7 +409,13 @@ pub struct ChromaKey {
 
 impl Default for ChromaKey {
     fn default() -> Self {
-        ChromaKey { enabled: false, key: [0.0, 1.0, 0.0], similarity: 0.4, smoothness: 0.1, spill: 0.0 }
+        ChromaKey {
+            enabled: false,
+            key: [0.0, 1.0, 0.0],
+            similarity: 0.4,
+            smoothness: 0.1,
+            spill: 0.0,
+        }
     }
 }
 
@@ -406,56 +423,56 @@ impl Default for ChromaKey {
 /// no audio filter chain, so the mix is byte-identical to P2. Ranges mirror Shotcut's audio filters.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioFx {
-    pub eq_low_db: f32,   // low-shelf gain, dB (Shotcut EQ: 3-band), 0 = flat
-    pub eq_mid_db: f32,   // mid peak gain, dB, 0 = flat
-    pub eq_high_db: f32,  // high-shelf gain, dB, 0 = flat
-    pub pan: f32,         // -1 = full left, 0 = center, +1 = full right
-    pub compress: bool,   // acompressor (sensible defaults)
-    pub gate: bool,       // agate
-    pub normalize: bool,  // loudnorm (single-pass)
+    pub eq_low_db: f32,  // low-shelf gain, dB (Shotcut EQ: 3-band), 0 = flat
+    pub eq_mid_db: f32,  // mid peak gain, dB, 0 = flat
+    pub eq_high_db: f32, // high-shelf gain, dB, 0 = flat
+    pub pan: f32,        // -1 = full left, 0 = center, +1 = full right
+    pub compress: bool,  // acompressor (sensible defaults)
+    pub gate: bool,      // agate
+    pub normalize: bool, // loudnorm (single-pass)
     // ----- P11 per-clip audio effects (Shotcut Reverb / Delay / Pitch). All `#[serde(default ..)]`
     // so pre-P11 .json (an audio_fx object lacking these keys) loads to the neutral, off state. Each
     // is a no-op at its default, so is_neutral() stays true and the chain stays "-" (P10 identity).
     #[serde(default)]
-    pub reverb: f32,      // reverb amount 0..1 (0 = off) → multi-tap aecho
+    pub reverb: f32, // reverb amount 0..1 (0 = off) → multi-tap aecho
     #[serde(default)]
-    pub delay_ms: f32,    // echo delay in ms (0 = off) → aecho
+    pub delay_ms: f32, // echo delay in ms (0 = off) → aecho
     #[serde(default = "default_delay_decay")]
     pub delay_decay: f32, // echo feedback 0..0.95 (only meaningful when delay_ms>0)
     #[serde(default)]
-    pub pitch: f32,       // pitch shift in SEMITONES (0 = off) → rubberband (tempo-preserving)
+    pub pitch: f32, // pitch shift in SEMITONES (0 = off) → rubberband (tempo-preserving)
     // ----- P12 per-clip audio filters (Shotcut Low Pass / High Pass / Tremolo). All `#[serde(default)]`
     // (each defaults to 0.0), so pre-P12 .json (an audio_fx object lacking these keys) loads to the
     // neutral, off state. Each is a no-op at its default, so is_neutral() stays true and the chain
     // stays "-" (identity preserved).
     #[serde(default)]
-    pub lowpass_hz: f32,  // low-pass cutoff in Hz (0 = off) → lowpass=f=<hz>
+    pub lowpass_hz: f32, // low-pass cutoff in Hz (0 = off) → lowpass=f=<hz>
     #[serde(default)]
     pub highpass_hz: f32, // high-pass cutoff in Hz (0 = off) → highpass=f=<hz>
     #[serde(default)]
-    pub tremolo: f32,     // tremolo depth 0..0.95 (0 = off) → tremolo=f=5:d=<depth>
+    pub tremolo: f32, // tremolo depth 0..0.95 (0 = off) → tremolo=f=5:d=<depth>
     // ----- P15 per-clip audio filters (Shotcut Bass & Treble / Notch / Chorus). All `#[serde(default)]`
     // (each defaults to 0.0), so pre-P15 .json (an audio_fx object lacking these keys) loads to the
     // neutral, off state. Each is a no-op at its default, so is_neutral() stays true and the chain
     // stays "-" (identity preserved).
     #[serde(default)]
-    pub bass_db: f32,    // low-shelf gain in dB (0 = flat / off) → bass=g=<db>
+    pub bass_db: f32, // low-shelf gain in dB (0 = flat / off) → bass=g=<db>
     #[serde(default)]
-    pub treble_db: f32,  // high-shelf gain in dB (0 = flat / off) → treble=g=<db>
+    pub treble_db: f32, // high-shelf gain in dB (0 = flat / off) → treble=g=<db>
     #[serde(default)]
-    pub notch_hz: f32,   // band-reject centre frequency in Hz (0 = off) → bandreject=f=<hz>
+    pub notch_hz: f32, // band-reject centre frequency in Hz (0 = off) → bandreject=f=<hz>
     #[serde(default)]
-    pub chorus: f32,     // chorus depth 0..1 (0 = off) → chorus=0.5:0.9:50:0.4:0.25:<2*depth ms>
+    pub chorus: f32, // chorus depth 0..1 (0 = off) → chorus=0.5:0.9:50:0.4:0.25:<2*depth ms>
     // ----- P22 per-clip audio filters (Shotcut Flanger / Phaser / Limiter). All `#[serde(default)]`
     // (each defaults to 0.0), so pre-P22 .json (an audio_fx object lacking these keys) loads to the
     // neutral, off state. Each is a no-op at its default, so is_neutral() stays true and the chain
     // stays "-" (identity preserved).
     #[serde(default)]
-    pub flanger: f32,    // flanger depth 0..1 (0 = off) → flanger=depth=<0..8 ms>:speed=0.5
+    pub flanger: f32, // flanger depth 0..1 (0 = off) → flanger=depth=<0..8 ms>:speed=0.5
     #[serde(default)]
-    pub phaser: f32,     // phaser intensity 0..1 (0 = off) → aphaser=speed=<0.1..2.1 Hz>
+    pub phaser: f32, // phaser intensity 0..1 (0 = off) → aphaser=speed=<0.1..2.1 Hz>
     #[serde(default)]
-    pub limiter: f32,    // limiter peak ceiling 0..1 (0 = off) → alimiter=limit=<0.05..1.0 linear>
+    pub limiter: f32, // limiter peak ceiling 0..1 (0 = off) → alimiter=limit=<0.05..1.0 linear>
     // ----- P32 GRAPHIC EQ (Shotcut audio_eq15band-style). 10 ISO bands at 31/62/125/250/500/1k/2k/
     // 4k/8k/16k Hz, each a peaking gain in dB (0 = flat). All-zero (the default) => no filter added,
     // is_neutral() stays true, chain "-" (identity preserved). Each active band => one `equalizer`.
@@ -566,9 +583,24 @@ impl Clip {
     pub fn video(media: usize, t0: i64, len: i64, track: u8, name_hint: &str) -> Clip {
         let _ = name_hint;
         Clip {
-            media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0,
-            fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0,
-            lut: String::new(), gain: 1.0, bright: 0.0, contrast: 1.0, sat: 1.0,
+            media,
+            src_in: 0,
+            len,
+            t0,
+            track,
+            look: 0,
+            look_amt: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+            px: 0.0,
+            py: 0.0,
+            pw: 1.0,
+            ph: 1.0,
+            lut: String::new(),
+            gain: 1.0,
+            bright: 0.0,
+            contrast: 1.0,
+            sat: 1.0,
             // P2 color-wheels / transform / blur — IDENTITY (no-op) so demo/render are unchanged.
             lift: [0.0, 0.0, 0.0],
             gamma: [1.0, 1.0, 1.0],
@@ -680,13 +712,12 @@ impl Clip {
 /// transition ids (0=crossfade, 1=wipe_lr, 2=wipe_rl, 3=wipe_up, 4=wipe_down, 5=slide_lr,
 /// 6=zoom, 7=dissolve). PINNED this wave: produced + edited here (Team B), consumed by Team A
 /// (worker::resolve_frame → ENC/PREVIEW trans fields) and Team C (timeline transition UI).
-#[derive(Clone, Copy)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Transition {
-    pub track: u8,    // 0 = V1, 1 = V2, 2 = A1 (Clip.track index space)
-    pub center: i64,  // timeline frame the transition is centered on (typically a clip boundary)
-    pub dur: i64,     // window length in frames (clamped >= 2); window = [center - dur/2, center + dur/2)
-    pub kind: i32,    // fpx_gpu track1 transition id 0..10 (0=crossfade .. 7=dissolve, 8=iris, 9=clock, 10=barn-door)
+    pub track: u8,   // 0 = V1, 1 = V2, 2 = A1 (Clip.track index space)
+    pub center: i64, // timeline frame the transition is centered on (typically a clip boundary)
+    pub dur: i64, // window length in frames (clamped >= 2); window = [center - dur/2, center + dur/2)
+    pub kind: i32, // fpx_gpu track1 transition id 0..10 (0=crossfade .. 7=dissolve, 8=iris, 9=clock, 10=barn-door)
 }
 
 impl Transition {
@@ -722,8 +753,7 @@ impl Transition {
 /// `Default = Linear`, and the `#[serde(default)]` on the `interp` fields means a pre-P14 .json
 /// keyframe (a bare `{t,v}` with no `interp` key) deserializes as `Linear` — so an old project's
 /// render is byte-identical (Linear is the previous, only mode).
-#[derive(Clone, Copy, PartialEq, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum KfInterp {
     Discrete,
     Linear,
@@ -738,16 +768,36 @@ pub enum KfInterp {
     SmoothTight,
     // P20: MLT easing keyframe types (mlt_animation.c interpolate_value, Robert-Penner easings).
     // Each is a closed-form factor on the linear blend (no neighbours needed) — see `ease_factor`.
-    SineIn, SineOut, SineInOut,
-    QuadIn, QuadOut, QuadInOut,
-    CubicIn, CubicOut, CubicInOut,
-    QuartIn, QuartOut, QuartInOut,
-    QuintIn, QuintOut, QuintInOut,
-    ExpoIn, ExpoOut, ExpoInOut,
-    CircIn, CircOut, CircInOut,
-    BackIn, BackOut, BackInOut,
-    ElasticIn, ElasticOut, ElasticInOut,
-    BounceIn, BounceOut, BounceInOut,
+    SineIn,
+    SineOut,
+    SineInOut,
+    QuadIn,
+    QuadOut,
+    QuadInOut,
+    CubicIn,
+    CubicOut,
+    CubicInOut,
+    QuartIn,
+    QuartOut,
+    QuartInOut,
+    QuintIn,
+    QuintOut,
+    QuintInOut,
+    ExpoIn,
+    ExpoOut,
+    ExpoInOut,
+    CircIn,
+    CircOut,
+    CircInOut,
+    BackIn,
+    BackOut,
+    BackInOut,
+    ElasticIn,
+    ElasticOut,
+    ElasticInOut,
+    BounceIn,
+    BounceOut,
+    BounceInOut,
 }
 
 impl KfInterp {
@@ -766,18 +816,42 @@ impl KfInterp {
     pub fn label(self) -> &'static str {
         use KfInterp::*;
         match self {
-            Discrete => "Discrete (hold)", Linear => "Linear", Smooth => "Smooth (eased)",
-            SmoothNatural => "Smooth Natural", SmoothLoose => "Smooth Loose", SmoothTight => "Smooth Tight",
-            SineIn => "Sine In", SineOut => "Sine Out", SineInOut => "Sine In-Out",
-            QuadIn => "Quad In", QuadOut => "Quad Out", QuadInOut => "Quad In-Out",
-            CubicIn => "Cubic In", CubicOut => "Cubic Out", CubicInOut => "Cubic In-Out",
-            QuartIn => "Quart In", QuartOut => "Quart Out", QuartInOut => "Quart In-Out",
-            QuintIn => "Quint In", QuintOut => "Quint Out", QuintInOut => "Quint In-Out",
-            ExpoIn => "Expo In", ExpoOut => "Expo Out", ExpoInOut => "Expo In-Out",
-            CircIn => "Circ In", CircOut => "Circ Out", CircInOut => "Circ In-Out",
-            BackIn => "Back In", BackOut => "Back Out", BackInOut => "Back In-Out",
-            ElasticIn => "Elastic In", ElasticOut => "Elastic Out", ElasticInOut => "Elastic In-Out",
-            BounceIn => "Bounce In", BounceOut => "Bounce Out", BounceInOut => "Bounce In-Out",
+            Discrete => "Discrete (hold)",
+            Linear => "Linear",
+            Smooth => "Smooth (eased)",
+            SmoothNatural => "Smooth Natural",
+            SmoothLoose => "Smooth Loose",
+            SmoothTight => "Smooth Tight",
+            SineIn => "Sine In",
+            SineOut => "Sine Out",
+            SineInOut => "Sine In-Out",
+            QuadIn => "Quad In",
+            QuadOut => "Quad Out",
+            QuadInOut => "Quad In-Out",
+            CubicIn => "Cubic In",
+            CubicOut => "Cubic Out",
+            CubicInOut => "Cubic In-Out",
+            QuartIn => "Quart In",
+            QuartOut => "Quart Out",
+            QuartInOut => "Quart In-Out",
+            QuintIn => "Quint In",
+            QuintOut => "Quint Out",
+            QuintInOut => "Quint In-Out",
+            ExpoIn => "Expo In",
+            ExpoOut => "Expo Out",
+            ExpoInOut => "Expo In-Out",
+            CircIn => "Circ In",
+            CircOut => "Circ Out",
+            CircInOut => "Circ In-Out",
+            BackIn => "Back In",
+            BackOut => "Back Out",
+            BackInOut => "Back In-Out",
+            ElasticIn => "Elastic In",
+            ElasticOut => "Elastic Out",
+            ElasticInOut => "Elastic In-Out",
+            BounceIn => "Bounce In",
+            BounceOut => "Bounce Out",
+            BounceInOut => "Bounce In-Out",
         }
     }
 
@@ -785,12 +859,42 @@ impl KfInterp {
     pub const ALL: [KfInterp; 36] = {
         use KfInterp::*;
         [
-            Discrete, Linear, Smooth, SmoothNatural, SmoothLoose, SmoothTight,
-            SineIn, SineOut, SineInOut, QuadIn, QuadOut, QuadInOut,
-            CubicIn, CubicOut, CubicInOut, QuartIn, QuartOut, QuartInOut,
-            QuintIn, QuintOut, QuintInOut, ExpoIn, ExpoOut, ExpoInOut,
-            CircIn, CircOut, CircInOut, BackIn, BackOut, BackInOut,
-            ElasticIn, ElasticOut, ElasticInOut, BounceIn, BounceOut, BounceInOut,
+            Discrete,
+            Linear,
+            Smooth,
+            SmoothNatural,
+            SmoothLoose,
+            SmoothTight,
+            SineIn,
+            SineOut,
+            SineInOut,
+            QuadIn,
+            QuadOut,
+            QuadInOut,
+            CubicIn,
+            CubicOut,
+            CubicInOut,
+            QuartIn,
+            QuartOut,
+            QuartInOut,
+            QuintIn,
+            QuintOut,
+            QuintInOut,
+            ExpoIn,
+            ExpoOut,
+            ExpoInOut,
+            CircIn,
+            CircOut,
+            CircInOut,
+            BackIn,
+            BackOut,
+            BackInOut,
+            ElasticIn,
+            ElasticOut,
+            ElasticInOut,
+            BounceIn,
+            BounceOut,
+            BounceInOut,
         ]
     };
 }
@@ -811,16 +915,36 @@ fn ease_factor(kind: KfInterp, t: f64) -> Option<f64> {
     use EaseDir::*;
     use KfInterp::*;
     let f = match kind {
-        SineIn => ease_sine(t, In), SineOut => ease_sine(t, Out), SineInOut => ease_sine(t, InOut),
-        QuadIn => ease_pow(t, 2.0, In), QuadOut => ease_pow(t, 2.0, Out), QuadInOut => ease_pow(t, 2.0, InOut),
-        CubicIn => ease_pow(t, 3.0, In), CubicOut => ease_pow(t, 3.0, Out), CubicInOut => ease_pow(t, 3.0, InOut),
-        QuartIn => ease_pow(t, 4.0, In), QuartOut => ease_pow(t, 4.0, Out), QuartInOut => ease_pow(t, 4.0, InOut),
-        QuintIn => ease_pow(t, 5.0, In), QuintOut => ease_pow(t, 5.0, Out), QuintInOut => ease_pow(t, 5.0, InOut),
-        ExpoIn => ease_expo(t, In), ExpoOut => ease_expo(t, Out), ExpoInOut => ease_expo(t, InOut),
-        CircIn => ease_circ(t, In), CircOut => ease_circ(t, Out), CircInOut => ease_circ(t, InOut),
-        BackIn => ease_back(t, In), BackOut => ease_back(t, Out), BackInOut => ease_back(t, InOut),
-        ElasticIn => ease_elastic(t, In), ElasticOut => ease_elastic(t, Out), ElasticInOut => ease_elastic(t, InOut),
-        BounceIn => ease_bounce(t, In), BounceOut => ease_bounce(t, Out), BounceInOut => ease_bounce(t, InOut),
+        SineIn => ease_sine(t, In),
+        SineOut => ease_sine(t, Out),
+        SineInOut => ease_sine(t, InOut),
+        QuadIn => ease_pow(t, 2.0, In),
+        QuadOut => ease_pow(t, 2.0, Out),
+        QuadInOut => ease_pow(t, 2.0, InOut),
+        CubicIn => ease_pow(t, 3.0, In),
+        CubicOut => ease_pow(t, 3.0, Out),
+        CubicInOut => ease_pow(t, 3.0, InOut),
+        QuartIn => ease_pow(t, 4.0, In),
+        QuartOut => ease_pow(t, 4.0, Out),
+        QuartInOut => ease_pow(t, 4.0, InOut),
+        QuintIn => ease_pow(t, 5.0, In),
+        QuintOut => ease_pow(t, 5.0, Out),
+        QuintInOut => ease_pow(t, 5.0, InOut),
+        ExpoIn => ease_expo(t, In),
+        ExpoOut => ease_expo(t, Out),
+        ExpoInOut => ease_expo(t, InOut),
+        CircIn => ease_circ(t, In),
+        CircOut => ease_circ(t, Out),
+        CircInOut => ease_circ(t, InOut),
+        BackIn => ease_back(t, In),
+        BackOut => ease_back(t, Out),
+        BackInOut => ease_back(t, InOut),
+        ElasticIn => ease_elastic(t, In),
+        ElasticOut => ease_elastic(t, Out),
+        ElasticInOut => ease_elastic(t, InOut),
+        BounceIn => ease_bounce(t, In),
+        BounceOut => ease_bounce(t, Out),
+        BounceInOut => ease_bounce(t, InOut),
         _ => return None,
     };
     Some(f)
@@ -828,7 +952,7 @@ fn ease_factor(kind: KfInterp, t: f64) -> Option<f64> {
 
 // --- Robert-Penner easing factors, verbatim from MLT mlt_animation.c ---
 fn ease_sine(t: f64, e: EaseDir) -> f64 {
-    use std::f64::consts::{PI, FRAC_PI_2};
+    use std::f64::consts::{FRAC_PI_2, PI};
     match e {
         EaseDir::In => (t - 1.0).mul_add(FRAC_PI_2, 0.0).sin() + 1.0,
         EaseDir::Out => (t * FRAC_PI_2).sin(),
@@ -909,7 +1033,8 @@ fn ease_elastic(t: f64, e: EaseDir) -> f64 {
             if t < 0.5 {
                 0.5 * (c * (2.0 * t)).sin() * 2f64.powf(10.0 * ((2.0 * t) - 1.0))
             } else {
-                0.5 * ((-c * ((2.0 * t - 1.0) + 1.0)).sin() * 2f64.powf(-10.0 * (2.0 * t - 1.0)) + 2.0)
+                0.5 * ((-c * ((2.0 * t - 1.0) + 1.0)).sin() * 2f64.powf(-10.0 * (2.0 * t - 1.0))
+                    + 2.0)
             }
         }
     }
@@ -950,8 +1075,7 @@ impl Default for KfInterp {
 /// `interp` (P14) is this keyframe's interpolation type; it controls the SEGMENT that STARTS at
 /// this key (i.e. the curve from this key up to the next). `#[serde(default)]` → pre-P14 `{t,v}`
 /// keyframes load as `Linear`.
-#[derive(Clone, Copy)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Kf {
     pub t: i64,
     pub v: f32,
@@ -974,11 +1098,10 @@ pub struct Kf {
 /// pre-P30 project (or any clip without keys) is byte-identical: `clip_param_at` returns the static
 /// value the worker already sent. `clip_param_at` (par 4..9) is the public entry; `add_clip_param_key`
 /// keys one param from its live field; `clip_param_key_count` reports per-param key counts.
-#[derive(Clone, Copy)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct PipKey {
-    pub clip: usize, // clip index these keys animate
-    pub par: u8,     // 0=px 1=py 2=pw 3=ph | 4=bright 5=contrast 6=sat 7=blur 8=rot 9=scale
+    pub clip: usize,  // clip index these keys animate
+    pub par: u8,      // 0=px 1=py 2=pw 3=ph | 4=bright 5=contrast 6=sat 7=blur 8=rot 9=scale
     pub t_local: i64, // clip-local frame (t - clip.t0)
     pub v: f32,
     // P14 interpolation type; controls the SEGMENT starting at this key (the lower key of an
@@ -1020,12 +1143,27 @@ fn eval_track(track: &[Kf], t: i64, fallback: f32) -> f32 {
         let p3 = if i + 2 < n { track[i + 2] } else { p2 };
         let prog = (t - p1.t) as f64 / (p2.t - p1.t) as f64;
         return catmull_rom(
-            p0.t as f64, p0.v as f64, p1.t as f64, p1.v as f64,
-            p2.t as f64, p2.v as f64, p3.t as f64, p3.v as f64,
-            prog, alpha, tension,
+            p0.t as f64,
+            p0.v as f64,
+            p1.t as f64,
+            p1.v as f64,
+            p2.t as f64,
+            p2.v as f64,
+            p3.t as f64,
+            p3.v as f64,
+            prog,
+            alpha,
+            tension,
         ) as f32;
     }
-    interp_segment(kind, track[i].t, track[i].v, track[i + 1].t, track[i + 1].v, t)
+    interp_segment(
+        kind,
+        track[i].t,
+        track[i].v,
+        track[i + 1].t,
+        track[i + 1].v,
+        t,
+    )
 }
 
 /// Euclidean distance between two control points (MLT `distance`, mlt_animation.c).
@@ -1041,8 +1179,17 @@ fn kf_distance(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
 /// computed at all, so a peak gets a flat tangent = no overshoot). Returns the interpolated value.
 #[allow(clippy::too_many_arguments)]
 fn catmull_rom(
-    mut x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, mut x3: f64, y3: f64,
-    t: f64, alpha: f64, tension: f64,
+    mut x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    mut x3: f64,
+    y3: f64,
+    t: f64,
+    alpha: f64,
+    tension: f64,
 ) -> f64 {
     // Duplicated boundary point → push it far away so the end segment gets a horizontal tangent.
     if x0 == x1 {
@@ -1128,8 +1275,7 @@ fn set_track(track: &mut Vec<Kf>, t: i64, v: f32, interp: KfInterp) {
 /// DEFAULTS REPRODUCE TODAY'S BEHAVIOR (1280×856 @ 30/1, mpeg4, 4 Mbit/s bitrate) so existing render
 /// gates pass unchanged. All fields are `#[serde(default = ..)]` so pre-P1 .json projects load with
 /// the defaults. `mlt`-style values are intentionally avoided — these map straight to fpx_encode.c.
-#[derive(Clone)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExportSettings {
     #[serde(default = "default_out_w")]
     pub out_w: u32,
@@ -1209,8 +1355,7 @@ impl Default for ExportSettings {
     }
 }
 
-#[derive(Clone, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     pub media: Vec<String>, // media file paths; clips index into this
     pub names: Vec<String>, // display names per media
@@ -1781,7 +1926,13 @@ impl Project {
             k.v = v;
             k.interp = interp;
         } else {
-            self.pip_kf.push(PipKey { clip, par, t_local, v, interp });
+            self.pip_kf.push(PipKey {
+                clip,
+                par,
+                t_local,
+                v,
+                interp,
+            });
         }
     }
 
@@ -1917,7 +2068,9 @@ impl Project {
 
     /// True if the given track is an AUDIO track (its clips contribute audio, not video).
     pub fn is_audio(&self, track: u8) -> bool {
-        self.tracks.get(track as usize).is_some_and(|t| t.kind == TrackKind::Audio)
+        self.tracks
+            .get(track as usize)
+            .is_some_and(|t| t.kind == TrackKind::Audio)
     }
 
     /// P42 mixer — the track's linear fader gain (1.0 = unity / out-of-range default). Folded into
@@ -1968,8 +2121,13 @@ impl Project {
         }
         let ti = idx as u8;
         // Remove clips on the track (descending so delete_clip's index/PiP remap stays valid).
-        let doomed: Vec<usize> =
-            self.clips.iter().enumerate().filter(|(_, c)| c.track == ti).map(|(i, _)| i).collect();
+        let doomed: Vec<usize> = self
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.track == ti)
+            .map(|(i, _)| i)
+            .collect();
         for &i in doomed.iter().rev() {
             self.delete_clip(i);
         }
@@ -2023,7 +2181,12 @@ impl Project {
             tr.dur = d;
             tr.kind = kind;
         } else {
-            self.transitions.push(Transition { track, center, dur: d, kind });
+            self.transitions.push(Transition {
+                track,
+                center,
+                dur: d,
+                kind,
+            });
         }
     }
 
@@ -2062,11 +2225,7 @@ impl Project {
             let gap = (b_t0 - a_end).abs();
             if overlap || gap <= BOUNDARY_GAP {
                 // overlap -> seam at the midpoint of [b_t0, a_end); abut/gap -> at A.end().
-                let boundary = if overlap {
-                    (b_t0 + a_end) / 2
-                } else {
-                    a_end
-                };
+                let boundary = if overlap { (b_t0 + a_end) / 2 } else { a_end };
                 out.push((a, b, boundary));
             }
         }
@@ -2263,7 +2422,7 @@ impl Project {
         freeze.speed = 0.0; // HOLD the source frame (P24: speed 0 = no source advance)
         freeze.reverse = false; // a held still has no direction
         freeze.gain = 0.0; // SILENT still (per-clip audio gain 0)
-        // A fresh independent still: no fades, not linked into C's group.
+                           // A fresh independent still: no fades, not linked into C's group.
         freeze.fade_in = 0;
         freeze.fade_out = 0;
         freeze.group = 0;
@@ -2396,8 +2555,10 @@ impl Project {
             return;
         }
         // Removed-clip snapshots: their original positions, captured before any index renumbering.
-        let removed: Vec<(u8, i64, i64)> =
-            idxs.iter().map(|&i| (self.clips[i].track, self.clips[i].t0, self.clips[i].len)).collect();
+        let removed: Vec<(u8, i64, i64)> = idxs
+            .iter()
+            .map(|&i| (self.clips[i].track, self.clips[i].t0, self.clips[i].len))
+            .collect();
 
         // Remove all selected clips in descending index order: higher indices first keeps the lower
         // indices (and `delete_clip`'s `clip > i` PiP remap) valid through the whole batch.
@@ -2620,7 +2781,13 @@ impl Project {
             return;
         }
         // Earliest member t0 (None => group has no members => nothing to move).
-        let min_t0 = match self.clips.iter().filter(|c| c.group == group).map(|c| c.t0).min() {
+        let min_t0 = match self
+            .clips
+            .iter()
+            .filter(|c| c.group == group)
+            .map(|c| c.t0)
+            .min()
+        {
             Some(m) => m,
             None => return,
         };
@@ -2976,9 +3143,10 @@ impl Project {
         let max_passes = self.clips.len() * 4 + 8;
         for _ in 0..max_passes {
             // Find the first same-track clip that still intersects [from, to).
-            let hit = self.clips.iter().position(|c| {
-                c.track == track && c.t0 < to && c.end() > from
-            });
+            let hit = self
+                .clips
+                .iter()
+                .position(|c| c.track == track && c.t0 < to && c.end() > from);
             let i = match hit {
                 Some(i) => i,
                 None => return, // range is clear
@@ -3063,7 +3231,10 @@ pub struct History {
 
 impl History {
     pub fn new() -> History {
-        History { undo: Vec::new(), redo: Vec::new() }
+        History {
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
     }
 
     /// Push the *current* project state onto the undo stack before a mutation, clearing
@@ -3146,13 +3317,25 @@ mod tests {
         let dir_str = dir.to_string_lossy().into_owned();
         let found = scan_lut_dir(&dir_str);
 
-        assert_eq!(found.len(), 2, "exactly two .cube files (the .txt is ignored): {found:?}");
+        assert_eq!(
+            found.len(),
+            2,
+            "exactly two .cube files (the .txt is ignored): {found:?}"
+        );
         // Sorted ascending by stem -> "a" then "b".
         assert_eq!(found[0].0, "a", "first stem is 'a' (sorted)");
         assert_eq!(found[1].0, "b", "second stem is 'b' (sorted)");
         // Full path = dir joined with the filename, assignable straight onto Clip.lut.
-        assert_eq!(found[0].1, dir.join("a.cube").to_string_lossy(), "a full path");
-        assert_eq!(found[1].1, dir.join("b.cube").to_string_lossy(), "b full path");
+        assert_eq!(
+            found[0].1,
+            dir.join("a.cube").to_string_lossy(),
+            "a full path"
+        );
+        assert_eq!(
+            found[1].1,
+            dir.join("b.cube").to_string_lossy(),
+            "b full path"
+        );
 
         // A non-existent directory -> empty Vec (no panic).
         let missing = dir.join("does_not_exist_subdir");
@@ -3173,7 +3356,11 @@ mod tests {
         p.bright = 1.0;
         p.add_grade_key(100);
         assert!((p.grade_at(0).0 - 0.0).abs() < 1e-4);
-        assert!((p.grade_at(50).0 - 0.5).abs() < 1e-3, "b50={}", p.grade_at(50).0);
+        assert!(
+            (p.grade_at(50).0 - 0.5).abs() < 1e-3,
+            "b50={}",
+            p.grade_at(50).0
+        );
         assert!((p.grade_at(100).0 - 1.0).abs() < 1e-4);
         assert!((p.grade_at(150).0 - 1.0).abs() < 1e-4); // clamp past last key
     }
@@ -3186,7 +3373,11 @@ mod tests {
         p.clips[0].px = 0.6;
         p.add_pip_key(0, 100);
         assert!((p.pip_at(0, 0).0 - 0.0).abs() < 1e-4);
-        assert!((p.pip_at(0, 50).0 - 0.3).abs() < 1e-3, "px50={}", p.pip_at(0, 50).0);
+        assert!(
+            (p.pip_at(0, 50).0 - 0.3).abs() < 1e-3,
+            "px50={}",
+            p.pip_at(0, 50).0
+        );
         assert!((p.pip_at(0, 100).0 - 0.6).abs() < 1e-4);
     }
 
@@ -3221,9 +3412,17 @@ mod tests {
         // (a) LINEAR: eval@5 == 5.0 (midpoint), both tracks. This is the pre-P14 behavior and the
         //     KfInterp::default, so it is also what an old .json loads as.
         let g = grade_0_10(KfInterp::Linear);
-        assert!((g.grade_at(5).0 - 5.0).abs() < 1e-3, "grade linear@5={}", g.grade_at(5).0);
+        assert!(
+            (g.grade_at(5).0 - 5.0).abs() < 1e-3,
+            "grade linear@5={}",
+            g.grade_at(5).0
+        );
         let pp = pip_0_10(KfInterp::Linear);
-        assert!((pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3, "pip linear@5={}", pp.pip_at(0, 5).0);
+        assert!(
+            (pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3,
+            "pip linear@5={}",
+            pp.pip_at(0, 5).0
+        );
         // sanity: default create mode is Linear, so an un-set kf_interp behaves identically.
         assert_eq!(KfInterp::default(), KfInterp::Linear);
     }
@@ -3233,13 +3432,37 @@ mod tests {
         // (b) DISCRETE: HOLD the lower key's value across the segment. eval@5 == 0.0, eval@9 == 0.0,
         //     eval@10 == 10.0 (the upper key's frame is its own value — endpoint clamp / next key).
         let g = grade_0_10(KfInterp::Discrete);
-        assert!((g.grade_at(5).0 - 0.0).abs() < 1e-3, "grade discrete@5={}", g.grade_at(5).0);
-        assert!((g.grade_at(9).0 - 0.0).abs() < 1e-3, "grade discrete@9={}", g.grade_at(9).0);
-        assert!((g.grade_at(10).0 - 10.0).abs() < 1e-3, "grade discrete@10={}", g.grade_at(10).0);
+        assert!(
+            (g.grade_at(5).0 - 0.0).abs() < 1e-3,
+            "grade discrete@5={}",
+            g.grade_at(5).0
+        );
+        assert!(
+            (g.grade_at(9).0 - 0.0).abs() < 1e-3,
+            "grade discrete@9={}",
+            g.grade_at(9).0
+        );
+        assert!(
+            (g.grade_at(10).0 - 10.0).abs() < 1e-3,
+            "grade discrete@10={}",
+            g.grade_at(10).0
+        );
         let pp = pip_0_10(KfInterp::Discrete);
-        assert!((pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3, "pip discrete@5={}", pp.pip_at(0, 5).0);
-        assert!((pp.pip_at(0, 9).0 - 0.0).abs() < 1e-3, "pip discrete@9={}", pp.pip_at(0, 9).0);
-        assert!((pp.pip_at(0, 10).0 - 10.0).abs() < 1e-3, "pip discrete@10={}", pp.pip_at(0, 10).0);
+        assert!(
+            (pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3,
+            "pip discrete@5={}",
+            pp.pip_at(0, 5).0
+        );
+        assert!(
+            (pp.pip_at(0, 9).0 - 0.0).abs() < 1e-3,
+            "pip discrete@9={}",
+            pp.pip_at(0, 9).0
+        );
+        assert!(
+            (pp.pip_at(0, 10).0 - 10.0).abs() < 1e-3,
+            "pip discrete@10={}",
+            pp.pip_at(0, 10).0
+        );
     }
 
     #[test]
@@ -3248,17 +3471,57 @@ mod tests {
         //     (eval@2 = smoothstep(0.2)*10 = 1.04 < 2.0); ease-OUT above midpoint
         //     (eval@8 = smoothstep(0.8)*10 = 8.96 > 8.0).
         let g = grade_0_10(KfInterp::Smooth);
-        assert!((g.grade_at(5).0 - 5.0).abs() < 1e-3, "grade smooth@5={}", g.grade_at(5).0);
-        assert!((g.grade_at(2).0 - 1.04).abs() < 1e-3, "grade smooth@2={}", g.grade_at(2).0);
-        assert!(g.grade_at(2).0 < 2.0, "grade smooth ease-in@2={}", g.grade_at(2).0);
-        assert!((g.grade_at(8).0 - 8.96).abs() < 1e-3, "grade smooth@8={}", g.grade_at(8).0);
-        assert!(g.grade_at(8).0 > 8.0, "grade smooth ease-out@8={}", g.grade_at(8).0);
+        assert!(
+            (g.grade_at(5).0 - 5.0).abs() < 1e-3,
+            "grade smooth@5={}",
+            g.grade_at(5).0
+        );
+        assert!(
+            (g.grade_at(2).0 - 1.04).abs() < 1e-3,
+            "grade smooth@2={}",
+            g.grade_at(2).0
+        );
+        assert!(
+            g.grade_at(2).0 < 2.0,
+            "grade smooth ease-in@2={}",
+            g.grade_at(2).0
+        );
+        assert!(
+            (g.grade_at(8).0 - 8.96).abs() < 1e-3,
+            "grade smooth@8={}",
+            g.grade_at(8).0
+        );
+        assert!(
+            g.grade_at(8).0 > 8.0,
+            "grade smooth ease-out@8={}",
+            g.grade_at(8).0
+        );
         let pp = pip_0_10(KfInterp::Smooth);
-        assert!((pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3, "pip smooth@5={}", pp.pip_at(0, 5).0);
-        assert!((pp.pip_at(0, 2).0 - 1.04).abs() < 1e-3, "pip smooth@2={}", pp.pip_at(0, 2).0);
-        assert!(pp.pip_at(0, 2).0 < 2.0, "pip smooth ease-in@2={}", pp.pip_at(0, 2).0);
-        assert!((pp.pip_at(0, 8).0 - 8.96).abs() < 1e-3, "pip smooth@8={}", pp.pip_at(0, 8).0);
-        assert!(pp.pip_at(0, 8).0 > 8.0, "pip smooth ease-out@8={}", pp.pip_at(0, 8).0);
+        assert!(
+            (pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3,
+            "pip smooth@5={}",
+            pp.pip_at(0, 5).0
+        );
+        assert!(
+            (pp.pip_at(0, 2).0 - 1.04).abs() < 1e-3,
+            "pip smooth@2={}",
+            pp.pip_at(0, 2).0
+        );
+        assert!(
+            pp.pip_at(0, 2).0 < 2.0,
+            "pip smooth ease-in@2={}",
+            pp.pip_at(0, 2).0
+        );
+        assert!(
+            (pp.pip_at(0, 8).0 - 8.96).abs() < 1e-3,
+            "pip smooth@8={}",
+            pp.pip_at(0, 8).0
+        );
+        assert!(
+            pp.pip_at(0, 8).0 > 8.0,
+            "pip smooth ease-out@8={}",
+            pp.pip_at(0, 8).0
+        );
     }
 
     #[test]
@@ -3270,14 +3533,22 @@ mod tests {
         g.kf_interp = KfInterp::Discrete;
         g.bright = 0.0;
         g.add_grade_key(0); // replace frame-0 key; its interp becomes Discrete
-        assert!((g.grade_at(5).0 - 0.0).abs() < 1e-3, "rekey->discrete holds, @5={}", g.grade_at(5).0);
+        assert!(
+            (g.grade_at(5).0 - 0.0).abs() < 1e-3,
+            "rekey->discrete holds, @5={}",
+            g.grade_at(5).0
+        );
 
         let mut pp = pip_0_10(KfInterp::Linear);
         assert!((pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3);
         pp.kf_interp = KfInterp::Discrete;
         pp.clips[0].px = 0.0;
         pp.add_pip_key(0, 0); // replace frame-0 param keys; their interp becomes Discrete
-        assert!((pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3, "pip rekey->discrete holds, @5={}", pp.pip_at(0, 5).0);
+        assert!(
+            (pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3,
+            "pip rekey->discrete holds, @5={}",
+            pp.pip_at(0, 5).0
+        );
     }
 
     // P19: a 3-key grade track 0@f0 -> 10@f10 -> 30@f20 with the SEGMENT [10,20] (lower key = f10)
@@ -3324,14 +3595,34 @@ mod tests {
             (KfInterp::SmoothTight, 20.0_f32),
         ] {
             let g = grade_3key(interp);
-            assert!((g.grade_at(15).0 - want).abs() < 1e-2, "grade {:?}@15 = {} (want {})", interp, g.grade_at(15).0, want);
+            assert!(
+                (g.grade_at(15).0 - want).abs() < 1e-2,
+                "grade {:?}@15 = {} (want {})",
+                interp,
+                g.grade_at(15).0,
+                want
+            );
             let pp = pip_3key(interp);
-            assert!((pp.pip_at(0, 15).0 - want).abs() < 1e-2, "pip {:?}@15 = {} (want {})", interp, pp.pip_at(0, 15).0, want);
+            assert!(
+                (pp.pip_at(0, 15).0 - want).abs() < 1e-2,
+                "pip {:?}@15 = {} (want {})",
+                interp,
+                pp.pip_at(0, 15).0,
+                want
+            );
         }
         // smooth_loose overshoot signature off the midpoint (MLT reference): @12=13.68, @18=27.12.
         let g = grade_3key(KfInterp::SmoothLoose);
-        assert!((g.grade_at(12).0 - 13.68).abs() < 1e-2, "loose@12={}", g.grade_at(12).0);
-        assert!((g.grade_at(18).0 - 27.12).abs() < 1e-2, "loose@18={}", g.grade_at(18).0);
+        assert!(
+            (g.grade_at(12).0 - 13.68).abs() < 1e-2,
+            "loose@12={}",
+            g.grade_at(12).0
+        );
+        assert!(
+            (g.grade_at(18).0 - 27.12).abs() < 1e-2,
+            "loose@18={}",
+            g.grade_at(18).0
+        );
     }
 
     // P20: a grade track 0@f0 -> 10@f100 with the given easing on the f0 (lower) key; grade_at(frame)
@@ -3368,7 +3659,14 @@ mod tests {
         for (interp, frame, want) in cases {
             let g = ease_track(interp);
             let got = g.grade_at(frame).0;
-            assert!((got - want).abs() < 1e-2, "{:?}@f{} = {} (want {})", interp, frame, got, want);
+            assert!(
+                (got - want).abs() < 1e-2,
+                "{:?}@f{} = {} (want {})",
+                interp,
+                frame,
+                got,
+                want
+            );
         }
         // every easing kind is reachable from ALL + has a label (UI invariant).
         assert_eq!(KfInterp::ALL.len(), 36);
@@ -3387,11 +3685,21 @@ mod tests {
         assert!(p.transition_at(0, 90).is_some(), "window start inclusive");
         assert!(p.transition_at(0, 109).is_some(), "inside window");
         assert!(p.transition_at(0, 110).is_none(), "window end exclusive");
-        assert!(p.transition_at(1, 100).is_none(), "other track has no transition");
+        assert!(
+            p.transition_at(1, 100).is_none(),
+            "other track has no transition"
+        );
         let tr = p.transition_at(0, 90).unwrap();
         assert!((tr.progress(90) - 0.0).abs() < 1e-4, "prog start=0");
-        assert!((tr.progress(100) - 0.5).abs() < 1e-3, "prog mid=0.5 got {}", tr.progress(100));
-        assert!((tr.progress(120) - 1.0).abs() < 1e-4, "prog clamped past end");
+        assert!(
+            (tr.progress(100) - 0.5).abs() < 1e-3,
+            "prog mid=0.5 got {}",
+            tr.progress(100)
+        );
+        assert!(
+            (tr.progress(120) - 1.0).abs() < 1e-4,
+            "prog clamped past end"
+        );
     }
 
     #[test]
@@ -3456,7 +3764,10 @@ mod tests {
         assert_eq!(p.transitions[0].dur, 40);
         // OOR index -> false + no mutation.
         assert!(!p.set_transition_dur(99, 8), "OOR idx returns false");
-        assert_eq!(p.transitions[0].dur, 40, "OOR set_transition_dur did not mutate");
+        assert_eq!(
+            p.transitions[0].dur, 40,
+            "OOR set_transition_dur did not mutate"
+        );
     }
 
     #[test]
@@ -3466,15 +3777,30 @@ mod tests {
         c.fade_in = 15;
         c.fade_out = 10;
         // fade-IN ramp 0->1 over the first 15 frames: (local+1)/15.
-        assert!((c.fade_factor(0) - 1.0 / 15.0).abs() < 1e-4, "first frame near black");
+        assert!(
+            (c.fade_factor(0) - 1.0 / 15.0).abs() < 1e-4,
+            "first frame near black"
+        );
         assert!((c.fade_factor(7) - 8.0 / 15.0).abs() < 1e-4, "mid fade-in");
-        assert!((c.fade_factor(14) - 1.0).abs() < 1e-4, "fade-in complete at frame 15");
+        assert!(
+            (c.fade_factor(14) - 1.0).abs() < 1e-4,
+            "fade-in complete at frame 15"
+        );
         // middle: full brightness.
         assert!((c.fade_factor(18) - 1.0).abs() < 1e-4, "middle full");
         // fade-OUT ramp 1->0 over the last 10 frames: remaining/10 (remaining = end - t).
-        assert!((c.fade_factor(20) - 1.0).abs() < 1e-4, "fade-out begins (remaining 10)");
-        assert!((c.fade_factor(25) - 5.0 / 10.0).abs() < 1e-4, "mid fade-out");
-        assert!((c.fade_factor(29) - 1.0 / 10.0).abs() < 1e-4, "last frame near black");
+        assert!(
+            (c.fade_factor(20) - 1.0).abs() < 1e-4,
+            "fade-out begins (remaining 10)"
+        );
+        assert!(
+            (c.fade_factor(25) - 5.0 / 10.0).abs() < 1e-4,
+            "mid fade-out"
+        );
+        assert!(
+            (c.fade_factor(29) - 1.0 / 10.0).abs() < 1e-4,
+            "last frame near black"
+        );
         // no fades -> always 1.0 (byte-identical render).
         let plain = Clip::video(0, 0, 30, 0, "P");
         assert_eq!(plain.fade_factor(0), 1.0);
@@ -3489,7 +3815,10 @@ mod tests {
         let ss = SubSeq {
             name: "comp".into(),
             len: 60,
-            clips: vec![Clip::video(0, 0, 30, 0, "r"), Clip::video(1, 30, 30, 0, "g")],
+            clips: vec![
+                Clip::video(0, 0, 30, 0, "r"),
+                Clip::video(1, 30, 30, 0, "g"),
+            ],
             tracks: default_tracks(),
         };
         p.subseqs = vec![ss];
@@ -3531,9 +3860,15 @@ mod tests {
 
         let mut p = Project::demo("x".into());
         p.subtitles = subs;
-        assert_eq!(p.active_subtitle_at(45).map(|s| s.text.as_str()), Some("Hello")); // in [30,60)
+        assert_eq!(
+            p.active_subtitle_at(45).map(|s| s.text.as_str()),
+            Some("Hello")
+        ); // in [30,60)
         assert!(p.active_subtitle_at(75).is_none()); // the gap
-        assert_eq!(p.active_subtitle_at(100).map(|s| s.text.as_str()), Some("World\nline2"));
+        assert_eq!(
+            p.active_subtitle_at(100).map(|s| s.text.as_str()),
+            Some("World\nline2")
+        );
         assert!(p.active_subtitle_at(0).is_none()); // before the first cue
     }
 
@@ -3556,7 +3891,10 @@ mod tests {
         // positive return == b lags a by K.
         assert_eq!(crate::model::cross_correlation_offset(&a, &b, 64), k as i64);
         // symmetric: aligning a onto b recovers -K.
-        assert_eq!(crate::model::cross_correlation_offset(&b, &a, 64), -(k as i64));
+        assert_eq!(
+            crate::model::cross_correlation_offset(&b, &a, 64),
+            -(k as i64)
+        );
         // identical signals -> 0 lag (no false shift).
         assert_eq!(crate::model::cross_correlation_offset(&a, &a, 64), 0);
         // empty input -> 0 (safe).
@@ -3579,11 +3917,11 @@ mod tests {
         let mut p = Project::demo("x".into());
         p.clips.clear();
         // V1 (track 0): A [0,100), B [100,200) abut exactly -> boundary at 100.
-        p.clips.push(Clip::video(0, 0, 100, 0, "A"));   // idx 0
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
         p.clips.push(Clip::video(0, 100, 100, 0, "B")); // idx 1
-        // V2 (track 1): C [0,100), D [80,180) overlap -> boundary at midpoint (80+100)/2 = 90.
-        p.clips.push(Clip::video(0, 0, 100, 1, "C"));   // idx 2
-        p.clips.push(Clip::video(0, 80, 100, 1, "D"));  // idx 3
+                                                        // V2 (track 1): C [0,100), D [80,180) overlap -> boundary at midpoint (80+100)/2 = 90.
+        p.clips.push(Clip::video(0, 0, 100, 1, "C")); // idx 2
+        p.clips.push(Clip::video(0, 80, 100, 1, "D")); // idx 3
 
         let bv1 = p.boundaries(0);
         assert_eq!(bv1.len(), 1);
@@ -3608,15 +3946,19 @@ mod tests {
         let mut p = Project::demo("x".into());
         p.clips.clear();
         // V1: A [0,100), B [100,150), C [150,210). V2: D [120,220) must NOT move.
-        p.clips.push(Clip::video(0, 0, 100, 0, "A"));   // idx 0
-        p.clips.push(Clip::video(0, 100, 50, 0, "B"));  // idx 1
-        p.clips.push(Clip::video(0, 150, 60, 0, "C"));  // idx 2
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B")); // idx 1
+        p.clips.push(Clip::video(0, 150, 60, 0, "C")); // idx 2
         p.clips.push(Clip::video(0, 120, 100, 1, "D")); // idx 3 (other track)
         p.ripple_delete(1); // delete B (len 50), C shifts left by 50
-        // B gone -> 3 clips. C now at 100, ends 160. D unchanged at 120.
+                            // B gone -> 3 clips. C now at 100, ends 160. D unchanged at 120.
         assert_eq!(p.clips.len(), 3);
         // find C (media 0 track 0 len 60) and D (track 1)
-        let c = p.clips.iter().find(|c| c.track == 0 && c.len == 60).unwrap();
+        let c = p
+            .clips
+            .iter()
+            .find(|c| c.track == 0 && c.len == 60)
+            .unwrap();
         assert_eq!(c.t0, 100, "C rippled left by B.len");
         let d = p.clips.iter().find(|c| c.track == 1).unwrap();
         assert_eq!(d.t0, 120, "other-track clip unmoved");
@@ -3648,12 +3990,15 @@ mod tests {
         let mut p = Project::demo("x".into());
         p.clips.clear();
         p.clips.push(Clip::video(0, 100, 50, 0, "later-but-idx0")); // idx 0, t0=100
-        p.clips.push(Clip::video(0, 0, 100, 0, "earlier-idx1"));    // idx 1, t0=0
-        p.clips.push(Clip::video(0, 150, 40, 0, "S"));              // idx 2, downstream survivor
+        p.clips.push(Clip::video(0, 0, 100, 0, "earlier-idx1")); // idx 1, t0=0
+        p.clips.push(Clip::video(0, 150, 40, 0, "S")); // idx 2, downstream survivor
         p.ripple_delete_many(&[0, 1]);
         assert_eq!(p.clips.len(), 1, "both block clips removed, S survives");
         assert_eq!(p.clips[0].len, 40, "survivor is S");
-        assert_eq!(p.clips[0].t0, 0, "S slid left by the full 150-frame removed block (no double-shift)");
+        assert_eq!(
+            p.clips[0].t0, 0,
+            "S slid left by the full 150-frame removed block (no double-shift)"
+        );
     }
 
     #[test]
@@ -3661,9 +4006,9 @@ mod tests {
         // A same-track ripple must never move clips on another track (ripple-current-track-only).
         let mut p = Project::demo("x".into());
         p.clips.clear();
-        p.clips.push(Clip::video(0, 0, 100, 0, "A"));   // idx 0, track 0
-        p.clips.push(Clip::video(0, 100, 50, 0, "B"));  // idx 1, track 0 downstream
-        p.clips.push(Clip::video(0, 50, 100, 1, "D"));  // idx 2, track 1 (other track)
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0, track 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B")); // idx 1, track 0 downstream
+        p.clips.push(Clip::video(0, 50, 100, 1, "D")); // idx 2, track 1 (other track)
         p.ripple_delete_many(&[0]);
         assert_eq!(p.clips.len(), 2);
         let b = p.clips.iter().find(|c| c.track == 0).unwrap();
@@ -3689,14 +4034,23 @@ mod tests {
         p.clips.clear();
         p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
         p.clips.push(Clip::video(0, 100, 50, 0, "B")); // idx 1
-        // Ripple head-trim: 20 frames come off A's head (src_in advances), the shortened clip is
-        // re-anchored at its original start, and the sequence slides left to stay gapless.
+                                                       // Ripple head-trim: 20 frames come off A's head (src_in advances), the shortened clip is
+                                                       // re-anchored at its original start, and the sequence slides left to stay gapless.
         p.ripple_trim_start(0, 20);
-        assert_eq!(p.clips[0].t0, 0, "re-anchored at original start — no front gap");
+        assert_eq!(
+            p.clips[0].t0, 0,
+            "re-anchored at original start — no front gap"
+        );
         assert_eq!(p.clips[0].len, 80, "head trimmed by 20 frames");
-        assert_eq!(p.clips[0].src_in, 20, "head trim advances the source in-point");
+        assert_eq!(
+            p.clips[0].src_in, 20,
+            "head trim advances the source in-point"
+        );
         // A now ends at 80; downstream B ripples left by 20 to stay tight (100 -> 80).
-        assert_eq!(p.clips[1].t0, 80, "downstream rippled left by the head-trim delta");
+        assert_eq!(
+            p.clips[1].t0, 80,
+            "downstream rippled left by the head-trim delta"
+        );
     }
 
     #[test]
@@ -3731,7 +4085,11 @@ mod tests {
         assert_eq!(p.clips[1].t0, 115, "right starts later");
         assert_eq!(p.clips[1].src_in, 215, "right source advanced with the cut");
         assert_eq!(p.clips[1].len, 85, "right shrank");
-        assert_eq!(p.clips[0].len + p.clips[1].len, total_before, "combined span unchanged");
+        assert_eq!(
+            p.clips[0].len + p.clips[1].len,
+            total_before,
+            "combined span unchanged"
+        );
         // boundary-keyed convenience: roll the cut at frame 115 back left by 15.
         let d2 = p.roll(0, 115, -15);
         assert_eq!(d2, -15);
@@ -3762,15 +4120,29 @@ mod tests {
         assert!(ok, "in-range slide succeeds");
         assert_eq!(p.clips[1].t0, 13, "C shifted +3 in time");
         assert_eq!(p.clips[1].len, 10, "C len (content) unchanged");
-        assert_eq!(p.clips[1].src_in, c_src_before, "C src_in (content) unchanged");
+        assert_eq!(
+            p.clips[1].src_in, c_src_before,
+            "C src_in (content) unchanged"
+        );
         assert_eq!(p.clips[0].len, 13, "prev P extended its OUT by +3");
-        assert_eq!(p.clips[2].t0, 23, "next N head moved to C's new end (13+10)");
+        assert_eq!(
+            p.clips[2].t0, 23,
+            "next N head moved to C's new end (13+10)"
+        );
         assert_eq!(p.clips[2].len, 7, "next N shrank from the head by 3");
-        assert_eq!(p.clips[2].src_in, 5 + 3, "next N source advanced by +3 with the head trim");
+        assert_eq!(
+            p.clips[2].src_in,
+            5 + 3,
+            "next N source advanced by +3 with the head trim"
+        );
         // Cuts still abut and total track length is invariant.
         assert_eq!(p.clips[0].end(), p.clips[1].t0, "P still abuts C");
         assert_eq!(p.clips[1].end(), p.clips[2].t0, "C still abuts N");
-        assert_eq!(p.clips[2].end(), total_end_before, "total track length unchanged (==30)");
+        assert_eq!(
+            p.clips[2].end(),
+            total_end_before,
+            "total track length unchanged (==30)"
+        );
 
         // Slide PAST the next neighbour: N has len 7 now, so +7 would make N.len == 0 -> reject,
         // mutate NOTHING. Snapshot the whole layout and confirm it is byte-identical afterward.
@@ -3778,15 +4150,17 @@ mod tests {
             p.clips.iter().map(|c| (c.t0, c.len, c.src_in)).collect();
         let bad = p.slide(1, 7);
         assert!(!bad, "slide that collapses a neighbour returns false");
-        let after: Vec<(i64, i64, i64)> =
-            p.clips.iter().map(|c| (c.t0, c.len, c.src_in)).collect();
+        let after: Vec<(i64, i64, i64)> = p.clips.iter().map(|c| (c.t0, c.len, c.src_in)).collect();
         assert_eq!(before, after, "rejected slide mutated nothing");
 
         // Slide with a MISSING neighbour: a lone clip on a fresh track has neither P nor N -> false.
         let mut q = Project::demo("x".into());
         q.clips.clear();
         q.clips.push(Clip::video(0, 0, 10, 0, "lone"));
-        assert!(!q.slide(0, 1), "slide with no abutting neighbours returns false");
+        assert!(
+            !q.slide(0, 1),
+            "slide with no abutting neighbours returns false"
+        );
         assert_eq!(q.clips[0].t0, 0, "lone clip unmoved");
     }
 
@@ -3810,15 +4184,27 @@ mod tests {
         assert_eq!(p.clips[0].t0, 5, "t0 preserved");
         assert_eq!(p.clips[0].len, 10, "len preserved");
         assert_eq!(p.clips[0].track, 0, "track preserved");
-        assert!((p.clips[0].bright - 0.5).abs() < 1e-6, "non-default field (bright) preserved");
+        assert!(
+            (p.clips[0].bright - 0.5).abs() < 1e-6,
+            "non-default field (bright) preserved"
+        );
         assert_eq!(p.clips[0].group, 0, "group preserved");
 
         // Replace with an OUT-OF-RANGE media (== media.len()): false + nothing mutated.
         let bad = p.replace_clip(0, 2); // media.len() == 2, so 2 is out of range
-        assert!(!bad, "replace with an out-of-range media index returns false");
-        assert_eq!(p.clips[0].media, 1, "out-of-range replace leaves media unchanged");
+        assert!(
+            !bad,
+            "replace with an out-of-range media index returns false"
+        );
+        assert_eq!(
+            p.clips[0].media, 1,
+            "out-of-range replace leaves media unchanged"
+        );
         // Out-of-range CLIP index is also a no-op/false.
-        assert!(!p.replace_clip(99, 0), "out-of-range clip index returns false");
+        assert!(
+            !p.replace_clip(99, 0),
+            "out-of-range clip index returns false"
+        );
     }
 
     #[test]
@@ -3828,9 +4214,9 @@ mod tests {
         // move is clamped so the EARLIEST member stays >= 0. ungroup clears both back to 0.
         let mut p = Project::demo("x".into());
         p.clips.clear();
-        p.clips.push(Clip::video(0, 0, 10, 0, "A"));  // idx 0, t0 0
+        p.clips.push(Clip::video(0, 0, 10, 0, "A")); // idx 0, t0 0
         p.clips.push(Clip::video(0, 20, 10, 0, "B")); // idx 1, t0 20
-        // Pre-existing group on an unrelated clip, to prove the fresh id never collides.
+                                                      // Pre-existing group on an unrelated clip, to prove the fresh id never collides.
         p.clips.push(Clip::video(0, 50, 10, 1, "PRIOR")); // idx 2
         p.clips[2].group = 7; // a prior group id
 
@@ -3850,13 +4236,19 @@ mod tests {
         // Move the group far LEFT (-100): clamped so the earliest (A at 5) stays >= 0, i.e. dt = -5.
         p.move_group(id, -100);
         assert_eq!(p.clips[0].t0, 0, "earliest member clamped to 0");
-        assert_eq!(p.clips[1].t0, 20, "B shifted by the SAME clamped delta (-5)");
+        assert_eq!(
+            p.clips[1].t0, 20,
+            "B shifted by the SAME clamped delta (-5)"
+        );
 
         // Ungroup: both members go back to group 0; the prior clip (group 7) is unaffected.
         p.ungroup(id);
         assert_eq!(p.clips[0].group, 0, "A ungrouped");
         assert_eq!(p.clips[1].group, 0, "B ungrouped");
-        assert_eq!(p.clips[2].group, 7, "ungroup(id) leaves a different group untouched");
+        assert_eq!(
+            p.clips[2].group, 7,
+            "ungroup(id) leaves a different group untouched"
+        );
     }
 
     #[test]
@@ -3874,7 +4266,10 @@ mod tests {
         c.src_in = 7;
         c.gain = 0.8; // per-clip AUDIO gain to detach
         p.clips.push(c); // idx 0: media 3, src_in 7, t0 12, len 40, track 0, gain 0.8
-        assert!(!p.tracks.iter().any(|t| t.kind == TrackKind::Audio), "no audio track to start");
+        assert!(
+            !p.tracks.iter().any(|t| t.kind == TrackKind::Audio),
+            "no audio track to start"
+        );
 
         let ok = p.detach_audio(0);
         assert!(ok, "detach_audio on a valid clip returns true");
@@ -3894,14 +4289,23 @@ mod tests {
         assert_eq!(det.src_in, 7, "detached clip keeps src_in");
         assert_eq!(det.t0, 12, "detached clip keeps t0 (aligned in time)");
         assert_eq!(det.len, 40, "detached clip keeps len");
-        assert!((det.gain - 0.8).abs() < 1e-6, "detached clip carries the original gain 0.8");
+        assert!(
+            (det.gain - 0.8).abs() < 1e-6,
+            "detached clip carries the original gain 0.8"
+        );
 
         // The ORIGINAL clip is silenced (gain == 0.0) but its VIDEO footprint is unchanged.
         let orig = &p.clips[0];
-        assert!((orig.gain - 0.0).abs() < 1e-6, "original clip audio is silenced (gain 0.0)");
+        assert!(
+            (orig.gain - 0.0).abs() < 1e-6,
+            "original clip audio is silenced (gain 0.0)"
+        );
         assert_eq!(orig.track, 0, "original clip stays on its video track");
         assert_eq!(orig.t0, 12, "original clip t0 unchanged (video untouched)");
-        assert_eq!(orig.len, 40, "original clip len unchanged (video untouched)");
+        assert_eq!(
+            orig.len, 40,
+            "original clip len unchanged (video untouched)"
+        );
         assert_eq!(orig.media, 3, "original clip media unchanged");
 
         // Out-of-range clip index is a no-op returning false.
@@ -3922,17 +4326,29 @@ mod tests {
         // (1) Default in=-1 (no region) -> (0, total), byte-identical to "export everything".
         assert_eq!(p.export_in, -1, "default in mark is -1 (no region)");
         assert_eq!(p.export_out, -1, "default out mark is -1 (no region)");
-        assert_eq!(p.export_range(total), (0, total), "no region -> whole timeline");
+        assert_eq!(
+            p.export_range(total),
+            (0, total),
+            "no region -> whole timeline"
+        );
 
         // (2) Valid region in=10,out=40 -> (10, 40).
         p.export_in = 10;
         p.export_out = 40;
-        assert_eq!(p.export_range(total), (10, 40), "valid region honored verbatim");
+        assert_eq!(
+            p.export_range(total),
+            (10, 40),
+            "valid region honored verbatim"
+        );
 
         // (3) INVALID region in=10,out=5 (out <= in) -> falls back to the WHOLE timeline (0, total).
         p.export_in = 10;
         p.export_out = 5;
-        assert_eq!(p.export_range(total), (0, total), "out<=in is invalid -> whole timeline");
+        assert_eq!(
+            p.export_range(total),
+            (0, total),
+            "out<=in is invalid -> whole timeline"
+        );
 
         // (4) An out past the end clamps to total; an in still >=0 is honored.
         p.export_in = 80;
@@ -3955,7 +4371,7 @@ mod tests {
         c.src_in = 5;
         p.clips.push(c); // idx 0: track 0, t0 0, len 100, src_in 5, end()=100
         p.clips.push(Clip::video(0, 120, 40, 0, "D")); // idx 1: track 0, t0 120 (later, same track)
-        // A clip on ANOTHER track that must NOT move (ripple is current-track-only).
+                                                       // A clip on ANOTHER track that must NOT move (ripple is current-track-only).
         p.clips.push(Clip::video(0, 50, 20, 1, "OTHER")); // idx 2: track 1
 
         let total_before = p.total_frames();
@@ -3963,7 +4379,11 @@ mod tests {
         assert!(ok, "freeze_frame strictly inside the clip succeeds");
 
         // Clip count: C split into 2 (left + right) + 1 freeze still = +2 over the original 3.
-        assert_eq!(p.clips.len(), 5, "split (+1) and freeze still (+1) added two clips");
+        assert_eq!(
+            p.clips.len(),
+            5,
+            "split (+1) and freeze still (+1) added two clips"
+        );
 
         // The FREEZE still: a clip at t0==40 with speed==0 && gain==0 && len==30, src_in==45.
         let freeze = p
@@ -3972,9 +4392,18 @@ mod tests {
             .find(|x| (x.speed - 0.0).abs() < 1e-6 && x.t0 == 40)
             .expect("a freeze still exists at t0=40 with speed 0");
         assert_eq!(freeze.len, 30, "freeze still length == dur");
-        assert!((freeze.speed - 0.0).abs() < 1e-6, "freeze still speed == 0 (held frame)");
-        assert!((freeze.gain - 0.0).abs() < 1e-6, "freeze still gain == 0 (silent)");
-        assert_eq!(freeze.src_in, 45, "freeze still holds C's source frame at t (5 + 40)");
+        assert!(
+            (freeze.speed - 0.0).abs() < 1e-6,
+            "freeze still speed == 0 (held frame)"
+        );
+        assert!(
+            (freeze.gain - 0.0).abs() < 1e-6,
+            "freeze still gain == 0 (silent)"
+        );
+        assert_eq!(
+            freeze.src_in, 45,
+            "freeze still holds C's source frame at t (5 + 40)"
+        );
         assert_eq!(freeze.track, 0, "freeze still on C's track");
 
         // C's LEFT half: t0=0, len=40 (shortened to the cut), src_in=5, normal speed.
@@ -3984,7 +4413,10 @@ mod tests {
             .find(|x| x.track == 0 && x.t0 == 0 && x.src_in == 5)
             .expect("C left half present");
         assert_eq!(left.len, 40, "C left half shortened to the cut point");
-        assert!((left.speed - 1.0).abs() < 1e-6, "C left half keeps normal speed");
+        assert!(
+            (left.speed - 1.0).abs() < 1e-6,
+            "C left half keeps normal speed"
+        );
 
         // C's RIGHT half rippled +30: was at t0=40 (split point), now at t0=70. Its source continues
         // from src_in = 5 + 40 = 45, len = 60.
@@ -4003,7 +4435,10 @@ mod tests {
             .iter()
             .find(|x| x.track == 0 && x.len == 40 && x.src_in == 0)
             .expect("D present");
-        assert_eq!(d.t0, 150, "later same-track clip D rippled +dur (120 -> 150)");
+        assert_eq!(
+            d.t0, 150,
+            "later same-track clip D rippled +dur (120 -> 150)"
+        );
 
         // The OTHER-track clip is UNMOVED (ripple is current-track-only).
         let other = p
@@ -4020,10 +4455,19 @@ mod tests {
         // no-ops returning false with the clip set unchanged.
         let count = p.clips.len();
         // Clip 0 is now C's left half [0,40): t==0 (its t0) is its left edge -> not strictly inside.
-        assert!(!p.freeze_frame(0, 0, 30), "t == clip t0 (left edge) is not strictly inside");
+        assert!(
+            !p.freeze_frame(0, 0, 30),
+            "t == clip t0 (left edge) is not strictly inside"
+        );
         // t==40 == left half end() -> not strictly inside either (the strict `t < end()` guard).
-        assert!(!p.freeze_frame(0, 40, 30), "t == clip end() (right edge) is not strictly inside");
-        assert!(!p.freeze_frame(99, 10, 30), "out-of-range clip index returns false");
+        assert!(
+            !p.freeze_frame(0, 40, 30),
+            "t == clip end() (right edge) is not strictly inside"
+        );
+        assert!(
+            !p.freeze_frame(99, 10, 30),
+            "out-of-range clip index returns false"
+        );
         // dur<=0 is rejected (use the left half, t=10 is strictly inside [0,40)).
         assert!(!p.freeze_frame(0, 10, 0), "dur == 0 returns false");
         assert!(!p.freeze_frame(0, 10, -5), "negative dur returns false");
@@ -4053,7 +4497,10 @@ mod tests {
         dst.fade_in = 3;
         dst.fade_out = 4;
         // dst starts neutral so the copy is observable: bright 0.0, sat 1.0 (Clip::video defaults).
-        assert!((dst.bright - 0.0).abs() < 1e-6, "dst starts at neutral bright");
+        assert!(
+            (dst.bright - 0.0).abs() < 1e-6,
+            "dst starts at neutral bright"
+        );
         assert!((dst.sat - 1.0).abs() < 1e-6, "dst starts at neutral sat");
         p.clips.push(dst); // idx 1 = DST
 
@@ -4062,7 +4509,10 @@ mod tests {
         p.copy_filters_from(1, &src_clone);
         let d = &p.clips[1];
         // Filter fields copied from src ...
-        assert!((d.bright - 0.5).abs() < 1e-6, "bright copied from src (0.5)");
+        assert!(
+            (d.bright - 0.5).abs() < 1e-6,
+            "bright copied from src (0.5)"
+        );
         assert!((d.sat - 2.0).abs() < 1e-6, "sat copied from src (2.0)");
         // ... dst identity/position PRESERVED.
         assert_eq!(d.media, 1, "dst media unchanged");
@@ -4080,7 +4530,10 @@ mod tests {
         p.clips.push(dst2); // idx 2
         p.paste_filters(0, 2); // copy src (idx 0) filters onto dst2 (idx 2)
         let d2 = &p.clips[2];
-        assert!((d2.bright - 0.5).abs() < 1e-6, "paste_filters copies bright");
+        assert!(
+            (d2.bright - 0.5).abs() < 1e-6,
+            "paste_filters copies bright"
+        );
         assert!((d2.sat - 2.0).abs() < 1e-6, "paste_filters copies sat");
         assert_eq!(d2.t0, 200, "paste_filters preserves dst2 t0");
         assert_eq!(d2.src_in, 15, "paste_filters preserves dst2 src_in");
@@ -4088,7 +4541,10 @@ mod tests {
 
         // paste onto SELF and out-of-range indices are no-ops (src filters unchanged, no panic).
         p.paste_filters(0, 0); // self -> no-op
-        assert!((p.clips[0].bright - 0.5).abs() < 1e-6, "self-paste leaves src unchanged");
+        assert!(
+            (p.clips[0].bright - 0.5).abs() < 1e-6,
+            "self-paste leaves src unchanged"
+        );
         p.paste_filters(0, 99); // OOR dst -> no-op
         p.paste_filters(99, 1); // OOR src -> no-op
     }
@@ -4123,9 +4579,17 @@ mod tests {
         // Track 0: A's left half (idx 0) kept t0=0,len=10,src_in=5; its right half abuts at t=10
         // with src_in = 5 + (10 - 0) = 15, len = 20.
         assert_eq!(p.clips[0].track, 0);
-        assert_eq!((p.clips[0].t0, p.clips[0].len, p.clips[0].src_in), (0, 10, 5), "A left half");
+        assert_eq!(
+            (p.clips[0].t0, p.clips[0].len, p.clips[0].src_in),
+            (0, 10, 5),
+            "A left half"
+        );
         // split_clip inserts A's right half directly after A (idx 1).
-        assert_eq!((p.clips[1].t0, p.clips[1].len, p.clips[1].src_in), (10, 20, 15), "A right half");
+        assert_eq!(
+            (p.clips[1].t0, p.clips[1].len, p.clips[1].src_in),
+            (10, 20, 15),
+            "A right half"
+        );
         assert_eq!(p.clips[1].track, 0, "A right half stays on track 0");
         assert_eq!(p.clips[0].end(), p.clips[1].t0, "A halves abut at t=10");
         assert_eq!(
@@ -4143,16 +4607,30 @@ mod tests {
             .find(|x| x.track == 0 && x.len == 10 && x.t0 == 0 && x.src_in == 0)
             .expect("edge-touching clip still present");
         assert_eq!(edge.t0, edge_before.t0, "edge clip t0 untouched");
-        assert_eq!(edge.len, edge_before.len, "edge clip len untouched (not split)");
-        assert_eq!(edge.src_in, edge_before.src_in, "edge clip src_in untouched");
+        assert_eq!(
+            edge.len, edge_before.len,
+            "edge clip len untouched (not split)"
+        );
+        assert_eq!(
+            edge.src_in, edge_before.src_in,
+            "edge clip src_in untouched"
+        );
 
         // Track 1: B split into a left half (t0=4,len=6,src_in=100) and a right half abutting at
         // t=10 with src_in = 100 + (10 - 4) = 106, len = 14. Find both B halves on track 1.
         let mut b_halves: Vec<&Clip> = p.clips.iter().filter(|x| x.track == 1).collect();
         b_halves.sort_by_key(|x| x.t0);
         assert_eq!(b_halves.len(), 2, "track 1 now has two clips");
-        assert_eq!((b_halves[0].t0, b_halves[0].len, b_halves[0].src_in), (4, 6, 100), "B left half");
-        assert_eq!((b_halves[1].t0, b_halves[1].len, b_halves[1].src_in), (10, 14, 106), "B right half");
+        assert_eq!(
+            (b_halves[0].t0, b_halves[0].len, b_halves[0].src_in),
+            (4, 6, 100),
+            "B left half"
+        );
+        assert_eq!(
+            (b_halves[1].t0, b_halves[1].len, b_halves[1].src_in),
+            (10, 14, 106),
+            "B right half"
+        );
         assert_eq!(b_halves[0].end(), b_halves[1].t0, "B halves abut at t=10");
         assert_eq!(
             b_halves[1].src_in,
@@ -4178,11 +4656,17 @@ mod tests {
         assert_eq!(p.clips[0].track, 0, "track unchanged by a nudge");
         assert_eq!(p.clips[0].src_in, 7, "src_in unchanged by a nudge");
 
-        assert!(p.nudge_clip(0, -1000), "large negative nudge still returns true");
+        assert!(
+            p.nudge_clip(0, -1000),
+            "large negative nudge still returns true"
+        );
         assert_eq!(p.clips[0].t0, 0, "t0 clamps to 0, never negative");
 
         // Out-of-range clip index: false, and the existing clip is untouched.
-        assert!(!p.nudge_clip(99, 5), "out-of-range clip index returns false");
+        assert!(
+            !p.nudge_clip(99, 5),
+            "out-of-range clip index returns false"
+        );
         assert_eq!(p.clips[0].t0, 0, "OOR nudge mutates nothing");
     }
 
@@ -4190,8 +4674,8 @@ mod tests {
     fn copy_paste_offset_preserving() {
         let mut p = Project::demo("x".into());
         p.clips.clear();
-        p.clips.push(Clip::video(0, 40, 30, 0, "A"));  // idx 0
-        p.clips.push(Clip::video(0, 90, 20, 1, "B"));  // idx 1 (later, other track)
+        p.clips.push(Clip::video(0, 40, 30, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 90, 20, 1, "B")); // idx 1 (later, other track)
         let clip = p.copy_clips(&[0, 1]);
         assert_eq!(clip.len(), 2);
         // rebased: earliest (A at 40) -> 0; B keeps its +50 offset.
@@ -4209,7 +4693,10 @@ mod tests {
         let mut p = Project::demo("x".into());
         p.clips.clear();
         p.tracks[1].locked = true; // V2 locked
-        let clips = vec![Clip::video(0, 0, 30, 0, "ok"), Clip::video(0, 10, 30, 1, "locked")];
+        let clips = vec![
+            Clip::video(0, 0, 30, 0, "ok"),
+            Clip::video(0, 10, 30, 1, "locked"),
+        ];
         let first = p.paste_clips(&clips, 100).unwrap();
         assert_eq!(p.clips.len(), 1, "only the unlocked-track clip pasted");
         assert_eq!(p.clips[first].track, 0);
@@ -4229,14 +4716,19 @@ mod tests {
         p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
         p.clips.push(Clip::video(0, 100, 60, 0, "B")); // idx 1
         let src = Clip::video(0, 0, 40, 0, "NEW");
-        let new_i = p.insert_clip(0, 50, src).expect("insert lands on unlocked track");
+        let new_i = p
+            .insert_clip(0, 50, src)
+            .expect("insert lands on unlocked track");
         // A split into two halves (+1) and the new clip pushed (+1): 2 -> 4 clips.
         assert_eq!(p.clips.len(), 4);
         assert_eq!(p.clips[new_i].t0, 50, "new clip at the insert frame");
         assert_eq!(p.clips[new_i].len, 40);
         // B (len 60, the only len-60 clip) rippled right by the inserted length (40): 100 -> 140.
         let b = p.clips.iter().find(|c| c.len == 60).unwrap();
-        assert_eq!(b.t0, 140, "downstream clip shifted right by the inserted length");
+        assert_eq!(
+            b.t0, 140,
+            "downstream clip shifted right by the inserted length"
+        );
         // A-left is the [0,50) remnant: len 50, src_in 0, unmoved (t0 0 < 50, not shifted right).
         let a_left = p
             .clips
@@ -4250,7 +4742,10 @@ mod tests {
             .iter()
             .find(|c| c.len == 50 && c.src_in == 50)
             .expect("A-right [50,100) remnant rides the ripple");
-        assert_eq!(a_right.t0, 90, "right remnant of the split clip rippled right by the inserted length");
+        assert_eq!(
+            a_right.t0, 90,
+            "right remnant of the split clip rippled right by the inserted length"
+        );
     }
 
     #[test]
@@ -4260,11 +4755,20 @@ mod tests {
         let mut p = Project::demo("x".into());
         p.clips.clear();
         p.clips.push(Clip::video(0, 0, 100, 0, "A"));
-        let new_i = p.insert_clip(0, 0, Clip::video(0, 0, 30, 0, "NEW")).unwrap();
-        assert_eq!(p.clips.len(), 2, "no split at a clip boundary — only the new clip is added");
+        let new_i = p
+            .insert_clip(0, 0, Clip::video(0, 0, 30, 0, "NEW"))
+            .unwrap();
+        assert_eq!(
+            p.clips.len(),
+            2,
+            "no split at a clip boundary — only the new clip is added"
+        );
         assert_eq!(p.clips[new_i].t0, 0, "new clip at the insert frame");
         let a = p.clips.iter().find(|c| c.len == 100).unwrap();
-        assert_eq!(a.t0, 30, "A (t0 0 >= 0) rippled right by the inserted length, intact (unsplit)");
+        assert_eq!(
+            a.t0, 30,
+            "A (t0 0 >= 0) rippled right by the inserted length, intact (unsplit)"
+        );
     }
 
     #[test]
@@ -4274,10 +4778,16 @@ mod tests {
         p.clips.clear();
         p.clips.push(Clip::video(0, 0, 100, 0, "A")); // track 0, t0 >= 0
         p.clips.push(Clip::video(0, 0, 100, 1, "D")); // track 1 (other)
-        let new_i = p.insert_clip(0, -10, Clip::video(0, 0, 30, 0, "NEW")).unwrap();
+        let new_i = p
+            .insert_clip(0, -10, Clip::video(0, 0, 30, 0, "NEW"))
+            .unwrap();
         assert_eq!(p.clips[new_i].t0, 0, "negative insert frame clamped to 0");
         // A (track 0, t0 0 >= 0) shifted right by 30; D (track 1) unmoved.
-        let a = p.clips.iter().find(|c| c.track == 0 && c.len == 100).unwrap();
+        let a = p
+            .clips
+            .iter()
+            .find(|c| c.track == 0 && c.len == 100)
+            .unwrap();
         assert_eq!(a.t0, 30, "same-track clip rippled");
         let d = p.clips.iter().find(|c| c.track == 1).unwrap();
         assert_eq!(d.t0, 0, "other-track clip unmoved");
@@ -4292,7 +4802,9 @@ mod tests {
         p.clips.clear();
         p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
         p.clips.push(Clip::video(0, 100, 100, 0, "B")); // idx 1
-        let new_i = p.overwrite_clip(0, 80, Clip::video(0, 0, 60, 0, "OVR")).expect("unlocked");
+        let new_i = p
+            .overwrite_clip(0, 80, Clip::video(0, 0, 60, 0, "OVR"))
+            .expect("unlocked");
         assert_eq!(p.clips[new_i].t0, 80);
         assert_eq!(p.clips[new_i].len, 60);
         // A tail-trimmed: now ends at 80 (len 80).
@@ -4300,7 +4812,10 @@ mod tests {
         assert_eq!(a.end(), 80, "A tail-trimmed to the overwrite start");
         // B head-trimmed: now starts at 140 (its tail at 200 is untouched -> no ripple).
         let b = p.clips.iter().find(|c| c.end() == 200).unwrap();
-        assert_eq!(b.t0, 140, "B head-trimmed to the overwrite end; tail unmoved (no ripple)");
+        assert_eq!(
+            b.t0, 140,
+            "B head-trimmed to the overwrite end; tail unmoved (no ripple)"
+        );
     }
 
     #[test]
@@ -4312,7 +4827,9 @@ mod tests {
         let mut a = Clip::video(0, 0, 300, 0, "A");
         a.src_in = 0;
         p.clips.push(a);
-        let new_i = p.overwrite_clip(0, 100, Clip::video(0, 0, 100, 0, "OVR")).unwrap();
+        let new_i = p
+            .overwrite_clip(0, 100, Clip::video(0, 0, 100, 0, "OVR"))
+            .unwrap();
         // 3 clips now: left remnant, new clip, right remnant.
         assert_eq!(p.clips.len(), 3);
         assert_eq!(p.clips[new_i].t0, 100);
@@ -4321,7 +4838,10 @@ mod tests {
         assert_eq!(left.end(), 100, "left remnant ends at overwrite start");
         let right = p.clips.iter().find(|c| c.t0 == 200).unwrap();
         assert_eq!(right.end(), 300, "right remnant starts at overwrite end");
-        assert_eq!(right.src_in, 200, "right remnant source advanced past the covered span");
+        assert_eq!(
+            right.src_in, 200,
+            "right remnant source advanced past the covered span"
+        );
     }
 
     #[test]
@@ -4331,11 +4851,16 @@ mod tests {
         p.clips.clear();
         p.clips.push(Clip::video(0, 50, 40, 0, "A")); // [50,90)
         p.clips.push(Clip::video(0, 50, 40, 1, "D")); // other track, must survive
-        let new_i = p.overwrite_clip(0, 0, Clip::video(0, 0, 200, 0, "OVR")).unwrap();
+        let new_i = p
+            .overwrite_clip(0, 0, Clip::video(0, 0, 200, 0, "OVR"))
+            .unwrap();
         // A removed; new clip + D remain (the new clip is appended LAST).
         assert_eq!(p.clips.len(), 2);
         assert_eq!(p.clips[new_i].t0, 0);
-        assert!(p.clips.iter().any(|c| c.track == 1), "other-track clip survived");
+        assert!(
+            p.clips.iter().any(|c| c.track == 1),
+            "other-track clip survived"
+        );
         assert!(
             !p.clips.iter().any(|c| c.track == 0 && c.len == 40),
             "fully-covered same-track clip was removed"
@@ -4361,8 +4886,15 @@ mod tests {
         let mut p = Project::demo("x".into());
         p.clips.clear();
         let i = p.append_clip(2, Clip::video(0, 0, 30, 2, "A1")).unwrap();
-        assert_eq!(p.clips[i].t0, 0, "append onto an empty track lands at frame 0");
-        assert_eq!(p.track_end(2), 30, "track_end now reflects the appended clip");
+        assert_eq!(
+            p.clips[i].t0, 0,
+            "append onto an empty track lands at frame 0"
+        );
+        assert_eq!(
+            p.track_end(2),
+            30,
+            "track_end now reflects the appended clip"
+        );
     }
 
     #[test]
@@ -4372,7 +4904,9 @@ mod tests {
         p.tracks[0].locked = true; // V1 locked
         let n0 = p.clips.len();
         assert!(p.insert_clip(0, 0, Clip::video(0, 0, 30, 0, "x")).is_none());
-        assert!(p.overwrite_clip(0, 0, Clip::video(0, 0, 30, 0, "x")).is_none());
+        assert!(p
+            .overwrite_clip(0, 0, Clip::video(0, 0, 30, 0, "x"))
+            .is_none());
         assert!(p.append_clip(0, Clip::video(0, 0, 30, 0, "x")).is_none());
         assert_eq!(p.clips.len(), n0, "no clip placed on a locked track");
     }
@@ -4418,9 +4952,18 @@ mod tests {
         assert!(p.remove_track(1)); // remove V2
         assert_eq!(p.tracks.len(), 2);
         assert_eq!(p.clips.len(), 2, "the clip on the removed track is gone");
-        assert!(p.clips.iter().any(|c| c.track == 0), "V1 clip stays on track 0");
-        assert!(p.clips.iter().any(|c| c.track == 1), "A1 clip reindexed 2 -> 1");
-        assert!(!p.clips.iter().any(|c| c.track == 2), "no clip left on the old track 2");
+        assert!(
+            p.clips.iter().any(|c| c.track == 0),
+            "V1 clip stays on track 0"
+        );
+        assert!(
+            p.clips.iter().any(|c| c.track == 1),
+            "A1 clip reindexed 2 -> 1"
+        );
+        assert!(
+            !p.clips.iter().any(|c| c.track == 2),
+            "no clip left on the old track 2"
+        );
     }
 
     #[test]
@@ -4458,7 +5001,10 @@ mod tests {
         let lt = Title::lower_third("Name / Role");
         assert!(!lt.is_empty(), "lower_third has text");
         assert_eq!(lt.text, "Name / Role");
-        assert!(lt.y > 0.5, "lower_third anchors toward the lower part of the frame");
+        assert!(
+            lt.y > 0.5,
+            "lower_third anchors toward the lower part of the frame"
+        );
         assert_eq!(lt.rgb, [1.0, 1.0, 1.0], "lower_third defaults to white");
     }
 
@@ -4502,7 +5048,11 @@ mod tests {
         let nbins_before = p.bin_names.len();
         let blank = p.add_bin("");
         assert_eq!(blank, 0, "a blank bin name returns 0");
-        assert_eq!(p.bin_names.len(), nbins_before, "a blank bin name adds no bin");
+        assert_eq!(
+            p.bin_names.len(),
+            nbins_before,
+            "a blank bin name adds no bin"
+        );
     }
 
     // T4 — MEDIA RELINK. relink_media swaps a pool media's path in place; clips index by media id, so
@@ -4521,17 +5071,29 @@ mod tests {
 
         // relink_media(0, "/y/b.mp4") -> true; media[0] is swapped; the clip still references media 0
         // (it now decodes the NEW file via its unchanged index).
-        assert!(p.relink_media(0, "/y/b.mp4"), "relink of a valid index + non-empty path succeeds");
+        assert!(
+            p.relink_media(0, "/y/b.mp4"),
+            "relink of a valid index + non-empty path succeeds"
+        );
         assert_eq!(p.media[0], "/y/b.mp4", "media[0] is now the new path");
-        assert_eq!(p.clips[0].media, 0, "the clip still references media 0 after relink");
+        assert_eq!(
+            p.clips[0].media, 0,
+            "the clip still references media 0 after relink"
+        );
 
         // relink_media(9, "z") -> false, NO mutation (index out of range).
         assert!(!p.relink_media(9, "z"), "out-of-range index returns false");
-        assert_eq!(p.media[0], "/y/b.mp4", "out-of-range relink did not mutate media[0]");
+        assert_eq!(
+            p.media[0], "/y/b.mp4",
+            "out-of-range relink did not mutate media[0]"
+        );
         assert_eq!(p.media.len(), 1, "out-of-range relink did not add media");
 
         // relink_media(0, "") -> false, NO mutation (empty new path).
         assert!(!p.relink_media(0, ""), "an empty new path returns false");
-        assert_eq!(p.media[0], "/y/b.mp4", "empty-path relink did not mutate media[0]");
+        assert_eq!(
+            p.media[0], "/y/b.mp4",
+            "empty-path relink did not mutate media[0]"
+        );
     }
 }

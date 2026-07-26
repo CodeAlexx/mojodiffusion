@@ -38,10 +38,11 @@ compatibility unless a separately reviewed contract migration changes them.
 - Prompt editors expose a practical multiline viewport and remain vertically
   resizable so longer prompts can be edited without relying on horizontal
   scrolling or a single-line-height control.
-- Generate is the image-only Swarm-style workspace: a filterable grouped
-  parameter rail, dominant result viewer, Current Batch, bottom prompt action,
-  and History/Presets/Models/LoRAs library. Video and inpainting controls and
-  model entries do not appear there; their dedicated tabs retain ownership.
+- Generate is Serenity's image and admitted text-to-video workspace: a
+  filterable grouped parameter rail, dominant result viewer, Current Batch,
+  bottom prompt action, and History/Presets/Models/LoRAs library. Video appears
+  only through exact server-published model profiles. Inpainting and
+  source-image editing remain Canvas-owned.
 - Generate submits a flat capability-admitted `/v1/generate` request rather
   than translating through the legacy `/prompt` graph adapter. Browser
   preflight and generation receive the exact same serialized body. The selected
@@ -159,10 +160,15 @@ compatibility unless a separately reviewed contract migration changes them.
 - Canvas stages the exact graph it submits for the next Workflow-tab visit.
   Tab switching must not rebuild that graph from unrelated Generate controls or
   replace its selected edit engine, source image, mask, or LoRA chain.
-- LTX2 is exposed only through the verified server template. Before queueing,
-  the browser requires the admitted `res2s` sampler, `ltx2` scheduler, and
-  prompt-matched conditioning sidecar. Incomplete legacy fallbacks are forbidden,
-  and any submission rejection must clear the Generating state immediately.
+- LTX2 is exposed only through the server-published exact AOT profile registry.
+  The browser may submit Creator distilled (`euler` + `ltx2_distilled`) or
+  bounded dev (`res2s` + `ltx2`) sampling only when the selected native
+  width/height/frame-count/FPS tuple has its exact executable. Automatic
+  prompt-matched Mojo conditioning is used when manual sidecars are blank.
+  Optional post-upscale is a separate admitted object and must never be
+  presented as native inference geometry. Incomplete legacy fallbacks are
+  forbidden, and any submission rejection must clear the Generating state
+  immediately.
 
 ## Verification
 

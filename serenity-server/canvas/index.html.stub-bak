@@ -11,13 +11,13 @@
   <div id="app">
     <header id="topbar"></header>
     <nav    id="tooldock"></nav>
-    <aside  id="param-rail"></aside>     <!-- LEFT param rail (SwarmUI controls) -->
+    <aside  id="param-rail"></aside>     <!-- LEFT param rail (Serenity controls) -->
     <main   id="canvas-host">
       <div id="canvas-toolbar"></div>    <!-- contextual toolbar over the stage -->
       <div id="konva-stage"></div>       <!-- Konva mounts here -->
       <div id="canvas-statusbar"></div>
     </main>
-    <section id="prompt-bar"></section>   <!-- bottom-center prompt + Generate (SwarmUI) -->
+    <section id="prompt-bar"></section>   <!-- bottom-center prompt + Generate (Serenity) -->
     <aside  id="layers-panel"></aside>   <!-- RIGHT layers panel (InvokeAI) -->
     <footer id="gallery"></footer>
     <div id="queue-strip"></div>
@@ -45,7 +45,7 @@
   <script src="js/modules/workflows.js"></script>
   <script src="js/modules/ideogram4_bbox_node.js"></script>
   <script src="js/modules/ideogram4_nodes.js"></script>
-  <!-- SwarmUI-parity modules (10 builder/bugfixer/skeptic teams) -->
+  <!-- Serenity modules (10 builder/bugfixer/skeptic teams) -->
   <script src="js/modules/advanced_sampling.js"></script>
   <script src="js/modules/grid_xyz.js"></script>
   <script src="js/modules/mask_paint.js"></script>

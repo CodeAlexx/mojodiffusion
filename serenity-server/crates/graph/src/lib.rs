@@ -87,7 +87,7 @@ pub struct GraphError {
     pub code: GraphErrorCode,
     /// The node id that triggered the error, when one is known.
     pub node_id: Option<i64>,
-    /// The Comfy/Swarm `type_id` that triggered the error, when one is known.
+    /// The Comfy `type_id` that triggered the error, when one is known.
     pub type_id: Option<String>,
     pub message: String,
 }
@@ -222,7 +222,7 @@ pub enum ValuePayload {
 }
 
 impl ValuePayload {
-    /// The Comfy/Swarm `typ` string this payload corresponds to — the same
+    /// The Comfy `typ` string this payload corresponds to — the same
     /// strings the Mojo executor stored in `value_types` (line 1733) and
     /// matched against in the allowlist (lines 1078-1091).
     pub fn type_id(&self) -> &'static str {
@@ -264,7 +264,7 @@ impl ValuePayload {
 pub struct WorkflowValue {
     pub node_id: i64,
     pub port: String,
-    /// Comfy/Swarm type string, kept for parity with the Mojo handle and for
+    /// Comfy type string, kept for parity with the Mojo handle and for
     /// the `_workflow_require_value_type` checks. Always equals
     /// `payload.type_id()`.
     pub typ: String,
@@ -445,7 +445,7 @@ pub struct WorkflowEdge {
     pub to: EdgeEndpoint,
 }
 
-/// A typed-graph node. `type_id` is the canonical Comfy/Swarm node type; the
+/// A typed-graph node. `type_id` is the canonical Comfy node type; the
 /// raw `fields` object holds widget values to be interpreted per node type
 /// (Mojo `_comfy_ui_widget_fields`, line 1128).
 #[derive(Debug, Clone, PartialEq)]
@@ -1163,5 +1163,39 @@ mod tests {
             out.get("mask_image").and_then(|v| v.as_str()),
             Some("m.png")
         );
+    }
+
+    #[test]
+    fn ltxv_sampler_lowers_full_video_guide() {
+        let out = lower_typed(json!({
+            "nodes": [
+                { "id": 1, "type_id": "LTXVLoader",
+                  "fields": { "checkpoint_path": "ltx-2.3-22b-dev-fp8" } },
+                { "id": 2, "type_id": "LoadVideo",
+                  "fields": { "video": "/tmp/ltx2-v2v-source.mp4" } },
+                { "id": 3, "type_id": "LTXVSampler",
+                  "fields": {
+                    "prompt": "preserve the source motion in a painted style",
+                    "width": 512,
+                    "height": 768,
+                    "num_frames": 121,
+                    "steps": 8,
+                    "seed": 42,
+                    "frame_rate": 25,
+                    "cfg": 1.0,
+                    "guide_strength": 0.7
+                  } }
+            ],
+            "edges": [
+                { "from": { "node": 1, "port": "MODEL" },
+                  "to": { "node": 3, "port": "ltxv_model" } },
+                { "from": { "node": 2, "port": "VIDEO" },
+                  "to": { "node": 3, "port": "guide_video" } }
+            ]
+        }))
+        .expect("LTXVSampler V2V source should lower");
+        assert_eq!(out["video_path"], "/tmp/ltx2-v2v-source.mp4");
+        assert_eq!(out["video_strength"], 0.7);
+        assert_eq!(out["prompt"], "preserve the source motion in a painted style");
     }
 }

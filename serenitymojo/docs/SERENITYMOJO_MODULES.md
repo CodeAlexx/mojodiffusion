@@ -72,6 +72,24 @@ debug comparison.
 - `probe_video_file(mp4_path: String) raises -> JSONValue` — `ffprobe`-backed MP4/A-V metadata (`width`, `height`, `frame_count`, `duration`, `fps`, codecs, muxing, audio behavior).
 - `ltx2_staged_smoke_video_result(body: JSONValue, video_id: String, backend_name: String, model_name: String, resident: String) raises -> JSONValue` — runs `output/bin/ltx2_video_smoke_runner`, writes `ltx2_video_result.json`, and sets artifact acceptance fields without claiming full video parity.
 
+### `models/text_encoder/gemma3_ltx_streamed.mojo` and `pipeline/ltx2_encode_prompt.mojo` — automatic LTX2 prompt conditioning ✅
+
+The pure-Mojo streamed Gemma-3-12B FP8 encoder processes positive and negative
+prompts together while loading each of the 48 transformer layers once. It
+implements Gemma's exact tokenizer, RMSNorm, local/global RoPE, causal padding,
+and 49 hidden-state FeatureExtractorV2 contract. The conditioner packs those
+states in the Creator-compatible feature order, applies the LTX2 video/audio
+aggregate projections, and writes `video_context`, `audio_context`,
+`neg_video_context`, `neg_audio_context`, `video_len`, and `neg_video_len`.
+
+`serenity-server` runs the optimized `output/bin/ltx2_encode_prompt` when an
+LTX2 request leaves manual conditioning overrides blank. Results are cached by
+prompt, negative prompt, and conditioner binary digest. The process emits
+tokenization, model load, every Gemma layer, projection, save, and completion
+activity for the centered Generate status line. Exact-tokenizer parity passed;
+real-context cosine is 0.99923-0.99973 against the cached Creator oracle, and
+the optimized oracle prompt ran in 17.19 seconds.
+
 ### `sampling/ltx2_request_cli.mojo` — exact canonical LTX2 request route 🟠
 
 Pure-Mojo `serenity.genparams.v1` adapter used by SerenityUI's Video tab. Unlike

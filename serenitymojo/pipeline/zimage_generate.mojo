@@ -131,7 +131,7 @@ comptime CAPLEN_MAX = 256     # comptime cap buffer (mult of 32). build_position
                               # so positions are unchanged; shorter prompts now match diffusers.
 comptime PAD_ID = 151643      # Qwen pad token (prepare_l2p PAD_TOKEN_ID); right-pad, causal-masked
 comptime EXTRACT_LAYER = 34   # Qwen3-4B penultimate (Z-Image canonical)
-comptime ZIMAGE_DEFAULT_SIGMA_SHIFT = Float32(3.0) # SwarmUI/Comfy ZImage sampling_settings shift
+comptime ZIMAGE_DEFAULT_SIGMA_SHIFT = Float32(3.0) # Comfy ZImage sampling_settings shift
 comptime ZIMAGE_COMFY_TIMESTEPS = 1000
 comptime PI = 6.283185307179586  # 2*pi
 

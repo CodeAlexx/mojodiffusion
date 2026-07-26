@@ -55,6 +55,7 @@ fn exec_ltxv_sampler(
     links: &LinkMap,
     store: &mut ValueStore,
     out: &mut JsonValue,
+    saw_prompt: &mut bool,
 ) -> GraphResult<Fire> {
     let id = node.id;
     let fields = &node.fields;
@@ -63,18 +64,36 @@ fn exec_ltxv_sampler(
         model_link = links.input(id, "model");
     }
     let audio_link = links.input(id, "audio");
+    let guide_image_link = links.input(id, "guide_image");
+    let guide_video_link = links.input(id, "guide_video");
     if !model_link.found {
         return Err(
             GraphError::unsupported("workflow graph LTXVSampler missing ltxv_model input")
                 .with_node(id),
         );
     }
-    if !(ready(store, &model_link) && optional_ready(store, &audio_link)) {
+    if !(ready(store, &model_link)
+        && optional_ready(store, &audio_link)
+        && optional_ready(store, &guide_image_link)
+        && optional_ready(store, &guide_video_link))
+    {
         return Ok(Fire::NotReady);
     }
     require_value_type(store, &model_link, "MODEL", "ltxv_model")?;
     if audio_link.found {
         require_value_type(store, &audio_link, "AUDIO", "audio")?;
+    }
+    if guide_image_link.found {
+        require_value_type(store, &guide_image_link, "IMAGE", "guide_image")?;
+    }
+    if guide_video_link.found {
+        require_value_type(store, &guide_video_link, "VIDEO", "guide_video")?;
+    }
+    if guide_image_link.found && guide_video_link.found {
+        return Err(GraphError::bad_request(
+            "workflow graph LTXVSampler guide_image and guide_video are mutually exclusive",
+        )
+        .with_node(id));
     }
     let model_name = model_name_of(store, &model_link)?;
     if !model_name.is_empty() {
@@ -83,6 +102,7 @@ fn exec_ltxv_sampler(
     let prompt = wf_string(fields, "prompt");
     if !prompt.is_empty() {
         set_if_missing(out, "prompt", json!(prompt));
+        *saw_prompt = true;
     }
     let negative = wf_string(fields, "negative_prompt");
     if !negative.is_empty() {
@@ -114,6 +134,31 @@ fn exec_ltxv_sampler(
     copy_field_if_missing(out, fields, "include_audio", "include_audio");
     copy_field_if_missing(out, fields, "audio_start_time", "audio_start_time");
     copy_field_if_missing(out, fields, "audio_duration", "audio_duration");
+    if guide_image_link.found {
+        let guide_frame_idx = opt_int(fields, "guide_frame_idx", 0, 0, 4095)?;
+        if guide_frame_idx != 0 {
+            return Err(GraphError::unsupported(
+                "LTX2 product I2V currently admits only guide_frame_idx=0",
+            )
+            .with_node(id));
+        }
+        let guide_strength = wf_float(fields, "guide_strength", 1.0, 0.0, 1.0)?;
+        set_if_missing(
+            out,
+            "image_path",
+            json!(image_path_of(store, &guide_image_link)?),
+        );
+        set_if_missing(out, "image_strength", json!(guide_strength));
+    }
+    if guide_video_link.found {
+        let guide_strength = wf_float(fields, "guide_strength", 0.7, 0.0, 1.0)?;
+        set_if_missing(
+            out,
+            "video_path",
+            json!(video_path_of(store, &guide_video_link)?),
+        );
+        set_if_missing(out, "video_strength", json!(guide_strength));
+    }
     add_value(
         store,
         id,

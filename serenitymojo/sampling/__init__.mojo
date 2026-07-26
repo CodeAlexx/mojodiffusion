@@ -4,7 +4,7 @@
 # update around a DiT (the DiT predicts velocity; the scheduler does the rest).
 #
 # Modules:
-#   sampler_registry — SwarmUI/Comfy sampler/scheduler catalog, backend support
+#   sampler_registry — Comfy sampler/scheduler catalog, backend support
 #                      matrix, and fail-loud product admission helpers.
 #   flow_match  — Z-Image rectified-flow Euler scheduler and Qwen-Image helpers.
 #   sdxl_euler  — SDXL EulerDiscreteScheduler scalar setup plus GPU CFG/update.

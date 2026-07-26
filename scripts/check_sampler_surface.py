@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static SwarmUI/ComfyUI sampler surface readiness checker.
+"""Static reference UI/ComfyUI sampler surface readiness checker.
 
 This checker intentionally does not import Mojo modules, allocate CUDA, or run
 generation. It verifies request-surface markers and writes a JSON readiness
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -17,7 +18,7 @@ from typing import Iterable
 
 
 REPO = Path(__file__).resolve().parents[1]
-SWARMUI = Path("/home/alex/SwarmUI")
+REFERENCE_UI = Path(os.environ.get("SERENITY_REFERENCE_UI_ROOT", "/home/alex/ComfyUI"))
 
 
 @dataclass(frozen=True)
@@ -687,31 +688,31 @@ def marker(
 def source_markers() -> list[Marker]:
     markers: list[Marker] = []
 
-    comfy_samplers = SWARMUI / "dlbackend/ComfyUI/comfy/samplers.py"
-    comfy_nodes = SWARMUI / "dlbackend/ComfyUI/nodes.py"
-    swarm_backend = (
-        SWARMUI
+    comfy_samplers = REFERENCE_UI / "dlbackend/ComfyUI/comfy/samplers.py"
+    comfy_nodes = REFERENCE_UI / "dlbackend/ComfyUI/nodes.py"
+    reference_backend = (
+        REFERENCE_UI
         / "src/BuiltinExtensions/ComfyUIBackend/ComfyUIBackendExtension.cs"
     )
     workflow_generator = (
-        SWARMUI / "src/BuiltinExtensions/ComfyUIBackend/WorkflowGenerator.cs"
+        REFERENCE_UI / "src/BuiltinExtensions/ComfyUIBackend/WorkflowGenerator.cs"
     )
-    swarm_ksampler = (
-        SWARMUI
-        / "src/BuiltinExtensions/ComfyUIBackend/ExtraNodes/SwarmComfyCommon/SwarmKSampler.py"
+    reference_ksampler = (
+        REFERENCE_UI
+        / "src/BuiltinExtensions/ComfyUIBackend/ExtraNodes/ReferenceComfyCommon/ReferenceKSampler.py"
     )
-    t2i_params = SWARMUI / "src/Text2Image/T2IParamTypes.cs"
+    t2i_params = REFERENCE_UI / "src/Text2Image/T2IParamTypes.cs"
 
     samplers_text = read_text(comfy_samplers)
     nodes_text = read_text(comfy_nodes)
-    backend_text = read_text(swarm_backend)
+    backend_text = read_text(reference_backend)
     workflow_text = read_text(workflow_generator)
-    swarm_ksampler_text = read_text(swarm_ksampler)
+    reference_ksampler_text = read_text(reference_ksampler)
     t2i_text = read_text(t2i_params)
 
     markers.append(
         marker(
-            "SwarmUI/Comfy expectation source",
+            "reference UI/Comfy expectation source",
             "Comfy sampler catalog found",
             comfy_samplers,
             has_all(
@@ -729,7 +730,7 @@ def source_markers() -> list[Marker]:
     )
     markers.append(
         marker(
-            "SwarmUI/Comfy expectation source",
+            "reference UI/Comfy expectation source",
             "Comfy scheduler catalog found",
             comfy_samplers,
             has_all(
@@ -748,9 +749,9 @@ def source_markers() -> list[Marker]:
     )
     markers.append(
         marker(
-            "SwarmUI/Comfy expectation source",
-            "Swarm scheduler extensions found",
-            swarm_backend,
+            "reference UI/Comfy expectation source",
+            "Reference scheduler extensions found",
+            reference_backend,
             has_all(
                 backend_text,
                 [
@@ -760,8 +761,8 @@ def source_markers() -> list[Marker]:
                     "flux2",
                 ],
             ),
-            "SwarmUI exposes extra scheduler names beyond base Comfy.",
-            "Unsupported Swarm scheduler names must fail loud or be hidden per model.",
+            "reference UI exposes extra scheduler names beyond base Comfy.",
+            "Unsupported Reference scheduler names must fail loud or be hidden per model.",
         )
     )
     markers.append(
@@ -786,7 +787,7 @@ def source_markers() -> list[Marker]:
     markers.append(
         marker(
             "KSampler request mapping",
-            "Swarm family defaults found",
+            "Reference family defaults found",
             workflow_generator,
             has_all(
                 workflow_text,
@@ -797,17 +798,17 @@ def source_markers() -> list[Marker]:
                     'defsampler ??= "er_sde"',
                 ],
             ),
-            "SwarmUI applies family-specific default sampler/scheduler choices.",
+            "reference UI applies family-specific default sampler/scheduler choices.",
             "Mojo must expose per-family defaults and not silently replace requested values.",
         )
     )
     markers.append(
         marker(
             "Variation seed and strength",
-            "Swarm variation noise blend found",
-            swarm_ksampler,
+            "Reference variation noise blend found",
+            reference_ksampler,
             has_all(
-                swarm_ksampler_text,
+                reference_ksampler_text,
                 [
                     "var_seed",
                     "var_seed_strength",
@@ -815,14 +816,14 @@ def source_markers() -> list[Marker]:
                     "seed + i",
                 ],
             ),
-            "SwarmKSampler blends variation noise and increments seeds per batch element.",
+            "ReferenceKSampler blends variation noise and increments seeds per batch element.",
             "Mojo variation support must affect noise, not just metadata.",
         )
     )
     markers.append(
         marker(
             "Img2img denoise / creativity",
-            "Swarm init image creativity found",
+            "Reference init image creativity found",
             t2i_params,
             has_all(
                 t2i_text,
@@ -833,7 +834,7 @@ def source_markers() -> list[Marker]:
                     "Images",
                 ],
             ),
-            "SwarmUI user params include images, variation seed, and init-image creativity.",
+            "reference UI user params include images, variation seed, and init-image creativity.",
             "Mojo must connect these controls to runtime behavior or reject unsupported cases.",
         )
     )
@@ -862,7 +863,7 @@ def mojo_markers() -> list[Marker]:
     harness = REPO / "serenitymojo/sampling/product_sampler_harness.mojo"
     harness_doc = REPO / "serenitymojo/docs/SAMPLER_PRODUCT_HARNESS_2026-06-05.md"
     parity_doc = (
-        REPO / "serenitymojo/docs/SWARMUI_SAMPLER_PARITY_MAP_2026-06-12.md"
+        REPO / "serenitymojo/docs/REFERENCE_UI_SAMPLER_PARITY_MAP_2026-06-12.md"
     )
     server_main = REPO / "serenity-server/crates/server/src/main.rs"
     server_capabilities = REPO / "serenity-server/crates/server/src/capabilities.rs"
@@ -970,7 +971,7 @@ def mojo_markers() -> list[Marker]:
     markers.append(
         marker(
             "Sampler/scheduler registry",
-            "Mojo exposes a SwarmUI/Comfy sampler support matrix",
+            "Mojo exposes a reference UI/Comfy sampler support matrix",
             sampler_registry,
             has_all(
                 sampler_registry_text,
@@ -997,7 +998,7 @@ def mojo_markers() -> list[Marker]:
                 daemon_text,
                 [
                     'path == "/v1/samplers"',
-                    "swarmui_sampler_registry_json",
+                    "serenity_sampler_registry_json",
                     "default_sampler_for_backend",
                     "default_scheduler_for_backend",
                 ],
@@ -1021,13 +1022,13 @@ def mojo_markers() -> list[Marker]:
     markers.append(
         marker(
             "Variation seed and strength",
-            "Swarm-style variation noise is wired into image backends",
+            "Reference-style variation noise is wired into image backends",
             variation_noise,
             has_all(
                 variation_noise_text,
                 [
-                    "swarm_variation_noise_chw",
-                    "SwarmKSampler-compatible slerp",
+                    "variation_noise_chw",
+                    "ReferenceKSampler-compatible slerp",
                     "acos",
                     "sin",
                 ],
@@ -1035,7 +1036,7 @@ def mojo_markers() -> list[Marker]:
             and has_all(
                 zimage_text + qwen_text,
                 [
-                    "swarm_variation_noise_chw",
+                    "variation_noise_chw",
                     "self.params.variation_seed + self.params.image_index",
                     "variation_strength > 0.0",
                 ],
@@ -1090,7 +1091,7 @@ def mojo_markers() -> list[Marker]:
                     "self.params.image_count",
                 ],
             ),
-            "Z-Image has real subset behavior, registry-backed admission, SwarmUI/Comfy-aligned Euler/simple and sgm_uniform flow-match sigmas with sigma_shift, bounded DPM++ 2M execution, bounded generic UniPC bh1/order<=3 execution, bounded UniPC bh2 execution, Comfy DISCARD_PENULTIMATE sigma prep plus SigmaConvert wording for UniPC schedules, and bounded flat img2img/creativity artifact evidence.",
+            "Z-Image has real subset behavior, registry-backed admission, reference UI/Comfy-aligned Euler/simple and sgm_uniform flow-match sigmas with sigma_shift, bounded DPM++ 2M execution, bounded generic UniPC bh1/order<=3 execution, bounded UniPC bh2 execution, Comfy DISCARD_PENULTIMATE sigma prep plus SigmaConvert wording for UniPC schedules, and bounded flat img2img/creativity artifact evidence.",
             "Accepted sampler parity needs per-sampler artifact evidence and executed sampler metadata.",
             severity="warning",
         )
@@ -1473,7 +1474,7 @@ def mojo_markers() -> list[Marker]:
             has_all(
                 parity_doc_text,
                 [
-                    "| Feature | SwarmUI/Comfy expectation | Current Mojo surface | Blocker | Acceptance gate |",
+                    "| Feature | reference UI/Comfy expectation | Current Mojo surface | Blocker | Acceptance gate |",
                     "Sampler name catalog",
                     "Scheduler name catalog",
                     "Variation seed and strength",
@@ -1541,7 +1542,7 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "sampler_scheduler_dispatch",
             "severity": "P1",
-            "blocker": "Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 paths on admitted simple and sgm_uniform flow-match schedules, including dedicated DPM++ 2M + sgm_uniform artifact evidence, but Karras, ancestral, SDE, CFG++, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
+            "blocker": "Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 paths on admitted simple and sgm_uniform flow-match schedules, including dedicated DPM++ 2M + sgm_uniform artifact evidence, but Karras, ancestral, SDE, CFG++, and the rest of the reference UI/Comfy sampler catalog still lack distinct daemon denoise loops.",
             "acceptance_gate": "Wire each accepted sampler/scheduler pair into a backend denoise loop and record requested versus executed values with artifact/timing/VRAM evidence.",
         },
         {
@@ -1585,10 +1586,10 @@ def build_report() -> dict[str, object]:
     blockers = surface_blockers()
 
     return {
-        "checker": "check_swarmui_sampler_surface",
+        "checker": "check_reference_ui_sampler_surface",
         "schema_version": 1,
         "repo": str(REPO),
-        "swarmui_repo": str(SWARMUI),
+        "reference_ui_repo": str(REFERENCE_UI),
         "surface_audit_only": True,
         "cuda_required": False,
         "runtime_generation_run": False,
@@ -1612,7 +1613,7 @@ def build_report() -> dict[str, object]:
             "This checker does not prove Qwen full-generation readiness.",
             "This checker does not prove video readiness.",
         ],
-        "next_command": "python3 scripts/check_swarmui_sampler_surface.py --write-readiness output/checks/swarmui_sampler_surface_readiness.json",
+        "next_command": "python3 scripts/check_sampler_surface.py --write-readiness output/checks/sampler_surface_readiness.json",
     }
 
 

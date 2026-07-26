@@ -92,7 +92,7 @@ from serenitymojo.sampling.dpmpp_2m import (
 from serenitymojo.sampling.unipc import (
     UniPcMultistepScheduler, ComfyUniPcMultistepScheduler,
 )
-from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
+from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
     reject_unsupported_reference_image_params,
@@ -941,7 +941,7 @@ struct ZImageBackend(GenBackend, Movable):
             )
 
         # Seeded initial latent (verbatim base noise math), kept BF16 at the
-        # tensor boundary. Variation uses the SwarmKSampler CHW slerp contract.
+        # tensor boundary. Variation uses the reference sampler CHW slerp contract.
         self.denoise_start_step = 0
         self.dpmpp_history = MultistepHistory(1)
         self.dpmpp_update_steps = 0
@@ -963,7 +963,7 @@ struct ZImageBackend(GenBackend, Movable):
                 16 * self.hl * self.wl,
                 UInt64(self.params.variation_seed + self.params.image_index),
             )
-            noise = swarm_variation_noise_chw(
+            noise = variation_noise_chw(
                 noise, vnoise, 16, self.hl, self.wl,
                 self.params.variation_strength,
             )

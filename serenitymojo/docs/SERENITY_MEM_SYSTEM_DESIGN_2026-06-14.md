@@ -6,7 +6,8 @@ H2D paging cost — which on this single-GPU, known-model, serial-job stack is a
 stall (measured: H2D of the 7.5 GB encoder can't be hidden because hiding it requires
 the coexistence we're removing).
 
-All ComfyUI references are from `/home/alex/SwarmUI/dlbackend/ComfyUI/comfy/model_management.py`.
+All ComfyUI references are from the local embedded ComfyUI checkout's
+`comfy/model_management.py`.
 All serenity facts are MEASURED this session unless tagged HYPOTHESIS.
 
 ---

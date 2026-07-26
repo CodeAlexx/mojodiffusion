@@ -29,6 +29,10 @@ function assert(value, message) {
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   const errors = [];
   const realRun = process.env.REAL_LTX2 === "1";
+  const sourceVideoPath = String(process.env.LTX2_V2V_SOURCE || "").trim();
+  const sourceImagePath = String(process.env.LTX2_I2V_SOURCE || "").trim();
+  const screenshotPath = String(process.env.LTX2_UI_SCREENSHOT || "").trim();
+  const skipTemplate = process.env.LTX2_SKIP_TEMPLATE === "1";
   let request = null;
 
   page.on("pageerror", (error) => errors.push(String(error)));
@@ -88,6 +92,7 @@ function assert(value, message) {
   }
 
   try {
+    assert(!(sourceVideoPath && sourceImagePath), "choose only one LTX2 source");
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.click('.nav-btn[data-tab="canvas"]');
     await page.waitForSelector("#cv-model");
@@ -96,12 +101,59 @@ function assert(value, message) {
     ).some((option) => option.value === "ltx-2.3-22b-dev-fp8"));
     await page.selectOption("#cv-model", "ltx-2.3-22b-dev-fp8");
     await page.waitForSelector("#cv-load-ltx2-template", { state: "visible" });
-    await page.click("#cv-load-ltx2-template");
     await page.waitForFunction(() => (
-      document.querySelector("#cv-steps")?.value === "8"
-      && document.querySelector("#cv-ltx2-mode")?.value === "distilled"
-      && document.querySelector("#cv-caps-positive")?.value.length > 0
+      document.querySelector("#cv-ltx2-profile")?.value === "512x768_121f_25fps"
+      && document.querySelector("#cv-bbox-w")?.value === "512"
+      && document.querySelector("#cv-bbox-h")?.value === "768"
+      && document.querySelector("#cv-frames")?.value === "121"
+      && document.querySelector("#cv-fps")?.value === "25"
     ));
+    assert(await page.locator("#cv-bbox-w").isDisabled(), "LTX2 width input must be profile-locked");
+    assert(await page.locator("#cv-bbox-h").isDisabled(), "LTX2 height input must be profile-locked");
+    assert(await page.locator("#cv-frames").isDisabled(), "LTX2 frames input must be profile-locked");
+    assert(await page.locator("#cv-fps").isDisabled(), "LTX2 FPS input must be profile-locked");
+    const profileValues = await page.locator("#cv-ltx2-profile option").evaluateAll(
+      (options) => options.map((option) => option.value),
+    );
+    assert(profileValues.length >= 21, `expected all available LTX2 profiles, got ${profileValues.length}`);
+    assert(profileValues.includes("960x544_241f_24fps"), "missing 540p landscape 10s profile");
+    assert(profileValues.includes("1088x1920_121f_24fps"), "missing 1080p portrait profile");
+    await page.selectOption("#cv-ltx2-profile", "960x544_241f_24fps");
+    await page.waitForFunction(() => (
+      document.querySelector("#cv-bbox-w")?.value === "960"
+      && document.querySelector("#cv-bbox-h")?.value === "544"
+      && document.querySelector("#cv-frames")?.value === "241"
+      && document.querySelector("#cv-fps")?.value === "24"
+    ));
+    await page.selectOption("#cv-ltx2-profile", "512x768_121f_25fps");
+    if (screenshotPath)
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+    if (skipTemplate) {
+      await page.locator("#cv-prompt").fill("A calm portrait comes alive with subtle natural motion");
+      await page.locator("#cv-caps-positive").fill("");
+      await page.locator("#cv-caps-positive").dispatchEvent("input");
+    } else {
+      await page.click("#cv-load-ltx2-template");
+      await page.waitForFunction(() => (
+        document.querySelector("#cv-steps")?.value === "8"
+        && document.querySelector("#cv-ltx2-mode")?.value === "distilled"
+        && document.querySelector("#cv-caps-positive")?.value.length > 0
+        && document.querySelectorAll("#cv-lora-list .cv-lora-row").length === 1
+      ));
+    }
+    if (sourceVideoPath) {
+      assert(fs.existsSync(sourceVideoPath), `missing V2V source: ${sourceVideoPath}`);
+      await page.setInputFiles("#cv-import-file", sourceVideoPath);
+      await page.waitForSelector("#cv-source-video", { state: "visible" });
+      await page.locator("#cv-ltx2-source-strength").fill("0.7");
+      await page.locator("#cv-ltx2-source-strength").dispatchEvent("input");
+    }
+    if (sourceImagePath) {
+      assert(fs.existsSync(sourceImagePath), `missing I2V source: ${sourceImagePath}`);
+      await page.setInputFiles("#cv-import-file", sourceImagePath);
+      await page.waitForSelector("#cv-source-preview", { state: "visible" });
+      await page.waitForTimeout(100);
+    }
     await page.click("#cv-generate-btn");
     if (realRun) {
       const startedAt = Date.now();
@@ -138,12 +190,32 @@ function assert(value, message) {
     assert(request.scheduler === "ltx2_distilled", `scheduler=${request.scheduler}`);
     assert(request.width === 512 && request.height === 768, `geometry=${request.width}x${request.height}`);
     assert(request.frames === 121 && request.fps === 25, `video=${request.frames}f@${request.fps}`);
-    assert(Array.isArray(request.lora) && request.lora.length === 1, `lora count=${request.lora?.length}`);
-    assert(request.lora[0].name === "ltx2_eri2_step3000", `lora=${request.lora[0].name}`);
+    if (sourceVideoPath) {
+      assert(typeof request.video_path === "string" && request.video_path.endsWith(".mp4"),
+        `video_path=${request.video_path}`);
+      assert(request.video_strength === 0.7, `video_strength=${request.video_strength}`);
+      assert(!request.image_path, `unexpected image_path=${request.image_path}`);
+    }
+    if (sourceImagePath) {
+      assert(typeof request.image_path === "string" && request.image_path.endsWith(".png"),
+        `image_path=${request.image_path}`);
+      assert(request.image_strength === 1, `image_strength=${request.image_strength}`);
+      assert(!request.video_path, `unexpected video_path=${request.video_path}`);
+    }
+    assert(Array.isArray(request.lora), "lora request field is not an array");
+    if (skipTemplate) {
+      assert(request.lora.length === 0, `unexpected lora count=${request.lora.length}`);
+      assert(request.caps_positive === "", `automatic conditioning override=${request.caps_positive}`);
+    } else {
+      assert(request.lora.length === 1, `lora count=${request.lora.length}`);
+      assert(request.lora[0].name === "ltx2_eri2_step3000", `lora=${request.lora[0].name}`);
+    }
     assert(errors.length === 0, `page errors: ${errors.join(" | ")}`);
     console.log(JSON.stringify({
       status: "PASS",
       real_run: realRun,
+      v2v: Boolean(sourceVideoPath),
+      i2v: Boolean(sourceImagePath),
       request,
       staged_video_src: await page.locator("#staging-panel video").getAttribute("src"),
     }, null, 2));

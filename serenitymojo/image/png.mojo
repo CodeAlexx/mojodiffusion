@@ -391,20 +391,32 @@ def _rgb24_from_bcthw_f32(
     x: LayoutTensor[DType.float32, _RGB_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
     frames: Int,
-    height: Int,
-    width: Int,
+    source_height: Int,
+    source_width: Int,
+    output_height: Int,
+    output_width: Int,
+    crop_y: Int,
+    crop_x: Int,
     range_tag: Int,
     n: Int,
 ):
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
-    var plane = height * width
+    var source_plane = source_height * source_width
+    var output_plane = output_height * output_width
     while i < n:
         var channel = i % 3
         var pixel = i // 3
-        var xy = pixel % plane
-        var frame = pixel // plane
-        var src = (channel * frames + frame) * plane + xy
+        var output_xy = pixel % output_plane
+        var frame = pixel // output_plane
+        var output_y = output_xy // output_width
+        var output_x = output_xy % output_width
+        var source_xy = (
+            (output_y + crop_y) * source_width + output_x + crop_x
+        )
+        var src = (
+            (channel * frames + frame) * source_plane + source_xy
+        )
         var v = Float32(rebind[Scalar[DType.float32]](x[src]))
         var scaled = (
             (v + Float32(1.0)) * Float32(127.5)
@@ -424,20 +436,32 @@ def _rgb24_from_bcthw_bf16(
     x: LayoutTensor[DType.bfloat16, _RGB_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
     frames: Int,
-    height: Int,
-    width: Int,
+    source_height: Int,
+    source_width: Int,
+    output_height: Int,
+    output_width: Int,
+    crop_y: Int,
+    crop_x: Int,
     range_tag: Int,
     n: Int,
 ):
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
-    var plane = height * width
+    var source_plane = source_height * source_width
+    var output_plane = output_height * output_width
     while i < n:
         var channel = i % 3
         var pixel = i // 3
-        var xy = pixel % plane
-        var frame = pixel // plane
-        var src = (channel * frames + frame) * plane + xy
+        var output_xy = pixel % output_plane
+        var frame = pixel // output_plane
+        var output_y = output_xy // output_width
+        var output_x = output_xy % output_width
+        var source_xy = (
+            (output_y + crop_y) * source_width + output_x + crop_x
+        )
+        var src = (
+            (channel * frames + frame) * source_plane + source_xy
+        )
         var v = Float32(rebind[Scalar[DType.bfloat16]](x[src]))
         var scaled = (
             (v + Float32(1.0)) * Float32(127.5)
@@ -457,20 +481,32 @@ def _rgb24_from_bcthw_f16(
     x: LayoutTensor[DType.float16, _RGB_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
     frames: Int,
-    height: Int,
-    width: Int,
+    source_height: Int,
+    source_width: Int,
+    output_height: Int,
+    output_width: Int,
+    crop_y: Int,
+    crop_x: Int,
     range_tag: Int,
     n: Int,
 ):
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
-    var plane = height * width
+    var source_plane = source_height * source_width
+    var output_plane = output_height * output_width
     while i < n:
         var channel = i % 3
         var pixel = i // 3
-        var xy = pixel % plane
-        var frame = pixel // plane
-        var src = (channel * frames + frame) * plane + xy
+        var output_xy = pixel % output_plane
+        var frame = pixel // output_plane
+        var output_y = output_xy // output_width
+        var output_x = output_xy % output_width
+        var source_xy = (
+            (output_y + crop_y) * source_width + output_x + crop_x
+        )
+        var src = (
+            (channel * frames + frame) * source_plane + source_xy
+        )
         var v = Float32(rebind[Scalar[DType.float16]](x[src]))
         var scaled = (
             (v + Float32(1.0)) * Float32(127.5)
@@ -491,12 +527,19 @@ def save_rgb24_video(
     path: String,
     ctx: DeviceContext,
     value_range: ValueRange = ValueRange.SIGNED,
+    output_height: Int = 0,
+    output_width: Int = 0,
 ) raises:
     """Write `[1,3,F,H,W]` as contiguous frame-major RGB24.
 
     CHW-to-HWC reordering, clamping, and float-to-u8 conversion run in one GPU
     kernel. The complete byte stream then crosses the PCIe boundary once and
-    is written once, avoiding 121 synchronized scalar CPU conversion loops.
+    is written once, avoiding synchronized scalar CPU conversion loops.
+
+    If `output_height`/`output_width` are non-zero, center-crop to that exact
+    size in the same conversion kernel. This lets LTX2 run its required
+    64-pixel-aligned internal grid while emitting the advertised 960x544
+    profile without a second full-frame tensor allocation.
     """
     var shape = video.shape()
     if len(shape) != 5 or shape[0] != 1 or shape[1] != 3:
@@ -505,12 +548,25 @@ def save_rgb24_video(
             + String(len(shape))
         )
     var frames = shape[2]
-    var height = shape[3]
-    var width = shape[4]
-    if frames <= 0 or height <= 0 or width <= 0:
+    var source_height = shape[3]
+    var source_width = shape[4]
+    if frames <= 0 or source_height <= 0 or source_width <= 0:
         raise Error("save_rgb24_video: zero-sized video")
+    var target_height = (
+        output_height if output_height > 0 else source_height
+    )
+    var target_width = output_width if output_width > 0 else source_width
+    if (
+        target_height <= 0 or target_width <= 0
+        or target_height > source_height or target_width > source_width
+    ):
+        raise Error(
+            "save_rgb24_video: output crop must fit inside source video"
+        )
+    var crop_y = (source_height - target_height) // 2
+    var crop_x = (source_width - target_width) // 2
 
-    var n = frames * height * width * 3
+    var n = frames * target_height * target_width * 3
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n)
     var rl = RuntimeLayout[_RGB_DYN1].row_major(IndexList[1](n))
     var o = LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin](
@@ -524,7 +580,8 @@ def save_rgb24_video(
             video.buf.unsafe_ptr().bitcast[Float32](), rl
         )
         ctx.enqueue_function[_rgb24_from_bcthw_f32, _rgb24_from_bcthw_f32](
-            x, o, frames, height, width, range_tag, n,
+            x, o, frames, source_height, source_width,
+            target_height, target_width, crop_y, crop_x, range_tag, n,
             grid_dim=grid, block_dim=_RGB_BLOCK,
         )
     elif dtype == DType.bfloat16:
@@ -532,7 +589,8 @@ def save_rgb24_video(
             video.buf.unsafe_ptr().bitcast[BFloat16](), rl
         )
         ctx.enqueue_function[_rgb24_from_bcthw_bf16, _rgb24_from_bcthw_bf16](
-            x, o, frames, height, width, range_tag, n,
+            x, o, frames, source_height, source_width,
+            target_height, target_width, crop_y, crop_x, range_tag, n,
             grid_dim=grid, block_dim=_RGB_BLOCK,
         )
     elif dtype == DType.float16:
@@ -540,7 +598,8 @@ def save_rgb24_video(
             video.buf.unsafe_ptr().bitcast[Float16](), rl
         )
         ctx.enqueue_function[_rgb24_from_bcthw_f16, _rgb24_from_bcthw_f16](
-            x, o, frames, height, width, range_tag, n,
+            x, o, frames, source_height, source_width,
+            target_height, target_width, crop_y, crop_x, range_tag, n,
             grid_dim=grid, block_dim=_RGB_BLOCK,
         )
     else:

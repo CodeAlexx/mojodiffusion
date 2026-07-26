@@ -20,7 +20,7 @@ from json.value import JSONValue
 from serenitymojo.io.env import serenity_model_root
 from serenitymojo.io.ffi import O_RDONLY, sys_close, sys_open
 from serenitymojo.pipeline.ltx2_t2v_av_hq import (
-    _mkdir, _write_ltx2_status, run_request_profile,
+    _mkdir, _write_ltx2_status, decode_request_profile, run_request_profile,
 )
 from serenitymojo.serve.model_scan import _read_text_file
 from serenitymojo.serve.product_manifest import write_text_file
@@ -93,6 +93,16 @@ def _optional_bool(obj: JSONValue, key: String, default: Bool) raises -> Bool:
     if not obj[key].is_bool():
         raise Error(String("LTX2 request: '") + key + String("' must be a bool"))
     return obj[key].as_bool()
+
+
+def _optional_number(
+    obj: JSONValue, key: String, default: Float64
+) raises -> Float64:
+    if not obj.contains(key):
+        return default
+    if not obj[key].is_number():
+        raise Error(String("LTX2 request: '") + key + String("' must be a number"))
+    return obj[key].as_float()
 
 
 def _resolve_lora_path(name: String) raises -> String:
@@ -289,6 +299,38 @@ def _run_request(request_path: String, out_dir: String) raises:
         raise Error(
             String("LTX2 request: noise_fixture not found: ") + noise_fixture
         )
+    var image_path = _optional_string(obj, String("image_path"))
+    var image_strength = _optional_number(
+        obj, String("image_strength"), Float64(1.0)
+    )
+    if image_strength < 0.0 or image_strength > 1.0:
+        raise Error("LTX2 request: image_strength must be in [0, 1]")
+    if image_path.byte_length() > 0 and not _path_exists(image_path):
+        raise Error(
+            String("LTX2 request: image_path not found: ") + image_path
+        )
+    if image_path.byte_length() == 0 and image_strength != 1.0:
+        raise Error(
+            "LTX2 request: image_strength requires a non-empty image_path"
+        )
+    var video_path = _optional_string(obj, String("video_path"))
+    var video_strength = _optional_number(
+        obj, String("video_strength"), Float64(1.0)
+    )
+    if video_strength < 0.0 or video_strength > 1.0:
+        raise Error("LTX2 request: video_strength must be in [0, 1]")
+    if video_path.byte_length() > 0 and not _path_exists(video_path):
+        raise Error(
+            String("LTX2 request: video_path not found: ") + video_path
+        )
+    if video_path.byte_length() == 0 and video_strength != 1.0:
+        raise Error(
+            "LTX2 request: video_strength requires a non-empty video_path"
+        )
+    if image_path.byte_length() > 0 and video_path.byte_length() > 0:
+        raise Error(
+            "LTX2 request: image_path and video_path are mutually exclusive"
+        )
     _configure_loras(obj)
     var quant = _require_string(obj, String("quant")).lower()
     if quant != String("fp8") and quant != String("int4"):
@@ -321,26 +363,85 @@ def _run_request(request_path: String, out_dir: String) raises:
         neg_path,
         caps.is_projected,
         noise_fixture,
+        image_path,
+        image_strength,
+        video_path,
+        video_strength,
         _optional_bool(obj, String("include_audio"), False),
+        _optional_bool(obj, String("defer_decode"), False),
         out_dir,
+    )
+
+
+def _run_decode(request_path: String, out_dir: String) raises:
+    var request = loads(_read_text_file(request_path))
+    if not request.is_object():
+        raise Error("LTX2 decode request must be a JSON object")
+    var handoff_path = out_dir + String("/decode_handoff.json")
+    if not _path_exists(handoff_path):
+        raise Error(
+            String("LTX2 decode handoff is missing: ") + handoff_path
+        )
+    var handoff = loads(_read_text_file(handoff_path))
+    if not handoff.is_object() or _require_string(
+        handoff, String("schema")
+    ) != String("serenity.ltx2.decode_handoff.v1"):
+        raise Error("LTX2 decode handoff schema mismatch")
+    _configure_loras(request)
+    var seed = _require_int(handoff, String("seed"))
+    if seed < 0:
+        raise Error("LTX2 decode handoff seed must be non-negative")
+    decode_request_profile(
+        out_dir + String("/final_latents.safetensors"),
+        out_dir,
+        _require_int(handoff, String("steps")),
+        UInt64(seed),
+        _optional_bool(handoff, String("include_audio"), False),
+        _require_string(handoff, String("guidance_mode")),
+        _require_string(handoff, String("quant")),
+        _require_string(handoff, String("context_path")),
+        _require_string(handoff, String("negative_context_path")),
+        _require_int(handoff, String("request_lora_count")),
+        _require_number(handoff, String("load_seconds")),
+        _require_number(handoff, String("conditioning_seconds")),
+        _optional_number(handoff, String("source_encode_seconds"), 0.0),
+        _require_number(handoff, String("prepare_seconds")),
+        _require_number(handoff, String("denoise_seconds")),
+        _require_number(handoff, String("elapsed_seconds")),
+        _require_int(handoff, String("total_vram_bytes")),
+        _require_int(handoff, String("min_free_bytes")),
     )
 
 
 def main() raises:
     var args = argv()
-    if len(args) != 3:
+    var decode_mode = (
+        len(args) == 4 and String(args[1]) == String("decode")
+    )
+    if len(args) != 3 and not decode_mode:
         raise Error(
             "usage: ltx2_request_cli <serenity.genparams.v1.json> <output_dir>"
+            " | ltx2_request_cli decode <resolved-request.json> <output_dir>"
         )
-    var request_path = String(args[1])
-    var out_dir = String(args[2])
+    var request_path = (
+        String(args[2]) if decode_mode else String(args[1])
+    )
+    var out_dir = (
+        String(args[3]) if decode_mode else String(args[2])
+    )
     _mkdir(out_dir)
     _write_ltx2_status(
-        out_dir, String("running"), String("preflight"), 0, 0,
-        String("Validating LTX2 request"),
+        out_dir, String("running"),
+        String("decode_preflight") if decode_mode else String("preflight"),
+        0, 0,
+        String("Validating fresh LTX2 decode")
+        if decode_mode else String("Validating LTX2 request"),
     )
     try:
-        _run_request(request_path, out_dir)
+        if decode_mode:
+            _run_decode(request_path, out_dir)
+        else:
+            _run_request(request_path, out_dir)
     except e:
         _write_ltx2_status(
             out_dir, String("failed"), String("failed"), 0, 0, String(e)

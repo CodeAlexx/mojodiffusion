@@ -19,6 +19,8 @@
 !docs/MOJO_TRAINER_RUNTIME_API_GUIDE.md
 !docs/MOJO_TRAINING_FREE_EDITING.md
 !docs/SERENITY_LANPAINT_MODEL_MATRIX_2026-07-22.md
+!docs/SERENITY_GENESIS_VIDEO_EDITOR_2026-07-23.md
+!docs/SERENITY_GENERATE_UI_2026-07-24.md
 !docs/TRAINER_PRODUCT_CONTRACT.md
 !docs/architecture/RECOMMENDED_TRAINER_STRUCTURE.md
 !docs/maps/T5_ZIMAGE_TRAINING_MAP.md
@@ -47,6 +49,7 @@
 !trainer/eguitrainer/README.md
 !trainer/tests/board/README.md
 !vendor/mojo-libs/README.md
+!vendor/genesis/UPSTREAM.md
 !vendor/mojo-libs/async/README.md
 !vendor/mojo-libs/audio/MIXER.md
 !vendor/mojo-libs/audio/README.md

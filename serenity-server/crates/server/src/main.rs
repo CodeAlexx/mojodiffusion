@@ -1710,6 +1710,22 @@ fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>, id: &str, ev: &
     }
 }
 
+fn publish_driver_phase(
+    jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
+    channel: &Arc<JobChannel>,
+    job_id: &str,
+    phase: String,
+) {
+    let event = WorkerEvent::Progress {
+        step: 0,
+        total: 0,
+        phase,
+        preview: String::new(),
+    };
+    apply_event_to_record(jobs, job_id, &event);
+    channel.publish(event);
+}
+
 fn kind_from_bin(bin: &std::path::Path) -> String {
     let name = bin.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if name.contains("ideogram") {
@@ -1941,6 +1957,12 @@ fn run_worker_driver(
                 continue;
             }
             tracing::info!(%job_id, from = %current_kind, to = %want_kind, "swapping worker for model");
+            publish_driver_phase(
+                &jobs,
+                &channel,
+                &job_id,
+                format!("Unloading {current_kind} model"),
+            );
             if let Some(mut h) = handle.take() {
                 h.kill(); // SIGKILL + wait -> process dies -> GPU driver reclaims its VRAM
             }
@@ -1953,6 +1975,12 @@ fn run_worker_driver(
         // Lazily (re)spawn if we have no live worker (first job, or after a prior
         // peer-close).
         if handle.is_none() {
+            publish_driver_phase(
+                &jobs,
+                &channel,
+                &job_id,
+                format!("Loading {current_kind} worker"),
+            );
             match spawn_and_handshake(&worker_bin, &worker_args) {
                 Ok(h) => handle = Some(h),
                 Err(e) => {
@@ -1971,6 +1999,12 @@ fn run_worker_driver(
 
         tracing::info!(%job_id, "starting job");
         set_in_flight(&in_flight, Some(job_id.clone()));
+        publish_driver_phase(
+            &jobs,
+            &channel,
+            &job_id,
+            format!("Preparing {current_kind} generation"),
+        );
 
         if let Err(e) = h.send_start(&params) {
             tracing::error!(%job_id, "send_start failed: {e:#}");
@@ -2507,7 +2541,7 @@ async fn post_preflight(
     (StatusCode::OK, Json(report)).into_response()
 }
 
-/// POST /v1/generate — accept the RAW request JSON so a Comfy/Swarm `workflow`
+/// POST /v1/generate — accept the RAW request JSON so a Comfy `workflow`
 /// graph survives. If the body carries a `workflow` key, lower it through the
 /// serenity-graph executor FIRST (flattening the graph into the flat keys the rest
 /// of this handler reads); a lowering error is surfaced with its own HTTP status
@@ -3027,7 +3061,7 @@ async fn get_health(State(st): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-/// `/v1/samplers` body — pinned SwarmUI/Comfy sampler inventory plus current
+/// `/v1/samplers` body — pinned Comfy sampler inventory plus current
 /// Rust product admission overlays. The catalog keeps known backend identities
 /// visible, but blocked families must expose empty supported sampler/scheduler
 /// lists so it cannot contradict `/v1/capabilities`.
@@ -3905,7 +3939,7 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn generate_request_forwards_swarm_variation_controls() {
+    fn generate_request_forwards_variation_controls() {
         let req: GenerateRequest = serde_json::from_value(json!({
             "model": "zimage_base",
             "prompt": "a lighthouse in sea fog",

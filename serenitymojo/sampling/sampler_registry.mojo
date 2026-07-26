@@ -1,4 +1,4 @@
-# serenitymojo.sampling.sampler_registry — SwarmUI/Comfy sampler discovery.
+# serenitymojo.sampling.sampler_registry — Comfy sampler discovery.
 #
 # This is a product-path registry, not a checker-only inventory. The daemon uses
 # it for UI discovery and backend admission; backends still mark
@@ -596,7 +596,7 @@ def scheduler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Flux2/Klein scheduler metadata is imported from Swarm/Comfy, "
+                "Flux2/Klein scheduler metadata is imported from Comfy, "
                 + "but the daemon backend currently admission-fails before "
                 + "executing it because cap-cache/ReferenceLatent inputs are not wired"
             ),
@@ -658,12 +658,11 @@ def _backend_json(
     return out^
 
 
-def swarmui_sampler_registry_json() raises -> String:
+def serenity_sampler_registry_json() raises -> String:
     """Versioned /v1/samplers response.
 
-    Catalog names are pinned to the local SwarmUI Comfy backend:
-    /home/alex/SwarmUI/dlbackend/ComfyUI/comfy/samplers.py
-    /home/alex/SwarmUI/src/BuiltinExtensions/ComfyUIBackend/WorkflowGenerator.cs
+    Catalog names are versioned with the Serenity runtime and its admitted
+    sampler/scheduler capability matrix.
     """
     var comfy_samplers = String(
         '["euler","euler_cfg_pp","euler_ancestral","euler_ancestral_cfg_pp",'
@@ -700,7 +699,7 @@ def swarmui_sampler_registry_json() raises -> String:
     var flux_supported_schedulers = String('["simple","flowmatch","flow_match"]')
     var out = String("{\n")
     out += String('  "schema":"serenity.samplers.v1",\n')
-    out += String('  "source":"local SwarmUI Comfy sampler catalog",\n')
+    out += String('  "source":"Serenity sampler catalog",\n')
     out += String('  "accepted_sampler_parity":false,\n')
     out += String('  "catalog":{\n')
     out += String('    "samplers":') + comfy_samplers + String(",\n")
@@ -715,7 +714,7 @@ def swarmui_sampler_registry_json() raises -> String:
         zimage_supported_samplers,
         zimage_supported_schedulers,
         String("[]"),
-        String("Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++/both-UniPC sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2/order<=3 over Comfy SigmaConvert. Generic uni_pc is not an alias for uni_pc_bh2."),
+        String("Z-Image daemon runs Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++/both-UniPC sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2/order<=3 over Comfy SigmaConvert. Generic uni_pc is not an alias for uni_pc_bh2."),
     )
     out += String(",\n    ")
     out += _backend_json(

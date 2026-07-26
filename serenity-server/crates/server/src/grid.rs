@@ -1,4 +1,4 @@
-//! POST /v1/grid — SwarmUI-style XYZ-plot / parameter-sweep grid generator.
+//! POST /v1/grid — Serenity XYZ-plot / parameter-sweep grid generator.
 //!
 //! Multi-axis (X / Y / Z): the cartesian product of up to three axes (each
 //! seed|cfg|steps|sampler|scheduler) becomes one cell job apiece. Enqueues one
@@ -669,7 +669,7 @@ fn apply_axis(p: &mut JobParams, axis: Axis, value: &Value) -> Result<String, St
         Axis::Lora => {
             // "name:weight" or "name" (weight defaults 1.0); "none"/""/"-" clears the
             // stack. REPLACES the inherited LoRA stack with this single overlay so each
-            // cell isolates exactly one LoRA (SwarmUI's <lora:..> axis behavior).
+            // cell isolates exactly one LoRA (the reference UI's <lora:..> axis behavior).
             let s = value
                 .as_str()
                 .ok_or("lora values must be strings (\"name:weight\")")?;
@@ -765,7 +765,7 @@ fn fmt_num(n: f64) -> String {
 // ── value-list normalization (range expansion + "||"/"," delimiters) ─────────────-
 
 /// Split a raw `<prefix>_values` JSON value into a list of typed `Value`s, applying
-/// SwarmUI-style sugar when the field is given as a STRING (rather than an explicit
+/// Serenity sugar when the field is given as a STRING (rather than an explicit
 /// JSON array):
 ///   - delimiter: `||` if present, else `,`  (so values may themselves contain commas
 ///     by switching to `||`, e.g. prompts);
@@ -857,7 +857,7 @@ fn coerce_numeric_token(tok: &str, axis: Axis, values_key: &str) -> Result<Value
 }
 
 /// Expand a comma-separated numeric spec with optional `..` range sentinels into JSON
-/// numbers, appended to `out`. Supported forms (mirrors SwarmUI's grid syntax):
+/// numbers, appended to `out`. Supported forms (mirrors the reference UI's grid syntax):
 ///   "1,2,3"           → 1, 2, 3
 ///   "1,..,5"          → 1, 2, 3, 4, 5            (step inferred ±1 from direction)
 ///   "1,3,..,9"        → 1, 3, 5, 7, 9            (step = 3-1 = 2)
@@ -991,7 +991,7 @@ fn parse_axis_spec(req: &Value, prefix: &str) -> Result<Option<AxisSpec>, String
     let raw = req.get(&values_key).ok_or_else(|| {
         format!("'{values_key}' (array or delimited string) is required when '{axis_key}' is set")
     })?;
-    // Accept BOTH an explicit JSON array AND a SwarmUI-style delimited string
+    // Accept BOTH an explicit JSON array AND a Serenity delimited string
     // ("1,2,..,10" / "a || b || c" / "SKIP:..").
     let values = normalize_values(raw, axis, &values_key)?;
     if values.is_empty() {

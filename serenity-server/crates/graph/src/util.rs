@@ -114,7 +114,7 @@ pub fn is_named_scheduler_node(type_id: &str) -> bool {
 }
 
 /// Gate against the zimage worker's supported sampler list. Mirrors
-/// sampler_registry.swarmui_sampler_registry_json `zimage_supported_samplers`.
+/// sampler_registry.serenity_sampler_registry_json `zimage_supported_samplers`.
 pub fn worker_supports_sampler(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
@@ -129,7 +129,7 @@ pub fn worker_supports_sampler(name: &str) -> bool {
 }
 
 /// Gate against the zimage worker's supported scheduler list. Mirrors
-/// sampler_registry.swarmui_sampler_registry_json `zimage_supported_schedulers`.
+/// sampler_registry.serenity_sampler_registry_json `zimage_supported_schedulers`.
 pub fn worker_supports_scheduler(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),

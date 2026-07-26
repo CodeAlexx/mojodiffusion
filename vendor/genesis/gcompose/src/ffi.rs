@@ -39,9 +39,15 @@ extern "C" {
     // PLACE on the grade-result buffer (OUTB), AFTER fpx_gpu_grade, BEFORE fpx_gpu_look. Identity at
     // lift 0 / gamma 1 / gain 1 (skipped). White balance is folded into the gains by the UI.
     fn fpx_gpu_lgg(
-        lr: f32, lg: f32, lb: f32,
-        gar: f32, gag: f32, gab: f32,
-        gnr: f32, gng: f32, gnb: f32,
+        lr: f32,
+        lg: f32,
+        lb: f32,
+        gar: f32,
+        gag: f32,
+        gab: f32,
+        gnr: f32,
+        gng: f32,
+        gnb: f32,
     );
     // P2 BLUR: separable gaussian (2 passes via device scratch), IN PLACE on OUTB. radius=ceil(2*sigma)
     // capped at 32; sigma<=0 => no-op. Runs AFTER fpx_gpu_lgg, BEFORE fpx_gpu_look.
@@ -283,12 +289,7 @@ extern "C" {
     // BEFORE start when the export uses rate_mode=1 (constant quality). Re-opens the video codec with
     // the crf private option set (x264/x265) or a global_quality/qscale fallback (mpeg4). Returns 0
     // on success, negative on error (best-effort: a failure leaves the bitrate config in place).
-    fn fpx_enc_set_quality(
-        h: *mut c_void,
-        crf: c_int,
-        gop: c_int,
-        preset: *const c_char,
-    ) -> c_int;
+    fn fpx_enc_set_quality(h: *mut c_void, crf: c_int, gop: c_int, preset: *const c_char) -> c_int;
     fn fpx_enc_start(h: *mut c_void) -> c_int;
     fn fpx_enc_video_frame_f32(
         h: *mut c_void,
@@ -399,7 +400,10 @@ impl Gpu {
             if let Some(g) = Gpu::init() {
                 return Some(g);
             }
-            eprintln!("[gpu] init attempt {} of {attempts} failed (rc != 0)", a + 1);
+            eprintln!(
+                "[gpu] init attempt {} of {attempts} failed (rc != 0)",
+                a + 1
+            );
         }
         None
     }
@@ -493,7 +497,9 @@ impl Gpu {
             return false;
         }
         if !nonzero_seen {
-            eprintln!("[gpu] self-check FAILED: download is all-zero (dead read / kernels not run)");
+            eprintln!(
+                "[gpu] self-check FAILED: download is all-zero (dead read / kernels not run)"
+            );
             return false;
         }
         // The vast majority of an identity-graded uniform-gray frame must land in the gray band.
@@ -770,7 +776,7 @@ impl Gpu {
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
             fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
-            // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
+                                           // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
             if ck_on != 0 {
                 // P37: ck_spill is the final arg — 0 leaves green untouched (byte-identical to pre-P37).
                 fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill);
@@ -778,11 +784,13 @@ impl Gpu {
             fpx_gpu_pip(op, blend as c_int, px, py, pw, ph); // composite slot 1 over, into the PiP rect (P31 blend mode)
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
-            // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
-            fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
+                                                  // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
+            fpx_gpu_lgg(
+                lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b,
+            );
             fpx_gpu_blur(blur);
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
-            // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
+                                                                             // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
             fpx_gpu_simplefx(fx as c_int);
             fpx_gpu_vignette(vig);
             fpx_gpu_sharpen(sharp);
@@ -818,7 +826,15 @@ impl Gpu {
             fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
             // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
             // (engine returns immediately → byte-identical to pre-P34).
-            fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
+            fpx_gpu_mask(
+                mask_shape as c_int,
+                mask_cx,
+                mask_cy,
+                mask_rw,
+                mask_rh,
+                mask_feather,
+                mask_invert as c_int,
+            );
             // P38 distortion batch, on OUTB after the P34 mask, before the look: mirror -> kaleido ->
             // dither. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0) → engine skips
             // → byte-identical to pre-P38.
@@ -1023,7 +1039,7 @@ impl Gpu {
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
             fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
-            // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
+                                           // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
             if ck_on != 0 {
                 // P37: ck_spill is the final arg — 0 leaves green untouched (byte-identical to pre-P37).
                 fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill);
@@ -1031,11 +1047,13 @@ impl Gpu {
             fpx_gpu_pip(op, blend as c_int, px, py, pw, ph); // composite slot 1 over, into the PiP rect (P31 blend mode)
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
-            // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
-            fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
+                                                  // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
+            fpx_gpu_lgg(
+                lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b,
+            );
             fpx_gpu_blur(blur);
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
-            // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
+                                                                             // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
             fpx_gpu_simplefx(fx as c_int);
             fpx_gpu_vignette(vig);
             fpx_gpu_sharpen(sharp);
@@ -1071,7 +1089,15 @@ impl Gpu {
             fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
             // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
             // (engine returns immediately → byte-identical to pre-P34).
-            fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
+            fpx_gpu_mask(
+                mask_shape as c_int,
+                mask_cx,
+                mask_cy,
+                mask_rw,
+                mask_rh,
+                mask_feather,
+                mask_invert as c_int,
+            );
             // P38 distortion batch, on OUTB after the P34 mask, before the look: mirror -> kaleido ->
             // dither. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0) → engine skips
             // → byte-identical to pre-P38.
@@ -1204,7 +1230,11 @@ impl Encoder {
         if h.is_null() {
             None
         } else {
-            Some(Encoder { h, in_w: 0, in_h: 0 })
+            Some(Encoder {
+                h,
+                in_w: 0,
+                in_h: 0,
+            })
         }
     }
 
@@ -1265,7 +1295,13 @@ impl Encoder {
     }
 
     /// Configure the audio stream (interleaved float input). Returns true on success.
-    pub fn config_audio(&mut self, codec: &str, channels: i32, sample_rate: i32, bit_rate: i64) -> bool {
+    pub fn config_audio(
+        &mut self,
+        codec: &str,
+        channels: i32,
+        sample_rate: i32,
+        bit_rate: i64,
+    ) -> bool {
         let c = match CString::new(codec) {
             Ok(c) => c,
             Err(_) => return false,
@@ -1525,7 +1561,13 @@ impl Decoder {
     pub fn decode_rgba(&mut self, frame_index: i32, w: usize, h: usize) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; w * h * 4];
         let rc = unsafe {
-            fpx_decode_frame_letterbox(self.h, frame_index, buf.as_mut_ptr(), w as c_int, h as c_int)
+            fpx_decode_frame_letterbox(
+                self.h,
+                frame_index,
+                buf.as_mut_ptr(),
+                w as c_int,
+                h as c_int,
+            )
         };
         if rc >= 0 {
             Some(buf)

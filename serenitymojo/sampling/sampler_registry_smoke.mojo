@@ -2,7 +2,7 @@ from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend,
     sampler_backend_for_model,
     scheduler_admission_for_backend,
-    swarmui_sampler_registry_json,
+    serenity_sampler_registry_json,
 )
 
 
@@ -40,7 +40,7 @@ def main() raises:
     var ideogram_karras = scheduler_admission_for_backend(String("ideogram4"), String("karras"))
     require(not ideogram_karras.supported, String("ideogram karras scheduler should stay blocked"))
 
-    var registry = swarmui_sampler_registry_json()
+    var registry = serenity_sampler_registry_json()
     require(registry.find(String('"backend":"qwenimage"')) >= 0, String("registry missing qwenimage"))
     require(registry.find(String('"backend":"ideogram4"')) >= 0, String("registry missing ideogram4"))
     require(registry.find(String('"simple_flowmatch"')) >= 0, String("registry missing ideogram simple alias"))

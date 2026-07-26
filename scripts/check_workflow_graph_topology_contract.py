@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static guard for Comfy/Swarm workflow topology fail-loud behavior.
+"""Static guard for Comfy/Reference workflow topology fail-loud behavior.
 
 The current executor lowers typed graphs into one flat JobParams object. It must
 reject multi-sampler or multi-output Comfy graphs until the runtime owns real

@@ -77,7 +77,7 @@ from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
-from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
+from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.training.aspect_buckets import (
     DEFAULT_ASPECT_LADDER_LEN, DEFAULT_ASPECT_LADDER_X100,
     aspect_lat_h_units, aspect_lat_w_units,
@@ -655,7 +655,7 @@ struct FluxBackend(GenBackend, Movable):
             )
             var base_h = noise.to_host(self.ctx)
             var var_h = vnoise.to_host(self.ctx)
-            var blended = swarm_variation_noise_chw(
+            var blended = variation_noise_chw(
                 base_h, var_h, AE_IN_CHANNELS, LATENT_H_, LATENT_W_,
                 self.params.variation_strength,
             )

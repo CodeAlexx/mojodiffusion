@@ -77,7 +77,7 @@ var WorkflowBuilder = (function () {
                 workflow = buildSD15(params);
                 break;
         }
-        // Generate exposes sampler and noise schedule as separate Swarm-style
+        // Generate exposes sampler and noise schedule as separate Serenity
         // controls. Builders retain legacy combined-scheduler compatibility,
         // then this final pass makes a staged Workflow graph match the exact
         // admitted values chosen in Generate.
@@ -1018,8 +1018,6 @@ var WorkflowBuilder = (function () {
                 throw new Error('LTX2 requires ' + (label || key));
             return value;
         }
-        if (p.initImageName)
-            throw new Error('The LTX2 Mojo request runner is text-to-video only');
         var w = ModelUtils.clampVideoDimension(requiredNumber('width'));
         var h = ModelUtils.clampVideoDimension(requiredNumber('height'));
         var seed = resolveSeed(p.seed);
@@ -1028,7 +1026,7 @@ var WorkflowBuilder = (function () {
         var fps = requiredNumber('fps');
         var sampler = requiredText('sampler');
         var scheduler = requiredText('scheduler');
-        var capsPositive = requiredText('capsPositive', 'prompt-matched conditioning');
+        var capsPositive = String(p.capsPositive || '').trim();
         if (frames < 1 || steps < 1 || fps <= 0)
             throw new Error('LTX2 frames, steps, and FPS must be positive');
         var loaderInputs = {
@@ -1066,6 +1064,28 @@ var WorkflowBuilder = (function () {
                     format: 'mp4'
                 } }
         };
+        if (p.initImageName && p.initVideoName)
+            throw new Error('LTX2 accepts either a guide image or a guide video, not both');
+        if (p.initImageName) {
+            workflow['4'] = {
+                class_type: 'LoadImage',
+                inputs: { image: p.initImageName }
+            };
+            workflow['2'].inputs.guide_image = ['4', 0];
+            workflow['2'].inputs.guide_strength = Number.isFinite(Number(p.imageStrength))
+                ? Number(p.imageStrength)
+                : 1.0;
+            workflow['2'].inputs.guide_frame_idx = 0;
+        } else if (p.initVideoName) {
+            workflow['4'] = {
+                class_type: 'LoadVideo',
+                inputs: { video: p.initVideoName }
+            };
+            workflow['2'].inputs.guide_video = ['4', 0];
+            workflow['2'].inputs.guide_strength = Number.isFinite(Number(p.videoStrength))
+                ? Number(p.videoStrength)
+                : 0.7;
+        }
         return workflow;
     }
     // ─── WAN (Video) ──────────────────────────────────────────────────────

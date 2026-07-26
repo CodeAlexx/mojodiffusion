@@ -41,6 +41,7 @@ pub fn is_allowed_type(t: &str) -> bool {
             | "LoadImage"
             | "LoadImageOutput"
             | "LoadImageMask"
+            | "LoadVideo"
             | "Krea2FlowEdit"
             | "Ideogram4FlowEdit"
             | "LoadAudio"

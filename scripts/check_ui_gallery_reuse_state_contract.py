@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime product contract for UI/gallery/reuse/state SwarmUI parity gaps.
+"""Runtime product contract for UI/gallery/reuse/state reference UI parity gaps.
 
 This checker starts the compiled Mojo daemon in stub mode, exercises the
 UI-adjacent API workflows that do not require CUDA, and writes a readiness
@@ -532,7 +532,7 @@ def print_report(report: dict[str, Any]) -> None:
         + ("READY" if report["product_api_core_ready"] else "BLOCKED")
     )
     print(
-        "[ui-gallery-reuse-state] SwarmUI UX parity: "
+        "[ui-gallery-reuse-state] reference UI UX parity: "
         + ("READY" if report["claims_ux_parity"] and report["ready"] else "BLOCKED")
     )
 

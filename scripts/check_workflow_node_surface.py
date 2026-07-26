@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""No-CUDA static guard for Comfy/Swarm workflow node surface.
+"""No-CUDA static guard for Comfy/Reference workflow node surface.
 
 This checker reads source files only. It validates the constrained daemon
 workflow adapter markers and fail-loud unsupported-node behavior. It does not
 run CUDA, does not start the daemon, does not execute arbitrary graphs, and
-does not claim ComfyUI/SwarmUI graph parity.
+does not claim ComfyUI/reference UI graph parity.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 REPO = Path(__file__).resolve().parents[1]
 
-DOC = REPO / "serenitymojo/docs/COMFY_SWARM_WORKFLOW_PARITY_MAP_2026-06-12.md"
+DOC = REPO / "serenitymojo/docs/COMFY_REFERENCE_WORKFLOW_PARITY_MAP_2026-06-12.md"
 DAEMON = REPO / "serenitymojo/serve/serenity_daemon.mojo"
 VIDEO_API = REPO / "serenitymojo/serve/video_api.mojo"
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
@@ -47,8 +47,8 @@ KLEIN_REAL_IMAGE_HEALTH_RUNNER = REPO / "scripts/check_klein_real_image_health.p
 LANPAINT_ORACLE_SURFACE_RUNNER = REPO / "scripts/check_lanpaint_oracle_surface.py"
 LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_lanpaint_canvas_daemon_smoke.py"
 PIXI = REPO / "pixi.toml"
-LEDGER = REPO / "serenitymojo/docs/SWARMUI_PRODUCT_PATH_LEDGER_2026-06-12.md"
-ROADMAP = REPO / "serenitymojo/docs/SWARMUI_PARITY_ROADMAP_2026-06-12.md"
+LEDGER = REPO / "serenitymojo/docs/REFERENCE_UI_PRODUCT_PATH_LEDGER_2026-06-12.md"
+ROADMAP = REPO / "serenitymojo/docs/REFERENCE_UI_PARITY_ROADMAP_2026-06-12.md"
 WORKFLOW_GRAPH_PRODUCT = REPO / "output/checks/workflow_graph_product_readiness.json"
 KLEIN4B_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein4b_reference_edit_daemon_smoke.json"
 KLEIN9B_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein9b_reference_edit_daemon_smoke.json"
@@ -62,7 +62,7 @@ SERENITYFLOW_LATENT_NODES = SERENITYFLOW / "nodes/latent.py"
 SERENITYFLOW_BASIC_CONDITIONING_NODES = SERENITYFLOW / "nodes/conditioning.py"
 SERENITYFLOW_CONDITIONING_NODES = SERENITYFLOW / "nodes/conditioning_extra.py"
 SERENITYFLOW_SAMPLING = SERENITYFLOW / "bridge/sampling.py"
-COMFY_NODES = Path("/home/alex/SwarmUI/dlbackend/ComfyUI/nodes.py")
+COMFY_NODES = Path("/home/alex/reference UI/dlbackend/ComfyUI/nodes.py")
 
 P0 = "P0"
 P1 = "P1"
@@ -778,7 +778,7 @@ def check_supported_nodes() -> list[Check]:
                 'elif type_id == "MarkdownNote" or type_id == "Note"',
             ],
             severity=P0,
-            acceptance="Swarm/Comfy UI-only notes are inert and PreviewImage is an optional IMAGE sink with fail-loud type checking.",
+            acceptance="Reference/Comfy UI-only notes are inert and PreviewImage is an optional IMAGE sink with fail-loud type checking.",
         )
     )
     checks.append(
@@ -854,7 +854,7 @@ def check_supported_nodes() -> list[Check]:
                 "unresolved or cyclic typed links",
             ],
             severity=P0,
-            acceptance="Supported Comfy/Swarm t2i graphs use typed handles and topological execution instead of field-only flattening.",
+            acceptance="Supported Comfy/Reference t2i graphs use typed handles and topological execution instead of field-only flattening.",
         )
     )
     checks.append(
@@ -1745,7 +1745,7 @@ def check_family_surfaces() -> list[Check]:
                 "cap-cache/ReferenceLatent bridge",
             ],
             severity=P1,
-            acceptance="Flux2/Klein workflow imports preserve Swarm/Comfy scheduler metadata while direct in-process sampler registry execution stays blocked outside the staged daemon bridge.",
+            acceptance="Flux2/Klein workflow imports preserve Reference/Comfy scheduler metadata while direct in-process sampler registry execution stays blocked outside the staged daemon bridge.",
         ),
         check_contains(
             KLEIN_REFERENCE_BRIDGE,
@@ -3956,7 +3956,7 @@ def check_docs() -> list[Check]:
             category="docs",
             label="roadmap keeps graph gap visible",
             needles=[
-                "advanced Comfy/Swarm node families beyond the typed t2i graph",
+                "advanced Comfy/Reference node families beyond the typed t2i graph",
                 "Qwen full daemon generation was not run",
                 "Video generation is still not accepted",
                 "ltx2_staged_dev_smoke",
@@ -4010,7 +4010,7 @@ def build_report(checks: list[Check]) -> dict[str, object]:
         "schema": "serenity.workflow_node_surface_readiness.v1",
         "scope": "workflow graph module markers plus the latest typed workflow graph product smoke report",
         "constrained_workflow_adapter_ready": not p0,
-        "arbitrary_comfy_swarm_graph_execution_ready": False,
+        "arbitrary_comfy_reference_graph_execution_ready": False,
         "supported_t2i_graph_execution_ready": not p0 and not p1,
         "full_graph_parity_claim": "blocked_for_advanced_node_families",
         "supported_adapter_node_types": SUPPORTED_NODE_TYPES,
@@ -4058,7 +4058,7 @@ def print_text_report(report: dict[str, object]) -> None:
         print("[workflow-node-surface] constrained adapter markers: READY")
     else:
         print("[workflow-node-surface] constrained adapter markers: BLOCKED")
-    print("[workflow-node-surface] arbitrary Comfy/Swarm graph parity: BLOCKED")
+    print("[workflow-node-surface] arbitrary Comfy/Reference graph parity: BLOCKED")
 
 
 def main() -> int:

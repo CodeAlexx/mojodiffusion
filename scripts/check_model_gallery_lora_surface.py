@@ -26,7 +26,7 @@ STUB_BACKEND = REPO / "serenitymojo/serve/stub_backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
 IDEOGRAM4_BACKEND = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
-PARITY_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
+PARITY_DOC = REPO / "serenitymojo/docs/REFERENCE_UI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
 ZIMAGE_MULTI_LORA_READINESS = REPO / "output/checks/zimage_multi_lora_product_readiness.json"
 UI_GALLERY_REUSE_STATE_READINESS = REPO / "output/checks/ui_gallery_reuse_state_readiness.json"
 
@@ -343,7 +343,7 @@ def ui_gallery_reuse_state_runtime_checks() -> list[SurfaceCheck]:
         runtime_report_check(
             id="ui_gallery_reuse_state_ux_parity_runtime",
             category="gallery",
-            feature="UI/gallery/reuse/state SwarmUI UX parity",
+            feature="UI/gallery/reuse/state reference UI UX parity",
             accepted=full_ready,
             severity="P1",
             evidence=evidence,
@@ -713,7 +713,7 @@ def build_report() -> dict:
             for item in blocked
         ],
         "non_claims": [
-            "This checker does not inspect UI controls or SwarmUI visual behavior.",
+            "This checker does not inspect UI controls or reference UI visual behavior.",
             "This checker does not run CUDA or generate images.",
             "This checker accepts multi-LoRA runtime parity only from the Z-Image product readiness report, not request JSON alone.",
             "This checker treats Qwen full generation and video generation as out of scope for this utility slice.",

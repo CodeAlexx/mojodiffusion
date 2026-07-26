@@ -17,6 +17,7 @@ var GenerateTab = (function () {
         guidance: 3.5,
         sampler: 'euler',
         scheduler: 'simple',
+        sigmaShift: 3.0,
         seed: -1,
         variationSeed: 0,
         variationStrength: 0,
@@ -56,6 +57,26 @@ var GenerateTab = (function () {
         modelSearchQuery: '',
         allModels: [],
         capabilities: null,
+        videoStatus: null,
+        videoGuidanceMode: 'distilled',
+        videoQuant: 'fp8',
+        videoCheckpoint: 'ltx-2.3-22b-dev-fp8',
+        capsPositive: '',
+        capsNegative: '',
+        noiseFixture: '',
+        includeAudio: false,
+        postUpscaler: 'none',
+        postUpscaleFactor: 2,
+        noSeedIncrement: false,
+        continueAfterErrors: true,
+        personalNote: '',
+        showAdvanced: true,
+        currentResultParams: null,
+        currentGalleryIndex: -1,
+        pendingVideoJobs: {},
+        completedVideoJobs: {},
+        currentBatchKeys: {},
+        videoPollToken: 0,
         // Phase 2: gallery enhancements
         selectedImages: [],
         lastSelectedIndex: -1,
@@ -106,6 +127,11 @@ var GenerateTab = (function () {
         // frames = seconds * fps + 1 (first frame is the start frame)
         return Math.max(9, Math.round(seconds * fps) + 1);
     }
+    function ltx2SecondsToFrames(seconds, fps) {
+        // LTX-2 requires (8 * K) + 1 frames. This matches Desktop's
+        // _compute_num_frames rather than silently sending an invalid shape.
+        return Math.max(9, Math.floor(seconds * fps / 8) * 8 + 1);
+    }
     // ── Aspect ratio definitions ──
     var videoAspects = [
         { label: 'Free', w: 0, h: 0, vw: 16, vh: 16 },
@@ -144,8 +170,24 @@ var GenerateTab = (function () {
     ];
     function getActiveAspects() {
         var arch = ModelUtils.detectArchFromFilename(state.model);
-        if (arch === 'ltxv')
-            return [{ label: '1920×1088', w: 1920, h: 1088, vw: 30, vh: 17 }];
+        if (arch === 'ltxv') {
+            var seen = {};
+            return activeLtx2RequestProfiles().filter(function (profile) {
+                var key = profile.width + 'x' + profile.height;
+                if (seen[key])
+                    return false;
+                seen[key] = true;
+                return true;
+            }).map(function (profile) {
+                return {
+                    label: profile.width + '×' + profile.height,
+                    w: Number(profile.width),
+                    h: Number(profile.height),
+                    vw: Number(profile.width) / 64,
+                    vh: Number(profile.height) / 64
+                };
+            });
+        }
         if (arch === 'wan')
             return [{ label: '832×480', w: 832, h: 480, vw: 26, vh: 15 }];
         if (arch === 'bernini')
@@ -153,6 +195,206 @@ var GenerateTab = (function () {
         if (arch === 'scail2')
             return [{ label: '896×512', w: 896, h: 512, vw: 28, vh: 16 }];
         return ModelUtils.aspectsForArch(state.capabilities, arch);
+    }
+    function activeLtx2RequestMode() {
+        var candidates = state.videoStatus && state.videoStatus.candidate_runners;
+        if (!Array.isArray(candidates))
+            return null;
+        var runner = candidates.find(function (entry) {
+            return entry && entry.model === 'ltx2_t2v_av';
+        });
+        return runner && runner.modes && runner.modes.ltx2_mojo_request || null;
+    }
+    function exactLtx2RequestProfile() {
+        var mode = activeLtx2RequestMode();
+        if (!mode)
+            return null;
+        var profiles = activeLtx2RequestProfiles();
+        return profiles.find(function (profile) {
+            return Number(profile.width) === Number(state.width) &&
+                Number(profile.height) === Number(state.height) &&
+                Number(profile.frames) === Number(state.frames) &&
+                Number(profile.fps) === Number(state.fps);
+        }) || null;
+    }
+    function activeLtx2RequestProfile() {
+        var mode = activeLtx2RequestMode();
+        if (!mode)
+            return null;
+        var profiles = activeLtx2RequestProfiles();
+        return exactLtx2RequestProfile() ||
+            (mode.compiled_profile && mode.compiled_profile.available !== false
+            ? mode.compiled_profile : null) || profiles[0] || null;
+    }
+    function updateLtx2ProfileStatus() {
+        var profileNote = document.getElementById('gen-video-profile-note');
+        if (!profileNote)
+            return;
+        var profiles = activeLtx2ProfilesForSize(state.width, state.height);
+        var exact = exactLtx2RequestProfile();
+        if (exact) {
+            profileNote.classList.remove('invalid');
+            profileNote.textContent = 'Supported native profile: ' +
+                state.width + '×' + state.height + ', ' +
+                state.frames + ' frames at ' + state.fps +
+                ' FPS. The exact AOT Mojo runner will be used.';
+            return;
+        }
+        profileNote.classList.add('invalid');
+        profileNote.textContent = 'No compiled native runner matches ' +
+            state.width + '×' + state.height + ', ' + state.frames +
+            ' frames at ' + state.fps + ' FPS. Supported here: ' +
+            profiles.map(function (profile) {
+                return profile.duration + 's / ' + profile.frames +
+                    'f @ ' + profile.fps;
+            }).join(', ') + '.';
+    }
+    function activeLtx2PostUpscalers() {
+        var mode = activeLtx2RequestMode();
+        return mode && Array.isArray(mode.post_upscalers)
+            ? mode.post_upscalers : [];
+    }
+    function refreshLtx2PostUpscaleControls() {
+        if (!els.postUpscaler || !els.postUpscaleFactor)
+            return;
+        var isLtx2 = ModelUtils.detectArchFromFilename(state.model) === 'ltxv';
+        var upscalers = activeLtx2PostUpscalers();
+        var available = upscalers.filter(function (entry) {
+            return entry && entry.available === true;
+        });
+        els.postUpscaler.innerHTML =
+            '<option value="none">Native output</option>' +
+            upscalers.map(function (entry) {
+                var disabled = entry.available === true ? '' : ' disabled';
+                var suffix = entry.available !== true
+                    ? ' (unavailable)'
+                    : (entry.status === 'experimental_slow'
+                        ? ' (experimental slow)' : '');
+                return '<option value="' + escapeHtml(String(entry.id)) + '"' +
+                    disabled + '>' + escapeHtml(String(entry.label || entry.id)) +
+                    suffix + '</option>';
+            }).join('');
+        if (!isLtx2 || (state.postUpscaler !== 'none' &&
+            !available.some(function (entry) {
+                return entry.id === state.postUpscaler;
+            }))) {
+            state.postUpscaler = 'none';
+        }
+        els.postUpscaler.value = state.postUpscaler;
+        els.postUpscaler.disabled = !isLtx2 || available.length === 0;
+        var selected = available.find(function (entry) {
+            return entry.id === state.postUpscaler;
+        });
+        var scales = selected && Array.isArray(selected.scales)
+            ? selected.scales.map(Number).filter(function (value) {
+                return value === 2 || value === 4;
+            }) : [2, 4];
+        if (scales.indexOf(Number(state.postUpscaleFactor)) < 0)
+            state.postUpscaleFactor = scales[0] || 2;
+        els.postUpscaleFactor.innerHTML = scales.map(function (factor) {
+            return '<option value="' + factor + '">' + factor + '× · ' +
+                (state.width * factor) + '×' + (state.height * factor) +
+                '</option>';
+        }).join('');
+        els.postUpscaleFactor.value = String(state.postUpscaleFactor);
+        els.postUpscaleFactor.disabled = !isLtx2 || state.postUpscaler === 'none';
+        if (els.postUpscaleNote) {
+            if (!isLtx2) {
+                els.postUpscaleNote.textContent =
+                    'Post-upscale is available on the LTX2 video route.';
+            }
+            else if (!available.length) {
+                els.postUpscaleNote.textContent =
+                    'No installed post-upscaler has both a Mojo runner and local weights.';
+            }
+            else if (!selected) {
+                els.postUpscaleNote.textContent =
+                    'Native output selected. Choose an admitted post-upscaler to render beyond the native profile.';
+            }
+            else {
+                els.postUpscaleNote.textContent =
+                    selected.label + ' will produce ' +
+                    (state.width * state.postUpscaleFactor) + '×' +
+                    (state.height * state.postUpscaleFactor) +
+                    ' after native LTX2 decode.' +
+                    (selected.status === 'experimental_slow'
+                        ? ' Measured RRDB x4plus speed is 18.24 seconds/frame at 960×544; long clips are not production-speed.'
+                        : '');
+            }
+        }
+    }
+    function activeLtx2RequestProfiles() {
+        var mode = activeLtx2RequestMode();
+        if (!mode)
+            return [];
+        var profiles = Array.isArray(mode.supported_profiles)
+            ? mode.supported_profiles : [];
+        return profiles.filter(function (profile) {
+            return profile && profile.available === true;
+        });
+    }
+    function activeLtx2ProfilesForSize(width, height) {
+        return activeLtx2RequestProfiles().filter(function (profile) {
+            return Number(profile.width) === Number(width) &&
+                Number(profile.height) === Number(height);
+        });
+    }
+    function applyLtx2RequestProfile(profile) {
+        if (!profile)
+            return;
+        state.videoCheckpoint = String(profile.checkpoint || state.videoCheckpoint);
+        state.width = Number(profile.width);
+        state.height = Number(profile.height);
+        state.frames = Number(profile.frames);
+        state.fps = Number(profile.fps);
+        state.seconds = Number(profile.duration);
+        if (!Number.isFinite(state.seconds) || state.seconds <= 0)
+            state.seconds = state.frames / state.fps;
+        syncDimensionInputs();
+        syncAspectDropdown();
+        updateAspectPreview();
+        refreshLtx2ProfileControls();
+        refreshLtx2PostUpscaleControls();
+        updateDurationHint();
+    }
+    function refreshLtx2ProfileControls() {
+        var profiles = activeLtx2ProfilesForSize(state.width, state.height);
+        if (!profiles.length)
+            return;
+        if (els.framesInput) {
+            var frameValues = profiles.map(function (profile) {
+                return Number(profile.frames);
+            });
+            els.framesInput.min = String(Math.min.apply(Math, frameValues));
+            els.framesInput.max = String(Math.max.apply(Math, frameValues));
+            els.framesInput.step = '8';
+            els.framesInput.value = String(state.frames);
+            els.framesInput.disabled = false;
+            els.framesInput.title = 'Editable LTX2 frame count; valid native counts match 8*K+1 and an available compiled profile';
+        }
+        if (els.secondsInput) {
+            els.secondsInput.min = '0.1';
+            els.secondsInput.max = '120';
+            els.secondsInput.step = '0.01';
+            els.secondsInput.value = String(state.seconds);
+            els.secondsInput.disabled = false;
+            els.secondsInput.title = 'Editable duration; frame count is resolved with the LTX2 8*K+1 rule';
+        }
+        if (els.fpsInput) {
+            els.fpsInput.value = String(state.fps);
+            els.fpsInput.min = '1';
+            els.fpsInput.max = '60';
+            els.fpsInput.disabled = false;
+            els.fpsInput.title = 'Editable FPS; the combination must match an available compiled native profile';
+        }
+        if (els.fpsRange) {
+            els.fpsRange.value = String(state.fps);
+            els.fpsRange.min = '1';
+            els.fpsRange.max = '60';
+            els.fpsRange.disabled = false;
+            els.fpsRange.title = 'Editable FPS; unsupported combinations fail before model loading';
+        }
+        updateLtx2ProfileStatus();
     }
     function buildAspectOptions() {
         var aspects = getActiveAspects();
@@ -183,17 +425,22 @@ var GenerateTab = (function () {
             return;
         panel.innerHTML = '';
         var layout = document.createElement('div');
-        layout.className = 'gen-layout gen-swarm-layout';
+        layout.className = 'gen-layout gen-workspace-layout';
         // Left panel
         var left = document.createElement('div');
-        left.className = 'gen-left gen-swarm-parameters';
+        left.className = 'gen-left gen-workspace-parameters';
         left.id = 'gen-left-panel';
-        left.innerHTML = buildSwarmLeftHTML();
+        left.innerHTML = buildGenerateLeftHTML();
         layout.appendChild(left);
+        var leftResizer = document.createElement('div');
+        leftResizer.id = 'gen-left-resizer';
+        leftResizer.className = 'gen-layout-resizer gen-layout-resizer-vertical gen-left-resizer';
+        leftResizer.title = 'Drag to resize Parameters';
+        layout.appendChild(leftResizer);
         // Center panel
         var center = document.createElement('div');
-        center.className = 'gen-center gen-swarm-stage';
-        center.innerHTML = buildSwarmTopToolbarHTML() + buildCenterHTML();
+        center.className = 'gen-center gen-workspace-stage';
+        center.innerHTML = buildGenerateTopToolbarHTML() + buildCenterHTML();
         layout.appendChild(center);
         // Floating side toolbar (inside center so it positions relative to center)
         var floatBar = document.createElement('div');
@@ -201,37 +448,60 @@ var GenerateTab = (function () {
         floatBar.id = 'gen-floating-toolbar';
         floatBar.innerHTML = buildFloatingToolbarHTML();
         center.appendChild(floatBar);
+        var rightResizer = document.createElement('div');
+        rightResizer.id = 'gen-right-resizer';
+        rightResizer.className = 'gen-layout-resizer gen-layout-resizer-vertical gen-right-resizer';
+        rightResizer.title = 'Drag to resize Current Batch';
+        layout.appendChild(rightResizer);
         // Right panel
         var right = document.createElement('div');
-        right.className = 'gen-right gen-swarm-batch-panel';
+        right.className = 'gen-right gen-workspace-batch-panel';
         right.id = 'gen-right-panel';
-        right.innerHTML = buildSwarmBatchHTML();
+        right.innerHTML = buildGenerateBatchHTML();
         layout.appendChild(right);
+        var promptResizer = document.createElement('div');
+        promptResizer.id = 'gen-prompt-resizer';
+        promptResizer.className = 'gen-layout-resizer gen-layout-resizer-horizontal gen-prompt-resizer';
+        promptResizer.title = 'Drag down to enlarge the preview · double-click to minimize prompts';
+        layout.appendChild(promptResizer);
         var promptDock = document.createElement('div');
-        promptDock.className = 'gen-swarm-prompt-dock';
-        promptDock.innerHTML = buildSwarmPromptHTML();
+        promptDock.className = 'gen-workspace-prompt-dock';
+        promptDock.innerHTML = buildGeneratePromptHTML();
         layout.appendChild(promptDock);
+        var libraryResizer = document.createElement('div');
+        libraryResizer.id = 'gen-library-resizer';
+        libraryResizer.className = 'gen-layout-resizer gen-layout-resizer-horizontal gen-library-resizer';
+        libraryResizer.title = 'Drag to resize History';
+        layout.appendChild(libraryResizer);
         var library = document.createElement('div');
-        library.className = 'gen-swarm-library';
-        library.innerHTML = buildSwarmLibraryHTML();
+        library.className = 'gen-workspace-library';
+        library.innerHTML = buildGenerateLibraryHTML();
         layout.appendChild(library);
         panel.appendChild(layout);
         cacheElements();
     }
 
-    function swarmGroup(id, title, body, open, help) {
-        return '<section class="gen-swarm-group gen-param-group" data-param-search="' +
+    function generateGroup(id, title, body, open, help) {
+        return '<section class="gen-workspace-group gen-param-group" data-param-search="' +
             (title + ' ' + (help || '')).toLowerCase() + '">' +
-            '<button type="button" id="' + id + '" class="gen-accordion-header gen-swarm-group-title' +
+            '<button type="button" id="' + id + '" class="gen-accordion-header gen-workspace-group-title' +
             (open ? '' : ' closed') + '">' +
             '<span><i data-lucide="chevron-down"></i>' + title + '</span>' +
-            (help ? '<span class="gen-swarm-help" title="' + help.replace(/"/g, '&quot;') + '">?</span>' : '') +
+            (help ? '<span class="gen-workspace-help" title="' + help.replace(/"/g, '&quot;') + '">?</span>' : '') +
             '</button>' +
-            '<div id="' + id.replace('-header', '-body') + '" class="gen-accordion-body gen-swarm-group-body' +
+            '<div id="' + id.replace('-header', '-body') + '" class="gen-accordion-body gen-workspace-group-body' +
             (open ? '' : ' closed') + '">' + body + '</div></section>';
     }
 
-    function buildSwarmLeftHTML() {
+    function disabledParamRow(label, value, search) {
+        return '<div class="gen-setting-row gen-param-row gen-parity-disabled" data-param-search="' +
+            String(search || label).toLowerCase() + '">' +
+            '<label class="gen-setting-label">' + label + '</label>' +
+            '<input class="gen-select" value="' + value + '" disabled title="Not admitted by the selected runtime">' +
+            '</div>';
+    }
+
+    function buildGenerateLeftHTML() {
         var modelBody =
             '<div class="gen-param-row" data-param-search="model checkpoint search">' +
             '<label class="gen-label" for="gen-model-search">Model</label>' +
@@ -279,67 +549,244 @@ var GenerateTab = (function () {
             '<div id="gen-aspect-preview" class="gen-aspect-preview"><span>1024×1024</span></div></div>';
         var samplingBody =
             '<div class="gen-param-row" data-param-search="sampler algorithm"><label class="gen-label" for="gen-sampler">Sampler</label><select id="gen-sampler" class="gen-select"></select></div>' +
-            '<div class="gen-param-row" data-param-search="scheduler noise schedule"><label class="gen-label" for="gen-scheduler">Scheduler</label><select id="gen-scheduler" class="gen-select"></select></div>';
-        var initBody =
-            '<div class="gen-param-row" data-param-search="init image image to image source denoise creativity">' +
-            '<div id="gen-init-drop" class="gen-init-drop"><input id="gen-init-image-input" type="file" accept="image/*">' +
-            '<div id="gen-init-empty"><i data-lucide="image-plus"></i><span>Choose or drop a source image</span></div>' +
-            '<img id="gen-init-preview" alt="Init image preview" style="display:none"></div>' +
-            '<div id="gen-init-name" class="gen-init-name">No source image</div>' +
-            '<button id="gen-init-clear" type="button" class="gen-small-btn" disabled>Clear image</button>' +
-            '<div class="gen-setting-row"><label class="gen-setting-label" for="gen-creativity">Creativity</label>' +
-            '<input id="gen-creativity-range" type="range" class="gen-range" min="0" max="1" step="0.01" value="0.5">' +
-            '<input id="gen-creativity" type="number" class="gen-number-input" min="0" max="1" step="0.01" value="0.5"></div></div>';
+            '<div class="gen-param-row" data-param-search="scheduler noise schedule"><label class="gen-label" for="gen-scheduler">Scheduler</label><select id="gen-scheduler" class="gen-select"></select></div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Zero Negative', 'Not admitted', 'zero negative empty negative prompt') +
+            disabledParamRow('Seamless Tileable', 'Not admitted', 'seamless tileable x y texture') +
+            '</div>';
+        var videoBody =
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Video Model', 'Current model selection', 'video model') +
+            disabledParamRow('Video Swap Model', 'No two-model runner', 'video swap model') +
+            disabledParamRow('Video Swap Percent', 'Not admitted', 'video swap percent') +
+            disabledParamRow('Video Resolution', 'Compiled profile', 'video resolution') +
+            '</div>' +
+            '<div id="gen-video-profile-note" class="gen-capability-note">Loading the admitted video profile…</div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="frames frame count video length">' +
+            '<label class="gen-setting-label" for="gen-frames">Frames</label><input id="gen-frames" type="number" class="gen-number-input" min="9" max="481" step="8" value="121">' +
+            '<span class="gen-batch-hint">native profile</span></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="fps frame rate">' +
+            '<label class="gen-setting-label" for="gen-fps">FPS</label><input id="gen-fps-range" type="range" class="gen-range" min="1" max="60" step="1" value="25">' +
+            '<input id="gen-fps" type="number" class="gen-number-input" min="1" max="120" step="1" value="25"></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="duration seconds">' +
+            '<label class="gen-setting-label" for="gen-seconds">Duration</label><input id="gen-seconds" type="number" class="gen-number-input" min="0.1" max="120" step="0.01" value="4.84">' +
+            '<span id="gen-duration-hint" class="gen-batch-hint">121 frames · 4.8s at 25fps</span></div>' +
+            '<div class="gen-param-row" data-param-search="guidance mode distilled dev"><label class="gen-label" for="gen-video-guidance-mode">Guidance mode</label>' +
+            '<select id="gen-video-guidance-mode" class="gen-select"><option value="distilled">Distilled</option><option value="dev">Dev CFG</option></select></div>' +
+            '<div class="gen-param-row" data-param-search="quant fp8 int4"><label class="gen-label" for="gen-video-quant">Quantization</label>' +
+            '<select id="gen-video-quant" class="gen-select"><option value="fp8">FP8</option><option value="int4">INT4</option></select></div>' +
+            '<label class="gen-check-row gen-param-row" data-param-search="audio include audio"><input id="gen-include-audio" type="checkbox"> Include generated audio</label>';
+        var videoConditioningBody =
+            '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
+            '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
+            '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-dev-fp8"></div>' +
+            '<div class="gen-param-row" data-param-search="conditioning caps positive"><label class="gen-label" for="gen-caps-positive">Positive conditioning override</label>' +
+            '<input id="gen-caps-positive" class="gen-select gen-path-input" placeholder="Automatic when blank"></div>' +
+            '<div class="gen-param-row" data-param-search="conditioning caps negative"><label class="gen-label" for="gen-caps-negative">Negative conditioning override</label>' +
+            '<input id="gen-caps-negative" class="gen-select gen-path-input" placeholder="Automatic when blank"></div>' +
+            '<div class="gen-param-row" data-param-search="noise fixture"><label class="gen-label" for="gen-noise-fixture">Noise fixture</label>' +
+            '<input id="gen-noise-fixture" class="gen-select gen-path-input" placeholder="Optional deterministic noise path"></div>';
+        var refineBody =
+            '<div id="gen-post-upscale-note" class="gen-capability-note">Loading installed post-upscalers…</div>' +
+            '<div class="gen-param-row" data-param-search="post upscale super resolution realesrgan seedvr2"><label class="gen-label" for="gen-post-upscaler">Post Upscaler</label>' +
+            '<select id="gen-post-upscaler" class="gen-select"><option value="none">Native output</option></select></div>' +
+            '<div class="gen-param-row" data-param-search="post upscale factor resolution 2x 4x"><label class="gen-label" for="gen-post-upscale-factor">Output Scale</label>' +
+            '<select id="gen-post-upscale-factor" class="gen-select"><option value="2">2×</option><option value="4">4×</option></select></div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Refiner Control Percentage', 'Not admitted', 'refiner control percentage') +
+            disabledParamRow('Refiner Method', 'No second-pass runtime', 'refiner method') +
+            disabledParamRow('Refiner Upscale', '1.0', 'refiner upscale') +
+            disabledParamRow('Refiner Model', 'Use base only', 'refiner model override') +
+            disabledParamRow('Refiner VAE', 'Use model VAE', 'refiner vae') +
+            disabledParamRow('Refiner Sampler', 'Runtime default', 'refiner sampler') +
+            disabledParamRow('Refiner Steps', 'Runtime unavailable', 'refiner steps') +
+            disabledParamRow('Refiner CFG', 'Runtime unavailable', 'refiner cfg') +
+            disabledParamRow('Refiner Do Tiling', 'Unavailable', 'refiner tiling') +
+            '</div>';
+        var runtimeInternalBody =
+            '<label class="gen-check-row gen-param-row" data-param-search="no seed increment fixed batch seed"><input id="gen-no-seed-increment" type="checkbox"> No Seed Increment</label>' +
+            '<label class="gen-check-row gen-param-row" data-param-search="continue after errors batch queue"><input id="gen-continue-after-errors" type="checkbox" checked> Continue After Errors</label>' +
+            '<div class="gen-param-row" data-param-search="personal note metadata"><label class="gen-label" for="gen-personal-note">Personal Note</label>' +
+            '<textarea id="gen-personal-note" class="gen-textarea gen-compact-textarea" rows="2" placeholder="Saved with reusable browser parameters"></textarea></div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Batch Size', 'Use Images in Core', 'batch size') +
+            disabledParamRow('Alt Resolution Height Multiplier', 'Use admitted aspect', 'alternate resolution height multiplier') +
+            disabledParamRow('Raw Resolution', 'Use admitted dimensions', 'raw resolution') +
+            disabledParamRow('Output Intermediate Images', 'Worker does not emit intermediates', 'output intermediate images') +
+            disabledParamRow('Do Not Save', 'Server result contract requires an artifact', 'do not save') +
+            disabledParamRow('Do Not Save Intermediates', 'No intermediate artifacts emitted', 'do not save intermediates') +
+            disabledParamRow('No Previews', 'Progress preview policy is runtime-owned', 'no previews') +
+            disabledParamRow('No Load Models', 'Resident worker routing is automatic', 'no load models') +
+            disabledParamRow('No Internal Special Handling', 'Not applicable', 'no internal special handling') +
+            disabledParamRow('Webhooks', 'Not admitted', 'webhooks') +
+            disabledParamRow('[Internal] Backend Type', 'Mojo worker', 'internal backend type') +
+            disabledParamRow('Exact Backend ID', 'Automatic worker dispatch', 'backend id') +
+            disabledParamRow('Wildcard Seed', 'Prompt wildcards unavailable', 'wildcard seed') +
+            disabledParamRow('Wildcard Seed Behavior', 'Random', 'wildcard seed behavior') +
+            disabledParamRow('Image Format', 'Runtime artifact contract', 'image format') +
+            disabledParamRow('Color Depth', '8-bit RGB', 'color depth') +
+            disabledParamRow('Override Outpath Format', 'Server output root', 'override output path format') +
+            disabledParamRow('Model Specific Enhancements', 'Worker profile owns enhancements', 'model specific enhancements') +
+            disabledParamRow('Custom Workflow', 'Use the Workflow tab', 'custom workflow') +
+            '</div>';
+        var advancedVideoBody =
+            '<div class="gen-capability-note" id="gen-video-advanced-note">Select an admitted video model to use the video controls.</div>' +
+            '<div class="gen-workspace-parity-list">' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="video format mp4"><label class="gen-setting-label">Video Format</label><input id="gen-video-format" class="gen-select" value="MP4" disabled></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="video preview type animate"><label class="gen-setting-label">Video Preview Type</label><input id="gen-video-preview-type" class="gen-select" value="Animate" disabled></div>' +
+            disabledParamRow('Video Boomerang', 'Not admitted', 'video boomerang') +
+            disabledParamRow('Video Audio Input', 'No audio-conditioning input route', 'video audio input') +
+            disabledParamRow('Video Audio Reference', 'No reference-audio input route', 'video audio reference') +
+            disabledParamRow('Video Min CFG', 'Not admitted', 'video minimum cfg') +
+            disabledParamRow('Video Motion Bucket', 'Not admitted', 'video motion bucket') +
+            disabledParamRow('Video Augmentation Level', 'Not admitted', 'video augmentation level') +
+            disabledParamRow('Trim Video Start Frames', 'Not admitted', 'trim video start frames') +
+            disabledParamRow('Trim Video End Frames', 'Not admitted', 'trim video end frames') +
+            disabledParamRow('Frame Interpolation', 'Not admitted', 'video frame interpolation') +
+            '</div>';
+        var videoExtendBody =
+            '<div class="gen-capability-note">Video extension is not exposed as generation because no Serenity request runner currently admits overlap-conditioned continuation.</div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Video Extend Model', 'No admitted runner', 'video extend model') +
+            disabledParamRow('Video Extend Swap Model', 'No admitted runner', 'video extend swap model') +
+            disabledParamRow('Video Extend Frame Overlap', '9', 'video extend frame overlap') +
+            disabledParamRow('Video Extend Format', 'MP4', 'video extend format') +
+            '</div>';
+        var modelAddonsBody =
+            '<div class="gen-capability-note">The selected checkpoint manifest owns these components. Overrides are never posted unless a model capability explicitly admits them.</div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('VAE', 'Automatic / checkpoint VAE', 'vae automatic override') +
+            disabledParamRow('Pixel Decoder Model', 'Checkpoint-owned', 'pixel decoder model') +
+            disabledParamRow('CLIP-L Model', 'Checkpoint-owned', 'clip l model') +
+            disabledParamRow('CLIP-G Model', 'Checkpoint-owned', 'clip g model') +
+            disabledParamRow('CLIP-Vision Model', 'Canvas-owned conditioning', 'clip vision model') +
+            disabledParamRow('T5-XXL Model', 'Checkpoint-owned', 't5 xxl model') +
+            disabledParamRow('LLaVA Model', 'Checkpoint-owned', 'llava model') +
+            disabledParamRow('LLaMA Model', 'Checkpoint-owned', 'llama model') +
+            disabledParamRow('Gemma Model', 'Checkpoint-owned', 'gemma model') +
+            disabledParamRow('GPT-OSS Model', 'Checkpoint-owned', 'gpt oss model') +
+            disabledParamRow('Mistral Model', 'Checkpoint-owned', 'mistral model') +
+            disabledParamRow('Qwen Model', 'Checkpoint-owned', 'qwen model') +
+            disabledParamRow('Torch Compile', 'Mojo compiled worker', 'torch compile') +
+            disabledParamRow('Override Prediction Type', 'Model manifest default', 'prediction type') +
+            disabledParamRow('Negative Model', 'Not admitted', 'negative model') +
+            disabledParamRow('Negative Model Include LoRAs', 'Not applicable', 'negative model include loras') +
+            '</div>';
+        var dynamicThresholdBody =
+            '<div class="gen-capability-note">Dynamic thresholding is not implemented in the current Mojo samplers.</div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Mimic Scale', '7.0', 'dynamic threshold mimic scale') +
+            disabledParamRow('Threshold Percentile', '1.0', 'dynamic threshold percentile') +
+            disabledParamRow('CFG Scale Mode', 'Constant', 'dynamic threshold cfg scale mode') +
+            disabledParamRow('CFG Scale Minimum', '1.0', 'dynamic threshold cfg minimum') +
+            disabledParamRow('Mimic Scale Mode', 'Constant', 'dynamic threshold mimic scale mode') +
+            disabledParamRow('Mimic Scale Minimum', '1.0', 'dynamic threshold mimic minimum') +
+            disabledParamRow('Scheduler Value', '4.0', 'dynamic threshold scheduler value') +
+            disabledParamRow('Separate Feature Channels', 'Enabled', 'dynamic threshold separate feature channels') +
+            disabledParamRow('Scaling Startpoint', 'MEAN', 'dynamic threshold scaling startpoint') +
+            disabledParamRow('Variability Measure', 'AD', 'dynamic threshold variability measure') +
+            disabledParamRow('Interpolate Phi', '1.0', 'dynamic threshold interpolate phi') +
+            '</div>';
+        var advancedSamplingBody =
+            '<div id="gen-advanced-sampling-note" class="gen-capability-note">Advanced sampler controls are capability-driven. Unsupported fields stay disabled and are not posted.</div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="sigma shift flow schedule">' +
+            '<label class="gen-setting-label" for="gen-sigma-shift">Sigma Shift</label><input id="gen-sigma-shift-range" type="range" class="gen-range" min="0.01" max="20" step="0.01" value="3" disabled>' +
+            '<input id="gen-sigma-shift" type="number" class="gen-number-input" min="0.01" max="100" step="0.01" value="3" disabled></div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('Sampler Sigma Min', 'Not admitted', 'sampler sigma min') +
+            disabledParamRow('Sampler Sigma Max', 'Not admitted', 'sampler sigma max') +
+            disabledParamRow('Sampler Eta', 'Not admitted', 'sampler eta') +
+            disabledParamRow('Sampler Rho', 'Not admitted', 'sampler rho') +
+            disabledParamRow('CLIP Stop At Layer', 'Not admitted', 'clip stop layer clip skip') +
+            disabledParamRow('VAE Tile Size', 'Runtime-owned', 'vae tile size') +
+            disabledParamRow('VAE Tile Overlap', 'Runtime-owned', 'vae tile overlap') +
+            disabledParamRow('VAE Temporal Tile Size', 'Runtime-owned', 'vae temporal tile size') +
+            disabledParamRow('VAE Temporal Tile Overlap', 'Runtime-owned', 'vae temporal tile overlap') +
+            disabledParamRow('Preferred DType', 'Model manifest default', 'preferred dtype') +
+            disabledParamRow('End Steps Early', 'Not admitted', 'end steps early') +
+            disabledParamRow('Shifted Latent Average Init', 'Not admitted', 'shifted latent average init') +
+            disabledParamRow('Restart Sampling', 'Not admitted', 'restart sampling') +
+            disabledParamRow('EasyCache Mode', 'Disabled', 'easycache') +
+            disabledParamRow('Refiner HyperTile', 'Not admitted', 'refiner hypertile') +
+            '</div>';
+        var alternateGuidanceBody =
+            '<div class="gen-capability-note">Alternate guidance implementations are not production-admitted by the selected sampler.</div>' +
+            '<div class="gen-workspace-parity-list">' +
+            disabledParamRow('FreeU Apply To', 'Both', 'freeu apply to') +
+            disabledParamRow('FreeU Version', '1', 'freeu version') +
+            disabledParamRow('FreeU Block One', '1.1', 'freeu block one') +
+            disabledParamRow('FreeU Block Two', '1.2', 'freeu block two') +
+            disabledParamRow('FreeU Skip One', '0.9', 'freeu skip one') +
+            disabledParamRow('FreeU Skip Two', '0.2', 'freeu skip two') +
+            '</div>';
+        var outputBody =
+            '<div class="gen-setting-row gen-param-row" data-param-search="output format png mp4"><label class="gen-setting-label">Format</label>' +
+            '<input id="gen-output-format" class="gen-select" value="PNG" disabled><span class="gen-batch-hint">runtime-owned</span></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="color depth"><label class="gen-setting-label">Color Depth</label><input class="gen-select" value="8-bit RGB" disabled></div>' +
+            '<div class="gen-setting-row gen-param-row" data-param-search="output path format"><label class="gen-setting-label">Output Path</label><input class="gen-select" value="Server output root" disabled></div>' +
+            '<div class="gen-capability-note">PNG for images and MP4 for video come from the admitted runtime artifact contract.</div>';
         var loraBody =
             '<div id="gen-lora-capability" class="gen-capability-note"></div><div id="gen-lora-list" class="gen-lora-list"></div>' +
-            '<select id="gen-lora-picker" class="gen-lora-dropdown"><option disabled selected>No compatible LoRAs loaded</option></select>';
-        return '<div class="gen-swarm-parameter-head"><div><strong>Parameters</strong><span id="gen-arch-badge" class="gen-arch-badge">IMAGE</span></div>' +
+            '<select id="gen-lora-picker" class="gen-lora-dropdown"><option value="" disabled selected>Select a LoRA…</option></select>';
+        return '<div class="gen-workspace-parameter-head"><div><strong>Parameters</strong><span id="gen-arch-badge" class="gen-arch-badge">IMAGE</span></div>' +
             '<button id="gen-quick-reset" type="button" class="gen-small-btn" title="Reset selected model defaults">Reset</button></div>' +
-            '<div class="gen-swarm-filter"><i data-lucide="search"></i><input id="gen-param-filter" type="search" placeholder="Filter parameters..."></div>' +
-            '<div class="gen-swarm-param-scroll">' +
-            swarmGroup('gen-settings-header', 'Model', modelBody, true, 'Select an installed image model. Video models are intentionally excluded here.') +
-            swarmGroup('gen-core-header', 'Core Parameters', coreBody, true, 'The controls used by every admitted image backend.') +
-            '<section id="gen-variation-section">' + swarmGroup('gen-variation-header', 'Variation Seed', variationBody, false, 'Blend deterministic secondary noise into supported model families.') + '</section>' +
-            swarmGroup('gen-image-header', 'Resolution', resolutionBody, false, 'Only compiled, production-admitted shapes are listed.') +
-            swarmGroup('gen-sampling-header', 'Sampling', samplingBody, false, 'Sampler and scheduler values come from the selected backend capability report.') +
-            '<section id="gen-init-section">' + swarmGroup('gen-init-header', 'Init Image', initBody, false, 'Image-to-image is shown only when the selected backend admits it.') + '</section>' +
-            '<section id="gen-lora-section">' + swarmGroup('gen-lora-header', 'LoRAs', loraBody, false, 'Only backend-admitted LoRA counts are allowed.') + '</section>' +
+            '<div class="gen-workspace-filter"><i data-lucide="search"></i><input id="gen-param-filter" type="search" placeholder="Filter parameters..."></div>' +
+            '<div class="gen-workspace-param-scroll">' +
+            generateGroup('gen-settings-header', 'Model', modelBody, true, 'Select an installed model admitted by the image or video runtime.') +
+            generateGroup('gen-core-header', 'Core Parameters', coreBody, true, 'The controls used by every admitted generation backend.') +
+            '<section id="gen-variation-section">' + generateGroup('gen-variation-header', 'Variation Seed', variationBody, false, 'Blend deterministic secondary noise into supported model families.') + '</section>' +
+            generateGroup('gen-image-header', 'Resolution', resolutionBody, false, 'Only compiled, production-admitted shapes are listed.') +
+            generateGroup('gen-sampling-header', 'Sampling', samplingBody, false, 'Sampler and scheduler values come from the selected backend capability report.') +
+            '<section id="gen-video-section">' + generateGroup('gen-video-header', 'Video', videoBody, false, 'Video duration, frame rate, guidance, quantization, and audio parameters.') + '</section>' +
+            '<section id="gen-video-conditioning-section">' + generateGroup('gen-video-conditioning-header', 'Video Conditioning', videoConditioningBody, false, 'Prompt-matched LTX2 conditioning and optional deterministic noise artifacts.') + '</section>' +
+            '<section id="gen-lora-section">' + generateGroup('gen-lora-header', 'LoRAs', loraBody, false, 'Only backend-admitted LoRA counts are allowed.') + '</section>' +
+            '<div class="gen-workspace-advanced-only">' +
+            generateGroup('gen-refine-header', 'Refine / Upscale', refineBody, false, 'Refiner and upscale controls with truthful current runtime admission.') +
+            generateGroup('gen-internal-header', 'Runtime & Output', runtimeInternalBody, false, 'Batch seed behavior, queue-error policy, local notes, and output/runtime controls.') +
+            generateGroup('gen-advanced-video-header', 'Advanced Video', advancedVideoBody, false, 'Video output, audio-conditioning, trim, and interpolation controls.') +
+            generateGroup('gen-video-extend-header', 'Video Extend', videoExtendBody, false, 'Video continuation and overlap parameters.') +
+            generateGroup('gen-model-addons-header', 'Advanced Model Addons', modelAddonsBody, false, 'VAE, text encoder, decoder, dtype, and model override controls.') +
+            generateGroup('gen-dynamic-threshold-header', 'Dynamic Thresholding', dynamicThresholdBody, false, 'Dynamic CFG thresholding parameters.') +
+            generateGroup('gen-advanced-sampling-header', 'Advanced Sampling', advancedSamplingBody, false, 'Sigma schedule and advanced sampler parameters.') +
+            generateGroup('gen-alternate-guidance-header', 'Alternate Guidance', alternateGuidanceBody, false, 'CFG override, FreeU, and alternate guidance parameters.') +
             '</div>' +
+            generateGroup('gen-output-header', 'Output', outputBody, false, 'Output container is selected by the admitted image or video route.') +
+            '</div>' +
+            '<label class="gen-workspace-advanced-toggle"><input id="gen-show-advanced" type="checkbox" checked> Display Advanced Options <span id="gen-advanced-count"></span></label>' +
             '<div id="gen-left-progress" class="gen-progress gen-left-progress"><div id="gen-left-progress-bar" class="gen-progress-bar"></div></div>' +
-            '<div id="gen-left-progress-label" class="gen-left-progress-label"></div>' +
-            '<div hidden aria-hidden="true"><div id="gen-video-section"></div><div id="gen-scail2-section"></div>' +
-            '<input id="gen-seconds" value="1"><input id="gen-fps" value="1"><input id="gen-fps-range" value="1">' +
-            '<div id="gen-duration-hint"></div></div>';
+            '<div id="gen-left-progress-label" class="gen-left-progress-label"></div>';
     }
 
-    function buildSwarmTopToolbarHTML() {
-        return '<div class="gen-swarm-topbar">' +
-            '<div class="gen-swarm-model-info"><span id="gen-model-badge" class="gen-model-badge"></span><span id="gen-runtime-label">Serenity image runtime</span></div>' +
-            '<div class="gen-swarm-quick-tools"><button id="gen-toolbar-copy" class="gen-toolbar-btn" title="Copy current image URL"><i data-lucide="copy"></i></button>' +
+    function buildGenerateTopToolbarHTML() {
+        return '<div class="gen-workspace-topbar">' +
+            '<div class="gen-workspace-model-info"><span id="gen-model-badge" class="gen-model-badge"></span><span id="gen-runtime-label">Serenity image runtime</span></div>' +
+            '<div id="gen-activity-status" class="gen-activity-status" data-state="idle" role="status" aria-live="polite">' +
+            '<span class="gen-activity-dot"></span><span id="gen-activity-text">Idle</span></div>' +
+            '<div class="gen-workspace-quick-tools"><button id="gen-toolbar-copy" class="gen-toolbar-btn" title="Copy current image URL"><i data-lucide="copy"></i></button>' +
             '<button id="gen-toolbar-delete" class="gen-toolbar-btn" title="Clear preview"><i data-lucide="trash-2"></i></button>' +
             '<button id="gen-toolbar-toggle-gallery" class="gen-toolbar-btn active" title="Toggle batch panel"><i data-lucide="panel-right"></i></button></div></div>';
     }
 
-    function buildSwarmPromptHTML() {
-        return '<div class="gen-swarm-prompts"><div class="gen-swarm-prompt-main">' +
+    function buildGeneratePromptHTML() {
+        return '<div class="gen-workspace-prompts"><div class="gen-workspace-prompt-main">' +
             '<div class="gen-prompt-label-row"><label class="gen-label" for="gen-prompt">Prompt</label><span id="gen-token-count" class="gen-token-count">~0 tokens</span></div>' +
-            '<textarea id="gen-prompt" class="gen-textarea gen-swarm-prompt-textarea" rows="3" placeholder="Describe the image you want..."></textarea>' +
-            '<div class="gen-swarm-prompt-options"><label class="gen-label" for="gen-style-preset">Style</label><select id="gen-style-preset" class="gen-select">' + buildStyleOptions() + '</select>' +
+            '<textarea id="gen-prompt" class="gen-textarea gen-workspace-prompt-textarea" rows="3" placeholder="Describe the image you want..."></textarea>' +
+            '<div class="gen-workspace-prompt-options"><label class="gen-label" for="gen-style-preset">Style</label><select id="gen-style-preset" class="gen-select">' + buildStyleOptions() + '</select>' +
             '<div id="gen-style-preview" class="gen-style-preview" style="display:none"></div></div></div>' +
-            '<div id="gen-neg-section" class="gen-swarm-negative"><label class="gen-label" for="gen-neg-prompt">Negative Prompt</label>' +
+            '<div id="gen-neg-section" class="gen-workspace-negative"><label class="gen-label" for="gen-neg-prompt">Negative Prompt</label>' +
             '<textarea id="gen-neg-prompt" class="gen-textarea" rows="3" placeholder="What to avoid..."></textarea></div></div>' +
-            '<div class="gen-swarm-generate-column"><button id="gen-btn" class="gen-btn"><i data-lucide="wand-2"></i><span>Generate</span></button>' +
+            '<div class="gen-workspace-generate-column"><button id="gen-btn" class="gen-btn"><i data-lucide="wand-2"></i><span>Generate</span></button>' +
             '<div class="gen-toolbar-batch"><label for="gen-toolbar-batch-input">Images</label><input type="number" id="gen-toolbar-batch-input" class="gen-toolbar-batch-input" min="1" max="8" value="1">' +
             '<button id="gen-toolbar-batch-up" title="Increase batch">+</button><button id="gen-toolbar-batch-down" title="Decrease batch">−</button></div></div>';
     }
 
-    function buildSwarmBatchHTML() {
-        return '<div class="gen-swarm-batch-head"><strong>Current Batch</strong><span id="gen-batch-status">Idle</span></div>' +
-            '<div id="gen-batch-strip" class="gen-swarm-batch-strip"><div class="gen-swarm-batch-empty">New results appear here</div></div>';
+    function buildGenerateBatchHTML() {
+        return '<div class="gen-workspace-batch-head"><strong>Current Batch</strong><span id="gen-batch-status">Idle</span></div>' +
+            '<div id="gen-batch-strip" class="gen-workspace-batch-strip"><div class="gen-workspace-batch-empty">New results appear here</div></div>';
     }
 
-    function buildSwarmLibraryHTML() {
-        return '<div class="gen-swarm-library-tabs">' +
+    function buildGenerateLibraryHTML() {
+        return '<div class="gen-workspace-library-tabs">' +
             '<button class="gen-library-tab active" data-library="history">History</button>' +
             '<button class="gen-library-tab" data-library="presets">Presets</button>' +
             '<button class="gen-library-tab" data-library="models">Models</button>' +
@@ -496,7 +943,7 @@ var GenerateTab = (function () {
             '<label class="gen-label" style="margin-top:8px">Concepts</label>' +
             '<div id="gen-lora-list" class="gen-lora-list"></div>' +
             '<select id="gen-lora-picker" class="gen-lora-dropdown">' +
-            '<option disabled selected>No LoRAs loaded</option>' +
+            '<option value="" disabled selected>Select a LoRA…</option>' +
             '</select>' +
             // Advanced Options for Generation (default OPEN)
             '<div id="gen-gen-adv-disclosure" class="gen-adv-disclosure open" style="margin-top:8px">' +
@@ -744,6 +1191,7 @@ var GenerateTab = (function () {
             '<button class="gen-action-btn" id="gen-download" title="Download"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>' +
             '<button class="gen-action-btn" id="gen-to-canvas" title="Coming in Canvas tab" disabled><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></button>' +
             '<button class="gen-action-btn" id="gen-to-timeline" title="Send to Timeline"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg></button>' +
+            '<button class="gen-action-btn gen-action-btn-wide" id="gen-reuse-params" title="Restore every parameter used for this result"><i data-lucide="rotate-ccw"></i><span>Reuse parameters</span></button>' +
             '<button class="gen-action-btn" id="gen-clear-preview" title="Clear"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>' +
             '</div>' +
             // Metadata panel (below action bar)
@@ -854,11 +1302,34 @@ var GenerateTab = (function () {
         els.negSection = document.getElementById('gen-neg-section');
         els.customWidth = document.getElementById('gen-custom-width');
         els.customHeight = document.getElementById('gen-custom-height');
+        els.layout = document.querySelector('#panel-generate .gen-workspace-layout');
+        els.leftResizer = document.getElementById('gen-left-resizer');
+        els.rightResizer = document.getElementById('gen-right-resizer');
+        els.promptResizer = document.getElementById('gen-prompt-resizer');
+        els.libraryResizer = document.getElementById('gen-library-resizer');
         els.videoSection = document.getElementById('gen-video-section');
+        els.videoConditioningSection = document.getElementById('gen-video-conditioning-section');
+        els.framesInput = document.getElementById('gen-frames');
         els.secondsInput = document.getElementById('gen-seconds');
         els.fpsInput = document.getElementById('gen-fps');
         els.fpsRange = document.getElementById('gen-fps-range');
         els.durationHint = document.getElementById('gen-duration-hint');
+        els.videoGuidanceMode = document.getElementById('gen-video-guidance-mode');
+        els.videoQuant = document.getElementById('gen-video-quant');
+        els.videoCheckpoint = document.getElementById('gen-video-checkpoint');
+        els.capsPositive = document.getElementById('gen-caps-positive');
+        els.capsNegative = document.getElementById('gen-caps-negative');
+        els.noiseFixture = document.getElementById('gen-noise-fixture');
+        els.includeAudio = document.getElementById('gen-include-audio');
+        els.postUpscaler = document.getElementById('gen-post-upscaler');
+        els.postUpscaleFactor = document.getElementById('gen-post-upscale-factor');
+        els.postUpscaleNote = document.getElementById('gen-post-upscale-note');
+        els.sigmaShift = document.getElementById('gen-sigma-shift');
+        els.sigmaShiftRange = document.getElementById('gen-sigma-shift-range');
+        els.noSeedIncrement = document.getElementById('gen-no-seed-increment');
+        els.continueAfterErrors = document.getElementById('gen-continue-after-errors');
+        els.personalNote = document.getElementById('gen-personal-note');
+        els.showAdvanced = document.getElementById('gen-show-advanced');
         els.scail2Section = document.getElementById('gen-scail2-section');
         els.scail2Mode = document.getElementById('gen-scail2-mode');
         els.scail2UploadStatus = document.getElementById('gen-scail2-upload-status');
@@ -884,6 +1355,7 @@ var GenerateTab = (function () {
         els.previewVideo = document.getElementById('gen-preview-video');
         els.actionBar = document.getElementById('gen-action-bar');
         els.download = document.getElementById('gen-download');
+        els.reuseParams = document.getElementById('gen-reuse-params');
         els.clearPreview = document.getElementById('gen-clear-preview');
         els.progress = document.getElementById('gen-progress');
         els.progressBar = document.getElementById('gen-progress-bar');
@@ -891,6 +1363,8 @@ var GenerateTab = (function () {
         els.leftProgress = document.getElementById('gen-left-progress');
         els.leftProgressBar = document.getElementById('gen-left-progress-bar');
         els.leftProgressLabel = document.getElementById('gen-left-progress-label');
+        els.activityStatus = document.getElementById('gen-activity-status');
+        els.activityText = document.getElementById('gen-activity-text');
         els.errorBanner = document.getElementById('gen-error-banner');
         els.wsIndicator = document.getElementById('gen-ws-indicator');
         els.galleryGrid = document.getElementById('gen-gallery-grid');
@@ -1041,7 +1515,156 @@ var GenerateTab = (function () {
             });
         });
     }
+    function storedLayoutNumber(key, fallback) {
+        var stored = localStorage.getItem(key);
+        if (stored == null || stored === '')
+            return fallback;
+        var value = Number(stored);
+        return Number.isFinite(value) ? value : fallback;
+    }
+    function syncPanelLayoutState() {
+        if (!els.layout)
+            return;
+        els.layout.classList.toggle('gen-left-collapsed', !state.leftPanelVisible);
+        els.layout.classList.toggle('gen-right-collapsed', !state.rightPanelVisible);
+    }
+    function bindLayoutResizers() {
+        if (!els.layout)
+            return;
+        var minPromptHeight = 96;
+        var minLibraryHeight = 42;
+        var minStageHeight = 160;
+        var hasStoredVerticalLayout = localStorage.getItem('sf-gen-prompt-height') != null ||
+            localStorage.getItem('sf-gen-library-height') != null;
+        var leftWidth = Math.max(260, Math.min(560, storedLayoutNumber('sf-gen-left-width', 380)));
+        var rightWidth = Math.max(180, Math.min(430, storedLayoutNumber('sf-gen-right-width', 250)));
+        var promptHeight = Math.max(minPromptHeight, Math.min(300, storedLayoutNumber('sf-gen-prompt-height', 154)));
+        var libraryHeight = Math.max(minLibraryHeight, Math.min(420, storedLayoutNumber('sf-gen-library-height', 230)));
+        function constrainVerticalTracks(reserveDefaultPreview) {
+            var height = els.layout.clientHeight;
+            if (!height)
+                return;
+            // Use the larger preview only for the untouched startup layout.
+            // Once the user resizes either lower panel, preserve that choice and
+            // allow the preview to shrink to its real CSS minimum.
+            var reservedPreview = reserveDefaultPreview
+                ? Math.max(180, Math.min(420, Math.floor(height * 0.52)))
+                : minStageHeight;
+            var maxLowerTracks = Math.max(minPromptHeight + minLibraryHeight, height - 12 - reservedPreview);
+            var overflow = promptHeight + libraryHeight - maxLowerTracks;
+            if (overflow <= 0)
+                return;
+            var libraryReduction = Math.min(overflow, libraryHeight - minLibraryHeight);
+            libraryHeight -= libraryReduction;
+            overflow -= libraryReduction;
+            if (overflow > 0)
+                promptHeight = Math.max(minPromptHeight, promptHeight - overflow);
+        }
+        function apply(reserveDefaultPreview) {
+            constrainVerticalTracks(Boolean(reserveDefaultPreview));
+            els.layout.style.setProperty('--gen-left-width', leftWidth + 'px');
+            els.layout.style.setProperty('--gen-right-width', rightWidth + 'px');
+            els.layout.style.setProperty('--gen-prompt-height', promptHeight + 'px');
+            els.layout.style.setProperty('--gen-library-height', libraryHeight + 'px');
+            els.layout.classList.toggle('gen-prompt-compact', promptHeight < 132);
+        }
+        function drag(handle, axis, update, persist) {
+            if (!handle)
+                return;
+            handle.addEventListener('pointerdown', function (event) {
+                if (event.button !== 0)
+                    return;
+                event.preventDefault();
+                var start = axis === 'x' ? event.clientX : event.clientY;
+                var startValue = update();
+                handle.classList.add('active');
+                document.body.classList.add(axis === 'x' ? 'gen-resizing-x' : 'gen-resizing-y');
+                function move(moveEvent) {
+                    var current = axis === 'x' ? moveEvent.clientX : moveEvent.clientY;
+                    update(startValue, current - start);
+                    apply(false);
+                }
+                function done() {
+                    handle.classList.remove('active');
+                    document.body.classList.remove('gen-resizing-x', 'gen-resizing-y');
+                    document.removeEventListener('pointermove', move);
+                    document.removeEventListener('pointerup', done);
+                    document.removeEventListener('pointercancel', done);
+                    persist();
+                }
+                document.addEventListener('pointermove', move);
+                document.addEventListener('pointerup', done);
+                document.addEventListener('pointercancel', done);
+            });
+        }
+        drag(els.leftResizer, 'x', function (start, delta) {
+            if (start == null)
+                return leftWidth;
+            var max = Math.max(260, Math.min(560, els.layout.clientWidth - 620));
+            leftWidth = Math.max(260, Math.min(max, start + delta));
+        }, function () {
+            localStorage.setItem('sf-gen-left-width', String(Math.round(leftWidth)));
+        });
+        drag(els.rightResizer, 'x', function (start, delta) {
+            if (start == null)
+                return rightWidth;
+            rightWidth = Math.max(180, Math.min(430, start - delta));
+        }, function () {
+            localStorage.setItem('sf-gen-right-width', String(Math.round(rightWidth)));
+        });
+        drag(els.promptResizer, 'y', function (start, delta) {
+            if (start == null)
+                return { prompt: promptHeight, library: libraryHeight };
+            var max = Math.max(
+                minPromptHeight,
+                els.layout.clientHeight - 12 - minStageHeight - start.library
+            );
+            if (delta >= 0) {
+                promptHeight = Math.max(minPromptHeight, start.prompt - delta);
+                var consumed = start.prompt - promptHeight;
+                libraryHeight = Math.max(minLibraryHeight, start.library - Math.max(0, delta - consumed));
+            }
+            else {
+                promptHeight = Math.max(minPromptHeight, Math.min(max, start.prompt - delta));
+                libraryHeight = start.library;
+            }
+        }, function () {
+            localStorage.setItem('sf-gen-prompt-height', String(Math.round(promptHeight)));
+            localStorage.setItem('sf-gen-library-height', String(Math.round(libraryHeight)));
+        });
+        drag(els.libraryResizer, 'y', function (start, delta) {
+            if (start == null)
+                return libraryHeight;
+            var max = Math.max(
+                minLibraryHeight,
+                els.layout.clientHeight - 12 - minStageHeight - promptHeight
+            );
+            libraryHeight = Math.max(minLibraryHeight, Math.min(max, start - delta));
+        }, function () {
+            localStorage.setItem('sf-gen-library-height', String(Math.round(libraryHeight)));
+        });
+        if (els.promptResizer) {
+            els.promptResizer.addEventListener('dblclick', function () {
+                promptHeight = minPromptHeight;
+                libraryHeight = minLibraryHeight;
+                apply(false);
+                localStorage.setItem('sf-gen-prompt-height', String(minPromptHeight));
+                localStorage.setItem('sf-gen-library-height', String(minLibraryHeight));
+            });
+        }
+        if (els.libraryResizer) {
+            els.libraryResizer.addEventListener('dblclick', function () {
+                libraryHeight = minLibraryHeight;
+                apply(false);
+                localStorage.setItem('sf-gen-library-height', String(minLibraryHeight));
+            });
+        }
+        window.addEventListener('resize', function () { apply(false); });
+        apply(!hasStoredVerticalLayout);
+        syncPanelLayoutState();
+    }
     function bindEvents() {
+        bindLayoutResizers();
         bindScail2Upload('gen-scail2-reference-image', 'referenceImagePath', 'reference image');
         bindScail2Upload('gen-scail2-reference-mask', 'referenceMaskPath', 'reference mask');
         bindScail2Upload('gen-scail2-driving-video', 'drivingVideoPath', 'driving video');
@@ -1215,8 +1838,19 @@ var GenerateTab = (function () {
                     if (aspects[i].label === val) {
                         state.width = aspects[i].w;
                         state.height = aspects[i].h;
-                        syncDimensionInputs();
-                        updateAspectPreview();
+                        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                            var sizeProfiles = activeLtx2ProfilesForSize(
+                                state.width, state.height
+                            );
+                            var nextProfile = sizeProfiles.find(function (profile) {
+                                return Number(profile.frames) === Number(state.frames);
+                            }) || sizeProfiles[0];
+                            applyLtx2RequestProfile(nextProfile);
+                        }
+                        else {
+                            syncDimensionInputs();
+                            updateAspectPreview();
+                        }
                         break;
                     }
                 }
@@ -1229,9 +1863,20 @@ var GenerateTab = (function () {
                 var tmp = state.width;
                 state.width = state.height;
                 state.height = tmp;
-                syncDimensionInputs();
-                syncAspectDropdown();
-                updateAspectPreview();
+                if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                    var swappedProfiles = activeLtx2ProfilesForSize(
+                        state.width, state.height
+                    );
+                    var swappedProfile = swappedProfiles.find(function (profile) {
+                        return Number(profile.frames) === Number(state.frames);
+                    }) || swappedProfiles[0];
+                    applyLtx2RequestProfile(swappedProfile);
+                }
+                else {
+                    syncDimensionInputs();
+                    syncAspectDropdown();
+                    updateAspectPreview();
+                }
             });
         }
         // Aspect lock
@@ -1439,25 +2084,124 @@ var GenerateTab = (function () {
                 }
             });
         }
+        if (els.framesInput) {
+            els.framesInput.addEventListener('input', function () {
+                if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                    state.frames = Math.max(9, parseInt(this.value) || 9);
+                    var frameProfile = exactLtx2RequestProfile();
+                    state.seconds = frameProfile
+                        ? Number(frameProfile.duration)
+                        : Math.max(0.1, (state.frames - 1) / Math.max(1, state.fps));
+                    if (els.secondsInput)
+                        els.secondsInput.value = String(Number(state.seconds.toFixed(3)));
+                    updateDurationHint();
+                    return;
+                }
+                state.frames = Math.max(1, parseInt(this.value) || 1);
+                state.seconds = state.frames / Math.max(1, state.fps);
+                if (els.secondsInput)
+                    els.secondsInput.value = String(Number(state.seconds.toFixed(3)));
+                updateDurationHint();
+            });
+        }
         // Seconds → compute frames
         els.secondsInput.addEventListener('input', function () {
-            state.seconds = Math.max(1, Math.min(30, parseInt(this.value) || 10));
+            if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                state.seconds = Math.max(
+                    0.1, Math.min(120, parseFloat(this.value) || 0.1)
+                );
+                state.frames = ltx2SecondsToFrames(state.seconds, state.fps);
+                if (els.framesInput)
+                    els.framesInput.value = String(state.frames);
+                updateDurationHint();
+                return;
+            }
+            state.seconds = Math.max(0.1, Math.min(120, parseFloat(this.value) || 1));
             state.frames = secondsToFrames(state.seconds, state.fps);
+            if (els.framesInput)
+                els.framesInput.value = String(state.frames);
             updateDurationHint();
         });
         // FPS sync — recompute frames from seconds
         els.fpsInput.addEventListener('input', function () {
-            state.fps = parseInt(this.value) || 24;
-            els.fpsRange.value = this.value;
-            state.frames = secondsToFrames(state.seconds, state.fps);
+            state.fps = Math.max(1, Math.min(60, parseInt(this.value) || 1));
+            els.fpsRange.value = String(state.fps);
+            state.frames = ModelUtils.detectArchFromFilename(state.model) === 'ltxv'
+                ? ltx2SecondsToFrames(state.seconds, state.fps)
+                : secondsToFrames(state.seconds, state.fps);
+            if (els.framesInput)
+                els.framesInput.value = String(state.frames);
             updateDurationHint();
         });
         els.fpsRange.addEventListener('input', function () {
             state.fps = parseInt(this.value);
             els.fpsInput.value = this.value;
-            state.frames = secondsToFrames(state.seconds, state.fps);
+            state.frames = ModelUtils.detectArchFromFilename(state.model) === 'ltxv'
+                ? ltx2SecondsToFrames(state.seconds, state.fps)
+                : secondsToFrames(state.seconds, state.fps);
+            if (els.framesInput)
+                els.framesInput.value = String(state.frames);
             updateDurationHint();
         });
+        if (els.videoGuidanceMode) {
+            els.videoGuidanceMode.addEventListener('change', function () {
+                state.videoGuidanceMode = this.value === 'dev' ? 'dev' : 'distilled';
+                applyVideoGuidanceMode();
+            });
+        }
+        if (els.videoQuant)
+            els.videoQuant.addEventListener('change', function () { state.videoQuant = this.value; });
+        if (els.videoCheckpoint)
+            els.videoCheckpoint.addEventListener('input', function () { state.videoCheckpoint = this.value; });
+        if (els.capsPositive)
+            els.capsPositive.addEventListener('input', function () { state.capsPositive = this.value; });
+        if (els.capsNegative)
+            els.capsNegative.addEventListener('input', function () { state.capsNegative = this.value; });
+        if (els.noiseFixture)
+            els.noiseFixture.addEventListener('input', function () { state.noiseFixture = this.value; });
+        if (els.includeAudio)
+            els.includeAudio.addEventListener('change', function () { state.includeAudio = this.checked; });
+        if (els.postUpscaler) {
+            els.postUpscaler.addEventListener('change', function () {
+                state.postUpscaler = this.value || 'none';
+                refreshLtx2PostUpscaleControls();
+            });
+        }
+        if (els.postUpscaleFactor) {
+            els.postUpscaleFactor.addEventListener('change', function () {
+                state.postUpscaleFactor = Number(this.value) === 4 ? 4 : 2;
+                refreshLtx2PostUpscaleControls();
+            });
+        }
+        if (els.sigmaShift) {
+            els.sigmaShift.addEventListener('input', function () {
+                var value = Number(this.value);
+                if (!Number.isFinite(value))
+                    return;
+                state.sigmaShift = value;
+                if (els.sigmaShiftRange)
+                    els.sigmaShiftRange.value = String(Math.min(Number(els.sigmaShiftRange.max), value));
+            });
+        }
+        if (els.sigmaShiftRange) {
+            els.sigmaShiftRange.addEventListener('input', function () {
+                state.sigmaShift = Number(this.value);
+                if (els.sigmaShift)
+                    els.sigmaShift.value = this.value;
+            });
+        }
+        if (els.noSeedIncrement)
+            els.noSeedIncrement.addEventListener('change', function () { state.noSeedIncrement = this.checked; });
+        if (els.continueAfterErrors)
+            els.continueAfterErrors.addEventListener('change', function () { state.continueAfterErrors = this.checked; });
+        if (els.personalNote)
+            els.personalNote.addEventListener('input', function () { state.personalNote = this.value; });
+        if (els.showAdvanced) {
+            els.showAdvanced.addEventListener('change', function () {
+                state.showAdvanced = this.checked;
+                updateAdvancedVisibility();
+            });
+        }
         // Generate (left panel button)
         els.btn.addEventListener('click', function () {
             generate();
@@ -1475,6 +2219,18 @@ var GenerateTab = (function () {
         els.clearPreview.addEventListener('click', function () {
             clearPreview();
         });
+        if (els.reuseParams) {
+            els.reuseParams.addEventListener('click', function () {
+                var params = state.currentResultParams;
+                if (!params && state.currentGalleryIndex >= 0 && state.gallery[state.currentGalleryIndex])
+                    params = reusableParamsForItem(state.gallery[state.currentGalleryIndex]);
+                if (!params) {
+                    showError('This result has no saved parameters to reuse');
+                    return;
+                }
+                applyParams(params);
+            });
+        }
         // Send to Timeline
         var toTimelineBtn = document.getElementById('gen-to-timeline');
         if (toTimelineBtn) {
@@ -1576,6 +2332,7 @@ var GenerateTab = (function () {
                 state.rightPanelVisible = !state.rightPanelVisible;
                 els.rightPanel.classList.toggle('gen-panel-hidden', !state.rightPanelVisible);
                 this.classList.toggle('active', state.rightPanelVisible);
+                syncPanelLayoutState();
             });
         }
         var toolbarCopy = document.getElementById('gen-toolbar-copy');
@@ -1594,6 +2351,7 @@ var GenerateTab = (function () {
                 state.leftPanelVisible = !state.leftPanelVisible;
                 els.leftPanel.classList.toggle('gen-panel-hidden', !state.leftPanelVisible);
                 this.classList.toggle('active', state.leftPanelVisible);
+                syncPanelLayoutState();
             });
         }
         var floatGenerate = document.getElementById('gen-float-generate');
@@ -1605,6 +2363,8 @@ var GenerateTab = (function () {
             floatCancel.addEventListener('click', function () {
                 if (state.generating) {
                     state.pendingBatch = 0;
+                    state.videoPollToken++;
+                    state.pendingVideoJobs = {};
                     SerenityAPI.interrupt();
                     setGenerating(false);
                 }
@@ -1641,6 +2401,7 @@ var GenerateTab = (function () {
             galleryClose.addEventListener('click', function () {
                 state.rightPanelVisible = false;
                 els.rightPanel.classList.add('gen-panel-hidden');
+                syncPanelLayoutState();
                 var galleryToggle = document.getElementById('gen-toolbar-toggle-gallery');
                 if (galleryToggle)
                     galleryToggle.classList.remove('active');
@@ -1729,7 +2490,7 @@ var GenerateTab = (function () {
                 }
             });
         }
-        bindSwarmControls();
+        bindGenerateControls();
     }
     function bindInitImage() {
         var input = document.getElementById('gen-init-image-input');
@@ -1825,8 +2586,10 @@ var GenerateTab = (function () {
         if (clear)
             clear.disabled = true;
     }
-    function bindSwarmControls() {
-        ['gen-core', 'gen-variation', 'gen-sampling', 'gen-init', 'gen-lora'].forEach(function (prefix) {
+    function bindGenerateControls() {
+        ['gen-core', 'gen-variation', 'gen-sampling', 'gen-video',
+            'gen-video-conditioning', 'gen-lora', 'gen-advanced-runtime',
+            'gen-output'].forEach(function (prefix) {
             bindAccordion(prefix + '-header', prefix + '-body');
         });
         var filter = document.getElementById('gen-param-filter');
@@ -1847,8 +2610,8 @@ var GenerateTab = (function () {
                     });
                     group.style.display = (!query || groupMatch || rowMatch) ? '' : 'none';
                     if (query && (groupMatch || rowMatch)) {
-                        var body = group.querySelector('.gen-swarm-group-body');
-                        var header = group.querySelector('.gen-swarm-group-title');
+                        var body = group.querySelector('.gen-workspace-group-body');
+                        var header = group.querySelector('.gen-workspace-group-title');
                         if (body) body.classList.remove('closed');
                         if (header) header.classList.remove('closed');
                     }
@@ -2072,6 +2835,78 @@ var GenerateTab = (function () {
         return !!(profile && profile.features && profile.features[name] &&
             profile.features[name].supported === true);
     }
+    function advancedParameterCapability(profile, name) {
+        var advanced = profile && profile.features && profile.features.advanced_sampling;
+        var parameters = advanced && advanced.parameters;
+        return parameters && parameters[name] || null;
+    }
+    function updateAdvancedSamplingUI(profile) {
+        var capability = advancedParameterCapability(profile, 'sigma_shift');
+        var supported = !!(capability && capability.supported === true);
+        var defaultValue = Number(capability && capability.default);
+        if (!Number.isFinite(defaultValue))
+            defaultValue = 3.0;
+        if (!supported || !Number.isFinite(state.sigmaShift))
+            state.sigmaShift = defaultValue;
+        if (els.sigmaShift) {
+            els.sigmaShift.disabled = !supported;
+            els.sigmaShift.value = String(state.sigmaShift);
+            els.sigmaShift.min = String(Number(capability && capability.min) || 0.01);
+            els.sigmaShift.max = String(Number(capability && capability.max) || 100);
+            els.sigmaShift.step = String(Number(capability && capability.step) || 0.01);
+            els.sigmaShift.title = supported
+                ? String(capability.reason || 'Applied by the selected runtime')
+                : String(capability && capability.reason || 'Not admitted by the selected runtime');
+        }
+        if (els.sigmaShiftRange) {
+            els.sigmaShiftRange.disabled = !supported;
+            els.sigmaShiftRange.value = String(Math.min(20, state.sigmaShift));
+            els.sigmaShiftRange.min = String(Number(capability && capability.min) || 0.01);
+            els.sigmaShiftRange.max = String(Math.min(20, Number(capability && capability.max) || 20));
+            els.sigmaShiftRange.step = String(Number(capability && capability.step) || 0.01);
+        }
+        var note = document.getElementById('gen-advanced-sampling-note');
+        if (note) {
+            note.textContent = supported
+                ? 'Sigma Shift is applied by this Mojo worker. The remaining advanced sampler fields are not admitted.'
+                : 'This runtime admits no user-adjustable advanced sampler fields; unsupported values stay disabled and are not posted.';
+        }
+    }
+    function setVideoControlsForMode(enabled) {
+        [els.videoSection, els.videoConditioningSection].forEach(function (section) {
+            if (!section)
+                return;
+            section.style.display = '';
+            Array.from(section.querySelectorAll('input, select, textarea')).forEach(function (control) {
+                control.disabled = !enabled || !!control.closest('.gen-parity-disabled');
+            });
+        });
+        var note = document.getElementById('gen-video-advanced-note');
+        if (note) {
+            note.textContent = enabled
+                ? 'The admitted LTX2 runner outputs MP4. Input audio, boomerang, trimming, interpolation, and extension remain unavailable.'
+                : 'Select the admitted LTX2 video model to enable its compiled video request parameters.';
+        }
+        // Native LTX2 frame counts and durations are discrete profile choices.
+        // FPS is part of each profile and changes with the selected profile.
+        [els.fpsInput, els.fpsRange].forEach(function (control) {
+            if (control)
+                control.disabled = true;
+        });
+    }
+    function updateAdvancedVisibility() {
+        var visible = state.showAdvanced !== false;
+        document.querySelectorAll('#panel-generate .gen-workspace-advanced-only').forEach(function (node) {
+            node.style.display = visible ? '' : 'none';
+        });
+        if (els.showAdvanced)
+            els.showAdvanced.checked = visible;
+        var count = document.getElementById('gen-advanced-count');
+        if (count) {
+            var rows = document.querySelectorAll('#panel-generate .gen-workspace-advanced-only .gen-param-row').length;
+            count.textContent = '(' + rows + ')';
+        }
+    }
     function variationSupportedForArch(arch) {
         // These are the worker implementations that actually blend secondary
         // noise. Other families reject or ignore the fields and must not expose
@@ -2100,11 +2935,29 @@ var GenerateTab = (function () {
     }
     // ── Model Loading ──
     function loadModels() {
-        Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities()])
+        var videoReadiness = fetch('/v1/video', { cache: 'no-store' })
+            .then(function (response) {
+                if (!response.ok)
+                    throw new Error('video readiness HTTP ' + response.status);
+                return response.json();
+            })
+            .catch(function () { return null; });
+        Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities(), videoReadiness])
             .then(function (loaded) {
+            state.videoStatus = loaded[2];
+            var ltxReady = !!(state.videoStatus && state.videoStatus.arms_ready &&
+                state.videoStatus.arms_ready.ltx2_t2v_av);
             var models = loaded[0].filter(function (model) {
-                return !ModelUtils.isVideoModel(model.name);
+                if (!ModelUtils.isVideoModel(model.name))
+                    return true;
+                return ltxReady && model.name.replace(/\.safetensors$/i, '') ===
+                    'ltx-2.3-22b-dev-fp8';
             });
+            if (ltxReady && !models.some(function (model) {
+                return model.name.replace(/\.safetensors$/i, '') === 'ltx-2.3-22b-dev-fp8';
+            })) {
+                models.push({ name: 'ltx-2.3-22b-dev-fp8', loader: 'video' });
+            }
             state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');
@@ -2144,7 +2997,7 @@ var GenerateTab = (function () {
             state.allModels = [];
             if (els.modelSearch) {
                 els.modelSearch.value = '';
-                els.modelSearch.placeholder = 'No models found';
+                els.modelSearch.placeholder = 'No admitted models found';
             }
             els.modelWarn.textContent = 'Could not load models or server capabilities';
             els.modelWarn.classList.add('visible');
@@ -2207,10 +3060,10 @@ var GenerateTab = (function () {
     }
     // ── Arch-aware UI ──
     function updateUIForArch(arch) {
-        updateSwarmUIForArch(arch);
+        updateGenerateUIForArch(arch);
         return;
         /* Legacy layout logic retained below only for source-map compatibility.
-           The Swarm-style Generate surface uses the capability-driven path. */
+           The Serenity Generate surface uses the capability-driven path. */
         state.arch = arch;
         var isFlux = arch === 'flux' || arch === 'klein';
         var noNegative = isFlux || arch === 'ideogram4' || arch === 'sensenova';
@@ -2262,13 +3115,13 @@ var GenerateTab = (function () {
         els.cfgRow.style.display = isFlux ? 'none' : 'flex';
         // Guidance: flux only
         els.guidanceRow.style.display = isFlux ? 'flex' : 'none';
-        // Video controls
-        els.videoSection.style.display = isVideo ? 'block' : 'none';
+        // Keep the complete Serenity video surface discoverable for image
+        // models, but only enable it for an admitted video runner.
+        if (els.videoSection)
+            els.videoSection.style.display = 'block';
         if (els.scail2Section)
             els.scail2Section.style.display = arch === 'scail2' ? 'block' : 'none';
-        if (els.secondsInput) els.secondsInput.disabled = arch === 'scail2';
-        if (els.fpsInput) els.fpsInput.disabled = arch === 'scail2';
-        if (els.fpsRange) els.fpsRange.disabled = arch === 'scail2';
+        setVideoControlsForMode(isVideo);
         // Batch: hide for video models
         var batchSection = document.getElementById('gen-batch-section');
         if (batchSection)
@@ -2356,7 +3209,142 @@ var GenerateTab = (function () {
             updateDurationHint();
         }
     }
-    function updateSwarmUIForArch(arch) {
+    function applyVideoGuidanceMode(preserveSteps) {
+        var profile = activeLtx2RequestProfile() || {};
+        var modes = profile.guidance_modes || {};
+        var selected = modes[state.videoGuidanceMode] || {};
+        state.sampler = selected.sampler ||
+            (state.videoGuidanceMode === 'dev' ? 'res2s' : 'euler');
+        state.scheduler = selected.scheduler ||
+            (state.videoGuidanceMode === 'dev' ? 'ltx2' : 'ltx2_distilled');
+        if (!preserveSteps) {
+            state.steps = Number(
+                state.videoGuidanceMode === 'dev'
+                    ? selected.default_steps
+                    : selected.steps
+            ) || (state.videoGuidanceMode === 'dev' ? 15 : 8);
+        }
+        if (els.sampler) {
+            els.sampler.innerHTML = '<option value="' + state.sampler + '">' +
+                displaySamplerName(state.sampler) + '</option>';
+            els.sampler.value = state.sampler;
+        }
+        if (els.scheduler) {
+            els.scheduler.innerHTML = '<option value="' + state.scheduler + '">' +
+                displaySchedulerName(state.scheduler) + '</option>';
+            els.scheduler.value = state.scheduler;
+        }
+        var maxSteps = state.videoGuidanceMode === 'dev'
+            ? (Number(selected.max_steps) || 20)
+            : state.steps;
+        if (els.steps) {
+            els.steps.max = String(maxSteps);
+            els.steps.value = String(state.steps);
+        }
+        if (els.stepsRange) {
+            els.stepsRange.max = String(maxSteps);
+            els.stepsRange.value = String(state.steps);
+        }
+        if (els.videoGuidanceMode)
+            els.videoGuidanceMode.value = state.videoGuidanceMode;
+    }
+    function updateVideoUIForArch(arch) {
+        state.arch = arch;
+        var mode = activeLtx2RequestMode();
+        var profile = activeLtx2RequestProfile();
+        if (!mode || mode.available !== true || !profile) {
+            if (els.modelWarn) {
+                els.modelWarn.textContent = 'The selected video request runner is not available on this machine';
+                els.modelWarn.classList.add('visible');
+            }
+            return;
+        }
+        if (els.modelWarn)
+            els.modelWarn.classList.remove('visible');
+        if (els.videoSection)
+            els.videoSection.style.display = '';
+        if (els.videoConditioningSection)
+            els.videoConditioningSection.style.display = '';
+        setVideoControlsForMode(true);
+        var variationSection = document.getElementById('gen-variation-section');
+        if (variationSection)
+            variationSection.style.display = 'none';
+        if (els.negSection)
+            els.negSection.style.display = '';
+        if (els.cfgRow)
+            els.cfgRow.style.display = 'none';
+        if (els.guidanceRow)
+            els.guidanceRow.style.display = 'none';
+        var batchSection = document.getElementById('gen-batch-section');
+        if (batchSection)
+            batchSection.style.display = 'none';
+        state.batchCount = 1;
+        if (els.toolbarBatchInput) {
+            els.toolbarBatchInput.value = '1';
+            els.toolbarBatchInput.disabled = true;
+        }
+        applyLtx2RequestProfile(profile);
+        var profileSelectReason = 'Choose an admitted native size and duration. Each combination dispatches to its exact AOT Mojo runner.';
+        if (els.videoCheckpoint)
+            els.videoCheckpoint.value = state.videoCheckpoint;
+        if (els.videoQuant)
+            els.videoQuant.value = state.videoQuant;
+        if (els.includeAudio)
+            els.includeAudio.checked = state.includeAudio;
+        if (els.capsPositive)
+            els.capsPositive.value = state.capsPositive;
+        if (els.capsNegative)
+            els.capsNegative.value = state.capsNegative;
+        if (els.noiseFixture)
+            els.noiseFixture.value = state.noiseFixture;
+        applyVideoGuidanceMode(false);
+        syncDimensionInputs();
+        if (els.customWidth) {
+            els.customWidth.disabled = true;
+            els.customWidth.title = profileSelectReason;
+        }
+        if (els.customHeight) {
+            els.customHeight.disabled = true;
+            els.customHeight.title = profileSelectReason;
+        }
+        var widthSlider = document.getElementById('gen-width-slider');
+        var heightSlider = document.getElementById('gen-height-slider');
+        if (widthSlider)
+            widthSlider.disabled = true;
+        if (heightSlider)
+            heightSlider.disabled = true;
+        if (els.aspectDropdown) {
+            els.aspectDropdown.innerHTML = buildAspectOptions();
+            els.aspectDropdown.value = profile.width + '×' + profile.height;
+        }
+        updateAspectPreview();
+        updateDurationHint();
+        var loraSection = document.getElementById('gen-lora-section');
+        if (loraSection)
+            loraSection.style.display = '';
+        var loraNote = document.getElementById('gen-lora-capability');
+        if (loraNote)
+            loraNote.textContent = 'LTX2 LoRAs are validated against the model registry before GPU work';
+        var output = document.getElementById('gen-output-format');
+        if (output)
+            output.value = String(profile.output_format || 'mp4').toUpperCase();
+        if (els.btn)
+            els.btn.innerHTML = '<i data-lucide="wand-2"></i><span>Generate Video</span>';
+        setPreviewModelBadges(state.model, arch);
+        var runtimeLabel = document.getElementById('gen-runtime-label');
+        if (runtimeLabel)
+            runtimeLabel.textContent = 'LTX2 · Mojo video request runner · admitted';
+        updateAdvancedSamplingUI(null);
+        renderModelLibrary();
+        refreshLtx2PostUpscaleControls();
+        if (typeof lucide !== 'undefined')
+            lucide.createIcons({ nameAttr: 'data-lucide' });
+    }
+    function updateGenerateUIForArch(arch) {
+        if (arch === 'ltxv') {
+            updateVideoUIForArch(arch);
+            return;
+        }
         state.arch = arch;
         var profile = activeCapabilityProfile(arch);
         if (!profile) {
@@ -2368,6 +3356,15 @@ var GenerateTab = (function () {
         }
         if (els.modelWarn)
             els.modelWarn.classList.remove('visible');
+        setVideoControlsForMode(false);
+        if (els.toolbarBatchInput)
+            els.toolbarBatchInput.disabled = false;
+        var batchSection = document.getElementById('gen-batch-section');
+        if (batchSection)
+            batchSection.style.display = 'flex';
+        var output = document.getElementById('gen-output-format');
+        if (output)
+            output.value = 'PNG';
         var defaults = profile.defaults || {};
         // Krea publishes one backend profile but has distinct Raw and Turbo
         // checkpoint defaults. Keep the checkpoint identity visible and exact.
@@ -2380,6 +3377,10 @@ var GenerateTab = (function () {
             state.cfg = 4.5;
         state.sampler = defaults.sampler || 'euler';
         state.scheduler = defaults.scheduler || 'simple';
+        var sigmaCapability = advancedParameterCapability(profile, 'sigma_shift');
+        var sigmaDefault = Number(sigmaCapability && sigmaCapability.default);
+        state.sigmaShift = Number.isFinite(sigmaDefault) ? sigmaDefault : 3.0;
+        updateAdvancedSamplingUI(profile);
         if (els.steps) els.steps.value = String(state.steps);
         if (els.stepsRange) els.stepsRange.value = String(state.steps);
         if (els.cfg) els.cfg.value = String(state.cfg);
@@ -2431,12 +3432,6 @@ var GenerateTab = (function () {
             variationSection.style.display = variationSupportedForArch(arch) ? '' : 'none';
         if (!variationSupportedForArch(arch))
             state.variationStrength = 0;
-        var initSection = document.getElementById('gen-init-section');
-        var imageToImage = featureSupported(profile, 'image_to_image');
-        if (initSection)
-            initSection.style.display = imageToImage ? '' : 'none';
-        if (!imageToImage)
-            clearInitImage();
         var loraFeature = profile.features && profile.features.lora;
         var loraSupported = !!(loraFeature && loraFeature.supported);
         var loraSection = document.getElementById('gen-lora-section');
@@ -2486,13 +3481,17 @@ var GenerateTab = (function () {
             }) ? '' : 'none';
         }
         renderModelLibrary();
+        refreshLtx2PostUpscaleControls();
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
     }
     function updateDurationHint() {
         if (!els.durationHint)
             return;
-        els.durationHint.textContent = state.frames + ' frames \u00b7 ' + state.seconds + 's at ' + state.fps + 'fps';
+        els.durationHint.textContent = state.frames + ' frames \u00b7 ' +
+            Number(state.seconds.toFixed(3)) + 's at ' + state.fps + 'fps';
+        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv')
+            updateLtx2ProfileStatus();
     }
     // ── Token Counter ──
     function updateTokenCount() {
@@ -2506,26 +3505,43 @@ var GenerateTab = (function () {
         fetch('/models/loras')
             .then(function (r) { return r.ok ? r.json() : []; })
             .then(function (list) {
-            if (!list || !list.length)
-                return;
             var picker = document.getElementById('gen-lora-picker');
             if (!picker)
                 return;
-            picker.innerHTML = '<option disabled selected>No LoRAs loaded</option>';
+            if (!list || !list.length) {
+                picker.innerHTML = '<option value="" disabled selected>No LoRAs installed</option>';
+                return;
+            }
+            picker.innerHTML = '<option value="" disabled selected>Select a LoRA…</option>';
             list.forEach(function (name) {
                 var opt = document.createElement('option');
                 opt.value = name;
                 opt.textContent = name;
                 picker.appendChild(opt);
             });
+            updateLoraPickerPrompt();
         })
             .catch(function () { });
+    }
+    function updateLoraPickerPrompt() {
+        var picker = document.getElementById('gen-lora-picker');
+        if (!picker || !picker.options.length)
+            return;
+        var prompt = picker.options[0];
+        prompt.value = '';
+        prompt.disabled = true;
+        prompt.textContent = state.loras.length
+            ? (state.loras.length + ' LoRA' + (state.loras.length === 1 ? '' : 's') + ' loaded · add another…')
+            : 'Select a LoRA…';
+        picker.selectedIndex = 0;
     }
     function addLora(name) {
         if (state.loras.some(function (l) { return l.name === name; }))
             return;
         var profile = activeCapabilityProfile();
-        var feature = profile && profile.features && profile.features.lora;
+        var feature = state.arch === 'ltxv'
+            ? { supported: true, max_count: null }
+            : (profile && profile.features && profile.features.lora);
         if (!feature || feature.supported !== true) {
             showError('The selected model does not admit LoRA overlays');
             return;
@@ -2593,6 +3609,7 @@ var GenerateTab = (function () {
                 removeLora(parseInt(this.dataset.idx));
             });
         });
+        updateLoraPickerPrompt();
     }
     // ── Workflow Builder ──
     function buildWorkflow() {
@@ -2620,6 +3637,7 @@ var GenerateTab = (function () {
             sampler: state.sampler,
             scheduler: state.scheduler,
             noiseScheduler: state.scheduler,
+            sigmaShift: state.sigmaShift,
             seed: state.seed,
             frames: state.frames,
             fps: state.fps,
@@ -2682,10 +3700,9 @@ var GenerateTab = (function () {
             request.variation_seed = state.variationSeed;
             request.variation_strength = state.variationStrength;
         }
-        if (featureSupported(profile, 'image_to_image') && state.initImagePath) {
-            request.init_image = state.initImagePath;
-            request.creativity = state.creativity;
-        }
+        var sigmaCapability = advancedParameterCapability(profile, 'sigma_shift');
+        if (sigmaCapability && sigmaCapability.supported === true)
+            request.sigma_shift = state.sigmaShift;
         var enabledLoras = state.loras.filter(function (lora) { return lora.enabled !== false; });
         if (enabledLoras.length) {
             request.lora = enabledLoras.map(function (lora) {
@@ -2693,6 +3710,170 @@ var GenerateTab = (function () {
             });
         }
         return request;
+    }
+    function buildVideoRequest(seed) {
+        var finalPrompt = state.prompt;
+        if (state.stylePreset && state.stylePreset !== 'none') {
+            for (var i = 0; i < stylePresets.length; i++) {
+                if (stylePresets[i].id === state.stylePreset) {
+                    finalPrompt += stylePresets[i].suffix;
+                    break;
+                }
+            }
+        }
+        return {
+            schema: 'serenity.genparams.v1',
+            model: 'ltx2',
+            runner: 'ltx2_mojo_request',
+            checkpoint: state.videoCheckpoint,
+            quant: state.videoQuant,
+            prompt: finalPrompt,
+            negative: state.negPrompt || '',
+            width: state.width,
+            height: state.height,
+            frames: state.frames,
+            steps: state.steps,
+            seed: seed,
+            fps: state.fps,
+            guidance_mode: state.videoGuidanceMode,
+            sampler: state.sampler,
+            scheduler: state.scheduler,
+            caps_positive: state.capsPositive.trim(),
+            caps_negative: state.capsNegative.trim(),
+            noise_fixture: state.noiseFixture.trim(),
+            include_audio: state.includeAudio === true,
+            post_upscale: state.postUpscaler === 'none'
+                ? { id: 'none', factor: 1 }
+                : {
+                    id: state.postUpscaler,
+                    factor: Number(state.postUpscaleFactor) === 4 ? 4 : 2
+                },
+            lora: state.loras.filter(function (lora) {
+                return lora.enabled !== false;
+            }).map(function (lora) {
+                return { name: lora.name, weight: Number(lora.strength) };
+            })
+        };
+    }
+    function videoResultUrl(videoId, manifest) {
+        if (manifest && manifest.mp4_url)
+            return String(manifest.mp4_url);
+        var artifact = String(manifest && manifest.artifact_path || '');
+        var filename = artifact.split('/').pop();
+        return filename
+            ? ('/out/' + encodeURIComponent(videoId) + '/' + encodeURIComponent(filename))
+            : '';
+    }
+    function pollVideoGeneration(job, request, reusable) {
+        var videoId = String(job.video_id || job.prompt_id || '');
+        var statusUrl = String(job.status_url || ('/out/' + encodeURIComponent(videoId) + '/status.json'));
+        var resultUrl = String(job.result_url || ('/out/' + encodeURIComponent(videoId) + '/result.json'));
+        var token = ++state.videoPollToken;
+        state.pendingVideoJobs[videoId] = true;
+        function poll() {
+            if (token !== state.videoPollToken || !state.pendingVideoJobs[videoId])
+                return;
+            fetch(statusUrl, { cache: 'no-store' })
+                .then(function (response) {
+                if (!response.ok)
+                    throw new Error('status HTTP ' + response.status);
+                return response.json();
+            })
+                .then(function (status) {
+                var step = Number(status.step) || 0;
+                var total = Number(status.total) || 0;
+                var phase = String(status.message || status.phase || 'LTX2 running');
+                var pct = total > 0 ? Math.max(0, Math.min(100, step / total * 100)) : 4;
+                updateGenerationActivity(phase, step, total);
+                els.progressBar.style.width = pct + '%';
+                els.progressLabel.textContent = phase + (total > 0 ? ' · Step ' + step + ' / ' + total : '');
+                els.progressLabel.classList.add('visible');
+                if (els.leftProgressBar)
+                    els.leftProgressBar.style.width = pct + '%';
+                if (els.leftProgressLabel)
+                    els.leftProgressLabel.textContent = els.progressLabel.textContent;
+                if (status.state === 'failed' || status.state === 'error')
+                    throw new Error(phase);
+                if (status.state !== 'done') {
+                    setTimeout(poll, 500);
+                    return null;
+                }
+                return fetch(resultUrl, { cache: 'no-store' })
+                    .then(function (response) {
+                    if (!response.ok)
+                        throw new Error('result HTTP ' + response.status);
+                    return response.json();
+                });
+            })
+                .then(function (manifest) {
+                if (!manifest)
+                    return;
+                var src = videoResultUrl(videoId, manifest);
+                if (!src)
+                    throw new Error('completed video manifest has no playable MP4');
+                var metadata = Object.assign({}, reusable, {
+                    params: reusable,
+                    cfg: null,
+                    guidance: null,
+                    frame_count: request.frames,
+                    fps: request.fps
+                });
+                displayVideo(src, metadata);
+                addToGallery(src, true, metadata);
+                state.completedVideoJobs[videoId] = true;
+                var completedIds = Object.keys(state.completedVideoJobs);
+                if (completedIds.length > 256)
+                    delete state.completedVideoJobs[completedIds[0]];
+                delete state.pendingVideoJobs[videoId];
+                state.pendingBatch = 0;
+                setGenerating(false);
+            })
+                .catch(function (error) {
+                if (token !== state.videoPollToken)
+                    return;
+                if (/status HTTP 404/.test(error.message)) {
+                    setTimeout(poll, 500);
+                    return;
+                }
+                delete state.pendingVideoJobs[videoId];
+                state.pendingBatch = 0;
+                showError('Video generation failed: ' + error.message);
+                setGenerating(false);
+            });
+        }
+        setTimeout(poll, 250);
+    }
+    function generateVideo() {
+        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv' &&
+            !exactLtx2RequestProfile()) {
+            var note = document.getElementById('gen-video-profile-note');
+            showError(note
+                ? note.textContent
+                : 'This LTX2 frame/FPS combination has no compiled native runner.');
+            return;
+        }
+        var seed = state.seed === -1
+            ? Math.floor(Math.random() * 4294967296)
+            : state.seed;
+        state.lastSeed = seed;
+        beginCurrentBatch();
+        state.pendingBatch = 1;
+        var request = buildVideoRequest(seed);
+        var reusable = getParams();
+        reusable.seed = seed;
+        setGenerating(true);
+        updateGenerationActivity('Preparing GPU · unloading image model if resident', 0, 0);
+        SerenityAPI.postVideo(request)
+            .then(function (job) {
+            if (!job || !(job.video_id || job.prompt_id))
+                throw new Error('server did not return a video job id');
+            pollVideoGeneration(job, request, reusable);
+        })
+            .catch(function (error) {
+            state.pendingBatch = 0;
+            showError('Failed to queue video: ' + error.message);
+            setGenerating(false);
+        });
     }
     // ── Generate ──
     function generate() {
@@ -2706,8 +3887,14 @@ var GenerateTab = (function () {
             showError('Enter a prompt');
             return;
         }
+        if (ModelUtils.isVideoModel(state.model)) {
+            pushPromptHistory(state.prompt);
+            generateVideo();
+            return;
+        }
         // Save to prompt history
         pushPromptHistory(state.prompt);
+        beginCurrentBatch();
         var batchN = state.batchCount || 1;
         state.pendingBatch = batchN;
         setGenerating(true);
@@ -2717,7 +3904,9 @@ var GenerateTab = (function () {
         var originalSeed = state.seed;
         var submissions = [];
         for (var i = 0; i < batchN; i++) {
-            state.seed = (i === 0) ? resolvedSeed : Math.floor(Math.random() * 4294967296);
+            state.seed = state.noSeedIncrement
+                ? resolvedSeed
+                : (resolvedSeed + i) % 4294967296;
             // Bind completion metadata to this immutable submission. Video
             // requests block until the render completes, so reading `state`
             // in their completion handler would mislabel the gallery item if
@@ -2737,11 +3926,12 @@ var GenerateTab = (function () {
             });
         }
         state.seed = originalSeed;
-        // Queue all batch items (server handles sequencing)
-        var queueFailed = false;
-        submissions.forEach(function (submission, i) {
-            if (queueFailed)
+        // Submit in order so "Continue After Errors" has real behavior instead
+        // of being a decorative checkbox. The server still owns execution order.
+        function submitAt(i) {
+            if (i >= submissions.length)
                 return;
+            var submission = submissions[i];
             if (batchN > 1) {
                 els.btn.innerHTML = '<i data-lucide="wand-2"></i> Generating ' + (i + 1) + ' / ' + batchN + '...';
                 if (typeof lucide !== 'undefined')
@@ -2755,15 +3945,97 @@ var GenerateTab = (function () {
                 .then(function (result) {
                 if (!result || !result.prompt_id)
                     throw new Error('server did not return a job id');
+                submitAt(i + 1);
             })
                 .catch(function (err) {
-                queueFailed = true;
-                showError('Failed to queue: ' + err.message);
-                setGenerating(false);
+                showError('Failed to queue item ' + (i + 1) + ': ' + err.message);
+                if (state.continueAfterErrors)
+                    submitAt(i + 1);
+                else
+                    setGenerating(false);
             });
-        });
+        }
+        submitAt(0);
     }
     // ── State Helpers ──
+    function updateGenerationActivity(phase, step, total) {
+        if (!els.activityStatus || !els.activityText)
+            return;
+        var raw = String(phase || '').trim();
+        var lower = raw.toLowerCase();
+        var label = raw;
+        var activityState = 'working';
+        if (/queued|waiting.*gpu|gpu.*wait/.test(lower)) {
+            label = 'Queued · waiting for GPU';
+            activityState = 'waiting';
+        }
+        else if (/unload|evict|releas.*model/.test(lower)) {
+            label = raw || 'Unloading current model';
+            activityState = 'loading';
+        }
+        else if (/load/.test(lower)) {
+            label = raw === '' || lower === 'loading'
+                ? 'Loading ' + (state.model || 'model')
+                : raw;
+            activityState = 'loading';
+        }
+        else if (/complet|done/.test(lower)) {
+            label = 'Complete';
+            activityState = 'done';
+        }
+        else if (/sav|mux|writ.*result/.test(lower)) {
+            label = 'Saving result';
+            activityState = 'saving';
+        }
+        else if (/decod|vae/.test(lower)) {
+            label = ModelUtils.isVideoModel(state.model) ? 'Decoding video' : 'Decoding image';
+            activityState = 'decoding';
+        }
+        else if (/token|encod|condition|caption/.test(lower)) {
+            if (/gemma layer|\b\d+\s*\/\s*\d+/.test(lower))
+                label = raw;
+            else if (/^token/.test(lower))
+                label = raw || 'Tokenizing prompt';
+            else if (/^encod/.test(lower))
+                label = raw || 'Encoding prompt';
+            else
+                label = /condition/.test(lower)
+                    ? 'Encoding prompt conditioning'
+                    : 'Tokenizing + encoding prompt';
+            activityState = 'encoding';
+        }
+        else if (/sampl|denois/.test(lower) || Number(step) > 0) {
+            label = 'Sampling';
+            activityState = 'sampling';
+        }
+        else if (/prepar|start|admit/.test(lower)) {
+            label = raw || 'Preparing generation';
+            activityState = 'working';
+        }
+        else if (!label) {
+            label = state.generating ? 'Preparing generation' : 'Idle';
+            activityState = state.generating ? 'working' : 'idle';
+        }
+        if (Number(total) > 0 && Number(step) > 0 &&
+            activityState === 'sampling') {
+            label += ' · Step ' + Number(step) + ' / ' + Number(total);
+        }
+        else if (Number(total) > 0 && Number(step) > 0 &&
+            activityState === 'encoding' &&
+            !new RegExp('(?:^|\\D)' + Number(step) + '\\s*\\/\\s*' + Number(total) + '(?:\\D|$)').test(label)) {
+            label += ' · Step ' + Number(step) + ' / ' + Number(total);
+        }
+        els.activityText.textContent = label;
+        els.activityStatus.dataset.state = activityState;
+        els.activityStatus.title = raw && raw !== label ? raw : label;
+    }
+    function setGenerationIdle() {
+        if (!els.activityStatus || !els.activityText)
+            return;
+        els.activityText.textContent = 'Idle';
+        els.activityStatus.dataset.state = 'idle';
+        els.activityStatus.title = 'No generation is running';
+    }
     function setGenerating(v) {
         state.generating = v;
         var isVideo = ModelUtils.isVideoModel(state.model);
@@ -2784,6 +4056,7 @@ var GenerateTab = (function () {
                 ? ('Running · ' + Math.max(1, state.pendingBatch) + ' queued')
                 : 'Idle';
         if (v) {
+            updateGenerationActivity('Queued · waiting for GPU', 0, 0);
             els.progress.classList.add('active');
             els.progressBar.style.width = '100%';
             if (els.leftProgress) {
@@ -2792,6 +4065,7 @@ var GenerateTab = (function () {
             }
         }
         else {
+            setGenerationIdle();
             els.progress.classList.remove('active');
             els.progressBar.style.width = '0%';
             els.progressLabel.classList.remove('visible');
@@ -2804,9 +4078,52 @@ var GenerateTab = (function () {
             }
         }
     }
-    function displayImage(src) {
+    function reusableParamsForItem(item) {
+        if (!item)
+            return null;
+        var base = item.params && typeof item.params === 'object'
+            ? JSON.parse(JSON.stringify(item.params))
+            : {};
+        var values = {
+            model: item.model,
+            prompt: item.prompt,
+            negPrompt: item.negPrompt,
+            width: item.width,
+            height: item.height,
+            steps: item.steps,
+            cfg: item.cfg,
+            guidance: item.guidance,
+            sampler: item.sampler,
+            scheduler: item.scheduler,
+            sigmaShift: item.sigmaShift,
+            seed: item.seed,
+            frames: item.frame_count,
+            fps: item.fps,
+            stylePreset: item.stylePreset,
+            loras: item.loras,
+            videoGuidanceMode: item.videoGuidanceMode,
+            videoQuant: item.videoQuant,
+            videoCheckpoint: item.videoCheckpoint,
+            capsPositive: item.capsPositive,
+            capsNegative: item.capsNegative,
+            noiseFixture: item.noiseFixture,
+            includeAudio: item.includeAudio,
+            postUpscaler: item.postUpscaler,
+            postUpscaleFactor: item.postUpscaleFactor,
+            noSeedIncrement: item.noSeedIncrement,
+            continueAfterErrors: item.continueAfterErrors,
+            personalNote: item.personalNote
+        };
+        Object.keys(values).forEach(function (key) {
+            if (values[key] != null && values[key] !== '' && base[key] == null)
+                base[key] = values[key];
+        });
+        return Object.keys(base).length ? base : null;
+    }
+    function displayImage(src, metadata) {
         state.currentImage = src;
         state.currentIsVideo = false;
+        state.currentResultParams = reusableParamsForItem(metadata);
         els.previewImg.src = src;
         els.previewImg.style.display = 'block';
         els.previewVideo.style.display = 'none';
@@ -2821,17 +4138,29 @@ var GenerateTab = (function () {
             metadata && (metadata.frame_count != null ? metadata.frame_count : metadata.frames)
         ) || Number(state.frames) || null;
         state.currentVideoFps = Number(metadata && metadata.fps) || Number(state.fps) || null;
+        state.currentResultParams = reusableParamsForItem(metadata);
+        els.previewVideo.pause();
         els.previewVideo.src = src;
+        els.previewVideo.muted = true;
+        els.previewVideo.loop = true;
+        els.previewVideo.controls = true;
+        els.previewVideo.playsInline = true;
+        els.previewVideo.load();
         els.previewVideo.style.display = 'block';
         els.previewImg.style.display = 'none';
         els.actionBar.style.display = 'flex';
         els.empty.style.display = 'none';
+        var playback = els.previewVideo.play();
+        if (playback && typeof playback.catch === 'function')
+            playback.catch(function () { /* controls remain available if autoplay is blocked */ });
     }
     function clearPreview() {
         state.currentImage = null;
         state.currentIsVideo = false;
         state.currentVideoFrames = null;
         state.currentVideoFps = null;
+        state.currentResultParams = null;
+        state.currentGalleryIndex = -1;
         els.previewImg.style.display = 'none';
         els.previewImg.removeAttribute('src');
         els.previewVideo.style.display = 'none';
@@ -2845,6 +4174,42 @@ var GenerateTab = (function () {
         updateSelectionUI();
         updateMetadataPanel();
         setPreviewModelBadges(state.model, state.arch);
+    }
+    function videoArtifactKey(src, isVideo) {
+        if (!isVideo || !src)
+            return '';
+        try {
+            var url = new URL(String(src), window.location.origin);
+            var filename = '';
+            var subfolder = '';
+            if (url.pathname === '/view') {
+                filename = url.searchParams.get('filename') || '';
+                subfolder = url.searchParams.get('subfolder') || '';
+            }
+            else {
+                var parts = url.pathname.split('/').filter(Boolean);
+                if (parts.length >= 3 && parts[0] === 'out') {
+                    subfolder = parts[1];
+                    filename = parts.slice(2).join('/');
+                }
+            }
+            if (!filename)
+                return '';
+            return 'video:' + subfolder.replace(/^\/+|\/+$/g, '') + '/' +
+                filename.replace(/^\/+/, '');
+        }
+        catch (error) {
+            return '';
+        }
+    }
+    function galleryItemKey(item) {
+        if (!item || !item.src)
+            return '';
+        return videoArtifactKey(item.src, item.isVideo) || 'media:' + String(item.src);
+    }
+    function beginCurrentBatch() {
+        state.currentBatchKeys = {};
+        renderGallery();
     }
     function addToGallery(src, isVideo, metadata) {
         function value(key, fallback) {
@@ -2868,10 +4233,46 @@ var GenerateTab = (function () {
             frame_count: value('frame_count', state.currentVideoFrames),
             fps: value('fps', state.currentVideoFps),
             arch: value('arch', state.arch),
+            negPrompt: value('negPrompt', value('negative', '')),
+            stylePreset: value('stylePreset', 'none'),
+            loras: value('loras', []),
+            videoGuidanceMode: value('videoGuidanceMode', ''),
+            videoQuant: value('videoQuant', ''),
+            videoCheckpoint: value('videoCheckpoint', ''),
+            capsPositive: value('capsPositive', ''),
+            capsNegative: value('capsNegative', ''),
+            noiseFixture: value('noiseFixture', ''),
+            includeAudio: value('includeAudio', false),
+            postUpscaler: value('postUpscaler', state.postUpscaler),
+            postUpscaleFactor: value('postUpscaleFactor', state.postUpscaleFactor),
+            sigmaShift: value('sigmaShift', value('sigma_shift', state.sigmaShift)),
+            noSeedIncrement: value('noSeedIncrement', state.noSeedIncrement),
+            continueAfterErrors: value('continueAfterErrors', state.continueAfterErrors),
+            personalNote: value('personalNote', state.personalNote),
+            params: metadata && metadata.params
+                ? JSON.parse(JSON.stringify(metadata.params))
+                : null,
             timestamp: Date.now(),
             starred: false
         };
+        var artifactKey = videoArtifactKey(item.src, item.isVideo);
+        if (artifactKey) {
+            var existingIndex = state.gallery.findIndex(function (existing) {
+                return videoArtifactKey(existing.src, existing.isVideo) === artifactKey;
+            });
+            if (existingIndex >= 0) {
+                if (!state.gallery[existingIndex].params && item.params)
+                    state.gallery[existingIndex] = item;
+                if (state.generating || state.pendingBatch > 0)
+                    state.currentBatchKeys[galleryItemKey(state.gallery[existingIndex])] = true;
+                renderGallery();
+                saveGallery();
+                return;
+            }
+        }
         state.gallery.unshift(item);
+        if (state.generating || state.pendingBatch > 0)
+            state.currentBatchKeys[galleryItemKey(item)] = true;
         if (state.gallery.length > 200)
             state.gallery.pop();
         state.galleryPage = 0;
@@ -2883,6 +4284,8 @@ var GenerateTab = (function () {
             updateSelectionUI();
             updateMetadataPanel();
             setPreviewModelBadges(item.model, item.arch);
+            state.currentGalleryIndex = 0;
+            state.currentResultParams = reusableParamsForItem(item);
         }
         saveGallery();
     }
@@ -2941,6 +4344,30 @@ var GenerateTab = (function () {
         var model = (job && job.model) || meta.model || params.model || '';
         var arch = params.arch || ModelUtils.detectArchFromFilename(model) || '';
         var executedCfg = meta.cfg != null ? meta.cfg : params.cfg;
+        var reusable = {
+            model: model,
+            prompt: meta.prompt != null ? meta.prompt : (params.prompt || ''),
+            negPrompt: params.negative || params.negPrompt || '',
+            width: meta.width != null ? meta.width : params.width,
+            height: meta.height != null ? meta.height : params.height,
+            steps: meta.steps != null ? meta.steps : params.steps,
+            cfg: executedCfg,
+            guidance: arch === 'flux' ? executedCfg : params.guidance,
+            sampler: meta.sampler || params.sampler || '',
+            scheduler: meta.scheduler || params.scheduler || '',
+            sigmaShift: params.sigma_shift,
+            seed: meta.seed != null ? meta.seed : params.seed,
+            variationSeed: params.variation_seed,
+            variationStrength: params.variation_strength,
+            stylePreset: meta.stylePreset || 'none',
+            loras: Array.isArray(params.lora) ? params.lora.map(function (row) {
+                return {
+                    name: row.name || '',
+                    strength: Number(row.weight == null ? 1 : row.weight),
+                    enabled: true
+                };
+            }) : []
+        };
         return {
             prompt: meta.prompt != null ? meta.prompt : (params.prompt || ''),
             model: model,
@@ -2952,11 +4379,16 @@ var GenerateTab = (function () {
             guidance: arch === 'flux' ? executedCfg : params.guidance,
             sampler: meta.sampler || params.sampler || '',
             scheduler: meta.scheduler || params.scheduler || '',
+            sigmaShift: reusable.sigmaShift,
             width: meta.width != null ? meta.width : params.width,
             height: meta.height != null ? meta.height : params.height,
             frame_count: meta.frame_count != null ? meta.frame_count : params.frames,
             fps: meta.fps != null ? meta.fps : params.fps,
-            arch: arch
+            arch: arch,
+            negPrompt: reusable.negPrompt,
+            stylePreset: reusable.stylePreset,
+            loras: reusable.loras,
+            params: reusable
         };
     }
     function restoredGalleryJobId(item) {
@@ -3010,16 +4442,30 @@ var GenerateTab = (function () {
         try {
             var saved = JSON.parse(localStorage.getItem('sf-gallery'));
             if (saved && Array.isArray(saved)) {
-                state.gallery = saved.slice(0, 200).map(function (item) {
+                var restored = [];
+                var videoKeys = {};
+                saved.slice(0, 200).forEach(function (item) {
                     if (typeof item === 'string')
-                        return { src: item, isVideo: false, prompt: '', starred: false, timestamp: 0 };
+                        item = { src: item, isVideo: false, prompt: '', starred: false, timestamp: 0 };
                     // Ensure backward compat: add missing fields
                     if (item.starred === undefined)
                         item.starred = false;
                     if (item.timestamp === undefined)
                         item.timestamp = 0;
-                    return item;
+                    var key = videoArtifactKey(item.src, item.isVideo);
+                    if (key && Object.prototype.hasOwnProperty.call(videoKeys, key)) {
+                        var existingIndex = videoKeys[key];
+                        if (!restored[existingIndex].params && item.params)
+                            restored[existingIndex] = item;
+                        return;
+                    }
+                    if (key)
+                        videoKeys[key] = restored.length;
+                    restored.push(item);
                 });
+                state.gallery = restored;
+                if (restored.length !== saved.slice(0, 200).length)
+                    saveGallery();
                 renderGallery();
                 repairRestoredGalleryMetadata();
             }
@@ -3319,13 +4765,16 @@ var GenerateTab = (function () {
                 return;
             var pct = data.max > 0 ? (data.value / data.max * 100).toFixed(0) : '0';
             els.progressBar.style.width = pct + '%';
-            els.progressLabel.textContent = 'Step ' + data.value + ' / ' + data.max;
+            var phase = data.phase || data.message || '';
+            updateGenerationActivity(phase, data.value, data.max);
+            els.progressLabel.textContent = (phase ? phase + ' · ' : '') +
+                'Step ' + data.value + ' / ' + data.max;
             els.progressLabel.classList.add('visible');
             if (els.leftProgressBar) {
                 els.leftProgressBar.style.width = pct + '%';
             }
             if (els.leftProgressLabel) {
-                els.leftProgressLabel.textContent = 'Step ' + data.value + ' / ' + data.max;
+                els.leftProgressLabel.textContent = els.progressLabel.textContent;
             }
         });
         SerenityWS.on('preview', function (data) {
@@ -3346,6 +4795,15 @@ var GenerateTab = (function () {
         });
         SerenityWS.on('executed', function (data) {
             if (!data || !data.output)
+                return;
+            var eventPromptId = String(data.prompt_id || '');
+            // LTX2 is completed by HTTP status/result polling. Its WorkerEvent::Done
+            // also becomes a Comfy-style `executed` WebSocket event. Whichever
+            // arrives first owns gallery insertion; suppress both the in-flight
+            // and late-event cases so one render produces one gallery movie.
+            if (eventPromptId &&
+                (state.pendingVideoJobs[eventPromptId] ||
+                    state.completedVideoJobs[eventPromptId]))
                 return;
             // Clean up live preview state
             if (els.previewImg) {
@@ -3422,7 +4880,11 @@ var GenerateTab = (function () {
     }
     // ── Phase 2: Gallery Rendering ──
     function getFilteredGallery() {
-        var items = state.gallery;
+        // A fresh result belongs to Current Batch until the next Generate.
+        // Do not render that same artifact a second time in History.
+        var items = state.gallery.filter(function (item) {
+            return !state.currentBatchKeys[galleryItemKey(item)];
+        });
         // Search filter
         if (state.gallerySearch) {
             var q = state.gallerySearch.toLowerCase();
@@ -3491,25 +4953,35 @@ var GenerateTab = (function () {
         if (!els.batchStrip)
             return;
         els.batchStrip.innerHTML = '';
-        var recent = state.gallery.slice(0, 12);
+        var recent = state.gallery.filter(function (item) {
+            return !!state.currentBatchKeys[galleryItemKey(item)];
+        }).slice(0, 12);
         if (!recent.length) {
-            els.batchStrip.innerHTML = '<div class="gen-swarm-batch-empty">New results appear here</div>';
+            els.batchStrip.innerHTML = '<div class="gen-workspace-batch-empty">New results appear here</div>';
             return;
         }
         recent.forEach(function (item) {
-            if (item.isVideo)
-                return;
             var button = document.createElement('button');
             button.type = 'button';
-            button.className = 'gen-swarm-batch-thumb';
-            var image = document.createElement('img');
-            image.src = item.src;
-            image.alt = item.prompt || 'Generated image';
-            button.appendChild(image);
+            button.className = 'gen-workspace-batch-thumb' + (item.isVideo ? ' gen-thumb-video' : '');
+            if (item.isVideo) {
+                var video = document.createElement('video');
+                video.src = item.src + '#t=0.1';
+                video.muted = true;
+                video.playsInline = true;
+                video.preload = 'metadata';
+                button.appendChild(video);
+            }
+            else {
+                var image = document.createElement('img');
+                image.src = item.src;
+                image.alt = item.prompt || 'Generated image';
+                button.appendChild(image);
+            }
             var caption = document.createElement('span');
             caption.textContent = (item.width && item.height)
-                ? (item.width + '×' + item.height)
-                : 'Image';
+                ? (item.width + '×' + item.height + (item.isVideo ? ' · Video' : ''))
+                : (item.isVideo ? 'Video' : 'Image');
             button.appendChild(caption);
             button.addEventListener('click', function () {
                 var index = state.gallery.indexOf(item);
@@ -3561,8 +5033,10 @@ var GenerateTab = (function () {
             displayVideo(item.src, item);
         }
         else {
-            displayImage(item.src);
+            displayImage(item.src, item);
         }
+        state.currentGalleryIndex = galleryIndex;
+        state.currentResultParams = reusableParamsForItem(item);
         setPreviewModelBadges(item.model, item.arch);
         updateSelectionUI();
         updateMetadataPanel();
@@ -3622,6 +5096,9 @@ var GenerateTab = (function () {
             pairs.push('<span class="gen-metadata-key">Steps:</span> <span class="gen-metadata-val">' + item.steps + '</span>');
         if (item.cfg != null)
             pairs.push('<span class="gen-metadata-key">' + (item.arch === 'flux' ? 'Guidance' : 'CFG') + ':</span> <span class="gen-metadata-val">' + item.cfg + '</span>');
+        if (item.isVideo && item.frame_count && item.fps)
+            pairs.push('<span class="gen-metadata-key">Video:</span> <span class="gen-metadata-val">' +
+                item.frame_count + 'f @ ' + item.fps + 'fps</span>');
         summary.innerHTML = pairs.join(' ');
         panel.classList.add('visible');
         // Full metadata
@@ -3636,6 +5113,12 @@ var GenerateTab = (function () {
             fullPairs.push('<span class="gen-metadata-key">Guidance:</span> <span class="gen-metadata-val">' + item.guidance + '</span>');
         if (item.arch)
             fullPairs.push('<span class="gen-metadata-key">Arch:</span> <span class="gen-metadata-val">' + item.arch + '</span>');
+        if (item.videoGuidanceMode)
+            fullPairs.push('<span class="gen-metadata-key">Guidance mode:</span> <span class="gen-metadata-val">' + escapeHtml(item.videoGuidanceMode) + '</span>');
+        if (item.videoQuant)
+            fullPairs.push('<span class="gen-metadata-key">Quantization:</span> <span class="gen-metadata-val">' + escapeHtml(item.videoQuant) + '</span>');
+        if (item.isVideo)
+            fullPairs.push('<span class="gen-metadata-key">Audio:</span> <span class="gen-metadata-val">' + (item.includeAudio ? 'included' : 'off') + '</span>');
         if (item.timestamp)
             fullPairs.push('<span class="gen-metadata-key">Time:</span> <span class="gen-metadata-val">' + new Date(item.timestamp).toLocaleString() + '</span>');
         full.innerHTML = fullPairs.join('<br>');
@@ -3734,46 +5217,7 @@ var GenerateTab = (function () {
                 }
                 break;
             case 'use-all':
-                if (item.prompt && els.prompt) {
-                    els.prompt.value = item.prompt;
-                    state.prompt = item.prompt;
-                    els.prompt.style.height = 'auto';
-                    els.prompt.style.height = els.prompt.scrollHeight + 'px';
-                    updateTokenCount();
-                }
-                if (item.seed != null && els.seed) {
-                    els.seed.value = String(item.seed);
-                    state.seed = item.seed;
-                }
-                if (item.steps && els.steps) {
-                    els.steps.value = String(item.steps);
-                    if (els.stepsRange)
-                        els.stepsRange.value = String(item.steps);
-                    state.steps = item.steps;
-                }
-                if (item.cfg != null && els.cfg) {
-                    els.cfg.value = String(item.cfg);
-                    if (els.cfgRange)
-                        els.cfgRange.value = String(item.cfg);
-                    state.cfg = item.cfg;
-                }
-                if (item.guidance && els.guidance) {
-                    els.guidance.value = String(item.guidance);
-                    if (els.guidanceRange)
-                        els.guidanceRange.value = String(item.guidance);
-                    state.guidance = item.guidance;
-                }
-                if (item.scheduler && els.scheduler) {
-                    els.scheduler.value = item.scheduler;
-                    state.scheduler = item.scheduler;
-                }
-                if (item.width && item.height) {
-                    state.width = item.width;
-                    state.height = item.height;
-                    syncDimensionInputs();
-                    syncAspectDropdown();
-                    updateAspectPreview();
-                }
+                applyParams(reusableParamsForItem(item));
                 break;
             case 'delete':
                 state.gallery.splice(idx, 1);
@@ -4009,17 +5453,33 @@ var GenerateTab = (function () {
             width: state.width,
             height: state.height,
             steps: state.steps,
-            cfg: state.cfg,
-            guidance: state.guidance,
+            cfg: ModelUtils.isVideoModel(state.model) ? null : state.cfg,
+            guidance: ModelUtils.isVideoModel(state.model) ? null : state.guidance,
+            sigmaShift: state.sigmaShift,
             sampler: state.sampler,
             scheduler: state.scheduler,
             noiseScheduler: state.scheduler,
             seed: state.seed,
+            frames: state.frames,
+            fps: state.fps,
+            seconds: state.seconds,
             variationSeed: state.variationSeed,
             variationStrength: state.variationStrength,
             creativity: state.creativity,
             batchCount: state.batchCount,
             stylePreset: state.stylePreset,
+            videoGuidanceMode: state.videoGuidanceMode,
+            videoQuant: state.videoQuant,
+            videoCheckpoint: state.videoCheckpoint,
+            capsPositive: state.capsPositive,
+            capsNegative: state.capsNegative,
+            noiseFixture: state.noiseFixture,
+            includeAudio: state.includeAudio,
+            postUpscaler: state.postUpscaler,
+            postUpscaleFactor: state.postUpscaleFactor,
+            noSeedIncrement: state.noSeedIncrement,
+            continueAfterErrors: state.continueAfterErrors,
+            personalNote: state.personalNote,
             loras: state.loras.map(function (lora) {
                 return { name: lora.name, strength: lora.strength, enabled: lora.enabled !== false };
             })
@@ -4031,23 +5491,41 @@ var GenerateTab = (function () {
             return;
         if (!initialized)
             init();
+        var normalized = Object.assign({}, params);
+        if (normalized.negPrompt == null && typeof normalized.negative === 'string')
+            normalized.negPrompt = normalized.negative;
+        if (!Array.isArray(normalized.loras) && Array.isArray(normalized.lora)) {
+            normalized.loras = normalized.lora.map(function (row) {
+                return {
+                    name: row.name || '',
+                    strength: Number(row.weight == null ? 1 : row.weight),
+                    enabled: true
+                };
+            });
+        }
+        params = normalized;
         if (typeof params.model === 'string' && params.model) {
-            state.model = params.model;
+            var requestedModel = params.model === 'ltx2'
+                ? 'ltx-2.3-22b-dev-fp8'
+                : params.model;
+            state.model = requestedModel;
             if (els.model)
-                els.model.value = params.model;
+                els.model.value = requestedModel;
             if (els.modelSearch)
-                els.modelSearch.value = params.model;
-            updateUIForArch(ModelUtils.detectArchFromFilename(params.model));
+                els.modelSearch.value = requestedModel;
+            updateUIForArch(ModelUtils.detectArchFromFilename(requestedModel));
         }
         if (typeof params.prompt === 'string')
             state.prompt = params.prompt;
         if (typeof params.negPrompt === 'string')
             state.negPrompt = params.negPrompt;
-        ['width', 'height', 'steps', 'cfg', 'guidance', 'seed', 'variationSeed',
-            'variationStrength', 'creativity', 'batchCount'].forEach(function (key) {
+        ['width', 'height', 'steps', 'cfg', 'guidance', 'sigmaShift', 'seed', 'frames', 'fps',
+            'seconds', 'variationSeed', 'variationStrength', 'creativity',
+            'batchCount'].forEach(function (key) {
             if (params[key] != null && Number.isFinite(Number(params[key])))
                 state[key] = Number(params[key]);
         });
+        var isVideo = ModelUtils.isVideoModel(state.model);
         var profile = activeCapabilityProfile();
         var supportedSamplers = profile && profile.samplers &&
             Array.isArray(profile.samplers.supported_samplers)
@@ -4055,10 +5533,11 @@ var GenerateTab = (function () {
         var supportedSchedulers = profile && profile.samplers &&
             Array.isArray(profile.samplers.supported_schedulers)
             ? profile.samplers.supported_schedulers : [];
-        if (typeof params.sampler === 'string' && supportedSamplers.indexOf(params.sampler) >= 0)
+        if (typeof params.sampler === 'string' &&
+            (isVideo || supportedSamplers.indexOf(params.sampler) >= 0))
             state.sampler = params.sampler;
         if (typeof params.scheduler === 'string' && params.scheduler) {
-            if (supportedSchedulers.indexOf(params.scheduler) >= 0)
+            if (isVideo || supportedSchedulers.indexOf(params.scheduler) >= 0)
                 state.scheduler = params.scheduler;
             else if (supportedSamplers.indexOf(params.scheduler) >= 0)
                 state.sampler = params.scheduler;
@@ -4068,6 +5547,55 @@ var GenerateTab = (function () {
             state.scheduler = params.noiseScheduler;
         if (typeof params.stylePreset === 'string')
             state.stylePreset = params.stylePreset;
+        if (typeof params.videoGuidanceMode === 'string')
+            state.videoGuidanceMode = params.videoGuidanceMode === 'dev' ? 'dev' : 'distilled';
+        else if (typeof params.guidance_mode === 'string')
+            state.videoGuidanceMode = params.guidance_mode === 'dev' ? 'dev' : 'distilled';
+        if (typeof params.videoQuant === 'string')
+            state.videoQuant = params.videoQuant;
+        else if (typeof params.quant === 'string')
+            state.videoQuant = params.quant;
+        if (typeof params.videoCheckpoint === 'string')
+            state.videoCheckpoint = params.videoCheckpoint;
+        else if (typeof params.checkpoint === 'string')
+            state.videoCheckpoint = params.checkpoint;
+        if (typeof params.capsPositive === 'string')
+            state.capsPositive = params.capsPositive;
+        else if (typeof params.caps_positive === 'string')
+            state.capsPositive = params.caps_positive;
+        if (typeof params.capsNegative === 'string')
+            state.capsNegative = params.capsNegative;
+        else if (typeof params.caps_negative === 'string')
+            state.capsNegative = params.caps_negative;
+        if (typeof params.noiseFixture === 'string')
+            state.noiseFixture = params.noiseFixture;
+        else if (typeof params.noise_fixture === 'string')
+            state.noiseFixture = params.noise_fixture;
+        if (typeof params.includeAudio === 'boolean')
+            state.includeAudio = params.includeAudio;
+        else if (typeof params.include_audio === 'boolean')
+            state.includeAudio = params.include_audio;
+        var postUpscale = params.post_upscale && typeof params.post_upscale === 'object'
+            ? params.post_upscale : null;
+        if (typeof params.postUpscaler === 'string')
+            state.postUpscaler = params.postUpscaler;
+        else if (postUpscale && typeof postUpscale.id === 'string')
+            state.postUpscaler = postUpscale.id;
+        if (params.postUpscaleFactor != null &&
+            (Number(params.postUpscaleFactor) === 2 || Number(params.postUpscaleFactor) === 4))
+            state.postUpscaleFactor = Number(params.postUpscaleFactor);
+        else if (postUpscale &&
+            (Number(postUpscale.factor) === 2 || Number(postUpscale.factor) === 4))
+            state.postUpscaleFactor = Number(postUpscale.factor);
+        if (params.sigmaShift == null && params.sigma_shift != null &&
+            Number.isFinite(Number(params.sigma_shift)))
+            state.sigmaShift = Number(params.sigma_shift);
+        if (typeof params.noSeedIncrement === 'boolean')
+            state.noSeedIncrement = params.noSeedIncrement;
+        if (typeof params.continueAfterErrors === 'boolean')
+            state.continueAfterErrors = params.continueAfterErrors;
+        if (typeof params.personalNote === 'string')
+            state.personalNote = params.personalNote;
         if (Array.isArray(params.loras)) {
             state.loras = params.loras.map(function (lora) {
                 return {
@@ -4078,6 +5606,18 @@ var GenerateTab = (function () {
             }).filter(function (lora) { return !!lora.name; });
             renderLoraList();
         }
+        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+            var reusedProfile = activeLtx2RequestProfiles().find(function (entry) {
+                return Number(entry.width) === Number(state.width) &&
+                    Number(entry.height) === Number(state.height) &&
+                    Number(entry.frames) === Number(state.frames) &&
+                    Number(entry.fps) === Number(state.fps);
+            });
+            if (reusedProfile)
+                applyLtx2RequestProfile(reusedProfile);
+        }
+        if (isVideo)
+            applyVideoGuidanceMode(true);
         if (els.prompt) {
             els.prompt.value = state.prompt;
             els.prompt.style.height = 'auto';
@@ -4103,6 +5643,39 @@ var GenerateTab = (function () {
             els.scheduler.value = state.scheduler;
         if (els.seed)
             els.seed.value = String(state.seed);
+        if (els.framesInput)
+            els.framesInput.value = String(state.frames);
+        if (els.fpsInput)
+            els.fpsInput.value = String(state.fps);
+        if (els.fpsRange)
+            els.fpsRange.value = String(state.fps);
+        if (els.secondsInput)
+            els.secondsInput.value = String(Number(state.seconds.toFixed(3)));
+        if (els.videoGuidanceMode)
+            els.videoGuidanceMode.value = state.videoGuidanceMode;
+        if (els.videoQuant)
+            els.videoQuant.value = state.videoQuant;
+        if (els.videoCheckpoint)
+            els.videoCheckpoint.value = state.videoCheckpoint;
+        if (els.capsPositive)
+            els.capsPositive.value = state.capsPositive;
+        if (els.capsNegative)
+            els.capsNegative.value = state.capsNegative;
+        if (els.noiseFixture)
+            els.noiseFixture.value = state.noiseFixture;
+        if (els.includeAudio)
+            els.includeAudio.checked = state.includeAudio;
+        refreshLtx2PostUpscaleControls();
+        if (els.sigmaShift)
+            els.sigmaShift.value = String(state.sigmaShift);
+        if (els.sigmaShiftRange)
+            els.sigmaShiftRange.value = String(Math.min(Number(els.sigmaShiftRange.max) || 20, state.sigmaShift));
+        if (els.noSeedIncrement)
+            els.noSeedIncrement.checked = state.noSeedIncrement;
+        if (els.continueAfterErrors)
+            els.continueAfterErrors.checked = state.continueAfterErrors;
+        if (els.personalNote)
+            els.personalNote.value = state.personalNote;
         var variationSeed = document.getElementById('gen-variation-seed');
         var variationStrength = document.getElementById('gen-variation-strength');
         var variationRange = document.getElementById('gen-variation-strength-range');
@@ -4145,6 +5718,7 @@ var GenerateTab = (function () {
         bindGallerySettings();
         bindPagination();
         bindGlobalPhase2();
+        updateAdvancedVisibility();
         // Render lucide icons
         if (typeof lucide !== 'undefined') {
             lucide.createIcons({ nameAttr: 'data-lucide' });
@@ -4156,13 +5730,13 @@ var GenerateTab = (function () {
         generate: generate,
         getParams: getParams,
         applyParams: applyParams,
-        displayResult: function (src, isVideo) {
+        displayResult: function (src, isVideo, metadata) {
             if (!initialized)
                 init();
             if (isVideo)
-                displayVideo(src);
+                displayVideo(src, metadata);
             else
-                displayImage(src);
+                displayImage(src, metadata);
         }
     };
 })();

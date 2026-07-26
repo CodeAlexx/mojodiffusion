@@ -4,7 +4,7 @@
 The product path may load large model artifacts from the local model store
 (`.serenity`) or, for explicitly pinned tokenizer/text-encoder snapshots, the
 local Hugging Face cache. It must not depend on old implementation repos such as
-EriDiffusion, SerenityFlow, SwarmUI, or ComfyUI at runtime.
+EriDiffusion, SerenityFlow, reference UI, or ComfyUI at runtime.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ PRODUCTION_SURFACES = [
 BANNED_RUNTIME_ROOTS = [
     "/home/alex/EriDiffusion",
     "/home/alex/SerenityFlow",
-    "/home/alex/SwarmUI",
+    "/home/alex/reference UI",
     "/home/alex/ComfyUI",
     "/home/alex/Lance",
 ]

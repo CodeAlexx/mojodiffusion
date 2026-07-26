@@ -67,7 +67,7 @@ from serenitymojo.sampling.sampler_registry import (
     default_generation_model, default_sampler_for_backend,
     default_scheduler_for_backend, sampler_backend_for_model,
     sampler_admission_for_backend, scheduler_admission_for_backend,
-    swarmui_sampler_registry_json,
+    serenity_sampler_registry_json,
 )
 from serenitymojo.io.ffi import sys_open, sys_close, file_size, O_RDONLY
 from serenitymojo.serve.backend import GenBackend, JobParams, LoraSpec, StepResult
@@ -952,7 +952,7 @@ def broadcast(mut ws: Dict[Int, Bool], msg: String):
 
 # ── gallery/read-params ─────────────────────────────────────────────────────
 def _png_genparams(path: String) raises -> String:
-    """Read the SwarmUI-style Serenity genparams tEXt value from one PNG."""
+    """Read the Serenity Serenity genparams tEXt value from one PNG."""
     var keywords = List[String]()
     var values = List[String]()
     read_png_text(path, keywords, values)
@@ -2343,7 +2343,7 @@ def handle_api(
         return json_response(200, dumps(o))
 
     if req.method == "GET" and path == "/v1/samplers":
-        return json_response(200, swarmui_sampler_registry_json())
+        return json_response(200, serenity_sampler_registry_json())
 
     if req.method == "GET" and path == "/v1/video":
         var doc = video_readiness_doc(backend_name, model_name, resident)

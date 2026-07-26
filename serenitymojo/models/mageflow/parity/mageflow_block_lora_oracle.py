@@ -24,7 +24,7 @@
 # the Mojo side's bf16/f32 noise is what the cos>=0.999 gate absorbs.
 #
 # Run (SEPARATE command):
-#   /home/alex/OneTrainer/venv/bin/python \
+#   python3 \
 #       serenitymojo/models/mageflow/parity/mageflow_block_lora_oracle.py
 
 import os

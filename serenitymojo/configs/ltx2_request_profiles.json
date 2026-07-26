@@ -1,0 +1,136 @@
+{
+  "schema": "serenity.ltx2.request_profiles.v1",
+  "checkpoint": "ltx-2.3-22b-dev-fp8",
+  "guidance_modes": {
+    "distilled": {
+      "steps": 8,
+      "sampler": "euler",
+      "scheduler": "ltx2_distilled"
+    },
+    "dev": {
+      "min_steps": 1,
+      "max_steps": 20,
+      "default_steps": 15,
+      "sampler": "res2s",
+      "scheduler": "ltx2"
+    }
+  },
+  "profile_groups": [
+    {
+      "id": "creator-portrait",
+      "label": "Creator Portrait",
+      "width": 512,
+      "height": 768,
+      "fps": 25,
+      "durations": [4.84],
+      "frames": [121],
+      "source": "Serenity creator-verified profile"
+    },
+    {
+      "id": "540p-landscape",
+      "label": "540p Landscape",
+      "width": 960,
+      "height": 544,
+      "fps": 24,
+      "durations": [5, 6, 8, 10, 20],
+      "frames": [121, 145, 193, 241, 481],
+      "source": "LTX Desktop local fast profile"
+    },
+    {
+      "id": "540p-portrait",
+      "label": "540p Portrait",
+      "width": 544,
+      "height": 960,
+      "fps": 24,
+      "durations": [5, 6, 8, 10, 20],
+      "frames": [121, 145, 193, 241, 481],
+      "source": "LTX Desktop local fast profile"
+    },
+    {
+      "id": "720p-landscape",
+      "label": "720p Landscape",
+      "width": 1280,
+      "height": 704,
+      "fps": 24,
+      "durations": [5, 6, 8, 10],
+      "frames": [121, 145, 193, 241],
+      "source": "LTX Desktop local fast profile"
+    },
+    {
+      "id": "720p-portrait",
+      "label": "720p Portrait",
+      "width": 704,
+      "height": 1280,
+      "fps": 24,
+      "durations": [5, 6, 8, 10],
+      "frames": [121, 145, 193, 241],
+      "source": "LTX Desktop local fast profile"
+    },
+    {
+      "id": "1080p-landscape",
+      "label": "1080p Landscape",
+      "width": 1920,
+      "height": 1088,
+      "fps": 24,
+      "durations": [5],
+      "frames": [121],
+      "source": "LTX Desktop local fast profile"
+    },
+    {
+      "id": "1080p-portrait",
+      "label": "1080p Portrait",
+      "width": 1088,
+      "height": 1920,
+      "fps": 24,
+      "durations": [5],
+      "frames": [121],
+      "source": "LTX Desktop local fast profile"
+    }
+  ],
+  "post_upscalers": [
+    {
+      "id": "realesrgan-x4plus",
+      "label": "Real-ESRGAN x4plus",
+      "source_commit": "254d886",
+      "source_runner": "serenitymojo/sampling/realesrgan_x4_cli.mojo",
+      "product_runner": "output/bin/serenity_realesrgan_x4",
+      "weights": "upscalers/realesrgan-x4plus/RealESRGAN_x4.safetensors",
+      "scales": [2, 4],
+      "status": "runtime_probe",
+      "benchmark": {
+        "input": "960x544 single decoded LTX2 frame",
+        "wall_seconds_per_frame": 18.24,
+        "estimated_121_frame_minutes": 36.8,
+        "estimated_481_frame_minutes": 146.2
+      },
+      "reason": "Pure-Mojo tiled image super-resolution. Video mode keeps weights resident across an extracted frame sequence; x2 output is the x4 result downsampled once during mux. Installed and functional, but measured too slow for production video."
+    },
+    {
+      "id": "realesrgan-fast-x4v3",
+      "label": "Real-ESRGAN Fast x4v3",
+      "source_commit": "853cddc",
+      "source_runner": "serenitymojo/sampling/realesrgan_x4_cli.mojo",
+      "product_runner": "output/bin/serenity_realesrgan_x4",
+      "weights": "upscalers/realesrgan-fast-x4v3/realesr-general-x4v3.safetensors",
+      "scales": [2, 4],
+      "status": "runtime_probe",
+      "reason": "Pure-Mojo SRVGGNetCompact fast path with resident sequence weights. Product-wired for machines that have the x4v3 safetensors; weights are absent here and are not downloaded automatically."
+    },
+    {
+      "id": "seedvr2-3b",
+      "label": "SeedVR2 3B",
+      "source_commit": "9f5d3c5",
+      "runtime_fix_commit": "2f8e26e",
+      "source_runner": "serenitymojo/sampling/seedvr2_upscale_general_cli.mojo",
+      "product_runner": "output/bin/seedvr2_upscale_video",
+      "weights": [
+        "upscalers/seedvr2-3b/seedvr2_vae.safetensors",
+        "upscalers/seedvr2-3b/seedvr2_dit.safetensors",
+        "upscalers/seedvr2-3b/seedvr2_text_emb.safetensors"
+      ],
+      "scales": [2, 4],
+      "status": "source_only",
+      "reason": "The GitHub runner currently consumes verification safetensors and writes demo PNG frames; it does not yet accept or emit a user video."
+    }
+  ]
+}

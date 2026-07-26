@@ -395,7 +395,7 @@ comptime TRANSFORMER_DIR = "/home/alex/.serenity/models/zimage_base/transformer"
 # call, mirroring zimage_generate.mojo) and the inference sigma shift.
 comptime ZROOT = "/home/alex/.serenity/models/zimage_base"
 comptime VAE_DIR = ZROOT + "/vae"
-comptime ZIMAGE_SAMPLE_SIGMA_SHIFT = Float32(3.0)  # SwarmUI/Comfy ZImage default
+comptime ZIMAGE_SAMPLE_SIGMA_SHIFT = Float32(3.0)  # reference UI/Comfy ZImage default
 # Neutral fallback defaults only; the JSON config is authoritative (cache via
 # dataset_cache_dir/cache_dir, output via output_model_destination).
 comptime CACHE_DIR = "/home/alex/mojodiffusion/output/zimage_cache"

@@ -65,7 +65,7 @@ config `configs_3b/main.yaml`). Weights + oracles + shims: `/home/alex/models/se
 | grid-general full DiT fwd (shifted+non) | (2,24,24) | 0.9995 |
 | general CLI verify (reproduces fixed) | 128²×13 | 0.9987 |
 
-## Oracles / shims (`/home/alex/models/seedvr2-3b`, torch = OneTrainer venv)
+## Oracles / shims (`/home/alex/models/seedvr2-3b`, torch = shared Python venv)
 - Shims (on `sys.path` before SeedVR for the DiT only — they break diffusers, so the
   VAE runs without them): `flash_attn`→torch SDPA, `apex.normalization`→pure-torch
   RMSNorm/LayerNorm, plus `pip install rotary_embedding_torch`. RoPE `get_freqs`

@@ -106,8 +106,8 @@ def main() raises:
                     tile[t0 + 1] = src[1 * plane + sy * W + sx]
                     tile[t0 + 2] = src[2 * plane + sy * W + sx]
             var xt = Tensor.from_host(tile, [1, TILE, TILE, 3], STDtype.F32, ctx)
-            var ot = rrdbnet_forward(w, xt, ctx)         # [1,512,512,3] NHWC
-            var oh = ot.to_host(ctx)
+            var out_tensor = rrdbnet_forward(w, xt, ctx)  # [1,512,512,3] NHWC
+            var oh = out_tensor.to_host(ctx)
 
             # write central 384x384 core into the canvas
             for r in range(OCORE):

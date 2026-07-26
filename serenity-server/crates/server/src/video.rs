@@ -113,7 +113,7 @@ const WAN22_A14B_LORA_T2V: &str = "output/bin/wan22_a14b_lora_t2v";
 const WAN22_A14B_HIGH: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/high";
 const WAN22_A14B_LOW: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/low";
 const WAN22_A14B_VAE: &str =
-    "/mnt/disk1/models/lingbot-video-moe/vae/diffusion_pytorch_model.safetensors";
+    "lingbot-video-moe/vae/diffusion_pytorch_model.safetensors";
 const WAN22_MODEL_ROOT: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo";
 const WAN22_ARTIFACT_MANIFEST: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/serenity_wan22_manifest.json";
@@ -1198,8 +1198,8 @@ fn wan22_a14b_missing() -> Vec<String> {
             missing.push(resolved.to_string_lossy().into_owned());
         }
     }
-    let vae = std::path::Path::new(WAN22_A14B_VAE);
-    if !nonempty_file(vae) {
+    let vae = model_path(WAN22_A14B_VAE);
+    if !nonempty_file(&vae) {
         missing.push(vae.to_string_lossy().into_owned());
     }
     missing

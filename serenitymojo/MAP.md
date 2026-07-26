@@ -2986,7 +2986,7 @@ AND bwd — zero block-math changes.
 
 ## 2026-07-23: BERNINI-R full 12-task conditioning trainer (5080)
 
-Built on the Tier-2b conditioning mechanism (28190c8). ONE trainer binary now
+Built on the Tier-2b conditioning mechanism (28190c8). A single trainer binary now
 covers ALL 12 renderer tasks (t2i/t2v · i2i/r2i/r2v · v2v/i2v/vi2v/vr2v/vrc2v/
 mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
 

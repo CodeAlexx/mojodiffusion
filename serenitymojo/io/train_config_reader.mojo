@@ -546,7 +546,7 @@ def _lr_scheduler_int(s: String) raises -> Int:
 
 
 def _lr_scaler_int(s: String) raises -> Int:
-    # OneTrainer LearningRateScaler: NONE 0 / LINEAR 1 / SQRT 2. LINEAR scales
+    # Reference LearningRateScaler: NONE 0 / LINEAR 1 / SQRT 2. LINEAR scales
     # cfg.lr by batch*grad_accum, SQRT by sqrt(batch*grad_accum), NONE unscaled.
     if s == "none" or s == "NONE":
         return 0
@@ -1447,9 +1447,9 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             + String(cur.pos)
         )
 
-    # OneTrainer learning_rate_scaler (post-parse: needs lr+batch+grad_accum all
+    # Reference learning_rate_scaler (post-parse: needs lr+batch+grad_accum all
     # read). NONE leaves cfg.lr untouched => byte-identical. LINEAR/SQRT scale by
-    # the effective batch (batch*grad_accum), matching OT's setup-time LR scaling.
+    # the effective batch (batch*grad_accum), matching reference setup-time scaling.
     if cfg.lr_scaler != 0:
         var ga = cfg.grad_accum_steps if cfg.grad_accum_steps > 0 else 1
         var eff = Float64(cfg.batch_size) * Float64(ga)

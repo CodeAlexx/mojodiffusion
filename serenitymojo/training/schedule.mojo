@@ -266,7 +266,7 @@ def sample_timestep_logit_normal(
     With shift=1.0 (SerenityTrainer qwen preset default) the remap is the identity, so
     the output is exactly sigmoid(N(0,1)) clamped to the strength window.
 
-    The clamp bounds are config-driven (min/max_noising_strength, the OneTrainer
+    The clamp bounds are config-driven (min/max_noising_strength, the reference
     noising-strength window). The DEFAULTS are the exact F64 expressions the clamp
     used when it was hardcoded — `1/1000` and `1` — so a config that omits them (or
     passes the defaults) is byte-identical to the pre-config path (C13).

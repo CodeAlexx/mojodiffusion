@@ -274,17 +274,17 @@ struct TrainConfig(Copyable, Movable):
     var timestep_distribution: Int
     var timestep_noising_weight: Float32
     var timestep_noising_bias: Float32
-    # OneTrainer noising-strength window (clamp on the sampled sigma). -1 = unset
+    # Reference noising-strength window (clamp on the sampled sigma). -1 = unset
     # => the sampler uses its built-in [1/1000, 1] default (byte-identical, C13).
     var min_noising_strength: Float32
     var max_noising_strength: Float32
-    # OneTrainer learning_rate_scaler: 0=NONE 1=LINEAR 2=SQRT. Scales cfg.lr by
+    # Reference learning_rate_scaler: 0=NONE 1=LINEAR 2=SQRT. Scales cfg.lr by
     # batch*grad_accum at config-load; NONE => unscaled = byte-identical.
     var lr_scaler: Int
-    # OneTrainer dynamic_timestep_shifting: resolution-adaptive flow-match shift
+    # Reference dynamic_timestep_shifting: resolution-adaptive flow-match shift
     # (exp(flux1_mu(seq_len))) instead of the fixed timestep_shift. False => fixed.
     var dynamic_timestep_shifting: Bool
-    # OneTrainer transformer.guidance_scale: the guidance value fed to a
+    # Reference transformer.guidance_scale: the guidance value fed to a
     # guidance-distilled DiT's guidance_in embedder (Flux.1-dev). Default 1.0 =
     # the previously-hardcoded value. Ignored by models with no guidance_in.
     var guidance_scale: Float32

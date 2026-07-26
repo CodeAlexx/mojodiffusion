@@ -1027,6 +1027,10 @@ var WorkflowBuilder = (function () {
         var sampler = requiredText('sampler');
         var scheduler = requiredText('scheduler');
         var capsPositive = String(p.capsPositive || '').trim();
+        var featureId = String(p.ltx2FeatureId || 'standard');
+        var featureWeight = Number(p.ltx2FeatureWeight);
+        if (featureId !== 'standard' && !Number.isFinite(featureWeight))
+            throw new Error('LTX2 feature workflow requires an authored numeric feature weight');
         if (frames < 1 || steps < 1 || fps <= 0)
             throw new Error('LTX2 frames, steps, and FPS must be positive');
         var loaderInputs = {
@@ -1052,7 +1056,13 @@ var WorkflowBuilder = (function () {
             caps_positive: capsPositive,
             caps_negative: p.capsNegative || '',
             noise_fixture: p.noiseFixture || '',
-            include_audio: p.includeAudio === true
+            include_audio: p.includeAudio === true,
+            audio_policy: p.ltx2AudioPolicy ||
+                (p.includeAudio === true ? 'generate' : 'none'),
+            feature_id: featureId,
+            feature_weight: featureId === 'standard' ? 1.0 : featureWeight,
+            post_upscale_id: p.ltx2PostUpscaler || 'none',
+            post_upscale_factor: Number(p.ltx2PostUpscaleFactor) === 4 ? 4 : 2
         };
         var workflow = {
             '1': { class_type: 'LTXVLoader', inputs: loaderInputs },
@@ -1085,6 +1095,13 @@ var WorkflowBuilder = (function () {
             workflow['2'].inputs.guide_strength = Number.isFinite(Number(p.videoStrength))
                 ? Number(p.videoStrength)
                 : 0.7;
+            if (p.videoMaskName) {
+                workflow['5'] = {
+                    class_type: 'LoadImage',
+                    inputs: { image: p.videoMaskName }
+                };
+                workflow['2'].inputs.guide_mask = ['5', 0];
+            }
         }
         return workflow;
     }

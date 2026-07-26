@@ -25,6 +25,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+const LTX2_FEATURE_ADAPTERS_JSON: &str =
+    include_str!("../../../../serenitymojo/configs/ltx2_feature_adapters.json");
+
 fn model_root() -> PathBuf {
     std::env::var_os("SERENITY_MODEL_ROOT")
         .map(PathBuf::from)
@@ -55,6 +58,7 @@ struct Sidecar {
     arch_hint: String,
 }
 
+#[derive(Clone)]
 struct ScanEntry {
     name: String,
     path: String,
@@ -65,6 +69,119 @@ struct ScanEntry {
     folder: String,
     /// Distilled sidecar preview/metadata (empty `Sidecar::default()` if none).
     sidecar: Sidecar,
+}
+
+fn ltx2_feature_adapter_registry() -> &'static Value {
+    static REGISTRY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry: Value = serde_json::from_str(LTX2_FEATURE_ADAPTERS_JSON)
+            .expect("embedded LTX2 feature adapter registry must be valid JSON");
+        assert_eq!(
+            registry.get("schema").and_then(Value::as_str),
+            Some("serenity.ltx2.feature_adapters.v1"),
+            "embedded LTX2 feature adapter registry schema mismatch"
+        );
+        assert!(
+            registry.get("adapters").and_then(Value::as_array).is_some(),
+            "embedded LTX2 feature adapter registry requires adapters"
+        );
+        registry
+    })
+}
+
+fn normalized_lora_filename(name: &str) -> String {
+    let basename = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    if basename.ends_with(".safetensors") {
+        basename.to_string()
+    } else {
+        format!("{basename}.safetensors")
+    }
+}
+
+fn ltx2_feature_adapter(name: &str) -> Option<&'static Value> {
+    let filename = normalized_lora_filename(name);
+    ltx2_feature_adapter_registry()
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| {
+            adapters.iter().find(|adapter| {
+                adapter.get("filename").and_then(Value::as_str) == Some(filename.as_str())
+            })
+        })
+}
+
+/// Resolve one feature-adapter document by its stable product id. The embedded
+/// registry remains the single source of truth for both readiness and request
+/// normalization.
+pub fn ltx2_feature_document(id: &str) -> Option<Value> {
+    ltx2_feature_adapter_registry()
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| {
+            adapters.iter().find(|adapter| {
+                adapter.get("id").and_then(Value::as_str) == Some(id)
+            })
+        })
+        .cloned()
+}
+
+/// Classify an artifact stored under the LoRA root. IC-LoRA feature adapters
+/// and companion embeddings require dedicated conditioning paths and must
+/// never be submitted through the ordinary trained-LoRA overlay route.
+pub fn lora_usage(name: &str) -> String {
+    if let Some(usage) = ltx2_feature_adapter(name)
+        .and_then(|adapter| adapter.get("usage"))
+        .and_then(Value::as_str)
+    {
+        return usage.to_string();
+    }
+    let filename = normalized_lora_filename(name).to_lowercase();
+    if filename.contains("ic-lora") || filename.contains("ic_lora") {
+        "ic_lora_feature".to_string()
+    } else {
+        "overlay".to_string()
+    }
+}
+
+fn lora_selectable_as_overlay(name: &str) -> bool {
+    lora_usage(name) == "overlay"
+}
+
+pub fn ltx2_feature_documents() -> Value {
+    let lora_root = model_root().join("loras");
+    let rows = ltx2_feature_adapter_registry()
+        .get("adapters")
+        .and_then(Value::as_array)
+        .map(|adapters| {
+            adapters
+                .iter()
+                .map(|adapter| {
+                    let mut doc = adapter.clone();
+                    let filename = adapter
+                        .get("filename")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let path = lora_root.join(filename);
+                    if let Some(object) = doc.as_object_mut() {
+                        object.insert("installed".to_string(), json!(path.is_file()));
+                        object.insert(
+                            "path".to_string(),
+                            json!(path.to_string_lossy().into_owned()),
+                        );
+                        object.insert(
+                            "selectable_as_lora".to_string(),
+                            json!(lora_selectable_as_overlay(filename)),
+                        );
+                    }
+                    doc
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(rows)
 }
 
 // ── arch detection (exact substring probes from model_scan.mojo) ────────────────
@@ -765,6 +882,8 @@ fn lora_entry_json(
     selected_arch: &str,
 ) -> Value {
     let target = entry_arch(e);
+    let usage = lora_usage(&e.name);
+    let selectable_as_lora = usage == "overlay";
     let compatible = model_lora_compatible(selected_arch, &target);
     let reason = lora_incompatible_reason(selected_model, selected_arch, &target, compatible);
     let compatibility = json!({
@@ -783,6 +902,8 @@ fn lora_entry_json(
         "trigger": trigger,                    // ADD: from <lora>.json/.civitai.info
         "notes": e.sidecar.description,        // ADD: sidecar description (if any)
         "description": e.sidecar.description,  // ADD: alias for clarity
+        "usage": usage,
+        "selectable_as_lora": selectable_as_lora,
     });
     let card = json!({
         "schema": "serenity.lora.card.v1",
@@ -812,6 +933,8 @@ fn lora_entry_json(
         "compatible": compatible,
         "compatibility": compatibility,
         "incompatible_reason": reason,
+        "usage": usage,
+        "selectable_as_lora": selectable_as_lora,
         "metadata": metadata,
         "card": card,
     })
@@ -863,7 +986,10 @@ pub async fn get_models(Query(q): Query<HashMap<String, String>>) -> Response {
     }
 
     let models = scan_checkpoints();
-    let loras = scan_loras();
+    let loras = scan_loras()
+        .into_iter()
+        .filter(|entry| lora_selectable_as_overlay(&entry.name))
+        .collect::<Vec<_>>();
     let selected_arch = model_arch_for(&models, &selected_model);
 
     let query = json!({
@@ -892,6 +1018,7 @@ pub async fn get_models(Query(q): Query<HashMap<String, String>>) -> Response {
         "model_selected_arch": selected_arch,
         "models": models_json,
         "loras": loras_json,
+        "ltx2_features": ltx2_feature_documents(),
     });
 
     (
@@ -912,13 +1039,20 @@ pub fn checkpoint_names() -> Vec<String> {
 
 /// LoRA NAMES from the disk scan. ComfyUI `/models/loras` is a bare string array.
 pub fn lora_names() -> Vec<String> {
-    scan_loras().into_iter().map(|e| e.name).collect()
+    scan_loras()
+        .into_iter()
+        .filter(|entry| lora_selectable_as_overlay(&entry.name))
+        .map(|entry| entry.name)
+        .collect()
 }
 
 /// Resolve a registry LoRA by its API name (with or without `.safetensors`) or
 /// exact scanned path. Video request preflight uses this before taking the GPU
 /// lease so missing and cross-architecture adapters never reach CUDA.
 pub fn lora_path_and_arch(name: &str) -> Option<(PathBuf, String)> {
+    if !lora_selectable_as_overlay(name) {
+        return None;
+    }
     let wanted = name.strip_suffix(".safetensors").unwrap_or(name);
     scan_loras().into_iter().find_map(|entry| {
         if entry.name == name || entry.name == wanted || entry.path == name {
@@ -1042,6 +1176,41 @@ mod tests {
         assert_eq!(detect_arch("...\"time_projection.\": ..."), "wan");
         assert_eq!(detect_arch("{}"), "unknown");
         assert_eq!(detect_lora_target_arch("...\"lora_unet_x\": ..."), "sdxl");
+    }
+
+    #[test]
+    fn ltx2_feature_artifacts_are_not_plain_loras() {
+        assert_eq!(
+            lora_usage("ltx-2.3-22b-ic-lora-ingredients-0.9"),
+            "ic_lora_feature"
+        );
+        assert_eq!(
+            lora_usage("ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors"),
+            "companion_embedding"
+        );
+        assert_eq!(
+            lora_usage("ltx-2.3-22b-lora-foley-v2a-1.0.safetensors"),
+            "v2a_feature"
+        );
+        assert_eq!(
+            lora_usage("ltx-2.3-22b-lora-cinemagraph-0.9.safetensors"),
+            "overlay"
+        );
+        assert_eq!(lora_usage("eri2_krea2_v2_2000.safetensors"), "overlay");
+    }
+
+    #[test]
+    fn ltx2_feature_registry_is_complete_and_unique() {
+        let adapters = ltx2_feature_adapter_registry()["adapters"]
+            .as_array()
+            .expect("adapters");
+        assert_eq!(adapters.len(), 19);
+        let mut filenames = std::collections::HashSet::new();
+        let mut ids = std::collections::HashSet::new();
+        for adapter in adapters {
+            assert!(ids.insert(adapter["id"].as_str().expect("id")));
+            assert!(filenames.insert(adapter["filename"].as_str().expect("filename")));
+        }
     }
 
     #[test]

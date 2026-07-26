@@ -408,6 +408,13 @@ Exposed via env `LTX2_TRAINED_LORA_STREAMS_{i}` (five comma-joined floats), the
 `ltx2_request_cli` per-row `video/video_to_audio/audio/audio_to_video/other` fields
 (validated `[0,1]`; default rows stay byte-identical), and the Rust serve
 `LTX2LoraLoaderAdvanced` node (`serve/workflow_graph.mojo` + `graph/execute.rs`).
+The request product additionally binds special adapters through stable IDs in
+`configs/ltx2_feature_adapters.json`. Foley/V2A is admitted only with
+`video=0`, `video_to_audio=1`, `audio=1`, `audio_to_video=0`, `other=1`,
+source strength `1.0`, and generated audio. Cinemagraph is admitted only as an
+I2V overlay with its exact trigger and explicit bounded weight. IC-LoRA
+artifacts are not ordinary overlays and remain rejected until their
+reference-token feature runner is admitted.
 
 **Callers today**: Klein (`training/validation_sampler.mojo`), krea2 inference
 (`pipeline/krea2_pipeline.mojo --lora`), LTX-2 runtime. NOTE: no Wan *inference*
@@ -476,6 +483,21 @@ admits 21 exact width/height/frame-count/FPS runners from 512x768/121f@25
 through 960x544/481f@24 and 1920x1088/121f@24. Unsupported tuples fail before
 model load; the UI must select from the published registry rather than round
 or substitute dimensions.
+
+I2V and V2V use clean-latent clamping plus exact per-token model timesteps.
+Painted V2V masks lower to the same latent grid with white/edit and
+black/preserve semantics at both stages. The deterministic
+`sampling/parity/ltx2_conditioning_mask_parity.mojo` gate checks I2V, uniform
+V2V, painted V2V, and the T2V broadcast control. Audio is never inferred from
+an input's mere presence: the canonical request carries an explicit generated,
+source-preserving, or no-audio policy.
+
+`configs/ltx2_feature_adapters.json` is the feature-adapter product registry.
+The server embeds the resolved document in the immutable request and the Mojo
+CLI revalidates the input kind, trigger, weight range, mask restrictions, and
+per-stream strengths. Cinemagraph and Foley/V2A have real product evidence.
+The installed reference-conditioned IC-LoRAs are published as runtime-pending,
+not silently treated as trained LoRAs.
 
 When manual conditioning sidecars are blank,
 `pipeline/ltx2_encode_prompt.mojo` tokenizes both prompts and runs the streamed

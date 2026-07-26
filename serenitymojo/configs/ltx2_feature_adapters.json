@@ -1,0 +1,231 @@
+{
+  "schema": "serenity.ltx2.feature_adapters.v1",
+  "base_model": "ltx-2.3-22b",
+  "adapters": [
+    {
+      "id": "cinemagraph",
+      "label": "Cinemagraph",
+      "filename": "ltx-2.3-22b-lora-cinemagraph-0.9.safetensors",
+      "usage": "overlay",
+      "input": "image",
+      "trigger": "CINEMAGRAPH_MOTION",
+      "audio_policy": "generated",
+      "reference_downscale_factor": 1,
+      "weight_default": 0.9,
+      "weight_min": 0.7,
+      "weight_max": 3.0,
+      "runtime": "trained_lora_overlay",
+      "status": "overlay_admitted"
+    },
+    {
+      "id": "foley-v2a",
+      "label": "Foley / Video to Audio",
+      "filename": "ltx-2.3-22b-lora-foley-v2a-1.0.safetensors",
+      "usage": "v2a_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "generated",
+      "reference_downscale_factor": 1,
+      "weight_default": 1.0,
+      "weight_min": 0.8,
+      "weight_max": 1.0,
+      "stream_strengths": {
+        "video": 0.0,
+        "video_to_audio": 1.0,
+        "audio": 1.0,
+        "audio_to_video": 0.0,
+        "other": 1.0
+      },
+      "runtime": "frozen_video_generated_audio",
+      "status": "v2a_admitted"
+    },
+    {
+      "id": "clean-plate",
+      "label": "Clean Plate",
+      "filename": "ltx-2.3-22b-ic-lora-clean-plate-1.0.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "colorization",
+      "label": "Colorization",
+      "filename": "ltx-2.3-22b-ic-lora-colorization-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "cross-eyed",
+      "label": "Cross-Eyed",
+      "filename": "ltx-2.3-22b-ic-lora-cross-eyed-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "day-to-night",
+      "label": "Day to Night",
+      "filename": "ltx-2.3-22b-ic-lora-day-to-night-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "deblur",
+      "label": "Deblur",
+      "filename": "ltx-2.3-22b-ic-lora-deblur-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "DEBLUR",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "decompression",
+      "label": "Decompression",
+      "filename": "ltx-2.3-22b-ic-lora-decompression-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "hdr",
+      "label": "HDR",
+      "filename": "ltx-2.3-22b-ic-lora-hdr-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "companion": "ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors",
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "hdr-scene-embedding",
+      "label": "HDR Scene Embedding",
+      "filename": "ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors",
+      "usage": "companion_embedding",
+      "input": "none",
+      "trigger": "",
+      "audio_policy": "none",
+      "reference_downscale_factor": 1,
+      "status": "companion_only"
+    },
+    {
+      "id": "in-outpainting",
+      "label": "In / Outpainting",
+      "filename": "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video_mask",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "ingredients",
+      "label": "Ingredients",
+      "filename": "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "image",
+      "trigger": "",
+      "audio_policy": "generated",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "instant-shave",
+      "label": "Instant Shave",
+      "filename": "ltx-2.3-22b-ic-lora-instant-shave-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "lipdub",
+      "label": "LipDub",
+      "filename": "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors",
+      "usage": "lipdub_feature",
+      "input": "video_audio",
+      "trigger": "",
+      "audio_policy": "reference",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "motion-track-control",
+      "label": "Motion Track Control",
+      "filename": "ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "generated",
+      "reference_downscale_factor": 2,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "pixel-spatial-upscaler-x2",
+      "label": "Pixel Spatial Upscaler x2",
+      "filename": "ltx-2.3-22b-ic-lora-pixel-spatial-upscaler-x2-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 2,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "pixel-spatial-upscaler-x4",
+      "label": "Pixel Spatial Upscaler x4",
+      "filename": "ltx-2.3-22b-ic-lora-pixel-spatial-upscaler-x4-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 4,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "union-control",
+      "label": "Union Control",
+      "filename": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "generated",
+      "reference_downscale_factor": 2,
+      "status": "feature_runner_required"
+    },
+    {
+      "id": "water-simulation",
+      "label": "Water Simulation",
+      "filename": "ltx-2.3-22b-ic-lora-water-simulation-0.9.safetensors",
+      "usage": "ic_lora_feature",
+      "input": "video",
+      "trigger": "",
+      "audio_policy": "source",
+      "reference_downscale_factor": 1,
+      "status": "feature_runner_required"
+    }
+  ]
+}

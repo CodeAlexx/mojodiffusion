@@ -108,6 +108,23 @@ present but remains disabled and labeled `source_only`: the imported GitHub CLI
 is a fixture/demo, its weights are absent on this machine, and it is not
 misrepresented as a user-video route.
 
+Canvas exposes the same post-upscale contract without changing native LTX2
+inference geometry. Its selector is readiness-driven: the installed
+Real-ESRGAN x4plus route is enabled and labeled slow, while missing or
+source-only implementations remain visibly disabled. The requested upscaler
+ID and factor are preserved in the workflow graph, immutable request, saved
+Canvas session, result metadata, and parameter reuse.
+
+Canvas also publishes the complete LTX2 feature roster from the server's
+embedded feature registry. Cinemagraph and Foley/V2A are enabled because they
+have dedicated product runtimes and real product evidence. Reference-token
+IC-LoRA features remain visible but disabled with `runtime pending`; installed
+weights alone never make a feature selectable. Cinemagraph requires I2V plus
+the exact `CINEMAGRAPH_MOTION` trigger. Foley/V2A requires an exact-profile
+source video, source strength `1.0`, no guide mask, and generated audio. The
+server resolves the selected stable feature ID, validates the explicit weight,
+and records the complete adapter contract in the request before Mojo starts.
+
 The top toolbar contains a centered, color-coded activity line. It is separate
 from the selected-model label and reports queue wait, current-model eviction,
 worker/model loading, tokenization, Gemma layer progress, sampling steps,
@@ -179,6 +196,13 @@ The focused Playwright gate checks:
 - no extra movie after a deliberately late duplicate WebSocket completion,
   plus cleanup of an already-persisted `/out` versus `/view` duplicate;
 - full video request restoration through **Reuse parameters**.
+
+The Canvas LTX2 request gate additionally checks all 21 native profile choices,
+the enabled Cinemagraph and Foley/V2A contracts, disabled reference-token
+IC-LoRA rows, readiness-driven post-upscaler choices, and exact feature fields
+in mocked I2V/V2V queue requests. The focused Rust suite verifies registry
+uniqueness, feature normalization, profile admission, audio-policy preflight,
+and source-audio remux behavior.
 
 JavaScript syntax checks and the complete Rust workspace tests are required
 alongside the browser gate.

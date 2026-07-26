@@ -452,9 +452,16 @@ pub async fn get_object_info() -> Response {
                 "caps_positive": str_w(),
                 "caps_negative": str_w(),
                 "noise_fixture": str_w(),
-                "include_audio": json!(["BOOLEAN", {"default": false}])
+                "include_audio": json!(["BOOLEAN", {"default": false}]),
+                "audio_policy": combo(&["none".into(),"generate".into(),"preserve".into()]),
+                "feature_id": str_w(),
+                "feature_weight": fl(1.0,-10.0,10.0),
+                "post_upscale_id": str_w(),
+                "post_upscale_factor": int(2,2,4)
             }, "optional": {
                 "guide_image": lk("IMAGE"),
+                "guide_video": lk("VIDEO"),
+                "guide_mask": lk("IMAGE"),
                 "guide_strength": fl(1.0,0.0,1.0),
                 "guide_frame_idx": int(0,0,4095)
             } },

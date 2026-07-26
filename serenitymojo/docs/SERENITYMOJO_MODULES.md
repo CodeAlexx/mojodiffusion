@@ -100,6 +100,18 @@ weights — including the optional per-row per-stream strengths
 `LTX2LoraLoaderAdvanced` intake, only emitted when any ≠ 1.0) — validates cached
 conditioning against the authored prompt, and either
 admits the exact compiled geometry/sampler pair or fails before model loading.
+I2V/V2V requests also carry exact clean-latent masks and per-token model
+timesteps; painted V2V masks use white/edit and black/preserve semantics. The
+seven-case `sampling/parity/ltx2_conditioning_mask_parity.mojo` harness checks
+I2V, uniform and painted V2V, plus the T2V broadcast control.
+
+Special features are stable-ID requests backed by
+`configs/ltx2_feature_adapters.json`, not guessed LoRA filenames. Cinemagraph
+requires I2V, the `CINEMAGRAPH_MOTION` trigger, and an explicit bounded weight.
+Foley/V2A freezes the source video at source strength `1.0` and applies only
+the admitted video-to-audio/audio LoRA streams before generated-audio muxing.
+Reference-conditioned IC-LoRAs remain fail-closed until their feature runner
+is implemented.
 `pipeline/ltx2_t2v_av_hq.mojo` supplies atomic phase/step status plus a result
 manifest containing the executed schedule, artifact geometry/frame count,
 timings, and peak-VRAM sample. Experimental acceptance evidence (2026-07-19):

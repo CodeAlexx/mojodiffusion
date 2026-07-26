@@ -74,6 +74,11 @@ var CanvasTab = (function () {
         capsNegative: '',
         noiseFixture: '',
         includeAudio: false,
+        ltx2AudioPolicy: 'none',
+        ltx2FeatureId: 'standard',
+        ltx2FeatureWeight: 1.0,
+        ltx2PostUpscaler: 'none',
+        ltx2PostUpscaleFactor: 2,
         ltx2Mode: 'distilled',
         ltx2ProfileKey: '',
         ltx2SourceStrength: 0.7,
@@ -1331,7 +1336,22 @@ var CanvasTab = (function () {
             '<input id="cv-caps-negative" class="cv-path-input" type="text" placeholder="Optional when the sidecar contains negative conditioning">' +
             '<label class="cv-setting-label cv-path-label" for="cv-noise-fixture">Noise fixture</label>' +
             '<input id="cv-noise-fixture" class="cv-path-input" type="text" placeholder="Optional server path; blank uses the authored seed">' +
-            '<label class="cv-check-row"><input id="cv-include-audio" type="checkbox"> Decode and mux audio</label>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Audio</span>' +
+            '<select id="cv-ltx2-audio-policy" class="cv-select">' +
+            '<option value="none">No audio</option>' +
+            '<option value="generate">Generate audio</option>' +
+            '<option value="preserve">Preserve V2V source audio</option>' +
+            '</select></div>' +
+            '<label class="cv-setting-label" for="cv-ltx2-feature">Feature workflow</label>' +
+            '<select id="cv-ltx2-feature" class="cv-select"><option value="standard">Standard T2V / I2V / V2V</option></select>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Feature weight</span>' +
+            '<input type="number" id="cv-ltx2-feature-weight" class="cv-number-input" min="-10" max="10" step="0.05" value="1.0"></div>' +
+            '<div id="cv-ltx2-feature-note" class="cv-helper-text">Standard LTX2 generation without a dedicated feature adapter.</div>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Post-upscale</span>' +
+            '<select id="cv-ltx2-post-upscaler" class="cv-select"><option value="none">None</option></select></div>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Upscale factor</span>' +
+            '<select id="cv-ltx2-post-upscale-factor" class="cv-select"><option value="2">2\u00d7</option><option value="4">4\u00d7</option></select></div>' +
+            '<div id="cv-ltx2-post-upscale-note" class="cv-helper-text">Runs after native LTX2 decode. Availability and speed are reported by the server.</div>' +
             '<button id="cv-load-ltx2-template" class="cv-import-btn" type="button">Load verified LTX2 + LoRA template</button>' +
             '<div class="cv-helper-text">The Mojo runner validates these exact values and rejects unsupported compiled profiles before model loading.</div>' +
             '</div>' +
@@ -1440,7 +1460,13 @@ var CanvasTab = (function () {
         els.capsPositive = document.getElementById('cv-caps-positive');
         els.capsNegative = document.getElementById('cv-caps-negative');
         els.noiseFixture = document.getElementById('cv-noise-fixture');
-        els.includeAudio = document.getElementById('cv-include-audio');
+        els.ltx2AudioPolicy = document.getElementById('cv-ltx2-audio-policy');
+        els.ltx2Feature = document.getElementById('cv-ltx2-feature');
+        els.ltx2FeatureWeight = document.getElementById('cv-ltx2-feature-weight');
+        els.ltx2FeatureNote = document.getElementById('cv-ltx2-feature-note');
+        els.ltx2PostUpscaler = document.getElementById('cv-ltx2-post-upscaler');
+        els.ltx2PostUpscaleFactor = document.getElementById('cv-ltx2-post-upscale-factor');
+        els.ltx2PostUpscaleNote = document.getElementById('cv-ltx2-post-upscale-note');
         els.loadLtx2Template = document.getElementById('cv-load-ltx2-template');
         els.modelRow = document.getElementById('cv-model-row');
         els.model = document.getElementById('cv-model');
@@ -3278,6 +3304,7 @@ var CanvasTab = (function () {
                 loras: enabledCanvasLoras(), capsPositive: genState.capsPositive,
                 capsNegative: genState.capsNegative, noiseFixture: genState.noiseFixture,
                 includeAudio: genState.includeAudio,
+                ltx2AudioPolicy: genState.ltx2AudioPolicy,
                 sourceLayerId: active.data.id, sourceLayerName: active.data.name,
                 submittedAt: new Date().toISOString()
             };
@@ -3288,7 +3315,8 @@ var CanvasTab = (function () {
                 negPrompt: genState.negative, sampler: genState.sampler, scheduler: genState.scheduler, batch: genState.batch,
                 frames: genState.frames, fps: genState.fps, loras: enabledCanvasLoras(),
                 capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
-                noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio
+                noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                ltx2AudioPolicy: genState.ltx2AudioPolicy
             };
             queueWorkflow(video ? WorkflowBuilder.build(params) : WorkflowBuilder.buildImg2Img(params));
         }).catch(function (error) {
@@ -3476,7 +3504,24 @@ var CanvasTab = (function () {
         els.capsPositive.addEventListener('input', function () { genState.capsPositive = this.value.trim(); });
         els.capsNegative.addEventListener('input', function () { genState.capsNegative = this.value.trim(); });
         els.noiseFixture.addEventListener('input', function () { genState.noiseFixture = this.value.trim(); });
-        els.includeAudio.addEventListener('change', function () { genState.includeAudio = this.checked; });
+        els.ltx2AudioPolicy.addEventListener('change', function () {
+            genState.ltx2AudioPolicy = this.value;
+            genState.includeAudio = this.value === 'generate';
+        });
+        els.ltx2Feature.addEventListener('change', function () {
+            applyCanvasLtx2Feature(this.value);
+        });
+        els.ltx2FeatureWeight.addEventListener('input', function () {
+            var value = Number(this.value);
+            if (Number.isFinite(value))
+                genState.ltx2FeatureWeight = value;
+        });
+        els.ltx2PostUpscaler.addEventListener('change', function () {
+            applyCanvasLtx2PostUpscaler(this.value);
+        });
+        els.ltx2PostUpscaleFactor.addEventListener('change', function () {
+            genState.ltx2PostUpscaleFactor = Number(this.value);
+        });
         els.ltx2Profile.addEventListener('change', function () {
             var key = this.value;
             var profile = activeCanvasLtx2Profiles().find(function (candidate) {
@@ -4120,6 +4165,11 @@ var CanvasTab = (function () {
             model: genState.model, arch: genState.arch, frames: genState.frames, fps: genState.fps,
             capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
             noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+            ltx2AudioPolicy: genState.ltx2AudioPolicy,
+            ltx2FeatureId: genState.ltx2FeatureId,
+            ltx2FeatureWeight: genState.ltx2FeatureWeight,
+            ltx2PostUpscaler: genState.ltx2PostUpscaler,
+            ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
             ltx2Mode: genState.ltx2Mode, ltx2ProfileKey: genState.ltx2ProfileKey,
             ltx2SourceStrength: genState.ltx2SourceStrength,
             editMode: genState.editMode, editEngine: genState.editEngine,
@@ -4227,6 +4277,16 @@ var CanvasTab = (function () {
                 genState.capsNegative = state.genSettings.capsNegative || '';
                 genState.noiseFixture = state.genSettings.noiseFixture || '';
                 genState.includeAudio = state.genSettings.includeAudio === true;
+                genState.ltx2AudioPolicy = state.genSettings.ltx2AudioPolicy ||
+                    (genState.includeAudio ? 'generate' : 'none');
+                genState.ltx2FeatureId = state.genSettings.ltx2FeatureId || 'standard';
+                genState.ltx2FeatureWeight =
+                    Number.isFinite(Number(state.genSettings.ltx2FeatureWeight))
+                        ? Number(state.genSettings.ltx2FeatureWeight) : 1.0;
+                genState.ltx2PostUpscaler =
+                    state.genSettings.ltx2PostUpscaler || 'none';
+                genState.ltx2PostUpscaleFactor =
+                    Number(state.genSettings.ltx2PostUpscaleFactor) === 4 ? 4 : 2;
                 genState.ltx2Mode = state.genSettings.ltx2Mode || 'distilled';
                 genState.ltx2ProfileKey = state.genSettings.ltx2ProfileKey || '';
                 genState.ltx2SourceStrength = Number.isFinite(Number(state.genSettings.ltx2SourceStrength)) ?
@@ -4288,8 +4348,8 @@ var CanvasTab = (function () {
                     els.capsNegative.value = genState.capsNegative;
                 if (els.noiseFixture)
                     els.noiseFixture.value = genState.noiseFixture;
-                if (els.includeAudio)
-                    els.includeAudio.checked = genState.includeAudio;
+                if (els.ltx2AudioPolicy)
+                    els.ltx2AudioPolicy.value = genState.ltx2AudioPolicy;
                 if (els.ltx2Mode)
                     els.ltx2Mode.value = genState.ltx2Mode;
                 setLtx2SourceStrength(genState.ltx2SourceStrength);
@@ -4469,8 +4529,11 @@ var CanvasTab = (function () {
         }
     }
     function validateCanvasGenerationFeatures(hasContent, hasMask) {
-        if (genState.arch === 'ltxv')
-            return hasMask ? 'LTX2 source conditioning does not admit a painted mask' : '';
+        if (genState.arch === 'ltxv') {
+            if (hasMask && !(editSourceIsVideo && editSourceFile))
+                return 'An LTX2 painted mask requires a loaded V2V source video';
+            return '';
+        }
         var loras = enabledCanvasLoras();
         if (loras.length > 0 && !canvasFeature('lora').supported)
             return canvasFeatureReason('lora');
@@ -4660,6 +4723,15 @@ var CanvasTab = (function () {
             genState.capsNegative = String(samplerValues.caps_negative || '');
             genState.noiseFixture = String(samplerValues.noise_fixture || '');
             genState.includeAudio = samplerValues.include_audio === true;
+            genState.ltx2AudioPolicy = String(samplerValues.audio_policy ||
+                (genState.includeAudio ? 'generate' : 'none'));
+            genState.ltx2FeatureId = String(samplerValues.feature_id || 'standard');
+            genState.ltx2FeatureWeight = Number(samplerValues.feature_weight);
+            if (!Number.isFinite(genState.ltx2FeatureWeight))
+                genState.ltx2FeatureWeight = 1.0;
+            genState.ltx2PostUpscaler = String(samplerValues.post_upscale_id || 'none');
+            genState.ltx2PostUpscaleFactor =
+                Number(samplerValues.post_upscale_factor) === 4 ? 4 : 2;
             genState.ltx2Mode = String(samplerValues.mode || 'distilled');
             canvasLoras = nodes.filter(function (node) {
                 return node.type === 'LoraLoader' || node.type === 'LoraLoaderModelOnly';
@@ -4690,7 +4762,9 @@ var CanvasTab = (function () {
             els.capsPositive.value = genState.capsPositive;
             els.capsNegative.value = genState.capsNegative;
             els.noiseFixture.value = genState.noiseFixture;
-            els.includeAudio.checked = genState.includeAudio;
+            els.ltx2AudioPolicy.value = genState.ltx2AudioPolicy;
+            refreshCanvasLtx2FeatureControls();
+            refreshCanvasLtx2PostUpscaleControls();
             els.ltx2Mode.value = genState.ltx2Mode;
             if (boundingBox) {
                 boundingBox.width(ModelUtils.clampVideoDimension(Number(samplerValues.width)));
@@ -4732,6 +4806,154 @@ var CanvasTab = (function () {
         return profiles.filter(function (profile) {
             return profile && profile.available === true;
         });
+    }
+    function activeCanvasLtx2Features() {
+        var mode = activeCanvasLtx2RequestMode();
+        return mode && Array.isArray(mode.feature_adapters)
+            ? mode.feature_adapters : [];
+    }
+    function canvasLtx2Feature(id) {
+        return activeCanvasLtx2Features().find(function (feature) {
+            return feature && String(feature.id || '') === String(id || '');
+        }) || null;
+    }
+    function admittedCanvasLtx2Feature(feature) {
+        return !!feature && feature.installed === true &&
+            (feature.status === 'overlay_admitted' ||
+                feature.status === 'v2a_admitted');
+    }
+    function applyCanvasLtx2Feature(id) {
+        var feature = id === 'standard' ? null : canvasLtx2Feature(id);
+        if (feature && !admittedCanvasLtx2Feature(feature))
+            feature = null;
+        var changed = genState.ltx2FeatureId !==
+            (feature ? String(feature.id) : 'standard');
+        genState.ltx2FeatureId = feature ? String(feature.id) : 'standard';
+        if (feature && (changed || !Number.isFinite(Number(genState.ltx2FeatureWeight)))) {
+            genState.ltx2FeatureWeight = Number(feature.weight_default);
+            if (!Number.isFinite(genState.ltx2FeatureWeight))
+                genState.ltx2FeatureWeight = 1.0;
+        }
+        if (els.ltx2Feature)
+            els.ltx2Feature.value = genState.ltx2FeatureId;
+        if (els.ltx2FeatureWeight) {
+            els.ltx2FeatureWeight.disabled = !feature;
+            els.ltx2FeatureWeight.value = String(genState.ltx2FeatureWeight);
+            els.ltx2FeatureWeight.min = String(feature && feature.weight_min != null
+                ? feature.weight_min : -10);
+            els.ltx2FeatureWeight.max = String(feature && feature.weight_max != null
+                ? feature.weight_max : 10);
+        }
+        if (!feature) {
+            if (els.ltx2FeatureNote)
+                els.ltx2FeatureNote.textContent =
+                    'Standard LTX2 generation without a dedicated feature adapter.';
+            return;
+        }
+        if (feature.id === 'cinemagraph') {
+            if (els.ltx2FeatureNote)
+                els.ltx2FeatureNote.textContent =
+                    'Requires a loaded source image and the exact prompt trigger CINEMAGRAPH_MOTION. Recommended weight range ' +
+                    feature.weight_min + '\u2013' + feature.weight_max + '.';
+        }
+        else if (feature.id === 'foley-v2a') {
+            genState.ltx2SourceStrength = 1.0;
+            genState.ltx2AudioPolicy = 'generate';
+            genState.includeAudio = true;
+            if (els.ltx2SourceStrength) els.ltx2SourceStrength.value = '1';
+            if (els.ltx2SourceStrengthVal) els.ltx2SourceStrengthVal.textContent = '1.00';
+            if (els.ltx2AudioPolicy) els.ltx2AudioPolicy.value = 'generate';
+            if (els.ltx2FeatureNote)
+                els.ltx2FeatureNote.textContent =
+                    'Requires a source video that exactly matches the selected native profile. The video is frozen; only Foley audio is generated.';
+        }
+    }
+    function refreshCanvasLtx2FeatureControls() {
+        if (!els.ltx2Feature)
+            return;
+        els.ltx2Feature.innerHTML = '';
+        var standard = document.createElement('option');
+        standard.value = 'standard';
+        standard.textContent = 'Standard T2V / I2V / V2V';
+        els.ltx2Feature.appendChild(standard);
+        activeCanvasLtx2Features().forEach(function (feature) {
+            if (!feature || feature.status === 'companion_only')
+                return;
+            var option = document.createElement('option');
+            option.value = String(feature.id || '');
+            option.disabled = !admittedCanvasLtx2Feature(feature);
+            option.textContent = String(feature.label || feature.id) +
+                (feature.installed !== true ? ' \u00b7 weights missing' :
+                    (option.disabled ? ' \u00b7 runtime pending' : ''));
+            option.title = option.disabled
+                ? 'Installed artifact requires a dedicated reference-token feature runner'
+                : '';
+            els.ltx2Feature.appendChild(option);
+        });
+        var selected = canvasLtx2Feature(genState.ltx2FeatureId);
+        applyCanvasLtx2Feature(
+            selected && admittedCanvasLtx2Feature(selected)
+                ? genState.ltx2FeatureId : 'standard'
+        );
+    }
+    function activeCanvasLtx2PostUpscalers() {
+        var mode = activeCanvasLtx2RequestMode();
+        return mode && Array.isArray(mode.post_upscalers)
+            ? mode.post_upscalers : [];
+    }
+    function canvasLtx2PostUpscaler(id) {
+        return activeCanvasLtx2PostUpscalers().find(function (upscaler) {
+            return upscaler && String(upscaler.id || '') === String(id || '');
+        }) || null;
+    }
+    function applyCanvasLtx2PostUpscaler(id) {
+        var upscaler = id === 'none' ? null : canvasLtx2PostUpscaler(id);
+        if (upscaler && upscaler.available !== true)
+            upscaler = null;
+        genState.ltx2PostUpscaler = upscaler ? String(upscaler.id) : 'none';
+        if (els.ltx2PostUpscaler)
+            els.ltx2PostUpscaler.value = genState.ltx2PostUpscaler;
+        var scales = upscaler && Array.isArray(upscaler.scales)
+            ? upscaler.scales.map(Number) : [2, 4];
+        if (upscaler && scales.indexOf(genState.ltx2PostUpscaleFactor) < 0)
+            genState.ltx2PostUpscaleFactor = scales[0];
+        if (els.ltx2PostUpscaleFactor) {
+            Array.from(els.ltx2PostUpscaleFactor.options).forEach(function (option) {
+                option.disabled = upscaler && scales.indexOf(Number(option.value)) < 0;
+            });
+            els.ltx2PostUpscaleFactor.value = String(genState.ltx2PostUpscaleFactor);
+            els.ltx2PostUpscaleFactor.disabled = !upscaler;
+        }
+        if (els.ltx2PostUpscaleNote) {
+            els.ltx2PostUpscaleNote.textContent = !upscaler
+                ? 'Runs after native LTX2 decode. Availability and speed are reported by the server.'
+                : String(upscaler.reason || upscaler.label || upscaler.id);
+        }
+    }
+    function refreshCanvasLtx2PostUpscaleControls() {
+        if (!els.ltx2PostUpscaler)
+            return;
+        els.ltx2PostUpscaler.innerHTML = '';
+        var none = document.createElement('option');
+        none.value = 'none';
+        none.textContent = 'None';
+        els.ltx2PostUpscaler.appendChild(none);
+        activeCanvasLtx2PostUpscalers().forEach(function (upscaler) {
+            if (!upscaler)
+                return;
+            var option = document.createElement('option');
+            option.value = String(upscaler.id || '');
+            option.disabled = upscaler.available !== true;
+            option.textContent = String(upscaler.label || upscaler.id) +
+                (upscaler.status === 'experimental_slow' ? ' \u00b7 slow' :
+                    (option.disabled ? ' \u00b7 unavailable' : ''));
+            els.ltx2PostUpscaler.appendChild(option);
+        });
+        var selected = canvasLtx2PostUpscaler(genState.ltx2PostUpscaler);
+        applyCanvasLtx2PostUpscaler(
+            selected && selected.available === true
+                ? genState.ltx2PostUpscaler : 'none'
+        );
     }
     function canvasLtx2ProfileKey(profile) {
         if (!profile)
@@ -4989,6 +5211,8 @@ var CanvasTab = (function () {
                 { value: 'ltx2_distilled', label: 'LTX2 Distilled (8 steps)' }
             ], genState.ltx2Mode === 'distilled' ? 'ltx2_distilled' : 'ltx2');
             refreshCanvasLtx2ProfileControls();
+            refreshCanvasLtx2FeatureControls();
+            refreshCanvasLtx2PostUpscaleControls();
             applyCanvasLtx2GuidanceMode();
         }
         else {
@@ -5224,10 +5448,51 @@ var CanvasTab = (function () {
         var isVideo = isVideoArch();
         var hasLtx2VideoSource = genState.arch === 'ltxv' &&
             editSourceIsVideo && !!editSourceFile;
+        var activeLtx2Feature = genState.arch === 'ltxv' &&
+            genState.ltx2FeatureId !== 'standard'
+            ? canvasLtx2Feature(genState.ltx2FeatureId) : null;
+        if (genState.arch === 'ltxv' &&
+            genState.ltx2FeatureId !== 'standard' &&
+            !admittedCanvasLtx2Feature(activeLtx2Feature)) {
+            showError('The selected LTX2 feature workflow is not runtime-admitted');
+            setCanvasGenerating(false);
+            return;
+        }
+        if (activeLtx2Feature && activeLtx2Feature.id === 'cinemagraph' &&
+            genState.prompt.indexOf('CINEMAGRAPH_MOTION') < 0) {
+            showError('Cinemagraph requires the exact prompt trigger CINEMAGRAPH_MOTION');
+            setCanvasGenerating(false);
+            return;
+        }
+        if (activeLtx2Feature && activeLtx2Feature.id === 'foley-v2a' &&
+            (!hasLtx2VideoSource || genState.ltx2SourceStrength !== 1 ||
+                genState.ltx2AudioPolicy !== 'generate')) {
+            showError('Foley requires a loaded V2V source, Source strength 1.00, and Audio Generate');
+            setCanvasGenerating(false);
+            return;
+        }
+        if (genState.arch === 'ltxv' &&
+            genState.ltx2AudioPolicy === 'preserve' &&
+            !hasLtx2VideoSource) {
+            showError('Preserve source audio requires a loaded V2V source video with audio');
+            setCanvasGenerating(false);
+            return;
+        }
         var maskedEditEngine = genState.editMode === 'inpaint' ? maskedEditEngineDefinition(genState.lanpaintEngine) : null;
         checkBboxContent().then(function (hasContent) {
             var maskLayerInfo = getMaskLayer();
             var hasMask = maskLayerInfo && maskLayerInfo.konvaLayer.getChildren().length > 0;
+            if (activeLtx2Feature && activeLtx2Feature.id === 'cinemagraph' &&
+                (!hasContent || hasLtx2VideoSource)) {
+                showError('Cinemagraph requires one source image, not T2V or V2V');
+                setCanvasGenerating(false);
+                return;
+            }
+            if (activeLtx2Feature && activeLtx2Feature.id === 'foley-v2a' && hasMask) {
+                showError('Foley freezes the complete source video and cannot use a painted mask');
+                setCanvasGenerating(false);
+                return;
+            }
             if (genState.editMode === 'inpaint' && !hasContent) {
                 showError('Load or select an image before starting the masked edit');
                 setCanvasGenerating(false);
@@ -5287,6 +5552,11 @@ var CanvasTab = (function () {
                 capsNegative: genState.capsNegative,
                 noiseFixture: genState.noiseFixture,
                 includeAudio: genState.includeAudio,
+                ltx2AudioPolicy: genState.ltx2AudioPolicy,
+                ltx2FeatureId: genState.ltx2FeatureId,
+                ltx2FeatureWeight: genState.ltx2FeatureWeight,
+                ltx2PostUpscaler: genState.ltx2PostUpscaler,
+                ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                 editMode: genState.editMode,
                 maskedEdit: maskedEditEngine ? {
                     engine: maskedEditEngine.id,
@@ -5313,10 +5583,20 @@ var CanvasTab = (function () {
             var ltx2V2V = genState.arch === 'ltxv' && isVideo && hasLtx2VideoSource;
             var ltx2I2V = genState.arch === 'ltxv' && isVideo && hasContent && !ltx2V2V;
             if (ltx2V2V) {
-                SerenityAPI.uploadMedia(editSourceFile).then(function (videoName) {
+                Promise.all([
+                    SerenityAPI.uploadMedia(editSourceFile),
+                    hasMask ? exportMaskAsBW().then(function (mask) {
+                        if (!mask || !mask.base64)
+                            throw new Error('The painted V2V mask could not be exported');
+                        return uploadInitImage(mask.base64);
+                    }) : Promise.resolve('')
+                ]).then(function (uploaded) {
+                    var videoName = uploaded[0];
+                    var videoMaskName = uploaded[1];
                     queueWorkflow(WorkflowBuilder.build({
                         model: genState.model || '', prompt: genState.prompt,
                         initVideoName: videoName,
+                        videoMaskName: videoMaskName,
                         videoStrength: genState.ltx2SourceStrength,
                         width: bw, height: bh,
                         steps: genState.steps, cfg: genState.cfg,
@@ -5325,10 +5605,15 @@ var CanvasTab = (function () {
                         frames: genState.frames, fps: genState.fps, loras: activeLoras,
                         capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
                         noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                        ltx2AudioPolicy: genState.ltx2AudioPolicy,
+                        ltx2FeatureId: genState.ltx2FeatureId,
+                        ltx2FeatureWeight: genState.ltx2FeatureWeight,
+                        ltx2PostUpscaler: genState.ltx2PostUpscaler,
+                        ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                         ltx2Mode: genState.ltx2Mode
                     }));
                 }).catch(function (err) {
-                    showError('Video source upload failed: ' + err.message);
+                    showError('V2V source upload failed: ' + err.message);
                     setCanvasGenerating(false);
                 });
             }
@@ -5342,6 +5627,11 @@ var CanvasTab = (function () {
                     frames: genState.frames, fps: genState.fps, loras: activeLoras,
                     capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
                     noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                    ltx2AudioPolicy: genState.ltx2AudioPolicy,
+                    ltx2FeatureId: genState.ltx2FeatureId,
+                    ltx2FeatureWeight: genState.ltx2FeatureWeight,
+                    ltx2PostUpscaler: genState.ltx2PostUpscaler,
+                    ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                     ltx2Mode: genState.ltx2Mode
                 }));
             }
@@ -5360,6 +5650,11 @@ var CanvasTab = (function () {
                         frames: genState.frames, fps: genState.fps, loras: activeLoras,
                         capsPositive: genState.capsPositive, capsNegative: genState.capsNegative,
                         noiseFixture: genState.noiseFixture, includeAudio: genState.includeAudio,
+                        ltx2AudioPolicy: genState.ltx2AudioPolicy,
+                        ltx2FeatureId: genState.ltx2FeatureId,
+                        ltx2FeatureWeight: genState.ltx2FeatureWeight,
+                        ltx2PostUpscaler: genState.ltx2PostUpscaler,
+                        ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                         ltx2Mode: genState.ltx2Mode
                     }));
                 }).catch(function (err) {

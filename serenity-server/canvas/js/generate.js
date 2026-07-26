@@ -65,6 +65,7 @@ var GenerateTab = (function () {
         capsNegative: '',
         noiseFixture: '',
         includeAudio: false,
+        audioPolicy: 'none',
         postUpscaler: 'none',
         postUpscaleFactor: 2,
         noSeedIncrement: false,
@@ -575,7 +576,8 @@ var GenerateTab = (function () {
             '<select id="gen-video-guidance-mode" class="gen-select"><option value="distilled">Distilled</option><option value="dev">Dev CFG</option></select></div>' +
             '<div class="gen-param-row" data-param-search="quant fp8 int4"><label class="gen-label" for="gen-video-quant">Quantization</label>' +
             '<select id="gen-video-quant" class="gen-select"><option value="fp8">FP8</option><option value="int4">INT4</option></select></div>' +
-            '<label class="gen-check-row gen-param-row" data-param-search="audio include audio"><input id="gen-include-audio" type="checkbox"> Include generated audio</label>';
+            '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
+            '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>';
         var videoConditioningBody =
             '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
             '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
@@ -1320,7 +1322,7 @@ var GenerateTab = (function () {
         els.capsPositive = document.getElementById('gen-caps-positive');
         els.capsNegative = document.getElementById('gen-caps-negative');
         els.noiseFixture = document.getElementById('gen-noise-fixture');
-        els.includeAudio = document.getElementById('gen-include-audio');
+        els.audioPolicy = document.getElementById('gen-audio-policy');
         els.postUpscaler = document.getElementById('gen-post-upscaler');
         els.postUpscaleFactor = document.getElementById('gen-post-upscale-factor');
         els.postUpscaleNote = document.getElementById('gen-post-upscale-note');
@@ -2159,8 +2161,11 @@ var GenerateTab = (function () {
             els.capsNegative.addEventListener('input', function () { state.capsNegative = this.value; });
         if (els.noiseFixture)
             els.noiseFixture.addEventListener('input', function () { state.noiseFixture = this.value; });
-        if (els.includeAudio)
-            els.includeAudio.addEventListener('change', function () { state.includeAudio = this.checked; });
+        if (els.audioPolicy)
+            els.audioPolicy.addEventListener('change', function () {
+                state.audioPolicy = this.value;
+                state.includeAudio = this.value === 'generate';
+            });
         if (els.postUpscaler) {
             els.postUpscaler.addEventListener('change', function () {
                 state.postUpscaler = this.value || 'none';
@@ -3289,8 +3294,8 @@ var GenerateTab = (function () {
             els.videoCheckpoint.value = state.videoCheckpoint;
         if (els.videoQuant)
             els.videoQuant.value = state.videoQuant;
-        if (els.includeAudio)
-            els.includeAudio.checked = state.includeAudio;
+        if (els.audioPolicy)
+            els.audioPolicy.value = state.audioPolicy;
         if (els.capsPositive)
             els.capsPositive.value = state.capsPositive;
         if (els.capsNegative)
@@ -3742,6 +3747,8 @@ var GenerateTab = (function () {
             caps_negative: state.capsNegative.trim(),
             noise_fixture: state.noiseFixture.trim(),
             include_audio: state.includeAudio === true,
+            audio_policy: state.audioPolicy ||
+                (state.includeAudio === true ? 'generate' : 'none'),
             post_upscale: state.postUpscaler === 'none'
                 ? { id: 'none', factor: 1 }
                 : {
@@ -4108,6 +4115,7 @@ var GenerateTab = (function () {
             capsNegative: item.capsNegative,
             noiseFixture: item.noiseFixture,
             includeAudio: item.includeAudio,
+            audioPolicy: item.audioPolicy,
             postUpscaler: item.postUpscaler,
             postUpscaleFactor: item.postUpscaleFactor,
             noSeedIncrement: item.noSeedIncrement,
@@ -4243,6 +4251,8 @@ var GenerateTab = (function () {
             capsNegative: value('capsNegative', ''),
             noiseFixture: value('noiseFixture', ''),
             includeAudio: value('includeAudio', false),
+            audioPolicy: value('audioPolicy',
+                value('audio_policy', value('includeAudio', false) ? 'generate' : 'none')),
             postUpscaler: value('postUpscaler', state.postUpscaler),
             postUpscaleFactor: value('postUpscaleFactor', state.postUpscaleFactor),
             sigmaShift: value('sigmaShift', value('sigma_shift', state.sigmaShift)),
@@ -5118,7 +5128,8 @@ var GenerateTab = (function () {
         if (item.videoQuant)
             fullPairs.push('<span class="gen-metadata-key">Quantization:</span> <span class="gen-metadata-val">' + escapeHtml(item.videoQuant) + '</span>');
         if (item.isVideo)
-            fullPairs.push('<span class="gen-metadata-key">Audio:</span> <span class="gen-metadata-val">' + (item.includeAudio ? 'included' : 'off') + '</span>');
+            fullPairs.push('<span class="gen-metadata-key">Audio:</span> <span class="gen-metadata-val">' +
+                escapeHtml(item.audioPolicy || (item.includeAudio ? 'generate' : 'none')) + '</span>');
         if (item.timestamp)
             fullPairs.push('<span class="gen-metadata-key">Time:</span> <span class="gen-metadata-val">' + new Date(item.timestamp).toLocaleString() + '</span>');
         full.innerHTML = fullPairs.join('<br>');
@@ -5475,6 +5486,7 @@ var GenerateTab = (function () {
             capsNegative: state.capsNegative,
             noiseFixture: state.noiseFixture,
             includeAudio: state.includeAudio,
+            audioPolicy: state.audioPolicy,
             postUpscaler: state.postUpscaler,
             postUpscaleFactor: state.postUpscaleFactor,
             noSeedIncrement: state.noSeedIncrement,
@@ -5575,6 +5587,12 @@ var GenerateTab = (function () {
             state.includeAudio = params.includeAudio;
         else if (typeof params.include_audio === 'boolean')
             state.includeAudio = params.include_audio;
+        if (typeof params.audioPolicy === 'string')
+            state.audioPolicy = params.audioPolicy;
+        else if (typeof params.audio_policy === 'string')
+            state.audioPolicy = params.audio_policy;
+        else
+            state.audioPolicy = state.includeAudio ? 'generate' : 'none';
         var postUpscale = params.post_upscale && typeof params.post_upscale === 'object'
             ? params.post_upscale : null;
         if (typeof params.postUpscaler === 'string')
@@ -5663,8 +5681,8 @@ var GenerateTab = (function () {
             els.capsNegative.value = state.capsNegative;
         if (els.noiseFixture)
             els.noiseFixture.value = state.noiseFixture;
-        if (els.includeAudio)
-            els.includeAudio.checked = state.includeAudio;
+        if (els.audioPolicy)
+            els.audioPolicy.value = state.audioPolicy;
         refreshLtx2PostUpscaleControls();
         if (els.sigmaShift)
             els.sigmaShift.value = String(state.sigmaShift);

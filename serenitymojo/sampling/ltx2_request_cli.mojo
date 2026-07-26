@@ -185,6 +185,9 @@ def _resolve_caps_sidecar(
 
 
 def _configure_loras(obj: JSONValue) raises:
+    var request_feature_id = _optional_string(
+        obj, String("feature_id")
+    )
     var count = 0
     if obj.contains(String("lora")):
         if not obj[String("lora")].is_array():
@@ -206,9 +209,33 @@ def _configure_loras(obj: JSONValue) raises:
             weight = row[String("weight")].as_float()
         if weight < -10.0 or weight > 10.0:
             raise Error(String("LTX2 request: lora[") + String(i) + String("].weight must be in [-10, 10]"))
+        var resolved_path = _resolve_lora_path(name)
+        var classified_name = resolved_path.lower()
+        var row_feature_id = _optional_string(row, String("feature_id"))
+        var feature_usage = _optional_string(row, String("feature_usage"))
+        var is_foley = (
+            classified_name.find(String("lora-foley-v2a")) >= 0
+        )
+        if classified_name.find(String("ic-lora")) >= 0 or (
+            classified_name.find(String("ic_lora")) >= 0
+        ):
+            raise Error(
+                String("LTX2 request: lora[") + String(i) + String("] '")
+                + name
+                + String("' is a feature adapter, not an ordinary LoRA overlay")
+            )
+        if is_foley and (
+            request_feature_id != String("foley-v2a")
+            or row_feature_id != String("foley-v2a")
+            or feature_usage != String("v2a_feature")
+        ):
+            raise Error(
+                String("LTX2 request: Foley may only be loaded by the ")
+                + String("dedicated feature_id=foley-v2a request contract")
+            )
         _setenv(
             String("LTX2_TRAINED_LORA_") + String(i),
-            _resolve_lora_path(name),
+            resolved_path,
         )
         _setenv(
             String("LTX2_TRAINED_LORA_NAME_") + String(i), name,
@@ -243,6 +270,17 @@ def _configure_loras(obj: JSONValue) raises:
                 if v != 1.0:
                     any_stream = True
             stream_vals.append(v)
+        if is_foley and (
+            stream_vals[0] != 0.0
+            or stream_vals[1] != 1.0
+            or stream_vals[2] != 1.0
+            or stream_vals[3] != 0.0
+            or stream_vals[4] != 1.0
+        ):
+            raise Error(
+                String("LTX2 request: Foley stream contract must be ")
+                + String("video=0,v2a=1,audio=1,a2v=0,other=1")
+            )
         if any_stream:
             var enc = String("")
             for j in range(len(stream_vals)):
@@ -327,9 +365,76 @@ def _run_request(request_path: String, out_dir: String) raises:
         raise Error(
             "LTX2 request: video_strength requires a non-empty video_path"
         )
+    var video_mask_path = _optional_string(
+        obj, String("video_mask_path")
+    )
+    if (
+        video_mask_path.byte_length() > 0
+        and not _path_exists(video_mask_path)
+    ):
+        raise Error(
+            String("LTX2 request: video_mask_path not found: ")
+            + video_mask_path
+        )
+    if (
+        video_mask_path.byte_length() > 0
+        and video_path.byte_length() == 0
+    ):
+        raise Error(
+            "LTX2 request: video_mask_path requires a non-empty video_path"
+        )
     if image_path.byte_length() > 0 and video_path.byte_length() > 0:
         raise Error(
             "LTX2 request: image_path and video_path are mutually exclusive"
+        )
+    var include_audio = _optional_bool(
+        obj, String("include_audio"), False
+    )
+    var audio_policy = _optional_string(obj, String("audio_policy")).lower()
+    if audio_policy.byte_length() == 0:
+        audio_policy = String("generate") if include_audio else String("none")
+    if (
+        audio_policy != String("none")
+        and audio_policy != String("generate")
+        and audio_policy != String("preserve")
+    ):
+        raise Error(
+            "LTX2 request: audio_policy must be none, generate, or preserve"
+        )
+    if (audio_policy == String("generate")) != include_audio:
+        raise Error(
+            "LTX2 request: audio_policy conflicts with include_audio"
+        )
+    if audio_policy == String("preserve") and video_path.byte_length() == 0:
+        raise Error(
+            "LTX2 request: audio_policy preserve requires video_path"
+        )
+    var feature_id = _optional_string(obj, String("feature_id"))
+    if feature_id == String("foley-v2a"):
+        if video_path.byte_length() == 0:
+            raise Error("LTX2 request: Foley requires video_path")
+        if video_mask_path.byte_length() > 0:
+            raise Error("LTX2 request: Foley does not accept video_mask_path")
+        if video_strength != 1.0:
+            raise Error(
+                "LTX2 request: Foley requires video_strength=1.0"
+            )
+        if audio_policy != String("generate") or not include_audio:
+            raise Error(
+                "LTX2 request: Foley requires generated audio"
+            )
+    elif feature_id == String("cinemagraph"):
+        if image_path.byte_length() == 0:
+            raise Error("LTX2 request: Cinemagraph requires image_path")
+        if prompt.find(String("CINEMAGRAPH_MOTION")) < 0:
+            raise Error(
+                String("LTX2 request: Cinemagraph requires exact trigger ")
+                + String("CINEMAGRAPH_MOTION")
+            )
+    elif feature_id.byte_length() > 0 and feature_id != String("standard"):
+        raise Error(
+            String("LTX2 request: unsupported admitted feature_id '")
+            + feature_id + String("'")
         )
     _configure_loras(obj)
     var quant = _require_string(obj, String("quant")).lower()
@@ -367,7 +472,8 @@ def _run_request(request_path: String, out_dir: String) raises:
         image_strength,
         video_path,
         video_strength,
-        _optional_bool(obj, String("include_audio"), False),
+        video_mask_path,
+        include_audio,
         _optional_bool(obj, String("defer_decode"), False),
         out_dir,
     )

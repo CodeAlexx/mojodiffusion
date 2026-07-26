@@ -21,7 +21,10 @@ Its current measured state is:
 - the request-driven pure-Mojo LTX-2.3 path accepts the UI's selected quant
   mode and LoRA list; its resident SVD-int4/factorized-LoRA profile produced a
   visually inspected 512x768, 121-frame movie in 52.36 seconds, with an
-  Nsight-guided cold HQ121 decode reduction from 25.95 to 7.32 seconds;
+  Nsight-guided cold HQ121 decode reduction from 25.95 to 7.32 seconds; I2V,
+  masked V2V, explicit source/generated/no-audio policies, Cinemagraph, and
+  Foley/V2A use the same request-driven path, while reference-token IC-LoRA
+  features remain fail-closed until their dedicated runner is admitted;
 - Serenity's browser Video Edit tab uses the separately vendored Genesis
   Rust/C/FFmpeg/OpenCL compositor for timeline preview, media analysis, LUT
   previews, and export; it does not launch Genesis's native UI or call Mojo;

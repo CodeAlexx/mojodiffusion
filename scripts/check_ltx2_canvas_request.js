@@ -32,6 +32,8 @@ function assert(value, message) {
   const sourceVideoPath = String(process.env.LTX2_V2V_SOURCE || "").trim();
   const sourceImagePath = String(process.env.LTX2_I2V_SOURCE || "").trim();
   const screenshotPath = String(process.env.LTX2_UI_SCREENSHOT || "").trim();
+  const featureId = String(process.env.LTX2_FEATURE || "standard").trim() || "standard";
+  const featureWeightText = String(process.env.LTX2_FEATURE_WEIGHT || "").trim();
   const skipTemplate = process.env.LTX2_SKIP_TEMPLATE === "1";
   let request = null;
 
@@ -118,6 +120,38 @@ function assert(value, message) {
     assert(profileValues.length >= 21, `expected all available LTX2 profiles, got ${profileValues.length}`);
     assert(profileValues.includes("960x544_241f_24fps"), "missing 540p landscape 10s profile");
     assert(profileValues.includes("1088x1920_121f_24fps"), "missing 1080p portrait profile");
+    const features = await page.locator("#cv-ltx2-feature option").evaluateAll(
+      (options) => options.map((option) => ({
+        value: option.value,
+        disabled: option.disabled,
+        text: option.textContent,
+      })),
+    );
+    const cinemagraph = features.find((feature) => feature.value === "cinemagraph");
+    const foley = features.find((feature) => feature.value === "foley-v2a");
+    const icPending = features.find((feature) => feature.value === "clean-plate");
+    assert(cinemagraph && !cinemagraph.disabled, "Cinemagraph feature must be admitted");
+    assert(foley && !foley.disabled, "Foley feature must be admitted");
+    assert(icPending && icPending.disabled, "IC-LoRA feature must remain disabled until its runner is admitted");
+    assert(await page.locator("#cv-ltx2-feature-weight").isDisabled(),
+      "feature weight must be disabled for the standard workflow");
+    const upscalers = await page.locator("#cv-ltx2-post-upscaler option").evaluateAll(
+      (options) => options.map((option) => ({
+        value: option.value,
+        disabled: option.disabled,
+        text: option.textContent,
+      })),
+    );
+    const realesrgan = upscalers.find((upscaler) => upscaler.value === "realesrgan-x4plus");
+    const realesrganFast = upscalers.find((upscaler) => upscaler.value === "realesrgan-fast-x4v3");
+    const seedvr2 = upscalers.find((upscaler) => upscaler.value === "seedvr2-3b");
+    assert(realesrgan && !realesrgan.disabled, "installed Real-ESRGAN must be selectable");
+    assert(realesrganFast && realesrganFast.disabled, "missing fast Real-ESRGAN must be disabled");
+    assert(seedvr2 && seedvr2.disabled, "source-only SeedVR2 must be disabled");
+    await page.selectOption("#cv-ltx2-post-upscaler", "realesrgan-x4plus");
+    assert(!(await page.locator("#cv-ltx2-post-upscale-factor").isDisabled()),
+      "post-upscale factor must be enabled for an admitted upscaler");
+    await page.selectOption("#cv-ltx2-post-upscaler", "none");
     await page.selectOption("#cv-ltx2-profile", "960x544_241f_24fps");
     await page.waitForFunction(() => (
       document.querySelector("#cv-bbox-w")?.value === "960"
@@ -129,7 +163,9 @@ function assert(value, message) {
     if (screenshotPath)
       await page.screenshot({ path: screenshotPath, fullPage: true });
     if (skipTemplate) {
-      await page.locator("#cv-prompt").fill("A calm portrait comes alive with subtle natural motion");
+      await page.locator("#cv-prompt").fill(featureId === "cinemagraph"
+        ? "CINEMAGRAPH_MOTION only the candle flame moves"
+        : "A calm portrait comes alive with subtle natural motion and natural Foley sound");
       await page.locator("#cv-caps-positive").fill("");
       await page.locator("#cv-caps-positive").dispatchEvent("input");
     } else {
@@ -153,6 +189,13 @@ function assert(value, message) {
       await page.setInputFiles("#cv-import-file", sourceImagePath);
       await page.waitForSelector("#cv-source-preview", { state: "visible" });
       await page.waitForTimeout(100);
+    }
+    if (featureId !== "standard") {
+      await page.selectOption("#cv-ltx2-feature", featureId);
+      if (featureWeightText) {
+        await page.locator("#cv-ltx2-feature-weight").fill(featureWeightText);
+        await page.locator("#cv-ltx2-feature-weight").dispatchEvent("input");
+      }
     }
     await page.click("#cv-generate-btn");
     if (realRun) {
@@ -193,7 +236,8 @@ function assert(value, message) {
     if (sourceVideoPath) {
       assert(typeof request.video_path === "string" && request.video_path.endsWith(".mp4"),
         `video_path=${request.video_path}`);
-      assert(request.video_strength === 0.7, `video_strength=${request.video_strength}`);
+      assert(request.video_strength === (featureId === "foley-v2a" ? 1 : 0.7),
+        `video_strength=${request.video_strength}`);
       assert(!request.image_path, `unexpected image_path=${request.image_path}`);
     }
     if (sourceImagePath) {
@@ -203,6 +247,18 @@ function assert(value, message) {
       assert(!request.video_path, `unexpected video_path=${request.video_path}`);
     }
     assert(Array.isArray(request.lora), "lora request field is not an array");
+    assert(request.feature_id === featureId, `feature_id=${request.feature_id}`);
+    if (featureId !== "standard") {
+      const expectedWeight = featureWeightText
+        ? Number(featureWeightText)
+        : (featureId === "cinemagraph" ? 0.9 : 1.0);
+      assert(request.feature_weight === expectedWeight,
+        `feature_weight=${request.feature_weight}`);
+    }
+    if (featureId === "foley-v2a") {
+      assert(request.include_audio === true, "Foley must generate audio");
+      assert(request.audio_policy === "generate", `audio_policy=${request.audio_policy}`);
+    }
     if (skipTemplate) {
       assert(request.lora.length === 0, `unexpected lora count=${request.lora.length}`);
       assert(request.caps_positive === "", `automatic conditioning override=${request.caps_positive}`);

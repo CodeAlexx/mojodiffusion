@@ -108,6 +108,7 @@ from serenitymojo.models.upsampler.ltx2_upsampler import (
 from serenitymojo.image.png import save_png, save_rgb24_video, ValueRange
 from serenitymojo.serve.image_io import (
     decode_image_any, image_bilinear_center_crop_to_signed_nchw,
+    image_rgb_at,
     raw_rgb24_video_to_signed_ncdhw_bf16_device,
 )
 from serenitymojo.components.artifacts import shell_quote
@@ -1161,6 +1162,57 @@ struct _Mod(Movable):
         self.v_prompt_ts = v_prompt_ts^; self.a_prompt_ts = a_prompt_ts^
 
 
+def _request_hq_video_timestep_values(
+    sigma: Float32,
+    sequence_tokens: Int,
+    conditioned_video_tokens: Int,
+    conditioned_video_denoise: Float32,
+    uniform_timestep: Bool = False,
+    conditioned_video_denoise_values: Optional[List[Float32]] = None,
+) raises -> List[Float32]:
+    """Materialize the official `sigma * denoise_mask` video timesteps.
+
+    Pure T2V may retain one broadcast row. I2V uses a conditioned prefix and
+    V2V conditions the complete sequence, so those paths always materialize
+    every token. Values include LTX2's required timestep multiplier.
+    """
+    if sequence_tokens <= 0:
+        raise Error("LTX2 request: video sequence token count must be positive")
+    if conditioned_video_tokens < 0 or conditioned_video_tokens > sequence_tokens:
+        raise Error("LTX2 request: conditioned video token count out of range")
+    if (
+        conditioned_video_denoise < Float32(0.0)
+        or conditioned_video_denoise > Float32(1.0)
+    ):
+        raise Error("LTX2 request: conditioned video denoise must be in [0, 1]")
+    var explicit_values = List[Float32]()
+    if conditioned_video_denoise_values:
+        explicit_values = conditioned_video_denoise_values.value().copy()
+        if len(explicit_values) != sequence_tokens:
+            raise Error(
+                "LTX2 request: explicit video denoise mask length mismatch"
+            )
+        for value in explicit_values:
+            if value < Float32(0.0) or value > Float32(1.0):
+                raise Error(
+                    "LTX2 request: explicit video denoise values must be in [0, 1]"
+                )
+    var rows = (
+        1 if uniform_timestep and conditioned_video_tokens == 0
+        and len(explicit_values) == 0
+        else sequence_tokens
+    )
+    var values = List[Float32]()
+    for i in range(rows):
+        var token_denoise = Float32(1.0)
+        if len(explicit_values) > 0:
+            token_denoise = explicit_values[i]
+        elif i < conditioned_video_tokens:
+            token_denoise = conditioned_video_denoise
+        values.append(sigma * token_denoise * TS_MULT)
+    return values^
+
+
 def _build_mod_dims(
     st: ShardedSafeTensors,
     gw: Dict[String, ArcPointer[Tensor]],
@@ -1171,34 +1223,24 @@ def _build_mod_dims(
     uniform_timestep: Bool = False,
     conditioned_video_tokens: Int = 0,
     conditioned_video_denoise: Float32 = 1.0,
+    conditioned_video_denoise_values: Optional[List[Float32]] = None,
 ) raises -> _Mod:
     # Pure T2V uses one sigma for every video token. The AV block's modulation
     # ops are broadcast-aware, so retaining one video row avoids a multi-GiB
     # full-grid tensor. Keep audio/prompt rows materialized: bounded Creator
     # parity measured a small audio first-denoiser drift when those were also
     # broadcast, and their memory cost is bounded.
-    if conditioned_video_tokens < 0 or conditioned_video_tokens > s_v:
-        raise Error("_build_mod_dims: conditioned video token count out of range")
-    if (
-        conditioned_video_denoise < Float32(0.0)
-        or conditioned_video_denoise > Float32(1.0)
-    ):
-        raise Error("_build_mod_dims: conditioned video denoise must be in [0, 1]")
     # A conditioned frame makes the model timestep spatially non-uniform:
     # official `timesteps_from_mask` is `sigma * denoise_mask`, so preserved
     # frame-zero tokens receive zero at strength 1.0. Stage 2 normally uses one
     # broadcast row; materialize its rows only when I2V requires the prefix.
-    var v_rows = (
-        1 if uniform_timestep and conditioned_video_tokens == 0 else s_v
+    var ts_v = _request_hq_video_timestep_values(
+        sigma, s_v, conditioned_video_tokens, conditioned_video_denoise,
+        uniform_timestep, conditioned_video_denoise_values,
     )
+    var v_rows = len(ts_v)
     var a_rows = s_a
     var prompt_rows = N_TXT
-    var ts_v = List[Float32]()
-    for i in range(v_rows):
-        var token_denoise = Float32(1.0)
-        if i < conditioned_video_tokens:
-            token_denoise = conditioned_video_denoise
-        ts_v.append(sigma * token_denoise * TS_MULT)
     var vt = _adaln_single(st, gw, String("adaln_single"), ts_v, ctx)
     var v_temb = reshape(vt[0], _sh3(1, v_rows, 9 * VD), ctx)
     var v_embedded = reshape(vt[1], _sh3(1, v_rows, VD), ctx)
@@ -2231,6 +2273,7 @@ def run_request_profile(
     image_strength: Float64,
     video_path: String,
     video_strength: Float64,
+    video_mask_path: String,
     include_audio: Bool,
     defer_decode: Bool,
     out_dir: String,
@@ -2290,6 +2333,10 @@ def run_request_profile(
         raise Error(
             "LTX2 request: video_strength requires a non-empty video_path"
         )
+    if video_mask_path.byte_length() > 0 and video_path.byte_length() == 0:
+        raise Error(
+            "LTX2 request: video_mask_path requires a non-empty video_path"
+        )
     if image_path.byte_length() > 0 and video_path.byte_length() > 0:
         raise Error(
             "LTX2 request: image_path and video_path are mutually exclusive"
@@ -2334,8 +2381,8 @@ def run_request_profile(
     run_request_hq(
         context_path, negative_context_path, contexts_are_projected,
         noise_fixture_path, image_path, Float32(image_strength),
-        video_path, Float32(video_strength), out_dir, seed, include_audio,
-        quant, steps, guidance_mode, defer_decode,
+        video_path, Float32(video_strength), video_mask_path, out_dir, seed,
+        include_audio, quant, steps, guidance_mode, defer_decode,
     )
 
 
@@ -3706,6 +3753,87 @@ def _request_hq_v2v_mask(
     )
 
 
+def _request_hq_v2v_spatial_mask_values(
+    mask_path: String,
+    nf: Int,
+    nh: Int,
+    nw: Int,
+    conditioned_denoise: Float32,
+) raises -> List[Float32]:
+    """Downsample a painted image mask onto LTX2's patchified video grid.
+
+    The Canvas convention is white=edit and black=preserve. LTX2's official
+    denoise mask has the same direction: zero preserves the clean source while
+    larger values admit more noise. Max pooling makes a thin painted stroke
+    survive the 32-pixel latent cell reduction, and the static image is tiled
+    through all latent frames.
+    """
+    if nf <= 0 or nh <= 0 or nw <= 0:
+        raise Error("LTX2 V2V mask: latent grid dimensions must be positive")
+    if conditioned_denoise < Float32(0.0) or conditioned_denoise > Float32(1.0):
+        raise Error("LTX2 V2V mask: conditioned denoise must be in [0, 1]")
+    var image = decode_image_any(mask_path)
+    var px: List[Int] = [0, 0, 0]
+    var spatial = List[Float32]()
+    var edited_cells = 0
+    for h in range(nh):
+        var y0 = (h * image.height) // nh
+        var y1 = ((h + 1) * image.height + nh - 1) // nh
+        if y1 <= y0:
+            y1 = y0 + 1
+        if y1 > image.height:
+            y1 = image.height
+        for w in range(nw):
+            var x0 = (w * image.width) // nw
+            var x1 = ((w + 1) * image.width + nw - 1) // nw
+            if x1 <= x0:
+                x1 = x0 + 1
+            if x1 > image.width:
+                x1 = image.width
+            var peak = 0
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    image_rgb_at(image, x, y, px)
+                    var value = max(px[0], max(px[1], px[2]))
+                    if value > peak:
+                        peak = value
+            var edit = Float32(peak) / Float32(255.0)
+            if edit > Float32(0.0):
+                edited_cells += 1
+            spatial.append(edit * conditioned_denoise)
+    if edited_cells == 0:
+        raise Error("LTX2 V2V mask: mask contains no editable pixels")
+    var out = List[Float32]()
+    for _ in range(nf):
+        for value in spatial:
+            out.append(value)
+    return out^
+
+
+def _request_hq_v2v_spatial_mask(
+    values: List[Float32],
+    sequence_tokens: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if len(values) != sequence_tokens:
+        raise Error("LTX2 V2V mask: patchified mask length mismatch")
+    var scaled = List[Float32]()
+    for value in values:
+        scaled.append(value * scale)
+    return Tensor.from_host(
+        scaled, _sh3(1, sequence_tokens, 1), STDtype.F32, ctx
+    )
+
+
+def _request_hq_optional_mask_values(
+    values: List[Float32],
+) -> Optional[List[Float32]]:
+    if len(values) == 0:
+        return None
+    return Optional[List[Float32]](values.copy())
+
+
 def _request_hq_i2v_stage1_clean(
     first_frame_tokens: Tensor,
     sequence_tokens: Int,
@@ -4841,6 +4969,7 @@ def run_request_hq(
     image_strength: Float32,
     video_path: String,
     video_strength: Float32,
+    video_mask_path: String,
     out_dir: String,
     seed: UInt64,
     include_audio: Bool,
@@ -4871,8 +5000,11 @@ def run_request_hq(
     var cfg = LTX2Config.ltx2()
     var i2v_enabled = image_path.byte_length() > 0
     var v2v_enabled = video_path.byte_length() > 0
+    var v2v_mask_enabled = video_mask_path.byte_length() > 0
     if i2v_enabled and v2v_enabled:
         raise Error("LTX2 request HQ: image and video sources are mutually exclusive")
+    if v2v_mask_enabled and not v2v_enabled:
+        raise Error("LTX2 request HQ: a V2V mask requires a video source")
     var source_enabled = i2v_enabled or v2v_enabled
     var source_strength = image_strength if i2v_enabled else video_strength
     var source_stage1: Optional[Tensor] = None
@@ -4899,6 +5031,8 @@ def run_request_hq(
             progress_total, String("Decoding and encoding V2V source clip"),
         )
         print("  [V2V] source:", video_path, "strength:", video_strength)
+        if v2v_mask_enabled:
+            print("  [V2V] spatial mask:", video_mask_path)
         var encoded_video = _request_hq_encode_v2v_video(
             video_path, out_dir, progress_total, ctx
         )
@@ -5082,6 +5216,7 @@ def run_request_hq(
     var audio_x: Tensor
     var source_clean1: Optional[Tensor] = None
     var source_mask1: Optional[Tensor] = None
+    var source_mask_values1 = List[Float32]()
     var i2v_frame_tokens1 = REQUEST_HQ_NH1 * REQUEST_HQ_NW1
     var source_conditioned_denoise = Float32(1.0) - source_strength
     var source_mod_tokens1 = 0
@@ -5119,6 +5254,14 @@ def run_request_hq(
             mask1 = _request_hq_i2v_mask(
                 REQUEST_HQ_S_V1, i2v_frame_tokens1,
                 source_conditioned_denoise, Float32(1.0), ctx,
+            )
+        elif v2v_mask_enabled:
+            source_mask_values1 = _request_hq_v2v_spatial_mask_values(
+                video_mask_path, REQUEST_HQ_NF, REQUEST_HQ_NH1,
+                REQUEST_HQ_NW1, source_conditioned_denoise,
+            )
+            mask1 = _request_hq_v2v_spatial_mask(
+                source_mask_values1, REQUEST_HQ_S_V1, Float32(1.0), ctx
             )
         else:
             mask1 = _request_hq_v2v_mask(
@@ -5164,6 +5307,9 @@ def run_request_hq(
             ck, gw, sigma, REQUEST_HQ_S_V1, REQUEST_HQ_S_A, ctx,
             conditioned_video_tokens=source_mod_tokens1,
             conditioned_video_denoise=source_conditioned_denoise,
+            conditioned_video_denoise_values=_request_hq_optional_mask_values(
+                source_mask_values1
+            ),
         )
         var c = _request_hq_forward_flat[
             REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
@@ -5222,6 +5368,9 @@ def run_request_hq(
                 ck, gw, sigma, REQUEST_HQ_S_V1, REQUEST_HQ_S_A, ctx,
                 conditioned_video_tokens=source_mod_tokens1,
                 conditioned_video_denoise=source_conditioned_denoise,
+                conditioned_video_denoise_values=_request_hq_optional_mask_values(
+                    source_mask_values1
+                ),
             )
             var c = _request_hq_forward_flat[
                 REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
@@ -5287,6 +5436,7 @@ def run_request_hq(
     )
     var source_clean2: Optional[Tensor] = None
     var source_mask2: Optional[Tensor] = None
+    var source_mask_values2 = List[Float32]()
     var i2v_frame_tokens2 = REQUEST_HQ_NH2 * REQUEST_HQ_NW2
     var source_mod_tokens2 = 0
     if i2v_enabled:
@@ -5319,6 +5469,14 @@ def run_request_hq(
             mask2 = _request_hq_i2v_mask(
                 REQUEST_HQ_S_V2, i2v_frame_tokens2,
                 source_conditioned_denoise, Float32(1.0), ctx,
+            )
+        elif v2v_mask_enabled:
+            source_mask_values2 = _request_hq_v2v_spatial_mask_values(
+                video_mask_path, REQUEST_HQ_NF, REQUEST_HQ_NH2,
+                REQUEST_HQ_NW2, source_conditioned_denoise,
+            )
+            mask2 = _request_hq_v2v_spatial_mask(
+                source_mask_values2, REQUEST_HQ_S_V2, Float32(1.0), ctx
             )
         else:
             mask2 = _request_hq_v2v_mask(
@@ -5356,6 +5514,9 @@ def run_request_hq(
             uniform_timestep=True,
             conditioned_video_tokens=source_mod_tokens2,
             conditioned_video_denoise=source_conditioned_denoise,
+            conditioned_video_denoise_values=_request_hq_optional_mask_values(
+                source_mask_values2
+            ),
         )
         var c = _request_hq_forward_flat[
             REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
@@ -5387,6 +5548,9 @@ def run_request_hq(
                 uniform_timestep=True,
                 conditioned_video_tokens=source_mod_tokens2,
                 conditioned_video_denoise=source_conditioned_denoise,
+                conditioned_video_denoise_values=_request_hq_optional_mask_values(
+                    source_mask_values2
+                ),
             )
             var c = _request_hq_forward_flat[
                 REQUEST_HQ_S_V2, REQUEST_HQ_S_A,

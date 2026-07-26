@@ -1643,8 +1643,9 @@ fn readiness_doc() -> Value {
                         "guidance_mode",
                         "caps_positive", "caps_negative", "noise_fixture",
                         "image_path", "image_strength", "video_path",
-                        "video_strength",
-                        "include_audio", "lora", "quant", "post_upscale"
+                        "video_strength", "video_mask_path",
+                        "include_audio", "audio_policy", "lora", "quant",
+                        "post_upscale", "feature_id", "feature_weight"
                     ],
                     "requires_authored_conditioning": false,
                     "automatic_conditioning": {
@@ -1656,6 +1657,7 @@ fn readiness_doc() -> Value {
                     "compiled_profile": ltx2_default_profile,
                     "supported_profiles": ltx2_profile_documents,
                     "post_upscalers": ltx2_post_upscaler_documents(),
+                    "feature_adapters": crate::models::ltx2_feature_documents(),
                     "available": ltx2_request_ready,
                 },
             },
@@ -1974,6 +1976,217 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     }
 }
 
+fn ltx2_feature_request(body: &Value) -> Result<Option<Value>, String> {
+    let feature_id = match body.get("feature_id") {
+        None => return Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() || value == "standard" => {
+            return Ok(None)
+        }
+        Some(Value::String(value)) => value.trim(),
+        Some(_) => return Err("LTX2 feature_id must be a string".to_string()),
+    };
+    let mut feature = crate::models::ltx2_feature_document(feature_id)
+        .ok_or_else(|| format!("unknown LTX2 feature workflow '{feature_id}'"))?;
+    let status = feature
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("feature_runner_required");
+    if !matches!(status, "overlay_admitted" | "v2a_admitted") {
+        return Err(format!(
+            "LTX2 feature workflow '{feature_id}' is installed but not runtime-admitted; status={status}"
+        ));
+    }
+    let filename = feature
+        .get("filename")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("LTX2 feature workflow '{feature_id}' has no adapter filename"))?;
+    let path = model_path(&format!("loras/{filename}"));
+    if !nonempty_file(&path) {
+        return Err(format!(
+            "LTX2 feature workflow '{feature_id}' is unavailable; missing {}",
+            path.display()
+        ));
+    }
+    let weight = body
+        .get("feature_weight")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            format!(
+                "LTX2 feature workflow '{feature_id}' requires an authored numeric feature_weight"
+            )
+        })?;
+    let min_weight = feature
+        .get("weight_min")
+        .and_then(Value::as_f64)
+        .unwrap_or(-10.0);
+    let max_weight = feature
+        .get("weight_max")
+        .and_then(Value::as_f64)
+        .unwrap_or(10.0);
+    if !weight.is_finite() || !(min_weight..=max_weight).contains(&weight) {
+        return Err(format!(
+            "LTX2 feature workflow '{feature_id}' requires feature_weight in [{min_weight}, {max_weight}]; got {weight}"
+        ));
+    }
+    if body
+        .get("lora")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| {
+                        std::path::Path::new(name)
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            == Some(filename)
+                    })
+            })
+        })
+    {
+        return Err(format!(
+            "LTX2 feature workflow '{feature_id}' already owns {filename}; remove the duplicate ordinary LoRA row"
+        ));
+    }
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let trigger = feature
+        .get("trigger")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !trigger.is_empty() && !prompt.contains(trigger) {
+        return Err(format!(
+            "LTX2 feature workflow '{feature_id}' requires the exact prompt trigger {trigger}"
+        ));
+    }
+    match feature_id {
+        "cinemagraph" => {
+            if body
+                .get("image_path")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(
+                    "LTX2 Cinemagraph requires a loaded I2V source image".to_string()
+                );
+            }
+        }
+        "foley-v2a" => {
+            let video_path = body
+                .get("video_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if video_path.is_empty() {
+                return Err("LTX2 Foley requires a loaded V2V source video".to_string());
+            }
+            if body
+                .get("video_mask_path")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(
+                    "LTX2 Foley freezes the complete source video and does not accept a painted video mask"
+                        .to_string(),
+                );
+            }
+            if body.get("audio_policy").and_then(Value::as_str) != Some("generate")
+                || body.get("include_audio").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(
+                    "LTX2 Foley requires Audio=Generate so only the audio stream is synthesized"
+                        .to_string(),
+                );
+            }
+            let video_strength = body
+                .get("video_strength")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            if (video_strength - 1.0).abs() > f64::EPSILON {
+                return Err(
+                    "LTX2 Foley requires Source strength=1.0 to freeze every video token"
+                        .to_string(),
+                );
+            }
+            let probe = probe_video_path(video_path)?;
+            let requested_width = body.get("width").and_then(Value::as_i64).unwrap_or(0);
+            let requested_height = body.get("height").and_then(Value::as_i64).unwrap_or(0);
+            let requested_frames = body.get("frames").and_then(Value::as_i64).unwrap_or(0);
+            let requested_fps = body.get("fps").and_then(Value::as_f64).unwrap_or(0.0);
+            let actual_fps = probe.get("fps").and_then(Value::as_f64).unwrap_or(0.0);
+            if probe.get("width").and_then(Value::as_i64) != Some(requested_width)
+                || probe.get("height").and_then(Value::as_i64) != Some(requested_height)
+                || probe.get("frame_count").and_then(Value::as_i64) != Some(requested_frames)
+                || (actual_fps - requested_fps).abs() > 0.01
+            {
+                return Err(format!(
+                    "LTX2 Foley preserves the original video bitstream, so the source must exactly match {requested_width}x{requested_height}, {requested_frames} frames at {requested_fps} FPS; probe={probe}"
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "LTX2 feature workflow '{feature_id}' has no admitted request contract"
+            ))
+        }
+    }
+    if let Some(object) = feature.as_object_mut() {
+        object.insert("path".to_string(), json!(path.to_string_lossy()));
+        object.insert("weight".to_string(), json!(weight));
+    }
+    Ok(Some(feature))
+}
+
+fn normalized_ltx2_feature_request(body: &Value) -> Result<Value, String> {
+    let Some(feature) = ltx2_feature_request(body)? else {
+        return Ok(body.clone());
+    };
+    let mut normalized = body.clone();
+    let request = normalized
+        .as_object_mut()
+        .ok_or_else(|| "LTX2 request must be a JSON object".to_string())?;
+    let rows = request
+        .entry("lora".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "LTX2 'lora' must be an array".to_string())?;
+    let mut row = serde_json::Map::new();
+    row.insert(
+        "name".to_string(),
+        feature.get("filename").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "weight".to_string(),
+        feature.get("weight").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "feature_id".to_string(),
+        feature.get("id").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "feature_usage".to_string(),
+        feature.get("usage").cloned().unwrap_or(Value::Null),
+    );
+    if let Some(streams) = feature.get("stream_strengths").and_then(Value::as_object) {
+        for key in [
+            "video",
+            "video_to_audio",
+            "audio",
+            "audio_to_video",
+            "other",
+        ] {
+            if let Some(value) = streams.get(key) {
+                row.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    rows.push(Value::Object(row));
+    request.insert("feature_adapter".to_string(), feature);
+    Ok(normalized)
+}
+
 fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     let required_strings = [
         "checkpoint",
@@ -2067,6 +2280,21 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     {
         return Err("LTX2 Mojo request requires boolean 'include_audio'".to_string());
     }
+    let include_audio = body["include_audio"].as_bool().unwrap_or(false);
+    let audio_policy = body
+        .get("audio_policy")
+        .and_then(Value::as_str)
+        .unwrap_or(if include_audio { "generate" } else { "none" });
+    if !matches!(audio_policy, "none" | "generate" | "preserve") {
+        return Err(format!(
+            "LTX2 audio_policy must be 'none', 'generate', or 'preserve'; got '{audio_policy}'"
+        ));
+    }
+    if (audio_policy == "generate") != include_audio {
+        return Err(format!(
+            "LTX2 audio_policy '{audio_policy}' conflicts with include_audio={include_audio}"
+        ));
+    }
     let _ = ltx2_requested_post_upscale(body)?;
     let caps = body
         .get("caps_positive")
@@ -2140,8 +2368,33 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     if video_path.is_empty() && body.get("video_strength").is_some() {
         return Err("LTX2 video_strength requires video_path".to_string());
     }
+    let video_mask_path = body
+        .get("video_mask_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !video_mask_path.is_empty() && !std::path::Path::new(video_mask_path).is_file() {
+        return Err(format!(
+            "LTX2 V2V mask image not found: {video_mask_path}"
+        ));
+    }
+    if !video_mask_path.is_empty() && video_path.is_empty() {
+        return Err("LTX2 video_mask_path requires video_path".to_string());
+    }
     if !image_path.is_empty() && !video_path.is_empty() {
         return Err("LTX2 image_path and video_path are mutually exclusive".to_string());
+    }
+    if audio_policy == "preserve" {
+        if video_path.is_empty() {
+            return Err("LTX2 audio_policy 'preserve' requires video_path".to_string());
+        }
+        let source_probe = probe_video_path(video_path)?;
+        if source_probe.get("has_audio").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                "LTX2 audio_policy 'preserve' requires an audio stream in the source video"
+                    .to_string(),
+            );
+        }
     }
     match body.get("lora") {
         Some(Value::Array(rows)) => {
@@ -2159,6 +2412,12 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
                 }
                 if !(-10.0..=10.0).contains(&weight) {
                     return Err(format!("LTX2 lora[{index}].weight must be in [-10, 10]"));
+                }
+                let usage = crate::models::lora_usage(name);
+                if usage != "overlay" {
+                    return Err(format!(
+                        "LTX2 lora[{index}] '{name}' is classified as '{usage}' and requires the dedicated LTX2 feature workflow"
+                    ));
                 }
                 let Some((path, arch)) = crate::models::lora_path_and_arch(name) else {
                     return Err(format!(
@@ -2181,6 +2440,7 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         Some(_) => return Err("LTX2 'lora' must be an array".to_string()),
         None => return Err("LTX2 Mojo request requires the authored 'lora' array".to_string()),
     }
+    let _ = ltx2_feature_request(body)?;
     Ok(())
 }
 
@@ -2466,11 +2726,118 @@ where
     Ok((artifact, probe))
 }
 
+fn remux_ltx2_source_audio(
+    video_artifact: &std::path::Path,
+    source_video: &std::path::Path,
+    out_dir: &std::path::Path,
+    expected_frames: i64,
+) -> Result<(std::path::PathBuf, Value), String> {
+    let artifact = out_dir.join("ltx2_source_audio.mp4");
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &video_artifact.to_string_lossy(),
+            "-i",
+            &source_video.to_string_lossy(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            &artifact.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|error| format!("cannot launch ffmpeg to preserve source audio: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg could not preserve the LTX2 source audio: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let probe = probe_video_path(&artifact.to_string_lossy())?;
+    if probe.get("muxing").and_then(Value::as_str) != Some("probe_ok")
+        || probe.get("has_audio").and_then(Value::as_bool) != Some(true)
+        || probe.get("frame_count").and_then(Value::as_i64) != Some(expected_frames)
+    {
+        return Err(format!(
+            "LTX2 source-audio artifact failed stream/frame probe: {probe}"
+        ));
+    }
+    Ok((artifact, probe))
+}
+
+/// Foley/V2A freezes the source video and synthesizes only audio. Preserve the
+/// source video stream byte-for-byte and replace its audio with the Mojo
+/// runner's generated audio stream.
+fn remux_ltx2_generated_audio(
+    source_video: &std::path::Path,
+    generated_artifact: &std::path::Path,
+    out_dir: &std::path::Path,
+    expected_frames: i64,
+) -> Result<(std::path::PathBuf, Value), String> {
+    let artifact = out_dir.join("ltx2_foley_v2a.mp4");
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &source_video.to_string_lossy(),
+            "-i",
+            &generated_artifact.to_string_lossy(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            &artifact.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|error| format!("cannot launch ffmpeg for LTX2 Foley output: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg could not assemble the LTX2 Foley output: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let probe = probe_video_path(&artifact.to_string_lossy())?;
+    if probe.get("muxing").and_then(Value::as_str) != Some("probe_ok")
+        || probe.get("has_video").and_then(Value::as_bool) != Some(true)
+        || probe.get("has_audio").and_then(Value::as_bool) != Some(true)
+        || probe.get("frame_count").and_then(Value::as_i64) != Some(expected_frames)
+    {
+        return Err(format!(
+            "LTX2 Foley artifact failed stream/frame probe: {probe}"
+        ));
+    }
+    Ok((artifact, probe))
+}
+
 fn start_ltx2_mojo_request(
     st: &AppState,
     body: &Value,
     gpu: crate::gpu_lock::GpuGuard,
 ) -> Response {
+    let normalized_body = match normalized_ltx2_feature_request(body) {
+        Ok(value) => value,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
+    let body = &normalized_body;
     let profile = match ltx2_request_profile(
         body.get("width").and_then(Value::as_i64).unwrap_or(0),
         body.get("height").and_then(Value::as_i64).unwrap_or(0),
@@ -2496,6 +2863,25 @@ fn start_ltx2_mojo_request(
         .get("quant")
         .and_then(Value::as_str)
         .unwrap_or("fp8")
+        .to_string();
+    let include_audio = body
+        .get("include_audio")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let audio_policy = body
+        .get("audio_policy")
+        .and_then(Value::as_str)
+        .unwrap_or(if include_audio { "generate" } else { "none" })
+        .to_string();
+    let source_video = body
+        .get("video_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let feature_id = body
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .unwrap_or("standard")
         .to_string();
     let requested_post_upscale = match ltx2_requested_post_upscale(body) {
         Ok(value) => value,
@@ -2543,6 +2929,9 @@ fn start_ltx2_mojo_request(
     let thread_frames = profile.frames;
     let thread_fps = profile.fps;
     let thread_post_upscale = requested_post_upscale.clone();
+    let thread_audio_policy = audio_policy.clone();
+    let thread_source_video = source_video.clone();
+    let thread_feature_id = feature_id.clone();
     let mut thread_request = body.clone();
     if let Some(request) = thread_request.as_object_mut() {
         // The denoiser always publishes exact final latents, exits, and lets a
@@ -2550,6 +2939,14 @@ fn start_ltx2_mojo_request(
         // required for 720p+ on 24 GB and also prevents allocator fragmentation
         // from making lower-resolution behavior depend on prior jobs.
         request.insert("defer_decode".to_string(), json!(true));
+        request.insert(
+            "include_audio".to_string(),
+            json!(thread_audio_policy == "generate"),
+        );
+        request.insert(
+            "audio_policy".to_string(),
+            json!(thread_audio_policy.clone()),
+        );
     }
     std::thread::spawn(move || {
         let _gpu = gpu;
@@ -2858,12 +3255,198 @@ fn start_ltx2_mojo_request(
                 .and_then(|doc| doc.get("artifact_path"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let artifact = if std::path::Path::new(authored).is_absolute() {
+            let mut artifact = if std::path::Path::new(authored).is_absolute() {
                 std::path::PathBuf::from(authored)
             } else {
                 repo_root().join(authored)
             };
             if artifact.is_file() {
+                if thread_feature_id == "foley-v2a" {
+                    let message = "Assembling generated Foley audio with the exact source video";
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "running",
+                        "assembling_foley_audio",
+                        thread_frames,
+                        thread_frames,
+                        message,
+                    );
+                    publish(WorkerEvent::Progress {
+                        step: thread_frames,
+                        total: thread_frames,
+                        phase: message.to_string(),
+                        preview: String::new(),
+                    });
+                    match remux_ltx2_generated_audio(
+                        std::path::Path::new(&thread_source_video),
+                        &artifact,
+                        &thread_out_dir,
+                        thread_frames,
+                    ) {
+                        Ok((foley_artifact, probe)) => {
+                            if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                                doc.insert(
+                                    "native_generated_av_artifact_path".to_string(),
+                                    json!(artifact.to_string_lossy()),
+                                );
+                                doc.insert(
+                                    "artifact_path".to_string(),
+                                    json!(foley_artifact.to_string_lossy()),
+                                );
+                                doc.insert(
+                                    "mp4_url".to_string(),
+                                    json!(format!(
+                                        "/out/{}/{}",
+                                        thread_video_id,
+                                        foley_artifact
+                                            .file_name()
+                                            .and_then(|value| value.to_str())
+                                            .unwrap_or("ltx2_foley_v2a.mp4")
+                                    )),
+                                );
+                                doc.insert("feature_id".to_string(), json!("foley-v2a"));
+                                doc.insert("audio_policy".to_string(), json!("generate"));
+                                doc.insert("audio_probe".to_string(), probe);
+                            }
+                            artifact = foley_artifact;
+                            if let Some(doc) = result.as_ref() {
+                                if let Ok(bytes) = serde_json::to_vec_pretty(doc) {
+                                    let _ = std::fs::write(&result_path, bytes);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                                doc.insert("state".to_string(), json!("failed"));
+                                doc.insert(
+                                    "failed_step".to_string(),
+                                    json!("assembling_foley_audio"),
+                                );
+                                doc.insert("error".to_string(), json!(error));
+                            }
+                            if let Some(doc) = result.as_ref() {
+                                if let Ok(bytes) = serde_json::to_vec_pretty(doc) {
+                                    let _ = std::fs::write(&result_path, bytes);
+                                }
+                            }
+                            let error = result
+                                .as_ref()
+                                .and_then(|doc| doc.get("error"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("LTX2 Foley assembly failed")
+                                .to_string();
+                            let _ = write_ltx2_job_status(
+                                &thread_out_dir,
+                                "failed",
+                                "assembling_foley_audio",
+                                thread_frames,
+                                thread_frames,
+                                &error,
+                            );
+                            publish(WorkerEvent::Failed { error });
+                            return;
+                        }
+                    }
+                } else if thread_audio_policy == "preserve" {
+                    let message = "Preserving audio from the V2V source";
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "running",
+                        "preserving_source_audio",
+                        thread_frames,
+                        thread_frames,
+                        message,
+                    );
+                    publish(WorkerEvent::Progress {
+                        step: thread_frames,
+                        total: thread_frames,
+                        phase: message.to_string(),
+                        preview: String::new(),
+                    });
+                    match remux_ltx2_source_audio(
+                        &artifact,
+                        std::path::Path::new(&thread_source_video),
+                        &thread_out_dir,
+                        thread_frames,
+                    ) {
+                        Ok((source_audio_artifact, probe)) => {
+                            if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                                doc.insert(
+                                    "native_video_only_artifact_path".to_string(),
+                                    json!(artifact.to_string_lossy()),
+                                );
+                                doc.insert(
+                                    "artifact_path".to_string(),
+                                    json!(source_audio_artifact.to_string_lossy()),
+                                );
+                                doc.insert(
+                                    "mp4_url".to_string(),
+                                    json!(format!(
+                                        "/out/{}/{}",
+                                        thread_video_id,
+                                        source_audio_artifact
+                                            .file_name()
+                                            .and_then(|value| value.to_str())
+                                            .unwrap_or("ltx2_source_audio.mp4")
+                                    )),
+                                );
+                                doc.insert("audio_policy".to_string(), json!("preserve"));
+                                doc.insert("audio_probe".to_string(), probe);
+                            }
+                            artifact = source_audio_artifact;
+                            if let Some(doc) = result.as_ref() {
+                                if let Ok(bytes) = serde_json::to_vec_pretty(doc) {
+                                    let _ = std::fs::write(&result_path, bytes);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                                doc.insert("state".to_string(), json!("failed"));
+                                doc.insert(
+                                    "failed_step".to_string(),
+                                    json!("preserving_source_audio"),
+                                );
+                                doc.insert("error".to_string(), json!(error));
+                            }
+                            if let Some(doc) = result.as_ref() {
+                                if let Ok(bytes) = serde_json::to_vec_pretty(doc) {
+                                    let _ = std::fs::write(&result_path, bytes);
+                                }
+                            }
+                            let error = result
+                                .as_ref()
+                                .and_then(|doc| doc.get("error"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("LTX2 source-audio preservation failed")
+                                .to_string();
+                            let _ = write_ltx2_job_status(
+                                &thread_out_dir,
+                                "failed",
+                                "preserving_source_audio",
+                                thread_frames,
+                                thread_frames,
+                                &error,
+                            );
+                            publish(WorkerEvent::Failed { error });
+                            return;
+                        }
+                    }
+                } else if let Some(doc) = result.as_mut().and_then(Value::as_object_mut) {
+                    doc.insert(
+                        "audio_policy".to_string(),
+                        json!(thread_audio_policy.clone()),
+                    );
+                    if thread_feature_id != "standard" {
+                        doc.insert(
+                            "feature_id".to_string(),
+                            json!(thread_feature_id.clone()),
+                        );
+                    }
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&*doc) {
+                        let _ = std::fs::write(&result_path, bytes);
+                    }
+                }
                 if let Some((upscaler, factor)) = thread_post_upscale.as_ref() {
                     let message = format!("Starting {upscaler} {factor}x post-upscale");
                     let _ = write_ltx2_job_status(
@@ -2992,6 +3575,23 @@ fn start_ltx2_mojo_request(
                         }
                     }
                 }
+                let done_message = if thread_feature_id == "foley-v2a" {
+                    "Foley audio and source video ready"
+                } else if thread_audio_policy == "preserve" {
+                    "Video and preserved source audio ready"
+                } else if thread_audio_policy == "generate" {
+                    "Video and generated audio ready"
+                } else {
+                    "Video ready"
+                };
+                let _ = write_ltx2_job_status(
+                    &thread_out_dir,
+                    "done",
+                    "done",
+                    thread_frames,
+                    thread_frames,
+                    done_message,
+                );
                 publish(WorkerEvent::Done {
                     output_path: artifact.to_string_lossy().into_owned(),
                 });
@@ -3028,6 +3628,8 @@ fn start_ltx2_mojo_request(
             "profile": ltx2_profile_document(&profile),
             "backend": "mojo",
             "quant": quant,
+            "audio_policy": audio_policy,
+            "feature_id": feature_id,
             "state": "queued",
             "status_url": format!("/out/{video_id}/status.json"),
             "result_url": format!("/out/{video_id}/result.json"),
@@ -5091,6 +5693,22 @@ mod tests {
         );
         let post_upscalers = request_runner["post_upscalers"].as_array().unwrap();
         assert_eq!(post_upscalers.len(), 3);
+        let feature_adapters = request_runner["feature_adapters"].as_array().unwrap();
+        assert_eq!(feature_adapters.len(), 19);
+        assert_eq!(
+            feature_adapters
+                .iter()
+                .find(|entry| entry["id"] == "cinemagraph")
+                .unwrap()["status"],
+            "overlay_admitted"
+        );
+        assert_eq!(
+            feature_adapters
+                .iter()
+                .find(|entry| entry["id"] == "foley-v2a")
+                .unwrap()["status"],
+            "v2a_admitted"
+        );
         let realesrgan = post_upscalers
             .iter()
             .find(|entry| entry["id"] == "realesrgan-x4plus")
@@ -5403,6 +6021,60 @@ mod tests {
     }
 
     #[test]
+    fn ltx2_cinemagraph_feature_is_explicit_and_normalizes_to_one_overlay() {
+        let adapter = model_path(
+            "loras/ltx-2.3-22b-lora-cinemagraph-0.9.safetensors",
+        );
+        if !nonempty_file(&adapter) {
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        );
+        let caps =
+            std::env::temp_dir().join(format!("serenity-ltx2-cinemagraph-caps-{suffix}.bin"));
+        let image =
+            std::env::temp_dir().join(format!("serenity-ltx2-cinemagraph-source-{suffix}.png"));
+        std::fs::write(&caps, b"conditioning fixture").unwrap();
+        std::fs::write(&image, b"image fixture").unwrap();
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "CINEMAGRAPH_MOTION only the candle flame moves",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "audio_policy": "none",
+            "lora": [],
+            "image_path": image,
+            "image_strength": 0.8,
+            "feature_id": "cinemagraph",
+            "feature_weight": 0.9,
+        });
+        validate_ltx2_mojo_request(&request).unwrap();
+        let normalized = normalized_ltx2_feature_request(&request).unwrap();
+        assert_eq!(normalized["feature_adapter"]["id"], "cinemagraph");
+        assert_eq!(normalized["lora"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            normalized["lora"][0]["name"],
+            "ltx-2.3-22b-lora-cinemagraph-0.9.safetensors"
+        );
+        assert_eq!(normalized["lora"][0]["weight"], 0.9);
+        let _ = std::fs::remove_file(caps);
+        let _ = std::fs::remove_file(image);
+    }
+
+    #[test]
     fn ltx2_mojo_request_preflight_rejects_invalid_i2v_source_before_gpu() {
         let caps = std::env::temp_dir().join(format!(
             "serenity-ltx2-i2v-invalid-caps-{}-{}.bin",
@@ -5450,9 +6122,11 @@ mod tests {
         let caps = std::env::temp_dir().join(format!("serenity-ltx2-v2v-caps-{suffix}.bin"));
         let video = std::env::temp_dir().join(format!("serenity-ltx2-v2v-source-{suffix}.mp4"));
         let image = std::env::temp_dir().join(format!("serenity-ltx2-v2v-source-{suffix}.png"));
+        let mask = std::env::temp_dir().join(format!("serenity-ltx2-v2v-mask-{suffix}.png"));
         std::fs::write(&caps, b"conditioning fixture").unwrap();
         std::fs::write(&video, b"video fixture").unwrap();
         std::fs::write(&image, b"image fixture").unwrap();
+        std::fs::write(&mask, b"mask fixture").unwrap();
         let mut request = json!({
             "checkpoint": LTX2_REFHQ_CHECKPOINT,
             "quant": "fp8",
@@ -5471,6 +6145,7 @@ mod tests {
             "lora": [],
             "video_path": video,
             "video_strength": 0.7,
+            "video_mask_path": mask,
         });
         validate_ltx2_mojo_request(&request).unwrap();
         request["image_path"] = json!(image);
@@ -5484,9 +6159,112 @@ mod tests {
         assert!(validate_ltx2_mojo_request(&request)
             .unwrap_err()
             .contains("video_strength must be in [0, 1]"));
+        request.as_object_mut().unwrap().remove("video_path");
+        request.as_object_mut().unwrap().remove("video_strength");
+        assert!(validate_ltx2_mojo_request(&request)
+            .unwrap_err()
+            .contains("video_mask_path requires video_path"));
         let _ = std::fs::remove_file(caps);
         let _ = std::fs::remove_file(video);
         let _ = std::fs::remove_file(image);
+        let _ = std::fs::remove_file(mask);
+    }
+
+    #[test]
+    fn ltx2_source_audio_policy_preflights_and_remuxes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "serenity-ltx2-source-audio-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let caps = root.join("caps.bin");
+        let source = root.join("source.mp4");
+        let generated = root.join("generated.mp4");
+        std::fs::write(&caps, b"conditioning fixture").unwrap();
+        let source_result = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-frames:v",
+                "4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                &source.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            source_result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&source_result.stderr)
+        );
+        let generated_result = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:size=160x120:rate=24",
+                "-frames:v",
+                "4",
+                "-pix_fmt",
+                "yuv420p",
+                &generated.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(generated_result.status.success());
+
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "preserve the source motion",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "audio_policy": "preserve",
+            "lora": [],
+            "video_path": source,
+            "video_strength": 0.7,
+        });
+        validate_ltx2_mojo_request(&request).unwrap();
+
+        let (artifact, probe) =
+            remux_ltx2_source_audio(&generated, &source, &root, 4).unwrap();
+        assert!(artifact.is_file());
+        assert_eq!(probe["has_audio"], true);
+        assert_eq!(probe["frame_count"], 4);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -84,6 +84,8 @@ var SerenityAPI = (function () {
                     frames: li.num_frames,
                     fps: li.frame_rate,
                     include_audio: li.include_audio === true,
+                    audio_policy: li.audio_policy ||
+                        (li.include_audio === true ? 'generate' : 'none'),
                     cfg: li.cfg,
                     guidance_mode: li.mode || 'distilled',
                     sampler: li.sampler,
@@ -91,8 +93,20 @@ var SerenityAPI = (function () {
                     caps_positive: li.caps_positive || '',
                     caps_negative: li.caps_negative || '',
                     noise_fixture: li.noise_fixture || '',
+                    feature_id: li.feature_id || 'standard',
+                    feature_weight: Number(li.feature_weight),
                     lora: loras
                 };
+                if (request.feature_id !== 'standard' &&
+                    !Number.isFinite(request.feature_weight))
+                    throw new Error('LTX2 feature workflow requires numeric feature_weight');
+                var postUpscaler = String(li.post_upscale_id || 'none');
+                if (postUpscaler !== 'none') {
+                    request.post_upscale = {
+                        id: postUpscaler,
+                        factor: Number(li.post_upscale_factor)
+                    };
+                }
                 if (Array.isArray(li.guide_image)) {
                     var guideNode = nodes[String(li.guide_image[0])];
                     var guidePath = guideNode && guideNode.inputs
@@ -118,6 +132,16 @@ var SerenityAPI = (function () {
                             ? Number(li.guide_strength)
                             : 0.7;
                     }
+                }
+                if (Array.isArray(li.guide_mask)) {
+                    if (!request.video_path)
+                        throw new Error('LTX2 guide_mask requires guide_video');
+                    var guideMaskNode = nodes[String(li.guide_mask[0])];
+                    var guideMaskPath = guideMaskNode && guideMaskNode.inputs
+                        ? String(guideMaskNode.inputs.image || guideMaskNode.inputs.path || '').trim()
+                        : '';
+                    if (guideMaskPath)
+                        request.video_mask_path = guideMaskPath;
                 }
                 return request;
             }

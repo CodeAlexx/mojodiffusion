@@ -80,6 +80,9 @@ def main():
     ap.add_argument("--group", type=int, default=64, help="scale group along in (64 or 32)")
     ap.add_argument("--format", default="int4", choices=("int4", "nvfp4"),
                     help="residual codec: int4 (dequant-first, any GPU) or nvfp4 (native FP4 fwd, sm_120)")
+    ap.add_argument("--budget-x", type=float, default=0.0,
+                    help="adaptive per-layer ranks: target TOTAL quantized bytes as a fraction "
+                         "of bf16 (e.g. 0.32). 0 = fixed --rank everywhere. int4 format only.")
     ap.add_argument("--blocks-per-shard", type=int, default=4)
     a = ap.parse_args()
     preset = MODELS[a.model]
@@ -105,6 +108,82 @@ def main():
 
     plan = new_plan(a.model, a.src, "squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG, core.HBLOCK, a.group)
     plan["rank_default"] = a.rank
+
+    # ── adaptive rank planner (chunk 8): one truncated SVD per layer, evaluate
+    # candidate ranks by ACTUAL quantized weight error, then greedy-allocate
+    # rank upgrades by marginal error-reduction per byte under --budget-x. ──
+    rank_by_layer = {}
+    if a.budget_x > 0:
+        if a.format != "int4":
+            raise SystemExit("--budget-x supports --format int4 only")
+        CAND = [16, 32, 64, 128]  # rank>=16: zero-width lora tensors would break loaders
+        elig = [k for k in keys if eligible(k, meta[k][0], preset["include"])
+                and preset["group"].match(k)]
+        tables = {}
+        total_bf16 = 0
+        with safe_open(a.src, "pt") as f:
+            for n, k in enumerate(elig):
+                wt = f.get_tensor(k).float()
+                o, i_f = wt.shape
+                total_bf16 += o * i_f * 2
+                gen = torch.random.get_rng_state()
+                torch.manual_seed(layer_seed(k))
+                U, S, V = torch.svd_lowrank(wt, q=CAND[-1] + 16, niter=6)
+                torch.random.set_rng_state(gen)
+                rows = []
+                for r in CAND:
+                    if r == 0:
+                        resid = wt.double()
+                        lr = None
+                    else:
+                        lu = (U[:, :r] * S[:r]).double()
+                        ld = V[:, :r].double()
+                        resid = wt.double() - lu @ ld.t()
+                        lr = (lu @ ld.t()).float()
+                    rrot = core.rht_grouped(resid).float()
+                    q, sc = core.quant_int4_g64(rrot, group=a.group)
+                    back = core.rht_grouped(
+                        core.dequant_int4_g64(q, sc, group=a.group).double()
+                    ).float()
+                    if lr is not None:
+                        back = back + lr
+                    err2 = float(((back - wt) ** 2).sum())
+                    nbytes = o * i_f // 2 + (i_f // a.group) * o * 2 + r * (o + i_f) * 2
+                    rows.append((r, nbytes, err2))
+                tables[k] = rows
+                del wt, U, S, V
+                if (n + 1) % 20 == 0 or n + 1 == len(elig):
+                    print(f"[squareq-plan] candidates {n + 1}/{len(elig)}")
+        budget = a.budget_x * total_bf16
+        cur = {k: 0 for k in elig}                    # index into CAND rows
+        used = sum(tables[k][0][1] for k in elig)
+        import heapq
+        heap = []
+        for k in elig:
+            r0, b0, e0 = tables[k][0]
+            r1, b1, e1 = tables[k][1]
+            heapq.heappush(heap, (-(e0 - e1) / (b1 - b0), k))
+        while heap:
+            neg_gain, k = heapq.heappop(heap)
+            ci = cur[k]
+            if ci + 1 >= len(tables[k]):
+                continue
+            db = tables[k][ci + 1][1] - tables[k][ci][1]
+            if used + db > budget:
+                continue
+            cur[k] = ci + 1
+            used += db
+            if ci + 2 < len(tables[k]):
+                _, b1, e1 = tables[k][ci + 1]
+                _, b2, e2 = tables[k][ci + 2]
+                heapq.heappush(heap, (-(e1 - e2) / (b2 - b1), k))
+        rank_by_layer = {k: tables[k][cur[k]][0] for k in elig}
+        hist = {}
+        for r in rank_by_layer.values():
+            hist[r] = hist.get(r, 0) + 1
+        print(f"[squareq-plan] adaptive ranks (budget {a.budget_x}x): {sorted(hist.items())}"
+              f"  used={used / total_bf16:.4f}x")
+        plan["rank_by_layer"] = rank_by_layer
     # Seed from the previous run's partial plan BEFORE any shard work — the
     # per-shard partial write below overwrites the file, so completed shards'
     # stats must be recovered here, not in an end-of-run merge.
@@ -150,7 +229,7 @@ def main():
                 if g and eligible(k, shape, preset["include"]):
                     base = k[: -len(".weight")]
                     o, i_f = shape
-                    r = a.rank
+                    r = rank_by_layer.get(k, a.rank)
                     if a.format == "nvfp4":
                         parts = [
                             (base + ".nvq", torch.uint8, [o, i_f // 2]),
@@ -213,7 +292,8 @@ def main():
                         suffixes = ("nvq", "nvs", "nvg", "lora_down", "lora_up")
                     else:
                         tensors, stats = core.quantize_layer(
-                            wt, rank=a.rank, group=a.group, seed=layer_seed(k)
+                            wt, rank=rank_by_layer.get(k, a.rank), group=a.group,
+                            seed=layer_seed(k)
                         )
                         suffixes = ("qweight", "wscales", "lora_down", "lora_up")
                     for suffix in suffixes:

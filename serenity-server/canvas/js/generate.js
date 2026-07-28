@@ -336,7 +336,13 @@ var GenerateTab = (function () {
         var profiles = Array.isArray(mode.supported_profiles)
             ? mode.supported_profiles : [];
         return profiles.filter(function (profile) {
-            return profile && profile.available === true;
+            // Generate always submits video_edit_mode=standard. Source-native
+            // 960x544/544x960 profiles belong only to Retake/Extend and Rust
+            // correctly rejects them for ordinary generation. Never advertise
+            // a temporal-edit runner as a standard T2V/I2V profile.
+            return profile && profile.available === true &&
+                Array.isArray(profile.modes) &&
+                profile.modes.indexOf('standard') >= 0;
         });
     }
     function activeLtx2ProfilesForSize(width, height) {

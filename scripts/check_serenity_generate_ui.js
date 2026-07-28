@@ -588,8 +588,10 @@ async function run() {
     );
     assert(
       videoUi.dimensionsLocked && videoUi.timelineControlsEnabled &&
-      videoUi.aspectOptions.includes("960×544") &&
+      videoUi.aspectOptions.includes("960×512") &&
       videoUi.aspectOptions.includes("1920×1088") &&
+      !videoUi.aspectOptions.includes("960×544") &&
+      !videoUi.aspectOptions.includes("544×960") &&
       videoUi.frameInput.min === 121 &&
       videoUi.frameInput.max === 121 &&
       videoUi.frameInput.step === 8 &&
@@ -617,7 +619,7 @@ async function run() {
     if (await page.locator("#gen-video-header").evaluate((node) => node.classList.contains("closed"))) {
       await page.locator("#gen-video-header").click();
     }
-    await page.locator("#gen-aspect-dropdown").selectOption("960×544");
+    await page.locator("#gen-aspect-dropdown").selectOption("1280×704");
     await page.locator("#gen-seconds").fill("8");
     const selectedNativeProfile = await page.evaluate(() => ({
       width: GenerateTab.state.width,
@@ -630,13 +632,13 @@ async function run() {
       profileNote: document.querySelector("#gen-video-profile-note").textContent.trim(),
     }));
     assert(
-      selectedNativeProfile.width === 960 &&
-      selectedNativeProfile.height === 544 &&
+      selectedNativeProfile.width === 1280 &&
+      selectedNativeProfile.height === 704 &&
       selectedNativeProfile.frames === 193 &&
       selectedNativeProfile.fps === 24 &&
       selectedNativeProfile.seconds === 8 &&
       selectedNativeProfile.frameMin === 121 &&
-      selectedNativeProfile.frameMax === 481 &&
+      selectedNativeProfile.frameMax === 241 &&
       selectedNativeProfile.profileNote.includes("exact AOT Mojo runner"),
       `LTX2 native profile selection did not stay coherent: ${JSON.stringify(selectedNativeProfile)}`
     );
@@ -677,8 +679,8 @@ async function run() {
     assert(
       selectedPostUpscale.id === "realesrgan-x4plus" &&
       selectedPostUpscale.factor === 2 &&
-      selectedPostUpscale.note.includes("1920×1088") &&
-      selectedPostUpscale.factorText.includes("1920×1088"),
+      selectedPostUpscale.note.includes("2560×1408") &&
+      selectedPostUpscale.factorText.includes("2560×1408"),
       `LTX2 post-upscale output dimensions are not coherent: ${JSON.stringify(selectedPostUpscale)}`
     );
     const eriLoraName = "ltx2_eri2_step3000";
@@ -732,7 +734,7 @@ async function run() {
       `LTX2 automatic conditioning should submit blank manual overrides: ${JSON.stringify(videoBodies[0])}`
     );
     assert(
-      videoBodies[0].width === 960 && videoBodies[0].height === 544 &&
+      videoBodies[0].width === 1280 && videoBodies[0].height === 704 &&
       videoBodies[0].frames === 193 && videoBodies[0].fps === 24,
       `video request did not preserve the published profile: ${JSON.stringify(videoBodies[0])}`
     );

@@ -83,17 +83,20 @@ not admit them. They are never sent as decorative or silently ignored fields.
 Canvas-owned image-conditioning controls are not present.
 
 The admitted LTX2 video path is read from `GET /v1/video`.
-`ltx2_mojo_request.supported_profiles` publishes 21 exact AOT Mojo runners:
-512x768 at 121 frames/25 fps; 960x544 and 544x960 at 121, 145, 193, 241,
-or 481 frames/24 fps; 1280x704 and 704x1280 at 121, 145, 193, or 241
-frames/24 fps; and 1920x1088 or 1088x1920 at 121 frames/24 fps. The UI lists
-only those exact size/duration combinations and never substitutes a nearby
-shape. Generate submits the user's prompt, negative prompt, seed, optional
-manual conditioning overrides, optional deterministic noise, audio choice,
-quantization, and LoRAs to `POST /v1/video`. When the conditioning overrides
-are blank, the server runs the pure-Mojo streamed Gemma-3 conditioner, caches
-its prompt-matched video/audio contexts, then launches the selected exact LTX2
-runner. No Python runtime is used for this path.
+`ltx2_mojo_request.supported_profiles` publishes mode-qualified exact AOT Mojo
+runners. Ordinary Generate exposes only profiles whose `modes` include
+`standard`: 512x768 at 121 frames/25 fps; 960x512 and 512x960 at 121
+frames/24 fps; 1280x704 and 704x1280 at 121, 145, 193, or 241 frames/24 fps;
+and 1920x1088 or 1088x1920 at 121 frames/24 fps. The 960x544 and 544x960
+source-native profiles are reserved for Retake/Extend and never appear as
+ordinary generation sizes. The UI lists only exact size/duration combinations
+and never substitutes a nearby shape. Generate submits the user's prompt,
+negative prompt, seed, optional manual conditioning overrides, optional
+deterministic noise, audio choice, quantization, and LoRAs to `POST /v1/video`.
+When the conditioning overrides are blank, the server runs the pure-Mojo
+streamed Gemma-3 conditioner, caches its prompt-matched video/audio contexts,
+then launches the selected exact LTX2 runner. No Python runtime is used for this
+path.
 
 The Models page hands a selected checkpoint to Generate through Generate's
 authoritative model selector rather than changing only the displayed name.

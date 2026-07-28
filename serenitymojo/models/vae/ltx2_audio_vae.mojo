@@ -67,6 +67,7 @@ from serenitymojo.ops.tensor_algebra import (
     concat,
     slice,
     add,
+    sub,
     mul,
     div,
     add_scalar,
@@ -90,6 +91,8 @@ comptime PIXEL_NORM_EPS = Float32(1e-6)
 comptime N_UP = 3
 comptime UP_NBLOCKS = [3, 3, 3]
 comptime UP_HAS_UPSAMPLE = [False, True, True]
+comptime N_AUDIO_ENCODER_DOWN = 3
+comptime AUDIO_ENCODER_NBLOCKS = 2
 # Per-block in/out channels (documented; derived at runtime from conv1 shapes):
 #   up[0]: 256->128, 128->128, 128->128   (nin_shortcut on block 0)
 #   up[1]: 512->256, 256->256, 256->256   (nin_shortcut on block 0)
@@ -230,6 +233,88 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         osh.append(CONV_IN_OUT)
         var ones_512 = Tensor.from_host(ones_h, osh^, dtype, ctx)
 
+        return LTX2AudioVaeDecoderWeights(
+            weights^, name_to_idx^, stat_std^, stat_mean^, ones_512^
+        )
+
+    @staticmethod
+    def load_encoder(
+        checkpoint_path: String, ctx: DeviceContext
+    ) raises -> LTX2AudioVaeDecoderWeights:
+        """Load the creator AudioEncoder into the shared audio-VAE weight holder.
+
+        The tensor helpers below are deliberately shared with the decoder: both
+        halves use the same BF16 causal Conv2d, PixelNorm, ResnetBlock, and
+        per-channel statistics contracts. Only the key inventory differs.
+        """
+        var sharded = ShardedSafeTensors.open(checkpoint_path)
+        var weights = List[ArcPointer[Tensor]]()
+        var name_to_idx = Dict[String, Int]()
+        var wanted = List[String]()
+        wanted.append(String("audio_vae.encoder.conv_in.conv.weight"))
+        wanted.append(String("audio_vae.encoder.conv_in.conv.bias"))
+
+        comptime for s in range(N_AUDIO_ENCODER_DOWN):
+            var sp = String("audio_vae.encoder.down.") + String(s)
+            comptime for b in range(AUDIO_ENCODER_NBLOCKS):
+                var bp = sp + ".block." + String(b)
+                wanted.append(bp + ".conv1.conv.weight")
+                wanted.append(bp + ".conv1.conv.bias")
+                wanted.append(bp + ".conv2.conv.weight")
+                wanted.append(bp + ".conv2.conv.bias")
+            comptime if s < N_AUDIO_ENCODER_DOWN - 1:
+                wanted.append(sp + ".downsample.conv.weight")
+                wanted.append(sp + ".downsample.conv.bias")
+
+        for ref bp in [
+            String("audio_vae.encoder.down.1.block.0.nin_shortcut.conv"),
+            String("audio_vae.encoder.down.2.block.0.nin_shortcut.conv"),
+        ]:
+            wanted.append(bp + ".weight")
+            wanted.append(bp + ".bias")
+
+        for ref bn in [String("block_1"), String("block_2")]:
+            var mp = String("audio_vae.encoder.mid.") + bn
+            wanted.append(mp + ".conv1.conv.weight")
+            wanted.append(mp + ".conv1.conv.bias")
+            wanted.append(mp + ".conv2.conv.weight")
+            wanted.append(mp + ".conv2.conv.bias")
+
+        wanted.append(String("audio_vae.encoder.conv_out.conv.weight"))
+        wanted.append(String("audio_vae.encoder.conv_out.conv.bias"))
+
+        for ref nm in wanted:
+            var tv = sharded.tensor_view(nm)
+            var t = Tensor.from_view(tv, ctx)
+            var idx = len(weights)
+            weights.append(ArcPointer(t^))
+            name_to_idx[nm] = idx
+
+        var dtype = sharded.tensor_info(
+            String("audio_vae.encoder.conv_in.conv.weight")
+        ).dtype
+        var std_t = Tensor.from_view(
+            sharded.tensor_view(
+                String("audio_vae.per_channel_statistics.std-of-means")
+            ),
+            ctx,
+        )
+        var mean_t = Tensor.from_view(
+            sharded.tensor_view(
+                String("audio_vae.per_channel_statistics.mean-of-means")
+            ),
+            ctx,
+        )
+        var bsh = List[Int]()
+        bsh.append(1); bsh.append(1); bsh.append(PATCHED_CH)
+        var stat_std = reshape(std_t, bsh.copy(), ctx)
+        var stat_mean = reshape(mean_t, bsh^, ctx)
+
+        var ones_h = List[Float32]()
+        ones_h.resize(CONV_IN_OUT, Float32(1.0))
+        var osh = List[Int]()
+        osh.append(CONV_IN_OUT)
+        var ones_512 = Tensor.from_host(ones_h, osh^, dtype, ctx)
         return LTX2AudioVaeDecoderWeights(
             weights^, name_to_idx^, stat_std^, stat_mean^, ones_512^
         )
@@ -425,6 +510,44 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         var ys = y.shape()
         return slice(y, 1, 1, ys[1] - 1, ctx)
 
+    # ── AudioEncoder Downsample: pad (left=0,right=1,top=2,bottom=0), stride 2. ──
+    def _downsample(
+        self, x: Tensor, prefix: String, ctx: DeviceContext
+    ) raises -> Tensor:
+        if x.dtype() != STDtype.BF16:
+            raise Error("LTX2 AudioVAE encoder downsample requires BF16")
+        var xs = x.shape()
+        var bsz = xs[0]
+        var tt = xs[1]
+        var ff = xs[2]
+        var cc = xs[3]
+
+        var top_shape = List[Int]()
+        top_shape.append(bsz); top_shape.append(2)
+        top_shape.append(ff); top_shape.append(cc)
+        var top = self._zeros(top_shape^, x.dtype(), ctx)
+        var padded = concat(1, ctx, top, x)
+
+        var right_shape = List[Int]()
+        right_shape.append(bsz); right_shape.append(tt + 2)
+        right_shape.append(1); right_shape.append(cc)
+        var right = self._zeros(right_shape^, x.dtype(), ctx)
+        padded = concat(2, ctx, padded, right)
+
+        var to_nchw = List[Int]()
+        to_nchw.append(0); to_nchw.append(3)
+        to_nchw.append(1); to_nchw.append(2)
+        var nchw = permute(padded, to_nchw^, ctx)
+        var w_oihw = self._conv2d_w_oihw(prefix + ".weight")
+        var b = self._bias(prefix + ".bias", ctx)
+        var y_nchw = cudnn_conv2d_bf16_nchw(
+            nchw, w_oihw^, b, 2, 2, 0, 0, ctx
+        )
+        var to_nhwc = List[Int]()
+        to_nhwc.append(0); to_nhwc.append(2)
+        to_nhwc.append(3); to_nhwc.append(1)
+        return permute(y_nchw, to_nhwc^, ctx)
+
     # ── un_normalize: rearrange "b c t f -> b t (c f)" -> *std + mean -> back. ──
     # x: NHWC [B,T,F,C=8].  patched dim = C*F = 128.
     def _un_normalize(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -451,6 +574,89 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         var to_nhwc = List[Int]()
         to_nhwc.append(0); to_nhwc.append(1); to_nhwc.append(3); to_nhwc.append(2)
         return permute(d_btcf, to_nhwc^, ctx)    # NHWC [B,T,F,C]
+
+    # AudioEncoder mean-half + patchify + per-channel normalize.
+    def _normalize_encoder_output(
+        self, x: Tensor, ctx: DeviceContext
+    ) raises -> Tensor:
+        var xs = x.shape()  # NHWC [B,T,F,16]
+        if len(xs) != 4 or xs[3] != 2 * LATENT_CH:
+            raise Error("LTX2 AudioVAE encoder output must be NHWC [B,T,F,16]")
+        var bsz = xs[0]
+        var tt = xs[1]
+        var ff = xs[2]
+        var means = slice(x, 3, 0, LATENT_CH, ctx)
+
+        # Creator AudioPatchifier: b c t f -> b t (c f).
+        var to_btcf = List[Int]()
+        to_btcf.append(0); to_btcf.append(1)
+        to_btcf.append(3); to_btcf.append(2)
+        var btcf = permute(means, to_btcf^, ctx)
+        var flat_shape = List[Int]()
+        flat_shape.append(bsz); flat_shape.append(tt)
+        flat_shape.append(LATENT_CH * ff)
+        var flat = reshape(btcf, flat_shape^, ctx)
+        var normalized = div(
+            sub(flat, self.stat_mean, ctx), self.stat_std, ctx
+        )
+
+        # Creator unpatchifier: b t (c f) -> b c t f.
+        var btcf_shape = List[Int]()
+        btcf_shape.append(bsz); btcf_shape.append(tt)
+        btcf_shape.append(LATENT_CH); btcf_shape.append(ff)
+        var normalized_btcf = reshape(normalized, btcf_shape^, ctx)
+        var to_nchw = List[Int]()
+        to_nchw.append(0); to_nchw.append(2)
+        to_nchw.append(1); to_nchw.append(3)
+        return permute(normalized_btcf, to_nchw^, ctx)
+
+
+# ── encode spectrogram ────────────────────────────────────────────────────────
+# Creator AudioProcessor supplies NCHW [B,2,T,64] log-mel. The waveform-to-mel
+# transform intentionally lives outside this model function so it can be parity
+# gated independently from the learned encoder.
+def encode_spectrogram(
+    weights: LTX2AudioVaeDecoderWeights,
+    spectrogram_nchw: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Encode creator log-mel [B,2,T,64] to normalized [B,8,T/4,16]."""
+    var ss = spectrogram_nchw.shape()
+    if len(ss) != 4 or ss[1] != 2 or ss[3] != 64:
+        raise Error("LTX2 AudioVAE encode: spectrogram must be [B,2,T,64]")
+    if spectrogram_nchw.dtype() != STDtype.BF16:
+        raise Error("LTX2 AudioVAE encode: spectrogram must use BF16 storage")
+
+    # NCHW [B,2,T,64] -> NHWC [B,T,64,2].
+    var to_nhwc = List[Int]()
+    to_nhwc.append(0); to_nhwc.append(2)
+    to_nhwc.append(3); to_nhwc.append(1)
+    var h = permute(spectrogram_nchw, to_nhwc^, ctx)
+    h = weights._causal_conv2d_named(
+        h, "audio_vae.encoder.conv_in.conv", ctx
+    )
+
+    comptime for s in range(N_AUDIO_ENCODER_DOWN):
+        var sp = String("audio_vae.encoder.down.") + String(s)
+        comptime for b in range(AUDIO_ENCODER_NBLOCKS):
+            h = weights._resnet_block(
+                h, sp + ".block." + String(b), ctx
+            )
+        comptime if s < N_AUDIO_ENCODER_DOWN - 1:
+            h = weights._downsample(h, sp + ".downsample.conv", ctx)
+
+    h = weights._resnet_block(
+        h, "audio_vae.encoder.mid.block_1", ctx
+    )
+    h = weights._resnet_block(
+        h, "audio_vae.encoder.mid.block_2", ctx
+    )
+    h = weights._pixel_norm(h, 512, ctx)
+    h = silu(h, ctx)
+    h = weights._causal_conv2d_named(
+        h, "audio_vae.encoder.conv_out.conv", ctx
+    )
+    return weights._normalize_encoder_output(h, ctx)
 
 
 # ── decode ────────────────────────────────────────────────────────────────────

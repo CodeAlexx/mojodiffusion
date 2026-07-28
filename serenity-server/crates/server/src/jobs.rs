@@ -17,13 +17,13 @@
 use std::path::Path;
 
 use axum::extract::State;
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use serenity_wire::JobParams;
 
-use crate::{result_manifest, AppState};
+use crate::{AppState, result_manifest};
 
 /// A current-session job in the shared JobBook (the daemon's `jobs` list): the
 /// emitted `record`, the `params` the driver needs to send_start, and the queued
@@ -184,7 +184,7 @@ pub async fn post_reorder(State(st): State<AppState>, body: String) -> Response 
             return jobs_err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "'id' (string) is required",
-            )
+            );
         }
     };
     let mut jobs = match st.jobs.lock() {
@@ -222,7 +222,7 @@ pub async fn post_remove(State(st): State<AppState>, body: String) -> Response {
             return jobs_err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "'id' (string) is required",
-            )
+            );
         }
     };
     let mut jobs = match st.jobs.lock() {
@@ -236,7 +236,9 @@ pub async fn post_remove(State(st): State<AppState>, body: String) -> Response {
     if !jobs[i].is_active_queued() {
         return jobs_err(
             StatusCode::CONFLICT,
-            &format!("only active queued jobs can be removed before execution; use /v1/cancel/<id> for running jobs: {id}"),
+            &format!(
+                "only active queued jobs can be removed before execution; use /v1/cancel/<id> for running jobs: {id}"
+            ),
         );
     }
     jobs.remove(i);
@@ -850,14 +852,16 @@ mod tests {
         let wrong_dims =
             attach_visual_health(single, &r.output_path, r#"{"width":512,"height":512}"#);
         assert_eq!(wrong_dims["visual_health"]["status"], "fail");
-        assert!(wrong_dims["visual_health"]["failures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("wrong_dimensions")));
+        assert!(
+            wrong_dims["visual_health"]["failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("wrong_dimensions"))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -65,8 +65,8 @@ def _check_strictly_less(name: String, actual: Float64, upper_bound: Float64) ra
 
 def main() raises:
     _check_close("default shift", Float64(CHROMA1_HD_DEFAULT_SHIFT), 3.0)
-    _check_equal("default steps", CHROMA1_HD_DEFAULT_STEPS, 30)
-    _check_close("default cfg", Float64(CHROMA1_HD_DEFAULT_CFG_SCALE), 3.5)
+    _check_equal("default steps", CHROMA1_HD_DEFAULT_STEPS, 40)
+    _check_close("default cfg", Float64(CHROMA1_HD_DEFAULT_CFG_SCALE), 3.0)
     _check_equal("cfg batch size", chroma1_hd_cfg_batch_size(), 2)
     _check_false("guidance embedding", chroma1_hd_uses_guidance_embedding())
     _check_close("cfg scalar", Float64(chroma1_hd_cfg_value(2.0, -1.0, 3.5)), 9.5)

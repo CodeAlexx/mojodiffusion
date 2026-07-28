@@ -416,10 +416,41 @@ I2V overlay with its exact trigger and explicit bounded weight. IC-LoRA
 artifacts are not ordinary overlays and remain rejected until their
 reference-token feature runner is admitted.
 
-**Callers today**: Klein (`training/validation_sampler.mojo`), krea2 inference
-(`pipeline/krea2_pipeline.mojo --lora`), LTX-2 runtime. NOTE: no Wan *inference*
-pipeline calls `LoraSet` yet — Wan trained LoRAs are loadable (FMT_DIFFUSION_MODEL)
-but not yet wired into a Wan inference run. Status: **INFERENCE**.
+**Product inference callers today**: SDXL, Ideogram 4, SD 3/3.5, Qwen Image,
+Anima, Flux.1, Chroma, Klein/Flux.2, Krea 2, Z-Image, and LTX-2. The Rust model
+registry discovers LoRAs recursively and case-insensitively, resolves the
+selected registry identity to the exact file, preserves the user's multiplier,
+and publishes each family's real composition limit. Unknown/custom adapters
+are allowed to reach the selected family worker; the Mojo target loader fails
+loudly only when its tensors do not match that model. Cross-family adapters
+with positive architecture metadata are rejected before GPU load.
+
+The model-specific product overlays preserve the creator key topology rather
+than pretending one universal mapping: `models/dit/sdxl_unet.mojo` handles
+kohya/Diffusers SDXL names; `models/dit/ideogram4_resident.mojo` accepts
+A/B and down/up pairs; Qwen uses canonical split/fused projection attachment;
+`models/sd35/sd3_lokr_overlay.mojo` implements the SwarmUI/Comfy efficient
+Kronecker carrier; `models/flux/flux_lora_overlay.mojo` and
+`models/chroma/chroma_lora_overlay.mojo` split fused creator projections into
+their runtime slots. NOTE: no Wan *inference* pipeline calls `LoraSet` yet —
+Wan trained LoRAs are loadable (`FMT_DIFFUSION_MODEL`) but not yet wired into a
+Wan inference run. Status: **INFERENCE**.
+
+## SwarmUI-compatible sampling schedules
+
+`sampling/swarmui_schedules.mojo` ports the creator's Flux model-sampling
+contract at shift 1.15. It implements `normal`, `karras`, `exponential`,
+`simple`, `ddim_uniform`, `sgm_uniform`, `beta`, `linear_quadratic`, and
+`kl_optimal`, including the creator's DDIM interval behavior when the requested
+step count is not a divisor of 999. `sampling/swarmui_schedules_smoke.mojo`
+pins exact scalar answers and the requested-versus-executed step contract.
+
+Flux and Chroma expose genuine Euler/flow-match Euler and DPM++ 2M
+data-prediction updates across those nine schedules. The server publishes the
+per-family executable set through one capability document consumed by both
+Canvas and Generate. The separate public discovery catalog mirrors SwarmUI's
+44 sampler and 16 scheduler IDs for workflow compatibility; catalog presence
+does not claim that all 44 algorithms are implemented for every model.
 
 ---
 
@@ -479,18 +510,37 @@ checks conditioning sidecar prompt identity, resolves an arbitrary LoRA list
 under the shared model root, carries the request's `model_quant`, and dispatches
 only profiles listed in `configs/ltx2_request_profiles.json` through
 `pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The registry currently
-admits 21 exact width/height/frame-count/FPS runners from 512x768/121f@25
-through 960x544/481f@24 and 1920x1088/121f@24. Unsupported tuples fail before
-model load; the UI must select from the published registry rather than round
-or substitute dimensions.
+admits 31 mode-qualified width/height/frame-count/FPS tuples. Ordinary LTX
+Desktop-style generation uses 960x512 or 512x960 after the creator's authored
+960x544/544x960 conditioning size is rounded to 64 pixels. Retake and Extend
+publish separate 960x544/544x960 source-native profiles, while the remaining
+matrix reaches 20 seconds at 540p, 10 seconds at 720p, and 5 seconds at 1080p.
+Unsupported tuples fail before model load; the UI must select from the
+published registry rather than round or substitute dimensions.
 
-I2V and V2V use clean-latent clamping plus exact per-token model timesteps.
-Painted V2V masks lower to the same latent grid with white/edit and
+Ordinary I2V uses the LTX Desktop preprocessing contract: Lanczos fit/fill at
+the authored conditioning size, one-frame libx264 CRF-33 `veryfast` yuv420p
+round-trip, source strength 1.0, separate half/full-resolution VAE encodes, and
+the creator's two-stage distilled denoiser with spatial latent upscaling. I2V
+and ordinary V2V use clean-latent clamping plus exact per-token model
+timesteps. Painted V2V masks lower to the same latent grid with white/edit and
 black/preserve semantics at both stages. The deterministic
 `sampling/parity/ltx2_conditioning_mask_parity.mojo` gate checks I2V, uniform
 V2V, painted V2V, and the T2V broadcast control. Audio is never inferred from
 an input's mere presence: the canonical request carries an explicit generated,
 source-preserving, or no-audio policy.
+
+Retake and Extend instead use the LTX Desktop one-stage full-resolution
+pipeline with the complete distilled BF16 checkpoint and no two-stage support
+LoRA or spatial upscaler. `models/vae/ltx2_audio_processor.mojo` implements the
+creator waveform-to-log-mel frontend, while `models/vae/ltx2_audio_vae.mojo`
+now exposes source-audio encode as well as decode. Source video VAE encode uses
+the creator's 256/64-pixel spatial and 24/16-frame temporal tiles. Retake uses a
+binary temporal mask and freezes source audio in replace-video mode. Extend
+zero-pads video/audio latents at the selected edge, regenerates audio, and
+includes the creator's 0.5-second seam. The Rust boundary stages creator-exact
+PyAV audio samples with `scripts/ltx2_decode_source_audio.py` before entering
+the Mojo AudioProcessor/AudioVAE path.
 
 `configs/ltx2_feature_adapters.json` is the feature-adapter product registry.
 The server embeds the resolved document in the immutable request and the Mojo
@@ -507,6 +557,10 @@ all 48 Gemma layers, projections, and save progress to the server. The server
 caches those tensors by prompt pair and conditioner digest. Exact tokenizer
 IDs passed and real context cosine measured 0.99923-0.99973; the optimized
 reference prompt completed in 17.19 seconds without Python in the product path.
+After each synchronized Gemma layer and aggregate projection upload, the
+conditioner releases clean mmap-backed checkpoint pages to the OS. A real
+512x768, 121-frame Canvas V2V product run measured a 17.8GB cgroup peak with no
+swap; the prior unreleased-page path reached 54.9GB and triggered desktop OOM.
 
 The admitted `int4` route keeps the 48-block SVD-int4 base slab resident and
 streams factorized LoRA A/B matrices per block without allocating dense
@@ -526,6 +580,14 @@ experimental-slow, while SRVGG x4v3 and the imported SeedVR2 source remain
 disabled when their local weights or complete user-video route are absent.
 Build the production request matrix with
 `pixi run bash scripts/build_ltx2_request_profiles.sh`.
+
+The 2026-07-27 creator-parity product gate used the same checkpoint, source,
+prompt, and locked seed in LTX Desktop and Serenity. Paired Retake measured
+0.962804 mean SSIM over 121 frames and 0.987185 over the protected region.
+Paired three-second Extend measured 0.986503 over the protected 108 frames;
+the seam and generated extension followed different numerical trajectories but
+both remained visually clean. Result manifests intentionally keep sampler and
+speed parity unaccepted until those independent gates pass.
 
 ---
 

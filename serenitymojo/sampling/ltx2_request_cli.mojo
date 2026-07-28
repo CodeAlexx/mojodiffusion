@@ -292,6 +292,40 @@ def _configure_loras(obj: JSONValue) raises:
             )
 
 
+def _configure_distillation_adapter(obj: JSONValue) raises:
+    # The Rust boundary resolves this exact path from the model registry.  It
+    # is deliberately separate from authored overlays: a checkpoint may have
+    # zero or one matching sampling/distillation adapter, and Serenity must
+    # never substitute the official LTX adapter for an arbitrary finetune.
+    _setenv(String("LTX2_REQUEST_DISTILLATION_LORA"), String(""))
+    _setenv(String("LTX2_REQUEST_DISTILLATION_MULT"), String("1"))
+    if not obj.contains(String("distillation_adapter")):
+        return
+    var adapter = obj[String("distillation_adapter")]
+    if not adapter.is_object():
+        raise Error(
+            "LTX2 request: distillation_adapter must be a resolved object"
+        )
+    var path = _require_string(adapter, String("path"))
+    if not _path_exists(path):
+        raise Error(
+            String("LTX2 request: distillation adapter not found: ") + path
+        )
+    var weight = Float64(1.0)
+    if adapter.contains(String("weight")):
+        if not adapter[String("weight")].is_number():
+            raise Error(
+                "LTX2 request: distillation_adapter.weight must be a number"
+            )
+        weight = adapter[String("weight")].as_float()
+    if weight < -10.0 or weight > 10.0:
+        raise Error(
+            "LTX2 request: distillation_adapter.weight must be in [-10, 10]"
+        )
+    _setenv(String("LTX2_REQUEST_DISTILLATION_LORA"), path)
+    _setenv(String("LTX2_REQUEST_DISTILLATION_MULT"), String(weight))
+
+
 def _run_request(request_path: String, out_dir: String) raises:
     var request_text = _read_text_file(request_path)
     write_text_file(out_dir + String("/request.json"), request_text)
@@ -387,6 +421,81 @@ def _run_request(request_path: String, out_dir: String) raises:
         raise Error(
             "LTX2 request: image_path and video_path are mutually exclusive"
         )
+    var video_edit_mode = _optional_string(
+        obj, String("video_edit_mode")
+    ).lower()
+    if video_edit_mode.byte_length() == 0:
+        video_edit_mode = String("standard")
+    if (
+        video_edit_mode != String("standard")
+        and video_edit_mode != String("retake")
+        and video_edit_mode != String("extend_start")
+        and video_edit_mode != String("extend_end")
+    ):
+        raise Error(
+            String("LTX2 request: unsupported video_edit_mode '")
+            + video_edit_mode + String("'")
+        )
+    var video_edit_start = _optional_number(
+        obj, String("video_edit_start"), Float64(0.0)
+    )
+    var video_edit_end = _optional_number(
+        obj, String("video_edit_end"), Float64(0.0)
+    )
+    var video_source_frames = 0
+    if obj.contains(String("video_source_frames")):
+        video_source_frames = _require_int(
+            obj, String("video_source_frames")
+        )
+    if video_edit_mode != String("standard"):
+        if video_path.byte_length() == 0:
+            raise Error(
+                "LTX2 request: temporal video editing requires video_path"
+            )
+        if video_mask_path.byte_length() > 0:
+            raise Error(
+                "LTX2 request: temporal video editing cannot use video_mask_path"
+            )
+        if video_source_frames <= 1:
+            raise Error(
+                "LTX2 request: temporal video editing requires video_source_frames"
+            )
+        if video_edit_start < 0.0 or video_edit_end <= video_edit_start:
+            raise Error(
+                "LTX2 request: temporal edit window must have 0 <= start < end"
+            )
+    var source_audio_path = _optional_string(
+        obj, String("source_audio_path")
+    )
+    if (
+        source_audio_path.byte_length() > 0
+        and not _path_exists(source_audio_path)
+    ):
+        raise Error(
+            String("LTX2 request: source_audio_path not found: ")
+            + source_audio_path
+        )
+    var source_audio_sample_rate = 0
+    var source_audio_channels = 0
+    var source_audio_samples = 0
+    if obj.contains(String("source_audio_sample_rate")):
+        source_audio_sample_rate = _require_int(
+            obj, String("source_audio_sample_rate")
+        )
+    if obj.contains(String("source_audio_channels")):
+        source_audio_channels = _require_int(
+            obj, String("source_audio_channels")
+        )
+    if obj.contains(String("source_audio_samples")):
+        source_audio_samples = _require_int(
+            obj, String("source_audio_samples")
+        )
+    if source_audio_path.byte_length() > 0 and (
+        source_audio_sample_rate <= 0
+        or source_audio_channels != 2
+        or source_audio_samples <= 0
+    ):
+        raise Error("LTX2 request: invalid creator source-audio metadata")
     var include_audio = _optional_bool(
         obj, String("include_audio"), False
     )
@@ -401,14 +510,29 @@ def _run_request(request_path: String, out_dir: String) raises:
         raise Error(
             "LTX2 request: audio_policy must be none, generate, or preserve"
         )
-    if (audio_policy == String("generate")) != include_audio:
+    if (
+        video_edit_mode == String("standard")
+        and (audio_policy == String("generate")) != include_audio
+    ):
         raise Error(
             "LTX2 request: audio_policy conflicts with include_audio"
+        )
+    if video_edit_mode != String("standard") and not include_audio:
+        raise Error(
+            "LTX2 creator Retake/Extend must decode its AV output"
         )
     if audio_policy == String("preserve") and video_path.byte_length() == 0:
         raise Error(
             "LTX2 request: audio_policy preserve requires video_path"
         )
+    var regenerate_source_audio = (
+        video_edit_mode == String("extend_start")
+        or video_edit_mode == String("extend_end")
+        or (
+            video_edit_mode == String("retake")
+            and audio_policy == String("generate")
+        )
+    )
     var feature_id = _optional_string(obj, String("feature_id"))
     if feature_id == String("foley-v2a"):
         if video_path.byte_length() == 0:
@@ -436,11 +560,16 @@ def _run_request(request_path: String, out_dir: String) raises:
             String("LTX2 request: unsupported admitted feature_id '")
             + feature_id + String("'")
         )
+    _configure_distillation_adapter(obj)
     _configure_loras(obj)
     var quant = _require_string(obj, String("quant")).lower()
-    if quant != String("fp8") and quant != String("int4"):
+    if (
+        quant != String("bf16")
+        and quant != String("fp8")
+        and quant != String("int4")
+    ):
         raise Error(
-            String("LTX2 request: quant must be fp8 or int4; got '")
+            String("LTX2 request: quant must be bf16, fp8, or int4; got '")
             + quant + String("'")
         )
     var guidance_mode = _require_string(
@@ -473,6 +602,15 @@ def _run_request(request_path: String, out_dir: String) raises:
         video_path,
         video_strength,
         video_mask_path,
+        video_edit_mode,
+        video_edit_start,
+        video_edit_end,
+        video_source_frames,
+        source_audio_path,
+        source_audio_sample_rate,
+        source_audio_channels,
+        source_audio_samples,
+        regenerate_source_audio,
         include_audio,
         _optional_bool(obj, String("defer_decode"), False),
         out_dir,
@@ -493,6 +631,7 @@ def _run_decode(request_path: String, out_dir: String) raises:
         handoff, String("schema")
     ) != String("serenity.ltx2.decode_handoff.v1"):
         raise Error("LTX2 decode handoff schema mismatch")
+    _configure_distillation_adapter(request)
     _configure_loras(request)
     var seed = _require_int(handoff, String("seed"))
     if seed < 0:

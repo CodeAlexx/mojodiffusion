@@ -70,12 +70,14 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.conv import conv2d
 from serenitymojo.ops.norm import group_norm, layer_norm
 from serenitymojo.ops.activations import silu, gelu
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.tensor_algebra import add, mul, concat, reshape, slice
 from serenitymojo.models.dit.sdxl_attention import sdxl_sdpa
 from serenitymojo.models.vae.decoder2d import nchw_to_nhwc, nhwc_to_nchw
 from serenitymojo.models.vae.upsample import upsample_nearest2x_nhwc
+from serenitymojo.lora import LoraSet
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -217,23 +219,96 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
     def load(
         path_or_dir: String, ctx: DeviceContext
     ) raises -> SDXLUNet[Self.LH, Self.LW]:
-        """Load all UNet tensors. Expects keys stripped of any
-        'model.diffusion_model.' prefix (the extracted sdxl_unet_bf16.safetensors
-        ships them stripped). Conv weights (rank-4) are converted OIHW->RSCF."""
+        var lora_paths = List[String]()
+        var lora_weights = List[Float32]()
+        return SDXLUNet[Self.LH, Self.LW].load_with_loras(
+            path_or_dir, lora_paths, lora_weights, ctx
+        )
+
+    @staticmethod
+    def load_with_loras(
+        path_or_dir: String,
+        lora_paths: List[String],
+        lora_weights: List[Float32],
+        ctx: DeviceContext,
+    ) raises -> SDXLUNet[Self.LH, Self.LW]:
+        """Load an extracted UNet or an ordinary full SDXL checkpoint.
+
+        Full checkpoints store the same tensors beneath
+        `model.diffusion_model.`. Detect that layout from the header, load only
+        those tensors, and normalize their names. This keeps arbitrary
+        compatible creator checkpoints out of filename-specific conversion
+        scripts while preserving the compact extracted-UNet path.
+
+        LoRAs are merged sequentially into BF16 OIHW/linear base tensors before
+        convolution weights are converted to the runtime RSCF layout. This
+        preserves the creator/reference LoRA math for both linear and
+        convolution targets."""
+        if len(lora_paths) != len(lora_weights):
+            raise Error("SDXLUNet.load_with_loras: path/weight length mismatch")
         var st = ShardedSafeTensors.open(path_or_dir)
+        var embedded = False
+        for ref nm in st.names():
+            if nm.startswith("model.diffusion_model."):
+                embedded = True
+                break
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
         for ref nm in st.names():
+            if embedded and not nm.startswith("model.diffusion_model."):
+                continue
+            var key = (
+                String(nm.removeprefix("model.diffusion_model."))
+                if embedded else nm.copy()
+            )
             var tv = st.tensor_view(nm)
             var t = Tensor.from_view(tv, ctx)
-            # Conv weights are rank-4 and end in ".weight"; convert to RSCF.
-            var sh = t.shape()
-            if len(sh) == 4 and nm.endswith(".weight"):
-                var rscf = _to_rscf(t, ctx)
-                t = rscf^
+            # Downloaded SDXL checkpoints are commonly FP16 while Serenity's
+            # resident SDXL kernels and conditioning execute BF16. Normalize
+            # every selected UNet tensor at this load boundary so the chosen
+            # checkpoint is usable without an offline conversion step.
+            if t.dtype() != STDtype.BF16:
+                var normalized = cast_tensor(t, STDtype.BF16, ctx)
+                t = normalized^
             var idx = len(weights)
             weights.append(ArcPointer(t^))
-            name_to_idx[nm] = idx
+            name_to_idx[key] = idx
+
+        for i in range(len(lora_paths)):
+            var overlay = LoraSet.load(lora_paths[i])
+            if overlay.format_name() != "KohyaSdxl":
+                raise Error(
+                    String("SDXL LoRA has unsupported tensor format: ")
+                    + overlay.format_name() + String(" (") + lora_paths[i] + String(")")
+                )
+            var resolved = overlay.resolve_sdxl_mappings(name_to_idx)
+            if resolved == 0:
+                raise Error(
+                    String("SDXL LoRA has no compatible UNet modules: ")
+                    + lora_paths[i]
+                )
+            var merged = overlay.merge_into_indexed(
+                weights, name_to_idx, lora_weights[i], ctx
+            )
+            if merged == 0:
+                raise Error(
+                    String("SDXL LoRA resolved but merged zero UNet modules: ")
+                    + lora_paths[i]
+                )
+            print(
+                "[sdxl] merged LoRA", lora_paths[i], "weight", lora_weights[i],
+                "modules", merged,
+            )
+
+        # The runtime convolutions consume RSCF. LoRA math above targets the
+        # checkpoint's native OIHW, so convert rank-4 weights only after every
+        # requested overlay has been applied.
+        for ref entry in name_to_idx.items():
+            var key = entry.key
+            var idx = entry.value
+            if len(weights[idx][].shape()) == 4 and key.endswith(".weight"):
+                var rscf = _to_rscf(weights[idx][], ctx)
+                weights[idx] = ArcPointer[Tensor](rscf^)
         return SDXLUNet[Self.LH, Self.LW](weights^, name_to_idx^)
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:

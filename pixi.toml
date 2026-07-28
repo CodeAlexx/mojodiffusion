@@ -20,6 +20,10 @@ cuda-nvrtc-dev = ">=12.8,<14"
 libcublas-dev = ">=12.8,<14"
 patchelf = ">=0.17,<0.18"
 ffmpeg = { version = ">=8.1.2,<8.2", build = "gpl_*" }
+# LTX Desktop's Retake/Extend oracle decodes source audio with PyAV before the
+# creator AudioProcessor and AudioVAE encoder. Pin the identical release so the
+# cross-modal source latent does not depend on a command-line ffmpeg conversion.
+av = "==16.1.0"
 
 [tasks]
 setup = "bash scripts/setup.sh"
@@ -39,6 +43,7 @@ check-ltx2-conditioning = { cmd = "mkdir -p output/checks && mojo build -O0 -j 1
 build-ltx2-conditioning = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -j 1 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -Lserenitymojo/ops/cshim/lib/cudnn_stubs -Xlinker -lcudnn -Xlinker -rpath -Xlinker \\$ORIGIN/../../serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib serenitymojo/pipeline/ltx2_encode_prompt.mojo -o output/bin/ltx2_encode_prompt", depends-on = ["build-cshim"] }
 build-krea-stage = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm -Xlinker -lpng16 -Xlinker -lturbojpeg serenitymojo/pipeline/zimage_stage.mojo -o output/bin/serenity_image_dataset_stage"
 build-inference-stub = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm serenitymojo/serve/serenity_worker_stub.mojo -o output/bin/serenity_worker_stub"
+build-worker-lens-raw = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -j 1 -I . -I trainer/src -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -lcublas -Xlinker -lm -Xlinker -ldl -Xlinker -lpng16 -Xlinker -lturbojpeg -Xlinker -lsqlite3 -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_lens.mojo -o output/bin/serenity_worker_lens && bash scripts/fix_mojo_runpath.sh output/bin/serenity_worker_lens", depends-on = ["build-cshim"] }
 build-genesis-video-editor = "bash scripts/build_genesis_video_editor.sh"
 check-genesis-video-editor = "node scripts/check_genesis_video_editor.js"
 build-scail2 = { cmd = "bash scripts/build_scail2.sh", depends-on = ["build-cshim"] }

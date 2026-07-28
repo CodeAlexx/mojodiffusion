@@ -34,6 +34,7 @@
 
 from std.gpu.host import DeviceContext
 from std.gpu import global_idx, grid_dim, block_dim
+from std.math import isfinite
 from std.memory import alloc
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -246,6 +247,12 @@ def save_png(
             + " values, expected "
             + String(3 * plane)
         )
+    for i in range(len(host)):
+        if not isfinite(host[i]):
+            raise Error(
+                String("save_png: image contains a non-finite value at index ")
+                + String(i)
+            )
 
     # Build filtered scanlines: per row, a filter byte (0=None) then HWC RGB.
     # CHW -> HWC interleave: out pixel (y,x) channel c comes from host[c*plane + y*width + x].

@@ -27,6 +27,7 @@ from std.memory import ArcPointer
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
 from serenitymojo.ops.linear import linear
@@ -1666,10 +1667,135 @@ def qwen_offload_lora_adamw_step_gpu(
 
 from serenitymojo.models.qwenimage.qwenimage_block_device import (
     QwenModVecsDevice, qwen_modvecs_to_device,
-    QwenDoubleBlockLoraDevice, qwen_double_block_lora_to_device,
+    QwenLoraAdapterDevice, QwenStreamLoraDevice,
+    QwenDoubleBlockLoraDevice, qwen_lora_adapter_to_device,
+    qwen_double_block_lora_to_device,
     QwenDoubleBlockSavedDevice,
     qwen_double_block_lora_forward_device, qwen_double_block_lora_backward_device,
 )
+
+
+@fieldwise_init
+struct QwenLoraDeviceSet(Copyable, Movable):
+    """Sparse runtime Qwen LoRA overlay, one optional six-slot pair per block."""
+
+    var dbl: List[QwenDoubleBlockLoraDevice]
+    var target_count: Int
+
+
+def _qwen_none_adapter() -> Optional[QwenLoraAdapterDevice]:
+    return Optional[QwenLoraAdapterDevice](None)
+
+
+def _qwen_pair_exists(st: SafeTensors, prefix: String) -> Bool:
+    return (
+        (
+            prefix + String(".lora_A.weight") in st.tensors
+            and prefix + String(".lora_B.weight") in st.tensors
+        )
+        or (
+            prefix + String(".lora_down.weight") in st.tensors
+            and prefix + String(".lora_up.weight") in st.tensors
+        )
+        or (
+            String("diffusion_model.") + prefix + String(".lora_A.weight") in st.tensors
+            and String("diffusion_model.") + prefix + String(".lora_B.weight") in st.tensors
+        )
+        or (
+            String("diffusion_model.") + prefix + String(".lora_down.weight") in st.tensors
+            and String("diffusion_model.") + prefix + String(".lora_up.weight") in st.tensors
+        )
+    )
+
+
+def _load_qwen_device_slot(
+    st: SafeTensors,
+    prefix: String,
+    expected_in: Int,
+    expected_out: Int,
+    multiplier: Float32,
+    path: String,
+    ctx: DeviceContext,
+) raises -> Optional[QwenLoraAdapterDevice]:
+    if not _qwen_pair_exists(st, prefix):
+        return Optional[QwenLoraAdapterDevice](None)
+
+    var prefixes = List[String]()
+    prefixes.append(prefix)
+    # PEFT files without an explicit alpha use scale=1.0. The shared resume
+    # loader reconstructs file alpha/rank when alpha is present.
+    var named = load_lora_for_resume(prefixes^, Float32(1.0), path, ctx)
+    var adapter = named[0].adapter.copy()
+    if adapter.in_f != expected_in or adapter.out_f != expected_out:
+        raise Error(
+            String("qwenimage LoRA shape mismatch for ") + prefix
+            + String(": got in=") + String(adapter.in_f)
+            + String(" out=") + String(adapter.out_f)
+            + String(" expected in=") + String(expected_in)
+            + String(" out=") + String(expected_out)
+        )
+    adapter.scale *= multiplier
+    return Optional[QwenLoraAdapterDevice](
+        qwen_lora_adapter_to_device(adapter^, ctx)
+    )
+
+
+def load_qwenimage_lora_device_set(
+    path: String,
+    multiplier: Float32,
+    ctx: DeviceContext,
+    num_double: Int = 60,
+    D: Int = 3072,
+    F: Int = 12288,
+) raises -> QwenLoraDeviceSet:
+    """Load any compatible subset of canonical Qwen PEFT/Serenity LoRA slots.
+
+    This is the product-inference form of the existing training loader. Missing
+    projections remain absent, while every present pair is shape-checked and
+    uses the exact existing Qwen device LoRA application math.
+    """
+    var st = SafeTensors.open(path)
+    var dbl = List[QwenDoubleBlockLoraDevice]()
+    var target_count = 0
+
+    for bi in range(num_double):
+        var slots = List[Optional[QwenLoraAdapterDevice]]()
+        for slot in range(DBL_SLOTS):
+            var in_f = D
+            var out_f = D
+            if slot == 4 or slot == 10:
+                out_f = F
+            elif slot == 5 or slot == 11:
+                in_f = F
+            var loaded = _load_qwen_device_slot(
+                st,
+                _qwen_lora_prefix(bi, slot),
+                in_f,
+                out_f,
+                multiplier,
+                path,
+                ctx,
+            )
+            if loaded:
+                target_count += 1
+            slots.append(loaded^)
+
+        var img = QwenStreamLoraDevice(
+            slots[0].copy(), slots[1].copy(), slots[2].copy(),
+            slots[3].copy(), slots[4].copy(), slots[5].copy(),
+        )
+        var txt = QwenStreamLoraDevice(
+            slots[6].copy(), slots[7].copy(), slots[8].copy(),
+            slots[9].copy(), slots[10].copy(), slots[11].copy(),
+        )
+        dbl.append(QwenDoubleBlockLoraDevice(img^, txt^))
+
+    if target_count == 0:
+        raise Error(
+            "qwenimage LoRA: no compatible Qwen transformer projection pairs"
+            " were found in the selected file"
+        )
+    return QwenLoraDeviceSet(dbl^, target_count)
 
 
 struct QwenOffloadForwardDevice(Movable):

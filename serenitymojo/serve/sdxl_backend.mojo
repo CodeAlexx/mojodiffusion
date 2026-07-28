@@ -35,8 +35,9 @@
 # Size support: the finite seven-shape 1024-area product ladder. Every arm is
 # comptime-specialized at its exact latent H/W; steps/cfg/seed stay runtime.
 #
-# LoRA / img2img: NOT supported yet — rejected at admission so they never silently
-# no-op (matches sdxl_sample_cli's "accepted-and-ignored" caveat, made fail-loud here).
+# SDXL kohya LoRAs are merged sequentially at UNet load, including creator-style
+# convolution adapters. Img2img remains fail-loud until its conditioning path is
+# implemented.
 
 from std.collections import Optional
 from std.ffi import external_call
@@ -68,6 +69,8 @@ from serenitymojo.ops.tensor_algebra import mul_scalar, concat
 from serenitymojo.sampling.sdxl_euler import (
     SDXLEulerScheduler,
     sdxl_cfg,
+    sdxl_denoised_from_eps,
+    sdxl_dpmpp_2m_step,
     sdxl_euler_step,
     sdxl_initial_noise_sigma,
     sdxl_input_scale,
@@ -141,6 +144,30 @@ comptime WHOLE_DECODE_MIN_FREE_BYTES = 22 * 1024 * 1024 * 1024  # 22 GiB
 # realistic free so it takes the tiled 3x3 fallback (which succeeds even at ~2 GiB
 # free, cf. klein/sd3) unless the card is nearly empty. tiled degrades slightly
 # (MJ-1054) but RENDERS — strictly better than OOM.
+
+
+def _sdxl_sampler_name(name: String) -> String:
+    var normalized = String(name.lower())
+    if normalized == String(""):
+        return String("euler")
+    if normalized == String("dpm++ 2m") or normalized == String("dpmpp 2m"):
+        return String("dpmpp_2m")
+    return normalized^
+
+
+def _sdxl_scheduler_name(name: String) -> String:
+    var normalized = String(name.lower())
+    return String("normal") if normalized == String("") else normalized^
+
+
+def _sdxl_executed_sampler(name: String) -> String:
+    var normalized = _sdxl_sampler_name(name)
+    if normalized == String("dpmpp_2m"):
+        return String("sdxl_dpmpp_2m")
+    if normalized == String("ddim"):
+        # This is a genuine Comfy alias: sampler_object("ddim") dispatches Euler.
+        return String("sdxl_euler_ddim_alias")
+    return String("sdxl_euler")
 
 
 def _shell(cmd: String) -> Int:
@@ -283,6 +310,8 @@ struct SdxlBackend(GenBackend, Movable):
 
     # ── resident across jobs (UNet weights, loaded once on first job) ──
     var loaded: Bool
+    var loaded_checkpoint: String
+    var loaded_lora_signature: String
     var model_width: Int
     var model_height: Int
     var model_square: List[ArcPointer[SDXLUNet[LH_SQUARE, LW_SQUARE]]]
@@ -304,6 +333,8 @@ struct SdxlBackend(GenBackend, Movable):
     var caps: List[ArcPointer[SdxlCaps]]            # 0/1
     var sched: List[ArcPointer[SDXLEulerScheduler]] # 0/1
     var latent: List[ArcPointer[Tensor]]            # 0/1 ([1,4,LH,LW] F32)
+    var previous_denoised: List[ArcPointer[Tensor]] # 0/1, DPM++ 2M history
+    var previous_sigma: Float32
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
@@ -316,6 +347,8 @@ struct SdxlBackend(GenBackend, Movable):
     def __init__(out self) raises:
         self.ctx = DeviceContext()
         self.loaded = False
+        self.loaded_checkpoint = String("")
+        self.loaded_lora_signature = String("")
         self.model_width = 0
         self.model_height = 0
         self.model_square = List[ArcPointer[SDXLUNet[LH_SQUARE, LW_SQUARE]]]()
@@ -335,6 +368,8 @@ struct SdxlBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[SdxlCaps]]()
         self.sched = List[ArcPointer[SDXLEulerScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.previous_denoised = List[ArcPointer[Tensor]]()
+        self.previous_sigma = 0.0
         self.job_t0_ns = UInt(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
@@ -354,7 +389,7 @@ struct SdxlBackend(GenBackend, Movable):
         """Best-effort match to a /v1/models scan entry for the resident UNet
         (the flat .serenity/models/checkpoints/sdxl_unet_bf16.safetensors
         checkpoint)."""
-        return String("sdxl_unet_bf16.safetensors") if self.loaded else String("")
+        return self.params.model.copy() if self.loaded else String("")
 
     # ── job admission ─────────────────────────────────────────────────────────
     def start(mut self, params: JobParams) raises:
@@ -393,11 +428,6 @@ struct SdxlBackend(GenBackend, Movable):
                 + "x" + String(params.height)
                 + " — supported compiled shapes are 1024x1024, 1152x896,"
                 + " 896x1152, 1344x768, 768x1344, 1280x832, and 832x1280"
-            )
-        if len(params.loras) > 0:
-            raise Error(
-                "sdxl: LoRA is not supported for SDXL in this backend yet"
-                " (no LoRA overlay path wired); submit without a LoRA"
             )
         if params.init_image.byte_length() > 0:
             raise Error(
@@ -479,14 +509,21 @@ struct SdxlBackend(GenBackend, Movable):
         content += String('    "sampler_registry_backend":"sdxl",\n')
         content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
-        content += String('    "executed_sampler":"sdxl_euler",\n')
-        content += String('    "executed_scheduler":"normal",\n')
+        content += String('    "executed_sampler":"') + json_escape(
+            _sdxl_executed_sampler(self.params.sampler)
+        ) + String('",\n')
+        content += String('    "executed_scheduler":"') + json_escape(
+            _sdxl_scheduler_name(self.params.scheduler)
+        ) + String('",\n')
         content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
         content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
         content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "lora_signature":"') + json_escape(
+            self._requested_lora_signature()
+        ) + String('",\n')
         content += String('    "dtype":"bf16_unet_f32_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
@@ -545,11 +582,19 @@ struct SdxlBackend(GenBackend, Movable):
         self.caps.append(ArcPointer(caps^))
 
     def _load_model(mut self) raises:
-        """Load the SDXL UNet (once; stays resident). Path from the registered
-        manifest (the verified sdxl_sample_cli source of truth)."""
+        """Load the selected compatible SDXL checkpoint (once; stays resident)."""
+        var manifest = default_manifest_by_id(String("sdxl"))
+        var checkpoint = (
+            self.params.checkpoint_path.copy()
+            if self.params.checkpoint_path != String("")
+            else manifest.denoiser_path.copy()
+        )
+        var lora_signature = self._requested_lora_signature()
         if (
             self.loaded and self.model_width == self.params.width
             and self.model_height == self.params.height
+            and self.loaded_checkpoint == checkpoint
+            and self.loaded_lora_signature == lora_signature
         ):
             return
         self.model_square = List[ArcPointer[SDXLUNet[LH_SQUARE, LW_SQUARE]]]()
@@ -560,57 +605,90 @@ struct SdxlBackend(GenBackend, Movable):
         self.model_1280x832 = List[ArcPointer[SDXLUNet[LH_1280X832, LW_1280X832]]]()
         self.model_832x1280 = List[ArcPointer[SDXLUNet[LH_832X1280, LW_832X1280]]]()
         self.loaded = False
+        self.loaded_checkpoint = String("")
+        self.loaded_lora_signature = String("")
         self.model_width = 0
         self.model_height = 0
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
         _print_vram("before SDXL UNet load")
-        var manifest = default_manifest_by_id(String("sdxl"))
+        var lora_paths = List[String]()
+        var lora_weights = List[Float32]()
+        for i in range(len(self.params.loras)):
+            lora_paths.append(self.params.loras[i].name)
+            lora_weights.append(Float32(self.params.loras[i].weight))
         if self.params.width == 1024:
-            print("[sdxl] loading SDXLUNet[128,128] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[128,128] from", checkpoint)
             self.model_square.append(ArcPointer(
-                SDXLUNet[LH_SQUARE, LW_SQUARE].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_SQUARE, LW_SQUARE].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         elif self.params.width == 1152:
-            print("[sdxl] loading SDXLUNet[112,144] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[112,144] from", checkpoint)
             self.model_1152x896.append(ArcPointer(
-                SDXLUNet[LH_1152X896, LW_1152X896].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_1152X896, LW_1152X896].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         elif self.params.width == 896:
-            print("[sdxl] loading SDXLUNet[144,112] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[144,112] from", checkpoint)
             self.model_896x1152.append(ArcPointer(
-                SDXLUNet[LH_896X1152, LW_896X1152].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_896X1152, LW_896X1152].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         elif self.params.width == 1344:
-            print("[sdxl] loading SDXLUNet[96,168] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[96,168] from", checkpoint)
             self.model_landscape.append(ArcPointer(
-                SDXLUNet[LH_LANDSCAPE, LW_LANDSCAPE].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_LANDSCAPE, LW_LANDSCAPE].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         elif self.params.width == 768:
-            print("[sdxl] loading SDXLUNet[168,96] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[168,96] from", checkpoint)
             self.model_portrait.append(ArcPointer(
-                SDXLUNet[LH_PORTRAIT, LW_PORTRAIT].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_PORTRAIT, LW_PORTRAIT].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         elif self.params.width == 1280:
-            print("[sdxl] loading SDXLUNet[104,160] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[104,160] from", checkpoint)
             self.model_1280x832.append(ArcPointer(
-                SDXLUNet[LH_1280X832, LW_1280X832].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_1280X832, LW_1280X832].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         else:
-            print("[sdxl] loading SDXLUNet[160,104] from", manifest.denoiser_path)
+            print("[sdxl] loading SDXLUNet[160,104] from", checkpoint)
             self.model_832x1280.append(ArcPointer(
-                SDXLUNet[LH_832X1280, LW_832X1280].load(manifest.denoiser_path, self.ctx)
+                SDXLUNet[LH_832X1280, LW_832X1280].load_with_loras(
+                    checkpoint, lora_paths, lora_weights, self.ctx
+                )
             ))
         self.loaded = True
+        self.loaded_checkpoint = checkpoint^
+        self.loaded_lora_signature = lora_signature^
         self.model_width = self.params.width
         self.model_height = self.params.height
         _print_vram("after SDXL UNet load (resident)")
 
+    def _requested_lora_signature(self) -> String:
+        var out = String("")
+        for i in range(len(self.params.loras)):
+            if i > 0:
+                out += String("|")
+            out += self.params.loras[i].name
+            out += String("@")
+            out += String(self.params.loras[i].weight)
+        return out
+
     def _prepare_job(mut self) raises:
-        """Euler scheduler (honors steps) + seeded scaled initial latent (honors seed)."""
+        """SwarmUI scheduler + seeded scaled initial latent (honors seed)."""
         self.sched = List[ArcPointer[SDXLEulerScheduler]]()
-        var sched = SDXLEulerScheduler(self.params.steps)
+        var scheduler_name = _sdxl_scheduler_name(self.params.scheduler)
+        var sched = SDXLEulerScheduler(self.params.steps, scheduler_name)
         var sigmas = sched.sigmas()
         var init_sigma = sdxl_initial_noise_sigma(sigmas[0])
         var lh = self.params.height // 8
@@ -634,14 +712,17 @@ struct SdxlBackend(GenBackend, Movable):
         self.sched.append(ArcPointer(sched^))
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x^))
+        self.previous_denoised = List[ArcPointer[Tensor]]()
+        self.previous_sigma = 0.0
         print(
             "[sdxl] job", self.params.job_id, ":", self.params.steps,
             "steps, cfg", self.cfg, "seed", self.params.seed,
             "size", self.params.width, "x", self.params.height,
+            "sampler", _sdxl_sampler_name(self.params.sampler),
+            "scheduler", scheduler_name,
         )
 
-    # ── one denoise step (CFG dual forward + Euler) ────────────────────────────
-    # Verbatim from sdxl_sample_cli._denoise's per-step body.
+    # ── one denoise step (CFG dual forward + selected SwarmUI sampler) ─────────
     def _denoise_one(mut self) raises:
         var i = self.cur
         var sigmas = self.sched[0][].sigmas()
@@ -712,9 +793,36 @@ struct SdxlBackend(GenBackend, Movable):
                 self.caps[0][].y_uncond, self.ctx
             ), STDtype.F32, self.ctx)
         var eps = sdxl_cfg(eps_cond, eps_uncond, self.cfg, self.ctx)
-        var x_new = sdxl_euler_step(
-            self.latent[0][], eps, sigma, sigma_next, self.ctx
-        )
+        var sampler_name = _sdxl_sampler_name(self.params.sampler)
+        var x_new: Tensor
+        if sampler_name == String("dpmpp_2m"):
+            var denoised = sdxl_denoised_from_eps(
+                self.latent[0][], eps, sigma, self.ctx
+            )
+            var have_previous = len(self.previous_denoised) > 0
+            var previous = (
+                self.previous_denoised[0][].clone(self.ctx)
+                if have_previous
+                else denoised.clone(self.ctx)
+            )
+            x_new = sdxl_dpmpp_2m_step(
+                self.latent[0][],
+                denoised,
+                previous,
+                have_previous,
+                sigma,
+                sigma_next,
+                self.previous_sigma,
+                self.ctx,
+            )
+            self.previous_denoised = List[ArcPointer[Tensor]]()
+            self.previous_denoised.append(ArcPointer(denoised^))
+            self.previous_sigma = sigma
+        else:
+            # Comfy's `ddim` sampler object is intentionally the Euler sampler.
+            x_new = sdxl_euler_step(
+                self.latent[0][], eps, sigma, sigma_next, self.ctx
+            )
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x_new^))
 
@@ -744,6 +852,8 @@ struct SdxlBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[SdxlCaps]]()
         self.sched = List[ArcPointer[SDXLEulerScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.previous_denoised = List[ArcPointer[Tensor]]()
+        self.previous_sigma = 0.0
         # The 1024^2 SDXL VAE decode activations OOM on a 24 GB card if the ~6 GB
         # resident UNet stays put (MEASURED: CUDA_ERROR_OUT_OF_MEMORY at decode with
         # ~15 GB already used). Free the UNet + trim the mempool before decoding; the
@@ -756,6 +866,8 @@ struct SdxlBackend(GenBackend, Movable):
         self.model_1280x832 = List[ArcPointer[SDXLUNet[LH_1280X832, LW_1280X832]]]()
         self.model_832x1280 = List[ArcPointer[SDXLUNet[LH_832X1280, LW_832X1280]]]()
         self.loaded = False
+        self.loaded_checkpoint = String("")
+        self.loaded_lora_signature = String("")
         self.model_width = 0
         self.model_height = 0
         self.ctx.synchronize()
@@ -786,6 +898,8 @@ struct SdxlBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[SdxlCaps]]()
         self.sched = List[ArcPointer[SDXLEulerScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.previous_denoised = List[ArcPointer[Tensor]]()
+        self.previous_sigma = 0.0
 
     # ── the pull-based tick ───────────────────────────────────────────────────
     def step(mut self) raises -> StepResult:

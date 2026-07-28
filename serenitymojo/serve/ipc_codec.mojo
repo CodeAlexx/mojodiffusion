@@ -32,6 +32,7 @@ def encode_start(p: JobParams) raises -> String:
     o.set("cmd", JSONValue.from_string(String("start")))
     o.set("job_id", JSONValue.from_string(p.job_id))
     o.set("model", JSONValue.from_string(p.model))
+    o.set("checkpoint_path", JSONValue.from_string(p.checkpoint_path))
     o.set("prompt", JSONValue.from_string(p.prompt))
     o.set("negative", JSONValue.from_string(p.negative))
     o.set("width", JSONValue.from_int(p.width))
@@ -128,6 +129,8 @@ def decode_start(obj: JSONValue) raises -> JobParams:
     var p = JobParams()
     p.job_id = obj["job_id"].as_string()
     p.model = obj["model"].as_string()
+    if obj.contains("checkpoint_path") and not obj["checkpoint_path"].is_null():
+        p.checkpoint_path = obj["checkpoint_path"].as_string()
     p.prompt = obj["prompt"].as_string()
     p.negative = obj["negative"].as_string()
     p.width = Int(obj["width"].as_float())

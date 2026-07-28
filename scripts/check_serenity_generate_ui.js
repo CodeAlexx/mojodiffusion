@@ -4,6 +4,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 function loadChromium() {
   try {
@@ -120,15 +121,24 @@ async function run() {
       }),
     });
   });
-  const restoreVideoFixture = path.join(
-    process.cwd(),
-    "output",
-    "serenity_ui_out",
-    "video_projects",
-    "project-1784913016021-437",
-    "media",
-    "1784913017255-ltx2_t2v_hq.mp4"
-  );
+  const restoreVideoFixture = path.join(os.tmpdir(), "serenity-generate-ui-video-fixture.mp4");
+  if (!fs.existsSync(restoreVideoFixture) || fs.statSync(restoreVideoFixture).size < 1024) {
+    const generated = spawnSync("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "color=c=black:s=320x180:d=1:r=24",
+      "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart", restoreVideoFixture,
+    ], { encoding: "utf8" });
+    assert(generated.status === 0 && fs.existsSync(restoreVideoFixture),
+      `failed to create browser video fixture: ${generated.stderr || generated.error || generated.status}`);
+  }
+  await page.route("**/out/video_projects/project-1784913016021-437/media/1784913017255-ltx2_t2v_hq.mp4", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "video/mp4",
+      body: fs.readFileSync(restoreVideoFixture),
+    });
+  });
   await page.route("**/out/video-restore-probe/ltx2_t2v_hq.mp4", async (route) => {
     await route.fulfill({
       status: 200,
@@ -236,8 +246,17 @@ async function run() {
     ];
     const missingNested = nestedInventory.filter((name) => !surface.railText.includes(name));
     assert(missingNested.length === 0, `nested parameter inventory is incomplete: ${missingNested.join(", ")}`);
+    const expectedLtxVideoModels = [
+      "ltx-2.3-22b-dev",
+      "ltx-2.3-22b-dev-fp8",
+      "ltx-2.3-22b-dev-fp8-dequant-bf16",
+      "ltx-2.3-22b-distilled",
+      "ltx-2.3-22b-distilled-fp8",
+      "ltx-2.3-22b-distilled-fp8-dequant-bf16",
+    ];
     assert(
-      surface.videoModels.length === 1 && /ltx-2\.3-22b-dev-fp8/i.test(surface.videoModels[0]),
+      surface.videoModels.length === expectedLtxVideoModels.length &&
+        expectedLtxVideoModels.every((model) => surface.videoModels.includes(model)),
       `admitted video picker inventory drifted: ${surface.videoModels.join(", ")}`
     );
     assert(
@@ -267,6 +286,43 @@ async function run() {
       `model menu is painted beneath Core Parameters: ${JSON.stringify(modelMenuLayering)}`
     );
     await page.locator("#gen-model-search").press("Escape");
+
+    const imageModelProfiles = await page.evaluate(() =>
+      GenerateTab.state.allModels
+        .filter((model) => model.generationRoute === "image")
+        .map((model) => ({
+          name: model.name,
+          defaults: model.generationDefaults || {},
+        }))
+    );
+    const modelDefaultAudit = [];
+    for (const model of imageModelProfiles) {
+      assert(
+        Number.isFinite(Number(model.defaults.steps)) &&
+        Number.isFinite(Number(model.defaults.cfg)),
+        `model card is missing exact generation defaults: ${JSON.stringify(model)}`
+      );
+      await selectModel(page, model.name);
+      const observed = await page.evaluate(() => ({
+        model: GenerateTab.state.model,
+        steps: GenerateTab.state.steps,
+        cfg: GenerateTab.state.cfg,
+        inputSteps: Number(document.querySelector("#gen-steps").value),
+        rangeSteps: Number(document.querySelector("#gen-steps-range").value),
+        inputMax: Number(document.querySelector("#gen-steps").max),
+        rangeMax: Number(document.querySelector("#gen-steps-range").max),
+      }));
+      assert(
+        observed.steps === Number(model.defaults.steps) &&
+        observed.inputSteps === Number(model.defaults.steps) &&
+        observed.rangeSteps === Number(model.defaults.steps) &&
+        observed.cfg === Number(model.defaults.cfg) &&
+        observed.inputMax >= 500 &&
+        observed.rangeMax >= 150,
+        `canvas did not honor ${model.name}'s model-card defaults: expected ${JSON.stringify(model.defaults)}, got ${JSON.stringify(observed)}`
+      );
+      modelDefaultAudit.push(observed);
+    }
 
     await selectModel(page, "zimage_base");
     const zimage = await page.evaluate(() => ({
@@ -698,6 +754,28 @@ async function run() {
       path: path.join(process.cwd(), "output", "checks", "serenity_generate_video.png"),
       fullPage: true,
     });
+    await selectModel(page, "krea2-raw");
+    const imageStepBoundsAfterVideo = await page.evaluate(() => {
+      const input = document.querySelector("#gen-steps");
+      const range = document.querySelector("#gen-steps-range");
+      input.value = "80";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return {
+        inputMax: Number(input.max),
+        rangeMax: Number(range.max),
+        inputValue: Number(input.value),
+        rangeValue: Number(range.value),
+        stateSteps: GenerateTab.state.steps,
+      };
+    });
+    assert(
+      imageStepBoundsAfterVideo.inputMax >= 500 &&
+      imageStepBoundsAfterVideo.rangeMax >= 150 &&
+      imageStepBoundsAfterVideo.inputValue === 80 &&
+      imageStepBoundsAfterVideo.rangeValue === 80 &&
+      imageStepBoundsAfterVideo.stateSteps === 80,
+      `LTX2's 20-step ceiling leaked into image generation: ${JSON.stringify(imageStepBoundsAfterVideo)}`
+    );
     await page.evaluate(() => {
       document.querySelectorAll(".gen-workspace-group-title.closed, .gen-workspace-group-body.closed")
         .forEach((node) => node.classList.remove("closed"));
@@ -838,6 +916,8 @@ async function run() {
       encodingActivity,
       samplingActivity,
       reused,
+      imageStepBoundsAfterVideo,
+      modelDefaultAudit,
       libraryTabs: surface.libraryTabs,
     }, null, 2));
   } finally {

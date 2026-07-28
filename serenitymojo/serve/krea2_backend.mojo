@@ -231,6 +231,7 @@ struct Krea2Backend(GenBackend, Movable):
     var edit_latent_cache: List[Float32]
     var edit_base_cache_valid: Bool
     var edit_base_cache_turbo: Bool
+    var edit_base_cache_checkpoint: String
     var edit_base_cache_resident_blocks: Int
     var edit_base_resident_i8: Optional[Krea2ResidentInt8]
     var edit_base_host_i8: Optional[Krea2HostInt8Inf]
@@ -250,6 +251,7 @@ struct Krea2Backend(GenBackend, Movable):
     var lanpaint_source_cache_signed_chw: List[Float32]
     var lanpaint_base_cache_valid: Bool
     var lanpaint_base_cache_turbo: Bool
+    var lanpaint_base_cache_checkpoint: String
     var lanpaint_base_cache_resident_blocks: Int
     var lanpaint_base_cond: Optional[Krea2ResidentCond]
     var lanpaint_base_fin: Optional[Krea2StreamFinal]
@@ -280,6 +282,7 @@ struct Krea2Backend(GenBackend, Movable):
         self.edit_latent_cache = List[Float32]()
         self.edit_base_cache_valid = False
         self.edit_base_cache_turbo = False
+        self.edit_base_cache_checkpoint = String("")
         self.edit_base_cache_resident_blocks = 0
         self.edit_base_resident_i8 = Optional[Krea2ResidentInt8](None)
         self.edit_base_host_i8 = Optional[Krea2HostInt8Inf](None)
@@ -295,6 +298,7 @@ struct Krea2Backend(GenBackend, Movable):
         self.lanpaint_source_cache_signed_chw = List[Float32]()
         self.lanpaint_base_cache_valid = False
         self.lanpaint_base_cache_turbo = False
+        self.lanpaint_base_cache_checkpoint = String("")
         self.lanpaint_base_cache_resident_blocks = 0
         self.lanpaint_base_cond = Optional[Krea2ResidentCond](None)
         self.lanpaint_base_fin = Optional[Krea2StreamFinal](None)
@@ -435,6 +439,7 @@ struct Krea2Backend(GenBackend, Movable):
         self.edit_base_host_i8 = Optional[Krea2HostInt8Inf](None)
         self.edit_base_shared = Optional[Krea2SharedResident](None)
         self.edit_base_cache_valid = False
+        self.edit_base_cache_checkpoint = String("")
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
@@ -449,6 +454,7 @@ struct Krea2Backend(GenBackend, Movable):
         self.lanpaint_base_resident_i8 = Optional[Krea2ResidentInt8](None)
         self.lanpaint_base_host_i8 = Optional[Krea2HostInt8Inf](None)
         self.lanpaint_base_cache_valid = False
+        self.lanpaint_base_cache_checkpoint = String("")
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
@@ -467,7 +473,11 @@ struct Krea2Backend(GenBackend, Movable):
 
         # 3) build the fp8-resident base + conditioning weights + final layer.
         var turbo = self.params.model.lower().find("turbo") >= 0
-        var checkpoint = String(KREA2_TURBO) if turbo else String(KREA2_RAW)
+        var checkpoint = (
+            self.params.checkpoint_path.copy()
+            if self.params.checkpoint_path != String("")
+            else (String(KREA2_TURBO) if turbo else String(KREA2_RAW))
+        )
         print("[krea2] model=", "Krea-2-Turbo" if turbo else "Krea-2-Raw",
               " checkpoint=", checkpoint)
         var st = ShardedSafeTensors.open(checkpoint)
@@ -593,7 +603,11 @@ struct Krea2Backend(GenBackend, Movable):
             return r^
 
         var turbo = self.params.model.lower().find("turbo") >= 0
-        var checkpoint = String(KREA2_TURBO) if turbo else String(KREA2_RAW)
+        var checkpoint = (
+            self.params.checkpoint_path.copy()
+            if self.params.checkpoint_path != String("")
+            else (String(KREA2_TURBO) if turbo else String(KREA2_RAW))
+        )
         print(
             "[krea2-lanpaint] model=",
             "Krea-2-Turbo" if turbo else "Krea-2-Raw",
@@ -623,6 +637,7 @@ struct Krea2Backend(GenBackend, Movable):
             i8_cache_valid
             and self.lanpaint_base_cache_valid
             and self.lanpaint_base_cache_turbo == turbo
+            and self.lanpaint_base_cache_checkpoint == checkpoint
             and self.lanpaint_base_cache_resident_blocks == i8_res_blocks
             and Bool(self.lanpaint_base_cond)
             and Bool(self.lanpaint_base_fin)
@@ -664,6 +679,7 @@ struct Krea2Backend(GenBackend, Movable):
             self.lanpaint_base_resident_i8 = resident_i8.copy()
             self.lanpaint_base_host_i8 = host_i8.copy()
             self.lanpaint_base_cache_turbo = turbo
+            self.lanpaint_base_cache_checkpoint = checkpoint.copy()
             self.lanpaint_base_cache_resident_blocks = i8_res_blocks
             self.lanpaint_base_cache_valid = True
         else:
@@ -968,7 +984,11 @@ struct Krea2Backend(GenBackend, Movable):
 
         # ── 3) int8 W8A8 base, sidecar-cache-first (the fast startup path). ──
         var turbo = self.params.model.lower().find("turbo") >= 0
-        var checkpoint = String(KREA2_TURBO) if turbo else String(KREA2_RAW)
+        var checkpoint = (
+            self.params.checkpoint_path.copy()
+            if self.params.checkpoint_path != String("")
+            else (String(KREA2_TURBO) if turbo else String(KREA2_RAW))
+        )
         print("[krea2-edit] model=", "Krea-2-Turbo" if turbo else "Krea-2-Raw",
               " checkpoint=", checkpoint)
         var st = ShardedSafeTensors.open(checkpoint)
@@ -983,6 +1003,7 @@ struct Krea2Backend(GenBackend, Movable):
         var base_cache_hit = (
             self.edit_base_cache_valid
             and self.edit_base_cache_turbo == turbo
+            and self.edit_base_cache_checkpoint == checkpoint
             and self.edit_base_cache_resident_blocks == i8_res_blocks
         )
         if base_cache_hit:
@@ -1035,6 +1056,7 @@ struct Krea2Backend(GenBackend, Movable):
             self.edit_base_host_i8 = host_i8.copy()
             self.edit_base_shared = shared.copy()
             self.edit_base_cache_turbo = turbo
+            self.edit_base_cache_checkpoint = checkpoint.copy()
             self.edit_base_cache_resident_blocks = i8_res_blocks
             self.edit_base_cache_valid = True
         self.ctx.synchronize()

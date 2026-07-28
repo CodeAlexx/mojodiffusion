@@ -11,6 +11,7 @@ var ModelsTab = (function () {
     var filters = { search: '', type: 'all', archs: {} };
     var selectedForDelete = {}; // name -> true
     var activeDetailModel = null; // currently shown in detail panel
+    var modelTypeOptions = [];
     var ARCH_COLORS = {
         flux: '#6c6af5',
         sdxl: '#3b82f6',
@@ -21,6 +22,7 @@ var ModelsTab = (function () {
         bernini: '#e879f9',
         scail2: '#22d3ee',
         klein: '#ec4899',
+        lens: '#38bdf8',
         any: '#6b7280'
     };
     function estimateSize(filename) {
@@ -75,10 +77,17 @@ var ModelsTab = (function () {
                 '<div class="models-filter-title">Type</div>' +
                 '<label class="models-radio"><input type="radio" name="model-type" value="all" checked> All</label>' +
                 '<label class="models-radio"><input type="radio" name="model-type" value="checkpoint"> Checkpoints</label>' +
-                '<label class="models-radio"><input type="radio" name="model-type" value="unet"> UNets</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="unet"> Diffusion / UNet</label>' +
                 '<label class="models-radio"><input type="radio" name="model-type" value="lora"> LoRA</label>' +
                 '<label class="models-radio"><input type="radio" name="model-type" value="vae"> VAE</label>' +
                 '<label class="models-radio"><input type="radio" name="model-type" value="controlnet"> ControlNet</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="embedding"> Embeddings</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="clip"> CLIP / Text Encoders</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="clip_vision"> CLIP Vision</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="ipadapter"> IP-Adapter</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="feature_adapter"> Feature Adapters</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="runtime_component"> Runtime Components</label>' +
+                '<label class="models-radio"><input type="radio" name="model-type" value="upscaler"> Upscalers</label>' +
                 '</div>' +
                 '<div class="models-filter-group">' +
                 '<div class="models-filter-title">Architecture</div>' +
@@ -143,30 +152,104 @@ var ModelsTab = (function () {
     }
     function load() {
         allModels = [];
-        return fetch('/object_info', { cache: 'no-store' })
-            .then(function (resp) { return resp.ok ? resp.json() : {}; })
-            .then(function (info) {
+        return Promise.all([
+            ModelUtils.loadModelRegistry(),
+            fetch('/object_info', { cache: 'no-store' })
+                .then(function (resp) { return resp.ok ? resp.json() : {}; })
+        ]).then(function (loaded) {
+            var registry = loaded[0] || {};
+            var info = loaded[1] || {};
             var seen = {};
+            modelTypeOptions = Array.isArray(registry.model_type_options)
+                ? registry.model_type_options : [];
+            (registry.models || []).forEach(function (model) {
+                if (!model || !model.name || seen['model:' + model.name])
+                    return;
+                seen['model:' + model.name] = true;
+                allModels.push({
+                    name: model.name,
+                    path: model.path || model.name,
+                    type: model.format === 'full_checkpoint' ? 'checkpoint' : 'unet',
+                    arch: model.arch || ModelUtils.archForModel(model.name),
+                    registryManaged: true,
+                    registryArch: model.arch || 'unknown',
+                    detectedArch: model.detected_arch || model.arch || 'unknown',
+                    archSource: model.arch_source || 'unknown',
+                    archOverride: model.arch_override || '',
+                    format: model.format || 'diffusion_model',
+                    size: Number(model.size) || 0,
+                    runtimeSupported: model.runtime_supported !== false,
+                    runtimeReason: model.runtime_reason || '',
+                    usesSelectedCheckpoint: model.uses_selected_checkpoint === true,
+                    preview: model.preview || ''
+                });
+            });
+            (registry.loras || []).forEach(function (model) {
+                if (!model || !model.name || seen['lora:' + model.name])
+                    return;
+                seen['lora:' + model.name] = true;
+                allModels.push({
+                    name: model.name,
+                    path: model.path || model.name,
+                    type: 'lora',
+                    arch: model.target_arch || model.arch || ModelUtils.archForModel(model.name),
+                    registryManaged: true,
+                    registryArch: model.target_arch || model.arch || 'unknown',
+                    detectedArch: model.detected_arch || model.target_arch || model.arch || 'unknown',
+                    archSource: model.arch_source || 'unknown',
+                    archOverride: model.arch_override || '',
+                    format: 'lora',
+                    size: Number(model.size) || 0,
+                    runtimeSupported: true,
+                    runtimeReason: '',
+                    preview: model.preview || ''
+                });
+            });
+            (registry.artifacts || []).forEach(function (model) {
+                if (!model || !model.name || !model.type)
+                    return;
+                var key = model.type + ':' + model.name;
+                if (seen[key])
+                    return;
+                seen[key] = true;
+                allModels.push({
+                    name: model.name,
+                    path: model.path || model.name,
+                    type: model.type,
+                    arch: 'any',
+                    registryManaged: false,
+                    format: model.type,
+                    size: Number(model.size) || 0,
+                    runtimeSupported: false,
+                    runtimeReason: 'Auxiliary model artifact; select it from the matching workflow control.',
+                    preview: model.preview || ''
+                });
+            });
             function addModels(nodeType, inputKey, type, defaultArch) {
                 var items = info && info[nodeType] && info[nodeType].input && info[nodeType].input.required && info[nodeType].input.required[inputKey];
                 if (items && Array.isArray(items[0])) {
                     items[0].forEach(function (name) {
-                        if (seen[name])
+                        var key = type + ':' + name;
+                        if (seen[key])
                             return;
-                        seen[name] = true;
+                        seen[key] = true;
                         allModels.push({
                             name: name,
+                            path: name,
                             type: type,
-                            arch: defaultArch || ModelUtils.detectArchFromFilename(name)
+                            arch: defaultArch || ModelUtils.archForModel(name),
+                            registryManaged: false,
+                            format: type,
+                            size: 0,
+                            runtimeSupported: true,
+                            runtimeReason: ''
                         });
                     });
                 }
             }
-            addModels('CheckpointLoaderSimple', 'ckpt_name', 'checkpoint');
-            addModels('UNETLoader', 'unet_name', 'unet');
-            addModels('LoraLoader', 'lora_name', 'lora');
             addModels('VAELoader', 'vae_name', 'vae', 'any');
             addModels('ControlNetLoader', 'control_net_name', 'controlnet');
+            addModels('CLIPLoader', 'clip_name', 'clip', 'any');
             buildArchFilters();
             applyFilters();
             checkMissingModels();
@@ -263,8 +346,13 @@ var ModelsTab = (function () {
         filteredModels = allModels.filter(function (m) {
             if (filters.search && m.name.toLowerCase().indexOf(filters.search) === -1)
                 return false;
-            if (filters.type !== 'all' && m.type !== filters.type)
+            if (filters.type === 'checkpoint') {
+                if (m.type !== 'checkpoint' && m.type !== 'unet')
+                    return false;
+            }
+            else if (filters.type !== 'all' && m.type !== filters.type) {
                 return false;
+            }
             if (!filters.archs[m.arch])
                 return false;
             return true;
@@ -289,6 +377,16 @@ var ModelsTab = (function () {
             card.className = 'model-card' + (selectedForDelete[m.name] ? ' model-card-selected' : '');
             var color = ARCH_COLORS[m.arch] || ARCH_COLORS['any'];
             var checked = selectedForDelete[m.name] ? ' checked' : '';
+            var sizeLabel = m.size > 0
+                ? (m.size / (1024 * 1024 * 1024)).toFixed(m.size >= 1024 * 1024 * 1024 ? 2 : 3) + ' GB'
+                : estimateSize(m.name);
+            var useDisabled = m.runtimeSupported === false ? ' disabled' : '';
+            var useTitle = m.runtimeSupported === false
+                ? ' title="' + escapeHtml(m.runtimeReason || 'No compatible runtime') + '"' : '';
+            var isBaseModel = m.type === 'checkpoint' || m.type === 'unet';
+            var useButton = isBaseModel
+                ? '<button class="model-use-btn" data-name="' + escapeHtml(m.name) + '"' + useDisabled + useTitle + '>Use in Generate</button>'
+                : '<div class="model-card-artifact-kind">' + escapeHtml(m.type.replace(/_/g, ' ')) + '</div>';
             card.innerHTML =
                 '<div class="model-card-top">' +
                     '<input type="checkbox" class="model-card-check" data-name="' + escapeHtml(m.name) + '"' + checked + '>' +
@@ -296,8 +394,8 @@ var ModelsTab = (function () {
                     '</div>' +
                     '<div class="model-card-type">' + m.type + '</div>' +
                     '<div class="model-card-name" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name) + '</div>' +
-                    '<div class="model-card-size">' + estimateSize(m.name) + '</div>' +
-                    '<button class="model-use-btn" data-name="' + escapeHtml(m.name) + '">Use in Generate</button>';
+                    '<div class="model-card-size">' + sizeLabel + '</div>' +
+                    useButton;
             grid.appendChild(card);
         });
         grid.onclick = function (e) {
@@ -356,6 +454,95 @@ var ModelsTab = (function () {
             selectAllLabel.style.display = filteredModels.length > 0 ? '' : 'none';
         }
     }
+    function modelTypeEditorHtml(model) {
+        if (!model.registryManaged)
+            return '';
+        var selected = model.archOverride || 'auto';
+        var detected = model.detectedArch || 'unknown';
+        var options = '<option value="auto"' + (selected === 'auto' ? ' selected' : '') +
+            '>Auto-detected (' + escapeHtml(detected.toUpperCase()) + ')</option>';
+        modelTypeOptions.forEach(function (option) {
+            if (!option || !option.id)
+                return;
+            var id = String(option.id);
+            var label = option.label || id.toUpperCase();
+            var support = option.arbitrary_checkpoint_supported
+                ? ' — selected file supported' : ' — classification only';
+            options += '<option value="' + escapeHtml(id) + '"' +
+                (selected === id ? ' selected' : '') + '>' +
+                escapeHtml(label + support) + '</option>';
+        });
+        return '<div class="models-detail-type-editor">' +
+            '<label class="models-detail-label" for="models-detail-type-select">Model Type</label>' +
+            '<select class="models-detail-type-select" id="models-detail-type-select">' +
+            options + '</select>' +
+            '<div class="models-detail-type-help">Choose how this ' +
+            (model.type === 'lora' ? 'LoRA' : 'checkpoint') +
+            ' is classified and routed. ' +
+            'An override cannot add a loader for an unsupported architecture.</div>' +
+            '<div class="models-detail-type-actions">' +
+            '<button class="models-detail-type-save" id="models-detail-type-save">Save Model Type</button>' +
+            (model.archOverride
+                ? '<button class="models-detail-type-reset" id="models-detail-type-reset">Reset to Auto</button>'
+                : '') +
+            '</div>' +
+            '<div class="models-detail-type-status" id="models-detail-type-status" aria-live="polite"></div>' +
+            '</div>';
+    }
+    function saveModelTypeOverride(model, reset) {
+        var select = document.getElementById('models-detail-type-select');
+        var status = document.getElementById('models-detail-type-status');
+        var saveButton = document.getElementById('models-detail-type-save');
+        var resetButton = document.getElementById('models-detail-type-reset');
+        var arch = reset ? 'auto' : (select ? select.value : 'auto');
+        if (status) {
+            status.className = 'models-detail-type-status';
+            status.textContent = 'Saving...';
+        }
+        if (saveButton)
+            saveButton.disabled = true;
+        if (resetButton)
+            resetButton.disabled = true;
+        fetch('/v1/models/type', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: model.name,
+                arch: arch,
+                kind: model.type === 'lora' ? 'lora' : 'checkpoint'
+            })
+        }).then(function (resp) {
+            return resp.text().then(function (text) {
+                var data = {};
+                try {
+                    data = text ? JSON.parse(text) : {};
+                }
+                catch (e) { }
+                if (!resp.ok)
+                    throw new Error(data.error || ('HTTP ' + resp.status));
+                return data;
+            });
+        }).then(function () {
+            ModelUtils.clearCache();
+            return load();
+        }).then(function () {
+            var updated = findModelByName(model.name);
+            if (updated)
+                showDetailPanel(updated);
+        }).catch(function (error) {
+            var currentStatus = document.getElementById('models-detail-type-status');
+            if (currentStatus) {
+                currentStatus.className = 'models-detail-type-status models-detail-type-error';
+                currentStatus.textContent = error.message || String(error);
+            }
+            var currentSave = document.getElementById('models-detail-type-save');
+            var currentReset = document.getElementById('models-detail-type-reset');
+            if (currentSave)
+                currentSave.disabled = false;
+            if (currentReset)
+                currentReset.disabled = false;
+        });
+    }
     /** Show the detail panel for a model (slide-in from right) */
     function showDetailPanel(model) {
         activeDetailModel = model;
@@ -363,6 +550,7 @@ var ModelsTab = (function () {
         if (!panel)
             return;
         var color = ARCH_COLORS[model.arch] || ARCH_COLORS['any'];
+        var isBaseModel = model.type === 'checkpoint' || model.type === 'unet';
         panel.style.display = 'flex';
         panel.innerHTML =
             '<button class="models-detail-close" id="models-detail-close">\u2715</button>' +
@@ -370,19 +558,39 @@ var ModelsTab = (function () {
                 '<div class="models-detail-row"><span class="models-detail-label">Name</span><span class="models-detail-value">' + escapeHtml(model.name) + '</span></div>' +
                 '<div class="models-detail-row"><span class="models-detail-label">Type</span><span class="models-detail-value">' + model.type + '</span></div>' +
                 '<div class="models-detail-row"><span class="models-detail-label">Architecture</span><span class="models-detail-value">' + model.arch.toUpperCase() + '</span></div>' +
+                (model.registryManaged ? '<div class="models-detail-row"><span class="models-detail-label">Architecture Source</span><span class="models-detail-value">' + escapeHtml((model.archSource || 'unknown').replace(/_/g, ' ')) + '</span></div>' : '') +
+                modelTypeEditorHtml(model) +
+                '<div class="models-detail-row"><span class="models-detail-label">Format</span><span class="models-detail-value">' + escapeHtml(model.format || '') + '</span></div>' +
+                '<div class="models-detail-row"><span class="models-detail-label">Loads selected file</span><span class="models-detail-value">' + (model.usesSelectedCheckpoint ? 'Yes' : 'No') + '</span></div>' +
                 '<div class="models-detail-row"><span class="models-detail-label">Est. Size</span><span class="models-detail-value">' + estimateSize(model.name) + '</span></div>' +
-                '<div class="models-detail-row"><span class="models-detail-label">Path</span><span class="models-detail-value models-detail-path">' + escapeHtml(model.name) + '</span></div>' +
+                '<div class="models-detail-row"><span class="models-detail-label">Path</span><span class="models-detail-value models-detail-path">' + escapeHtml(model.path || model.name) + '</span></div>' +
+                (model.runtimeReason ? '<div class="models-detail-row"><span class="models-detail-label">Runtime</span><span class="models-detail-value">' + escapeHtml(model.runtimeReason) + '</span></div>' : '') +
                 '<div class="models-detail-actions">' +
-                '<button class="models-detail-use-btn" id="models-detail-use-btn">Use in Generate</button>' +
+                (isBaseModel ? '<button class="models-detail-use-btn" id="models-detail-use-btn"' + (model.runtimeSupported === false ? ' disabled' : '') + '>Use in Generate</button>' : '') +
                 '<button class="models-detail-delete-btn" id="models-detail-delete-btn">Delete Model</button>' +
                 '</div>';
         // Trigger reflow for slide-in animation
         panel.offsetHeight;
         panel.classList.add('models-detail-open');
         document.getElementById('models-detail-close').addEventListener('click', closeDetailPanel);
-        document.getElementById('models-detail-use-btn').addEventListener('click', function () {
-            useModelInGenerate(model.name);
-        });
+        var detailUse = document.getElementById('models-detail-use-btn');
+        if (detailUse) {
+            detailUse.addEventListener('click', function () {
+                useModelInGenerate(model.name);
+            });
+        }
+        var typeSave = document.getElementById('models-detail-type-save');
+        if (typeSave) {
+            typeSave.addEventListener('click', function () {
+                saveModelTypeOverride(model, false);
+            });
+        }
+        var typeReset = document.getElementById('models-detail-type-reset');
+        if (typeReset) {
+            typeReset.addEventListener('click', function () {
+                saveModelTypeOverride(model, true);
+            });
+        }
         document.getElementById('models-detail-delete-btn').addEventListener('click', function () {
             showDeleteConfirm(model);
         });

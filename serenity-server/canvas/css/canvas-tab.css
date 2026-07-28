@@ -4,6 +4,11 @@
 .cv-layout {
     --cv-parameters-width: 320px;
     --cv-entities-width: 300px;
+    --cv-parameters-offset: 0px;
+    --cv-entities-offset: 0px;
+    --cv-parameters-visible-width: calc(var(--cv-parameters-width) - var(--cv-parameters-offset));
+    --cv-entities-visible-width: calc(var(--cv-entities-width) - var(--cv-entities-offset));
+    position: relative;
     display: flex;
     width: 100%;
     height: 100%;
@@ -22,13 +27,17 @@
     flex-direction: column;
     overflow: hidden;
     z-index: 2;
+    position: relative;
+    left: var(--cv-entities-offset);
+    margin-left: calc(-1 * var(--cv-entities-offset));
+    transition: left 180ms ease, margin-left 180ms ease;
 }
 
 /* ── Tool Rail ── */
 .cv-tools {
     position: fixed;
     top: 96px;
-    left: calc(52px + var(--cv-parameters-width) + 10px);
+    left: calc(52px + var(--cv-parameters-visible-width) + 10px);
     z-index: 25;
     display: flex;
     flex-direction: column;
@@ -494,6 +503,7 @@
 }
 
 .cv-source-dropzone {
+    position: relative;
     flex: 1;
     min-height: 0;
     margin: 10px;
@@ -527,12 +537,68 @@
 
 #cv-source-preview,
 #cv-source-video,
+#cv-source-video-fallback,
 #cv-style-preview {
     display: none;
     width: 100%;
     height: 100%;
     object-fit: contain;
     background: #0b0b11;
+}
+
+#cv-source-video-fallback {
+    object-fit: contain;
+}
+
+.cv-source-video-note {
+    display: none;
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    top: 10px;
+    z-index: 3;
+    padding: 6px 8px;
+    border: 1px solid color-mix(in srgb, #38bdf8 55%, var(--shell-border));
+    border-radius: 6px;
+    background: color-mix(in srgb, #0c4a6e 78%, transparent);
+    color: #e0f2fe;
+    font: 600 10px/1.35 var(--shell-font);
+    text-align: center;
+    pointer-events: none;
+}
+
+.cv-source-video-note.error {
+    border-color: color-mix(in srgb, #ef4444 70%, var(--shell-border));
+    background: color-mix(in srgb, #7f1d1d 82%, transparent);
+    color: #fee2e2;
+}
+
+.cv-ltx2-v2v-presets {
+    gap: 6px;
+    margin: 4px 0 7px;
+}
+
+.cv-ltx2-v2v-presets button {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--shell-border);
+    border-radius: 5px;
+    background: var(--shell-bg-raised);
+    color: var(--shell-text-secondary);
+    padding: 5px 6px;
+    font: 600 10px/1.2 var(--shell-font);
+    cursor: pointer;
+}
+
+.cv-ltx2-v2v-presets button:hover {
+    color: var(--shell-text);
+    border-color: var(--shell-accent);
+}
+
+.cv-ltx2-v2v-presets button.active {
+    color: #fff;
+    border-color: var(--shell-accent);
+    background: color-mix(in srgb, var(--shell-accent) 32%, var(--shell-bg-raised));
 }
 
 .cv-style-dropzone {
@@ -562,6 +628,55 @@
     flex-direction: column;
     gap: 16px;
     z-index: 2;
+    position: relative;
+    left: calc(-1 * var(--cv-parameters-offset));
+    margin-right: calc(-1 * var(--cv-parameters-offset));
+    transition: left 180ms ease, margin-right 180ms ease;
+}
+
+.cv-panel-dragging,
+.cv-panel-dragging * {
+    user-select: none;
+}
+
+.cv-panel-dragging .cv-right,
+.cv-panel-dragging .cv-left,
+.cv-panel-dragging .cv-panel-handle {
+    transition: none;
+}
+
+.cv-panel-handle {
+    position: absolute;
+    top: 50%;
+    z-index: 35;
+    width: 18px;
+    height: 72px;
+    padding: 0;
+    transform: translateY(-50%);
+    border: 1px solid color-mix(in srgb, var(--shell-accent) 68%, var(--shell-border));
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--shell-bg-surface) 94%, transparent);
+    color: color-mix(in srgb, var(--shell-accent) 82%, #fff);
+    box-shadow: 0 5px 18px rgba(0, 0, 0, 0.42);
+    cursor: ew-resize;
+    font: 700 20px/1 var(--shell-font);
+    touch-action: none;
+    transition: left 180ms ease, right 180ms ease, background 150ms ease, color 150ms ease;
+}
+
+.cv-panel-handle:hover,
+.cv-panel-handle:focus-visible {
+    outline: none;
+    background: var(--shell-accent);
+    color: #fff;
+}
+
+.cv-parameters-handle {
+    left: max(0px, calc(var(--cv-parameters-visible-width) - 9px));
+}
+
+.cv-entities-handle {
+    right: max(0px, calc(var(--cv-entities-visible-width) - 9px));
 }
 
 .cv-edit-settings {
@@ -708,7 +823,7 @@
 
 .cv-left .cv-mask-actions {
     position: fixed;
-    left: calc(52px + var(--cv-parameters-width) + 390px);
+    left: calc(52px + var(--cv-parameters-visible-width) + 390px);
     top: 54px;
     z-index: 24;
     border: 1px solid var(--shell-border);
@@ -719,7 +834,7 @@
 
 @media (max-width: 1400px) {
     .cv-left .cv-mask-actions {
-        left: calc(52px + var(--cv-parameters-width) + 244px);
+        left: calc(52px + var(--cv-parameters-visible-width) + 244px);
     }
 }
 
@@ -732,9 +847,9 @@
 .cv-right .cv-tool-options {
     position: fixed;
     top: 52px;
-    left: calc(52px + var(--cv-parameters-width) + 12px);
+    left: calc(52px + var(--cv-parameters-visible-width) + 12px);
     z-index: 23;
-    width: min(360px, calc(100vw - var(--cv-parameters-width) - var(--cv-entities-width) - 120px));
+    width: min(360px, calc(100vw - var(--cv-parameters-visible-width) - var(--cv-entities-visible-width) - 120px));
     padding: 7px 10px;
     border: 1px solid var(--shell-border);
     border-radius: 7px;
@@ -883,6 +998,26 @@
 }
 .cv-lora-header { justify-content: space-between; }
 .cv-lora-header .cv-section-title { margin: 0; }
+.cv-lora-header-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    min-width: 0;
+}
+.cv-lora-clear {
+    min-height: 24px;
+    padding: 2px 7px;
+    border: 1px solid #7f1d1d;
+    border-radius: 4px;
+    background: color-mix(in srgb, #450a0a 72%, var(--shell-bg-panel));
+    color: #fecaca;
+    cursor: pointer;
+    font: 600 10px var(--shell-font);
+    white-space: nowrap;
+}
+.cv-lora-clear:hover:not(:disabled) { background: #991b1b; color: #fff; }
+.cv-lora-clear:disabled { opacity: 0.38; cursor: default; }
 .cv-lora-compat,
 .cv-lora-empty { color: var(--shell-text-muted); font-size: 10px; }
 .cv-lora-add-row .cv-select { min-width: 0; flex: 1; }

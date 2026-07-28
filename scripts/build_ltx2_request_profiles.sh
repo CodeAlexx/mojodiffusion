@@ -8,6 +8,7 @@ source_file="$repo_root/serenitymojo/sampling/ltx2_request_cli.mojo"
 pipeline_file="$repo_root/serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
 tiled_decode_file="$repo_root/serenitymojo/models/vae/ltx2_tiled_decode.mojo"
 vae_encoder_file="$repo_root/serenitymojo/models/vae/ltx2_vae_encoder.mojo"
+conv3d_file="$repo_root/serenitymojo/models/vae/conv3d.mojo"
 png_file="$repo_root/serenitymojo/image/png.mojo"
 image_io_file="$repo_root/serenitymojo/serve/image_io.mojo"
 image_decode_file="$repo_root/serenitymojo/image/decode.mojo"
@@ -42,6 +43,7 @@ build_one() {
         && "$runner" -nt "$pipeline_file" \
         && "$runner" -nt "$tiled_decode_file" \
         && "$runner" -nt "$vae_encoder_file" \
+        && "$runner" -nt "$conv3d_file" \
         && "$runner" -nt "$png_file" \
         && "$runner" -nt "$image_io_file" \
         && "$runner" -nt "$image_decode_file" ]]; then

@@ -512,6 +512,16 @@ struct ShardedSafeTensors(Movable):
         var bytes = shard.tensor_bytes(name)
         return from_parts(info.dtype, info.shape.copy(), bytes)
 
+    def release_to_os(self):
+        """Release clean mmap pages for every shard after device upload.
+
+        Long streamed encoders touch most of a multi-gigabyte checkpoint. The
+        mapping remains valid, but Linux may reclaim those clean pages instead
+        of charging the product cgroup until the desktop hits memory pressure.
+        """
+        for idx in range(len(self.shards)):
+            self.shards[idx][].release_to_os()
+
 
 # ── Test: open the VAE *directory* (single-file fallback path) ────────────────
 def test_single_file_fallback() raises:

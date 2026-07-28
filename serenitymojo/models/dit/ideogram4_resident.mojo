@@ -29,11 +29,13 @@ struct Ideogram4Weights(Movable):
     var t: Dict[String, ArcPointer[Tensor]]
     var lora_a: Dict[String, ArcPointer[Tensor]]   # base-weight-name -> A [rank,in]
     var lora_b: Dict[String, ArcPointer[Tensor]]   # base-weight-name -> B [out,rank]
+    var lora_scale: Dict[String, Float32]
 
     fn __init__(out self, var t: Dict[String, ArcPointer[Tensor]]):
         self.t = t^
         self.lora_a = Dict[String, ArcPointer[Tensor]]()
         self.lora_b = Dict[String, ArcPointer[Tensor]]()
+        self.lora_scale = Dict[String, Float32]()
 
     @staticmethod
     def load(st: ShardedSafeTensors, ctx: DeviceContext) raises -> Ideogram4Weights:
@@ -57,23 +59,75 @@ struct Ideogram4Weights(Movable):
 
     # Runtime additive LoRA overlay (NEVER fused into a saved model; memory-safe —
     # keeps the fp8 weights resident, stores only the rank-16 A/B). _lin adds
-    # B·(A·x) for any base weight that has a LoRA. Keys:
-    # diffusion_model.<base>.lora_A/B.weight ; this LoRA has alpha==rank (16/16) ⇒
-    # scale 1.0 (folded into B at this scale; add a mul if a future LoRA differs).
-    def load_lora(mut self, lora_path: String, ctx: DeviceContext) raises -> Int:
+    # B·(A·x) for any base weight that has a LoRA. Accept canonical PEFT
+    # lora_A/B and Serenity lora_down/up spellings, with file alpha/rank
+    # composed with the UI multiplier.
+    def load_lora(
+        mut self,
+        lora_path: String,
+        ctx: DeviceContext,
+        multiplier: Float32 = Float32(1.0),
+    ) raises -> Int:
         var lst = ShardedSafeTensors.open(lora_path)
         var n = 0
         for ref nm in lst.names():
-            if not nm.endswith(".lora_A.weight"):
+            var suffix_a = String("")
+            var suffix_b = String("")
+            if nm.endswith(".lora_A.weight"):
+                suffix_a = String(".lora_A.weight")
+                suffix_b = String(".lora_B.weight")
+            elif nm.endswith(".lora_down.weight"):
+                suffix_a = String(".lora_down.weight")
+                suffix_b = String(".lora_up.weight")
+            else:
                 continue
-            var inner = String(nm[byte=16 : nm.byte_length() - 14])   # strip "diffusion_model." + ".lora_A.weight"
+            var prefix = String(
+                nm[byte=0 : nm.byte_length() - suffix_a.byte_length()]
+            )
+            var inner = prefix.copy()
+            if inner.startswith("diffusion_model."):
+                inner = String(inner[byte=16 :])
+            elif inner.startswith("transformer."):
+                inner = String(inner[byte=12 :])
             var bw = inner + ".weight"
             if bw not in self.t:
                 continue
-            self.lora_a[bw] = ArcPointer(Tensor.from_view(lst.tensor_view(nm), ctx))           # [rank,in] bf16
-            self.lora_b[bw] = ArcPointer(Tensor.from_view(
-                lst.tensor_view(String("diffusion_model.") + inner + ".lora_B.weight"), ctx))  # [out,rank] bf16
+            var b_key = prefix + suffix_b
+            if b_key not in lst.names():
+                raise Error(String("Ideogram4 LoRA missing paired tensor ") + b_key)
+            var a = Tensor.from_view(lst.tensor_view(nm), ctx)
+            var b = Tensor.from_view(lst.tensor_view(b_key), ctx)
+            var ash = a.shape()
+            var bsh = b.shape()
+            var wsh = self.w(bw).shape()
+            if (
+                len(ash) != 2
+                or len(bsh) != 2
+                or len(wsh) != 2
+                or ash[1] != wsh[1]
+                or bsh[0] != wsh[0]
+                or bsh[1] != ash[0]
+            ):
+                raise Error(String("Ideogram4 LoRA shape mismatch for ") + prefix)
+            var scale = multiplier
+            var alpha_key = prefix + String(".alpha")
+            if alpha_key in lst.names():
+                var alpha = Tensor.from_view_as_f32(
+                    lst.tensor_view(alpha_key), ctx
+                ).to_host(ctx)
+                if len(alpha) != 1:
+                    raise Error(
+                        String("Ideogram4 LoRA alpha must be scalar for ") + prefix
+                    )
+                scale *= alpha[0] / Float32(ash[0])
+            self.lora_a[bw] = ArcPointer(a^)
+            self.lora_b[bw] = ArcPointer(b^)
+            self.lora_scale[bw] = scale
             n += 1
+        if n == 0:
+            raise Error(
+                "Ideogram4 LoRA contained no compatible transformer projection pairs"
+            )
         return n
 
 
@@ -83,10 +137,11 @@ struct Ideogram4Weights(Movable):
 # resident so both transformers fit + zero per-step mmap/streaming.
 def _lin(w: Ideogram4Weights, x: Tensor, name: String, bias: String, ctx: DeviceContext) raises -> Tensor:
     var wbf = fp8_e4m3_dequant_perrow_to_bf16(w.w(name), w.w(name + "_scale"), ctx)
-    # runtime LoRA overlay: out += B·(A·x)  (A [rank,in], B [out,rank], scale 1.0)
+    # runtime LoRA overlay: out += scale·B·(A·x)
     if name in w.lora_a:
         var down = linear(x, w.lora_a[name][].clone(ctx), None, ctx)   # x·Aᵀ -> [..,rank]
         var up = linear(down, w.lora_b[name][].clone(ctx), None, ctx)  # ·Bᵀ -> [..,out]
+        up = mul_scalar(up, w.lora_scale[name], ctx)
         if len(bias) == 0:
             return add(linear(x, wbf, None, ctx), up, ctx)
         return add(linear(x, wbf, Optional[Tensor](w.w(bias).clone(ctx)), ctx), up, ctx)

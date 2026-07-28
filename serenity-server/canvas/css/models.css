@@ -170,6 +170,17 @@
     font-size: 11px;
     color: var(--shell-text-muted);
 }
+.model-card-artifact-kind {
+    margin-top: auto;
+    padding: 6px 9px;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
 .model-use-btn {
     margin-top: auto;
     padding: 6px 10px;
@@ -277,8 +288,8 @@
     transition: width 200ms ease, min-width 200ms ease, padding 200ms ease;
 }
 .models-detail-panel.models-detail-open {
-    width: 300px;
-    min-width: 300px;
+    width: 340px;
+    min-width: 340px;
     padding: 16px;
     overflow-y: auto;
 }
@@ -325,6 +336,68 @@
     font-family: monospace;
     font-size: 11px;
     color: var(--shell-text-muted);
+}
+.models-detail-type-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 7px;
+}
+.models-detail-type-select {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--shell-bg-surface);
+    border: 1px solid var(--shell-border);
+    border-radius: 5px;
+    color: var(--shell-text);
+    font: 12px var(--shell-font);
+}
+.models-detail-type-select:focus {
+    border-color: var(--shell-accent);
+    outline: none;
+}
+.models-detail-type-help {
+    color: var(--shell-text-muted);
+    font-size: 10px;
+    line-height: 1.4;
+}
+.models-detail-type-actions {
+    display: flex;
+    gap: 7px;
+}
+.models-detail-type-save,
+.models-detail-type-reset {
+    flex: 1;
+    padding: 7px 8px;
+    border-radius: 5px;
+    font: 600 11px var(--shell-font);
+    cursor: pointer;
+}
+.models-detail-type-save {
+    background: var(--shell-accent);
+    border: 1px solid var(--shell-accent);
+    color: #fff;
+}
+.models-detail-type-reset {
+    background: transparent;
+    border: 1px solid var(--shell-border);
+    color: var(--shell-text);
+}
+.models-detail-type-save:disabled,
+.models-detail-type-reset:disabled {
+    cursor: wait;
+    opacity: 0.55;
+}
+.models-detail-type-status {
+    min-height: 14px;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+}
+.models-detail-type-error {
+    color: var(--shell-error);
 }
 .models-detail-actions {
     display: flex;

@@ -386,6 +386,7 @@ def encode_gemma3_hidden_states_streamed(
         # Gemma's sqrt(3840) embedding scale rounds to exactly 62 in BF16.
         hiddens.append(TArc(mul_scalar(embedder._embed(ids[p], ctx), Float32(62.0), ctx)))
     ctx.synchronize()
+    st.release_to_os()
 
     var ropes = List[GemmaRope]()
     for p in range(len(ids)):
@@ -406,6 +407,7 @@ def encode_gemma3_hidden_states_streamed(
                 layer, hiddens[p][], ropes[p], is_global, lengths[p], ctx
             ))
         ctx.synchronize()
+        st.release_to_os()
         print(
             String("LTX2_ACTIVITY encoding Gemma layer ")
             + String(li + 1) + String("/") + String(GEMMA_LAYERS)
@@ -417,4 +419,5 @@ def encode_gemma3_hidden_states_streamed(
         ref prompt_states = states[p]
         prompt_states.append(TArc(final_hidden^))
     ctx.synchronize()
+    st.release_to_os()
     return GemmaHiddenBatch(states^, lengths^, bucket)

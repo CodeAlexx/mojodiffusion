@@ -6,7 +6,7 @@
 //! - `genesis-gcompose` is a separate Rust/C/FFmpeg/OpenCL process;
 //! - no Mojo code or native Genesis window participates in this path.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -14,18 +14,18 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use genesis_web::model::{
     Clip as GenesisClip, Project as GenesisProject, Subtitle as GenesisSubtitle,
     Track as GenesisTrack, TrackKind as GenesisTrackKind, Transition as GenesisTransition,
 };
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
@@ -1208,7 +1208,7 @@ fn serve_file(path: &FsPath, headers: &HeaderMap) -> Response {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("open media: {e}"),
-            )
+            );
         }
     };
     if let Err(e) = file.seek(SeekFrom::Start(start)) {
@@ -1320,7 +1320,7 @@ pub async fn post_import_clip(
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("create imported clip: {e}"),
-                )
+                );
             }
         };
         let mut field = field;
@@ -1336,7 +1336,7 @@ pub async fn post_import_clip(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    return json_error(StatusCode::BAD_REQUEST, format!("read imported clip: {e}"))
+                    return json_error(StatusCode::BAD_REQUEST, format!("read imported clip: {e}"));
                 }
             }
         }
@@ -1530,13 +1530,13 @@ pub async fn post_thumbnails(
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "Genesis could not decode thumbnail frames",
-            )
+            );
         }
         Err(e) => {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("thumbnail task failed: {e}"),
-            )
+            );
         }
     };
     if let Err(e) = DynamicImage::ImageRgba8(sprite).save_with_format(&cache_path, ImageFormat::Png)

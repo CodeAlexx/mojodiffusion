@@ -4,13 +4,13 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use axum::extract::{Path as AxPath, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use serenity_wire::JobParams;
 
-use crate::{jobs, AppState};
+use crate::{AppState, jobs};
 
 const SERVER_RESULT_SUFFIX: &str = ".serenity_server_result.json";
 const VISUAL_MIN_AVG_STDDEV: f64 = 18.0;
@@ -609,6 +609,7 @@ pub(crate) fn write_server_result_manifest(
         "output": output,
         "request": {
             "model": &params.model,
+            "checkpoint_path": &params.checkpoint_path,
             "prompt": &params.prompt,
             "negative": &params.negative,
             "width": params.width,
@@ -659,7 +660,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -681,6 +682,7 @@ mod tests {
         let mut params = JobParams::default();
         params.job_id = "job-0099".to_string();
         params.model = "flux-2-klein-base-9b_fp8_e4m3fn".to_string();
+        params.checkpoint_path = "/models/user-selected.safetensors".to_string();
         params.prompt = "workflow manifest test".to_string();
         params.width = 512;
         params.height = 512;
@@ -747,6 +749,10 @@ mod tests {
 
         assert_eq!(v["schema"], "serenity.server_result.v1");
         assert_eq!(v["job_id"], "job-0099");
+        assert_eq!(
+            v["request"]["checkpoint_path"],
+            "/models/user-selected.safetensors"
+        );
         assert_eq!(v["output"]["width"].as_u64(), Some(2));
         assert_eq!(v["output"]["height"].as_u64(), Some(3));
         assert_eq!(v["output"]["location"]["root_kind"], "ui_workflow_gallery");
@@ -760,11 +766,13 @@ mod tests {
             v["evidence"]["worker_result_manifest"]["present"].as_bool(),
             Some(false)
         );
-        assert!(v["readiness"]["limits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str() == Some("worker_specific_result_manifest_missing")));
+        assert!(
+            v["readiness"]["limits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str() == Some("worker_specific_result_manifest_missing"))
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -777,10 +785,11 @@ mod tests {
             .unwrap();
         let flat = visual_health_for_output(&flat_path.to_string_lossy(), Some((64, 64)));
         assert_eq!(flat["status"], "fail");
-        assert!(flat["failures"].as_array().unwrap().iter().any(|item| item
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("low_rgb_stddev")));
+        assert!(flat["failures"].as_array().unwrap().iter().any(|item| {
+            item.as_str()
+                .unwrap_or_default()
+                .starts_with("low_rgb_stddev")
+        }));
 
         let varied_path = dir.join("varied.png");
         let mut varied = image::RgbImage::new(64, 64);
@@ -802,14 +811,16 @@ mod tests {
         assert_eq!(ok["status"], "pass", "{ok:#}");
         let wrong_size = visual_health_for_output(&varied_path.to_string_lossy(), Some((512, 512)));
         assert_eq!(wrong_size["status"], "fail");
-        assert!(wrong_size["failures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("wrong_dimensions")));
+        assert!(
+            wrong_size["failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("wrong_dimensions"))
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -836,10 +847,11 @@ mod tests {
         let health = visual_health_for_output(&path.to_string_lossy(), Some((64, 64)));
         assert_eq!(health["status"], "fail", "{health:#}");
         let failures = health["failures"].as_array().unwrap();
-        assert!(failures.iter().any(|item| item
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("flat_region_channel:bottom")));
+        assert!(failures.iter().any(|item| {
+            item.as_str()
+                .unwrap_or_default()
+                .starts_with("flat_region_channel:bottom")
+        }));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -931,10 +943,12 @@ mod tests {
 
         let doc = result_document_for_output("job-0103", &output);
         assert_eq!(doc["server_result"].is_null(), true);
-        assert!(doc["server_result_error"]
-            .as_str()
-            .unwrap()
-            .contains("expected"));
+        assert!(
+            doc["server_result_error"]
+                .as_str()
+                .unwrap()
+                .contains("expected")
+        );
         assert_eq!(
             doc["result_manifests"]["server_result_manifest"]["present"],
             true

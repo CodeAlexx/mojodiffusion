@@ -71,8 +71,8 @@
 # learned-position crop, image-token count, joint-attention sequence, and VAE
 # decoder is comptime-dispatched. steps/cfg/seed are honored at runtime.
 #
-# LoRA / img2img: NOT supported yet — rejected at admission so they never silently
-# no-op (matches sd3_sample_cli's "accepted-and-ignored" caveat, made fail-loud).
+# SimpleTuner/LyCORIS full-factor LoKr is applied through the exact
+# SwarmUI/Comfy efficient Kronecker bypass. img2img remains fail-loud.
 
 from std.collections import Optional
 from std.ffi import external_call
@@ -105,6 +105,9 @@ from serenitymojo.models.dit.sd3_contract import (
 from serenitymojo.models.dit.sd3_mmdit import (
     SD3MMDiTPreBlockGate, _sd3_joint_block,
 )
+from serenitymojo.models.sd35.sd3_lokr_overlay import (
+    Sd3LokrOverlay, load_sd3_large_lokr,
+)
 from serenitymojo.pipeline.sd3_tiled_decode import sd3_tiled_decode_5x5_lowmem
 from serenitymojo.models.vae.ldm_decoder import load_sd3_embedded_ldm_decoder
 from serenitymojo.ops.cast import cast_tensor
@@ -114,6 +117,10 @@ from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import reshape, concat
 from serenitymojo.sampling.sd3_flow_match import (
     SD3FlowMatchScheduler, sd3_cfg, sd3_euler_step,
+)
+from serenitymojo.sampling.dpmpp_2m import (
+    MultistepHistory, denoised_from_velocity, dpmpp_2m_step,
+    lambda_from_sigma_f64,
 )
 from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.sampling.sampler_registry import (
@@ -465,6 +472,7 @@ def _sd3_large_forward[LH_: Int, LW_: Int, N_IMG_: Int, S_JOINT_: Int](
     gate: SD3MMDiTPreBlockGate,
     loader: BlockLoader,
     ctx: DeviceContext,
+    lora: Optional[ArcPointer[Sd3LokrOverlay]] = None,
 ) raises -> Tensor:
     var x_tokens = gate.latent_patch_embed[LH_, LW_](latent, ctx)
     var c = gate.conditioning(sigma, pooled, ctx)
@@ -476,7 +484,8 @@ def _sd3_large_forward[LH_: Int, LW_: Int, N_IMG_: Int, S_JOINT_: Int](
         loader.prefetch_block(block_prefix)
         var blk = loader.load_block(block_prefix, ctx)
         _sd3_joint_block[1, S_JOINT_, N_CTX, N_IMG_, H_HEADS, H_DIM](
-            ctx_tokens, x_tokens, c, blk, i, is_last, DUAL_BLOCKS, HIDDEN, ctx
+            ctx_tokens, x_tokens, c, blk, i, is_last, DUAL_BLOCKS, HIDDEN, ctx,
+            lora,
         )
         unload_block(blk^)
 
@@ -491,6 +500,8 @@ struct Sd3Backend(GenBackend, Movable):
     var loaded: Bool
     var gate: List[ArcPointer[SD3MMDiTPreBlockGate]]  # 0/1 (resident gate)
     var loader: List[ArcPointer[BlockLoader]]         # 0/1 (mmap handle)
+    var lora: List[ArcPointer[Sd3LokrOverlay]]         # 0/1 runtime LoKr
+    var lora_target_count: Int
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -500,6 +511,10 @@ struct Sd3Backend(GenBackend, Movable):
     var cur: Int
     var params: JobParams
     var cfg: Float32
+    var executed_sampler: String
+    var dpmpp_history: MultistepHistory
+    var dpmpp_update_steps: Int
+    var dpmpp_second_order_steps: Int
     var caps: List[ArcPointer[Sd3Caps]]                 # 0/1
     var sched: List[ArcPointer[SD3FlowMatchScheduler]]  # 0/1
     var latent: List[ArcPointer[Tensor]]                # 0/1 ([1,16,LH,LW] BF16)
@@ -517,6 +532,8 @@ struct Sd3Backend(GenBackend, Movable):
         self.loaded = False
         self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
         self.loader = List[ArcPointer[BlockLoader]]()
+        self.lora = List[ArcPointer[Sd3LokrOverlay]]()
+        self.lora_target_count = 0
         self.active = False
         self.cancel_flag = False
         self.phase = S3PHASE_IDLE
@@ -524,6 +541,10 @@ struct Sd3Backend(GenBackend, Movable):
         self.cur = 0
         self.params = JobParams()
         self.cfg = Float32(4.5)
+        self.executed_sampler = String("sd3_flowmatch_euler")
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
         self.caps = List[ArcPointer[Sd3Caps]]()
         self.sched = List[ArcPointer[SD3FlowMatchScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
@@ -577,10 +598,10 @@ struct Sd3Backend(GenBackend, Movable):
                 + "x" + String(params.height)
                 + " — supported sizes are the compiled seven-shape 1MP aspect ladder"
             )
-        if len(params.loras) > 0:
+        if len(params.loras) > 1:
             raise Error(
-                "sd3: LoRA is not supported for SD3.5 Large in this backend yet"
-                " (no LoRA overlay path wired); submit without a LoRA"
+                "sd3: this runtime currently supports one creator-compatible"
+                " LyCORIS LoKr at a time"
             )
         if params.init_image.byte_length() > 0:
             raise Error(
@@ -590,7 +611,20 @@ struct Sd3Backend(GenBackend, Movable):
         # Warn-loud (never silently drop) on any advanced-sampling knob set but
         # unsupported by this fixed flow-match Euler path.
         warn_unsupported_advanced_sampling_params(params, String("sd3"), List[String]())
+        # Normal completion already releases this streamed model before VAE
+        # decode. A cancelled/failed job can leave it resident; never reuse that
+        # state across a changed LoKr request.
+        if self.loaded:
+            self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
+            self.loader = List[ArcPointer[BlockLoader]]()
+            self.lora = List[ArcPointer[Sd3LokrOverlay]]()
+            self.lora_target_count = 0
+            self.loaded = False
         self.params = params.copy()
+        self.executed_sampler = sampler_admission.executed
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
         # MJ-1053: backfill the SD3 gate-recipe defaults ONLY for degenerate
         # inputs. KNOWN LIMITATION (accepted): the wire protocol has no "unset"
         # sentinel, so a request that omits steps/seed arrives indistinguishable
@@ -651,6 +685,7 @@ struct Sd3Backend(GenBackend, Movable):
             print("[sd3] releasing resident SD3 gate + BlockLoader before VAE decode")
         self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
         self.loader = List[ArcPointer[BlockLoader]]()
+        self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.loaded = False
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
@@ -686,7 +721,9 @@ struct Sd3Backend(GenBackend, Movable):
         content += String('    "sampler_registry_backend":"sd3",\n')
         content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
-        content += String('    "executed_sampler":"sd3_flowmatch_euler",\n')
+        content += String('    "executed_sampler":"') + json_escape(
+            self.executed_sampler
+        ) + String('",\n')
         content += String('    "executed_scheduler":"sd3_simple_flowmatch",\n')
         content += String('    "schedule_source":"sd3_large_shifted_flowmatch",\n')
         content += String('    "streamed_blocks":') + String(DEPTH) + String(",\n")
@@ -698,6 +735,27 @@ struct Sd3Backend(GenBackend, Movable):
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        if len(self.params.loras) == 1:
+            content += String('    "loaded_lora":"') + json_escape(
+                self.params.loras[0].name
+            ) + String('",\n')
+            content += String('    "loaded_lora_weight":') + String(
+                self.params.loras[0].weight
+            ) + String(",\n")
+        else:
+            content += String('    "loaded_lora":"",\n')
+            content += String('    "loaded_lora_weight":0,\n')
+        content += String('    "lora_target_count":') + String(
+            self.lora_target_count
+        ) + String(",\n")
+        content += String('    "sampler_trace":{"algorithm":"') + json_escape(
+            self.executed_sampler
+        ) + String('","history_capacity":1,"history_final_len":')
+        content += String(self.dpmpp_history.len()) + String(
+            ',"dpmpp_update_steps":'
+        ) + String(self.dpmpp_update_steps) + String(
+            ',"dpmpp_second_order_steps":'
+        ) + String(self.dpmpp_second_order_steps) + String("},\n")
         content += String('    "dtype":"bf16_mmdit_bf16_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
@@ -804,6 +862,25 @@ struct Sd3Backend(GenBackend, Movable):
         ))
         self.loader = List[ArcPointer[BlockLoader]]()
         self.loader.append(ArcPointer(BlockLoader.open(String(MODEL_PATH))))
+        self.lora = List[ArcPointer[Sd3LokrOverlay]]()
+        self.lora_target_count = 0
+        if len(self.params.loras) == 1:
+            print(
+                "[sd3] loading creator-compatible LoKr:",
+                self.params.loras[0].name,
+                "weight",
+                self.params.loras[0].weight,
+            )
+            var overlay = load_sd3_large_lokr(
+                self.params.loras[0].name,
+                DEPTH,
+                HIDDEN,
+                Float32(self.params.loras[0].weight),
+                self.ctx,
+            )
+            self.lora_target_count = overlay.count()
+            print("[sd3] loaded", self.lora_target_count, "LoKr attention targets")
+            self.lora.append(ArcPointer(overlay^))
         self.loaded = True
         _print_vram("after SD3 gate + BlockLoader load (resident)")
 
@@ -866,13 +943,51 @@ struct Sd3Backend(GenBackend, Movable):
         var v_cond = _sd3_large_forward[LH_, LW_, N_IMG_, S_JOINT_](
             self.latent[0][], sigma, self.caps[0][].context, self.caps[0][].pooled,
             self.gate[0][], self.loader[0][], self.ctx,
+            (
+                Optional[ArcPointer[Sd3LokrOverlay]](self.lora[0])
+                if len(self.lora) == 1
+                else Optional[ArcPointer[Sd3LokrOverlay]]()
+            ),
         )
         var v_uncond = _sd3_large_forward[LH_, LW_, N_IMG_, S_JOINT_](
             self.latent[0][], sigma, self.caps[0][].context_uncond,
             self.caps[0][].pooled_uncond, self.gate[0][], self.loader[0][], self.ctx,
+            (
+                Optional[ArcPointer[Sd3LokrOverlay]](self.lora[0])
+                if len(self.lora) == 1
+                else Optional[ArcPointer[Sd3LokrOverlay]]()
+            ),
         )
         var velocity = sd3_cfg(v_cond, v_uncond, self.cfg, self.ctx)
-        var x_new = sd3_euler_step(self.latent[0][], velocity, dt, self.ctx)
+        var x_new: Tensor
+        if self.executed_sampler == "dpmpp_2m":
+            var sigma_next = sigma + dt
+            var latent_f32 = cast_tensor(
+                self.latent[0][], STDtype.F32, self.ctx
+            )
+            var velocity_f32 = cast_tensor(velocity, STDtype.F32, self.ctx)
+            var denoised = denoised_from_velocity(
+                latent_f32, velocity_f32, sigma, self.ctx
+            )
+            if not self.dpmpp_history.is_empty():
+                self.dpmpp_second_order_steps += 1
+            var stepped = dpmpp_2m_step(
+                latent_f32,
+                denoised,
+                sigma,
+                sigma_next,
+                self.dpmpp_history,
+                self.ctx,
+            )
+            self.dpmpp_history.push(
+                denoised^, lambda_from_sigma_f64(Float64(sigma))
+            )
+            self.dpmpp_update_steps += 1
+            x_new = cast_tensor(stepped, STDtype.BF16, self.ctx)
+        else:
+            x_new = sd3_euler_step(
+                self.latent[0][], velocity, dt, self.ctx
+            )
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x_new^))
 

@@ -45,6 +45,9 @@ struct JobParams(Copyable, Movable):
 
     var job_id: String
     var model: String
+    # Exact path resolved by the Rust registry. Empty keeps the canonical
+    # built-in checkpoint for legacy daemon/API requests.
+    var checkpoint_path: String
     var prompt: String
     var negative: String
     var width: Int
@@ -150,6 +153,7 @@ struct JobParams(Copyable, Movable):
     def __init__(out self):
         self.job_id = String("")
         self.model = String("")
+        self.checkpoint_path = String("")
         self.prompt = String("")
         self.negative = String("")
         self.width = 512

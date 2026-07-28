@@ -30,8 +30,10 @@
 # Qwen-Image DiT N_IMG / S_POS / S_NEG and VAE decode shape remains comptime-
 # fixed inside its selected arm. steps/cfg/seed are honored at runtime.
 #
-# LoRA: NOT supported for Qwen-Image yet (no LoRA path in the model) — a LoRA
-# request is rejected at admission so it never silently no-ops.
+# LoRA: one sparse canonical Qwen PEFT/Serenity adapter is loaded through the
+# existing parity-gated 60-block Qwen LoRA device math. Present projections are
+# applied exactly; missing projections remain absent and incompatible shapes
+# fail loud.
 
 from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
@@ -53,13 +55,24 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.dit.qwenimage_dit import (
     QwenImageDitOffloaded,
+    QwenImageCfgPreds,
     qwenimage_resident_pin_budget,
+)
+from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
+    QwenLoraDeviceSet,
+    load_qwenimage_lora_device_set,
 )
 from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
 from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen_device
+from serenitymojo.sampling.dpmpp_2m import (
+    MultistepHistory,
+    denoised_from_velocity,
+    dpmpp_2m_step,
+    lambda_from_sigma_f64,
+)
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
@@ -87,6 +100,10 @@ from serenitymojo.serve.backend import (
     reject_unsupported_qwen_edit_conditioning_params,
     reject_unsupported_conditioning_mask_params, reject_unsupported_lanpaint_params,
     advanced_sampling_params_set,
+)
+from serenitymojo.serve.product_manifest import (
+    json_escape,
+    write_text_file,
 )
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
@@ -316,6 +333,14 @@ struct QwenImageBackend(GenBackend, Movable):
     var caps: List[ArcPointer[QwenCaps]]      # 0/1
     var sched: List[ArcPointer[Scheduler]]    # 0/1
     var latent: List[ArcPointer[Tensor]]      # 0/1 (packed)
+    var lora: List[ArcPointer[QwenLoraDeviceSet]]  # 0/1, per job
+    var lora_target_count: Int
+    var executed_sampler: String
+    var executed_scheduler: String
+    var dpmpp_history: MultistepHistory
+    var dpmpp_history_final_len: Int
+    var dpmpp_update_steps: Int
+    var dpmpp_second_order_steps: Int
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
@@ -331,6 +356,14 @@ struct QwenImageBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[QwenCaps]]()
         self.sched = List[ArcPointer[Scheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.lora = List[ArcPointer[QwenLoraDeviceSet]]()
+        self.lora_target_count = 0
+        self.executed_sampler = String("qwenimage_flowmatch_euler")
+        self.executed_scheduler = String("qwenimage_simple_flowmatch")
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
 
     def backend_name(self) -> String:
         return String("qwenimage")
@@ -376,10 +409,10 @@ struct QwenImageBackend(GenBackend, Movable):
                 + "x" + String(params.height)
                 + " — choose a compiled Qwen 1024px-area aspect bucket"
             )
-        if len(params.loras) > 0:
+        if len(params.loras) > 1:
             raise Error(
-                "qwenimage: LoRA is not supported for Qwen-Image yet"
-                " (no LoRA path in the model); submit without a LoRA"
+                "qwenimage: this runtime currently supports one compatible"
+                " Qwen PEFT/Serenity adapter at a time"
             )
         if params.init_image.byte_length() > 0:
             raise Error(
@@ -391,6 +424,12 @@ struct QwenImageBackend(GenBackend, Movable):
         # input (see QWENIMAGE_DEFAULT_CFG note). Mirrors sensenova_backend's
         # cfg-default idiom.
         self.cfg = Float32(params.cfg) if params.cfg > 0.0 else QWENIMAGE_DEFAULT_CFG
+        self.executed_sampler = sampler_admission.executed.copy()
+        self.executed_scheduler = scheduler_admission.executed.copy()
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
         self.active = True
         self.cancel_flag = False
         self.cur = 0
@@ -436,25 +475,46 @@ struct QwenImageBackend(GenBackend, Movable):
         self.caps.append(ArcPointer(caps^))
 
     def _load_model(mut self) raises:
-        """Load the Qwen-Image DiT offloader handle (once; stays resident)."""
-        if self.loaded:
-            return
-        _print_vram("before DiT offloader load")
-        print("[qwenimage] loading Qwen-Image MMDiT offloader from", DIT_DIR)
-        self.model = List[ArcPointer[QwenImageDitOffloaded]]()
-        self.model.append(ArcPointer(QwenImageDitOffloaded.load(DIT_DIR, self.ctx)))
-        var free_info = cu_mem_get_info()
-        var resident_budget = qwenimage_resident_pin_budget(free_info.free_bytes)
-        var pinned_blocks = self.model[0][].pin_resident_blocks(
-            resident_budget, self.ctx
-        )
-        print(
-            "[qwenimage] resident block prefix pinned:", pinned_blocks,
-            "budget_bytes=", resident_budget,
-            "free_before_pin_mib=", free_info.free_bytes // (1024 * 1024),
-        )
-        self.loaded = True
-        _print_vram("after DiT offloader load (resident)")
+        """Load the resident base offloader and the current job's LoRA."""
+        if not self.loaded:
+            _print_vram("before DiT offloader load")
+            print("[qwenimage] loading Qwen-Image MMDiT offloader from", DIT_DIR)
+            self.model = List[ArcPointer[QwenImageDitOffloaded]]()
+            self.model.append(ArcPointer(QwenImageDitOffloaded.load(DIT_DIR, self.ctx)))
+            var free_info = cu_mem_get_info()
+            var resident_budget = qwenimage_resident_pin_budget(free_info.free_bytes)
+            var pinned_blocks = self.model[0][].pin_resident_blocks(
+                resident_budget, self.ctx
+            )
+            print(
+                "[qwenimage] resident block prefix pinned:", pinned_blocks,
+                "budget_bytes=", resident_budget,
+                "free_before_pin_mib=", free_info.free_bytes // (1024 * 1024),
+            )
+            self.loaded = True
+            _print_vram("after DiT offloader load (resident)")
+
+        self.lora = List[ArcPointer[QwenLoraDeviceSet]]()
+        self.lora_target_count = 0
+        if len(self.params.loras) == 1:
+            print(
+                "[qwenimage] loading sparse canonical adapter:",
+                self.params.loras[0].name,
+                "weight",
+                self.params.loras[0].weight,
+            )
+            var loaded_lora = load_qwenimage_lora_device_set(
+                self.params.loras[0].name,
+                Float32(self.params.loras[0].weight),
+                self.ctx,
+            )
+            self.lora_target_count = loaded_lora.target_count
+            self.lora.append(ArcPointer(loaded_lora^))
+            print(
+                "[qwenimage] loaded",
+                self.lora_target_count,
+                "compatible projection factors",
+            )
 
     def _prepare_job_shape[LH_: Int, LW_: Int, N_IMG_: Int](mut self) raises:
         """Scheduler (honors steps) + seeded initial packed latent (honors seed)."""
@@ -500,15 +560,55 @@ struct QwenImageBackend(GenBackend, Movable):
         var i = self.cur
         var sigmas = self.sched[0][].sigmas()
         comptime S_BI = N_IMG_ + N_TXT_KEPT
-        var preds = self.model[0][].forward_cfg_mixed_text[
-            N_IMG_, N_TXT_KEPT, S_BI, N_TXT_KEPT, S_BI
-        ](
-            self.latent[0][], self.caps[0][].pos, self.caps[0][].neg, sigmas[i],
-            self.caps[0][].real_pos, self.caps[0][].real_neg,
-            1, LH_ // PATCH, LW_ // PATCH, self.ctx,
-        )
+        var preds: QwenImageCfgPreds
+        if len(self.lora) == 1:
+            preds = self.model[0][].forward_cfg_mixed_text[
+                N_IMG_, N_TXT_KEPT, S_BI, N_TXT_KEPT, S_BI
+            ](
+                self.latent[0][], self.caps[0][].pos, self.caps[0][].neg, sigmas[i],
+                self.caps[0][].real_pos, self.caps[0][].real_neg,
+                1, LH_ // PATCH, LW_ // PATCH, self.ctx,
+                Optional[QwenLoraDeviceSet](self.lora[0][].copy()),
+            )
+        else:
+            preds = self.model[0][].forward_cfg_mixed_text[
+                N_IMG_, N_TXT_KEPT, S_BI, N_TXT_KEPT, S_BI
+            ](
+                self.latent[0][], self.caps[0][].pos, self.caps[0][].neg, sigmas[i],
+                self.caps[0][].real_pos, self.caps[0][].real_neg,
+                1, LH_ // PATCH, LW_ // PATCH, self.ctx,
+            )
         var pred = cfg_qwen_device(preds.pos, preds.neg, self.cfg, self.ctx)
-        var x_new = self.sched[0][].step(self.latent[0][], pred, i, self.ctx)
+        var x_new: Tensor
+        if self.executed_sampler == "dpmpp_2m":
+            var sigma_next = sigmas[i + 1]
+            var latent_f32 = cast_tensor(
+                self.latent[0][], STDtype.F32, self.ctx
+            )
+            var pred_f32 = cast_tensor(pred, STDtype.F32, self.ctx)
+            var denoised = denoised_from_velocity(
+                latent_f32, pred_f32, sigmas[i], self.ctx
+            )
+            if not self.dpmpp_history.is_empty():
+                self.dpmpp_second_order_steps += 1
+            var stepped = dpmpp_2m_step(
+                latent_f32,
+                denoised,
+                sigmas[i],
+                sigma_next,
+                self.dpmpp_history,
+                self.ctx,
+            )
+            self.dpmpp_history.push(
+                denoised^,
+                lambda_from_sigma_f64(Float64(sigmas[i])),
+            )
+            self.dpmpp_update_steps += 1
+            x_new = cast_tensor(stepped, STDtype.BF16, self.ctx)
+        else:
+            x_new = self.sched[0][].step(
+                self.latent[0][], pred, i, self.ctx
+            )
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x_new^))
 
@@ -532,6 +632,9 @@ struct QwenImageBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[QwenCaps]]()
         self.sched = List[ArcPointer[Scheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.lora = List[ArcPointer[QwenLoraDeviceSet]]()
+        self.dpmpp_history_final_len = self.dpmpp_history.len()
+        self.dpmpp_history = MultistepHistory(1)
         print("[qwenimage] tiled VAE decode (3x3 overlap) + save")
         var img = qwenimage_tiled_decode[LH_, LW_](latent, VAE_DIR, self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
@@ -546,6 +649,45 @@ struct QwenImageBackend(GenBackend, Movable):
                 return self._decode_and_save_shape[LH_BI, LW_BI]()
         raise Error("qwenimage: admitted decode shape was not compiled")
 
+    def _write_result_manifest(self, png_path: String) raises -> String:
+        var manifest_path = png_path + String(".qwenimage_daemon_result.json")
+        var content = String("{\n")
+        content += String('  "schema":"serenity.qwenimage.daemon_result.v1",\n')
+        content += String('  "backend":"qwenimage_daemon",\n')
+        content += String('  "model":"qwen-image-2512",\n')
+        content += String('  "accepted_sampler_parity":false,\n')
+        content += String('  "run_identity":{\n')
+        content += String('    "job_id":"') + json_escape(self.params.job_id) + String('",\n')
+        content += String('    "prompt":"') + json_escape(self.params.prompt) + String('",\n')
+        content += String('    "negative":"') + json_escape(self.params.negative) + String('",\n')
+        content += String('    "seed":') + String(self.params.seed) + String(",\n")
+        content += String('    "resolution":{"width":') + String(self.params.width)
+        content += String(',"height":') + String(self.params.height) + String("},\n")
+        content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "cfg":') + String(self.cfg) + String(",\n")
+        content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
+        content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
+        content += String('    "executed_sampler":"') + json_escape(self.executed_sampler) + String('",\n')
+        content += String('    "executed_scheduler":"') + json_escape(self.executed_scheduler) + String('",\n')
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "loaded_lora":"') + json_escape(
+            self.params.loras[0].name if len(self.params.loras) == 1 else String("")
+        ) + String('",\n')
+        content += String('    "loaded_lora_weight":') + String(
+            self.params.loras[0].weight if len(self.params.loras) == 1 else Float64(0.0)
+        ) + String(",\n")
+        content += String('    "lora_target_count":') + String(self.lora_target_count) + String(",\n")
+        content += String('    "sampler_trace":{"history_capacity":1,"history_final_len":')
+        content += String(self.dpmpp_history_final_len) + String(',"dpmpp_update_steps":')
+        content += String(self.dpmpp_update_steps) + String(',"dpmpp_second_order_steps":')
+        content += String(self.dpmpp_second_order_steps) + String("},\n")
+        content += String('    "dtype":"bf16_mmdit_bf16_latent"\n')
+        content += String("  },\n")
+        content += String('  "output_png":"') + json_escape(png_path) + String('"\n')
+        content += String("}\n")
+        write_text_file(manifest_path, content)
+        return manifest_path
+
     def _clear_job(mut self):
         self.active = False
         self.phase = QPHASE_IDLE
@@ -555,6 +697,12 @@ struct QwenImageBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[QwenCaps]]()
         self.sched = List[ArcPointer[Scheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.lora = List[ArcPointer[QwenLoraDeviceSet]]()
+        self.lora_target_count = 0
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
 
     # ── the pull-based tick ───────────────────────────────────────────────────
     def step(mut self) raises -> StepResult:
@@ -590,8 +738,8 @@ struct QwenImageBackend(GenBackend, Movable):
                         r.step = 0
                         r.phase = String("loading")
                         return r^
-                    self._load_model()
-                    self.announced = False
+                self._load_model()
+                self.announced = False
                 self._prepare_job()
                 self.phase = QPHASE_DENOISE
                 r.step = 0
@@ -610,6 +758,8 @@ struct QwenImageBackend(GenBackend, Movable):
                 r.phase = String("decoding")
                 return r^
             var path = self._decode_and_save()
+            var manifest = self._write_result_manifest(path)
+            print("[qwenimage][manifest] saved:", manifest)
             r.step = self.params.steps
             self._clear_job()
             r.done = True

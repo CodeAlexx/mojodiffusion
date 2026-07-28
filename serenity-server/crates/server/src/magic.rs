@@ -9,11 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::AppState;
 
@@ -120,7 +120,7 @@ pub async fn post_magic_prompt(State(st): State<AppState>, body: String) -> Resp
                 StatusCode::CONFLICT,
                 Json(crate::gpu_lock::gpu_busy_conflict_report("magic", &cur)),
             )
-                .into_response()
+                .into_response();
         }
     };
     // Shell the ephemeral-llama-server script (blocking; model load + gen ~15-40s).
@@ -227,7 +227,7 @@ pub async fn post_enhance_prompt(State(st): State<AppState>, body: String) -> Re
                 StatusCode::CONFLICT,
                 Json(crate::gpu_lock::gpu_busy_conflict_report("magic", &cur)),
             )
-                .into_response()
+                .into_response();
         }
     };
     match run_mojo_magic(&prompt, &aspect) {

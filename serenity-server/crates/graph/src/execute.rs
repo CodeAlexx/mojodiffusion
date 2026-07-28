@@ -172,6 +172,10 @@ fn exec_refiner_upscale_intent(fields: &JsonValue, out: &mut JsonValue) -> Graph
 /// `_workflow_append_lora` (Mojo 176): append `{name, weight}` to `out["lora"]`,
 /// skipping zero-weight; the float weight is emitted as JSON number.
 fn append_lora(out: &mut JsonValue, name: &str, weight: f64) -> GraphResult<()> {
+    append_lora_role(out, name, weight, "overlay")
+}
+
+fn append_lora_role(out: &mut JsonValue, name: &str, weight: f64, role: &str) -> GraphResult<()> {
     if name.is_empty() {
         return Err(GraphError::unsupported(
             "workflow graph LoRA loader missing lora_name",
@@ -191,7 +195,12 @@ fn append_lora(out: &mut JsonValue, name: &str, weight: f64) -> GraphResult<()> 
         }
     };
     let mut arr = arr;
-    arr.push(json!({ "name": name, "weight": weight }));
+    let row = if role == "distillation" {
+        json!({ "name": name, "weight": weight, "role": "distillation" })
+    } else {
+        json!({ "name": name, "weight": weight })
+    };
+    arr.push(row);
     o.insert("lora".to_string(), JsonValue::Array(arr));
     Ok(())
 }
@@ -725,7 +734,27 @@ fn exec_node(
             if t == "LoraLoader" {
                 strength_clip = wf_float(fields, "strength_clip", 1.0, -10.0, 10.0)?;
             }
-            append_lora(out, &lora_name, strength)?;
+            let role = if t == "LoraLoaderModelOnly" {
+                wf_string(fields, "role")
+            } else {
+                String::new()
+            };
+            if !role.is_empty() && !matches!(role.as_str(), "overlay" | "distillation") {
+                return Err(GraphError::bad_request(format!(
+                    "workflow graph LoraLoaderModelOnly role must be overlay or distillation; got '{role}'"
+                ))
+                .with_node(id));
+            }
+            append_lora_role(
+                out,
+                &lora_name,
+                strength,
+                if role == "distillation" {
+                    "distillation"
+                } else {
+                    "overlay"
+                },
+            )?;
             add_value(store, id, "MODEL", ValuePayload::Model { name: model_name })?;
             if t == "LoraLoader" {
                 if strength_clip == 0.0 {
@@ -1203,12 +1232,7 @@ fn exec_node(
                         .with_node(id),
                 );
             }
-            add_value(
-                store,
-                id,
-                "VIDEO",
-                ValuePayload::Video { path: video_path },
-            )?;
+            add_value(store, id, "VIDEO", ValuePayload::Video { path: video_path })?;
             Ok(Fire::Done)
         }
         "LoadAudio" => {

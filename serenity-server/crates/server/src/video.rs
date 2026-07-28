@@ -11,10 +11,10 @@
 use std::collections::HashMap;
 
 use axum::extract::{Query, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use serenity_wire::WorkerEvent;
 
 use crate::AppState;
@@ -42,9 +42,13 @@ const LTX2_CONDITIONING_CHECKPOINT: &str = "checkpoints/ltx-2.3-22b-distilled-fp
 const LTX2_CSHIM: &str = "serenitymojo/ops/cshim/lib/libserenity_cudnn_sdpa.so";
 const LTX2_CONTEXT_PYTHON: &str = ".local/share/LTXDesktop/python/bin/python3";
 const LTX2_CONTEXT_SCRIPT: &str = "scripts/ltx2_refhq_contexts.py";
+const LTX2_CREATOR_AUDIO_DECODER: &str = "scripts/ltx2_decode_source_audio.py";
 const LTX2_CONTEXT_SCHEMA: &str = "serenity.ltx2.refhq_context_cache.v1";
 const LTX2_CREATOR_REVISION: &str = "780984275fd47128b02bef9b5c085404276866ee";
 const LTX2_REFHQ_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8";
+const LTX2_REFHQ_BF16_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8-dequant-bf16";
+const LTX2_REFHQ_DISTILLATION_ADAPTER: &str =
+    "checkpoints/ltx-2.3-22b-distilled-lora-384-1.1.safetensors";
 // Backward-compatible creator profile. New native LTX2 profiles are selected
 // from LTX2_REQUEST_PROFILES_JSON and dispatched to an exact AOT Mojo runner.
 const LTX2_REQUEST_WIDTH: i64 = 512;
@@ -112,8 +116,7 @@ const WAN22_T2V: &str = "output/bin/wan22_t2v";
 const WAN22_A14B_LORA_T2V: &str = "output/bin/wan22_a14b_lora_t2v";
 const WAN22_A14B_HIGH: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/high";
 const WAN22_A14B_LOW: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/low";
-const WAN22_A14B_VAE: &str =
-    "lingbot-video-moe/vae/diffusion_pytorch_model.safetensors";
+const WAN22_A14B_VAE: &str = "lingbot-video-moe/vae/diffusion_pytorch_model.safetensors";
 const WAN22_MODEL_ROOT: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo";
 const WAN22_ARTIFACT_MANIFEST: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/serenity_wan22_manifest.json";
@@ -183,6 +186,18 @@ fn ltx2_decode_ld_path() -> std::ffi::OsString {
     }
     std::env::join_paths(parts).unwrap_or_default()
 }
+
+/// Retake and Extend encode source audio in the main request process before
+/// denoising. Keep that whole temporal-edit process on Creator's pinned cuDNN
+/// runtime; once a process loads libcudnn.so.9, changing the path for a later
+/// phase cannot replace it.
+fn ltx2_request_ld_path(edit_mode: &str) -> std::ffi::OsString {
+    if edit_mode == "standard" {
+        mojo_ld_path()
+    } else {
+        ltx2_decode_ld_path()
+    }
+}
 /// svdint4 slab matching the distilled-fp8 base the LTX2 runner streams
 /// (`CKPT_FP8` in ltx2_t2v_av_hq.mojo). Selected via `LTX2_INT4_SLAB` for the
 /// int4 W4A16-resident path. (Verified present on this box, 2026-07-11.)
@@ -191,6 +206,10 @@ const LTX2_INT4_SLAB: &str = "checkpoints/ltx-2.3-22b-distilled-svdint4-r32.safe
 /// request runner applies the official support LoRA and authored LoRAs on top,
 /// so it must not use the already-distilled slab above.
 const LTX2_REFHQ_INT4_SLAB: &str = "checkpoints/ltx-2.3-22b-svdint4-r32.safetensors";
+/// Full dequantized BF16 LTX-2.3 dev transformer used by the request runner
+/// when Canvas selects BF16 precision. Activations remain BF16 and reductions
+/// remain F32; this is a real storage-mode switch, not an FP8 label alias.
+const LTX2_REFHQ_BF16: &str = "checkpoints/ltx-2.3-22b-dev-fp8-dequant-bf16.safetensors";
 /// wan22_t2v compiled (comptime) geometry — MUST match the binary. It raises on
 /// any `frames != WAN22_FRAMES`, so the server rejects a mismatch up front rather
 /// than burning a multi-minute render on a guaranteed failure.
@@ -295,7 +314,12 @@ struct Ltx2RequestProfileGroup {
     label: String,
     width: i64,
     height: i64,
+    #[serde(default)]
+    conditioning_width: Option<i64>,
+    #[serde(default)]
+    conditioning_height: Option<i64>,
     fps: i64,
+    modes: Vec<String>,
     durations: Vec<f64>,
     frames: Vec<i64>,
     source: String,
@@ -307,8 +331,11 @@ struct Ltx2ResolvedRequestProfile {
     label: String,
     width: i64,
     height: i64,
+    conditioning_width: i64,
+    conditioning_height: i64,
     frames: i64,
     fps: i64,
+    modes: Vec<String>,
     duration: f64,
     source: String,
     runner: String,
@@ -324,10 +351,12 @@ fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
             "embedded LTX2 request profile registry schema mismatch"
         );
         assert!(
-            registry.profile_groups.iter().all(
-                |group| !group.frames.is_empty() && group.frames.len() == group.durations.len()
-            ),
-            "each embedded LTX2 profile group must pair frames with durations"
+            registry.profile_groups.iter().all(|group| {
+                !group.frames.is_empty()
+                    && group.frames.len() == group.durations.len()
+                    && !group.modes.is_empty()
+            }),
+            "each embedded LTX2 profile group must pair frames with durations and declare modes"
         );
         registry
     })
@@ -335,6 +364,50 @@ fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
 
 fn ltx2_profile_runner_name(width: i64, height: i64, frames: i64, fps: i64) -> String {
     format!("output/bin/ltx2_serenity_{width}x{height}_{frames}f_{fps}fps")
+}
+
+const LTX2_REQUEST_RUNNER_BUILD_INPUTS: &[&str] = &[
+    "serenitymojo/configs/ltx2_request_profiles.json",
+    "serenitymojo/sampling/ltx2_request_cli.mojo",
+    "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo",
+    "serenitymojo/models/vae/ltx2_tiled_decode.mojo",
+    "serenitymojo/models/vae/ltx2_vae_encoder.mojo",
+    "serenitymojo/models/vae/conv3d.mojo",
+    "serenitymojo/image/png.mojo",
+    "serenitymojo/serve/image_io.mojo",
+    "serenitymojo/image/decode.mojo",
+];
+
+fn ltx2_runner_mtime_covers_inputs(
+    runner_modified: std::time::SystemTime,
+    input_modified: &[std::time::SystemTime],
+) -> bool {
+    input_modified
+        .iter()
+        .all(|modified| *modified <= runner_modified)
+}
+
+/// An executable alone is not an available LTX profile. These runners contain
+/// compile-time geometry and request-routing code, so a binary older than any
+/// of its build inputs can execute a different checkpoint contract than the
+/// server publishes. Fail closed until the exact profile is rebuilt.
+fn ltx2_request_runner_current(path: &str) -> bool {
+    if !bin_x(path) {
+        return false;
+    }
+    let Ok(runner_modified) = std::fs::metadata(repo_path(path)).and_then(|meta| meta.modified())
+    else {
+        return false;
+    };
+    let mut input_modified = Vec::with_capacity(LTX2_REQUEST_RUNNER_BUILD_INPUTS.len());
+    for input in LTX2_REQUEST_RUNNER_BUILD_INPUTS {
+        let Ok(modified) = std::fs::metadata(repo_path(input)).and_then(|meta| meta.modified())
+        else {
+            return false;
+        };
+        input_modified.push(modified);
+    }
+    ltx2_runner_mtime_covers_inputs(runner_modified, &input_modified)
 }
 
 fn ltx2_resolved_profiles() -> Vec<Ltx2ResolvedRequestProfile> {
@@ -352,8 +425,11 @@ fn ltx2_resolved_profiles() -> Vec<Ltx2ResolvedRequestProfile> {
                     label: group.label.clone(),
                     width: group.width,
                     height: group.height,
+                    conditioning_width: group.conditioning_width.unwrap_or(group.width),
+                    conditioning_height: group.conditioning_height.unwrap_or(group.height),
                     frames,
                     fps: group.fps,
+                    modes: group.modes.clone(),
                     duration,
                     source: group.source.clone(),
                     runner: ltx2_profile_runner_name(group.width, group.height, frames, group.fps),
@@ -363,27 +439,43 @@ fn ltx2_resolved_profiles() -> Vec<Ltx2ResolvedRequestProfile> {
 }
 
 fn ltx2_profile_runner_available(profile: &Ltx2ResolvedRequestProfile) -> bool {
-    bin_x(&profile.runner)
+    ltx2_request_runner_current(&profile.runner)
         || (profile.width == LTX2_REQUEST_WIDTH
             && profile.height == LTX2_REQUEST_HEIGHT
             && profile.frames == LTX2_REQUEST_FRAMES
             && profile.fps as f64 == LTX2_REQUEST_FPS
-            && bin_x(LTX2_MOJO_REQUEST_RUNNER))
+            && ltx2_request_runner_current(LTX2_MOJO_REQUEST_RUNNER))
 }
 
 fn ltx2_effective_profile_runner(profile: &Ltx2ResolvedRequestProfile) -> String {
-    if bin_x(&profile.runner) {
+    if ltx2_request_runner_current(&profile.runner) {
         profile.runner.clone()
     } else if profile.width == LTX2_REQUEST_WIDTH
         && profile.height == LTX2_REQUEST_HEIGHT
         && profile.frames == LTX2_REQUEST_FRAMES
         && profile.fps as f64 == LTX2_REQUEST_FPS
-        && bin_x(LTX2_MOJO_REQUEST_RUNNER)
+        && ltx2_request_runner_current(LTX2_MOJO_REQUEST_RUNNER)
     {
         LTX2_MOJO_REQUEST_RUNNER.to_string()
     } else {
         profile.runner.clone()
     }
+}
+
+fn ltx2_request_profile_for_mode(
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: f64,
+    mode: &str,
+) -> Option<Ltx2ResolvedRequestProfile> {
+    ltx2_resolved_profiles().into_iter().find(|profile| {
+        profile.width == width
+            && profile.height == height
+            && profile.frames == frames
+            && (profile.fps as f64 - fps).abs() <= f64::EPSILON
+            && profile.modes.iter().any(|candidate| candidate == mode)
+    })
 }
 
 fn ltx2_request_profile(
@@ -392,12 +484,7 @@ fn ltx2_request_profile(
     frames: i64,
     fps: f64,
 ) -> Option<Ltx2ResolvedRequestProfile> {
-    ltx2_resolved_profiles().into_iter().find(|profile| {
-        profile.width == width
-            && profile.height == height
-            && profile.frames == frames
-            && (profile.fps as f64 - fps).abs() <= f64::EPSILON
-    })
+    ltx2_request_profile_for_mode(width, height, frames, fps, "standard")
 }
 
 fn ltx2_profile_document(profile: &Ltx2ResolvedRequestProfile) -> Value {
@@ -407,8 +494,11 @@ fn ltx2_profile_document(profile: &Ltx2ResolvedRequestProfile) -> Value {
         "checkpoint": ltx2_request_profile_registry().checkpoint,
         "width": profile.width,
         "height": profile.height,
+        "conditioning_width": profile.conditioning_width,
+        "conditioning_height": profile.conditioning_height,
         "frames": profile.frames,
         "fps": profile.fps,
+        "modes": profile.modes,
         "duration": profile.duration,
         "source": profile.source,
         "runner": ltx2_effective_profile_runner(profile),
@@ -416,6 +506,127 @@ fn ltx2_profile_document(profile: &Ltx2ResolvedRequestProfile) -> Value {
         "output_format": "mp4",
         "guidance_modes": ltx2_request_profile_registry().guidance_modes,
     })
+}
+
+fn stage_ltx2_creator_i2v_source(
+    source_path: &str,
+    profile: &Ltx2ResolvedRequestProfile,
+    out_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    // LTX Desktop first converts to RGB, Lanczos-resizes with fill, and
+    // center-crops at the UI-authored size. The fast pipeline then performs a
+    // one-frame libx264 CRF-33 round trip before its per-stage bilinear resize.
+    let source = image::open(source_path)
+        .map_err(|error| format!("cannot decode LTX2 I2V source '{source_path}': {error}"))?
+        .to_rgb8();
+    let source_width = source.width();
+    let source_height = source.height();
+    let target_width = u32::try_from(profile.conditioning_width)
+        .map_err(|_| "invalid LTX2 conditioning width".to_string())?;
+    let target_height = u32::try_from(profile.conditioning_height)
+        .map_err(|_| "invalid LTX2 conditioning height".to_string())?;
+    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+        return Err("LTX2 I2V source and conditioning dimensions must be positive".to_string());
+    }
+
+    let source_is_wider = u64::from(source_width) * u64::from(target_height)
+        > u64::from(target_width) * u64::from(source_height);
+    let (resized_width, resized_height) = if source_is_wider {
+        (
+            u32::try_from(
+                u64::from(source_width) * u64::from(target_height) / u64::from(source_height),
+            )
+            .map_err(|_| "LTX2 I2V resized width overflow".to_string())?,
+            target_height,
+        )
+    } else {
+        (
+            target_width,
+            u32::try_from(
+                u64::from(source_height) * u64::from(target_width) / u64::from(source_width),
+            )
+            .map_err(|_| "LTX2 I2V resized height overflow".to_string())?,
+        )
+    };
+    let resized = image::imageops::resize(
+        &source,
+        resized_width,
+        resized_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let left = (resized_width - target_width) / 2;
+    let top = (resized_height - target_height) / 2;
+    let prepared =
+        image::imageops::crop_imm(&resized, left, top, target_width, target_height).to_image();
+
+    let prepared_png = out_dir.join("creator_i2v_prepared.png");
+    prepared
+        .save_with_format(&prepared_png, image::ImageFormat::Png)
+        .map_err(|error| format!("cannot save creator-prepared I2V source: {error}"))?;
+    let raw_path = out_dir.join(".creator_i2v_prepared.rgb24");
+    std::fs::write(&raw_path, prepared.as_raw())
+        .map_err(|error| format!("cannot stage creator I2V RGB frame: {error}"))?;
+    let roundtrip_mp4 = out_dir.join(".creator_i2v_crf33.mp4");
+    let roundtrip_png = out_dir.join("creator_i2v_conditioning.png");
+    let dimensions = format!("{target_width}x{target_height}");
+    let encode = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgb24",
+            "-video_size",
+            &dimensions,
+            "-framerate",
+            "1",
+            "-i",
+        ])
+        .arg(&raw_path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "33",
+            "-preset",
+            "veryfast",
+            "-x264-params",
+            "sliced_threads=1",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&roundtrip_mp4)
+        .output()
+        .map_err(|error| format!("cannot launch creator I2V CRF round trip: {error}"))?;
+    let _ = std::fs::remove_file(&raw_path);
+    if !encode.status.success() {
+        return Err(format!(
+            "creator I2V CRF encode failed: {}",
+            String::from_utf8_lossy(&encode.stderr).trim()
+        ));
+    }
+    let decode = std::process::Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&roundtrip_mp4)
+        .args(["-frames:v", "1", "-pix_fmt", "rgb24"])
+        .arg(&roundtrip_png)
+        .output()
+        .map_err(|error| format!("cannot launch creator I2V CRF decode: {error}"))?;
+    let _ = std::fs::remove_file(&roundtrip_mp4);
+    if !decode.status.success() || !nonempty_file(&roundtrip_png) {
+        return Err(format!(
+            "creator I2V CRF decode failed: {}",
+            String::from_utf8_lossy(&decode.stderr).trim()
+        ));
+    }
+    Ok(roundtrip_png)
 }
 
 fn ltx2_post_upscaler_documents() -> Value {
@@ -1520,6 +1731,8 @@ fn readiness_doc() -> Value {
         .iter()
         .map(ltx2_profile_document)
         .collect::<Vec<_>>();
+    let ltx2_bf16_checkpoint = model_path(LTX2_REFHQ_BF16);
+    let ltx2_bf16_available = nonempty_file(&ltx2_bf16_checkpoint);
     let ltx2_default_profile = ltx2_profiles
         .iter()
         .find(|profile| {
@@ -1644,6 +1857,8 @@ fn readiness_doc() -> Value {
                         "caps_positive", "caps_negative", "noise_fixture",
                         "image_path", "image_strength", "video_path",
                         "video_strength", "video_mask_path",
+                        "video_edit_mode", "video_edit_start",
+                        "video_edit_end", "video_source_frames",
                         "include_audio", "audio_policy", "lora", "quant",
                         "post_upscale", "feature_id", "feature_weight"
                     ],
@@ -1656,14 +1871,35 @@ fn readiness_doc() -> Value {
                     },
                     "compiled_profile": ltx2_default_profile,
                     "supported_profiles": ltx2_profile_documents,
+                    "quant_modes": [
+                        {
+                            "id": "bf16",
+                            "label": "BF16",
+                            "available": ltx2_bf16_available,
+                            "checkpoint": ltx2_bf16_checkpoint,
+                            "dtype_contract": "bf16_transformer_weights_bf16_activations_f32_reductions",
+                        },
+                        {
+                            "id": "fp8",
+                            "label": "FP8",
+                            "available": true,
+                            "dtype_contract": "fp8_transformer_bf16_activations_f32_reductions",
+                        },
+                        {
+                            "id": "int4",
+                            "label": "INT4",
+                            "available": nonempty_file(&model_path(LTX2_REFHQ_INT4_SLAB)),
+                            "dtype_contract": "int4_resident_w4a16_bf16_activations_f32_reductions",
+                        }
+                    ],
                     "post_upscalers": ltx2_post_upscaler_documents(),
                     "feature_adapters": crate::models::ltx2_feature_documents(),
                     "available": ltx2_request_ready,
                 },
             },
             "target_fps": 24,
-            "quant_modes": ["fp8", "int4"],
-            "quant_note": "staged smoke: distilled-fp8 resident or W4A16 int4-resident; refhq: official LTX-2.3 dev-fp8 base plus official 1.1 distilled LoRA. W4A4 int4-compute is NOT integrated.",
+            "quant_modes": ["bf16", "fp8", "int4"],
+            "quant_note": "request runner: dequantized dev BF16, native dev FP8, or W4A16 int4-resident. All execute BF16 activations with F32 reductions; W4A4 int4-compute is NOT integrated.",
             "limit": "staged is bounded smoke; refhq parity claims are admitted only from current machine-local Creator reports at the 0.999 bar",
         },
         {
@@ -1784,7 +2020,7 @@ pub async fn get_video() -> Response {
 /// LoRA preview; `"bernini"` = the gated Bernini-R;
 /// `"scail2"` = automatic character-animation orchestration.
 pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
-    let b: Value = serde_json::from_str::<Value>(&body)
+    let mut b: Value = serde_json::from_str::<Value>(&body)
         .ok()
         .filter(|v| v.is_object())
         .unwrap_or_else(|| json!({}));
@@ -1809,14 +2045,23 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     let is_ltx2_mojo_request =
         model == "ltx2" && b.get("runner").and_then(Value::as_str) == Some("ltx2_mojo_request");
     if is_ltx2_mojo_request {
+        b = match normalized_ltx2_video_edit_request(&b) {
+            Ok(value) => value,
+            Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        };
         if let Err(error) = validate_ltx2_mojo_request(&b) {
             return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
         }
-        let profile = ltx2_request_profile(
+        let edit_mode = b
+            .get("video_edit_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("standard");
+        let profile = ltx2_request_profile_for_mode(
             b["width"].as_i64().unwrap_or(0),
             b["height"].as_i64().unwrap_or(0),
             b["frames"].as_i64().unwrap_or(0),
             b["fps"].as_f64().unwrap_or(0.0),
+            edit_mode,
         )
         .expect("validated LTX2 request must resolve to an admitted profile");
         if !ltx2_profile_runner_available(&profile) {
@@ -1824,11 +2069,7 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!(
                     "LTX2 profile {}x{}, {} frames at {} FPS is supported but its exact Mojo runner is not built: {}",
-                    profile.width,
-                    profile.height,
-                    profile.frames,
-                    profile.fps,
-                    profile.runner,
+                    profile.width, profile.height, profile.frames, profile.fps, profile.runner,
                 ),
             );
         }
@@ -1934,7 +2175,7 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
                 StatusCode::CONFLICT,
                 axum::Json(crate::gpu_lock::gpu_busy_conflict_report("video", &cur)),
             )
-                .into_response()
+                .into_response();
         }
     };
     // The GPU lease excludes an active image job, but an IDLE Mojo worker can
@@ -1954,13 +2195,13 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
             return err_detail(
                 StatusCode::CONFLICT,
                 "image worker became active before video launch",
-            )
+            );
         }
         Err(_) => {
             return err_detail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "timed out evicting idle image worker before video launch",
-            )
+            );
         }
     }
     if is_ltx2_mojo_request {
@@ -1980,7 +2221,7 @@ fn ltx2_feature_request(body: &Value) -> Result<Option<Value>, String> {
     let feature_id = match body.get("feature_id") {
         None => return Ok(None),
         Some(Value::String(value)) if value.trim().is_empty() || value == "standard" => {
-            return Ok(None)
+            return Ok(None);
         }
         Some(Value::String(value)) => value.trim(),
         Some(_) => return Err("LTX2 feature_id must be a string".to_string()),
@@ -2033,14 +2274,12 @@ fn ltx2_feature_request(body: &Value) -> Result<Option<Value>, String> {
         .and_then(Value::as_array)
         .is_some_and(|rows| {
             rows.iter().any(|row| {
-                row.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| {
-                        std::path::Path::new(name)
-                            .file_name()
-                            .and_then(|value| value.to_str())
-                            == Some(filename)
-                    })
+                row.get("name").and_then(Value::as_str).is_some_and(|name| {
+                    std::path::Path::new(name)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        == Some(filename)
+                })
             })
         })
     {
@@ -2048,14 +2287,8 @@ fn ltx2_feature_request(body: &Value) -> Result<Option<Value>, String> {
             "LTX2 feature workflow '{feature_id}' already owns {filename}; remove the duplicate ordinary LoRA row"
         ));
     }
-    let prompt = body
-        .get("prompt")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let trigger = feature
-        .get("trigger")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let trigger = feature.get("trigger").and_then(Value::as_str).unwrap_or("");
     if !trigger.is_empty() && !prompt.contains(trigger) {
         return Err(format!(
             "LTX2 feature workflow '{feature_id}' requires the exact prompt trigger {trigger}"
@@ -2068,9 +2301,7 @@ fn ltx2_feature_request(body: &Value) -> Result<Option<Value>, String> {
                 .and_then(Value::as_str)
                 .is_none_or(|value| value.trim().is_empty())
             {
-                return Err(
-                    "LTX2 Cinemagraph requires a loaded I2V source image".to_string()
-                );
+                return Err("LTX2 Cinemagraph requires a loaded I2V source image".to_string());
             }
         }
         "foley-v2a" => {
@@ -2129,7 +2360,7 @@ fn ltx2_feature_request(body: &Value) -> Result<Option<Value>, String> {
         _ => {
             return Err(format!(
                 "LTX2 feature workflow '{feature_id}' has no admitted request contract"
-            ))
+            ));
         }
     }
     if let Some(object) = feature.as_object_mut() {
@@ -2187,6 +2418,396 @@ fn normalized_ltx2_feature_request(body: &Value) -> Result<Value, String> {
     Ok(normalized)
 }
 
+fn normalized_ltx2_video_edit_request(body: &Value) -> Result<Value, String> {
+    let mode = body
+        .get("video_edit_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("standard")
+        .trim();
+    if !matches!(mode, "standard" | "retake" | "extend_start" | "extend_end") {
+        return Err(format!(
+            "LTX2 video_edit_mode must be standard, retake, extend_start, or extend_end; got '{mode}'"
+        ));
+    }
+    if mode == "standard" {
+        return Ok(body.clone());
+    }
+    let video_path = body
+        .get("video_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if video_path.is_empty() {
+        return Err(format!("LTX2 {mode} requires video_path"));
+    }
+    if body
+        .get("image_path")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(format!("LTX2 {mode} cannot also use image_path"));
+    }
+    if body
+        .get("video_mask_path")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(format!(
+            "LTX2 {mode} uses a temporal edit mask and cannot also use video_mask_path"
+        ));
+    }
+    let requested_width = body.get("width").and_then(Value::as_i64).unwrap_or(0);
+    let requested_height = body.get("height").and_then(Value::as_i64).unwrap_or(0);
+    let requested_frames = body.get("frames").and_then(Value::as_i64).unwrap_or(0);
+    let requested_fps = body.get("fps").and_then(Value::as_f64).unwrap_or(0.0);
+    if requested_width <= 0
+        || requested_height <= 0
+        || requested_frames <= 1
+        || requested_fps <= 0.0
+    {
+        return Err(
+            "LTX2 temporal edit requires valid target width, height, frames, and FPS".to_string(),
+        );
+    }
+    let probe = probe_video_path(video_path)?;
+    let source_width = probe.get("width").and_then(Value::as_i64).unwrap_or(0);
+    let source_height = probe.get("height").and_then(Value::as_i64).unwrap_or(0);
+    let source_frames = probe
+        .get("frame_count")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let source_fps = probe.get("fps").and_then(Value::as_f64).unwrap_or(0.0);
+    if probe.get("muxing").and_then(Value::as_str) != Some("probe_ok") || source_frames <= 1 {
+        return Err(format!("LTX2 {mode} source probe is incomplete: {probe}"));
+    }
+    if source_width != requested_width
+        || source_height != requested_height
+        || (source_fps - requested_fps).abs() > 0.01
+    {
+        return Err(format!(
+            "LTX2 {mode} preserves native source geometry and FPS; source is {source_width}x{source_height}, {source_frames} frames at {source_fps} FPS but target is {requested_width}x{requested_height}, {requested_frames} frames at {requested_fps} FPS"
+        ));
+    }
+    let mut normalized = body.clone();
+    let request = normalized
+        .as_object_mut()
+        .ok_or_else(|| "LTX2 request must be a JSON object".to_string())?;
+    request.insert("video_edit_mode".to_string(), json!(mode));
+    request.insert("video_source_frames".to_string(), json!(source_frames));
+    if mode == "retake" {
+        if source_frames != requested_frames {
+            return Err(format!(
+                "LTX2 Retake requires an exact compiled source profile; source has {source_frames} frames but target has {requested_frames}"
+            ));
+        }
+        let start = body
+            .get("video_edit_start")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| "LTX2 Retake requires numeric video_edit_start".to_string())?;
+        let end = body
+            .get("video_edit_end")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| "LTX2 Retake requires numeric video_edit_end".to_string())?;
+        let source_duration = (source_frames - 1) as f64 / source_fps;
+        if start < 0.0 || end <= start || end - start < 2.0 || end > source_duration + 0.001 {
+            return Err(format!(
+                "LTX2 Retake window must be at least 2 seconds and within 0..{source_duration:.3}; got {start:.3}..{end:.3}"
+            ));
+        }
+        request.insert("video_edit_start".to_string(), json!(start));
+        request.insert("video_edit_end".to_string(), json!(end));
+        // LTX Desktop's TemporalRegionMask is binary. Retake has no soft
+        // preservation-strength blend: the selected interval is regenerated
+        // at mask=1 and every other token is frozen at mask=0.
+        request.insert("video_strength".to_string(), json!(0.0));
+    } else {
+        // LTX Desktop zero-pads the extension region in latent space; the
+        // temporal mask fully denoises that region plus the 0.5-second seam.
+        request.insert("video_strength".to_string(), json!(0.0));
+        if source_frames >= requested_frames {
+            return Err(format!(
+                "LTX2 Extend target must be longer than its source; source has {source_frames} frames and target has {requested_frames}"
+            ));
+        }
+        let extension_frames = requested_frames - source_frames;
+        if extension_frames % 8 != 0 {
+            return Err(format!(
+                "LTX2 Extend requires an 8-frame-aligned extension; target-source delta is {extension_frames}"
+            ));
+        }
+        let seam_frames = (0.5 * requested_fps).round() as i64;
+        let (start, end) = if mode == "extend_start" {
+            (
+                0.0,
+                (extension_frames + seam_frames).min(requested_frames - 1) as f64 / requested_fps,
+            )
+        } else {
+            (
+                (source_frames - 1 - seam_frames).max(0) as f64 / requested_fps,
+                (requested_frames - 1) as f64 / requested_fps,
+            )
+        };
+        request.insert("video_edit_start".to_string(), json!(start));
+        request.insert("video_edit_end".to_string(), json!(end));
+        request.insert("video_extend_frames".to_string(), json!(extension_frames));
+        request.insert(
+            "video_extend_seconds".to_string(),
+            json!(extension_frames as f64 / requested_fps),
+        );
+        request.insert("video_seam_seconds".to_string(), json!(0.5));
+    }
+    Ok(normalized)
+}
+
+fn resolve_ltx2_request_checkpoint(
+    body: &Value,
+) -> Result<crate::models::ResolvedCheckpoint, String> {
+    let selection = body
+        .get("checkpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let checkpoint = crate::models::resolve_checkpoint(selection).ok_or_else(|| {
+        format!(
+            "LTX2 checkpoint '{selection}' was not found in the scanned Serenity model registry"
+        )
+    })?;
+    if checkpoint.arch != "ltx2" {
+        return Err(format!(
+            "checkpoint '{}' is classified as '{}', not LTX2; set its Model Type to LTX 2 / 2.3 if this is a compatible full finetune",
+            checkpoint.name, checkpoint.arch
+        ));
+    }
+    let checkpoint_id = checkpoint
+        .name
+        .strip_suffix(".safetensors")
+        .unwrap_or(&checkpoint.name);
+    let known_ltx23_single_file = matches!(
+        checkpoint_id,
+        "ltx-2.3-22b-dev-fp8"
+            | "ltx-2.3-22b-dev-fp8-dequant-bf16"
+            | "ltx-2.3-22b-distilled-fp8"
+            | "ltx-2.3-22b-distilled-fp8-dequant-bf16"
+    );
+    if !matches!(
+        checkpoint.format.as_str(),
+        "diffusion_model" | "full_checkpoint"
+    ) {
+        return Err(format!(
+            "LTX2 selected-checkpoint loading requires one complete safetensors file; '{}' has format '{}'",
+            checkpoint.name, checkpoint.format
+        ));
+    }
+    if checkpoint.arch_source == "filename"
+        && checkpoint.arch_override.is_empty()
+        && !known_ltx23_single_file
+    {
+        return Err(format!(
+            "checkpoint '{}' only resembles LTX by filename; confirm it is an LTX 2.3-compatible full checkpoint by setting Model Type to LTX 2 / 2.3",
+            checkpoint.name
+        ));
+    }
+    if !nonempty_file(&checkpoint.path) {
+        return Err(format!(
+            "selected LTX2 checkpoint is missing or empty: {}",
+            checkpoint.path.display()
+        ));
+    }
+    Ok(checkpoint)
+}
+
+#[derive(Clone, Debug)]
+struct Ltx2DistillationAdapter {
+    name: String,
+    path: std::path::PathBuf,
+    weight: f64,
+    source: &'static str,
+}
+
+/// Resolve the sampling adapter that belongs to the selected checkpoint.
+///
+/// Ordinary authored LoRAs remain in `lora[]`. A row explicitly marked
+/// `role=distillation` replaces the official creator adapter. The official
+/// adapter is only implicit for the two official dev checkpoints; arbitrary
+/// finetunes never inherit it by accident, and directly distilled full
+/// checkpoints never receive a second distillation delta.
+fn resolve_ltx2_distillation_adapter(
+    body: &Value,
+    checkpoint: &crate::models::ResolvedCheckpoint,
+) -> Result<Option<Ltx2DistillationAdapter>, String> {
+    let mut explicit: Option<Ltx2DistillationAdapter> = None;
+    if let Some(rows) = body.get("lora").and_then(Value::as_array) {
+        for (index, row) in rows.iter().enumerate() {
+            let role = row.get("role").and_then(Value::as_str).unwrap_or("overlay");
+            if role != "distillation" {
+                continue;
+            }
+            if explicit.is_some() {
+                return Err("LTX2 requests admit at most one role=distillation adapter".to_string());
+            }
+            let name = row.get("name").and_then(Value::as_str).unwrap_or("");
+            let weight = row.get("weight").and_then(Value::as_f64).unwrap_or(1.0);
+            let Some((path, arch)) = crate::models::lora_path_and_arch(name) else {
+                return Err(format!(
+                    "LTX2 lora[{index}] distillation adapter not found in the model registry: {name}"
+                ));
+            };
+            if arch != "ltx2" {
+                return Err(format!(
+                    "LTX2 lora[{index}] distillation adapter '{name}' targets '{arch}', not ltx2"
+                ));
+            }
+            explicit = Some(Ltx2DistillationAdapter {
+                name: name.to_string(),
+                path,
+                weight,
+                source: "user",
+            });
+        }
+    }
+
+    let guidance_mode = body
+        .get("guidance_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let edit_mode = body
+        .get("video_edit_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("standard");
+    if edit_mode != "standard" {
+        let checkpoint_id = checkpoint
+            .name
+            .strip_suffix(".safetensors")
+            .unwrap_or(&checkpoint.name)
+            .to_ascii_lowercase();
+        if checkpoint_id.contains("distill") {
+            if explicit.is_some() {
+                return Err(
+                    "LTX2 Retake/Extend selected a directly distilled full checkpoint; remove the separate role=distillation adapter"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
+        return Ok(explicit);
+    }
+    if guidance_mode == "dev" {
+        if explicit.is_some() {
+            return Err(
+                "role=distillation requires Distilled guidance; remove it for pristine Dev CFG sampling"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    let checkpoint_id = checkpoint
+        .name
+        .strip_suffix(".safetensors")
+        .unwrap_or(&checkpoint.name);
+    let direct_distilled = checkpoint_id.to_ascii_lowercase().contains("distill");
+    if direct_distilled {
+        if explicit.is_some() {
+            return Err(format!(
+                "checkpoint '{}' is already a directly distilled full checkpoint; remove the separate role=distillation adapter",
+                checkpoint.name
+            ));
+        }
+        return Ok(None);
+    }
+    if let Some(adapter) = explicit {
+        return Ok(Some(adapter));
+    }
+    if matches!(
+        checkpoint_id,
+        LTX2_REFHQ_CHECKPOINT | LTX2_REFHQ_BF16_CHECKPOINT
+    ) {
+        let path = model_path(LTX2_REFHQ_DISTILLATION_ADAPTER);
+        if !nonempty_file(&path) {
+            return Err(format!(
+                "official LTX2 dev fast sampling requires its creator distillation adapter: {}",
+                path.display()
+            ));
+        }
+        return Ok(Some(Ltx2DistillationAdapter {
+            name: std::path::Path::new(LTX2_REFHQ_DISTILLATION_ADAPTER)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("official-ltx2-distillation-adapter")
+                .to_string(),
+            path,
+            weight: 1.0,
+            source: "official_creator_default",
+        }));
+    }
+    Err(format!(
+        "checkpoint '{}' is an arbitrary dev/full finetune. Distilled guidance requires its matching LoRA marked Distillation in the LoRA row; choose Dev CFG to run the checkpoint pristine",
+        checkpoint.name
+    ))
+}
+
+fn resolve_ltx2_retake_checkpoint(
+    selected: crate::models::ResolvedCheckpoint,
+    has_distillation_adapter: bool,
+) -> Result<crate::models::ResolvedCheckpoint, String> {
+    let selected_id = selected
+        .name
+        .strip_suffix(".safetensors")
+        .unwrap_or(&selected.name);
+    let selected_is_distilled = selected_id.to_ascii_lowercase().contains("distill");
+    if selected_is_distilled {
+        if !ltx2_checkpoint_has_creator_edit_components(&selected.path) {
+            return Err(format!(
+                "LTX2 Retake requires the creator's complete checkpoint (transformer plus video/audio VAE encoders); '{}' is a partial diffusion-only artifact",
+                selected.name
+            ));
+        }
+        return Ok(selected);
+    }
+    if matches!(
+        selected_id,
+        LTX2_REFHQ_CHECKPOINT | LTX2_REFHQ_BF16_CHECKPOINT
+    ) {
+        for direct_distilled in ["ltx-2.3-22b-distilled-1.1", "ltx-2.3-22b-distilled"] {
+            if let Some(candidate) = crate::models::resolve_checkpoint(direct_distilled) {
+                if ltx2_checkpoint_has_creator_edit_components(&candidate.path) {
+                    return Ok(candidate);
+                }
+            }
+        }
+        return Err(
+            "LTX2 Retake follows the creator's one-stage BF16 topology. Install/select the complete ltx-2.3-22b-distilled-1.1 checkpoint; the partial FP8 diffusion files do not contain the source audio/video encoders"
+                .to_string(),
+        );
+    }
+    if has_distillation_adapter {
+        if !ltx2_checkpoint_has_creator_edit_components(&selected.path) {
+            return Err(format!(
+                "LTX2 Retake cannot use '{}' because it lacks the creator video/audio VAE encoder weights",
+                selected.name
+            ));
+        }
+        return Ok(selected);
+    }
+    Err(format!(
+        "LTX2 Retake requires either a directly distilled complete checkpoint or the selected dev/full checkpoint's creator-specified role=distillation adapter; '{}' has neither",
+        selected.name
+    ))
+}
+
+fn ltx2_checkpoint_has_creator_edit_components(path: &std::path::Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    header
+        .get("model.diffusion_model.transformer_blocks.0.attn1.to_q.weight")
+        .is_some()
+        && header.get("vae.encoder.conv_in.conv.weight").is_some()
+        && header
+            .get("audio_vae.encoder.conv_in.conv.weight")
+            .is_some()
+}
+
 fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     let required_strings = [
         "checkpoint",
@@ -2201,21 +2822,24 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
             return Err(format!("LTX2 Mojo request requires non-empty '{key}'"));
         }
     }
-    let checkpoint = body["checkpoint"].as_str().unwrap_or("");
-    if checkpoint != LTX2_REFHQ_CHECKPOINT
-        && checkpoint != format!("{LTX2_REFHQ_CHECKPOINT}.safetensors")
-    {
-        return Err(format!(
-            "LTX2 checkpoint '{checkpoint}' is not a compiled request profile; use {LTX2_REFHQ_CHECKPOINT}"
-        ));
-    }
     let quant = body.get("quant").and_then(Value::as_str).unwrap_or("");
-    if !matches!(quant, "fp8" | "int4") {
+    if !matches!(quant, "bf16" | "fp8" | "int4") {
         return Err(format!(
-            "LTX2 Mojo request requires quant 'fp8' or 'int4'; got '{quant}'"
+            "LTX2 Mojo request requires quant 'bf16', 'fp8', or 'int4'; got '{quant}'"
         ));
     }
+    let checkpoint = resolve_ltx2_request_checkpoint(body)?;
     if quant == "int4" {
+        let checkpoint_name = checkpoint
+            .name
+            .strip_suffix(".safetensors")
+            .unwrap_or(&checkpoint.name);
+        if checkpoint_name != LTX2_REFHQ_CHECKPOINT {
+            return Err(format!(
+                "LTX2 int4 uses a checkpoint-specific slab and is only available for '{LTX2_REFHQ_CHECKPOINT}'; select fp8 or bf16 for '{}'",
+                checkpoint.name
+            ));
+        }
         let slab = model_path(LTX2_REFHQ_INT4_SLAB);
         if !slab.is_file() {
             return Err(format!(
@@ -2258,9 +2882,14 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     let height = body["height"].as_i64().unwrap_or(0);
     let frames = body["frames"].as_i64().unwrap_or(0);
     let fps = body["fps"].as_f64().unwrap_or(0.0);
-    if ltx2_request_profile(width, height, frames, fps).is_none() {
+    let edit_mode = body
+        .get("video_edit_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("standard");
+    if ltx2_request_profile_for_mode(width, height, frames, fps, edit_mode).is_none() {
         let supported = ltx2_resolved_profiles()
             .iter()
+            .filter(|profile| profile.modes.iter().any(|candidate| candidate == edit_mode))
             .map(|profile| {
                 format!(
                     "{}x{} {}f@{}",
@@ -2270,7 +2899,7 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "unsupported LTX2 native profile {width}x{height}, {frames} frames at {fps} FPS; admitted profiles: {supported}"
+            "unsupported LTX2 {edit_mode} native profile {width}x{height}, {frames} frames at {fps} FPS; admitted profiles: {supported}"
         ));
     }
     if !body
@@ -2338,7 +2967,10 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         .get("image_strength")
         .and_then(Value::as_f64)
         .unwrap_or(1.0);
-    if body.get("image_strength").is_some_and(|value| !value.is_number()) {
+    if body
+        .get("image_strength")
+        .is_some_and(|value| !value.is_number())
+    {
         return Err("LTX2 image_strength must be numeric".to_string());
     }
     if !(0.0..=1.0).contains(&image_strength) {
@@ -2359,7 +2991,10 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         .get("video_strength")
         .and_then(Value::as_f64)
         .unwrap_or(1.0);
-    if body.get("video_strength").is_some_and(|value| !value.is_number()) {
+    if body
+        .get("video_strength")
+        .is_some_and(|value| !value.is_number())
+    {
         return Err("LTX2 video_strength must be numeric".to_string());
     }
     if !(0.0..=1.0).contains(&video_strength) {
@@ -2374,9 +3009,7 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         .unwrap_or("")
         .trim();
     if !video_mask_path.is_empty() && !std::path::Path::new(video_mask_path).is_file() {
-        return Err(format!(
-            "LTX2 V2V mask image not found: {video_mask_path}"
-        ));
+        return Err(format!("LTX2 V2V mask image not found: {video_mask_path}"));
     }
     if !video_mask_path.is_empty() && video_path.is_empty() {
         return Err("LTX2 video_mask_path requires video_path".to_string());
@@ -2405,6 +3038,12 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
                 let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
                 if name.is_empty() {
                     return Err(format!("LTX2 lora[{index}].name is required"));
+                }
+                let role = obj.get("role").and_then(Value::as_str).unwrap_or("overlay");
+                if !matches!(role, "overlay" | "distillation") {
+                    return Err(format!(
+                        "LTX2 lora[{index}].role must be 'overlay' or 'distillation'; got '{role}'"
+                    ));
                 }
                 let weight = obj.get("weight").and_then(Value::as_f64).unwrap_or(1.0);
                 if obj.get("weight").is_some_and(|v| !v.is_number()) {
@@ -2440,6 +3079,7 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
         Some(_) => return Err("LTX2 'lora' must be an array".to_string()),
         None => return Err("LTX2 Mojo request requires the authored 'lora' array".to_string()),
     }
+    let _ = resolve_ltx2_distillation_adapter(body, &checkpoint)?;
     let _ = ltx2_feature_request(body)?;
     Ok(())
 }
@@ -2568,7 +3208,7 @@ where
         _ => {
             return Err(format!(
                 "unsupported Real-ESRGAN product runner '{upscaler_id}'"
-            ))
+            ));
         }
     };
     let stage_root = out_dir.join(upscaler_id);
@@ -2775,6 +3415,82 @@ fn remux_ltx2_source_audio(
     Ok((artifact, probe))
 }
 
+/// Stage the source-audio samples with the exact PyAV media contract used by
+/// LTX Desktop. Mojo performs the creator resample, log-mel transform, and
+/// learned AudioVAE encode; this helper only preserves PyAV's decoded samples.
+fn stage_ltx2_creator_source_audio(
+    source_video: &std::path::Path,
+    out_dir: &std::path::Path,
+    frames: i64,
+    fps: f64,
+) -> Result<Option<Value>, String> {
+    let probe = probe_video_path(&source_video.to_string_lossy())?;
+    if probe.get("has_audio").and_then(Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    let python = repo_path(".pixi/envs/default/bin/python");
+    let script = repo_path(LTX2_CREATOR_AUDIO_DECODER);
+    if !python.is_file() || !script.is_file() {
+        return Err(format!(
+            "creator audio staging is unavailable; missing {} or {}",
+            python.display(),
+            script.display()
+        ));
+    }
+    let raw = out_dir.join("ltx2_creator_source_audio.f32le");
+    let duration = frames as f64 / fps;
+    let output = std::process::Command::new(&python)
+        .current_dir(repo_root())
+        .arg(&script)
+        .args(["--input"])
+        .arg(source_video)
+        .args(["--output"])
+        .arg(&raw)
+        .args(["--max-duration", &format!("{duration:.17}")])
+        .output()
+        .map_err(|error| format!("cannot launch creator PyAV audio decoder: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "creator PyAV audio decode failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let metadata = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .ok_or_else(|| "creator PyAV audio decoder returned no metadata".to_string())?;
+    let sample_rate = metadata
+        .get("sample_rate")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let channels = metadata
+        .get("channels")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let samples = metadata
+        .get("samples_per_channel")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let expected_bytes = samples.saturating_mul(channels).saturating_mul(4);
+    let actual_bytes = std::fs::metadata(&raw)
+        .map(|value| value.len() as i64)
+        .unwrap_or(0);
+    if sample_rate <= 0 || channels != 2 || samples <= 0 || actual_bytes != expected_bytes {
+        return Err(format!(
+            "creator source-audio staging contract failed: metadata={metadata}, bytes={actual_bytes}"
+        ));
+    }
+    Ok(Some(json!({
+        "path": raw.to_string_lossy(),
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "samples_per_channel": samples,
+        "decoder": "pyav-16.1.0-creator-contract",
+    })))
+}
+
 /// Foley/V2A freezes the source video and synthesizes only audio. Preserve the
 /// source video stream byte-for-byte and replace its audio with the Mojo
 /// runner's generated audio stream.
@@ -2833,29 +3549,42 @@ fn start_ltx2_mojo_request(
     body: &Value,
     gpu: crate::gpu_lock::GpuGuard,
 ) -> Response {
-    let normalized_body = match normalized_ltx2_feature_request(body) {
+    let normalized_feature_body = match normalized_ltx2_feature_request(body) {
+        Ok(value) => value,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
+    let normalized_body = match normalized_ltx2_video_edit_request(&normalized_feature_body) {
         Ok(value) => value,
         Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
     };
     let body = &normalized_body;
-    let profile = match ltx2_request_profile(
+    let selected_checkpoint = match resolve_ltx2_request_checkpoint(body) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
+    let edit_mode = body
+        .get("video_edit_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("standard");
+    let profile = match ltx2_request_profile_for_mode(
         body.get("width").and_then(Value::as_i64).unwrap_or(0),
         body.get("height").and_then(Value::as_i64).unwrap_or(0),
         body.get("frames").and_then(Value::as_i64).unwrap_or(0),
         body.get("fps").and_then(Value::as_f64).unwrap_or(0.0),
+        edit_mode,
     ) {
         Some(profile) if ltx2_profile_runner_available(&profile) => profile,
         Some(profile) => {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!("missing exact LTX2 Mojo runner {}", profile.runner),
-            )
+            );
         }
         None => {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "LTX2 request does not match an admitted native profile",
-            )
+            );
         }
     };
     let request_runner = ltx2_effective_profile_runner(&profile);
@@ -2888,6 +3617,35 @@ fn start_ltx2_mojo_request(
         Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
     };
     let int4_slab = (quant == "int4").then(|| model_path(LTX2_REFHQ_INT4_SLAB));
+    if edit_mode != "standard" && quant != "bf16" {
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "LTX2 Retake/Extend follows the creator's complete BF16 checkpoint path; select BF16 precision",
+        );
+    }
+    let distillation_adapter = match resolve_ltx2_distillation_adapter(body, &selected_checkpoint) {
+        Ok(adapter) => adapter,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
+    let effective_checkpoint = if edit_mode != "standard" {
+        match resolve_ltx2_retake_checkpoint(selected_checkpoint, distillation_adapter.is_some()) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        }
+    } else {
+        selected_checkpoint
+    };
+    let request_checkpoint_path = effective_checkpoint.path.clone();
+    let effective_checkpoint_name = effective_checkpoint
+        .name
+        .strip_suffix(".safetensors")
+        .unwrap_or(&effective_checkpoint.name)
+        .to_string();
+    let request_checkpoint_env = if quant == "bf16" {
+        "LTX2_REFHQ_CKPT_BF16"
+    } else {
+        "LTX2_REFHQ_CKPT_FP8"
+    };
     let n = st
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2900,14 +3658,49 @@ fn start_ltx2_mojo_request(
             &format!("cannot create LTX2 output directory: {error}"),
         );
     }
+    let mut request_document = body.clone();
+    if edit_mode == "standard" {
+        if let Some(image_path) = body
+            .get("image_path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let staged_path = match stage_ltx2_creator_i2v_source(image_path, &profile, &out_dir) {
+                Ok(path) => path,
+                Err(error) => {
+                    return err_detail(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!("LTX2 creator I2V preprocessing failed: {error}"),
+                    );
+                }
+            };
+            if let Some(request) = request_document.as_object_mut() {
+                request.insert("creator_source_image_path".to_string(), json!(image_path));
+                request.insert(
+                    "image_path".to_string(),
+                    json!(staged_path.to_string_lossy().to_string()),
+                );
+                request.insert("image_strength".to_string(), json!(1.0));
+                request.insert(
+                    "creator_conditioning_width".to_string(),
+                    json!(profile.conditioning_width),
+                );
+                request.insert(
+                    "creator_conditioning_height".to_string(),
+                    json!(profile.conditioning_height),
+                );
+                request.insert("creator_image_crf".to_string(), json!(33));
+            }
+        }
+    }
     let request_path = out_dir.join("request.json");
-    let request_bytes = match serde_json::to_vec_pretty(body) {
+    let request_bytes = match serde_json::to_vec_pretty(&request_document) {
         Ok(bytes) => bytes,
         Err(error) => {
             return err_detail(
                 StatusCode::BAD_REQUEST,
                 &format!("cannot serialize LTX2 request: {error}"),
-            )
+            );
         }
     };
     if let Err(error) = std::fs::write(&request_path, request_bytes) {
@@ -2931,8 +3724,13 @@ fn start_ltx2_mojo_request(
     let thread_post_upscale = requested_post_upscale.clone();
     let thread_audio_policy = audio_policy.clone();
     let thread_source_video = source_video.clone();
+    let thread_source_frames = body
+        .get("video_source_frames")
+        .and_then(Value::as_i64)
+        .unwrap_or(profile.frames);
     let thread_feature_id = feature_id.clone();
-    let mut thread_request = body.clone();
+    let thread_edit_mode = edit_mode.to_string();
+    let mut thread_request = request_document.clone();
     if let Some(request) = thread_request.as_object_mut() {
         // The denoiser always publishes exact final latents, exits, and lets a
         // fresh invocation of the same profile binary own VAE decode. This is
@@ -2941,12 +3739,41 @@ fn start_ltx2_mojo_request(
         request.insert("defer_decode".to_string(), json!(true));
         request.insert(
             "include_audio".to_string(),
-            json!(thread_audio_policy == "generate"),
+            json!(thread_audio_policy == "generate" || thread_edit_mode != "standard"),
         );
         request.insert(
             "audio_policy".to_string(),
             json!(thread_audio_policy.clone()),
         );
+        request.insert("checkpoint".to_string(), json!(effective_checkpoint_name));
+        request.insert(
+            "checkpoint_path".to_string(),
+            json!(request_checkpoint_path.to_string_lossy()),
+        );
+        let overlay_loras = body
+            .get("lora")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| row.get("role").and_then(Value::as_str) != Some("distillation"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        request.insert("lora".to_string(), Value::Array(overlay_loras));
+        if let Some(adapter) = distillation_adapter.as_ref() {
+            request.insert(
+                "distillation_adapter".to_string(),
+                json!({
+                    "name": adapter.name,
+                    "path": adapter.path.to_string_lossy(),
+                    "weight": adapter.weight,
+                    "source": adapter.source,
+                }),
+            );
+        } else {
+            request.remove("distillation_adapter");
+        }
     }
     std::thread::spawn(move || {
         let _gpu = gpu;
@@ -3025,6 +3852,74 @@ fn start_ltx2_mojo_request(
                 preview: String::new(),
             });
         }
+        if thread_edit_mode != "standard" {
+            let message = "Decoding source audio with the LTX Desktop PyAV contract";
+            let _ = write_ltx2_job_status(
+                &thread_out_dir,
+                "running",
+                "encoding_source_audio",
+                0,
+                0,
+                message,
+            );
+            publish(WorkerEvent::Progress {
+                step: 0,
+                total: 0,
+                phase: message.to_string(),
+                preview: String::new(),
+            });
+            match stage_ltx2_creator_source_audio(
+                std::path::Path::new(&thread_source_video),
+                &thread_out_dir,
+                thread_source_frames,
+                thread_fps as f64,
+            ) {
+                Ok(Some(audio)) => {
+                    if let Some(request) = thread_request.as_object_mut() {
+                        request.insert(
+                            "source_audio_path".to_string(),
+                            audio.get("path").cloned().unwrap_or(Value::Null),
+                        );
+                        request.insert(
+                            "source_audio_sample_rate".to_string(),
+                            audio.get("sample_rate").cloned().unwrap_or(Value::Null),
+                        );
+                        request.insert(
+                            "source_audio_channels".to_string(),
+                            audio.get("channels").cloned().unwrap_or(Value::Null),
+                        );
+                        request.insert(
+                            "source_audio_samples".to_string(),
+                            audio
+                                .get("samples_per_channel")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        );
+                        request.insert("source_audio_decode".to_string(), audio);
+                    }
+                }
+                Ok(None) => {
+                    if let Some(request) = thread_request.as_object_mut() {
+                        request.insert("source_audio_path".to_string(), json!(""));
+                        request.insert("source_audio_sample_rate".to_string(), json!(0));
+                        request.insert("source_audio_channels".to_string(), json!(0));
+                        request.insert("source_audio_samples".to_string(), json!(0));
+                    }
+                }
+                Err(error) => {
+                    let _ = write_ltx2_job_status(
+                        &thread_out_dir,
+                        "failed",
+                        "encoding_source_audio",
+                        0,
+                        0,
+                        &error,
+                    );
+                    publish(WorkerEvent::Failed { error });
+                    return;
+                }
+            }
+        }
         let request_bytes = match serde_json::to_vec_pretty(&thread_request) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -3064,15 +3959,21 @@ fn start_ltx2_mojo_request(
             }
         };
         let mut command = std::process::Command::new(repo_path(&thread_request_runner));
+        let request_ld_path = ltx2_request_ld_path(&thread_edit_mode);
         command
             .current_dir(repo_root())
-            .env("LD_LIBRARY_PATH", mojo_ld_path())
+            .env("LD_LIBRARY_PATH", request_ld_path)
             .arg(&thread_request_path)
             .arg(&thread_out_dir)
             .stdout(std::process::Stdio::from(log))
             .stderr(std::process::Stdio::from(stderr));
         if let Some(path) = int4_slab {
             command.env("LTX2_INT4_SLAB", path);
+        }
+        command.env(request_checkpoint_env, &request_checkpoint_path);
+        if thread_edit_mode != "standard" {
+            command.env("LTX2_AUDIO_VAE_CKPT", &request_checkpoint_path);
+            command.env("LTX2_VIDEO_VAE_CKPT", &request_checkpoint_path);
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -3347,7 +4248,7 @@ fn start_ltx2_mojo_request(
                             return;
                         }
                     }
-                } else if thread_audio_policy == "preserve" {
+                } else if thread_audio_policy == "preserve" && thread_edit_mode == "standard" {
                     let message = "Preserving audio from the V2V source";
                     let _ = write_ltx2_job_status(
                         &thread_out_dir,
@@ -3438,10 +4339,7 @@ fn start_ltx2_mojo_request(
                         json!(thread_audio_policy.clone()),
                     );
                     if thread_feature_id != "standard" {
-                        doc.insert(
-                            "feature_id".to_string(),
-                            json!(thread_feature_id.clone()),
-                        );
+                        doc.insert("feature_id".to_string(), json!(thread_feature_id.clone()));
                     }
                     if let Ok(bytes) = serde_json::to_vec_pretty(&*doc) {
                         let _ = std::fs::write(&result_path, bytes);
@@ -4304,7 +5202,9 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
     if quant != "fp8" {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("wan22_t2v production profile is cached FP8 E4M3; quant '{quant}' is not admitted (use fp8)"),
+            &format!(
+                "wan22_t2v production profile is cached FP8 E4M3; quant '{quant}' is not admitted (use fp8)"
+            ),
         );
     }
     let frames = b
@@ -4719,7 +5619,9 @@ fn post_video_bernini(st: &AppState, b: &Value) -> Response {
     if quant != "fp8" {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("Bernini-R requires its bounded FP8 E4M3 expert caches; quant '{quant}' is unsupported"),
+            &format!(
+                "Bernini-R requires its bounded FP8 E4M3 expert caches; quant '{quant}' is unsupported"
+            ),
         );
     }
     let width = b
@@ -5209,7 +6111,7 @@ fn post_video_scail2(st: &AppState, b: &Value) -> Response {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "scail2: driving_video has no readable video stream",
-            )
+            );
         }
         Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
     };
@@ -5639,6 +6541,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ltx2_temporal_edits_pin_creator_cudnn_before_general_mojo_runtime() {
+        let standard = std::env::split_paths(&ltx2_request_ld_path("standard"))
+            .next()
+            .unwrap();
+        let retake = std::env::split_paths(&ltx2_request_ld_path("retake"))
+            .next()
+            .unwrap();
+        let extend = std::env::split_paths(&ltx2_request_ld_path("extend_end"))
+            .next()
+            .unwrap();
+        assert_eq!(standard, repo_root().join(".pixi/envs/default/lib"));
+        assert_eq!(retake, ltx2_decode_cudnn_lib());
+        assert_eq!(extend, ltx2_decode_cudnn_lib());
+    }
+
+    #[test]
+    fn ltx2_profile_runner_rejects_stale_build_inputs() {
+        let base = std::time::UNIX_EPOCH;
+        let runner = base + std::time::Duration::from_secs(20);
+        assert!(ltx2_runner_mtime_covers_inputs(
+            runner,
+            &[
+                base + std::time::Duration::from_secs(10),
+                base + std::time::Duration::from_secs(20),
+            ],
+        ));
+        assert!(!ltx2_runner_mtime_covers_inputs(
+            runner,
+            &[base + std::time::Duration::from_secs(21)],
+        ));
+    }
+
+    #[test]
     fn readiness_shape() {
         let d = readiness_doc();
         assert_eq!(d.get("schema").unwrap(), "serenity.video_status.v1");
@@ -5689,7 +6624,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            21
+            31
         );
         let post_upscalers = request_runner["post_upscalers"].as_array().unwrap();
         assert_eq!(post_upscalers.len(), 3);
@@ -5738,11 +6673,13 @@ mod tests {
                 .all(|weight| nonempty_file(&model_path(weight)));
         assert_eq!(seedvr2["available"], false);
         assert_eq!(seedvr2["status"], "source_only");
-        assert!(seedvr2["missing"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry == "product user-video adapter is not implemented"));
+        assert!(
+            seedvr2["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "product user-video adapter is not implemented")
+        );
         if !seedvr2_available {
             assert!(seedvr2["missing"].as_array().unwrap().len() > 1);
         }
@@ -5758,12 +6695,14 @@ mod tests {
         assert_eq!(runners[2].get("model").unwrap(), "wan22_t2v");
         if !wan22_built {
             assert_eq!(runners[2].get("status").unwrap(), "prerequisites_missing");
-            assert!(!runners[2]
-                .get("missing")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .is_empty());
+            assert!(
+                !runners[2]
+                    .get("missing")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
         }
         assert_eq!(runners[2].get("target_frame_count").unwrap(), 121);
         assert_eq!(runners[2].get("target_width").unwrap(), 832);
@@ -5986,6 +6925,44 @@ mod tests {
     }
 
     #[test]
+    fn ltx2_mojo_request_bf16_requires_and_accepts_dequantized_checkpoint() {
+        let caps = std::env::temp_dir().join(format!(
+            "serenity-ltx2-bf16-caps-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&caps, b"{}").unwrap();
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_BF16_CHECKPOINT,
+            "quant": "bf16",
+            "prompt": "BF16 request contract probe",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+        });
+        let result = validate_ltx2_mojo_request(&request);
+        if nonempty_file(&model_path(LTX2_REFHQ_BF16)) {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("dequantized dev checkpoint is missing")
+            );
+        }
+        let _ = std::fs::remove_file(caps);
+    }
+
+    #[test]
     fn ltx2_mojo_request_preflight_accepts_i2v_source_and_strength() {
         let suffix = format!(
             "{}-{}",
@@ -6022,9 +6999,7 @@ mod tests {
 
     #[test]
     fn ltx2_cinemagraph_feature_is_explicit_and_normalizes_to_one_overlay() {
-        let adapter = model_path(
-            "loras/ltx-2.3-22b-lora-cinemagraph-0.9.safetensors",
-        );
+        let adapter = model_path("loras/ltx-2.3-22b-lora-cinemagraph-0.9.safetensors");
         if !nonempty_file(&adapter) {
             return;
         }
@@ -6101,14 +7076,18 @@ mod tests {
             "image_path": "/definitely/missing/ltx2-source.png",
             "image_strength": 1.0,
         });
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("I2V source image not found"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("I2V source image not found")
+        );
         request["image_path"] = json!("");
         request["image_strength"] = json!(1.5);
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("image_strength must be in [0, 1]"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("image_strength must be in [0, 1]")
+        );
         let _ = std::fs::remove_file(caps);
     }
 
@@ -6150,24 +7129,123 @@ mod tests {
         validate_ltx2_mojo_request(&request).unwrap();
         request["image_path"] = json!(image);
         request["image_strength"] = json!(1.0);
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("mutually exclusive"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("mutually exclusive")
+        );
         request.as_object_mut().unwrap().remove("image_path");
         request.as_object_mut().unwrap().remove("image_strength");
         request["video_strength"] = json!(1.5);
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("video_strength must be in [0, 1]"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("video_strength must be in [0, 1]")
+        );
         request.as_object_mut().unwrap().remove("video_path");
         request.as_object_mut().unwrap().remove("video_strength");
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("video_mask_path requires video_path"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("video_mask_path requires video_path")
+        );
         let _ = std::fs::remove_file(caps);
         let _ = std::fs::remove_file(video);
         let _ = std::fs::remove_file(image);
         let _ = std::fs::remove_file(mask);
+    }
+
+    #[test]
+    fn ltx2_temporal_edit_normalizes_retake_and_extend_from_real_probe() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let video = std::env::temp_dir().join(format!(
+            "serenity-ltx2-temporal-source-{}-{nonce}.mp4",
+            std::process::id()
+        ));
+        let fixture = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=navy:size=960x544:rate=24",
+                "-frames:v",
+                "121",
+                "-pix_fmt",
+                "yuv420p",
+                &video.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+
+        let retake = normalized_ltx2_video_edit_request(&json!({
+            "video_edit_mode": "retake",
+            "video_edit_start": 1.0,
+            "video_edit_end": 3.5,
+            "video_path": video,
+            "video_strength": 0.7,
+            "width": 960,
+            "height": 544,
+            "frames": 121,
+            "fps": 24.0,
+        }))
+        .unwrap();
+        assert_eq!(retake["video_source_frames"], 121);
+        assert_eq!(retake["video_strength"], 0.0);
+        assert_eq!(retake["video_edit_start"], 1.0);
+        assert_eq!(retake["video_edit_end"], 3.5);
+
+        let extend_end = normalized_ltx2_video_edit_request(&json!({
+            "video_edit_mode": "extend_end",
+            "video_path": video,
+            "width": 960,
+            "height": 544,
+            "frames": 193,
+            "fps": 24.0,
+        }))
+        .unwrap();
+        assert_eq!(extend_end["video_source_frames"], 121);
+        assert_eq!(extend_end["video_extend_frames"], 72);
+        assert_eq!(extend_end["video_extend_seconds"], 3.0);
+        assert_eq!(extend_end["video_edit_start"], 4.5);
+        assert_eq!(extend_end["video_edit_end"], 8.0);
+
+        let extend_start = normalized_ltx2_video_edit_request(&json!({
+            "video_edit_mode": "extend_start",
+            "video_path": video,
+            "width": 960,
+            "height": 544,
+            "frames": 193,
+            "fps": 24.0,
+        }))
+        .unwrap();
+        assert_eq!(extend_start["video_edit_start"], 0.0);
+        assert_eq!(extend_start["video_edit_end"], 3.5);
+
+        let too_short = normalized_ltx2_video_edit_request(&json!({
+            "video_edit_mode": "retake",
+            "video_edit_start": 1.0,
+            "video_edit_end": 2.0,
+            "video_path": video,
+            "width": 960,
+            "height": 544,
+            "frames": 121,
+            "fps": 24.0,
+        }))
+        .unwrap_err();
+        assert!(too_short.contains("at least 2 seconds"));
+        let _ = std::fs::remove_file(video);
     }
 
     #[test]
@@ -6259,8 +7337,7 @@ mod tests {
         });
         validate_ltx2_mojo_request(&request).unwrap();
 
-        let (artifact, probe) =
-            remux_ltx2_source_audio(&generated, &source, &root, 4).unwrap();
+        let (artifact, probe) = remux_ltx2_source_audio(&generated, &source, &root, 4).unwrap();
         assert!(artifact.is_file());
         assert_eq!(probe["has_audio"], true);
         assert_eq!(probe["frame_count"], 4);
@@ -6293,9 +7370,11 @@ mod tests {
         if missing.is_empty() {
             result.unwrap();
         } else {
-            assert!(result
-                .unwrap_err()
-                .contains("automatic prompt conditioning is unavailable"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("automatic prompt conditioning is unavailable")
+            );
         }
     }
 
@@ -6319,13 +7398,33 @@ mod tests {
             "lora": [],
         });
         let error = validate_ltx2_mojo_request(&request).unwrap_err();
-        assert!(error.contains("unsupported LTX2 native profile 1024x1024"));
+        assert!(error.contains("unsupported LTX2 standard native profile 1024x1024"));
         assert!(!error.contains("conditioning artifact"));
     }
 
     #[test]
     fn ltx2_mojo_request_accepts_every_registry_profile_before_artifact_checks() {
         for profile in ltx2_resolved_profiles() {
+            for mode in &profile.modes {
+                assert!(
+                    ltx2_request_profile_for_mode(
+                        profile.width,
+                        profile.height,
+                        profile.frames,
+                        profile.fps as f64,
+                        mode,
+                    )
+                    .is_some(),
+                    "profile {}x{} {}f@{} did not resolve for declared mode {mode}",
+                    profile.width,
+                    profile.height,
+                    profile.frames,
+                    profile.fps,
+                );
+            }
+            if !profile.modes.iter().any(|mode| mode == "standard") {
+                continue;
+            }
             let request = json!({
                 "checkpoint": LTX2_REFHQ_CHECKPOINT,
                 "quant": "fp8",
@@ -6374,9 +7473,11 @@ mod tests {
             "include_audio": false,
             "lora": [],
         });
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("conditioning artifact not found"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("conditioning artifact not found")
+        );
     }
 
     #[test]
@@ -6398,9 +7499,11 @@ mod tests {
             "include_audio": false,
             "lora": [],
         });
-        assert!(validate_ltx2_mojo_request(&request)
-            .unwrap_err()
-            .contains("distilled mode requires sampler=euler"));
+        assert!(
+            validate_ltx2_mojo_request(&request)
+                .unwrap_err()
+                .contains("distilled mode requires sampler=euler")
+        );
     }
 
     #[test]

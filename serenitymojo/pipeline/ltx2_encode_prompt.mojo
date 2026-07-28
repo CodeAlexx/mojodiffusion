@@ -230,11 +230,13 @@ def encode_ltx2_prompts(
         String("text_embedding_projection.video_aggregate_embed"),
         4096, hidden.bucket, ctx,
     )
+    ltx.release_to_os()
     var audio = _project_pair(
         ltx, positive_features, negative_features,
         String("text_embedding_projection.audio_aggregate_embed"),
         2048, hidden.bucket, ctx,
     )
+    ltx.release_to_os()
 
     var pos_len_host = List[Float32]()
     pos_len_host.append(Float32(hidden.lengths[0]))

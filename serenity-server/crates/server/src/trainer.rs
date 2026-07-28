@@ -20,13 +20,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::{gpu_lock, AppState};
+use crate::{AppState, gpu_lock};
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -125,7 +125,7 @@ pub async fn post_train(State(st): State<AppState>, body: String) -> Response {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
                 &format!("no trainer family is known for '{model}'"),
-            )
+            );
         }
     };
     if stem != "krea2" {
@@ -148,7 +148,7 @@ pub async fn post_train(State(st): State<AppState>, body: String) -> Response {
                 return err(
                     StatusCode::BAD_REQUEST,
                     &format!("dataset is not readable: {e}"),
-                )
+                );
             }
         },
         None => return err(StatusCode::BAD_REQUEST, "dataset required"),
@@ -185,7 +185,7 @@ pub async fn post_train(State(st): State<AppState>, body: String) -> Response {
                 StatusCode::CONFLICT,
                 Json(gpu_lock::gpu_busy_conflict_report("train", &cur)),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -218,7 +218,7 @@ pub async fn post_train(State(st): State<AppState>, body: String) -> Response {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("load Krea defaults: {e}"),
-            )
+            );
         }
     };
     let Some(object) = config.as_object_mut() else {
@@ -319,7 +319,7 @@ pub async fn post_train(State(st): State<AppState>, body: String) -> Response {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("spawn {}: {e}", bin.display()),
-            )
+            );
         }
     };
     let pid = child.id();

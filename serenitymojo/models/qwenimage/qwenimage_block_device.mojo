@@ -273,6 +273,17 @@ def _lora_apply_device(
     return add(base_y, delta_bf, ctx)
 
 
+def qwen_lora_apply_device(
+    var base_y: Tensor,
+    x: Tensor,
+    lo: Optional[QwenLoraAdapterDevice],
+    M: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Public inference seam for the parity-gated Qwen device LoRA primitive."""
+    return _lora_apply_device(base_y^, x, lo, M, ctx)
+
+
 @fieldwise_init
 struct _QwenLoraBwd(Copyable, Movable):
     var d_a: TArc      # [rank,in_f] bf16

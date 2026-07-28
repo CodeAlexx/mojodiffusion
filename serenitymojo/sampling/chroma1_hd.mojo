@@ -18,9 +18,9 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, sub
 
 
-comptime CHROMA1_HD_DEFAULT_STEPS = 30
+comptime CHROMA1_HD_DEFAULT_STEPS = 40
 comptime CHROMA1_HD_DEFAULT_SHIFT: Float32 = 3.0
-comptime CHROMA1_HD_DEFAULT_CFG_SCALE: Float32 = 3.5
+comptime CHROMA1_HD_DEFAULT_CFG_SCALE: Float32 = 3.0
 
 
 def chroma1_hd_shifted_sigma(

@@ -28,6 +28,7 @@
 #     serenitymojo/pipeline/chroma_pipeline_1024_multistep.mojo \
 #     -o /tmp/chroma_1024 && /tmp/chroma_1024
 
+from std.collections import Optional
 from std.gpu.host import DeviceContext
 from std.math import cos as fcos, exp as fexp, log as flog, sin as fsin, sqrt
 
@@ -56,6 +57,7 @@ from serenitymojo.models.dit.chroma_contract import (
     CHROMA_PATCH_VECTOR_DIM,
 )
 from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
+from serenitymojo.models.chroma.chroma_lora_overlay import ChromaLoraOverlay
 from serenitymojo.models.vae.ldm_decoder import load_flux1_ldm_decoder
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 from serenitymojo.ops.activations import gelu, silu
@@ -168,6 +170,25 @@ def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 # ── Linear helper with cloned bias ───────────────────────────────────────────
 def _linear_b(x: Tensor, w: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     return linear(x, w, Optional[Tensor](_clone(b, ctx)), ctx)
+
+
+def _linear_chroma_lora(
+    x: Tensor,
+    w: Tensor,
+    b: Tensor,
+    base_name: String,
+    lora: Optional[ArcPointer[ChromaLoraOverlay]],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Creator-equivalent runtime patch: base linear + scale*B(A(x)).
+
+    The no-LoRA arm calls the original `_linear_b` and returns it untouched.
+    """
+    var base = _linear_b(x, w, b, ctx)
+    if lora and lora.value()[].has(base_name):
+        var delta = lora.value()[].delta(x, base_name, ctx)
+        return add(base, delta, ctx)
+    return base^
 
 
 # ── Shared weight loading (approximator + x_embedder + context_embedder + proj_out) ──
@@ -400,6 +421,7 @@ def _double_block_shape[N_IMG_: Int](
     real_txt_len: Int,
     ref loader_block: Block,
     ctx: DeviceContext,
+    lora: Optional[ArcPointer[ChromaLoraOverlay]] = None,
 ) raises -> Tuple[Tensor, Tensor]:
     comptime S_ = N_IMG_ + N_TXT
     var p = String("transformer_blocks.") + String(block_idx)
@@ -425,27 +447,69 @@ def _double_block_shape[N_IMG_: Int](
 
     # 2. QKV projections
     var img_q = _to_bshd(
-        _linear_b(img_norm, _bw(loader_block, p + ".attn.to_q.weight"), _bw(loader_block, p + ".attn.to_q.bias"), ctx),
+        _linear_chroma_lora(
+            img_norm,
+            _bw(loader_block, p + ".attn.to_q.weight"),
+            _bw(loader_block, p + ".attn.to_q.bias"),
+            p + ".attn.to_q.weight",
+            lora,
+            ctx,
+        ),
         N_IMG_, ctx
     )
     var img_k = _to_bshd(
-        _linear_b(img_norm, _bw(loader_block, p + ".attn.to_k.weight"), _bw(loader_block, p + ".attn.to_k.bias"), ctx),
+        _linear_chroma_lora(
+            img_norm,
+            _bw(loader_block, p + ".attn.to_k.weight"),
+            _bw(loader_block, p + ".attn.to_k.bias"),
+            p + ".attn.to_k.weight",
+            lora,
+            ctx,
+        ),
         N_IMG_, ctx
     )
     var img_v = _to_bshd(
-        _linear_b(img_norm, _bw(loader_block, p + ".attn.to_v.weight"), _bw(loader_block, p + ".attn.to_v.bias"), ctx),
+        _linear_chroma_lora(
+            img_norm,
+            _bw(loader_block, p + ".attn.to_v.weight"),
+            _bw(loader_block, p + ".attn.to_v.bias"),
+            p + ".attn.to_v.weight",
+            lora,
+            ctx,
+        ),
         N_IMG_, ctx
     )
     var txt_q = _to_bshd(
-        _linear_b(txt_norm, _bw(loader_block, p + ".attn.add_q_proj.weight"), _bw(loader_block, p + ".attn.add_q_proj.bias"), ctx),
+        _linear_chroma_lora(
+            txt_norm,
+            _bw(loader_block, p + ".attn.add_q_proj.weight"),
+            _bw(loader_block, p + ".attn.add_q_proj.bias"),
+            p + ".attn.add_q_proj.weight",
+            lora,
+            ctx,
+        ),
         N_TXT, ctx
     )
     var txt_k = _to_bshd(
-        _linear_b(txt_norm, _bw(loader_block, p + ".attn.add_k_proj.weight"), _bw(loader_block, p + ".attn.add_k_proj.bias"), ctx),
+        _linear_chroma_lora(
+            txt_norm,
+            _bw(loader_block, p + ".attn.add_k_proj.weight"),
+            _bw(loader_block, p + ".attn.add_k_proj.bias"),
+            p + ".attn.add_k_proj.weight",
+            lora,
+            ctx,
+        ),
         N_TXT, ctx
     )
     var txt_v = _to_bshd(
-        _linear_b(txt_norm, _bw(loader_block, p + ".attn.add_v_proj.weight"), _bw(loader_block, p + ".attn.add_v_proj.bias"), ctx),
+        _linear_chroma_lora(
+            txt_norm,
+            _bw(loader_block, p + ".attn.add_v_proj.weight"),
+            _bw(loader_block, p + ".attn.add_v_proj.bias"),
+            p + ".attn.add_v_proj.weight",
+            lora,
+            ctx,
+        ),
         N_TXT, ctx
     )
 
@@ -479,8 +543,22 @@ def _double_block_shape[N_IMG_: Int](
     var txt_att = _from_bshd(txt_att_bshd, N_TXT, ctx)
 
     # 6. Output projections
-    var img_o = _linear_b(img_att, _bw(loader_block, p + ".attn.to_out.0.weight"), _bw(loader_block, p + ".attn.to_out.0.bias"), ctx)
-    var txt_o = _linear_b(txt_att, _bw(loader_block, p + ".attn.to_add_out.weight"), _bw(loader_block, p + ".attn.to_add_out.bias"), ctx)
+    var img_o = _linear_chroma_lora(
+        img_att,
+        _bw(loader_block, p + ".attn.to_out.0.weight"),
+        _bw(loader_block, p + ".attn.to_out.0.bias"),
+        p + ".attn.to_out.0.weight",
+        lora,
+        ctx,
+    )
+    var txt_o = _linear_chroma_lora(
+        txt_att,
+        _bw(loader_block, p + ".attn.to_add_out.weight"),
+        _bw(loader_block, p + ".attn.to_add_out.bias"),
+        p + ".attn.to_add_out.weight",
+        lora,
+        ctx,
+    )
 
     # 7. Gated residuals (attention)
     var img_r = residual_gate(img, img_gate1, img_o, ctx)
@@ -488,15 +566,43 @@ def _double_block_shape[N_IMG_: Int](
 
     # 8. FFN: modulate -> linear -> gelu -> linear -> gated residual
     var img_ff_in = _modulate_pre(img_r, img_shift2, img_scale2, ctx)
-    var img_ff = _linear_b(img_ff_in, _bw(loader_block, p + ".ff.net.0.proj.weight"), _bw(loader_block, p + ".ff.net.0.proj.bias"), ctx)
+    var img_ff = _linear_chroma_lora(
+        img_ff_in,
+        _bw(loader_block, p + ".ff.net.0.proj.weight"),
+        _bw(loader_block, p + ".ff.net.0.proj.bias"),
+        p + ".ff.net.0.proj.weight",
+        lora,
+        ctx,
+    )
     img_ff = gelu(img_ff, ctx)
-    img_ff = _linear_b(img_ff, _bw(loader_block, p + ".ff.net.2.weight"), _bw(loader_block, p + ".ff.net.2.bias"), ctx)
+    img_ff = _linear_chroma_lora(
+        img_ff,
+        _bw(loader_block, p + ".ff.net.2.weight"),
+        _bw(loader_block, p + ".ff.net.2.bias"),
+        p + ".ff.net.2.weight",
+        lora,
+        ctx,
+    )
     var img_final = residual_gate(img_r, img_gate2, img_ff, ctx)
 
     var txt_ff_in = _modulate_pre(txt_r, txt_shift2, txt_scale2, ctx)
-    var txt_ff = _linear_b(txt_ff_in, _bw(loader_block, p + ".ff_context.net.0.proj.weight"), _bw(loader_block, p + ".ff_context.net.0.proj.bias"), ctx)
+    var txt_ff = _linear_chroma_lora(
+        txt_ff_in,
+        _bw(loader_block, p + ".ff_context.net.0.proj.weight"),
+        _bw(loader_block, p + ".ff_context.net.0.proj.bias"),
+        p + ".ff_context.net.0.proj.weight",
+        lora,
+        ctx,
+    )
     txt_ff = gelu(txt_ff, ctx)
-    txt_ff = _linear_b(txt_ff, _bw(loader_block, p + ".ff_context.net.2.weight"), _bw(loader_block, p + ".ff_context.net.2.bias"), ctx)
+    txt_ff = _linear_chroma_lora(
+        txt_ff,
+        _bw(loader_block, p + ".ff_context.net.2.weight"),
+        _bw(loader_block, p + ".ff_context.net.2.bias"),
+        p + ".ff_context.net.2.weight",
+        lora,
+        ctx,
+    )
     var txt_final = residual_gate(txt_r, txt_gate2, txt_ff, ctx)
 
     return (img_final^, txt_final^)
@@ -534,6 +640,7 @@ def _single_block_shape[N_IMG_: Int](
     real_txt_len: Int,
     ref loader_block: Block,
     ctx: DeviceContext,
+    lora: Optional[ArcPointer[ChromaLoraOverlay]] = None,
 ) raises -> Tensor:
     comptime S_ = N_IMG_ + N_TXT
     var p = String("single_transformer_blocks.") + String(block_idx)
@@ -548,15 +655,36 @@ def _single_block_shape[N_IMG_: Int](
 
     # 2. QKV projections -> [1, HEADS, S, HEAD_DIM]
     var q = _to_bshd(
-        _linear_b(x_norm, _bw(loader_block, p + ".attn.to_q.weight"), _bw(loader_block, p + ".attn.to_q.bias"), ctx),
+        _linear_chroma_lora(
+            x_norm,
+            _bw(loader_block, p + ".attn.to_q.weight"),
+            _bw(loader_block, p + ".attn.to_q.bias"),
+            p + ".attn.to_q.weight",
+            lora,
+            ctx,
+        ),
         S_, ctx
     )
     var k = _to_bshd(
-        _linear_b(x_norm, _bw(loader_block, p + ".attn.to_k.weight"), _bw(loader_block, p + ".attn.to_k.bias"), ctx),
+        _linear_chroma_lora(
+            x_norm,
+            _bw(loader_block, p + ".attn.to_k.weight"),
+            _bw(loader_block, p + ".attn.to_k.bias"),
+            p + ".attn.to_k.weight",
+            lora,
+            ctx,
+        ),
         S_, ctx
     )
     var v = _to_bshd(
-        _linear_b(x_norm, _bw(loader_block, p + ".attn.to_v.weight"), _bw(loader_block, p + ".attn.to_v.bias"), ctx),
+        _linear_chroma_lora(
+            x_norm,
+            _bw(loader_block, p + ".attn.to_v.weight"),
+            _bw(loader_block, p + ".attn.to_v.bias"),
+            p + ".attn.to_v.weight",
+            lora,
+            ctx,
+        ),
         S_, ctx
     )
 
@@ -576,12 +704,26 @@ def _single_block_shape[N_IMG_: Int](
     var att_flat = _from_bshd(att, S_, ctx)
 
     # 6. MLP path
-    var mlp = _linear_b(x_norm, _bw(loader_block, p + ".proj_mlp.weight"), _bw(loader_block, p + ".proj_mlp.bias"), ctx)
+    var mlp = _linear_chroma_lora(
+        x_norm,
+        _bw(loader_block, p + ".proj_mlp.weight"),
+        _bw(loader_block, p + ".proj_mlp.bias"),
+        p + ".proj_mlp.weight",
+        lora,
+        ctx,
+    )
     mlp = gelu(mlp, ctx)
 
     # 7. Concat [att | mlp] -> proj_out -> gated residual
     var cat_out = concat(2, ctx, att_flat, mlp)
-    var out = _linear_b(cat_out, _bw(loader_block, p + ".proj_out.weight"), _bw(loader_block, p + ".proj_out.bias"), ctx)
+    var out = _linear_chroma_lora(
+        cat_out,
+        _bw(loader_block, p + ".proj_out.weight"),
+        _bw(loader_block, p + ".proj_out.bias"),
+        p + ".proj_out.weight",
+        lora,
+        ctx,
+    )
     return residual_gate(x, gate, out, ctx)
 
 

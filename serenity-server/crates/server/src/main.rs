@@ -52,10 +52,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use serenity_graph::lower_request;
-use serenity_ipc::{spawn_worker, EventPoll, WorkerHandle};
+use serenity_ipc::{EventPoll, WorkerHandle, spawn_worker};
 use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 
 mod block_profiles;
@@ -75,13 +75,14 @@ mod video;
 mod video_edit;
 
 use capabilities::{
-    capability_profile_for_model, generate_capabilities_v1, has_text, has_vae_override,
-    json_prompt_to_string, model_family, normalize_ideogram4_prompt_json, normalize_sampler_name,
-    normalize_scheduler_name, raw_surface_generate_error_report, raw_surface_preflight_report,
-    reject_disabled_raw_surfaces, reject_unsupported_workflow_route, requested_sampler,
-    requested_scheduler, validate_generate_prequeue, workflow_feature_generate_error_report,
-    workflow_feature_preflight_report, workflow_generate_error_report, workflow_preflight_report,
-    workflow_route_generate_error_report, workflow_route_preflight_report, ModelFamily,
+    ModelFamily, capability_profile_for_model, generate_capabilities_v1, has_text,
+    has_vae_override, json_prompt_to_string, model_family, normalize_ideogram4_prompt_json,
+    normalize_sampler_name, normalize_scheduler_name, raw_surface_generate_error_report,
+    raw_surface_preflight_report, reject_disabled_raw_surfaces, reject_unsupported_workflow_route,
+    requested_sampler, requested_scheduler, validate_generate_prequeue,
+    workflow_feature_generate_error_report, workflow_feature_preflight_report,
+    workflow_generate_error_report, workflow_preflight_report,
+    workflow_route_generate_error_report, workflow_route_preflight_report,
 };
 
 /// How many buffered events a slow WS subscriber may lag before it's dropped.
@@ -526,8 +527,69 @@ fn push_safetensor_shards(
     }
 }
 
-fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
+fn local_artifact_manifest(
+    model: &str,
+    selected_checkpoint: &str,
+) -> Option<LocalArtifactManifest> {
     let m = model.trim().to_ascii_lowercase();
+    let selected_family = capabilities::model_family(model).ok();
+
+    if selected_family == Some(ModelFamily::Lens) {
+        let root = "/home/alex/.serenity/models/microsoft_lens".to_string();
+        let transformer = format!("{root}/transformer");
+        let text_encoder = format!("{root}/text_encoder");
+        let tokenizer = format!("{root}/tokenizer");
+        let mut specs = vec![
+            artifact_file("model index", format!("{root}/model_index.json")),
+            artifact_file("transformer config", format!("{transformer}/config.json")),
+            artifact_file(
+                "transformer shard index",
+                format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
+            ),
+        ];
+        push_safetensor_shards(
+            &mut specs,
+            "transformer",
+            &transformer,
+            "diffusion_pytorch_model",
+            2,
+        );
+        specs.extend([
+            artifact_file(
+                "GPT-OSS text encoder config",
+                format!("{text_encoder}/config.json"),
+            ),
+            artifact_file(
+                "GPT-OSS text encoder shard index",
+                format!("{text_encoder}/model.safetensors.index.json"),
+            ),
+        ]);
+        push_safetensor_shards(
+            &mut specs,
+            "GPT-OSS text encoder",
+            &text_encoder,
+            "model",
+            3,
+        );
+        specs.extend([
+            artifact_file("Lens tokenizer", format!("{tokenizer}/tokenizer.json")),
+            artifact_file(
+                "FLUX.2 VAE",
+                "/home/alex/.serenity/models/vaes/flux2-vae.safetensors",
+            ),
+            artifact_file(
+                "Lens worker",
+                repository_path("output/bin/serenity_worker_lens"),
+            ),
+        ]);
+        return Some(LocalArtifactManifest {
+            profile: "microsoft_lens_1024",
+            family: "lens",
+            root,
+            production_entry: "serenitymojo/serve/lens_backend.mojo",
+            specs,
+        });
+    }
 
     if m.contains("chroma") {
         // Chroma single-file DiT + live T5-XXL encode + flux VAE (paths from
@@ -566,14 +628,18 @@ fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
         });
     }
 
-    if m.contains("krea") {
+    if m.contains("krea") || selected_family == Some(ModelFamily::Krea2) {
         // Krea-2 Raw/Turbo single-file DiT + shared Qwen3-VL-4B TE and
         // Qwen-Image VAE (paths from krea2_paths.mojo/krea2_backend.mojo).
         let root = repository_path("models/krea2");
         let raw = format!("{root}/raw.safetensors");
         let turbo = format!("{root}/turbo.safetensors");
         let is_turbo = m.contains("turbo");
-        let checkpoint = if is_turbo { &turbo } else { &raw };
+        let checkpoint = if selected_checkpoint.is_empty() {
+            if is_turbo { &turbo } else { &raw }
+        } else {
+            selected_checkpoint
+        };
         let te = repository_path("models/qwen3-vl-4b");
         let vae = repository_path("models/qwen-image/vae");
         let specs = vec![
@@ -583,7 +649,7 @@ fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
                 } else {
                     "krea2 raw checkpoint"
                 },
-                checkpoint.clone(),
+                checkpoint.to_string(),
             ),
             artifact_dir("Qwen3-VL-4B text encoder", te.to_string()),
             artifact_file("TE tokenizer json", format!("{te}/tokenizer.json")),
@@ -780,7 +846,8 @@ fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
         });
     }
 
-    if m.contains("sdxl")
+    if selected_family == Some(ModelFamily::Sdxl)
+        || m.contains("sdxl")
         || m.contains("sd_xl")
         || m.contains("sd-xl")
         || m.contains("sd xl")
@@ -789,8 +856,13 @@ fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
     {
         let root = repository_path("models/sdxl");
         let text = repository_path("models/text-encoders");
+        let unet = if selected_checkpoint.is_empty() {
+            format!("{root}/unet.safetensors")
+        } else {
+            selected_checkpoint.to_string()
+        };
         let specs = vec![
-            artifact_file("UNet checkpoint", format!("{root}/unet.safetensors")),
+            artifact_file("selected SDXL checkpoint", unet),
             artifact_file(
                 "VAE weights",
                 repository_path("models/vae/sdxl.safetensors"),
@@ -998,8 +1070,8 @@ fn actual_artifact_kind(metadata: &fs::Metadata) -> &'static str {
     }
 }
 
-fn local_artifact_report(model: &str) -> serde_json::Value {
-    let Some(manifest) = local_artifact_manifest(model) else {
+fn local_artifact_report(model: &str, selected_checkpoint: &str) -> serde_json::Value {
+    let Some(manifest) = local_artifact_manifest(model, selected_checkpoint) else {
         return json!({
             "schema": "serenity.artifacts.local.v1",
             "known_model": false,
@@ -1152,22 +1224,129 @@ fn validate_generate_runtime_ready(
     hires_scale: f64,
 ) -> Result<ModelFamily, String> {
     let family = validate_generate_prequeue(params, hires_scale)?;
-    let artifact_report = local_artifact_report(&params.model);
+    if !params.checkpoint_path.is_empty() {
+        let resolved = models::resolve_checkpoint(&params.model).ok_or_else(|| {
+            format!(
+                "{}: selected checkpoint is no longer present in the model registry: {}",
+                family.backend_key(),
+                params.model
+            )
+        })?;
+        let expected = capabilities::model_family_for_arch(&resolved.arch).ok_or_else(|| {
+            format!(
+                "{}: selected checkpoint architecture '{}' has no production runtime",
+                family.backend_key(),
+                resolved.arch
+            )
+        })?;
+        if expected != family {
+            return Err(format!(
+                "{}: selected checkpoint architecture '{}' routes to '{}', not '{}'",
+                family.backend_key(),
+                resolved.arch,
+                expected.backend_key(),
+                family.backend_key()
+            ));
+        }
+        match family {
+            ModelFamily::Krea2 if resolved.format != "diffusion_model" => {
+                return Err(format!(
+                    "krea2: unsupported selected checkpoint format '{}'; expected a Krea-2 diffusion-model safetensors",
+                    resolved.format
+                ));
+            }
+            ModelFamily::Sdxl
+                if resolved.format != "diffusion_model" && resolved.format != "full_checkpoint" =>
+            {
+                return Err(format!(
+                    "sdxl: unsupported selected checkpoint format '{}'; expected an SDXL UNet or full checkpoint safetensors",
+                    resolved.format
+                ));
+            }
+            _ => {}
+        }
+    }
+    validate_image_lora_registry(params, family)?;
+    let artifact_report = local_artifact_report(&params.model, &params.checkpoint_path);
     if let Some(error) = local_artifact_gate_error(&artifact_report, family.backend_key()) {
         return Err(error);
     }
     Ok(family)
 }
 
+fn validate_image_lora_registry(
+    params: &JobParams,
+    family: ModelFamily,
+) -> Result<Vec<String>, String> {
+    let mut resolved_paths = Vec::with_capacity(params.loras.len());
+    for (index, lora) in params.loras.iter().enumerate() {
+        let requested = lora.name.trim();
+        if requested.is_empty() {
+            return Err(format!(
+                "{}: lora[{index}] name is empty",
+                family.backend_key()
+            ));
+        }
+        let Some((path, target_arch)) = models::lora_path_and_arch(requested) else {
+            return Err(format!(
+                "{}: lora[{index}] is not present in the recursive model registry: {requested}",
+                family.backend_key()
+            ));
+        };
+        if !path.is_file() {
+            return Err(format!(
+                "{}: lora[{index}] registry path is not a file: {}",
+                family.backend_key(),
+                path.display()
+            ));
+        }
+
+        // A positively identified cross-family adapter is never safe to hand
+        // to a different worker. Unknown/custom adapters remain admissible:
+        // the selected worker validates their actual tensor names and shapes
+        // against the loaded model and must fail loudly if nothing matches.
+        let normalized_arch = target_arch.trim().to_ascii_lowercase();
+        if !normalized_arch.is_empty() && normalized_arch != "unknown" {
+            let target_family =
+                capabilities::model_family_for_arch(&normalized_arch).ok_or_else(|| {
+                    format!(
+                        "{}: lora[{index}] targets unsupported architecture '{}': {requested}",
+                        family.backend_key(),
+                        target_arch
+                    )
+                })?;
+            if target_family != family {
+                return Err(format!(
+                    "{}: lora[{index}] targets '{}', not '{}': {requested}",
+                    family.backend_key(),
+                    target_arch,
+                    family.backend_key()
+                ));
+            }
+        }
+        resolved_paths.push(path.to_string_lossy().into_owned());
+    }
+    Ok(resolved_paths)
+}
+
+fn resolve_image_lora_paths(params: &mut JobParams, family: ModelFamily) -> Result<(), String> {
+    let paths = validate_image_lora_registry(params, family)?;
+    for (lora, path) in params.loras.iter_mut().zip(paths) {
+        lora.name = path;
+    }
+    Ok(())
+}
+
 fn generate_preflight_report(params: &JobParams, hires_scale: f64) -> serde_json::Value {
-    let validation = validate_generate_prequeue(params, hires_scale);
-    let artifact_profile = local_artifact_report(&params.model);
+    let validation = validate_generate_runtime_ready(params, hires_scale);
+    let artifact_profile = local_artifact_report(&params.model, &params.checkpoint_path);
     let (admitted, family, error) = match validation {
-        Ok(family) => match local_artifact_gate_error(&artifact_profile, family.backend_key()) {
-            Some(error) => (false, Some(family), error),
-            None => (true, Some(family), String::new()),
-        },
-        Err(error) => (false, None, error),
+        Ok(family) => (true, Some(family), String::new()),
+        // A missing local artifact or invalid optional control blocks enqueue,
+        // but it must not erase the already identified model family from the
+        // preflight document. The UI still needs that backend's capabilities
+        // to explain and repair the rejected request.
+        Err(error) => (false, model_family(&params.model).ok(), error),
     };
     let backend = family.map(ModelFamily::backend_key).unwrap_or("");
     let sampler = family
@@ -1182,6 +1361,7 @@ fn generate_preflight_report(params: &JobParams, hires_scale: f64) -> serde_json
         "admitted": admitted,
         "error": error,
         "model": params.model,
+        "checkpoint_path": params.checkpoint_path,
         "backend": backend,
         "output_root": {
             "root_kind": "ui_workflow_gallery",
@@ -1260,6 +1440,14 @@ fn params_from_generate_request(
     let mut params = JobParams::default();
     params.job_id = job_id.to_string();
     params.model = req.model;
+    if let Some(checkpoint) = models::resolve_checkpoint(&params.model) {
+        if matches!(
+            capabilities::model_family_for_arch(&checkpoint.arch),
+            Some(ModelFamily::Krea2 | ModelFamily::Sdxl)
+        ) {
+            params.checkpoint_path = checkpoint.path.to_string_lossy().into_owned();
+        }
+    }
     if let Some(v) = req.prompt_json {
         params.prompt = json_prompt_to_string(&v, "prompt_json").unwrap_or_default();
     } else if let Some(v) = req.prompt {
@@ -1762,12 +1950,13 @@ fn kind_from_bin(bin: &std::path::Path) -> String {
 }
 
 /// Some Mojo runtimes keep a job's allocation pool pinned even after every
-/// backend tensor has been dropped. SD3 retains ~8.3 GiB after a completed
-/// 1024px job, so recycle that measured worker after a terminal event.
+/// backend tensor has been dropped. SD3 retains ~8.3 GiB and Lens retained
+/// ~14.0 GiB after completed 1024px jobs, so recycle those measured workers
+/// after a terminal event.
 /// Z-Image deliberately keeps its DiT and VAE resident between jobs; recycling
 /// it here turns every Canvas edit into a multi-minute cold model load.
 fn kind_requires_per_job_recycle(kind: &str) -> bool {
-    matches!(kind, "sd3")
+    matches!(kind, "sd3" | "lens")
 }
 
 /// Keep the one measured-safe resident edit worker through the common
@@ -2655,8 +2844,21 @@ pub(crate) fn enqueue_generate(
     let (mut params, hires_scale, hires_denoise) =
         params_from_generate_request(req, &job_id, &out_dir);
 
-    if validate_generate_runtime_ready(&params, hires_scale).is_err() {
+    let family = match validate_generate_runtime_ready(&params, hires_scale) {
+        Ok(family) => family,
+        Err(_) => {
+            let mut report = generate_prequeue_error_report(&params, hires_scale);
+            if has_workflow {
+                attach_workflow_capability_metadata(&mut report, &genparams_value);
+            }
+            return Err((StatusCode::BAD_REQUEST, Json(report)).into_response());
+        }
+    };
+    if let Err(error) = resolve_image_lora_paths(&mut params, family) {
         let mut report = generate_prequeue_error_report(&params, hires_scale);
+        if let Some(map) = report.as_object_mut() {
+            map.insert("error".to_string(), json!(error));
+        }
         if has_workflow {
             attach_workflow_capability_metadata(&mut report, &genparams_value);
         }
@@ -2816,7 +3018,7 @@ async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) ->
                 return djson(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     json!({"detail": "job book poisoned"}),
-                )
+                );
             }
         };
         match book.iter_mut().find(|e| e.record.id == id) {
@@ -2824,7 +3026,7 @@ async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) ->
                 return djson(
                     StatusCode::NOT_FOUND,
                     json!({"detail": format!("no such job: {id}")}),
-                )
+                );
             }
             Some(e) => {
                 let s = e.record.state.clone();
@@ -3215,7 +3417,7 @@ fn handle_upload(st: &AppState, body: &str, fallback_stem: &str) -> Response {
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "upload body must be a JSON object",
-            )
+            );
         }
     };
     // accept the payload under any of the names the canvas / ComfyUI conventions use
@@ -3238,7 +3440,7 @@ fn handle_upload(st: &AppState, body: &str, fallback_stem: &str) -> Response {
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "'data' is not valid base64",
-            )
+            );
         }
     };
     let req_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -3330,7 +3532,7 @@ async fn post_upload_image(State(st): State<AppState>, req: axum::extract::Reque
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "upload body too large or unreadable",
-            )
+            );
         }
     };
     let body = String::from_utf8_lossy(&bytes).into_owned();
@@ -3366,7 +3568,7 @@ async fn upload_image_multipart(st: &AppState, req: axum::extract::Request) -> R
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!("invalid multipart form: {e}"),
-            )
+            );
         }
     };
     loop {
@@ -3390,13 +3592,13 @@ async fn upload_image_multipart(st: &AppState, req: axum::extract::Request) -> R
                         return error_detail(
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "multipart file field is empty",
-                        )
+                        );
                     }
                     Err(e) => {
                         return error_detail(
                             StatusCode::UNPROCESSABLE_ENTITY,
                             &format!("cannot read multipart file field: {e}"),
-                        )
+                        );
                     }
                 };
                 let ext = upload_ext_from_filename(&file_name);
@@ -3412,7 +3614,7 @@ async fn upload_image_multipart(st: &AppState, req: axum::extract::Request) -> R
                 return error_detail(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     &format!("malformed multipart field: {e}"),
-                )
+                );
             }
         }
     }
@@ -3491,7 +3693,7 @@ async fn post_state(State(st): State<AppState>, body: String) -> Response {
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "state body must be a JSON object",
-            )
+            );
         }
     };
     if !obj.is_object() {
@@ -3506,7 +3708,7 @@ async fn post_state(State(st): State<AppState>, body: String) -> Response {
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "'state' must be an object",
-            )
+            );
         }
         None => obj.clone(),
     };
@@ -3614,7 +3816,7 @@ async fn post_presets_root(State(st): State<AppState>, body: String) -> Response
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "preset body must be a JSON object",
-            )
+            );
         }
     };
     let name = match obj.get("name").and_then(|n| n.as_str()) {
@@ -3623,7 +3825,7 @@ async fn post_presets_root(State(st): State<AppState>, body: String) -> Response
             return error_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "'name' (string) is required",
-            )
+            );
         }
     };
     if obj.get("params").is_none() {
@@ -3808,6 +4010,7 @@ mod endpoint_tests {
             ("klein-9b", "flux2", "serenity_worker_klein"),
             ("klein-4b", "flux2", "serenity_worker_klein"),
             ("sensenova-u1", "sensenova", "serenity_worker_sensenova"),
+            ("microsoft_lens", "lens", "serenity_worker_lens"),
         ];
 
         for (model, want_kind, want_bin) in cases {
@@ -3820,7 +4023,7 @@ mod endpoint_tests {
     #[test]
     fn worker_dispatch_rejects_blocked_model_families() {
         let current = PathBuf::from("/tmp/serenity-bin/serenity_worker_zimage");
-        for model in ["qwen-image-edit", "flux2-dev", "microsoft-lens"] {
+        for model in ["qwen-image-edit", "flux2-dev"] {
             assert!(
                 worker_for_model(&current, model).is_err(),
                 "blocked model must not dispatch: {model}"
@@ -3842,11 +4045,16 @@ mod endpoint_tests {
             kind_from_bin(FsPath::new("/tmp/serenity_worker_zimage")),
             "zimage"
         );
+        assert_eq!(
+            kind_from_bin(FsPath::new("/tmp/serenity_worker_lens")),
+            "lens"
+        );
     }
 
     #[test]
     fn only_measured_non_resident_workers_recycle_per_job() {
         assert!(kind_requires_per_job_recycle("sd3"));
+        assert!(kind_requires_per_job_recycle("lens"));
         for kind in [
             "zimage",
             "qwenimage",
@@ -4029,36 +4237,46 @@ mod endpoint_tests {
     #[test]
     fn production_validator_blocks_unadmitted_or_out_of_scope_features() {
         let mut params = valid_t2i_params("flux2-dev");
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("generic Flux2 model names remain blocked"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("generic Flux2 model names remain blocked")
+        );
 
         params = valid_t2i_params("klein-9b");
         params.width = 768;
         params.height = 768;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted product shapes"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
 
         params = valid_t2i_params("ideogram4");
         params.prompt = "a plain text prompt".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("structured JSON caption"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("structured JSON caption")
+        );
 
         params = valid_t2i_params("zimage");
         params.width = 256;
         params.height = 256;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted product shapes"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
 
         params = valid_t2i_params("klein-9b");
         params.width = 256;
         params.height = 256;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted product shapes"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
 
         params = valid_t2i_params("sensenova-u1");
         params.width = 512;
@@ -4071,53 +4289,68 @@ mod endpoint_tests {
         params = valid_t2i_params("sensenova-u1");
         params.width = 1536;
         params.height = 1536;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted product shapes"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
 
         params = valid_t2i_params("sensenova-u1");
         params.negative = "low quality".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("negative prompt"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("negative prompt")
+        );
 
         params = valid_t2i_params("klein-9b");
         params.negative = "low quality".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("negative prompt"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("negative prompt")
+        );
 
         params = valid_t2i_params("ideogram4");
         params.width = 1280;
         params.height = 768;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted product shapes"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
 
         params = valid_t2i_params("qwen-image");
         params
             .loras
             .push(LoraSpec::new("adapter.safetensors".to_string(), 1.0));
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("LoRA"));
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::QwenImage
+        );
 
         params = valid_t2i_params("sdxl");
         params.init_image = "/tmp/init.png".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted only for Z-Image"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted only for Z-Image")
+        );
 
         params = valid_t2i_params("zimage");
         params.vae = "sdxl_vae.safetensors".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("VAE override"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("VAE override")
+        );
 
         params = valid_t2i_params("zimage");
-        assert!(validate_generate_prequeue(&params, 2.0)
-            .unwrap_err()
-            .contains("hires two-pass"));
+        assert!(
+            validate_generate_prequeue(&params, 2.0)
+                .unwrap_err()
+                .contains("hires two-pass")
+        );
     }
 
     #[test]
@@ -4196,10 +4429,12 @@ mod endpoint_tests {
             report["request"]["vae"],
             "OfficialStableDiffusion/sdxl_vae.safetensors"
         );
-        assert!(report["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("VAE override"));
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("VAE override")
+        );
 
         params.vae = "Automatic".to_string();
         assert_eq!(
@@ -4249,10 +4484,12 @@ mod endpoint_tests {
         assert_eq!(generate["enqueue_blocked"], true);
         assert_eq!(generate["rejection_stage"], "workflow_capability");
         assert_eq!(generate["workflow_plan"]["route_kind"], "image");
-        assert!(generate["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("generic Flux2 model names remain blocked"));
+        assert!(
+            generate["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("generic Flux2 model names remain blocked")
+        );
     }
 
     #[test]
@@ -4292,10 +4529,12 @@ mod endpoint_tests {
         let params_4b = valid_t2i_params("klein-4b");
         let report_4b = generate_preflight_report(&params_4b, 1.0);
         assert_eq!(report_4b["artifact_profile"]["profile"], "klein4b_flux2");
-        assert!(report_4b["artifact_profile"]["root"]
-            .as_str()
-            .unwrap_or("")
-            .ends_with("/models/klein4b"));
+        assert!(
+            report_4b["artifact_profile"]["root"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("/models/klein4b")
+        );
         assert_eq!(report_4b["block_profile"]["profile"], "klein4b_flux2_dit");
         assert_eq!(report_4b["block_profile"]["block_count"], 25);
         assert_eq!(
@@ -4341,6 +4580,27 @@ mod endpoint_tests {
     #[test]
     fn static_sampler_registry_advertises_inventory_and_admitted_families() {
         let doc: serde_json::Value = serde_json::from_str(SAMPLERS_V1).unwrap();
+        let sampler_catalog = doc["catalog"]["samplers"].as_array().unwrap();
+        let scheduler_catalog = doc["catalog"]["schedulers"].as_array().unwrap();
+        assert_eq!(sampler_catalog.len(), 44);
+        assert_eq!(scheduler_catalog.len(), 16);
+        assert!(
+            !sampler_catalog
+                .iter()
+                .any(|value| value == "flowmatch_euler")
+        );
+        for expected in ["ideogram4", "ideogram4turbo"] {
+            assert!(
+                scheduler_catalog.iter().any(|value| value == expected),
+                "missing SwarmUI scheduler catalog id {expected}"
+            );
+        }
+        for removed_alias in ["flowmatch", "flow_match", "qwen"] {
+            assert!(
+                !scheduler_catalog.iter().any(|value| value == removed_alias),
+                "execution alias leaked into the SwarmUI scheduler catalog: {removed_alias}"
+            );
+        }
         let backends = doc["backends"].as_array().unwrap();
         let names: std::collections::HashSet<&str> = backends
             .iter()
@@ -4353,6 +4613,7 @@ mod endpoint_tests {
             "sdxl",
             "anima",
             "sd3",
+            "chroma",
             "flux",
             "flux2",
         ] {
@@ -4365,10 +4626,31 @@ mod endpoint_tests {
             .iter()
             .find(|entry| entry["backend"].as_str() == Some("flux"))
             .expect("missing flux sampler backend");
-        assert_eq!(flux["production_status"], "blocked");
-        assert!(flux["supported_samplers"].as_array().unwrap().is_empty());
-        assert!(flux["supported_schedulers"].as_array().unwrap().is_empty());
-        assert!(flux["reason"].as_str().unwrap_or("").contains("6/20"));
+        assert!(
+            flux["supported_samplers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "dpmpp_2m")
+        );
+        assert!(
+            flux["supported_schedulers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "simple")
+        );
+        let chroma = backends
+            .iter()
+            .find(|entry| entry["backend"].as_str() == Some("chroma"))
+            .expect("missing chroma sampler backend");
+        assert!(
+            chroma["supported_schedulers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "beta")
+        );
     }
 
     #[test]
@@ -4445,20 +4727,75 @@ mod endpoint_tests {
         }
         assert_eq!(zimage["features"]["negative_prompt"]["supported"], true);
         assert_eq!(zimage["features"]["lora"]["supported"], true);
-        assert!(zimage["samplers"]["supported_schedulers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str() == Some("sgm_uniform")));
-        assert!(!zimage["samplers"]["supported_schedulers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str() == Some("karras")));
+        assert!(
+            zimage["samplers"]["supported_schedulers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str() == Some("sgm_uniform"))
+        );
+        assert!(
+            !zimage["samplers"]["supported_schedulers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str() == Some("karras"))
+        );
 
         let ideogram = backend("ideogram4");
         assert_eq!(ideogram["features"]["bbox_prompt_json"]["supported"], true);
         assert_eq!(ideogram["features"]["negative_prompt"]["supported"], false);
+        for name in [
+            "zimage",
+            "qwenimage",
+            "ideogram4",
+            "sdxl",
+            "anima",
+            "sd3",
+            "chroma",
+            "flux",
+            "flux2",
+            "krea2",
+        ] {
+            assert_eq!(
+                backend(name)["features"]["lora"]["supported"],
+                true,
+                "{name} lost its LoRA loader capability"
+            );
+        }
+        for name in ["flux", "chroma"] {
+            let profile = backend(name);
+            for sampler in ["euler", "dpmpp_2m"] {
+                assert!(
+                    profile["samplers"]["supported_samplers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.as_str() == Some(sampler)),
+                    "{name} lost Swarm-compatible sampler {sampler}"
+                );
+            }
+            for scheduler in [
+                "beta",
+                "simple",
+                "normal",
+                "sgm_uniform",
+                "ddim_uniform",
+                "karras",
+                "exponential",
+                "linear_quadratic",
+                "kl_optimal",
+            ] {
+                assert!(
+                    profile["samplers"]["supported_schedulers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.as_str() == Some(scheduler)),
+                    "{name} lost Swarm-compatible scheduler {scheduler}"
+                );
+            }
+        }
 
         let flux2 = backend("flux2");
         assert_eq!(flux2["worker_binary"], "serenity_worker_klein");
@@ -4467,12 +4804,16 @@ mod endpoint_tests {
         assert_eq!(flux2["defaults"]["steps"], 4);
         assert_eq!(flux2["limits"]["resolution"]["mode"], "shape_dispatch");
         let flux2_sizes = flux2["limits"]["sizes"].as_array().unwrap();
-        assert!(flux2_sizes
-            .iter()
-            .any(|shape| shape["width"] == 1024 && shape["height"] == 1024));
-        assert!(flux2_sizes
-            .iter()
-            .any(|shape| shape["width"] == 512 && shape["height"] == 512));
+        assert!(
+            flux2_sizes
+                .iter()
+                .any(|shape| shape["width"] == 1024 && shape["height"] == 1024)
+        );
+        assert!(
+            flux2_sizes
+                .iter()
+                .any(|shape| shape["width"] == 512 && shape["height"] == 512)
+        );
         assert_eq!(flux2["features"]["lora"]["max_count"], 1);
         assert_eq!(flux2["features"]["negative_prompt"]["supported"], false);
 
@@ -4480,7 +4821,7 @@ mod endpoint_tests {
         assert_eq!(sensenova["worker_binary"], "serenity_worker_sensenova");
         assert_eq!(sensenova["defaults"]["width"], 1024);
         assert_eq!(sensenova["defaults"]["height"], 1024);
-        assert_eq!(sensenova["defaults"]["steps"], 30);
+        assert_eq!(sensenova["defaults"]["steps"], 50);
         assert_eq!(sensenova["defaults"]["cfg"], 4.0);
         assert_eq!(sensenova["defaults"]["scheduler"], "simple");
         assert_eq!(sensenova["limits"]["sizes"][0]["width"], 512);
@@ -4591,6 +4932,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| anyhow::anyhow!("create out_dir {}: {e}", out_dir.display()))?;
     let out_dir = std::fs::canonicalize(&out_dir).unwrap_or(out_dir);
+    models::set_extra_model_roots(settings::configured_extra_model_roots(&out_dir));
     tracing::info!(
         worker = %worker_bin.display(),
         port,
@@ -4696,6 +5038,7 @@ async fn main() -> anyhow::Result<()> {
             post(post_upload_media).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .route("/v1/models", get(models::get_models))
+        .route("/v1/models/type", post(models::post_model_type_override))
         .route("/v1/llms", get(magic::get_llms))
         .route("/v1/magic_prompt", post(magic::post_magic_prompt))
         .route("/enhance_prompt", post(magic::post_enhance_prompt))

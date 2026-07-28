@@ -17,10 +17,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::AppState;
 
@@ -86,6 +86,13 @@ fn extra_folder_paths(settings: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn configured_extra_model_roots(out: &Path) -> Vec<PathBuf> {
+    extra_folder_paths(&load_settings(out))
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 // ── GET /templates ───────────────────────────────────────────────────────────────
@@ -169,6 +176,17 @@ pub async fn post_folder_paths_add(State(st): State<AppState>, body: String) -> 
     if path.is_empty() {
         return err(StatusCode::BAD_REQUEST, "'path' is required");
     }
+    let candidate = PathBuf::from(&path);
+    if !candidate.is_dir() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "'path' must be an existing directory",
+        );
+    }
+    let path = std::fs::canonicalize(&candidate)
+        .unwrap_or(candidate)
+        .to_string_lossy()
+        .into_owned();
     let out = st.out_dir.as_path();
     let mut settings = load_settings(out);
     let mut paths = extra_folder_paths(&settings);
@@ -184,6 +202,7 @@ pub async fn post_folder_paths_add(State(st): State<AppState>, body: String) -> 
             "cannot persist folder paths",
         );
     }
+    crate::models::set_extra_model_roots(paths.iter().map(PathBuf::from).collect());
     json_ok(&json!({ "added": path, "paths": paths }))
 }
 

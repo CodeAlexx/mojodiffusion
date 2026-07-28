@@ -134,6 +134,9 @@ fn exec_ltxv_sampler(
     copy_field_if_missing(out, fields, "include_audio", "include_audio");
     copy_field_if_missing(out, fields, "audio_start_time", "audio_start_time");
     copy_field_if_missing(out, fields, "audio_duration", "audio_duration");
+    copy_field_if_missing(out, fields, "video_edit_mode", "video_edit_mode");
+    copy_field_if_missing(out, fields, "video_edit_start", "video_edit_start");
+    copy_field_if_missing(out, fields, "video_edit_end", "video_edit_end");
     if guide_image_link.found {
         let guide_frame_idx = opt_int(fields, "guide_frame_idx", 0, 0, 4095)?;
         if guide_frame_idx != 0 {

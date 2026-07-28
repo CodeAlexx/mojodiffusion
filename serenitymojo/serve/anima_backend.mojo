@@ -54,10 +54,10 @@
 # with per-shape RoPE tables and Wan21 tiled VAE decode. steps/cfg/seed are
 # honored at runtime; sigmas reuse the parity-gated Anima FlowMatch shift=3 path.
 #
-# LoRA: a base-only run uses build_anima_lora_set's PEFT init (B=0 => forward ==
-# frozen base DiT). A real LoRA path (load_anima_lora_resume) exists in the model
-# but is NOT wired in this backend yet — a LoRA request is rejected at admission
-# so it never silently no-ops. img2img: NOT supported yet — rejected at admission.
+# LoRA: the base-only run keeps the zero-B identity overlay. A requested
+# SerenityTrainer/PEFT Anima adapter is loaded through the model's canonical
+# prefix table, its file alpha/rank scale is preserved, and the user's
+# multiplier composes on top. img2img remains fail-loud.
 
 from std.collections import List, Optional
 from std.ffi import external_call
@@ -87,7 +87,6 @@ from serenitymojo.models.anima.anima_text_context import (
     ANIMA_T5_PAD_ID, AnimaAdapterWeights, tokenize_anima_text,
     encode_anima_context_host,
 )
-from serenitymojo.models.anima.config import anima
 from serenitymojo.models.anima.weights import (
     AnimaStackBase, load_anima_stack_base, verify_anima_stack_shapes,
     AnimaBlockWeights, load_anima_block_weights_bf16_normf32,
@@ -96,12 +95,13 @@ from serenitymojo.models.anima.anima_stack_lora import (
     AnimaLoraSet, build_anima_lora_set,
     AnimaLoraDeviceSet, anima_lora_set_to_device,
     anima_stack_lora_forward_device_resident_nosave,
+    load_anima_lora_resume,
 )
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.models.dit.anima_contract import (
     ANIMA_HIDDEN, ANIMA_NUM_HEADS, ANIMA_HEAD_DIM, ANIMA_DEPTH,
     ANIMA_LATENT_CHANNELS, ANIMA_PATCH_SIZE, ANIMA_ADAPTER_DIM,
-    ANIMA_VAE_PATH,
+    ANIMA_DIT_PATH, ANIMA_VAE_PATH,
 )
 from serenitymojo.models.vae.qwenimage_tiled_decode import wan21_image_tiled_decode
 from serenitymojo.sampling.anima_sampling import AnimaLinearFlowScheduler
@@ -420,6 +420,18 @@ def _zero_b_set(set: AnimaLoraSet) -> AnimaLoraSet:
     return AnimaLoraSet(ad^, set.num_blocks, set.rank)
 
 
+def _multiply_lora_set(
+    set: AnimaLoraSet, multiplier: Float32
+) -> AnimaLoraSet:
+    """Compose the UI multiplier with the adapter's file alpha/rank scale."""
+    var ad = List[LoraAdapter]()
+    for i in range(len(set.ad)):
+        var src = set.ad[i].copy()
+        src.scale *= multiplier
+        ad.append(src^)
+    return AnimaLoraSet(ad^, set.num_blocks, set.rank)
+
+
 def _count_nonfinite(v: List[Float32]) -> Int:
     var bad = 0
     for i in range(len(v)):
@@ -580,11 +592,10 @@ struct AnimaBackend(GenBackend, Movable):
             )
         if params.sigma_shift != 3.0:
             raise Error("anima: sigma_shift override is not supported; use 3.0")
-        if len(params.loras) > 0:
+        if len(params.loras) > 1:
             raise Error(
-                "anima: LoRA is not supported in this backend yet"
-                " (base-only overlay; load_anima_lora_resume not wired);"
-                " submit without a LoRA"
+                "anima: this runtime currently supports one canonical"
+                " SerenityTrainer/PEFT adapter at a time"
             )
         if params.init_image.byte_length() > 0:
             raise Error(
@@ -680,6 +691,20 @@ struct AnimaBackend(GenBackend, Movable):
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        if len(self.params.loras) == 1:
+            content += String('    "loaded_lora":"') + json_escape(
+                self.params.loras[0].name
+            ) + String('",\n')
+            content += String('    "loaded_lora_weight":') + String(
+                self.params.loras[0].weight
+            ) + String(",\n")
+            content += String('    "lora_target_count":') + String(
+                ANIMA_DEPTH * 10
+            ) + String(",\n")
+        else:
+            content += String('    "loaded_lora":"",\n')
+            content += String('    "loaded_lora_weight":0,\n')
+            content += String('    "lora_target_count":0,\n')
         content += String('    "dtype":"bf16_dit_f32_host_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
@@ -740,14 +765,37 @@ struct AnimaBackend(GenBackend, Movable):
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
         _print_vram("before Anima DiT load")
-        var cfg = anima()
-        print("[anima] loading Anima base DiT from", cfg.checkpoint)
-        var st = SafeTensors.open(cfg.checkpoint)
+        print("[anima] loading Anima base DiT from", ANIMA_DIT_PATH)
+        var st = SafeTensors.open(String(ANIMA_DIT_PATH))
         verify_anima_stack_shapes(st, ANIMA_DEPTH)
         var base = load_anima_stack_base(st, self.ctx)
 
-        # base-only LoRA overlay (PEFT init has B=0; zero-B keeps forward == base).
-        var lora = _zero_b_set(build_anima_lora_set(ANIMA_DEPTH, D, JOINT, F, RANK, ALPHA))
+        # Base-only uses an exact zero-B identity overlay. Requested files use
+        # the same canonical prefix table as training/resume, then compose the
+        # UI multiplier with the file alpha/rank scale.
+        var lora: AnimaLoraSet
+        if len(self.params.loras) == 1:
+            print(
+                "[anima] loading canonical adapter:",
+                self.params.loras[0].name,
+                "weight",
+                self.params.loras[0].weight,
+            )
+            lora = _multiply_lora_set(
+                load_anima_lora_resume(
+                    ANIMA_DEPTH,
+                    RANK,
+                    ALPHA,
+                    self.params.loras[0].name,
+                    self.ctx,
+                ),
+                Float32(self.params.loras[0].weight),
+            )
+            print("[anima] loaded", ANIMA_DEPTH * 10, "projection factors")
+        else:
+            lora = _zero_b_set(
+                build_anima_lora_set(ANIMA_DEPTH, D, JOINT, F, RANK, ALPHA)
+            )
         var lora_dev = anima_lora_set_to_device(lora, STDtype.BF16, self.ctx)
 
         var blocks = List[AnimaBlockWeights]()
@@ -968,7 +1016,7 @@ struct AnimaBackend(GenBackend, Movable):
 
 # ── small helpers ─────────────────────────────────────────────────────────────
 def _checkpoint_path() raises -> String:
-    return anima().checkpoint
+    return String(ANIMA_DIT_PATH)
 
 
 def _nonpad(mask: List[Int]) -> Int:

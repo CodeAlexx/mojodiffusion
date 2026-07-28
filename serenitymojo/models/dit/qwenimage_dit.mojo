@@ -84,6 +84,11 @@ from serenitymojo.ops.tensor_algebra import (
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.offload.plan import build_qwenimage_block_plan, OffloadConfig
+from serenitymojo.models.qwenimage.qwenimage_block_device import (
+    QwenDoubleBlockLoraDevice,
+    qwen_lora_apply_device,
+)
+from serenitymojo.models.qwenimage.qwenimage_stack_lora import QwenLoraDeviceSet
 
 
 comptime QWENIMAGE_RESIDENT_PIN_MAX_BYTES = 4 * 1024 * 1024 * 1024
@@ -532,6 +537,9 @@ struct QwenImageDit(Movable):
         pe_sin: Tensor,
         real_txt_len: Int,
         ctx: DeviceContext,
+        lora: Optional[QwenDoubleBlockLoraDevice] = Optional[
+            QwenDoubleBlockLoraDevice
+        ](None),
     ) raises:
         comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
         var cfg = self.config
@@ -572,30 +580,50 @@ struct QwenImageDit(Movable):
         var txt_modulated = self._modulate(txt_normed, txt_scale1, txt_shift1, ctx)
 
         # ── Q/K/V projections (split) -> BSHD ──
-        var img_q = self._to_bshd(
-            self._linear_b(img_modulated, p + ".attn.to_q.weight", p + ".attn.to_q.bias", ctx),
-            N_IMG, h, d, ctx,
+        var img_q_2d = self._linear_b(
+            img_modulated, p + ".attn.to_q.weight", p + ".attn.to_q.bias", ctx
         )
-        var img_k = self._to_bshd(
-            self._linear_b(img_modulated, p + ".attn.to_k.weight", p + ".attn.to_k.bias", ctx),
-            N_IMG, h, d, ctx,
+        var img_k_2d = self._linear_b(
+            img_modulated, p + ".attn.to_k.weight", p + ".attn.to_k.bias", ctx
         )
-        var img_v = self._to_bshd(
-            self._linear_b(img_modulated, p + ".attn.to_v.weight", p + ".attn.to_v.bias", ctx),
-            N_IMG, h, d, ctx,
+        var img_v_2d = self._linear_b(
+            img_modulated, p + ".attn.to_v.weight", p + ".attn.to_v.bias", ctx
         )
-        var txt_q = self._to_bshd(
-            self._linear_b(txt_modulated, p + ".attn.add_q_proj.weight", p + ".attn.add_q_proj.bias", ctx),
-            N_TXT, h, d, ctx,
+        var txt_q_2d = self._linear_b(
+            txt_modulated, p + ".attn.add_q_proj.weight", p + ".attn.add_q_proj.bias", ctx
         )
-        var txt_k = self._to_bshd(
-            self._linear_b(txt_modulated, p + ".attn.add_k_proj.weight", p + ".attn.add_k_proj.bias", ctx),
-            N_TXT, h, d, ctx,
+        var txt_k_2d = self._linear_b(
+            txt_modulated, p + ".attn.add_k_proj.weight", p + ".attn.add_k_proj.bias", ctx
         )
-        var txt_v = self._to_bshd(
-            self._linear_b(txt_modulated, p + ".attn.add_v_proj.weight", p + ".attn.add_v_proj.bias", ctx),
-            N_TXT, h, d, ctx,
+        var txt_v_2d = self._linear_b(
+            txt_modulated, p + ".attn.add_v_proj.weight", p + ".attn.add_v_proj.bias", ctx
         )
+        if lora:
+            ref lo = lora.value()
+            img_q_2d = qwen_lora_apply_device(
+                img_q_2d^, img_modulated, lo.img.q, N_IMG, ctx
+            )
+            img_k_2d = qwen_lora_apply_device(
+                img_k_2d^, img_modulated, lo.img.k, N_IMG, ctx
+            )
+            img_v_2d = qwen_lora_apply_device(
+                img_v_2d^, img_modulated, lo.img.v, N_IMG, ctx
+            )
+            txt_q_2d = qwen_lora_apply_device(
+                txt_q_2d^, txt_modulated, lo.txt.q, N_TXT, ctx
+            )
+            txt_k_2d = qwen_lora_apply_device(
+                txt_k_2d^, txt_modulated, lo.txt.k, N_TXT, ctx
+            )
+            txt_v_2d = qwen_lora_apply_device(
+                txt_v_2d^, txt_modulated, lo.txt.v, N_TXT, ctx
+            )
+        var img_q = self._to_bshd(img_q_2d, N_IMG, h, d, ctx)
+        var img_k = self._to_bshd(img_k_2d, N_IMG, h, d, ctx)
+        var img_v = self._to_bshd(img_v_2d, N_IMG, h, d, ctx)
+        var txt_q = self._to_bshd(txt_q_2d, N_TXT, h, d, ctx)
+        var txt_k = self._to_bshd(txt_k_2d, N_TXT, h, d, ctx)
+        var txt_v = self._to_bshd(txt_v_2d, N_TXT, h, d, ctx)
 
         # ── QK RMSNorm (over head_dim, weight [128]) ──
         ref nq = self._w(p + ".attn.norm_q.weight")
@@ -636,6 +664,14 @@ struct QwenImageDit(Movable):
         var txt_o = self._linear_b(
             txt_attn_2d, p + ".attn.to_add_out.weight", p + ".attn.to_add_out.bias", ctx
         )
+        if lora:
+            ref lo = lora.value()
+            img_o = qwen_lora_apply_device(
+                img_o^, img_attn_2d, lo.img.out, N_IMG, ctx
+            )
+            txt_o = qwen_lora_apply_device(
+                txt_o^, txt_attn_2d, lo.txt.out, N_TXT, ctx
+            )
 
         # ── gated residual (gate1) ──
         img = add(img, mul(img_gate1, img_o, ctx), ctx)
@@ -647,11 +683,21 @@ struct QwenImageDit(Movable):
         var img_mlp = self._linear_b(
             img_mlp_in, p + ".img_mlp.net.0.proj.weight", p + ".img_mlp.net.0.proj.bias", ctx
         )
+        if lora:
+            ref lo = lora.value()
+            img_mlp = qwen_lora_apply_device(
+                img_mlp^, img_mlp_in, lo.img.ff_up, N_IMG, ctx
+            )
         img_mlp = gelu(img_mlp, ctx)
-        img_mlp = self._linear_b(
+        var img_mlp_down = self._linear_b(
             img_mlp, p + ".img_mlp.net.2.weight", p + ".img_mlp.net.2.bias", ctx
         )
-        img = add(img, mul(img_gate2, img_mlp, ctx), ctx)
+        if lora:
+            ref lo = lora.value()
+            img_mlp_down = qwen_lora_apply_device(
+                img_mlp_down^, img_mlp, lo.img.ff_down, N_IMG, ctx
+            )
+        img = add(img, mul(img_gate2, img_mlp_down, ctx), ctx)
 
         # ── FFN (txt) ──
         var txt_normed2 = self._layer_norm_no_affine(txt, ctx)
@@ -659,11 +705,21 @@ struct QwenImageDit(Movable):
         var txt_mlp = self._linear_b(
             txt_mlp_in, p + ".txt_mlp.net.0.proj.weight", p + ".txt_mlp.net.0.proj.bias", ctx
         )
+        if lora:
+            ref lo = lora.value()
+            txt_mlp = qwen_lora_apply_device(
+                txt_mlp^, txt_mlp_in, lo.txt.ff_up, N_TXT, ctx
+            )
         txt_mlp = gelu(txt_mlp, ctx)
-        txt_mlp = self._linear_b(
+        var txt_mlp_down = self._linear_b(
             txt_mlp, p + ".txt_mlp.net.2.weight", p + ".txt_mlp.net.2.bias", ctx
         )
-        txt = add(txt, mul(txt_gate2, txt_mlp, ctx), ctx)
+        if lora:
+            ref lo = lora.value()
+            txt_mlp_down = qwen_lora_apply_device(
+                txt_mlp_down^, txt_mlp, lo.txt.ff_down, N_TXT, ctx
+            )
+        txt = add(txt, mul(txt_gate2, txt_mlp_down, ctx), ctx)
 
     # ── one edit block with target/reference image modulation ────────────────
     def _block_forward_edit[
@@ -1170,6 +1226,7 @@ struct QwenImageDitOffloaded(Movable):
         h_latent: Int,
         w_latent: Int,
         ctx: DeviceContext,
+        lora: Optional[QwenLoraDeviceSet] = Optional[QwenLoraDeviceSet](None),
     ) raises -> QwenImageCfgPreds:
         """Run CFG with separate positive/negative text lengths.
 
@@ -1205,11 +1262,18 @@ struct QwenImageDitOffloaded(Movable):
             var handle = self.loader.await_block(i, ctx)
             self.loader.prefetch_next_with_ctx(i, ctx)
             var tmp = self._block_model(handle.block)
+            var block_lora = Optional[QwenDoubleBlockLoraDevice](None)
+            if lora:
+                block_lora = Optional[QwenDoubleBlockLoraDevice](
+                    lora.value().dbl[i].copy()
+                )
             tmp._block_forward[N_IMG, N_TXT_POS, S_POS](
-                i, img_pos, txt_pos, temb, rope_pos[0], rope_pos[1], real_txt_len_pos, ctx
+                i, img_pos, txt_pos, temb, rope_pos[0], rope_pos[1],
+                real_txt_len_pos, ctx, block_lora,
             )
             tmp._block_forward[N_IMG, N_TXT_NEG, S_NEG](
-                i, img_neg, txt_neg, temb, rope_neg[0], rope_neg[1], real_txt_len_neg, ctx
+                i, img_neg, txt_neg, temb, rope_neg[0], rope_neg[1],
+                real_txt_len_neg, ctx, block_lora,
             )
             self.loader.mark_active_block_done(ctx)
 

@@ -35,6 +35,7 @@
 from std.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import sqrt
+from std.collections import Optional
 from std.memory import ArcPointer
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -86,6 +87,7 @@ from serenitymojo.models.dit.sd3_contract import (
     validate_sd3_large_checkpoint_header,
     validate_sd3_medium_checkpoint_header,
 )
+from serenitymojo.models.sd35.sd3_lokr_overlay import Sd3LokrOverlay
 from serenitymojo.offload.block_loader import BlockLoader, unload_block
 from serenitymojo.ops.activations import gelu, silu
 from serenitymojo.ops.attention import sdpa_nomask
@@ -727,6 +729,10 @@ def _qkv_project(
     num_heads: Int,
     head_dim: Int,
     ctx: DeviceContext,
+    q_lora_target: String = "",
+    k_lora_target: String = "",
+    v_lora_target: String = "",
+    lora: Optional[ArcPointer[Sd3LokrOverlay]] = None,
 ) raises -> Tensor:
     """Project x to QKV with QK-RMSNorm. Returns [B, N, 3, H, Dh] (5D).
     Caller slices dim=2 to get q, k, v each [B, N, 1, H, Dh] then reshapes to [B, N, H, Dh]."""
@@ -755,7 +761,30 @@ def _qkv_project(
     var v_slice = slice(qkv5, 2, 2, 1, ctx)
     var q = reshape(q_slice, head_sh.copy(), ctx)
     var k = reshape(k_slice, head_sh.copy(), ctx)
-    var v = reshape(v_slice, head_sh^, ctx)
+    var v = reshape(v_slice, head_sh.copy(), ctx)
+    if lora:
+        var flat_sh = List[Int]()
+        flat_sh.append(b)
+        flat_sh.append(n)
+        flat_sh.append(num_heads * head_dim)
+        if q_lora_target.byte_length() > 0 and lora.value()[].has(q_lora_target):
+            var q_flat = reshape(q, flat_sh.copy(), ctx)
+            q_flat = add(
+                q_flat, lora.value()[].delta(x, q_lora_target, ctx), ctx
+            )
+            q = reshape(q_flat, head_sh.copy(), ctx)
+        if k_lora_target.byte_length() > 0 and lora.value()[].has(k_lora_target):
+            var k_flat = reshape(k, flat_sh.copy(), ctx)
+            k_flat = add(
+                k_flat, lora.value()[].delta(x, k_lora_target, ctx), ctx
+            )
+            k = reshape(k_flat, head_sh.copy(), ctx)
+        if v_lora_target.byte_length() > 0 and lora.value()[].has(v_lora_target):
+            var v_flat = reshape(v, flat_sh^, ctx)
+            v_flat = add(
+                v_flat, lora.value()[].delta(x, v_lora_target, ctx), ctx
+            )
+            v = reshape(v_flat, head_sh^, ctx)
     var ln_q_w = _w_bf16(blk, ln_q_key, ctx)
     var ln_k_w = _w_bf16(blk, ln_k_key, ctx)
     q = _qk_rms_norm(q, ln_q_w, ctx)
@@ -815,6 +844,7 @@ def _sd3_joint_block[
     num_dual_blocks: Int, # first num_dual_blocks x_blocks have attn2
     hidden: Int,
     ctx: DeviceContext,
+    lora: Optional[ArcPointer[Sd3LokrOverlay]] = None,
 ) raises:
     # Block keys in the safetensors file include the "model.diffusion_model." prefix.
     var pfx = String("model.diffusion_model.")
@@ -856,7 +886,12 @@ def _sd3_joint_block[
             ctx_pfx + String(".attn.qkv.bias"),
             ctx_pfx + String(".attn.ln_q.weight"),
             ctx_pfx + String(".attn.ln_k.weight"),
-            H, Dh, ctx)
+            H, Dh, ctx,
+            String("transformer_blocks.") + String(block_idx) + String(".attn.add_q_proj"),
+            String("transformer_blocks.") + String(block_idx) + String(".attn.add_k_proj"),
+            String("transformer_blocks.") + String(block_idx) + String(".attn.add_v_proj"),
+            lora,
+        )
         ctx_gate_msa = None
         ctx_shift_mlp = None
         ctx_scale_mlp = None
@@ -875,7 +910,12 @@ def _sd3_joint_block[
             ctx_pfx + String(".attn.qkv.bias"),
             ctx_pfx + String(".attn.ln_q.weight"),
             ctx_pfx + String(".attn.ln_k.weight"),
-            H, Dh, ctx)
+            H, Dh, ctx,
+            String("transformer_blocks.") + String(block_idx) + String(".attn.add_q_proj"),
+            String("transformer_blocks.") + String(block_idx) + String(".attn.add_k_proj"),
+            String("transformer_blocks.") + String(block_idx) + String(".attn.add_v_proj"),
+            lora,
+        )
         ctx_gate_msa = ctx_gate^
         ctx_shift_mlp = ctx_smlp^
         ctx_scale_mlp = ctx_scmlp^
@@ -917,7 +957,12 @@ def _sd3_joint_block[
         x_pfx + String(".attn.qkv.bias"),
         x_pfx + String(".attn.ln_q.weight"),
         x_pfx + String(".attn.ln_k.weight"),
-        H, Dh, ctx)
+        H, Dh, ctx,
+        String("transformer_blocks.") + String(block_idx) + String(".attn.to_q"),
+        String("transformer_blocks.") + String(block_idx) + String(".attn.to_k"),
+        String("transformer_blocks.") + String(block_idx) + String(".attn.to_v"),
+        lora,
+    )
     var x_head_sh = List[Int]()
     x_head_sh.append(B)
     x_head_sh.append(N_IMG)
@@ -973,6 +1018,16 @@ def _sd3_joint_block[
         var ctx_proj_wt = _w_bf16(blk, ctx_proj_w, ctx)
         var ctx_proj_bt = _w_bf16(blk, ctx_proj_b, ctx)
         var ctx_proj = linear(ctx_attn, ctx_proj_wt, Optional[Tensor](ctx_proj_bt^), ctx)
+        var ctx_lora_target = (
+            String("transformer_blocks.") + String(block_idx)
+            + String(".attn.to_add_out")
+        )
+        if lora and lora.value()[].has(ctx_lora_target):
+            ctx_proj = add(
+                ctx_proj,
+                lora.value()[].delta(ctx_attn, ctx_lora_target, ctx),
+                ctx,
+            )
         # gate_msa is [B, hidden]; unsqueeze to [B, 1, hidden] for broadcast
         var gate_sh = List[Int]()
         gate_sh.append(B)
@@ -1001,6 +1056,16 @@ def _sd3_joint_block[
     var x_proj_wt = _w_bf16(blk, x_proj_w, ctx)
     var x_proj_bt = _w_bf16(blk, x_proj_b, ctx)
     var x_proj = linear(x_attn, x_proj_wt, Optional[Tensor](x_proj_bt^), ctx)
+    var x_lora_target = (
+        String("transformer_blocks.") + String(block_idx)
+        + String(".attn.to_out.0")
+    )
+    if lora and lora.value()[].has(x_lora_target):
+        x_proj = add(
+            x_proj,
+            lora.value()[].delta(x_attn, x_lora_target, ctx),
+            ctx,
+        )
     var xg_sh = List[Int]()
     xg_sh.append(B)
     xg_sh.append(1)

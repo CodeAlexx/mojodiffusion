@@ -13,6 +13,95 @@ Genesis's native egui application. The boundary, API, build, and measured smoke
 evidence are documented in
 `../docs/SERENITY_GENESIS_VIDEO_EDITOR_2026-07-23.md`.
 
+## User checkpoint registry
+
+Serenity Studio recursively discovers `.safetensors` beneath
+`~/.serenity/models/checkpoints/`, `diffusion_models/`, `unet/`, and `dits/`.
+It also recursively discovers complete Diffusers bundles anywhere below the
+model root by their `model_index.json`; a folder such as `microsoft_lens/` or a
+future nested user folder does not require a source-code allowlist. The Models
+and Generate refresh actions rescan the registry.
+
+The Models tab treats full checkpoints and standalone diffusion/UNet weights
+as base checkpoints. It also recursively inventories the SwarmUI-style
+auxiliary model sets under `vaes/`, `loras/`, `Embeddings/`, `controlnets/`,
+`text_encoders/`, `clip/`, and `clip_vision/`, plus Serenity's `ipadapters/`
+and upscaler roots. Feature adapters and compiled runtime support weights are
+shown in their own filters. Auxiliary artifacts remain separate from
+base-model generation routing.
+
+Architecture routing uses safetensors ModelSpec/compatible metadata first,
+tensor-key signatures second, and legacy filename hints only as a fallback.
+The generate API resolves the selected registry identity to an exact scanned
+path and carries it over the Rust-to-Mojo job protocol; it does not accept an
+arbitrary filesystem path.
+
+When metadata is absent or wrong, open the checkpoint in the Models tab and
+set **Model Type**. Serenity stores the override by registry-relative model
+name in `~/.serenity/models/model_type_overrides.json`; **Reset to Auto**
+returns to header, sidecar, and filename detection without modifying the
+downloaded checkpoint. The override controls classification and routing but
+does not claim that an architecture-specific worker can consume arbitrary
+weights when that loader is not implemented.
+
+The selected-checkpoint loaders currently cover:
+
+- Krea 2 diffusion-model safetensors;
+- extracted SDXL UNets and ordinary full SDXL checkpoints. FP16 and BF16 UNet
+  tensors are normalized to the worker's BF16 execution dtype while loading.
+
+For a full SDXL checkpoint, the selected file currently supplies the denoiser;
+the installed shared SDXL CLIP-L, CLIP-G, tokenizers, and VAE remain in use.
+Model cards expose this as `selected_checkpoint_scope: "denoiser"`.
+
+Other architecture workers retain their finite bundled profiles. A discovered
+file that its worker does not consume is disabled with a reason instead of
+silently generating with different canonical weights. Unknown architectures
+remain visible but are not reported as runnable merely because a file exists.
+The bundled `microsoft_lens` Diffusers directory is admitted through the
+Mojo-native `serenity_worker_lens` route at 1024x1024 only, with Euler/Simple,
+CFG 5, optional negative text, and no LoRA or image-conditioning support. Lens
+is recycled after every terminal job because its VAE path otherwise retains
+about 14 GiB on the measured 24 GiB product GPU.
+The LTX 2.3 route accepts a registry-classified, complete single-file LTX 2.3
+checkpoint for ordinary generation and I2V; when detection is ambiguous, the
+user must confirm **Model Type: LTX 2 / 2.3**. The official partial FP8
+diffusion file remains available for its admitted standard path. Retake and
+Extend deliberately select the complete
+`ltx-2.3-22b-distilled-1.1` BF16 checkpoint because the creator topology needs
+the bundled video and audio VAE encoders. Standalone VAE, text-encoder,
+upscaler, and adapter artifacts remain visible as components rather than base
+generators.
+
+On 2026-07-27 this contract was product-gated with an ordinary FP16 SDXL full
+checkpoint and with a Krea 2 checkpoint exposed through an arbitrary nested
+filename. Both worker logs named the exact selected path and both runs produced
+non-uniform 1024x1024 PNGs; the temporary Krea registry fixture was removed.
+
+## LoRAs, samplers, and schedulers
+
+LoRAs are recursively discovered beneath the configured model roots and shown
+case-insensitively A-Z in Models, Generate, and Canvas. Selecting an adapter
+passes its exact registry path and user multiplier to the model worker. Product
+loading is connected for SDXL, Ideogram 4, SD 3/3.5, Qwen Image, Anima,
+Flux.1, Chroma, Klein/Flux.2, Krea 2, Z-Image, and LTX-2. A custom adapter
+without architecture metadata may reach the selected worker and is validated
+against that worker's real tensor targets; positively identified cross-family
+adapters are rejected with the conflicting architecture instead of being
+silently ignored. Per-family capability metadata reports whether one or
+multiple adapters can actually be composed.
+
+Serenity publishes the same 44 sampler and 16 scheduler identifiers as the
+bundled SwarmUI source for discovery/workflow compatibility. Canvas and
+Generate do not expose that entire catalog blindly: both hydrate the selected
+model's executable subset from the same `/v1/capabilities` document. Flux and
+Chroma currently execute Euler/flow-match Euler and genuine DPM++ 2M over nine
+creator-compatible schedules: Normal, Karras, Exponential, Simple,
+DDIM Uniform, SGM Uniform, Beta, Linear Quadratic, and KL Optimal. Other
+families publish their own measured implementations and defaults. Requested and
+executed sampler/scheduler names are recorded separately in worker result
+manifests; a public catalog name is not evidence that its algorithm executed.
+
 Run every command from the repository root. Do not use another checkout, a
 standalone static-file server, a retired Mojo daemon, or the trainer web UI as a
 substitute for Serenity Studio.

@@ -158,7 +158,10 @@ def conv3d_fcqrs_cudnn(
     var wo = (wi + 2 * pad_w - s) // stride_w + 1
 
     var dt = x.dtype().to_mojo_dtype()
-    if dt == DType.bfloat16 and low_startup:
+    # The generic helper below has only F32 and F16 instantiations. Falling
+    # through with BF16 reinterprets BF16 buffers as FP16 and produces invalid
+    # VAE activations. BF16 must always use the native BF16 cuDNN shim.
+    if dt == DType.bfloat16:
         return cudnn_conv3d_bf16_ndhwc(
             x,
             weight,

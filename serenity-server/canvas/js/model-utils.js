@@ -1,11 +1,13 @@
 "use strict";
 /**
  * Model Utilities — SerenityFlow
- * Architecture detection from model filenames and dimension clamping.
+ * Registry-first architecture lookup and dimension clamping.
  */
 var ModelUtils = (function () {
     'use strict';
     var objectInfoCache = null;
+    var modelRegistryCache = null;
+    var modelByIdentity = {};
     var capabilitiesCache = null;
     function loadObjectInfo() {
         if (objectInfoCache)
@@ -44,9 +46,9 @@ var ModelUtils = (function () {
             });
         });
     }
-    // Detect architecture from model filename heuristics.
-    // The backend does proper header detection — this is frontend-only best-effort
-    // for choosing the right workflow graph before generation starts.
+    // Legacy fallback for bundled profiles or a temporarily unavailable registry.
+    // User-downloaded checkpoints route through archForModel(), whose primary
+    // authority is the server's metadata/tensor-signature registry.
     function detectArchFromFilename(filename) {
         if (!filename)
             return 'sd15';
@@ -72,6 +74,8 @@ var ModelUtils = (function () {
             return 'sensenova';
         if (f.includes('chroma'))
             return 'chroma';
+        if (f.includes('microsoft_lens') || f.includes('microsoft-lens') || f.includes('lenspipeline'))
+            return 'lens';
         if (f.includes('flux') || f.includes('flex') || f.includes('f1d') || f.includes('f1s'))
             return 'flux';
         if (f.includes('sd3') || f.includes('stable-diffusion-3') || f.includes('sd_3') || f.includes('stablediffusion3'))
@@ -88,9 +92,51 @@ var ModelUtils = (function () {
             return 'hunyuan';
         return 'sd15';
     }
+    function normalizeRegistryArch(arch) {
+        var value = String(arch || '').toLowerCase();
+        var aliases = {
+            'qwen-image': 'qwen',
+            'flux-2': 'klein',
+            'flux-2/klein': 'klein',
+            'ltx2': 'ltxv',
+            'wan2.2': 'wan'
+        };
+        return aliases[value] || value || 'unknown';
+    }
+    function rememberModel(model) {
+        if (!model)
+            return;
+        var arch = normalizeRegistryArch(model.arch);
+        [model.name, model.path].forEach(function (identity) {
+            if (identity)
+                modelByIdentity[String(identity)] = arch;
+        });
+    }
+    function archForModel(identity) {
+        return modelByIdentity[String(identity || '')] || detectArchFromFilename(identity);
+    }
+    function loadModelRegistry() {
+        if (modelRegistryCache)
+            return Promise.resolve(modelRegistryCache);
+        return fetch('/v1/models?refresh=1', { cache: 'no-store' })
+            .then(function (resp) {
+            if (!resp.ok)
+                throw new Error('models HTTP ' + resp.status);
+            return resp.json();
+        })
+            .then(function (data) {
+            if (!data || data.schema !== 'serenity.models.v1' || !Array.isArray(data.models))
+                throw new Error('invalid Serenity model registry');
+            modelRegistryCache = data;
+            modelByIdentity = {};
+            data.models.forEach(rememberModel);
+            (data.loras || []).forEach(rememberModel);
+            return data;
+        });
+    }
     // Check if a detected architecture is a video model
     function isVideoModel(filename) {
-        var arch = detectArchFromFilename(filename);
+        var arch = archForModel(filename);
         return arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2';
     }
     // Standard video resolutions (smaller, snap to 32 for video VAE)
@@ -117,18 +163,11 @@ var ModelUtils = (function () {
     function clampVideoDimension(val) {
         return Math.min(1280, Math.max(64, snapTo32(val)));
     }
-    // Fetch all available models from /object_info, merging checkpoints and UNETs.
-    // Returns a promise that resolves to an array of { name, loader } objects.
-    // loader is 'checkpoint' or 'unet'.
+    // Fetch exact model cards from the disk registry. Architecture and format
+    // come from safetensors metadata/key signatures; filenames are fallback-only.
     // Filter out sub-model components (text encoders, clips, sharded parts, upscalers, loras)
     function isMainModel(name) {
         var lower = name.toLowerCase();
-        // LTX RefHQ has one production-admitted base. The other local LTX files
-        // are legacy bases, parity oracles, LoRAs, and upscalers; exposing them
-        // in Generate would falsely imply that /v1/video executes the selected
-        // file. They remain visible in the model manager's /v1/models inventory.
-        if (lower.includes('ltx') && lower !== 'ltx-2.3-22b-dev-fp8')
-            return false;
         // Skip files inside subdirectories that are clearly sub-components
         if (/\/(text_encoder|clip|tokenizer|vae|scheduler|feature_extractor|vision_encoder|transformer)\//.test(name))
             return false;
@@ -156,37 +195,23 @@ var ModelUtils = (function () {
         return true;
     }
     function fetchAllModels() {
-        return loadObjectInfo()
+        return loadModelRegistry()
             .then(function (data) {
-            var models = [];
-            var seen = {};
-            // Checkpoints (SD1.5, SDXL, SD3, etc.)
-            var ckptInfo = data && data.CheckpointLoaderSimple &&
-                data.CheckpointLoaderSimple.input &&
-                data.CheckpointLoaderSimple.input.required &&
-                data.CheckpointLoaderSimple.input.required.ckpt_name;
-            if (ckptInfo && Array.isArray(ckptInfo[0])) {
-                ckptInfo[0].forEach(function (m) {
-                    if (!seen[m] && isMainModel(m)) {
-                        seen[m] = true;
-                        models.push({ name: m, loader: 'checkpoint' });
-                    }
-                });
-            }
-            // UNETs (FLUX, Klein, WAN, etc.)
-            var unetInfo = data && data.UNETLoader &&
-                data.UNETLoader.input &&
-                data.UNETLoader.input.required &&
-                data.UNETLoader.input.required.unet_name;
-            if (unetInfo && Array.isArray(unetInfo[0])) {
-                unetInfo[0].forEach(function (m) {
-                    if (!seen[m] && isMainModel(m)) {
-                        seen[m] = true;
-                        models.push({ name: m, loader: 'unet' });
-                    }
-                });
-            }
-            return models;
+            return data.models.filter(function (model) {
+                return model && model.runtime_supported !== false && isMainModel(model.name);
+            }).map(function (model) {
+                rememberModel(model);
+                return {
+                    name: model.name,
+                    path: model.path,
+                    arch: normalizeRegistryArch(model.arch),
+                    format: model.format || 'diffusion_model',
+                    loader: model.format === 'full_checkpoint' ? 'checkpoint' : 'unet',
+                    generationRoute: model.generation_route || 'image',
+                    usesSelectedCheckpoint: model.uses_selected_checkpoint === true,
+                    generationDefaults: model.generation_defaults || {}
+                };
+            });
         });
     }
     function loadCapabilities() {
@@ -217,7 +242,8 @@ var ModelUtils = (function () {
             klein: 'flux2',
             sensenova: 'sensenova',
             krea2: 'krea2',
-            chroma: 'chroma'
+            chroma: 'chroma',
+            lens: 'lens'
         };
         return byArch[arch] || '';
     }
@@ -247,12 +273,15 @@ var ModelUtils = (function () {
     }
     function clearCache() {
         objectInfoCache = null;
+        modelRegistryCache = null;
+        modelByIdentity = {};
         capabilitiesCache = null;
         localStorage.removeItem('sf-object-info-etag');
         localStorage.removeItem('sf-object-info-data');
     }
     return {
         detectArchFromFilename: detectArchFromFilename,
+        archForModel: archForModel,
         isVideoModel: isVideoModel,
         VIDEO_RESOLUTIONS: VIDEO_RESOLUTIONS,
         snapTo64: snapTo64,
@@ -260,6 +289,7 @@ var ModelUtils = (function () {
         clampDimension: clampDimension,
         clampVideoDimension: clampVideoDimension,
         fetchAllModels: fetchAllModels,
+        loadModelRegistry: loadModelRegistry,
         loadCapabilities: loadCapabilities,
         backendForArch: backendForArch,
         aspectsForArch: aspectsForArch,

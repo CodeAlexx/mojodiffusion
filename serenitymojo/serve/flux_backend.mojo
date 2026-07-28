@@ -43,11 +43,11 @@
 # (=cfg)/seed remain runtime job inputs.
 #
 # LoRA: HONORED via Flux1Offloaded.load_with_lora (Kohya/sd-scripts BFL FLUX
-# LoRA, additive overlay W += scale·up@down at multiplier 1.0 — the saved
+# LoRA, additive overlay W += scale·up@down at the requested multiplier — the saved
 # checkpoint is never fused, per the LoRA-never-fused rule). Because a LoRA
 # changes the resident DiT, a LoRA job (or a LoRA change) reloads the DiT; only
-# base (no-LoRA) jobs keep the resident handle. Diffusers-format FLUX LoRAs are
-# not supported by the model loader yet (it fails loud inside load_with_lora).
+# base (no-LoRA) jobs keep the resident handle. The loader accepts both
+# Kohya/sd-scripts BFL keys and common Diffusers/PEFT Transformer2DModel keys.
 
 from std.collections import Optional
 from std.ffi import external_call
@@ -68,7 +68,13 @@ from serenitymojo.offload.turbo_loader import TurboBlockLoader
 from serenitymojo.models.dit.flux1_dit import (
     Flux1Config, Flux1Offloaded, build_flux1_rope_tables,
 )
-from serenitymojo.sampling.flux1_dev import build_flux1_sigma_schedule
+from serenitymojo.sampling.swarmui_schedules import build_swarm_flux_schedule
+from serenitymojo.sampling.dpmpp_2m import (
+    MultistepHistory,
+    denoised_from_velocity,
+    dpmpp_2m_step,
+    lambda_from_sigma_f64,
+)
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
@@ -117,9 +123,10 @@ comptime FLUX_PRODUCT_EDGE_UNITS = 16
 # degrade output; the ungated 5x5-lowmem variant is the WORST (84.8% px differ
 # same-latent). After the DiT free + mempool trim we query free VRAM and decode
 # whole when it clears this bar, else fall back to the GATED 3x3 flux_tiled_decode
-# (parity-gated, unlike 5x5). 14 GiB is a conservative estimate — tighten by
-# measurement. See MJ-1054.
-comptime WHOLE_DECODE_MIN_FREE_BYTES = 14 * 1024 * 1024 * 1024  # 14 GiB
+# (parity-gated, unlike 5x5). A live 1024² job with 16.64 GiB free still OOMed
+# inside whole decode on 2026-07-28; require 20 GiB so a high-water parent uses
+# the safe tiled route instead of failing after a completed denoise. See MJ-1054.
+comptime WHOLE_DECODE_MIN_FREE_BYTES = 20 * 1024 * 1024 * 1024
 
 
 def _shell(cmd: String) -> Int:
@@ -195,6 +202,18 @@ def _select_lora_path(loras: List[LoraSpec]) -> String:
     if len(loras) == 0:
         return String("")
     return loras[0].name.copy()
+
+
+def _select_lora_multiplier(loras: List[LoraSpec]) -> Float32:
+    if len(loras) == 0:
+        return Float32(1.0)
+    return Float32(loras[0].weight)
+
+
+def _select_lora_signature(loras: List[LoraSpec]) -> String:
+    if len(loras) == 0:
+        return String("")
+    return loras[0].name + String("@") + String(loras[0].weight)
 
 
 # ── Turbo-streamed FLUX.1-dev DiT forward ─────────────────────────────────────
@@ -307,8 +326,8 @@ struct FluxBackend(GenBackend, Movable):
     # ── resident across BASE jobs (offloader handle + rope, first base job) ──
     # ArcPointer wrappers: Flux1Offloaded / Tensor are Movable-not-Copyable, and
     # List[T] requires T: Copyable — Arc is Copyable (refcount), so List[Arc[..]]
-    # holds the 0/1. `loaded_lora` tracks which LoRA the resident DiT carries
-    # ("" = base) so a LoRA change forces a reload.
+    # holds the 0/1. `loaded_lora` tracks the path AND requested multiplier
+    # ("" = base) so changing either forces a reload.
     var loaded: Bool
     var loaded_lora: String
     var loaded_width: Int
@@ -328,7 +347,14 @@ struct FluxBackend(GenBackend, Movable):
     var guidance: Float32
     var caps: List[ArcPointer[FluxCaps]]   # 0/1
     var sched: List[Float32]               # flow-match sigma table (steps+1)
+    var runtime_steps: Int                 # len(sched)-1; DDIM may exceed request
     var latent: List[ArcPointer[Tensor]]   # 0/1 (packed [1,N_IMG,64] BF16-castable)
+    var executed_sampler: String
+    var executed_scheduler: String
+    var dpmpp_history: MultistepHistory
+    var dpmpp_history_final_len: Int
+    var dpmpp_update_steps: Int
+    var dpmpp_second_order_steps: Int
     var vae_decode_grid: String            # executed decode path (result manifest)
     var job_t0_ns: UInt
     var load_seconds: Float64
@@ -358,7 +384,14 @@ struct FluxBackend(GenBackend, Movable):
         self.guidance = Float32(3.5)
         self.caps = List[ArcPointer[FluxCaps]]()
         self.sched = List[Float32]()
+        self.runtime_steps = 0
         self.latent = List[ArcPointer[Tensor]]()
+        self.executed_sampler = String("flux_flowmatch_euler")
+        self.executed_scheduler = String("simple")
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
         self.vae_decode_grid = String("")
         self.job_t0_ns = UInt(0)
         self.load_seconds = 0.0
@@ -424,6 +457,13 @@ struct FluxBackend(GenBackend, Movable):
         # unsupported by this fixed flow-match Euler path.
         warn_unsupported_advanced_sampling_params(params, String("flux"), List[String]())
         self.params = params.copy()
+        self.executed_sampler = sampler_admission.executed.copy()
+        self.executed_scheduler = scheduler_admission.normalized.copy()
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
+        self.runtime_steps = 0
         # FLUX is guidance-distilled: params.cfg is the guidance scalar fed to the
         # DiT (NOT a CFG multiplier). Negative prompt is discarded (no CFG path).
         # cfg<=0 means unset/invalid -> FLUX recipe default 3.5, mirroring the
@@ -475,8 +515,8 @@ struct FluxBackend(GenBackend, Movable):
         self._record_vram()
         var manifest_path = png_path + String(".flux_daemon_result.json")
         var denoise_per_step = Float64(0.0)
-        if self.params.steps > 0:
-            denoise_per_step = self.denoise_seconds / Float64(self.params.steps)
+        if self.runtime_steps > 0:
+            denoise_per_step = self.denoise_seconds / Float64(self.runtime_steps)
         var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
         var peak_mib = Float64(0.0)
         if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
@@ -497,13 +537,14 @@ struct FluxBackend(GenBackend, Movable):
         content += String('    "seed":') + String(self.params.seed) + String(",\n")
         content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
         content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "executed_steps":') + String(self.runtime_steps) + String(",\n")
         content += String('    "guidance":') + String(self.guidance) + String(",\n")
         content += String('    "sampler_registry_backend":"flux",\n')
         content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
-        content += String('    "executed_sampler":"flux_flowmatch_euler",\n')
-        content += String('    "executed_scheduler":"flux_simple_flowmatch",\n')
-        content += String('    "schedule_source":"flux1_dev_flowmatch",\n')
+        content += String('    "executed_sampler":"') + json_escape(self.executed_sampler) + String('",\n')
+        content += String('    "executed_scheduler":"flux_swarmui_') + json_escape(self.executed_scheduler) + String('",\n')
+        content += String('    "schedule_source":"swarmui_comfy_model_sampling_flux_1_15",\n')
         content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
         content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
         content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
@@ -517,6 +558,13 @@ struct FluxBackend(GenBackend, Movable):
         content += String('    "loaded_lora":"') + json_escape(
             _select_lora_path(self.params.loras)
         ) + String('",\n')
+        content += String('    "lora_weight":') + String(
+            _select_lora_multiplier(self.params.loras)
+        ) + String(",\n")
+        content += String('    "sampler_trace":{"history_capacity":1,"history_final_len":')
+        content += String(self.dpmpp_history_final_len) + String(',"dpmpp_update_steps":')
+        content += String(self.dpmpp_update_steps) + String(',"dpmpp_second_order_steps":')
+        content += String(self.dpmpp_second_order_steps) + String("},\n")
         content += String('    "vae_decode_tile_grid":"') + json_escape(self.vae_decode_grid) + String('",\n')
         content += String('    "dtype":"bf16_dit_f32_latent"\n')
         content += String("  },\n")
@@ -575,10 +623,12 @@ struct FluxBackend(GenBackend, Movable):
         """Load the FLUX.1-dev DiT offloader handle + rope tables. Resident across
         BASE jobs; a LoRA job (or a LoRA change vs the resident handle) reloads."""
         var want_lora = _select_lora_path(self.params.loras)
+        var want_lora_signature = _select_lora_signature(self.params.loras)
+        var want_lora_multiplier = _select_lora_multiplier(self.params.loras)
         # Cancellation/failure can leave the offloader resident. Its RoPE is
-        # shape-specific, so a LoRA OR shape change must rebuild the handle.
+        # shape-specific, so a LoRA path/weight OR shape change must rebuild the handle.
         if self.loaded and (
-            self.loaded_lora != want_lora
+            self.loaded_lora != want_lora_signature
             or self.loaded_width != self.params.width
             or self.loaded_height != self.params.height
         ):
@@ -589,9 +639,14 @@ struct FluxBackend(GenBackend, Movable):
         _print_vram("before FLUX DiT offloader load")
         self.model = List[ArcPointer[Flux1Offloaded]]()
         if want_lora != String(""):
-            print("[flux] loading FLUX.1-dev DiT (offloaded) + LoRA overlay:", want_lora)
+            print(
+                "[flux] loading FLUX.1-dev DiT (offloaded) + LoRA overlay:",
+                want_lora,
+                "weight",
+                want_lora_multiplier,
+            )
             self.model.append(ArcPointer(Flux1Offloaded.load_with_lora(
-                DIT_PATH, Flux1Config.dev(), want_lora, Float32(1.0), self.ctx
+                DIT_PATH, Flux1Config.dev(), want_lora, want_lora_multiplier, self.ctx
             )))
         else:
             print("[flux] loading FLUX.1-dev DiT (offloaded) from", DIT_PATH)
@@ -620,7 +675,7 @@ struct FluxBackend(GenBackend, Movable):
         self.rope_cos.append(ArcPointer(rope[0].clone(self.ctx)))
         self.rope_sin.append(ArcPointer(rope[1].clone(self.ctx)))
         self.loaded = True
-        self.loaded_lora = want_lora
+        self.loaded_lora = want_lora_signature
         self.loaded_width = self.params.width
         self.loaded_height = self.params.height
         _print_vram("after FLUX DiT offloader load (resident)")
@@ -643,7 +698,14 @@ struct FluxBackend(GenBackend, Movable):
     ](mut self) raises:
         """Flow-match sigma table (honors steps) + seeded initial packed latent
         (honors seed). Mirrors flux_sample_cli.denoise's noise+pack."""
-        self.sched = build_flux1_sigma_schedule(self.params.steps, N_IMG_)
+        self.sched = build_swarm_flux_schedule(
+            self.executed_scheduler, self.params.steps
+        )
+        # Comfy's ddim_uniform intentionally uses range(1, timesteps,
+        # timesteps//requested_steps), which can produce one extra interval for
+        # non-divisor step counts. Execute the complete creator schedule instead
+        # of silently dropping its final interval.
+        self.runtime_steps = len(self.sched) - 1
         var nsh = [1, AE_IN_CHANNELS, LATENT_H_, LATENT_W_]
         var noise = randn(nsh.copy(), UInt64(self.params.seed), STDtype.F32, self.ctx)
         if self.params.variation_strength > 0.0:
@@ -665,7 +727,8 @@ struct FluxBackend(GenBackend, Movable):
         self.latent.append(ArcPointer(packed^))
         print(
             "[flux] job", self.params.job_id, ":", self.params.steps,
-            "steps, guidance", self.guidance, "seed", self.params.seed,
+            "requested steps,", self.runtime_steps, "executed steps, guidance",
+            self.guidance, "seed", self.params.seed,
             "size", self.params.width, "x", self.params.height,
             "(FLUX Dev guidance-distilled; negative discarded)",
         )
@@ -710,9 +773,30 @@ struct FluxBackend(GenBackend, Movable):
             STDtype.F32,
             self.ctx,
         )
-        # Euler step: img = img + (t_prev - t_curr) * pred
-        var dt = t_prev - t_curr
-        var x_new = add(self.latent[0][], mul_scalar(pred, dt, self.ctx), self.ctx)
+        var x_new: Tensor
+        if self.executed_sampler == "dpmpp_2m":
+            var denoised = denoised_from_velocity(
+                self.latent[0][], pred, t_curr, self.ctx
+            )
+            if not self.dpmpp_history.is_empty():
+                self.dpmpp_second_order_steps += 1
+            x_new = dpmpp_2m_step(
+                self.latent[0][],
+                denoised,
+                t_curr,
+                t_prev,
+                self.dpmpp_history,
+                self.ctx,
+            )
+            self.dpmpp_history.push(
+                denoised^,
+                lambda_from_sigma_f64(Float64(t_curr)),
+            )
+            self.dpmpp_update_steps += 1
+        else:
+            # Euler step: img = img + (t_prev - t_curr) * pred
+            var dt = t_prev - t_curr
+            x_new = add(self.latent[0][], mul_scalar(pred, dt, self.ctx), self.ctx)
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x_new^))
 
@@ -738,6 +822,8 @@ struct FluxBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[FluxCaps]]()
         self.sched = List[Float32]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.dpmpp_history_final_len = self.dpmpp_history.len()
+        self.dpmpp_history = MultistepHistory(1)
         self._free_dit()
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
@@ -787,12 +873,19 @@ struct FluxBackend(GenBackend, Movable):
         self.announced = False
         self.caps = List[ArcPointer[FluxCaps]]()
         self.sched = List[Float32]()
+        self.runtime_steps = 0
         self.latent = List[ArcPointer[Tensor]]()
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
 
     # ── the pull-based tick ───────────────────────────────────────────────────
     def step(mut self) raises -> StepResult:
         var r = StepResult()
-        r.total = self.params.steps
+        r.total = (
+            self.runtime_steps if self.runtime_steps > 0 else self.params.steps
+        )
         if not self.active:
             r.failed = True
             r.error = String("no active job")
@@ -844,13 +937,13 @@ struct FluxBackend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
-                if self.cur >= self.params.steps:
+                if self.cur >= self.runtime_steps:
                     self.phase = FPHASE_DECODE
                 return r^
             if not self.announced:
                 # announce BEFORE the long blocking VAE-decode tick.
                 self.announced = True
-                r.step = self.params.steps
+                r.step = self.runtime_steps
                 r.phase = String("decoding")
                 return r^
             var decode_t0 = perf_counter_ns()
@@ -859,7 +952,7 @@ struct FluxBackend(GenBackend, Movable):
             self._record_vram()
             var manifest = self._write_result_manifest(path)
             print("[flux][manifest] saved:", manifest)
-            r.step = self.params.steps
+            r.step = self.runtime_steps
             self._clear_job()
             r.done = True
             r.output_path = path

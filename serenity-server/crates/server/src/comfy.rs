@@ -17,18 +17,18 @@
 
 use std::collections::HashMap;
 
+use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use serenity_wire::WorkerEvent;
 
-use crate::{enqueue_generate, AppState, DriverCtl};
+use crate::{AppState, DriverCtl, enqueue_generate};
 
 // ── POST /prompt ────────────────────────────────────────────────────────────────
 
@@ -208,22 +208,26 @@ fn comfy_messages_for(prompt_id: &str, ev: &WorkerEvent) -> Vec<String> {
                     .to_string(),
             ]
         }
-        WorkerEvent::Failed { error } => vec![json!({
-            "type": "execution_error",
-            "data": {
-                "prompt_id": prompt_id,
-                "exception_message": error,
-                "node_id": "",
-                "node_type": "",
-                "executed": []
-            }
-        })
-        .to_string()],
-        WorkerEvent::Cancelled => vec![json!({
-            "type": "execution_interrupted",
-            "data": { "prompt_id": prompt_id }
-        })
-        .to_string()],
+        WorkerEvent::Failed { error } => vec![
+            json!({
+                "type": "execution_error",
+                "data": {
+                    "prompt_id": prompt_id,
+                    "exception_message": error,
+                    "node_id": "",
+                    "node_type": "",
+                    "executed": []
+                }
+            })
+            .to_string(),
+        ],
+        WorkerEvent::Cancelled => vec![
+            json!({
+                "type": "execution_interrupted",
+                "data": { "prompt_id": prompt_id }
+            })
+            .to_string(),
+        ],
     }
 }
 
@@ -297,20 +301,13 @@ fn combo(options: &[String]) -> Value {
 pub async fn get_object_info() -> Response {
     let models = crate::models::checkpoint_names();
     let loras = crate::models::lora_names();
-    // VAE options: the canvas's zimage/flux builders hardcode `ae.safetensors`; expose
-    // a small curated set so the advanced VAE picker is non-empty.
-    let vaes: Vec<String> = vec![
-        "ae.safetensors".into(),
-        "flux2-vae.safetensors".into(),
-        "sdxl_vae.safetensors".into(),
-        "wan2.2_vae.safetensors".into(),
-    ];
-    let clips: Vec<String> = vec![
-        "qwen_3_4b.safetensors".into(),
-        "clip_l.safetensors".into(),
-        "clip_g.safetensors".into(),
-        "t5xxl_fp16.safetensors".into(),
-    ];
+    let mut artifacts = crate::models::artifact_name_inventory();
+    let vaes = artifacts.remove("vae").unwrap_or_default();
+    let clips = artifacts.remove("clip").unwrap_or_default();
+    let clip_vision = artifacts
+        .remove("clip_vision")
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| clips.clone());
     let dtypes: Vec<String> = vec!["default".into(), "fp8_e4m3fn".into(), "fp8_e5m2".into()];
 
     // Node catalog with FULL linked-input + widget declarations. The canvas
@@ -365,11 +362,14 @@ pub async fn get_object_info() -> Response {
             "output": ["CLIP"], "output_name": ["CLIP"], "name": "DualCLIPLoader", "category": "loaders" },
         "TripleCLIPLoader": { "input": { "required": { "clip_name1": combo(&clips), "clip_name2": combo(&clips), "clip_name3": combo(&clips) } },
             "output": ["CLIP"], "output_name": ["CLIP"], "name": "TripleCLIPLoader", "category": "loaders" },
-        "CLIPVisionLoader": { "input": { "required": { "clip_name": combo(&clips) } },
+        "CLIPVisionLoader": { "input": { "required": { "clip_name": combo(&clip_vision) } },
             "output": ["CLIP_VISION"], "output_name": ["CLIP_VISION"], "name": "CLIPVisionLoader", "category": "loaders" },
         "LoraLoader": { "input": { "required": { "model": lk("MODEL"), "clip": lk("CLIP"), "lora_name": combo(&loras), "strength_model": fl(1.0,-20.0,20.0), "strength_clip": fl(1.0,-20.0,20.0) } },
             "output": ["MODEL","CLIP"], "output_name": ["MODEL","CLIP"], "name": "LoraLoader", "category": "loaders" },
-        "LoraLoaderModelOnly": { "input": { "required": { "model": lk("MODEL"), "lora_name": combo(&loras), "strength_model": fl(1.0,-20.0,20.0) } },
+        "LoraLoaderModelOnly": { "input": {
+                "required": { "model": lk("MODEL"), "lora_name": combo(&loras), "strength_model": fl(1.0,-20.0,20.0) },
+                "optional": { "role": combo(&["overlay".into(),"distillation".into()]) }
+            },
             "output": ["MODEL"], "output_name": ["MODEL"], "name": "LoraLoaderModelOnly", "category": "loaders" },
         "LTX2LoraLoaderAdvanced": { "input": { "required": {
                 "model": lk("MODEL"),
@@ -457,7 +457,13 @@ pub async fn get_object_info() -> Response {
                 "feature_id": str_w(),
                 "feature_weight": fl(1.0,-10.0,10.0),
                 "post_upscale_id": str_w(),
-                "post_upscale_factor": int(2,2,4)
+                "post_upscale_factor": int(2,2,4),
+                "video_edit_mode": combo(&[
+                    "standard".into(),"retake".into(),
+                    "extend_start".into(),"extend_end".into()
+                ]),
+                "video_edit_start": fl(0.0,0.0,3600.0),
+                "video_edit_end": fl(0.0,0.0,3600.0)
             }, "optional": {
                 "guide_image": lk("IMAGE"),
                 "guide_video": lk("VIDEO"),

@@ -9,7 +9,9 @@
 # Current product limits are explicit and fail-loud:
 #   * txt2img uses the seven compiled 1024-area core shapes. FlowEdit remains
 #     1024-only and has its own request gate.
-#   * no negative prompt, LoRA, init image, variation, or non-Ideogram schedulers
+#   * no negative prompt, init image, variation, or non-Ideogram schedulers
+#   * txt2img accepts one additive Ideogram PEFT/Serenity LoRA on the conditional
+#     creator trunk; FlowEdit remains fail-loud for LoRA
 #   * fixed 1024 token text window so the DiT sequence is compile-time static
 #
 # Residency note: the Qwen3-VL text encoder and the two fp8 transformers do not
@@ -420,6 +422,7 @@ struct Ideogram4Backend(GenBackend, Movable):
     var sigma_trace: List[Float32]
     var executed_sampler: String
     var executed_scheduler: String
+    var lora_target_count: Int
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
@@ -467,6 +470,7 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.sigma_trace = List[Float32]()
         self.executed_sampler = String("ideogram4_logitnormal_euler")
         self.executed_scheduler = String("ideogram4_logitnormal")
+        self.lora_target_count = 0
         self.job_t0_ns = 0
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
@@ -541,8 +545,13 @@ struct Ideogram4Backend(GenBackend, Movable):
             raise Error("ideogram4 FlowEdit: only 1024x1024 is supported")
         if params.negative.byte_length() > 0:
             raise Error("ideogram4: negative prompt is not supported in this bounded slice")
-        if len(params.loras) > 0:
-            raise Error("ideogram4: LoRA is not supported in this bounded slice")
+        if len(params.loras) > 1:
+            raise Error(
+                "ideogram4: this runtime currently supports one compatible"
+                " Ideogram PEFT/Serenity adapter at a time"
+            )
+        if params.edit_src_image != String("") and len(params.loras) > 0:
+            raise Error("ideogram4 FlowEdit: LoRA is not supported yet")
         if params.init_image.byte_length() > 0:
             raise Error("ideogram4: img2img/init image is not supported in this bounded slice")
         if params.creativity != 0.5:
@@ -567,6 +576,7 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.cfg = Float32(params.cfg)
         self.executed_sampler = executed_samp.copy()
         self.executed_scheduler = executed_sched.copy()
+        self.lora_target_count = 0
         self.active = True
         self.cancel_flag = False
         self.phase = IPHASE_ENCODE
@@ -710,9 +720,27 @@ struct Ideogram4Backend(GenBackend, Movable):
         if self.load_stage == 0:
             print("[ideogram4] loading conditional fp8 transformer")
             self.cond = List[ArcPointer[Ideogram4Weights]]()
-            self.cond.append(ArcPointer(
-                Ideogram4Weights.load(ShardedSafeTensors.open(String(COND)), self.ctx)
-            ))
+            var cond = Ideogram4Weights.load(
+                ShardedSafeTensors.open(String(COND)), self.ctx
+            )
+            if len(self.params.loras) == 1:
+                print(
+                    "[ideogram4] loading additive conditional LoRA:",
+                    self.params.loras[0].name,
+                    "weight",
+                    self.params.loras[0].weight,
+                )
+                self.lora_target_count = cond.load_lora(
+                    self.params.loras[0].name,
+                    self.ctx,
+                    Float32(self.params.loras[0].weight),
+                )
+                print(
+                    "[ideogram4] loaded",
+                    self.lora_target_count,
+                    "compatible projection factors",
+                )
+            self.cond.append(ArcPointer(cond^))
             self.load_stage = 1
             return False
         if self.load_stage == 1:
@@ -978,7 +1006,21 @@ struct Ideogram4Backend(GenBackend, Movable):
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
         content += String('    "variation_applied":false,\n')
-        content += String('    "lora_count":0,\n')
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        if len(self.params.loras) == 1:
+            content += String('    "loaded_lora":"') + _json_escape(
+                self.params.loras[0].name
+            ) + String('",\n')
+            content += String('    "loaded_lora_weight":') + String(
+                self.params.loras[0].weight
+            ) + String(",\n")
+            content += String('    "lora_target_count":') + String(
+                self.lora_target_count
+            ) + String(",\n")
+        else:
+            content += String('    "loaded_lora":"",\n')
+            content += String('    "loaded_lora_weight":0,\n')
+            content += String('    "lora_target_count":0,\n')
         content += String('    "dtype":"fp8_transformer_bf16_activations_f32_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')

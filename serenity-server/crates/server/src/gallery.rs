@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::{result_manifest, AppState};
+use crate::{AppState, result_manifest};
 
 const GENPARAMS_TEXT_KEY: &str = "serenity.genparams.v1";
 
@@ -1017,7 +1017,7 @@ pub async fn post_favorite(
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "'favorite' must be a boolean",
-            )
+            );
         }
     };
     let next = set_favorite_doc(&load_gallery_state(out), &id, favorite);
@@ -1118,7 +1118,7 @@ pub async fn post_import(State(st): State<AppState>, body: String) -> Response {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!("gallery import source has no {GENPARAMS_TEXT_KEY}"),
-            )
+            );
         }
         Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
     }

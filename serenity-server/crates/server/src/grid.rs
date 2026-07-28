@@ -48,13 +48,13 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
-use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
 use image::{ImageFormat, Rgb, RgbImage};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::capabilities::{
     json_prompt_to_string, normalize_ideogram4_prompt_json, raw_surface_generate_error_report,
@@ -64,8 +64,8 @@ use crate::capabilities::{
 };
 use crate::jobs;
 use crate::{
-    generate_prequeue_error_report, validate_generate_prequeue_for_enqueue, AppState, DriverCtl,
-    JobChannel,
+    AppState, DriverCtl, JobChannel, generate_prequeue_error_report,
+    validate_generate_prequeue_for_enqueue,
 };
 use serenity_graph::lower_request;
 use serenity_wire::JobParams;
@@ -73,8 +73,7 @@ use serenity_wire::JobParams;
 // ── tunables ────────────────────────────────────────────────────────────────────
 
 /// Human-readable list of accepted axis names (kept in sync with `Axis::parse`).
-const AXIS_NAMES: &str =
-    "seed, cfg, steps, sampler, scheduler, model, prompt, negative, width, height, resolution, lora";
+const AXIS_NAMES: &str = "seed, cfg, steps, sampler, scheduler, model, prompt, negative, width, height, resolution, lora";
 
 /// Max number of values on ANY single axis (X, Y, or Z).
 const MAX_VALUES: usize = 16;
@@ -899,11 +898,7 @@ fn expand_numeric_csv(
                 let b = json_to_f64(&out[out.len() - 1]);
                 let d = b - a;
                 if d == 0.0 {
-                    if end >= start {
-                        1.0
-                    } else {
-                        -1.0
-                    }
+                    if end >= start { 1.0 } else { -1.0 }
                 } else {
                     d
                 }
@@ -1170,7 +1165,7 @@ fn snapshot_states(st: &AppState, ids: &[String]) -> Vec<(String, String)> {
             return ids
                 .iter()
                 .map(|_| ("failed".to_string(), String::new()))
-                .collect()
+                .collect();
         }
     };
     ids.iter()
@@ -1891,7 +1886,7 @@ mod tests {
         assert_eq!(specs[0].axis, Axis::Cfg); // X
         assert_eq!(specs[1].axis, Axis::Steps); // Y
         assert_eq!(specs[2].axis, Axis::Seed); // Z
-                                               // total product 2*3*2 = 12 (under MAX_CELLS).
+        // total product 2*3*2 = 12 (under MAX_CELLS).
         let total: usize = specs.iter().map(|s| s.values.len()).product();
         assert_eq!(total, 12);
     }

@@ -59,8 +59,8 @@ var GenerateTab = (function () {
         capabilities: null,
         videoStatus: null,
         videoGuidanceMode: 'distilled',
-        videoQuant: 'fp8',
-        videoCheckpoint: 'ltx-2.3-22b-dev-fp8',
+        videoQuant: 'bf16',
+        videoCheckpoint: 'ltx-2.3-22b-dev-fp8-dequant-bf16',
         capsPositive: '',
         capsNegative: '',
         noiseFixture: '',
@@ -121,6 +121,11 @@ var GenerateTab = (function () {
         mediaUploadsInFlight: 0
     };
     var initialized = false;
+    // Image samplers are not constrained by the bounded LTX request profile.
+    // LTX temporarily rewrites these shared controls to its exact 8/20-step
+    // schedules, so every switch back to an image model must restore them.
+    var IMAGE_STEPS_SLIDER_MAX = 150;
+    var IMAGE_STEPS_INPUT_MAX = 500;
     // DOM refs (set in init)
     var els = {};
     // Convert seconds + fps to frame count (round to nearest valid frame count)
@@ -170,7 +175,7 @@ var GenerateTab = (function () {
         { value: 'uni_pc', label: 'UniPC (Wan)' }
     ];
     function getActiveAspects() {
-        var arch = ModelUtils.detectArchFromFilename(state.model);
+        var arch = ModelUtils.archForModel(state.model);
         if (arch === 'ltxv') {
             var seen = {};
             return activeLtx2RequestProfiles().filter(function (profile) {
@@ -258,7 +263,7 @@ var GenerateTab = (function () {
     function refreshLtx2PostUpscaleControls() {
         if (!els.postUpscaler || !els.postUpscaleFactor)
             return;
-        var isLtx2 = ModelUtils.detectArchFromFilename(state.model) === 'ltxv';
+        var isLtx2 = ModelUtils.archForModel(state.model) === 'ltxv';
         var upscalers = activeLtx2PostUpscalers();
         var available = upscalers.filter(function (entry) {
             return entry && entry.available === true;
@@ -343,7 +348,12 @@ var GenerateTab = (function () {
     function applyLtx2RequestProfile(profile) {
         if (!profile)
             return;
-        state.videoCheckpoint = String(profile.checkpoint || state.videoCheckpoint);
+        if (ModelUtils.archForModel(state.model) === 'ltxv')
+            state.videoCheckpoint = String(state.model).replace(/\.safetensors$/i, '');
+        else
+            state.videoCheckpoint = state.videoQuant === 'bf16'
+                ? 'ltx-2.3-22b-dev-fp8-dequant-bf16'
+                : String(profile.checkpoint || 'ltx-2.3-22b-dev-fp8');
         state.width = Number(profile.width);
         state.height = Number(profile.height);
         state.frames = Number(profile.frames);
@@ -574,14 +584,14 @@ var GenerateTab = (function () {
             '<span id="gen-duration-hint" class="gen-batch-hint">121 frames · 4.8s at 25fps</span></div>' +
             '<div class="gen-param-row" data-param-search="guidance mode distilled dev"><label class="gen-label" for="gen-video-guidance-mode">Guidance mode</label>' +
             '<select id="gen-video-guidance-mode" class="gen-select"><option value="distilled">Distilled</option><option value="dev">Dev CFG</option></select></div>' +
-            '<div class="gen-param-row" data-param-search="quant fp8 int4"><label class="gen-label" for="gen-video-quant">Quantization</label>' +
-            '<select id="gen-video-quant" class="gen-select"><option value="fp8">FP8</option><option value="int4">INT4</option></select></div>' +
+            '<div class="gen-param-row" data-param-search="quant bf16 fp8 int4"><label class="gen-label" for="gen-video-quant">Precision</label>' +
+            '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int4">INT4</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
             '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>';
         var videoConditioningBody =
             '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
             '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
-            '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-dev-fp8"></div>' +
+            '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-dev-fp8-dequant-bf16"></div>' +
             '<div class="gen-param-row" data-param-search="conditioning caps positive"><label class="gen-label" for="gen-caps-positive">Positive conditioning override</label>' +
             '<input id="gen-caps-positive" class="gen-select gen-path-input" placeholder="Automatic when blank"></div>' +
             '<div class="gen-param-row" data-param-search="conditioning caps negative"><label class="gen-label" for="gen-caps-negative">Negative conditioning override</label>' +
@@ -1817,6 +1827,7 @@ var GenerateTab = (function () {
         if (modelRefresh) {
             modelRefresh.addEventListener('click', function (e) {
                 e.stopPropagation();
+                ModelUtils.clearCache();
                 loadModels();
             });
         }
@@ -1840,7 +1851,7 @@ var GenerateTab = (function () {
                     if (aspects[i].label === val) {
                         state.width = aspects[i].w;
                         state.height = aspects[i].h;
-                        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                        if (ModelUtils.archForModel(state.model) === 'ltxv') {
                             var sizeProfiles = activeLtx2ProfilesForSize(
                                 state.width, state.height
                             );
@@ -1865,7 +1876,7 @@ var GenerateTab = (function () {
                 var tmp = state.width;
                 state.width = state.height;
                 state.height = tmp;
-                if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                if (ModelUtils.archForModel(state.model) === 'ltxv') {
                     var swappedProfiles = activeLtx2ProfilesForSize(
                         state.width, state.height
                     );
@@ -2088,7 +2099,7 @@ var GenerateTab = (function () {
         }
         if (els.framesInput) {
             els.framesInput.addEventListener('input', function () {
-                if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+                if (ModelUtils.archForModel(state.model) === 'ltxv') {
                     state.frames = Math.max(9, parseInt(this.value) || 9);
                     var frameProfile = exactLtx2RequestProfile();
                     state.seconds = frameProfile
@@ -2108,7 +2119,7 @@ var GenerateTab = (function () {
         }
         // Seconds → compute frames
         els.secondsInput.addEventListener('input', function () {
-            if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+            if (ModelUtils.archForModel(state.model) === 'ltxv') {
                 state.seconds = Math.max(
                     0.1, Math.min(120, parseFloat(this.value) || 0.1)
                 );
@@ -2128,7 +2139,7 @@ var GenerateTab = (function () {
         els.fpsInput.addEventListener('input', function () {
             state.fps = Math.max(1, Math.min(60, parseInt(this.value) || 1));
             els.fpsRange.value = String(state.fps);
-            state.frames = ModelUtils.detectArchFromFilename(state.model) === 'ltxv'
+            state.frames = ModelUtils.archForModel(state.model) === 'ltxv'
                 ? ltx2SecondsToFrames(state.seconds, state.fps)
                 : secondsToFrames(state.seconds, state.fps);
             if (els.framesInput)
@@ -2138,7 +2149,7 @@ var GenerateTab = (function () {
         els.fpsRange.addEventListener('input', function () {
             state.fps = parseInt(this.value);
             els.fpsInput.value = this.value;
-            state.frames = ModelUtils.detectArchFromFilename(state.model) === 'ltxv'
+            state.frames = ModelUtils.archForModel(state.model) === 'ltxv'
                 ? ltx2SecondsToFrames(state.seconds, state.fps)
                 : secondsToFrames(state.seconds, state.fps);
             if (els.framesInput)
@@ -2152,7 +2163,22 @@ var GenerateTab = (function () {
             });
         }
         if (els.videoQuant)
-            els.videoQuant.addEventListener('change', function () { state.videoQuant = this.value; });
+            els.videoQuant.addEventListener('change', function () {
+                state.videoQuant = this.value;
+                var selectedIsLtx = ModelUtils.archForModel(state.model) === 'ltxv';
+                var checkpoint = selectedIsLtx
+                    ? String(state.model).replace(/\.safetensors$/i, '')
+                    : (state.videoQuant === 'bf16'
+                        ? 'ltx-2.3-22b-dev-fp8-dequant-bf16'
+                        : 'ltx-2.3-22b-dev-fp8');
+                state.videoCheckpoint = checkpoint;
+                if (els.videoCheckpoint)
+                    els.videoCheckpoint.value = checkpoint;
+                if (!selectedIsLtx && (state.allModels || []).some(function (model) {
+                    return model.name.replace(/\.safetensors$/i, '') === checkpoint;
+                }))
+                    selectModel(checkpoint);
+            });
         if (els.videoCheckpoint)
             els.videoCheckpoint.addEventListener('input', function () { state.videoCheckpoint = this.value; });
         if (els.capsPositive)
@@ -2953,16 +2979,8 @@ var GenerateTab = (function () {
             var ltxReady = !!(state.videoStatus && state.videoStatus.arms_ready &&
                 state.videoStatus.arms_ready.ltx2_t2v_av);
             var models = loaded[0].filter(function (model) {
-                if (!ModelUtils.isVideoModel(model.name))
-                    return true;
-                return ltxReady && model.name.replace(/\.safetensors$/i, '') ===
-                    'ltx-2.3-22b-dev-fp8';
+                return ModelUtils.archForModel(model.name) !== 'ltxv' || ltxReady;
             });
-            if (ltxReady && !models.some(function (model) {
-                return model.name.replace(/\.safetensors$/i, '') === 'ltx-2.3-22b-dev-fp8';
-            })) {
-                models.push({ name: 'ltx-2.3-22b-dev-fp8', loader: 'video' });
-            }
             state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');
@@ -2995,7 +3013,7 @@ var GenerateTab = (function () {
                 els.modelSearch.value = pick.name;
                 els.modelSearch.placeholder = 'Search models...';
             }
-            updateUIForArch(ModelUtils.detectArchFromFilename(pick.name));
+            updateUIForArch(ModelUtils.archForModel(pick.name));
             els.modelWarn.classList.remove('visible');
         })
             .catch(function () {
@@ -3048,11 +3066,11 @@ var GenerateTab = (function () {
         // rewrite the selected model when an older History item is viewed.
         var resolvedModel = state.model || model || '';
         var resolvedArch = state.arch ||
-            (resolvedModel && ModelUtils.detectArchFromFilename(resolvedModel)) ||
+            (resolvedModel && ModelUtils.archForModel(resolvedModel)) ||
             arch || 'other';
         var archBadge = document.getElementById('gen-arch-badge');
         if (archBadge) {
-            var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
+            var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', lens: 'MICROSOFT LENS', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
             archBadge.textContent = archNames[resolvedArch] || resolvedArch.toUpperCase();
             archBadge.dataset.arch = resolvedArch;
         }
@@ -3092,16 +3110,16 @@ var GenerateTab = (function () {
         if (els.cfg) els.cfg.min = String(cfgMin);
         if (els.cfgRange) els.cfgRange.min = String(cfgMin);
         var productDefaults = {
-            zimage: { steps: 16, cfg: 5.0 }, qwen: { steps: 20, cfg: 4.0 },
-            ideogram4: { steps: 20, cfg: 7.0 }, sdxl: { steps: 20, cfg: 7.0 },
-            anima: { steps: 20, cfg: 4.5 }, sd3: { steps: 28, cfg: 4.5 },
-            flux: { steps: 20, cfg: 4.0 },
+            zimage: { steps: 28, cfg: 4.0 }, qwen: { steps: 50, cfg: 4.0 },
+            ideogram4: { steps: 48, cfg: 7.0 }, sdxl: { steps: 50, cfg: 7.0 },
+            anima: { steps: 30, cfg: 4.5 }, sd3: { steps: 28, cfg: 4.5 },
+            flux: { steps: 50, cfg: 3.5 },
             // BFL: undistilled Klein Base is 50-step / CFG 4; the distilled
             // production checkpoint is 4-step / guidance 1.
             klein: /base/i.test(state.model) ? { steps: 50, cfg: 4.0 } : { steps: 4, cfg: 1.0 },
-            sensenova: { steps: 30, cfg: 4.0 },
+            sensenova: { steps: 50, cfg: 4.0 },
             krea2: /turbo/i.test(state.model) ? { steps: 8, cfg: 0.0 } : { steps: 52, cfg: 3.5 },
-            chroma: { steps: 30, cfg: 4.0 }
+            chroma: { steps: 40, cfg: 3.0 }
         };
         var defaults = productDefaults[arch];
         if (defaults) {
@@ -3345,6 +3363,29 @@ var GenerateTab = (function () {
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
     }
+    function restoreImageStepBounds(defaultSteps) {
+        var selectedDefault = Math.max(1, Number(defaultSteps) || 1);
+        var inputMax = Math.max(IMAGE_STEPS_INPUT_MAX, selectedDefault);
+        var sliderMax = Math.min(
+            inputMax,
+            Math.max(IMAGE_STEPS_SLIDER_MAX, selectedDefault)
+        );
+        if (els.steps) {
+            els.steps.min = '1';
+            els.steps.max = String(inputMax);
+        }
+        if (els.stepsRange) {
+            els.stepsRange.min = '1';
+            els.stepsRange.max = String(sliderMax);
+        }
+    }
+    function selectedModelGenerationDefaults() {
+        var selected = state.allModels.find(function (model) {
+            return model && model.name === state.model;
+        });
+        return selected && selected.generationDefaults
+            ? selected.generationDefaults : {};
+    }
     function updateGenerateUIForArch(arch) {
         if (arch === 'ltxv') {
             updateVideoUIForArch(arch);
@@ -3370,13 +3411,14 @@ var GenerateTab = (function () {
         var output = document.getElementById('gen-output-format');
         if (output)
             output.value = 'PNG';
-        var defaults = profile.defaults || {};
-        // Krea publishes one backend profile but has distinct Raw and Turbo
-        // checkpoint defaults. Keep the checkpoint identity visible and exact.
-        if (arch === 'krea2' && /turbo/i.test(state.model || '')) {
-            defaults = Object.assign({}, defaults, { steps: 8, cfg: 0.0 });
-        }
-        state.steps = Number(defaults.steps) || 20;
+        var defaults = Object.assign(
+            {},
+            profile.defaults || {},
+            selectedModelGenerationDefaults()
+        );
+        var defaultSteps = Number(defaults.steps) || 20;
+        restoreImageStepBounds(defaultSteps);
+        state.steps = defaultSteps;
         state.cfg = Number(defaults.cfg);
         if (!Number.isFinite(state.cfg))
             state.cfg = 4.5;
@@ -3495,7 +3537,7 @@ var GenerateTab = (function () {
             return;
         els.durationHint.textContent = state.frames + ' frames \u00b7 ' +
             Number(state.seconds.toFixed(3)) + 's at ' + state.fps + 'fps';
-        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv')
+        if (ModelUtils.archForModel(state.model) === 'ltxv')
             updateLtx2ProfileStatus();
     }
     // ── Token Counter ──
@@ -3556,7 +3598,13 @@ var GenerateTab = (function () {
             showError('The selected model admits at most ' + maxCount + ' LoRA' + (maxCount === 1 ? '' : 's'));
             return;
         }
-        state.loras.push({ name: name, strength: 1.0, enabled: true });
+        state.loras.push({
+            name: name,
+            strength: 1.0,
+            enabled: true,
+            role: state.arch === 'ltxv' && /distill/i.test(name)
+                ? 'distillation' : 'overlay'
+        });
         renderLoraList();
     }
     function removeLora(idx) {
@@ -3572,12 +3620,25 @@ var GenerateTab = (function () {
             // Ensure enabled property exists (migration from old format)
             if (lora.enabled === undefined)
                 lora.enabled = true;
+            if (lora.role !== 'distillation')
+                lora.role = 'overlay';
             var disabledClass = lora.enabled ? '' : ' gen-lora-disabled';
             var row = document.createElement('div');
             row.className = 'gen-lora-row' + disabledClass;
+            var roleControl = state.arch === 'ltxv'
+                ? ('<select class="gen-select gen-lora-role"' +
+                    (lora.enabled ? '' : ' disabled') + '>' +
+                    '<option value="overlay"' +
+                    (lora.role === 'overlay' ? ' selected' : '') +
+                    '>Overlay</option>' +
+                    '<option value="distillation"' +
+                    (lora.role === 'distillation' ? ' selected' : '') +
+                    '>Distillation</option></select>')
+                : '';
             row.innerHTML =
                 '<button class="gen-toggle gen-lora-toggle' + (lora.enabled ? ' on' : '') + '" data-idx="' + idx + '"></button>' +
                     '<span class="gen-lora-name">' + lora.name + '</span>' +
+                    roleControl +
                     '<input type="range" class="gen-range gen-lora-strength" min="-1" max="2" step="0.05" value="' + lora.strength + '"' + (lora.enabled ? '' : ' disabled') + '>' +
                     '<input type="number" class="gen-number-input gen-lora-val-input" min="-10" max="10" step="0.05" value="' + lora.strength.toFixed(2) + '"' + (lora.enabled ? '' : ' disabled') + '>' +
                     '<button class="gen-lora-remove" data-idx="' + idx + '">&times;</button>';
@@ -3600,6 +3661,20 @@ var GenerateTab = (function () {
                 var slider = this.parentElement.querySelector('.gen-lora-strength');
                 if (slider)
                     slider.value = String(Math.max(-1, Math.min(2, v))); // clamp slider visual
+            });
+        });
+        list.querySelectorAll('.gen-lora-role').forEach(function (select, idx) {
+            select.addEventListener('change', function () {
+                var role = this.value === 'distillation'
+                    ? 'distillation' : 'overlay';
+                if (role === 'distillation') {
+                    state.loras.forEach(function (candidate, candidateIdx) {
+                        if (candidateIdx !== idx)
+                            candidate.role = 'overlay';
+                    });
+                }
+                state.loras[idx].role = role;
+                renderLoraList();
             });
         });
         list.querySelectorAll('.gen-lora-toggle').forEach(function (btn) {
@@ -3758,7 +3833,12 @@ var GenerateTab = (function () {
             lora: state.loras.filter(function (lora) {
                 return lora.enabled !== false;
             }).map(function (lora) {
-                return { name: lora.name, weight: Number(lora.strength) };
+                return {
+                    name: lora.name,
+                    weight: Number(lora.strength),
+                    role: lora.role === 'distillation'
+                        ? 'distillation' : 'overlay'
+                };
             })
         };
     }
@@ -3851,7 +3931,7 @@ var GenerateTab = (function () {
         setTimeout(poll, 250);
     }
     function generateVideo() {
-        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv' &&
+        if (ModelUtils.archForModel(state.model) === 'ltxv' &&
             !exactLtx2RequestProfile()) {
             var note = document.getElementById('gen-video-profile-note');
             showError(note
@@ -3929,7 +4009,7 @@ var GenerateTab = (function () {
                 scheduler: state.scheduler,
                 width: state.width,
                 height: state.height,
-                arch: ModelUtils.detectArchFromFilename(state.model)
+                arch: ModelUtils.archForModel(state.model)
             });
         }
         state.seed = originalSeed;
@@ -4352,7 +4432,7 @@ var GenerateTab = (function () {
         var meta = (job && job.metadata) || {};
         var params = meta.params || (job && job.params) || {};
         var model = (job && job.model) || meta.model || params.model || '';
-        var arch = params.arch || ModelUtils.detectArchFromFilename(model) || '';
+        var arch = params.arch || ModelUtils.archForModel(model) || '';
         var executedCfg = meta.cfg != null ? meta.cfg : params.cfg;
         var reusable = {
             model: model,
@@ -4374,7 +4454,9 @@ var GenerateTab = (function () {
                 return {
                     name: row.name || '',
                     strength: Number(row.weight == null ? 1 : row.weight),
-                    enabled: true
+                    enabled: true,
+                    role: row.role === 'distillation'
+                        ? 'distillation' : 'overlay'
                 };
             }) : []
         };
@@ -4637,7 +4719,23 @@ var GenerateTab = (function () {
         if (els.modelSearch)
             els.modelSearch.value = name;
         closeModelDropdown();
-        updateUIForArch(ModelUtils.detectArchFromFilename(name));
+        var checkpoint = name.replace(/\.safetensors$/i, '');
+        if (ModelUtils.archForModel(name) === 'ltxv') {
+            if (/bf16/i.test(checkpoint))
+                state.videoQuant = 'bf16';
+            else if (/fp8/i.test(checkpoint))
+                state.videoQuant = 'fp8';
+            state.videoCheckpoint = checkpoint;
+            var officialDev = checkpoint === 'ltx-2.3-22b-dev-fp8' ||
+                checkpoint === 'ltx-2.3-22b-dev-fp8-dequant-bf16';
+            state.videoGuidanceMode = officialDev || /distill/i.test(checkpoint)
+                ? 'distilled' : 'dev';
+            if (els.videoQuant)
+                els.videoQuant.value = state.videoQuant;
+            if (els.videoCheckpoint)
+                els.videoCheckpoint.value = checkpoint;
+        }
+        updateUIForArch(ModelUtils.archForModel(name));
         var globalBadge = document.querySelector('#topbar .model-badge');
         if (globalBadge) {
             globalBadge.textContent = name;
@@ -4654,10 +4752,10 @@ var GenerateTab = (function () {
         });
         // Group by architecture
         var groups = {};
-        var groupOrder = ['krea2', 'klein', 'flux2', 'flux', 'ideogram4', 'sdxl', 'sd3', 'zimage', 'qwen', 'hunyuan', 'sd15', 'ltxv', 'wan', 'bernini', 'scail2', 'other'];
-        var groupLabels = { krea2: 'KREA2', klein: 'KLEIN', flux2: 'FLUX 2', flux: 'FLUX', ideogram4: 'IDEOGRAM 4', sdxl: 'SDXL', sd3: 'SD3', zimage: 'Z-IMAGE', qwen: 'QWEN', hunyuan: 'HUNYUAN', sd15: 'SD 1.5', ltxv: 'Video (LTX)', wan: 'Video (WAN)', bernini: 'Video (BERNINI-R)', scail2: 'Video (SCAIL-2)', other: 'Other' };
+        var groupOrder = ['krea2', 'klein', 'flux2', 'flux', 'ideogram4', 'lens', 'sdxl', 'sd3', 'zimage', 'qwen', 'hunyuan', 'sd15', 'ltxv', 'wan', 'bernini', 'scail2', 'other'];
+        var groupLabels = { krea2: 'KREA2', klein: 'KLEIN', flux2: 'FLUX 2', flux: 'FLUX', ideogram4: 'IDEOGRAM 4', lens: 'MICROSOFT LENS', sdxl: 'SDXL', sd3: 'SD3', zimage: 'Z-IMAGE', qwen: 'QWEN', hunyuan: 'HUNYUAN', sd15: 'SD 1.5', ltxv: 'Video (LTX)', wan: 'Video (WAN)', bernini: 'Video (BERNINI-R)', scail2: 'Video (SCAIL-2)', other: 'Other' };
         filtered.forEach(function (m) {
-            var arch = ModelUtils.detectArchFromFilename(m.name) || 'other';
+            var arch = ModelUtils.archForModel(m.name) || 'other';
             if (!groups[arch])
                 groups[arch] = [];
             groups[arch].push(m);
@@ -4677,7 +4775,7 @@ var GenerateTab = (function () {
                     return;
                 html += '<div class="gen-model-dropdown-group">' + (groupLabels[arch] || arch.toUpperCase()) + '</div>';
                 groups[arch].forEach(function (m) {
-                    var archVal = ModelUtils.detectArchFromFilename(m.name) || 'other';
+                    var archVal = ModelUtils.archForModel(m.name) || 'other';
                     html += '<div class="gen-model-dropdown-item" data-model="' + m.name + '">' +
                         '<span class="gen-model-dropdown-name">' + m.name + '</span>' +
                         '<span class="gen-arch-badge" data-arch="' + archVal + '">' + (groupLabels[archVal] || archVal.toUpperCase()) + '</span>' +
@@ -5493,7 +5591,13 @@ var GenerateTab = (function () {
             continueAfterErrors: state.continueAfterErrors,
             personalNote: state.personalNote,
             loras: state.loras.map(function (lora) {
-                return { name: lora.name, strength: lora.strength, enabled: lora.enabled !== false };
+                return {
+                    name: lora.name,
+                    strength: lora.strength,
+                    enabled: lora.enabled !== false,
+                    role: lora.role === 'distillation'
+                        ? 'distillation' : 'overlay'
+                };
             })
         };
     }
@@ -5511,21 +5615,25 @@ var GenerateTab = (function () {
                 return {
                     name: row.name || '',
                     strength: Number(row.weight == null ? 1 : row.weight),
-                    enabled: true
+                    enabled: true,
+                    role: row.role === 'distillation'
+                        ? 'distillation' : 'overlay'
                 };
             });
         }
         params = normalized;
         if (typeof params.model === 'string' && params.model) {
             var requestedModel = params.model === 'ltx2'
-                ? 'ltx-2.3-22b-dev-fp8'
+                ? ((params.videoQuant || params.quant) === 'bf16'
+                    ? 'ltx-2.3-22b-dev-fp8-dequant-bf16'
+                    : 'ltx-2.3-22b-dev-fp8')
                 : params.model;
             state.model = requestedModel;
             if (els.model)
                 els.model.value = requestedModel;
             if (els.modelSearch)
                 els.modelSearch.value = requestedModel;
-            updateUIForArch(ModelUtils.detectArchFromFilename(requestedModel));
+            updateUIForArch(ModelUtils.archForModel(requestedModel));
         }
         if (typeof params.prompt === 'string')
             state.prompt = params.prompt;
@@ -5619,12 +5727,14 @@ var GenerateTab = (function () {
                 return {
                     name: lora.name || '',
                     strength: Number(lora.strength == null ? 1 : lora.strength),
-                    enabled: lora.enabled !== false
+                    enabled: lora.enabled !== false,
+                    role: lora.role === 'distillation'
+                        ? 'distillation' : 'overlay'
                 };
             }).filter(function (lora) { return !!lora.name; });
             renderLoraList();
         }
-        if (ModelUtils.detectArchFromFilename(state.model) === 'ltxv') {
+        if (ModelUtils.archForModel(state.model) === 'ltxv') {
             var reusedProfile = activeLtx2RequestProfiles().find(function (entry) {
                 return Number(entry.width) === Number(state.width) &&
                     Number(entry.height) === Number(state.height) &&

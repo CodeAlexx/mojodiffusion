@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::AppState;
 
@@ -147,7 +147,7 @@ pub async fn post_caption(State(st): State<AppState>, body: String) -> Response 
                 StatusCode::CONFLICT,
                 axum::Json(crate::gpu_lock::gpu_busy_conflict_report("caption", &cur)),
             )
-                .into_response()
+                .into_response();
         }
     };
     if let Err(response) = evict_idle_image_worker(&st) {
@@ -180,7 +180,7 @@ pub async fn post_caption(State(st): State<AppState>, body: String) -> Response 
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("spawn failed: {e}"),
-            )
+            );
         }
     };
     if !out.status.success() {

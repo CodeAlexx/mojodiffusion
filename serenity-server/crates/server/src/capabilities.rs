@@ -1,4 +1,4 @@
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use serenity_wire::JobParams;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub(crate) enum ModelFamily {
     Sensenova,
     Krea2,
     Chroma,
+    Lens,
 }
 
 impl ModelFamily {
@@ -30,6 +31,7 @@ impl ModelFamily {
             ModelFamily::Sensenova => "sensenova",
             ModelFamily::Krea2 => "krea2",
             ModelFamily::Chroma => "chroma",
+            ModelFamily::Lens => "lens",
         }
     }
 
@@ -46,6 +48,7 @@ impl ModelFamily {
             ModelFamily::Sensenova => "serenity_worker_sensenova",
             ModelFamily::Krea2 => "serenity_worker_krea2",
             ModelFamily::Chroma => "serenity_worker_chroma",
+            ModelFamily::Lens => "serenity_worker_lens",
         }
     }
 }
@@ -89,13 +92,6 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
     // whole-resident worker; flux_backend.mojo now streams the DiT (BlockLoader)
     // with per-job encoder load->use->free, so admission defers to the worker's
     // own fail-loud preflights.
-    if m.contains("lens") || m.contains("microsoft_lens") || m.contains("microsoft-lens") {
-        return Some(BlockedModelInfo {
-            backend: "microsoft_lens",
-            production_status: "blocked",
-            reason: "Microsoft Lens is compiled experimentally, but is not production-admitted until the render/OOM gate passes",
-        });
-    }
     if m.contains("wan")
         || m.contains("lance")
         || m.contains("ltx")
@@ -118,6 +114,24 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
     None
 }
 
+pub(crate) fn model_family_for_arch(arch: &str) -> Option<ModelFamily> {
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "ideogram4" => Some(ModelFamily::Ideogram4),
+        "qwen-image" | "qwenimage" => Some(ModelFamily::QwenImage),
+        "sdxl" => Some(ModelFamily::Sdxl),
+        "anima" => Some(ModelFamily::Anima),
+        "sd3" => Some(ModelFamily::Sd3),
+        "flux-2" | "flux-2/klein" | "klein" => Some(ModelFamily::Flux2),
+        "flux" => Some(ModelFamily::Flux),
+        "sensenova" => Some(ModelFamily::Sensenova),
+        "krea2" => Some(ModelFamily::Krea2),
+        "chroma" => Some(ModelFamily::Chroma),
+        "lens" | "microsoft_lens" | "microsoft-lens" => Some(ModelFamily::Lens),
+        "zimage" => Some(ModelFamily::ZImage),
+        _ => None,
+    }
+}
+
 pub(crate) fn model_family(model: &str) -> Result<ModelFamily, String> {
     let m = model.trim().to_ascii_lowercase();
     if m.is_empty() || m.contains("select model") {
@@ -125,6 +139,11 @@ pub(crate) fn model_family(model: &str) -> Result<ModelFamily, String> {
     }
     if let Some(info) = blocked_model_info(&m) {
         return Err(info.reason.to_string());
+    }
+    if let Some(arch) = crate::models::architecture_for_model(model) {
+        return model_family_for_arch(&arch).ok_or_else(|| {
+            format!("unsupported model architecture for production generation: {arch} ({model})")
+        });
     }
     if m.contains("ideogram") {
         return Ok(ModelFamily::Ideogram4);
@@ -161,6 +180,9 @@ pub(crate) fn model_family(model: &str) -> Result<ModelFamily, String> {
     }
     if m.contains("chroma") {
         return Ok(ModelFamily::Chroma);
+    }
+    if m.contains("lens") {
+        return Ok(ModelFamily::Lens);
     }
     if m.contains("zimage") || m.contains("z-image") || m.contains("z_image") {
         return Ok(ModelFamily::ZImage);
@@ -213,7 +235,8 @@ fn default_sampler_for_family(family: ModelFamily) -> &'static str {
         | ModelFamily::Flux2
         | ModelFamily::Sensenova
         | ModelFamily::Krea2
-        | ModelFamily::Chroma => "euler",
+        | ModelFamily::Chroma
+        | ModelFamily::Lens => "euler",
     }
 }
 
@@ -226,7 +249,8 @@ fn default_scheduler_for_family(family: ModelFamily) -> &'static str {
         | ModelFamily::Flux2
         | ModelFamily::Sensenova
         | ModelFamily::Krea2
-        | ModelFamily::Chroma => "simple",
+        | ModelFamily::Lens => "simple",
+        ModelFamily::Chroma => "beta",
         ModelFamily::Ideogram4 => "ideogram_logitnormal",
         ModelFamily::Sdxl | ModelFamily::Anima => "normal",
     }
@@ -238,30 +262,41 @@ fn default_size_for_family(_family: ModelFamily) -> (i64, i64) {
 
 pub(crate) fn default_steps_for_family(family: ModelFamily) -> i64 {
     match family {
-        ModelFamily::ZImage => 16,
-        ModelFamily::QwenImage => 20,
-        ModelFamily::Ideogram4 => 20,
-        ModelFamily::Sdxl | ModelFamily::Anima | ModelFamily::Flux => 20,
+        // Z-Image Base is undistilled. The publisher recommends 28-50 steps
+        // and the local sampler contract pins the product default at 28.
+        ModelFamily::ZImage => 28,
+        // Qwen-Image's published pipeline default and the Mojo scheduler
+        // contract are both 50 inference steps.
+        ModelFamily::QwenImage => 50,
+        // Ideogram's quality preset is the published default. The 20-step
+        // profile is explicitly the speed-oriented V4_DEFAULT_20 preset.
+        ModelFamily::Ideogram4 => 48,
+        ModelFamily::Sdxl => 50,
+        ModelFamily::Anima => 30,
         ModelFamily::Sd3 => 28,
-        ModelFamily::Chroma => 30,
+        ModelFamily::Flux => 50,
+        ModelFamily::Chroma => 40,
         ModelFamily::Flux2 => 4,
-        ModelFamily::Sensenova => 30,
+        ModelFamily::Sensenova => 50,
         ModelFamily::Krea2 => 52,
+        ModelFamily::Lens => 20,
     }
 }
 
 pub(crate) fn default_cfg_for_family(family: ModelFamily) -> f64 {
     match family {
-        ModelFamily::ZImage => 5.0,
+        ModelFamily::ZImage => 4.0,
         ModelFamily::QwenImage => 4.0,
         ModelFamily::Ideogram4 | ModelFamily::Sdxl => 7.0,
         ModelFamily::Anima | ModelFamily::Sd3 => 4.5,
-        ModelFamily::Flux | ModelFamily::Sensenova => 4.0,
+        ModelFamily::Flux => 3.5,
+        ModelFamily::Sensenova => 4.0,
         // BFL's production Klein checkpoints are guidance-distilled. The
         // undistilled Base checkpoints override this to 4.0 below.
         ModelFamily::Flux2 => 1.0,
         ModelFamily::Krea2 => 3.5,
-        ModelFamily::Chroma => 4.0,
+        ModelFamily::Chroma => 3.0,
+        ModelFamily::Lens => 5.0,
     }
 }
 
@@ -270,8 +305,22 @@ pub(crate) fn default_steps_for_model(model: &str, family: ModelFamily) -> i64 {
     if family == ModelFamily::Flux2 && normalized.contains("base") {
         // Official FLUX.2 Klein Base inference profile: undistilled, 50 steps.
         50
+    } else if family == ModelFamily::ZImage && normalized.contains("turbo") {
+        8
+    } else if family == ModelFamily::Anima && normalized.contains("turbo") {
+        10
+    } else if family == ModelFamily::Ideogram4 && normalized.contains("turbo") {
+        12
+    } else if family == ModelFamily::Sensenova
+        && (normalized.contains("8step") || normalized.contains("8-step"))
+    {
+        8
     } else if family == ModelFamily::Krea2 && normalized.contains("turbo") {
         8
+    } else if family == ModelFamily::Lens && normalized.contains("turbo") {
+        4
+    } else if family == ModelFamily::Lens && normalized.contains("base") {
+        50
     } else {
         default_steps_for_family(family)
     }
@@ -282,11 +331,35 @@ pub(crate) fn default_cfg_for_model(model: &str, family: ModelFamily) -> f64 {
     if family == ModelFamily::Flux2 && normalized.contains("base") {
         // Base is not guidance-distilled; BFL's model card specifies CFG 4.0.
         4.0
+    } else if family == ModelFamily::ZImage && normalized.contains("turbo") {
+        0.0
+    } else if family == ModelFamily::Anima && normalized.contains("turbo") {
+        1.0
+    } else if family == ModelFamily::Sensenova
+        && (normalized.contains("8step") || normalized.contains("8-step"))
+    {
+        1.0
     } else if family == ModelFamily::Krea2 && normalized.contains("turbo") {
         0.0
+    } else if family == ModelFamily::Lens && normalized.contains("turbo") {
+        1.0
     } else {
         default_cfg_for_family(family)
     }
+}
+
+/// Exact defaults attached to one registry model card. Family capabilities
+/// describe the backend; this record preserves checkpoint variants such as
+/// Base, Turbo, and distilled without frontend filename guesses.
+pub(crate) fn generation_defaults_for_model_arch(model: &str, arch: &str) -> Option<JsonValue> {
+    let family = model_family_for_arch(arch)?;
+    Some(json!({
+        "source": "server_model_profile",
+        "steps": default_steps_for_model(model, family),
+        "cfg": default_cfg_for_model(model, family),
+        "sampler": default_sampler_for_family(family),
+        "scheduler": default_scheduler_for_family(family),
+    }))
 }
 
 // Z-Image supports the proven 512 square path plus the shared seven-shape 1MP
@@ -318,6 +391,7 @@ const KLEIN_SIZES: &[(i64, i64)] = &[
     (832, 1280),
 ];
 const SENSENOVA_SIZES: &[(i64, i64)] = &[(512, 512), (1024, 1024)];
+const LENS_SIZES: &[(i64, i64)] = &[(1024, 1024)];
 // Exact 1024px-area ladder compiled by the Krea and Qwen image workers. Krea
 // also shares it with training/cache. Keep this wire contract synchronized with
 // serenitymojo.training.aspect_buckets.DEFAULT_ASPECT_LADDER_X100.
@@ -333,6 +407,8 @@ const IMAGE_1024_ASPECT_SIZES: &[(i64, i64)] = &[
 ];
 const SAMPLERS_EULER: &[&str] = &["euler"];
 const SAMPLERS_EULER_FLOWMATCH: &[&str] = &["euler", "flowmatch_euler"];
+const SAMPLERS_FLOWMATCH_DPM2M: &[&str] = &["euler", "flowmatch_euler", "dpmpp_2m"];
+const SAMPLERS_SDXL: &[&str] = &["euler", "ddim", "dpmpp_2m"];
 const SAMPLERS_ZIMAGE: &[&str] = &[
     "euler",
     "flowmatch_euler",
@@ -345,8 +421,20 @@ const SCHEDULERS_SIMPLE: &[&str] = &["simple"];
 // it; klein_runtime maps it onto its flow-match schedule) alongside "simple".
 const SCHEDULERS_FLUX2: &[&str] = &["simple", "flux2"];
 const SCHEDULERS_NORMAL: &[&str] = &["normal"];
+const SCHEDULERS_SDXL: &[&str] = &["normal", "karras", "exponential", "simple", "ddim_uniform"];
 const SCHEDULERS_ZIMAGE: &[&str] = &["simple", "sgm_uniform"];
 const SCHEDULERS_IDEOGRAM4: &[&str] = &["ideogram_logitnormal", "simple"];
+const SCHEDULERS_SWARM_FLUX: &[&str] = &[
+    "normal",
+    "karras",
+    "exponential",
+    "simple",
+    "ddim_uniform",
+    "sgm_uniform",
+    "beta",
+    "linear_quadratic",
+    "kl_optimal",
+];
 
 #[derive(Debug, Copy, Clone)]
 struct ResolutionPolicy {
@@ -435,6 +523,17 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             admitted_shapes,
             note: "SenseNova worker dispatches concrete compiled image-token shapes; add specializations before exposing more workflow resolutions",
         },
+        ModelFamily::Lens => ResolutionPolicy {
+            mode: "fixed_shape",
+            min_width: 1024,
+            max_width: 1024,
+            min_height: 1024,
+            max_height: 1024,
+            multiple: 1024,
+            square_only: true,
+            admitted_shapes,
+            note: "Microsoft Lens is compiled for the fixed 1024x1024 DiT, RoPE, and SDPA geometry",
+        },
     }
 }
 
@@ -449,19 +548,19 @@ fn production_sizes_for_family(family: ModelFamily) -> &'static [(i64, i64)] {
         ModelFamily::Flux2 => KLEIN_SIZES,
         ModelFamily::Sensenova => SENSENOVA_SIZES,
         ModelFamily::Krea2 => IMAGE_1024_ASPECT_SIZES,
+        ModelFamily::Lens => LENS_SIZES,
     }
 }
 
 fn supported_samplers_for_family(family: ModelFamily) -> &'static [&'static str] {
     match family {
         ModelFamily::ZImage => SAMPLERS_ZIMAGE,
-        ModelFamily::QwenImage
-        | ModelFamily::Ideogram4
-        | ModelFamily::Sd3
-        | ModelFamily::Flux
-        | ModelFamily::Chroma => SAMPLERS_EULER_FLOWMATCH,
-        ModelFamily::Flux2 | ModelFamily::Sensenova => SAMPLERS_EULER,
-        ModelFamily::Sdxl | ModelFamily::Anima => SAMPLERS_EULER,
+        ModelFamily::QwenImage | ModelFamily::Sd3 => SAMPLERS_FLOWMATCH_DPM2M,
+        ModelFamily::Flux | ModelFamily::Chroma => SAMPLERS_FLOWMATCH_DPM2M,
+        ModelFamily::Ideogram4 => SAMPLERS_EULER_FLOWMATCH,
+        ModelFamily::Flux2 | ModelFamily::Sensenova | ModelFamily::Lens => SAMPLERS_EULER,
+        ModelFamily::Sdxl => SAMPLERS_SDXL,
+        ModelFamily::Anima => SAMPLERS_EULER,
         ModelFamily::Krea2 => SAMPLERS_EULER,
     }
 }
@@ -470,14 +569,15 @@ fn supported_schedulers_for_family(family: ModelFamily) -> &'static [&'static st
     match family {
         ModelFamily::ZImage => SCHEDULERS_ZIMAGE,
         ModelFamily::Ideogram4 => SCHEDULERS_IDEOGRAM4,
-        ModelFamily::Sdxl | ModelFamily::Anima => SCHEDULERS_NORMAL,
+        ModelFamily::Flux | ModelFamily::Chroma => SCHEDULERS_SWARM_FLUX,
+        ModelFamily::Sdxl => SCHEDULERS_SDXL,
+        ModelFamily::Anima => SCHEDULERS_NORMAL,
         ModelFamily::Flux2 => SCHEDULERS_FLUX2,
         ModelFamily::QwenImage
         | ModelFamily::Sd3
-        | ModelFamily::Flux
         | ModelFamily::Sensenova
         | ModelFamily::Krea2
-        | ModelFamily::Chroma => SCHEDULERS_SIMPLE,
+        | ModelFamily::Lens => SCHEDULERS_SIMPLE,
     }
 }
 
@@ -490,15 +590,16 @@ fn supports_negative_prompt(family: ModelFamily) -> bool {
 
 fn lora_limit_for_family(family: ModelFamily) -> Option<usize> {
     match family {
-        ModelFamily::ZImage => None,
-        ModelFamily::Flux | ModelFamily::Flux2 | ModelFamily::Krea2 => Some(1),
-        ModelFamily::QwenImage
-        | ModelFamily::Ideogram4
-        | ModelFamily::Sdxl
-        | ModelFamily::Anima
+        ModelFamily::ZImage | ModelFamily::Sdxl => None,
+        ModelFamily::Flux
+        | ModelFamily::Flux2
+        | ModelFamily::Krea2
+        | ModelFamily::Chroma
         | ModelFamily::Sd3
-        | ModelFamily::Sensenova
-        | ModelFamily::Chroma => Some(0),
+        | ModelFamily::Anima
+        | ModelFamily::QwenImage
+        | ModelFamily::Ideogram4 => Some(1),
+        ModelFamily::Sensenova | ModelFamily::Lens => Some(0),
     }
 }
 
@@ -1486,7 +1587,7 @@ pub(crate) fn validate_generate_prequeue(
         ModelFamily::QwenImage => {
             reject_qwen_runtime_overrides(params)?;
         }
-        ModelFamily::Anima | ModelFamily::Sensenova => {
+        ModelFamily::Anima | ModelFamily::Sensenova | ModelFamily::Lens => {
             reject_variation(params, family)?;
         }
         ModelFamily::ZImage
@@ -1861,6 +1962,7 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
         ModelFamily::Sensenova,
         ModelFamily::Krea2,
         ModelFamily::Chroma,
+        ModelFamily::Lens,
     ];
     let backends: Vec<JsonValue> = families
         .iter()
@@ -1935,6 +2037,8 @@ mod tests {
         );
 
         let profile = capability_for_family(ModelFamily::QwenImage);
+        assert_eq!(profile["defaults"]["steps"], 50);
+        assert_eq!(profile["defaults"]["cfg"], 4.0);
         assert_eq!(profile["limits"]["resolution"]["mode"], "shape_dispatch");
         assert_eq!(profile["limits"]["resolution"]["square_only"], false);
         assert_eq!(profile["limits"]["sizes"].as_array().unwrap().len(), 7);
@@ -2029,6 +2133,7 @@ mod tests {
             "sensenova: 'sensenova'",
             "krea2: 'krea2'",
             "chroma: 'chroma'",
+            "lens: 'lens'",
         ] {
             assert!(
                 model_utils.contains(mapping),
@@ -2220,9 +2325,11 @@ mod tests {
             "prompt": "replace the sky",
             "mask_image": "/tmp/mask.png"
         });
-        assert!(reject_disabled_raw_surfaces(&missing_init)
-            .unwrap_err()
-            .contains("requires init_image"));
+        assert!(
+            reject_disabled_raw_surfaces(&missing_init)
+                .unwrap_err()
+                .contains("requires init_image")
+        );
 
         let full_lanpaint = json!({
             "model": "zimage",
@@ -2231,9 +2338,56 @@ mod tests {
             "mask_image": "/tmp/mask.png",
             "lanpaint_num_steps": 16
         });
-        assert!(reject_disabled_raw_surfaces(&full_lanpaint)
-            .unwrap_err()
-            .contains("LanPaint"));
+        assert!(
+            reject_disabled_raw_surfaces(&full_lanpaint)
+                .unwrap_err()
+                .contains("LanPaint")
+        );
+    }
+
+    #[test]
+    fn lens_profile_admits_only_the_compiled_txt2img_surface() {
+        let profile = capability_profile_for_model("microsoft_lens");
+        assert_eq!(profile["backend"], "lens");
+        assert_eq!(profile["production_status"], "admitted");
+        assert_eq!(profile["worker_binary"], "serenity_worker_lens");
+        assert_eq!(profile["defaults"]["steps"], 20);
+        assert_eq!(profile["defaults"]["cfg"], 5.0);
+        assert_eq!(profile["limits"]["sizes"].as_array().unwrap().len(), 1);
+        assert_eq!(profile["limits"]["sizes"][0]["width"], 1024);
+        assert_eq!(profile["limits"]["sizes"][0]["height"], 1024);
+        assert_eq!(profile["features"]["negative_prompt"]["supported"], true);
+        assert_eq!(profile["features"]["lora"]["supported"], false);
+
+        let mut params = JobParams::default();
+        params.model = "microsoft_lens".to_string();
+        params.prompt = "a red ceramic teapot".to_string();
+        params.width = 1024;
+        params.height = 1024;
+        params.steps = 1;
+        params.cfg = 5.0;
+        params.sampler = "euler".to_string();
+        params.scheduler = "simple".to_string();
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::Lens
+        );
+
+        params.width = 896;
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
+        params.width = 1024;
+        params
+            .loras
+            .push(serenity_wire::LoraSpec::new("unsupported".to_string(), 1.0));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("LoRA")
+        );
     }
 
     #[test]
@@ -2261,16 +2415,20 @@ mod tests {
         );
 
         params.sampler = "uni_pc".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("UniPC img2img/inpaint"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("UniPC img2img/inpaint")
+        );
 
         params.model = "sdxl".to_string();
         params.sampler = "euler".to_string();
         params.scheduler = "normal".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted only for Z-Image"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted only for Z-Image")
+        );
     }
 
     #[test]
@@ -2296,9 +2454,11 @@ mod tests {
 
         params.width = 768;
         params.height = 768;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("admitted product shapes"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("admitted product shapes")
+        );
     }
 
     #[test]
@@ -2357,15 +2517,19 @@ mod tests {
 
         params.width = 512;
         params.height = 512;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("1024x1024"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("1024x1024")
+        );
         params.width = 1024;
         params.height = 1024;
         params.lanpaint_friction = -1.0;
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("lanpaint_friction"));
+        assert!(
+            validate_generate_prequeue(&params, 1.0)
+                .unwrap_err()
+                .contains("lanpaint_friction")
+        );
     }
 
     #[test]
@@ -2568,5 +2732,36 @@ mod tests {
         assert_eq!(four_b["backend"], "flux2");
         assert_eq!(four_b["production_status"], "admitted");
         assert_eq!(four_b["features"]["instruction_edit"]["supported"], true);
+    }
+
+    #[test]
+    fn every_image_family_uses_a_publisher_aligned_generation_profile() {
+        let cases = [
+            ("zimage_base", "zimage", 28, 4.0),
+            ("z_image_turbo_bf16", "zimage", 8, 0.0),
+            ("qwen-image-2512", "qwen-image", 50, 4.0),
+            ("ideogram-4-fp8", "ideogram4", 48, 7.0),
+            ("sd_xl_base_1.0", "sdxl", 50, 7.0),
+            ("anima", "anima", 30, 4.5),
+            ("sd3.5_large", "sd3", 28, 4.5),
+            ("flux1-dev", "flux", 50, 3.5),
+            ("flux-2-klein-base-9b", "flux-2/klein", 50, 4.0),
+            ("flux-2-klein-9b", "flux-2/klein", 4, 1.0),
+            ("sensenova-u1", "sensenova", 50, 4.0),
+            ("sensenova-u1-8step-preview", "sensenova", 8, 1.0),
+            ("krea2-raw", "krea2", 52, 3.5),
+            ("krea2-turbo", "krea2", 8, 0.0),
+            ("chroma1_hd_bf16", "chroma", 40, 3.0),
+            ("microsoft_lens", "lens", 20, 5.0),
+            ("microsoft_lens_turbo", "lens", 4, 1.0),
+            ("microsoft_lens_base", "lens", 50, 5.0),
+        ];
+        for (model, arch, steps, cfg) in cases {
+            let defaults = generation_defaults_for_model_arch(model, arch)
+                .unwrap_or_else(|| panic!("missing defaults for {model} ({arch})"));
+            assert_eq!(defaults["steps"], steps, "wrong step default for {model}");
+            assert_eq!(defaults["cfg"], cfg, "wrong CFG default for {model}");
+            assert_eq!(defaults["sampler"], "euler");
+        }
     }
 }

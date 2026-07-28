@@ -48,9 +48,10 @@
 #
 # Size support: 512 square plus the finite seven-shape 1MP product ladder (the
 # Klein attention shape N_IMG/S/LH/LW is comptime; klein_sample dispatches those
-# exact specializations). steps/cfg/seed honored at runtime. ONE LoRA at weight
-# 1.0 supported (the sampler's live adapter path); >1 LoRA or weight != 1.0 is
-# rejected at admission. Native ReferenceLatent edit accepts one 512x512 or
+# exact specializations). steps/cfg/seed honored at runtime. One live LoRA is
+# supported at the user's requested multiplier through the creator sampler's
+# existing lora_multiplier argument; multiple adapters remain uncomposed.
+# Native ReferenceLatent edit accepts one 512x512 or
 # 1024x1024 source image for both 9B and 4B. The preserved two-reference legacy
 # path remains 512x512. Ordinary img2img is rejected loudly.
 #
@@ -213,20 +214,17 @@ def _resolve_klein_lora_path(name: String) raises -> String:
 
 
 def _klein_lora_path(params: JobParams) raises -> String:
-    """The single supported LoRA path ("" = base). Same constraints as the staged
-    klein_backend: at most one LoRA, weight must be 1.0 (the live-adapter sampler
-    path applies a single multiplier we keep at 1.0)."""
+    """The single supported LoRA path ("" = base).
+
+    The creator sampler already accepts a runtime lora_multiplier, so admission
+    must not hard-code the user weight to 1.0.
+    """
     if len(params.loras) == 0:
         return String("")
     if len(params.loras) > 1:
         raise Error(
             "klein_runtime: exactly one LoRA is supported (the sampler applies a"
             " single live adapter); submit one LoRA"
-        )
-    if params.loras[0].weight != 1.0:
-        raise Error(
-            "klein_runtime: LoRA weight other than 1.0 is not wired through the"
-            " runtime sampler path yet; submit weight 1.0"
         )
     return _resolve_klein_lora_path(params.loras[0].name)
 
@@ -334,6 +332,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     var config_path: String
     var cfg: List[ArcPointer[TrainConfig]]   # 0/1 (per-job, loaded at admission)
     var lora_path: String
+    var lora_multiplier: Float32
     var out_png: String
     var job_t0_ns: UInt
     var encode_seconds: Float64
@@ -357,6 +356,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.config_path = String(KLEIN9B_CONFIG)
         self.cfg = List[ArcPointer[TrainConfig]]()
         self.lora_path = String("")
+        self.lora_multiplier = Float32(1.0)
         self.out_png = String("")
         self.job_t0_ns = UInt(0)
         self.encode_seconds = 0.0
@@ -492,6 +492,11 @@ struct KleinRuntimeBackend(GenBackend, Movable):
             )
 
         self.lora_path = _klein_lora_path(params)
+        self.lora_multiplier = (
+            Float32(params.loras[0].weight)
+            if len(params.loras) == 1
+            else Float32(1.0)
+        )
         if self.lora_path != String(""):
             _require_file(String("LoRA"), self.lora_path)
 
@@ -550,6 +555,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.pos_txt = List[ArcPointer[Tensor]]()
         self.neg_txt = List[ArcPointer[Tensor]]()
         self.lora_path = String("")
+        self.lora_multiplier = Float32(1.0)
         self.out_png = String("")
 
     # ── per-job prep ───────────────────────────────────────────────────────────
@@ -627,6 +633,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         content += String('    "config_path":"') + json_escape(self.config_path) + String('",\n')
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
         content += String('    "lora_path":"') + json_escape(self.lora_path) + String('",\n')
+        content += String('    "lora_weight":') + String(self.lora_multiplier) + String(",\n")
         content += String('    "dtype":"bf16_klein_runtime"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
@@ -680,12 +687,14 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                 seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                 allow_child_decode=True,
+                lora_multiplier=self.lora_multiplier,
             )
         else:
             var _img = klein_sample[N_IMG_, N_TXT, S_, LH_, LW_, H_4B, Dh](
                 self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                 seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                 allow_child_decode=True,
+                lora_multiplier=self.lora_multiplier,
             )
 
     def _sample_product(
@@ -726,6 +735,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     ](
                         self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                         seed, ref_lat^, self.out_png, self.ctx,
+                        lora_multiplier=self.lora_multiplier,
                     )
                 else:
                     var _e = klein_sample_with_reference_latent[
@@ -733,6 +743,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     ](
                         self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                         seed, ref_lat^, self.out_png, self.ctx,
+                        lora_multiplier=self.lora_multiplier,
                     )
             else:
                 var ref_lat = self._encode_reference_512(ref_path)
@@ -742,6 +753,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     ](
                         self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                         seed, ref_lat^, self.out_png, self.ctx,
+                        lora_multiplier=self.lora_multiplier,
                     )
                 else:
                     var _e = klein_sample_with_reference_latent[
@@ -749,6 +761,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     ](
                         self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                         seed, ref_lat^, self.out_png, self.ctx,
+                        lora_multiplier=self.lora_multiplier,
                     )
         elif self.params.reference_latent_count == 2:
             # Lowering contract (serenityflow__klein9b_edit golden): ref A rides
@@ -763,6 +776,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 ](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                     seed, ref_a^, ref_b^, self.out_png, self.ctx,
+                    lora_multiplier=self.lora_multiplier,
                 )
             else:
                 var _e = klein_sample_with_reference_latents2[
@@ -770,6 +784,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 ](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                     seed, ref_a^, ref_b^, self.out_png, self.ctx,
+                    lora_multiplier=self.lora_multiplier,
                 )
         elif self.params.width == 512 and self.params.height == 512:
             if self.variant == String("9b"):
@@ -777,12 +792,14 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                     seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                     allow_child_decode=True,
+                    lora_multiplier=self.lora_multiplier,
                 )
             else:
                 var _img = klein_sample[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_4B, Dh](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
                     seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                     allow_child_decode=True,
+                    lora_multiplier=self.lora_multiplier,
                 )
         else:
             self._sample_product(pos, neg, cfg_scale, steps, seed)

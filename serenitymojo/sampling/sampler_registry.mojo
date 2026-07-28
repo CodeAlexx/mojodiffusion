@@ -72,6 +72,8 @@ def _backend_key(backend_name: String) -> String:
         return String("qwenimage")
     if b == "ideogram" or b == "ideogram4" or b.find("ideogram") >= 0:
         return String("ideogram4")
+    if b == "chroma" or b.find("chroma") >= 0:
+        return String("chroma")
     if (
         b == "zimage"
         or b == "z-image"
@@ -114,6 +116,8 @@ def sampler_backend_for_model(model_name: String, default_backend: String) -> St
         return String("qwenimage")
     if m.find("ideogram") >= 0:
         return String("ideogram4")
+    if m.find("chroma") >= 0:
+        return String("chroma")
     if m.find("sdxl") >= 0 or m.find("stable-diffusion-xl") >= 0 or m.find("animagine") >= 0:
         return String("sdxl")
     if m.find("anima") >= 0:
@@ -147,6 +151,8 @@ def default_generation_model(default_backend: String) -> String:
         return String("sd3.5-large")
     if b == "flux":
         return String("flux-dev")
+    if b == "chroma":
+        return String("chroma1-hd")
     if b == "zimage":
         return String("zimage_base")
     return default_backend
@@ -167,6 +173,8 @@ def default_scheduler_for_backend(backend_name: String) -> String:
         return String("flux2")
     if b == "sdxl" or b == "anima":
         return String("normal")
+    if b == "chroma":
+        return String("beta")
     if b == "sd3" or b == "flux":
         return String("simple")
     if b == "zimage" or b == "qwenimage":
@@ -280,6 +288,18 @@ def sampler_admission_for_backend(
                 String("qwenimage_flowmatch_euler"),
                 String("backend executes the bounded Qwen-Image Euler/simple flow-match path"),
             )
+        if normalized == "dpmpp_2m":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("dpmpp_2m"),
+                String(
+                    "backend executes genuine DPM++ 2M data prediction over "
+                    + "the Qwen dynamic-shift sigma schedule"
+                ),
+            )
         return SamplerAdmission(
             False,
             b,
@@ -287,8 +307,9 @@ def sampler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Qwen-Image currently supports only euler/flowmatch_euler over "
-                + "its simple flow-match schedule; other Comfy sampler catalog "
+                "Qwen-Image currently supports euler/flowmatch_euler and "
+                + "dpmpp_2m over its dynamic-shift flow-match schedule; other "
+                + "Comfy sampler catalog "
                 + "names remain fail-loud until artifact evidence exists"
             ),
         )
@@ -315,14 +336,23 @@ def sampler_admission_for_backend(
             ),
         )
     if b == "sdxl":
-        if normalized == "euler":
+        if normalized == "euler" or normalized == "ddim":
             return SamplerAdmission(
                 True,
                 b,
                 requested,
                 normalized,
-                String("sdxl_euler_fixed_cli"),
-                String("existing SDXL sample CLI executes the fixed 1024x1024 30-step Euler path"),
+                String("sdxl_euler"),
+                String("SDXL executes Comfy Euler; Comfy's ddim ID is a genuine Euler alias"),
+            )
+        if normalized == "dpmpp_2m":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("sdxl_dpmpp_2m"),
+                String("SDXL executes Comfy sample_dpmpp_2m over EPS x0 prediction"),
             )
         return SamplerAdmission(
             False,
@@ -331,7 +361,8 @@ def sampler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "SDXL daemon route currently admits only Comfy euler over normal scheduler through the existing sample CLI; DPM++/UniPC/ancestral/SDE/flowmatch aliases remain fail-loud"
+                "SDXL currently executes euler/ddim and dpmpp_2m; ancestral/SDE/"
+                + "UniPC/CFG++ names remain fail-loud until their distinct math is proven"
             ),
         )
     if b == "anima":
@@ -364,6 +395,18 @@ def sampler_admission_for_backend(
                 String("sd3_flowmatch_euler"),
                 String("existing SD3.5 Mojo worker executes the bounded 1024x1024 Euler/simple flow-match path"),
             )
+        if normalized == "dpmpp_2m":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("dpmpp_2m"),
+                String(
+                    "SD3.5 executes DPM++ 2M data prediction over its shifted "
+                    + "simple flow-match sigma schedule"
+                ),
+            )
         return SamplerAdmission(
             False,
             b,
@@ -371,7 +414,9 @@ def sampler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "SD3.5 currently supports only euler/flowmatch_euler over the simple flow-match schedule; other Comfy sampler catalog names remain fail-loud"
+                "SD3.5 currently executes euler/flowmatch_euler and dpmpp_2m "
+                + "over the simple flow-match schedule; other Comfy sampler "
+                + "catalog names remain fail-loud"
             ),
         )
     if b == "flux":
@@ -384,6 +429,15 @@ def sampler_admission_for_backend(
                 String("flux_flowmatch_euler"),
                 String("existing Flux Mojo worker executes the bounded 1024x1024 Euler/simple flow-match path"),
             )
+        if normalized == "dpmpp_2m":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("dpmpp_2m"),
+                String("Flux executes genuine DPM++ 2M data prediction over its dynamic flow schedule"),
+            )
         return SamplerAdmission(
             False,
             b,
@@ -391,8 +445,35 @@ def sampler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Flux currently supports only euler/flowmatch_euler over the simple flow-match schedule; other Comfy sampler catalog names remain fail-loud"
+                "Flux currently supports euler/flowmatch_euler and dpmpp_2m over the simple flow-match schedule; other Comfy sampler catalog names remain fail-loud"
             ),
+        )
+    if b == "chroma":
+        if normalized == "euler" or normalized == "flowmatch_euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("chroma_cfg_flowmatch_euler"),
+                String("Chroma executes real-CFG Euler over its selected Flux sigma table"),
+            )
+        if normalized == "dpmpp_2m":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("dpmpp_2m"),
+                String("Chroma executes genuine DPM++ 2M data prediction after real CFG"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("Chroma currently executes euler/flowmatch_euler and dpmpp_2m; other algorithms remain fail-loud"),
         )
     if b == "flux2":
         return SamplerAdmission(
@@ -517,14 +598,20 @@ def scheduler_admission_for_backend(
             ),
         )
     if b == "sdxl":
-        if normalized == "normal":
+        if (
+            normalized == "normal"
+            or normalized == "karras"
+            or normalized == "exponential"
+            or normalized == "simple"
+            or normalized == "ddim_uniform"
+        ):
             return SamplerAdmission(
                 True,
                 b,
                 requested,
                 normalized,
-                String("sdxl_normal_fixed_cli"),
-                String("existing SDXL sample CLI executes its fixed normal Euler schedule"),
+                String("sdxl_comfy_") + normalized,
+                String("SDXL executes the bundled SwarmUI/Comfy scalar schedule"),
             )
         return SamplerAdmission(
             False,
@@ -532,7 +619,10 @@ def scheduler_admission_for_backend(
             requested,
             normalized,
             String(""),
-            String("SDXL sample CLI route currently admits only normal scheduler metadata"),
+            String(
+                "SDXL currently executes normal, karras, exponential, simple, and "
+                + "ddim_uniform schedules; other scheduler IDs remain fail-loud"
+            ),
         )
     if b == "anima":
         if normalized == "normal":
@@ -571,14 +661,24 @@ def scheduler_admission_for_backend(
             String("SD3.5 currently admits only the simple flow-match scheduler"),
         )
     if b == "flux":
-        if normalized == "simple":
+        if (
+            normalized == "normal"
+            or normalized == "karras"
+            or normalized == "exponential"
+            or normalized == "simple"
+            or normalized == "ddim_uniform"
+            or normalized == "sgm_uniform"
+            or normalized == "beta"
+            or normalized == "linear_quadratic"
+            or normalized == "kl_optimal"
+        ):
             return SamplerAdmission(
                 True,
                 b,
                 requested,
                 normalized,
-                String("flux_simple_flowmatch"),
-                String("existing Flux Mojo worker executes its simple flow-match schedule"),
+                String("flux_swarmui_") + normalized,
+                String("Flux executes the bundled SwarmUI/Comfy ModelSamplingFlux schedule"),
             )
         return SamplerAdmission(
             False,
@@ -586,7 +686,35 @@ def scheduler_admission_for_backend(
             requested,
             normalized,
             String(""),
-            String("Flux currently admits only the simple flow-match scheduler"),
+            String("Flux supports the nine genuine general-purpose SwarmUI schedules wired to ModelSamplingFlux"),
+        )
+    if b == "chroma":
+        if (
+            normalized == "normal"
+            or normalized == "karras"
+            or normalized == "exponential"
+            or normalized == "simple"
+            or normalized == "ddim_uniform"
+            or normalized == "sgm_uniform"
+            or normalized == "beta"
+            or normalized == "linear_quadratic"
+            or normalized == "kl_optimal"
+        ):
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("chroma_swarmui_") + normalized,
+                String("Chroma executes the bundled SwarmUI/Comfy ModelSamplingFlux schedule"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("Chroma supports the nine genuine general-purpose SwarmUI schedules wired to ModelSamplingFlux"),
         )
     if b == "flux2":
         return SamplerAdmission(
@@ -676,27 +804,31 @@ def serenity_sampler_registry_json() raises -> String:
         + '"res_multistep_ancestral","res_multistep_ancestral_cfg_pp",'
         + '"gradient_estimation","gradient_estimation_cfg_pp","er_sde",'
         + '"seeds_2","seeds_3","sa_solver","sa_solver_pece","ddim","uni_pc",'
-        + '"uni_pc_bh2","flowmatch_euler"]'
+        + '"uni_pc_bh2"]'
     )
     var comfy_schedulers = String(
-        '["simple","sgm_uniform","karras","exponential","ddim_uniform","beta",'
-        + '"normal","linear_quadratic","kl_optimal","turbo","align_your_steps",'
-        + '"flux2","ltxv","ltxv-image","flowmatch","flow_match","qwen"]'
+        '["normal","karras","exponential","simple","ddim_uniform","sgm_uniform",'
+        + '"turbo","align_your_steps","beta","linear_quadratic","ltxv",'
+        + '"ltxv-image","kl_optimal","flux2","ideogram4","ideogram4turbo"]'
     )
     var zimage_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc","uni_pc_bh2"]')
-    var qwen_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
+    var qwen_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m"]')
     var ideogram_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
-    var sdxl_supported_samplers = String('["euler"]')
+    var sdxl_supported_samplers = String('["euler","ddim","dpmpp_2m"]')
     var anima_supported_samplers = String('["euler"]')
-    var sd3_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
-    var flux_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
+    var sd3_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m"]')
+    var flux_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m"]')
+    var chroma_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m"]')
     var zimage_supported_schedulers = String('["simple","flowmatch","flow_match","sgm_uniform"]')
     var qwen_supported_schedulers = String('["simple","flowmatch","flow_match"]')
     var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal","simple","flowmatch","flow_match","simple_flowmatch"]')
-    var sdxl_supported_schedulers = String('["normal"]')
+    var sdxl_supported_schedulers = String(
+        '["normal","karras","exponential","simple","ddim_uniform"]'
+    )
     var anima_supported_schedulers = String('["normal"]')
     var sd3_supported_schedulers = String('["simple","flowmatch","flow_match"]')
-    var flux_supported_schedulers = String('["simple","flowmatch","flow_match"]')
+    var flux_supported_schedulers = String('["normal","karras","exponential","simple","ddim_uniform","sgm_uniform","beta","linear_quadratic","kl_optimal"]')
+    var chroma_supported_schedulers = String('["normal","karras","exponential","simple","ddim_uniform","sgm_uniform","beta","linear_quadratic","kl_optimal"]')
     var out = String("{\n")
     out += String('  "schema":"serenity.samplers.v1",\n')
     out += String('  "source":"Serenity sampler catalog",\n')
@@ -725,7 +857,7 @@ def serenity_sampler_registry_json() raises -> String:
         qwen_supported_samplers,
         qwen_supported_schedulers,
         String("[]"),
-        String("Qwen-Image daemon admits a bounded 1024x1024 txt2img route over Euler/simple flow-match; edit, LoRA, img2img, and broad sampler/scheduler aliases remain fail-loud."),
+        String("Qwen-Image executes Euler or genuine DPM++ 2M over its dynamic-shift flow-match schedule and accepts one sparse canonical PEFT/Serenity LoRA; edit, img2img, and remaining sampler/scheduler names stay fail-loud."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -736,18 +868,18 @@ def serenity_sampler_registry_json() raises -> String:
         ideogram_supported_samplers,
         ideogram_supported_schedulers,
         String("[]"),
-        String("Ideogram-4 daemon runs a bounded 1024x1024 txt2img path with explicit logit-normal Euler semantics; non-Euler sampler and broad scheduler aliases remain fail-loud."),
+        String("Ideogram-4 runs bounded txt2img with logit-normal or simple Euler semantics and accepts one creator-compatible conditional-trunk LoRA; non-Euler sampler names remain fail-loud."),
     )
     out += String(",\n    ")
     out += _backend_json(
         String("sdxl"),
         String("sdxl"),
-        String("sdxl_euler_fixed_cli"),
-        String("sdxl_normal_fixed_cli"),
+        String("sdxl_euler_or_dpmpp_2m"),
+        String("sdxl_swarmui_schedule"),
         sdxl_supported_samplers,
         sdxl_supported_schedulers,
         String("[]"),
-        String("SDXL daemon route delegates to the existing Mojo SDXL sample CLI: fixed 1024x1024, 30 steps, cfg 7.5, seed 42, pre-encoded caps_pos sidecar required. This is a bounded route, not full Comfy sampler parity."),
+        String("SDXL executes Comfy Euler/DDIM-alias and DPM++ 2M over normal, Karras, exponential, simple, or DDIM-uniform schedules. Other algorithms remain fail-loud."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -758,7 +890,7 @@ def serenity_sampler_registry_json() raises -> String:
         anima_supported_samplers,
         anima_supported_schedulers,
         String("[]"),
-        String("Anima daemon route delegates to the existing Mojo Anima sample CLI: fixed 1024x1024, 30 steps, cfg 4.5, pre-encoded caps_pos/caps_neg sidecars required. This is a bounded route, not full Comfy sampler parity."),
+        String("Anima's product backend executes its existing Euler/normal runtime and loads one canonical PEFT LoRA through the creator training/resume target contract. This remains a bounded route, not full Comfy sampler parity."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -769,7 +901,7 @@ def serenity_sampler_registry_json() raises -> String:
         sd3_supported_samplers,
         sd3_supported_schedulers,
         String("[]"),
-        String("SD3.5 worker admits the bounded 1024x1024 Euler/simple flow-match route backed by the streamed MMDiT and embedded VAE path. LoRA and image-conditioning remain fail-loud."),
+        String("SD3.5 executes Euler or genuine DPM++ 2M over the simple flow-match schedule and loads one SimpleTuner/LyCORIS LoKr through the SwarmUI/Comfy Kronecker bypass; image-conditioning remains fail-loud."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -780,7 +912,18 @@ def serenity_sampler_registry_json() raises -> String:
         flux_supported_samplers,
         flux_supported_schedulers,
         String("[]"),
-        String("Flux worker admits the bounded 1024x1024 Euler/simple flow-match route; negative prompt, image-conditioning, and multiple LoRAs remain fail-loud."),
+        String("Flux executes Euler or genuine DPM++ 2M over nine genuine SwarmUI ModelSamplingFlux schedules and loads one creator-compatible LoRA; negative prompt and image-conditioning remain fail-loud."),
+    )
+    out += String(",\n    ")
+    out += _backend_json(
+        String("chroma"),
+        String("chroma"),
+        String("chroma_cfg_flowmatch_euler"),
+        String("chroma_swarmui_beta"),
+        chroma_supported_samplers,
+        chroma_supported_schedulers,
+        String("[]"),
+        String("Chroma executes real-CFG Euler or genuine DPM++ 2M over nine genuine SwarmUI ModelSamplingFlux schedules, including the creator-default beta schedule, and accepts one creator-compatible LoRA."),
     )
     out += String("\n  ],\n")
     out += String('  "non_claims":[\n')

@@ -16,7 +16,7 @@
 #
 # Unlike FLUX.1-dev (guidance-distilled, negative discarded), Chroma runs REAL
 # CFG: the negative prompt IS encoded and drives the uncond forward; params.cfg
-# is the CFG multiplier (default 4.0 — the verified pipeline's GUIDANCE).
+# is the CFG multiplier (publisher profile default 3.0).
 #
 # Residency model (16 GB GPU, Chroma1-HD ~17.8 GB BF16 on disk — must stream):
 #   * The Chroma DiT is NEVER fully resident: ChromaShared (approximator +
@@ -56,8 +56,9 @@
 # VAE decode. Product admission follows this exact finite ladder. Rectangular
 # denoise remains slower than square on the 16GB product GPU.
 #
-# LoRA: NOT supported (Chroma has no LoRA hook in the Mojo stack yet) — fail
-# loud. img2img: NOT supported — fail loud.
+# LoRA: one runtime additive Chroma overlay is supported.  The product path
+# accepts ai-toolkit BFL-fused and Diffusers/PEFT projection keys and never
+# modifies the checkpoint. img2img: NOT supported — fail loud.
 
 from std.collections import Optional
 from std.ffi import external_call
@@ -76,6 +77,9 @@ from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_in
 from serenitymojo.offload.turbo_loader import TurboBlockLoader
 
 from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
+from serenitymojo.models.chroma.chroma_lora_overlay import (
+    ChromaLoraOverlay, load_chroma_lora,
+)
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.serve.chroma_encode_subprocess import encode_captions_subprocess
@@ -83,7 +87,15 @@ from serenitymojo.serve.chroma_decode_subprocess import decode_whole_subprocess
 from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
-from serenitymojo.sampling.flux1_dev import build_flux1_sigma_schedule
+from serenitymojo.sampling.swarmui_schedules import (
+    build_swarm_flux_schedule,
+)
+from serenitymojo.sampling.dpmpp_2m import (
+    MultistepHistory,
+    denoised_from_velocity,
+    dpmpp_2m_step,
+    lambda_from_sigma_f64,
+)
 from serenitymojo.sampling.sampler_registry import (
     normalize_sampler_name, normalize_scheduler_name,
 )
@@ -120,9 +132,9 @@ from serenitymojo.serve.product_manifest import (
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
-# Verified pipeline defaults (chroma_pipeline_1024_multistep NUM_STEPS/GUIDANCE).
-comptime DEFAULT_STEPS = 30
-comptime DEFAULT_GUIDANCE = Float32(4.0)
+# Chroma1-HD publisher inference profile.
+comptime DEFAULT_STEPS = 40
+comptime DEFAULT_GUIDANCE = Float32(3.0)
 
 
 comptime CPHASE_IDLE = 0
@@ -210,6 +222,7 @@ def _chroma_forward_turbo[N_IMG_: Int](
     rope_cos: Tensor,
     rope_sin: Tensor,
     real_txt_len: Int,
+    lora: Optional[ArcPointer[ChromaLoraOverlay]],
     ctx: DeviceContext,
 ) raises -> Tensor:
     # Stage block 0 first: its DMA overlaps the approximator + embedder compute.
@@ -249,7 +262,7 @@ def _chroma_forward_turbo[N_IMG_: Int](
 
         var res = _double_block_shape[N_IMG_](
             i, img, x_txt, img_mod_s, txt_mod_s, rope_cos, rope_sin,
-            real_txt_len, block, ctx,
+            real_txt_len, block, ctx, lora,
         )
         img = _clone(res[0], ctx)
         x_txt = _clone(res[1], ctx)
@@ -269,7 +282,7 @@ def _chroma_forward_turbo[N_IMG_: Int](
         var sgl_mod_s = slice(pooled_temb, 1, MOD_SGL_OFF + 3 * i, 3, ctx)
 
         x = _single_block_shape[N_IMG_](
-            i, x, sgl_mod_s, rope_cos, rope_sin, real_txt_len, block, ctx,
+            i, x, sgl_mod_s, rope_cos, rope_sin, real_txt_len, block, ctx, lora,
         )
         loader.mark_active_slot_compute_done(ctx)
 
@@ -299,6 +312,8 @@ struct ChromaBackend(GenBackend, Movable):
     var loader: List[ArcPointer[TurboBlockLoader]]  # 0/1 (async block-stream handle)
     var rope_cos: List[ArcPointer[Tensor]]       # 0/1
     var rope_sin: List[ArcPointer[Tensor]]       # 0/1
+    var lora: List[ArcPointer[ChromaLoraOverlay]]  # 0/1 additive runtime overlay
+    var lora_factor_count: Int
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -308,11 +323,18 @@ struct ChromaBackend(GenBackend, Movable):
     var cur: Int
     var params: JobParams
     var guidance: Float32
+    var executed_sampler: String
+    var executed_scheduler: String
+    var dpmpp_history: MultistepHistory
+    var dpmpp_history_final_len: Int
+    var dpmpp_update_steps: Int
+    var dpmpp_second_order_steps: Int
     var t5_cond: List[ArcPointer[Tensor]]        # 0/1 [1,512,4096] BF16
     var t5_uncond: List[ArcPointer[Tensor]]      # 0/1 [1,512,4096] BF16
     var cond_real_len: Int                       # unpadded T5 token count (MJ-1048 mask)
     var uncond_real_len: Int
     var sched: List[Float32]                     # flow-match sigma table (steps+1)
+    var runtime_steps: Int                       # len(sched)-1; DDIM may exceed request
     var latent: List[ArcPointer[Tensor]]         # 0/1 (packed [1,N_IMG,64] BF16)
     var vae_decode_grid: String                  # executed decode path (manifest)
     var job_t0_ns: UInt
@@ -331,6 +353,8 @@ struct ChromaBackend(GenBackend, Movable):
         self.loader = List[ArcPointer[TurboBlockLoader]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
+        self.lora = List[ArcPointer[ChromaLoraOverlay]]()
+        self.lora_factor_count = 0
         self.active = False
         self.cancel_flag = False
         self.phase = CPHASE_IDLE
@@ -338,11 +362,18 @@ struct ChromaBackend(GenBackend, Movable):
         self.cur = 0
         self.params = JobParams()
         self.guidance = DEFAULT_GUIDANCE
+        self.executed_sampler = String("chroma_cfg_flowmatch_euler")
+        self.executed_scheduler = String("")
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
         self.t5_cond = List[ArcPointer[Tensor]]()
         self.t5_uncond = List[ArcPointer[Tensor]]()
         self.cond_real_len = N_TXT
         self.uncond_real_len = N_TXT
         self.sched = List[Float32]()
+        self.runtime_steps = 0
         self.latent = List[ArcPointer[Tensor]]()
         self.vae_decode_grid = String("")
         self.job_t0_ns = UInt(0)
@@ -375,25 +406,39 @@ struct ChromaBackend(GenBackend, Movable):
         reject_unsupported_conditioning_mask_params(params, String("chroma"))
         reject_unsupported_mask_image_params(params, String("chroma"))
         reject_unsupported_lanpaint_params(params, String("chroma"))
-        # Local sampler/scheduler admission: the sampler registry has no chroma
-        # arm yet (its unknown-backend fallback ACCEPTS everything, which is not
-        # an admission gate) — so gate here on the one executed pair.
+        # Chroma's SwarmUI creator default is Euler + beta.  Keep the previous
+        # Serenity simple flow schedule available as an explicit user choice.
         var norm_sampler = normalize_sampler_name(params.sampler)
         if norm_sampler == String(""):
             norm_sampler = String("euler")
-        if not (norm_sampler == String("euler") or norm_sampler == String("flowmatch_euler")):
+        if not (
+            norm_sampler == String("euler")
+            or norm_sampler == String("flowmatch_euler")
+            or norm_sampler == String("dpmpp_2m")
+        ):
             raise Error(
                 String("chroma: unsupported sampler '") + params.sampler
-                + String("'; only euler/flowmatch_euler is served (the verified"
-                         " Chroma CFG flow-match Euler path)")
+                + String("'; supported: euler/flowmatch_euler, dpmpp_2m")
             )
         var norm_scheduler = normalize_scheduler_name(params.scheduler)
         if norm_scheduler == String(""):
-            norm_scheduler = String("simple")
-        if norm_scheduler != String("simple"):
+            norm_scheduler = String("beta")
+        if not (
+            norm_scheduler == String("normal")
+            or norm_scheduler == String("karras")
+            or norm_scheduler == String("exponential")
+            or norm_scheduler == String("simple")
+            or norm_scheduler == String("ddim_uniform")
+            or norm_scheduler == String("sgm_uniform")
+            or norm_scheduler == String("beta")
+            or norm_scheduler == String("linear_quadratic")
+            or norm_scheduler == String("kl_optimal")
+        ):
             raise Error(
                 String("chroma: unsupported scheduler '") + params.scheduler
-                + String("'; only the simple flow-match schedule is served")
+                + String("'; supported: normal, karras, exponential, simple,"
+                         " ddim_uniform, sgm_uniform, beta, linear_quadratic,"
+                         " kl_optimal")
             )
         if not _chroma_shape_supported(params.width, params.height):
             raise Error(
@@ -402,11 +447,13 @@ struct ChromaBackend(GenBackend, Movable):
                 + " — only 1024x1024 is product-admitted; rectangular Chroma"
                 + " core arms remain gated after measured ~24x denoise slowdown"
             )
-        if len(params.loras) > 0:
+        if len(params.loras) > 1:
             raise Error(
-                "chroma: LoRA is not supported for Chroma1-HD yet;"
-                " submit without LoRAs"
+                "chroma: this product path currently accepts one additive LoRA;"
+                " remove extra LoRAs"
             )
+        if len(params.loras) == 1 and params.loras[0].name == String(""):
+            raise Error("chroma: selected LoRA path is empty")
         if params.init_image.byte_length() > 0:
             raise Error(
                 "chroma: img2img is not supported for Chroma1-HD yet;"
@@ -416,13 +463,24 @@ struct ChromaBackend(GenBackend, Movable):
         # unsupported by this fixed CFG flow-match Euler path.
         warn_unsupported_advanced_sampling_params(params, String("chroma"), List[String]())
         self.params = params.copy()
+        self.executed_sampler = (
+            String("dpmpp_2m")
+            if norm_sampler == String("dpmpp_2m")
+            else String("chroma_cfg_flowmatch_euler")
+        )
+        self.executed_scheduler = norm_scheduler
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
+        self.runtime_steps = 0
         # Honor steps at runtime; <=0 means unset/invalid -> the verified
-        # pipeline default 30 (chroma_pipeline_1024_multistep NUM_STEPS).
+        # Publisher default is 40 inference steps.
         if self.params.steps <= 0:
             self.params.steps = DEFAULT_STEPS
         # Chroma runs REAL CFG: params.cfg is the CFG multiplier
         # (pred = uncond + cfg*(cond-uncond)). cfg<=0 means unset/invalid ->
-        # the verified pipeline default 4.0 (GUIDANCE).
+        # the publisher default 3.0.
         self.guidance = Float32(self.params.cfg) if self.params.cfg > 0.0 else DEFAULT_GUIDANCE
         self.active = True
         self.cancel_flag = False
@@ -435,6 +493,7 @@ struct ChromaBackend(GenBackend, Movable):
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
+        self.lora_factor_count = 0
         var mem = cu_mem_get_info()
         self.total_vram_bytes = mem.total_bytes
         self.min_free_bytes = mem.free_bytes
@@ -469,8 +528,8 @@ struct ChromaBackend(GenBackend, Movable):
         self._record_vram()
         var manifest_path = png_path + String(".chroma_daemon_result.json")
         var denoise_per_step = Float64(0.0)
-        if self.params.steps > 0:
-            denoise_per_step = self.denoise_seconds / Float64(self.params.steps)
+        if self.runtime_steps > 0:
+            denoise_per_step = self.denoise_seconds / Float64(self.runtime_steps)
         var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
         var peak_mib = Float64(0.0)
         if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
@@ -491,13 +550,14 @@ struct ChromaBackend(GenBackend, Movable):
         content += String('    "seed":') + String(self.params.seed) + String(",\n")
         content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
         content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "executed_steps":') + String(self.runtime_steps) + String(",\n")
         content += String('    "cfg":') + String(self.guidance) + String(",\n")
         content += String('    "sampler_registry_backend":"chroma",\n')
         content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
-        content += String('    "executed_sampler":"chroma_cfg_flowmatch_euler",\n')
-        content += String('    "executed_scheduler":"flux_simple_flowmatch",\n')
-        content += String('    "schedule_source":"flux1_dev_flowmatch",\n')
+        content += String('    "executed_sampler":"') + json_escape(self.executed_sampler) + String('",\n')
+        content += String('    "executed_scheduler":"chroma_swarmui_') + json_escape(self.executed_scheduler) + String('",\n')
+        content += String('    "schedule_source":"swarmui_comfy_model_sampling_flux_1_15",\n')
         content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
         content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
         content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
@@ -505,6 +565,17 @@ struct ChromaBackend(GenBackend, Movable):
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "loaded_lora":"') + json_escape(
+            self.params.loras[0].name if len(self.params.loras) == 1 else String("")
+        ) + String('",\n')
+        content += String('    "lora_weight":') + String(
+            self.params.loras[0].weight if len(self.params.loras) == 1 else Float64(1.0)
+        ) + String(",\n")
+        content += String('    "lora_factor_count":') + String(self.lora_factor_count) + String(",\n")
+        content += String('    "sampler_trace":{"history_capacity":1,"history_final_len":')
+        content += String(self.dpmpp_history_final_len) + String(',"dpmpp_update_steps":')
+        content += String(self.dpmpp_update_steps) + String(',"dpmpp_second_order_steps":')
+        content += String(self.dpmpp_second_order_steps) + String("},\n")
         content += String('    "cond_real_len":') + String(self.cond_real_len) + String(",\n")
         content += String('    "uncond_real_len":') + String(self.uncond_real_len) + String(",\n")
         content += String('    "vae_decode_tile_grid":"') + json_escape(self.vae_decode_grid) + String('",\n')
@@ -564,6 +635,7 @@ struct ChromaBackend(GenBackend, Movable):
         self.loader = List[ArcPointer[TurboBlockLoader]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
+        self.lora = List[ArcPointer[ChromaLoraOverlay]]()
         self.loaded = False
 
     def _load_model_shape[LH_: Int, LW_: Int, N_IMG_: Int](mut self) raises:
@@ -574,6 +646,26 @@ struct ChromaBackend(GenBackend, Movable):
         if self.loaded:
             return
         _print_vram("before Chroma shared-weight load")
+        self.lora = List[ArcPointer[ChromaLoraOverlay]]()
+        if len(self.params.loras) == 1:
+            print(
+                "[chroma] loading additive LoRA:",
+                self.params.loras[0].name,
+                "weight",
+                self.params.loras[0].weight,
+            )
+            var overlay = load_chroma_lora(
+                self.params.loras[0].name,
+                N_DBL,
+                N_SGL,
+                Float32(self.params.loras[0].weight),
+                self.ctx,
+            )
+            self.lora_factor_count = overlay.count()
+            self.lora.append(ArcPointer(overlay^))
+        else:
+            self.lora_factor_count = 0
+            self.lora.append(ArcPointer(ChromaLoraOverlay.empty()))
         print("[chroma] loading Chroma1-HD shared weights from", CHROMA_CKPT)
         self.shared = List[ArcPointer[ChromaShared]]()
         self.shared.append(ArcPointer(ChromaShared.load(String(CHROMA_CKPT), self.ctx)))
@@ -609,9 +701,14 @@ struct ChromaBackend(GenBackend, Movable):
         raise Error("chroma: admitted load shape was not compiled")
 
     def _prepare_job_shape[LH_: Int, LW_: Int, N_IMG_: Int](mut self) raises:
-        """Flow-match sigma table (honors steps) + seeded initial packed latent
-        (honors seed). Mirrors the pipeline's Stage 5/6 (BF16 noise → pack)."""
-        self.sched = build_flux1_sigma_schedule(self.params.steps, N_IMG_)
+        """Selected creator-compatible sigma table + seeded initial packed latent."""
+        self.sched = build_swarm_flux_schedule(
+            self.executed_scheduler, self.params.steps
+        )
+        # Comfy's ddim_uniform can contain one more denoise interval than the
+        # requested count when 10,000 is not evenly divisible. Preserve and
+        # execute that exact creator schedule.
+        self.runtime_steps = len(self.sched) - 1
         var nsh = [1, LC, LH_, LW_]
         var noise = randn(nsh.copy(), UInt64(self.params.seed), STDtype.BF16, self.ctx)
         if self.params.variation_strength > 0.0:
@@ -633,7 +730,8 @@ struct ChromaBackend(GenBackend, Movable):
         self.latent.append(ArcPointer(packed^))
         print(
             "[chroma] job", self.params.job_id, ":", self.params.steps,
-            "steps, cfg", self.guidance, "seed", self.params.seed,
+            "requested steps,", self.runtime_steps, "executed steps, cfg",
+            self.guidance, "seed", self.params.seed,
             "size", self.params.width, "x", self.params.height,
             "(Chroma real CFG; negative prompt IS used)",
         )
@@ -661,13 +759,17 @@ struct ChromaBackend(GenBackend, Movable):
         var pred_cond = _chroma_forward_turbo[N_IMG_](
             self.shared[0][], self.loader[0][], self.latent[0][],
             self.t5_cond[0][], t_curr, self.rope_cos[0][], self.rope_sin[0][],
-            self.cond_real_len, self.ctx,
+            self.cond_real_len,
+            Optional[ArcPointer[ChromaLoraOverlay]](self.lora[0]),
+            self.ctx,
         )
         # Unconditioned forward
         var pred_uncond = _chroma_forward_turbo[N_IMG_](
             self.shared[0][], self.loader[0][], self.latent[0][],
             self.t5_uncond[0][], t_curr, self.rope_cos[0][], self.rope_sin[0][],
-            self.uncond_real_len, self.ctx,
+            self.uncond_real_len,
+            Optional[ArcPointer[ChromaLoraOverlay]](self.lora[0]),
+            self.ctx,
         )
 
         # CFG: pred = uncond + guidance * (cond - uncond)
@@ -676,9 +778,33 @@ struct ChromaBackend(GenBackend, Movable):
         var scaled_diff = mul_scalar(diff, self.guidance, self.ctx)
         var pred = add(pred_uncond, scaled_diff, self.ctx)
 
-        # Euler step: x = x + dt * pred
-        var step_delta = mul_scalar(pred, dt, self.ctx)
-        var x_new = add(self.latent[0][], step_delta, self.ctx)
+        var x_new: Tensor
+        if self.executed_sampler == "dpmpp_2m":
+            var latent_f32 = cast_tensor(self.latent[0][], STDtype.F32, self.ctx)
+            var pred_f32 = cast_tensor(pred, STDtype.F32, self.ctx)
+            var denoised = denoised_from_velocity(
+                latent_f32, pred_f32, t_curr, self.ctx
+            )
+            if not self.dpmpp_history.is_empty():
+                self.dpmpp_second_order_steps += 1
+            var stepped = dpmpp_2m_step(
+                latent_f32,
+                denoised,
+                t_curr,
+                t_next,
+                self.dpmpp_history,
+                self.ctx,
+            )
+            self.dpmpp_history.push(
+                denoised^,
+                lambda_from_sigma_f64(Float64(t_curr)),
+            )
+            self.dpmpp_update_steps += 1
+            x_new = cast_tensor(stepped, STDtype.BF16, self.ctx)
+        else:
+            # Euler step: x = x + dt * pred
+            var step_delta = mul_scalar(pred, dt, self.ctx)
+            x_new = add(self.latent[0][], step_delta, self.ctx)
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x_new^))
 
@@ -704,6 +830,8 @@ struct ChromaBackend(GenBackend, Movable):
         self.t5_uncond = List[ArcPointer[Tensor]]()
         self.sched = List[Float32]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.dpmpp_history_final_len = self.dpmpp_history.len()
+        self.dpmpp_history = MultistepHistory(1)
         self._free_dit()
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
@@ -757,12 +885,19 @@ struct ChromaBackend(GenBackend, Movable):
         self.t5_cond = List[ArcPointer[Tensor]]()
         self.t5_uncond = List[ArcPointer[Tensor]]()
         self.sched = List[Float32]()
+        self.runtime_steps = 0
         self.latent = List[ArcPointer[Tensor]]()
+        self.dpmpp_history = MultistepHistory(1)
+        self.dpmpp_history_final_len = 0
+        self.dpmpp_update_steps = 0
+        self.dpmpp_second_order_steps = 0
 
     # ── the pull-based tick ───────────────────────────────────────────────────
     def step(mut self) raises -> StepResult:
         var r = StepResult()
-        r.total = self.params.steps
+        r.total = (
+            self.runtime_steps if self.runtime_steps > 0 else self.params.steps
+        )
         if not self.active:
             r.failed = True
             r.error = String("no active job")
@@ -821,13 +956,13 @@ struct ChromaBackend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
-                if self.cur >= self.params.steps:
+                if self.cur >= self.runtime_steps:
                     self.phase = CPHASE_DECODE
                 return r^
             if not self.announced:
                 # announce BEFORE the long blocking VAE-decode tick.
                 self.announced = True
-                r.step = self.params.steps
+                r.step = self.runtime_steps
                 r.phase = String("decoding")
                 return r^
             var decode_t0 = perf_counter_ns()
@@ -836,7 +971,7 @@ struct ChromaBackend(GenBackend, Movable):
             self._record_vram()
             var manifest = self._write_result_manifest(path)
             print("[chroma][manifest] saved:", manifest)
-            r.step = self.params.steps
+            r.step = self.runtime_steps
             self._clear_job()
             r.done = True
             r.output_path = path

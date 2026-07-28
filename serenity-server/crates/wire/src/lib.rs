@@ -91,6 +91,9 @@ impl LoraSpec {
 pub struct JobParams {
     pub job_id: String,
     pub model: String,
+    /// Exact registry-resolved checkpoint selected by the user. Empty preserves
+    /// the canonical built-in profile for legacy API callers.
+    pub checkpoint_path: String,
     pub prompt: String,
     pub negative: String,
     pub width: i64,
@@ -190,6 +193,7 @@ impl Default for JobParams {
         JobParams {
             job_id: String::new(),
             model: String::new(),
+            checkpoint_path: String::new(),
             prompt: String::new(),
             negative: String::new(),
             width: 512,
@@ -341,6 +345,7 @@ mod tests {
         let mut p = JobParams::default();
         p.job_id = "j1".into();
         p.model = "stub".into();
+        p.checkpoint_path = "/tmp/custom.safetensors".into();
         p.prompt = "hello".into();
         p.out_dir = "/tmp".into();
         let line = p.to_start_line();
@@ -348,6 +353,7 @@ mod tests {
         assert_eq!(v["cmd"], "start");
         assert_eq!(v["job_id"], "j1");
         assert_eq!(v["model"], "stub");
+        assert_eq!(v["checkpoint_path"], "/tmp/custom.safetensors");
         assert_eq!(v["width"], 512); // default carried
         assert_eq!(v["cfg"], 4.5);
         assert!(v.get("lora").unwrap().is_array());

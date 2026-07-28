@@ -47,27 +47,25 @@
       "sa_solver_pece",
       "ddim",
       "uni_pc",
-      "uni_pc_bh2",
-      "flowmatch_euler"
+      "uni_pc_bh2"
     ],
     "schedulers": [
-      "simple",
-      "sgm_uniform",
+      "normal",
       "karras",
       "exponential",
+      "simple",
       "ddim_uniform",
-      "beta",
-      "normal",
-      "linear_quadratic",
-      "kl_optimal",
+      "sgm_uniform",
       "turbo",
       "align_your_steps",
-      "flux2",
+      "beta",
+      "linear_quadratic",
       "ltxv",
       "ltxv-image",
-      "flowmatch",
-      "flow_match",
-      "qwen"
+      "kl_optimal",
+      "flux2",
+      "ideogram4",
+      "ideogram4turbo"
     ]
   },
   "backends": [
@@ -105,7 +103,8 @@
       "supported_samplers": [
         "euler",
         "flowmatch_euler",
-        "flow_match_euler"
+        "flow_match_euler",
+        "dpmpp_2m"
       ],
       "supported_schedulers": [
         "simple",
@@ -114,7 +113,7 @@
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Qwen-Image daemon admits a bounded 1024x1024 txt2img route over Euler/simple flow-match; edit, LoRA, img2img, and broad sampler/scheduler aliases remain fail-loud."
+      "reason": "Qwen-Image executes Euler or genuine DPM++ 2M over its dynamic-shift flow-match schedule and accepts one sparse canonical PEFT/Serenity LoRA; edit and img2img remain fail-loud."
     },
     {
       "backend": "ideogram4",
@@ -139,23 +138,29 @@
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Ideogram-4 daemon runs a bounded 1024x1024 txt2img path with explicit logit-normal Euler semantics and bounded Comfy simple AuraFlow scheduler admission; non-Euler sampler and broad scheduler aliases remain fail-loud."
+      "reason": "Ideogram-4 runs bounded txt2img with logit-normal or simple Euler semantics and accepts one creator-compatible conditional-trunk LoRA; non-Euler sampler names remain fail-loud."
     },
     {
       "backend": "sdxl",
       "model_family": "sdxl",
       "accepted_sampler_parity": false,
-      "executed_sampler": "sdxl_euler_fixed_cli",
-      "executed_scheduler": "normal",
+      "executed_sampler": "sdxl_euler_or_dpmpp_2m",
+      "executed_scheduler": "sdxl_swarmui_schedule",
       "supported_samplers": [
-        "euler"
+        "euler",
+        "ddim",
+        "dpmpp_2m"
       ],
       "supported_schedulers": [
-        "normal"
+        "normal",
+        "karras",
+        "exponential",
+        "simple",
+        "ddim_uniform"
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "SDXL daemon route delegates to the existing Mojo SDXL sample CLI: fixed 1024x1024, 30 steps, euler/normal only. This is a bounded route, not full Comfy sampler parity."
+      "reason": "SDXL executes Comfy Euler/DDIM-alias and DPM++ 2M over normal, Karras, exponential, simple, or DDIM-uniform schedules. Kohya LoRAs compose separately; remaining Swarm algorithms stay fail-loud until their distinct denoise loops are implemented and proven."
     },
     {
       "backend": "anima",
@@ -171,7 +176,7 @@
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Anima daemon route delegates to the existing Mojo Anima sample CLI: fixed 1024x1024, 30 steps, cfg 4.5, pre-encoded caps_pos/caps_neg sidecars required. This is a bounded route, not full Comfy sampler parity."
+      "reason": "Anima's product backend executes its existing Euler/normal runtime and loads one canonical PEFT LoRA through the creator training/resume target contract. This remains a bounded route, not full Comfy sampler parity."
     },
     {
       "backend": "sd3",
@@ -182,7 +187,8 @@
       "supported_samplers": [
         "euler",
         "flowmatch_euler",
-        "flow_match_euler"
+        "flow_match_euler",
+        "dpmpp_2m"
       ],
       "supported_schedulers": [
         "simple",
@@ -191,20 +197,61 @@
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "SD3.5 worker admits the bounded 1024x1024 Euler/simple flow-match route backed by the streamed MMDiT and embedded VAE path. LoRA and image-conditioning remain fail-loud."
+      "reason": "SD3.5 worker executes Euler or genuine DPM++ 2M data prediction over the shifted simple flow-match schedule. SimpleTuner/LyCORIS full-factor attention LoKr runs through the SwarmUI/Comfy efficient Kronecker bypass; image-conditioning remains fail-loud."
+    },
+    {
+      "backend": "chroma",
+      "model_family": "chroma",
+      "accepted_sampler_parity": false,
+      "executed_sampler": "chroma_cfg_flowmatch_euler",
+      "executed_scheduler": "chroma_swarmui_beta",
+      "supported_samplers": [
+        "euler",
+        "flowmatch_euler",
+        "flow_match_euler",
+        "dpmpp_2m"
+      ],
+      "supported_schedulers": [
+        "normal",
+        "karras",
+        "exponential",
+        "simple",
+        "ddim_uniform",
+        "sgm_uniform",
+        "beta",
+        "linear_quadratic",
+        "kl_optimal"
+      ],
+      "blocked_samplers": [],
+      "unsupported_policy": "fail_loud",
+      "reason": "Chroma executes real-CFG Euler or genuine DPM++ 2M over nine genuine SwarmUI ModelSamplingFlux schedules, including the creator-default beta schedule, and accepts one creator-compatible LoRA."
     },
     {
       "backend": "flux",
       "model_family": "flux",
-      "production_status": "blocked",
       "accepted_sampler_parity": false,
-      "executed_sampler": "",
-      "executed_scheduler": "",
-      "supported_samplers": [],
-      "supported_schedulers": [],
+      "executed_sampler": "flux_flowmatch_euler_or_dpmpp_2m",
+      "executed_scheduler": "flux_simple_flowmatch",
+      "supported_samplers": [
+        "euler",
+        "flowmatch_euler",
+        "flow_match_euler",
+        "dpmpp_2m"
+      ],
+      "supported_schedulers": [
+        "normal",
+        "karras",
+        "exponential",
+        "simple",
+        "ddim_uniform",
+        "sgm_uniform",
+        "beta",
+        "linear_quadratic",
+        "kl_optimal"
+      ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Flux.1-dev reached the Rust-server browser workflow worker at 1024x1024/20 steps but failed with CUDA OOM at 6/20 on 2026-06-17 after the worker reached about 22.3 GiB VRAM; keep blocked until the real worker memory gate passes."
+      "reason": "Flux executes Euler or genuine DPM++ 2M over nine genuine SwarmUI ModelSamplingFlux schedules and loads one creator-compatible LoRA; negative prompt and image-conditioning remain fail-loud."
     },
     {
       "backend": "flux2",

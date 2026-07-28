@@ -41,7 +41,9 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors, TensorRef
 from serenitymojo.io.tensor_view import TensorView, from_parts
-from serenitymojo.ops.tensor_algebra import transpose, concat, slice, add, mul_scalar
+from serenitymojo.ops.tensor_algebra import (
+    transpose, concat, slice, add, mul_scalar, reshape,
+)
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.models.dit.ltx2_dit import LTX2AVBlockWeights
@@ -426,6 +428,266 @@ def _map_diffusion_model(prefix: String) -> LoraMapping:
     return LoraMapping(prefix, target, SLOT_FULL, 0, 0)
 
 
+def _rewrite_sdxl_resblock_tail(encoded: String) -> String:
+    """Diffusers SDXL ResBlock leaf names -> LDM checkpoint leaf names.
+
+    This is the Mojo equivalent of EriDiffusion
+    `rewrite_kohya_diffusers_to_ldm::rewrite_resblock_submodule`.
+    It is called only after a ResBlock root matched, so transformer-block
+    `norm1`/`norm2` names are never rewritten accidentally.
+    """
+    var out = encoded.replace("_norm1", "_in_layers_0")
+    out = out.replace("_conv1", "_in_layers_2")
+    out = out.replace("_time_emb_proj", "_emb_layers_1")
+    out = out.replace("_norm2", "_out_layers_0")
+    out = out.replace("_conv2", "_out_layers_3")
+    out = out.replace("_conv_shortcut", "_skip_connection")
+    return out
+
+
+def _rewrite_sdxl_root(
+    prefix: String,
+    old_root: String,
+    new_root: String,
+    resblock: Bool = False,
+    downsample: Bool = False,
+) -> String:
+    """Replace one exact kohya-encoded module root, preserving its leaf tail."""
+    var tail = String("")
+    if prefix == old_root:
+        pass
+    elif prefix.startswith(old_root + "_"):
+        tail = _substr_bytes(prefix, old_root.byte_length(), prefix.byte_length())
+    else:
+        return String("")
+    if resblock:
+        tail = _rewrite_sdxl_resblock_tail(tail)
+    elif downsample:
+        tail = tail.replace("_conv", "_op")
+    return new_root + tail
+
+
+def _rewrite_kohya_diffusers_to_ldm(prefix: String) -> String:
+    """Rewrite an SDXL kohya Diffusers prefix to Serenity's LDM prefix.
+
+    This is a direct table port of the creator/reference implementation in
+    `/home/alex/EriDiffusion/inference-flame/src/lora_merge.rs`. Returning ""
+    means the prefix is not a supported SDXL UNet module.
+    """
+    if prefix == "lora_unet_conv_in":
+        return String("lora_unet_input_blocks_0_0")
+    if prefix == "lora_unet_conv_norm_out":
+        return String("lora_unet_out_0")
+    if prefix == "lora_unet_conv_out":
+        return String("lora_unet_out_2")
+    if prefix == "lora_unet_time_embedding_linear_1":
+        return String("lora_unet_time_embed_0")
+    if prefix == "lora_unet_time_embedding_linear_2":
+        return String("lora_unet_time_embed_2")
+    if prefix == "lora_unet_add_embedding_linear_1":
+        return String("lora_unet_label_emb_0_0")
+    if prefix == "lora_unet_add_embedding_linear_2":
+        return String("lora_unet_label_emb_0_2")
+
+    var out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_0_resnets_0",
+        "lora_unet_input_blocks_1_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_0_resnets_1",
+        "lora_unet_input_blocks_2_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_0_downsamplers_0",
+        "lora_unet_input_blocks_3_0", downsample=True,
+    )
+    if out.byte_length() > 0:
+        return out
+
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_1_resnets_0",
+        "lora_unet_input_blocks_4_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_1_attentions_0",
+        "lora_unet_input_blocks_4_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_1_resnets_1",
+        "lora_unet_input_blocks_5_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_1_attentions_1",
+        "lora_unet_input_blocks_5_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_1_downsamplers_0",
+        "lora_unet_input_blocks_6_0", downsample=True,
+    )
+    if out.byte_length() > 0:
+        return out
+
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_2_resnets_0",
+        "lora_unet_input_blocks_7_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_2_attentions_0",
+        "lora_unet_input_blocks_7_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_2_resnets_1",
+        "lora_unet_input_blocks_8_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_down_blocks_2_attentions_1",
+        "lora_unet_input_blocks_8_1",
+    )
+    if out.byte_length() > 0:
+        return out
+
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_mid_block_resnets_0",
+        "lora_unet_middle_block_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_mid_block_attentions_0",
+        "lora_unet_middle_block_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_mid_block_resnets_1",
+        "lora_unet_middle_block_2", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_resnets_0",
+        "lora_unet_output_blocks_0_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_attentions_0",
+        "lora_unet_output_blocks_0_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_resnets_1",
+        "lora_unet_output_blocks_1_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_attentions_1",
+        "lora_unet_output_blocks_1_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_resnets_2",
+        "lora_unet_output_blocks_2_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_attentions_2",
+        "lora_unet_output_blocks_2_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_0_upsamplers_0",
+        "lora_unet_output_blocks_2_2",
+    )
+    if out.byte_length() > 0:
+        return out
+
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_resnets_0",
+        "lora_unet_output_blocks_3_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_attentions_0",
+        "lora_unet_output_blocks_3_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_resnets_1",
+        "lora_unet_output_blocks_4_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_attentions_1",
+        "lora_unet_output_blocks_4_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_resnets_2",
+        "lora_unet_output_blocks_5_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_attentions_2",
+        "lora_unet_output_blocks_5_1",
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_1_upsamplers_0",
+        "lora_unet_output_blocks_5_2",
+    )
+    if out.byte_length() > 0:
+        return out
+
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_2_resnets_0",
+        "lora_unet_output_blocks_6_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_2_resnets_1",
+        "lora_unet_output_blocks_7_0", resblock=True,
+    )
+    if out.byte_length() > 0:
+        return out
+    out = _rewrite_sdxl_root(
+        prefix, "lora_unet_up_blocks_2_resnets_2",
+        "lora_unet_output_blocks_8_0", resblock=True,
+    )
+    return out
+
+
 def _map_klein_split_qkv(prefix: String, out_dim: Int) -> LoraMapping:
     """Klein DiffusionModel-format SPLIT Q/K/V → FUSED qkv RowRange mapper.
 
@@ -540,9 +802,10 @@ struct LoraSet(Movable):
         `<prefix>{suffix_a}` pair into a (base_key, slot) mapping. The data
         segment is mmap'd — tensors are loaded H2D lazily in `merge_into`.
 
-        kohya SDXL: only direct-named (dotted→underscore) prefixes resolve;
-        text-encoder (lora_te*) and diffusers-named UNet LoRAs are skipped (the
-        diffusers→LDM rewriter is not ported — see module header)."""
+        kohya SDXL text-encoder modules (`lora_te*`) are intentionally excluded
+        from this UNet merge object. Call `resolve_sdxl_mappings` against the
+        loaded SDXL UNet before merging so Diffusers and LDM kohya names resolve
+        through the exact base-weight inventory."""
         var st = SafeTensors.open(path)
         var names = st.names()
         var fmt = _detect_format(names)
@@ -581,6 +844,44 @@ struct LoraSet(Movable):
             mappings.append(m^)
 
         return LoraSet(st^, fmt, mappings^, sa^, sb^)
+
+    def resolve_sdxl_mappings(
+        mut self, name_to_idx: Dict[String, Int]
+    ) raises -> Int:
+        """Resolve kohya SDXL prefixes against the loaded LDM UNet inventory.
+
+        A forward table from real base keys avoids ambiguous underscore
+        decoding (`to_out_0`, `input_blocks_4_1`, etc.). Diffusers-style roots
+        are first rewritten with the exact EriDiffusion conversion table above.
+        Returns the number of LoRA modules that target a real base tensor.
+        """
+        if self.format != FMT_KOHYA_SDXL:
+            return len(self.mappings)
+
+        var kohya_to_base = Dict[String, String]()
+        for ref entry in name_to_idx.items():
+            var key = entry.key
+            var module = _strip_suffix(key, ".weight")
+            if module.byte_length() == 0:
+                continue
+            kohya_to_base[String("lora_unet_") + module.replace(".", "_")] = key
+
+        var resolved = List[LoraMapping]()
+        for ref mapping in self.mappings:
+            var candidate = mapping.prefix.copy()
+            if candidate not in kohya_to_base:
+                candidate = _rewrite_kohya_diffusers_to_ldm(candidate)
+            if candidate.byte_length() == 0 or candidate not in kohya_to_base:
+                continue
+            resolved.append(LoraMapping(
+                mapping.prefix.copy(),
+                kohya_to_base[candidate].copy(),
+                SLOT_FULL,
+                0,
+                0,
+            ))
+        self.mappings = resolved^
+        return len(self.mappings)
 
     def num_mappings(self) -> Int:
         """Number of resolved LoRA modules (post key-resolution, pre base-match)."""
@@ -684,11 +985,34 @@ struct LoraSet(Movable):
         self, m: LoraMapping, scale: Float32, base_dtype: STDtype, ctx: DeviceContext
     ) raises -> Tensor:
         """Load A,B and return the scaled delta = scale*(B@A) cast to base_dtype.
-        B @ A via linear(B, Aᵀ) = B @ (Aᵀ)ᵀ = B @ A (foundation linear = x@wᵀ)."""
+        B @ A via linear(B, Aᵀ) = B @ (Aᵀ)ᵀ = B @ A (foundation linear = x@wᵀ).
+
+        SDXL convolution adapters use A=[rank,in,kh,kw] and
+        B=[out,rank,1,1]. Flattening the spatial/input axes, multiplying, then
+        reshaping to [out,in,kh,kw] is the creator/reference merge method."""
         var key_a = m.prefix + self.suffix_a
         var key_b = m.prefix + self.suffix_b
         var a = self._load_lora_tensor(key_a, ctx)  # [rank, in]
         var b = self._load_lora_tensor(key_b, ctx)  # [out, rank]
+        var a_shape = a.shape()
+        var b_shape = b.shape()
+        var convolution = len(a_shape) == 4
+        if convolution:
+            if (
+                len(b_shape) != 4
+                or b_shape[1] != a_shape[0]
+                or b_shape[2] != 1
+                or b_shape[3] != 1
+            ):
+                raise Error(
+                    String("LoRA convolution factor shape mismatch for ") + m.prefix
+                )
+            a = reshape(
+                a,
+                [a_shape[0], a_shape[1] * a_shape[2] * a_shape[3]],
+                ctx,
+            )
+            b = reshape(b, [b_shape[0], b_shape[1]], ctx)
         # Match the PyTorch oracle when the target weight is F32: LoRA factors
         # are promoted before B @ A, not after the product has already rounded.
         var b_for_mm: Tensor
@@ -704,22 +1028,40 @@ struct LoraSet(Movable):
             b_for_mm = b^
         var a_t = transpose(a_for_mm, 0, 1, ctx)  # [in, rank]
         var prod = linear(b_for_mm, a_t, None, ctx)  # [out, in]
+        if convolution:
+            prod = reshape(
+                prod,
+                [b_shape[0], a_shape[1], a_shape[2], a_shape[3]],
+                ctx,
+            )
         var delta = mul_scalar(prod, scale, ctx)
         if delta.dtype() != base_dtype:
             return cast_tensor(delta, base_dtype, ctx)
         return delta^
 
     def _pair_present(self, m: LoraMapping) raises -> Bool:
-        """True iff both lora_A and lora_B exist and neither is 4D (conv)."""
+        """True iff a supported linear or convolution A/B pair is present."""
         var key_a = m.prefix + self.suffix_a
         var key_b = m.prefix + self.suffix_b
         if key_a not in self.st.tensors or key_b not in self.st.tensors:
             return False
         var a_info = self.st.tensor_info(key_a)
         var b_info = self.st.tensor_info(key_b)
-        if len(a_info.shape) == 4 or len(b_info.shape) == 4:
-            return False  # conv LoRA — not supported (lora.rs:289-294)
-        return True
+        if len(a_info.shape) == 2 and len(b_info.shape) == 2:
+            return True
+        if len(a_info.shape) == 4 and len(b_info.shape) == 4:
+            if (
+                b_info.shape[1] == a_info.shape[0]
+                and b_info.shape[2] == 1
+                and b_info.shape[3] == 1
+            ):
+                return True
+            raise Error(
+                String("unsupported LoRA convolution factor shape for ") + m.prefix
+            )
+        raise Error(
+            String("unsupported LoRA A/B rank combination for ") + m.prefix
+        )
 
     def merge_into(
         self,

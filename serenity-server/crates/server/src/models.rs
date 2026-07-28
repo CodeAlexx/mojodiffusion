@@ -15,15 +15,16 @@
 //! - resident="" here (matches the stub oracle; the Rust server tracks no resident model
 //!   name yet) → `loaded` is always false and selected_model defaults to "".
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Path as AxPath, Query};
-use axum::http::header::CONTENT_TYPE;
+use axum::extract::{Json, Path as AxPath, Query};
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 const LTX2_FEATURE_ADAPTERS_JSON: &str =
     include_str!("../../../../serenitymojo/configs/ltx2_feature_adapters.json");
@@ -38,11 +39,99 @@ fn model_root() -> PathBuf {
                 .join(".serenity/models")
         })
 }
+
+type ExtraModelRoots = std::sync::RwLock<Vec<PathBuf>>;
+
+fn extra_model_roots_store() -> &'static ExtraModelRoots {
+    static ROOTS: std::sync::OnceLock<ExtraModelRoots> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let roots = std::env::var_os("SERENITY_EXTRA_MODEL_ROOTS")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default();
+        std::sync::RwLock::new(normalize_extra_model_roots(roots))
+    })
+}
+
+fn normalize_extra_model_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let primary = std::fs::canonicalize(model_root()).ok();
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for root in roots {
+        let Ok(root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if !root.is_dir()
+            || primary.as_ref().is_some_and(|primary| primary == &root)
+            || !seen.insert(root.clone())
+        {
+            continue;
+        }
+        normalized.push(root);
+    }
+    normalized
+}
+
+fn extra_model_roots() -> Vec<PathBuf> {
+    extra_model_roots_store()
+        .read()
+        .map(|roots| roots.clone())
+        .unwrap_or_default()
+}
+
+/// Replace the live external registry roots after Settings changes. The model
+/// cache is invalidated immediately so "Add Directory" is a real scanner
+/// contract, not a cosmetic list that takes up to a minute to become visible.
+pub(crate) fn set_extra_model_roots(roots: Vec<PathBuf>) {
+    if let Ok(mut current) = extra_model_roots_store().write() {
+        *current = normalize_extra_model_roots(roots);
+    }
+    invalidate_checkpoint_scan_cache();
+}
 const HEADER_PROBE_CAP: u64 = 16 * 1024 * 1024;
 /// Cap on an inlined sidecar preview image (encoded as a `data:` URI). Sidecar
 /// previews are meant to be small thumbnails; oversize files are skipped rather
 /// than bloating the /v1/models JSON. 2 MiB raw → ~2.7 MiB base64.
 const PREVIEW_INLINE_CAP: u64 = 2 * 1024 * 1024;
+const MODEL_TYPE_OVERRIDES_FILENAME: &str = "model_type_overrides.json";
+const MODEL_TYPE_OVERRIDES_SCHEMA: &str = "serenity.model_type_overrides.v1";
+const MODEL_TYPE_OPTIONS: &[(&str, &str)] = &[
+    ("sdxl", "SDXL / Pony / Illustrious"),
+    ("krea2", "Krea 2"),
+    ("zimage", "Z-Image"),
+    ("qwen-image", "Qwen Image"),
+    ("sd3", "Stable Diffusion 3 / 3.5"),
+    ("flux", "FLUX.1"),
+    ("flux-2/klein", "FLUX.2 / Klein"),
+    ("chroma", "Chroma"),
+    ("anima", "Anima"),
+    ("ideogram4", "Ideogram 4"),
+    ("sensenova", "SenseNova"),
+    ("lens", "Microsoft Lens"),
+    ("ltx2", "LTX 2 / 2.3 video"),
+    ("wan2.2", "Wan 2.2 video"),
+    ("nava", "NAVA audio/video"),
+    ("bernini", "Bernini video"),
+    ("scail2", "SCAIL-2 video"),
+];
+const REGISTRY_ARTIFACT_ROOTS: &[(&str, &str)] = &[
+    ("vae", "vaes"),
+    ("controlnet", "controlnets"),
+    ("controlnet", "model_patches"),
+    ("embedding", "Embeddings"),
+    ("embedding", "embeddings"),
+    ("clip", "text_encoders"),
+    ("clip", "clip"),
+    ("clip_vision", "clip_vision"),
+    ("ipadapter", "ipadapters"),
+    ("upscaler", "upscale_models"),
+    ("upscaler", "latent_upscale_models"),
+    ("upscaler", "upscalers"),
+    ("upscaler", "ltx2_upscalers"),
+    ("upscaler", "pid/checkpoints"),
+    ("runtime_component", "style_models"),
+    ("runtime_component", "sam3"),
+    ("vae", "lance"),
+];
 
 /// Sidecar metadata distilled from a `<model>.json` / `.civitai.info` next to a
 /// checkpoint or LoRA. All fields are "" when absent. ADD-only on the wire.
@@ -63,12 +152,55 @@ struct ScanEntry {
     name: String,
     path: String,
     arch: String,
+    /// Architecture found without a user override.
+    detected_arch: String,
+    /// `user_override`, `metadata`, `tensor_signature`, `sidecar`,
+    /// `filename`, `bundled_identity`, or `unknown`.
+    arch_source: String,
+    /// Stable architecture id saved by the user, or "" when automatic.
+    arch_override: String,
+    format: String,
     size: i64,
     /// Subdir of the entry RELATIVE to its scan root ("" = top level). Lets the
     /// browser show a folder tree without guessing the root from the abs path.
     folder: String,
     /// Distilled sidecar preview/metadata (empty `Sidecar::default()` if none).
     sidecar: Sidecar,
+}
+
+#[derive(Clone)]
+struct RegistryArtifact {
+    name: String,
+    path: String,
+    folder: String,
+    artifact_type: String,
+    size: i64,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct ModelTypeOverrides {
+    schema: String,
+    #[serde(default)]
+    models: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelTypeOverrideRequest {
+    model: String,
+    #[serde(default)]
+    arch: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedCheckpoint {
+    pub name: String,
+    pub path: PathBuf,
+    pub arch: String,
+    pub arch_source: String,
+    pub arch_override: String,
+    pub format: String,
 }
 
 fn ltx2_feature_adapter_registry() -> &'static Value {
@@ -121,9 +253,9 @@ pub fn ltx2_feature_document(id: &str) -> Option<Value> {
         .get("adapters")
         .and_then(Value::as_array)
         .and_then(|adapters| {
-            adapters.iter().find(|adapter| {
-                adapter.get("id").and_then(Value::as_str) == Some(id)
-            })
+            adapters
+                .iter()
+                .find(|adapter| adapter.get("id").and_then(Value::as_str) == Some(id))
         })
         .cloned()
 }
@@ -184,44 +316,287 @@ pub fn ltx2_feature_documents() -> Value {
     Value::Array(rows)
 }
 
-// ── arch detection (exact substring probes from model_scan.mojo) ────────────────
+// ── architecture + artifact-format detection ──────────────────────────────────
 
-fn detect_arch(header: &str) -> &'static str {
-    if header.contains("\"noise_refiner.") {
-        "zimage"
+/// Collapse ModelSpec/Civitai/Comfy spellings to the stable IDs used by the
+/// Serenity capability registry. This is deliberately architecture-based: a
+/// creator filename is presentation metadata, never runtime routing authority.
+fn normalize_architecture_id(raw: &str) -> String {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return "unknown".to_string();
+    }
+    if value.contains("stable-diffusion-xl")
+        || value.contains("stable diffusion xl")
+        || value == "sdxl"
+        || value.starts_with("pony")
+        || value.starts_with("illustrious")
+    {
+        "sdxl".to_string()
+    } else if value.contains("krea 2") || value.contains("krea-2") || value.contains("krea2") {
+        "krea2".to_string()
+    } else if value.contains("flux.2") || value.contains("flux-2") || value.contains("klein") {
+        "flux-2/klein".to_string()
+    } else if value.contains("flux") {
+        "flux".to_string()
+    } else if value.contains("z-image") || value.contains("zimage") || value.contains("z_image") {
+        "zimage".to_string()
+    } else if value.contains("qwen") && value.contains("image") {
+        "qwen-image".to_string()
+    } else if value.contains("stable-diffusion-3")
+        || value.contains("stable-diffusion-v3")
+        || value.contains("stable diffusion 3")
+        || value == "sd3"
+        || value.starts_with("sd3.")
+    {
+        "sd3".to_string()
+    } else if value.contains("lens") {
+        "lens".to_string()
+    } else if value.contains("nava") {
+        "nava".to_string()
+    } else if value.contains("ltx") {
+        "ltx2".to_string()
+    } else if value.contains("wan") {
+        "wan2.2".to_string()
+    } else if value.contains("ideogram") {
+        "ideogram4".to_string()
+    } else if value.contains("chroma") {
+        "chroma".to_string()
+    } else if value.contains("anima") {
+        "anima".to_string()
+    } else if value.contains("sensenova") || value.contains("sense-nova") {
+        "sensenova".to_string()
+    } else {
+        value
+    }
+}
+
+fn normalize_user_model_type(raw: &str) -> Option<String> {
+    let normalized = normalize_architecture_id(raw);
+    MODEL_TYPE_OPTIONS
+        .iter()
+        .any(|(id, _)| *id == normalized)
+        .then_some(normalized)
+}
+
+fn model_type_options_json() -> Value {
+    Value::Array(
+        MODEL_TYPE_OPTIONS
+            .iter()
+            .map(|(id, label)| {
+                json!({
+                    "id": id,
+                    "label": label,
+                    "route": if matches!(*id, "ltx2" | "wan2.2" | "bernini" | "scail2") {
+                        "video"
+                    } else if crate::capabilities::model_family_for_arch(id).is_some() {
+                        "image"
+                    } else {
+                        "unsupported"
+                    },
+                    "arbitrary_checkpoint_supported": matches!(*id, "krea2" | "sdxl" | "ltx2"),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn model_type_overrides_path(root: &Path) -> PathBuf {
+    root.join(MODEL_TYPE_OVERRIDES_FILENAME)
+}
+
+fn lora_type_override_key(name: &str) -> String {
+    format!("lora:{name}")
+}
+
+fn load_model_type_overrides_from(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let path = model_type_overrides_path(root);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let document: ModelTypeOverrides = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if document.schema != MODEL_TYPE_OVERRIDES_SCHEMA {
+        return Err(format!(
+            "{} has unsupported schema {:?}",
+            path.display(),
+            document.schema
+        ));
+    }
+    let mut normalized = BTreeMap::new();
+    for (model, arch) in document.models {
+        if model.trim().is_empty() {
+            return Err(format!(
+                "{} contains an empty model identity",
+                path.display()
+            ));
+        }
+        let Some(arch) = normalize_user_model_type(&arch) else {
+            return Err(format!(
+                "{} contains unsupported model type {:?} for {:?}",
+                path.display(),
+                arch,
+                model
+            ));
+        };
+        normalized.insert(model, arch);
+    }
+    Ok(normalized)
+}
+
+fn persist_model_type_overrides_to(
+    root: &Path,
+    models: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let path = model_type_overrides_path(root);
+    if models.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove {}: {error}", path.display())),
+        };
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("create model registry {}: {error}", root.display()))?;
+    let document = ModelTypeOverrides {
+        schema: MODEL_TYPE_OVERRIDES_SCHEMA.to_string(),
+        models: models.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("serialize model type overrides: {error}"))?;
+    bytes.push(b'\n');
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = root.join(format!(
+        ".{MODEL_TYPE_OVERRIDES_FILENAME}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::write(&temp_path, bytes)
+        .map_err(|error| format!("write {}: {error}", temp_path.display()))?;
+    if let Err(error) = std::fs::rename(&temp_path, &path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "replace {} with {}: {error}",
+            path.display(),
+            temp_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn model_type_override_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn metadata_architecture(header: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(header) else {
+        return String::new();
+    };
+    let metadata = value.get("__metadata__").unwrap_or(&Value::Null);
+    for key in [
+        "modelspec.architecture",
+        "architecture",
+        "general.architecture",
+        "model_type",
+    ] {
+        if let Some(raw) = metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .or_else(|| value.get(key).and_then(Value::as_str))
+        {
+            let normalized = normalize_architecture_id(raw);
+            if normalized != "unknown" {
+                return normalized;
+            }
+        }
+    }
+    String::new()
+}
+
+fn detect_arch(header: &str) -> String {
+    let metadata = metadata_architecture(header);
+    if !metadata.is_empty() {
+        return metadata;
+    }
+    if header.contains("\"backbone.double_blocks.")
+        && header.contains("_audio")
+        && header.contains("\"backbone.single_blocks.")
+    {
+        "nava".to_string()
+    } else if header.contains("\"noise_refiner.") {
+        "zimage".to_string()
     } else if header.contains("\"double_stream_modulation_img") {
-        "flux-2/klein"
+        "flux-2/klein".to_string()
     } else if header.contains("\"distilled_guidance_layer") {
-        "chroma"
+        "chroma".to_string()
     } else if header.contains("\"double_blocks.") {
-        "flux"
+        "flux".to_string()
     } else if header.contains("\"audio_vae.") {
-        "ltx2"
+        "ltx2".to_string()
     } else if header.contains("\"txtfusion.") {
-        "krea2"
+        "krea2".to_string()
     } else if header.contains("\"embed_image_indicator.weight\"")
         || header.contains("\"llm_cond_proj.weight\"")
     {
-        "ideogram4"
+        "ideogram4".to_string()
     } else if header.contains("\"model.diffusion_model.joint_blocks") {
-        "sd3"
+        "sd3".to_string()
     } else if header.contains("\"model.diffusion_model.input_blocks") {
-        "sdxl"
+        "sdxl".to_string()
     } else if header.contains("\"input_blocks.0.") {
-        "sdxl"
+        "sdxl".to_string()
     } else if header.contains("\"txt_norm.") {
-        "qwen-image"
+        "qwen-image".to_string()
     } else if header.contains("\"time_projection.") {
-        "wan"
+        "wan2.2".to_string()
     } else {
-        "unknown"
+        "unknown".to_string()
+    }
+}
+
+fn detect_checkpoint_arch(header: &str, sidecar_hint: &str, name: &str) -> (String, String) {
+    let metadata = metadata_architecture(header);
+    if !metadata.is_empty() {
+        return (metadata, "metadata".to_string());
+    }
+    let signature = detect_arch(header);
+    if signature != "unknown" {
+        return (signature, "tensor_signature".to_string());
+    }
+    let sidecar = normalize_architecture_id(sidecar_hint);
+    if sidecar != "unknown" {
+        return (sidecar, "sidecar".to_string());
+    }
+    let filename = detect_arch_from_name(name);
+    if filename != "unknown" {
+        return (filename.to_string(), "filename".to_string());
+    }
+    ("unknown".to_string(), "unknown".to_string())
+}
+
+fn detect_checkpoint_format(header: &str, arch: &str) -> &'static str {
+    if arch == "sdxl"
+        && header.contains("\"model.diffusion_model.")
+        && header.contains("\"conditioner.embedders.")
+    {
+        "full_checkpoint"
+    } else {
+        "diffusion_model"
     }
 }
 
 fn detect_arch_from_name(name: &str) -> &'static str {
     let lo = name.to_lowercase();
     let c = |s: &str| lo.contains(s);
-    if c("scail") {
+    if c("nava") {
+        "nava"
+    } else if c("scail") {
         "scail2"
     } else if c("bernini") {
         "bernini"
@@ -235,8 +610,14 @@ fn detect_arch_from_name(name: &str) -> &'static str {
         "sensenova"
     } else if c("qwen") {
         "qwen-image"
+    } else if c("microsoft_lens") || c("microsoft-lens") || c("lenspipeline") {
+        "lens"
     } else if c("sd3") || c("sd35") {
         "sd3"
+    } else if c("chroma") || c("crhroma") {
+        // Keep the common historical EriCrhroma spelling selectable as the
+        // Chroma adapter it is; tensor admission still validates every target.
+        "chroma"
     } else if c("sdxl")
         || c("sd_xl")
         || c("sd-xl")
@@ -270,8 +651,58 @@ fn detect_lora_target_arch(header: &str) -> &'static str {
         || header.contains("\"lora_te2")
     {
         "sdxl"
+    } else if header.contains("\"lycoris_transformer_blocks_")
+        && header.contains("_attn_add_q_proj.")
+        && header.contains(".lokr_w1\"")
+        && header.contains(".lokr_w2\"")
+    {
+        // LyCORIS MMDiT exports use flattened Diffusers joint-attention names.
+        // The added-context q projection distinguishes SD3/3.5 from ordinary
+        // FLUX/Chroma LoRA surfaces.
+        "sd3"
     } else if header.contains("\"lora_transformer_distilled_guidance_layer") {
         "chroma"
+    } else if header.contains("\"diffusion_model.transformer_blocks.")
+        && (header.contains(".lora_A.weight\"") || header.contains(".lora_down.weight\""))
+    {
+        // Native/PEFT LTX exports use diffusion_model.transformer_blocks
+        // directly. Do this before the generic transformer checks below so an
+        // arbitrary user-trained LTX adapter does not require "ltx" in its
+        // filename to become selectable.
+        "ltx2"
+    } else if header.contains("\"transformer.transformer_blocks.")
+        && header.contains(".attn.to_q.")
+        && header.contains(".attn.add_q_proj.")
+        && header.contains(".img_mlp.net.0.proj.")
+        && (header.contains(".lora_A.weight\"") || header.contains(".lora_down.weight\""))
+    {
+        // Canonical Qwen-Image PEFT/Serenity export: separate image and added
+        // context attention projections plus image/text MLP targets.
+        "qwen-image"
+    } else if header.contains("\"transformer.layers.")
+        && header.contains(".attention.qkv.")
+        && header.contains(".feed_forward.w1.")
+        && (header.contains(".lora_A.weight\"") || header.contains(".lora_down.weight\""))
+    {
+        // Canonical Ideogram-4 trainer export: fused qkv plus SwiGLU feed-forward
+        // projections on the 34-layer AuraFlow-style trunk.
+        "ideogram4"
+    } else if header.contains("\"transformer.transformer_blocks.")
+        && header.contains(".attn1.to_q.")
+        && header.contains(".attn2.to_k.")
+        && header.contains(".ff.net.0.proj.")
+        && (header.contains(".lora_A.weight\"") || header.contains(".lora_down.weight\""))
+    {
+        // Canonical Anima SerenityTrainer/PEFT export: 28 blocks with distinct
+        // self-attention (attn1), cross-attention (attn2), and GELU FF targets.
+        "anima"
+    } else if header.contains("\"transformer.single_transformer_blocks.")
+        && header.contains("\"transformer.transformer_blocks.")
+        && (header.contains(".lora_A.weight\"") || header.contains(".lora_down.weight\""))
+    {
+        // Diffusers PEFT FLUX.1 adapters do not use the older
+        // lora_transformer_* Kohya key prefix.
+        "flux"
     } else if header.contains("\"lora_transformer_single_transformer_blocks")
         || header.contains("\"lora_transformer_transformer_blocks")
     {
@@ -555,34 +986,444 @@ fn folder_relative_to(path: &str, root: &str) -> String {
 
 // ── scanners ────────────────────────────────────────────────────────────────────
 
-/// `find -L <dir> -maxdepth 1 -type f -name '*.safetensors'` — symlinks followed,
-/// arch left "". Order is irrelevant (the response re-sorts).
-fn list_safetensors(dir: &str) -> Vec<ScanEntry> {
-    let mut out = Vec::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SafetensorsScanKind {
+    Checkpoint,
+    Lora,
+}
+
+fn should_skip_safetensors_dir(name: &str, kind: SafetensorsScanKind) -> bool {
+    let lower = name.to_ascii_lowercase();
+    name.starts_with('.')
+        || lower == "temp"
+        || (kind == SafetensorsScanKind::Checkpoint
+            && matches!(
+                lower.as_str(),
+                "text_encoder"
+                    | "text_encoders"
+                    | "audio_vae"
+                    | "connectors"
+                    | "latent_upsampler"
+                    | "vocoder"
+                    | "tokenizer"
+                    | "tokenizers"
+                    | "vae"
+                    | "scheduler"
+                    | "feature_extractor"
+                    | "vision_encoder"
+            ))
+}
+
+fn should_skip_safetensors_file(name: &str, kind: SafetensorsScanKind) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let sharded_part = lower
+        .strip_suffix(".safetensors")
+        .and_then(|stem| stem.rsplit_once("-of-"))
+        .is_some_and(|(left, right)| {
+            right.chars().all(|c| c.is_ascii_digit())
+                && left
+                    .rsplit_once('-')
+                    .is_some_and(|(_, index)| index.chars().all(|c| c.is_ascii_digit()))
+        });
+    lower.contains(".fp8cache.")
+        || sharded_part
+        || (kind == SafetensorsScanKind::Checkpoint && lower.contains("lora"))
+}
+
+fn list_safetensors_recursive(
+    root: &Path,
+    dir: &Path,
+    kind: SafetensorsScanKind,
+    seen_dirs: &mut HashSet<PathBuf>,
+    out: &mut Vec<ScanEntry>,
+) {
+    let canonical = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    if !seen_dirs.insert(canonical) {
+        return;
+    }
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return out,
+        Err(_) => return,
     };
     for ent in rd.flatten() {
+        let path = ent.path();
         let fname = ent.file_name().to_string_lossy().into_owned();
-        if !fname.ends_with(".safetensors") {
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            if !should_skip_safetensors_dir(&fname, kind) {
+                list_safetensors_recursive(root, &path, kind, seen_dirs, out);
+            }
             continue;
         }
-        // -type f with -L: stat the target (follows symlinks).
-        let meta = match std::fs::metadata(ent.path()) {
-            Ok(m) if m.is_file() => m,
-            _ => continue,
-        };
-        let stem = fname[..fname.len() - ".safetensors".len()].to_string();
+        if !metadata.is_file()
+            || !fname.to_ascii_lowercase().ends_with(".safetensors")
+            || should_skip_safetensors_file(&fname, kind)
+        {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let name = relative
+            .strip_suffix(".safetensors")
+            .unwrap_or(&relative)
+            .to_string();
         out.push(ScanEntry {
-            name: stem,
-            path: format!("{dir}/{fname}"),
+            name,
+            path: path.to_string_lossy().into_owned(),
             arch: String::new(),
-            size: meta.len() as i64,
-            folder: String::new(), // top-level scan: filled by caller if nested
+            detected_arch: String::new(),
+            arch_source: String::new(),
+            arch_override: String::new(),
+            format: String::new(),
+            size: metadata.len() as i64,
+            folder: String::new(),
             sidecar: Sidecar::default(),
         });
     }
+}
+
+/// Recursively discover safetensors beneath a registry root. This is the same
+/// user contract as SwarmUI's model folders: category subdirectories are valid
+/// and do not require a code change. Symlinked directories are followed once.
+fn list_safetensors(dir: &str) -> Vec<ScanEntry> {
+    let mut out = Vec::new();
+    let root = Path::new(dir);
+    let mut seen_dirs = HashSet::new();
+    list_safetensors_recursive(
+        root,
+        root,
+        SafetensorsScanKind::Checkpoint,
+        &mut seen_dirs,
+        &mut out,
+    );
+    out
+}
+
+fn list_lora_safetensors(dir: &str) -> Vec<ScanEntry> {
+    let mut out = Vec::new();
+    let root = Path::new(dir);
+    let mut seen_dirs = HashSet::new();
+    list_safetensors_recursive(
+        root,
+        root,
+        SafetensorsScanKind::Lora,
+        &mut seen_dirs,
+        &mut out,
+    );
+    out
+}
+
+fn external_checkpoint_scan_roots(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut roots = Vec::new();
+    for (prefix, subdir) in [
+        ("", "checkpoints"),
+        ("diffusion_models", "diffusion_models"),
+        ("unet", "unet"),
+        ("dits", "dits"),
+    ] {
+        let candidate = root.join(subdir);
+        if candidate.is_dir() {
+            roots.push((prefix.to_string(), candidate));
+        }
+    }
+    // A user may point Settings directly at a folder of checkpoint files, as
+    // SwarmUI allows. Only fall back to the root itself when it is not already
+    // a conventional multi-category model tree.
+    if roots.is_empty() {
+        roots.push((String::new(), root.to_path_buf()));
+    }
+    roots
+}
+
+fn external_identity_prefix(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("external")
+        .replace(['/', '\\'], "_")
+}
+
+fn append_checkpoint_files(
+    out: &mut Vec<ScanEntry>,
+    scan_root: &Path,
+    identity_prefix: &str,
+    identity_collision_prefix: &str,
+    overrides: &BTreeMap<String, String>,
+    used_paths: &mut HashSet<PathBuf>,
+    used_names: &mut HashSet<String>,
+) {
+    let scan_root_text = scan_root.to_string_lossy().into_owned();
+    for mut entry in list_safetensors(&scan_root_text) {
+        let Ok(canonical_path) = std::fs::canonicalize(&entry.path) else {
+            continue;
+        };
+        if !used_paths.insert(canonical_path) {
+            continue;
+        }
+        if !identity_prefix.is_empty() {
+            entry.name = format!("{identity_prefix}/{}", entry.name);
+        }
+        if checkpoint_component_type(&entry.name).is_some() {
+            continue;
+        }
+        if used_names.contains(&entry.name) {
+            entry.name = format!("external/{identity_collision_prefix}/{}", entry.name);
+        }
+        used_names.insert(entry.name.clone());
+        let header = header_text(&entry.path);
+        entry.sidecar = sidecar_for_file(&entry.path);
+        let (detected_arch, detected_source) =
+            detect_checkpoint_arch(&header, &entry.sidecar.arch_hint, &entry.name);
+        entry.detected_arch = detected_arch.clone();
+        if let Some(arch_override) = overrides.get(&entry.name) {
+            entry.arch = arch_override.clone();
+            entry.arch_override = arch_override.clone();
+            entry.arch_source = "user_override".to_string();
+        } else {
+            entry.arch = detected_arch;
+            entry.arch_source = detected_source;
+        }
+        entry.format = detect_checkpoint_format(&header, &entry.arch).to_string();
+        entry.folder = folder_relative_to(&entry.path, &scan_root_text);
+        out.push(entry);
+    }
+}
+
+/// Some installations keep product support weights in `checkpoints/` because
+/// that is where the upstream download instructions put them. They remain
+/// visible in the registry, but are not independent generator checkpoints.
+fn checkpoint_component_type(name: &str) -> Option<&'static str> {
+    let normalized = name.replace('\\', "/").to_ascii_lowercase();
+    let basename = Path::new(&normalized)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&normalized)
+        .strip_suffix(".safetensors")
+        .unwrap_or_else(|| {
+            Path::new(&normalized)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&normalized)
+        });
+    if normalized.contains("audio_vae") || basename == "wan2.2_vae" || basename == "wan2_2_vae" {
+        Some("vae")
+    } else if normalized.contains("spatial-upscaler") || normalized.contains("spatial_upscaler") {
+        Some("upscaler")
+    } else if normalized.contains("umt5_xxl_enc")
+        || normalized.contains("qwen_2.5_vl_7b_fp8_scaled")
+    {
+        Some("clip")
+    } else if basename.contains("ltx")
+        && (basename.contains("lora") || basename.contains("svdint4") || basename.contains("svdw"))
+    {
+        Some("runtime_component")
+    } else {
+        None
+    }
+}
+
+fn discover_model_index_dirs_recursive(
+    dir: &Path,
+    seen_dirs: &mut HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) {
+    let canonical = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    if !seen_dirs.insert(canonical) {
+        return;
+    }
+    if dir.join("model_index.json").is_file() {
+        out.push(dir.to_path_buf());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if name.starts_with('.') || matches!(lower.as_str(), "temp" | "output") {
+            continue;
+        }
+        discover_model_index_dirs_recursive(&path, seen_dirs, out);
+    }
+}
+
+/// Discover complete Diffusers-style bundles by their manifest rather than by
+/// a hardcoded folder-name allowlist. This includes arbitrary user subfolders.
+fn discover_model_index_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    discover_model_index_dirs_recursive(root, &mut HashSet::new(), &mut out);
+    out.sort();
+    out
+}
+
+fn diffusers_directory_identity(root: &Path, dir: &Path) -> String {
+    let relative = dir
+        .strip_prefix(root)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    relative
+        .strip_prefix("checkpoints/")
+        .unwrap_or(&relative)
+        .to_string()
+}
+
+fn diffusers_directory_arch(dir: &Path, identity: &str) -> String {
+    let name_arch = detect_arch_from_name(identity);
+    if name_arch != "unknown" {
+        return name_arch.to_string();
+    }
+    let class_name = std::fs::read_to_string(dir.join("model_index.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|document| {
+            document
+                .get("_class_name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    normalize_user_model_type(&class_name).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn is_registry_artifact_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("safetensors" | "ckpt" | "pt" | "pth" | "bin")
+    )
+}
+
+fn scan_registry_artifact_dir(
+    category: &str,
+    root: &Path,
+    dir: &Path,
+    seen_dirs: &mut HashSet<PathBuf>,
+    seen_files: &mut HashSet<PathBuf>,
+    out: &mut Vec<RegistryArtifact>,
+) {
+    let canonical_dir = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    if !seen_dirs.insert(canonical_dir) {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            let lower = name.to_ascii_lowercase();
+            if !name.starts_with('.') && lower != "temp" {
+                scan_registry_artifact_dir(category, root, &path, seen_dirs, seen_files, out);
+            }
+            continue;
+        }
+        if !metadata.is_file() || !is_registry_artifact_file(&path) {
+            continue;
+        }
+        let canonical_file = match std::fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !seen_files.insert(canonical_file) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let folder = Path::new(&relative)
+            .parent()
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .filter(|parent| parent != ".")
+            .unwrap_or_default();
+        out.push(RegistryArtifact {
+            name: relative,
+            path: path.to_string_lossy().into_owned(),
+            folder,
+            artifact_type: category.to_string(),
+            size: metadata.len() as i64,
+        });
+    }
+}
+
+fn scan_registry_artifacts() -> Vec<RegistryArtifact> {
+    let models = model_root();
+    let mut out = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    let mut seen_files = HashSet::new();
+    for (category, relative_root) in REGISTRY_ARTIFACT_ROOTS {
+        let root = models.join(relative_root);
+        scan_registry_artifact_dir(
+            category,
+            &root,
+            &root,
+            &mut seen_dirs,
+            &mut seen_files,
+            &mut out,
+        );
+    }
+    // Reclassify support weights placed in checkpoints/ by upstream download
+    // recipes. The base-model scan applies the same predicate and skips them.
+    let checkpoint_root = models.join("checkpoints");
+    let mut checkpoint_candidates = Vec::new();
+    scan_registry_artifact_dir(
+        "runtime_component",
+        &checkpoint_root,
+        &checkpoint_root,
+        &mut seen_dirs,
+        &mut seen_files,
+        &mut checkpoint_candidates,
+    );
+    for mut artifact in checkpoint_candidates {
+        if let Some(category) = checkpoint_component_type(&artifact.name) {
+            artifact.artifact_type = category.to_string();
+            out.push(artifact);
+        }
+    }
+    out.sort_by(|left, right| {
+        left.artifact_type
+            .cmp(&right.artifact_type)
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
     out
 }
 
@@ -605,39 +1446,142 @@ fn du_sb(dir: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn scan_checkpoints() -> Vec<ScanEntry> {
+fn scan_checkpoints_uncached() -> Vec<ScanEntry> {
     let mut out = Vec::new();
+    let mut directory_identities = HashSet::new();
     let models = model_root();
+    let overrides = load_model_type_overrides_from(&models).unwrap_or_else(|error| {
+        eprintln!("warning: ignoring invalid model type overrides: {error}");
+        BTreeMap::new()
+    });
     let checkpoints = models.join("checkpoints");
     let checkpoints = checkpoints.to_string_lossy().into_owned();
-    for mut e in list_safetensors(&checkpoints) {
-        let mut arch = detect_arch_from_name(&e.name).to_string();
-        if arch == "unknown" {
-            arch = detect_arch(&header_text(&e.path)).to_string();
-        }
-        e.arch = arch;
-        e.folder = folder_relative_to(&e.path, &checkpoints);
-        e.sidecar = sidecar_for_file(&e.path);
-        // sidecar may rescue an unknown arch (only when it offers a hint).
-        if e.arch == "unknown" && !e.sidecar.arch_hint.is_empty() {
-            e.arch = e.sidecar.arch_hint.clone();
-        }
-        out.push(e);
-    }
-    // known diffusers-tree DIRS (arch by identity), size via du -sb.
-    for (name, arch) in [
-        ("zimage_base", "zimage"),
-        ("anima", "anima"),
-        ("ideogram-4-fp8", "ideogram4"),
-        ("sensenova_u1", "sensenova"),
+    for (identity_prefix, scan_root) in [
+        ("", checkpoints.clone()),
+        (
+            "diffusion_models",
+            models
+                .join("diffusion_models")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("unet", models.join("unet").to_string_lossy().into_owned()),
+        ("dits", models.join("dits").to_string_lossy().into_owned()),
     ] {
+        for mut e in list_safetensors(&scan_root) {
+            if !identity_prefix.is_empty() {
+                e.name = format!("{identity_prefix}/{}", e.name);
+            }
+            if checkpoint_component_type(&e.name).is_some() {
+                continue;
+            }
+            let header = header_text(&e.path);
+            e.sidecar = sidecar_for_file(&e.path);
+            let (detected_arch, detected_source) =
+                detect_checkpoint_arch(&header, &e.sidecar.arch_hint, &e.name);
+            e.detected_arch = detected_arch.clone();
+            if let Some(arch_override) = overrides.get(&e.name) {
+                e.arch = arch_override.clone();
+                e.arch_override = arch_override.clone();
+                e.arch_source = "user_override".to_string();
+            } else {
+                e.arch = detected_arch;
+                e.arch_source = detected_source;
+            }
+            e.format = detect_checkpoint_format(&header, &e.arch).to_string();
+            e.folder = if identity_prefix.is_empty() {
+                folder_relative_to(&e.path, &scan_root)
+            } else {
+                folder_relative_to(&e.path, &models.to_string_lossy())
+            };
+            out.push(e);
+        }
+    }
+    let mut used_checkpoint_paths = out
+        .iter()
+        .filter_map(|entry| std::fs::canonicalize(&entry.path).ok())
+        .collect::<HashSet<_>>();
+    let mut used_checkpoint_names = out
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<HashSet<_>>();
+    let external_roots = extra_model_roots();
+    for external_root in &external_roots {
+        let collision_prefix = external_identity_prefix(external_root);
+        for (identity_prefix, scan_root) in external_checkpoint_scan_roots(external_root) {
+            append_checkpoint_files(
+                &mut out,
+                &scan_root,
+                &identity_prefix,
+                &collision_prefix,
+                &overrides,
+                &mut used_checkpoint_paths,
+                &mut used_checkpoint_names,
+            );
+        }
+    }
+    // Complete Diffusers bundles are discovered recursively by model_index.json.
+    // Users may add them in any subdirectory without requiring a code change.
+    for discovery_root in std::iter::once(models.clone()).chain(external_roots.into_iter()) {
+        let collision_prefix = external_identity_prefix(&discovery_root);
+        for dir_path in discover_model_index_dirs(&discovery_root) {
+            let mut name = diffusers_directory_identity(&discovery_root, &dir_path);
+            let Ok(canonical_path) = std::fs::canonicalize(&dir_path) else {
+                continue;
+            };
+            if name.is_empty() || !used_checkpoint_paths.insert(canonical_path) {
+                continue;
+            }
+            if used_checkpoint_names.contains(&name) {
+                name = format!("external/{collision_prefix}/{name}");
+            }
+            if !directory_identities.insert(name.clone()) {
+                continue;
+            }
+            used_checkpoint_names.insert(name.clone());
+            let detected_arch = diffusers_directory_arch(&dir_path, &name);
+            let (arch, arch_override, arch_source) =
+                if let Some(arch_override) = overrides.get(&name) {
+                    (
+                        arch_override.clone(),
+                        arch_override.clone(),
+                        "user_override".to_string(),
+                    )
+                } else {
+                    (
+                        detected_arch.clone(),
+                        String::new(),
+                        "model_index".to_string(),
+                    )
+                };
+            let dir = dir_path.to_string_lossy().into_owned();
+            out.push(ScanEntry {
+                name,
+                path: dir.clone(),
+                arch,
+                detected_arch,
+                arch_source,
+                arch_override,
+                format: "diffusers_directory".to_string(),
+                size: du_sb(&dir),
+                folder: folder_relative_to(&dir, &discovery_root.to_string_lossy()),
+                sidecar: sidecar_for_dir(&dir),
+            });
+        }
+    }
+    // Bundled directory models without a Diffusers model_index manifest.
+    for (name, arch) in [("anima", "anima"), ("sensenova_u1", "sensenova")] {
         let dir = models.join(name).to_string_lossy().into_owned();
-        if dir_exists(&dir) {
+        if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
             let size = du_sb(&dir);
             out.push(ScanEntry {
                 name: name.to_string(),
                 path: dir.clone(),
                 arch: arch.to_string(),
+                detected_arch: arch.to_string(),
+                arch_source: "bundled_identity".to_string(),
+                arch_override: String::new(),
+                format: "diffusers_directory".to_string(),
                 size,
                 folder: folder_relative_to(&dir, &models.to_string_lossy()),
                 sidecar: sidecar_for_dir(&dir),
@@ -651,11 +1595,15 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
     if crate::video::bernini_product_gate_passed() {
         let name = "Bernini-R-Diffusers";
         let dir = format!("{checkpoints}/{name}");
-        if dir_exists(&dir) {
+        if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
             out.push(ScanEntry {
                 name: name.to_string(),
                 path: dir.clone(),
                 arch: "bernini".to_string(),
+                detected_arch: "bernini".to_string(),
+                arch_source: "bundled_identity".to_string(),
+                arch_override: String::new(),
+                format: "diffusers_directory".to_string(),
                 size: du_sb(&dir),
                 folder: folder_relative_to(&dir, &checkpoints),
                 sidecar: sidecar_for_dir(&dir),
@@ -668,11 +1616,15 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
     if crate::video::scail2_product_gate_passed() {
         let name = "SCAIL-2-Mojo";
         let dir = format!("{checkpoints}/{name}");
-        if dir_exists(&dir) {
+        if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
             out.push(ScanEntry {
                 name: name.to_string(),
                 path: dir.clone(),
                 arch: "scail2".to_string(),
+                detected_arch: "scail2".to_string(),
+                arch_source: "bundled_identity".to_string(),
+                arch_override: String::new(),
+                format: "diffusers_directory".to_string(),
                 size: du_sb(&dir),
                 folder: folder_relative_to(&dir, &checkpoints),
                 sidecar: sidecar_for_dir(&dir),
@@ -683,16 +1635,23 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
     for (name, arch) in [
         ("qwen-image-2512", "qwen-image"),
         ("ideogram-4-fp8", "ideogram4"),
+        ("ltx2-diffusers", "ltx2"),
+        ("Wan2.2-TI2V-5B", "wan2.2"),
+        ("Wan2.2-TI2V-5B-bf16", "wan2.2"),
         ("Wan2.2-TI2V-5B-Mojo", "wan2.2"),
         ("wan2.2_t2v_a14b_fp8_e4m3", "wan2.2"),
     ] {
         let dir = format!("{checkpoints}/{name}");
-        if dir_exists(&dir) {
+        if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
             let size = du_sb(&dir);
             out.push(ScanEntry {
                 name: name.to_string(),
                 path: dir.clone(),
                 arch: arch.to_string(),
+                detected_arch: arch.to_string(),
+                arch_source: "bundled_identity".to_string(),
+                arch_override: String::new(),
+                format: "diffusers_directory".to_string(),
                 size,
                 folder: folder_relative_to(&dir, &checkpoints),
                 sidecar: sidecar_for_dir(&dir),
@@ -702,22 +1661,110 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
     out
 }
 
+/// Model headers are immutable for the common request path, while capability
+/// validation may ask for the selected architecture several times. Keep a
+/// short snapshot instead of rereading every safetensors header per request.
+/// The one-minute window remains responsive through explicit UI refreshes
+/// without requiring a long-lived file watcher.
+type CheckpointScanCache = std::sync::Mutex<Option<(std::time::Instant, Vec<ScanEntry>)>>;
+
+fn checkpoint_scan_cache() -> &'static CheckpointScanCache {
+    static CACHE: std::sync::OnceLock<CheckpointScanCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn invalidate_checkpoint_scan_cache() {
+    if let Ok(mut guard) = checkpoint_scan_cache().lock() {
+        *guard = None;
+    }
+}
+
+fn scan_checkpoints_with_refresh(force: bool) -> Vec<ScanEntry> {
+    let cache = checkpoint_scan_cache();
+    if !force {
+        if let Ok(guard) = cache.lock() {
+            if let Some((created, entries)) = guard.as_ref() {
+                if created.elapsed() < std::time::Duration::from_secs(60) {
+                    return entries.clone();
+                }
+            }
+        }
+    }
+    let entries = scan_checkpoints_uncached();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), entries.clone()));
+    }
+    entries
+}
+
+fn scan_checkpoints() -> Vec<ScanEntry> {
+    scan_checkpoints_with_refresh(false)
+}
+
 fn scan_loras() -> Vec<ScanEntry> {
     let mut out = Vec::new();
-    let loras = model_root().join("loras").to_string_lossy().into_owned();
-    for mut e in list_safetensors(&loras) {
-        let mut target = detect_arch_from_name(&e.name).to_string();
-        if target == "unknown" {
-            target = detect_lora_target_arch(&header_text(&e.path)).to_string();
+    let overrides = load_model_type_overrides_from(&model_root()).unwrap_or_else(|error| {
+        eprintln!("warning: ignoring invalid LoRA type overrides: {error}");
+        BTreeMap::new()
+    });
+    let primary = model_root().join("loras");
+    let mut roots = vec![primary];
+    for external in extra_model_roots() {
+        let candidate = if external
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("loras"))
+        {
+            external
+        } else {
+            external.join("loras")
+        };
+        if candidate.is_dir() {
+            roots.push(candidate);
         }
-        e.arch = target;
-        e.folder = folder_relative_to(&e.path, &loras);
-        e.sidecar = sidecar_for_file(&e.path);
-        if e.arch == "unknown" && !e.sidecar.arch_hint.is_empty() {
-            e.arch = e.sidecar.arch_hint.clone();
-        }
-        out.push(e);
     }
+    let mut used_paths = HashSet::new();
+    let mut used_names = HashSet::new();
+    for root in roots {
+        let root_text = root.to_string_lossy().into_owned();
+        let collision_prefix = external_identity_prefix(&root);
+        for mut entry in list_lora_safetensors(&root_text) {
+            let Ok(canonical_path) = std::fs::canonicalize(&entry.path) else {
+                continue;
+            };
+            if !used_paths.insert(canonical_path) {
+                continue;
+            }
+            if used_names.contains(&entry.name) {
+                entry.name = format!("external/{collision_prefix}/{}", entry.name);
+            }
+            used_names.insert(entry.name.clone());
+            let mut target = detect_arch_from_name(&entry.name).to_string();
+            if target == "unknown" {
+                target = detect_lora_target_arch(&header_text(&entry.path)).to_string();
+            }
+            entry.arch = target.clone();
+            entry.detected_arch = target;
+            entry.arch_source = if entry.detected_arch == "unknown" {
+                "unknown".to_string()
+            } else {
+                "tensor_or_filename".to_string()
+            };
+            entry.format = "lora".to_string();
+            entry.folder = folder_relative_to(&entry.path, &root_text);
+            entry.sidecar = sidecar_for_file(&entry.path);
+            if entry.arch == "unknown" && !entry.sidecar.arch_hint.is_empty() {
+                entry.arch = entry.sidecar.arch_hint.clone();
+            }
+            if let Some(arch_override) = overrides.get(&lora_type_override_key(&entry.name)) {
+                entry.arch = arch_override.clone();
+                entry.arch_override = arch_override.clone();
+                entry.arch_source = "user_override".to_string();
+            }
+            out.push(entry);
+        }
+    }
+    out.sort_by(|left, right| scan_entry_cmp(left, right, "name"));
     out
 }
 
@@ -835,12 +1882,102 @@ fn lora_incompatible_reason(
 
 fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     let arch = entry_arch(e);
+    let generation_defaults =
+        crate::capabilities::generation_defaults_for_model_arch(&e.name, &arch);
     let loaded = !resident.is_empty() && e.name == resident;
     let preview = e.sidecar.preview.clone();
+    let known_ltx23_single_file = matches!(
+        e.name.strip_suffix(".safetensors").unwrap_or(&e.name),
+        "ltx-2.3-22b-dev-fp8"
+            | "ltx-2.3-22b-dev-fp8-dequant-bf16"
+            | "ltx-2.3-22b-distilled-fp8"
+            | "ltx-2.3-22b-distilled-fp8-dequant-bf16"
+    );
+    let selected_checkpoint_supported = matches!(arch.as_str(), "krea2" | "sdxl")
+        || (arch == "ltx2"
+            && matches!(e.format.as_str(), "diffusion_model" | "full_checkpoint")
+            && (e.arch_source != "filename"
+                || !e.arch_override.is_empty()
+                || known_ltx23_single_file));
+    // These are the finite, pre-existing product profiles whose workers choose
+    // a bundled artifact by profile identity. Keep them selectable, but never
+    // pretend that an arbitrary same-architecture filename reaches the worker.
+    // New user checkpoints must use a selected-checkpoint loader (currently
+    // Krea-2 and SDXL) instead of being added to this compatibility list.
+    let bundled_profile = matches!(
+        (arch.as_str(), e.name.as_str()),
+        ("anima", "anima")
+            | ("chroma", "chroma1_hd_bf16")
+            | ("flux", "flux1-dev")
+            | ("flux-2/klein", "flux-2-klein-base-4b")
+            | ("flux-2/klein", "flux-2-klein-base-9b")
+            | ("flux-2/klein", "flux-2-klein-base-9b_fp8_e4m3fn")
+            | ("ideogram4", "ideogram-4-fp8")
+            | ("lens", "microsoft_lens")
+            | ("qwen-image", "qwen-image-2512")
+            | ("sd3", "sd3.5_large")
+            | ("sd3", "sd3.5_medium")
+            | ("sd3", "stablediffusion35_medium")
+            | ("zimage", "z_image_base_bf16")
+            | ("zimage", "zimage_base")
+    );
+    let route = if matches!(
+        arch.as_str(),
+        "ltx2" | "wan2.2" | "nava" | "bernini" | "scail2"
+    ) {
+        "video"
+    } else if crate::capabilities::model_family_for_arch(&arch).is_some() {
+        "image"
+    } else {
+        "unsupported"
+    };
+    // Non-LTX video workers still consume finite compiled product identities.
+    // LTX2 is selected-checkpoint capable: geometry remains bounded by an AOT
+    // runner, while the denoiser artifact is the exact scanned file selected
+    // by the user.
+    let video_profile = e.arch_override.is_empty()
+        && matches!(
+            (arch.as_str(), e.name.as_str()),
+            ("wan2.2", "Wan2.2-TI2V-5B-Mojo")
+                | ("wan2.2", "wan2.2_t2v_a14b_fp8_e4m3")
+                | ("bernini", "Bernini-R-Diffusers")
+                | ("scail2", "SCAIL-2-Mojo")
+        );
+    let runtime_supported = video_profile || selected_checkpoint_supported || bundled_profile;
+    let selected_checkpoint_scope = if selected_checkpoint_supported {
+        if arch == "ltx2" {
+            "video_denoiser"
+        } else {
+            "denoiser"
+        }
+    } else if bundled_profile {
+        "bundled_profile"
+    } else if video_profile {
+        "video_route"
+    } else {
+        ""
+    };
+    let runtime_reason = if runtime_supported {
+        String::new()
+    } else if route == "video" {
+        format!(
+            "This {arch} artifact is visible, but it is not one of the compiled video product profiles and its selected path is not consumed"
+        )
+    } else if route == "image" {
+        format!(
+            "The {arch} backend is installed, but it does not yet consume arbitrary selected checkpoints; this file is disabled to prevent silently loading different weights"
+        )
+    } else {
+        format!("No production runtime is registered for architecture {arch}")
+    };
     let metadata = json!({
         "schema": "serenity.model.metadata.v1",
         "source": "disk_scan",
         "family": arch,
+        "detected_arch": e.detected_arch,
+        "arch_source": e.arch_source,
+        "arch_override": e.arch_override,
+        "format": e.format,
         "notes": e.sidecar.description,        // ADD: from <model>.json/.civitai.info
         "description": e.sidecar.description,  // ADD: alias for clarity
         "trigger": e.sidecar.trigger,          // ADD: sidecar trigger words (if any)
@@ -850,12 +1987,23 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
         "title": e.name,
         "subtitle": arch,
         "path": e.path,
+        "arch": arch,
+        "detected_arch": e.detected_arch,
+        "arch_source": e.arch_source,
+        "arch_override": e.arch_override,
+        "format": e.format,
+        "generation_route": route,
+        "runtime_supported": runtime_supported,
+        "runtime_reason": runtime_reason,
+        "uses_selected_checkpoint": selected_checkpoint_supported,
+        "selected_checkpoint_scope": selected_checkpoint_scope,
         "folder": e.folder,                    // ADD: subdir under scan root ("" = top)
         "size": e.size,
         "thumbnail": "",
         "preview": preview,                    // ADD: data: URI if a sidecar exists
         "favorite": false,
         "loaded": loaded,
+        "generation_defaults": generation_defaults.clone(),
         "metadata": metadata,
     });
     json!({
@@ -863,6 +2011,15 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
         "path": e.path,
         "folder": e.folder,                    // ADD: subdir under scan root ("" = top)
         "arch": arch,
+        "detected_arch": e.detected_arch,
+        "arch_source": e.arch_source,
+        "arch_override": e.arch_override,
+        "format": e.format,
+        "generation_route": route,
+        "runtime_supported": runtime_supported,
+        "runtime_reason": runtime_reason,
+        "uses_selected_checkpoint": selected_checkpoint_supported,
+        "selected_checkpoint_scope": selected_checkpoint_scope,
         "size": e.size,
         "loaded": loaded,
         "type": "checkpoint",
@@ -870,6 +2027,7 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
         "preview": preview,                    // ADD: data: URI if a sidecar exists
         "trigger": e.sidecar.trigger,          // ADD: sidecar trigger words (if any)
         "favorite": false,
+        "generation_defaults": generation_defaults,
         "metadata": metadata,
         "card": card,
     })
@@ -925,6 +2083,9 @@ fn lora_entry_json(
         "size": e.size,
         "arch": target,
         "target_arch": target,
+        "detected_arch": e.detected_arch,
+        "arch_source": e.arch_source,
+        "arch_override": e.arch_override,
         "trigger": trigger,                    // populated from sidecar (was always "")
         "thumbnail": "",
         "preview": preview,                    // ADD: data: URI if a sidecar exists
@@ -937,6 +2098,18 @@ fn lora_entry_json(
         "selectable_as_lora": selectable_as_lora,
         "metadata": metadata,
         "card": card,
+    })
+}
+
+fn registry_artifact_json(artifact: &RegistryArtifact) -> Value {
+    json!({
+        "schema": "serenity.model.artifact.v1",
+        "name": artifact.name,
+        "path": artifact.path,
+        "folder": artifact.folder,
+        "type": artifact.artifact_type,
+        "arch": "any",
+        "size": artifact.size,
     })
 }
 
@@ -985,11 +2158,40 @@ pub async fn get_models(Query(q): Query<HashMap<String, String>>) -> Response {
         selected_model = resident.to_string();
     }
 
-    let models = scan_checkpoints();
-    let loras = scan_loras()
-        .into_iter()
+    let force_refresh = matches!(
+        g("refresh").to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    );
+    let models = scan_checkpoints_with_refresh(force_refresh);
+    let scanned_loras = scan_loras();
+    let loras = scanned_loras
+        .iter()
         .filter(|entry| lora_selectable_as_overlay(&entry.name))
+        .cloned()
         .collect::<Vec<_>>();
+    let mut artifacts = scan_registry_artifacts();
+    artifacts.extend(
+        scanned_loras
+            .iter()
+            .filter(|entry| !lora_selectable_as_overlay(&entry.name))
+            .map(|entry| RegistryArtifact {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+                folder: entry.folder.clone(),
+                artifact_type: "feature_adapter".to_string(),
+                size: entry.size,
+            }),
+    );
+    artifacts.sort_by(|left, right| {
+        left.artifact_type
+            .cmp(&right.artifact_type)
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
     let selected_arch = model_arch_for(&models, &selected_model);
 
     let query = json!({
@@ -1008,22 +2210,170 @@ pub async fn get_models(Query(q): Query<HashMap<String, String>>) -> Response {
     let loras_json = sorted_filtered(&loras, &lora_search, &lora_filter, &lora_sort, |e| {
         lora_entry_json(e, &models, &selected_model, &selected_arch)
     });
+    let artifacts_json = Value::Array(artifacts.iter().map(registry_artifact_json).collect());
 
     let doc = json!({
         "schema": "serenity.models.v1",
         "query": query,
         "models_total": models.len(),
         "loras_total": loras.len(),
+        "artifacts_total": artifacts.len(),
         "model_selected": selected_model,
         "model_selected_arch": selected_arch,
+        "model_type_options": model_type_options_json(),
         "models": models_json,
         "loras": loras_json,
+        "artifacts": artifacts_json,
         "ltx2_features": ltx2_feature_documents(),
     });
 
     (
         [(CONTENT_TYPE, "application/json")],
         serde_json::to_string(&doc).unwrap_or_else(|_| String::from("{}")),
+    )
+        .into_response()
+}
+
+fn model_type_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&json!({ "error": message.into() }))
+            .unwrap_or_else(|_| String::from(r#"{"error":"model type update failed"}"#)),
+    )
+        .into_response()
+}
+
+/// POST /v1/models/type — persist or reset the architecture assigned to one
+/// exact checkpoint or LoRA registry identity. The server still controls which
+/// architecture loaders exist; this endpoint changes classification/routing,
+/// never runtime capability claims.
+pub async fn post_model_type_override(Json(payload): Json<ModelTypeOverrideRequest>) -> Response {
+    let model = payload.model.trim();
+    if model.is_empty() {
+        return model_type_error(StatusCode::BAD_REQUEST, "model is required");
+    }
+
+    let kind = payload
+        .kind
+        .as_deref()
+        .unwrap_or("checkpoint")
+        .trim()
+        .to_ascii_lowercase();
+    let is_lora = kind == "lora";
+    if !is_lora && !matches!(kind.as_str(), "checkpoint" | "unet" | "model") {
+        return model_type_error(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported registry kind {kind:?}; expected checkpoint or lora"),
+        );
+    }
+    let entries = if is_lora {
+        scan_loras()
+    } else {
+        scan_checkpoints_uncached()
+    };
+    let Some(target) = entries
+        .iter()
+        .find(|entry| entry.name == model && Path::new(&entry.path).is_file())
+    else {
+        return model_type_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "{} registry model not found: {model}",
+                if is_lora { "LoRA" } else { "checkpoint" }
+            ),
+        );
+    };
+    let model_name = target.name.clone();
+    let override_key = if is_lora {
+        lora_type_override_key(&model_name)
+    } else {
+        model_name.clone()
+    };
+    let requested = payload.arch.as_deref().unwrap_or("").trim();
+    let reset = requested.is_empty()
+        || matches!(
+            requested.to_ascii_lowercase().as_str(),
+            "auto" | "automatic" | "detected"
+        );
+    let arch_override = if reset {
+        None
+    } else {
+        match normalize_user_model_type(requested) {
+            Some(arch) => Some(arch),
+            None => {
+                let supported = MODEL_TYPE_OPTIONS
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return model_type_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported model type {requested:?}; choose one of: {supported}"),
+                );
+            }
+        }
+    };
+
+    {
+        let _guard = match model_type_override_write_lock().lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return model_type_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "model type override lock is poisoned",
+                );
+            }
+        };
+        let root = model_root();
+        let mut overrides = match load_model_type_overrides_from(&root) {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                return model_type_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+            }
+        };
+        if let Some(arch) = arch_override.as_ref() {
+            overrides.insert(override_key.clone(), arch.clone());
+        } else {
+            overrides.remove(&override_key);
+        }
+        if let Err(error) = persist_model_type_overrides_to(&root, &overrides) {
+            return model_type_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+    }
+
+    invalidate_checkpoint_scan_cache();
+    let updated_entries = if is_lora {
+        scan_loras()
+    } else {
+        scan_checkpoints_with_refresh(true)
+    };
+    let Some(updated) = updated_entries
+        .into_iter()
+        .find(|entry| entry.name == model_name)
+    else {
+        return model_type_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "model disappeared while saving its type",
+        );
+    };
+    let updated_json = if is_lora {
+        let models = scan_checkpoints();
+        lora_entry_json(&updated, &models, "", "")
+    } else {
+        model_entry_json(&updated, "")
+    };
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&json!({
+            "schema": "serenity.model_type_override.result.v1",
+            "reset": reset,
+            "kind": if is_lora { "lora" } else { "checkpoint" },
+            "model": updated_json,
+            "model_type_options": model_type_options_json(),
+        }))
+        .unwrap_or_else(|_| String::from("{}")),
     )
         .into_response()
 }
@@ -1037,6 +2387,37 @@ pub fn checkpoint_names() -> Vec<String> {
     scan_checkpoints().into_iter().map(|e| e.name).collect()
 }
 
+/// Resolve a UI/API model identity to the exact artifact discovered under the
+/// configured registry root. Absolute paths are accepted only when they equal a
+/// scanned entry, preventing the generate API from becoming an arbitrary-file
+/// reader.
+pub(crate) fn resolve_checkpoint(selection: &str) -> Option<ResolvedCheckpoint> {
+    let wanted = selection.trim();
+    let wanted_without_ext = wanted.strip_suffix(".safetensors").unwrap_or(wanted);
+    scan_checkpoints().into_iter().find_map(|entry| {
+        let entry_without_ext = entry
+            .name
+            .strip_suffix(".safetensors")
+            .unwrap_or(&entry.name);
+        if entry.name == wanted || entry_without_ext == wanted_without_ext || entry.path == wanted {
+            Some(ResolvedCheckpoint {
+                name: entry.name,
+                path: PathBuf::from(entry.path),
+                arch: entry.arch,
+                arch_source: entry.arch_source,
+                arch_override: entry.arch_override,
+                format: entry.format,
+            })
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn architecture_for_model(selection: &str) -> Option<String> {
+    resolve_checkpoint(selection).map(|entry| entry.arch)
+}
+
 /// LoRA NAMES from the disk scan. ComfyUI `/models/loras` is a bare string array.
 pub fn lora_names() -> Vec<String> {
     scan_loras()
@@ -1044,6 +2425,20 @@ pub fn lora_names() -> Vec<String> {
         .filter(|entry| lora_selectable_as_overlay(&entry.name))
         .map(|entry| entry.name)
         .collect()
+}
+
+/// Auxiliary model artifacts from the same recursive registry inventory used
+/// by the Models tab. Names remain relative to their category root so nested
+/// user organization is preserved.
+pub fn artifact_name_inventory() -> BTreeMap<String, Vec<String>> {
+    let mut inventory = BTreeMap::<String, Vec<String>>::new();
+    for artifact in scan_registry_artifacts() {
+        inventory
+            .entry(artifact.artifact_type)
+            .or_default()
+            .push(artifact.name);
+    }
+    inventory
 }
 
 /// Resolve a registry LoRA by its API name (with or without `.safetensors`) or
@@ -1090,7 +2485,7 @@ pub async fn delete_model(AxPath((mtype, name)): AxPath<(String, String)>) -> Re
                 serde_json::to_string(&json!({ "error": format!("unknown model type: {mtype}") }))
                     .unwrap(),
             )
-                .into_response()
+                .into_response();
         }
     };
     // filename guard: single path component, no traversal, .safetensors only.
@@ -1119,7 +2514,7 @@ pub async fn delete_model(AxPath((mtype, name)): AxPath<(String, String)>) -> Re
                 serde_json::to_string(&json!({ "error": format!("model not found: {name}") }))
                     .unwrap(),
             )
-                .into_response()
+                .into_response();
         }
     }
     match std::fs::remove_file(&p) {
@@ -1142,12 +2537,8 @@ pub async fn delete_model(AxPath((mtype, name)): AxPath<(String, String)>) -> Re
 mod tests {
     use super::*;
 
-    // Locks the arch probes + the NAME-PRECEDENCE scan order (HEAD model_scan.mojo:
-    // arch = detect_arch_from_name(name); header only fills "unknown"). This is the
-    // documented "disabled-family name tag" feature — and the one place the Rust
-    // diverges from the STALE Jun-13 daemon binary, which predates this order and
-    // tags header-first (flux-2-klein→"flux-2/klein", wan2.2→"wan"). A daemon rebuilt
-    // from HEAD agrees with the Rust.
+    // Filename probes remain a compatibility fallback for legacy files without
+    // useful metadata or recognizable tensor keys.
     #[test]
     fn arch_name_precedence_known_families() {
         assert_eq!(detect_arch_from_name("flux-2-klein-base-9b"), "flux-2");
@@ -1161,6 +2552,8 @@ mod tests {
             "qwen-image"
         );
         assert_eq!(detect_arch_from_name("ltx-2.3-22b-dev"), "ltx2");
+        assert_eq!(detect_arch_from_name("EriCrhroma_000004800"), "chroma");
+        assert_eq!(detect_arch_from_name("NAVA/NAVA_fp8"), "nava");
         assert_eq!(detect_arch_from_name("Bernini-R-Diffusers"), "bernini");
         assert_eq!(detect_arch_from_name("SCAIL-2-Mojo"), "scail2");
         assert_eq!(detect_arch_from_name("some-random-checkpoint"), "unknown");
@@ -1173,9 +2566,466 @@ mod tests {
             detect_arch("...\"double_stream_modulation_img\": ..."),
             "flux-2/klein"
         );
-        assert_eq!(detect_arch("...\"time_projection.\": ..."), "wan");
+        assert_eq!(
+            detect_arch(
+                "...\"backbone.double_blocks.0.self_attn.q_audio.bias\":\
+                 ...\"backbone.single_blocks.0.self_attn.q.bias\":..."
+            ),
+            "nava"
+        );
+        assert_eq!(detect_arch("...\"time_projection.\": ..."), "wan2.2");
         assert_eq!(detect_arch("{}"), "unknown");
         assert_eq!(detect_lora_target_arch("...\"lora_unet_x\": ..."), "sdxl");
+        assert_eq!(
+            detect_lora_target_arch(
+                r#"{"transformer.single_transformer_blocks.0.attn.to_q.lora_A.weight":{},
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight":{}}"#
+            ),
+            "flux"
+        );
+        assert_eq!(
+            detect_lora_target_arch(
+                r#"{"diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight":{}}"#
+            ),
+            "ltx2"
+        );
+        assert_eq!(
+            detect_lora_target_arch(
+                r#"{"lycoris_transformer_blocks_0_attn_add_q_proj.lokr_w1":{},
+                    "lycoris_transformer_blocks_0_attn_add_q_proj.lokr_w2":{}}"#
+            ),
+            "sd3"
+        );
+        assert_eq!(
+            detect_lora_target_arch(
+                r#"{"transformer.transformer_blocks.0.attn1.to_q.lora_A.weight":{},
+                    "transformer.transformer_blocks.0.attn2.to_k.lora_B.weight":{},
+                    "transformer.transformer_blocks.0.ff.net.0.proj.lora_A.weight":{}}"#
+            ),
+            "anima"
+        );
+        assert_eq!(
+            detect_lora_target_arch(
+                r#"{"transformer.transformer_blocks.0.attn.to_q.lora_A.weight":{},
+                    "transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight":{},
+                    "transformer.transformer_blocks.0.img_mlp.net.0.proj.lora_A.weight":{}}"#
+            ),
+            "qwen-image"
+        );
+        assert_eq!(
+            detect_lora_target_arch(
+                r#"{"transformer.layers.0.attention.qkv.lora_A.weight":{},
+                    "transformer.layers.0.feed_forward.w1.lora_B.weight":{}}"#
+            ),
+            "ideogram4"
+        );
+    }
+
+    #[test]
+    fn modelspec_architecture_beats_random_creator_filename() {
+        assert_eq!(
+            detect_arch(
+                r#"{"__metadata__":{"modelspec.architecture":"stable-diffusion-xl-v1-base"}}"#
+            ),
+            "sdxl"
+        );
+        assert_eq!(
+            detect_arch(r#"{"__metadata__":{"modelspec.architecture":"Krea 2"}}"#),
+            "krea2"
+        );
+        assert_eq!(normalize_architecture_id("Pony Diffusion V6 XL"), "sdxl");
+        assert_eq!(
+            normalize_architecture_id("stable-diffusion-v3.5-large"),
+            "sd3"
+        );
+    }
+
+    #[test]
+    fn model_type_override_values_are_normalized_and_bounded() {
+        assert_eq!(
+            normalize_user_model_type("Pony Diffusion V6 XL"),
+            Some("sdxl".to_string())
+        );
+        assert_eq!(
+            normalize_user_model_type("FLUX-2 Klein"),
+            Some("flux-2/klein".to_string())
+        );
+        assert_eq!(
+            normalize_user_model_type("LensPipeline"),
+            Some("lens".to_string())
+        );
+        assert_eq!(
+            normalize_user_model_type("Baidu NAVA"),
+            Some("nava".to_string())
+        );
+        assert_eq!(normalize_user_model_type("made-up-runtime"), None);
+    }
+
+    #[test]
+    fn model_type_override_file_round_trips_and_reset_removes_it() {
+        let unique = format!(
+            "serenity_model_type_override_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let mut overrides = BTreeMap::new();
+        overrides.insert("portraits/cyber-pony".to_string(), "sdxl".to_string());
+        overrides.insert(
+            lora_type_override_key("styles/custom-adapter"),
+            "chroma".to_string(),
+        );
+        persist_model_type_overrides_to(&root, &overrides).unwrap();
+        assert_eq!(load_model_type_overrides_from(&root).unwrap(), overrides);
+
+        persist_model_type_overrides_to(&root, &BTreeMap::new()).unwrap();
+        assert!(!model_type_overrides_path(&root).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_detection_reports_automatic_source() {
+        assert_eq!(
+            detect_checkpoint_arch(
+                r#"{"__metadata__":{"modelspec.architecture":"stable-diffusion-xl-v1-base"}}"#,
+                "Krea 2",
+                "krea-name"
+            ),
+            ("sdxl".to_string(), "metadata".to_string())
+        );
+        assert_eq!(
+            detect_checkpoint_arch("{}", "Pony Diffusion V6 XL", "random-name"),
+            ("sdxl".to_string(), "sidecar".to_string())
+        );
+    }
+
+    #[test]
+    fn arbitrary_checkpoints_are_enabled_only_when_the_worker_uses_the_file() {
+        let entry = |name: &str, arch: &str, format: &str| ScanEntry {
+            name: name.to_string(),
+            path: format!("/models/{name}.safetensors"),
+            arch: arch.to_string(),
+            detected_arch: arch.to_string(),
+            arch_source: "tensor_signature".to_string(),
+            arch_override: String::new(),
+            format: format.to_string(),
+            size: 1,
+            folder: String::new(),
+            sidecar: Sidecar::default(),
+        };
+
+        let arbitrary_sdxl =
+            model_entry_json(&entry("creator-name", "sdxl", "full_checkpoint"), "");
+        assert_eq!(arbitrary_sdxl["runtime_supported"], true);
+        assert_eq!(arbitrary_sdxl["uses_selected_checkpoint"], true);
+        assert_eq!(arbitrary_sdxl["selected_checkpoint_scope"], "denoiser");
+        assert_eq!(arbitrary_sdxl["generation_defaults"]["steps"], 50);
+
+        let arbitrary_qwen =
+            model_entry_json(&entry("creator-name", "qwen-image", "diffusion_model"), "");
+        assert_eq!(arbitrary_qwen["runtime_supported"], false);
+        assert_eq!(arbitrary_qwen["uses_selected_checkpoint"], false);
+        assert!(
+            arbitrary_qwen["runtime_reason"]
+                .as_str()
+                .unwrap()
+                .contains("prevent silently loading different weights")
+        );
+
+        let bundled_flux = model_entry_json(&entry("flux1-dev", "flux", "diffusion_model"), "");
+        assert_eq!(bundled_flux["runtime_supported"], true);
+        assert_eq!(bundled_flux["uses_selected_checkpoint"], false);
+        assert_eq!(bundled_flux["selected_checkpoint_scope"], "bundled_profile");
+
+        let bundled_lens =
+            model_entry_json(&entry("microsoft_lens", "lens", "diffusers_directory"), "");
+        assert_eq!(bundled_lens["runtime_supported"], true);
+        assert_eq!(bundled_lens["selected_checkpoint_scope"], "bundled_profile");
+        assert_eq!(bundled_lens["generation_defaults"]["steps"], 20);
+        assert_eq!(bundled_lens["card"]["generation_defaults"]["cfg"], 5.0);
+
+        let unbound_zimage_turbo = model_entry_json(
+            &entry("z_image_turbo_bf16", "zimage", "diffusion_model"),
+            "",
+        );
+        assert_eq!(unbound_zimage_turbo["runtime_supported"], false);
+        assert_eq!(unbound_zimage_turbo["generation_defaults"]["steps"], 8);
+        assert!(
+            unbound_zimage_turbo["runtime_reason"]
+                .as_str()
+                .unwrap()
+                .contains("does not yet consume arbitrary selected checkpoints")
+        );
+
+        let ltx_product =
+            model_entry_json(&entry("ltx-2.3-22b-dev-fp8", "ltx2", "diffusion_model"), "");
+        assert_eq!(ltx_product["runtime_supported"], true);
+        assert_eq!(ltx_product["uses_selected_checkpoint"], true);
+        assert_eq!(ltx_product["selected_checkpoint_scope"], "video_denoiser");
+        let ltx_bf16_product = model_entry_json(
+            &entry(
+                "ltx-2.3-22b-dev-fp8-dequant-bf16",
+                "ltx2",
+                "diffusion_model",
+            ),
+            "",
+        );
+        assert_eq!(ltx_bf16_product["runtime_supported"], true);
+        assert_eq!(
+            ltx_bf16_product["selected_checkpoint_scope"],
+            "video_denoiser"
+        );
+
+        let arbitrary_ltx = model_entry_json(
+            &entry("creator-full-finetune", "ltx2", "diffusion_model"),
+            "",
+        );
+        assert_eq!(arbitrary_ltx["runtime_supported"], true);
+        assert_eq!(arbitrary_ltx["uses_selected_checkpoint"], true);
+        assert_eq!(arbitrary_ltx["selected_checkpoint_scope"], "video_denoiser");
+
+        let mut user_classified_ltx = entry("sulphur_dev_bf16", "ltx2", "diffusion_model");
+        user_classified_ltx.detected_arch = "unknown".to_string();
+        user_classified_ltx.arch_source = "user_override".to_string();
+        user_classified_ltx.arch_override = "ltx2".to_string();
+        let user_classified_ltx = model_entry_json(&user_classified_ltx, "");
+        assert_eq!(user_classified_ltx["runtime_supported"], true);
+        assert_eq!(
+            user_classified_ltx["selected_checkpoint_scope"],
+            "video_denoiser"
+        );
+
+        let source_wan = model_entry_json(
+            &entry("Wan2.2-TI2V-5B", "wan2.2", "diffusers_directory"),
+            "",
+        );
+        assert_eq!(source_wan["runtime_supported"], false);
+        let product_wan = model_entry_json(
+            &entry("Wan2.2-TI2V-5B-Mojo", "wan2.2", "diffusers_directory"),
+            "",
+        );
+        assert_eq!(product_wan["runtime_supported"], true);
+
+        let nava = model_entry_json(&entry("NAVA/NAVA_fp8", "nava", "diffusion_model"), "");
+        assert_eq!(nava["generation_route"], "video");
+        assert_eq!(nava["runtime_supported"], false);
+        assert!(
+            nava["runtime_reason"]
+                .as_str()
+                .unwrap()
+                .contains("not one of the compiled video product profiles")
+        );
+
+        let mut classified_video = entry("creator-video", "ltx2", "diffusion_model");
+        classified_video.detected_arch = "unknown".to_string();
+        classified_video.arch_source = "user_override".to_string();
+        classified_video.arch_override = "ltx2".to_string();
+        let classified_video = model_entry_json(&classified_video, "");
+        assert_eq!(classified_video["generation_route"], "video");
+        assert_eq!(classified_video["runtime_supported"], true);
+        assert_eq!(classified_video["uses_selected_checkpoint"], true);
+        assert_eq!(
+            classified_video["selected_checkpoint_scope"],
+            "video_denoiser"
+        );
+    }
+
+    #[test]
+    fn checkpoint_support_weights_are_classified_as_components() {
+        assert_eq!(
+            checkpoint_component_type("ltx-2.3-22b-dev-fp8.safetensors"),
+            None
+        );
+        assert_eq!(
+            checkpoint_component_type("ltx-2.3-22b-dev-fp8-dequant-bf16.safetensors"),
+            None
+        );
+        assert_eq!(
+            checkpoint_component_type("ltx-2.3-22b-distilled-fp8.safetensors"),
+            None
+        );
+        assert_eq!(
+            checkpoint_component_type("ltx-2.3-22b-distilled-lora-384.safetensors"),
+            Some("runtime_component")
+        );
+        assert_eq!(
+            checkpoint_component_type("ltx-2.3-22b-svdint4-r32.safetensors"),
+            Some("runtime_component")
+        );
+        assert_eq!(
+            checkpoint_component_type("ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            Some("upscaler")
+        );
+        assert_eq!(
+            checkpoint_component_type("NAVA/params/LTX2/ltx-2.3-22b-dev_audio_vae.safetensors"),
+            Some("vae")
+        );
+        assert_eq!(
+            checkpoint_component_type("NAVA/umt5_xxl_enc.safetensors"),
+            Some("clip")
+        );
+        assert_eq!(
+            checkpoint_component_type("creator/cyberrealisticPony.safetensors"),
+            None
+        );
+    }
+
+    #[test]
+    fn diffusers_bundles_are_discovered_recursively_and_lens_is_detected() {
+        let unique = format!(
+            "serenity_diffusers_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let lens = root.join("creators/microsoft_lens");
+        std::fs::create_dir_all(lens.join("transformer")).unwrap();
+        std::fs::write(
+            lens.join("model_index.json"),
+            br#"{"_class_name":"LensPipeline"}"#,
+        )
+        .unwrap();
+        std::fs::write(lens.join("transformer/config.json"), b"{}").unwrap();
+
+        let dirs = discover_model_index_dirs(&root);
+        assert_eq!(dirs, vec![lens.clone()]);
+        assert_eq!(
+            diffusers_directory_identity(&root, &lens),
+            "creators/microsoft_lens"
+        );
+        assert_eq!(
+            diffusers_directory_arch(&lens, "creators/microsoft_lens"),
+            "lens"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_scan_recurses_category_folders_and_skips_components() {
+        let unique = format!(
+            "serenity_model_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let portraits = root.join("portraits");
+        let text_encoder = root.join("bundle/text_encoder");
+        std::fs::create_dir_all(&portraits).unwrap();
+        std::fs::create_dir_all(&text_encoder).unwrap();
+        std::fs::write(portraits.join("random-name.safetensors"), b"fixture").unwrap();
+        std::fs::write(text_encoder.join("model.safetensors"), b"component").unwrap();
+        std::fs::write(root.join("model-00001-of-00002.safetensors"), b"shard").unwrap();
+
+        let entries = list_safetensors(root.to_str().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "portraits/random-name");
+        assert_eq!(entries[0].folder, "");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_checkpoint_root_accepts_direct_user_model_folder() {
+        let unique = format!(
+            "serenity_external_model_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).unwrap();
+        let checkpoint = root.join("creator-custom-model.safetensors");
+        std::fs::write(&checkpoint, b"fixture").unwrap();
+
+        assert_eq!(
+            external_checkpoint_scan_roots(&root),
+            vec![(String::new(), root.clone())]
+        );
+        let mut entries = Vec::new();
+        append_checkpoint_files(
+            &mut entries,
+            &root,
+            "",
+            "external-test",
+            &BTreeMap::new(),
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "creator-custom-model");
+        assert_eq!(Path::new(&entries[0].path), checkpoint);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lora_scan_keeps_lora_named_files_in_subdirectories() {
+        let unique = format!(
+            "serenity_lora_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(root.join("LTX/features")).unwrap();
+        std::fs::write(
+            root.join("LTX/features/reference-lora.safetensors"),
+            b"fixture",
+        )
+        .unwrap();
+
+        assert!(list_safetensors(root.to_str().unwrap()).is_empty());
+        let entries = list_lora_safetensors(root.to_str().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "LTX/features/reference-lora");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auxiliary_artifact_scan_recurses_and_skips_cache_noise() {
+        let unique = format!(
+            "serenity_artifact_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(root.join("family")).unwrap();
+        std::fs::create_dir_all(root.join(".cache")).unwrap();
+        std::fs::write(root.join("family/decoder.safetensors"), b"weights").unwrap();
+        std::fs::write(root.join("legacy.pth"), b"weights").unwrap();
+        std::fs::write(root.join("notes.json"), b"metadata").unwrap();
+        std::fs::write(root.join(".cache/duplicate.safetensors"), b"cache").unwrap();
+
+        let mut artifacts = Vec::new();
+        scan_registry_artifact_dir(
+            "vae",
+            &root,
+            &root,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut artifacts,
+        );
+        artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].name, "family/decoder.safetensors");
+        assert_eq!(artifacts[0].folder, "family");
+        assert_eq!(artifacts[0].artifact_type, "vae");
+        assert_eq!(artifacts[1].name, "legacy.pth");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1225,6 +3075,36 @@ mod tests {
         assert_eq!(
             lora_incompatible_reason("m", "flux", "sdxl", false),
             "target_arch sdxl is not compatible with model arch flux"
+        );
+    }
+
+    #[test]
+    fn lora_inventory_order_is_case_insensitive_and_stable() {
+        let make = |name: &str, path: &str| ScanEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            arch: "flux".to_string(),
+            detected_arch: "flux".to_string(),
+            arch_source: "tensor_signature".to_string(),
+            arch_override: String::new(),
+            format: "lora".to_string(),
+            size: 1,
+            folder: String::new(),
+            sidecar: Sidecar::default(),
+        };
+        let mut entries = vec![
+            make("zeta", "/loras/zeta.safetensors"),
+            make("Alpha", "/loras/Alpha.safetensors"),
+            make("alpha", "/loras/alpha.safetensors"),
+            make("beta", "/loras/beta.safetensors"),
+        ];
+        entries.sort_by(|left, right| scan_entry_cmp(left, right, "name"));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "alpha", "beta", "zeta"]
         );
     }
 

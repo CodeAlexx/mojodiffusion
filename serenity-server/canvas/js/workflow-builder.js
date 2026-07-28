@@ -23,7 +23,7 @@ var WorkflowBuilder = (function () {
         return { sampler: s, scheduler: sched };
     }
     function build(params) {
-        var arch = ModelUtils.detectArchFromFilename(params.model);
+        var arch = ModelUtils.archForModel(params.model);
         var workflow;
         switch (arch) {
             case 'flux':
@@ -108,7 +108,7 @@ var WorkflowBuilder = (function () {
         return workflow;
     }
     function buildImg2Img(params) {
-        var arch = ModelUtils.detectArchFromFilename(params.model);
+        var arch = ModelUtils.archForModel(params.model);
         var workflow;
         switch (arch) {
             case 'flux':
@@ -136,7 +136,7 @@ var WorkflowBuilder = (function () {
         return workflow;
     }
     function buildEditModel(params) {
-        var arch = ModelUtils.detectArchFromFilename(params.model);
+        var arch = ModelUtils.archForModel(params.model);
         if (!params.initImageName)
             throw new Error('Edit Models requires a source image');
         if (arch === 'klein')
@@ -146,7 +146,7 @@ var WorkflowBuilder = (function () {
         throw new Error('The selected model does not have a native image-edit graph');
     }
     function buildInpaint(params) {
-        var arch = ModelUtils.detectArchFromFilename(params.model);
+        var arch = ModelUtils.archForModel(params.model);
         var w = ModelUtils.clampDimension(params.width);
         var h = ModelUtils.clampDimension(params.height);
         var seed = resolveSeed(params.seed);
@@ -182,7 +182,7 @@ var WorkflowBuilder = (function () {
     function buildLanPaintCandidate(p) {
         if (!p.initImageName || !p.maskImageName)
             throw new Error('LanPaint requires both a source image and a painted mask');
-        var arch = ModelUtils.detectArchFromFilename(p.model);
+        var arch = ModelUtils.archForModel(p.model);
         var graphReadyArchitectures = ['flux', 'klein', 'qwen', 'sd3', 'sdxl', 'anima', 'ideogram4', 'sd15'];
         if (graphReadyArchitectures.indexOf(arch) < 0)
             throw new Error('LanPaint graph authoring is not implemented for ' + arch);
@@ -447,6 +447,8 @@ var WorkflowBuilder = (function () {
                 strength_model: lora.strength,
                 model: prevModelRef
             };
+            if (lora.role === 'distillation')
+                inputs.role = 'distillation';
             if (prevClipRef) {
                 inputs.strength_clip = lora.strength;
                 inputs.clip = prevClipRef;
@@ -1062,7 +1064,12 @@ var WorkflowBuilder = (function () {
             feature_id: featureId,
             feature_weight: featureId === 'standard' ? 1.0 : featureWeight,
             post_upscale_id: p.ltx2PostUpscaler || 'none',
-            post_upscale_factor: Number(p.ltx2PostUpscaleFactor) === 4 ? 4 : 2
+            post_upscale_factor: Number(p.ltx2PostUpscaleFactor) === 4 ? 4 : 2,
+            video_edit_mode: p.ltx2VideoEditMode || 'standard',
+            video_edit_start: Number.isFinite(Number(p.ltx2VideoEditStart))
+                ? Number(p.ltx2VideoEditStart) : 0,
+            video_edit_end: Number.isFinite(Number(p.ltx2VideoEditEnd))
+                ? Number(p.ltx2VideoEditEnd) : 0
         };
         var workflow = {
             '1': { class_type: 'LTXVLoader', inputs: loaderInputs },

@@ -1,6 +1,6 @@
 {
   "schema": "serenity.ltx2.request_profiles.v1",
-  "checkpoint": "ltx-2.3-22b-dev-fp8",
+  "checkpoint": "ltx-2.3-22b-distilled-1.1",
   "guidance_modes": {
     "distilled": {
       "steps": 8,
@@ -22,6 +22,7 @@
       "width": 512,
       "height": 768,
       "fps": 25,
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [4.84],
       "frames": [121],
       "source": "Serenity creator-verified profile"
@@ -30,21 +31,49 @@
       "id": "540p-landscape",
       "label": "540p Landscape",
       "width": 960,
-      "height": 544,
+      "height": 512,
+      "conditioning_width": 960,
+      "conditioning_height": 544,
       "fps": 24,
+      "modes": ["standard"],
       "durations": [5, 6, 8, 10, 20],
       "frames": [121, 145, 193, 241, 481],
-      "source": "LTX Desktop local fast profile"
+      "source": "LTX Desktop local fast profile after creator 64-pixel rounding"
     },
     {
       "id": "540p-portrait",
       "label": "540p Portrait",
+      "width": 512,
+      "height": 960,
+      "conditioning_width": 544,
+      "conditioning_height": 960,
+      "fps": 24,
+      "modes": ["standard"],
+      "durations": [5, 6, 8, 10, 20],
+      "frames": [121, 145, 193, 241, 481],
+      "source": "LTX Desktop local fast profile after creator 64-pixel rounding"
+    },
+    {
+      "id": "540p-source-landscape",
+      "label": "540p Source-native Landscape",
+      "width": 960,
+      "height": 544,
+      "fps": 24,
+      "modes": ["retake", "extend_start", "extend_end"],
+      "durations": [5, 6, 8, 10, 20],
+      "frames": [121, 145, 193, 241, 481],
+      "source": "LTX Desktop one-stage source-native temporal edit profile"
+    },
+    {
+      "id": "540p-source-portrait",
+      "label": "540p Source-native Portrait",
       "width": 544,
       "height": 960,
       "fps": 24,
+      "modes": ["retake", "extend_start", "extend_end"],
       "durations": [5, 6, 8, 10, 20],
       "frames": [121, 145, 193, 241, 481],
-      "source": "LTX Desktop local fast profile"
+      "source": "LTX Desktop one-stage source-native temporal edit profile"
     },
     {
       "id": "720p-landscape",
@@ -52,6 +81,7 @@
       "width": 1280,
       "height": 704,
       "fps": 24,
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [5, 6, 8, 10],
       "frames": [121, 145, 193, 241],
       "source": "LTX Desktop local fast profile"
@@ -62,6 +92,7 @@
       "width": 704,
       "height": 1280,
       "fps": 24,
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [5, 6, 8, 10],
       "frames": [121, 145, 193, 241],
       "source": "LTX Desktop local fast profile"
@@ -72,6 +103,7 @@
       "width": 1920,
       "height": 1088,
       "fps": 24,
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [5],
       "frames": [121],
       "source": "LTX Desktop local fast profile"
@@ -82,6 +114,7 @@
       "width": 1088,
       "height": 1920,
       "fps": 24,
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [5],
       "frames": [121],
       "source": "LTX Desktop local fast profile"

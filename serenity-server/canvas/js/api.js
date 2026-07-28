@@ -95,6 +95,9 @@ var SerenityAPI = (function () {
                     noise_fixture: li.noise_fixture || '',
                     feature_id: li.feature_id || 'standard',
                     feature_weight: Number(li.feature_weight),
+                    video_edit_mode: li.video_edit_mode || 'standard',
+                    video_edit_start: Number(li.video_edit_start) || 0,
+                    video_edit_end: Number(li.video_edit_end) || 0,
                     lora: loras
                 };
                 if (request.feature_id !== 'standard' &&
@@ -367,7 +370,7 @@ var SerenityAPI = (function () {
         return uploadImageDetails(base64Data, prefix)
             .then(function (data) { return data.path || data.name; });
     }
-    function uploadMedia(file) {
+    function uploadMediaDetails(file) {
         if (!file)
             return Promise.reject(new Error('No media file selected'));
         var form = new FormData();
@@ -387,7 +390,10 @@ var SerenityAPI = (function () {
                 });
             }
             return resp.json();
-        })
+        });
+    }
+    function uploadMedia(file) {
+        return uploadMediaDetails(file)
             .then(function (data) { return data.path || data.name; });
     }
     function viewUrl(filename, subfolder, type) {
@@ -403,6 +409,7 @@ var SerenityAPI = (function () {
         interrupt: interrupt,
         uploadImage: uploadImage,
         uploadImageDetails: uploadImageDetails,
+        uploadMediaDetails: uploadMediaDetails,
         uploadMedia: uploadMedia,
         viewUrl: viewUrl
     };

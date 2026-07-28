@@ -692,7 +692,7 @@ var SimpleMode = (function () {
         if (els.model) {
             els.model.addEventListener('change', function () {
                 state.model = this.value;
-                var arch = ModelUtils.detectArchFromFilename(this.value);
+                var arch = ModelUtils.archForModel(this.value);
                 updateUIForArch(arch);
                 applySmartDefaults(arch);
                 // Update topbar model badge
@@ -795,7 +795,7 @@ var SimpleMode = (function () {
             // the Generate tab, so do not expose an unusable text-only card in
             // Simple mode.
             var models = loaded[0].filter(function (model) {
-                return ModelUtils.detectArchFromFilename(model.name) !== 'scail2';
+                return ModelUtils.archForModel(model.name) !== 'scail2';
             });
             state.capabilities = loaded[1];
             if (!models.length)
@@ -810,7 +810,7 @@ var SimpleMode = (function () {
                 els.model.appendChild(opt);
             });
             state.model = models[0].name;
-            var arch = ModelUtils.detectArchFromFilename(models[0].name);
+            var arch = ModelUtils.archForModel(models[0].name);
             updateUIForArch(arch);
             applySmartDefaults(arch);
             // Update topbar badge

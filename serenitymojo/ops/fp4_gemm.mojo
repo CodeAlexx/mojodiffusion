@@ -27,6 +27,7 @@ def fp4_gemm_nt_rc(
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    alpha: Float32 = 1.0,   # combined per-tensor global scale (a_g * b_g)
 ) raises -> Int:
     """Raw shim call; returns the shim rc (0 = OK). Probe entry point."""
     var a_ptr = BytePtr(unsafe_from_address=Int(a_buf.unsafe_ptr()))
@@ -38,6 +39,7 @@ def fp4_gemm_nt_rc(
     return Int(external_call["serenity_lt_fp4_gemm_nt", Int32](
         a_ptr, as_ptr, b_ptr, bs_ptr, d_ptr,
         Int32(m), Int32(n), Int32(k),
+        alpha,
         stream,
     ))
 
@@ -52,9 +54,10 @@ def fp4_gemm_nt(
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    alpha: Float32 = 1.0,
 ) raises:
-    """D[M,N] f32 = A @ Bᵀ, NVFP4 block-16 ue4m3 scales. FAIL-LOUD."""
-    var rc = fp4_gemm_nt_rc(a_buf, a_scale, b_buf, b_scale, d_buf, m, n, k, ctx)
+    """D[M,N] f32 = alpha * A @ Bᵀ, NVFP4 block-16 ue4m3 scales. FAIL-LOUD."""
+    var rc = fp4_gemm_nt_rc(a_buf, a_scale, b_buf, b_scale, d_buf, m, n, k, ctx, alpha)
     if rc != 0:
         raise Error(
             String("fp4_gemm_nt: shim rc=") + String(rc)

@@ -280,3 +280,68 @@ def nvfp4_decode(
     bs = _ue4m3_decode(block_scales).unsqueeze(-1)
     out = (val.reshape(*val.shape[:-1], k // block, block) * bs).reshape(val.shape)
     return out * global_scale.float()
+
+
+# ── NVFP4 tiled weight payload (chunk 7: native FP4 forward) ─────────────────
+# cuBLASLt VEC16_UE4M3 wants block scales in 512-byte tiles of 128 rows x 4
+# scale-cols with a 32-row interleave (verified bit-exact by
+# serenitymojo/ops/parity/fp4_layout_probe.mojo).
+
+def _phys_scale_offset(r: int, c: int, kb_pad4: int) -> int:
+    tile = (r // 128) * (kb_pad4 // 4) + (c // 4)
+    return tile * 512 + (r % 32) * 16 + ((r // 32) % 4) * 4 + (c % 4)
+
+
+def scale_tiles_bytes(rows: int, kblocks: int) -> int:
+    rows_pad = ((rows + 127) // 128) * 128
+    kb_pad = ((kblocks + 3) // 4) * 4
+    return (rows_pad // 128) * (kb_pad // 4) * 512
+
+
+def nvfp4_encode_weight_tiled(rrot: torch.Tensor) -> tuple:
+    """Rotated residual [out, in] -> (nvq u8 [out,in/2] e2m1 lo=even,
+    nvs u8 TILED ue4m3 block-16 scales, nvg f32 per-tensor global scale).
+    Decode contract: value = e2m1(code) * ue4m3(scale) * nvg."""
+    out_f, in_f = rrot.shape
+    if in_f % 16 != 0:
+        raise ValueError("nvfp4_encode_weight_tiled: in % 16 != 0")
+    x = rrot.float()
+    g = (x.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30)
+    xb = (x / g).reshape(out_f, in_f // 16, 16)
+    bs = xb.abs().amax(-1) / 6.0
+    bs_b = _ue4m3_encode(bs)
+    bs_d = _ue4m3_decode(bs_b)
+    safe = torch.where(bs_d == 0, torch.ones_like(bs_d), bs_d)
+    v = xb / safe.unsqueeze(-1)
+    v = torch.where((bs_d == 0).unsqueeze(-1), torch.zeros_like(v), v)
+    sign = (v < 0).to(torch.uint8) << 3
+    idx = (v.abs().unsqueeze(-1) - _E2M1_MAG.view(1, 1, 1, -1)).abs().argmin(-1)
+    code = (sign | idx.to(torch.uint8)).reshape(out_f, in_f)
+    nvq = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
+    kb = in_f // 16
+    kb_pad = ((kb + 3) // 4) * 4
+    nvs = torch.zeros(scale_tiles_bytes(out_f, kb), dtype=torch.uint8)
+    rr = torch.arange(out_f).view(-1, 1).expand(out_f, kb)
+    cc = torch.arange(kb).view(1, -1).expand(out_f, kb)
+    tile = (rr // 128) * (kb_pad // 4) + (cc // 4)
+    off = tile * 512 + (rr % 32) * 16 + ((rr // 32) % 4) * 4 + (cc % 4)
+    nvs[off.reshape(-1)] = bs_b.reshape(-1)
+    return nvq, nvs, g.float().reshape(1)
+
+
+def nvfp4_decode_weight_tiled(nvq, nvs, nvg, out_f: int, in_f: int) -> torch.Tensor:
+    """Inverse of nvfp4_encode_weight_tiled -> f32 [out, in] (still rotated)."""
+    b = nvq.to(torch.int16)
+    codes = torch.empty(out_f, in_f, dtype=torch.int16)
+    codes[:, 0::2] = b & 0xF
+    codes[:, 1::2] = (b >> 4) & 0xF
+    mag = _E2M1_MAG[(codes & 0x7).long()]
+    val = torch.where((codes & 0x8) != 0, -mag, mag)
+    kb = in_f // 16
+    kb_pad = ((kb + 3) // 4) * 4
+    rr = torch.arange(out_f).view(-1, 1).expand(out_f, kb)
+    cc = torch.arange(kb).view(1, -1).expand(out_f, kb)
+    tile = (rr // 128) * (kb_pad // 4) + (cc // 4)
+    off = tile * 512 + (rr % 32) * 16 + ((rr // 32) % 4) * 4 + (cc % 4)
+    bs = _ue4m3_decode(nvs[off.reshape(-1)].reshape(out_f, kb))
+    return (val.reshape(out_f, kb, 16) * bs.unsqueeze(-1)).reshape(out_f, in_f) * nvg.float()

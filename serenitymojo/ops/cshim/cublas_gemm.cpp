@@ -347,6 +347,7 @@ extern "C" int serenity_lt_fp4_gemm_nt(
     const void* B, const void* Bscale,
     void* D,
     int M, int N, int K,
+    float alpha,          // combined per-tensor global scale (a_g * b_g)
     void* stream
 ) {
     if (!A || !B || !D || !Ascale || !Bscale) return -1;
@@ -428,7 +429,7 @@ extern "C" int serenity_lt_fp4_gemm_nt(
             break;
         }
 
-        const float alpha = 1.0f, beta = 0.0f;
+        const float beta = 0.0f;
         cublasStatus_t ms = cublasLtMatmul(
             g_lt, op, &alpha, B, Ad, A, Bd, &beta, D, Cd, D, Dd,
             &heur.algo, g_lt_ws, g_lt_ws_bytes, (cudaStream_t)stream);

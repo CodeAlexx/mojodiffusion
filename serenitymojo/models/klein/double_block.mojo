@@ -100,6 +100,12 @@ from serenitymojo.ops.int8_linear import (
     int8_linear_fwd_f32_bands,
     int8_band_tensor,
 )
+# SquareQ NVFP4 native-FP4 base fwd (cfg.quantized_resident=="squareq_nvfp4"):
+# frozen-base linears run alpha*fp4gemm(rht_quant(x), nvq) + (x@ld)@lu^T when
+# the payload is present. FORWARD-ONLY dispatch — every backward arm keeps
+# consuming the reconstructed BF16 W_hat the loader put in the Block under the
+# weight's own name (ops/squareq_nvfp4.mojo header).
+from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_linear
 from serenitymojo.ops.norm import rms_norm, layer_norm, layer_norm_modulate, lnmod_placeholder
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
@@ -265,6 +271,12 @@ struct StreamWeights(Copyable, Movable):
     # this holds the (int8 weight, F32 scalar scale) payload the int8 forward reads.
     # None on the bf16 path (default) → the base fields are the real bf16 weights.
     var int8: Optional[StreamInt8]
+    # squareq_nvfp4 loader sidecar (SquareQ chunk 8): when the block was pinned
+    # nvfp4-resident (pin_residents_squareq_nvfp4), the 4 base matmul weights
+    # above hold the RECONSTRUCTED BF16 W_hat (every backward arm reads them
+    # unchanged) and this holds the packed (nvq/nvs/ld/lu + nvg) payload the
+    # native-FP4 FORWARD reads. None everywhere else (default).
+    var nvfp4: Optional[StreamNvfp4]
 
     def __init__(
         out self,
@@ -280,6 +292,7 @@ struct StreamWeights(Copyable, Movable):
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
         self.int8 = Optional[StreamInt8](None)
+        self.nvfp4 = Optional[StreamNvfp4](None)
 
     def __init__(
         out self,
@@ -295,6 +308,7 @@ struct StreamWeights(Copyable, Movable):
         self.q_norm = q_norm^
         self.k_norm = k_norm^
         self.int8 = int8^
+        self.nvfp4 = Optional[StreamNvfp4](None)
 
 
 struct DoubleBlockWeights(Copyable, Movable):
@@ -1465,6 +1479,68 @@ def _base_fwd_i8_dbl(
     return linear(a, w_bf, nb^, ctx)
 
 
+# ── SquareQ NVFP4 payload for ONE stream's 4 frozen base matmul weights ──────
+# MIRRORS StreamInt8's slot order [0]=wqkv, [1]=wproj, [2]=wgu, [3]=wd. Per
+# slot: nvq U8 [out,in/2] e2m1 codes, nvs U8 tiled ue4m3 scales, ld/lu BF16
+# low-rank factors (BASE quantization correction, NOT the trained LoRA), nvg
+# F32 per-tensor global scale (HOST scalar, read once at pin time). FORWARD-
+# ONLY: the backward consumes the reconstructed BF16 W_hat in the StreamWeights
+# fields (disclosed numerics-mismatch STE, ops/squareq_nvfp4.mojo:15).
+struct StreamNvfp4(Copyable, Movable):
+    var nvq: List[TArc]     # len 4: U8 [out, in/2]
+    var nvs: List[TArc]     # len 4: U8 tiled ue4m3 scales
+    var ld: List[TArc]      # len 4: BF16 [in, R]
+    var lu: List[TArc]      # len 4: BF16 [out, R]
+    var nvg: List[Float32]  # len 4: per-tensor global scale (host)
+
+    def __init__(
+        out self,
+        var nvq: List[TArc], var nvs: List[TArc],
+        var ld: List[TArc], var lu: List[TArc], var nvg: List[Float32],
+    ):
+        self.nvq = nvq^
+        self.nvs = nvs^
+        self.ld = ld^
+        self.lu = lu^
+        self.nvg = nvg^
+
+
+# nvfp4 payload for a whole double block: one StreamNvfp4 per stream (the
+# DoubleBlockInt8 shape). The forward dispatch reads the per-stream payload
+# straight off StreamWeights.nvfp4, so this wrapper exists for callers that
+# want the whole-block carrier (API symmetry with int8_payload()).
+struct DoubleBlockNvfp4(Copyable, Movable):
+    var img: StreamNvfp4
+    var txt: StreamNvfp4
+
+    def __init__(out self, var img: StreamNvfp4, var txt: StreamNvfp4):
+        self.img = img^
+        self.txt = txt^
+
+
+# Frozen base forward y = a @ W_hat[idx]ᵀ via the NATIVE NVFP4 GEMM (cast F32
+# act → bf16 at the GEMM, bf16 result → a's dtype — the exact _base_fwd_i8_dbl
+# boundary discipline). Mirror of single_block's `_base_fwd_nv4`.
+def _base_fwd_nv4_dbl(
+    a: Tensor, p: StreamNvfp4, idx: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var o: Tensor
+    if a.dtype() == STDtype.BF16:
+        o = squareq_nvfp4_linear(
+            a, p.nvq[idx][], p.nvs[idx][], p.nvg[idx],
+            p.ld[idx][], p.lu[idx][], ctx,
+        )
+    else:
+        var ab = cast_tensor(a, STDtype.BF16, ctx)
+        o = squareq_nvfp4_linear(
+            ab, p.nvq[idx][], p.nvs[idx][], p.nvg[idx],
+            p.ld[idx][], p.lu[idx][], ctx,
+        )
+    if o.dtype() != a.dtype():
+        return cast_tensor(o, a.dtype(), ctx)
+    return o^
+
+
 # ── LoRA-aware per-stream pre (wqkv delta applied to the qkv output) ─────────
 def _stream_pre_lora_resident[
     H: Int, Dh: Int
@@ -1485,7 +1561,15 @@ def _stream_pre_lora_resident[
     var q_pre_flat: Tensor
     var k_pre_flat: Tensor
     var v_flat: Tensor
-    if s8 and norm.dtype() == STDtype.F32:
+    if w.nvfp4:
+        # SquareQ NVFP4 native-FP4 base wqkv (idx 0, FORWARD-ONLY dispatch):
+        # one fp4 GEMM norm@Wqkv_hatᵀ → [N,3D], sliced into the same q/k/v
+        # bands the bf16/int8 arms produce.
+        var qkv_nv = _base_fwd_nv4_dbl(norm, w.nvfp4.value(), 0, ctx)   # [N,3D]
+        q_pre_flat = slice(qkv_nv, 1, 0, D, ctx)
+        k_pre_flat = slice(qkv_nv, 1, D, D, ctx)
+        v_flat = slice(qkv_nv, 1, 2 * D, D, ctx)
+    elif s8 and norm.dtype() == STDtype.F32:
         # FUSED F32 boundary + band-split (2026-07-11): quant reads the F32
         # norm directly, dequant writes the q/k/v bands as separate tensors —
         # bit-identical to _base_fwd_i8_dbl (cast→int8→cast) + 3×slice.
@@ -1528,8 +1612,13 @@ def _stream_post_lora_resident(
     s8: Optional[StreamInt8] = None,
     recompute_only: Bool = False,
 ) raises -> _StreamPost:
-    # FROZEN base wproj (idx 1): int8 W8A8 when s8 present, else unchanged bf16.
-    var out = _base_fwd_i8_dbl(att[], w.wproj[], s8, 1, ctx)   # [N,D]
+    # FROZEN base wproj (idx 1): nvfp4 native-fp4 when the payload is present
+    # (FORWARD-ONLY dispatch), else int8 W8A8 when s8 present, else unchanged bf16.
+    var out: Tensor
+    if w.nvfp4:
+        out = _base_fwd_nv4_dbl(att[], w.nvfp4.value(), 1, ctx)   # [N,D]
+    else:
+        out = _base_fwd_i8_dbl(att[], w.wproj[], s8, 1, ctx)   # [N,D]
     # LoRA on attn out-proj (SerenityTrainer attn.to_out.0 / attn.to_add_out,
     # transformer_flux2.py:535/544): input att [N,D]; delta [N,D] added to out.
     # Own dropout (LoRAModule.py:328); p==0 -> identity.
@@ -1538,8 +1627,13 @@ def _stream_post_lora_resident(
     var attn_res = residual_gate(x[], mv.gate1[], out, ctx)
     var ln2 = lnmod_placeholder(ctx)
     var mlp_in = layer_norm_modulate(attn_res, mv.scale2[], mv.shift2[], eps, ctx, ln2)
-    # FROZEN base wgu (idx 2): int8 W8A8 when s8 present, else unchanged bf16.
-    var gu = _base_fwd_i8_dbl(mlp_in, w.wgu[], s8, 2, ctx)   # [N,2F]
+    # FROZEN base wgu (idx 2): nvfp4 native-fp4 when the payload is present,
+    # else int8 W8A8 when s8 present, else unchanged bf16.
+    var gu: Tensor
+    if w.nvfp4:
+        gu = _base_fwd_nv4_dbl(mlp_in, w.nvfp4.value(), 2, ctx)   # [N,2F]
+    else:
+        gu = _base_fwd_i8_dbl(mlp_in, w.wgu[], s8, 2, ctx)   # [N,2F]
     # LoRA on ff.linear_in / ff_context.linear_in (transformer_flux2.py:314,
     # Flux2Model.py:58/63): one adapter in=D out=2F added to the FULL gu output.
     if lo.ff_in:
@@ -1559,8 +1653,13 @@ def _stream_post_lora_resident(
             attn_res_arc.copy(), attn_res_arc^, TArc(ln2^), TArc(mlp_in^),
             TArc(gu^), TArc(gate^), TArc(up^), TArc(act^),
         )
-    # FROZEN base wd (idx 3): int8 W8A8 when s8 present, else unchanged bf16.
-    var mlp = _base_fwd_i8_dbl(act, w.wd[], s8, 3, ctx)   # [N,D]
+    # FROZEN base wd (idx 3): nvfp4 native-fp4 when the payload is present,
+    # else int8 W8A8 when s8 present, else unchanged bf16.
+    var mlp: Tensor
+    if w.nvfp4:
+        mlp = _base_fwd_nv4_dbl(act, w.nvfp4.value(), 3, ctx)   # [N,D]
+    else:
+        mlp = _base_fwd_i8_dbl(act, w.wd[], s8, 3, ctx)   # [N,D]
     # LoRA on ff.linear_out / ff_context.linear_out (transformer_flux2.py:316,
     # Flux2Model.py:59/64): adapter in=F out=D added to mlp (input is act [N,F]).
     if lo.ff_out:

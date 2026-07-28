@@ -90,6 +90,11 @@ from serenitymojo.ops.int8_quant import (
 # squareq_w4-resident (SquareQ chunk 3): packed int4+H256+low-rank sidecar,
 # reconstructed to BF16 per block on await (same shape as the fp8 branch).
 from serenitymojo.ops.squareq import squareq_reconstruct_weight
+# squareq_nvfp4-resident (SquareQ chunk 8): packed NVFP4 (e2m1 + tiled ue4m3
+# scales + low-rank + global scale) sidecar. await returns BOTH the
+# reconstructed BF16 W_hat (backward + non-wired consumers) AND the packed
+# payload under "::"-suffixed keys (the Klein blocks' native-fp4 forward).
+from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_reconstruct_weight
 from serenitymojo.io.sharded import ShardedSafeTensors
 
 comptime TArc = ArcPointer[Tensor]
@@ -103,6 +108,15 @@ comptime TArc = ArcPointer[Tensor]
 # name (real Klein tensor names never contain "::").
 def resident_i8_scale_key(name: String) -> String:
     return name + String("::i8scale")
+
+
+# nvfp4-resident Block payload keys (SquareQ chunk 8): each quantized weight
+# lands in the Block under its own name (the reconstructed BF16 W_hat) AND
+# under these "::"-suffixed keys carrying the packed payload the native-FP4
+# forward reads (`part` ∈ nvq/nvs/ld/lu/nvg). Same collision argument as
+# resident_i8_scale_key: real Klein tensor names never contain "::".
+def resident_nvfp4_key(name: String, part: String) -> String:
+    return name + String("::") + part
 
 # fp8-resident base weights (MJ-1065, 2026-07-03): the per-block permanent set,
 # but the large 2-D BF16 matmul weights are quantized ONCE to E4M3 bytes + a
@@ -144,6 +158,42 @@ struct _ResidentSquareqTensor(Copyable, Movable):
         self.s = s^
         self.ld = ld^
         self.lu = lu^
+        self.in_f = in_f
+        self.out_f = out_f
+
+
+# squareq_nvfp4-resident sibling of _ResidentSquareqTensor. If `is_quant`:
+# `nvq` is the packed e2m1 U8 [out,in/2], `nvs` the U8 tiled ue4m3 weight
+# scales, `ld`/`lu` the BF16 low-rank factors [in,R]/[out,R], `nvg_t` the
+# pinned 1-elem F32 global-scale tensor (shared into the Block under the
+# "::nvg" key) and `nvg` its HOST value read ONCE at pin time (rides cublasLt
+# alpha in the fp4 forward + the reconstruct kernel). Else `nvq` is the owned
+# BF16 tensor held verbatim (the other TArcs are unused aliases of `nvq`).
+struct _ResidentNvfp4Tensor(Copyable, Movable):
+    var name: String
+    var is_quant: Bool
+    var nvq: TArc
+    var nvs: TArc
+    var ld: TArc
+    var lu: TArc
+    var nvg_t: TArc
+    var nvg: Float32
+    var in_f: Int
+    var out_f: Int
+
+    def __init__(
+        out self, var name: String, is_quant: Bool,
+        var nvq: TArc, var nvs: TArc, var ld: TArc, var lu: TArc,
+        var nvg_t: TArc, nvg: Float32, in_f: Int, out_f: Int,
+    ):
+        self.name = name^
+        self.is_quant = is_quant
+        self.nvq = nvq^
+        self.nvs = nvs^
+        self.ld = ld^
+        self.lu = lu^
+        self.nvg_t = nvg_t^
+        self.nvg = nvg
         self.in_f = in_f
         self.out_f = out_f
 
@@ -353,6 +403,13 @@ struct TurboPlannedLoader(Movable):
     # pin_residents_squareq(); default empty = no-op.
     var _squareq_prefixes: List[String]
     var _squareq_blocks: List[List[_ResidentSquareqTensor]]
+    # ── squareq_nvfp4-resident set: parallel to _squareq_blocks. Pinned
+    # VERBATIM from the prebuilt nvfp4 sidecar (scripts/squareq_build_slab.py
+    # --format nvfp4 output — never quantize-at-load); await reconstructs the
+    # BF16 W_hat per block AND shares the packed payload under "::" keys.
+    # Opt in via pin_residents_squareq_nvfp4(); default empty = no-op.
+    var _nvfp4_prefixes: List[String]
+    var _nvfp4_blocks: List[List[_ResidentNvfp4Tensor]]
     # ── host-pinned fp8 set (fp8_e4m3_host): E4M3+scale PINNED in host RAM,
     # H2D'd + dequanted per await (half the PCIe of bf16 streaming; NO disk).
     var _fp8h_prefixes: List[String]
@@ -475,6 +532,8 @@ struct TurboPlannedLoader(Movable):
         self._fp8_blocks = List[List[_ResidentFp8Tensor]]()
         self._squareq_prefixes = List[String]()
         self._squareq_blocks = List[List[_ResidentSquareqTensor]]()
+        self._nvfp4_prefixes = List[String]()
+        self._nvfp4_blocks = List[List[_ResidentNvfp4Tensor]]()
         self._fp8h_prefixes = List[String]()
         self._fp8h_blocks = List[List[_HostFp8Tensor]]()
         self._int8_prefixes = List[String]()
@@ -515,6 +574,12 @@ struct TurboPlannedLoader(Movable):
     def _squareq_slot(self, norm_prefix: String) -> Int:
         for r in range(len(self._squareq_prefixes)):
             if self._squareq_prefixes[r] == norm_prefix:
+                return r
+        return -1
+
+    def _nvfp4_slot(self, norm_prefix: String) -> Int:
+        for r in range(len(self._nvfp4_prefixes)):
+            if self._nvfp4_prefixes[r] == norm_prefix:
                 return r
         return -1
 
@@ -797,6 +862,130 @@ struct TurboPlannedLoader(Movable):
         print(
             "  squareq_w4-resident: pinned", pinned, "blocks,",
             used, "bytes packed (reconstruct-on-await)",
+        )
+        return pinned
+
+    def pin_residents_squareq_nvfp4(
+        mut self, sidecar_dir: String, budget_bytes: Int, ctx: DeviceContext
+    ) raises -> Int:
+        """Pin plan blocks (plan order) as squareq_nvfp4-resident from the
+        PREBUILT nvfp4 sidecar (scripts/squareq_build_slab.py --format nvfp4
+        output: sharded safetensors holding `<base>.nvq/.nvs/.nvg/.lora_down/
+        .lora_up` per quantized linear, everything else passthrough). NEVER
+        quantizes at load.
+
+        For each base-checkpoint tensor name in the block:
+          - `<base>.weight` with a sidecar `<base>.nvq`: pin the 4 packed
+            device tensors VERBATIM (nvq/nvs raw U8; lora_down/lora_up BF16)
+            plus the 1-elem F32 `nvg` tensor, whose HOST value is read ONCE
+            here (to_host at pin time — it rides cublasLt alpha per fp4 GEMM).
+            await_block then returns BOTH the reconstructed BF16 W_hat under
+            the weight's own name (squareq_nvfp4_reconstruct_weight — backward
+            + any non-wired consumer stays correct) AND the payload under
+            resident_nvfp4_key(name, part) so the Klein block builders can
+            assemble the FORWARD-ONLY native-fp4 payload.
+          - anything else: pinned resident BF16 from the sidecar's passthrough
+            copy (falls back to the base checkpoint if the sidecar lacks it).
+
+        Same MJ-1065 contract as fp8/squareq_w4: the caller must require
+        pinned == block_count. One sync per block bounds transients.
+        """
+        var sc = ShardedSafeTensors.open(sidecar_dir)
+        var used = 0
+        var pinned = 0
+        for i in range(self._plan.count()):
+            self._assert_raw_copy_dtype_safe(i)
+            var p = self._plan.normalized_prefix(i)
+            if (
+                self._nvfp4_slot(p) >= 0
+                or self._squareq_slot(p) >= 0
+                or self._fp8_slot(p) >= 0
+                or self._resident_slot(p) >= 0
+            ):
+                continue
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                raise Error(
+                    String("pin_residents_squareq_nvfp4: no tensors for prefix: ") + p
+                )
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            var tensors = List[_ResidentNvfp4Tensor]()
+            var block_bytes = 0
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                var is_weight = nm.endswith(String(".weight"))
+                var base = String(nm.removesuffix(String(".weight")))
+                var qname = base + String(".nvq")
+                if is_weight and sc.has_tensor(qname):
+                    var nvq = Tensor.from_view_raw(sc.tensor_view(qname), ctx)
+                    var nvs = Tensor.from_view_raw(
+                        sc.tensor_view(base + String(".nvs")), ctx
+                    )
+                    var ld = Tensor.from_view(
+                        sc.tensor_view(base + String(".lora_down")), ctx
+                    )
+                    var lu = Tensor.from_view(
+                        sc.tensor_view(base + String(".lora_up")), ctx
+                    )
+                    var nvg_t = Tensor.from_view(
+                        sc.tensor_view(base + String(".nvg")), ctx
+                    )
+                    # HOST global scale read ONCE at pin time (never per step).
+                    var nvg_host = nvg_t.to_host(ctx)
+                    if len(nvg_host) != 1:
+                        raise Error(
+                            String("pin_residents_squareq_nvfp4: nvg numel != 1: ")
+                            + qname
+                        )
+                    var nvg = nvg_host[0]
+                    var out_f = nvq.shape()[0]
+                    var in_f = nvq.shape()[1] * 2
+                    block_bytes += (
+                        nvq.numel() * nvq.dtype().byte_size()
+                        + nvs.numel() * nvs.dtype().byte_size()
+                        + ld.numel() * ld.dtype().byte_size()
+                        + lu.numel() * lu.dtype().byte_size()
+                        + nvg_t.numel() * nvg_t.dtype().byte_size()
+                    )
+                    tensors.append(
+                        _ResidentNvfp4Tensor(
+                            nm, True, TArc(nvq^), TArc(nvs^), TArc(ld^),
+                            TArc(lu^), TArc(nvg_t^), nvg, in_f, out_f,
+                        )
+                    )
+                else:
+                    # small/passthrough: prefer the sidecar copy (bit-identical
+                    # to the base by builder contract), fall back to the base.
+                    var t: Tensor
+                    if sc.has_tensor(nm):
+                        t = Tensor.from_view_as_bf16(sc.tensor_view(nm), ctx)
+                    else:
+                        t = Tensor.from_view_as_bf16(
+                            self._turbo.sharded.tensor_view(nm), ctx
+                        )
+                    block_bytes += t.numel() * t.dtype().byte_size()
+                    var arc = TArc(t^)
+                    tensors.append(
+                        _ResidentNvfp4Tensor(
+                            nm, False, arc.copy(), arc.copy(), arc.copy(),
+                            arc.copy(), arc, 0.0, 0, 0,
+                        )
+                    )
+            if used + block_bytes > budget_bytes:
+                break  # plan-order contiguous pin; caller enforces pinned==count
+            self._nvfp4_prefixes.append(p)
+            self._nvfp4_blocks.append(tensors^)
+            used += block_bytes
+            pinned += 1
+            ctx.synchronize()  # fence this block's transients before the next
+        print(
+            "  squareq_nvfp4-resident: pinned", pinned, "blocks,",
+            used, "bytes packed (native-fp4 fwd payload + W_hat-on-await)",
         )
         return pinned
 
@@ -1559,6 +1748,7 @@ struct TurboPlannedLoader(Movable):
             self._resident_slot(norm) >= 0
             or self._fp8_slot(norm) >= 0
             or self._squareq_slot(norm) >= 0
+            or self._nvfp4_slot(norm) >= 0
             or f8h_pre >= 0
             or self._int8_slot(norm) >= 0
         ):
@@ -1703,6 +1893,37 @@ struct TurboPlannedLoader(Movable):
                     sblock[sqt.name] = sqt.q.copy()  # share the resident BF16
             self._step += 1
             return PlannedBlockHandle(index, prefix, sblock^)
+
+        # ── squareq_nvfp4-resident fast path: native-FP4 payload + BF16 W_hat
+        # (NO disk), no slot/fence. Each quantized weight lands TWICE in the
+        # Block: (a) the reconstructed BF16 W_hat under its own name
+        # (squareq_nvfp4_reconstruct_weight — the backward and any non-wired
+        # consumer read the same names/dtypes the squareq_w4 branch returns),
+        # and (b) the packed payload under resident_nvfp4_key(name, part)
+        # ("::"-suffixed keys can never collide with real tensor names) so the
+        # Klein block builders can assemble the FORWARD-ONLY fp4 payload.
+        # Small tensors are the held-BF16 residents, shared by refcount.
+        var nvslot = self._nvfp4_slot(load_prefix)
+        if nvslot >= 0:
+            self._dispatch_pending(ctx)  # keep lookahead for any streamed blocks
+            var nblock = Block()
+            for t in range(len(self._nvfp4_blocks[nvslot])):
+                ref nvt = self._nvfp4_blocks[nvslot][t]
+                if nvt.is_quant:
+                    var w = squareq_nvfp4_reconstruct_weight(
+                        nvt.nvq[], nvt.nvs[], nvt.nvg, nvt.ld[], nvt.lu[],
+                        nvt.in_f, nvt.out_f, ctx,
+                    )
+                    nblock[nvt.name] = ArcPointer(w^)
+                    nblock[resident_nvfp4_key(nvt.name, String("nvq"))] = nvt.nvq.copy()
+                    nblock[resident_nvfp4_key(nvt.name, String("nvs"))] = nvt.nvs.copy()
+                    nblock[resident_nvfp4_key(nvt.name, String("ld"))] = nvt.ld.copy()
+                    nblock[resident_nvfp4_key(nvt.name, String("lu"))] = nvt.lu.copy()
+                    nblock[resident_nvfp4_key(nvt.name, String("nvg"))] = nvt.nvg_t.copy()
+                else:
+                    nblock[nvt.name] = nvt.nvq.copy()  # share the resident BF16
+            self._step += 1
+            return PlannedBlockHandle(index, prefix, nblock^)
 
         # ── int8-resident fast path (Klein int8-W8A8 slice 4): NO dequant, no
         # slot/fence. Return the SAME per-tensor names the streamed/bf16 path

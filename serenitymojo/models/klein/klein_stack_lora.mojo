@@ -79,6 +79,7 @@ from serenitymojo.models.klein.double_block import (
     DoubleBlockDirectDoRAGradsT, DoubleBlockDirectOFTGradsT,
     StreamDirectDoRAGradsT, StreamDirectOFTGradsT,
     StreamInt8, DoubleBlockInt8,
+    StreamNvfp4,
 )
 from serenitymojo.models.klein.single_block import (
     SingleBlockWeights, SingleModVecs, SingleModVecsDevice, single_modvecs_to_device,
@@ -101,7 +102,7 @@ from serenitymojo.models.klein.single_block import (
     single_block_direct_oft_forward_device_resident_scratch,
     single_block_direct_oft_backward_device_resident_scratch,
     SingleBlockDirectDoRAGradsT, SingleBlockDirectOFTGradsT,
-    SingleBlockInt8,
+    SingleBlockInt8, SingleBlockNvfp4,
 )
 from serenitymojo.models.klein.klein_direct_lycoris_stack import (
     KleinStackDirectDoRA, KleinStackDirectOFT,
@@ -178,7 +179,7 @@ from serenitymojo.models.klein.activation_tape import (
 )
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import (
-    TurboPlannedLoader, resident_i8_scale_key,
+    TurboPlannedLoader, resident_i8_scale_key, resident_nvfp4_key,
 )
 from serenitymojo.ops.cast import cast_tensor
 
@@ -532,7 +533,33 @@ def _stream_weights_from_block(
         w8.append(wd.copy())
         sc.append(_block_tensor_base(block, resident_i8_scale_key(wd_k)))
         i8 = Optional[StreamInt8](StreamInt8(w8^, sc^))
-    return StreamWeights(wqkv, wproj, wgu, wd, qn, kn, i8^)
+    var sw = StreamWeights(wqkv, wproj, wgu, wd, qn, kn, i8^)
+    # squareq_nvfp4-resident handle (pin_residents_squareq_nvfp4): the loader
+    # put the RECONSTRUCTED BF16 W_hat under the 4 weight names above (every
+    # backward arm reads those unchanged) and the packed payload under
+    # resident_nvfp4_key(name, part). Assemble the FORWARD-ONLY StreamNvfp4
+    # (list order [wqkv, wproj, wgu, wd] — the int8/base-matmul index the
+    # forward dispatch uses). nvg is a 1-elem F32 device tensor → host scalar.
+    if resident_nvfp4_key(wqkv_k, String("nvq")) in block:
+        var keys = [wqkv_k.copy(), wproj_k.copy(), wgu_k.copy(), wd_k.copy()]
+        var nvq = List[TArc]()
+        var nvs = List[TArc]()
+        var ld = List[TArc]()
+        var lu = List[TArc]()
+        var nvg = List[Float32]()
+        for k in keys:
+            nvq.append(_block_tensor_base(block, resident_nvfp4_key(k, String("nvq"))))
+            nvs.append(_block_tensor_base(block, resident_nvfp4_key(k, String("nvs"))))
+            ld.append(_block_tensor_base(block, resident_nvfp4_key(k, String("ld"))))
+            lu.append(_block_tensor_base(block, resident_nvfp4_key(k, String("lu"))))
+            var g = _block_tensor_base(
+                block, resident_nvfp4_key(k, String("nvg"))
+            )[].to_host(ctx)
+            if len(g) != 1:
+                raise Error(String("nvfp4 nvg numel != 1: ") + k)
+            nvg.append(g[0])
+        sw.nvfp4 = Optional[StreamNvfp4](StreamNvfp4(nvq^, nvs^, ld^, lu^, nvg^))
+    return sw^
 
 
 def _double_weights_from_block(
@@ -565,12 +592,38 @@ def _single_weights_from_block(
         w8.append(w2.copy())
         sc.append(_block_tensor_base(block, resident_i8_scale_key(w2_k)))
         return SingleBlockWeights(SingleBlockInt8(w8^, sc^), qn, kn, ctx)
-    return SingleBlockWeights(
+    var sw = SingleBlockWeights(
         w1,
         _block_tensor_base(block, w2_k),
         qn, kn,
         D, F, ctx, False,
     )
+    # squareq_nvfp4-resident handle (pin_residents_squareq_nvfp4): w1/w2 above
+    # are the RECONSTRUCTED BF16 W_hat (backward unchanged); assemble the
+    # FORWARD-ONLY SingleBlockNvfp4 payload from the "::" keys (list order
+    # [w1, w2] — the int8/base-matmul index the forward dispatch uses).
+    if resident_nvfp4_key(w1_k, String("nvq")) in block:
+        var keys = [w1_k.copy(), w2_k.copy()]
+        var nvq = List[TArc]()
+        var nvs = List[TArc]()
+        var ld = List[TArc]()
+        var lu = List[TArc]()
+        var nvg = List[Float32]()
+        for k in keys:
+            nvq.append(_block_tensor_base(block, resident_nvfp4_key(k, String("nvq"))))
+            nvs.append(_block_tensor_base(block, resident_nvfp4_key(k, String("nvs"))))
+            ld.append(_block_tensor_base(block, resident_nvfp4_key(k, String("ld"))))
+            lu.append(_block_tensor_base(block, resident_nvfp4_key(k, String("lu"))))
+            var g = _block_tensor_base(
+                block, resident_nvfp4_key(k, String("nvg"))
+            )[].to_host(ctx)
+            if len(g) != 1:
+                raise Error(String("nvfp4 nvg numel != 1: ") + k)
+            nvg.append(g[0])
+        sw.nvfp4 = Optional[SingleBlockNvfp4](
+            SingleBlockNvfp4(nvq^, nvs^, ld^, lu^, nvg^)
+        )
+    return sw^
 
 
 def _single_weights_full_from_block(

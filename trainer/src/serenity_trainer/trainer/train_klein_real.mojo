@@ -1268,6 +1268,7 @@ def main() raises:
         fill_block_store=(
             cfg.quantized_resident != String("fp8_e4m3")
             and cfg.quantized_resident != String("squareq_w4")
+            and cfg.quantized_resident != String("squareq_nvfp4")
         ),
     )
     if runtime_profile:
@@ -1337,6 +1338,34 @@ def main() raises:
             "  squareq_w4-resident base:", pinned_blocks, "of", n_blocks,
             "blocks pinned packed from", cfg.squareq_sidecar,
             "(int4-g64 + H256 + low-rank; reconstruct per block; NO per-step disk read).",
+        )
+    elif cfg.quantized_resident == String("squareq_nvfp4"):
+        # SquareQ chunk 8: packed NVFP4 sidecar (e2m1 + tiled ue4m3 scales +
+        # low-rank + global scale) pinned VERBATIM; await returns BOTH the
+        # reconstructed BF16 W_hat (backward + non-wired consumers) AND the
+        # "::"-keyed payload the Klein blocks' NATIVE-FP4 forward reads. Slab
+        # is PREBUILT by scripts/squareq_build_slab.py --format nvfp4 — never
+        # quantized here. Same MJ-1065 all-or-nothing contract as fp8/w4.
+        if cfg.squareq_sidecar == String(""):
+            raise Error(
+                "klein squareq_nvfp4: config key 'squareq_sidecar' is empty — "
+                + "point it at the scripts/squareq_build_slab.py --format "
+                + "nvfp4 output dir"
+            )
+        pinned_blocks = loader.pin_residents_squareq_nvfp4(
+            cfg.squareq_sidecar, KLEIN_FP8_RESIDENT_BUDGET_BYTES, ctx
+        )
+        if pinned_blocks != n_blocks:
+            raise Error(
+                String("klein squareq_nvfp4-resident: pinned ") + String(pinned_blocks)
+                + " of " + String(n_blocks) + " blocks within budget "
+                + String(KLEIN_FP8_RESIDENT_BUDGET_BYTES) + " bytes — a block "
+                + "would still per-step disk-stream (MJ-1065). Raise the budget."
+            )
+        print(
+            "  squareq_nvfp4-resident base:", pinned_blocks, "of", n_blocks,
+            "blocks pinned packed from", cfg.squareq_sidecar,
+            "(NVFP4 e2m1+ue4m3+low-rank; native-fp4 fwd, W_hat bwd; NO per-step disk read).",
         )
     elif cfg.quantized_resident == String("streamed_base_opt_in"):
         var memory_info = ctx.get_memory_info()

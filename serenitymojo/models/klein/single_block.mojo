@@ -128,6 +128,13 @@ from serenitymojo.ops.int8_linear import (
     int8_linear_bwd_nn_f32_bands, int8_linear_bwd_nt_f32_bands,
     int8_band_tensor,
 )
+# SquareQ NVFP4 native-FP4 base fwd (cfg.quantized_resident=="squareq_nvfp4"):
+# frozen-base linears run alpha*fp4gemm(rht_quant(x), nvq) + (x@ld)@lu^T when
+# the payload is present. FORWARD-ONLY dispatch — every backward arm keeps
+# consuming the reconstructed BF16 W_hat the loader put in the Block under the
+# weight's own name (ops/squareq_nvfp4.mojo header: disclosed numerics-mismatch
+# STE, same class as ai-toolkit's).
+from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_linear
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
 from serenitymojo.ops.linalg_backward import (
@@ -245,6 +252,13 @@ struct SingleBlockWeights(Copyable, Movable):
     # dummies (the bf16 GEMM is skipped) and this holds the (int8 weight, F32 scalar
     # scale) payload the int8 forward reads. None on the bf16 path (default).
     var int8: Optional[SingleBlockInt8]
+    # squareq_nvfp4 loader sidecar (SquareQ chunk 8): when the block was pinned
+    # nvfp4-resident (pin_residents_squareq_nvfp4), w1/w2/w2_att/w2_mlp above
+    # hold the RECONSTRUCTED BF16 W_hat (every backward arm reads them
+    # unchanged) and this holds the packed (nvq/nvs/ld/lu + nvg) payload the
+    # native-FP4 FORWARD reads. None everywhere else (default) — the bf16/int8
+    # paths are byte-identical with this None.
+    var nvfp4: Optional[SingleBlockNvfp4]
 
     def __init__(
         out self,
@@ -273,6 +287,7 @@ struct SingleBlockWeights(Copyable, Movable):
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
         self.int8 = Optional[SingleBlockInt8](None)
+        self.nvfp4 = Optional[SingleBlockNvfp4](None)
 
     def __init__(
         out self,
@@ -290,6 +305,7 @@ struct SingleBlockWeights(Copyable, Movable):
         self.q_norm = q_norm^
         self.k_norm = k_norm^
         self.int8 = Optional[SingleBlockInt8](None)
+        self.nvfp4 = Optional[SingleBlockNvfp4](None)
 
     # int8-W8A8 loader constructor (Klein int8 slice 4): the base weights live in
     # the int8 payload; w1/w2/w2_att/w2_mlp are BF16 [1,1] dummies (never read on
@@ -309,6 +325,7 @@ struct SingleBlockWeights(Copyable, Movable):
         self.q_norm = q_norm^
         self.k_norm = k_norm^
         self.int8 = Optional[SingleBlockInt8](int8^)
+        self.nvfp4 = Optional[SingleBlockNvfp4](None)
 
 
 # ── saved activations (DEVICE-RESIDENT via TArc) ─────────────────────────────
@@ -970,7 +987,17 @@ def single_block_lora_forward_device_resident_scratch[
             norm_t, lora.qkv.value(), S, drop_qkv, ctx
         ))
     var delta_fused = False
-    if int8 and norm_t.dtype() == STDtype.F32:
+    if w.nvfp4:
+        # SquareQ NVFP4 native-FP4 base w1 (FORWARD-ONLY dispatch): ONE fused
+        # fp4 GEMM norm_t@W1_hatᵀ → [S,3D+2F], channel-sliced into the exact
+        # q/k/v/gate_up bands the bf16/int8 arms produce. The LoRA delta stays
+        # on the unchanged band-add path below (delta_fused stays False).
+        var fused_nv = _base_fwd_nv4(norm_t, w.nvfp4.value(), 0, ctx)
+        q_pre_flat = slice(fused_nv, 1, 0, D, ctx)
+        k_pre_flat = slice(fused_nv, 1, D, D, ctx)
+        v_flat = slice(fused_nv, 1, 2 * D, D, ctx)
+        gate_up = slice(fused_nv, 1, 3 * D, 2 * F, ctx)
+    elif int8 and norm_t.dtype() == STDtype.F32:
         # FUSED F32 boundary + band-split (2026-07-11): quant reads the F32
         # norm_t directly (bf16 rounding in-register == the old cast_tensor),
         # the dequant writes the 4 q/k/v/gate_up column bands as separate F32
@@ -1085,7 +1112,11 @@ def single_block_lora_forward_device_resident_scratch[
     # (== concat(att,mlp)@w2ᵀ) that linear_two_inputs_scratch computes bf16. When
     # None this is BYTE-IDENTICAL to the bf16 two-input path.
     var out_proj: Tensor
-    if int8:
+    if w.nvfp4:
+        # SquareQ NVFP4 native-FP4 base w2 (FORWARD-ONLY dispatch): fp4 GEMM
+        # on the FULL out_in [S,D+F] == concat(att,mlp)@W2_hatᵀ.
+        out_proj = _base_fwd_nv4(out_in_t, w.nvfp4.value(), 1, ctx)   # [S,D]
+    elif int8:
         out_proj = _base_fwd_i8(out_in_t, w.w2[], int8, 1, ctx)   # [S,D]
     else:
         out_proj = linear_two_inputs_scratch(
@@ -3044,6 +3075,67 @@ def _base_fwd_i8(
         return o^
     var nb = Optional[Tensor](None)
     return linear(x, w_bf, nb^, ctx)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SquareQ NVFP4 NATIVE-FP4 BASE PATH (chunk 8: forward dispatch only)
+#
+# MIRRORS the SingleBlockInt8 payload pattern above. Per base-matmul slot
+# ([0]=w1 to_qkv_mlp_proj, [1]=w2 to_out — the SingleBlockInt8 index order):
+#   nvq[i] = U8 [out, in/2]  e2m1 codes of the rotated residual,
+#   nvs[i] = U8 tiled ue4m3 weight scales (cuBLASLt layout),
+#   ld[i]/lu[i] = BF16 [in,R]/[out,R] low-rank factors (BASE quantization
+#                 correction, NOT the trained LoRA),
+#   nvg[i] = F32 per-tensor global scale (HOST scalar — rides cublasLt alpha;
+#            read once at pin time, threaded through the block builders).
+# FORWARD-ONLY: the backward keeps the reconstructed BF16 W_hat that the
+# nvfp4-resident loader placed in the Block under the weight's own name
+# (squareq_nvfp4_reconstruct_weight) — a disclosed numerics-mismatch STE
+# (ops/squareq_nvfp4.mojo:15). Base weight is FROZEN → no weight grad; only
+# the bf16 LoRA adapters train, exactly like the int8 path.
+# ══════════════════════════════════════════════════════════════════════════════
+struct SingleBlockNvfp4(Copyable, Movable):
+    var nvq: List[TArc]     # len 2: U8 [out, in/2] (w1, w2)
+    var nvs: List[TArc]     # len 2: U8 tiled ue4m3 scales
+    var ld: List[TArc]      # len 2: BF16 [in, R]
+    var lu: List[TArc]      # len 2: BF16 [out, R]
+    var nvg: List[Float32]  # len 2: per-tensor global scale (host)
+
+    def __init__(
+        out self,
+        var nvq: List[TArc], var nvs: List[TArc],
+        var ld: List[TArc], var lu: List[TArc], var nvg: List[Float32],
+    ):
+        self.nvq = nvq^
+        self.nvs = nvs^
+        self.ld = ld^
+        self.lu = lu^
+        self.nvg = nvg^
+
+
+# Frozen base forward y = x @ W_hat[idx]ᵀ via the NATIVE NVFP4 GEMM. Klein's
+# trainer chain runs F32 activations, so cast to BF16 at the GEMM boundary
+# (== the reference trainer's bf16 activations — the exact _base_fwd_i8
+# boundary discipline) and cast the BF16 result back to x's dtype so the rest
+# of the block stays dtype-identical to the bf16 base path.
+def _base_fwd_nv4(
+    x: Tensor, p: SingleBlockNvfp4, idx: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var o: Tensor
+    if x.dtype() == STDtype.BF16:
+        o = squareq_nvfp4_linear(
+            x, p.nvq[idx][], p.nvs[idx][], p.nvg[idx],
+            p.ld[idx][], p.lu[idx][], ctx,
+        )
+    else:
+        var xb = cast_tensor(x, STDtype.BF16, ctx)
+        o = squareq_nvfp4_linear(
+            xb, p.nvq[idx][], p.nvs[idx][], p.nvg[idx],
+            p.ld[idx][], p.lu[idx][], ctx,
+        )
+    if o.dtype() != x.dtype():
+        return cast_tensor(o, x.dtype(), ctx)
+    return o^
 
 
 # ── FORWARD of one SINGLE block with the FROZEN BASE matmuls dispatched int8 ────

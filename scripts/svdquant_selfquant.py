@@ -36,8 +36,9 @@ NBITS_MAX = 7  # symmetric int4 range [-8,7]; use /7 so max maps to 7
 
 # quant math lives in SquareQ now (folded 2026-07-10); this preserves the exact
 # original full-SVD behavior the per-layer Mojo gate was verified against.
+import os
 import sys as _sys
-_sys.path.insert(0, "/home/alex/SquareQ/src")
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # in-repo scripts/squareq package
 from squareq.svdquant_int4 import quantize_svdquant_w4a16 as _sq_quant, NBITS_MAX as _SQ_NBITS  # noqa: E402
 
 def quantize_svdquant_w4a16(W, rank, group):

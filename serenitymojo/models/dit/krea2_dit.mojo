@@ -111,6 +111,49 @@ struct Krea2ResidentFp8(Copyable, Movable):
         self.blocks = blocks^
 
 
+# ── SquareQ W4-RESIDENT base store (cfg.quantized_resident == "squareq_w4").
+# Mirrors the fp8 store but holds the PREBUILT sidecar payload per matmul weight
+# (scripts/squareq_build_slab.py: int4-g64 of the H256-rotated rank-R residual +
+# BF16 low-rank factors, ~0.28x bf16). Per-block load reconstructs the bf16
+# weight W_hat = dequant4@H_bd + lora_up@lora_down^T (ops/squareq.mojo) — the
+# unchanged block fwd/bwd consume it exactly like the fp8 dequant path. ──
+struct Krea2BlockResidentSquareq(Copyable, Movable):
+    var qweight: List[ArcPointer[Tensor]]    # len 8: U8 packed int4 [out, in/2]
+    var wscales: List[ArcPointer[Tensor]]    # len 8: BF16 [in/64, out]
+    var lora_down: List[ArcPointer[Tensor]]  # len 8: BF16 [in, R]
+    var lora_up: List[ArcPointer[Tensor]]    # len 8: BF16 [out, R]
+    var qnorm_scale: ArcPointer[Tensor]  # raw checkpoint dtype [HEADDIM]
+    var knorm_scale: ArcPointer[Tensor]  # raw checkpoint dtype [HEADDIM]
+    var prenorm_scale: ArcPointer[Tensor]   # raw checkpoint dtype [features]
+    var postnorm_scale: ArcPointer[Tensor]  # raw checkpoint dtype [features]
+    var mod_lin: ArcPointer[Tensor]         # bf16 [6*features]
+
+    def __init__(
+        out self,
+        var qweight: List[ArcPointer[Tensor]], var wscales: List[ArcPointer[Tensor]],
+        var lora_down: List[ArcPointer[Tensor]], var lora_up: List[ArcPointer[Tensor]],
+        var qnorm_scale: ArcPointer[Tensor], var knorm_scale: ArcPointer[Tensor],
+        var prenorm_scale: ArcPointer[Tensor], var postnorm_scale: ArcPointer[Tensor],
+        var mod_lin: ArcPointer[Tensor],
+    ):
+        self.qweight = qweight^
+        self.wscales = wscales^
+        self.lora_down = lora_down^
+        self.lora_up = lora_up^
+        self.qnorm_scale = qnorm_scale^
+        self.knorm_scale = knorm_scale^
+        self.prenorm_scale = prenorm_scale^
+        self.postnorm_scale = postnorm_scale^
+        self.mod_lin = mod_lin^
+
+
+struct Krea2ResidentSquareq(Copyable, Movable):
+    var blocks: List[Krea2BlockResidentSquareq]   # len == nblocks
+
+    def __init__(out self, var blocks: List[Krea2BlockResidentSquareq]):
+        self.blocks = blocks^
+
+
 # ── int8 W8A8-RESIDENT base store (cfg.quantized_resident == "int_w8a8"). Mirrors
 # the fp8 store but holds int8 tensorwise-quantized weights: no per-step dequant
 # (the whole point) — the block does int8×int8→int32 GEMM directly. Per matmul

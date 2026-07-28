@@ -87,6 +87,10 @@ from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 from serenitymojo.ops.int8_quant import (
     int8_tensorwise_scale, int8_encode_tensorwise,
 )
+# squareq_w4-resident (SquareQ chunk 3): packed int4+H256+low-rank sidecar,
+# reconstructed to BF16 per block on await (same shape as the fp8 branch).
+from serenitymojo.ops.squareq import squareq_reconstruct_weight
+from serenitymojo.io.sharded import ShardedSafeTensors
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -111,6 +115,37 @@ def resident_i8_scale_key(name: String) -> String:
 # mantissa bits → decode(encode(w)) ≈ cos 0.99 vs bf16 — a different-trajectory
 # numerics class from the streamed base, gated on "loss still drops", NOT bit-exact.
 comptime _FP8_MIN_ELEMS = 1 << 16   # only fp8 sizeable 2-D weights; tiny ones stay bf16
+
+
+# squareq_w4-resident sibling of _ResidentFp8Tensor. If `is_quant`: `q` is the
+# packed int4 qweight U8 [out,in/2], `s` the BF16 group-64 scales [in/64,out],
+# `ld`/`lu` the BF16 low-rank factors [in,R]/[out,R]; await reconstructs
+# W_hat = dequant@H_bd + lu@ld^T to BF16 (ops/squareq.mojo). Else `q` is the
+# owned BF16 tensor held verbatim (`s`/`ld`/`lu` are unused aliases of `q`).
+# Resident bytes ~0.28x bf16 — the whole point of the vertical.
+struct _ResidentSquareqTensor(Copyable, Movable):
+    var name: String
+    var is_quant: Bool
+    var q: TArc
+    var s: TArc
+    var ld: TArc
+    var lu: TArc
+    var in_f: Int
+    var out_f: Int
+
+    def __init__(
+        out self, var name: String, is_quant: Bool,
+        var q: TArc, var s: TArc, var ld: TArc, var lu: TArc,
+        in_f: Int, out_f: Int,
+    ):
+        self.name = name^
+        self.is_quant = is_quant
+        self.q = q^
+        self.s = s^
+        self.ld = ld^
+        self.lu = lu^
+        self.in_f = in_f
+        self.out_f = out_f
 
 
 struct _ResidentFp8Tensor(Copyable, Movable):
@@ -311,6 +346,13 @@ struct TurboPlannedLoader(Movable):
     # (dequant on await). Opt in via pin_residents_fp8(); default empty = no-op.
     var _fp8_prefixes: List[String]
     var _fp8_blocks: List[List[_ResidentFp8Tensor]]
+
+    # ── squareq_w4-resident set: parallel to _fp8_blocks. Pinned VERBATIM from
+    # the prebuilt sidecar (scripts/squareq_build_slab.py output dir — never
+    # quantize-at-load); await reconstructs BF16 per block. Opt in via
+    # pin_residents_squareq(); default empty = no-op.
+    var _squareq_prefixes: List[String]
+    var _squareq_blocks: List[List[_ResidentSquareqTensor]]
     # ── host-pinned fp8 set (fp8_e4m3_host): E4M3+scale PINNED in host RAM,
     # H2D'd + dequanted per await (half the PCIe of bf16 streaming; NO disk).
     var _fp8h_prefixes: List[String]
@@ -431,6 +473,8 @@ struct TurboPlannedLoader(Movable):
         self._res_recs = List[List[_TensorRecord]]()
         self._fp8_prefixes = List[String]()
         self._fp8_blocks = List[List[_ResidentFp8Tensor]]()
+        self._squareq_prefixes = List[String]()
+        self._squareq_blocks = List[List[_ResidentSquareqTensor]]()
         self._fp8h_prefixes = List[String]()
         self._fp8h_blocks = List[List[_HostFp8Tensor]]()
         self._int8_prefixes = List[String]()
@@ -465,6 +509,12 @@ struct TurboPlannedLoader(Movable):
     def _fp8h_slot(self, norm_prefix: String) -> Int:
         for r in range(len(self._fp8h_prefixes)):
             if self._fp8h_prefixes[r] == norm_prefix:
+                return r
+        return -1
+
+    def _squareq_slot(self, norm_prefix: String) -> Int:
+        for r in range(len(self._squareq_prefixes)):
+            if self._squareq_prefixes[r] == norm_prefix:
                 return r
         return -1
 
@@ -641,6 +691,113 @@ struct TurboPlannedLoader(Movable):
             used += block_bytes
             pinned += 1
             ctx.synchronize()  # fence this block's transient BF16 before the next
+        return pinned
+
+    def pin_residents_squareq(
+        mut self, sidecar_dir: String, budget_bytes: Int, ctx: DeviceContext
+    ) raises -> Int:
+        """Pin plan blocks (plan order) as squareq_w4-resident from the PREBUILT
+        sidecar directory (scripts/squareq_build_slab.py output: sharded
+        safetensors holding `<base>.qweight/.wscales/.lora_down/.lora_up` per
+        quantized linear, everything else passthrough). NEVER quantizes at load.
+
+        For each base-checkpoint tensor name in the block:
+          - `<base>.weight` with a sidecar `<base>.qweight`: pin the 4 packed
+            sidecar tensors VERBATIM (qweight raw U8; scales/factors BF16).
+            await_block reconstructs W_hat = dequant@H_bd + lora_up@lora_down^T
+            to BF16 per visit (ops/squareq.squareq_reconstruct_weight) — the
+            downstream block builders see the same names/dtypes as the streamed
+            path, so no model-side changes are needed for the dequant-first tier.
+          - anything else: pinned resident BF16 from the sidecar's passthrough
+            copy (falls back to the base checkpoint if the sidecar lacks it).
+
+        Resident bytes ~0.28x bf16. Same MJ-1065 contract as fp8: the caller
+        must require pinned == block_count. One sync per block bounds transients.
+        """
+        var sc = ShardedSafeTensors.open(sidecar_dir)
+        var used = 0
+        var pinned = 0
+        for i in range(self._plan.count()):
+            self._assert_raw_copy_dtype_safe(i)
+            var p = self._plan.normalized_prefix(i)
+            if (
+                self._squareq_slot(p) >= 0
+                or self._fp8_slot(p) >= 0
+                or self._resident_slot(p) >= 0
+            ):
+                continue
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                raise Error(
+                    String("pin_residents_squareq: no tensors for prefix: ") + p
+                )
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            var tensors = List[_ResidentSquareqTensor]()
+            var block_bytes = 0
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                var is_weight = nm.endswith(String(".weight"))
+                var base = String(nm.removesuffix(String(".weight")))
+                var qname = base + String(".qweight")
+                if is_weight and sc.has_tensor(qname):
+                    var q = Tensor.from_view_raw(sc.tensor_view(qname), ctx)
+                    var s = Tensor.from_view(
+                        sc.tensor_view(base + String(".wscales")), ctx
+                    )
+                    var ld = Tensor.from_view(
+                        sc.tensor_view(base + String(".lora_down")), ctx
+                    )
+                    var lu = Tensor.from_view(
+                        sc.tensor_view(base + String(".lora_up")), ctx
+                    )
+                    var out_f = q.shape()[0]
+                    var in_f = q.shape()[1] * 2
+                    block_bytes += (
+                        q.numel() * q.dtype().byte_size()
+                        + s.numel() * s.dtype().byte_size()
+                        + ld.numel() * ld.dtype().byte_size()
+                        + lu.numel() * lu.dtype().byte_size()
+                    )
+                    tensors.append(
+                        _ResidentSquareqTensor(
+                            nm, True, TArc(q^), TArc(s^), TArc(ld^), TArc(lu^),
+                            in_f, out_f,
+                        )
+                    )
+                else:
+                    # small/passthrough: prefer the sidecar copy (bit-identical
+                    # to the base by builder contract), fall back to the base.
+                    var t: Tensor
+                    if sc.has_tensor(nm):
+                        t = Tensor.from_view_as_bf16(sc.tensor_view(nm), ctx)
+                    else:
+                        t = Tensor.from_view_as_bf16(
+                            self._turbo.sharded.tensor_view(nm), ctx
+                        )
+                    block_bytes += t.numel() * t.dtype().byte_size()
+                    var arc = TArc(t^)
+                    tensors.append(
+                        _ResidentSquareqTensor(
+                            nm, False, arc.copy(), arc.copy(), arc.copy(), arc,
+                            0, 0,
+                        )
+                    )
+            if used + block_bytes > budget_bytes:
+                break  # plan-order contiguous pin; caller enforces pinned==count
+            self._squareq_prefixes.append(p)
+            self._squareq_blocks.append(tensors^)
+            used += block_bytes
+            pinned += 1
+            ctx.synchronize()  # fence this block's transients before the next
+        print(
+            "  squareq_w4-resident: pinned", pinned, "blocks,",
+            used, "bytes packed (reconstruct-on-await)",
+        )
         return pinned
 
     def pin_residents_fp8_prequantized(
@@ -1401,6 +1558,7 @@ struct TurboPlannedLoader(Movable):
         if (
             self._resident_slot(norm) >= 0
             or self._fp8_slot(norm) >= 0
+            or self._squareq_slot(norm) >= 0
             or f8h_pre >= 0
             or self._int8_slot(norm) >= 0
         ):
@@ -1523,6 +1681,28 @@ struct TurboPlannedLoader(Movable):
                     fblock[rt.name] = rt.a.copy()  # share the resident BF16 tensor
             self._step += 1
             return PlannedBlockHandle(index, prefix, fblock^)
+
+        # ── squareq_w4-resident fast path: reconstruct BF16 per block (NO disk),
+        # no slot/fence. Mirrors the fp8 branch: big weights are rebuilt
+        # W_hat = dequant4@H_bd + lora_up@lora_down^T on the fly; small tensors
+        # are held-BF16, shared by refcount. Downstream builders are source-
+        # agnostic (BF16 tensors by name) — same Block the streamed path returns.
+        var sqslot = self._squareq_slot(load_prefix)
+        if sqslot >= 0:
+            self._dispatch_pending(ctx)  # keep lookahead for any streamed blocks
+            var sblock = Block()
+            for t in range(len(self._squareq_blocks[sqslot])):
+                ref sqt = self._squareq_blocks[sqslot][t]
+                if sqt.is_quant:
+                    var w = squareq_reconstruct_weight(
+                        sqt.q[], sqt.s[], sqt.ld[], sqt.lu[],
+                        sqt.in_f, sqt.out_f, ctx,
+                    )
+                    sblock[sqt.name] = ArcPointer(w^)
+                else:
+                    sblock[sqt.name] = sqt.q.copy()  # share the resident BF16
+            self._step += 1
+            return PlannedBlockHandle(index, prefix, sblock^)
 
         # ── int8-resident fast path (Klein int8-W8A8 slice 4): NO dequant, no
         # slot/fence. Return the SAME per-tensor names the streamed/bf16 path

@@ -329,6 +329,130 @@ extern "C" int serenity_cublas_gemm_fp8e4m3_f32_rowmajor_nt(
 }
 
 // ---------------------------------------------------------------------------
+// Native NVFP4 block-scaled row-major NT GEMM probe/entry (Blackwell sm_120):
+//   D[M,N] f32 = dequant(A[M,K] fp4, Ascale) @ dequant(B[N,K] fp4, Bscale)^T
+//
+// A/B are packed 2 fp4 (e2m1) per byte along K (row-major [rows, K/2] bytes);
+// scales are UE4M3 bytes, one per 16 contiguous K elements
+// (CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3). Same stored-col-major NT
+// convention as the FP8 entry above. Whether the installed cuBLASLt accepts
+// this on sm_120 is exactly what ops/parity/fp4_lt_probe.mojo measures.
+//
+// Distinct return codes so the probe can name the failure stage:
+//   0 OK · -1 bad args · -2 Lt handle · -3 desc/layout create ·
+//   -5 scale-mode attr rejected · -4 heuristic miss · >0 cublasStatus_t of
+//   the matmul itself.
+extern "C" int serenity_lt_fp4_gemm_nt(
+    const void* A, const void* Ascale,
+    const void* B, const void* Bscale,
+    void* D,
+    int M, int N, int K,
+    void* stream
+) {
+    if (!A || !B || !D || !Ascale || !Bscale) return -1;
+    if (M <= 0 || N <= 0 || K <= 0 || (K & 31)) return -1;
+    if (ensure_lt() != 0 || g_lt == nullptr) return -2;
+
+    std::lock_guard<std::mutex> lock(g_lt_call_mutex);
+
+    cublasLtMatmulDesc_t       op   = nullptr;
+    cublasLtMatrixLayout_t     Ad   = nullptr, Bd = nullptr;
+    cublasLtMatrixLayout_t     Cd   = nullptr, Dd = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    int rc = -3;
+
+    do {
+        if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+                != CUBLAS_STATUS_SUCCESS) break;
+        cublasOperation_t opA = CUBLAS_OP_T;
+        cublasOperation_t opB = CUBLAS_OP_N;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA))
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB))
+                != CUBLAS_STATUS_SUCCESS) break;
+
+        cublasLtMatmulMatrixScale_t sm =
+            CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        rc = -5;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &sm, sizeof(sm))
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &sm, sizeof(sm))
+                != CUBLAS_STATUS_SUCCESS) break;
+        // NOTE the A/B swap in the cublasLtMatmul call below (weight rides the
+        // A slot, matching the FP8 entry): the A-slot scale is the WEIGHT's.
+        const void* aslot_scale = Bscale;
+        const void* bslot_scale = Ascale;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                &aslot_scale, sizeof(aslot_scale)) != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatmulDescSetAttribute(
+                op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                &bslot_scale, sizeof(bslot_scale)) != CUBLAS_STATUS_SUCCESS) break;
+
+        rc = -3;
+        // Stored col-major views: weight B[N,K] row-major -> [K,N] fp4 ld=K,
+        // activation A[M,K] row-major -> [K,M] fp4 ld=K (ld in ELEMENTS).
+        if (cublasLtMatrixLayoutCreate(
+                &Ad, CUDA_R_4F_E2M1, (uint64_t)K, (uint64_t)N, K)
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatrixLayoutCreate(
+                &Bd, CUDA_R_4F_E2M1, (uint64_t)K, (uint64_t)M, K)
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatrixLayoutCreate(
+                &Cd, CUDA_R_32F, (uint64_t)N, (uint64_t)M, N)
+                != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatrixLayoutCreate(
+                &Dd, CUDA_R_32F, (uint64_t)N, (uint64_t)M, N)
+                != CUBLAS_STATUS_SUCCESS) break;
+
+        if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) break;
+        if (cublasLtMatmulPreferenceSetAttribute(
+                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &g_lt_ws_bytes, sizeof(g_lt_ws_bytes))
+                != CUBLAS_STATUS_SUCCESS) break;
+
+        cublasLtMatmulHeuristicResult_t heur;
+        int returned = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(
+            g_lt, op, Ad, Bd, Cd, Dd, pref, 1, &heur, &returned);
+        if (hs != CUBLAS_STATUS_SUCCESS || returned == 0) {
+            fprintf(stderr,
+                    "[serenity_cublas] FP4 heuristic miss "
+                    "status=%d returned=%d (M=%d N=%d K=%d)\n",
+                    (int)hs, returned, M, N, K);
+            rc = -4;
+            break;
+        }
+
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t ms = cublasLtMatmul(
+            g_lt, op, &alpha, B, Ad, A, Bd, &beta, D, Cd, D, Dd,
+            &heur.algo, g_lt_ws, g_lt_ws_bytes, (cudaStream_t)stream);
+        if (ms != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                    "[serenity_cublas] FP4 matmul failed "
+                    "status=%d (M=%d N=%d K=%d)\n",
+                    (int)ms, M, N, K);
+            rc = (int)ms;
+            break;
+        }
+        rc = 0;
+    } while (0);
+
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (Dd)   cublasLtMatrixLayoutDestroy(Dd);
+    if (Cd)   cublasLtMatrixLayoutDestroy(Cd);
+    if (Bd)   cublasLtMatrixLayoutDestroy(Bd);
+    if (Ad)   cublasLtMatrixLayoutDestroy(Ad);
+    if (op)   cublasLtMatmulDescDestroy(op);
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
 // int8 W8A8 GEMM (mirrors SerenityTrainer LinearW8A8 int8_forward_tokenwise:
 // res = torch._int_mm(x_8, weight.T)  →  int8×int8 accumulate int32).
 //

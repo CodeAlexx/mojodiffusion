@@ -62,6 +62,9 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.int8_quant import (
     int8_tensorwise_scale, int8_encode_tensorwise,
 )
+# squareq W4-resident base (cfg.quantized_resident=="squareq_w4"): per-block bf16
+# reconstruction W_hat = dequant4@H_bd + lora_up@lora_down^T from the prebuilt sidecar.
+from serenitymojo.ops.squareq import squareq_reconstruct_weight
 # Reclaim freed transient bf16 sources back to the OS between quantized weights so
 # the load-once int8 quantize can hold all 28 blocks resident without the mempool
 # retaining garbage (cuMemPoolTrimTo at an allocation boundary — after a sync).
@@ -79,6 +82,7 @@ from serenitymojo.models.dit.krea2_dit import (
     krea2_last_layer, krea2_simple_modulation, _reshape_chunk_to_vec,
     _tile_rope_table, krea2_rmsnorm, krea2_rmsnorm_backward_dx,
     Krea2BlockResidentFp8, Krea2ResidentFp8,   # resident-fp8 structs moved here (no cycle)
+    Krea2BlockResidentSquareq, Krea2ResidentSquareq, # resident-squareq structs (same reason)
     Krea2BlockResidentInt8, Krea2ResidentInt8, # resident-int8 structs (same reason)
     Krea2HostInt8Inf, _krea2_host_i8_block_dev,
 )
@@ -764,6 +768,96 @@ def _load_krea2_block_resident(
         TArc(fp8_e4m3_dequant_perrow_to_bf16(b.fp8[5][], b.scale[5][], ctx)),
         TArc(fp8_e4m3_dequant_perrow_to_bf16(b.fp8[6][], b.scale[6][], ctx)),
         TArc(fp8_e4m3_dequant_perrow_to_bf16(b.fp8[7][], b.scale[7][], ctx)),
+        b.qnorm_scale.copy(),
+        b.knorm_scale.copy(),
+        b.prenorm_scale.copy(),
+        b.postnorm_scale.copy(),
+        b.mod_lin.copy(),
+    )
+
+
+# ── SquareQ W4-RESIDENT base (cfg.quantized_resident == "squareq_w4") ──────────
+# Loads the PREBUILT sidecar slab (scripts/squareq_build_slab.py output dir —
+# never quantizes at startup): per matmul weight the packed int4 qweight of the
+# H256-rotated rank-R residual + group-64 BF16 scales + BF16 low-rank factors
+# (~0.28x bf16, vs fp8's ~0.5x). Per-block load reconstructs the bf16 weight
+# W_hat = dequant4@H_bd + lora_up@lora_down^T (ops/squareq.mojo) into the SAME
+# Krea2BlockWeights the block fwd/bwd consume — a drop-in sibling of the fp8
+# dequant path. The 5 small per-block tensors are read from the sidecar's
+# passthrough copies (bit-identical to the base checkpoint by builder contract).
+
+
+def build_krea2_resident_squareq(
+    sc: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    resident_blocks: Int, ctx: DeviceContext
+) raises -> Krea2ResidentSquareq:
+    """Pin the FIRST `resident_blocks` (≤ nblocks) blocks' squareq payloads
+    device-resident VERBATIM from the sidecar. ~0.28x bf16 → all 28 krea2
+    blocks fit in ~4.8GB. Sync per block bounds transients."""
+    var n_res = resident_blocks if resident_blocks < nblocks else nblocks
+    var blocks = List[Krea2BlockResidentSquareq]()
+    for bi in range(n_res):
+        var p = key_prefix + "blocks." + String(bi) + "."
+        var bases = List[String]()
+        bases.append(p + "attn.wq")
+        bases.append(p + "attn.wk")
+        bases.append(p + "attn.wv")
+        bases.append(p + "attn.gate")
+        bases.append(p + "attn.wo")
+        bases.append(p + "mlp.gate")
+        bases.append(p + "mlp.up")
+        bases.append(p + "mlp.down")
+        var qw = List[TArc]()
+        var ws = List[TArc]()
+        var ld = List[TArc]()
+        var lu = List[TArc]()
+        for ki in range(KREA2_FP8_KEYS):
+            qw.append(TArc(Tensor.from_view_raw(
+                sc.tensor_view(bases[ki] + ".qweight"), ctx)))
+            ws.append(TArc(Tensor.from_view(
+                sc.tensor_view(bases[ki] + ".wscales"), ctx)))
+            ld.append(TArc(Tensor.from_view(
+                sc.tensor_view(bases[ki] + ".lora_down"), ctx)))
+            lu.append(TArc(Tensor.from_view(
+                sc.tensor_view(bases[ki] + ".lora_up"), ctx)))
+        blocks.append(Krea2BlockResidentSquareq(
+            qw^, ws^, ld^, lu^,
+            _stream_scale(sc, p + "attn.qknorm.qnorm.scale", ctx),
+            _stream_scale(sc, p + "attn.qknorm.knorm.scale", ctx),
+            _stream_scale(sc, p + "prenorm.scale", ctx),
+            _stream_scale(sc, p + "postnorm.scale", ctx),
+            _stream_wb(sc, p + "mod.lin", ctx),
+        ))
+        ctx.synchronize()
+        if (bi + 1) % 7 == 0 or bi + 1 == n_res:
+            print("squareq_w4 resident base: pinned block", bi + 1, "/", n_res,
+                  "(", nblocks - n_res, "streamed)")
+    return Krea2ResidentSquareq(blocks^)
+
+
+def _squareq_rw(
+    b: Krea2BlockResidentSquareq, ki: Int, ctx: DeviceContext
+) raises -> TArc:
+    """Reconstruct ONE packed squareq weight `ki` of block bundle `b` → bf16 TArc."""
+    var out_f = b.qweight[ki][].shape()[0]
+    var in_f = b.qweight[ki][].shape()[1] * 2
+    return TArc(squareq_reconstruct_weight(
+        b.qweight[ki][], b.wscales[ki][], b.lora_down[ki][], b.lora_up[ki][],
+        in_f, out_f, ctx,
+    ))
+
+
+def _load_krea2_block_squareq(
+    store: Krea2ResidentSquareq, bi: Int, ctx: DeviceContext
+) raises -> Krea2BlockWeights:
+    """Reconstruct block `bi`'s 8 bf16 matmul weights from the resident packed
+    payload (NO disk). Drop-in sibling of _load_krea2_block_resident (fp8)."""
+    ref b = store.blocks[bi]
+    return Krea2BlockWeights(
+        _squareq_rw(b, 0, ctx), _squareq_rw(b, 1, ctx),
+        _squareq_rw(b, 2, ctx), _squareq_rw(b, 3, ctx),
+        _squareq_rw(b, 4, ctx), _squareq_rw(b, 5, ctx),
+        _squareq_rw(b, 6, ctx), _squareq_rw(b, 7, ctx),
         b.qnorm_scale.copy(),
         b.knorm_scale.copy(),
         b.prenorm_scale.copy(),
@@ -1481,6 +1575,10 @@ def krea2_stack_lora_forward_streamed[
         # T2.B fp8-quantized-resident base. None (default, C13) = the per-step disk
         # stream from `st` (UNCHANGED, byte-identical). Present = dequant each
         # block's 8 matmul weights from the resident fp8 store (NO disk).
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+        # squareq_w4-resident base: reconstruct each block's 8 matmul weights from
+        # the resident packed sidecar payload (NO disk). Priority just above the
+        # fp8 `resident` arm, below the host_bf16/int8 arms.
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
         # int8 W8A8-resident base (SPEED path): the block does int8 GEMM with NO
         # per-step dequant. Takes priority over `resident` when present.
@@ -1564,6 +1662,8 @@ def krea2_stack_lora_forward_streamed[
             wbi = _load_krea2_block_host_int8_slot(host_i8.value(), li, ctx)
             # Overlap: stage the NEXT host block while this one computes.
             krea2_host_i8_prefetch(host_i8.value(), li + 1)
+        elif resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
         elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
@@ -1611,6 +1711,7 @@ def krea2_stack_dora_forward_streamed[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackForward:
     """STREAMING single-stream stack forward with direct DoRA W_eff projections."""
     comptime features = HEADS * HEADDIM
@@ -1625,7 +1726,9 @@ def krea2_stack_dora_forward_streamed[
     for bi in range(nblocks):
         block_inputs.append(x.copy())
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -1664,6 +1767,7 @@ def krea2_stack_oft_forward_streamed[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackForward:
     """STREAMING single-stream stack forward with direct OFT W_eff projections."""
     comptime features = HEADS * HEADDIM
@@ -1678,7 +1782,9 @@ def krea2_stack_oft_forward_streamed[
     for bi in range(nblocks):
         block_inputs.append(x.copy())
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -1721,6 +1827,9 @@ def krea2_stack_lora_backward_streamed[
         # T2.B fp8-quantized-resident base. MUST match the forward call: None
         # (default, C13) = per-step disk stream from `st` (UNCHANGED); present =
         # dequant each block's 8 matmul weights from the resident fp8 store (NO disk).
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+        # squareq_w4-resident base. MUST match the forward call (same weight source
+        # fwd + bwd). Priority just above the fp8 `resident` arm.
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
         # int8 W8A8-resident base (SPEED path). MUST match the forward call. Takes
         # priority over `resident` when present (int8 GEMM, no per-step dequant).
@@ -1763,6 +1872,8 @@ def krea2_stack_lora_backward_streamed[
         var wbi: Krea2BlockWeights
         if resident_i8 and bi < len(resident_i8.value().blocks):
             wbi = _load_krea2_block_int8(resident_i8.value(), bi, ctx)
+        elif resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
         elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
@@ -1956,6 +2067,7 @@ def krea2_stack_lora_forward_streamed_b2[
     ctx: DeviceContext,
     real_len0: Int, real_len1: Int,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
     save_tapes: Int = 0,
@@ -1991,6 +2103,8 @@ def krea2_stack_lora_forward_streamed_b2[
             var li = bi - res_i8_count
             wbi = _load_krea2_block_host_int8_slot(host_i8.value(), li, ctx)
             krea2_host_i8_prefetch(host_i8.value(), li + 1)
+        elif resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
         elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
@@ -2037,6 +2151,7 @@ def krea2_stack_lora_backward_streamed_b2[
     ctx: DeviceContext,
     real_len0: Int, real_len1: Int,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackLoraGrads:
     """STREAMING batch-2 stack backward. final-layer bwd (frozen, per-sample scatter)
     → walk N b2 blocks deepest→shallowest: RE-LOAD + RE-RUN each block's b2 forward
@@ -2063,7 +2178,9 @@ def krea2_stack_lora_backward_streamed_b2[
     var bi = nblocks - 1
     while bi >= 0:
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -2307,6 +2424,7 @@ def krea2_stack_lora_backward_streamed_dev[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     # OPT-IN img-EDIT reference conditioning (SAME as krea2_stack_lora_backward). The
     # ref carriers are CONSTANT — used only AFTER the streaming loop. Absent =>
     # d_img_in_ref stays None and the pass is byte-identical.
@@ -2343,7 +2461,9 @@ def krea2_stack_lora_backward_streamed_dev[
     var bi = nblocks - 1
     while bi >= 0:
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -2399,6 +2519,7 @@ def krea2_stack_lora_backward_streamed_adamw_device_grads[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
     # OPT-IN img-EDIT reference conditioning. The ref carriers are CONSTANT — used
@@ -2437,6 +2558,8 @@ def krea2_stack_lora_backward_streamed_adamw_device_grads[
             wbi = _load_krea2_block_host_int8_slot(host_i8.value(), li, ctx)
             # Overlap: stage the next-shallower host block during this compute.
             krea2_host_i8_prefetch(host_i8.value(), li - 1)
+        elif resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
         elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
@@ -2509,6 +2632,7 @@ def krea2_stack_lora_backward_streamed_b2_adamw_device_grads[
     ctx: DeviceContext,
     real_len0: Int, real_len1: Int,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
 ) raises -> Krea2StackDeviceGradWrite:
@@ -2539,6 +2663,8 @@ def krea2_stack_lora_backward_streamed_b2_adamw_device_grads[
             var li = bi - res_i8_count
             wbi = _load_krea2_block_host_int8_slot(host_i8.value(), li, ctx)
             krea2_host_i8_prefetch(host_i8.value(), li - 1)
+        elif resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
         elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
@@ -2709,6 +2835,7 @@ def krea2_stack_lora_backward_streamed_automagic3_device_grads[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackDeviceGradWrite:
     comptime features = HEADS * HEADDIM
 
@@ -2727,7 +2854,9 @@ def krea2_stack_lora_backward_streamed_automagic3_device_grads[
     var bi = nblocks - 1
     while bi >= 0:
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -2767,6 +2896,7 @@ def krea2_stack_dora_backward_streamed_dev[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackDirectDoRAGradsT:
     """Device-grad streamed backward for direct DoRA Krea2 blocks."""
     comptime features = HEADS * HEADDIM
@@ -2788,7 +2918,9 @@ def krea2_stack_dora_backward_streamed_dev[
     var bi = nblocks - 1
     while bi >= 0:
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -2830,6 +2962,7 @@ def krea2_stack_oft_backward_streamed_dev[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackDirectOFTGradsT:
     """Device-grad streamed backward for direct OFT Krea2 blocks."""
     comptime features = HEADS * HEADDIM
@@ -2851,7 +2984,9 @@ def krea2_stack_oft_backward_streamed_dev[
     var bi = nblocks - 1
     while bi >= 0:
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -2897,6 +3032,7 @@ def krea2_stack_lora_backward_graph[
     mut scratch: ScratchRingAllocator,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackLoraGrads:
     """autograd_v2 ENGINE replacement for krea2_stack_lora_backward_streamed
     ([[feedback_all_trainers_autograd_v2]] mandate; Phase 4b). IDENTICAL conductor
@@ -2934,7 +3070,9 @@ def krea2_stack_lora_backward_graph[
     while bi >= 0:
         # fp8-resident: dequant from the resident store (NO disk). Else stream H2D.
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)  # H2D this block
@@ -2991,6 +3129,7 @@ def krea2_stack_lora_backward_graph_slab[
     mut slab: StepSlab,
     real_len: Optional[Int] = Optional[Int](None),
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> Krea2StackLoraGrads:
     comptime features = HEADS * HEADDIM
     var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
@@ -3010,7 +3149,9 @@ def krea2_stack_lora_backward_graph_slab[
     var bi = nblocks - 1
     while bi >= 0:
         var wbi: Krea2BlockWeights
-        if resident and bi < len(resident.value().blocks):
+        if resident_sq and bi < len(resident_sq.value().blocks):
+            wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+        elif resident and bi < len(resident.value().blocks):
             wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)

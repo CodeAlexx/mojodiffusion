@@ -250,6 +250,7 @@ from serenitymojo.models.krea2.krea2_stack import (
     _load_krea2_block_streamed, _load_krea2_block_resident,
     krea2_stack_lora_backward_graph, krea2_stack_lora_backward_graph_slab,
     Krea2ResidentFp8, build_krea2_resident_fp8,
+    Krea2ResidentSquareq, build_krea2_resident_squareq, _load_krea2_block_squareq,
     Krea2ResidentInt8, build_krea2_resident_int8,
     Krea2HostInt8, build_krea2_host_int8,
     Krea2HostBf16, build_krea2_host_bf16, krea2_host_bf16_save,
@@ -324,16 +325,19 @@ comptime KREA2_TXTFUSION_LORA = get_defined_int["KREA2_TXTFUSION_LORA", 0]() != 
 comptime EPS = Float32(1.0e-5)
 comptime THETA = Float32(1.0e3)
 
-# ── 512px ARM (KREA2_RES_512, default False) ─────────────────────────────────
-# 1024px (default): clean [1,16,128,128] → IMGLEN=4096 → LFULL=4864 (L=4864).
-# 512px (True):     clean [1,16,64,64]  → IMGLEN=1024 → LFULL=1792 (L=1792).
-# Just flips LH/LW=64 (everything else derives). KREA2_RES_512=True + SYNTH=False
+# ── 512px ARM (-D KREA2_RES_512, default 1 = 512px) ──────────────────────────
+# 1024px (0): clean [1,16,128,128] → IMGLEN=4096 → LFULL=LTMAX+4096.
+# 512px  (1): clean [1,16,64,64]  → IMGLEN=1024 → LFULL=LTMAX+1024.
+# Just flips LH/LW=64 (everything else derives). KREA2_RES_512=1 + SYNTH=False
 # = REAL 512px training: reads a 64×64-latent 512px cache via sample_padded (real
 # conditioning + pos). The 512px cache is built by re-staging the source images at
 # 512 (krea2_stage_images.py <dataset> <stage_512> 512) then prepare_cache <stage_512>
 # <cache_512> n 512. ai-toolkit trains krea2 at 512 → this is the matched-resolution
-# real-data run. Default False = the 1024px production arm, byte-untouched.
-comptime KREA2_RES_512 = True
+# real-data run. The 1024px arm is the same two steps at 1024 plus
+# `-D KREA2_RES_512=0 -D KREA2_LTMAX=<>= the cache's max LT>` on the build.
+# The DEFAULT stays 512 (the value this was pinned to before it became a build
+# flag) so every existing build command is byte-identical.
+comptime KREA2_RES_512 = get_defined_int["KREA2_RES_512", 1]() != 0
 
 # ── DIAGNOSTIC sub-flag: synthesize the sample (KREA2_RES_512_SYNTH, default False).
 # True = random latents (the wall-clock TIMING diagnostic — step time depends on the
@@ -564,6 +568,8 @@ def _krea2_perf_flags(
         flags += String(",real-cache")
     if cfg.quantized_resident == String("fp8_e4m3"):
         flags += String(",fp8-resident-base")
+    elif cfg.quantized_resident == String("squareq_w4"):
+        flags += String(",squareq-w4-resident-base")
     else:
         flags += String(",bf16-streamed-base")
     if sample_enabled:
@@ -1184,6 +1190,9 @@ def _train_one_sample[LHp: Int = LH, LWp: Int = LW](
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
         # T2.B fp8-quantized-resident base (cfg.quantized_resident=="fp8_e4m3").
         # None (default) = the per-step disk stream from `st` (C13 byte-identical).
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+        # squareq_w4-resident base (cfg.quantized_resident=="squareq_w4"): reconstruct
+        # each block's 8 matmul weights from the prebuilt sidecar payload (NO disk).
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
         # int8 W8A8-resident base (cfg.quantized_resident=="int_w8a8"). The SPEED
         # path: int8 GEMM, no per-step dequant. Mutually exclusive with `resident`.
@@ -1231,7 +1240,7 @@ def _train_one_sample[LHp: Int = LH, LWp: Int = LW](
     var fwd = krea2_stack_lora_forward_streamed[LFULLp, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin,
-        cond.cos, cond.sin, EPS, lt, IMGLENp, ctx, real_len, resident, resident_i8,
+        cond.cos, cond.sin, EPS, lt, IMGLENp, ctx, real_len, resident, resident_sq, resident_i8,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
@@ -1261,7 +1270,7 @@ def _train_one_sample[LHp: Int = LH, LWp: Int = LW](
             grads = krea2_stack_lora_backward_graph_slab[LFULLp, HEADS, KVHEADS, HEADDIM](
                 d_velocity, cond.blk_vec, cond.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin, fwd,
-                cond.cos, cond.sin, EPS, ctx, slab, real_len, resident,
+                cond.cos, cond.sin, EPS, ctx, slab, real_len, resident, resident_sq,
             )
             print(
                 "[krea2-slab] segment peak_bytes =", slab.peak_bytes(),
@@ -1277,7 +1286,7 @@ def _train_one_sample[LHp: Int = LH, LWp: Int = LW](
             grads = krea2_stack_lora_backward_graph[LFULLp, HEADS, KVHEADS, HEADDIM](
                 d_velocity, cond.blk_vec, cond.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin, fwd,
-                cond.cos, cond.sin, EPS, ctx, scratch_v2, real_len, resident,
+                cond.cos, cond.sin, EPS, ctx, scratch_v2, real_len, resident, resident_sq,
             )
     else:
         comptime if KREA2_DEVICE_LORA_GRAD:
@@ -1291,13 +1300,13 @@ def _train_one_sample[LHp: Int = LH, LWp: Int = LW](
             grads = krea2_stack_lora_backward_streamed_dev[LFULLp, HEADS, KVHEADS, HEADDIM](
                 d_velocity, cond.blk_vec, cond.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin, fwd,
-                cond.cos, cond.sin, EPS, ctx, real_len, resident,
+                cond.cos, cond.sin, EPS, ctx, real_len, resident, resident_sq,
             )
         else:
             grads = krea2_stack_lora_backward_streamed[LFULLp, HEADS, KVHEADS, HEADDIM](
                 d_velocity, cond.blk_vec, cond.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin, fwd,
-                cond.cos, cond.sin, EPS, ctx, real_len, resident, resident_i8,
+                cond.cos, cond.sin, EPS, ctx, real_len, resident, resident_sq, resident_i8,
             )
 
     comptime if KREA2_PHASE_TIMING:
@@ -1340,6 +1349,7 @@ def _train_one_sample_b2(
     cfg: TrainConfig,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOut:
     if levers_loss_active(cfg):
         raise Error(
@@ -1375,7 +1385,7 @@ def _train_one_sample_b2(
         TArc(combined_b2^), blk_vec2, tmlp2,
         st, key_prefix, NBLOCKS, lora, fin,
         cond0.cos, cond0.sin, cond1.cos, cond1.sin,
-        EPS, lt0, lt1, IMGLEN, ctx, real_len0, real_len1, resident,
+        EPS, lt0, lt1, IMGLEN, ctx, real_len0, real_len1, resident, resident_sq,
     )
 
     # ── joint 2N-mean MSE: each per-sample loss/grad scaled by 0.5 → summed. ─────
@@ -1394,7 +1404,7 @@ def _train_one_sample_b2(
         d_vel0, d_vel1, blk_vec2, tmlp2,
         st, key_prefix, NBLOCKS, lora, fin, fwd,
         cond0.cos, cond0.sin, cond1.cos, cond1.sin,
-        EPS, ctx, real_len0, real_len1, resident,
+        EPS, ctx, real_len0, real_len1, resident, resident_sq,
     )
 
     var gn = _grad_norm(grads)
@@ -1415,6 +1425,7 @@ def _train_one_sample_adamw_device_grads(
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
     # OPT-IN img-EDIT reference conditioning (task #7). Absent (default) => the ref
@@ -1445,8 +1456,8 @@ def _train_one_sample_adamw_device_grads(
     var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin,
-        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident, resident_i8,
-        host_i8, KREA2_SAVE_TAPES,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident, resident_sq, resident_i8,
+        host_i8, save_tapes=KREA2_SAVE_TAPES,
         ref_tokens=ref_tokens.copy(), img_in_ref_w=img_in_ref_w.copy(),
     )
     comptime if KREA2_PHASE_TIMING:
@@ -1469,7 +1480,7 @@ def _train_one_sample_adamw_device_grads(
     ](
         d_velocity, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin, fwd,
-        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len, resident, resident_i8,
+        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len, resident, resident_sq, resident_i8,
         host_i8,
         ref_tokens=ref_tokens.copy(), img_in_ref_w=img_in_ref_w.copy(),
     )
@@ -1507,6 +1518,7 @@ def _train_one_sample_b2_adamw_device_grads(
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
 ) raises -> _StepOutAdamWDeviceGrads:
@@ -1544,7 +1556,7 @@ def _train_one_sample_b2_adamw_device_grads(
         TArc(combined_b2^), blk_vec2, tmlp2,
         st, key_prefix, NBLOCKS, lora, fin,
         cond0.cos, cond0.sin, cond1.cos, cond1.sin,
-        EPS, lt0, lt1, IMGLEN, ctx, real_len0, real_len1, resident,
+        EPS, lt0, lt1, IMGLEN, ctx, real_len0, real_len1, resident, resident_sq,
         resident_i8, host_i8, KREA2_SAVE_TAPES,
     )
 
@@ -1570,7 +1582,7 @@ def _train_one_sample_b2_adamw_device_grads(
         d_vel0, d_vel1, blk_vec2, tmlp2,
         st, key_prefix, NBLOCKS, lora, fin, fwd,
         cond0.cos, cond0.sin, cond1.cos, cond1.sin,
-        EPS, adamw_state, ctx, real_len0, real_len1, resident,
+        EPS, adamw_state, ctx, real_len0, real_len1, resident, resident_sq,
         resident_i8, host_i8,
     )
     return _StepOutAdamWDeviceGrads(
@@ -1592,6 +1604,7 @@ def _train_one_sample_automagic3_device_grads(
     mut a3_state: Automagic3DeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutAdamWDeviceGrads:
     var _pt = 0
     comptime if KREA2_PHASE_TIMING:
@@ -1616,7 +1629,7 @@ def _train_one_sample_automagic3_device_grads(
     var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin,
-        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
@@ -1638,7 +1651,7 @@ def _train_one_sample_automagic3_device_grads(
     ](
         d_velocity, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin, fwd,
-        cond.cos, cond.sin, EPS, a3_state, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, a3_state, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_backward_a3_device_grads", _pt, ctx)
@@ -1663,6 +1676,7 @@ def _train_one_sample_adamw_device_grads_full_surface(
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutAdamWDeviceGrads:
     var _pt = 0
     comptime if KREA2_PHASE_TIMING:
@@ -1687,7 +1701,7 @@ def _train_one_sample_adamw_device_grads_full_surface(
     var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin,
-        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
@@ -1709,7 +1723,7 @@ def _train_one_sample_adamw_device_grads_full_surface(
     ](
         d_velocity, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin, fwd,
-        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len, resident, resident_sq,
     )
     var txt_grad_count = _preload_txtfusion_grads_from_combined[
         LTMAX, LFULL
@@ -1736,6 +1750,7 @@ def _train_one_sample_dora(
     cfg: TrainConfig,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutDoRA:
     var _pt = 0
     comptime if KREA2_PHASE_TIMING:
@@ -1761,7 +1776,7 @@ def _train_one_sample_dora(
     var fwd = krea2_stack_dora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, dora, fin,
-        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
@@ -1775,7 +1790,7 @@ def _train_one_sample_dora(
     var grads = krea2_stack_dora_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
         d_velocity, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, dora, fin, fwd,
-        cond.cos, cond.sin, EPS, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_backward", _pt, ctx)
@@ -1796,6 +1811,7 @@ def _train_one_sample_oft(
     cfg: TrainConfig,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutOFT:
     var _pt = 0
     comptime if KREA2_PHASE_TIMING:
@@ -1821,7 +1837,7 @@ def _train_one_sample_oft(
     var fwd = krea2_stack_oft_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, oft, fin,
-        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
@@ -1835,7 +1851,7 @@ def _train_one_sample_oft(
     var grads = krea2_stack_oft_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
         d_velocity, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, oft, fin, fwd,
-        cond.cos, cond.sin, EPS, ctx, real_len, resident,
+        cond.cos, cond.sin, EPS, ctx, real_len, resident, resident_sq,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_backward", _pt, ctx)
@@ -2088,9 +2104,12 @@ def _krea2_direct_dora_block_weights_host(
     st: ShardedSafeTensors, key_prefix: String, bi: Int, targets: Int,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> List[List[Float32]]:
     var wbi: Krea2BlockWeights
-    if resident:
+    if resident_sq and bi < len(resident_sq.value().blocks):
+        wbi = _load_krea2_block_squareq(resident_sq.value(), bi, ctx)
+    elif resident:
         wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
     else:
         wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
@@ -2108,12 +2127,13 @@ def _build_krea2_direct_dora_set_streamed(
     st: ShardedSafeTensors, key_prefix: String, rank: Int, alpha: Float32,
     targets: Int, ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> FlatDirectDoRASet:
     var set = empty_krea2_direct_dora_set()
     var seed = UInt64(7000)
     for bi in range(NBLOCKS):
         var weights = _krea2_direct_dora_block_weights_host(
-            st, key_prefix, bi, targets, ctx, resident,
+            st, key_prefix, bi, targets, ctx, resident, resident_sq,
         )
         krea2_direct_dora_append_block_weights(
             set, bi, weights^, FEATURES, MLPDIM, HEADS * HEADDIM,
@@ -2585,6 +2605,7 @@ def _step_dispatch[LHp: Int = LH, LWp: Int = LW](
     lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
 ) raises -> _StepOut:
     if lt > LTMAX:
@@ -2594,7 +2615,7 @@ def _step_dispatch[LHp: Int = LH, LWp: Int = LW](
         )
     return _train_one_sample[LHp, LWp](
         st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
-        sigma, noise_seed, cfg, ctx, resident, resident_i8)
+        sigma, noise_seed, cfg, ctx, resident, resident_sq, resident_i8)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2636,6 +2657,7 @@ def _bucketed_step(
     lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
 ) raises -> _StepOut:
     """Run ONE training step for an aspect-bucketed sample: dispatch to the ladder
@@ -2652,7 +2674,7 @@ def _bucketed_step(
             return _step_dispatch[LH_BI, LW_BI](
                 st, key_prefix,
                 sample.clean[], sample.context[], sample.pos[], sample.text_len,
-                lora, fin, cond_w, sigma, noise_seed, cfg, ctx, resident, resident_i8,
+                lora, fin, cond_w, sigma, noise_seed, cfg, ctx, resident, resident_sq, resident_i8,
             )
     raise Error(
         String("_bucketed_step: sample latent ") + String(lh) + "x" + String(lw)
@@ -2669,6 +2691,7 @@ def _step_dispatch_b2(
     lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     cfg: TrainConfig, ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOut:
     if lt0 > LTMAX or lt1 > LTMAX:
         raise Error(
@@ -2680,7 +2703,7 @@ def _step_dispatch_b2(
         st, key_prefix,
         clean0, context0, pos0, lt0, sigma0, noise_seed0,
         clean1, context1, pos1, lt1, sigma1, noise_seed1,
-        lora, fin, cond_w, cfg, ctx, resident)
+        lora, fin, cond_w, cfg, ctx, resident, resident_sq)
 
 
 def _step_dispatch_adamw_device_grads(
@@ -2691,6 +2714,7 @@ def _step_dispatch_adamw_device_grads(
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
     ref_tokens: Optional[TArc] = Optional[TArc](None),
@@ -2703,7 +2727,7 @@ def _step_dispatch_adamw_device_grads(
         )
     return _train_one_sample_adamw_device_grads(
         st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
-        sigma, noise_seed, cfg, adamw_state, ctx, resident, resident_i8, host_i8,
+        sigma, noise_seed, cfg, adamw_state, ctx, resident, resident_sq, resident_i8, host_i8,
         ref_tokens=ref_tokens.copy(), img_in_ref_w=img_in_ref_w.copy())
 
 
@@ -2718,6 +2742,7 @@ def _step_dispatch_b2_adamw_device_grads(
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
 ) raises -> _StepOutAdamWDeviceGrads:
@@ -2731,7 +2756,7 @@ def _step_dispatch_b2_adamw_device_grads(
         st, key_prefix,
         clean0, context0, pos0, lt0, sigma0, noise_seed0,
         clean1, context1, pos1, lt1, sigma1, noise_seed1,
-        lora, fin, cond_w, cfg, adamw_state, ctx, resident, resident_i8, host_i8)
+        lora, fin, cond_w, cfg, adamw_state, ctx, resident, resident_sq, resident_i8, host_i8)
 
 
 def _step_dispatch_automagic3_device_grads(
@@ -2742,6 +2767,7 @@ def _step_dispatch_automagic3_device_grads(
     mut a3_state: Automagic3DeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutAdamWDeviceGrads:
     if lt > LTMAX:
         raise Error(
@@ -2750,7 +2776,7 @@ def _step_dispatch_automagic3_device_grads(
         )
     return _train_one_sample_automagic3_device_grads(
         st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
-        sigma, noise_seed, cfg, a3_state, ctx, resident)
+        sigma, noise_seed, cfg, a3_state, ctx, resident, resident_sq)
 
 
 def _step_dispatch_adamw_device_grads_full_surface(
@@ -2762,6 +2788,7 @@ def _step_dispatch_adamw_device_grads_full_surface(
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutAdamWDeviceGrads:
     if lt > LTMAX:
         raise Error(
@@ -2770,7 +2797,7 @@ def _step_dispatch_adamw_device_grads_full_surface(
         )
     return _train_one_sample_adamw_device_grads_full_surface(
         st, key_prefix, clean, context, pos, lt, lora, txt_lora, fin, cond_w,
-        sigma, noise_seed, cfg, adamw_state, ctx, resident)
+        sigma, noise_seed, cfg, adamw_state, ctx, resident, resident_sq)
 
 
 def _step_dispatch_dora(
@@ -2779,6 +2806,7 @@ def _step_dispatch_dora(
     dora: Krea2StackDirectDoRA, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutDoRA:
     if lt > LTMAX:
         raise Error(
@@ -2787,7 +2815,7 @@ def _step_dispatch_dora(
         )
     return _train_one_sample_dora(
         st, key_prefix, clean, context, pos, lt, dora, fin, cond_w,
-        sigma, noise_seed, cfg, ctx, resident)
+        sigma, noise_seed, cfg, ctx, resident, resident_sq)
 
 
 def _step_dispatch_oft(
@@ -2796,6 +2824,7 @@ def _step_dispatch_oft(
     oft: Krea2StackDirectOFT, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
 ) raises -> _StepOutOFT:
     if lt > LTMAX:
         raise Error(
@@ -2804,7 +2833,7 @@ def _step_dispatch_oft(
         )
     return _train_one_sample_oft(
         st, key_prefix, clean, context, pos, lt, oft, fin, cond_w,
-        sigma, noise_seed, cfg, ctx, resident)
+        sigma, noise_seed, cfg, ctx, resident, resident_sq)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2921,6 +2950,7 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
     seed: UInt64,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
 ) raises -> Tensor:
@@ -2953,7 +2983,7 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
         ](
             c.combined, c.blk_vec, c.tmlp_out,
             st, key_prefix, NBLOCKS, lora, fin,
-            c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
+            c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident, resident_sq,
             resident_i8, host_i8,
         )
 
@@ -2979,7 +3009,7 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
                 u.combined, u.blk_vec, u.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin,
                 u.cos, u.sin, EPS, uncond.text_len, imglen, ctx,
-                real_len_u, resident, resident_i8, host_i8,
+                real_len_u, resident, resident_sq, resident_i8, host_i8,
             )
             v_bf16 = krea2_cfg(v_c, pred_u.velocity[], cfg_scale, ctx)
 
@@ -3015,6 +3045,7 @@ def _krea2_run_inline_samples[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: Int](
     completed_step: Int,
     ctx: DeviceContext,
     resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
     resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
     host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
 ) raises:
@@ -3076,7 +3107,7 @@ def _krea2_run_inline_samples[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: Int](
             # `+ completed_step*1000` reseeded every cadence, making the grid
             # uncomparable and confounding quality/color reads across steps.
             prompt.steps, guidance, prompt.seed + UInt64(pi),
-            ctx, resident, resident_i8, host_i8,
+            ctx, resident, resident_sq, resident_i8, host_i8,
         )
         var out_png = (
             samples_dir + String("/step_") + String(completed_step)
@@ -3212,9 +3243,10 @@ def _krea2_ft_sample_store_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
             c.combined, c.blk_vec, c.tmlp_out,
             st, key_prefix, NBLOCKS, lora, fin,
             c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c,
-            Optional[Krea2ResidentFp8](None), Optional[Krea2ResidentInt8](None),
-            Optional[Krea2HostInt8](None), 0,
-            Optional[Krea2HostBf16](store.copy()),
+            Optional[Krea2ResidentFp8](None), Optional[Krea2ResidentSquareq](None),
+            Optional[Krea2ResidentInt8](None),
+            Optional[Krea2HostInt8](None), save_tapes=0,
+            host_bf16=Optional[Krea2HostBf16](store.copy()),
         )
 
         var v_bf16: Tensor
@@ -3238,9 +3270,10 @@ def _krea2_ft_sample_store_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
                 u.combined, u.blk_vec, u.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin,
                 u.cos, u.sin, EPS, uncond.text_len, imglen, ctx, real_len_u,
-                Optional[Krea2ResidentFp8](None), Optional[Krea2ResidentInt8](None),
-                Optional[Krea2HostInt8](None), 0,
-                Optional[Krea2HostBf16](store.copy()),
+                Optional[Krea2ResidentFp8](None), Optional[Krea2ResidentSquareq](None),
+            Optional[Krea2ResidentInt8](None),
+                Optional[Krea2HostInt8](None), save_tapes=0,
+                host_bf16=Optional[Krea2HostBf16](store.copy()),
             )
             v_bf16 = krea2_cfg(v_c, pred_u.velocity[], cfg_scale, ctx)
 
@@ -3520,9 +3553,10 @@ def _krea2_full_ft_run(
             cond.combined, cond.blk_vec, cond.tmlp_out,
             st, key_prefix, NBLOCKS, lora, fin,
             cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len,
-            Optional[Krea2ResidentFp8](None), Optional[Krea2ResidentInt8](None),
-            Optional[Krea2HostInt8](None), KREA2_SAVE_TAPES,
-            Optional[Krea2HostBf16](store.copy()),
+            Optional[Krea2ResidentFp8](None), Optional[Krea2ResidentSquareq](None),
+            Optional[Krea2ResidentInt8](None),
+            Optional[Krea2HostInt8](None), save_tapes=KREA2_SAVE_TAPES,
+            host_bf16=Optional[Krea2HostBf16](store.copy()),
         )
         var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
         var loss = vloss.loss
@@ -3712,6 +3746,9 @@ def main() raises:
     # per-step disk re-read. "" / "OFF" (default, C13) = the per-step bf16 disk
     # stream below stays UNTOUCHED (byte-identical to the pre-fp8 path).
     var resident = Optional[Krea2ResidentFp8](None)
+    # SquareQ W4-resident base (cfg.quantized_resident=="squareq_w4"): pin the
+    # prebuilt sidecar payloads resident, reconstruct bf16 per block in the step.
+    var resident_sq = Optional[Krea2ResidentSquareq](None)
     var resident_i8 = Optional[Krea2ResidentInt8](None)
     # int8 PINNED-HOST offload for the NON-resident blocks [K:NBLOCKS] (MJ-1065:
     # replaces the per-step disk stream with H2D of pinned int8 — no disk, no decode).
@@ -3726,10 +3763,16 @@ def main() raises:
         var loaded_from_cache = False
         if cfg.fp8_cache and krea2_fp8_cache_valid(cache_path, cfg.checkpoint, NBLOCKS):
             print("[fp8cache] fresh sidecar found:", cache_path)
+            # Honor the SAME resident budget as the fresh-quantize path below —
+            # the sidecar used to load all NBLOCKS regardless, which made
+            # -D KREA2_RESIDENT_BLOCKS a no-op on any box that had a sidecar.
             resident = Optional[Krea2ResidentFp8](
-                load_krea2_fp8_cache(cache_path, NBLOCKS, ctx)
+                load_krea2_fp8_cache(
+                    cache_path, NBLOCKS, ctx, KREA2_RESIDENT_BLOCKS
+                )
             )
-            print("[fp8cache] loaded", NBLOCKS, "blocks from sidecar (skipped quantize)")
+            print("[fp8cache] loaded", KREA2_RESIDENT_BLOCKS, "of", NBLOCKS,
+                  "blocks from sidecar (skipped quantize); the rest stream per step")
             loaded_from_cache = True
         if not loaded_from_cache:
             print("fp8_e4m3 resident base: quantizing", NBLOCKS, "blocks ONCE at load ...")
@@ -3792,6 +3835,31 @@ def main() raises:
                 build_krea2_host_int8(st, key_prefix, NBLOCKS, KREA2_RESIDENT_BLOCKS, ctx)
             )
             print("int8_w8a8 host offload: DONE (H2D int8 per step, no disk).")
+        perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+    elif cfg.quantized_resident == String("squareq_w4"):
+        # SquareQ W4-resident base: load the PREBUILT sidecar slab (never quantizes
+        # at startup — scripts/squareq_build_slab.py output) and pin the first
+        # KREA2_RESIDENT_BLOCKS blocks' packed payloads device-resident (~0.28x
+        # bf16). Per-block bf16 reconstruction happens inside the step (NO disk).
+        if cfg.squareq_sidecar == String(""):
+            raise Error(
+                String("krea2: quantized_resident='squareq_w4' requires ")
+                + String("squareq_sidecar=<prebuilt sidecar path> ")
+                + String("(scripts/squareq_build_slab.py output); refusing to guess.")
+            )
+        print("squareq_w4 resident base: pinning", KREA2_RESIDENT_BLOCKS,
+              "of", NBLOCKS, "blocks from sidecar", cfg.squareq_sidecar, "...")
+        var sq_sc = ShardedSafeTensors.open(cfg.squareq_sidecar)
+        resident_sq = Optional[Krea2ResidentSquareq](
+            build_krea2_resident_squareq(
+                sq_sc, key_prefix, NBLOCKS, KREA2_RESIDENT_BLOCKS, ctx
+            )
+        )
+        # Blocks [KREA2_RESIDENT_BLOCKS:NBLOCKS] fall through to the existing
+        # per-step disk-stream arm (same tail behavior as the fp8 partial-resident fit).
+        print("squareq_w4 resident base: DONE (", KREA2_RESIDENT_BLOCKS,
+              "pinned;", NBLOCKS - KREA2_RESIDENT_BLOCKS,
+              "stream from disk per step).")
         perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
     elif cfg.quantized_resident == String("streamed_base_opt_in"):
         # Explicit experiment arm ONLY (quality-control A/Bs like the 07-02
@@ -3944,7 +4012,7 @@ def main() raises:
         print("[krea2-dora-direct] initializing DoRA magnitudes from streamed runtime weights ...")
         dora_masters = _build_krea2_direct_dora_set_streamed(
             st, key_prefix, cfg.lora_rank, cfg.lora_alpha, k2_targets, ctx,
-            resident,
+            resident, resident_sq,
         )
         print("[krea2-dora-direct] trainable bytes:", krea2_direct_dora_trainable_bytes(dora_masters),
               " slots:", len(dora_masters.ad))
@@ -4308,14 +4376,14 @@ def main() raises:
                     st, key_prefix,
                     sample.clean[], sample.context[], sample.pos[], lt,
                     resident_dev_lora, resident_txt_lora, fin, cond_w,
-                    sigma, noise_seed, cfg, adamw_device_state, ctx, resident,
+                    sigma, noise_seed, cfg, adamw_device_state, ctx, resident, resident_sq,
                 )
             else:
                 so_dev = _step_dispatch_adamw_device_grads(
                     st, key_prefix,
                     sample.clean[], sample.context[], sample.pos[], lt,
                     resident_dev_lora, fin, cond_w, sigma, noise_seed, cfg,
-                    adamw_device_state, ctx, resident, resident_i8, host_i8,
+                    adamw_device_state, ctx, resident, resident_sq, resident_i8, host_i8,
                 )
             if so_dev.grad_count != n_adapters:
                 raise Error(
@@ -4440,7 +4508,7 @@ def main() raises:
             try:
                 _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                     cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
-                    0, ctx, resident, resident_i8, host_i8,
+                    0, ctx, resident, resident_sq, resident_i8, host_i8,
                 )
             except e:
                 print("[krea2-sample-inline] step-0 sample FAILED (training continues):", e)
@@ -4481,7 +4549,7 @@ def main() raises:
                 st, key_prefix,
                 sample.clean[], sample.context[], sample.pos[], lt,
                 resident_a3_lora, fin, cond_w, sigma, noise_seed, cfg,
-                a3_dev, ctx, resident,
+                a3_dev, ctx, resident, resident_sq,
             )
             if so_dev.grad_count != n_adapters:
                 raise Error(
@@ -4570,7 +4638,7 @@ def main() raises:
                 try:
                     _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                         cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
-                        step + 1, ctx, resident, resident_i8, host_i8,
+                        step + 1, ctx, resident, resident_sq, resident_i8, host_i8,
                     )
                 except e:
                     print("[krea2-sample-inline] sample FAILED (training continues):", e)
@@ -4624,7 +4692,7 @@ def main() raises:
             try:
                 _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                     cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
-                    0, ctx, resident, resident_i8, host_i8,
+                    0, ctx, resident, resident_sq, resident_i8, host_i8,
                 )
             except e:
                 print("[krea2-sample-inline] step-0 sample FAILED (training continues):", e)
@@ -4672,7 +4740,7 @@ def main() raises:
                     st, key_prefix,
                     sample.clean[], sample.context[], sample.pos[], lt, sigma, noise_seed,
                     sample1.clean[], sample1.context[], sample1.pos[], lt1, sigma1, noise_seed1,
-                    resident_dev_lora, fin, cond_w, cfg, adamw_dev, ctx, resident,
+                    resident_dev_lora, fin, cond_w, cfg, adamw_dev, ctx, resident, resident_sq,
                     resident_i8, host_i8,
                 )
             else:
@@ -4686,7 +4754,7 @@ def main() raises:
                     st, key_prefix,
                     sample.clean[], sample.context[], sample.pos[], lt,
                     resident_dev_lora, fin, cond_w, sigma, noise_seed, cfg,
-                    adamw_dev, ctx, resident, resident_i8, host_i8,
+                    adamw_dev, ctx, resident, resident_sq, resident_i8, host_i8,
                     ref_tokens=ref_tok_opt.copy(),
                     img_in_ref_w=img_in_ref_dev.copy(),
                 )
@@ -4784,7 +4852,7 @@ def main() raises:
                 try:
                     _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                         cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
-                        step + 1, ctx, resident, resident_i8, host_i8,
+                        step + 1, ctx, resident, resident_sq, resident_i8, host_i8,
                     )
                 except e:
                     print("[krea2-sample-inline] sample FAILED (training continues):", e)
@@ -4889,7 +4957,7 @@ def main() raises:
                 st, key_prefix,
                 sample.clean[], sample.context[], sample.pos[], lt,
                 dev_dora, fin, cond_w, sigma, noise_seed, cfg, ctx,
-                resident,
+                resident, resident_sq,
             )
             var so_dora_h = so_dora^.to_host(dora_masters, k2_targets, ctx)
             perf_visible_transfer_count += len(dora_masters.ad)
@@ -4934,7 +5002,7 @@ def main() raises:
                 st, key_prefix,
                 sample.clean[], sample.context[], sample.pos[], lt,
                 dev_oft, fin, cond_w, sigma, noise_seed, cfg, ctx,
-                resident,
+                resident, resident_sq,
             )
             var so_oft_h = so_oft^.to_host(oft_masters, k2_targets, ctx)
             perf_visible_transfer_count += len(oft_masters.ad)
@@ -4981,7 +5049,7 @@ def main() raises:
             # fail-loud at startup), so only the plain b1 host-grad path lands here.
             so = _bucketed_step(
                 st, key_prefix, sample,
-                dev_lora, fin, cond_w, sigma, noise_seed, cfg, ctx, resident, resident_i8,
+                dev_lora, fin, cond_w, sigma, noise_seed, cfg, ctx, resident, resident_sq, resident_i8,
             )
         else:
             if use_b2:
@@ -5001,14 +5069,14 @@ def main() raises:
                     st, key_prefix,
                     sample.clean[], sample.context[], sample.pos[], lt, sigma, noise_seed,
                     sample1.clean[], sample1.context[], sample1.pos[], lt1, sigma1, noise_seed1,
-                    dev_lora, fin, cond_w, cfg, ctx, resident,
+                    dev_lora, fin, cond_w, cfg, ctx, resident, resident_sq,
                 )
             else:
                 so = _step_dispatch(
                     st, key_prefix,
                     sample.clean[], sample.context[], sample.pos[], lt,
                     dev_lora, fin, cond_w, sigma, noise_seed, cfg, ctx,
-                    resident, resident_i8,
+                    resident, resident_sq, resident_i8,
                 )
 
         # extract flat grad lists, then global-norm clip (max_grad_norm).
@@ -5153,7 +5221,7 @@ def main() raises:
             try:
                 _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                     cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
-                    0, ctx, resident, resident_i8, host_i8,
+                    0, ctx, resident, resident_sq, resident_i8, host_i8,
                 )
             except e:
                 print("[krea2-sample-inline] step-0 sample FAILED (training continues):", e)
@@ -5201,7 +5269,7 @@ def main() raises:
             try:
                 _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                     cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
-                    step + 1, ctx, resident, resident_i8, host_i8,
+                    step + 1, ctx, resident, resident_sq, resident_i8, host_i8,
                 )
             except e:
                 print("[krea2-sample-inline] sample FAILED (training continues):", e)

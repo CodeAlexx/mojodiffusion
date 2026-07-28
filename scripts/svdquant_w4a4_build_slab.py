@@ -4,10 +4,11 @@
 W4A4 (QuaRot, per-out rank-128) for class-A linears with in∈{2048,4096,8192};
 W4A16 group-64 for in=16384 (the FWHT shared-mem blocker); pass-through the rest.
 """
+import os
 import sys
 import time
 
-sys.path.insert(0, "/home/alex/SquareQ/src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # in-repo scripts/squareq package
 from squareq.svdquant_int4 import build_svdquant_w4a4_slab  # noqa: E402
 
 SRC = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8-dequant-bf16.safetensors"

@@ -9,11 +9,12 @@ under normal + channel-outlier activations. Bar: >= 0.985 (the sim showed ~0.99)
 
 Usage: python scripts/svdquant_w4a4_gate.py
 """
+import os
 import sys
 import torch
 from safetensors import safe_open
 
-sys.path.insert(0, "/home/alex/SquareQ/src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # in-repo scripts/squareq package
 from squareq.svdquant_int4 import quantize_svdquant_w4a4, w4a4_forward, hadamard, _unpack_int4_perout  # noqa: E402
 
 SWEEP = "--sweep" in sys.argv

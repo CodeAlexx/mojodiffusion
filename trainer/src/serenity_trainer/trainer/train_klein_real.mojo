@@ -40,6 +40,7 @@
 #   pixi run mojo run -I . serenitymojo/training/train_klein_real.mojo
 
 from std.sys import argv
+from std.sys.defines import get_defined_int
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.gpu.host import DeviceContext
@@ -269,8 +270,19 @@ comptime LW = 32
 comptime N_IMG = 1024
 comptime N_TXT = 512
 comptime S = N_IMG + N_TXT
-comptime H = 32
+# H is -D-overridable for the Klein-4B variant (n_heads 24, inner_dim 3072):
+# build with -D KLEIN_HEADS=24 into a separate binary. Default 32 = Klein-9B,
+# byte-identical to the pre-flag build.
+comptime H = get_defined_int["KLEIN_HEADS", 32]()
 comptime Dh = 128
+# Variant-derived architecture expectations (asserted against the config):
+# H=32 -> Klein-9B (8 double + 24 single, joint 12288, mlp 12288);
+# H=24 -> Klein-4B (5 double + 20 single, joint 7680, mlp 9216).
+comptime KLEIN_IS_4B = H == 24
+comptime KLEIN_JOINT_DIM = 7680 if KLEIN_IS_4B else 12288
+comptime KLEIN_NUM_DOUBLE = 5 if KLEIN_IS_4B else 8
+comptime KLEIN_NUM_SINGLE = 20 if KLEIN_IS_4B else 24
+comptime KLEIN_MLP_HIDDEN = 9216 if KLEIN_IS_4B else 12288
 
 # ── run knobs (NOT model params; cadence target comes from cfg.max_steps) ─────
 comptime SEED_BASE = UInt64(1234)
@@ -871,17 +883,18 @@ def validate_klein_train_config(cfg: TrainConfig) raises:
         raise Error(String("config d_model ") + String(cfg.d_model) + " != H*Dh " + String(H * Dh))
     if cfg.in_channels != 128:
         raise Error(String("Klein 9B trainer requires in_channels=128; parsed ") + String(cfg.in_channels))
-    if cfg.joint_attention_dim != 12288:
-        raise Error(String("Klein 9B trainer requires joint_attention_dim=12288; parsed ") + String(cfg.joint_attention_dim))
+    if cfg.joint_attention_dim != KLEIN_JOINT_DIM:
+        raise Error(String("Klein trainer requires joint_attention_dim=") + String(KLEIN_JOINT_DIM) + "; parsed " + String(cfg.joint_attention_dim))
     if cfg.out_channels != 128:
-        raise Error(String("Klein 9B trainer requires out_channels=128; parsed ") + String(cfg.out_channels))
-    if cfg.num_double != 8 or cfg.num_single != 24:
+        raise Error(String("Klein trainer requires out_channels=128; parsed ") + String(cfg.out_channels))
+    if cfg.num_double != KLEIN_NUM_DOUBLE or cfg.num_single != KLEIN_NUM_SINGLE:
         raise Error(
-            String("Klein 9B trainer requires double=8 single=24; got double=")
+            String("Klein trainer requires double=") + String(KLEIN_NUM_DOUBLE)
+            + " single=" + String(KLEIN_NUM_SINGLE) + "; got double="
             + String(cfg.num_double) + String(" single=") + String(cfg.num_single)
         )
-    if cfg.mlp_hidden != 12288:
-        raise Error(String("Klein 9B trainer requires mlp_hidden=12288; parsed ") + String(cfg.mlp_hidden))
+    if cfg.mlp_hidden != KLEIN_MLP_HIDDEN:
+        raise Error(String("Klein trainer requires mlp_hidden=") + String(KLEIN_MLP_HIDDEN) + "; parsed " + String(cfg.mlp_hidden))
     if cfg.timestep_dim != 256:
         raise Error(String("Klein 9B trainer requires timestep_dim=256; parsed ") + String(cfg.timestep_dim))
     if not _close_f32(Float32(cfg.rope_theta), Float32(2000.0)):
@@ -1252,7 +1265,10 @@ def main() raises:
     # concurrent stores OOM-killed the user session (systemd-oomd 2026-07-04).
     var loader = TurboPlannedLoader.open(
         cfg.checkpoint, plan^, OffloadConfig.synchronous_single(), ctx,
-        fill_block_store=cfg.quantized_resident != String("fp8_e4m3"),
+        fill_block_store=(
+            cfg.quantized_resident != String("fp8_e4m3")
+            and cfg.quantized_resident != String("squareq_w4")
+        ),
     )
     if runtime_profile:
         print("PROG_STAGE step=0 total=", run_steps, " phase=open_turbo_loader")
@@ -1297,6 +1313,31 @@ def main() raises:
                 "  note: fp8 base pins all blocks (~8.7 GiB) even with",
                 "carrier/large-inline-sample — use streamed_base_opt_in if VRAM-tight.",
             )
+    elif cfg.quantized_resident == String("squareq_w4"):
+        # SquareQ chunk 4: packed int4+H256+low-rank sidecar pinned VERBATIM
+        # (~0.28x bf16 — vs fp8's ~0.5x); await reconstructs BF16 per block.
+        # Slab is PREBUILT by scripts/squareq_build_slab.py — never quantized
+        # here. Same MJ-1065 all-or-nothing contract as fp8.
+        if cfg.squareq_sidecar == String(""):
+            raise Error(
+                "klein squareq_w4: config key 'squareq_sidecar' is empty — "
+                + "point it at the scripts/squareq_build_slab.py output dir"
+            )
+        pinned_blocks = loader.pin_residents_squareq(
+            cfg.squareq_sidecar, KLEIN_FP8_RESIDENT_BUDGET_BYTES, ctx
+        )
+        if pinned_blocks != n_blocks:
+            raise Error(
+                String("klein squareq_w4-resident: pinned ") + String(pinned_blocks)
+                + " of " + String(n_blocks) + " blocks within budget "
+                + String(KLEIN_FP8_RESIDENT_BUDGET_BYTES) + " bytes — a block "
+                + "would still per-step disk-stream (MJ-1065). Raise the budget."
+            )
+        print(
+            "  squareq_w4-resident base:", pinned_blocks, "of", n_blocks,
+            "blocks pinned packed from", cfg.squareq_sidecar,
+            "(int4-g64 + H256 + low-rank; reconstruct per block; NO per-step disk read).",
+        )
     elif cfg.quantized_resident == String("streamed_base_opt_in"):
         var memory_info = ctx.get_memory_info()
         var total_vram_bytes = Int(memory_info[1])

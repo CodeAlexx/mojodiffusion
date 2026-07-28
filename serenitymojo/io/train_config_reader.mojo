@@ -864,14 +864,21 @@ def read_model_config(json_path: String) raises -> TrainConfig:
                     and sc.s != String("fp8_e4m3")
                     and sc.s != String("fp8_e4m3_host")
                     and sc.s != String("int_w8a8")
+                    and sc.s != String("squareq_w4")
                     and sc.s != String("streamed_base_opt_in")
                 ):
                     raise Error(
                         String("train config: unsupported quantized_resident '")
                         + sc.s + "' (supported: OFF, fp8_e4m3, fp8_e4m3_host, "
-                        + "int_w8a8, streamed_base_opt_in)"
+                        + "int_w8a8, squareq_w4, streamed_base_opt_in)"
                     )
                 cfg.quantized_resident = sc.s
+        elif key == "squareq_sidecar":
+            # SquareQ prebuilt slab dir; consulted when
+            # quantized_resident=="squareq_w4" (trainer fail-louds if empty).
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.squareq_sidecar = sc.s
         elif key == "fp8_cache":
             # fp8-resident disk sidecar toggle (default True in TrainConfig).
             # Only consulted when quantized_resident=="fp8_e4m3".

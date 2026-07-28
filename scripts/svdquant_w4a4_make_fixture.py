@@ -5,12 +5,13 @@ Quantizes a real bf16 linear with SquareQ quantize_svdquant_w4a4 and saves the
 tensors the Mojo svdquant_linear_w4a4 consumes + a non-degenerate x and the bf16
 ideal y_true = x @ W_orig^T. The Mojo gate asserts cos(y_w4a4, y_true) ~ 0.99.
 """
+import os
 import sys
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, "/home/alex/SquareQ/src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # in-repo scripts/squareq package
 from squareq.svdquant_int4 import quantize_svdquant_w4a4  # noqa: E402
 
 SRC = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8-dequant-bf16.safetensors"

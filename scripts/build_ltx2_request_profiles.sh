@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 registry="$repo_root/serenitymojo/configs/ltx2_request_profiles.json"
 output_dir="$repo_root/output/bin"
 source_file="$repo_root/serenitymojo/sampling/ltx2_request_cli.mojo"
+sampling_file="$repo_root/serenitymojo/sampling/ltx2_sampling.mojo"
 pipeline_file="$repo_root/serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
 tiled_decode_file="$repo_root/serenitymojo/models/vae/ltx2_tiled_decode.mojo"
 vae_encoder_file="$repo_root/serenitymojo/models/vae/ltx2_vae_encoder.mojo"
@@ -40,6 +41,7 @@ build_one() {
     if [[ "${LTX2_FORCE_REBUILD:-0}" != "1" && -x "$runner" \
         && "$runner" -nt "$registry" \
         && "$runner" -nt "$source_file" \
+        && "$runner" -nt "$sampling_file" \
         && "$runner" -nt "$pipeline_file" \
         && "$runner" -nt "$tiled_decode_file" \
         && "$runner" -nt "$vae_encoder_file" \

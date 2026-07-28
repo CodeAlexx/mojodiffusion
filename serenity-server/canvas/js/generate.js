@@ -59,6 +59,8 @@ var GenerateTab = (function () {
         capabilities: null,
         videoStatus: null,
         videoGuidanceMode: 'distilled',
+        videoWorkflowProfile: '',
+        videoPromptEnhancer: 'none',
         videoQuant: 'bf16',
         videoCheckpoint: 'ltx-2.3-22b-dev-fp8-dequant-bf16',
         capsPositive: '',
@@ -76,6 +78,8 @@ var GenerateTab = (function () {
         currentGalleryIndex: -1,
         pendingVideoJobs: {},
         completedVideoJobs: {},
+        pendingImageJobs: {},
+        completedImageJobs: {},
         currentBatchKeys: {},
         videoPollToken: 0,
         // Phase 2: gallery enhancements
@@ -210,6 +214,59 @@ var GenerateTab = (function () {
             return entry && entry.model === 'ltx2_t2v_av';
         });
         return runner && runner.modes && runner.modes.ltx2_mojo_request || null;
+    }
+    function ltx2CheckpointWorkflow(checkpoint) {
+        var mode = activeLtx2RequestMode();
+        var profiles = mode && Array.isArray(mode.checkpoint_workflows)
+            ? mode.checkpoint_workflows : [];
+        var normalized = String(checkpoint || '')
+            .replace(/\.safetensors$/i, '').toLowerCase();
+        return profiles.find(function (profile) {
+            return profile && Array.isArray(profile.checkpoints) &&
+                profile.checkpoints.some(function (name) {
+                    return String(name || '').replace(/\.safetensors$/i, '')
+                        .toLowerCase() === normalized;
+                });
+        }) || null;
+    }
+    function refreshVideoPromptEnhancer() {
+        if (!els.videoPromptEnhancer)
+            return;
+        var workflow = ltx2CheckpointWorkflow(state.videoCheckpoint);
+        var enhancer = workflow && workflow.prompt_enhancer;
+        var available = !!(enhancer && workflow.prompt_enhancer_available === true);
+        var enhancerId = enhancer ? String(enhancer.id || '') : '';
+        els.videoPromptEnhancer.innerHTML =
+            '<option value="none">Raw prompt (creator workflow default)</option>' +
+            (enhancerId
+                ? '<option value="' + escapeHtml(enhancerId) + '"' +
+                    (available ? '' : ' disabled') + '>' +
+                    escapeHtml(enhancerId) +
+                    (available ? '' : ' (weights missing)') + '</option>'
+                : '');
+        if (!available || state.videoPromptEnhancer !== enhancerId)
+            state.videoPromptEnhancer = 'none';
+        els.videoPromptEnhancer.value = state.videoPromptEnhancer;
+        els.videoPromptEnhancer.disabled = !enhancerId || !available;
+        if (!els.videoPromptEnhancerNote)
+            return;
+        if (!enhancer) {
+            els.videoPromptEnhancerNote.textContent =
+                'The selected checkpoint has no registered creator prompt enhancer.';
+        }
+        else if (!available) {
+            var filesAvailable = workflow.prompt_enhancer_files_available === true;
+            els.videoPromptEnhancerNote.textContent = filesAvailable
+                ? 'Creator enhancer files are installed, but its execution route is not implemented yet. Serenity will keep the prompt raw; it will not fake enhancement.'
+                : 'Creator enhancer is unavailable: install ' +
+                    String(enhancer.weights || '') + ' and ' +
+                    String(enhancer.mmproj || '') +
+                    '. Serenity will keep the prompt raw; it will not fake enhancement.';
+        }
+        else {
+            els.videoPromptEnhancerNote.textContent =
+                'Creator enhancer uses the raw prompt and optional source image with no system prompt.';
+        }
     }
     function exactLtx2RequestProfile() {
         var mode = activeLtx2RequestMode();
@@ -598,6 +655,9 @@ var GenerateTab = (function () {
             '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
             '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
             '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-dev-fp8-dequant-bf16"></div>' +
+            '<div class="gen-param-row" data-param-search="prompt enhancer sulphur qwen"><label class="gen-label" for="gen-video-prompt-enhancer">Prompt enhancer</label>' +
+            '<select id="gen-video-prompt-enhancer" class="gen-select"><option value="none">Raw prompt (creator workflow default)</option></select></div>' +
+            '<div id="gen-video-prompt-enhancer-note" class="gen-capability-note">The selected checkpoint has no registered creator prompt enhancer.</div>' +
             '<div class="gen-param-row" data-param-search="conditioning caps positive"><label class="gen-label" for="gen-caps-positive">Positive conditioning override</label>' +
             '<input id="gen-caps-positive" class="gen-select gen-path-input" placeholder="Automatic when blank"></div>' +
             '<div class="gen-param-row" data-param-search="conditioning caps negative"><label class="gen-label" for="gen-caps-negative">Negative conditioning override</label>' +
@@ -1335,6 +1395,8 @@ var GenerateTab = (function () {
         els.videoGuidanceMode = document.getElementById('gen-video-guidance-mode');
         els.videoQuant = document.getElementById('gen-video-quant');
         els.videoCheckpoint = document.getElementById('gen-video-checkpoint');
+        els.videoPromptEnhancer = document.getElementById('gen-video-prompt-enhancer');
+        els.videoPromptEnhancerNote = document.getElementById('gen-video-prompt-enhancer-note');
         els.capsPositive = document.getElementById('gen-caps-positive');
         els.capsNegative = document.getElementById('gen-caps-negative');
         els.noiseFixture = document.getElementById('gen-noise-fixture');
@@ -2165,6 +2227,10 @@ var GenerateTab = (function () {
         if (els.videoGuidanceMode) {
             els.videoGuidanceMode.addEventListener('change', function () {
                 state.videoGuidanceMode = this.value === 'dev' ? 'dev' : 'distilled';
+                var creatorWorkflow = ltx2CheckpointWorkflow(state.videoCheckpoint);
+                state.videoWorkflowProfile =
+                    state.videoGuidanceMode === 'distilled' && creatorWorkflow
+                        ? String(creatorWorkflow.id || '') : '';
                 applyVideoGuidanceMode();
             });
         }
@@ -2186,7 +2252,24 @@ var GenerateTab = (function () {
                     selectModel(checkpoint);
             });
         if (els.videoCheckpoint)
-            els.videoCheckpoint.addEventListener('input', function () { state.videoCheckpoint = this.value; });
+            els.videoCheckpoint.addEventListener('input', function () {
+                state.videoCheckpoint = this.value;
+                var creatorWorkflow = ltx2CheckpointWorkflow(
+                    state.videoCheckpoint
+                );
+                state.videoWorkflowProfile = creatorWorkflow
+                    ? String(creatorWorkflow.id || '') : '';
+                if (creatorWorkflow)
+                    state.videoGuidanceMode = String(
+                        creatorWorkflow.guidance_mode || 'distilled'
+                    );
+                applyVideoGuidanceMode();
+                refreshVideoPromptEnhancer();
+            });
+        if (els.videoPromptEnhancer)
+            els.videoPromptEnhancer.addEventListener('change', function () {
+                state.videoPromptEnhancer = this.value || 'none';
+            });
         if (els.capsPositive)
             els.capsPositive.addEventListener('input', function () { state.capsPositive = this.value; });
         if (els.capsNegative)
@@ -2402,6 +2485,7 @@ var GenerateTab = (function () {
                     state.pendingBatch = 0;
                     state.videoPollToken++;
                     state.pendingVideoJobs = {};
+                    state.pendingImageJobs = {};
                     SerenityAPI.interrupt();
                     setGenerating(false);
                 }
@@ -3239,6 +3323,42 @@ var GenerateTab = (function () {
         }
     }
     function applyVideoGuidanceMode(preserveSteps) {
+        var creatorWorkflow = state.videoWorkflowProfile
+            ? ltx2CheckpointWorkflow(state.videoCheckpoint) : null;
+        if (creatorWorkflow &&
+            creatorWorkflow.id === state.videoWorkflowProfile) {
+            state.videoGuidanceMode = String(
+                creatorWorkflow.guidance_mode || 'distilled'
+            );
+            state.sampler = String(
+                creatorWorkflow.sampler || 'euler_ancestral_cfg_pp'
+            );
+            state.scheduler = String(
+                creatorWorkflow.scheduler || 'sulphur_creator_8_3'
+            );
+            state.steps = Number(creatorWorkflow.steps) || 8;
+            if (els.sampler) {
+                els.sampler.innerHTML = '<option value="' + state.sampler + '">' +
+                    displaySamplerName(state.sampler) + '</option>';
+                els.sampler.value = state.sampler;
+            }
+            if (els.scheduler) {
+                els.scheduler.innerHTML = '<option value="' + state.scheduler + '">' +
+                    displaySchedulerName(state.scheduler) + '</option>';
+                els.scheduler.value = state.scheduler;
+            }
+            if (els.steps) {
+                els.steps.max = String(state.steps);
+                els.steps.value = String(state.steps);
+            }
+            if (els.stepsRange) {
+                els.stepsRange.max = String(state.steps);
+                els.stepsRange.value = String(state.steps);
+            }
+            if (els.videoGuidanceMode)
+                els.videoGuidanceMode.value = state.videoGuidanceMode;
+            return;
+        }
         var profile = activeLtx2RequestProfile() || {};
         var modes = profile.guidance_modes || {};
         var selected = modes[state.videoGuidanceMode] || {};
@@ -3327,6 +3447,7 @@ var GenerateTab = (function () {
         if (els.noiseFixture)
             els.noiseFixture.value = state.noiseFixture;
         applyVideoGuidanceMode(false);
+        refreshVideoPromptEnhancer();
         syncDimensionInputs();
         if (els.customWidth) {
             els.customWidth.disabled = true;
@@ -3798,7 +3919,7 @@ var GenerateTab = (function () {
         return request;
     }
     function buildVideoRequest(seed) {
-        var finalPrompt = state.prompt;
+        var finalPrompt = state.prompt.trim();
         if (state.stylePreset && state.stylePreset !== 'none') {
             for (var i = 0; i < stylePresets.length; i++) {
                 if (stylePresets[i].id === state.stylePreset) {
@@ -3807,14 +3928,14 @@ var GenerateTab = (function () {
                 }
             }
         }
-        return {
+        var request = {
             schema: 'serenity.genparams.v1',
             model: 'ltx2',
             runner: 'ltx2_mojo_request',
             checkpoint: state.videoCheckpoint,
             quant: state.videoQuant,
-            prompt: finalPrompt,
-            negative: state.negPrompt || '',
+            prompt: finalPrompt.trim(),
+            negative: (state.negPrompt || '').trim(),
             width: state.width,
             height: state.height,
             frames: state.frames,
@@ -3822,6 +3943,8 @@ var GenerateTab = (function () {
             seed: seed,
             fps: state.fps,
             guidance_mode: state.videoGuidanceMode,
+            workflow_profile: state.videoWorkflowProfile || '',
+            prompt_enhancer: state.videoPromptEnhancer || 'none',
             sampler: state.sampler,
             scheduler: state.scheduler,
             caps_positive: state.capsPositive.trim(),
@@ -3847,6 +3970,14 @@ var GenerateTab = (function () {
                 };
             })
         };
+        // The source picker is shared by image and video generation, but its
+        // uploaded path previously never reached the LTX2 request. That made
+        // the visible "I2V" source a preview-only decoration and silently ran
+        // T2V. LTX2's server performs the creator CRF-33 preparation and owns
+        // the exact strength, so send the source only and let it author 1.0.
+        if (state.initImagePath)
+            request.image_path = state.initImagePath;
+        return request;
     }
     function videoResultUrl(videoId, manifest) {
         if (manifest && manifest.mp4_url)
@@ -4038,6 +4169,7 @@ var GenerateTab = (function () {
                 .then(function (result) {
                 if (!result || !result.prompt_id)
                     throw new Error('server did not return a job id');
+                state.pendingImageJobs[String(result.prompt_id)] = true;
                 submitAt(i + 1);
             })
                 .catch(function (err) {
@@ -4195,6 +4327,8 @@ var GenerateTab = (function () {
             stylePreset: item.stylePreset,
             loras: item.loras,
             videoGuidanceMode: item.videoGuidanceMode,
+            videoWorkflowProfile: item.videoWorkflowProfile,
+            videoPromptEnhancer: item.videoPromptEnhancer,
             videoQuant: item.videoQuant,
             videoCheckpoint: item.videoCheckpoint,
             capsPositive: item.capsPositive,
@@ -4331,6 +4465,10 @@ var GenerateTab = (function () {
             stylePreset: value('stylePreset', 'none'),
             loras: value('loras', []),
             videoGuidanceMode: value('videoGuidanceMode', ''),
+            videoWorkflowProfile: value('videoWorkflowProfile',
+                value('workflow_profile', '')),
+            videoPromptEnhancer: value('videoPromptEnhancer',
+                value('prompt_enhancer', 'none')),
             videoQuant: value('videoQuant', ''),
             videoCheckpoint: value('videoCheckpoint', ''),
             capsPositive: value('capsPositive', ''),
@@ -4732,10 +4870,20 @@ var GenerateTab = (function () {
             else if (/fp8/i.test(checkpoint))
                 state.videoQuant = 'fp8';
             state.videoCheckpoint = checkpoint;
-            var officialDev = checkpoint === 'ltx-2.3-22b-dev-fp8' ||
-                checkpoint === 'ltx-2.3-22b-dev-fp8-dequant-bf16';
-            state.videoGuidanceMode = officialDev || /distill/i.test(checkpoint)
-                ? 'distilled' : 'dev';
+            var creatorWorkflow = ltx2CheckpointWorkflow(checkpoint);
+            state.videoWorkflowProfile = creatorWorkflow
+                ? String(creatorWorkflow.id || '') : '';
+            if (creatorWorkflow) {
+                state.videoGuidanceMode = String(
+                    creatorWorkflow.guidance_mode || 'distilled'
+                );
+            }
+            else {
+                var officialDev = checkpoint === 'ltx-2.3-22b-dev-fp8' ||
+                    checkpoint === 'ltx-2.3-22b-dev-fp8-dequant-bf16';
+                state.videoGuidanceMode = officialDev || /distill/i.test(checkpoint)
+                    ? 'distilled' : 'dev';
+            }
             if (els.videoQuant)
                 els.videoQuant.value = state.videoQuant;
             if (els.videoCheckpoint)
@@ -4877,6 +5025,11 @@ var GenerateTab = (function () {
         SerenityWS.on('progress', function (data) {
             if (!data)
                 return;
+            var progressPromptId = String(data.prompt_id || '');
+            if (progressPromptId &&
+                !state.pendingImageJobs[progressPromptId] &&
+                !state.pendingVideoJobs[progressPromptId])
+                return;
             var pct = data.max > 0 ? (data.value / data.max * 100).toFixed(0) : '0';
             els.progressBar.style.width = pct + '%';
             var phase = data.phase || data.message || '';
@@ -4893,6 +5046,11 @@ var GenerateTab = (function () {
         });
         SerenityWS.on('preview', function (data) {
             if (!data || !data.blob || !state.generating)
+                return;
+            var previewPromptId = String(data.prompt_id || '');
+            if (previewPromptId &&
+                !state.pendingImageJobs[previewPromptId] &&
+                !state.pendingVideoJobs[previewPromptId])
                 return;
             var url = URL.createObjectURL(data.blob);
             if (els.previewImg) {
@@ -4919,6 +5077,16 @@ var GenerateTab = (function () {
                 (state.pendingVideoJobs[eventPromptId] ||
                     state.completedVideoJobs[eventPromptId]))
                 return;
+            // This server WebSocket is shared by Canvas, diagnostics, and other
+            // API clients. Only a prompt id submitted by this Generate tab may
+            // replace its preview or enter its Current Batch gallery.
+            if (!eventPromptId || !state.pendingImageJobs[eventPromptId])
+                return;
+            delete state.pendingImageJobs[eventPromptId];
+            state.completedImageJobs[eventPromptId] = true;
+            var completedImageIds = Object.keys(state.completedImageJobs);
+            if (completedImageIds.length > 256)
+                delete state.completedImageJobs[completedImageIds[0]];
             // Clean up live preview state
             if (els.previewImg) {
                 els.previewImg.classList.remove('gen-preview-live');
@@ -4986,6 +5154,13 @@ var GenerateTab = (function () {
             });
         });
         SerenityWS.on('execution_error', function (data) {
+            var errorPromptId = String(data && data.prompt_id || '');
+            if (errorPromptId &&
+                !state.pendingImageJobs[errorPromptId] &&
+                !state.pendingVideoJobs[errorPromptId])
+                return;
+            if (errorPromptId)
+                delete state.pendingImageJobs[errorPromptId];
             state.pendingBatch = 0;
             var errMsg = (data && data.exception_message) || 'Generation failed';
             showError(errMsg);
@@ -5584,6 +5759,8 @@ var GenerateTab = (function () {
             batchCount: state.batchCount,
             stylePreset: state.stylePreset,
             videoGuidanceMode: state.videoGuidanceMode,
+            videoWorkflowProfile: state.videoWorkflowProfile,
+            videoPromptEnhancer: state.videoPromptEnhancer,
             videoQuant: state.videoQuant,
             videoCheckpoint: state.videoCheckpoint,
             capsPositive: state.capsPositive,
@@ -5677,6 +5854,14 @@ var GenerateTab = (function () {
             state.videoGuidanceMode = params.videoGuidanceMode === 'dev' ? 'dev' : 'distilled';
         else if (typeof params.guidance_mode === 'string')
             state.videoGuidanceMode = params.guidance_mode === 'dev' ? 'dev' : 'distilled';
+        if (typeof params.videoWorkflowProfile === 'string')
+            state.videoWorkflowProfile = params.videoWorkflowProfile;
+        else if (typeof params.workflow_profile === 'string')
+            state.videoWorkflowProfile = params.workflow_profile;
+        if (typeof params.videoPromptEnhancer === 'string')
+            state.videoPromptEnhancer = params.videoPromptEnhancer;
+        else if (typeof params.prompt_enhancer === 'string')
+            state.videoPromptEnhancer = params.prompt_enhancer;
         if (typeof params.videoQuant === 'string')
             state.videoQuant = params.videoQuant;
         else if (typeof params.quant === 'string')

@@ -35,6 +35,14 @@ profile defaults to BF16:
 - **FP8** streams the native FP8 dev checkpoint with BF16 activations.
 - **INT4** uses the resident W4A16 reconstruction path for lower memory.
 
+Registered custom checkpoints may publish their own creator workflow. For
+example, selecting `sulphur_dev_bf16` automatically selects Sulphur's published
+eight-step Euler ancestral CFG++ stage, three-step LCM refinement, and
+stage-specific CondSafe distillation-adapter strengths. Users do not need an
+assistant to add or re-enter those settings. The Sulphur prompt enhancer stays
+disabled unless its published GGUF/mmproj artifacts and execution route are
+actually available; Serenity never labels a raw prompt as enhanced.
+
 Retake and Extend require BF16 plus a complete checkpoint because their source
 video and source audio both pass through the bundled creator VAE encoders. The
 partial diffusion-only FP8 files cannot implement that contract. Retake and
@@ -67,10 +75,13 @@ decoding, audio work, and post-processing.
 1. Set **Mode** to **I2V - LTX 2.3**.
 2. Load one image into the source area, or select a gallery image and send it
    to Canvas.
-3. Describe the motion and camera behavior in the prompt.
-4. Select native resolution, duration, and precision. **Source preservation**
+3. Optionally choose a **Last-frame keyframe**. LTX 2.3 will interpolate toward
+   this clean final-frame guide; **Clear** removes it.
+4. Describe subject motion in the prompt and choose **Camera motion**: none,
+   static, focus shift, dolly in/out/left/right, or jib up/down.
+5. Select native resolution, duration, and precision. **Source preservation**
    starts at `1.00`.
-5. Press **Generate I2V**.
+6. Press **Generate I2V**.
 
 The source image supplies frame-zero guidance and is encoded at both native
 LTX stages. The native profile controls output dimensions, frame count, and
@@ -79,6 +90,9 @@ size. The mode rejects videos and refuses to generate until an image is loaded,
 so it cannot silently fall back to text-to-video. Canvas uploads the original
 selected file and gives that exact worker-readable path to LTX; painted masks
 and the composited Canvas are never substituted for the selected I2V source.
+The optional final image is uploaded independently and encoded at both stages
+as a clean keyframe at the last frame's exact time coordinate. Both images use
+the creator's PyAV/libx264 CRF-33 conditioning round trip before VAE encoding.
 
 ## Video-to-video
 

@@ -83,6 +83,7 @@ var CanvasTab = (function () {
         ltx2ProfileKey: '',
         ltx2Quant: 'bf16',
         ltx2SourceStrength: 0.7,
+        ltx2CameraMotion: 'none',
         ltx2RetakeStart: 0,
         ltx2RetakeDuration: 2,
         ltx2ExtendDirection: 'end',
@@ -118,6 +119,9 @@ var CanvasTab = (function () {
     var editSourceIsVideo = false;
     var editSourceUploadedPath = '';
     var editSourceUploadPromise = null;
+    var ltx2LastFrameFile = null;
+    var ltx2LastFrameUploadedPath = '';
+    var ltx2LastFrameUploadPromise = null;
     var editSourceVideoProbe = null;
     var styleReferenceDataUrl = '';
     var styleReferenceId = '';
@@ -1365,6 +1369,25 @@ var CanvasTab = (function () {
             '<option value="distilled">Fast distilled (single pass)</option>' +
             '<option value="dev">Dev CFG-star (quality, 3 pass)</option>' +
             '</select></div>' +
+            '<label class="cv-setting-label" for="cv-ltx2-camera-motion">Camera motion</label>' +
+            '<select id="cv-ltx2-camera-motion" class="cv-select">' +
+            '<option value="none">None</option>' +
+            '<option value="static">Static / locked off</option>' +
+            '<option value="focus_shift">Focus shift / rack focus</option>' +
+            '<option value="dolly_in">Dolly in</option>' +
+            '<option value="dolly_out">Dolly out</option>' +
+            '<option value="dolly_left">Dolly left</option>' +
+            '<option value="dolly_right">Dolly right</option>' +
+            '<option value="jib_up">Jib up</option>' +
+            '<option value="jib_down">Jib down</option>' +
+            '</select>' +
+            '<div id="cv-ltx2-last-frame-row" style="display:none">' +
+            '<div class="cv-section-title">Last-frame keyframe</div>' +
+            '<input id="cv-ltx2-last-frame-file" type="file" accept="image/*" hidden>' +
+            '<label for="cv-ltx2-last-frame-file" class="cv-import-btn">Choose optional last frame</label>' +
+            '<button id="cv-ltx2-last-frame-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
+            '<div id="cv-ltx2-last-frame-note" class="cv-helper-text">Optional. LTX 2.3 interpolates from the loaded source image to this clean final keyframe.</div>' +
+            '</div>' +
             '<div id="cv-ltx2-source-strength-row" class="cv-setting-row">' +
             '<span class="cv-setting-label">Source preservation</span>' +
             '<input type="range" id="cv-ltx2-source-strength" class="cv-range" min="0" max="1" step="0.01" value="0.70">' +
@@ -1530,6 +1553,11 @@ var CanvasTab = (function () {
         els.ltx2Profile = document.getElementById('cv-ltx2-profile');
         els.ltx2ProfileNote = document.getElementById('cv-ltx2-profile-note');
         els.ltx2Mode = document.getElementById('cv-ltx2-mode');
+        els.ltx2CameraMotion = document.getElementById('cv-ltx2-camera-motion');
+        els.ltx2LastFrameRow = document.getElementById('cv-ltx2-last-frame-row');
+        els.ltx2LastFrameFile = document.getElementById('cv-ltx2-last-frame-file');
+        els.ltx2LastFrameClear = document.getElementById('cv-ltx2-last-frame-clear');
+        els.ltx2LastFrameNote = document.getElementById('cv-ltx2-last-frame-note');
         els.ltx2SourceStrength = document.getElementById('cv-ltx2-source-strength');
         els.ltx2SourceStrengthVal = document.getElementById('cv-ltx2-source-strength-val');
         els.ltx2SourceStrengthHelp = document.getElementById('cv-ltx2-source-strength-help');
@@ -2137,6 +2165,18 @@ var CanvasTab = (function () {
             els.ltx2SourceStrengthVal.textContent = genState.ltx2SourceStrength.toFixed(2);
         updateLtx2SourceStrengthHelp();
     }
+    function clearLtx2LastFrame() {
+        ltx2LastFrameFile = null;
+        ltx2LastFrameUploadedPath = '';
+        ltx2LastFrameUploadPromise = null;
+        if (els.ltx2LastFrameFile)
+            els.ltx2LastFrameFile.value = '';
+        if (els.ltx2LastFrameClear)
+            els.ltx2LastFrameClear.disabled = true;
+        if (els.ltx2LastFrameNote)
+            els.ltx2LastFrameNote.textContent =
+                'Optional. LTX 2.3 interpolates from the loaded source image to this clean final keyframe.';
+    }
     function updateLtx2SourceStrengthHelp() {
         if (!els.ltx2SourceStrengthHelp)
             return;
@@ -2191,6 +2231,7 @@ var CanvasTab = (function () {
     }
     function clearCanvasEditSource() {
         clearCanvasVideoPreview();
+        clearLtx2LastFrame();
         editSourceFile = null;
         editSourceDataUrl = '';
         editSourceIsVideo = false;
@@ -2783,6 +2824,8 @@ var CanvasTab = (function () {
             (mode === 'create' && genState.arch === 'ltxv');
         var maskedEditEngine = maskedEditEngineDefinition(genState.lanpaintEngine);
         var sourceStrengthRow = document.getElementById('cv-ltx2-source-strength-row');
+        if (els.ltx2LastFrameRow)
+            els.ltx2LastFrameRow.style.display = i2vLtx23Mode ? 'block' : 'none';
         if (sourceStrengthRow)
             sourceStrengthRow.style.display = temporalLtx23Mode ? 'none' : 'flex';
         if (els.ltx2V2vPresets && temporalLtx23Mode)
@@ -4238,6 +4281,45 @@ var CanvasTab = (function () {
             genState.ltx2Mode = this.value;
             applyCanvasLtx2GuidanceMode();
         });
+        els.ltx2CameraMotion.addEventListener('change', function () {
+            genState.ltx2CameraMotion = this.value || 'none';
+        });
+        els.ltx2LastFrameFile.addEventListener('change', function () {
+            var file = this.files && this.files[0];
+            if (!file || !file.type.startsWith('image/')) {
+                clearLtx2LastFrame();
+                if (file)
+                    showError('Choose an image file for the final keyframe');
+                return;
+            }
+            ltx2LastFrameFile = file;
+            ltx2LastFrameUploadedPath = '';
+            if (els.ltx2LastFrameClear)
+                els.ltx2LastFrameClear.disabled = false;
+            if (els.ltx2LastFrameNote)
+                els.ltx2LastFrameNote.textContent =
+                    'Uploading final keyframe · ' + file.name;
+            ltx2LastFrameUploadPromise = SerenityAPI.uploadMedia(file).then(function (path) {
+                if (file !== ltx2LastFrameFile)
+                    throw new Error('Last-frame image changed during upload');
+                ltx2LastFrameUploadedPath = String(path || '');
+                if (!ltx2LastFrameUploadedPath)
+                    throw new Error('Media upload did not return a worker-readable path');
+                if (els.ltx2LastFrameNote)
+                    els.ltx2LastFrameNote.textContent =
+                        'Final keyframe ready · ' + file.name;
+                return ltx2LastFrameUploadedPath;
+            }).catch(function (error) {
+                if (file === ltx2LastFrameFile && els.ltx2LastFrameNote)
+                    els.ltx2LastFrameNote.textContent =
+                        'Final keyframe upload failed · ' + error.message;
+                throw error;
+            });
+            ltx2LastFrameUploadPromise.catch(function () {
+                /* surfaced beside the picker and again on Generate */
+            });
+        });
+        els.ltx2LastFrameClear.addEventListener('click', clearLtx2LastFrame);
         els.ltx2SourceStrength.addEventListener('input', function () {
             genState.ltx2SourceStrength = Math.max(0, Math.min(1, Number(this.value)));
             els.ltx2SourceStrengthVal.textContent = genState.ltx2SourceStrength.toFixed(2);
@@ -4916,6 +4998,7 @@ var CanvasTab = (function () {
             ltx2Mode: genState.ltx2Mode, ltx2ProfileKey: genState.ltx2ProfileKey,
             ltx2Quant: genState.ltx2Quant,
             ltx2SourceStrength: genState.ltx2SourceStrength,
+            ltx2CameraMotion: genState.ltx2CameraMotion,
             ltx2RetakeStart: genState.ltx2RetakeStart,
             ltx2RetakeDuration: genState.ltx2RetakeDuration,
             ltx2ExtendDirection: genState.ltx2ExtendDirection,
@@ -5047,6 +5130,8 @@ var CanvasTab = (function () {
                 genState.ltx2SourceStrength = Number.isFinite(Number(state.genSettings.ltx2SourceStrength)) ?
                     Math.max(0, Math.min(1, Number(state.genSettings.ltx2SourceStrength))) :
                     genState.ltx2SourceStrength;
+                genState.ltx2CameraMotion =
+                    state.genSettings.ltx2CameraMotion || 'none';
                 genState.ltx2RetakeStart = Number.isFinite(Number(state.genSettings.ltx2RetakeStart))
                     ? Math.max(0, Number(state.genSettings.ltx2RetakeStart)) : 0;
                 genState.ltx2RetakeDuration = Number.isFinite(Number(state.genSettings.ltx2RetakeDuration))
@@ -5117,6 +5202,8 @@ var CanvasTab = (function () {
                     els.ltx2AudioPolicy.value = genState.ltx2AudioPolicy;
                 if (els.ltx2Mode)
                     els.ltx2Mode.value = genState.ltx2Mode;
+                if (els.ltx2CameraMotion)
+                    els.ltx2CameraMotion.value = genState.ltx2CameraMotion;
                 setLtx2SourceStrength(genState.ltx2SourceStrength);
                 if (els.ltx2RetakeStart)
                     els.ltx2RetakeStart.value = String(genState.ltx2RetakeStart);
@@ -5560,6 +5647,20 @@ var CanvasTab = (function () {
         });
         return runner && runner.modes && runner.modes.ltx2_mojo_request || null;
     }
+    function canvasLtx2CheckpointWorkflow() {
+        var mode = activeCanvasLtx2RequestMode();
+        var profiles = mode && Array.isArray(mode.checkpoint_workflows)
+            ? mode.checkpoint_workflows : [];
+        var checkpoint = String(genState.model || '')
+            .replace(/\.safetensors$/i, '').toLowerCase();
+        return profiles.find(function (profile) {
+            return profile && Array.isArray(profile.checkpoints) &&
+                profile.checkpoints.some(function (name) {
+                    return String(name || '').replace(/\.safetensors$/i, '')
+                        .toLowerCase() === checkpoint;
+                });
+        }) || null;
+    }
     function activeCanvasLtx2Profiles() {
         var mode = activeCanvasLtx2RequestMode();
         var profiles = mode && Array.isArray(mode.supported_profiles)
@@ -5998,6 +6099,28 @@ var CanvasTab = (function () {
     function applyCanvasLtx2GuidanceMode() {
         var mode = activeCanvasLtx2RequestMode();
         var modes = mode && mode.guidance_modes || {};
+        var workflow = canvasLtx2CheckpointWorkflow();
+        if (workflow && genState.editMode !== 'retake_ltx23' &&
+            genState.editMode !== 'extend_ltx23') {
+            genState.ltx2Mode = String(workflow.guidance_mode || 'distilled');
+            genState.steps = Number(workflow.steps) || 8;
+            genState.sampler = String(workflow.sampler || 'euler');
+            genState.scheduler = String(workflow.scheduler || 'ltx2_distilled');
+            if (els.ltx2Mode) {
+                els.ltx2Mode.value = genState.ltx2Mode;
+                els.ltx2Mode.disabled = true;
+                els.ltx2Mode.title = 'The selected checkpoint creator workflow owns guidance and sampling.';
+            }
+            els.steps.value = String(genState.steps);
+            els.stepsRange.value = String(genState.steps);
+            els.sampler.value = genState.sampler;
+            els.scheduler.value = genState.scheduler;
+            return;
+        }
+        if (els.ltx2Mode) {
+            els.ltx2Mode.disabled = false;
+            els.ltx2Mode.title = '';
+        }
         var config = modes[genState.ltx2Mode] || {};
         if (genState.ltx2Mode === 'distilled') {
             genState.steps = Number(config.steps) || 8;
@@ -6098,14 +6221,44 @@ var CanvasTab = (function () {
         els.batch.style.display = isVideo ? 'none' : '';
         els.batchLabel.style.display = isVideo ? 'none' : '';
         if (isLtx2) {
-            setCanvasSelectOptions(els.sampler, [
+            var checkpointWorkflow = canvasLtx2CheckpointWorkflow();
+            var samplerOptions = [
                 { value: 'res2s', label: 'Res2S' },
                 { value: 'euler', label: 'Euler (fast distilled)' }
-            ], genState.ltx2Mode === 'distilled' ? 'euler' : 'res2s');
-            setCanvasSelectOptions(els.scheduler, [
+            ];
+            var schedulerOptions = [
                 { value: 'ltx2', label: 'LTX2' },
                 { value: 'ltx2_distilled', label: 'LTX2 Distilled (8 steps)' }
-            ], genState.ltx2Mode === 'distilled' ? 'ltx2_distilled' : 'ltx2');
+            ];
+            if (checkpointWorkflow) {
+                if (!samplerOptions.some(function (row) {
+                    return row.value === checkpointWorkflow.sampler;
+                })) {
+                    samplerOptions.push({
+                        value: String(checkpointWorkflow.sampler),
+                        label: 'Creator · ' + String(checkpointWorkflow.sampler)
+                    });
+                }
+                if (!schedulerOptions.some(function (row) {
+                    return row.value === checkpointWorkflow.scheduler;
+                })) {
+                    schedulerOptions.push({
+                        value: String(checkpointWorkflow.scheduler),
+                        label: 'Creator · ' + String(checkpointWorkflow.scheduler)
+                    });
+                }
+            }
+            setCanvasSelectOptions(
+                els.sampler, samplerOptions,
+                checkpointWorkflow ? String(checkpointWorkflow.sampler) :
+                    (genState.ltx2Mode === 'distilled' ? 'euler' : 'res2s')
+            );
+            setCanvasSelectOptions(
+                els.scheduler, schedulerOptions,
+                checkpointWorkflow ? String(checkpointWorkflow.scheduler) :
+                    (genState.ltx2Mode === 'distilled'
+                        ? 'ltx2_distilled' : 'ltx2')
+            );
             refreshCanvasLtx2ProfileControls();
             refreshCanvasLtx2FeatureControls();
             refreshCanvasLtx2PostUpscaleControls();
@@ -6376,13 +6529,25 @@ var CanvasTab = (function () {
                 showError('Choose a supported Native video profile. LTX2 resolution, frame count, and FPS must match one available compiled Mojo runner.');
                 return;
             }
-            var validLtx2Sampler = genState.ltx2Mode === 'distilled'
-                ? genState.sampler === 'euler' && genState.scheduler === 'ltx2_distilled' && genState.steps === 8
-                : genState.sampler === 'res2s' && genState.scheduler === 'ltx2' && genState.steps >= 1 && genState.steps <= 20;
+            var checkpointWorkflow = canvasLtx2CheckpointWorkflow();
+            var validLtx2Sampler = checkpointWorkflow
+                ? genState.ltx2Mode === checkpointWorkflow.guidance_mode &&
+                    genState.sampler === checkpointWorkflow.sampler &&
+                    genState.scheduler === checkpointWorkflow.scheduler &&
+                    genState.steps === Number(checkpointWorkflow.steps)
+                : (genState.ltx2Mode === 'distilled'
+                    ? genState.sampler === 'euler' &&
+                        genState.scheduler === 'ltx2_distilled' &&
+                        genState.steps === 8
+                    : genState.sampler === 'res2s' &&
+                        genState.scheduler === 'ltx2' &&
+                        genState.steps >= 1 && genState.steps <= 20);
             if (!validLtx2Sampler) {
-                showError(genState.ltx2Mode === 'distilled'
-                    ? 'Fast distilled LTX2 requires Euler, the LTX2 Distilled scheduler, and 8 steps'
-                    : 'Dev LTX2 requires Res2S, the LTX2 scheduler, and 1–20 steps');
+                showError(checkpointWorkflow
+                    ? 'The selected LTX2 checkpoint requires its registered creator sampler, scheduler, guidance mode, and step count'
+                    : (genState.ltx2Mode === 'distilled'
+                        ? 'Fast distilled LTX2 requires Euler, the LTX2 Distilled scheduler, and 8 steps'
+                        : 'Dev LTX2 requires Res2S, the LTX2 scheduler, and 1–20 steps'));
                 return;
             }
         }
@@ -6536,6 +6701,9 @@ var CanvasTab = (function () {
                 ltx2PostUpscaler: genState.ltx2PostUpscaler,
                 ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                 ltx2Quant: genState.ltx2Quant,
+                ltx2CameraMotion: genState.ltx2CameraMotion,
+                ltx2LastFrame: ltx2LastFrameFile
+                    ? ltx2LastFrameFile.name : '',
                 ltx2RetakeStart: genState.ltx2RetakeStart,
                 ltx2RetakeDuration: genState.ltx2RetakeDuration,
                 ltx2ExtendDirection: genState.ltx2ExtendDirection,
@@ -6566,6 +6734,10 @@ var CanvasTab = (function () {
             var ltx2V2V = genState.arch === 'ltxv' && isVideo && hasLtx2VideoSource;
             var ltx2I2V = genState.arch === 'ltxv' && isVideo &&
                 (hasExactLtx2ImageSource || hasContent) && !ltx2V2V;
+            var ltx2CheckpointWorkflow = genState.arch === 'ltxv'
+                ? canvasLtx2CheckpointWorkflow() : null;
+            var ltx2WorkflowProfile = ltx2CheckpointWorkflow
+                ? String(ltx2CheckpointWorkflow.id || '') : '';
             if (ltx2V2V) {
                 var sourceUpload = editSourceUploadedPath
                     ? Promise.resolve(editSourceUploadedPath)
@@ -6600,6 +6772,9 @@ var CanvasTab = (function () {
                         ltx2PostUpscaler: genState.ltx2PostUpscaler,
                         ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                         ltx2Mode: genState.ltx2Mode,
+                        ltx2WorkflowProfile: ltx2WorkflowProfile,
+                        ltx2PromptEnhancer: 'none',
+                        ltx2CameraMotion: genState.ltx2CameraMotion,
                         quantization: genState.ltx2Quant,
                         ltx2VideoEditMode: genState.editMode === 'retake_ltx23'
                             ? 'retake'
@@ -6633,6 +6808,9 @@ var CanvasTab = (function () {
                     ltx2PostUpscaler: genState.ltx2PostUpscaler,
                     ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                     ltx2Mode: genState.ltx2Mode,
+                    ltx2WorkflowProfile: ltx2WorkflowProfile,
+                    ltx2PromptEnhancer: 'none',
+                    ltx2CameraMotion: genState.ltx2CameraMotion,
                     quantization: genState.ltx2Quant
                 }));
             }
@@ -6652,11 +6830,21 @@ var CanvasTab = (function () {
                             return uploadInitImage(base64);
                         })
                 );
-                imageUpload.then(function (imageName) {
+                var lastImageUpload = ltx2LastFrameFile
+                    ? (ltx2LastFrameUploadedPath
+                        ? Promise.resolve(ltx2LastFrameUploadedPath)
+                        : (ltx2LastFrameUploadPromise ||
+                            SerenityAPI.uploadMedia(ltx2LastFrameFile)))
+                    : Promise.resolve('');
+                Promise.all([imageUpload, lastImageUpload]).then(function (images) {
+                    var imageName = images[0];
+                    var lastImageName = images[1];
                     queueWorkflow(WorkflowBuilder.build({
                         model: genState.model || '', prompt: genState.prompt,
                         initImageName: imageName,
                         imageStrength: genState.ltx2SourceStrength,
+                        lastImageName: lastImageName,
+                        lastImageStrength: lastImageName ? 1.0 : undefined,
                         width: bw, height: bh,
                         steps: genState.steps, cfg: genState.cfg,
                         guidance: genState.guidance, seed: seed,
@@ -6670,10 +6858,13 @@ var CanvasTab = (function () {
                         ltx2PostUpscaler: genState.ltx2PostUpscaler,
                         ltx2PostUpscaleFactor: genState.ltx2PostUpscaleFactor,
                         ltx2Mode: genState.ltx2Mode,
+                        ltx2WorkflowProfile: ltx2WorkflowProfile,
+                        ltx2PromptEnhancer: 'none',
+                        ltx2CameraMotion: genState.ltx2CameraMotion,
                         quantization: genState.ltx2Quant
                     }));
                 }).catch(function (err) {
-                    showError('Video init upload failed: ' + err.message);
+                    showError('Video keyframe upload failed: ' + err.message);
                     setCanvasGenerating(false);
                 });
             }

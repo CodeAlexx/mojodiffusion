@@ -42,7 +42,7 @@ from serenitymojo.ops import (
     torch_bf16_eager_add_scaled,
     torch_bf16_eager_blend_with_f32_mask,
 )
-from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar
+from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar, div_scalar
 from std.gpu.host import DeviceContext
 from std.math import exp, log, sqrt
 
@@ -86,6 +86,122 @@ def ltx2_stage2_distilled_sigmas() -> List[Float32]:
     out.append(0.421875)
     out.append(0.0)
     return out^
+
+
+def _ltx2_sulphur_shifted_sigma(raw: Float64, tokens: Int) -> Float64:
+    if raw == 0.0:
+        return 0.0
+    var slope = (4.0 - 1.5) / (4096.0 - 1024.0)
+    var intercept = 1.5 - slope * 1024.0
+    var sigma_shift = Float64(tokens) * slope + intercept
+    var shifted = exp(sigma_shift)
+    return shifted / (shifted + (1.0 / raw - 1.0))
+
+
+def ltx2_sulphur_stage1_sigmas(tokens: Int) raises -> List[Float32]:
+    """Sulphur-2's shipped LTXVScheduler(8, 4, 1.5, True, 0.1).
+
+    This is the creator workflow's token-count-dependent stage-1 schedule,
+    including the exact terminal stretch performed by ComfyUI's LTXVScheduler.
+    """
+    if tokens <= 0:
+        raise Error("Sulphur LTXVScheduler requires a positive video token count")
+    var last_nonzero = _ltx2_sulphur_shifted_sigma(1.0 / 8.0, tokens)
+    var scale = (1.0 - last_nonzero) / (1.0 - 0.1)
+    var out = List[Float32]()
+    for i in range(8):
+        var raw = 1.0 - Float64(i) / 8.0
+        var shifted = _ltx2_sulphur_shifted_sigma(raw, tokens)
+        out.append(Float32(1.0 - (1.0 - shifted) / scale))
+    out.append(0.0)
+    return out^
+
+
+def ltx2_sulphur_stage2_sigmas() -> List[Float32]:
+    """ManualSigmas from Sulphur's shipped distilled T2V/I2V workflows."""
+    var out = List[Float32]()
+    out.append(0.85)
+    out.append(0.725)
+    out.append(0.4219)
+    out.append(0.0)
+    return out^
+
+
+def ltx2_euler_ancestral_cfgpp_step(
+    latent: Tensor,
+    cond_denoised: Tensor,
+    uncond_denoised: Tensor,
+    noise: Tensor,
+    sigma: Float32,
+    sigma_next: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """ComfyUI `sample_euler_ancestral_cfg_pp` for CONST/rectified-flow models."""
+    if sigma_next == 0.0:
+        return add(
+            cond_denoised, mul_scalar(cond_denoised, 0.0, ctx), ctx
+        )
+    var alpha_t = Float32(1.0) - sigma_next
+    if sigma >= Float32(0.999999):
+        return add(
+            mul_scalar(cond_denoised, alpha_t, ctx),
+            mul_scalar(noise, sigma_next, ctx),
+            ctx,
+        )
+    var alpha_s = Float32(1.0) - sigma
+    var sigma_from = Float64(sigma / alpha_s)
+    var sigma_to = Float64(sigma_next / alpha_t)
+    var variance = (
+        sigma_to * sigma_to
+        * (sigma_from * sigma_from - sigma_to * sigma_to)
+        / (sigma_from * sigma_from)
+    )
+    if variance < 0.0:
+        variance = 0.0
+    var sigma_up = sqrt(variance)
+    if sigma_up > sigma_to:
+        sigma_up = sigma_to
+    var sigma_down_sq = sigma_to * sigma_to - sigma_up * sigma_up
+    if sigma_down_sq < 0.0:
+        sigma_down_sq = 0.0
+    var sigma_down = sqrt(sigma_down_sq)
+    var derivative = div_scalar(
+        sub(
+            latent,
+            mul_scalar(uncond_denoised, alpha_s, ctx),
+            ctx,
+        ),
+        sigma,
+        ctx,
+    )
+    var deterministic = add(
+        mul_scalar(cond_denoised, alpha_t, ctx),
+        mul_scalar(
+            derivative, alpha_t * Float32(sigma_down), ctx
+        ),
+        ctx,
+    )
+    return add(
+        deterministic,
+        mul_scalar(noise, alpha_t * Float32(sigma_up), ctx),
+        ctx,
+    )
+
+
+def ltx2_lcm_step(
+    denoised: Tensor,
+    noise: Tensor,
+    sigma_next: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """ComfyUI `sample_lcm` noise scaling for CONST/rectified-flow models."""
+    if sigma_next == 0.0:
+        return add(denoised, mul_scalar(denoised, 0.0, ctx), ctx)
+    return add(
+        mul_scalar(denoised, Float32(1.0) - sigma_next, ctx),
+        mul_scalar(noise, sigma_next, ctx),
+        ctx,
+    )
 
 
 def ltx2_creator_noiser_from_noise(

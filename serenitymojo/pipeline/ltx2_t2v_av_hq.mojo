@@ -76,7 +76,10 @@ from serenitymojo.offload.vmm_cuda import cu_mem_get_info
 from serenitymojo.sampling.ltx2_sampling import (
     LTX2Scheduler, res2s_coefficients, res2s_substep, res2s_combine, Res2sCoeffs,
     res2s_sde_step, res2s_bong_refine, res2s_bong_active,
-    ltx2_creator_noiser_from_noise, ltx2_stage2_distilled_sigmas,
+    ltx2_creator_noiser_from_noise, ltx2_distilled_sigmas,
+    ltx2_stage2_distilled_sigmas,
+    ltx2_sulphur_stage1_sigmas, ltx2_sulphur_stage2_sigmas,
+    ltx2_euler_ancestral_cfgpp_step, ltx2_lcm_step,
 )
 from serenitymojo.sampling.ltx2_res2s_ref import (
     NoiseSource, RES2S_REF_TERMINAL_SIGMA, res2s_post_process_latent,
@@ -223,6 +226,18 @@ def _request_hq_distillation_weight() raises -> Float32:
     var value = Float32(Float64(text))
     if value < Float32(-10.0) or value > Float32(10.0):
         raise Error("LTX2 request distillation adapter weight must be in [-10, 10]")
+    return value
+
+
+def _request_hq_distillation_stage_weight(
+    env_name: String, fallback: Float32
+) raises -> Float32:
+    var text = _env_str(env_name)
+    if text.byte_length() == 0:
+        return fallback
+    var value = Float32(Float64(text))
+    if value < Float32(-10.0) or value > Float32(10.0):
+        raise Error("LTX2 request distillation stage weight must be in [-10, 10]")
     return value
 
 
@@ -2362,6 +2377,8 @@ def run_request_profile(
     noise_fixture_path: String,
     image_path: String,
     image_strength: Float64,
+    last_image_path: String,
+    last_image_strength: Float64,
     video_path: String,
     video_strength: Float64,
     video_mask_path: String,
@@ -2402,10 +2419,31 @@ def run_request_profile(
     var distilled_euler = sampler_key == String("euler") and (
         scheduler_key == String("ltx2_distilled")
     )
-    if guidance_mode == String("distilled") and not distilled_euler:
+    var workflow_profile = _env_str("LTX2_REQUEST_WORKFLOW_PROFILE")
+    var sulphur_creator = (
+        workflow_profile == String("sulphur-2-base-distilled-v1")
+    )
+    var sulphur_sampler = (
+        sampler_key == String("euler_ancestral_cfg_pp")
+        and scheduler_key == String("sulphur_creator_8_3")
+    )
+    if sulphur_creator and (
+        guidance_mode != String("distilled") or not sulphur_sampler
+    ):
+        raise Error(
+            String("LTX2 Sulphur creator workflow requires distilled/")
+            + String("euler_ancestral_cfg_pp/sulphur_creator_8_3; got ")
+            + guidance_mode + String("/") + sampler + String("/") + scheduler
+        )
+    if (
+        guidance_mode == String("distilled")
+        and not distilled_euler
+        and not (sulphur_creator and sulphur_sampler)
+    ):
         raise Error(
             String("LTX2 request: distilled guidance requires euler/")
-            + String("ltx2_distilled; got ") + sampler + String("/")
+            + String("ltx2_distilled or its registered creator workflow; got ")
+            + sampler + String("/")
             + scheduler
         )
     if guidance_mode == String("dev") and not res2s:
@@ -2425,6 +2463,12 @@ def run_request_profile(
     if image_path.byte_length() == 0 and image_strength != 1.0:
         raise Error(
             "LTX2 request: image_strength requires a non-empty image_path"
+        )
+    if last_image_strength < 0.0 or last_image_strength > 1.0:
+        raise Error("LTX2 request: last_image_strength must be in [0, 1]")
+    if last_image_path.byte_length() == 0 and last_image_strength != 1.0:
+        raise Error(
+            "LTX2 request: last_image_strength requires last_image_path"
         )
     if video_strength < 0.0 or video_strength > 1.0:
         raise Error("LTX2 request: video_strength must be in [0, 1]")
@@ -2470,6 +2514,20 @@ def run_request_profile(
     if image_path.byte_length() > 0 and video_path.byte_length() > 0:
         raise Error(
             "LTX2 request: image_path and video_path are mutually exclusive"
+        )
+    if last_image_path.byte_length() > 0 and video_path.byte_length() > 0:
+        raise Error(
+            "LTX2 request: last_image_path and video_path are mutually exclusive"
+        )
+    if last_image_path.byte_length() > 0 and (
+        video_edit_mode != String("standard")
+    ):
+        raise Error(
+            "LTX2 keyframe interpolation cannot be combined with Retake/Extend"
+        )
+    if last_image_path.byte_length() > 0 and noise_fixture_path.byte_length() > 0:
+        raise Error(
+            "LTX2 keyframe interpolation does not accept target-only noise fixtures"
         )
     if width != REQUEST_HQ_WIDTH or height != REQUEST_HQ_HEIGHT:
         raise Error(
@@ -2529,6 +2587,7 @@ def run_request_profile(
     run_request_hq(
         context_path, negative_context_path, contexts_are_projected,
         noise_fixture_path, image_path, Float32(image_strength),
+        last_image_path, Float32(last_image_strength),
         video_path, Float32(video_strength), video_mask_path,
         video_edit_mode, Float32(video_edit_start), Float32(video_edit_end),
         video_source_frames,
@@ -3402,6 +3461,14 @@ comptime REQUEST_HQ_S_A = (
 comptime REQUEST_HQ_NH2 = REQUEST_HQ_HEIGHT // 32
 comptime REQUEST_HQ_NW2 = REQUEST_HQ_WIDTH // 32
 comptime REQUEST_HQ_S_V2 = REQUEST_HQ_NF * REQUEST_HQ_NH2 * REQUEST_HQ_NW2
+comptime REQUEST_HQ_KEYFRAME_TOKENS1 = REQUEST_HQ_NH1 * REQUEST_HQ_NW1
+comptime REQUEST_HQ_KEYFRAME_TOKENS2 = REQUEST_HQ_NH2 * REQUEST_HQ_NW2
+comptime REQUEST_HQ_S_V1_KEYFRAME = (
+    REQUEST_HQ_S_V1 + REQUEST_HQ_KEYFRAME_TOKENS1
+)
+comptime REQUEST_HQ_S_V2_KEYFRAME = (
+    REQUEST_HQ_S_V2 + REQUEST_HQ_KEYFRAME_TOKENS2
+)
 # Flash-attention specialization pads sequence lengths to a 512-token boundary.
 comptime REQUEST_HQ_VPAD1_BASE = (
     REQUEST_HQ_S_V1 if REQUEST_HQ_S_V1 > 1024 else 1024
@@ -3420,6 +3487,20 @@ comptime REQUEST_HQ_VPAD2_BASE = (
 )
 comptime REQUEST_HQ_VPAD2 = (
     (REQUEST_HQ_VPAD2_BASE + 511) // 512
+) * 512
+comptime REQUEST_HQ_VPAD1_KEYFRAME_BASE = (
+    REQUEST_HQ_S_V1_KEYFRAME
+    if REQUEST_HQ_S_V1_KEYFRAME > 1024 else 1024
+)
+comptime REQUEST_HQ_VPAD1_KEYFRAME = (
+    (REQUEST_HQ_VPAD1_KEYFRAME_BASE + 511) // 512
+) * 512
+comptime REQUEST_HQ_VPAD2_KEYFRAME_BASE = (
+    REQUEST_HQ_S_V2_KEYFRAME
+    if REQUEST_HQ_S_V2_KEYFRAME > 1024 else 1024
+)
+comptime REQUEST_HQ_VPAD2_KEYFRAME = (
+    (REQUEST_HQ_VPAD2_KEYFRAME_BASE + 511) // 512
 ) * 512
 
 
@@ -3450,6 +3531,52 @@ def _build_video_coords_fps(
                 out[(1 * s_v + tok) * 2 + 1] = Float64(h + 1) * VAE_SF1
                 out[(2 * s_v + tok) * 2 + 0] = Float64(w) * VAE_SF2
                 out[(2 * s_v + tok) * 2 + 1] = Float64(w + 1) * VAE_SF2
+    return out^
+
+
+def _build_video_coords_with_keyframe_fps(
+    nf: Int,
+    nh: Int,
+    nw: Int,
+    fps: Float64,
+    frame_idx: Int,
+) raises -> List[Float64]:
+    """Append one creator keyframe guide grid to the generated-token RoPE.
+
+    This is the exact `VideoConditionByKeyframeIndex` coordinate contract:
+    generated tokens retain their ordinary causal-VAE bounds, while the
+    appended single-image guide uses non-causal spatial bounds and the narrow
+    temporal interval `[frame_idx, frame_idx + 1) / fps`.
+    """
+    if frame_idx <= 0:
+        raise Error("LTX2 keyframe guide index must be greater than zero")
+    var target = _build_video_coords_fps(nf, nh, nw, fps)
+    var target_tokens = nf * nh * nw
+    var guide_tokens = nh * nw
+    var total_tokens = target_tokens + guide_tokens
+    var out = List[Float64]()
+    out.resize(3 * total_tokens * 2, Float64(0.0))
+    for d in range(3):
+        for tok in range(target_tokens):
+            out[(d * total_tokens + tok) * 2 + 0] = (
+                target[(d * target_tokens + tok) * 2 + 0]
+            )
+            out[(d * total_tokens + tok) * 2 + 1] = (
+                target[(d * target_tokens + tok) * 2 + 1]
+            )
+    for h in range(nh):
+        for w in range(nw):
+            var tok = target_tokens + h * nw + w
+            out[(0 * total_tokens + tok) * 2 + 0] = (
+                Float64(frame_idx) / fps
+            )
+            out[(0 * total_tokens + tok) * 2 + 1] = (
+                Float64(frame_idx + 1) / fps
+            )
+            out[(1 * total_tokens + tok) * 2 + 0] = Float64(h) * VAE_SF1
+            out[(1 * total_tokens + tok) * 2 + 1] = Float64(h + 1) * VAE_SF1
+            out[(2 * total_tokens + tok) * 2 + 0] = Float64(w) * VAE_SF2
+            out[(2 * total_tokens + tok) * 2 + 1] = Float64(w + 1) * VAE_SF2
     return out^
 
 
@@ -3492,6 +3619,31 @@ def _request_hq_video_rope(
     )
     var cav = _compute_rope(
         vtc, 1, s_v, CA_DIM, _mp1(), ROPE_THETA, V_HEADS, STDtype.BF16, ctx
+    )
+    return _RefhqRope(
+        _clone(vrope[0], ctx), _clone(vrope[1], ctx),
+        _clone(cav[0], ctx), _clone(cav[1], ctx),
+    )
+
+
+def _request_hq_video_rope_with_keyframe(
+    nf: Int,
+    nh: Int,
+    nw: Int,
+    s_v: Int,
+    frame_idx: Int,
+    ctx: DeviceContext,
+) raises -> _RefhqRope:
+    var vc = _build_video_coords_with_keyframe_fps(
+        nf, nh, nw, REQUEST_HQ_FPS, frame_idx
+    )
+    var vtc = _video_temporal_coords_dims(vc, s_v)
+    var vrope = _compute_rope(
+        vc, 3, s_v, VD, _mp3(), ROPE_THETA, V_HEADS, STDtype.BF16, ctx
+    )
+    var cav = _compute_rope(
+        vtc, 1, s_v, CA_DIM, _mp1(), ROPE_THETA, V_HEADS,
+        STDtype.BF16, ctx,
     )
     return _RefhqRope(
         _clone(vrope[0], ctx), _clone(vrope[1], ctx),
@@ -4523,6 +4675,48 @@ def _request_hq_i2v_stage2_clean(
         upscaled_tokens, 1, frame_tokens, sequence_tokens - frame_tokens, ctx
     )
     return concat(1, ctx, first_frame_tokens, suffix)
+
+
+def _request_hq_keyframe_mask_values(
+    target_tokens: Int,
+    first_frame_tokens: Int,
+    first_enabled: Bool,
+    first_denoise: Float32,
+    guide_tokens: Int,
+    guide_denoise: Float32,
+) raises -> List[Float32]:
+    """Creator denoise mask for generated tokens plus one appended keyframe."""
+    if target_tokens <= 0 or guide_tokens <= 0:
+        raise Error("LTX2 keyframe conditioning requires positive token counts")
+    if first_enabled and (
+        first_frame_tokens <= 0 or first_frame_tokens >= target_tokens
+    ):
+        raise Error("LTX2 first-frame conditioning span is invalid")
+    if (
+        first_denoise < Float32(0.0) or first_denoise > Float32(1.0)
+        or guide_denoise < Float32(0.0)
+        or guide_denoise > Float32(1.0)
+    ):
+        raise Error("LTX2 keyframe denoise values must be in [0, 1]")
+    var values = List[Float32]()
+    for i in range(target_tokens):
+        values.append(
+            first_denoise
+            if first_enabled and i < first_frame_tokens
+            else Float32(1.0)
+        )
+    for _ in range(guide_tokens):
+        values.append(guide_denoise)
+    return values^
+
+
+def _request_hq_keyframe_clean(
+    target_clean: Tensor,
+    guide_tokens: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Append the clean creator guide tokens after the generated sequence."""
+    return concat(1, ctx, target_clean, guide_tokens)
 
 
 # patchify/unpatchify between latent layout and the loop's token layout.
@@ -6009,6 +6203,8 @@ def run_request_hq(
     noise_fixture_path: String,
     image_path: String,
     image_strength: Float32,
+    last_image_path: String,
+    last_image_strength: Float32,
     video_path: String,
     video_strength: Float32,
     video_mask_path: String,
@@ -6050,11 +6246,14 @@ def run_request_hq(
     var min_free_bytes = mem0.free_bytes
     var cfg = LTX2Config.ltx2()
     var i2v_enabled = image_path.byte_length() > 0
+    var last_keyframe_enabled = last_image_path.byte_length() > 0
     var v2v_enabled = video_path.byte_length() > 0
     var v2v_mask_enabled = video_mask_path.byte_length() > 0
     var temporal_edit_enabled = video_edit_mode != String("standard")
-    if i2v_enabled and v2v_enabled:
-        raise Error("LTX2 request HQ: image and video sources are mutually exclusive")
+    if (i2v_enabled or last_keyframe_enabled) and v2v_enabled:
+        raise Error(
+            "LTX2 request HQ: image keyframes and video sources are mutually exclusive"
+        )
     if v2v_mask_enabled and not v2v_enabled:
         raise Error("LTX2 request HQ: a V2V mask requires a video source")
     if temporal_edit_enabled and not v2v_enabled:
@@ -6069,10 +6268,16 @@ def run_request_hq(
         or video_edit_end <= video_edit_start
     ):
         raise Error("LTX2 request HQ: invalid temporal edit contract")
-    var source_enabled = i2v_enabled or v2v_enabled
+    if last_keyframe_enabled and temporal_edit_enabled:
+        raise Error(
+            "LTX2 request HQ: keyframe interpolation cannot use temporal editing"
+        )
+    var source_enabled = i2v_enabled or last_keyframe_enabled or v2v_enabled
     var source_strength = image_strength if i2v_enabled else video_strength
     var source_stage1: Optional[Tensor] = None
     var source_stage2: Optional[Tensor] = None
+    var last_stage1: Optional[Tensor] = None
+    var last_stage2: Optional[Tensor] = None
     if i2v_enabled:
         var source_t0 = perf_counter()
         _write_ltx2_status(
@@ -6088,7 +6293,27 @@ def run_request_hq(
         ctx.synchronize()
         source_encode_seconds = perf_counter() - source_t0
         min_free_bytes = _record_ltx2_min_free(min_free_bytes)
-    elif v2v_enabled:
+    if last_keyframe_enabled:
+        var keyframe_t0 = perf_counter()
+        _write_ltx2_status(
+            out_dir, String("running"), String("encoding_source"), 0,
+            progress_total,
+            String("Encoding creator last-frame guide at both stages"),
+        )
+        print(
+            "  [keyframe] last source:", last_image_path,
+            "frame:", REQUEST_HQ_NUM_FRAMES - 1,
+            "strength:", last_image_strength,
+        )
+        var encoded_last = _request_hq_encode_i2v_first_frames(
+            last_image_path, ctx
+        )
+        last_stage1 = Optional[Tensor](encoded_last[0].clone(ctx))
+        last_stage2 = Optional[Tensor](encoded_last[1].clone(ctx))
+        ctx.synchronize()
+        source_encode_seconds += perf_counter() - keyframe_t0
+        min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    if v2v_enabled:
         var source_t0 = perf_counter()
         _write_ltx2_status(
             out_dir, String("running"), String("encoding_source"), 0,
@@ -6149,7 +6374,11 @@ def run_request_hq(
           "steps + official 3-step stage2; guidance:", guidance_mode,
           "seed:", seed)
     var request_mode = String("T2V")
-    if i2v_enabled:
+    if i2v_enabled and last_keyframe_enabled:
+        request_mode = String("first/last keyframe interpolation")
+    elif last_keyframe_enabled:
+        request_mode = String("last-frame keyframe guidance")
+    elif i2v_enabled:
         request_mode = String("I2V first-frame conditioning")
     elif v2v_enabled:
         request_mode = (
@@ -6166,9 +6395,25 @@ def run_request_hq(
     var loras = _RequestHQLoraStack.load()
     loras.validate()
     loras.print_summary()
+    var workflow_profile = _env_str("LTX2_REQUEST_WORKFLOW_PROFILE")
+    var sulphur_creator = (
+        workflow_profile == String("sulphur-2-base-distilled-v1")
+    )
     var distillation_weight = _request_hq_distillation_weight()
-    var request_distill_s1 = REFHQ_LORA_S1 * distillation_weight
-    var request_distill_s2 = REFHQ_LORA_S2 * distillation_weight
+    var request_distill_s1 = _request_hq_distillation_stage_weight(
+        String("LTX2_REQUEST_DISTILLATION_S1"),
+        REFHQ_LORA_S1 * distillation_weight,
+    )
+    var request_distill_s2 = _request_hq_distillation_stage_weight(
+        String("LTX2_REQUEST_DISTILLATION_S2"),
+        REFHQ_LORA_S2 * distillation_weight,
+    )
+    if workflow_profile.byte_length() > 0:
+        print("  creator workflow profile:", workflow_profile)
+    print(
+        "  [lora] effective distillation stage weights:",
+        request_distill_s1, request_distill_s2,
+    )
     var preload_lora_factors = quant == String("fp8")
     if preload_lora_factors:
         print("  [lora] preloading factor tensors once for the complete request")
@@ -6291,6 +6536,17 @@ def run_request_hq(
         REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2,
         REQUEST_HQ_S_V2, ctx,
     )
+    if last_keyframe_enabled:
+        vr1 = _request_hq_video_rope_with_keyframe(
+            REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1,
+            REQUEST_HQ_S_V1_KEYFRAME,
+            REQUEST_HQ_NUM_FRAMES - 1, ctx,
+        )
+        vr2 = _request_hq_video_rope_with_keyframe(
+            REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2,
+            REQUEST_HQ_S_V2_KEYFRAME,
+            REQUEST_HQ_NUM_FRAMES - 1, ctx,
+        )
     var ac = _build_audio_coords_dims(REQUEST_HQ_S_A)
     var arope = _compute_rope(
         ac, 1, REQUEST_HQ_S_A, AD, _mp1(), ROPE_THETA, A_HEADS,
@@ -6325,8 +6581,9 @@ def run_request_hq(
     var source_mask_values1 = List[Float32]()
     var i2v_frame_tokens1 = REQUEST_HQ_NH1 * REQUEST_HQ_NW1
     var source_conditioned_denoise = Float32(1.0) - source_strength
+    var last_conditioned_denoise = Float32(1.0) - last_image_strength
     var source_mod_tokens1 = 0
-    if i2v_enabled:
+    if i2v_enabled and not last_keyframe_enabled:
         source_mod_tokens1 = i2v_frame_tokens1
     elif v2v_enabled:
         source_mod_tokens1 = REQUEST_HQ_S_V1
@@ -6344,16 +6601,43 @@ def run_request_hq(
     else:
         ns = NoiseSource.production(seed)
         # rng-contract: mojo-native-not-pytorch-parity
-        video_x = randn(
-            _sh3(1, REQUEST_HQ_S_V1, 128), seed, STDtype.BF16, ctx
-        )
+        if last_keyframe_enabled:
+            video_x = randn(
+                _sh3(1, REQUEST_HQ_S_V1_KEYFRAME, 128),
+                seed, STDtype.BF16, ctx,
+            )
+        else:
+            video_x = randn(
+                _sh3(1, REQUEST_HQ_S_V1, 128), seed, STDtype.BF16, ctx
+            )
         audio_x = randn(
             _sh3(1, REQUEST_HQ_S_A, 128), seed + 1, STDtype.BF16, ctx
         )
     if source_enabled:
-        var clean1 = source_stage1.value().clone(ctx)
+        var clean1: Tensor
         var mask1: Tensor
-        if i2v_enabled:
+        if last_keyframe_enabled:
+            var target_clean1 = zeros_device(
+                _sh3(1, REQUEST_HQ_S_V1, 128), STDtype.BF16, ctx
+            )
+            if i2v_enabled:
+                target_clean1 = _request_hq_i2v_stage1_clean(
+                    source_stage1.value(), REQUEST_HQ_S_V1,
+                    i2v_frame_tokens1, ctx,
+                )
+            clean1 = _request_hq_keyframe_clean(
+                target_clean1, last_stage1.value(), ctx
+            )
+            source_mask_values1 = _request_hq_keyframe_mask_values(
+                REQUEST_HQ_S_V1, i2v_frame_tokens1, i2v_enabled,
+                Float32(1.0) - image_strength,
+                REQUEST_HQ_KEYFRAME_TOKENS1, last_conditioned_denoise,
+            )
+            mask1 = _request_hq_v2v_spatial_mask(
+                source_mask_values1, REQUEST_HQ_S_V1_KEYFRAME,
+                Float32(1.0), ctx,
+            )
+        elif i2v_enabled:
             clean1 = _request_hq_i2v_stage1_clean(
                 source_stage1.value(), REQUEST_HQ_S_V1,
                 i2v_frame_tokens1, ctx,
@@ -6363,6 +6647,7 @@ def run_request_hq(
                 source_conditioned_denoise, Float32(1.0), ctx,
             )
         elif temporal_edit_enabled:
+            clean1 = source_stage1.value().clone(ctx)
             source_mask_values1 = _request_hq_v2v_temporal_mask_values(
                 REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1,
                 Float32(REQUEST_HQ_FPS), video_edit_start, video_edit_end,
@@ -6372,6 +6657,7 @@ def run_request_hq(
                 source_mask_values1, REQUEST_HQ_S_V1, Float32(1.0), ctx
             )
         elif v2v_mask_enabled:
+            clean1 = source_stage1.value().clone(ctx)
             source_mask_values1 = _request_hq_v2v_spatial_mask_values(
                 video_mask_path, REQUEST_HQ_NF, REQUEST_HQ_NH1,
                 REQUEST_HQ_NW1, source_conditioned_denoise,
@@ -6380,6 +6666,7 @@ def run_request_hq(
                 source_mask_values1, REQUEST_HQ_S_V1, Float32(1.0), ctx
             )
         else:
+            clean1 = source_stage1.value().clone(ctx)
             mask1 = _request_hq_v2v_mask(
                 REQUEST_HQ_S_V1, source_conditioned_denoise,
                 Float32(1.0), ctx,
@@ -6389,16 +6676,19 @@ def run_request_hq(
         )
         source_clean1 = Optional[Tensor](clean1^)
         source_mask1 = Optional[Tensor](mask1^)
-    var sig1 = _ltx2_scheduler_sigmas(
-        steps, REQUEST_HQ_S_V1
-    )
+    var sig1 = _ltx2_scheduler_sigmas(steps, REQUEST_HQ_S_V1)
+    if sulphur_creator:
+        sig1 = ltx2_sulphur_stage1_sigmas(REQUEST_HQ_S_V1)
     ctx.synchronize()
     prepare_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
     if guidance_mode == String("distilled"):
-        print("  [Stage1] Creator fast-distilled Euler", steps,
-              "steps x 1 evaluation")
+        if sulphur_creator:
+            print("  [Stage1] Sulphur creator distilled workflow")
+        else:
+            print("  [Stage1] Creator fast-distilled Euler", steps,
+                  "steps x 1 evaluation")
     else:
         print("  [Stage1] dev CFG-star res_2s", steps,
               "steps x 2 evaluations x 3 passes")
@@ -6419,38 +6709,71 @@ def run_request_hq(
                 + String(steps),
             )
         s1_eval += 1
+        var active_s_v1 = (
+            REQUEST_HQ_S_V1_KEYFRAME
+            if last_keyframe_enabled else REQUEST_HQ_S_V1
+        )
         var mod = _build_mod_dims(
-            ck, gw, sigma, REQUEST_HQ_S_V1, REQUEST_HQ_S_A, ctx,
+            ck, gw, sigma, active_s_v1, REQUEST_HQ_S_A, ctx,
             conditioned_video_tokens=source_mod_tokens1,
             conditioned_video_denoise=source_conditioned_denoise,
             conditioned_video_denoise_values=_request_hq_optional_mask_values(
                 source_mask_values1
             ),
         )
-        var c = _request_hq_forward_flat[
-            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
-            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
-        ](
-            loras, request_distill_s1, cfg, g, stream, vx, ax, enc, aenc,
-            mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
-            first_s1_eval, True, ctx,
-        )
-        var u = _request_hq_forward_flat[
-            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
-            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
-        ](
-            loras, request_distill_s1, cfg, g, stream, vx, ax,
-            neg_enc, neg_aenc, mod, vr1, a_cos, a_sin, ca_a_cos,
-            ca_a_sin, False, False, True, ctx,
-        )
-        var m = _request_hq_forward_flat[
-            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
-            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
-        ](
-            loras, request_distill_s1, cfg, g, stream, vx, ax, enc, aenc,
-            mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin, True, False,
-            True, ctx,
-        )
+        var c: Tuple[Tensor, Tensor]
+        var u: Tuple[Tensor, Tensor]
+        var m: Tuple[Tensor, Tensor]
+        if last_keyframe_enabled:
+            c = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1_KEYFRAME, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1_KEYFRAME, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s1, cfg, g, stream, vx, ax,
+                enc, aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin,
+                False, first_s1_eval, True, ctx,
+            )
+            u = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1_KEYFRAME, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1_KEYFRAME, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s1, cfg, g, stream, vx, ax,
+                neg_enc, neg_aenc, mod, vr1, a_cos, a_sin, ca_a_cos,
+                ca_a_sin, False, False, True, ctx,
+            )
+            m = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1_KEYFRAME, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1_KEYFRAME, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s1, cfg, g, stream, vx, ax,
+                enc, aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin,
+                True, False, True, ctx,
+            )
+        else:
+            c = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s1, cfg, g, stream, vx, ax,
+                enc, aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin,
+                False, first_s1_eval, True, ctx,
+            )
+            u = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s1, cfg, g, stream, vx, ax,
+                neg_enc, neg_aenc, mod, vr1, a_cos, a_sin, ca_a_cos,
+                ca_a_sin, False, False, True, ctx,
+            )
+            m = _request_hq_forward_flat[
+                REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s1, cfg, g, stream, vx, ax,
+                enc, aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin,
+                True, False, True, ctx,
+            )
         first_s1_eval = False
         var c_v = _refhq_x0(vx, c[0], sigma, ctx)
         var u_v = _refhq_x0(vx, u[0], sigma, ctx)
@@ -6471,7 +6794,16 @@ def run_request_hq(
 
     t0 = perf_counter()
     if guidance_mode == String("distilled"):
-        var s1_sched = LTX2Scheduler.distilled()
+        var s1_distilled_sigmas = ltx2_distilled_sigmas()
+        if sulphur_creator:
+            s1_distilled_sigmas = ltx2_sulphur_stage1_sigmas(
+                REQUEST_HQ_S_V1
+            )
+            print(
+                "  [Stage1] Sulphur creator euler_ancestral_cfg_pp",
+                steps, "steps x cond+uncond",
+            )
+        var s1_sched = LTX2Scheduler(s1_distilled_sigmas^)
         for step in range(s1_sched.num_steps):
             var sigma = s1_sched.sigma(step)
             _write_ltx2_status(
@@ -6480,25 +6812,95 @@ def run_request_hq(
                 String("Stage 1 step ") + String(step + 1) + String(" of ")
                 + String(s1_sched.num_steps),
             )
+            var active_s_v1 = (
+                REQUEST_HQ_S_V1_KEYFRAME
+                if last_keyframe_enabled else REQUEST_HQ_S_V1
+            )
             var mod = _build_mod_dims(
-                ck, gw, sigma, REQUEST_HQ_S_V1, REQUEST_HQ_S_A, ctx,
+                ck, gw, sigma, active_s_v1, REQUEST_HQ_S_A, ctx,
                 conditioned_video_tokens=source_mod_tokens1,
                 conditioned_video_denoise=source_conditioned_denoise,
                 conditioned_video_denoise_values=_request_hq_optional_mask_values(
                     source_mask_values1
                 ),
             )
-            var c = _request_hq_forward_flat[
-                REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
-                REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
-            ](
-                loras, request_distill_s1, cfg, g, stream, video_x, audio_x,
-                enc, aenc, mod, vr1, a_cos, a_sin, ca_a_cos, ca_a_sin,
-                False, first_s1_eval, True, ctx,
-            )
+            var c: Tuple[Tensor, Tensor]
+            if last_keyframe_enabled:
+                c = _request_hq_forward_flat[
+                    REQUEST_HQ_S_V1_KEYFRAME, REQUEST_HQ_S_A,
+                    REQUEST_HQ_VPAD1_KEYFRAME, REQUEST_HQ_APAD,
+                ](
+                    loras, request_distill_s1, cfg, g, stream,
+                    video_x, audio_x, enc, aenc, mod, vr1,
+                    a_cos, a_sin, ca_a_cos, ca_a_sin,
+                    False, first_s1_eval, True, ctx,
+                )
+            else:
+                c = _request_hq_forward_flat[
+                    REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+                    REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+                ](
+                    loras, request_distill_s1, cfg, g, stream,
+                    video_x, audio_x, enc, aenc, mod, vr1,
+                    a_cos, a_sin, ca_a_cos, ca_a_sin,
+                    False, first_s1_eval, True, ctx,
+                )
             first_s1_eval = False
-            video_x = s1_sched.step(video_x, c[0], step, ctx)
-            audio_x = s1_sched.step(audio_x, c[1], step, ctx)
+            if sulphur_creator:
+                var u: Tuple[Tensor, Tensor]
+                if last_keyframe_enabled:
+                    u = _request_hq_forward_flat[
+                        REQUEST_HQ_S_V1_KEYFRAME, REQUEST_HQ_S_A,
+                        REQUEST_HQ_VPAD1_KEYFRAME, REQUEST_HQ_APAD,
+                    ](
+                        loras, request_distill_s1, cfg, g, stream,
+                        video_x, audio_x, neg_enc, neg_aenc, mod, vr1,
+                        a_cos, a_sin, ca_a_cos, ca_a_sin,
+                        False, False, True, ctx,
+                    )
+                else:
+                    u = _request_hq_forward_flat[
+                        REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+                        REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+                    ](
+                        loras, request_distill_s1, cfg, g, stream,
+                        video_x, audio_x, neg_enc, neg_aenc, mod, vr1,
+                        a_cos, a_sin, ca_a_cos, ca_a_sin,
+                        False, False, True, ctx,
+                    )
+                var cond_v = _refhq_x0(video_x, c[0], sigma, ctx)
+                var cond_a = _refhq_x0(audio_x, c[1], sigma, ctx)
+                var uncond_v = _refhq_x0(video_x, u[0], sigma, ctx)
+                var uncond_a = _refhq_x0(audio_x, u[1], sigma, ctx)
+                var ancestral_v: Tensor
+                if last_keyframe_enabled:
+                    ancestral_v = randn(
+                        _sh3(1, REQUEST_HQ_S_V1_KEYFRAME, 128),
+                        seed + UInt64(1000 + step * 2),
+                        STDtype.BF16, ctx,
+                    )
+                else:
+                    ancestral_v = randn(
+                        _sh3(1, REQUEST_HQ_S_V1, 128),
+                        seed + UInt64(1000 + step * 2),
+                        STDtype.BF16, ctx,
+                    )
+                var ancestral_a = randn(
+                    _sh3(1, REQUEST_HQ_S_A, 128),
+                    seed + UInt64(1001 + step * 2),
+                    STDtype.BF16, ctx,
+                )
+                video_x = ltx2_euler_ancestral_cfgpp_step(
+                    video_x, cond_v, uncond_v, ancestral_v,
+                    sigma, s1_sched.sigma(step + 1), ctx,
+                )
+                audio_x = ltx2_euler_ancestral_cfgpp_step(
+                    audio_x, cond_a, uncond_a, ancestral_a,
+                    sigma, s1_sched.sigma(step + 1), ctx,
+                )
+            else:
+                video_x = s1_sched.step(video_x, c[0], step, ctx)
+                audio_x = s1_sched.step(audio_x, c[1], step, ctx)
             if source_enabled:
                 video_x = res2s_post_process_latent(
                     video_x, source_mask1.value(), source_clean1.value(), ctx
@@ -6521,8 +6923,14 @@ def run_request_hq(
         steps, progress_total,
         String("Upscaling stage-1 latents"),
     )
+    var generated_video1 = video_x.clone(ctx)
+    if last_keyframe_enabled:
+        generated_video1 = slice(
+            video_x, 1, 0, REQUEST_HQ_S_V1, ctx
+        )
     var v_lat1 = _refhq_unpatchify_video(
-        video_x, REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1, ctx
+        generated_video1,
+        REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1, ctx,
     )
     var upscaled = _refhq_spatial_upscale_scoped(v_lat1, ctx)
     _ = _stats(String("upscaled"), upscaled, ctx)
@@ -6545,6 +6953,8 @@ def run_request_hq(
     )
 
     var s2sig = ltx2_stage2_distilled_sigmas()
+    if sulphur_creator:
+        s2sig = ltx2_sulphur_stage2_sigmas()
     var s2_scale = s2sig[0]
     var up_flat = cast_tensor(
         _refhq_patchify_video(upscaled, REQUEST_HQ_S_V2, ctx),
@@ -6555,7 +6965,7 @@ def run_request_hq(
     var source_mask_values2 = List[Float32]()
     var i2v_frame_tokens2 = REQUEST_HQ_NH2 * REQUEST_HQ_NW2
     var source_mod_tokens2 = 0
-    if i2v_enabled:
+    if i2v_enabled and not last_keyframe_enabled:
         source_mod_tokens2 = i2v_frame_tokens2
     elif v2v_enabled:
         source_mod_tokens2 = REQUEST_HQ_S_V2
@@ -6568,17 +6978,46 @@ def run_request_hq(
         s2n_a = ns.load_key_f32(String("s2init_audio"), ctx)
     else:
         # rng-contract: mojo-native-not-pytorch-parity
-        s2n_v = randn(
-            _sh3(1, REQUEST_HQ_S_V2, 128), seed + 100, STDtype.BF16, ctx
-        )
+        var stage2_seed = seed + 100
+        if sulphur_creator:
+            stage2_seed = UInt64(42)
+        if last_keyframe_enabled:
+            s2n_v = randn(
+                _sh3(1, REQUEST_HQ_S_V2_KEYFRAME, 128),
+                stage2_seed, STDtype.BF16, ctx,
+            )
+        else:
+            s2n_v = randn(
+                _sh3(1, REQUEST_HQ_S_V2, 128),
+                stage2_seed, STDtype.BF16, ctx,
+            )
         s2n_a = randn(
-            _sh3(1, REQUEST_HQ_S_A, 128), seed + 101, STDtype.BF16, ctx
+            _sh3(1, REQUEST_HQ_S_A, 128), stage2_seed + 1, STDtype.BF16, ctx
         )
     var vx2: Tensor
     if source_enabled:
-        var clean2 = source_stage2.value().clone(ctx)
+        var clean2: Tensor
         var mask2: Tensor
-        if i2v_enabled:
+        if last_keyframe_enabled:
+            var target_clean2 = up_flat.clone(ctx)
+            if i2v_enabled:
+                target_clean2 = _request_hq_i2v_stage2_clean(
+                    source_stage2.value(), up_flat, REQUEST_HQ_S_V2,
+                    i2v_frame_tokens2, ctx,
+                )
+            clean2 = _request_hq_keyframe_clean(
+                target_clean2, last_stage2.value(), ctx
+            )
+            source_mask_values2 = _request_hq_keyframe_mask_values(
+                REQUEST_HQ_S_V2, i2v_frame_tokens2, i2v_enabled,
+                Float32(1.0) - image_strength,
+                REQUEST_HQ_KEYFRAME_TOKENS2, last_conditioned_denoise,
+            )
+            mask2 = _request_hq_v2v_spatial_mask(
+                source_mask_values2, REQUEST_HQ_S_V2_KEYFRAME,
+                Float32(1.0), ctx,
+            )
+        elif i2v_enabled:
             clean2 = _request_hq_i2v_stage2_clean(
                 source_stage2.value(), up_flat, REQUEST_HQ_S_V2,
                 i2v_frame_tokens2, ctx,
@@ -6588,6 +7027,7 @@ def run_request_hq(
                 source_conditioned_denoise, Float32(1.0), ctx,
             )
         elif temporal_edit_enabled:
+            clean2 = source_stage2.value().clone(ctx)
             source_mask_values2 = _request_hq_v2v_temporal_mask_values(
                 REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2,
                 Float32(REQUEST_HQ_FPS), video_edit_start, video_edit_end,
@@ -6597,6 +7037,7 @@ def run_request_hq(
                 source_mask_values2, REQUEST_HQ_S_V2, Float32(1.0), ctx
             )
         elif v2v_mask_enabled:
+            clean2 = source_stage2.value().clone(ctx)
             source_mask_values2 = _request_hq_v2v_spatial_mask_values(
                 video_mask_path, REQUEST_HQ_NF, REQUEST_HQ_NH2,
                 REQUEST_HQ_NW2, source_conditioned_denoise,
@@ -6605,6 +7046,7 @@ def run_request_hq(
                 source_mask_values2, REQUEST_HQ_S_V2, Float32(1.0), ctx
             )
         else:
+            clean2 = source_stage2.value().clone(ctx)
             mask2 = _request_hq_v2v_mask(
                 REQUEST_HQ_S_V2, source_conditioned_denoise,
                 Float32(1.0), ctx,
@@ -6635,8 +7077,12 @@ def run_request_hq(
                 + String(" of 3"),
             )
         s2_eval += 1
+        var active_s_v2 = (
+            REQUEST_HQ_S_V2_KEYFRAME
+            if last_keyframe_enabled else REQUEST_HQ_S_V2
+        )
         var mod = _build_mod_dims(
-            ck, gw, sigma, REQUEST_HQ_S_V2, REQUEST_HQ_S_A, ctx,
+            ck, gw, sigma, active_s_v2, REQUEST_HQ_S_A, ctx,
             uniform_timestep=True,
             conditioned_video_tokens=source_mod_tokens2,
             conditioned_video_denoise=source_conditioned_denoise,
@@ -6644,14 +7090,27 @@ def run_request_hq(
                 source_mask_values2
             ),
         )
-        var c = _request_hq_forward_flat[
-            REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
-            REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
-        ](
-            loras, request_distill_s2, cfg, g, stream, vx, ax, enc, aenc,
-            mod, vr2, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
-            first_s2_eval, True, ctx,
-        )
+        var c: Tuple[Tensor, Tensor]
+        if last_keyframe_enabled:
+            c = _request_hq_forward_flat[
+                REQUEST_HQ_S_V2_KEYFRAME, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD2_KEYFRAME, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s2, cfg, g, stream,
+                vx, ax, enc, aenc, mod, vr2,
+                a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+                first_s2_eval, True, ctx,
+            )
+        else:
+            c = _request_hq_forward_flat[
+                REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
+                REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
+            ](
+                loras, request_distill_s2, cfg, g, stream,
+                vx, ax, enc, aenc, mod, vr2,
+                a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+                first_s2_eval, True, ctx,
+            )
         first_s2_eval = False
         return (
             _refhq_x0(vx, c[0], sigma, ctx),
@@ -6659,8 +7118,14 @@ def run_request_hq(
         )
 
     if guidance_mode == String("distilled"):
-        print("  [Stage2] Creator fast-distilled Euler 3 steps x 1 evaluation")
-        var s2_sched = LTX2Scheduler.stage2()
+        if sulphur_creator:
+            print("  [Stage2] Sulphur creator LCM 3 steps x 1 evaluation")
+        else:
+            print("  [Stage2] Creator fast-distilled Euler 3 steps x 1 evaluation")
+        var s2_distilled_sigmas = ltx2_stage2_distilled_sigmas()
+        if sulphur_creator:
+            s2_distilled_sigmas = ltx2_sulphur_stage2_sigmas()
+        var s2_sched = LTX2Scheduler(s2_distilled_sigmas^)
         for step in range(s2_sched.num_steps):
             var sigma = s2_sched.sigma(step)
             _write_ltx2_status(
@@ -6669,8 +7134,12 @@ def run_request_hq(
                 String("Stage 2 step ") + String(step + 1)
                 + String(" of ") + String(s2_sched.num_steps),
             )
+            var active_s_v2 = (
+                REQUEST_HQ_S_V2_KEYFRAME
+                if last_keyframe_enabled else REQUEST_HQ_S_V2
+            )
             var mod = _build_mod_dims(
-                ck, gw, sigma, REQUEST_HQ_S_V2, REQUEST_HQ_S_A, ctx,
+                ck, gw, sigma, active_s_v2, REQUEST_HQ_S_A, ctx,
                 uniform_timestep=True,
                 conditioned_video_tokens=source_mod_tokens2,
                 conditioned_video_denoise=source_conditioned_denoise,
@@ -6678,17 +7147,55 @@ def run_request_hq(
                     source_mask_values2
                 ),
             )
-            var c = _request_hq_forward_flat[
-                REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
-                REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
-            ](
-                loras, request_distill_s2, cfg, g, stream, vx2, ax2, enc, aenc,
-                mod, vr2, a_cos, a_sin, ca_a_cos, ca_a_sin, False,
-                first_s2_eval, True, ctx,
-            )
+            var c: Tuple[Tensor, Tensor]
+            if last_keyframe_enabled:
+                c = _request_hq_forward_flat[
+                    REQUEST_HQ_S_V2_KEYFRAME, REQUEST_HQ_S_A,
+                    REQUEST_HQ_VPAD2_KEYFRAME, REQUEST_HQ_APAD,
+                ](
+                    loras, request_distill_s2, cfg, g, stream,
+                    vx2, ax2, enc, aenc, mod, vr2,
+                    a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+                    first_s2_eval, True, ctx,
+                )
+            else:
+                c = _request_hq_forward_flat[
+                    REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
+                    REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
+                ](
+                    loras, request_distill_s2, cfg, g, stream,
+                    vx2, ax2, enc, aenc, mod, vr2,
+                    a_cos, a_sin, ca_a_cos, ca_a_sin, False,
+                    first_s2_eval, True, ctx,
+                )
             first_s2_eval = False
-            vx2 = s2_sched.step(vx2, c[0], step, ctx)
-            ax2 = s2_sched.step(ax2, c[1], step, ctx)
+            if sulphur_creator:
+                var denoised_v = _refhq_x0(vx2, c[0], sigma, ctx)
+                var denoised_a = _refhq_x0(ax2, c[1], sigma, ctx)
+                var lcm_v: Tensor
+                if last_keyframe_enabled:
+                    lcm_v = randn(
+                        _sh3(1, REQUEST_HQ_S_V2_KEYFRAME, 128),
+                        UInt64(4200 + step * 2), STDtype.BF16, ctx,
+                    )
+                else:
+                    lcm_v = randn(
+                        _sh3(1, REQUEST_HQ_S_V2, 128),
+                        UInt64(4200 + step * 2), STDtype.BF16, ctx,
+                    )
+                var lcm_a = randn(
+                    _sh3(1, REQUEST_HQ_S_A, 128),
+                    UInt64(4201 + step * 2), STDtype.BF16, ctx,
+                )
+                vx2 = ltx2_lcm_step(
+                    denoised_v, lcm_v, s2_sched.sigma(step + 1), ctx
+                )
+                ax2 = ltx2_lcm_step(
+                    denoised_a, lcm_a, s2_sched.sigma(step + 1), ctx
+                )
+            else:
+                vx2 = s2_sched.step(vx2, c[0], step, ctx)
+                ax2 = s2_sched.step(ax2, c[1], step, ctx)
             if source_enabled:
                 vx2 = res2s_post_process_latent(
                     vx2, source_mask2.value(), source_clean2.value(), ctx
@@ -6707,8 +7214,14 @@ def run_request_hq(
     denoise_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 
+    var generated_video2 = vx2.clone(ctx)
+    if last_keyframe_enabled:
+        generated_video2 = slice(
+            vx2, 1, 0, REQUEST_HQ_S_V2, ctx
+        )
     var v_final = _refhq_unpatchify_video(
-        vx2, REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2, ctx
+        generated_video2,
+        REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2, ctx,
     )
     var a_final = _refhq_unpatchify_audio(ax2, REQUEST_HQ_S_A, ctx)
     var f_names = List[String]()
@@ -6792,11 +7305,13 @@ def run_request_hq(
     mux_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
     var executed_sampler = (
-        String("euler") if guidance_mode == String("distilled")
+        String("euler_ancestral_cfg_pp") if sulphur_creator
+        else String("euler") if guidance_mode == String("distilled")
         else String("res2s")
     )
     var executed_scheduler = (
-        String("ltx2_distilled") if guidance_mode == String("distilled")
+        String("sulphur_creator_8_3") if sulphur_creator
+        else String("ltx2_distilled") if guidance_mode == String("distilled")
         else String("ltx2")
     )
     _write_ltx2_result(
@@ -6998,12 +7513,18 @@ def decode_request_profile(
             )
     var mux_seconds = perf_counter() - mux_t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    var sulphur_creator = (
+        _env_str("LTX2_REQUEST_WORKFLOW_PROFILE")
+        == String("sulphur-2-base-distilled-v1")
+    )
     var executed_sampler = (
-        String("euler") if guidance_mode == String("distilled")
+        String("euler_ancestral_cfg_pp") if sulphur_creator
+        else String("euler") if guidance_mode == String("distilled")
         else String("res2s")
     )
     var executed_scheduler = (
-        String("ltx2_distilled") if guidance_mode == String("distilled")
+        String("sulphur_creator_8_3") if sulphur_creator
+        else String("ltx2_distilled") if guidance_mode == String("distilled")
         else String("ltx2")
     )
     _write_ltx2_result(

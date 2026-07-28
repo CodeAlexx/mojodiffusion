@@ -105,6 +105,21 @@ timesteps; painted V2V masks use white/edit and black/preserve semantics. The
 seven-case `sampling/parity/ltx2_conditioning_mask_parity.mojo` harness checks
 I2V, uniform and painted V2V, plus the T2V broadcast control.
 
+`configs/ltx2_checkpoint_workflows.json` pins checkpoint-specific publisher
+recipes independently of model discovery. Sulphur BF16 auto-selects the
+published eight-step Euler ancestral CFG++ stage, three-step LCM refinement,
+and CondSafe adapter weights (`0.7`/`0.5`), including when an older UI sends an
+empty workflow ID. The registered prompt-enhancer contract remains explicitly
+unavailable until its two local artifacts and a real llama.cpp execution route
+exist.
+
+Ordinary I2V uses the LTX Desktop frame-zero in-place conditioning path.
+`scripts/ltx2_creator_image_preprocess.py` reproduces Lightricks' PyAV/libx264
+CRF-33 frame round trip exactly. An optional last image adds Lightricks clean
+keyframe tokens at the final FPS-normalized frame coordinate, with separate
+half/full-resolution VAE encodes and denoise masks in both stages; guide tokens
+are sliced away before decode.
+
 Special features are stable-ID requests backed by
 `configs/ltx2_feature_adapters.json`, not guessed LoRA filenames. Cinemagraph
 requires I2V, the `CINEMAGRAPH_MOTION` trigger, and an explicit bounded weight.
@@ -118,6 +133,9 @@ timings, and peak-VRAM sample. Experimental acceptance evidence (2026-07-19):
 768x512, 97 frames, 24 FPS, 8-step distilled Euler, step-3000 trained LoRA,
 valid H.264 MP4, 99.47 s wall, 10,024 MiB peak; frames 0/48/96 and a 13-frame
 contact sheet were visually inspected for convergence and temporal continuity.
+The 2026-07-28 Sulphur BF16 first+last-frame product gate (`video-0016`) also
+passed: 704x1280, 121f@24, 192.20 seconds, 14,583 MiB sampled peak, exact
+creator-preprocess pixels, and stable inspected eyes/facial/mechanical detail.
 
 ---
 

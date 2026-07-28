@@ -500,9 +500,10 @@ through them.
 
 `sampling/ltx2_sampling.mojo` exposes the creator-fast LTX2 public surface
 through `serenitymojo.sampling`: `LTX2Scheduler`, distilled sigma tables, and
-`ltx2_creator_noiser_from_noise`. BF16 `LTX2Scheduler.step` uses the shared
-PyTorch-eager BF16 API so noiser/scheduler phase parity is not lost in fused
-tensor algebra.
+`ltx2_creator_noiser_from_noise`, plus the Sulphur creator stage-one shifted
+schedule, stage-two LCM sigmas, LCM update, and Euler ancestral CFG++ step.
+BF16 `LTX2Scheduler.step` uses the shared PyTorch-eager BF16 API so
+noiser/scheduler phase parity is not lost in fused tensor algebra.
 
 `sampling/ltx2_request_cli.mojo` is the pure-Mojo product adapter for canonical
 `serenity.genparams.v1` video requests. It preserves the exact authored JSON,
@@ -518,13 +519,30 @@ matrix reaches 20 seconds at 540p, 10 seconds at 720p, and 5 seconds at 1080p.
 Unsupported tuples fail before model load; the UI must select from the
 published registry rather than round or substitute dimensions.
 
+`configs/ltx2_checkpoint_workflows.json` separately binds checkpoint identities
+to publisher-authored inference recipes without hard-coding those recipes into
+the UI. The initial Sulphur profile follows its published workflow: eight
+stage-one Euler ancestral CFG++ evaluations with the LTX shifted schedule,
+three stage-two LCM evaluations with fixed sigmas/seed, and its CondSafe
+distillation adapter at `0.7` then `0.5`. An empty workflow ID still
+auto-detects the registered creator profile. The published Qwen3.5 prompt
+enhancer files and raw-text/optional-image/no-system-prompt contract are
+advertised, but execution stays fail-closed until both local artifacts and a
+real llama.cpp route exist.
+
 Ordinary I2V uses the LTX Desktop preprocessing contract: Lanczos fit/fill at
-the authored conditioning size, one-frame libx264 CRF-33 `veryfast` yuv420p
-round-trip, source strength 1.0, separate half/full-resolution VAE encodes, and
-the creator's two-stage distilled denoiser with spatial latent upscaling. I2V
-and ordinary V2V use clean-latent clamping plus exact per-token model
-timesteps. Painted V2V masks lower to the same latent grid with white/edit and
-black/preserve semantics at both stages. The deterministic
+the authored conditioning size, then
+`scripts/ltx2_creator_image_preprocess.py` performs the creator's one-frame
+PyAV/libx264 CRF-33 `veryfast` yuv420p round trip. The product check matched
+the creator output pixel-for-pixel (MAE `0.0`, maximum difference `0`).
+Frame-zero conditioning uses source strength 1.0 and separate
+half/full-resolution VAE encodes. An optional final image uses Lightricks'
+clean keyframe-token contract at the final FPS-normalized frame coordinate,
+including a per-guide denoise mask and independent encoding in both stages;
+the guide tokens are removed before VAE decode. I2V and ordinary V2V use
+clean-latent clamping plus exact per-token model timesteps. Painted V2V masks
+lower to the same latent grid with white/edit and black/preserve semantics at
+both stages. The deterministic
 `sampling/parity/ltx2_conditioning_mask_parity.mojo` gate checks I2V, uniform
 V2V, painted V2V, and the T2V broadcast control. Audio is never inferred from
 an input's mere presence: the canonical request carries an explicit generated,
@@ -588,6 +606,12 @@ Paired three-second Extend measured 0.986503 over the protected 108 frames;
 the seam and generated extension followed different numerical trajectories but
 both remained visually clean. Result manifests intentionally keep sampler and
 speed parity unaccepted until those independent gates pass.
+
+The 2026-07-28 real Sulphur BF16 first+last-frame gate (`video-0016`) produced
+704x1280, 121 frames at 24 FPS in 192.20 seconds with a 14,583 MiB sampled peak.
+Frames 0/30/60/90/120 retained coherent eyes, lips, hair, facial identity,
+wires, and metal-panel geometry. Both staged keyframes were pixel-identical to
+the creator PyAV preprocessing output.
 
 ---
 

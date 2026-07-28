@@ -463,12 +463,19 @@ pub async fn get_object_info() -> Response {
                     "extend_start".into(),"extend_end".into()
                 ]),
                 "video_edit_start": fl(0.0,0.0,3600.0),
-                "video_edit_end": fl(0.0,0.0,3600.0)
+                "video_edit_end": fl(0.0,0.0,3600.0),
+                "camera_motion": combo(&[
+                    "none".into(),"static".into(),"focus_shift".into(),
+                    "dolly_in".into(),"dolly_out".into(),"dolly_left".into(),
+                    "dolly_right".into(),"jib_up".into(),"jib_down".into()
+                ])
             }, "optional": {
                 "guide_image": lk("IMAGE"),
+                "last_image": lk("IMAGE"),
                 "guide_video": lk("VIDEO"),
                 "guide_mask": lk("IMAGE"),
                 "guide_strength": fl(1.0,0.0,1.0),
+                "last_image_strength": fl(1.0,0.0,1.0),
                 "guide_frame_idx": int(0,0,4095)
             } },
             "output": ["LATENT","VIDEO","AUDIO"], "output_name": ["LATENT","VIDEO","AUDIO"], "name": "LTXVSampler", "category": "sampling" },

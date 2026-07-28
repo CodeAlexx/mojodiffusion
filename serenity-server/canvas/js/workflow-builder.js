@@ -1055,6 +1055,8 @@ var WorkflowBuilder = (function () {
             mode: requiredText('ltx2Mode', 'guidance mode'),
             sampler: sampler,
             scheduler: scheduler,
+            workflow_profile: p.ltx2WorkflowProfile || '',
+            prompt_enhancer: p.ltx2PromptEnhancer || 'none',
             caps_positive: capsPositive,
             caps_negative: p.capsNegative || '',
             noise_fixture: p.noiseFixture || '',
@@ -1069,7 +1071,8 @@ var WorkflowBuilder = (function () {
             video_edit_start: Number.isFinite(Number(p.ltx2VideoEditStart))
                 ? Number(p.ltx2VideoEditStart) : 0,
             video_edit_end: Number.isFinite(Number(p.ltx2VideoEditEnd))
-                ? Number(p.ltx2VideoEditEnd) : 0
+                ? Number(p.ltx2VideoEditEnd) : 0,
+            camera_motion: p.ltx2CameraMotion || 'none'
         };
         var workflow = {
             '1': { class_type: 'LTXVLoader', inputs: loaderInputs },
@@ -1109,6 +1112,18 @@ var WorkflowBuilder = (function () {
                 };
                 workflow['2'].inputs.guide_mask = ['5', 0];
             }
+        }
+        if (p.lastImageName) {
+            if (p.initVideoName)
+                throw new Error('LTX2 last frame cannot be combined with a guide video');
+            workflow['6'] = {
+                class_type: 'LoadImage',
+                inputs: { image: p.lastImageName }
+            };
+            workflow['2'].inputs.last_image = ['6', 0];
+            workflow['2'].inputs.last_image_strength =
+                Number.isFinite(Number(p.lastImageStrength))
+                    ? Number(p.lastImageStrength) : 1.0;
         }
         return workflow;
     }

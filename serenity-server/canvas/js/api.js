@@ -90,6 +90,7 @@ var SerenityAPI = (function () {
                     guidance_mode: li.mode || 'distilled',
                     sampler: li.sampler,
                     scheduler: li.scheduler,
+                    prompt_enhancer: li.prompt_enhancer || 'none',
                     caps_positive: li.caps_positive || '',
                     caps_negative: li.caps_negative || '',
                     noise_fixture: li.noise_fixture || '',
@@ -98,8 +99,11 @@ var SerenityAPI = (function () {
                     video_edit_mode: li.video_edit_mode || 'standard',
                     video_edit_start: Number(li.video_edit_start) || 0,
                     video_edit_end: Number(li.video_edit_end) || 0,
+                    camera_motion: li.camera_motion || 'none',
                     lora: loras
                 };
+                if (String(li.workflow_profile || '').trim())
+                    request.workflow_profile = String(li.workflow_profile).trim();
                 if (request.feature_id !== 'standard' &&
                     !Number.isFinite(request.feature_weight))
                     throw new Error('LTX2 feature workflow requires numeric feature_weight');
@@ -134,6 +138,20 @@ var SerenityAPI = (function () {
                         request.video_strength = Number.isFinite(Number(li.guide_strength))
                             ? Number(li.guide_strength)
                             : 0.7;
+                    }
+                }
+                if (Array.isArray(li.last_image)) {
+                    if (request.video_path)
+                        throw new Error('LTX2 workflow cannot use last_image and guide_video together');
+                    var lastImageNode = nodes[String(li.last_image[0])];
+                    var lastImagePath = lastImageNode && lastImageNode.inputs
+                        ? String(lastImageNode.inputs.image || lastImageNode.inputs.path || '').trim()
+                        : '';
+                    if (lastImagePath) {
+                        request.last_image_path = lastImagePath;
+                        request.last_image_strength =
+                            Number.isFinite(Number(li.last_image_strength))
+                                ? Number(li.last_image_strength) : 1.0;
                     }
                 }
                 if (Array.isArray(li.guide_mask)) {

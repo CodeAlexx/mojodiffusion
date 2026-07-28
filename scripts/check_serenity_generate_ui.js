@@ -192,6 +192,16 @@ async function run() {
       videoModels: GenerateTab.state.allModels
         .filter((model) => ModelUtils.archForModel(model.name) === "ltxv")
         .map((model) => model.name),
+      checkpointWorkflows: (() => {
+        const runners = GenerateTab.state.videoStatus &&
+          GenerateTab.state.videoStatus.candidate_runners;
+        const runner = Array.isArray(runners)
+          ? runners.find((entry) => entry && entry.model === "ltx2_t2v_av")
+          : null;
+        const mode = runner && runner.modes && runner.modes.ltx2_mojo_request;
+        return mode && Array.isArray(mode.checkpoint_workflows)
+          ? mode.checkpoint_workflows : [];
+      })(),
       encoderOrEditModels: GenerateTab.state.allModels
         .map((model) => model.name)
         .filter((name) => /(?:qwen[_-]?2\\.5[_-]?vl|qwen.*image.*edit)/i.test(name)),
@@ -262,6 +272,13 @@ async function run() {
       /bf16/i.test(model) && !expectedLtxVideoModels.includes(model)
     );
     if (customLtxBf16) {
+      const customWorkflow = surface.checkpointWorkflows.find((workflow) =>
+        Array.isArray(workflow.checkpoints) &&
+        workflow.checkpoints.some((name) =>
+          String(name).replace(/\.safetensors$/i, "").toLowerCase() ===
+          customLtxBf16.replace(/\.safetensors$/i, "").toLowerCase()
+        )
+      );
       await page.locator('.nav-btn[data-tab="models"]').click();
       const useButton = page.locator(
         `.model-use-btn[data-name="${customLtxBf16}"]`
@@ -277,23 +294,43 @@ async function run() {
         guidanceMode: GenerateTab.state.videoGuidanceMode,
         sampler: GenerateTab.state.sampler,
         scheduler: GenerateTab.state.scheduler,
+        workflowProfile: GenerateTab.state.videoWorkflowProfile,
+        promptEnhancer: GenerateTab.state.videoPromptEnhancer,
+        promptEnhancerDisabled: document.querySelector("#gen-video-prompt-enhancer").disabled,
+        promptEnhancerNote: document.querySelector("#gen-video-prompt-enhancer-note").textContent.trim(),
         button: document.querySelector("#gen-btn").textContent.trim(),
         params: GenerateTab.getParams(),
       }));
+      const expectedGuidance = customWorkflow ? "distilled" : "dev";
+      const expectedSampler = customWorkflow ? "euler_ancestral_cfg_pp" : "res2s";
+      const expectedScheduler = customWorkflow ? "sulphur_creator_8_3" : "ltx2";
       assert(
         customLtxHandoff.activeTab === "generate" &&
           customLtxHandoff.model === customLtxBf16 &&
           customLtxHandoff.arch === "ltxv" &&
           customLtxHandoff.quant === "bf16" &&
           customLtxHandoff.checkpoint === customLtxBf16 &&
-          customLtxHandoff.guidanceMode === "dev" &&
-          customLtxHandoff.sampler === "res2s" &&
-          customLtxHandoff.scheduler === "ltx2" &&
+          customLtxHandoff.guidanceMode === expectedGuidance &&
+          customLtxHandoff.sampler === expectedSampler &&
+          customLtxHandoff.scheduler === expectedScheduler &&
+          customLtxHandoff.workflowProfile === (customWorkflow ? customWorkflow.id : "") &&
+          customLtxHandoff.promptEnhancer === "none" &&
           customLtxHandoff.button.includes("Generate Video") &&
           customLtxHandoff.params.videoCheckpoint === customLtxBf16,
         `Models-to-Generate custom LTX BF16 handoff is incomplete: ${JSON.stringify(customLtxHandoff)}`
       );
-      await page.locator("#gen-prompt").fill("Custom LTX BF16 handoff request");
+      if (customWorkflow && customWorkflow.prompt_enhancer_available !== true) {
+        assert(
+          customLtxHandoff.promptEnhancerDisabled &&
+          customLtxHandoff.promptEnhancerNote.includes("will not fake enhancement"),
+          `missing creator enhancer is not represented truthfully: ${JSON.stringify(customLtxHandoff)}`
+        );
+      }
+      await page.locator("#gen-prompt").fill("  Custom LTX BF16 handoff request \n");
+      await page.locator("#gen-neg-prompt").fill("  watermark \t");
+      await page.evaluate(() => {
+        GenerateTab.state.initImagePath = "/tmp/serenity-ltx2-i2v-source.png";
+      });
       await page.locator("#gen-btn").click();
       await page.waitForFunction(() => {
         return document.querySelector("#gen-activity-status").dataset.state !== "idle";
@@ -305,11 +342,19 @@ async function run() {
           customLtxRequest.runner === "ltx2_mojo_request" &&
           customLtxRequest.checkpoint === customLtxBf16 &&
           customLtxRequest.quant === "bf16" &&
-          customLtxRequest.guidance_mode === "dev" &&
-          customLtxRequest.sampler === "res2s" &&
-          customLtxRequest.scheduler === "ltx2",
+          customLtxRequest.guidance_mode === expectedGuidance &&
+          customLtxRequest.sampler === expectedSampler &&
+          customLtxRequest.scheduler === expectedScheduler &&
+          customLtxRequest.workflow_profile === (customWorkflow ? customWorkflow.id : "") &&
+          customLtxRequest.prompt_enhancer === "none" &&
+          customLtxRequest.prompt === "Custom LTX BF16 handoff request" &&
+          customLtxRequest.negative === "watermark" &&
+          customLtxRequest.image_path === "/tmp/serenity-ltx2-i2v-source.png",
         `custom LTX BF16 request identity drifted: ${JSON.stringify(customLtxRequest)}`
       );
+      await page.evaluate(() => {
+        GenerateTab.state.initImagePath = "";
+      });
       videoBodies.length = 0;
       videoStatusPolls = 0;
       await page.evaluate(() => localStorage.removeItem("sf-gallery"));
@@ -771,6 +816,35 @@ async function run() {
     assert(
       historyVideosBeforeLateEvent === 0,
       `Current Batch movie was also duplicated in History: ${historyVideosBeforeLateEvent}`
+    );
+    const previewBeforeUnownedEvent = await page.evaluate(() => ({
+      videoDisplay: getComputedStyle(document.querySelector("#gen-preview-video")).display,
+      videoSrc: document.querySelector("#gen-preview-video").currentSrc,
+      imageDisplay: getComputedStyle(document.querySelector("#gen-preview-img")).display,
+    }));
+    await page.evaluate(() => {
+      SerenityWS._emit("executed", {
+        prompt_id: "unowned-diagnostic-image",
+        output: {
+          images: [{
+            filename: "teapot.png",
+            subfolder: "external-diagnostic",
+            type: "output",
+          }],
+        },
+      });
+    });
+    await page.waitForTimeout(200);
+    const previewAfterUnownedEvent = await page.evaluate(() => ({
+      videoDisplay: getComputedStyle(document.querySelector("#gen-preview-video")).display,
+      videoSrc: document.querySelector("#gen-preview-video").currentSrc,
+      imageDisplay: getComputedStyle(document.querySelector("#gen-preview-img")).display,
+    }));
+    assert(
+      previewAfterUnownedEvent.videoDisplay !== "none" &&
+      previewAfterUnownedEvent.videoSrc === previewBeforeUnownedEvent.videoSrc &&
+      previewAfterUnownedEvent.imageDisplay === previewBeforeUnownedEvent.imageDisplay,
+      `unowned WebSocket result hijacked the active preview: before=${JSON.stringify(previewBeforeUnownedEvent)} after=${JSON.stringify(previewAfterUnownedEvent)}`
     );
     await page.evaluate(() => {
       SerenityWS._emit("executed", {

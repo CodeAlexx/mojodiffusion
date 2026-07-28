@@ -1,0 +1,45 @@
+{
+  "schema": "serenity.ltx2.checkpoint_workflows.v1",
+  "profiles": [
+    {
+      "id": "sulphur-2-base-distilled-v1",
+      "label": "Sulphur 2 Creator Distilled",
+      "checkpoints": [
+        "sulphur_dev_bf16",
+        "sulphur_dev_bf16.safetensors"
+      ],
+      "source": "https://huggingface.co/SulphurAI/Sulphur-2-base/blob/main/workflows/ltx23_t2v%20distilled.json",
+      "model_card": "https://huggingface.co/SulphurAI/Sulphur-2-base",
+      "guidance_mode": "distilled",
+      "steps": 8,
+      "sampler": "euler_ancestral_cfg_pp",
+      "scheduler": "sulphur_creator_8_3",
+      "stage1": {
+        "sampler": "euler_ancestral_cfg_pp",
+        "scheduler": "ltxv",
+        "max_shift": 4.0,
+        "base_shift": 1.5,
+        "stretch": true,
+        "terminal": 0.1
+      },
+      "stage2": {
+        "sampler": "lcm",
+        "sigmas": [0.85, 0.725, 0.4219, 0.0],
+        "seed": 42
+      },
+      "distillation_adapter": {
+        "name": "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
+        "path": "loras/Sulphur-2-base/distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
+        "stage1_weight": 0.7,
+        "stage2_weight": 0.5
+      },
+      "default_negative": "pc game, console game, video game, cartoon, childish, ugly",
+      "prompt_enhancer": {
+        "id": "sulphur-qwen35",
+        "input_contract": "raw user prompt and optional source image; no system prompt",
+        "weights": "prompt_enhancer/sulphur_prompt_enhancer_model-q8_0.gguf",
+        "mmproj": "prompt_enhancer/mmproj-BF16.gguf"
+      }
+    }
+  ]
+}

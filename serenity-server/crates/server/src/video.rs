@@ -33,6 +33,8 @@ const SEEDVR2_WEIGHTS: [&str; 3] = [
 ];
 const LTX2_REQUEST_PROFILES_JSON: &str =
     include_str!("../../../../serenitymojo/configs/ltx2_request_profiles.json");
+const LTX2_CHECKPOINT_WORKFLOWS_JSON: &str =
+    include_str!("../../../../serenitymojo/configs/ltx2_checkpoint_workflows.json");
 const LTX2_MOJO_CONDITIONER: &str = "output/bin/ltx2_encode_prompt";
 const LTX2_MOJO_CONTEXT_SCHEMA: &str = "serenity.ltx2.mojo_gemma3_context_cache.v1";
 const LTX2_GEMMA_FP8: &str =
@@ -341,6 +343,94 @@ struct Ltx2ResolvedRequestProfile {
     runner: String,
 }
 
+fn ltx2_checkpoint_workflow_registry() -> &'static Value {
+    static REGISTRY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry: Value = serde_json::from_str(LTX2_CHECKPOINT_WORKFLOWS_JSON)
+            .expect("embedded LTX2 checkpoint workflow registry must be valid JSON");
+        assert_eq!(
+            registry.get("schema").and_then(Value::as_str),
+            Some("serenity.ltx2.checkpoint_workflows.v1"),
+            "embedded LTX2 checkpoint workflow registry schema mismatch"
+        );
+        registry
+    })
+}
+
+fn ltx2_checkpoint_workflow(checkpoint: &str) -> Option<&'static Value> {
+    let checkpoint = checkpoint
+        .strip_suffix(".safetensors")
+        .unwrap_or(checkpoint)
+        .to_ascii_lowercase();
+    ltx2_checkpoint_workflow_registry()
+        .get("profiles")
+        .and_then(Value::as_array)
+        .and_then(|profiles| {
+            profiles.iter().find(|profile| {
+                profile
+                    .get("checkpoints")
+                    .and_then(Value::as_array)
+                    .is_some_and(|names| {
+                        names.iter().filter_map(Value::as_str).any(|name| {
+                            name.strip_suffix(".safetensors")
+                                .unwrap_or(name)
+                                .eq_ignore_ascii_case(&checkpoint)
+                        })
+                    })
+            })
+        })
+}
+
+fn ltx2_checkpoint_workflow_documents() -> Value {
+    let profiles = ltx2_checkpoint_workflow_registry()
+        .get("profiles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut profile| {
+            let adapter_path = profile
+                .pointer("/distillation_adapter/path")
+                .and_then(Value::as_str)
+                .map(model_path);
+            let enhancer_weights = profile
+                .pointer("/prompt_enhancer/weights")
+                .and_then(Value::as_str)
+                .map(model_path);
+            let enhancer_mmproj = profile
+                .pointer("/prompt_enhancer/mmproj")
+                .and_then(Value::as_str)
+                .map(model_path);
+            let enhancer_files_available =
+                enhancer_weights.as_deref().is_some_and(nonempty_file)
+                    && enhancer_mmproj.as_deref().is_some_and(nonempty_file);
+            if let Some(object) = profile.as_object_mut() {
+                object.insert(
+                    "adapter_available".to_string(),
+                    json!(adapter_path.as_deref().is_some_and(nonempty_file)),
+                );
+                object.insert(
+                    "prompt_enhancer_files_available".to_string(),
+                    json!(enhancer_files_available),
+                );
+                // Installed files are not runtime support. Keep this false
+                // until the creator's llama.cpp vision route exists and has
+                // product evidence.
+                object.insert(
+                    "prompt_enhancer_available".to_string(),
+                    json!(false),
+                );
+                object.insert(
+                    "prompt_enhancer_runtime".to_string(),
+                    json!("not_implemented"),
+                );
+            }
+            profile
+        })
+        .collect::<Vec<_>>();
+    Value::Array(profiles)
+}
+
 fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
     static REGISTRY: std::sync::OnceLock<Ltx2RequestProfileRegistry> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| {
@@ -368,7 +458,9 @@ fn ltx2_profile_runner_name(width: i64, height: i64, frames: i64, fps: i64) -> S
 
 const LTX2_REQUEST_RUNNER_BUILD_INPUTS: &[&str] = &[
     "serenitymojo/configs/ltx2_request_profiles.json",
+    "serenitymojo/configs/ltx2_checkpoint_workflows.json",
     "serenitymojo/sampling/ltx2_request_cli.mojo",
+    "serenitymojo/sampling/ltx2_sampling.mojo",
     "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo",
     "serenitymojo/models/vae/ltx2_tiled_decode.mojo",
     "serenitymojo/models/vae/ltx2_vae_encoder.mojo",
@@ -512,6 +604,7 @@ fn stage_ltx2_creator_i2v_source(
     source_path: &str,
     profile: &Ltx2ResolvedRequestProfile,
     out_dir: &std::path::Path,
+    stem: &str,
 ) -> Result<std::path::PathBuf, String> {
     // LTX Desktop first converts to RGB, Lanczos-resizes with fill, and
     // center-crops at the UI-authored size. The fast pipeline then performs a
@@ -559,71 +652,31 @@ fn stage_ltx2_creator_i2v_source(
     let prepared =
         image::imageops::crop_imm(&resized, left, top, target_width, target_height).to_image();
 
-    let prepared_png = out_dir.join("creator_i2v_prepared.png");
+    let prepared_png = out_dir.join(format!("{stem}_prepared.png"));
     prepared
         .save_with_format(&prepared_png, image::ImageFormat::Png)
         .map_err(|error| format!("cannot save creator-prepared I2V source: {error}"))?;
-    let raw_path = out_dir.join(".creator_i2v_prepared.rgb24");
-    std::fs::write(&raw_path, prepared.as_raw())
-        .map_err(|error| format!("cannot stage creator I2V RGB frame: {error}"))?;
-    let roundtrip_mp4 = out_dir.join(".creator_i2v_crf33.mp4");
-    let roundtrip_png = out_dir.join("creator_i2v_conditioning.png");
-    let dimensions = format!("{target_width}x{target_height}");
-    let encode = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgb24",
-            "-video_size",
-            &dimensions,
-            "-framerate",
-            "1",
-            "-i",
-        ])
-        .arg(&raw_path)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            "format=yuv420p",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "33",
-            "-preset",
-            "veryfast",
-            "-x264-params",
-            "sliced_threads=1",
-            "-pix_fmt",
-            "yuv420p",
-        ])
-        .arg(&roundtrip_mp4)
-        .output()
-        .map_err(|error| format!("cannot launch creator I2V CRF round trip: {error}"))?;
-    let _ = std::fs::remove_file(&raw_path);
-    if !encode.status.success() {
+    let roundtrip_png = out_dir.join(format!("{stem}_conditioning.png"));
+    let python = repo_path(".pixi/envs/default/bin/python3");
+    let creator_preprocess = repo_path("scripts/ltx2_creator_image_preprocess.py");
+    if !python.is_file() || !creator_preprocess.is_file() {
         return Err(format!(
-            "creator I2V CRF encode failed: {}",
-            String::from_utf8_lossy(&encode.stderr).trim()
+            "creator I2V preprocessing runtime is missing: {}, {}",
+            python.display(),
+            creator_preprocess.display()
         ));
     }
-    let decode = std::process::Command::new("ffmpeg")
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(&roundtrip_mp4)
-        .args(["-frames:v", "1", "-pix_fmt", "rgb24"])
+    let preprocess = std::process::Command::new(&python)
+        .arg(&creator_preprocess)
+        .arg(&prepared_png)
         .arg(&roundtrip_png)
+        .args(["--crf", "33"])
         .output()
-        .map_err(|error| format!("cannot launch creator I2V CRF decode: {error}"))?;
-    let _ = std::fs::remove_file(&roundtrip_mp4);
-    if !decode.status.success() || !nonempty_file(&roundtrip_png) {
+        .map_err(|error| format!("cannot launch creator PyAV I2V preprocessing: {error}"))?;
+    if !preprocess.status.success() || !nonempty_file(&roundtrip_png) {
         return Err(format!(
-            "creator I2V CRF decode failed: {}",
-            String::from_utf8_lossy(&decode.stderr).trim()
+            "creator PyAV I2V preprocessing failed: {}",
+            String::from_utf8_lossy(&preprocess.stderr).trim()
         ));
     }
     Ok(roundtrip_png)
@@ -1855,12 +1908,15 @@ fn readiness_doc() -> Value {
                         "steps", "seed", "fps", "sampler", "scheduler",
                         "guidance_mode",
                         "caps_positive", "caps_negative", "noise_fixture",
-                        "image_path", "image_strength", "video_path",
+                        "image_path", "image_strength",
+                        "last_image_path", "last_image_strength",
+                        "camera_motion", "video_path",
                         "video_strength", "video_mask_path",
                         "video_edit_mode", "video_edit_start",
                         "video_edit_end", "video_source_frames",
                         "include_audio", "audio_policy", "lora", "quant",
-                        "post_upscale", "feature_id", "feature_weight"
+                        "post_upscale", "feature_id", "feature_weight",
+                        "workflow_profile", "prompt_enhancer"
                     ],
                     "requires_authored_conditioning": false,
                     "automatic_conditioning": {
@@ -1871,6 +1927,18 @@ fn readiness_doc() -> Value {
                     },
                     "compiled_profile": ltx2_default_profile,
                     "supported_profiles": ltx2_profile_documents,
+                    "checkpoint_workflows": ltx2_checkpoint_workflow_documents(),
+                    "camera_motions": [
+                        { "id": "none", "label": "None", "prompt_suffix": "" },
+                        { "id": "static", "label": "Static", "prompt_suffix": ", static camera, locked off shot, no camera movement" },
+                        { "id": "focus_shift", "label": "Focus shift", "prompt_suffix": ", focus shift, rack focus, changing focal point" },
+                        { "id": "dolly_in", "label": "Dolly in", "prompt_suffix": ", dolly in, camera pushing forward, smooth forward movement" },
+                        { "id": "dolly_out", "label": "Dolly out", "prompt_suffix": ", dolly out, camera pulling back, smooth backward movement" },
+                        { "id": "dolly_left", "label": "Dolly left", "prompt_suffix": ", dolly left, camera tracking left, lateral movement" },
+                        { "id": "dolly_right", "label": "Dolly right", "prompt_suffix": ", dolly right, camera tracking right, lateral movement" },
+                        { "id": "jib_up", "label": "Jib up", "prompt_suffix": ", jib up, camera rising up, upward crane movement" },
+                        { "id": "jib_down", "label": "Jib down", "prompt_suffix": ", jib down, camera lowering down, downward crane movement" }
+                    ],
                     "quant_modes": [
                         {
                             "id": "bf16",
@@ -2015,6 +2083,120 @@ pub async fn get_video() -> Response {
     json_resp(StatusCode::OK, &readiness_doc())
 }
 
+fn normalize_ltx2_prompt_fields(body: &Value) -> Value {
+    let mut normalized = body.clone();
+    let Some(object) = normalized.as_object_mut() else {
+        return normalized;
+    };
+    for key in ["prompt", "negative"] {
+        let Some(text) = object.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        object.insert(key.to_string(), json!(text.trim()));
+    }
+    normalized
+}
+
+fn normalized_ltx2_camera_motion_request(body: &Value) -> Result<Value, String> {
+    let mut normalized = body.clone();
+    let motion = body
+        .get("camera_motion")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .trim();
+    let suffix = match motion {
+        "none" => "",
+        "static" => ", static camera, locked off shot, no camera movement",
+        "focus_shift" => ", focus shift, rack focus, changing focal point",
+        "dolly_in" => ", dolly in, camera pushing forward, smooth forward movement",
+        "dolly_out" => ", dolly out, camera pulling back, smooth backward movement",
+        "dolly_left" => ", dolly left, camera tracking left, lateral movement",
+        "dolly_right" => ", dolly right, camera tracking right, lateral movement",
+        "jib_up" => ", jib up, camera rising up, upward crane movement",
+        "jib_down" => ", jib down, camera lowering down, downward crane movement",
+        other => {
+            return Err(format!(
+                "unsupported LTX Desktop camera_motion '{other}'"
+            ));
+        }
+    };
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| "LTX2 request must be an object".to_string())?;
+    object.insert("camera_motion".to_string(), json!(motion));
+    if !suffix.is_empty()
+        && object
+            .get("creator_camera_motion_applied")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        let prompt = object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        object.insert("creator_prompt".to_string(), json!(prompt));
+        object.insert("prompt".to_string(), json!(format!("{prompt}{suffix}")));
+        object.insert(
+            "creator_camera_motion_suffix".to_string(),
+            json!(suffix),
+        );
+        object.insert(
+            "creator_camera_motion_applied".to_string(),
+            json!(true),
+        );
+    }
+    Ok(normalized)
+}
+
+fn normalized_ltx2_checkpoint_workflow_request(body: &Value) -> Result<Value, String> {
+    let mut normalized = body.clone();
+    let checkpoint = body
+        .get("checkpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Some(profile) = ltx2_checkpoint_workflow(checkpoint) else {
+        return Ok(normalized);
+    };
+    let requested_profile = body
+        .get("workflow_profile")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let profile_id = profile.get("id").and_then(Value::as_str).unwrap_or("");
+    if let Some(requested) = requested_profile {
+        if requested != profile_id {
+            return Err(format!(
+                "LTX2 checkpoint '{checkpoint}' does not provide workflow_profile '{requested}'; its creator profile is '{profile_id}'"
+            ));
+        }
+    }
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| "LTX2 request must be an object".to_string())?;
+    for key in ["guidance_mode", "sampler", "scheduler", "steps"] {
+        let value = profile
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("LTX2 creator profile '{profile_id}' is missing '{key}'"))?;
+        object.insert(key.to_string(), value);
+    }
+    object.insert("workflow_profile".to_string(), json!(profile_id));
+    object.insert(
+        "creator_workflow_source".to_string(),
+        profile.get("source").cloned().unwrap_or(Value::Null),
+    );
+    if object
+        .get("negative")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        if let Some(default_negative) = profile.get("default_negative").and_then(Value::as_str) {
+            object.insert("negative".to_string(), json!(default_negative));
+        }
+    }
+    Ok(normalized)
+}
+
 /// POST /v1/video — dispatch on `model`: `"ltx2"` (default) = the bounded LTX2
 /// staged smoke; `"wan22"` = Wan2.2 5B; `"wan22_a14b"` = the bounded A14B
 /// LoRA preview; `"bernini"` = the gated Bernini-R;
@@ -2045,6 +2227,15 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     let is_ltx2_mojo_request =
         model == "ltx2" && b.get("runner").and_then(Value::as_str) == Some("ltx2_mojo_request");
     if is_ltx2_mojo_request {
+        b = normalize_ltx2_prompt_fields(&b);
+        b = match normalized_ltx2_camera_motion_request(&b) {
+            Ok(value) => value,
+            Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        };
+        b = match normalized_ltx2_checkpoint_workflow_request(&b) {
+            Ok(value) => value,
+            Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        };
         b = match normalized_ltx2_video_edit_request(&b) {
             Ok(value) => value,
             Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
@@ -2621,6 +2812,8 @@ struct Ltx2DistillationAdapter {
     name: String,
     path: std::path::PathBuf,
     weight: f64,
+    stage1_weight: Option<f64>,
+    stage2_weight: Option<f64>,
     source: &'static str,
 }
 
@@ -2661,6 +2854,8 @@ fn resolve_ltx2_distillation_adapter(
                 name: name.to_string(),
                 path,
                 weight,
+                stage1_weight: None,
+                stage2_weight: None,
                 source: "user",
             });
         }
@@ -2705,6 +2900,44 @@ fn resolve_ltx2_distillation_adapter(
         .name
         .strip_suffix(".safetensors")
         .unwrap_or(&checkpoint.name);
+    if let Some(workflow) = ltx2_checkpoint_workflow(checkpoint_id) {
+        let workflow_id = workflow.get("id").and_then(Value::as_str).unwrap_or("");
+        let requested_workflow = body
+            .get("workflow_profile")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if requested_workflow == workflow_id {
+            if explicit.is_some() {
+                return Err(format!(
+                    "checkpoint '{}' already uses creator workflow '{}'; remove the manually selected Distillation LoRA",
+                    checkpoint.name, workflow_id
+                ));
+            }
+            let adapter = workflow
+                .get("distillation_adapter")
+                .ok_or_else(|| format!("creator workflow '{workflow_id}' has no distillation adapter"))?;
+            let relative_path = adapter.get("path").and_then(Value::as_str).unwrap_or("");
+            let path = model_path(relative_path);
+            if !nonempty_file(&path) {
+                return Err(format!(
+                    "creator workflow '{workflow_id}' requires its distillation adapter: {}",
+                    path.display()
+                ));
+            }
+            return Ok(Some(Ltx2DistillationAdapter {
+                name: adapter
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("creator-distillation-adapter")
+                    .to_string(),
+                path,
+                weight: 1.0,
+                stage1_weight: adapter.get("stage1_weight").and_then(Value::as_f64),
+                stage2_weight: adapter.get("stage2_weight").and_then(Value::as_f64),
+                source: "checkpoint_creator_profile",
+            }));
+        }
+    }
     let direct_distilled = checkpoint_id.to_ascii_lowercase().contains("distill");
     if direct_distilled {
         if explicit.is_some() {
@@ -2737,6 +2970,8 @@ fn resolve_ltx2_distillation_adapter(
                 .to_string(),
             path,
             weight: 1.0,
+            stage1_weight: None,
+            stage2_weight: None,
             source: "official_creator_default",
         }));
     }
@@ -2857,7 +3092,40 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     let sampler = body["sampler"].as_str().unwrap_or("");
     let scheduler = body["scheduler"].as_str().unwrap_or("");
     let steps = body.get("steps").and_then(Value::as_i64).unwrap_or(0);
-    match guidance_mode {
+    let workflow_profile = body
+        .get("workflow_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let selected_workflow = ltx2_checkpoint_workflow(&checkpoint.name)
+        .filter(|profile| profile.get("id").and_then(Value::as_str) == Some(workflow_profile));
+    if !workflow_profile.is_empty() && selected_workflow.is_none() {
+        return Err(format!(
+            "LTX2 workflow_profile '{workflow_profile}' is not registered for checkpoint '{}'",
+            checkpoint.name
+        ));
+    }
+    if let Some(workflow) = selected_workflow {
+        let expected_guidance = workflow
+            .get("guidance_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let expected_sampler = workflow.get("sampler").and_then(Value::as_str).unwrap_or("");
+        let expected_scheduler = workflow
+            .get("scheduler")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let expected_steps = workflow.get("steps").and_then(Value::as_i64).unwrap_or(0);
+        if guidance_mode != expected_guidance
+            || sampler != expected_sampler
+            || scheduler != expected_scheduler
+            || steps != expected_steps
+        {
+            return Err(format!(
+                "LTX2 creator workflow '{workflow_profile}' requires guidance_mode={expected_guidance}, sampler={expected_sampler}, scheduler={expected_scheduler}, and steps={expected_steps}; got guidance_mode={guidance_mode}, sampler={sampler}, scheduler={scheduler}, steps={steps}"
+            ));
+        }
+    } else {
+        match guidance_mode {
         "distilled" if sampler != "euler" || scheduler != "ltx2_distilled" || steps != 8 => {
             return Err(format!(
                 "LTX2 distilled mode requires sampler=euler, scheduler=ltx2_distilled, and steps=8; got sampler={sampler}, scheduler={scheduler}, steps={steps}"
@@ -2869,6 +3137,48 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
             ));
         }
         _ => {}
+        }
+    }
+    let prompt_enhancer = body
+        .get("prompt_enhancer")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if prompt_enhancer != "none" {
+        let Some(workflow) = selected_workflow else {
+            return Err(format!(
+                "LTX2 prompt_enhancer '{prompt_enhancer}' requires a registered checkpoint creator workflow"
+            ));
+        };
+        let enhancer = workflow
+            .get("prompt_enhancer")
+            .ok_or_else(|| {
+                format!(
+                    "LTX2 creator workflow '{workflow_profile}' has no prompt enhancer"
+                )
+            })?;
+        let expected = enhancer.get("id").and_then(Value::as_str).unwrap_or("");
+        if prompt_enhancer != expected {
+            return Err(format!(
+                "LTX2 creator workflow '{workflow_profile}' provides prompt_enhancer '{expected}', not '{prompt_enhancer}'"
+            ));
+        }
+        let missing = ["weights", "mmproj"]
+            .into_iter()
+            .filter_map(|key| {
+                let path = enhancer.get(key).and_then(Value::as_str)?;
+                let resolved = model_path(path);
+                (!nonempty_file(&resolved)).then(|| resolved.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "LTX2 prompt_enhancer '{prompt_enhancer}' is unavailable; missing creator files: {}",
+                missing.join(", ")
+            ));
+        }
+        return Err(format!(
+            "LTX2 prompt_enhancer '{prompt_enhancer}' files are installed, but its ephemeral llama.cpp execution route is not implemented; use prompt_enhancer='none' so Serenity cannot claim enhancement that did not run"
+        ));
     }
     for key in ["width", "height", "frames", "steps", "seed"] {
         if body.get(key).and_then(Value::as_i64).is_none() {
@@ -2979,6 +3289,37 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     if image_path.is_empty() && body.get("image_strength").is_some() {
         return Err("LTX2 image_strength requires image_path".to_string());
     }
+    let last_image_path = body
+        .get("last_image_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !last_image_path.is_empty() && !std::path::Path::new(last_image_path).is_file() {
+        return Err(format!(
+            "LTX2 last-frame source image not found: {last_image_path}"
+        ));
+    }
+    let last_image_strength = body
+        .get("last_image_strength")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if body
+        .get("last_image_strength")
+        .is_some_and(|value| !value.is_number())
+    {
+        return Err("LTX2 last_image_strength must be numeric".to_string());
+    }
+    if !(0.0..=1.0).contains(&last_image_strength) {
+        return Err("LTX2 last_image_strength must be in [0, 1]".to_string());
+    }
+    if last_image_path.is_empty() && body.get("last_image_strength").is_some() {
+        return Err("LTX2 last_image_strength requires last_image_path".to_string());
+    }
+    if !last_image_path.is_empty() && edit_mode != "standard" {
+        return Err(
+            "LTX2 last-frame keyframe interpolation cannot use Retake/Extend".to_string(),
+        );
+    }
     let video_path = body
         .get("video_path")
         .and_then(Value::as_str)
@@ -3016,6 +3357,9 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     }
     if !image_path.is_empty() && !video_path.is_empty() {
         return Err("LTX2 image_path and video_path are mutually exclusive".to_string());
+    }
+    if !last_image_path.is_empty() && !video_path.is_empty() {
+        return Err("LTX2 last_image_path and video_path are mutually exclusive".to_string());
     }
     if audio_policy == "preserve" {
         if video_path.is_empty() {
@@ -3665,7 +4009,12 @@ fn start_ltx2_mojo_request(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            let staged_path = match stage_ltx2_creator_i2v_source(image_path, &profile, &out_dir) {
+            let staged_path = match stage_ltx2_creator_i2v_source(
+                image_path,
+                &profile,
+                &out_dir,
+                "creator_i2v",
+            ) {
                 Ok(path) => path,
                 Err(error) => {
                     return err_detail(
@@ -3675,12 +4024,16 @@ fn start_ltx2_mojo_request(
                 }
             };
             if let Some(request) = request_document.as_object_mut() {
+                let image_strength = body
+                    .get("image_strength")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
                 request.insert("creator_source_image_path".to_string(), json!(image_path));
                 request.insert(
                     "image_path".to_string(),
                     json!(staged_path.to_string_lossy().to_string()),
                 );
-                request.insert("image_strength".to_string(), json!(1.0));
+                request.insert("image_strength".to_string(), json!(image_strength));
                 request.insert(
                     "creator_conditioning_width".to_string(),
                     json!(profile.conditioning_width),
@@ -3690,6 +4043,49 @@ fn start_ltx2_mojo_request(
                     json!(profile.conditioning_height),
                 );
                 request.insert("creator_image_crf".to_string(), json!(33));
+            }
+        }
+        if let Some(last_image_path) = body
+            .get("last_image_path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let staged_path = match stage_ltx2_creator_i2v_source(
+                last_image_path,
+                &profile,
+                &out_dir,
+                "creator_last_frame",
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    return err_detail(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!("LTX2 creator last-frame preprocessing failed: {error}"),
+                    );
+                }
+            };
+            if let Some(request) = request_document.as_object_mut() {
+                let last_image_strength = body
+                    .get("last_image_strength")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                request.insert(
+                    "creator_last_image_path".to_string(),
+                    json!(last_image_path),
+                );
+                request.insert(
+                    "last_image_path".to_string(),
+                    json!(staged_path.to_string_lossy().to_string()),
+                );
+                request.insert(
+                    "last_image_strength".to_string(),
+                    json!(last_image_strength),
+                );
+                request.insert(
+                    "creator_last_frame_index".to_string(),
+                    json!(profile.frames - 1),
+                );
+                request.insert("creator_last_image_crf".to_string(), json!(33));
             }
         }
     }
@@ -3762,14 +4158,27 @@ fn start_ltx2_mojo_request(
             .unwrap_or_default();
         request.insert("lora".to_string(), Value::Array(overlay_loras));
         if let Some(adapter) = distillation_adapter.as_ref() {
+            let mut adapter_document = json!({
+                "name": adapter.name,
+                "path": adapter.path.to_string_lossy(),
+                "weight": adapter.weight,
+                "source": adapter.source,
+            });
+            if let Some(value) = adapter.stage1_weight {
+                adapter_document
+                    .as_object_mut()
+                    .expect("adapter document is an object")
+                    .insert("stage1_weight".to_string(), json!(value));
+            }
+            if let Some(value) = adapter.stage2_weight {
+                adapter_document
+                    .as_object_mut()
+                    .expect("adapter document is an object")
+                    .insert("stage2_weight".to_string(), json!(value));
+            }
             request.insert(
                 "distillation_adapter".to_string(),
-                json!({
-                    "name": adapter.name,
-                    "path": adapter.path.to_string_lossy(),
-                    "weight": adapter.weight,
-                    "source": adapter.source,
-                }),
+                adapter_document,
             );
         } else {
             request.remove("distillation_adapter");
@@ -6541,6 +6950,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ltx2_prompt_normalization_removes_token_changing_edge_whitespace() {
+        let normalized = normalize_ltx2_prompt_fields(&json!({
+            "prompt": "  a woman turns toward camera \n",
+            "negative": "\twatermark  ",
+        }));
+        assert_eq!(normalized["prompt"], "a woman turns toward camera");
+        assert_eq!(normalized["negative"], "watermark");
+    }
+
+    #[test]
+    fn ltx2_camera_motion_uses_the_ltx_desktop_prompt_contract_once() {
+        let normalized = normalized_ltx2_camera_motion_request(&json!({
+            "prompt": "A woman turns toward the camera",
+            "camera_motion": "dolly_in",
+        }))
+        .unwrap();
+        assert_eq!(
+            normalized["prompt"],
+            "A woman turns toward the camera, dolly in, camera pushing forward, smooth forward movement"
+        );
+        assert_eq!(
+            normalized["creator_prompt"],
+            "A woman turns toward the camera"
+        );
+        assert_eq!(normalized["creator_camera_motion_applied"], true);
+        let repeated = normalized_ltx2_camera_motion_request(&normalized).unwrap();
+        assert_eq!(repeated["prompt"], normalized["prompt"]);
+        assert!(normalized_ltx2_camera_motion_request(&json!({
+            "prompt": "probe",
+            "camera_motion": "orbit",
+        }))
+        .unwrap_err()
+        .contains("unsupported LTX Desktop camera_motion"));
+    }
+
+    #[test]
+    fn ltx2_mojo_request_accepts_creator_first_and_last_keyframes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "serenity-ltx2-keyframes-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let caps = root.join("caps.json");
+        let first = root.join("first.png");
+        let last = root.join("last.png");
+        std::fs::write(&caps, b"{}").unwrap();
+        std::fs::write(&first, b"first-frame fixture").unwrap();
+        std::fs::write(&last, b"last-frame fixture").unwrap();
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "the subject turns and settles into the final pose",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": caps,
+            "width": 512,
+            "height": 768,
+            "frames": 121,
+            "steps": 8,
+            "seed": 42,
+            "fps": 25.0,
+            "include_audio": false,
+            "lora": [],
+            "image_path": first,
+            "image_strength": 1.0,
+            "last_image_path": last,
+            "last_image_strength": 1.0,
+        });
+        validate_ltx2_mojo_request(&request).unwrap();
+        let mut with_video = request;
+        with_video["video_path"] = json!(root.join("source.mp4"));
+        std::fs::write(
+            with_video["video_path"].as_str().unwrap(),
+            b"video fixture",
+        )
+        .unwrap();
+        assert!(validate_ltx2_mojo_request(&with_video)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sulphur_checkpoint_defaults_to_the_creator_workflow() {
+        let normalized = normalized_ltx2_checkpoint_workflow_request(&json!({
+            "checkpoint": "sulphur_dev_bf16",
+            "prompt": "creator workflow probe",
+            "negative": "",
+            "guidance_mode": "dev",
+            "sampler": "res2s",
+            "scheduler": "ltx2",
+            "steps": 20,
+            "workflow_profile": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            normalized["workflow_profile"],
+            "sulphur-2-base-distilled-v1"
+        );
+        assert_eq!(normalized["guidance_mode"], "distilled");
+        assert_eq!(normalized["sampler"], "euler_ancestral_cfg_pp");
+        assert_eq!(normalized["scheduler"], "sulphur_creator_8_3");
+        assert_eq!(normalized["steps"], 8);
+        assert_eq!(
+            normalized["negative"],
+            "pc game, console game, video game, cartoon, childish, ugly"
+        );
+        assert_eq!(
+            normalized["creator_workflow_source"],
+            "https://huggingface.co/SulphurAI/Sulphur-2-base/blob/main/workflows/ltx23_t2v%20distilled.json"
+        );
+    }
+
+    #[test]
+    fn sulphur_creator_registry_uses_the_published_enhancer_artifacts() {
+        let profile = ltx2_checkpoint_workflow("sulphur_dev_bf16.safetensors").unwrap();
+        assert_eq!(
+            profile["prompt_enhancer"]["weights"],
+            "prompt_enhancer/sulphur_prompt_enhancer_model-q8_0.gguf"
+        );
+        assert_eq!(
+            profile["prompt_enhancer"]["mmproj"],
+            "prompt_enhancer/mmproj-BF16.gguf"
+        );
+        assert_eq!(
+            profile["distillation_adapter"]["stage1_weight"],
+            0.7
+        );
+        assert_eq!(
+            profile["distillation_adapter"]["stage2_weight"],
+            0.5
+        );
+    }
+
+    #[test]
     fn ltx2_temporal_edits_pin_creator_cudnn_before_general_mojo_runtime() {
         let standard = std::env::split_paths(&ltx2_request_ld_path("standard"))
             .next()
@@ -6630,6 +7179,17 @@ mod tests {
         assert_eq!(post_upscalers.len(), 3);
         let feature_adapters = request_runner["feature_adapters"].as_array().unwrap();
         assert_eq!(feature_adapters.len(), 19);
+        let checkpoint_workflows = request_runner["checkpoint_workflows"].as_array().unwrap();
+        let sulphur = checkpoint_workflows
+            .iter()
+            .find(|entry| entry["id"] == "sulphur-2-base-distilled-v1")
+            .unwrap();
+        assert_eq!(sulphur["sampler"], "euler_ancestral_cfg_pp");
+        assert_eq!(sulphur["scheduler"], "sulphur_creator_8_3");
+        assert!(sulphur["adapter_available"].is_boolean());
+        assert_eq!(sulphur["prompt_enhancer_available"], false);
+        assert!(sulphur["prompt_enhancer_files_available"].is_boolean());
+        assert_eq!(sulphur["prompt_enhancer_runtime"], "not_implemented");
         assert_eq!(
             feature_adapters
                 .iter()

@@ -31,6 +31,8 @@ function assert(value, message) {
   const realRun = process.env.REAL_LTX2 === "1";
   const sourceVideoPath = String(process.env.LTX2_V2V_SOURCE || "").trim();
   const sourceImagePath = String(process.env.LTX2_I2V_SOURCE || "").trim();
+  const lastImagePath = String(process.env.LTX2_LAST_FRAME || "").trim();
+  const cameraMotion = String(process.env.LTX2_CAMERA_MOTION || "none").trim() || "none";
   const canvasMode = String(process.env.LTX2_CANVAS_MODE ||
     (sourceImagePath ? "i2v_ltx23" : "create")).trim();
   const temporalEditMode = canvasMode === "retake_ltx23" ||
@@ -107,6 +109,8 @@ function assert(value, message) {
 
   try {
     assert(!(sourceVideoPath && sourceImagePath), "choose only one LTX2 source");
+    assert(!lastImagePath || sourceImagePath,
+      "LTX2_LAST_FRAME requires LTX2_I2V_SOURCE");
     await page.addInitScript(() => {
       localStorage.removeItem("serenity-canvas-panel-offsets-v1");
     });
@@ -216,6 +220,8 @@ function assert(value, message) {
         "I2V - LTX 2.3 must own and hide its model selection");
       assert(await page.locator("#cv-generate-btn").textContent() === "Generate I2V",
         "I2V - LTX 2.3 must expose an explicit Generate I2V action");
+      assert(await page.locator("#cv-ltx2-last-frame-row").isVisible(),
+        "I2V - LTX 2.3 must expose the optional last-frame keyframe");
     } else if (canvasMode === "retake_ltx23" || canvasMode === "extend_ltx23") {
       await page.selectOption("#cv-edit-mode", canvasMode);
       await page.waitForFunction((mode) => (
@@ -234,11 +240,11 @@ function assert(value, message) {
     }
     await page.waitForSelector("#cv-load-ltx2-template", { state: "visible" });
     await page.waitForFunction(() => (
-      document.querySelector("#cv-ltx2-profile")?.value === "512x768_121f_25fps"
-      && document.querySelector("#cv-bbox-w")?.value === "512"
-      && document.querySelector("#cv-bbox-h")?.value === "768"
-      && document.querySelector("#cv-frames")?.value === "121"
-      && document.querySelector("#cv-fps")?.value === "25"
+      Boolean(document.querySelector("#cv-ltx2-profile")?.value)
+      && Number(document.querySelector("#cv-bbox-w")?.value) > 0
+      && Number(document.querySelector("#cv-bbox-h")?.value) > 0
+      && Number(document.querySelector("#cv-frames")?.value) > 0
+      && Number(document.querySelector("#cv-fps")?.value) > 0
     ));
     assert(await page.locator("#cv-bbox-w").isDisabled(), "LTX2 width input must be profile-locked");
     assert(await page.locator("#cv-bbox-h").isDisabled(), "LTX2 height input must be profile-locked");
@@ -327,6 +333,7 @@ function assert(value, message) {
     await page.locator("#cv-ltx2-duration").fill(durationText);
     await page.locator("#cv-ltx2-duration").dispatchEvent("change");
     await page.selectOption("#cv-ltx2-quant", quantization);
+    await page.selectOption("#cv-ltx2-camera-motion", cameraMotion);
     expectedProfile = await page.evaluate(() => ({
       width: Number(document.querySelector("#cv-bbox-w")?.value),
       height: Number(document.querySelector("#cv-bbox-h")?.value),
@@ -418,6 +425,14 @@ function assert(value, message) {
       await page.waitForTimeout(100);
       assert(await page.locator("#cv-ltx2-source-strength").inputValue() === "1",
         "I2V source preservation must default to 1.0");
+      if (lastImagePath) {
+        assert(fs.existsSync(lastImagePath), `missing last-frame source: ${lastImagePath}`);
+        await page.setInputFiles("#cv-ltx2-last-frame-file", lastImagePath);
+        await page.waitForFunction(() =>
+          /Final keyframe ready/.test(
+            document.querySelector("#cv-ltx2-last-frame-note")?.textContent || ""
+          ));
+      }
     }
     if (featureId !== "standard") {
       await page.selectOption("#cv-ltx2-feature", featureId);
@@ -467,6 +482,8 @@ function assert(value, message) {
     assert(request.frames === expectedProfile.frames && request.fps === expectedProfile.fps,
       `video=${request.frames}f@${request.fps}`);
     assert(request.quant === expectedProfile.quant, `quant=${request.quant}`);
+    assert(request.camera_motion === cameraMotion,
+      `camera_motion=${request.camera_motion}`);
     assert(request.checkpoint === (expectedProfile.quant === "bf16"
       ? "ltx-2.3-22b-distilled"
       : "ltx-2.3-22b-dev-fp8"), `checkpoint=${request.checkpoint}`);
@@ -509,6 +526,18 @@ function assert(value, message) {
         `I2V upload differs from the exact selected source: ${request.image_path}`);
       assert(request.image_strength === 1, `image_strength=${request.image_strength}`);
       assert(!request.video_path, `unexpected video_path=${request.video_path}`);
+      if (lastImagePath) {
+        assert(typeof request.last_image_path === "string" &&
+          request.last_image_path.length > 0,
+          `last_image_path=${request.last_image_path}`);
+        assert(fs.existsSync(request.last_image_path),
+          `missing staged last-frame upload=${request.last_image_path}`);
+        assert(fs.readFileSync(request.last_image_path).equals(
+          fs.readFileSync(lastImagePath)),
+          `last-frame upload differs from exact selected source: ${request.last_image_path}`);
+        assert(request.last_image_strength === 1,
+          `last_image_strength=${request.last_image_strength}`);
+      }
     }
     assert(Array.isArray(request.lora), "lora request field is not an array");
     assert(request.feature_id === featureId, `feature_id=${request.feature_id}`);

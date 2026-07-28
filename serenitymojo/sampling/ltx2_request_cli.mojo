@@ -299,6 +299,8 @@ def _configure_distillation_adapter(obj: JSONValue) raises:
     # never substitute the official LTX adapter for an arbitrary finetune.
     _setenv(String("LTX2_REQUEST_DISTILLATION_LORA"), String(""))
     _setenv(String("LTX2_REQUEST_DISTILLATION_MULT"), String("1"))
+    _setenv(String("LTX2_REQUEST_DISTILLATION_S1"), String(""))
+    _setenv(String("LTX2_REQUEST_DISTILLATION_S2"), String(""))
     if not obj.contains(String("distillation_adapter")):
         return
     var adapter = obj[String("distillation_adapter")]
@@ -324,6 +326,44 @@ def _configure_distillation_adapter(obj: JSONValue) raises:
         )
     _setenv(String("LTX2_REQUEST_DISTILLATION_LORA"), path)
     _setenv(String("LTX2_REQUEST_DISTILLATION_MULT"), String(weight))
+    if adapter.contains(String("stage1_weight")):
+        if not adapter[String("stage1_weight")].is_number():
+            raise Error(
+                "LTX2 request: distillation_adapter.stage1_weight must be a number"
+            )
+        var stage1_weight = adapter[String("stage1_weight")].as_float()
+        if stage1_weight < -10.0 or stage1_weight > 10.0:
+            raise Error(
+                "LTX2 request: distillation_adapter.stage1_weight must be in [-10, 10]"
+            )
+        _setenv(
+            String("LTX2_REQUEST_DISTILLATION_S1"), String(stage1_weight)
+        )
+    if adapter.contains(String("stage2_weight")):
+        if not adapter[String("stage2_weight")].is_number():
+            raise Error(
+                "LTX2 request: distillation_adapter.stage2_weight must be a number"
+            )
+        var stage2_weight = adapter[String("stage2_weight")].as_float()
+        if stage2_weight < -10.0 or stage2_weight > 10.0:
+            raise Error(
+                "LTX2 request: distillation_adapter.stage2_weight must be in [-10, 10]"
+            )
+        _setenv(
+            String("LTX2_REQUEST_DISTILLATION_S2"), String(stage2_weight)
+        )
+
+
+def _configure_checkpoint_workflow(obj: JSONValue) raises:
+    _setenv(String("LTX2_REQUEST_WORKFLOW_PROFILE"), String(""))
+    if not obj.contains(String("workflow_profile")):
+        return
+    if not obj[String("workflow_profile")].is_string():
+        raise Error("LTX2 request: workflow_profile must be a string")
+    _setenv(
+        String("LTX2_REQUEST_WORKFLOW_PROFILE"),
+        obj[String("workflow_profile")].as_string(),
+    )
 
 
 def _run_request(request_path: String, out_dir: String) raises:
@@ -385,6 +425,31 @@ def _run_request(request_path: String, out_dir: String) raises:
         raise Error(
             "LTX2 request: image_strength requires a non-empty image_path"
         )
+    var last_image_path = _optional_string(
+        obj, String("last_image_path")
+    )
+    var last_image_strength = _optional_number(
+        obj, String("last_image_strength"), Float64(1.0)
+    )
+    if last_image_strength < 0.0 or last_image_strength > 1.0:
+        raise Error(
+            "LTX2 request: last_image_strength must be in [0, 1]"
+        )
+    if (
+        last_image_path.byte_length() > 0
+        and not _path_exists(last_image_path)
+    ):
+        raise Error(
+            String("LTX2 request: last_image_path not found: ")
+            + last_image_path
+        )
+    if (
+        last_image_path.byte_length() == 0
+        and last_image_strength != 1.0
+    ):
+        raise Error(
+            "LTX2 request: last_image_strength requires last_image_path"
+        )
     var video_path = _optional_string(obj, String("video_path"))
     var video_strength = _optional_number(
         obj, String("video_strength"), Float64(1.0)
@@ -420,6 +485,10 @@ def _run_request(request_path: String, out_dir: String) raises:
     if image_path.byte_length() > 0 and video_path.byte_length() > 0:
         raise Error(
             "LTX2 request: image_path and video_path are mutually exclusive"
+        )
+    if last_image_path.byte_length() > 0 and video_path.byte_length() > 0:
+        raise Error(
+            "LTX2 request: last_image_path and video_path are mutually exclusive"
         )
     var video_edit_mode = _optional_string(
         obj, String("video_edit_mode")
@@ -463,6 +532,10 @@ def _run_request(request_path: String, out_dir: String) raises:
         if video_edit_start < 0.0 or video_edit_end <= video_edit_start:
             raise Error(
                 "LTX2 request: temporal edit window must have 0 <= start < end"
+            )
+        if last_image_path.byte_length() > 0:
+            raise Error(
+                "LTX2 keyframe interpolation cannot use Retake/Extend"
             )
     var source_audio_path = _optional_string(
         obj, String("source_audio_path")
@@ -560,6 +633,7 @@ def _run_request(request_path: String, out_dir: String) raises:
             String("LTX2 request: unsupported admitted feature_id '")
             + feature_id + String("'")
         )
+    _configure_checkpoint_workflow(obj)
     _configure_distillation_adapter(obj)
     _configure_loras(obj)
     var quant = _require_string(obj, String("quant")).lower()
@@ -599,6 +673,8 @@ def _run_request(request_path: String, out_dir: String) raises:
         noise_fixture,
         image_path,
         image_strength,
+        last_image_path,
+        last_image_strength,
         video_path,
         video_strength,
         video_mask_path,
@@ -631,6 +707,7 @@ def _run_decode(request_path: String, out_dir: String) raises:
         handoff, String("schema")
     ) != String("serenity.ltx2.decode_handoff.v1"):
         raise Error("LTX2 decode handoff schema mismatch")
+    _configure_checkpoint_workflow(request)
     _configure_distillation_adapter(request)
     _configure_loras(request)
     var seed = _require_int(handoff, String("seed"))

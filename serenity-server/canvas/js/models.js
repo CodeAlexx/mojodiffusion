@@ -660,14 +660,15 @@ var ModelsTab = (function () {
     }
     function useModelInGenerate(modelName) {
         trackUsedModel(modelName);
-        if (typeof GenerateTab !== 'undefined' && GenerateTab.state) {
-            GenerateTab.state.model = modelName;
-            var picker = document.getElementById('gen-model');
-            if (picker)
-                picker.value = modelName;
-        }
         if (typeof switchTab === 'function')
             switchTab('generate');
+        if (typeof GenerateTab !== 'undefined' &&
+            typeof GenerateTab.selectModel === 'function') {
+            GenerateTab.selectModel(modelName);
+        }
+        else {
+            console.error('Generate model selector is unavailable');
+        }
     }
     function escapeHtml(str) {
         if (!str)

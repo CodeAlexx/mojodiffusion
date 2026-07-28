@@ -190,8 +190,8 @@ async function run() {
         document.querySelectorAll("#gen-video-section input, #gen-video-section select, #gen-video-conditioning-section input")
       ).every((node) => node.disabled),
       videoModels: GenerateTab.state.allModels
-        .map((model) => model.name)
-        .filter((name) => /(?:ltx|wan|bernini|scail)/i.test(name)),
+        .filter((model) => ModelUtils.archForModel(model.name) === "ltxv")
+        .map((model) => model.name),
       encoderOrEditModels: GenerateTab.state.allModels
         .map((model) => model.name)
         .filter((name) => /(?:qwen[_-]?2\\.5[_-]?vl|qwen.*image.*edit)/i.test(name)),
@@ -255,10 +255,71 @@ async function run() {
       "ltx-2.3-22b-distilled-fp8-dequant-bf16",
     ];
     assert(
-      surface.videoModels.length === expectedLtxVideoModels.length &&
-        expectedLtxVideoModels.every((model) => surface.videoModels.includes(model)),
+      expectedLtxVideoModels.every((model) => surface.videoModels.includes(model)),
       `admitted video picker inventory drifted: ${surface.videoModels.join(", ")}`
     );
+    const customLtxBf16 = surface.videoModels.find((model) =>
+      /bf16/i.test(model) && !expectedLtxVideoModels.includes(model)
+    );
+    if (customLtxBf16) {
+      await page.locator('.nav-btn[data-tab="models"]').click();
+      const useButton = page.locator(
+        `.model-use-btn[data-name="${customLtxBf16}"]`
+      );
+      await useButton.waitFor({ state: "visible" });
+      await useButton.click();
+      const customLtxHandoff = await page.evaluate(() => ({
+        activeTab: localStorage.getItem("sf-active-tab"),
+        model: GenerateTab.state.model,
+        arch: GenerateTab.state.arch,
+        quant: GenerateTab.state.videoQuant,
+        checkpoint: GenerateTab.state.videoCheckpoint,
+        guidanceMode: GenerateTab.state.videoGuidanceMode,
+        sampler: GenerateTab.state.sampler,
+        scheduler: GenerateTab.state.scheduler,
+        button: document.querySelector("#gen-btn").textContent.trim(),
+        params: GenerateTab.getParams(),
+      }));
+      assert(
+        customLtxHandoff.activeTab === "generate" &&
+          customLtxHandoff.model === customLtxBf16 &&
+          customLtxHandoff.arch === "ltxv" &&
+          customLtxHandoff.quant === "bf16" &&
+          customLtxHandoff.checkpoint === customLtxBf16 &&
+          customLtxHandoff.guidanceMode === "dev" &&
+          customLtxHandoff.sampler === "res2s" &&
+          customLtxHandoff.scheduler === "ltx2" &&
+          customLtxHandoff.button.includes("Generate Video") &&
+          customLtxHandoff.params.videoCheckpoint === customLtxBf16,
+        `Models-to-Generate custom LTX BF16 handoff is incomplete: ${JSON.stringify(customLtxHandoff)}`
+      );
+      await page.locator("#gen-prompt").fill("Custom LTX BF16 handoff request");
+      await page.locator("#gen-btn").click();
+      await page.waitForFunction(() => {
+        return document.querySelector("#gen-activity-status").dataset.state !== "idle";
+      });
+      assert(videoBodies.length === 1, `custom LTX request was not submitted: ${videoBodies.length}`);
+      const customLtxRequest = videoBodies[0];
+      assert(
+        customLtxRequest.model === "ltx2" &&
+          customLtxRequest.runner === "ltx2_mojo_request" &&
+          customLtxRequest.checkpoint === customLtxBf16 &&
+          customLtxRequest.quant === "bf16" &&
+          customLtxRequest.guidance_mode === "dev" &&
+          customLtxRequest.sampler === "res2s" &&
+          customLtxRequest.scheduler === "ltx2",
+        `custom LTX BF16 request identity drifted: ${JSON.stringify(customLtxRequest)}`
+      );
+      videoBodies.length = 0;
+      videoStatusPolls = 0;
+      await page.evaluate(() => localStorage.removeItem("sf-gallery"));
+      await page.reload({ waitUntil: "networkidle" });
+      await page.locator('.nav-btn[data-tab="generate"]').click();
+      await page.waitForFunction(() =>
+        window.GenerateTab && GenerateTab.state.allModels && GenerateTab.state.allModels.length > 0
+      );
+      videoStatusPolls = 0;
+    }
     assert(
       surface.encoderOrEditModels.length === 0,
       `encoder/edit artifacts leaked into text-to-image picker: ${surface.encoderOrEditModels.join(", ")}`

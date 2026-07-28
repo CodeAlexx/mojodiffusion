@@ -5855,6 +5855,7 @@ var GenerateTab = (function () {
     return {
         state: state,
         init: init,
+        selectModel: selectModel,
         generate: generate,
         getParams: getParams,
         applyParams: applyParams,

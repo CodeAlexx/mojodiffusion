@@ -1,6 +1,6 @@
 # Serenity Generate UI
 
-Status: implemented and browser/product-path verified through 2026-07-25.
+Status: implemented and browser/product-path verified through 2026-07-28.
 
 ## Scope
 
@@ -95,6 +95,14 @@ are blank, the server runs the pure-Mojo streamed Gemma-3 conditioner, caches
 its prompt-matched video/audio contexts, then launches the selected exact LTX2
 runner. No Python runtime is used for this path.
 
+The Models page hands a selected checkpoint to Generate through Generate's
+authoritative model selector rather than changing only the displayed name.
+This preserves the registry architecture, exact checkpoint identity,
+quantization, guidance mode, sampler, scheduler, and image-versus-video route.
+In particular, a registry-classified custom LTX 2.3 BF16 full finetune is
+submitted as its own `ltx2_mojo_request` checkpoint with BF16 and Dev/Res2S
+defaults; it is never replaced by the bundled distilled checkpoint.
+
 LTX2 can optionally post-upscale the decoded MP4 with a published pure-Mojo
 upscaler. The request carries an explicit `post_upscale` object; 2x and 4x
 output are available, progress is reported per frame, and weights remain
@@ -171,6 +179,8 @@ The focused Playwright gate checks:
 - absence of Canvas-owned init-image/inpaint surfaces;
 - filtering of unavailable video models and encoder/edit artifacts while
   exposing the admitted LTX2 request model;
+- Models-to-Generate selection of an installed custom LTX2 BF16 full finetune,
+  including its exact checkpoint identity in the emitted `/v1/video` request;
 - Z-Image variation controls;
 - the full advanced parameter inventory and nested advanced rows;
 - capability-admitted Z-Image Sigma Shift reaching both preflight and generate;

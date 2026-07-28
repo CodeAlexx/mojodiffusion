@@ -22,7 +22,7 @@ from std.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_linear
+from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_linear, squareq_nvfp4_reconstruct_weight
 
 comptime FIXTURE = "/home/alex/mojodiffusion/serenitymojo/ops/parity/squareq_nvfp4_fixture.safetensors"
 
@@ -67,4 +67,13 @@ def main() raises:
         raise Error("nvfp4 parity FAILED vs emulation")
     if c_ideal < 0.995:
         raise Error("nvfp4 quality floor FAILED vs ideal (regression)")
+    # bwd-side reconstruct vs oracle
+    var w_ref = Tensor.from_view(st.tensor_view(String("w_hat_nv")), ctx)
+    var w_hat = squareq_nvfp4_reconstruct_weight(
+        nvq, nvs, nvg, ld, lu, nvq.shape()[1] * 2, nvq.shape()[0], ctx
+    )
+    var c_w = _cos(w_hat.to_host(ctx), w_ref.to_host(ctx))
+    print("[nvfp4-parity] reconstruct_weight vs oracle cos=", c_w)
+    if c_w < 0.9999:
+        raise Error("nvfp4 reconstruct parity FAILED")
     print("[nvfp4-parity] ALL PASS")

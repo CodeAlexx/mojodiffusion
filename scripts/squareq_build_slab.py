@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--group", type=int, default=64, help="scale group along in (64 or 32)")
+    ap.add_argument("--format", default="int4", choices=("int4", "nvfp4"),
+                    help="residual codec: int4 (dequant-first, any GPU) or nvfp4 (native FP4 fwd, sm_120)")
     ap.add_argument("--blocks-per-shard", type=int, default=4)
     a = ap.parse_args()
     preset = MODELS[a.model]
@@ -101,7 +103,7 @@ def main():
             sl = f.get_slice(k)
             meta[k] = (sl.get_shape(), sl.get_dtype())
 
-    plan = new_plan(a.model, a.src, core.FORMAT_TAG, core.HBLOCK, a.group)
+    plan = new_plan(a.model, a.src, "squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG, core.HBLOCK, a.group)
     plan["rank_default"] = a.rank
     # Seed from the previous run's partial plan BEFORE any shard work — the
     # per-shard partial write below overwrites the file, so completed shards'
@@ -138,7 +140,7 @@ def main():
         fpath = os.path.join(a.out_dir, fname)
         done = fname in state["completed_shards"] and os.path.exists(fpath)
         w = None if done else StreamingSafetensorsWriter(
-            fpath, metadata={"format": core.FORMAT_TAG, "rank": a.rank, "group": a.group}
+            fpath, metadata={"format": ("squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG), "rank": a.rank, "group": a.group}
         )
         # declare (and always account plan/weight_map, even when skipping)
         decls: list = []  # (out_name, src_key, kind)
@@ -149,12 +151,21 @@ def main():
                     base = k[: -len(".weight")]
                     o, i_f = shape
                     r = a.rank
-                    parts = [
-                        (base + ".qweight", torch.uint8, [o, i_f // 2]),
-                        (base + ".wscales", torch.bfloat16, [i_f // a.group, o]),
-                        (base + ".lora_down", torch.bfloat16, [i_f, r]),
-                        (base + ".lora_up", torch.bfloat16, [o, r]),
-                    ]
+                    if a.format == "nvfp4":
+                        parts = [
+                            (base + ".nvq", torch.uint8, [o, i_f // 2]),
+                            (base + ".nvs", torch.uint8, [core.scale_tiles_bytes(o, i_f // 16)]),
+                            (base + ".nvg", torch.float32, [1]),
+                            (base + ".lora_down", torch.bfloat16, [i_f, r]),
+                            (base + ".lora_up", torch.bfloat16, [o, r]),
+                        ]
+                    else:
+                        parts = [
+                            (base + ".qweight", torch.uint8, [o, i_f // 2]),
+                            (base + ".wscales", torch.bfloat16, [i_f // a.group, o]),
+                            (base + ".lora_down", torch.bfloat16, [i_f, r]),
+                            (base + ".lora_up", torch.bfloat16, [o, r]),
+                        ]
                     for nm, dtp, shp in parts:
                         if w:
                             w.declare(nm, dtp, shp)
@@ -180,12 +191,34 @@ def main():
                             plan["passthrough"].append(k)
                         continue
                     wt = f.get_tensor(k).float()
-                    tensors, stats = core.quantize_layer(
-                        wt, rank=a.rank, group=a.group, seed=layer_seed(k)
-                    )
-                    for suffix in ("qweight", "wscales", "lora_down", "lora_up"):
+                    if a.format == "nvfp4":
+                        ld_, lu_ = core.svd_lowrank_init(wt, a.rank, seed=layer_seed(k))
+                        resid = (wt.double() - lu_.double() @ ld_.double().t())
+                        rrot = core.rht_grouped(resid).float()
+                        nvq, nvs, nvg = core.nvfp4_encode_weight_tiled(rrot)
+                        back = core.rht_grouped(
+                            core.nvfp4_decode_weight_tiled(nvq, nvs, nvg, *wt.shape).double()
+                        ).float() + lu_ @ ld_.t()
+                        aa, bb = back.flatten().double(), wt.double().flatten()
+                        cos_w = float(aa @ bb / (aa.norm() * bb.norm() + 1e-30))
+                        bytes_q = nvq.numel() + nvs.numel() + 4 + (ld_.numel() + lu_.numel()) * 2
+                        tensors = {
+                            "nvq": nvq, "nvs": nvs, "nvg": nvg,
+                            "lora_down": ld_.to(torch.bfloat16).contiguous(),
+                            "lora_up": lu_.to(torch.bfloat16).contiguous(),
+                        }
+                        stats = {"out": wt.shape[0], "in": wt.shape[1], "rank": a.rank,
+                                 "cos_w": cos_w, "rel_l2": 0.0,
+                                 "bytes_q": bytes_q, "bytes_bf16": wt.numel() * 2}
+                        suffixes = ("nvq", "nvs", "nvg", "lora_down", "lora_up")
+                    else:
+                        tensors, stats = core.quantize_layer(
+                            wt, rank=a.rank, group=a.group, seed=layer_seed(k)
+                        )
+                        suffixes = ("qweight", "wscales", "lora_down", "lora_up")
+                    for suffix in suffixes:
                         w.write_tensor(base + "." + suffix, tensors[suffix])
-                    plan["layers"][k] = {**stats, "format": core.FORMAT_TAG}
+                    plan["layers"][k] = {**stats, "format": ("squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG)}
                     print(
                         f"[squareq-build] shard {si + 1}/{nsh}  {k}"
                         f"  [{stats['out']}x{stats['in']}]  cos_w={stats['cos_w']:.5f}"

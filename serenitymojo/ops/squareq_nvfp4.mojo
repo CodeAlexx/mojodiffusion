@@ -298,3 +298,132 @@ def squareq_nvfp4_linear(
         oshape.append(xshape[i])
     oshape.append(out_f)
     return Tensor(out_buf^, oshape^, STDtype.BF16)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKWARD-SIDE dequant: decode the nvfp4 payload to the bf16 derotated
+# residual (one CTA per (row, 256-segment), tiled scale fetch), so the SAME
+# payload serves the fp4 forward AND the bf16 bwd-recompute weight.
+# ─────────────────────────────────────────────────────────────────────────────
+def _nvfp4_dequant_ih256_kernel(
+    nvq: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],    # [out*in/2]
+    nvs: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],    # tiled scales
+    o_out: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [out*in]
+    out_f: Int,
+    in_f: Int,
+    kb_pad4: Int,
+    nvg: Float32,
+):
+    var segs_per_row = in_f // _SEG
+    var seg = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var row = seg // segs_per_row
+    var s_in_row = seg - row * segs_per_row
+    var k_even = s_in_row * _SEG + 2 * tid
+    var byte_i = Int(
+        rebind[Scalar[DType.uint8]](nvq[row * (in_f // 2) + (k_even >> 1)])
+    )
+    var c = k_even // 16                       # logical scale col
+    var tile = (row // 128) * (kb_pad4 // 4) + (c // 4)
+    var soff = tile * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + (c % 4)
+    var sb = Int(rebind[Scalar[DType.uint8]](nvs[soff]))
+    var sdec: Float32 = 0.0
+    if sb != 0:
+        var e = ((sb >> 3) & 0xF) - 7
+        var dv: Float32 = 1.0 + Float32(sb & 0x7) / 8.0
+        var p = e
+        while p > 0:
+            dv = dv * 2.0
+            p -= 1
+        while p < 0:
+            dv = dv * 0.5
+            p += 1
+        sdec = dv
+    var s_all = sdec * nvg
+
+    var sh = stack_allocation[
+        _SEG, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    sh[2 * tid] = _e2m1_val(byte_i & 0xF) * s_all
+    sh[2 * tid + 1] = _e2m1_val((byte_i >> 4) & 0xF) * s_all
+    barrier()
+
+    var length = 1
+    while length < _SEG:
+        var blk = tid // length
+        var within = tid - blk * length
+        var j = blk * (2 * length) + within
+        var a = sh[j]
+        var b = sh[j + length]
+        sh[j] = a + b
+        sh[j + length] = a - b
+        barrier()
+        length *= 2
+
+    var out_base = row * in_f + s_in_row * _SEG
+    o_out[out_base + tid] = rebind[o_out.element_type](
+        (sh[tid] * _INV_SQRT_SEG).cast[DType.bfloat16]()
+    )
+    o_out[out_base + tid + _SEG_TPB] = rebind[o_out.element_type](
+        (sh[tid + _SEG_TPB] * _INV_SQRT_SEG).cast[DType.bfloat16]()
+    )
+
+
+def _e2m1_val(code: Int) -> Float32:
+    var m = code & 0x7
+    var v: Float32
+    if m == 0:
+        v = 0.0
+    elif m == 1:
+        v = 0.5
+    elif m == 2:
+        v = 1.0
+    elif m == 3:
+        v = 1.5
+    elif m == 4:
+        v = 2.0
+    elif m == 5:
+        v = 3.0
+    elif m == 6:
+        v = 4.0
+    else:
+        v = 6.0
+    if (code & 0x8) != 0:
+        return -v
+    return v
+
+
+def squareq_nvfp4_reconstruct_weight(
+    nvq: Tensor,
+    nvs: Tensor,
+    nvg: Float32,
+    lora_down: Tensor,
+    lora_up: Tensor,
+    in_f: Int,
+    out_f: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """W_hat BF16 [out,in] = derotate(decode(nvq,nvs)*nvg) + lu@ld^T — the
+    bwd-recompute weight for nvfp4-resident blocks (2x-weight transients)."""
+    if in_f % _SEG != 0:
+        raise Error("squareq_nvfp4_reconstruct_weight: in % 256 != 0")
+    var kb = in_f // 16
+    var kb_pad = ((kb + 3) // 4) * 4
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_f * in_f * 2)
+    var rl_q = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * (in_f // 2)))
+    var rl_s = RuntimeLayout[_DYN1].row_major(IndexList[1](nvs.numel()))
+    var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * in_f))
+    var Q = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](nvq.buf.unsafe_ptr(), rl_q)
+    var S = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](nvs.buf.unsafe_ptr(), rl_s)
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), rl_o
+    )
+    comptime kern = _nvfp4_dequant_ih256_kernel
+    ctx.enqueue_function[kern, kern](
+        Q, S, O, out_f, in_f, kb_pad, nvg,
+        grid_dim=out_f * (in_f // _SEG), block_dim=_SEG_TPB,
+    )
+    var w_res = Tensor(out_buf^, [out_f, in_f], STDtype.BF16)
+    var lr = linear(lora_up, lora_down, None, ctx)
+    add_in_place(w_res, lr, ctx)
+    return w_res^

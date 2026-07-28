@@ -56,8 +56,13 @@ def main():
     w_deq = core.nvfp4_decode_weight_tiled(nvq, nvs, nvg, OUT_F, IN_F)
     y_fp4 = x_deq @ w_deq.t() + (x.float() @ ld) @ lu.t()
 
+    w_hat_nv = (core.rht_grouped(
+        core.nvfp4_decode_weight_tiled(nvq, nvs, nvg, OUT_F, IN_F).double()
+    ).float() + lu @ ld.t()).to(torch.bfloat16)
+
     save_file(
         {
+            "w_hat_nv": w_hat_nv.contiguous(),
             "nvq": nvq,
             "nvs": nvs,
             "nvg": nvg,                                    # f32 [1]

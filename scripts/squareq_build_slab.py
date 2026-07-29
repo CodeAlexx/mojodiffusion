@@ -59,6 +59,11 @@ MODELS = {
         "group": re.compile(r"^(blocks\.\d+)\."),
         "exclude": re.compile(r"(\.mod\.|modulation|adaln|norm)", re.IGNORECASE),
     },
+    "ltx2": {
+        "include": re.compile(r"^model\.diffusion_model\.transformer_blocks\.\d+\..*\.weight$"),
+        "group": re.compile(r"^(model\.diffusion_model\.transformer_blocks\.\d+)\."),
+        "exclude": re.compile(r"(scale_shift|adaln|norm|gate_logits|modulation)", re.IGNORECASE),
+    },
 }
 
 

@@ -29,10 +29,16 @@ OUT = "/home/alex/datasets/ltx2_cache_512_v2"
 RES = 512
 
 
-def load_center_frame(mp4_path):
-    frames = iio.imread(mp4_path, plugin="pyav")            # [T,H,W,3] uint8
-    t = frames.shape[0] // 2
-    img = torch.from_numpy(frames[t].copy()).float() / 127.5 - 1.0
+def load_center_frame(path):
+    if path.lower().endswith((".jpg", ".jpeg", ".png")):
+        frame = iio.imread(path)                            # [H,W,3] uint8
+        if frame.ndim == 2:
+            frame = frame[:, :, None].repeat(3, axis=2)
+        img = torch.from_numpy(frame[..., :3].copy()).float() / 127.5 - 1.0
+    else:
+        frames = iio.imread(path, plugin="pyav")            # [T,H,W,3] uint8
+        t = frames.shape[0] // 2
+        img = torch.from_numpy(frames[t].copy()).float() / 127.5 - 1.0
     img = img.permute(2, 0, 1)
     _, h, w = img.shape
     s = min(h, w)
@@ -67,7 +73,12 @@ def main():
     from diffusers import AutoencoderKLLTX2Video
 
     os.makedirs(args.out, exist_ok=True)
-    vids = sorted(glob.glob(os.path.join(args.videos, "*.mp4")))
+    vids = sorted(
+        glob.glob(os.path.join(args.videos, "*.mp4"))
+        + glob.glob(os.path.join(args.videos, "*.jpg"))
+        + glob.glob(os.path.join(args.videos, "*.jpeg"))
+        + glob.glob(os.path.join(args.videos, "*.png"))
+    )
     if args.limit:
         vids = vids[: args.limit]
     if not vids:

@@ -1,0 +1,8 @@
+{
+  "model_type": "ltx2",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8-dequant-bf16.safetensors",
+  "cache_dir": "/home/alex/datasets/ltx2_eri2_cache_512_v2",
+  "quantized_resident": "squareq_w4",
+  "squareq_sidecar": "/mnt/disk1/squareq/ltx2_squareq_w4_r32g32",
+  "max_steps": 10
+}

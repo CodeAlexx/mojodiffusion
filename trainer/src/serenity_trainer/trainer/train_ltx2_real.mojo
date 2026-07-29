@@ -48,7 +48,11 @@
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo build -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/training/train_ltx2_real.mojo -o /tmp/train_ltx2_real && \
-#     /tmp/train_ltx2_real --legacy-video-only [steps]
+#     /tmp/train_ltx2_real --legacy-video-only [config.json] [steps]
+#   Optional [config.json] (io/train_config_reader whitelist) selects the
+#   quantized-resident base ladder: quantized_resident="squareq_w4" +
+#   squareq_sidecar=<scripts/squareq_build_slab.py output dir> pins the packed
+#   base device-resident (klein precedent); empty keeps the legacy bf16 stream.
 #
 # Readiness status:
 #   pixi run mojo run -I . serenitymojo/training/ltx2_av_training_readiness.mojo --expect-not-ready
@@ -83,6 +87,7 @@ from serenitymojo.training.lora_save import lora_train_state_has_moments
 from serenitymojo.training.trainer_core import (
     trainer_resolve_resume_path, trainer_warn_warm_resume,
 )
+from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.models.dit.ltx2_rope import build_ltx2_rope
 from serenitymojo.offload.ltx2_plan import build_ltx2_block_plan
 from serenitymojo.offload.plan import OffloadConfig
@@ -127,6 +132,11 @@ comptime TEMB_DIM = 256
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/ltx2_video_bf16.safetensors"
 comptime CACHE_DIR = "/home/alex/datasets/ltx2_cache_512"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/ltx2_lora"
+
+# squareq_w4 packed-resident budget (klein MJ-1065 precedent: cap is a fail-loud
+# ceiling, NOT a partial-pin knob — the trainer requires pinned == block_count).
+# 22B blocks packed ~0.28x bf16; 16 GiB bounds the pin on the 16GB refit.
+comptime LTX2_SQUAREQ_RESIDENT_BUDGET_BYTES = 16 * 1024 * 1024 * 1024
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -260,11 +270,39 @@ def main() raises:
         print("Run with --legacy-video-only only when intentionally testing the old stack.")
         raise Error("train_ltx2_real: production AV trainer not implemented here")
 
+    # Optional argv[2]: a .json train config (shared io/train_config_reader,
+    # same key whitelist as the klein/chroma trainers). Consulted ONLY for the
+    # quantized-resident base ladder (quantized_resident + squareq_sidecar), the
+    # checkpoint path override, and the default step count — arch/recipe stay
+    # comptime (legacy smoke contract). Remaining argv shift right by one.
+    var arg_base = 2
+    var quant_tag = String("")
+    var squareq_sidecar = String("")
+    var ckpt_path = String(CKPT)
+    var cache_dir = String(CACHE_DIR)
     var run_steps = 5
-    if len(a) >= 3:
+    if len(a) >= 3 and String(a[2]).endswith(String(".json")):
+        var train_cfg = read_model_config(String(a[2]))
+        quant_tag = train_cfg.quantized_resident.copy()
+        squareq_sidecar = train_cfg.squareq_sidecar.copy()
+        if train_cfg.checkpoint != String(""):
+            ckpt_path = train_cfg.checkpoint.copy()
+        print("  [config] cache_dir field='", train_cfg.cache_dir,
+              "' dataset_cache_dir='", train_cfg.dataset_cache_dir, "'")
+        if train_cfg.cache_dir != String(""):
+            cache_dir = train_cfg.cache_dir.copy()
+        elif train_cfg.dataset_cache_dir != String(""):
+            cache_dir = train_cfg.dataset_cache_dir.copy()
+        if train_cfg.max_steps > 0:
+            run_steps = train_cfg.max_steps
+        print("  [config]", String(a[2]))
+        print("  [config] quantized_resident=", quant_tag,
+              " squareq_sidecar=", squareq_sidecar)
+        arg_base = 3
+    if len(a) >= arg_base + 1:
         var v = 0
-        var bs = String(a[2]).as_bytes()
-        for i in range(String(a[2]).byte_length()):
+        var bs = String(a[arg_base]).as_bytes()
+        for i in range(String(a[arg_base]).byte_length()):
             if bs[i] < 0x30 or bs[i] > 0x39:
                 raise Error("train_ltx2_real: steps must be a positive integer")
             v = v * 10 + Int(bs[i] - 0x30)
@@ -272,12 +310,12 @@ def main() raises:
             raise Error("train_ltx2_real: steps must be a positive integer")
         run_steps = v
 
-    # Optional argv[3]: resume checkpoint. Pass either the `<ckpt>.safetensors.state`
+    # Optional next arg: resume checkpoint. Pass either the `<ckpt>.safetensors.state`
     # sidecar (FULL moment resume) or the plain PEFT `.safetensors` (WARM start —
     # the .state sibling is auto-probed first so the PEFT path still full-resumes).
     var resume_path = String("")
-    if len(a) >= 4:
-        resume_path = String(a[3])
+    if len(a) >= arg_base + 2:
+        resume_path = String(a[arg_base + 1])
 
     print("=== LTX-2 LEGACY video-only LoRA training loop (block-swap offload) ===")
     print("  WARNING: legacy stack; not production full-AV LTX2 training")
@@ -287,20 +325,73 @@ def main() raises:
     print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT)
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
     print("  hot loop note: legacy smoke uses host noise/loss; not production AV device-loop training")
-    print("  ckpt:", CKPT)
-    print("  cache:", CACHE_DIR)
+    print("  ckpt:", ckpt_path)
+    print("  cache:", cache_dir)
 
     # ── stack-level base (frozen; patchify_proj/proj_out/adaln_single) ────────
     print("[load] LTX2StackBase (patchify_proj, proj_out, adaln_single)")
-    var base_st = SafeTensors.open(String(CKPT))
+    var base_st = SafeTensors.open(ckpt_path)
     var base = load_ltx2_stack_base(base_st, NUM_LAYERS, D, IN_CH, OUT_CH, ctx)
     print("[load] base resident")
 
     # ── block-swap offload loader ─────────────────────────────────────────────
     var plan = build_ltx2_block_plan(NUM_LAYERS)
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    # squareq_w4 pins EVERY block device-resident packed, so the whole-DiT
+    # pinned host block store (never read again) must not be allocated — the
+    # klein precedent's two-concurrent-stores host OOM (systemd-oomd 2026-07-04).
+    var loader = TurboPlannedLoader.open(
+        ckpt_path, plan^, cfg, ctx,
+        fill_block_store=(quant_tag != String("squareq_w4")),
+    )
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── Residency ladder (mirrors train_klein_real; MJ-1065 all-or-nothing) ───
+    # squareq_w4: packed int4 + H-block + low-rank sidecar pinned VERBATIM
+    #   (~0.28x bf16); await_block reconstructs BF16 under the original tensor
+    #   names, so the ltx2_stack_lora fwd/bwd needs NO changes. Slab is PREBUILT
+    #   by scripts/squareq_build_slab.py — never quantized here.
+    # empty/OFF/streamed_base_opt_in: the ORIGINAL legacy behavior — per-step
+    #   bf16 disk stream through the turbo slots (kept as the smoke default so
+    #   the documented `--legacy-video-only [steps]` invocation is unchanged).
+    # anything else (fp8_e4m3, ...): FAIL LOUD — not wired in this trainer.
+    var n_blocks = loader.block_count()
+    if quant_tag == String("squareq_w4"):
+        if squareq_sidecar == String(""):
+            raise Error(
+                "ltx2 squareq_w4: config key 'squareq_sidecar' is empty — "
+                + "point it at the scripts/squareq_build_slab.py output dir"
+            )
+        var pinned_blocks = loader.pin_residents_squareq(
+            squareq_sidecar, LTX2_SQUAREQ_RESIDENT_BUDGET_BYTES, ctx
+        )
+        if pinned_blocks != n_blocks:
+            raise Error(
+                String("ltx2 squareq_w4-resident: pinned ") + String(pinned_blocks)
+                + " of " + String(n_blocks) + " blocks within budget "
+                + String(LTX2_SQUAREQ_RESIDENT_BUDGET_BYTES) + " bytes — a block "
+                + "would still per-step disk-stream (MJ-1065). Raise the budget."
+            )
+        print(
+            "  squareq_w4-resident base:", pinned_blocks, "of", n_blocks,
+            "blocks pinned packed from", squareq_sidecar,
+            "(packed int4 + low-rank; reconstruct per block; NO per-step disk read).",
+        )
+    elif (
+        quant_tag == String("") or quant_tag == String("OFF")
+        or quant_tag == String("streamed_base_opt_in")
+    ):
+        print(
+            "  streamed base (legacy smoke default): per-step bf16 disk stream",
+            "through the turbo slots.",
+        )
+    else:
+        raise Error(
+            String("ltx2: quantized_resident='") + quant_tag
+            + "' is not wired in the legacy video-only trainer. Use "
+            + "\"squareq_w4\" (packed resident base) or leave it empty/"
+            + "\"streamed_base_opt_in\" for the legacy streamed arm."
+        )
 
     # ── split-rope tables [S*H, Dh//2] (built once, BF16 storage) ─────────────
     var rope = build_ltx2_rope[GRID_F, GRID_H, GRID_W](
@@ -316,7 +407,7 @@ def main() raises:
     var n_adapters = total_ltx2_adapters(lora)
     print("[lora] adapters:", n_adapters, " (4 x", NUM_LAYERS, "blocks: q,k,v,out)")
 
-    var files = _list_cache(String(CACHE_DIR))
+    var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
 
     var b_absum_init = Float32(0.0)

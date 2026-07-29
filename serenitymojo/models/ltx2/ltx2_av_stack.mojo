@@ -30,6 +30,7 @@ from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 
 from serenitymojo.models.dit.ltx2_dit import LTX2Config, LTX2AVBlockWeights
 from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream
+from serenitymojo.offload.ltx2_int4_block_stream import LTX2Int4BlockStream
 from serenitymojo.models.ltx2.ltx2_av_backward import (
     ltx2_block_forward_av_train,
     LTX2AVBlockActs,
@@ -61,17 +62,45 @@ comptime TS_MULT = Float32(1000.0)   # sigma -> timestep scale (MVP _build_mod)
 # (parity/ltx2_av_ckpt_equiv_probe.mojo), so residency costs zero accuracy.
 struct LTX2AVBlockSource(Movable):
     var stream: LTX2BlockStream
+    # When set, blocks come from a packed W4A16 slab instead of the fp8
+    # checkpoint (LTX2Int4BlockStream reconstructs dense BF16 on use; it
+    # auto-detects class-A svdquant vs squareq_w4 per linear by `.smooth`
+    # key presence). Mirrors LTX2VideoBlockSource.int4.
+    var quant: Optional[LTX2Int4BlockStream]
     var cfg: LTX2Config
     var run_f32: Bool
 
-    def __init__(out self, var stream: LTX2BlockStream, cfg: LTX2Config, run_f32: Bool):
+    def __init__(
+        out self, var stream: LTX2BlockStream,
+        var quant: Optional[LTX2Int4BlockStream], cfg: LTX2Config, run_f32: Bool
+    ):
         self.stream = stream^
+        self.quant = quant^
         self.cfg = cfg
         self.run_f32 = run_f32
 
     @staticmethod
     def open(ckpt: String, cfg: LTX2Config, run_f32: Bool = True) raises -> LTX2AVBlockSource:
-        return LTX2AVBlockSource(LTX2BlockStream.open(ckpt), cfg, run_f32)
+        return LTX2AVBlockSource(
+            LTX2BlockStream.open(ckpt),
+            Optional[LTX2Int4BlockStream](None), cfg, run_f32)
+
+    @staticmethod
+    def open_squareq(
+        ckpt: String, slab: String, cfg: LTX2Config, run_f32: Bool = True
+    ) raises -> LTX2AVBlockSource:
+        """SquareQ W4A16 residency arm: blocks reconstructed to dense BF16 from
+        the packed slab (per quantized linear: qweight U8 [out,in/2] + wscales
+        BF16 [in/group,out] + lora_down/lora_up BF16, NO smooth —
+        ops/squareq.squareq_reconstruct_weight, dequant4 + inverse-H256 +
+        low-rank). Downstream is UNCHANGED: same FP8Block key contract ->
+        from_fp8_block -> same forward. The checkpoint is still opened (cheap
+        mmap, no VRAM) for block_count parity; head/tail keep loading from it
+        elsewhere. Mirrors LTX2VideoBlockSource.open_int4."""
+        return LTX2AVBlockSource(
+            LTX2BlockStream.open(ckpt),
+            Optional[LTX2Int4BlockStream](LTX2Int4BlockStream.open(slab)),
+            cfg, run_f32)
 
     def block_count(self) -> Int:
         return self.stream.block_count()
@@ -90,6 +119,13 @@ struct LTX2AVBlockSource(Movable):
         would reject the RIGHT file. The range is checked first as the fast path
         — a real 48-block run hits fp8 by block 4 — and only an empty range pays
         for the full sweep needed to tell "boundary blocks" from "wrong file"."""
+        if self.quant:
+            raise Error(
+                "LTX2AVBlockSource.enable_resident: fp8 residency does not"
+                " apply to the packed-slab (squareq/int4) arm — blocks"
+                " reconstruct from the slab per visit. Set --resident_blocks 0"
+                " / unset LTX2_RESIDENT_BLOCKS."
+            )
         var n_fp8 = 0
         for b in range(first, last + 1):
             n_fp8 += self.stream.fp8_tensor_count(b)
@@ -114,8 +150,13 @@ struct LTX2AVBlockSource(Movable):
         return self.stream.resident_bytes()
 
     def get_block(self, i: Int, ctx: DeviceContext) raises -> LTX2AVBlockWeights:
-        var blk = self.stream.load_block_bf16(i, ctx)
-        var w = LTX2AVBlockWeights.from_fp8_block(blk^, self.cfg, ctx)
+        var w: LTX2AVBlockWeights
+        if self.quant:
+            var blkq = self.quant.value().load_block_bf16(i, ctx)
+            w = LTX2AVBlockWeights.from_fp8_block(blkq^, self.cfg, ctx)
+        else:
+            var blk = self.stream.load_block_bf16(i, ctx)
+            w = LTX2AVBlockWeights.from_fp8_block(blk^, self.cfg, ctx)
         if self.run_f32:
             return w.to_f32(ctx)
         return w^

@@ -1215,7 +1215,27 @@ def _run_geometry[
     print("  [load] head/tail/blocks from", ckpt)
     var head = LTX2VideoStackHead.load(ckpt, ctx)
     var tail = LTX2VideoTail.load(ckpt, stack_f32, ctx)
-    var src = LTX2VideoBlockSource.open(ckpt, model_cfg, stack_f32)
+    # SquareQ W4A16 residency arm (env LTX2_SQUAREQ_SLAB=<slab dir>, mirrors the
+    # inference pipeline's LTX2_INT4_SLAB precedent at pipeline/ltx2_t2v_av_hq.
+    # mojo:5106): blocks reconstruct dense BF16 from the packed slab per visit
+    # (ops/squareq, auto-detected inside LTX2Int4BlockStream by the absent
+    # `.smooth` key); head/tail/w0 keep loading from the checkpoint, which MUST
+    # be the slab's build source (see <slab>/build-state.json) so passthrough
+    # tensors match. Fail LOUD if the slab does not open.
+    var squareq_slab = env_or("LTX2_SQUAREQ_SLAB", String(""))
+    var src: LTX2VideoBlockSource
+    if len(squareq_slab) > 0:
+        try:
+            src = LTX2VideoBlockSource.open_int4(
+                ckpt, squareq_slab, model_cfg, stack_f32)
+        except err:
+            raise Error(
+                String("train_ltx2_av: LTX2_SQUAREQ_SLAB='") + squareq_slab
+                + "' failed to open: " + String(err))
+        print("  [squareq] W4A16 base ON — blocks reconstruct BF16 from",
+              squareq_slab)
+    else:
+        src = LTX2VideoBlockSource.open(ckpt, model_cfg, stack_f32)
     if src.block_count() != NUM_LAYERS:
         raise Error(String("checkpoint block_count != 48: ") + String(src.block_count()))
 
@@ -1238,11 +1258,27 @@ def _run_geometry[
     var n_resident = 42
     if v2_capture:
         n_resident = env_int("LTX2_RESIDENT_BLOCKS", 39)
+    var resident_explicit = False
     for i in range(len(args)):
         if String(args[i]) == "--resident_blocks" and i + 1 < len(args):
             n_resident = Int(_parse_int_arg(String(args[i + 1])))
+            resident_explicit = True
     if n_resident > NUM_LAYERS:
         n_resident = NUM_LAYERS
+    # SquareQ arm: fp8 residency stages the fp8 CHECKPOINT's raw bytes, but the
+    # blocks come from the packed slab — there is nothing to park. The implicit
+    # default (42) just switches off; an EXPLICIT --resident_blocks > 0 is a
+    # contradiction and fails loud.
+    if len(squareq_slab) > 0 and n_resident > 0:
+        if resident_explicit:
+            raise Error(
+                "train_ltx2_av: --resident_blocks > 0 is the fp8 residency"
+                " knob; it does not combine with LTX2_SQUAREQ_SLAB (blocks"
+                " reconstruct from the packed slab). Pass --resident_blocks 0."
+            )
+        n_resident = 0
+        print("  [squareq] fp8 residency default OFF — blocks reconstruct from"
+              " the packed slab per visit")
     if n_resident > 0:
         # PRE-ALLOC over-commit guard: enable_fp8_resident_range below allocates
         # n_resident × ~405 MiB of fp8 up front; an over-committed --resident_blocks
@@ -2152,7 +2188,32 @@ def _run_geometry_av[
             n_resident = Int(_parse_int_arg(String(args[i + 1])))
     if n_resident > NUM_LAYERS:
         n_resident = NUM_LAYERS
-    var src = LTX2AVBlockSource.open(ckpt, model_cfg)
+    # SquareQ W4A16 residency arm (env LTX2_SQUAREQ_SLAB=<slab dir>, mirrors the
+    # video arm + the inference LTX2_INT4_SLAB precedent): blocks reconstruct
+    # dense BF16 from the packed slab per visit (ops/squareq via
+    # LTX2Int4BlockStream smooth-key auto-detect). The checkpoint MUST be the
+    # slab's build source (<slab>/build-state.json) so head/tail/w0 passthrough
+    # tensors match. fp8 residency is a contradiction here — fail loud.
+    var squareq_slab = env_or("LTX2_SQUAREQ_SLAB", String(""))
+    var src: LTX2AVBlockSource
+    if len(squareq_slab) > 0:
+        if n_resident > 0:
+            raise Error(
+                "train_ltx2_av (AV): --resident_blocks/LTX2_RESIDENT_BLOCKS > 0"
+                " is the fp8 residency knob; it does not combine with"
+                " LTX2_SQUAREQ_SLAB (blocks reconstruct from the packed slab)."
+                " Set it to 0."
+            )
+        try:
+            src = LTX2AVBlockSource.open_squareq(ckpt, squareq_slab, model_cfg)
+        except err:
+            raise Error(
+                String("train_ltx2_av (AV): LTX2_SQUAREQ_SLAB='") + squareq_slab
+                + "' failed to open: " + String(err))
+        print("  [squareq] W4A16 base ON — blocks reconstruct BF16 from",
+              squareq_slab)
+    else:
+        src = LTX2AVBlockSource.open(ckpt, model_cfg)
     if n_resident > 0:
         # PRE-ALLOC over-commit guard (mirrors the video arm): the resident range
         # allocates up front, which otherwise dies as a generic CUDA OOM inside

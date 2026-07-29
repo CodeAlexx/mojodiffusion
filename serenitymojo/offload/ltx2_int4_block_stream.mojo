@@ -1,15 +1,20 @@
-# offload/ltx2_int4_block_stream.mojo — INT4 (SVDQuant class-A) DiT block streamer
-# for LTX-2.
+# offload/ltx2_int4_block_stream.mojo — INT4 (SVDQuant class-A + SquareQ w4) DiT
+# block streamer for LTX-2.
 #
 # Sibling of offload/ltx2_block_stream.mojo (the FP8 streamer). Same BlockLoader
 # discipline (load → use → drop), same FP8Block return type, same prefix/block
 # discovery — the ONLY difference is the on-use decode: where the FP8 stream
 # dequants F8_E4M3 → BF16 with a per-tensor scale, this stream RECONSTRUCTS each
-# quantized class-A linear's dense BF16 weight from its INT4 slab bundle
-# (qweight/wscales/lora_down/lora_up/smooth/bias) via
-# ops/svdquant.svdquant_reconstruct_weight (dequant4 + low-rank). Everything the
-# quantizer left verbatim (norms, scale_shift_table, biases of quantized linears,
-# any non-quantized weight) passes through as BF16.
+# quantized linear's dense BF16 weight from its INT4 slab bundle. TWO slab
+# flavors share the qweight/wscales/lora_down/lora_up bundle and are told apart
+# PER LINEAR by key presence:
+#   * class-A svdquant : carries `<base>.smooth` → ops/svdquant.
+#     svdquant_reconstruct_weight (plain dequant4 + low-rank)
+#   * squareq_w4       : NO smooth tensor (scripts/squareq_build_slab.py) →
+#     ops/squareq.squareq_reconstruct_weight (dequant4 + inverse-H256 + low-rank;
+#     scale group inferred from the wscales shape, g32 and g64 both load)
+# Everything the quantizer left verbatim (norms, scale_shift_table, biases of
+# quantized linears, any non-quantized weight) passes through as BF16.
 #
 # The returned FP8Block is prefix-stripped canonical keys → BF16 device Tensors,
 # EXACTLY the layout LTX2BlockWeights.from_fp8_block already consumes, so the
@@ -39,6 +44,7 @@ from serenitymojo.ops.svdquant import (
     SvdquantLinearA,
     svdquant_reconstruct_weight,
 )
+from serenitymojo.ops.squareq import squareq_reconstruct_weight
 
 
 def _substr(s: String, start: Int, end: Int) -> String:
@@ -165,35 +171,47 @@ struct LTX2Int4BlockStream(Movable):
             var canon = _substr(nm, len(bp), len(nm))
 
             if canon.endswith(".qweight"):
-                # ── Quantized class-A linear: reconstruct dense BF16 W. ──
+                # ── Quantized linear: reconstruct dense BF16 W. Flavor is
+                #    detected PER LINEAR by `.smooth` presence (class-A carries
+                #    it; squareq_w4 has no smooth tensor at all). ──
                 var qsuf = len(String(".qweight"))
                 var base = _substr(canon, 0, len(canon) - qsuf)  # prefix-stripped
                 var full = _substr(nm, 0, len(nm) - qsuf)        # full slab base
                 var qtv = self.sharded.tensor_view(full + ".qweight")
-                var qweight = Tensor.from_view_raw(qtv, ctx)     # I8 [out, in/2]
+                var qweight = Tensor.from_view_raw(qtv, ctx)     # I8/U8 [out, in/2]
                 var wtv = self.sharded.tensor_view(full + ".wscales")
-                var wscales = Tensor.from_view(wtv, ctx)         # BF16 [in/64, out]
+                var wscales = Tensor.from_view(wtv, ctx)         # BF16 [in/group, out]
                 var ldtv = self.sharded.tensor_view(full + ".lora_down")
                 var lora_down = Tensor.from_view(ldtv, ctx)      # BF16 [in, rank]
                 var lutv = self.sharded.tensor_view(full + ".lora_up")
                 var lora_up = Tensor.from_view(lutv, ctx)        # BF16 [out, rank]
-                var smtv = self.sharded.tensor_view(full + ".smooth")
-                var smooth = Tensor.from_view(smtv, ctx)         # BF16 [in]
                 var btv = self.sharded.tensor_view(full + ".bias")
                 var bias = Tensor.from_view(btv, ctx)            # BF16 [out]
 
                 var in_f = qweight.shape()[1] * 2
                 var out_f = qweight.shape()[0]
-                var rank = lora_down.shape()[1]
 
-                # Emit bias verbatim; clone because the struct consumes `bias`.
+                # Emit bias verbatim; clone because the class-A struct consumes
+                # `bias` (the squareq arm only borrows and drops it).
                 block[base + ".bias"] = ArcPointer(bias.clone(ctx))
 
-                var w = SvdquantLinearA(
-                    qweight^, wscales^, lora_down^, lora_up^, smooth^, bias^,
-                    in_f, out_f, rank,
-                )
-                var W = svdquant_reconstruct_weight(w, ctx)      # BF16 [out, in]
+                var W: Tensor
+                if (full + ".smooth") in self.sharded.name_to_shard:
+                    # class-A svdquant: smooth present.
+                    var smtv = self.sharded.tensor_view(full + ".smooth")
+                    var smooth = Tensor.from_view(smtv, ctx)     # BF16 [in]
+                    var rank = lora_down.shape()[1]
+                    var w = SvdquantLinearA(
+                        qweight^, wscales^, lora_down^, lora_up^, smooth^, bias^,
+                        in_f, out_f, rank,
+                    )
+                    W = svdquant_reconstruct_weight(w, ctx)      # BF16 [out, in]
+                else:
+                    # squareq_w4: dequant4 + inverse-H256 + low-rank; the scale
+                    # group is inferred from the wscales shape (g32/g64 agnostic).
+                    W = squareq_reconstruct_weight(
+                        qweight, wscales, lora_down, lora_up, in_f, out_f, ctx
+                    )                                            # BF16 [out, in]
                 block[base + ".weight"] = ArcPointer(W^)
 
             elif (

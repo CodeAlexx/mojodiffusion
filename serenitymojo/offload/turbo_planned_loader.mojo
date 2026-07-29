@@ -412,6 +412,17 @@ struct TurboPlannedLoader(Movable):
     # Opt in via pin_residents_squareq_nvfp4(); default empty = no-op.
     var _nvfp4_prefixes: List[String]
     var _nvfp4_blocks: List[List[_ResidentNvfp4Tensor]]
+    # P2-A: when True, nvfp4 awaits SKIP the bf16 W_hat reconstruct for
+    # quantized weights (forward uses only the ::payload; a 1-elem bf16 dummy
+    # rides under the weight name for shape-agnostic builders). The trainer
+    # toggles this ON for forward passes and OFF before backward/recompute.
+    # Default False = byte-identical to the pre-flag behavior.
+    var _fwd_only_awaits: Bool
+    # Shared shape-dummy backing store (largest quantized weight, allocated at
+    # nvfp4 pin): fwd-only awaits return shape-correct Tensors viewing this
+    # buffer (contents GARBAGE — forward reads shapes only; any value use
+    # corrupts loss and the smoke catches it).
+    var _nvfp4_dummy: List[DeviceBuffer[DType.uint8]]
     # ── host-pinned fp8 set (fp8_e4m3_host): E4M3+scale PINNED in host RAM,
     # H2D'd + dequanted per await (half the PCIe of bf16 streaming; NO disk).
     var _fp8h_prefixes: List[String]
@@ -536,6 +547,8 @@ struct TurboPlannedLoader(Movable):
         self._squareq_blocks = List[List[_ResidentSquareqTensor]]()
         self._nvfp4_prefixes = List[String]()
         self._nvfp4_blocks = List[List[_ResidentNvfp4Tensor]]()
+        self._fwd_only_awaits = False
+        self._nvfp4_dummy = List[DeviceBuffer[DType.uint8]]()
         self._fp8h_prefixes = List[String]()
         self._fp8h_blocks = List[List[_HostFp8Tensor]]()
         self._int8_prefixes = List[String]()
@@ -578,6 +591,11 @@ struct TurboPlannedLoader(Movable):
             if self._squareq_prefixes[r] == norm_prefix:
                 return r
         return -1
+
+    def set_fwd_only_awaits(mut self, on: Bool):
+        """P2-A speed lever: skip nvfp4 W_hat reconstructs on forward-only
+        visits. MUST be reset to False before any backward/recompute pass."""
+        self._fwd_only_awaits = on
 
     def _nvfp4_slot(self, norm_prefix: String) -> Int:
         for r in range(len(self._nvfp4_prefixes)):
@@ -993,6 +1011,17 @@ struct TurboPlannedLoader(Movable):
             used += block_bytes
             pinned += 1
             ctx.synchronize()  # fence this block's transients before the next
+        # P2-A shape-dummy: size = largest quantized weight in bf16.
+        var max_bytes = 2
+        for bi2 in range(len(self._nvfp4_blocks)):
+            for ti2 in range(len(self._nvfp4_blocks[bi2])):
+                ref t2 = self._nvfp4_blocks[bi2][ti2]
+                if t2.is_quant and t2.out_f * t2.in_f * 2 > max_bytes:
+                    max_bytes = t2.out_f * t2.in_f * 2
+        if len(self._nvfp4_dummy) == 0:
+            self._nvfp4_dummy.append(
+                ctx.enqueue_create_buffer[DType.uint8](max_bytes)
+            )
         print(
             "  squareq_nvfp4-resident: pinned", pinned, "blocks,",
             used, "bytes packed (native-fp4 fwd payload + W_hat-on-await)",
@@ -1927,11 +1956,22 @@ struct TurboPlannedLoader(Movable):
             for t in range(len(self._nvfp4_blocks[nvslot])):
                 ref nvt = self._nvfp4_blocks[nvslot][t]
                 if nvt.is_quant:
-                    var w = squareq_nvfp4_reconstruct_weight(
-                        nvt.nvq[], nvt.nvs[], nvt.nvg, nvt.ld[], nvt.lu[],
-                        nvt.in_f, nvt.out_f, ctx,
-                    )
-                    nblock[nvt.name] = ArcPointer(w^)
+                    if self._fwd_only_awaits:
+                        # fwd-only: the fp4 dispatch reads the ::payload; the
+                        # name slot gets a SHAPE-correct view of the shared
+                        # dummy buffer (values garbage — never read in fwd).
+                        var sub = self._nvfp4_dummy[0].create_sub_buffer[
+                            DType.uint8
+                        ](0, nvt.out_f * nvt.in_f * 2)
+                        nblock[nvt.name] = ArcPointer(
+                            Tensor(sub^, [nvt.out_f, nvt.in_f], STDtype.BF16)
+                        )
+                    else:
+                        var w = squareq_nvfp4_reconstruct_weight(
+                            nvt.nvq[], nvt.nvs[], nvt.nvg, nvt.ld[], nvt.lu[],
+                            nvt.in_f, nvt.out_f, ctx,
+                        )
+                        nblock[nvt.name] = ArcPointer(w^)
                     nblock[resident_nvfp4_key(nvt.name, String("nvq"))] = nvt.nvq.copy()
                     nblock[resident_nvfp4_key(nvt.name, String("nvs"))] = nvt.nvs.copy()
                     nblock[resident_nvfp4_key(nvt.name, String("ld"))] = nvt.ld.copy()

@@ -46,13 +46,18 @@ _ST2TORCH = {
 MODELS = {
     # include: 2D .weight keys eligible for quantization; group_key: shard
     # affinity (same block -> same shard) for locality + resume granularity.
+    # exclude: EXPLICIT sensitivity policy (not just filter luck) — AdaLN /
+    # modulation / norm projections stay bf16 even if they match include.
+    # The builder REPORTS what the policy excluded so it is visible, not silent.
     "klein4b": {
         "include": re.compile(r"^(double_blocks|single_blocks)\.\d+\..*\.weight$"),
         "group": re.compile(r"^((?:double_blocks|single_blocks)\.\d+)\."),
+        "exclude": re.compile(r"(_mod\.|modulation|adaln|norm)", re.IGNORECASE),
     },
     "krea2": {
         "include": re.compile(r"^blocks\.\d+\..*\.weight$"),
         "group": re.compile(r"^(blocks\.\d+)\."),
+        "exclude": re.compile(r"(\.mod\.|modulation|adaln|norm)", re.IGNORECASE),
     },
 }
 
@@ -61,9 +66,10 @@ def layer_seed(key: str) -> int:
     return int.from_bytes(hashlib.sha256(key.encode()).digest()[:4], "little")
 
 
-def eligible(key: str, shape, include) -> bool:
+def eligible(key: str, shape, include, exclude=None) -> bool:
     return (
         bool(include.match(key))
+        and not (exclude and exclude.search(key))
         and len(shape) == 2
         and shape[0] >= 1024
         and shape[1] >= 1024
@@ -117,7 +123,7 @@ def main():
         if a.format != "int4":
             raise SystemExit("--budget-x supports --format int4 only")
         CAND = [16, 32, 64, 128]  # rank>=16: zero-width lora tensors would break loaders
-        elig = [k for k in keys if eligible(k, meta[k][0], preset["include"])
+        elig = [k for k in keys if eligible(k, meta[k][0], preset["include"], preset.get("exclude"))
                 and preset["group"].match(k)]
         tables = {}
         total_bf16 = 0
@@ -200,8 +206,19 @@ def main():
     groups: dict = {}  # group name ("" = misc/passthrough) -> [keys]
     for k in keys:
         m = preset["group"].match(k)
-        g = m.group(1) if (m and eligible(k, meta[k][0], preset["include"])) else ""
+        g = m.group(1) if (m and eligible(k, meta[k][0], preset["include"], preset.get("exclude"))) else ""
         groups.setdefault(g, []).append(k)
+
+    excl = preset.get("exclude")
+    if excl:
+        policy_excluded = [
+            k for k in keys
+            if preset["include"].match(k) and excl.search(k)
+            and len(meta[k][0]) == 2
+        ]
+        print(f"[squareq-build] sensitivity policy: {len(policy_excluded)} matching "
+              f"2D tensors kept bf16 (mod/adaln/norm): {policy_excluded[:3]}")
+        plan["policy_excluded"] = policy_excluded
 
     block_names = sorted(g for g in groups if g)
     shards: list = []  # (shard_filename_stub, [group names])
@@ -226,7 +243,7 @@ def main():
         for g in groups_in_shard:
             for k in groups[g]:
                 shape, dt = meta[k]
-                if g and eligible(k, shape, preset["include"]):
+                if g and eligible(k, shape, preset["include"], preset.get("exclude")):
                     base = k[: -len(".weight")]
                     o, i_f = shape
                     r = rank_by_layer.get(k, a.rank)

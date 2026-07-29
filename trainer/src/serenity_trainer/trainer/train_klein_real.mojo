@@ -2296,6 +2296,7 @@ def main() raises:
                     cfg.out_channels, cfg.eps, ctx, scratch_bwd,
                 )
         elif use_activation_tape_offload:
+            loader.set_fwd_only_awaits(True)   # P2-A: nvfp4 fwd skips W_hat
             var fwd_tape = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[H, Dh, N_IMG, N_TXT, S](
                 x_t_dev, txt_tokens_t, base,
                 loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
@@ -2316,6 +2317,7 @@ def main() raises:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
             perf_loss_seconds += Float64(t_bwd0 - t_fwd1) / 1.0e9
+            loader.set_fwd_only_awaits(False)  # P2-A reset: bwd needs W_hat
             g = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                 lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
                 loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
@@ -2323,6 +2325,7 @@ def main() raises:
                 cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
             )
         else:
+            loader.set_fwd_only_awaits(True)   # P2-A: nvfp4 fwd skips W_hat
             var fwd = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                 x_t_dev, txt_tokens_t, base,
                 loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
@@ -2342,6 +2345,7 @@ def main() raises:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
             perf_loss_seconds += Float64(t_bwd0 - t_fwd1) / 1.0e9
+            loader.set_fwd_only_awaits(False)  # P2-A reset: bwd needs W_hat
             comptime if KLEIN_V2_GRAPH_PATH:
                 # P6: per-block graph-engine backward (same conductor loop,
                 # same scratch ring, same arg list — drop-in for the

@@ -89,7 +89,7 @@ from serenitymojo.ops.int8_quant import (
 )
 # squareq_w4-resident (SquareQ chunk 3): packed int4+H256+low-rank sidecar,
 # reconstructed to BF16 per block on await (same shape as the fp8 branch).
-from serenitymojo.ops.squareq import squareq_reconstruct_weight
+from serenitymojo.ops.squareq import squareq_reconstruct_weight, squareq_w8_reconstruct_weight
 # squareq_nvfp4-resident (SquareQ chunk 8): packed NVFP4 (e2m1 + tiled ue4m3
 # scales + low-rank + global scale) sidecar. await returns BOTH the
 # reconstructed BF16 W_hat (backward + non-wired consumers) AND the packed
@@ -140,6 +140,7 @@ comptime _FP8_MIN_ELEMS = 1 << 16   # only fp8 sizeable 2-D weights; tiny ones s
 struct _ResidentSquareqTensor(Copyable, Movable):
     var name: String
     var is_quant: Bool
+    var is_w8: Bool   # v3.1 int8-residual (q=i8 [out,in], s=per-row bf16 [out])
     var q: TArc
     var s: TArc
     var ld: TArc
@@ -150,10 +151,11 @@ struct _ResidentSquareqTensor(Copyable, Movable):
     def __init__(
         out self, var name: String, is_quant: Bool,
         var q: TArc, var s: TArc, var ld: TArc, var lu: TArc,
-        in_f: Int, out_f: Int,
+        in_f: Int, out_f: Int, is_w8: Bool = False,
     ):
         self.name = name^
         self.is_quant = is_quant
+        self.is_w8 = is_w8
         self.q = q^
         self.s = s^
         self.ld = ld^
@@ -809,10 +811,16 @@ struct TurboPlannedLoader(Movable):
                 var is_weight = nm.endswith(String(".weight"))
                 var base = String(nm.removesuffix(String(".weight")))
                 var qname = base + String(".qweight")
-                if is_weight and sc.has_tensor(qname):
+                var q8name = base + String(".q8weight")
+                var use_w8 = is_weight and (not sc.has_tensor(qname)) and sc.has_tensor(q8name)
+                if use_w8:
+                    qname = q8name
+                if is_weight and (sc.has_tensor(qname)):
                     var q = Tensor.from_view_raw(sc.tensor_view(qname), ctx)
                     var s = Tensor.from_view(
-                        sc.tensor_view(base + String(".wscales")), ctx
+                        sc.tensor_view(
+                            base + (String(".w8scale") if use_w8 else String(".wscales"))
+                        ), ctx
                     )
                     var ld = Tensor.from_view(
                         sc.tensor_view(base + String(".lora_down")), ctx
@@ -822,6 +830,8 @@ struct TurboPlannedLoader(Movable):
                     )
                     var out_f = q.shape()[0]
                     var in_f = q.shape()[1] * 2
+                    if use_w8:
+                        in_f = q.shape()[1]   # i8 is unpacked [out, in]
                     block_bytes += (
                         q.numel() * q.dtype().byte_size()
                         + s.numel() * s.dtype().byte_size()
@@ -831,7 +841,7 @@ struct TurboPlannedLoader(Movable):
                     tensors.append(
                         _ResidentSquareqTensor(
                             nm, True, TArc(q^), TArc(s^), TArc(ld^), TArc(lu^),
-                            in_f, out_f,
+                            in_f, out_f, use_w8,
                         )
                     )
                 else:
@@ -1884,10 +1894,17 @@ struct TurboPlannedLoader(Movable):
             for t in range(len(self._squareq_blocks[sqslot])):
                 ref sqt = self._squareq_blocks[sqslot][t]
                 if sqt.is_quant:
-                    var w = squareq_reconstruct_weight(
-                        sqt.q[], sqt.s[], sqt.ld[], sqt.lu[],
-                        sqt.in_f, sqt.out_f, ctx,
-                    )
+                    var w: Tensor
+                    if sqt.is_w8:
+                        w = squareq_w8_reconstruct_weight(
+                            sqt.q[], sqt.s[], sqt.ld[], sqt.lu[],
+                            sqt.in_f, sqt.out_f, ctx,
+                        )
+                    else:
+                        w = squareq_reconstruct_weight(
+                            sqt.q[], sqt.s[], sqt.ld[], sqt.lu[],
+                            sqt.in_f, sqt.out_f, ctx,
+                        )
                     sblock[sqt.name] = ArcPointer(w^)
                 else:
                     sblock[sqt.name] = sqt.q.copy()  # share the resident BF16

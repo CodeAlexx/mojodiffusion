@@ -275,3 +275,92 @@ def squareq_reconstruct_weight(
     # the 3-tensor version OOM'd krea2 1024px training at step 83 (2026-07-28).
     add_in_place(w_res, lr, ctx)
     return w_res^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3.1 int8-residual ("squareq_w8_v1"): i8 [out,in] + per-ROW bf16 scale,
+# same inverse-H256. Beats plain int8-per-row fidelity at ~equal bytes (the
+# low-rank branch rides on top) — measured vs the public ConvRot artifact.
+# ─────────────────────────────────────────────────────────────────────────────
+def _sq8_dequant_ih256_kernel(
+    q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],       # [out*in]
+    s8: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [out]
+    o_out: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [out*in]
+    out_f: Int,
+    in_f: Int,
+):
+    var segs_per_row = in_f // _SEG
+    var seg = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var row = seg // segs_per_row
+    var s_in_row = seg - row * segs_per_row
+    var base = row * in_f + s_in_row * _SEG
+    var scale = rebind[Scalar[DType.bfloat16]](s8[row]).cast[DType.float32]()
+
+    var sh = stack_allocation[
+        _SEG, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    sh[tid] = Float32(Int(rebind[Scalar[DType.int8]](q8[base + tid]))) * scale
+    sh[tid + _SEG_TPB] = Float32(
+        Int(rebind[Scalar[DType.int8]](q8[base + tid + _SEG_TPB]))
+    ) * scale
+    barrier()
+
+    var length = 1
+    while length < _SEG:
+        var blk = tid // length
+        var within = tid - blk * length
+        var j = blk * (2 * length) + within
+        var a = sh[j]
+        var b = sh[j + length]
+        sh[j] = a + b
+        sh[j + length] = a - b
+        barrier()
+        length *= 2
+
+    o_out[base + tid] = rebind[o_out.element_type](
+        (sh[tid] * _INV_SQRT_SEG).cast[DType.bfloat16]()
+    )
+    o_out[base + tid + _SEG_TPB] = rebind[o_out.element_type](
+        (sh[tid + _SEG_TPB] * _INV_SQRT_SEG).cast[DType.bfloat16]()
+    )
+
+
+def squareq_w8_reconstruct_weight(
+    q8: Tensor,
+    s8: Tensor,
+    lora_down: Tensor,
+    lora_up: Tensor,
+    in_f: Int,
+    out_f: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """W_hat BF16 [out,in] = derotate(q8 * s8_perrow) + lu@ld^T (2x transients)."""
+    if in_f % _SEG != 0:
+        raise Error("squareq_w8_reconstruct_weight: in % 256 != 0")
+    var q_bytes = q8.numel() * q8.dtype().byte_size()
+    if q_bytes != out_f * in_f:
+        raise Error("squareq_w8_reconstruct_weight: q8 bytes != out*in")
+    if s8.numel() != out_f:
+        raise Error("squareq_w8_reconstruct_weight: s8 numel != out")
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_f * in_f * 2)
+    var rl_q = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * in_f))
+    var rl_s = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f))
+    var Q = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
+        q8.buf.unsafe_ptr().bitcast[Int8](), rl_q
+    )
+    var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        s8.buf.unsafe_ptr().bitcast[BFloat16](), rl_s
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), rl_q
+    )
+    comptime kern = _sq8_dequant_ih256_kernel
+    ctx.enqueue_function[kern, kern](
+        Q, S, O, out_f, in_f,
+        grid_dim=out_f * (in_f // _SEG), block_dim=_SEG_TPB,
+    )
+    var w_res = Tensor(out_buf^, [out_f, in_f], STDtype.BF16)
+    var lr = linear(lora_up, lora_down, None, ctx)
+    add_in_place(w_res, lr, ctx)
+    return w_res^

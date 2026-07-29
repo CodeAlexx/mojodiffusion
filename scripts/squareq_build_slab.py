@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--group", type=int, default=64, help="scale group along in (64 or 32)")
-    ap.add_argument("--format", default="int4", choices=("int4", "nvfp4"),
+    ap.add_argument("--format", default="int4", choices=("int4", "nvfp4", "int8"),
                     help="residual codec: int4 (dequant-first, any GPU) or nvfp4 (native FP4 fwd, sm_120)")
     ap.add_argument("--budget-x", type=float, default=0.0,
                     help="adaptive per-layer ranks: target TOTAL quantized bytes as a fraction "
@@ -106,7 +106,7 @@ def main():
             sl = f.get_slice(k)
             meta[k] = (sl.get_shape(), sl.get_dtype())
 
-    plan = new_plan(a.model, a.src, "squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG, core.HBLOCK, a.group)
+    plan = new_plan(a.model, a.src, {"nvfp4": "squareq_nvfp4_v1", "int8": core.FORMAT_TAG_W8}.get(a.format, core.FORMAT_TAG), core.HBLOCK, a.group)
     plan["rank_default"] = a.rank
 
     # ── adaptive rank planner (chunk 8): one truncated SVD per layer, evaluate
@@ -219,7 +219,7 @@ def main():
         fpath = os.path.join(a.out_dir, fname)
         done = fname in state["completed_shards"] and os.path.exists(fpath)
         w = None if done else StreamingSafetensorsWriter(
-            fpath, metadata={"format": ("squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG), "rank": a.rank, "group": a.group}
+            fpath, metadata={"format": ({"nvfp4": "squareq_nvfp4_v1", "int8": core.FORMAT_TAG_W8}.get(a.format, core.FORMAT_TAG)), "rank": a.rank, "group": a.group}
         )
         # declare (and always account plan/weight_map, even when skipping)
         decls: list = []  # (out_name, src_key, kind)
@@ -230,7 +230,14 @@ def main():
                     base = k[: -len(".weight")]
                     o, i_f = shape
                     r = rank_by_layer.get(k, a.rank)
-                    if a.format == "nvfp4":
+                    if a.format == "int8":
+                        parts = [
+                            (base + ".q8weight", torch.int8, [o, i_f]),
+                            (base + ".w8scale", torch.bfloat16, [o]),
+                            (base + ".lora_down", torch.bfloat16, [i_f, r]),
+                            (base + ".lora_up", torch.bfloat16, [o, r]),
+                        ]
+                    elif a.format == "nvfp4":
                         parts = [
                             (base + ".nvq", torch.uint8, [o, i_f // 2]),
                             (base + ".nvs", torch.uint8, [core.scale_tiles_bytes(o, i_f // 16)]),
@@ -270,7 +277,12 @@ def main():
                             plan["passthrough"].append(k)
                         continue
                     wt = f.get_tensor(k).float()
-                    if a.format == "nvfp4":
+                    if a.format == "int8":
+                        tensors, stats = core.quantize_layer_w8(
+                            wt, rank=rank_by_layer.get(k, a.rank), seed=layer_seed(k)
+                        )
+                        suffixes = ("q8weight", "w8scale", "lora_down", "lora_up")
+                    elif a.format == "nvfp4":
                         ld_, lu_ = core.svd_lowrank_init(wt, a.rank, seed=layer_seed(k))
                         resid = (wt.double() - lu_.double() @ ld_.double().t())
                         rrot = core.rht_grouped(resid).float()
@@ -298,7 +310,7 @@ def main():
                         suffixes = ("qweight", "wscales", "lora_down", "lora_up")
                     for suffix in suffixes:
                         w.write_tensor(base + "." + suffix, tensors[suffix])
-                    plan["layers"][k] = {**stats, "format": ("squareq_nvfp4_v1" if a.format == "nvfp4" else core.FORMAT_TAG)}
+                    plan["layers"][k] = {**stats, "format": ({"nvfp4": "squareq_nvfp4_v1", "int8": core.FORMAT_TAG_W8}.get(a.format, core.FORMAT_TAG))}
                     print(
                         f"[squareq-build] shard {si + 1}/{nsh}  {k}"
                         f"  [{stats['out']}x{stats['in']}]  cos_w={stats['cos_w']:.5f}"

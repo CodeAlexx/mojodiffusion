@@ -345,3 +345,57 @@ def nvfp4_decode_weight_tiled(nvq, nvs, nvg, out_f: int, in_f: int) -> torch.Ten
     off = tile * 512 + (rr % 32) * 16 + ((rr // 32) % 4) * 4 + (cc % 4)
     bs = _ue4m3_decode(nvs[off.reshape(-1)].reshape(out_f, kb))
     return (val.reshape(out_f, kb, 16) * bs.unsqueeze(-1)).reshape(out_f, in_f) * nvg.float()
+
+
+# ── v3.1: int8-residual mode ("squareq_w8_v1") — contest the 0.5x point ─────
+# W = lora_up@lora_down^T + invH256(dequant8(q8weight, w8scale)); per-ROW
+# bf16 scales of the rotated residual with the same MSE sweep. Measured on
+# krea2 vs the public ConvRot int8 artifact (2026-07-28): beats it on all
+# tested layers (e.g. attn.wq 0.999989 vs 0.999958) at r32/0.511x, r16/0.505x.
+FORMAT_TAG_W8 = "squareq_w8_v1"
+
+
+def quant_int8_perrow(rrot: torch.Tensor, mse_scales: bool = True) -> tuple:
+    """Rotated residual [out, in] -> (q8weight i8 [out,in], w8scale bf16 [out])."""
+    amax = rrot.float().abs().amax(1, keepdim=True)
+    fracs = (0.97, 0.98, 0.99, 1.0) if mse_scales else (1.0,)
+    best_q = best_s = best_e = None
+    for f in fracs:
+        s = (amax * f / 127.0).to(torch.bfloat16).float()
+        s = torch.where(s == 0, torch.ones_like(s), s)
+        q = torch.clamp(torch.round(rrot.float() / s), -128, 127)
+        e = ((q * s - rrot.float()) ** 2).sum(1, keepdim=True)
+        if best_e is None:
+            best_q, best_s, best_e = q, s, e
+        else:
+            m = e < best_e
+            best_q = torch.where(m, q, best_q)
+            best_s = torch.where(m, s, best_s)
+            best_e = torch.where(m, e, best_e)
+    return best_q.to(torch.int8).contiguous(), best_s.squeeze(1).to(torch.bfloat16).contiguous()
+
+
+def dequant_int8_perrow(q8: torch.Tensor, s8: torch.Tensor) -> torch.Tensor:
+    return q8.float() * s8.float().unsqueeze(1)
+
+
+def quantize_layer_w8(w: torch.Tensor, rank: int = 16, hblock: int = HBLOCK, seed: int = 0) -> tuple:
+    """squareq_w8_v1 encode. Returns (tensors {q8weight,w8scale,lora_down,lora_up}, stats)."""
+    out_f, in_f = w.shape
+    wf = w.float()
+    lora_down, lora_up = svd_lowrank_init(wf, rank, seed=seed)
+    rrot = rht_grouped(wf.double() - lora_up.double() @ lora_down.double().t(), block=hblock).float()
+    q8, s8 = quant_int8_perrow(rrot)
+    w_hat = rht_grouped(dequant_int8_perrow(q8, s8).double(), block=hblock).float() \
+        + lora_up @ lora_down.t()
+    a, b = w_hat.flatten().double(), wf.flatten().double()
+    cos_w = float(a @ b / (a.norm() * b.norm() + 1e-30))
+    bytes_q = q8.numel() + s8.numel() * 2 + (lora_down.numel() + lora_up.numel()) * 2
+    tensors = {
+        "q8weight": q8, "w8scale": s8,
+        "lora_down": lora_down.to(torch.bfloat16).contiguous(),
+        "lora_up": lora_up.to(torch.bfloat16).contiguous(),
+    }
+    stats = {"out": out_f, "in": in_f, "rank": rank, "cos_w": cos_w,
+             "rel_l2": 0.0, "bytes_q": bytes_q, "bytes_bf16": w.numel() * 2}
+    return tensors, stats

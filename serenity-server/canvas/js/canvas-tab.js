@@ -547,6 +547,41 @@ var CanvasTab = (function () {
             var size = genState.editMode === 'style' ? 1024 : flowEditEngineSize(genState.editEngine);
             genState.editEngine = 'krea2_' + (turbo ? 'turbo' : 'raw') + '_' + size;
         }
+        else if (arch === 'wan') {
+            genState.width = 832;
+            genState.height = 480;
+            genState.frames = 121;
+            genState.fps = 24;
+            genState.steps = 50;
+            genState.cfg = 5.0;
+            genState.sampler = 'uni_pc';
+            genState.scheduler = 'normal';
+            setCanvasLtx2GeometryLocked(false);
+            [els.framesInput, els.framesRange, els.fpsInput, els.fpsRange].forEach(function (control) {
+                if (!control)
+                    return;
+                control.disabled = true;
+                control.title = 'Wan2.2 TI2V-5B is admitted at 121 frames and 24 FPS';
+            });
+            els.framesInput.value = '121';
+            els.framesRange.value = '121';
+            els.fpsInput.value = '24';
+            els.fpsRange.value = '24';
+            els.steps.value = '50';
+            els.stepsRange.value = '50';
+            setCanvasSelectOptions(
+                els.sampler,
+                [{ value: 'uni_pc', label: 'UniPC (Wan creator)' }],
+                'uni_pc',
+                false
+            );
+            setCanvasSelectOptions(
+                els.scheduler,
+                [{ value: 'normal', label: 'Wan flow schedule' }],
+                'normal',
+                false
+            );
+        }
         else {
             return false;
         }
@@ -5298,9 +5333,19 @@ var CanvasTab = (function () {
     function loraArchForCanvas(arch) {
         if (arch === 'ltxv')
             return 'ltx2';
+        if (arch === 'wan')
+            return 'wan2.2';
         if (arch === 'qwen')
             return 'qwen-image';
         return arch;
+    }
+    function activeCanvasWanRunner() {
+        var candidates = canvasVideoStatus && canvasVideoStatus.candidate_runners;
+        if (!Array.isArray(candidates))
+            return null;
+        return candidates.find(function (entry) {
+            return entry && entry.model === 'wan22_t2v';
+        }) || null;
     }
     function canvasBackendProfile() {
         if (!canvasCapabilities || !Array.isArray(canvasCapabilities.backends) || genState.arch === 'ltxv')
@@ -5311,6 +5356,32 @@ var CanvasTab = (function () {
         }) || null;
     }
     function canvasFeature(name) {
+        if (genState.arch === 'wan') {
+            var runner = activeCanvasWanRunner();
+            var loraMode = runner && runner.modes && runner.modes.lora;
+            if (name === 'lora') {
+                return {
+                    supported: !!(loraMode && loraMode.available),
+                    max_count: 1,
+                    policy: 'fail_loud',
+                    reason: 'Wan LoRAs must target the installed TI2V-5B base'
+                };
+            }
+            if (name === 'multi_lora') {
+                return {
+                    supported: false,
+                    policy: 'fail_loud',
+                    reason: 'Wan2.2 TI2V-5B currently accepts one resident LoRA per render'
+                };
+            }
+            if (name === 'image_to_image' || name === 'image_conditioning') {
+                return {
+                    supported: !!(runner && runner.status === 'quality_profile_ready'),
+                    policy: 'first_frame',
+                    note: 'The Canvas image becomes Wan TI2V frame zero'
+                };
+            }
+        }
         var profile = canvasBackendProfile();
         var feature = profile && profile.features && profile.features[name];
         return feature || { supported: false, policy: 'fail_loud', reason: 'The selected backend does not advertise ' + name };
@@ -5362,6 +5433,11 @@ var CanvasTab = (function () {
         }
         else if (genState.arch === 'ltxv') {
             els.capabilityNote.textContent = 'Mojo T2V/I2V/V2V request profile. Leave the source and Canvas empty for text-to-video, load an image to condition frame 0, or load a video to preserve its motion through full-video conditioning.';
+            els.capabilityNote.style.display = 'block';
+        }
+        else if (genState.arch === 'wan') {
+            els.capabilityNote.textContent =
+                'Wan2.2 TI2V-5B: an empty Canvas generates T2V; Canvas content becomes the creator first-frame I2V source. One shape-validated 5B LoRA may be loaded.';
             els.capabilityNote.style.display = 'block';
         }
         else {
@@ -6655,7 +6731,8 @@ var CanvasTab = (function () {
             // source-consuming modes (FlowEdit/style/inpaint) own editing.
             var consumesCanvasSource = genState.editMode === 'inpaint' ||
                 (genState.arch === 'ltxv' &&
-                    (hasContent || hasExactLtx2ImageSource || hasLtx2VideoSource));
+                    (hasContent || hasExactLtx2ImageSource || hasLtx2VideoSource)) ||
+                (genState.arch === 'wan' && hasContent);
             var featureError = validateCanvasGenerationFeatures(
                 consumesCanvasSource && (hasContent || hasExactLtx2ImageSource),
                 consumesCanvasSource && hasMask
@@ -6668,6 +6745,17 @@ var CanvasTab = (function () {
             var seed = genState.seed === -1 ? Math.floor(Math.random() * 4294967296) : genState.seed;
             var bw = isVideo ? ModelUtils.clampVideoDimension(boundingBox.width()) : ModelUtils.clampDimension(boundingBox.width());
             var bh = isVideo ? ModelUtils.clampVideoDimension(boundingBox.height()) : ModelUtils.clampDimension(boundingBox.height());
+            if (genState.arch === 'wan') {
+                var wanI2v = hasContent;
+                var wanPortrait = wanI2v && boundingBox.height() > boundingBox.width();
+                bw = wanPortrait ? 480 : 832;
+                bh = wanPortrait ? 832 : 480;
+                genState.width = bw;
+                genState.height = bh;
+                genState.frames = 121;
+                genState.fps = 24;
+                genState.steps = wanI2v ? 40 : 50;
+            }
             var activeLoras = enabledCanvasLoras();
             if (maskedEditEngine && maskedEditEngine.maxLoras !== null && activeLoras.length > maskedEditEngine.maxLoras) {
                 showError(maskedEditEngine.label + ' admits at most ' + maskedEditEngine.maxLoras + ' LoRA loader per request');

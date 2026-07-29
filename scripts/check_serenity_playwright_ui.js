@@ -657,6 +657,46 @@ async function run() {
         && wanContract.request.quant === "fp8",
       `Wan quality profile drifted: ${JSON.stringify(wanContract.request)}`,
     );
+    const wanI2vContract = await page.evaluate(() => {
+      const workflow = WorkflowBuilder.build({
+        model: "Wan2.2-TI2V-5B-Diffusers",
+        prompt: "crush it, a blonde cyborg crushes a metal can",
+        negPrompt: "",
+        width: 480,
+        height: 832,
+        steps: 40,
+        cfg: 5,
+        seed: 123,
+        frames: 121,
+        fps: 24,
+        initImageName: "/tmp/wan-first-frame.png",
+        ltx2CameraMotion: "dolly_in",
+        loras: [{
+          name: "wan22_5b_i2v_crush_it_lora",
+          strength: 1,
+        }],
+      });
+      return { workflow, request: SerenityAPI.videoRequestFromWorkflow(workflow) };
+    });
+    assert(wanI2vContract.request, "Wan I2V workflow did not route to /v1/video");
+    assert(
+      wanI2vContract.request.model === "wan22"
+        && wanI2vContract.request.image_path === "/tmp/wan-first-frame.png",
+      `Wan I2V lost its source image: ${JSON.stringify(wanI2vContract.request)}`,
+    );
+    assert(
+      wanI2vContract.request.width === 480 && wanI2vContract.request.height === 832
+        && wanI2vContract.request.frames === 121 && wanI2vContract.request.fps === 24
+        && wanI2vContract.request.steps === 40,
+      `Wan I2V creator profile drifted: ${JSON.stringify(wanI2vContract.request)}`,
+    );
+    assert(
+      wanI2vContract.request.camera_motion === "dolly_in"
+        && wanI2vContract.request.lora.length === 1
+        && wanI2vContract.request.lora[0].name === "wan22_5b_i2v_crush_it_lora"
+        && wanI2vContract.request.lora[0].weight === 1,
+      `Wan I2V lost camera or LoRA controls: ${JSON.stringify(wanI2vContract.request)}`,
+    );
 
     // Bernini remains hidden until its machine-local product gate passes, but
     // the shared Gen/Workflow builder and /v1/video translation contract can

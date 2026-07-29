@@ -60,22 +60,33 @@
 # Mojo 1.0.0b1, NVIDIA GPU. NO in-pipeline text encode (ephemeral-encode split).
 
 from std.sys import argv
+from std.sys.defines import get_defined_int
 from std.gpu.host import DeviceContext
+from std.math import round
+from image.studio_ops import resize_lanczos
+from image.transform import crop
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.lora import LoraSet
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import add, mul, mul_scalar, permute, reshape
+from serenitymojo.ops.tensor_algebra import (
+    add, mul, mul_scalar, permute, reshape, slice, full_device, concat,
+)
 from serenitymojo.models.dit.wan22_dit import Wan22Config, Wan22DiT
 from serenitymojo.models.vae.wan22_decoder import Wan22VaeImageDecoder
+from serenitymojo.models.vae.wan22_vae_encoder import Wan22VaeImageEncoder
 from serenitymojo.sampling.unipc import UniPcMultistepScheduler
 from serenitymojo.components.artifacts import (
     video_frame_path, build_ffmpeg_mux_command, save_video_frame_png,
 )
 from serenitymojo.image.png import ValueRange
+from serenitymojo.serve.image_io import (
+    decode_image_any, image_to_signed_nchw,
+)
 
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -89,9 +100,9 @@ comptime FP8_CACHE = (
 comptime VAE_PATH = "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"
 
 # ── First-video geometry (COMPTIME — rebuild to change) ──────────────────────
-comptime HEIGHT = 480          # pixel height (multiple of 32)
-comptime WIDTH = 832           # landscape width (multiple of 32)
-comptime FRAMES = 121          # 4n+1 frame count; 5.04s at 24 fps
+comptime HEIGHT = get_defined_int["WAN22_HEIGHT", 480]()
+comptime WIDTH = get_defined_int["WAN22_WIDTH", 832]()
+comptime FRAMES = get_defined_int["WAN22_FRAMES", 121]()
 comptime H_LAT = HEIGHT // 16  # 30 (VAE spatial stride 16)
 comptime W_LAT = WIDTH // 16   # 52
 comptime T_LAT = (FRAMES - 1) // 4 + 1  # 31 (VAE temporal stride 4)
@@ -114,8 +125,10 @@ comptime HD = 128              # head_dim
 # 1.31->1.10, fractal->coherent face). Runtime-overridable via argv (GUIDANCE is
 # used in the CFG loop, not comptime-specialized, so it can be a runtime scalar).
 comptime DEFAULT_GUIDANCE = Float32(5.0)
-comptime SHIFT = Float32(5.0)
-comptime DEFAULT_STEPS = 50
+comptime T2V_SHIFT = Float32(5.0)
+comptime I2V_SHIFT_480P = Float32(3.0)
+comptime DEFAULT_T2V_STEPS = 50
+comptime DEFAULT_I2V_STEPS = 40
 comptime DEFAULT_SEED = 0
 comptime NUM_TRAIN_TIMESTEPS = Float32(1000.0)
 
@@ -179,12 +192,87 @@ def _zero_pad_rows(
     return mul(embed, mask, ctx)
 
 
+def _zero_condition(ctx: DeviceContext) raises -> Tensor:
+    return full_device(
+        [48, T_LAT, H_LAT, W_LAT], Float32(0.0), STDtype.F32, ctx
+    )
+
+
+def _encode_i2v_first_frame(
+    image_path: String, ctx: DeviceContext
+) raises -> Tensor:
+    """Creator TI2V image preprocessing and VAE first-frame conditioning.
+
+    Official Wan cover-resizes with preserved aspect ratio and center-crops to
+    the 32-aligned output grid, normalizes RGB to [-1,1], VAE-encodes one
+    image, and leaves the remaining latent frames empty.
+    """
+    var image = decode_image_any(image_path)
+    var scale = max(
+        Float64(WIDTH) / Float64(image.width),
+        Float64(HEIGHT) / Float64(image.height),
+    )
+    var resized_width = Int(round(Float64(image.width) * scale))
+    var resized_height = Int(round(Float64(image.height) * scale))
+    var resized = resize_lanczos(image, resized_width, resized_height)
+    var crop_left = (resized.width - WIDTH) // 2
+    var crop_top = (resized.height - HEIGHT) // 2
+    var cropped = crop(resized, crop_left, crop_top, WIDTH, HEIGHT)
+    var values = image_to_signed_nchw(cropped)
+    var pixels = Tensor.from_host(
+        values, [1, 3, HEIGHT, WIDTH], STDtype.BF16, ctx
+    )
+    var vae = Wan22VaeImageEncoder[HEIGHT, WIDTH].load(
+        String(VAE_PATH), ctx
+    )
+    var encoded = vae.encode_image(pixels, ctx)
+    var first = cast_tensor(
+        reshape(encoded, [48, 1, H_LAT, W_LAT], ctx),
+        STDtype.F32,
+        ctx,
+    )
+    var tail = full_device(
+        [48, T_LAT - 1, H_LAT, W_LAT],
+        Float32(0.0),
+        STDtype.F32,
+        ctx,
+    )
+    return concat(1, ctx, first, tail)
+
+
+def _clamp_creator_first_frame(
+    x: Tensor, condition: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    var first = slice(condition, 1, 0, 1, ctx)
+    var generated = slice(x, 1, 1, T_LAT - 1, ctx)
+    return concat(1, ctx, first, generated)
+
+
+def _creator_i2v_token_timesteps(
+    timestep: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """mask2[0][0][:,::2,::2] * t, flattened in patch-token order."""
+    comptime FIRST_FRAME_TOKENS = HG * WG
+    var conditioned = full_device(
+        [FIRST_FRAME_TOKENS], Float32(0.0), STDtype.F32, ctx
+    )
+    var generated = full_device(
+        [S - FIRST_FRAME_TOKENS], timestep, STDtype.F32, ctx
+    )
+    return concat(0, ctx, conditioned, generated)
+
+
 def _denoise_scoped(
     pos: Tensor,
     neg: Tensor,
+    condition: Tensor,
+    i2v: Bool,
     steps: Int,
     seed: UInt64,
     guidance: Float32,
+    shift: Float32,
+    lora_path: String,
+    lora_mult: Float32,
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Run the DiT in its own lifetime so resident weights die before VAE load."""
@@ -192,21 +280,41 @@ def _denoise_scoped(
     print("  loading Wan2.2-TI2V-5B weights from FP8 cache", FP8_CACHE)
     var model = Wan22DiT.load_fp8_cache(String(FP8_CACHE), cfg, ctx)
     print("  weights loaded.")
+    if lora_path.byte_length() > 0 and lora_path != String("-"):
+        print("  loading Wan TI2V-5B LoRA:", lora_path)
+        _ = model.merge_lora_fp8_resident(
+            LoraSet.load(lora_path), lora_mult, ctx
+        )
 
     var x = randn([48, T_LAT, H_LAT, W_LAT], seed, STDtype.F32, ctx)
+    if i2v:
+        # Official Wan applies this replacement both before the first denoise
+        # call and after every scheduler step.
+        x = _clamp_creator_first_frame(x, condition, ctx)
     var scheduler = UniPcMultistepScheduler(
-        1000, steps, Float64(SHIFT), 2
+        1000, steps, Float64(shift), 2
     )
     var sigmas = scheduler.sigmas()
     for i in range(steps):
         var t = Float32(sigmas[i]) * NUM_TRAIN_TIMESTEPS
         var x_bf = cast_tensor(x, STDtype.BF16, ctx)
-        var v_cond = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
-            x_bf, t, pos, ctx
-        )
-        var v_unc = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
-            x_bf, t, neg, ctx
-        )
+        var v_cond: Tensor
+        var v_unc: Tensor
+        if i2v:
+            var token_timesteps = _creator_i2v_token_timesteps(t, ctx)
+            v_cond = model.forward_timesteps[
+                FG, HG, WG, S, TXT, CTXL, NH, HD
+            ](x_bf, token_timesteps, pos, ctx)
+            v_unc = model.forward_timesteps[
+                FG, HG, WG, S, TXT, CTXL, NH, HD
+            ](x_bf, token_timesteps, neg, ctx)
+        else:
+            v_cond = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
+                x_bf, t, pos, ctx
+            )
+            v_unc = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
+                x_bf, t, neg, ctx
+            )
         var vc = cast_tensor(v_cond, STDtype.F32, ctx)
         var vu = cast_tensor(v_unc, STDtype.F32, ctx)
         var v = add(
@@ -215,6 +323,8 @@ def _denoise_scoped(
             ctx,
         )
         x = scheduler.step(v, x, ctx)
+        if i2v:
+            x = _clamp_creator_first_frame(x, condition, ctx)
         print("  step", i + 1, "/", steps, " sigma=", sigmas[i], " t=", t)
     return x^
 
@@ -222,8 +332,9 @@ def _denoise_scoped(
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        print("usage: wan22_t2v <conds.safetensors> <out_dir> [frames] [steps] [seed] [guidance] [decode=1]")
+        print("usage: wan22_t2v <conds.safetensors> <out_dir> [frames] [steps] [seed] [guidance] [decode=1] [first_image=\"\"] [lora=\"-\"] [lora_mult=1.0]")
         print("  conds.safetensors: keys pos_embed[512,4096], neg_embed[512,4096]")
+        print("  first_image: PNG/JPEG/WebP enables creator TI2V first-frame conditioning")
         print("  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames, S=", S)
         return
 
@@ -232,7 +343,17 @@ def main() raises:
     var req_frames = FRAMES
     if len(args) >= 4:
         req_frames = atol(String(args[3]))
-    var steps = DEFAULT_STEPS
+    var image_path = String("")
+    if len(args) >= 9:
+        image_path = String(args[8])
+    var i2v = image_path.byte_length() > 0
+    var lora_path = String("-")
+    if len(args) >= 10:
+        lora_path = String(args[9])
+    var lora_mult = Float32(1.0)
+    if len(args) >= 11:
+        lora_mult = Float32(Float64(String(args[10])))
+    var steps = DEFAULT_I2V_STEPS if i2v else DEFAULT_T2V_STEPS
     if len(args) >= 5:
         steps = atol(String(args[4]))
     var seed = UInt64(DEFAULT_SEED)
@@ -254,10 +375,13 @@ def main() raises:
     if steps < 1:
         raise Error("steps must be >= 1")
 
-    print("=== Wan2.2-TI2V-5B T2V ===")
+    var shift = I2V_SHIFT_480P if i2v else T2V_SHIFT
+    print("=== Wan2.2-TI2V-5B", "I2V" if i2v else "T2V", "===")
     print("  geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames ->",
           "latent [48,", T_LAT, ",", H_LAT, ",", W_LAT, "], S=", S)
-    print("  steps=", steps, " guidance=", guidance, " shift=", SHIFT, " seed=", seed)
+    print("  steps=", steps, " guidance=", guidance, " shift=", shift, " seed=", seed)
+    if lora_path.byte_length() > 0 and lora_path != String("-"):
+        print("  LoRA:", lora_path, " multiplier=", lora_mult)
 
     var ctx = DeviceContext()
     # 1. Conds (pre-encoded umt5-xxl hidden states, raw, padded to 512).
@@ -274,9 +398,21 @@ def main() raises:
     pos = _zero_pad_rows(pos, pos_valid, ctx)
     neg = _zero_pad_rows(neg, neg_valid, ctx)
 
-    # 2-5. Cached DiT + creator UniPC in a nested lifetime. On return, resident
+    # 2. Optional first frame is encoded before the DiT is allocated so the VAE
+    # encoder and 5B transformer are never resident together.
+    var condition = _zero_condition(ctx)
+    if i2v:
+        print("  creator first-frame encode:", image_path)
+        condition = _encode_i2v_first_frame(image_path, ctx)
+        ctx.synchronize()
+        print("  first-frame VAE scope released")
+
+    # 3-6. Cached DiT + creator UniPC in a nested lifetime. On return, resident
     # weights and scheduler history are gone before the VAE is allocated.
-    var x = _denoise_scoped(pos, neg, steps, seed, guidance, ctx)
+    var x = _denoise_scoped(
+        pos, neg, condition, i2v, steps, seed, guidance, shift,
+        lora_path, lora_mult, ctx
+    )
     print("  denoise scope released; loading VAE next")
 
     if not decode:

@@ -174,6 +174,7 @@ var SerenityAPI = (function () {
         var bernini = false;
         var sampler = null;
         var latent = null;
+        var wanI2v = null;
         var videoLoras = [];
         for (var j = 0; j < keys.length; j++) {
             var node = nodes[keys[j]] || {};
@@ -194,15 +195,20 @@ var SerenityAPI = (function () {
                 sampler = node;
             if (node.class_type === 'EmptyLatentVideo')
                 latent = node;
+            if (node.class_type === 'WanImageToVideo')
+                wanI2v = node;
         }
         if ((wan || bernini) && sampler) {
             var si = sampler.inputs || {};
             function textFromRef(ref) {
                 if (!Array.isArray(ref) || !nodes[String(ref[0])])
                     return '';
-                return (nodes[String(ref[0])].inputs || {}).text || '';
+                var textInputs = nodes[String(ref[0])].inputs || {};
+                if (typeof textInputs.text === 'string')
+                    return textInputs.text;
+                return textFromRef(textInputs.positive);
             }
-            return {
+            var request = {
                 model: bernini ? 'bernini' : (wanA14b ? 'wan22_a14b' : 'wan22'),
                 prompt: textFromRef(si.positive),
                 negative_prompt: textFromRef(si.negative),
@@ -214,8 +220,23 @@ var SerenityAPI = (function () {
                 seed: si.seed || 0,
                 fps: (bernini || wanA14b) ? 16 : 24,
                 quant: 'fp8',
+                camera_motion: si.camera_motion || 'none',
                 lora: videoLoras
             };
+            if (wanI2v && !wanA14b && !bernini) {
+                var wi = wanI2v.inputs || {};
+                var imageRef = wi.image;
+                var imageNode = Array.isArray(imageRef)
+                    ? nodes[String(imageRef[0])] : null;
+                var imagePath = imageNode && imageNode.inputs
+                    ? String(imageNode.inputs.image || imageNode.inputs.path || '').trim()
+                    : '';
+                if (!imagePath)
+                    throw new Error('Wan first-frame workflow requires a loaded source image');
+                request.image_path = imagePath;
+                request.steps = 40;
+            }
+            return request;
         }
         return null;
     }

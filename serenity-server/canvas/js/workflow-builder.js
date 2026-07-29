@@ -1133,19 +1133,22 @@ var WorkflowBuilder = (function () {
         var h = ModelUtils.clampVideoDimension(p.height);
         var seed = resolveSeed(p.seed);
         var frames = Math.max(9, p.frames || 121);
-        return {
+        var i2v = !!p.initImageName;
+        var workflow = {
             '1': { class_type: 'UNETLoader', inputs: { unet_name: p.model, weight_dtype: 'default' } },
             '2': { class_type: 'CLIPLoader', inputs: { clip_name: 'umt5-xxl-enc-bf16.safetensors', type: 'wan' } },
             '3': { class_type: 'CLIPTextEncode', inputs: { text: p.prompt, clip: ['2', 0] } },
             '4': { class_type: 'CLIPTextEncode', inputs: { text: p.negPrompt || '', clip: ['2', 0] } },
             '5': { class_type: 'EmptyLatentVideo', inputs: { width: w, height: h, length: frames, batch_size: 1 } },
             '6': { class_type: 'KSampler', inputs: {
-                    seed: seed, steps: p.steps || 50, cfg: p.cfg || 5.0,
+                    seed: seed, steps: i2v ? 40 : 50, cfg: 5.0,
                     // SerenityAPI translates this graph to the oracle-gated
                     // Mojo Flow-UniPC route; these labels keep saved workflow
                     // metadata aligned with the actual sampler contract.
                     sampler_name: 'uni_pc', scheduler: 'normal', denoise: 1.0,
-                    model: ['1', 0], positive: ['3', 0], negative: ['4', 0], latent_image: ['5', 0]
+                    model: ['1', 0], positive: ['3', 0], negative: ['4', 0],
+                    latent_image: ['5', 0],
+                    camera_motion: p.ltx2CameraMotion || p.cameraMotion || 'none'
                 } },
             '7': { class_type: 'VAEDecode', inputs: { samples: ['6', 0], vae: ['1', 1] } },
             '8': { class_type: 'SaveAnimatedWEBP', inputs: {
@@ -1154,6 +1157,26 @@ var WorkflowBuilder = (function () {
                     fps: p.fps || 24
                 } }
         };
+        if (i2v) {
+            workflow['9'] = {
+                class_type: 'LoadImage',
+                inputs: { image: p.initImageName }
+            };
+            workflow['10'] = {
+                class_type: 'WanImageToVideo',
+                inputs: {
+                    positive: ['3', 0],
+                    image: ['9', 0],
+                    width: w,
+                    height: h,
+                    length: frames,
+                    creator_profile: 'ti2v-5b-first-frame'
+                }
+            };
+            workflow['6'].inputs.positive = ['10', 0];
+            workflow['6'].inputs.latent_image = ['10', 2];
+        }
+        return workflow;
     }
     // Bernini-R intentionally reuses the established Wan-shaped workflow
     // graph. SerenityAPI translates the selected model identity to the gated

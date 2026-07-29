@@ -42,6 +42,7 @@ from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.lora import LoraSet
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_tiled
@@ -753,6 +754,74 @@ struct Wan22DiT(Movable):
             raise Error("refusing to save incomplete Wan FP8 resident store")
         save_safetensors(names, tensors, path, ctx)
 
+    def merge_lora_fp8_resident(
+        mut self,
+        var lora: LoraSet,
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """Merge a TI2V-5B LoRA once into the in-memory resident weight store.
+
+        The production checkpoint keeps its 300 large block matrices as
+        row-scaled E4M3.  A trained LoRA delta must therefore be applied after
+        dequantization, then the merged matrix is requantized into the same
+        resident representation.  This is deliberately a one-time load seam:
+        doing B@A in every conditional/unconditional block forward would repeat
+        the identical adapter work thousands of times during one video.
+
+        Nothing is written to disk and the pinned base cache remains unchanged.
+        Partial adapters are supported, but a completely inert or wrong-model
+        adapter fails loudly instead of silently rendering the base model.
+        """
+        var merged_count = 0
+        for ref m in lora.mappings:
+            if m.base_key not in self.weights:
+                continue
+            var scale = lora._module_scale(m, multiplier, ctx)
+            ref base = self.weights[m.base_key][]
+            if base.dtype() == STDtype.F8_E4M3:
+                var scale_key = m.base_key + String(".__fp8_scale")
+                if scale_key not in self.weights:
+                    raise Error(
+                        String("Wan TI2V-5B LoRA target is missing FP8 scale: ")
+                        + m.base_key
+                    )
+                var base_bf16 = fp8_e4m3_dequant_perrow_to_bf16(
+                    base, self.weights[scale_key][], ctx
+                )
+                var delta = lora._compute_delta(
+                    m, scale, STDtype.BF16, ctx
+                )
+                var fused = add(base_bf16, delta, ctx)
+                var fused_scale = fp8_e4m3_rowscale(fused, ctx)
+                var fused_bytes = fp8_e4m3_encode_perrow(
+                    fused, fused_scale, ctx
+                )
+                ctx.synchronize()
+                self.weights[m.base_key] = ArcPointer(fused_bytes^)
+                self.weights[scale_key] = ArcPointer(fused_scale^)
+            else:
+                var delta = lora._compute_delta(
+                    m, scale, base.dtype(), ctx
+                )
+                var fused = add(base, delta, ctx)
+                ctx.synchronize()
+                self.weights[m.base_key] = ArcPointer(fused^)
+            merged_count += 1
+        if merged_count == 0:
+            raise Error(
+                "Wan TI2V-5B LoRA matched no resident weights; wrong model or key format"
+            )
+        print(
+            "  Wan TI2V-5B LoRA merged into resident cache: modules=",
+            merged_count,
+            " multiplier=",
+            multiplier,
+            " format=",
+            lora.format_name(),
+        )
+        return merged_count
+
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         return self.weights[name][]
 
@@ -798,11 +867,34 @@ struct Wan22DiT(Movable):
         self, x_lat: Tensor, timestep: Float32, context: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
+        """Creator T2V forward with one shared diffusion timestep."""
+        var t_shape = List[Int]()
+        t_shape.append(S)
+        var t_vec = full_device(t_shape^, timestep, STDtype.F32, ctx)
+        return self.forward_timesteps[FG, HG, WG, S, TXT, CTXL, H, DH](
+            x_lat, t_vec, context, ctx
+        )
+
+    def forward_timesteps[
+        FG: Int, HG: Int, WG: Int, S: Int, TXT: Int, CTXL: Int, H: Int, DH: Int
+    ](
+        self, x_lat: Tensor, timestep_tokens: Tensor, context: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """Creator TI2V forward with one diffusion timestep per image token.
+
+        Wan2.2-TI2V-5B marks the conditioned first-frame tokens with timestep
+        zero while the generated tokens use the scheduler timestep.  Keeping
+        this as an explicit entrypoint prevents the I2V path from silently
+        collapsing back to the scalar T2V contract.
+        """
         var cfg = self.config
         var dim = cfg.dim
         var in_dim = cfg.in_dim
         var out_dim = cfg.out_dim
         var bf = x_lat.dtype()
+        if timestep_tokens.numel() != S:
+            raise Error("Wan22 token timestep vector must have exactly S values")
 
         # ── Patch embedding: Conv3d(in_dim, dim, k=(1,2,2), s=(1,2,2)) ──
         # patchify3d unfold [in_dim,F,H,W] -> [n_patches, in_dim*1*2*2]; then
@@ -820,12 +912,12 @@ struct Wan22DiT(Movable):
         img_shape.append(dim)
         var img = reshape(img2d, img_shape^, ctx)  # [1,S,dim]
 
-        # ── Time embedding (per-token; all tokens share the scalar timestep) ──
-        # Device-side fill (all S tokens = the same scalar) — was a host loop +
-        # from_host + synchronize per forward.
-        var t_shape = List[Int]()
-        t_shape.append(S)
-        var t_vec = full_device(t_shape^, timestep, STDtype.F32, ctx)
+        # ── Time embedding (creator per-token TI2V contract) ─────────────────
+        var t_vec: Tensor
+        if timestep_tokens.dtype() == STDtype.F32:
+            t_vec = timestep_tokens.clone(ctx)
+        else:
+            t_vec = cast_tensor(timestep_tokens, STDtype.F32, ctx)
         var sin_bf = timestep_embedding(
             t_vec, cfg.freq_dim, ctx, 10000.0, bf
         )

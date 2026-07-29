@@ -27,10 +27,31 @@ DEFAULT_SNAPSHOT = Path(
 DEFAULT_OUTPUT = Path(
     "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-Mojo"
 )
+DEFAULT_NATIVE_TRANSFORMER = Path(
+    "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-bf16"
+)
+DEFAULT_NATIVE_UMT5 = Path(
+    "/home/alex/.serenity/models/checkpoints/NAVA/umt5_xxl_enc.safetensors"
+)
+DEFAULT_NATIVE_TOKENIZER = Path(
+    "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl"
+)
 
 
 def transformer_key(key: str) -> str:
     if key.startswith("blocks."):
+        if any(
+            marker in key
+            for marker in (
+                ".self_attn.",
+                ".cross_attn.",
+                ".ffn.0.",
+                ".ffn.2.",
+                ".norm3.",
+                ".modulation",
+            )
+        ):
+            return key
         out = key
         out = out.replace(".attn1.", ".self_attn.")
         out = out.replace(".attn2.", ".cross_attn.")
@@ -59,7 +80,13 @@ def transformer_key(key: str) -> str:
             return target + key[len(source) :]
     if key == "scale_shift_table":
         return "head.modulation"
-    if key.startswith("patch_embedding."):
+    if (
+        key.startswith("patch_embedding.")
+        or key.startswith("text_embedding.")
+        or key.startswith("time_embedding.")
+        or key.startswith("time_projection.")
+        or key.startswith("head.")
+    ):
         return key
     raise ValueError(f"unmapped transformer key: {key}")
 
@@ -159,14 +186,91 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--local-native",
+        action="store_true",
+        help=(
+            "build the same zero-copy runtime view from the installed official "
+            "native Wan shards instead of requiring a second Diffusers snapshot"
+        ),
+    )
+    parser.add_argument(
+        "--native-transformer",
+        type=Path,
+        default=DEFAULT_NATIVE_TRANSFORMER,
+    )
+    parser.add_argument("--native-umt5", type=Path, default=DEFAULT_NATIVE_UMT5)
+    parser.add_argument(
+        "--native-tokenizer",
+        type=Path,
+        default=DEFAULT_NATIVE_TOKENIZER,
+    )
     args = parser.parse_args()
+
+    output = args.output
+    if args.local_native:
+        transformer_source = args.native_transformer.resolve(strict=True)
+        transformer_index_path = (
+            transformer_source / "diffusion_pytorch_model.safetensors.index.json"
+        )
+        transformer_index = validate_index_mapping(
+            transformer_index_path, transformer_key, expected_count=825
+        )
+        atomic_json(
+            output / "diffusion_pytorch_model.safetensors.index.json",
+            transformer_index,
+        )
+        link_index_shards(transformer_source, output, transformer_index)
+
+        umt5_source = args.native_umt5.resolve(strict=True)
+        tokenizer_source = args.native_tokenizer.resolve(strict=True)
+        safe_symlink(umt5_source, output / "umt5" / "model.safetensors")
+        safe_symlink(tokenizer_source / "tokenizer.json", output / "tokenizer.json")
+        safe_symlink(tokenizer_source / "spiece.model", output / "spiece.model")
+        safe_symlink(transformer_source / "config.json", output / "transformer_config.json")
+        atomic_json(
+            output / "scheduler_config.json",
+            {
+                "_class_name": "FlowUniPCMultistepScheduler",
+                "num_train_timesteps": 1000,
+                "shift": 5.0,
+                "solver_order": 2,
+            },
+        )
+        manifest = {
+            "schema": "serenity.wan22.artifact_view.v1",
+            "repo_id": "Wan-AI/Wan2.2-TI2V-5B",
+            "revision": "installed-official-native",
+            "oracle_revision": ORACLE_REVISION,
+            "source_kind": "official_native_zero_copy",
+            "transformer": {
+                "source": str(transformer_source),
+                "index": "diffusion_pytorch_model.safetensors.index.json",
+                "index_sha256": sha256(transformer_index_path),
+                "tensor_count": len(transformer_index["weight_map"]),
+                "source_total_size": transformer_index["metadata"].get("total_size"),
+                "shard_count": len(set(transformer_index["weight_map"].values())),
+            },
+            "umt5": {
+                "source": str(umt5_source),
+                "file": "umt5/model.safetensors",
+                "source_size": umt5_source.stat().st_size,
+                "tensor_count": 242,
+                "shard_count": 1,
+            },
+        }
+        atomic_json(output / "serenity_wan22_manifest.json", manifest)
+        for path in output.rglob("*"):
+            if path.is_symlink() and not path.exists():
+                raise FileNotFoundError(f"broken artifact symlink: {path}")
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return
 
     snapshot = args.snapshot.resolve(strict=True)
     if snapshot.name != REVISION:
         raise ValueError(
             f"snapshot revision mismatch: expected {REVISION}, got {snapshot.name}"
         )
-    output = args.output
 
     transformer_source = snapshot / "transformer"
     transformer_index_path = (

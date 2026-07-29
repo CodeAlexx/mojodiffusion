@@ -2889,8 +2889,9 @@ NOTE: Musubi trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
   streamed) — a lever, not correctness. `configs/wan22_{real_smoke_2step,dual_smoke_4step}.json`.
 - **Save↔load closed**: these ai-toolkit-format saves load back through the inference
   loader `lora.mojo` `FMT_DIFFUSION_MODEL` with NO conversion (`_map_diffusion_model`
-  strips `diffusion_model.`). No Wan *inference* pipeline wires `LoraSet` yet — the
-  files are loadable but the Wan inference apply path is a follow-up.
+  strips `diffusion_model.`). Superseded on 2026-07-29 for TI2V-5B inference:
+  `Wan22DiT.merge_lora_fp8_resident` now applies compatible 5B block LoRAs once
+  in memory; the A14B streamed inference path remains separate.
 
 ## 2026-07-21: LoRA LOADER (`lora.mojo`) — 5-format detect + LTX2LoraLoaderAdvanced per-stream
 
@@ -3027,3 +3028,39 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
 - OPEN follow-ups: condition dropout 0.1 (text/img/video), mv2v true N-scaling
   (smoke uses N=2), real multi-task cache builder + umt5 system-prompt tokens
   (renderer trains on VAE latents; text currently synthetic).
+
+## 2026-07-29: Wan2.2 TI2V-5B creator T2V/I2V + resident LoRA product path
+
+- Re-audited against `Wan-Video/Wan2.2` creator source at
+  `42bf4cfaa384bc21833865abc2f9e6c0e67233dc`. T2V is the creator 50-step
+  Flow-UniPC/shift-5/CFG-5 route. I2V is the creator 40-step/shift-3 route:
+  aspect-preserving Lanczos cover resize and center crop, single-frame VAE
+  encode, frame-zero latent replacement before denoise and after every step,
+  and timestep zero on the conditioned first temporal patch tokens.
+- Product geometry is compiled as 832x480 and 480x832, both 121 frames at
+  24 fps. Rust validates the exact profiles, sequences UMT5 then DiT then VAE,
+  muxes H.264, probes the result, and returns the synchronous video artifact.
+  Model/sampler/VAE math remains Mojo-owned.
+- The official BF16 transformer shards and canonical UMT5 are reused through a
+  zero-copy symlink view. The resident cache contains 300 row-scaled E4M3
+  matrices plus 525 exact BF16 tensors. No second base checkpoint was copied.
+- Real gates: landscape T2V 371.75 s / 14,863 MiB; portrait I2V 324.46 s /
+  15,714 MiB; I2V frame-zero SSIM 0.9711869 against the creator Lanczos
+  preprocessing. Both outputs are 121-frame 24-fps H.264 and were visually
+  inspected.
+- `Wan22DiT.merge_lora_fp8_resident` admits generic AI Toolkit/DiffusionModel
+  TI2V-5B block LoRAs. It computes each BF16 delta once and requantizes only
+  the in-memory resident matrix. Rust header preflight checks the 3072/14336
+  5B dimensions and rejects 14B adapters before CUDA. The 161 MB
+  `ostris/wan22_5b_i2v_crush_it_lora` fixture matched all 300 intended modules
+  and passed a real portrait I2V denoise smoke; full-render evidence is under
+  `output/checks/wan22_20260729/i2v_portrait_cyborg_crush_lora`.
+- Generate, Workflow, and Canvas preserve the exact Wan request contract,
+  expose one shape-validated 5B LoRA, and route Canvas content as frame-zero
+  I2V. VACE/control, FLF2V last-frame conditioning, arbitrary frame counts,
+  and the installed 14B LoRAs remain explicitly unavailable because their
+  required compatible weights/runtime are not installed.
+- Rebuild with `scripts/build_wan22.sh`; regenerate the machine-local gate with
+  `python3 scripts/check_wan22_product_gate.py --visual-accepted`. The gate
+  records the exact local artifact paths, hashes, timing, VRAM, and visual
+  acceptance used by the running server.

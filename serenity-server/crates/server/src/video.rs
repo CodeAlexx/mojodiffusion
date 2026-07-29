@@ -115,6 +115,7 @@ fn model_path(path: &str) -> std::path::PathBuf {
 /// Wan2.2 two-process video: encode umt5 conds, then T2V (both under output/bin/).
 const WAN22_ENCODE: &str = "output/bin/wan22_encode_prompt";
 const WAN22_T2V: &str = "output/bin/wan22_t2v";
+const WAN22_T2V_PORTRAIT: &str = "output/bin/wan22_t2v_480x832";
 const WAN22_A14B_LORA_T2V: &str = "output/bin/wan22_a14b_lora_t2v";
 const WAN22_A14B_HIGH: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/high";
 const WAN22_A14B_LOW: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/low";
@@ -124,21 +125,20 @@ const WAN22_ARTIFACT_MANIFEST: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/serenity_wan22_manifest.json";
 const WAN22_FP8_CACHE: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/wan22_dit_fp8_e4m3_b8fff7315c768468.safetensors";
-const WAN22_UMT5_INDEX: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo/umt5/model.safetensors.index.json";
-const WAN22_UMT5_SHARD_1: &str =
-    "checkpoints/Wan2.2-TI2V-5B-Mojo/umt5/model-00001-of-00003.safetensors";
-const WAN22_UMT5_SHARD_2: &str =
-    "checkpoints/Wan2.2-TI2V-5B-Mojo/umt5/model-00002-of-00003.safetensors";
-const WAN22_UMT5_SHARD_3: &str =
-    "checkpoints/Wan2.2-TI2V-5B-Mojo/umt5/model-00003-of-00003.safetensors";
+const WAN22_UMT5_FILE: &str =
+    "checkpoints/Wan2.2-TI2V-5B-Mojo/umt5/model.safetensors";
 const WAN22_TOKENIZER: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo/tokenizer.json";
 const WAN22_SPIECE: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo/spiece.model";
 const WAN22_VAE: &str = "vaes/wan2.2_vae.safetensors";
 const WAN22_PRODUCT_GATE: &str = "output/checks/wan22_product_gate.json";
-const WAN22_HF_REVISION: &str = "b8fff7315c768468a5333511427288870b2e9635";
+const WAN22_HF_REVISION: &str = "installed-official-native";
 const WAN22_CREATOR_REVISION: &str = "42bf4cfaa384bc21833865abc2f9e6c0e67233dc";
 const WAN22_FP8_CACHE_SHA256: &str =
-    "84812d4fe806b7a414c47bd91d02498e8ac07ec5fa4db34ae58dc241524ccb49";
+    "bd2abdeeef4ab37454a7e6dab6eeb9517206f8c003a6aa1e345906e71a6d5010";
+const WAN22_TRANSFORMER_INDEX_SHA256: &str =
+    "cd769dd8bddb0825ffb3516a39d64fc2ac3a5946fb93337f8594af926d6a0f56";
+const WAN22_RUNNER_SOURCE_BUNDLE_SHA256: &str =
+    "9a07732e237c01e5bd8bb69a2b3192d60f49826d66376881ebfe66c81eb25a68";
 const WAN22_DEFAULT_NEGATIVE: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 const MOJO_CUDNN_RUNTIME: &str = "cudnn/lib/libcudnn.so.9";
 /// Pixi runtime libs + cshim (cuDNN/int4) shims — required by the Mojo binaries.
@@ -218,8 +218,11 @@ const LTX2_REFHQ_BF16: &str = "checkpoints/ltx-2.3-22b-dev-fp8-dequant-bf16.safe
 const WAN22_FRAMES: i64 = 121;
 const WAN22_WIDTH: i64 = 832;
 const WAN22_HEIGHT: i64 = 480;
+const WAN22_PORTRAIT_WIDTH: i64 = 480;
+const WAN22_PORTRAIT_HEIGHT: i64 = 832;
 const WAN22_FPS: i64 = 24;
 const WAN22_DEFAULT_STEPS: i64 = 50;
+const WAN22_I2V_STEPS: i64 = 40;
 const WAN22_DEFAULT_GUIDANCE: f64 = 5.0;
 const WAN22_A14B_FRAMES: i64 = 81;
 const WAN22_A14B_WIDTH: i64 = 832;
@@ -1425,13 +1428,13 @@ fn wan22_missing() -> Vec<String> {
     if !bin_x(WAN22_T2V) {
         m.push(WAN22_T2V.to_string());
     }
+    if !bin_x(WAN22_T2V_PORTRAIT) {
+        m.push(WAN22_T2V_PORTRAIT.to_string());
+    }
     for path in [
         WAN22_ARTIFACT_MANIFEST,
         WAN22_FP8_CACHE,
-        WAN22_UMT5_INDEX,
-        WAN22_UMT5_SHARD_1,
-        WAN22_UMT5_SHARD_2,
-        WAN22_UMT5_SHARD_3,
+        WAN22_UMT5_FILE,
         WAN22_TOKENIZER,
         WAN22_SPIECE,
         WAN22_VAE,
@@ -1512,6 +1515,155 @@ fn wan22_a14b_lora(body: &Value) -> Result<(std::path::PathBuf, f64, String), St
     Ok((path, weight, name.to_string()))
 }
 
+fn wan22_ti2v5b_lora_header(doc: &Value) -> Result<usize, String> {
+    let Some(tensors) = doc.as_object() else {
+        return Err("invalid safetensors header".to_string());
+    };
+    let mut pairs = 0;
+    for (key, entry) in tensors {
+        if key == "__metadata__" || !key.ends_with(".lora_A.weight") {
+            continue;
+        }
+        if !key.starts_with("diffusion_model.blocks.") {
+            return Err(format!(
+                "unsupported Wan LoRA key '{key}'; TI2V-5B admits AI Toolkit/DiffusionModel block adapters"
+            ));
+        }
+        let prefix = key.trim_end_matches(".lora_A.weight");
+        let b_key = format!("{prefix}.lora_B.weight");
+        let Some(b_entry) = tensors.get(&b_key) else {
+            return Err(format!("Wan LoRA is missing pair tensor '{b_key}'"));
+        };
+        let a_shape = entry
+            .get("shape")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("Wan LoRA tensor '{key}' has no shape"))?;
+        let b_shape = b_entry
+            .get("shape")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("Wan LoRA tensor '{b_key}' has no shape"))?;
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(format!("Wan TI2V-5B LoRA tensor '{key}' must be rank-2"));
+        }
+        let rank = a_shape[0]
+            .as_u64()
+            .ok_or_else(|| format!("Wan LoRA tensor '{key}' has invalid rank"))?;
+        let input = a_shape[1]
+            .as_u64()
+            .ok_or_else(|| format!("Wan LoRA tensor '{key}' has invalid input size"))?;
+        let output = b_shape[0]
+            .as_u64()
+            .ok_or_else(|| format!("Wan LoRA tensor '{b_key}' has invalid output size"))?;
+        let b_rank = b_shape[1]
+            .as_u64()
+            .ok_or_else(|| format!("Wan LoRA tensor '{b_key}' has invalid rank"))?;
+        if rank == 0 || b_rank != rank {
+            return Err(format!("Wan LoRA A/B rank mismatch for '{prefix}'"));
+        }
+        let module = prefix
+            .split_once(".blocks.")
+            .and_then(|(_, tail)| tail.split_once('.').map(|(_, module)| module))
+            .unwrap_or("");
+        let expected = match module {
+            "self_attn.q" | "self_attn.k" | "self_attn.v" | "self_attn.o"
+            | "cross_attn.q" | "cross_attn.k" | "cross_attn.v" | "cross_attn.o" => {
+                (3_072, 3_072)
+            }
+            "ffn.0" => (14_336, 3_072),
+            "ffn.2" => (3_072, 14_336),
+            _ => {
+                return Err(format!(
+                    "Wan TI2V-5B LoRA module '{module}' is not an admitted block linear"
+                ));
+            }
+        };
+        if (output, input) != expected {
+            return Err(format!(
+                "Wan LoRA module '{module}' has [{output},{input}], expected TI2V-5B [{},{}]; this is probably a 14B adapter",
+                expected.0, expected.1
+            ));
+        }
+        for (tensor_key, tensor_entry) in [(key.as_str(), entry), (b_key.as_str(), b_entry)] {
+            let dtype = tensor_entry
+                .get("dtype")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !matches!(dtype, "BF16" | "F16" | "F32") {
+                return Err(format!(
+                    "Wan LoRA tensor '{tensor_key}' uses unsupported dtype '{dtype}'"
+                ));
+            }
+        }
+        pairs += 1;
+    }
+    if pairs == 0 {
+        return Err(
+            "no AI Toolkit/DiffusionModel Wan TI2V-5B LoRA A/B pairs were found".to_string(),
+        );
+    }
+    Ok(pairs)
+}
+
+fn wan22_ti2v5b_lora(
+    body: &Value,
+) -> Result<Option<(std::path::PathBuf, f64, String, usize)>, String> {
+    let Some(rows) = body
+        .get("lora")
+        .or_else(|| body.get("loras"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(None);
+    };
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != 1 {
+        return Err(
+            "Wan2.2-TI2V-5B currently accepts one resident LoRA per render".to_string(),
+        );
+    }
+    let row = rows[0]
+        .as_object()
+        .ok_or_else(|| "Wan2.2-TI2V-5B lora[0] must be an object".to_string())?;
+    let name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return Err("Wan2.2-TI2V-5B lora[0].name is required".to_string());
+    }
+    let weight = row
+        .get("weight")
+        .or_else(|| row.get("strength"))
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if !weight.is_finite() || !(-10.0..=10.0).contains(&weight) {
+        return Err(
+            "Wan2.2-TI2V-5B lora[0] weight must be finite in [-10, 10]".to_string(),
+        );
+    }
+    if crate::models::lora_usage(name) != "overlay" {
+        return Err(format!(
+            "Wan2.2-TI2V-5B LoRA '{name}' is a feature adapter, not a model overlay"
+        ));
+    }
+    let Some((path, arch)) = crate::models::lora_path_and_arch(name) else {
+        return Err(format!(
+            "Wan2.2-TI2V-5B LoRA not found in the model registry: {name}"
+        ));
+    };
+    if arch != "wan2.2" {
+        return Err(format!(
+            "Wan2.2-TI2V-5B LoRA '{name}' targets '{arch}', not wan2.2"
+        ));
+    }
+    let header = safetensors_header(&path)
+        .ok_or_else(|| format!("cannot read Wan LoRA safetensors header: {}", path.display()))?;
+    let pairs = wan22_ti2v5b_lora_header(&header)?;
+    Ok(Some((path, weight, name.to_string(), pairs)))
+}
+
 /// Read acceptance only from the machine-local evidence gate. The report is
 /// regenerated by scripts/check_wan22_product_gate.py after verifying the
 /// pinned artifacts, exact cache digest, parity, representative frame bytes,
@@ -1523,7 +1675,7 @@ fn wan22_product_gate_passed() -> bool {
     let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    doc.get("schema").and_then(Value::as_str) == Some("serenity.wan22.product_gate.v1")
+    doc.get("schema").and_then(Value::as_str) == Some("serenity.wan22.product_gate.v2")
         && doc.get("passed").and_then(Value::as_bool) == Some(true)
         && doc.pointer("/pins/hf_revision").and_then(Value::as_str) == Some(WAN22_HF_REVISION)
         && doc
@@ -1534,11 +1686,30 @@ fn wan22_product_gate_passed() -> bool {
             .pointer("/pins/fp8_cache_sha256")
             .and_then(Value::as_str)
             == Some(WAN22_FP8_CACHE_SHA256)
+        && doc
+            .pointer("/pins/transformer_index_sha256")
+            .and_then(Value::as_str)
+            == Some(WAN22_TRANSFORMER_INDEX_SHA256)
+        && doc
+            .pointer("/pins/runner_source_bundle_sha256")
+            .and_then(Value::as_str)
+            == Some(WAN22_RUNNER_SOURCE_BUNDLE_SHA256)
         && doc.pointer("/profile/width").and_then(Value::as_i64) == Some(WAN22_WIDTH)
         && doc.pointer("/profile/height").and_then(Value::as_i64) == Some(WAN22_HEIGHT)
         && doc.pointer("/profile/frames").and_then(Value::as_i64) == Some(WAN22_FRAMES)
         && doc.pointer("/profile/steps").and_then(Value::as_i64) == Some(WAN22_DEFAULT_STEPS)
         && doc.pointer("/profile/guidance").and_then(Value::as_f64) == Some(WAN22_DEFAULT_GUIDANCE)
+        && doc.pointer("/i2v_profile/steps").and_then(Value::as_i64)
+            == Some(WAN22_I2V_STEPS)
+        && doc.pointer("/i2v_profile/shift").and_then(Value::as_f64) == Some(3.0)
+        && doc.pointer("/i2v_profile/width").and_then(Value::as_i64)
+            == Some(WAN22_PORTRAIT_WIDTH)
+        && doc.pointer("/i2v_profile/height").and_then(Value::as_i64)
+            == Some(WAN22_PORTRAIT_HEIGHT)
+        && doc
+            .pointer("/checks/i2v_first_frame_identity")
+            .and_then(Value::as_bool)
+            == Some(true)
         && doc
             .pointer("/performance/requires_isolated_gpu_worker")
             .and_then(Value::as_bool)
@@ -1986,12 +2157,65 @@ fn readiness_doc() -> Value {
             "target_width": WAN22_WIDTH,
             "target_height": WAN22_HEIGHT,
             "target_frame_count": WAN22_FRAMES,
+            "native_profiles": [
+                {
+                    "width": WAN22_WIDTH,
+                    "height": WAN22_HEIGHT,
+                    "label": "16:9 landscape",
+                },
+                {
+                    "width": WAN22_PORTRAIT_WIDTH,
+                    "height": WAN22_PORTRAIT_HEIGHT,
+                    "label": "9:16 portrait",
+                }
+            ],
             "default_steps": WAN22_DEFAULT_STEPS,
+            "i2v_steps": WAN22_I2V_STEPS,
             "default_guidance": WAN22_DEFAULT_GUIDANCE,
-            "sampler": "Flow-UniPC order 2, predict_x0, shift 5",
+            "modes": {
+                "t2v": {
+                    "available": wan22_product_accepted,
+                    "steps": WAN22_DEFAULT_STEPS,
+                    "shift": 5.0,
+                },
+                "i2v_first_frame": {
+                    "available": wan22_product_accepted,
+                    "source_images": 1,
+                    "steps": WAN22_I2V_STEPS,
+                    "shift": 3.0,
+                    "conditioning": "creator clean-frame replacement plus per-token zero timestep",
+                },
+                "last_frame": {
+                    "available": false,
+                    "reason": "official TI2V-5B accepts one input image; FLF2V requires different weights",
+                },
+                "vace_control": {
+                    "available": false,
+                    "reason": "VACE/control weights are not installed",
+                },
+                "lora": {
+                    "available": wan22_product_accepted,
+                    "max_count": 1,
+                    "base_model": "Wan-AI/Wan2.2-TI2V-5B",
+                    "format": "AI Toolkit/DiffusionModel block LoRA",
+                    "merge": "one-time in-memory BF16 delta merge into resident row-scaled FP8 weights",
+                }
+            },
+            "camera_motions": [
+                { "id": "none", "label": "None", "prompt_suffix": "" },
+                { "id": "static", "label": "Static", "prompt_suffix": ", static camera, locked off shot, no camera movement" },
+                { "id": "focus_shift", "label": "Focus shift", "prompt_suffix": ", focus shift, rack focus, changing focal point" },
+                { "id": "dolly_in", "label": "Dolly in", "prompt_suffix": ", dolly in, camera pushing forward, smooth forward movement" },
+                { "id": "dolly_out", "label": "Dolly out", "prompt_suffix": ", dolly out, camera pulling back, smooth backward movement" },
+                { "id": "dolly_left", "label": "Dolly left", "prompt_suffix": ", dolly left, camera tracking left, lateral movement" },
+                { "id": "dolly_right", "label": "Dolly right", "prompt_suffix": ", dolly right, camera tracking right, lateral movement" },
+                { "id": "jib_up", "label": "Jib up", "prompt_suffix": ", jib up, camera rising up, upward crane movement" },
+                { "id": "jib_down", "label": "Jib down", "prompt_suffix": ", jib down, camera lowering down, downward crane movement" }
+            ],
+            "sampler": "Flow-UniPC order 2, predict_x0; T2V shift 5, I2V shift 3",
             "quant_modes": ["fp8"],
             "quant_note": "persistent row-scaled FP8 E4M3 DiT cache; BF16 exact tensors and BF16 on-use compute",
-            "note": "Measured high-quality profile: 832x480, 121 frames, 24 fps, 50 Flow-UniPC steps, CFG 5. Geometry is comptime-compiled; frames must equal 121 without a rebuild.",
+            "note": "Creator T2V and first-frame I2V profile: 832x480, 121 frames, 24 fps, CFG 5. Geometry is comptime-compiled; frames must equal 121 without a rebuild.",
             "limit": "requires the existing isolated GPU lease; machine-local product acceptance requires the pinned parity, visual, mux, timing, and peak-VRAM gate",
         },
         {
@@ -2149,6 +2373,54 @@ fn normalized_ltx2_camera_motion_request(body: &Value) -> Result<Value, String> 
     Ok(normalized)
 }
 
+fn normalized_wan22_camera_motion_request(body: &Value) -> Result<Value, String> {
+    let mut normalized = body.clone();
+    let motion = body
+        .get("camera_motion")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .trim();
+    let suffix = match motion {
+        "none" => "",
+        "static" => ", static camera, locked off shot, no camera movement",
+        "focus_shift" => ", focus shift, rack focus, changing focal point",
+        "dolly_in" => ", dolly in, camera pushing forward, smooth forward movement",
+        "dolly_out" => ", dolly out, camera pulling back, smooth backward movement",
+        "dolly_left" => ", dolly left, camera tracking left, lateral movement",
+        "dolly_right" => ", dolly right, camera tracking right, lateral movement",
+        "jib_up" => ", jib up, camera rising up, upward crane movement",
+        "jib_down" => ", jib down, camera lowering down, downward crane movement",
+        other => return Err(format!("unsupported Wan camera_motion '{other}'")),
+    };
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| "Wan request must be an object".to_string())?;
+    object.insert("camera_motion".to_string(), json!(motion));
+    if !suffix.is_empty()
+        && object
+            .get("creator_camera_motion_applied")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        let prompt = object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        object.insert("creator_prompt".to_string(), json!(prompt));
+        object.insert("prompt".to_string(), json!(format!("{prompt}{suffix}")));
+        object.insert(
+            "creator_camera_motion_suffix".to_string(),
+            json!(suffix),
+        );
+        object.insert(
+            "creator_camera_motion_applied".to_string(),
+            json!(true),
+        );
+    }
+    Ok(normalized)
+}
+
 fn normalized_ltx2_checkpoint_workflow_request(body: &Value) -> Result<Value, String> {
     let mut normalized = body.clone();
     let checkpoint = body
@@ -2264,6 +2536,12 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
                 ),
             );
         }
+    }
+    if model == "wan22" {
+        b = match normalized_wan22_camera_motion_request(&b) {
+            Ok(value) => value,
+            Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        };
     }
     // Fail closed before taking the GPU lease or evicting an idle image model.
     // A partially installed or non-accepted video arm is not a GPU operation.
@@ -5605,6 +5883,40 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
     } else {
         requested_negative
     };
+    let image_path = s("image_path", "").trim().to_string();
+    let is_i2v = !image_path.is_empty();
+    if is_i2v && !std::path::Path::new(&image_path).is_file() {
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("Wan TI2V first-frame image not found: {image_path}"),
+        );
+    }
+    if b.get("last_image_path")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Wan2.2-TI2V-5B officially accepts one input image; last-frame conditioning requires a different FLF2V model and is not faked",
+        );
+    }
+    for unsupported in ["video_path", "vace_path", "control_video_path", "motion_track_path"] {
+        if b.get(unsupported)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "Wan2.2-TI2V-5B does not support '{unsupported}' with the installed weights; VACE/control/motion models are not installed"
+                ),
+            );
+        }
+    }
+    let lora = match wan22_ti2v5b_lora(b) {
+        Ok(value) => value,
+        Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
+    };
     // The admitted 16 GiB route is the persistent E4M3 cache. A BF16 request
     // would select the old OOM-prone profile and must fail before GPU launch.
     let quant = s("quant", "fp8");
@@ -5643,22 +5955,36 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         .and_then(|v| v.as_i64())
         .unwrap_or(WAN22_HEIGHT);
     let fps = b.get("fps").and_then(|v| v.as_i64()).unwrap_or(24);
-    if width != WAN22_WIDTH || height != WAN22_HEIGHT || fps != 24 {
+    let landscape = width == WAN22_WIDTH && height == WAN22_HEIGHT;
+    let portrait = width == WAN22_PORTRAIT_WIDTH && height == WAN22_PORTRAIT_HEIGHT;
+    if (!landscape && !portrait) || fps != 24 {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!(
-                "wan22_t2v admitted profile is {WAN22_WIDTH}x{WAN22_HEIGHT} at 24 fps; requested {width}x{height} at {fps} fps"
+                "Wan2.2 admitted native profiles are {WAN22_WIDTH}x{WAN22_HEIGHT} and {WAN22_PORTRAIT_WIDTH}x{WAN22_PORTRAIT_HEIGHT} at 24 fps; requested {width}x{height} at {fps} fps"
             ),
         );
     }
     let steps = b
         .get("steps")
         .and_then(|v| v.as_i64())
-        .unwrap_or(WAN22_DEFAULT_STEPS);
-    if steps != WAN22_DEFAULT_STEPS {
+        .unwrap_or(if is_i2v {
+            WAN22_I2V_STEPS
+        } else {
+            WAN22_DEFAULT_STEPS
+        });
+    let required_steps = if is_i2v {
+        WAN22_I2V_STEPS
+    } else {
+        WAN22_DEFAULT_STEPS
+    };
+    if steps != required_steps {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("wan22_t2v high-quality profile requires exactly {WAN22_DEFAULT_STEPS} steps"),
+            &format!(
+                "Wan2.2 {} creator profile requires exactly {required_steps} steps",
+                if is_i2v { "I2V" } else { "T2V" }
+            ),
         );
     }
     let seed = match ltx2_seed(b) {
@@ -5708,7 +6034,16 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
     let t2v_log = out_dir.join("wan22_t2v.log");
 
     let abs_encode = repo_path(WAN22_ENCODE);
-    let abs_t2v = repo_path(WAN22_T2V);
+    let abs_t2v = repo_path(if portrait {
+        WAN22_T2V_PORTRAIT
+    } else {
+        WAN22_T2V
+    });
+    let lora_path = lora
+        .as_ref()
+        .map(|(path, _, _, _)| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_string());
+    let lora_weight = lora.as_ref().map(|(_, weight, _, _)| *weight).unwrap_or(1.0);
 
     // ── Step A: encode umt5 conds (prompt strings passed directly as argv) ──
     let ta = std::time::Instant::now();
@@ -5744,7 +6079,11 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         .arg(frames.to_string())
         .arg(steps.to_string())
         .arg(seed.to_string())
-        .arg(format!("{guidance}"));
+        .arg(format!("{guidance}"))
+        .arg("1")
+        .arg(&image_path)
+        .arg(&lora_path)
+        .arg(format!("{lora_weight}"));
     let t2v = run_logged_with_gpu_peak(&mut t2v, &t2v_log);
     let t2v_secs = tb.elapsed().as_secs_f64();
     let (t2v_rc, t2v_peak_vram_mib) = match t2v {
@@ -5791,8 +6130,8 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
     let artifact_ok = probe.as_ref().is_some_and(|value| {
         probe_matches_video_profile(
             value,
-            WAN22_WIDTH,
-            WAN22_HEIGHT,
+            width,
+            height,
             WAN22_FRAMES,
             WAN22_FPS,
             false,
@@ -5808,11 +6147,23 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         &json!({
             "schema": "serenity.video_result.v1", "video_id": video_id, "model": "wan22",
             "backend": BACKEND_NAME, "control_plane": "serenity-server", "resident": "fp8_e4m3_cached",
+            "mode": if is_i2v { "i2v_first_frame" } else { "t2v" },
             "readiness_label": if parity_ok { "quality_profile_ready" } else { "product_gate_required" },
             "accepted_video_artifact": artifact_ok, "accepted_video_parity": parity_ok,
-            "target_width": WAN22_WIDTH, "target_height": WAN22_HEIGHT, "frames": frames,
+            "target_width": width, "target_height": height, "frames": frames,
             "frames_written": frames_written, "mux": mux, "fps": WAN22_FPS,
             "steps": steps, "seed": seed, "guidance": guidance, "quant": quant,
+            "flow_shift": if is_i2v { 3.0 } else { 5.0 },
+            "image_path": if is_i2v { image_path.as_str() } else { "" },
+            "camera_motion": b.get("camera_motion").and_then(Value::as_str).unwrap_or("none"),
+            "creator_prompt": b.get("creator_prompt").and_then(Value::as_str).unwrap_or(&prompt),
+            "lora": lora.as_ref().map(|(path, weight, name, pairs)| json!({
+                "name": name,
+                "weight": weight,
+                "path": path,
+                "matched_modules": pairs,
+                "merge": "resident_fp8_requantized_once",
+            })),
             "negative_prompt_source": if b.get("negative_prompt").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()) { "request" } else { "creator_default" },
             "encode_exit_code": enc_rc, "t2v_exit_code": t2v_rc,
             "out_dir": out_dir_s, "conds": conds_s, "mp4": mp4,
@@ -5821,7 +6172,11 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
             "encode_log": enc_log.to_string_lossy(), "t2v_log": t2v_log.to_string_lossy(),
             "encode_seconds": enc_secs, "t2v_seconds": t2v_secs, "total_wall_seconds": total_wall,
             "encode_peak_vram_mib": encode_peak_vram_mib, "t2v_peak_vram_mib": t2v_peak_vram_mib,
-            "note": "Wan2.2-TI2V-5B high-quality Mojo profile: official UMT5 conditioning and default negative prompt, cached FP8 E4M3 DiT, Flow-UniPC 50-step shift-5 sampling, tiled VAE decode, and verified 24 fps MP4 mux.",
+            "note": if is_i2v {
+                "Wan2.2-TI2V-5B creator I2V profile: cover-resize/center-crop source VAE encode, clean frame-0 replacement before and after each step, per-token zero timestep for conditioned frame patches, Flow-UniPC 40-step shift-3 sampling, and 24 fps MP4 mux."
+            } else {
+                "Wan2.2-TI2V-5B creator T2V profile: official UMT5 conditioning and default negative prompt, cached FP8 E4M3 DiT, Flow-UniPC 50-step shift-5 sampling, tiled VAE decode, and 24 fps MP4 mux."
+            },
         }),
     )
 }
@@ -6986,6 +7341,32 @@ mod tests {
     }
 
     #[test]
+    fn wan_camera_motion_is_explicit_and_idempotent() {
+        let normalized = normalized_wan22_camera_motion_request(&json!({
+            "prompt": "A blonde cyborg turns toward the camera",
+            "camera_motion": "dolly_in",
+        }))
+        .unwrap();
+        assert_eq!(
+            normalized["prompt"],
+            "A blonde cyborg turns toward the camera, dolly in, camera pushing forward, smooth forward movement"
+        );
+        assert_eq!(
+            normalized["creator_prompt"],
+            "A blonde cyborg turns toward the camera"
+        );
+        assert_eq!(normalized["creator_camera_motion_applied"], true);
+        let repeated = normalized_wan22_camera_motion_request(&normalized).unwrap();
+        assert_eq!(repeated["prompt"], normalized["prompt"]);
+        assert!(normalized_wan22_camera_motion_request(&json!({
+            "prompt": "probe",
+            "camera_motion": "orbit",
+        }))
+        .unwrap_err()
+        .contains("unsupported Wan camera_motion"));
+    }
+
+    #[test]
     fn ltx2_mojo_request_accepts_creator_first_and_last_keyframes() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7267,9 +7648,23 @@ mod tests {
         assert_eq!(runners[2].get("target_frame_count").unwrap(), 121);
         assert_eq!(runners[2].get("target_width").unwrap(), 832);
         assert_eq!(runners[2].get("target_height").unwrap(), 480);
+        assert_eq!(
+            runners[2].pointer("/native_profiles/1/width").unwrap(),
+            WAN22_PORTRAIT_WIDTH
+        );
+        assert_eq!(
+            runners[2].pointer("/native_profiles/1/height").unwrap(),
+            WAN22_PORTRAIT_HEIGHT
+        );
+        assert_eq!(runners[2].get("i2v_steps").unwrap(), WAN22_I2V_STEPS);
         assert_eq!(runners[2].get("default_steps").unwrap(), 50);
         assert_eq!(runners[2].get("default_guidance").unwrap(), 5.0);
         assert_eq!(runners[2].get("quant_modes").unwrap(), &json!(["fp8"]));
+        assert_eq!(runners[2].pointer("/modes/lora/max_count").unwrap(), 1);
+        assert_eq!(
+            runners[2].pointer("/modes/lora/base_model").unwrap(),
+            "Wan-AI/Wan2.2-TI2V-5B"
+        );
         assert_eq!(
             runners[2].get("accepted_video_parity").unwrap(),
             &(wan22_built && wan22_product_gate_passed())
@@ -7306,6 +7701,33 @@ mod tests {
         assert_eq!(
             arms.get("scail2_animation").unwrap(),
             &(scail2_built && scail2_product_gate_passed())
+        );
+    }
+
+    #[test]
+    fn wan22_ti2v5b_lora_header_rejects_14b_dimensions() {
+        let compatible = json!({
+            "diffusion_model.blocks.0.self_attn.q.lora_A.weight": {
+                "dtype": "BF16", "shape": [32, 3072], "data_offsets": [0, 1]
+            },
+            "diffusion_model.blocks.0.self_attn.q.lora_B.weight": {
+                "dtype": "BF16", "shape": [3072, 32], "data_offsets": [1, 2]
+            }
+        });
+        assert_eq!(wan22_ti2v5b_lora_header(&compatible).unwrap(), 1);
+
+        let incompatible = json!({
+            "diffusion_model.blocks.0.self_attn.q.lora_A.weight": {
+                "dtype": "BF16", "shape": [32, 5120], "data_offsets": [0, 1]
+            },
+            "diffusion_model.blocks.0.self_attn.q.lora_B.weight": {
+                "dtype": "BF16", "shape": [5120, 32], "data_offsets": [1, 2]
+            }
+        });
+        assert!(
+            wan22_ti2v5b_lora_header(&incompatible)
+                .unwrap_err()
+                .contains("probably a 14B adapter")
         );
     }
 

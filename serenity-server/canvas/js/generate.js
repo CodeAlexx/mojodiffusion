@@ -23,6 +23,8 @@ var GenerateTab = (function () {
         variationStrength: 0,
         initImagePath: '',
         initImageName: '',
+        initImageWidth: 0,
+        initImageHeight: 0,
         creativity: 0.5,
         generating: false,
         currentImage: null,
@@ -62,6 +64,7 @@ var GenerateTab = (function () {
         videoWorkflowProfile: '',
         videoPromptEnhancer: 'none',
         videoQuant: 'bf16',
+        cameraMotion: 'none',
         videoCheckpoint: 'ltx-2.3-22b-dev-fp8-dequant-bf16',
         capsPositive: '',
         capsNegative: '',
@@ -650,7 +653,14 @@ var GenerateTab = (function () {
             '<div class="gen-param-row" data-param-search="quant bf16 fp8 int4"><label class="gen-label" for="gen-video-quant">Precision</label>' +
             '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int4">INT4</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
-            '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>';
+            '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>' +
+            '<div class="gen-param-row" data-param-search="camera motion dolly jib focus static"><label class="gen-label" for="gen-camera-motion">Camera Motion</label>' +
+            '<select id="gen-camera-motion" class="gen-select">' +
+            '<option value="none">None / prompt only</option><option value="static">Static</option>' +
+            '<option value="focus_shift">Focus shift</option><option value="dolly_in">Dolly in</option>' +
+            '<option value="dolly_out">Dolly out</option><option value="dolly_left">Dolly left</option>' +
+            '<option value="dolly_right">Dolly right</option><option value="jib_up">Jib up</option>' +
+            '<option value="jib_down">Jib down</option></select></div>';
         var videoConditioningBody =
             '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
             '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
@@ -1394,6 +1404,7 @@ var GenerateTab = (function () {
         els.durationHint = document.getElementById('gen-duration-hint');
         els.videoGuidanceMode = document.getElementById('gen-video-guidance-mode');
         els.videoQuant = document.getElementById('gen-video-quant');
+        els.cameraMotion = document.getElementById('gen-camera-motion');
         els.videoCheckpoint = document.getElementById('gen-video-checkpoint');
         els.videoPromptEnhancer = document.getElementById('gen-video-prompt-enhancer');
         els.videoPromptEnhancerNote = document.getElementById('gen-video-prompt-enhancer-note');
@@ -2287,6 +2298,10 @@ var GenerateTab = (function () {
                 refreshLtx2PostUpscaleControls();
             });
         }
+        if (els.cameraMotion)
+            els.cameraMotion.addEventListener('change', function () {
+                state.cameraMotion = this.value || 'none';
+            });
         if (els.postUpscaleFactor) {
             els.postUpscaleFactor.addEventListener('change', function () {
                 state.postUpscaleFactor = Number(this.value) === 4 ? 4 : 2;
@@ -2637,6 +2652,18 @@ var GenerateTab = (function () {
                 empty.style.display = 'none';
             if (name)
                 name.textContent = 'Uploading ' + (file.name || 'image') + '…';
+            if (typeof createImageBitmap === 'function') {
+                createImageBitmap(file).then(function (bitmap) {
+                    state.initImageWidth = bitmap.width;
+                    state.initImageHeight = bitmap.height;
+                    if (typeof bitmap.close === 'function')
+                        bitmap.close();
+                    syncWanI2vSteps();
+                }).catch(function () {
+                    state.initImageWidth = 0;
+                    state.initImageHeight = 0;
+                });
+            }
             fetch('/upload/image', { method: 'POST', body: form })
                 .then(function (resp) {
                 return resp.text().then(function (body) {
@@ -2653,6 +2680,7 @@ var GenerateTab = (function () {
                 state.initImageName = data.name || file.name || state.initImagePath;
                 if (!state.initImagePath)
                     throw new Error('upload returned no image path');
+                syncWanI2vSteps();
                 if (name)
                     name.textContent = state.initImageName;
                 if (clear)
@@ -2687,6 +2715,9 @@ var GenerateTab = (function () {
     function clearInitImage() {
         state.initImagePath = '';
         state.initImageName = '';
+        state.initImageWidth = 0;
+        state.initImageHeight = 0;
+        syncWanI2vSteps();
         var input = document.getElementById('gen-init-image-input');
         var preview = document.getElementById('gen-init-preview');
         var empty = document.getElementById('gen-init-empty');
@@ -3490,6 +3521,167 @@ var GenerateTab = (function () {
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
     }
+
+    function activeWan22Runner() {
+        var candidates = state.videoStatus && state.videoStatus.candidate_runners;
+        if (!Array.isArray(candidates))
+            return null;
+        return candidates.find(function (entry) {
+            return entry && entry.model === 'wan22_t2v';
+        }) || null;
+    }
+
+    function activeWan22LoraMode() {
+        var runner = activeWan22Runner();
+        return runner && runner.modes && runner.modes.lora || null;
+    }
+
+    function syncWanI2vSteps() {
+        if (state.arch !== 'wan')
+            return;
+        var portrait = !!state.initImagePath &&
+            state.initImageHeight > state.initImageWidth;
+        state.width = portrait ? 480 : 832;
+        state.height = portrait ? 832 : 480;
+        state.steps = state.initImagePath ? 40 : 50;
+        if (els.steps) {
+            els.steps.min = String(state.steps);
+            els.steps.max = String(state.steps);
+            els.steps.value = String(state.steps);
+            els.steps.disabled = true;
+        }
+        if (els.stepsRange) {
+            els.stepsRange.min = String(state.steps);
+            els.stepsRange.max = String(state.steps);
+            els.stepsRange.value = String(state.steps);
+            els.stepsRange.disabled = true;
+        }
+        var note = document.getElementById('gen-video-profile-note');
+        if (note) {
+            note.textContent = state.initImagePath
+                ? 'Wan2.2 TI2V-5B I2V · creator first-frame conditioning · ' +
+                    state.width + '×' + state.height +
+                    ' · 121 frames · 24 FPS · 40 UniPC steps · shift 3'
+                : 'Wan2.2 TI2V-5B T2V · 832×480 · 121 frames · 24 FPS · 50 UniPC steps · shift 5';
+        }
+        syncDimensionInputs();
+        if (els.aspectDropdown) {
+            els.aspectDropdown.innerHTML =
+                '<option value="' + state.width + '×' + state.height + '">' +
+                state.width + '×' + state.height + '</option>';
+            els.aspectDropdown.value = state.width + '×' + state.height;
+        }
+    }
+
+    function updateWanVideoUI(arch) {
+        state.arch = arch;
+        var runner = activeWan22Runner();
+        if (!runner || runner.status !== 'quality_profile_ready') {
+            if (els.modelWarn) {
+                els.modelWarn.textContent = runner
+                    ? 'Wan2.2 is installed but its machine-local T2V/I2V product gate has not passed'
+                    : 'The Wan2.2 Mojo runner is not available on this machine';
+                els.modelWarn.classList.add('visible');
+            }
+            return;
+        }
+        if (els.modelWarn)
+            els.modelWarn.classList.remove('visible');
+        setVideoControlsForMode(true);
+        if (els.videoSection)
+            els.videoSection.style.display = '';
+        // These controls are LTX2-only conditioning cache overrides. Wan owns
+        // its UMT5 encode automatically and uses the shared source-image picker.
+        if (els.videoConditioningSection)
+            els.videoConditioningSection.style.display = 'none';
+        var variationSection = document.getElementById('gen-variation-section');
+        if (variationSection)
+            variationSection.style.display = 'none';
+        if (els.negSection)
+            els.negSection.style.display = '';
+        if (els.cfgRow)
+            els.cfgRow.style.display = 'flex';
+        if (els.guidanceRow)
+            els.guidanceRow.style.display = 'none';
+        var batchSection = document.getElementById('gen-batch-section');
+        if (batchSection)
+            batchSection.style.display = 'none';
+        if (els.toolbarBatchInput) {
+            els.toolbarBatchInput.value = '1';
+            els.toolbarBatchInput.disabled = true;
+        }
+        state.batchCount = 1;
+        state.width = Number(runner.target_width) || 832;
+        state.height = Number(runner.target_height) || 480;
+        state.frames = Number(runner.target_frame_count) || 121;
+        state.fps = 24;
+        state.seconds = state.frames / state.fps;
+        state.cfg = Number(runner.default_guidance) || 5;
+        state.videoQuant = 'fp8';
+        state.sampler = 'uni_pc';
+        state.scheduler = 'normal';
+        if (els.cfg) els.cfg.value = String(state.cfg);
+        if (els.cfgRange) els.cfgRange.value = String(state.cfg);
+        if (els.framesInput) {
+            els.framesInput.value = String(state.frames);
+            els.framesInput.disabled = true;
+        }
+        if (els.fpsInput) els.fpsInput.value = String(state.fps);
+        if (els.fpsRange) els.fpsRange.value = String(state.fps);
+        if (els.secondsInput) {
+            els.secondsInput.value = state.seconds.toFixed(3);
+            els.secondsInput.disabled = true;
+        }
+        if (els.sampler) {
+            els.sampler.innerHTML = '<option value="uni_pc">UniPC (Wan creator)</option>';
+            els.sampler.value = state.sampler;
+        }
+        if (els.scheduler) {
+            els.scheduler.innerHTML = '<option value="normal">Wan flow schedule</option>';
+            els.scheduler.value = state.scheduler;
+        }
+        if (els.cameraMotion) {
+            els.cameraMotion.disabled = false;
+            els.cameraMotion.value = state.cameraMotion || 'none';
+        }
+        syncWanI2vSteps();
+        syncDimensionInputs();
+        if (els.customWidth) els.customWidth.disabled = true;
+        if (els.customHeight) els.customHeight.disabled = true;
+        if (els.aspectDropdown) {
+            els.aspectDropdown.innerHTML =
+                '<option value="' + state.width + '×' + state.height + '">' +
+                state.width + '×' + state.height + '</option>';
+            els.aspectDropdown.value = state.width + '×' + state.height;
+            els.aspectDropdown.disabled = true;
+        }
+        updateAspectPreview();
+        updateDurationHint();
+        var loraSection = document.getElementById('gen-lora-section');
+        if (loraSection)
+            loraSection.style.display = '';
+        var loraMode = activeWan22LoraMode();
+        var loraNote = document.getElementById('gen-lora-capability');
+        if (loraNote)
+            loraNote.textContent = loraMode && loraMode.available
+                ? 'One Wan2.2 TI2V-5B LoRA · 5B tensor shapes are checked before GPU work'
+                : 'Wan2.2 TI2V-5B LoRA runtime is not ready';
+        if (state.loras.length > 1)
+            state.loras = state.loras.slice(0, 1);
+        renderLoraList();
+        var output = document.getElementById('gen-output-format');
+        if (output)
+            output.value = 'MP4';
+        if (els.btn)
+            els.btn.innerHTML = '<i data-lucide="wand-2"></i><span>Generate Wan Video</span>';
+        setPreviewModelBadges(state.model, arch);
+        var runtimeLabel = document.getElementById('gen-runtime-label');
+        if (runtimeLabel)
+            runtimeLabel.textContent = 'Wan2.2 TI2V-5B · Mojo creator T2V/I2V runner · admitted';
+        updateAdvancedSamplingUI(null);
+        if (typeof lucide !== 'undefined')
+            lucide.createIcons({ nameAttr: 'data-lucide' });
+    }
     function restoreImageStepBounds(defaultSteps) {
         var selectedDefault = Math.max(1, Number(defaultSteps) || 1);
         var inputMax = Math.max(IMAGE_STEPS_INPUT_MAX, selectedDefault);
@@ -3516,6 +3708,10 @@ var GenerateTab = (function () {
     function updateGenerateUIForArch(arch) {
         if (arch === 'ltxv') {
             updateVideoUIForArch(arch);
+            return;
+        }
+        if (arch === 'wan') {
+            updateWanVideoUI(arch);
             return;
         }
         state.arch = arch;
@@ -3715,7 +3911,13 @@ var GenerateTab = (function () {
         var profile = activeCapabilityProfile();
         var feature = state.arch === 'ltxv'
             ? { supported: true, max_count: null }
-            : (profile && profile.features && profile.features.lora);
+            : (state.arch === 'wan'
+                ? {
+                    supported: !!(activeWan22LoraMode() &&
+                        activeWan22LoraMode().available),
+                    max_count: 1
+                }
+                : (profile && profile.features && profile.features.lora));
         if (!feature || feature.supported !== true) {
             showError('The selected model does not admit LoRA overlays');
             return;
@@ -3855,6 +4057,8 @@ var GenerateTab = (function () {
             scail2Mode: state.scail2Mode,
             additionalReferenceImagePaths: state.additionalReferenceImagePaths.slice(),
             additionalReferenceMaskPaths: state.additionalReferenceMaskPaths.slice(),
+            initImageName: state.initImagePath || state.initImageName || '',
+            ltx2CameraMotion: state.cameraMotion || 'none',
             loras: enabledLoras,
             // Phase 3: Advanced
             vae: state.vae,
@@ -3927,6 +4131,35 @@ var GenerateTab = (function () {
                     break;
                 }
             }
+        }
+        if (state.arch === 'wan') {
+            var wanI2v = !!state.initImagePath;
+            return {
+                schema: 'serenity.genparams.v1',
+                model: 'wan22',
+                prompt: finalPrompt.trim(),
+                negative_prompt: (state.negPrompt || '').trim(),
+                width: state.width,
+                height: state.height,
+                frames: 121,
+                steps: wanI2v ? 40 : 50,
+                seed: seed,
+                fps: 24,
+                guidance: 5,
+                quant: 'fp8',
+                sampler: 'uni_pc',
+                scheduler: 'normal',
+                camera_motion: state.cameraMotion || 'none',
+                image_path: wanI2v ? state.initImagePath : '',
+                lora: state.loras.filter(function (lora) {
+                    return lora.enabled !== false;
+                }).slice(0, 1).map(function (lora) {
+                    return {
+                        name: lora.name,
+                        weight: Number(lora.strength)
+                    };
+                })
+            };
         }
         var request = {
             schema: 'serenity.genparams.v1',
@@ -4089,6 +4322,25 @@ var GenerateTab = (function () {
         updateGenerationActivity('Preparing GPU · unloading image model if resident', 0, 0);
         SerenityAPI.postVideo(request)
             .then(function (job) {
+            if (job && job.accepted_video_artifact === true && job.mp4_url) {
+                var videoId = String(job.video_id || '');
+                var metadata = Object.assign({}, reusable, {
+                    params: reusable,
+                    cfg: null,
+                    guidance: null,
+                    frame_count: request.frames,
+                    fps: request.fps,
+                    mode: job.mode ||
+                        (request.image_path ? 'i2v_first_frame' : 't2v')
+                });
+                displayVideo(String(job.mp4_url), metadata);
+                addToGallery(String(job.mp4_url), true, metadata);
+                if (videoId)
+                    state.completedVideoJobs[videoId] = true;
+                state.pendingBatch = 0;
+                setGenerating(false);
+                return;
+            }
             if (!job || !(job.video_id || job.prompt_id))
                 throw new Error('server did not return a video job id');
             pollVideoGeneration(job, request, reusable);
@@ -5770,6 +6022,9 @@ var GenerateTab = (function () {
             audioPolicy: state.audioPolicy,
             postUpscaler: state.postUpscaler,
             postUpscaleFactor: state.postUpscaleFactor,
+            cameraMotion: state.cameraMotion,
+            initImagePath: state.initImagePath,
+            initImageName: state.initImageName,
             noSeedIncrement: state.noSeedIncrement,
             continueAfterErrors: state.continueAfterErrors,
             personalNote: state.personalNote,
@@ -5913,6 +6168,10 @@ var GenerateTab = (function () {
             state.continueAfterErrors = params.continueAfterErrors;
         if (typeof params.personalNote === 'string')
             state.personalNote = params.personalNote;
+        if (typeof params.cameraMotion === 'string')
+            state.cameraMotion = params.cameraMotion;
+        else if (typeof params.camera_motion === 'string')
+            state.cameraMotion = params.camera_motion;
         if (Array.isArray(params.loras)) {
             state.loras = params.loras.map(function (lora) {
                 return {

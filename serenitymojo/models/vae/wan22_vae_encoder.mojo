@@ -69,7 +69,7 @@ from serenitymojo.models.vae.conv3d import conv3d
 from serenitymojo.models.vae.wan22_decoder import (
     _wan22_mean,
     _wan22_std,
-    _load_conv3d_qrscf_bf16,
+    _load_conv3d_qrscf,
     _clone,
     _zeros_device,
     _shape1,
@@ -495,7 +495,7 @@ struct Wan22VaeImageEncoder[H: Int, W: Int]:
             var tv = st.tensor_view(nm)
             var t: Tensor
             if nm.endswith(".weight") and len(tv.shape) == 5:
-                t = _load_conv3d_qrscf_bf16(tv, ctx)
+                t = _load_conv3d_qrscf(tv, STDtype.BF16, ctx)
             elif _is_enc_resample_conv2d_weight(nm):
                 t = _load_conv2d_rscf_bf16(tv, ctx)
             else:

@@ -121,11 +121,32 @@
 #       starts with the b2 forward.
 #
 # D) CACHE READER — serenitymojo/models/krea2/krea2_cache_reader.mojo
-#    `krea2_build_pos` (:84-100) grows a cond grid section built from
-#    `krea2_omini_cond_pos()`; `krea2_build_pad_mask` / `_krea2_pad_mask_kernel`
-#    (:117-149) is already parameterized on (lt, ltmax, imglen) — the edit mask
-#    passes imglen+condlen so the masked key columns stay [lt, ltmax) relative
-#    to a [TXT|IMG|COND] source order; the flash path only needs real_len().
+#    LANDED IN C5. `krea2_build_pos_cond[LH,LW](lt, condlen, dh, dw, scale)` is the
+#    device twin of `krea2_omini_pos_src` below (the C5 gate compares them
+#    element-for-element, exact); `krea2_build_pos` now DELEGATES to it with
+#    condlen=0 and is bit-equal to the pre-C5 dump (krea2_omini_c5_regress_dump +
+#    cmp). `krea2_build_pad_mask_edit(lt, ltmax, imglen, condlen)` and
+#    `krea2_edit_real_len(lt, imglen, condlen)` are the mask/prefix wrappers;
+#    `KreaTrainCache.sample_padded_edit` returns a `Krea2EditSample`.
+#
+#    ⚠ SOURCE ORDER — the open question this file used to record is now DECIDED:
+#    the cache/pos SOURCE order is [TXT(LTMAX) | IMG | COND], full stop. Reason
+#    (not taste): the trainer's reorder `_reorder_pos_for_combined`
+#    (train_krea2.mojo:880-894) slices the TEXT block out of the FRONT of the
+#    source table by ABSOLUTE offsets — real text [0, lt), pad text [lt, LTMAX) —
+#    and the IMG block at [LTMAX, LTMAX+IMGLEN). Any order that puts COND before
+#    IMG (or before TXT) shifts those offsets and silently breaks the pre-edit
+#    path. Appending COND is the only placement that leaves them alone. Both
+#    producers now build this order and are gated against each other:
+#    krea2_omini_pos_src (host, this file) and krea2_build_pos_cond (device,
+#    reader). The CACHE itself stores no pos table — pos is derived in the reader
+#    from (LH, LW, LTMAX, cond_pos_delta.<i>, cond_pos_scale.<i>) — so there is
+#    exactly ONE place the order is spelled on each side.
+#
+#    CACHE KEYS (settled in C5, differs from the intake's proposal — see
+#    krea2_prepare_cache.mojo _run for the argument): the condition latent reuses
+#    the existing `ref.<i>` slot rather than a new `cond_clean.<i>`; the new keys
+#    are `cond_pos_delta.<i>` [2] F32 and `cond_pos_scale.<i>` [1] F32.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Row-modulation selector values (per-segment AdaLN policy, intake §1.5/§3.3).

@@ -11,6 +11,16 @@
 #   pos     [1, LFULL, 3]     F32   txt zeros [LT,3] + img grid [imglen,3] (`pos`)
 #   text_len Int                    LT (natural caption length, == LFULL - imglen)
 #
+# OMINICONTROL EDIT (C5) adds, via sample_padded_edit / Krea2EditSample:
+#   cond    [1, 16, LH, LW]  BF16  CLEAN condition latent (cache key `ref.<i>`)
+#   cond_img[1, condlen, 64] BF16  patchified condition tokens
+#   pos     [1, LTMAX+imglen+condlen, 3] F32 — SOURCE order [TXT | IMG | COND]
+#   plus (delta_h, delta_w, scale) from `cond_pos_delta.<i>`/`cond_pos_scale.<i>`
+# The condition is CLEAN and stays clean: it rides at t=0, so no reader or trainer
+# path noises it. See KreaTrainCache's Omini accessors for the key-schema rationale
+# (short version: the cond latent REUSES the existing `ref.<i>` slot — identical
+# contract — and only the position metadata is new).
+#
 # This mirrors serenity-trainer/dataLoader/Ideogram4CacheReader: one sample at a
 # time (krea2 latents + the 12-layer context are large and the train step already
 # owns the activation memory), the same discover/validate/materialise shape, and the
@@ -42,6 +52,9 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import reshape, permute, zeros_device, concat
+from serenitymojo.training.krea2_omini_layout import (
+    Krea2OminiLayout, krea2_omini_cond_pos,
+)
 
 comptime TArc = ArcPointer[Tensor]
 comptime _DYN1 = Layout.row_major(-1)
@@ -81,13 +94,38 @@ def krea2_patchify[LH: Int, LW: Int](
 # pos [1, LFULL, 3] f32 = cat(txt zeros [LT,3], img grid [imglen,3]); for img token
 # (hi,wi): axis0(global)=0, axis1(h)=hi, axis2(w)=wi, in (gh,gw) row-major (matches
 # the patchify token order). Built host-side then uploaded (tiny).
-def krea2_build_pos[LH: Int, LW: Int](
-    lt: Int, ctx: DeviceContext
+#
+# OMINICONTROL EDIT (C5) — SOURCE ORDER IS [TXT(lt) | IMG | COND]. This is the
+# convention the layout module flagged as an OPEN QUESTION; it is decided HERE and
+# it is the only one that works, because the trainer's reorder
+# (_reorder_pos_for_combined, train_krea2.mojo:880-894) slices the TEXT block out
+# of the FRONT of this table by absolute offsets [0,lt) and [lt,LTMAX) — putting
+# COND anywhere but after IMG would move those offsets and break the pre-edit path.
+# krea2_omini_pos_src (training/krea2_omini_layout.mojo:278) builds exactly this
+# order; krea2_build_pos_cond below is its device-side twin and the C5 gate proves
+# the two agree element-for-element.
+def krea2_build_pos_cond[LH: Int, LW: Int](
+    lt: Int, condlen: Int, dh: Int, dw: Int, scale: Float32, ctx: DeviceContext
 ) raises -> Tensor:
-    """Build pos [1, LT+imglen, 3] f32 for a krea2 sample (== _build_pos)."""
+    """SOURCE-order pos [1, lt+imglen+condlen, 3] f32 =
+    [txt zeros(lt) | img grid | cond grid]. The cond grid is the img grid pushed
+    through krea2_omini_cond_pos(hi, wi, dh, dw, scale) — for EDIT (dh=dw=0,
+    scale=1.0) it EQUALS the img grid, which is the spatial-overlap property
+    OminiControl's edit/spatial-alignment condition relies on.
+
+    condlen == 0 reduces to the pre-C5 krea2_build_pos EXACTLY (same loop, same
+    float writes, no cond section) — krea2_build_pos delegates here so there is one
+    implementation, and the C5 regression gate bit-compares the result against a
+    dump taken before this change."""
     comptime gh = LH // KREA2_PATCH
     comptime gw = LW // KREA2_PATCH
     comptime imglen = gh * gw
+    if condlen != 0 and condlen != imglen:
+        raise Error(
+            String("krea2_build_pos_cond: condlen=") + String(condlen)
+            + " must be 0 or the img grid size " + String(imglen)
+            + " (EDIT: the condition shares the target canvas)"
+        )
     var host = List[Float32]()
     for _ in range(lt * 3):
         host.append(Float32(0.0))            # txt positions: all zeros
@@ -96,8 +134,22 @@ def krea2_build_pos[LH: Int, LW: Int](
             host.append(Float32(0.0))        # axis 0 (global) = 0
             host.append(Float32(hi))         # axis 1 (h)
             host.append(Float32(wi))         # axis 2 (w)
-    var lfull = lt + imglen
+    if condlen > 0:
+        for hi in range(gh):
+            for wi in range(gw):
+                var p = krea2_omini_cond_pos(hi, wi, dh, dw, scale)
+                host.append(p.g)
+                host.append(p.h)
+                host.append(p.w)
+    var lfull = lt + imglen + condlen
     return Tensor.from_host(host^, [1, lfull, 3], STDtype.F32, ctx)
+
+
+def krea2_build_pos[LH: Int, LW: Int](
+    lt: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Build pos [1, LT+imglen, 3] f32 for a krea2 sample (== _build_pos)."""
+    return krea2_build_pos_cond[LH, LW](lt, 0, 0, 0, Float32(1.0), ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +210,31 @@ def krea2_build_pad_mask(
     return mask^
 
 
+# ── OMINICONTROL EDIT padmask / real_len (seam D) ─────────────────────────────
+# The mask kernel above is already parameterized on (lt, ltmax, imglen) and only
+# ever masks the KEY COLUMNS [lt, ltmax) — i.e. the text-pad slots at the FRONT of
+# the source order. Adding a COND segment only lengthens LFULL, so the edit mask is
+# the same call with imglen -> imglen + condlen. These two wrappers exist so no
+# caller has to open-code that (and so the +condlen can never be forgotten on one
+# of the two).
+def krea2_build_pad_mask_edit(
+    lt: Int, ltmax: Int, imglen: Int, condlen: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Additive pad mask [1,H,LFULL,LFULL] for the EDIT sequence,
+    LFULL = ltmax + imglen + condlen. condlen == 0 is byte-identical to
+    krea2_build_pad_mask(lt, ltmax, imglen)."""
+    return krea2_build_pad_mask(lt, ltmax, imglen + condlen, ctx)
+
+
+def krea2_edit_real_len(lt: Int, imglen: Int, condlen: Int) -> Int:
+    """Flash-padmask valid contiguous-prefix length for the EDIT sequence:
+    TXT_real + IMG + COND are ALL attention-valid (OminiControl v1 is fully
+    bidirectional), so real_len = lt + imglen + condlen and the masked tail is the
+    text pad. == Krea2OminiLayout.real_len(); condlen == 0 gives the pre-edit
+    lt + imglen the trainer already uses (train_krea2.mojo:1237)."""
+    return lt + imglen + condlen
+
+
 # Build the additive REFINER txtmask [1, heads, ltmax, ltmax] F32 for the txtfusion
 # refiner blocks (self-attention over the LTMAX text slots). -inf on the text-pad key
 # columns [real_text_len, ltmax); 0 else. When real_text_len >= ltmax returns an all-
@@ -208,6 +285,42 @@ struct KreaTrainSample(Copyable, Movable):
         self.pos = pos^
         self.text_len = text_len
         self.index = index
+
+
+# ── one materialised OMINICONTROL EDIT sample (C5) ────────────────────────────
+# A SEPARATE struct rather than new fields on KreaTrainSample: the base struct is
+# constructed in train_krea2.mojo:1900 as well as here, and the pre-edit path must
+# stay untouched. `base` carries the target exactly as today EXCEPT that its `pos`
+# is the EXTENDED source-order table [TXT(LTMAX) | IMG | COND].
+struct Krea2EditSample(Movable):
+    var base: KreaTrainSample  # clean/img/context/text_len as today; pos EXTENDED
+    var cond: TArc             # [1,16,LH,LW]   BF16 CLEAN condition latent
+    var cond_img: TArc         # [1,condlen,64] BF16 patchified condition tokens
+    var cond_len: Int          # == imglen for EDIT (condition shares the canvas)
+    var pos_delta_h: Int       # OminiControl position_delta[0]  (EDIT: 0)
+    var pos_delta_w: Int       # OminiControl position_delta[1]  (EDIT: 0)
+    var pos_scale: Float32     # OminiControl position_scale     (EDIT: 1.0)
+    var real_len: Int          # lt + imglen + condlen (flash valid prefix)
+
+    def __init__(
+        out self,
+        var base: KreaTrainSample,
+        var cond: TArc,
+        var cond_img: TArc,
+        cond_len: Int,
+        pos_delta_h: Int,
+        pos_delta_w: Int,
+        pos_scale: Float32,
+        real_len: Int,
+    ):
+        self.base = base^
+        self.cond = cond^
+        self.cond_img = cond_img^
+        self.cond_len = cond_len
+        self.pos_delta_h = pos_delta_h
+        self.pos_delta_w = pos_delta_w
+        self.pos_scale = pos_scale
+        self.real_len = real_len
 
 
 # ── uncond (caption-dropout) conditioning: context + pos + LT only ────────────
@@ -374,6 +487,112 @@ struct KreaTrainCache(Movable):
         )
         _validate_clean_shape[LH, LW](ref_lat)
         return ref_lat^
+
+    # ── OMINICONTROL EDIT accessors (C5) ─────────────────────────────────────
+    # KEY SCHEMA (settled in krea2_prepare_cache.mojo _run's docstring):
+    #   ref.<i>              [1,16,LH,LW] BF16 — the CONDITION latent. Reuses the
+    #                        pre-existing edit/reference slot: identical contract
+    #                        (same VAE encode_mean, same (z-mean)/std, same bucket
+    #                        as clean.<i>), so a second key for the same bytes
+    #                        would just give the trainer two spellings of one thing.
+    #   cond_pos_delta.<i>   [2] F32 — OminiControl position_delta (h, w)
+    #   cond_pos_scale.<i>   [1] F32 — OminiControl position_scale
+    # A sample is an OMINI EDIT sample iff ALL THREE are present. ref.<i> ALONE is
+    # the older token-concat edit cache and must NOT be mistaken for an Omini cond
+    # (it carries no position metadata), hence the three-way test.
+    def _cond_delta_key(self, index: Int) -> String:
+        return String("cond_pos_delta.") + String(index)
+
+    def _cond_scale_key(self, index: Int) -> String:
+        return String("cond_pos_scale.") + String(index)
+
+    def has_cond(self, index: Int) -> Bool:
+        """True iff sample `index` carries a full OminiControl condition record
+        (cond latent + position delta + position scale). Cheap — header only."""
+        if index < 0 or index >= self.len():
+            return False
+        if len(self.ref_keys[index]) == 0:
+            return False
+        if self._cond_delta_key(index) not in self.src.name_to_shard:
+            return False
+        return self._cond_scale_key(index) in self.src.name_to_shard
+
+    def cond_pos_at(
+        self, index: Int, ctx: DeviceContext
+    ) raises -> Tuple[Int, Int, Float32]:
+        """(delta_h, delta_w, scale) for sample `index`. Fail loud when absent —
+        a missing position record must never default to [0,0]/1.0 silently, since
+        that is a VALID (edit) configuration and the mistake would be invisible."""
+        if not self.has_cond(index):
+            raise Error(
+                String("KreaTrainCache.cond_pos_at: sample ") + String(index)
+                + " has no OminiControl condition record (need ref.<i> +"
+                + " cond_pos_delta.<i> + cond_pos_scale.<i>); re-run"
+                + " krea2_prepare_cache on an Omini edit stage dir"
+            )
+        var d = Tensor.from_view(
+            self.src.tensor_view(self._cond_delta_key(index)), ctx
+        ).to_host(ctx)
+        var s = Tensor.from_view(
+            self.src.tensor_view(self._cond_scale_key(index)), ctx
+        ).to_host(ctx)
+        if len(d) != 2 or len(s) != 1:
+            raise Error(
+                String("KreaTrainCache.cond_pos_at: sample ") + String(index)
+                + " position record has the wrong element count"
+            )
+        # The deltas are integer latent-grid/2 cells (OminiControl adds them to the
+        # integer ids); reject a fractional delta rather than truncating it.
+        if d[0] != Float32(Int(d[0])) or d[1] != Float32(Int(d[1])):
+            raise Error(
+                String("KreaTrainCache.cond_pos_at: sample ") + String(index)
+                + " position_delta is not integral"
+            )
+        return (Int(d[0]), Int(d[1]), s[0])
+
+    def sample_padded_edit[LH: Int, LW: Int, LTMAX: Int](
+        self, index: Int, ctx: DeviceContext
+    ) raises -> Krea2EditSample:
+        """Length-bucketed OminiControl EDIT sample. `base` is EXACTLY what
+        sample_padded returns except that `pos` is the EXTENDED SOURCE-order table
+        [TXT zeros(LTMAX) | IMG grid | COND grid]; `cond`/`cond_img` are the CLEAN
+        condition latent and its patchified tokens.
+
+        The condition is CLEAN by construction: it is returned un-noised and the
+        trainer feeds it at t=0 (per-segment modulation, C2/C3/C4). Nothing in this
+        reader ever adds noise to it — the flow-noising the trainer applies is on
+        `base.clean` only.
+
+        Fail loud when the sample has no condition record; the caller must pick the
+        non-edit path explicitly rather than get a silently condition-free step."""
+        comptime gh = LH // KREA2_PATCH
+        comptime gw = LW // KREA2_PATCH
+        comptime imglen = gh * gw
+        if not self.has_cond(index):
+            raise Error(
+                String("KreaTrainCache.sample_padded_edit: sample ") + String(index)
+                + " is not an OminiControl edit sample (missing ref.<i> and/or"
+                + " cond_pos_delta/scale.<i>)"
+            )
+        var meta = self.cond_pos_at(index, ctx)
+        var dh = meta[0]
+        var dw = meta[1]
+        var scale = meta[2]
+        var cond = self.load_ref[LH, LW](index, ctx)         # [1,16,LH,LW] BF16
+        var cond_img = krea2_patchify[LH, LW](cond, ctx)     # [1,imglen,64] BF16
+        var base = self.sample_padded[LH, LW, LTMAX](index, ctx)
+        # Structural check against the layout module's own contract (this is the
+        # same object train_krea2/krea2_block consume for offsets).
+        var lay = Krea2OminiLayout(LTMAX, imglen, imglen, base.text_len)
+        lay.check_flash_prefix()
+        var pos_ext = krea2_build_pos_cond[LH, LW](
+            LTMAX, imglen, dh, dw, scale, ctx
+        )                                                    # SOURCE order
+        base.pos = TArc(pos_ext^)
+        var rl = krea2_edit_real_len(base.text_len, imglen, imglen)
+        return Krea2EditSample(
+            base^, TArc(cond^), TArc(cond_img^), imglen, dh, dw, scale, rl
+        )
 
     def uncond[LH: Int, LW: Int](self, ctx: DeviceContext) raises -> KreaUncondCond:
         """Caption-dropout: the cached empty-caption (uncond) conditioning

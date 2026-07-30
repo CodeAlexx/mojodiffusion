@@ -10,6 +10,9 @@
 #   context.<i>   [1, LT, 12, 2560]    BF16  Qwen3-VL-4B 12-layer stack (== krea2_forward `context`)
 #   text_len.<i>  [1]                  F32   LT (caption natural token count - DROP_IDX)
 #   (optional)    context_uncond [1,LTu,12,2560] BF16 + text_len_uncond [1] F32
+#   (edit)        ref.<i>        [1, 16, LH, LW]      BF16  reference/CONDITION latent
+#   (omini edit)  cond_pos_delta.<i> [2] F32 + cond_pos_scale.<i> [1] F32
+#                 (OminiControl condition RoPE offset/scale; EDIT = [0,0] / 1.0)
 #
 # WHY THESE EXACT TENSORS (read from the consumers):
 #   * The DiT forward (models/dit/krea2_dit.mojo krea2_forward:1304) consumes `img`
@@ -161,16 +164,47 @@ def _stage_caption_path(stage_dir: String, i: Int) -> String:
     return stage_dir + String("/") + _stage_name(i) + String(".txt")
 
 
-def _staged_image_hw(stage_dir: String, i: Int) raises -> Tuple[Int, Int]:
-    """(IH, IW) from the generic Mojo dataset stage ([1,3,IH,IW])."""
+def _staged_image_hw_key(stage_dir: String, i: Int, key: String) raises -> Tuple[Int, Int]:
+    """(IH, IW) of tensor `key` in the staged record ([1,3,IH,IW])."""
     var imgs = ShardedSafeTensors.open(_stage_tensor_path(stage_dir, i))
-    var info = imgs.tensor_info(String("image"))
+    var info = imgs.tensor_info(key)
     if len(info.shape) != 4 or info.shape[0] != 1 or info.shape[1] != 3:
         raise Error(
-            String("[krea2-prepare] staged image.") + String(i)
+            String("[krea2-prepare] staged ") + key + String(".") + String(i)
             + " must be [1,3,IH,IW]"
         )
     return (info.shape[2], info.shape[3])
+
+
+def _staged_image_hw(stage_dir: String, i: Int) raises -> Tuple[Int, Int]:
+    """(IH, IW) from the generic Mojo dataset stage ([1,3,IH,IW])."""
+    return _staged_image_hw_key(stage_dir, i, String("image"))
+
+
+def _stage_has_key(stage_dir: String, i: Int, key: String) raises -> Bool:
+    """True iff the staged record `i` carries tensor `key` (header-only probe)."""
+    var imgs = ShardedSafeTensors.open(_stage_tensor_path(stage_dir, i))
+    return key in imgs.name_to_shard
+
+
+def _encode_one_latent_key[IH: Int, IW: Int](
+    venc: QwenImageVaeEncoder[IH, IW],
+    stage_dir: String, i: Int, key: String,
+    mean_ch: Tensor, std_ch: Tensor, ctx: DeviceContext,
+) raises -> Tensor:
+    """<key>.<i> [1,3,IH,IW] -> deterministic MEAN latent [1,16,IH/8,IW/8] ->
+    ai-toolkit-normalized BF16 latent. venc is the bucket-resident encoder. The
+    key is a parameter so the OminiControl EDIT stage can push BOTH the target
+    ("image") and the condition ("cond_image") of the SAME staged record through
+    the IDENTICAL encoder + normalization — the condition latent must live on the
+    same normalized scale as clean.<i> or the cond tokens enter the DiT off-scale."""
+    var imgs = ShardedSafeTensors.open(_stage_tensor_path(stage_dir, i))
+    var img_f32 = Tensor.from_view(imgs.tensor_view(key), ctx)
+    var img = cast_tensor(img_f32, STDtype.BF16, ctx)
+    var lat_mean = venc.encode_mean(img, ctx)              # [1,16,IH/8,IW/8] BF16
+    var lat_f32 = cast_tensor(lat_mean, STDtype.F32, ctx)
+    var clean_f32 = _normalize_latent(lat_f32, mean_ch, std_ch, ctx)
+    return cast_tensor(clean_f32, STDtype.BF16, ctx)
 
 
 def _encode_one_latent[IH: Int, IW: Int](
@@ -178,15 +212,38 @@ def _encode_one_latent[IH: Int, IW: Int](
     stage_dir: String, i: Int,
     mean_ch: Tensor, std_ch: Tensor, ctx: DeviceContext,
 ) raises -> Tensor:
-    """image.<i> [1,3,IH,IW] -> deterministic MEAN latent [1,16,IH/8,IW/8] ->
-    ai-toolkit-normalized BF16 clean latent. venc is the bucket-resident encoder."""
-    var imgs = ShardedSafeTensors.open(_stage_tensor_path(stage_dir, i))
-    var img_f32 = Tensor.from_view(imgs.tensor_view(String("image")), ctx)
-    var img = cast_tensor(img_f32, STDtype.BF16, ctx)
-    var lat_mean = venc.encode_mean(img, ctx)              # [1,16,IH/8,IW/8] BF16
-    var lat_f32 = cast_tensor(lat_mean, STDtype.F32, ctx)
-    var clean_f32 = _normalize_latent(lat_f32, mean_ch, std_ch, ctx)
-    return cast_tensor(clean_f32, STDtype.BF16, ctx)
+    """image.<i> [1,3,IH,IW] -> normalized BF16 clean latent (see the _key form)."""
+    return _encode_one_latent_key[IH, IW](
+        venc, stage_dir, i, String("image"), mean_ch, std_ch, ctx
+    )
+
+
+def _copy_stage_tensor(
+    stage_dir: String, i: Int, key: String, n_expect: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Copy a small rank-1 metadata tensor out of the staged record verbatim
+    (OminiControl cond_pos_delta [2] / cond_pos_scale [1]). Fail loud on shape —
+    a mis-shaped position record would silently move the condition grid."""
+    var rec = ShardedSafeTensors.open(_stage_tensor_path(stage_dir, i))
+    if key not in rec.name_to_shard:
+        raise Error(
+            String("[krea2-prepare] omini-edit: staged record ") + String(i)
+            + " has cond_image but no " + key
+            + " — re-stage with scripts/krea2_omini_stage_edit.py"
+        )
+    var t = cast_tensor(
+        Tensor.from_view(rec.tensor_view(key), ctx), STDtype.F32, ctx
+    )
+    var sh = t.shape()
+    var n = 1
+    for d in range(len(sh)):
+        n *= sh[d]
+    if n != n_expect:
+        raise Error(
+            String("[krea2-prepare] omini-edit: ") + key + String(".") + String(i)
+            + " has " + String(n) + " elements, expected " + String(n_expect)
+        )
+    return t^
 
 
 def _run[E_UNITS: Int](
@@ -207,8 +264,32 @@ def _run[E_UNITS: Int](
     in the additive ref.<i> slot -> an edit cache. The reference MUST land in the
     same (IH,IW) bucket as its target (same encoder arm); fail loud otherwise. The
     base clean/context/text_len keys are UNCHANGED — a reader that ignores ref.<i>
-    (or an old cache without it) loads byte-identically."""
+    (or an old cache without it) loads byte-identically.
+
+    OMINICONTROL EDIT (C5): when `ref_dir` is EMPTY but the staged records carry a
+    `cond_image` tensor (scripts/krea2_omini_stage_edit.py writes target+condition
+    into ONE record), the CONDITION image is VAE-encoded with the same per-bucket
+    encoder into the SAME additive `ref.<i>` slot, and the per-sample position
+    metadata is copied through as `cond_pos_delta.<i>` [2] F32 + `cond_pos_scale.<i>`
+    [1] F32. KEY-SCHEMA DECISION (recorded here because the intake proposed a new
+    `cond_clean.<i>`): the condition latent REUSES `ref.<i>` because that slot
+    already exists in this file and in krea2_cache_reader (has_ref/load_ref/
+    ref_hw_at) with the IDENTICAL contract — [1,16,LH,LW] BF16, same encoder, same
+    (z-mean)/std normalization, same bucket as the target. Adding a second key for
+    the same bytes would give the trainer two ways to spell one thing. The
+    OminiControl-specific part of the schema is the POSITION metadata, which is new
+    and named per the intake. A cache is an Omini EDIT cache iff BOTH ref.<i> and
+    cond_pos_delta.<i>/cond_pos_scale.<i> are present."""
     var edit_mode = len(ref_dir) > 0
+    # Omini single-record edit staging: probe record 0 for `cond_image`.
+    var omini_mode = False
+    if not edit_mode and n > 0:
+        omini_mode = _stage_has_key(stage_dir, 0, String("cond_image"))
+    if omini_mode:
+        print(
+            "[krea2-prepare] OMINICONTROL EDIT MODE: cond_image in the staged",
+            "records -> ref.<i> + cond_pos_delta.<i>/cond_pos_scale.<i>",
+        )
     var mean_ch = _mean_ch(ctx)   # [1,16,1,1] F32
     var std_ch = _std_ch(ctx)     # [1,16,1,1] F32
     var tok = Qwen3Tokenizer(String(KREA2_TOK_JSON))
@@ -233,6 +314,19 @@ def _run[E_UNITS: Int](
                     + " is " + String(rhw[0]) + "x" + String(rhw[1])
                     + " but target is " + String(hw[0]) + "x" + String(hw[1])
                     + " — a reference must be the SAME bucket canvas as its target"
+                )
+        if omini_mode:
+            # EDIT: the condition overlaps the target spatially (delta [0,0],
+            # scale 1.0), so S_COND == S_IMG — the cond canvas MUST equal the
+            # target canvas. Fail loud; a mismatched grid silently breaks the
+            # krea2_omini_cond_pos == img-grid identity the layout asserts.
+            var chw = _staged_image_hw_key(stage_dir, i, String("cond_image"))
+            if chw[0] != hw[0] or chw[1] != hw[1]:
+                raise Error(
+                    String("[krea2-prepare] omini-edit: cond_image.") + String(i)
+                    + " is " + String(chw[0]) + "x" + String(chw[1])
+                    + " but target is " + String(hw[0]) + "x" + String(hw[1])
+                    + " — the EDIT condition must share the target's canvas"
                 )
 
     # ── pass 1: captions -> context.<i> + text_len.<i> (aspect-independent) ─────
@@ -298,6 +392,30 @@ def _run[E_UNITS: Int](
                         tensors.append(TArc(ref_lat^))
                         print("[krea2-prepare] sample", i,
                               " ref latent=[1,16,", LH_BI, ",", LW_BI, "]")
+                    if omini_mode:
+                        # OminiControl EDIT: the CONDITION image rides in the SAME
+                        # staged record. Same encoder instance, same normalization
+                        # -> ref.<i>. The condition is CLEAN: the trainer never
+                        # noises it (it enters at t=0), so nothing else is applied.
+                        var cond_lat = _encode_one_latent_key[IH_BI, IW_BI](
+                            venc, stage_dir, i, String("cond_image"),
+                            mean_ch, std_ch, ctx
+                        )
+                        names.append(String("ref.") + String(i))
+                        tensors.append(TArc(cond_lat^))
+                        var cpd = _copy_stage_tensor(
+                            stage_dir, i, String("cond_pos_delta"), 2, ctx
+                        )
+                        names.append(String("cond_pos_delta.") + String(i))
+                        tensors.append(TArc(cpd^))
+                        var cps = _copy_stage_tensor(
+                            stage_dir, i, String("cond_pos_scale"), 1, ctx
+                        )
+                        names.append(String("cond_pos_scale.") + String(i))
+                        tensors.append(TArc(cps^))
+                        print("[krea2-prepare] sample", i,
+                              " COND latent=[1,16,", LH_BI, ",", LW_BI, "]",
+                              " -> ref.", i, " + cond_pos_*")
 
     for i in range(n):
         if not processed[i]:

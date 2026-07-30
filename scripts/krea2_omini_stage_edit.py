@@ -22,6 +22,12 @@
 #       "cond_image"  [1,3,H,W] f32 [-1,1] CHW  (condition; SAME bucket as target
 #                     — EDIT overlaps the target spatially, so the cond grid must
 #                     equal the img grid for the delta-[0,0] position map)
+#       "cond_pos_delta" [2] f32  (dh, dw)   ─ position metadata AS TENSORS, so
+#       "cond_pos_scale" [1] f32  (scale)      krea2_prepare_cache can copy them
+#                     straight into cond_pos_delta.<i> / cond_pos_scale.<i>
+#                     without a JSON parser in Mojo. The .json sidecar below is
+#                     the human-readable twin of these two tensors — the
+#                     TENSORS are what the cache prepare reads.
 #   sample_NNNNN.txt           raw instruction text, stripped (the Mojo prepare
 #                              wraps it in the krea2 template itself — do NOT
 #                              pre-wrap, same rule as krea2_stage_images.py)
@@ -37,7 +43,13 @@
 # cond latent for drop_image_prob=0.1 — is Stage B's job: encode a black image
 # once, store as a constant. Intake §3.6.)
 #
-# AUTHORED, NOT YET RUN — do not treat staged output as verified.
+# DATASET ORIENTATION — VERIFIED BY EYE 2026-07-30 on /home/alex/datasets/qwen_edit_test
+# (samples 1-01, 3-1, 4-1, 5-01 rendered side by side and inspected): every
+# caption is "restore and colorize this photo" (2 of 96 read "restore this old
+# damaged photo to a clean high quality image"), <stem>.jpg is the CLEAN /
+# COLORIZED result and <stem>-condlabel.png is the FADED, SCRATCHED, often
+# black-and-white original. So target=<stem>.jpg, condition=<stem>-condlabel.png,
+# as assumed below. Reversing the two would train an un-restore LoRA.
 #
 # Run (default bucket 512 — the OminiControl training resolution). Needs
 # numpy+PIL+safetensors; the krea2_stage_images.py-cited serenityflow-v2 venv
@@ -225,6 +237,14 @@ def main():
             {
                 "image": _decode_to_bucket(tgt, bucket_w, bucket_h),
                 "cond_image": _decode_to_bucket(cond, bucket_w, bucket_h),
+                # Position metadata as TENSORS (krea2_prepare_cache copies these
+                # verbatim into cond_pos_delta.<i> / cond_pos_scale.<i>).
+                "cond_pos_delta": np.asarray(
+                    EDIT_POSITION_DELTA, dtype=np.float32
+                ),
+                "cond_pos_scale": np.asarray(
+                    [EDIT_POSITION_SCALE], dtype=np.float32
+                ),
             },
             str(out / f"{name}.safetensors"),
         )

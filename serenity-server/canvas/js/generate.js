@@ -201,8 +201,29 @@ var GenerateTab = (function () {
                 };
             });
         }
-        if (arch === 'wan')
-            return [{ label: '832×480', w: 832, h: 480, vw: 26, vh: 15 }];
+        if (arch === 'wan') {
+            var wanRunner = activeWan22Runner();
+            var wanProfiles = wanRunner && Array.isArray(wanRunner.native_profiles)
+                ? wanRunner.native_profiles : [];
+            if (wanProfiles.length) {
+                return wanProfiles.map(function (profile) {
+                    return {
+                        label: profile.width + '×' + profile.height +
+                            (profile.mode === 'i2v_first_frame' ? ' I2V' : ''),
+                        w: Number(profile.width),
+                        h: Number(profile.height),
+                        vw: Number(profile.width) / 64,
+                        vh: Number(profile.height) / 64
+                    };
+                });
+            }
+            return [
+                { label: '1280×704', w: 1280, h: 704, vw: 20, vh: 11 },
+                { label: '704×1280', w: 704, h: 1280, vw: 11, vh: 20 },
+                { label: '1248×704 I2V', w: 1248, h: 704, vw: 19.5, vh: 11 },
+                { label: '704×1248 I2V', w: 704, h: 1248, vw: 11, vh: 19.5 }
+            ];
+        }
         if (arch === 'bernini')
             return [{ label: '848×480', w: 848, h: 480, vw: 53, vh: 30 }];
         if (arch === 'scail2')
@@ -2968,7 +2989,7 @@ var GenerateTab = (function () {
             krea2: { w: 1024, h: 1024 },
             qwen: { w: 1024, h: 1024 },
             ltxv: { w: 1920, h: 1088 },
-            wan: { w: 832, h: 480 },
+            wan: { w: 1280, h: 704 },
             bernini: { w: 848, h: 480 },
             scail2: { w: 896, h: 512 }
         };
@@ -3536,14 +3557,44 @@ var GenerateTab = (function () {
         return runner && runner.modes && runner.modes.lora || null;
     }
 
+    function wanCreatorI2vSize(sourceWidth, sourceHeight) {
+        // Exact port of Wan creator best_output_size(): the advertised
+        // 1280×704/704×1280 value is a max-area bucket. I2V follows the source
+        // aspect ratio on the model's 32-pixel grid.
+        var area = 1280 * 704;
+        var ratio = sourceWidth / sourceHeight;
+        var outputWidth = Math.sqrt(area * ratio);
+        var outputHeight = area / outputWidth;
+        var widthFirst = Math.floor(outputWidth / 32) * 32;
+        var heightFromWidth = Math.floor(area / widthFirst / 32) * 32;
+        var ratioWidthFirst = widthFirst / heightFromWidth;
+        var heightFirst = Math.floor(outputHeight / 32) * 32;
+        var widthFromHeight = Math.floor(area / heightFirst / 32) * 32;
+        var ratioHeightFirst = widthFromHeight / heightFirst;
+        var distortionWidth = Math.max(
+            ratio / ratioWidthFirst, ratioWidthFirst / ratio);
+        var distortionHeight = Math.max(
+            ratio / ratioHeightFirst, ratioHeightFirst / ratio);
+        return distortionWidth < distortionHeight
+            ? { width: widthFirst, height: heightFromWidth }
+            : { width: widthFromHeight, height: heightFirst };
+    }
+
     function syncWanI2vSteps() {
         if (state.arch !== 'wan')
             return;
-        var portrait = !!state.initImagePath &&
-            state.initImageHeight > state.initImageWidth;
-        state.width = portrait ? 480 : 832;
-        state.height = portrait ? 832 : 480;
-        state.steps = state.initImagePath ? 40 : 50;
+        if (state.initImagePath &&
+            state.initImageWidth > 0 && state.initImageHeight > 0) {
+            var creatorSize = wanCreatorI2vSize(
+                state.initImageWidth, state.initImageHeight);
+            state.width = creatorSize.width;
+            state.height = creatorSize.height;
+        }
+        else {
+            state.width = 1280;
+            state.height = 704;
+        }
+        state.steps = 50;
         if (els.steps) {
             els.steps.min = String(state.steps);
             els.steps.max = String(state.steps);
@@ -3559,10 +3610,10 @@ var GenerateTab = (function () {
         var note = document.getElementById('gen-video-profile-note');
         if (note) {
             note.textContent = state.initImagePath
-                ? 'Wan2.2 TI2V-5B I2V · creator first-frame conditioning · ' +
+                ? 'Wan2.2 TI2V-5B I2V · creator source-aspect sizing and first-frame conditioning · ' +
                     state.width + '×' + state.height +
-                    ' · 121 frames · 24 FPS · 40 UniPC steps · shift 3'
-                : 'Wan2.2 TI2V-5B T2V · 832×480 · 121 frames · 24 FPS · 50 UniPC steps · shift 5';
+                    ' · BF16 · 121 frames · 24 FPS · 50 UniPC steps · shift 5'
+                : 'Wan2.2 TI2V-5B T2V · 1280×704 · BF16 · 121 frames · 24 FPS · 50 UniPC steps · shift 5';
         }
         syncDimensionInputs();
         if (els.aspectDropdown) {
@@ -3611,13 +3662,13 @@ var GenerateTab = (function () {
             els.toolbarBatchInput.disabled = true;
         }
         state.batchCount = 1;
-        state.width = Number(runner.target_width) || 832;
-        state.height = Number(runner.target_height) || 480;
+        state.width = Number(runner.target_width) || 1280;
+        state.height = Number(runner.target_height) || 704;
         state.frames = Number(runner.target_frame_count) || 121;
         state.fps = 24;
         state.seconds = state.frames / state.fps;
         state.cfg = Number(runner.default_guidance) || 5;
-        state.videoQuant = 'fp8';
+        state.videoQuant = 'bf16';
         state.sampler = 'uni_pc';
         state.scheduler = 'normal';
         if (els.cfg) els.cfg.value = String(state.cfg);
@@ -4142,11 +4193,11 @@ var GenerateTab = (function () {
                 width: state.width,
                 height: state.height,
                 frames: 121,
-                steps: wanI2v ? 40 : 50,
+                steps: 50,
                 seed: seed,
                 fps: 24,
                 guidance: 5,
-                quant: 'fp8',
+                quant: 'bf16',
                 sampler: 'uni_pc',
                 scheduler: 'normal',
                 camera_motion: state.cameraMotion || 'none',

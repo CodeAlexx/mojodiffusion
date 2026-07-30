@@ -11,7 +11,8 @@
 #   - wan22_grid_large.txt             grid metadata
 #
 # Run: /home/alex/SimpleTuner/.venv/bin/python wan22_gen_oracle_large.py
-import os, sys, math
+import os, sys, math, subprocess
+from pathlib import Path
 import numpy as np
 import torch
 
@@ -63,7 +64,12 @@ mod_m.flash_attention = _sdpa_flash_attention
 
 torch.manual_seed(0)
 HERE = os.path.dirname(os.path.abspath(__file__))
-CKPT = "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-bf16"
+REPO_ROOT = str(Path(HERE).parents[3])
+sys.path.insert(0, REPO_ROOT)
+from scripts.prepare_wan22_diffusers_artifacts import transformer_key
+
+ORACLE_REVISION = "42bf4cfaa384bc21833865abc2f9e6c0e67233dc"
+CKPT = "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-Mojo"
 DEV = "cuda"
 
 # LARGE grid: F=4 frames (patch_f=1), H=64, W=64 latent -> patch (1,2,2) ->
@@ -83,24 +89,56 @@ def dump(name, t):
     return a
 
 def main():
+    oracle_head = subprocess.check_output(
+        ["git", "-C", WAN_ROOT, "rev-parse", "HEAD"], text=True
+    ).strip()
+    oracle_dirty = subprocess.check_output(
+        ["git", "-C", WAN_ROOT, "status", "--porcelain"], text=True
+    ).strip()
+    assert oracle_head == ORACLE_REVISION and not oracle_dirty, (
+        f"Wan creator oracle must be clean at {ORACLE_REVISION}; "
+        f"head={oracle_head!r} dirty={bool(oracle_dirty)}"
+    )
+
     cfg = dict(model_type="ti2v", patch_size=(1, 2, 2), text_len=512,
                in_dim=IN_DIM, dim=3072, ffn_dim=14336, freq_dim=256,
                text_dim=TEXT_DIM, out_dim=IN_DIM, num_heads=24, num_layers=30,
                qk_norm=True, cross_attn_norm=True, eps=1e-6)
-    model = WanModel(**cfg)
+    previous_default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        model = WanModel(**cfg)
+    finally:
+        torch.set_default_dtype(previous_default)
 
     from safetensors.torch import load_file
-    sd = {}
     import glob
-    for shard in sorted(glob.glob(os.path.join(CKPT, "*.safetensors"))):
-        sd.update(load_file(shard))
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    miss_real = [k for k in missing if k != "freqs"]
-    print("missing (non-freqs):", miss_real)
-    assert not miss_real, f"missing weights: {miss_real}"
-    del sd
+    expected = set(model.state_dict().keys())
+    loaded = set()
+    for shard in sorted(
+        glob.glob(
+            os.path.join(
+                CKPT, "diffusion_pytorch_model-*.safetensors"
+            )
+        )
+    ):
+        source = load_file(shard)
+        mapped = {transformer_key(k): v for k, v in source.items()}
+        extra = set(mapped) - expected
+        assert not extra, (
+            f"unexpected mapped keys in {shard}: {sorted(extra)[:8]}"
+        )
+        overlap = loaded.intersection(mapped)
+        assert not overlap, (
+            f"duplicate keys across shards: {sorted(overlap)[:8]}"
+        )
+        model.load_state_dict(mapped, strict=False)
+        loaded.update(mapped)
+        del mapped, source
+    missing = expected - loaded
+    assert not missing, f"missing weights: {sorted(missing)[:8]}"
 
-    model = model.to(torch.bfloat16).eval()
+    model = model.eval()
     model = model.to(DEV)
 
     g = torch.Generator(device="cpu").manual_seed(1234)

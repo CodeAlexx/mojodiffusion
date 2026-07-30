@@ -63,6 +63,7 @@ from serenitymojo.ops.tensor_algebra import (
     add, mul, add_scalar, mul_scalar, slice, reshape, permute, transpose,
     full_device, concat,
 )
+from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 
 
 def wan22_canonical_weight_key(name: String) raises -> String:
@@ -982,6 +983,307 @@ struct Wan22DiT(Movable):
         head_2d_shape.append(out_dim * 1 * 2 * 2)
         var head_2d = reshape(head_out, head_2d_shape^, ctx)  # [S, out_dim*4]
         return unpatchify3d(head_2d, out_dim, FG * 1, HG * 2, WG * 2, 1, 2, 2, ctx)
+
+
+struct Wan22CfgPreds(Movable):
+    """Paired creator-CFG velocities from one exact-BF16 block stream."""
+
+    var cond: Tensor
+    var uncond: Tensor
+
+    def __init__(out self, var cond: Tensor, var uncond: Tensor):
+        self.cond = cond^
+        self.uncond = uncond^
+
+
+struct Wan22DiTOffloaded(Movable):
+    """Exact-BF16 Wan TI2V-5B with creator-CFG paired block streaming.
+
+    Only the non-block patch/time/text/head tensors stay resident. Each of the
+    30 transformer blocks is loaded from the pinned BF16 artifact view, used by
+    both positive and negative branches, and then released. This preserves the
+    creator's two-branch CFG math while avoiding the resident-5B-plus-active-
+    block peak that exceeds a 24 GB card at the native 1280x704 profile.
+    """
+
+    var shared: Wan22DiT
+    var loader: BlockLoader
+    var lora: Optional[LoraSet]
+    var lora_multiplier: Float32
+
+    @staticmethod
+    def load(
+        dir: String, cfg: Wan22Config, ctx: DeviceContext
+    ) raises -> Wan22DiTOffloaded:
+        var st = ShardedSafeTensors.open(dir)
+        var weights = Dict[String, ArcPointer[Tensor]]()
+        var shared_count = 0
+        for ref nm in st.names():
+            var source_key = String(nm)
+            var key = wan22_canonical_weight_key(source_key)
+            if key.startswith("blocks."):
+                continue
+            weights[key] = ArcPointer(
+                Tensor.from_view_as_bf16(st.tensor_view(source_key), ctx)
+            )
+            shared_count += 1
+        var shared = Wan22DiT(weights^, cfg)
+        var loader = BlockLoader.open(dir)
+        print(
+            "  Wan BF16 block stream: shared_tensors=", shared_count,
+            " streamed_blocks=", cfg.num_layers,
+        )
+        return Wan22DiTOffloaded(
+            shared^, loader^, Optional[LoraSet](), Float32(1.0)
+        )
+
+    @staticmethod
+    def load_with_lora(
+        dir: String,
+        cfg: Wan22Config,
+        lora_path: String,
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Wan22DiTOffloaded:
+        """Load exact BF16 blocks and attach a fail-closed streamed LoRA.
+
+        Block deltas are added to each freshly streamed BF16 block in memory;
+        global deltas are merged once into the small resident shared set.
+        Nothing is written back to the base checkpoint or adapter.
+        """
+        var model = Wan22DiTOffloaded.load(dir, cfg, ctx)
+        var lora = LoraSet.load(lora_path)
+        if lora.num_mappings() == 0:
+            raise Error("Wan BF16 LoRA has no resolved mappings")
+
+        var inventory = Dict[String, Bool]()
+        for ref entry in model.shared.weights.items():
+            inventory[entry.key] = True
+        for ref name in model.loader.sharded.names():
+            inventory[name] = True
+        var matched = 0
+        var global_mappings = 0
+        for ref mapping in lora.mappings:
+            if mapping.base_key not in inventory:
+                raise Error(
+                    String("Wan BF16 LoRA target is absent from TI2V-5B: ")
+                    + mapping.base_key
+                )
+            matched += 1
+            if not mapping.base_key.startswith("blocks."):
+                global_mappings += 1
+
+        var globals_merged = lora.merge_into(
+            model.shared.weights, multiplier, ctx
+        )
+        if globals_merged != global_mappings:
+            raise Error(
+                String("Wan BF16 LoRA global coverage mismatch: merged=")
+                + String(globals_merged)
+                + String(" expected=") + String(global_mappings)
+            )
+        model.lora = Optional[LoraSet](lora^)
+        model.lora_multiplier = multiplier
+        print(
+            "  Wan BF16 streamed LoRA attached: mappings=", matched,
+            " global=", globals_merged, " multiplier=", multiplier,
+        )
+        return model^
+
+    def __init__(
+        out self,
+        var shared: Wan22DiT,
+        var loader: BlockLoader,
+        var lora: Optional[LoraSet],
+        lora_multiplier: Float32,
+    ):
+        self.shared = shared^
+        self.loader = loader^
+        self.lora = lora^
+        self.lora_multiplier = lora_multiplier
+
+    def _load_block(
+        self, index: Int, ctx: DeviceContext
+    ) raises -> Block:
+        var prefix = String("blocks.") + String(index)
+        self.loader.prefetch_block(prefix)
+        var loaded = self.loader.load_block_as_bf16(prefix, ctx)
+        if self.lora:
+            var merged = self.lora.value().merge_into(
+                loaded, self.lora_multiplier, ctx
+            )
+            if merged == 0:
+                # A partial LoRA may intentionally omit this block. The entire
+                # adapter inventory was validated at load time, so zero here is
+                # an explicit no-target block rather than a silent mismatch.
+                pass
+        var local = Block()
+        var dotted = prefix + String(".")
+        for ref entry in loaded.items():
+            var canonical = wan22_canonical_weight_key(entry.key)
+            if not canonical.startswith(dotted):
+                raise Error(
+                    String("Wan streamed block key escaped prefix: ")
+                    + canonical
+                )
+            local[canonical.replace(dotted, String(""))] = entry.value
+        return local^
+
+    def _embed_context[
+        TXT: Int, CTXL: Int
+    ](
+        self, context: Tensor, bf: STDtype, ctx: DeviceContext
+    ) raises -> Tensor:
+        var cfg = self.shared.config
+        var padded = _pad_context(
+            context, CTXL, TXT, cfg.text_dim, bf, ctx
+        )
+        var txt = linear(
+            padded,
+            self.shared._w("text_embedding.0.weight"),
+            Optional(self.shared._w("text_embedding.0.bias").clone(ctx)),
+            ctx,
+        )
+        txt = gelu(txt, ctx)
+        return linear(
+            txt,
+            self.shared._w("text_embedding.2.weight"),
+            Optional(self.shared._w("text_embedding.2.bias").clone(ctx)),
+            ctx,
+        )
+
+    def _head[
+        FG: Int, HG: Int, WG: Int, S: Int
+    ](
+        self, img: Tensor, e_head: Tensor, bf: STDtype,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var cfg = self.shared.config
+        var dim = cfg.dim
+        var out_dim = cfg.out_dim
+        var head_mod_f32 = cast_tensor(
+            self.shared._w("head.modulation"), STDtype.F32, ctx
+        )
+        var e_head_u = _unsqueeze2(e_head, S, dim, ctx)
+        var head_e = add(head_mod_f32, e_head_u, ctx)
+        var head_shift = _chunk2(head_e, 0, S, dim, ctx)
+        var head_scale = _chunk2(head_e, 1, S, dim, ctx)
+        var head_in_f32 = wan22_mod_pre(
+            img, head_scale, head_shift, dim, cfg.eps, ctx
+        )
+        var head_in = cast_tensor(head_in_f32, bf, ctx)
+        var head_out = linear(
+            head_in,
+            self.shared._w("head.head.weight"),
+            Optional(self.shared._w("head.head.bias").clone(ctx)),
+            ctx,
+        )
+        var head_2d = reshape(
+            head_out, [S, out_dim * 1 * 2 * 2], ctx
+        )
+        return unpatchify3d(
+            head_2d, out_dim, FG, HG * 2, WG * 2, 1, 2, 2, ctx
+        )
+
+    def forward_cfg_timesteps[
+        FG: Int, HG: Int, WG: Int, S: Int,
+        TXT: Int, CTXL: Int, H: Int, DH: Int,
+    ](
+        self,
+        x_lat: Tensor,
+        timestep_tokens: Tensor,
+        context_cond: Tensor,
+        context_uncond: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Wan22CfgPreds:
+        """Run the creator's cond/uncond calls through one BF16 block stream."""
+        var cfg = self.shared.config
+        var dim = cfg.dim
+        var in_dim = cfg.in_dim
+        var bf = x_lat.dtype()
+        if timestep_tokens.numel() != S:
+            raise Error("Wan22 token timestep vector must have exactly S values")
+
+        var patched = patchify3d(x_lat, 1, 2, 2, ctx)
+        var pe_w_flat = reshape(
+            self.shared._w("patch_embedding.weight"),
+            [dim, in_dim * 4],
+            ctx,
+        )
+        var img2d = linear(
+            patched,
+            pe_w_flat,
+            Optional(self.shared._w("patch_embedding.bias").clone(ctx)),
+            ctx,
+        )
+        var img = reshape(img2d, [1, S, dim], ctx)
+
+        var t_vec: Tensor
+        if timestep_tokens.dtype() == STDtype.F32:
+            t_vec = timestep_tokens.clone(ctx)
+        else:
+            t_vec = cast_tensor(timestep_tokens, STDtype.F32, ctx)
+        var sin_bf = timestep_embedding(
+            t_vec, cfg.freq_dim, ctx, 10000.0, bf
+        )
+        var e = linear(
+            sin_bf,
+            self.shared._w("time_embedding.0.weight"),
+            Optional(self.shared._w("time_embedding.0.bias").clone(ctx)),
+            ctx,
+        )
+        e = silu(e, ctx)
+        e = linear(
+            e,
+            self.shared._w("time_embedding.2.weight"),
+            Optional(self.shared._w("time_embedding.2.bias").clone(ctx)),
+            ctx,
+        )
+        var e_silu = silu(e, ctx)
+        var e0_flat = linear(
+            e_silu,
+            self.shared._w("time_projection.1.weight"),
+            Optional(self.shared._w("time_projection.1.bias").clone(ctx)),
+            ctx,
+        )
+        var e0 = reshape(
+            cast_tensor(e0_flat, STDtype.F32, ctx),
+            [1, S, 6, dim],
+            ctx,
+        )
+        var e_head = reshape(
+            cast_tensor(e, STDtype.F32, ctx), [1, S, dim], ctx
+        )
+
+        var txt_cond = self._embed_context[TXT, CTXL](
+            context_cond, bf, ctx
+        )
+        var txt_uncond = self._embed_context[TXT, CTXL](
+            context_uncond, bf, ctx
+        )
+        var cs = wan22_build_rope(
+            FG, HG, WG, DH, cfg.rope_theta, bf, ctx
+        )
+        var img_cond = img.clone(ctx)
+        var img_uncond = img^
+
+        for i in range(cfg.num_layers):
+            var block = self._load_block(i, ctx)
+            img_cond = wan22_block_forward[S, TXT, H, DH](
+                img_cond, e0, txt_cond, cs[0], cs[1], block, cfg, ctx
+            )
+            img_uncond = wan22_block_forward[S, TXT, H, DH](
+                img_uncond, e0, txt_uncond, cs[0], cs[1], block, cfg, ctx
+            )
+            unload_block(block^)
+
+        var cond = self._head[FG, HG, WG, S](
+            img_cond, e_head, bf, ctx
+        )
+        var uncond = self._head[FG, HG, WG, S](
+            img_uncond, e_head, bf, ctx
+        )
+        return Wan22CfgPreds(cond^, uncond^)
 
 
 # pad raw context [ctx_len, text_dim] -> [1, TXT, text_dim] (zero-pad on tokens).

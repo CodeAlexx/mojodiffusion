@@ -132,7 +132,13 @@ def main():
     import glob
     expected = set(model.state_dict().keys())
     loaded = set()
-    for shard in sorted(glob.glob(os.path.join(CKPT, "*.safetensors"))):
+    for shard in sorted(
+        glob.glob(
+            os.path.join(
+                CKPT, "diffusion_pytorch_model-*.safetensors"
+            )
+        )
+    ):
         source = load_file(shard)
         mapped = {transformer_key(k): v for k, v in source.items()}
         extra = set(mapped) - expected

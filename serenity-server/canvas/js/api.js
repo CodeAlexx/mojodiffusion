@@ -212,14 +212,14 @@ var SerenityAPI = (function () {
                 model: bernini ? 'bernini' : (wanA14b ? 'wan22_a14b' : 'wan22'),
                 prompt: textFromRef(si.positive),
                 negative_prompt: textFromRef(si.negative),
-                width: latent ? ((latent.inputs || {}).width || (bernini ? 848 : 832)) : (bernini ? 848 : 832),
-                height: latent ? ((latent.inputs || {}).height || 480) : 480,
+                width: latent ? ((latent.inputs || {}).width || (bernini ? 848 : (wanA14b ? 832 : 1280))) : (bernini ? 848 : (wanA14b ? 832 : 1280)),
+                height: latent ? ((latent.inputs || {}).height || (bernini || wanA14b ? 480 : 704)) : (bernini || wanA14b ? 480 : 704),
                 frames: latent ? ((latent.inputs || {}).length || ((bernini || wanA14b) ? 81 : 121)) : ((bernini || wanA14b) ? 81 : 121),
                 steps: si.steps || (bernini || wanA14b ? 40 : 50),
                 guidance: si.cfg || (bernini ? 4.0 : (wanA14b ? 3.0 : 5.0)),
                 seed: si.seed || 0,
                 fps: (bernini || wanA14b) ? 16 : 24,
-                quant: 'fp8',
+                quant: (!bernini && !wanA14b) ? 'bf16' : 'fp8',
                 camera_motion: si.camera_motion || 'none',
                 lora: videoLoras
             };
@@ -234,7 +234,7 @@ var SerenityAPI = (function () {
                 if (!imagePath)
                     throw new Error('Wan first-frame workflow requires a loaded source image');
                 request.image_path = imagePath;
-                request.steps = 40;
+                request.steps = 50;
             }
             return request;
         }

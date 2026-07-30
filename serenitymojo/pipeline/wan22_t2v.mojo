@@ -55,7 +55,9 @@
 #   per-row scales; 525 small tensors remain BF16. Each active block is restored
 #   to BF16 for the existing math. Full-forward creator parity is 0.997239.
 #
-# argv: <conds.safetensors> <out_dir> [frames=121] [steps=50] [seed=0] [guidance=5.0] [decode=1]
+# argv: <conds.safetensors> <out_dir> [frames=121] [steps=50] [seed=0]
+#       [guidance=5.0] [decode=1] [first_image=""] [lora="-"]
+#       [lora_mult=1.0] [precision="fp8"|"bf16"]
 #
 # Mojo 1.0.0b1, NVIDIA GPU. NO in-pipeline text encode (ephemeral-encode split).
 
@@ -76,7 +78,9 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import (
     add, mul, mul_scalar, permute, reshape, slice, full_device, concat,
 )
-from serenitymojo.models.dit.wan22_dit import Wan22Config, Wan22DiT
+from serenitymojo.models.dit.wan22_dit import (
+    Wan22Config, Wan22DiT, Wan22DiTOffloaded,
+)
 from serenitymojo.models.vae.wan22_decoder import Wan22VaeImageDecoder
 from serenitymojo.models.vae.wan22_vae_encoder import Wan22VaeImageEncoder
 from serenitymojo.sampling.unipc import UniPcMultistepScheduler
@@ -125,10 +129,9 @@ comptime HD = 128              # head_dim
 # 1.31->1.10, fractal->coherent face). Runtime-overridable via argv (GUIDANCE is
 # used in the CFG loop, not comptime-specialized, so it can be a runtime scalar).
 comptime DEFAULT_GUIDANCE = Float32(5.0)
-comptime T2V_SHIFT = Float32(5.0)
-comptime I2V_SHIFT_480P = Float32(3.0)
+comptime CREATOR_NATIVE_SHIFT = Float32(5.0)
 comptime DEFAULT_T2V_STEPS = 50
-comptime DEFAULT_I2V_STEPS = 40
+comptime DEFAULT_I2V_STEPS = 50
 comptime DEFAULT_SEED = 0
 comptime NUM_TRAIN_TIMESTEPS = Float32(1000.0)
 
@@ -240,6 +243,31 @@ def _encode_i2v_first_frame(
     return concat(1, ctx, first, tail)
 
 
+def _load_i2v_first_frame(
+    latent_path: String, ctx: DeviceContext
+) raises -> Tensor:
+    """Load the process-isolated creator VAE result and append zero tail."""
+    var st = ShardedSafeTensors.open(latent_path)
+    var key = String("first_latent")
+    if key not in st.names():
+        raise Error("Wan first-frame latent cache missing 'first_latent'")
+    var first = Tensor.from_view_as_f32(st.tensor_view(key), ctx)
+    if first.numel() != 48 * H_LAT * W_LAT:
+        raise Error(
+            String("Wan first-frame latent numel ")
+            + String(first.numel()) + String(" != ")
+            + String(48 * H_LAT * W_LAT)
+        )
+    first = reshape(first, [48, 1, H_LAT, W_LAT], ctx)
+    var tail = full_device(
+        [48, T_LAT - 1, H_LAT, W_LAT],
+        Float32(0.0),
+        STDtype.F32,
+        ctx,
+    )
+    return concat(1, ctx, first, tail)
+
+
 def _clamp_creator_first_frame(
     x: Tensor, condition: Tensor, ctx: DeviceContext
 ) raises -> Tensor:
@@ -273,10 +301,69 @@ def _denoise_scoped(
     shift: Float32,
     lora_path: String,
     lora_mult: Float32,
+    precision: String,
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Run the DiT in its own lifetime so resident weights die before VAE load."""
     var cfg = Wan22Config.ti2v_5b()
+    if precision == String("bf16"):
+        print(
+            "  loading Wan2.2-TI2V-5B exact-BF16 block stream from",
+            CKPT_DIR,
+        )
+        var streamed: Wan22DiTOffloaded
+        if lora_path.byte_length() > 0 and lora_path != String("-"):
+            print("  loading Wan TI2V-5B BF16 streamed LoRA:", lora_path)
+            streamed = Wan22DiTOffloaded.load_with_lora(
+                String(CKPT_DIR), cfg, lora_path, lora_mult, ctx
+            )
+        else:
+            streamed = Wan22DiTOffloaded.load(
+                String(CKPT_DIR), cfg, ctx
+            )
+        print("  weights ready.")
+        var x = randn(
+            [48, T_LAT, H_LAT, W_LAT], seed, STDtype.F32, ctx
+        )
+        if i2v:
+            x = _clamp_creator_first_frame(x, condition, ctx)
+        var scheduler = UniPcMultistepScheduler(
+            1000, steps, Float64(shift), 2
+        )
+        var sigmas = scheduler.sigmas()
+        for i in range(steps):
+            var t = Float32(sigmas[i]) * NUM_TRAIN_TIMESTEPS
+            var token_timesteps: Tensor
+            if i2v:
+                token_timesteps = _creator_i2v_token_timesteps(t, ctx)
+            else:
+                token_timesteps = full_device(
+                    [S], t, STDtype.F32, ctx
+                )
+            var x_bf = cast_tensor(x, STDtype.BF16, ctx)
+            var preds = streamed.forward_cfg_timesteps[
+                FG, HG, WG, S, TXT, CTXL, NH, HD
+            ](x_bf, token_timesteps, pos, neg, ctx)
+            var vc = cast_tensor(preds.cond, STDtype.F32, ctx)
+            var vu = cast_tensor(preds.uncond, STDtype.F32, ctx)
+            var v = add(
+                mul_scalar(vu, Float32(1.0) - guidance, ctx),
+                mul_scalar(vc, guidance, ctx),
+                ctx,
+            )
+            x = scheduler.step(v, x, ctx)
+            if i2v:
+                x = _clamp_creator_first_frame(x, condition, ctx)
+            # Fence one complete creator step. This makes the lifetime of all
+            # 30 released block buffers explicit and bounds the async allocator
+            # high-water mark before the next CFG pair begins.
+            ctx.synchronize()
+            print(
+                "  step", i + 1, "/", steps,
+                " sigma=", sigmas[i], " t=", t,
+            )
+        return x^
+
     print("  loading Wan2.2-TI2V-5B weights from FP8 cache", FP8_CACHE)
     var model = Wan22DiT.load_fp8_cache(String(FP8_CACHE), cfg, ctx)
     print("  weights loaded.")
@@ -285,7 +372,6 @@ def _denoise_scoped(
         _ = model.merge_lora_fp8_resident(
             LoraSet.load(lora_path), lora_mult, ctx
         )
-
     var x = randn([48, T_LAT, H_LAT, W_LAT], seed, STDtype.F32, ctx)
     if i2v:
         # Official Wan applies this replacement both before the first denoise
@@ -325,6 +411,7 @@ def _denoise_scoped(
         x = scheduler.step(v, x, ctx)
         if i2v:
             x = _clamp_creator_first_frame(x, condition, ctx)
+        ctx.synchronize()
         print("  step", i + 1, "/", steps, " sigma=", sigmas[i], " t=", t)
     return x^
 
@@ -332,7 +419,7 @@ def _denoise_scoped(
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        print("usage: wan22_t2v <conds.safetensors> <out_dir> [frames] [steps] [seed] [guidance] [decode=1] [first_image=\"\"] [lora=\"-\"] [lora_mult=1.0]")
+        print("usage: wan22_t2v <conds.safetensors> <out_dir> [frames] [steps] [seed] [guidance] [decode=1] [first_image=\"\"] [lora=\"-\"] [lora_mult=1.0] [precision=fp8|bf16]")
         print("  conds.safetensors: keys pos_embed[512,4096], neg_embed[512,4096]")
         print("  first_image: PNG/JPEG/WebP enables creator TI2V first-frame conditioning")
         print("  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames, S=", S)
@@ -353,6 +440,9 @@ def main() raises:
     var lora_mult = Float32(1.0)
     if len(args) >= 11:
         lora_mult = Float32(Float64(String(args[10])))
+    var precision = String("fp8")
+    if len(args) >= 12:
+        precision = String(args[11])
     var steps = DEFAULT_I2V_STEPS if i2v else DEFAULT_T2V_STEPS
     if len(args) >= 5:
         steps = atol(String(args[4]))
@@ -374,12 +464,19 @@ def main() raises:
         )
     if steps < 1:
         raise Error("steps must be >= 1")
+    if precision != String("fp8") and precision != String("bf16"):
+        raise Error("precision must be 'fp8' or 'bf16'")
 
-    var shift = I2V_SHIFT_480P if i2v else T2V_SHIFT
+    # The official TI2V-5B 720p CLI inherits config shift=5 for both T2V and
+    # I2V. Shift=3 is only recommended by the creator for a 480p I2V render.
+    var shift = CREATOR_NATIVE_SHIFT
     print("=== Wan2.2-TI2V-5B", "I2V" if i2v else "T2V", "===")
     print("  geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames ->",
           "latent [48,", T_LAT, ",", H_LAT, ",", W_LAT, "], S=", S)
-    print("  steps=", steps, " guidance=", guidance, " shift=", shift, " seed=", seed)
+    print(
+        "  steps=", steps, " guidance=", guidance, " shift=", shift,
+        " seed=", seed, " precision=", precision,
+    )
     if lora_path.byte_length() > 0 and lora_path != String("-"):
         print("  LoRA:", lora_path, " multiplier=", lora_mult)
 
@@ -398,20 +495,25 @@ def main() raises:
     pos = _zero_pad_rows(pos, pos_valid, ctx)
     neg = _zero_pad_rows(neg, neg_valid, ctx)
 
-    # 2. Optional first frame is encoded before the DiT is allocated so the VAE
-    # encoder and 5B transformer are never resident together.
+    # 2. Product I2V passes a process-isolated VAE latent cache. Direct image
+    # input remains a developer fallback, but native BF16 product runs must use
+    # the cache so the VAE allocator cannot fragment the DiT process.
     var condition = _zero_condition(ctx)
     if i2v:
-        print("  creator first-frame encode:", image_path)
-        condition = _encode_i2v_first_frame(image_path, ctx)
+        if image_path.endswith(".safetensors"):
+            print("  loading process-isolated creator first frame:", image_path)
+            condition = _load_i2v_first_frame(image_path, ctx)
+        else:
+            print("  creator first-frame encode (developer fallback):", image_path)
+            condition = _encode_i2v_first_frame(image_path, ctx)
         ctx.synchronize()
-        print("  first-frame VAE scope released")
+        print("  first-frame condition ready")
 
     # 3-6. Cached DiT + creator UniPC in a nested lifetime. On return, resident
     # weights and scheduler history are gone before the VAE is allocated.
     var x = _denoise_scoped(
         pos, neg, condition, i2v, steps, seed, guidance, shift,
-        lora_path, lora_mult, ctx
+        lora_path, lora_mult, precision, ctx
     )
     print("  denoise scope released; loading VAE next")
 

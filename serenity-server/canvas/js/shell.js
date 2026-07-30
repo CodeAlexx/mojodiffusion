@@ -227,7 +227,7 @@ function setupTemplatesDropdown() {
         { name: 'Anima · Text to Image', preset: { model: 'anima', prompt: 'a red fox in a field of lavender, detailed illustration', steps: 20, cfg: 4.5, scheduler: 'euler' } },
         { name: 'Ideogram 4 · Text to Image', preset: { model: 'ideogram-4-fp8', prompt: 'a bakery storefront sign reading SERENITY, warm evening light', steps: 20, cfg: 7, scheduler: 'euler' } },
         { name: 'SenseNova · Text to Image', preset: { model: 'sensenova_u1', prompt: 'a silver robot watering orange flowers in a greenhouse', steps: 30, cfg: 4, scheduler: 'euler' } },
-        { name: 'Wan 2.2 5B · Text to Video', preset: { model: 'Wan2.2-TI2V-5B-Mojo', prompt: 'two anthropomorphic cats in comfortable boxing gear and bright gloves fight intensely on a spotlighted stage, cinematic lighting, dynamic camera movement', width: 832, height: 480, steps: 50, cfg: 5, scheduler: 'uni_pc', frames: 121, fps: 24 } },
+        { name: 'Wan 2.2 5B · Text to Video', preset: { model: 'Wan2.2-TI2V-5B-Mojo', prompt: 'two anthropomorphic cats in comfortable boxing gear and bright gloves fight intensely on a spotlighted stage, cinematic lighting, dynamic camera movement', width: 1280, height: 704, steps: 50, cfg: 5, scheduler: 'uni_pc', frames: 121, fps: 24, quant: 'bf16' } },
         { name: 'Bernini-R · Text to Video', preset: { model: 'Bernini-R-Diffusers', prompt: 'a woman in a flowing red coat walks through a rain-soaked neon city at night, cinematic tracking shot, natural motion, detailed reflections, atmospheric depth', width: 848, height: 480, steps: 40, cfg: 4, scheduler: 'uni_pc', frames: 81, fps: 16 } },
     ];
     function admittedFallbackTemplates() {

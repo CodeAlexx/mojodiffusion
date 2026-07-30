@@ -4,7 +4,7 @@
 # Grid: latent F=4,H=64,W=64 -> patch (1,2,2) -> grid (4,32,32) -> S=4096.
 # At head_dim=128 the math-mode SDPA would materialize [1,24,4096,4096] f32
 # scores (~1.6 GB/block) and OOM; wan22_block_forward dispatches S>512 to
-# sdpa_nomask_tiled. Deep 30-block chain -> gate cos >= 0.99.
+# sdpa_nomask_tiled. Deep 30-block chain -> production BF16 gate cos >= 0.999.
 #
 # Run the large oracle first, then this probe:
 #   cd /home/alex/mojodiffusion
@@ -22,7 +22,7 @@ from serenitymojo.models.dit.wan22_dit import Wan22Config, Wan22DiT
 
 
 comptime DIR = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/"
-comptime CKPT = "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-bf16"
+comptime CKPT = "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-Mojo"
 
 # Large grid: latent F=4,H=64,W=64 -> patch grid (4,32,32) -> S=4096.
 comptime IN_DIM = 48
@@ -90,7 +90,7 @@ def main() raises:
     var ctx_bf = cast_tensor(ctx_f32, STDtype.BF16, ctx)
 
     print("    loading Wan2.2-TI2V-5B weights (bf16, resident)...")
-    var model = Wan22DiT.load(CKPT, cfg, ctx)
+    var model = Wan22DiT.load_bf16(CKPT, cfg, ctx)
     print("    weights loaded; running 30-block forward at S=", S, " (tiled SDPA)...")
 
     var out_bf = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
@@ -98,7 +98,7 @@ def main() raises:
     )
     var out_f32 = cast_tensor(out_bf, STDtype.F32, ctx)
 
-    var harness = ParityHarness(0.99)
+    var harness = ParityHarness(0.999)
     var r = harness.compare(out_f32, ref_h, ctx)
     print("    wan22 LARGE full forward (bf16, tiled):", r)
     if r.passed:

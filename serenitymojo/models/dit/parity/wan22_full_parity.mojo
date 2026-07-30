@@ -4,7 +4,7 @@
 # + text embed -> 30 blocks -> head -> unpatchify3d) against the canonical
 # WanModel oracle (wan22_gen_oracle.py). Both sides fed byte-identical f32 inputs
 # (full_x_in, full_context_raw) + the same scalar timestep; Mojo runs bf16 on GPU.
-# Deep 30-block chain -> gate cos >= 0.99.
+# Deep 30-block chain -> production BF16 gate cos >= 0.999.
 #
 # Run the oracle first, then the probe:
 #   cd /home/alex/mojodiffusion
@@ -19,10 +19,13 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.models.dit.wan22_dit import Wan22Config, Wan22DiT
+from serenitymojo.ops.tensor_algebra import full_device
+from serenitymojo.models.dit.wan22_dit import (
+    Wan22Config, Wan22DiT, Wan22DiTOffloaded,
+)
 
 
-comptime DIR = "/home/alex/mojodiffusion-sync/serenitymojo/models/dit/parity/"
+comptime DIR = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/"
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B-Mojo"
 
 # Grid from wan22_grid.txt: latent F=1,H=8,W=8 -> patch grid (1,4,4) -> S=16.
@@ -81,6 +84,7 @@ def _load_model(
 def main() raises:
     var args = argv()
     var use_fp8 = len(args) > 1 and args[1] == "--fp8"
+    var use_stream = len(args) > 1 and args[1] == "--stream"
     var cache_path = String("")
     if len(args) > 2 and args[1] == "--fp8-cache":
         use_fp8 = True
@@ -88,7 +92,9 @@ def main() raises:
     var ctx = DeviceContext()
     print(
         "=== Wan2.2 FULL forward parity (S=", S,
-        ", 30 blocks, storage=", "fp8-e4m3" if use_fp8 else "bf16", ") ===",
+        ", 30 blocks, storage=",
+        "bf16-stream" if use_stream else ("fp8-e4m3" if use_fp8 else "bf16"),
+        ") ===",
     )
 
     var cfg = Wan22Config.ti2v_5b()
@@ -109,16 +115,25 @@ def main() raises:
     var ctx_f32 = Tensor.from_host(ctx_h.copy(), [CTXL, TEXT_DIM], STDtype.F32, ctx)
     var ctx_bf = cast_tensor(ctx_f32, STDtype.BF16, ctx)
 
-    print("    loading Wan2.2-TI2V-5B weights...")
-    var model = _load_model(use_fp8, cache_path, cfg, ctx)
-    print("    weights loaded; running 30-block forward...")
-
-    var out_bf = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
-        x_bf, TIMESTEP, ctx_bf, ctx
-    )
+    var out_bf: Tensor
+    if use_stream:
+        print("    loading exact-BF16 streamed Wan2.2-TI2V-5B weights...")
+        var model = Wan22DiTOffloaded.load(CKPT, cfg, ctx)
+        var timesteps = full_device([S], TIMESTEP, STDtype.F32, ctx)
+        var paired = model.forward_cfg_timesteps[
+            FG, HG, WG, S, TXT, CTXL, NH, HD
+        ](x_bf, timesteps, ctx_bf, ctx_bf, ctx)
+        out_bf = paired.cond.clone(ctx)
+    else:
+        print("    loading Wan2.2-TI2V-5B weights...")
+        var model = _load_model(use_fp8, cache_path, cfg, ctx)
+        print("    weights loaded; running 30-block forward...")
+        out_bf = model.forward[FG, HG, WG, S, TXT, CTXL, NH, HD](
+            x_bf, TIMESTEP, ctx_bf, ctx
+        )
     var out_f32 = cast_tensor(out_bf, STDtype.F32, ctx)
 
-    var harness = ParityHarness(0.99)
+    var harness = ParityHarness(0.999)
     var r = harness.compare(out_f32, ref_h, ctx)
     print("    wan22 full forward:", r)
     if r.passed:

@@ -1141,7 +1141,7 @@ var WorkflowBuilder = (function () {
             '4': { class_type: 'CLIPTextEncode', inputs: { text: p.negPrompt || '', clip: ['2', 0] } },
             '5': { class_type: 'EmptyLatentVideo', inputs: { width: w, height: h, length: frames, batch_size: 1 } },
             '6': { class_type: 'KSampler', inputs: {
-                    seed: seed, steps: i2v ? 40 : 50, cfg: 5.0,
+                    seed: seed, steps: 50, cfg: 5.0,
                     // SerenityAPI translates this graph to the oracle-gated
                     // Mojo Flow-UniPC route; these labels keep saved workflow
                     // metadata aligned with the actual sampler contract.

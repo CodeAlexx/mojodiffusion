@@ -10,14 +10,15 @@
 # |mine|/|ref| for each.  The temporal case (B) exercises the per-frame causal
 # feat_cache loop + downsample3d.time_conv (the path that was UNVERIFIED).
 #
-# GATE: cos >= 0.999 (deep 3D conv chain may sit at ~0.99 BF16 ceiling — raw
-# value reported either way).
+# GATE: every case cos >= 0.99. The full raw values are reported and the
+# product gate records the minimum; this deep 3D BF16 chain has a lower
+# cross-kernel numerical ceiling than the DiT and decoder.
 #
 # Run: pixi run mojo run -I . serenitymojo/models/vae/parity/wan22_vae_encoder_parity.mojo
 # DEV-ONLY: Python never runs here; the .bin files are static host references.
 
 from std.gpu.host import DeviceContext
-from std.math import sqrt
+from std.math import sqrt, min
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -131,8 +132,11 @@ def main() raises:
     var magC = _mag_ratio(muC.to_host(ctx), refC)
     all_pass = _report("(C) 256", resC.cos, resC.max_abs, magC) and all_pass
 
+    var min_cos = min(resA.cos, min(resB.cos, resC.cos))
     print("")
     if all_pass:
         print("[parity] OVERALL GATE PASS (all three cases cos >= 0.99)")
+        print("GATE PASS wan22VaeEncodeCosMin=", min_cos)
     else:
         print("[parity] OVERALL GATE FAIL")
+        raise Error("Wan2.2 VAE encoder creator parity failed")

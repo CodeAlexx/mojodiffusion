@@ -29,7 +29,10 @@ import torch
 sys.path.insert(0, "/home/alex/Lance/modeling/vae/wan")
 import vae2_2  # noqa: E402
 
-SAFET = "/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors"
+# Use the exact VAE artifact consumed by the Serenity product runner.  The old
+# Lance-only path was a stale development copy and made this creator oracle
+# impossible to rerun on an otherwise complete Serenity installation.
+SAFET = "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"
 OUTDIR = "/home/alex/mojodiffusion/serenitymojo/models/vae/parity"
 
 # Per-channel latents_mean / latents_std — hardcoded in Wan2_2_VAE.__init__.

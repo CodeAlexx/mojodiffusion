@@ -7,21 +7,20 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
-from transformers import AutoTokenizer, UMT5EncoderModel
 
 
-HF_REVISION = "b8fff7315c768468a5333511427288870b2e9635"
+HF_REVISION = "installed-official-native"
 ORACLE_REVISION = "42bf4cfaa384bc21833865abc2f9e6c0e67233dc"
-SNAPSHOT = Path(
-    "/home/alex/.cache/huggingface/hub/"
-    "models--Wan-AI--Wan2.2-TI2V-5B-Diffusers/snapshots/" + HF_REVISION
-)
 ORACLE_ROOT = Path("/home/alex/Wan2.2")
+MODEL_ROOT = Path(
+    "/home/alex/.serenity/models/checkpoints/Wan2.2-TI2V-5B"
+)
 DEFAULT_NEGATIVE = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
     "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
@@ -39,8 +38,6 @@ def digest(path: Path) -> str:
 
 
 def check_pins() -> None:
-    if SNAPSHOT.name != HF_REVISION or not SNAPSHOT.is_dir():
-        raise RuntimeError(f"missing pinned HF snapshot: {SNAPSHOT}")
     head = subprocess.check_output(
         ["git", "-C", str(ORACLE_ROOT), "rev-parse", "HEAD"], text=True
     ).strip()
@@ -52,27 +49,27 @@ def check_pins() -> None:
             f"Wan oracle checkout must be clean at {ORACLE_REVISION}; "
             f"head={head!r} dirty={bool(dirty)}"
         )
-
-
-def encode(tokenizer, model, text: str) -> tuple[torch.Tensor, int]:
-    tokens = tokenizer(
-        text,
-        padding="max_length",
-        max_length=512,
-        truncation=True,
-        add_special_tokens=True,
-        return_attention_mask=True,
-        return_tensors="pt",
+    required = (
+        MODEL_ROOT / "models_t5_umt5-xxl-enc-bf16.pth",
+        MODEL_ROOT / "google/umt5-xxl/tokenizer.json",
+        MODEL_ROOT / "google/umt5-xxl/spiece.model",
     )
-    ids = tokens.input_ids.to("cuda")
-    mask = tokens.attention_mask.to("cuda")
-    valid = int(mask.sum().item())
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"missing official Wan UMT5 assets: {missing}")
+
+
+def encode(model, text: str) -> tuple[torch.Tensor, int]:
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        hidden = model(input_ids=ids, attention_mask=mask).last_hidden_state
-    # Creator returns valid rows; the product cache contract pads those rows to
-    # 512 with exact zero so Wan cross-attention can remain unmasked.
-    hidden = (hidden * mask.unsqueeze(-1)).to(torch.bfloat16).cpu().contiguous()
-    return hidden, valid
+        valid_hidden = model([text], torch.device("cuda"))[0]
+    valid = int(valid_hidden.shape[0])
+    if valid > 512:
+        raise RuntimeError(f"creator returned {valid} tokens, expected <= 512")
+    # The creator returns only valid rows. The product contract zero-pads them
+    # back to [1,512,4096] because Wan cross-attention is unmasked.
+    hidden = torch.zeros((1, 512, 4096), dtype=torch.bfloat16)
+    hidden[0, :valid] = valid_hidden.to(torch.bfloat16).cpu()
+    return hidden.contiguous(), valid
 
 
 def main() -> None:
@@ -84,22 +81,28 @@ def main() -> None:
     args = parser.parse_args()
     check_pins()
 
+    sys.path.insert(0, str(ORACLE_ROOT))
+    from wan.modules.t5 import T5EncoderModel
+
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(
-        SNAPSHOT / "tokenizer", local_files_only=True
-    )
-    model = UMT5EncoderModel.from_pretrained(
-        SNAPSHOT / "text_encoder",
-        local_files_only=True,
+    # Construct BF16 on CPU first. The creator helper's default GPU construction
+    # transiently creates an F32 model and exceeds a 24 GB card before loading.
+    model = T5EncoderModel(
+        text_len=512,
         dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    ).eval().to("cuda")
+        device=torch.device("cpu"),
+        checkpoint_path=str(
+            MODEL_ROOT / "models_t5_umt5-xxl-enc-bf16.pth"
+        ),
+        tokenizer_path=str(MODEL_ROOT / "google/umt5-xxl"),
+    )
+    model.model.to("cuda")
     loaded = time.perf_counter()
-    pos, pos_len = encode(tokenizer, model, args.prompt)
+    pos, pos_len = encode(model, args.prompt)
     pos_done = time.perf_counter()
-    neg, neg_len = encode(tokenizer, model, args.negative)
+    neg, neg_len = encode(model, args.negative)
     torch.cuda.synchronize()
     finished = time.perf_counter()
 
@@ -116,12 +119,18 @@ def main() -> None:
             "schema": "serenity.wan22.conditioning_oracle.v1",
             "hf_revision": HF_REVISION,
             "oracle_revision": ORACLE_REVISION,
+            "oracle_impl": "wan.modules.t5.T5EncoderModel",
         },
     )
     manifest = {
         "schema": "serenity.wan22.conditioning_oracle.v1",
         "hf_revision": HF_REVISION,
         "oracle_revision": ORACLE_REVISION,
+        "oracle_impl": "wan.modules.t5.T5EncoderModel",
+        "model_root": str(MODEL_ROOT),
+        "umt5_sha256": digest(
+            MODEL_ROOT / "models_t5_umt5-xxl-enc-bf16.pth"
+        ),
         "prompt": args.prompt,
         "negative_prompt": args.negative,
         "pos_len": pos_len,

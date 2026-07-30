@@ -43,6 +43,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.tokenizer.t5_tokenizer import T5Tokenizer
 from serenitymojo.tokenizer.tokenizer import _read_utf8_file
+from serenitymojo.tokenizer.wan_prompt_clean import wan_creator_clean
 from serenitymojo.models.text_encoder.umt5_encoder import Umt5Encoder, Umt5Config
 
 
@@ -123,8 +124,10 @@ def main() raises:
             'usage: wan22_encode_prompt <prompt.txt|"text"> '
             '<neg.txt|"text"> <out.safetensors>'
         )
-    var pos_text = _read_arg_text(String(a[1]))
-    var neg_text = _read_arg_text(String(a[2]))
+    # Match the creator's cleanup before tokenization. This is material for the
+    # bundled Chinese negative prompt: ftfy folds its full-width commas to ASCII.
+    var pos_text = wan_creator_clean(_read_arg_text(String(a[1])))
+    var neg_text = wan_creator_clean(_read_arg_text(String(a[2])))
     var out_path = String(a[3])
 
     var ctx = DeviceContext()

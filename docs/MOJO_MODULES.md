@@ -398,13 +398,17 @@ as `multiplier`). LTX-2 uses `strength·(B@A)` (no alpha/rank division).
 `apply_to_globals*`. These are fail-closed on unmatched keys; the resident `merge_into`
 path SKIPS an absent base key (does not fail-loud, `lora.mojo:751-752`).
 
-**Wan2.2 TI2V-5B resident-FP8 hook** (2026-07-29):
-`Wan22DiT.merge_lora_fp8_resident` resolves the generic
-`FMT_DIFFUSION_MODEL` mappings, dequantizes each targeted row-scaled E4M3
-matrix to BF16, applies `scale·(B@A)` once, and requantizes only the in-memory
-resident tensor. The base cache is never rewritten. The Rust `/v1/video`
-preflight checks every admitted A/B pair against the 5B 3072/14336 dimensions
-before GPU work, so a Wan 14B adapter cannot silently run on the 5B base.
+**Wan2.2 TI2V-5B BF16-streamed and resident-FP8 hooks** (2026-07-29):
+`Wan22DiTOffloaded.load_with_lora` resolves the generic
+`FMT_DIFFUSION_MODEL` mappings, merges global tensors once, and applies each
+block delta to that block's freshly loaded exact-BF16 weights. The adapter does
+not accumulate across steps. `Wan22DiT.merge_lora_fp8_resident` dequantizes each
+targeted row-scaled E4M3 matrix to BF16, applies `scale·(B@A)` once, and
+requantizes only the in-memory resident tensor. Neither path rewrites the base
+checkpoint/cache. The Rust `/v1/video` preflight checks every admitted A/B pair
+against the 5B 3072/14336 dimensions before GPU work, so a Wan 14B adapter
+cannot silently run on the 5B base. The 300-mapping BF16 product smoke completes
+one denoise step and is required by the Wan product gate.
 
 **KJNodes `LTX2LoraLoaderAdvanced` — per-stream strengths** (commit `4706f99`):
 `LoraStreamMults` POD (`lora.mojo:101-142`) = five multipliers

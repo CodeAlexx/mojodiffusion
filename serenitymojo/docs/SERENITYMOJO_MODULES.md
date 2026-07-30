@@ -137,6 +137,32 @@ The 2026-07-28 Sulphur BF16 first+last-frame product gate (`video-0016`) also
 passed: 704x1280, 121f@24, 192.20 seconds, 14,583 MiB sampled peak, exact
 creator-preprocess pixels, and stable inspected eyes/facial/mechanical detail.
 
+### `models/dit/wan22_dit.mojo` and `pipeline/wan22_*` — Wan2.2 TI2V-5B creator product ✅
+
+`Wan22DiTOffloaded` keeps 15 exact-BF16 shared tensors resident and streams
+each of the 30 transformer blocks once per denoise step, running positive and
+negative CFG through the same materialized block. `load_with_lora` validates
+AI Toolkit/DiffusionModel adapter shapes, merges globals once, and applies each
+delta to the freshly streamed block without rewriting the checkpoint. The
+resident row-scaled FP8 route remains available as an explicit speed option.
+
+`pipeline/wan22_encode_prompt.mojo` implements the creator UMT5 tokenizer,
+prompt cleaner, zero-padding, and positive/negative conditioning contract.
+`pipeline/wan22_encode_first_frame.mojo` runs the creator-compatible VAE encode
+in a separate process so its CUDA allocator cannot fragment the later
+denoiser. `pipeline/wan22_t2v.mojo` accepts that clean latent cache, applies
+frame-zero replacement and zero timestep conditioning, runs creator
+Flow-UniPC/shift-5/CFG-5 sampling, and decodes 121 frames.
+
+T2V profiles are 1280x704/704x1280. I2V treats that as a max-area bucket and
+derives a 32-aligned source-aspect size; the common compiled profiles are
+1248x704/704x1248. All run at 24 fps and 50 steps with BF16 as the quality
+default. The v3 product gate binds exact model/source hashes, prompt,
+scheduler, transformer stream, VAE encode/decode, LoRA, VRAM/timing, muxed
+artifacts, and inspected visual evidence. Current minimum creator cosines are
+0.999731 conditioning, 0.999246 transformer, 0.999975 VAE decode, and
+0.999977 VAE encode; portrait I2V frame-zero SSIM is 0.984725.
+
 ---
 
 ## lora.mojo — inference LoRA loader (`LoraSet`)
@@ -156,8 +182,10 @@ the repo-root `docs/MOJO_MODULES.md` "LoRA — lora.mojo" section; summary:
   strengths `video/video_to_audio/audio/audio_to_video/other`, substring-matched
   with most-specific precedence, `0.0` drops the module; via env
   `LTX2_TRAINED_LORA_STREAMS_{i}`, the request CLI rows, and the Rust serve node.
-- Callers: Klein (`validation_sampler`), krea2 (`krea2_pipeline --lora`), LTX-2.
-  Wan trained LoRAs are loadable but not yet wired into a Wan inference pipeline.
+- Callers: Klein (`validation_sampler`), krea2 (`krea2_pipeline --lora`), LTX-2,
+  and Wan2.2 TI2V-5B. Wan supports exact-BF16 per-block application and
+  resident-FP8 dequant/add/requant; Rust rejects 14B shapes on the 5B runtime
+  before GPU work.
 
 ---
 

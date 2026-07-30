@@ -548,8 +548,8 @@ var CanvasTab = (function () {
             genState.editEngine = 'krea2_' + (turbo ? 'turbo' : 'raw') + '_' + size;
         }
         else if (arch === 'wan') {
-            genState.width = 832;
-            genState.height = 480;
+            genState.width = 1280;
+            genState.height = 704;
             genState.frames = 121;
             genState.fps = 24;
             genState.steps = 50;
@@ -5347,6 +5347,25 @@ var CanvasTab = (function () {
             return entry && entry.model === 'wan22_t2v';
         }) || null;
     }
+    function canvasWanCreatorI2vSize(sourceWidth, sourceHeight) {
+        var area = 1280 * 704;
+        var ratio = sourceWidth / sourceHeight;
+        var outputWidth = Math.sqrt(area * ratio);
+        var outputHeight = area / outputWidth;
+        var widthFirst = Math.floor(outputWidth / 32) * 32;
+        var heightFromWidth = Math.floor(area / widthFirst / 32) * 32;
+        var ratioWidthFirst = widthFirst / heightFromWidth;
+        var heightFirst = Math.floor(outputHeight / 32) * 32;
+        var widthFromHeight = Math.floor(area / heightFirst / 32) * 32;
+        var ratioHeightFirst = widthFromHeight / heightFirst;
+        var distortionWidth = Math.max(
+            ratio / ratioWidthFirst, ratioWidthFirst / ratio);
+        var distortionHeight = Math.max(
+            ratio / ratioHeightFirst, ratioHeightFirst / ratio);
+        return distortionWidth < distortionHeight
+            ? { width: widthFirst, height: heightFromWidth }
+            : { width: widthFromHeight, height: heightFirst };
+    }
     function canvasBackendProfile() {
         if (!canvasCapabilities || !Array.isArray(canvasCapabilities.backends) || genState.arch === 'ltxv')
             return null;
@@ -6747,14 +6766,21 @@ var CanvasTab = (function () {
             var bh = isVideo ? ModelUtils.clampVideoDimension(boundingBox.height()) : ModelUtils.clampDimension(boundingBox.height());
             if (genState.arch === 'wan') {
                 var wanI2v = hasContent;
-                var wanPortrait = wanI2v && boundingBox.height() > boundingBox.width();
-                bw = wanPortrait ? 480 : 832;
-                bh = wanPortrait ? 832 : 480;
+                if (wanI2v) {
+                    var wanCreatorSize = canvasWanCreatorI2vSize(
+                        boundingBox.width(), boundingBox.height());
+                    bw = wanCreatorSize.width;
+                    bh = wanCreatorSize.height;
+                }
+                else {
+                    bw = 1280;
+                    bh = 704;
+                }
                 genState.width = bw;
                 genState.height = bh;
                 genState.frames = 121;
                 genState.fps = 24;
-                genState.steps = wanI2v ? 40 : 50;
+                genState.steps = 50;
             }
             var activeLoras = enabledCanvasLoras();
             if (maskedEditEngine && maskedEditEngine.maxLoras !== null && activeLoras.length > maskedEditEngine.maxLoras) {

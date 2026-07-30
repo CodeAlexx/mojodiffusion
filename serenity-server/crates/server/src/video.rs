@@ -114,8 +114,18 @@ fn model_path(path: &str) -> std::path::PathBuf {
 }
 /// Wan2.2 two-process video: encode umt5 conds, then T2V (both under output/bin/).
 const WAN22_ENCODE: &str = "output/bin/wan22_encode_prompt";
-const WAN22_T2V: &str = "output/bin/wan22_t2v";
-const WAN22_T2V_PORTRAIT: &str = "output/bin/wan22_t2v_480x832";
+const WAN22_T2V: &str = "output/bin/wan22_t2v_1280x704";
+const WAN22_T2V_PORTRAIT: &str = "output/bin/wan22_t2v_704x1280";
+const WAN22_I2V_LANDSCAPE: &str = "output/bin/wan22_t2v_1248x704";
+const WAN22_I2V_PORTRAIT: &str = "output/bin/wan22_t2v_704x1248";
+const WAN22_FIRST_FRAME_LANDSCAPE: &str =
+    "output/bin/wan22_encode_first_frame_1280x704";
+const WAN22_FIRST_FRAME_PORTRAIT: &str =
+    "output/bin/wan22_encode_first_frame_704x1280";
+const WAN22_FIRST_FRAME_I2V_LANDSCAPE: &str =
+    "output/bin/wan22_encode_first_frame_1248x704";
+const WAN22_FIRST_FRAME_I2V_PORTRAIT: &str =
+    "output/bin/wan22_encode_first_frame_704x1248";
 const WAN22_A14B_LORA_T2V: &str = "output/bin/wan22_a14b_lora_t2v";
 const WAN22_A14B_HIGH: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/high";
 const WAN22_A14B_LOW: &str = "checkpoints/wan2.2_t2v_a14b_fp8_e4m3/low";
@@ -123,8 +133,12 @@ const WAN22_A14B_VAE: &str = "lingbot-video-moe/vae/diffusion_pytorch_model.safe
 const WAN22_MODEL_ROOT: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo";
 const WAN22_ARTIFACT_MANIFEST: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/serenity_wan22_manifest.json";
-const WAN22_FP8_CACHE: &str =
-    "checkpoints/Wan2.2-TI2V-5B-Mojo/wan22_dit_fp8_e4m3_b8fff7315c768468.safetensors";
+const WAN22_TRANSFORMER_SHARD_1: &str =
+    "checkpoints/Wan2.2-TI2V-5B-Mojo/diffusion_pytorch_model-00001-of-00003.safetensors";
+const WAN22_TRANSFORMER_SHARD_2: &str =
+    "checkpoints/Wan2.2-TI2V-5B-Mojo/diffusion_pytorch_model-00002-of-00003.safetensors";
+const WAN22_TRANSFORMER_SHARD_3: &str =
+    "checkpoints/Wan2.2-TI2V-5B-Mojo/diffusion_pytorch_model-00003-of-00003.safetensors";
 const WAN22_UMT5_FILE: &str =
     "checkpoints/Wan2.2-TI2V-5B-Mojo/umt5/model.safetensors";
 const WAN22_TOKENIZER: &str = "checkpoints/Wan2.2-TI2V-5B-Mojo/tokenizer.json";
@@ -133,12 +147,19 @@ const WAN22_VAE: &str = "vaes/wan2.2_vae.safetensors";
 const WAN22_PRODUCT_GATE: &str = "output/checks/wan22_product_gate.json";
 const WAN22_HF_REVISION: &str = "installed-official-native";
 const WAN22_CREATOR_REVISION: &str = "42bf4cfaa384bc21833865abc2f9e6c0e67233dc";
-const WAN22_FP8_CACHE_SHA256: &str =
-    "bd2abdeeef4ab37454a7e6dab6eeb9517206f8c003a6aa1e345906e71a6d5010";
 const WAN22_TRANSFORMER_INDEX_SHA256: &str =
     "cd769dd8bddb0825ffb3516a39d64fc2ac3a5946fb93337f8594af926d6a0f56";
+const WAN22_LOCAL_TRANSFORMER_INDEX_SHA256: &str =
+    "ff3fe4b6936ac924f881863bcaeda0e5e1e54c8b7e2202b2990aba8fcf18ce47";
+const WAN22_TRANSFORMER_SHARD_SHA256: [&str; 3] = [
+    "07cddfa20368c5e0884ee6660ed82b29d7ac97a9207b31fb630e4557c5308eb7",
+    "38b79f68c95618f5341d4deae5ab364f9c74f10e8e903326499d0cb95353f1ff",
+    "8d76abc71dee3e61a59ccc3a2e40889bb52ec9697acebfa7110de73f2a510452",
+];
+const WAN22_VAE_SHA256: &str =
+    "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156";
 const WAN22_RUNNER_SOURCE_BUNDLE_SHA256: &str =
-    "9a07732e237c01e5bd8bb69a2b3192d60f49826d66376881ebfe66c81eb25a68";
+    "ea317b6ae0914c4828d85489c1e5a2d0952d2ca3880a122e56287771f65d24fe";
 const WAN22_DEFAULT_NEGATIVE: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 const MOJO_CUDNN_RUNTIME: &str = "cudnn/lib/libcudnn.so.9";
 /// Pixi runtime libs + cshim (cuDNN/int4) shims — required by the Mojo binaries.
@@ -216,13 +237,17 @@ const LTX2_REFHQ_BF16: &str = "checkpoints/ltx-2.3-22b-dev-fp8-dequant-bf16.safe
 /// any `frames != WAN22_FRAMES`, so the server rejects a mismatch up front rather
 /// than burning a multi-minute render on a guaranteed failure.
 const WAN22_FRAMES: i64 = 121;
-const WAN22_WIDTH: i64 = 832;
-const WAN22_HEIGHT: i64 = 480;
-const WAN22_PORTRAIT_WIDTH: i64 = 480;
-const WAN22_PORTRAIT_HEIGHT: i64 = 832;
+const WAN22_WIDTH: i64 = 1280;
+const WAN22_HEIGHT: i64 = 704;
+const WAN22_PORTRAIT_WIDTH: i64 = 704;
+const WAN22_PORTRAIT_HEIGHT: i64 = 1280;
+const WAN22_I2V_LANDSCAPE_WIDTH: i64 = 1248;
+const WAN22_I2V_LANDSCAPE_HEIGHT: i64 = 704;
+const WAN22_I2V_PORTRAIT_WIDTH: i64 = 704;
+const WAN22_I2V_PORTRAIT_HEIGHT: i64 = 1248;
 const WAN22_FPS: i64 = 24;
 const WAN22_DEFAULT_STEPS: i64 = 50;
-const WAN22_I2V_STEPS: i64 = 40;
+const WAN22_I2V_STEPS: i64 = 50;
 const WAN22_DEFAULT_GUIDANCE: f64 = 5.0;
 const WAN22_A14B_FRAMES: i64 = 81;
 const WAN22_A14B_WIDTH: i64 = 832;
@@ -1431,9 +1456,27 @@ fn wan22_missing() -> Vec<String> {
     if !bin_x(WAN22_T2V_PORTRAIT) {
         m.push(WAN22_T2V_PORTRAIT.to_string());
     }
+    if !bin_x(WAN22_I2V_LANDSCAPE) {
+        m.push(WAN22_I2V_LANDSCAPE.to_string());
+    }
+    if !bin_x(WAN22_I2V_PORTRAIT) {
+        m.push(WAN22_I2V_PORTRAIT.to_string());
+    }
+    for binary in [
+        WAN22_FIRST_FRAME_LANDSCAPE,
+        WAN22_FIRST_FRAME_PORTRAIT,
+        WAN22_FIRST_FRAME_I2V_LANDSCAPE,
+        WAN22_FIRST_FRAME_I2V_PORTRAIT,
+    ] {
+        if !bin_x(binary) {
+            m.push(binary.to_string());
+        }
+    }
     for path in [
         WAN22_ARTIFACT_MANIFEST,
-        WAN22_FP8_CACHE,
+        WAN22_TRANSFORMER_SHARD_1,
+        WAN22_TRANSFORMER_SHARD_2,
+        WAN22_TRANSFORMER_SHARD_3,
         WAN22_UMT5_FILE,
         WAN22_TOKENIZER,
         WAN22_SPIECE,
@@ -1666,8 +1709,8 @@ fn wan22_ti2v5b_lora(
 
 /// Read acceptance only from the machine-local evidence gate. The report is
 /// regenerated by scripts/check_wan22_product_gate.py after verifying the
-/// pinned artifacts, exact cache digest, parity, representative frame bytes,
-/// muxed MP4, visual inspection, wall time, and peak VRAM.
+/// pinned native BF16 shards/VAE, streamed-runtime parity, representative frame
+/// bytes, muxed T2V/I2V artifacts, visual inspection, wall time, and peak VRAM.
 fn wan22_product_gate_passed() -> bool {
     let Ok(bytes) = std::fs::read(repo_path(WAN22_PRODUCT_GATE)) else {
         return false;
@@ -1675,7 +1718,7 @@ fn wan22_product_gate_passed() -> bool {
     let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    doc.get("schema").and_then(Value::as_str) == Some("serenity.wan22.product_gate.v2")
+    doc.get("schema").and_then(Value::as_str) == Some("serenity.wan22.product_gate.v3")
         && doc.get("passed").and_then(Value::as_bool) == Some(true)
         && doc.pointer("/pins/hf_revision").and_then(Value::as_str) == Some(WAN22_HF_REVISION)
         && doc
@@ -1683,13 +1726,24 @@ fn wan22_product_gate_passed() -> bool {
             .and_then(Value::as_str)
             == Some(WAN22_CREATOR_REVISION)
         && doc
-            .pointer("/pins/fp8_cache_sha256")
-            .and_then(Value::as_str)
-            == Some(WAN22_FP8_CACHE_SHA256)
-        && doc
-            .pointer("/pins/transformer_index_sha256")
+            .pointer("/pins/source_transformer_index_sha256")
             .and_then(Value::as_str)
             == Some(WAN22_TRANSFORMER_INDEX_SHA256)
+        && doc
+            .pointer("/pins/local_transformer_index_sha256")
+            .and_then(Value::as_str)
+            == Some(WAN22_LOCAL_TRANSFORMER_INDEX_SHA256)
+        && (0..WAN22_TRANSFORMER_SHARD_SHA256.len()).all(|index| {
+            doc.pointer(&format!(
+                "/pins/bf16_transformer_shard_sha256/{index}"
+            ))
+            .and_then(Value::as_str)
+                == Some(WAN22_TRANSFORMER_SHARD_SHA256[index])
+        })
+        && doc
+            .pointer("/pins/bf16_vae_sha256")
+            .and_then(Value::as_str)
+            == Some(WAN22_VAE_SHA256)
         && doc
             .pointer("/pins/runner_source_bundle_sha256")
             .and_then(Value::as_str)
@@ -1699,15 +1753,30 @@ fn wan22_product_gate_passed() -> bool {
         && doc.pointer("/profile/frames").and_then(Value::as_i64) == Some(WAN22_FRAMES)
         && doc.pointer("/profile/steps").and_then(Value::as_i64) == Some(WAN22_DEFAULT_STEPS)
         && doc.pointer("/profile/guidance").and_then(Value::as_f64) == Some(WAN22_DEFAULT_GUIDANCE)
+        && doc.pointer("/profile/shift").and_then(Value::as_f64) == Some(5.0)
+        && doc.pointer("/profile/quant").and_then(Value::as_str) == Some("bf16")
         && doc.pointer("/i2v_profile/steps").and_then(Value::as_i64)
             == Some(WAN22_I2V_STEPS)
-        && doc.pointer("/i2v_profile/shift").and_then(Value::as_f64) == Some(3.0)
+        && doc.pointer("/i2v_profile/shift").and_then(Value::as_f64) == Some(5.0)
+        && doc.pointer("/i2v_profile/quant").and_then(Value::as_str) == Some("bf16")
         && doc.pointer("/i2v_profile/width").and_then(Value::as_i64)
-            == Some(WAN22_PORTRAIT_WIDTH)
+            == Some(WAN22_I2V_PORTRAIT_WIDTH)
         && doc.pointer("/i2v_profile/height").and_then(Value::as_i64)
-            == Some(WAN22_PORTRAIT_HEIGHT)
+            == Some(WAN22_I2V_PORTRAIT_HEIGHT)
         && doc
             .pointer("/checks/i2v_first_frame_identity")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && doc
+            .pointer("/checks/vae_encoder_mojo_parity")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && doc
+            .pointer("/checks/creator_prompt_extension")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && doc
+            .pointer("/checks/transformer_bf16_stream_parity")
             .and_then(Value::as_bool)
             == Some(true)
         && doc
@@ -2146,8 +2215,14 @@ fn readiness_doc() -> Value {
             "status": if wan22_product_accepted { "quality_profile_ready" } else if wan22_ready { "gate_required" } else { "prerequisites_missing" },
             "runner": WAN22_T2V,
             "encode_runner": WAN22_ENCODE,
+            "first_frame_encode_runners": [
+                WAN22_FIRST_FRAME_LANDSCAPE,
+                WAN22_FIRST_FRAME_PORTRAIT,
+                WAN22_FIRST_FRAME_I2V_LANDSCAPE,
+                WAN22_FIRST_FRAME_I2V_PORTRAIT,
+            ],
             "missing": wan22_absent,
-            "mode": "two-process: wan22_encode_prompt -> wan22_t2v",
+            "mode": "phase-isolated: wan22_encode_prompt -> optional wan22_encode_first_frame -> wan22_t2v",
             "artifact_root": model_path(WAN22_MODEL_ROOT).to_string_lossy(),
             "artifact_manifest": model_path(WAN22_ARTIFACT_MANIFEST).to_string_lossy(),
             "hf_revision": WAN22_HF_REVISION,
@@ -2161,12 +2236,26 @@ fn readiness_doc() -> Value {
                 {
                     "width": WAN22_WIDTH,
                     "height": WAN22_HEIGHT,
-                    "label": "16:9 landscape",
+                    "mode": "t2v",
+                    "label": "T2V landscape",
                 },
                 {
                     "width": WAN22_PORTRAIT_WIDTH,
                     "height": WAN22_PORTRAIT_HEIGHT,
-                    "label": "9:16 portrait",
+                    "mode": "t2v",
+                    "label": "T2V portrait",
+                },
+                {
+                    "width": WAN22_I2V_LANDSCAPE_WIDTH,
+                    "height": WAN22_I2V_LANDSCAPE_HEIGHT,
+                    "mode": "i2v_first_frame",
+                    "label": "I2V 16:9 source-derived",
+                },
+                {
+                    "width": WAN22_I2V_PORTRAIT_WIDTH,
+                    "height": WAN22_I2V_PORTRAIT_HEIGHT,
+                    "mode": "i2v_first_frame",
+                    "label": "I2V 9:16 source-derived",
                 }
             ],
             "default_steps": WAN22_DEFAULT_STEPS,
@@ -2182,8 +2271,9 @@ fn readiness_doc() -> Value {
                     "available": wan22_product_accepted,
                     "source_images": 1,
                     "steps": WAN22_I2V_STEPS,
-                    "shift": 3.0,
-                    "conditioning": "creator clean-frame replacement plus per-token zero timestep",
+                    "shift": 5.0,
+                    "size_policy": "creator max-area aspect-preserving 32-aligned output",
+                    "conditioning": "process-isolated creator VAE encode, clean-frame replacement, and per-token zero timestep",
                 },
                 "last_frame": {
                     "available": false,
@@ -2198,7 +2288,7 @@ fn readiness_doc() -> Value {
                     "max_count": 1,
                     "base_model": "Wan-AI/Wan2.2-TI2V-5B",
                     "format": "AI Toolkit/DiffusionModel block LoRA",
-                    "merge": "one-time in-memory BF16 delta merge into resident row-scaled FP8 weights",
+                    "merge": "BF16: additive delta on each exact streamed block; FP8: one-time resident dequant-add-requant",
                 }
             },
             "camera_motions": [
@@ -2212,10 +2302,10 @@ fn readiness_doc() -> Value {
                 { "id": "jib_up", "label": "Jib up", "prompt_suffix": ", jib up, camera rising up, upward crane movement" },
                 { "id": "jib_down", "label": "Jib down", "prompt_suffix": ", jib down, camera lowering down, downward crane movement" }
             ],
-            "sampler": "Flow-UniPC order 2, predict_x0; T2V shift 5, I2V shift 3",
-            "quant_modes": ["fp8"],
-            "quant_note": "persistent row-scaled FP8 E4M3 DiT cache; BF16 exact tensors and BF16 on-use compute",
-            "note": "Creator T2V and first-frame I2V profile: 832x480, 121 frames, 24 fps, CFG 5. Geometry is comptime-compiled; frames must equal 121 without a rebuild.",
+            "sampler": "Flow-UniPC order 2, predict_x0; creator-native T2V/I2V shift 5",
+            "quant_modes": ["bf16", "fp8"],
+            "quant_note": "BF16 block-streams the official converted transformer shards and is the admitted quality default; FP8 uses the persistent row-scaled E4M3 cache with BF16 on-use compute.",
+            "note": "Creator-native TI2V-5B: T2V uses the 1280x704/704x1280 native shapes; I2V treats that as a max-area bucket and preserves source aspect on a 32-pixel grid. The common 1248x704/704x1248 I2V shapes are precompiled. All profiles use 121 frames, 24 fps, and CFG 5. The visual product gate uses Wan's recommended local-Qwen prompt extension; raw prompts remain valid but may be less detailed.",
             "limit": "requires the existing isolated GPU lease; machine-local product acceptance requires the pinned parity, visual, mux, timing, and peak-VRAM gate",
         },
         {
@@ -5864,6 +5954,37 @@ fn mux_wan22_frames(dir: &std::path::Path, fps: i64) -> Result<String, String> {
     }
 }
 
+/// Creator `best_output_size` for TI2V-5B I2V. The CLI's 1280x704/704x1280
+/// values are maximum-area buckets; the actual output follows the source
+/// aspect ratio on a 32-pixel grid. Keep this byte-for-byte equivalent to
+/// `wan/utils/utils.py::best_output_size` instead of stretching every source
+/// into the two T2V shapes.
+fn wan22_creator_i2v_size(source_width: u32, source_height: u32) -> (i64, i64) {
+    const ALIGN: f64 = 32.0;
+    const EXPECTED_AREA: f64 = (WAN22_WIDTH * WAN22_HEIGHT) as f64;
+    let ratio = source_width as f64 / source_height as f64;
+    let output_width = (EXPECTED_AREA * ratio).sqrt();
+    let output_height = EXPECTED_AREA / output_width;
+
+    let width_first = (output_width / ALIGN).floor() * ALIGN;
+    let height_from_width = (EXPECTED_AREA / width_first / ALIGN).floor() * ALIGN;
+    let ratio_width_first = width_first / height_from_width;
+
+    let height_first = (output_height / ALIGN).floor() * ALIGN;
+    let width_from_height = (EXPECTED_AREA / height_first / ALIGN).floor() * ALIGN;
+    let ratio_height_first = width_from_height / height_first;
+
+    let distortion_width =
+        (ratio / ratio_width_first).max(ratio_width_first / ratio);
+    let distortion_height =
+        (ratio / ratio_height_first).max(ratio_height_first / ratio);
+    if distortion_width < distortion_height {
+        (width_first as i64, height_from_width as i64)
+    } else {
+        (width_from_height as i64, height_first as i64)
+    }
+}
+
 /// Wan2.2 T2V arm — two-process orchestration (encode umt5 conds → t2v → mp4).
 /// Synchronous, multi-minute blocking render (matches the LTX2 arm's convention). All
 /// validation happens BEFORE the binary-presence check + spawn, so a bad request
@@ -5917,14 +6038,14 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         Ok(value) => value,
         Err(error) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error),
     };
-    // The admitted 16 GiB route is the persistent E4M3 cache. A BF16 request
-    // would select the old OOM-prone profile and must fail before GPU launch.
-    let quant = s("quant", "fp8");
-    if quant != "fp8" {
+    // Both official BF16 storage and the row-scaled E4M3 cache are explicit
+    // runtime choices. Never silently alias a BF16 UI selection to FP8.
+    let quant = s("quant", "bf16");
+    if quant != "fp8" && quant != "bf16" {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!(
-                "wan22_t2v production profile is cached FP8 E4M3; quant '{quant}' is not admitted (use fp8)"
+                "wan22_t2v quant '{quant}' is unsupported; choose bf16 or fp8"
             ),
         );
     }
@@ -5955,13 +6076,57 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         .and_then(|v| v.as_i64())
         .unwrap_or(WAN22_HEIGHT);
     let fps = b.get("fps").and_then(|v| v.as_i64()).unwrap_or(24);
-    let landscape = width == WAN22_WIDTH && height == WAN22_HEIGHT;
-    let portrait = width == WAN22_PORTRAIT_WIDTH && height == WAN22_PORTRAIT_HEIGHT;
-    if (!landscape && !portrait) || fps != 24 {
+    let t2v_landscape = width == WAN22_WIDTH && height == WAN22_HEIGHT;
+    let t2v_portrait =
+        width == WAN22_PORTRAIT_WIDTH && height == WAN22_PORTRAIT_HEIGHT;
+    let i2v_landscape =
+        width == WAN22_I2V_LANDSCAPE_WIDTH && height == WAN22_I2V_LANDSCAPE_HEIGHT;
+    let i2v_portrait =
+        width == WAN22_I2V_PORTRAIT_WIDTH && height == WAN22_I2V_PORTRAIT_HEIGHT;
+    if fps != WAN22_FPS {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!(
-                "Wan2.2 admitted native profiles are {WAN22_WIDTH}x{WAN22_HEIGHT} and {WAN22_PORTRAIT_WIDTH}x{WAN22_PORTRAIT_HEIGHT} at 24 fps; requested {width}x{height} at {fps} fps"
+                "Wan2.2 creator profile requires {WAN22_FPS} fps; requested {fps}"
+            ),
+        );
+    }
+    if is_i2v {
+        let (source_width, source_height) =
+            match image::image_dimensions(std::path::Path::new(&image_path)) {
+                Ok(dimensions) => dimensions,
+                Err(error) => {
+                    return err_detail(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!(
+                            "cannot inspect Wan I2V source dimensions for creator sizing: {error}"
+                        ),
+                    )
+                }
+            };
+        let creator_size = wan22_creator_i2v_size(source_width, source_height);
+        if (width, height) != creator_size {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "Wan2.2 creator I2V sizing for source {source_width}x{source_height} is {}x{}, not {width}x{height}",
+                    creator_size.0, creator_size.1
+                ),
+            );
+        }
+        if !(t2v_landscape || t2v_portrait || i2v_landscape || i2v_portrait) {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "Wan2.2 creator-derived I2V profile {width}x{height} is not precompiled on this installation"
+                ),
+            );
+        }
+    } else if !(t2v_landscape || t2v_portrait) {
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "Wan2.2 T2V native profiles are {WAN22_WIDTH}x{WAN22_HEIGHT} and {WAN22_PORTRAIT_WIDTH}x{WAN22_PORTRAIT_HEIGHT}; requested {width}x{height}"
             ),
         );
     }
@@ -6031,14 +6196,40 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
     let conds_s = conds.to_string_lossy().into_owned();
     let out_dir_s = out_dir.to_string_lossy().into_owned();
     let enc_log = out_dir.join("wan22_encode.log");
+    let first_frame_log = out_dir.join("wan22_first_frame_encode.log");
     let t2v_log = out_dir.join("wan22_t2v.log");
 
     let abs_encode = repo_path(WAN22_ENCODE);
-    let abs_t2v = repo_path(if portrait {
-        WAN22_T2V_PORTRAIT
+    let runner = match (width, height) {
+        (WAN22_WIDTH, WAN22_HEIGHT) => WAN22_T2V,
+        (WAN22_PORTRAIT_WIDTH, WAN22_PORTRAIT_HEIGHT) => WAN22_T2V_PORTRAIT,
+        (WAN22_I2V_LANDSCAPE_WIDTH, WAN22_I2V_LANDSCAPE_HEIGHT) => {
+            WAN22_I2V_LANDSCAPE
+        }
+        (WAN22_I2V_PORTRAIT_WIDTH, WAN22_I2V_PORTRAIT_HEIGHT) => {
+            WAN22_I2V_PORTRAIT
+        }
+        _ => unreachable!("Wan profile validated before runner selection"),
+    };
+    let abs_t2v = repo_path(runner);
+    let abs_first_frame = if is_i2v {
+        let binary = match (width, height) {
+            (WAN22_WIDTH, WAN22_HEIGHT) => WAN22_FIRST_FRAME_LANDSCAPE,
+            (WAN22_PORTRAIT_WIDTH, WAN22_PORTRAIT_HEIGHT) => {
+                WAN22_FIRST_FRAME_PORTRAIT
+            }
+            (WAN22_I2V_LANDSCAPE_WIDTH, WAN22_I2V_LANDSCAPE_HEIGHT) => {
+                WAN22_FIRST_FRAME_I2V_LANDSCAPE
+            }
+            (WAN22_I2V_PORTRAIT_WIDTH, WAN22_I2V_PORTRAIT_HEIGHT) => {
+                WAN22_FIRST_FRAME_I2V_PORTRAIT
+            }
+            _ => unreachable!("Wan I2V profile validated before encoder selection"),
+        };
+        Some(repo_path(binary))
     } else {
-        WAN22_T2V
-    });
+        None
+    };
     let lora_path = lora
         .as_ref()
         .map(|(path, _, _, _)| path.to_string_lossy().into_owned())
@@ -6071,7 +6262,56 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         );
     }
 
-    // ── Step B: T2V render (comptime 832x480/121f, cached FP8 E4M3) ──
+    // ── Step B: process-isolated creator first-frame VAE encode. ───────────
+    // A same-process VAE->DiT handoff leaves allocator residue/fragmentation
+    // and OOMs the exact BF16 stream on a 24 GB card. Persist only the small
+    // first latent, then let process exit reclaim every VAE allocation.
+    let first_frame_cache = out_dir.join("wan22_first_frame.safetensors");
+    let first_frame_cache_s = first_frame_cache.to_string_lossy().into_owned();
+    let (first_frame_arg, first_frame_rc, first_frame_secs, first_frame_peak_vram_mib) =
+        if let Some(first_frame_binary) = abs_first_frame.as_ref() {
+            let started = std::time::Instant::now();
+            let mut encode_first = wan22_command(first_frame_binary);
+            encode_first.args([&image_path, &first_frame_cache_s]);
+            let measured = run_logged_with_gpu_peak(
+                &mut encode_first,
+                &first_frame_log,
+            );
+            let seconds = started.elapsed().as_secs_f64();
+            let (code, peak) = match measured {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = std::fs::write(
+                        &first_frame_log,
+                        format!("spawn failed: {error}"),
+                    );
+                    (-1, None)
+                }
+            };
+            (first_frame_cache_s.clone(), code, seconds, peak)
+        } else {
+            (String::new(), 0, 0.0, None)
+        };
+    if first_frame_rc != 0 {
+        return json_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "schema": "serenity.video_result.v1", "video_id": video_id, "model": "wan22",
+                "state": "failed", "failed_step": "first_frame_encode",
+                "encode_exit_code": enc_rc, "first_frame_exit_code": first_frame_rc,
+                "encode_log": enc_log.to_string_lossy(),
+                "first_frame_log": first_frame_log.to_string_lossy(),
+                "out_dir": out_dir_s, "conds": conds_s,
+                "encode_seconds": enc_secs,
+                "first_frame_seconds": first_frame_secs,
+                "encode_peak_vram_mib": encode_peak_vram_mib,
+                "first_frame_peak_vram_mib": first_frame_peak_vram_mib,
+                "error": "wan22_encode_first_frame failed; inspect first_frame_log",
+            }),
+        );
+    }
+
+    // ── Step C: creator-native 121-frame render in the selected precision ──
     let tb = std::time::Instant::now();
     let mut t2v = wan22_command(&abs_t2v);
     t2v.arg(&conds_s)
@@ -6081,9 +6321,10 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         .arg(seed.to_string())
         .arg(format!("{guidance}"))
         .arg("1")
-        .arg(&image_path)
+        .arg(&first_frame_arg)
         .arg(&lora_path)
-        .arg(format!("{lora_weight}"));
+        .arg(format!("{lora_weight}"))
+        .arg(&quant);
     let t2v = run_logged_with_gpu_peak(&mut t2v, &t2v_log);
     let t2v_secs = tb.elapsed().as_secs_f64();
     let (t2v_rc, t2v_peak_vram_mib) = match t2v {
@@ -6093,24 +6334,30 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
             (-1, None)
         }
     };
-    let total_wall = enc_secs + t2v_secs;
+    let total_wall = enc_secs + first_frame_secs + t2v_secs;
     if t2v_rc != 0 {
         return json_resp(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({
                 "schema": "serenity.video_result.v1", "video_id": video_id, "model": "wan22",
                 "state": "failed", "failed_step": "t2v",
-                "encode_exit_code": enc_rc, "t2v_exit_code": t2v_rc,
-                "encode_log": enc_log.to_string_lossy(), "t2v_log": t2v_log.to_string_lossy(),
+                "encode_exit_code": enc_rc, "first_frame_exit_code": first_frame_rc,
+                "t2v_exit_code": t2v_rc,
+                "encode_log": enc_log.to_string_lossy(),
+                "first_frame_log": first_frame_log.to_string_lossy(),
+                "t2v_log": t2v_log.to_string_lossy(),
                 "out_dir": out_dir_s, "conds": conds_s,
-                "encode_seconds": enc_secs, "t2v_seconds": t2v_secs, "total_wall_seconds": total_wall,
-                "encode_peak_vram_mib": encode_peak_vram_mib, "t2v_peak_vram_mib": t2v_peak_vram_mib,
+                "encode_seconds": enc_secs, "first_frame_seconds": first_frame_secs,
+                "t2v_seconds": t2v_secs, "total_wall_seconds": total_wall,
+                "encode_peak_vram_mib": encode_peak_vram_mib,
+                "first_frame_peak_vram_mib": first_frame_peak_vram_mib,
+                "t2v_peak_vram_mib": t2v_peak_vram_mib,
                 "error": "wan22_t2v failed; inspect t2v_log",
             }),
         );
     }
 
-    // ── Step C: mux the frame_*.png the runner wrote into an mp4 (24fps). ──
+    // ── Step D: mux the frame_*.png the runner wrote into an mp4 (24fps). ──
     let frames_written = count_wan22_frames(&out_dir);
     let (mp4, mux) = if frames_written > 0 {
         match mux_wan22_frames(&out_dir, 24) {
@@ -6146,14 +6393,15 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         },
         &json!({
             "schema": "serenity.video_result.v1", "video_id": video_id, "model": "wan22",
-            "backend": BACKEND_NAME, "control_plane": "serenity-server", "resident": "fp8_e4m3_cached",
+            "backend": BACKEND_NAME, "control_plane": "serenity-server",
+            "resident": if quant == "bf16" { "bf16_native_shards_block_streamed" } else { "fp8_e4m3_cached" },
             "mode": if is_i2v { "i2v_first_frame" } else { "t2v" },
             "readiness_label": if parity_ok { "quality_profile_ready" } else { "product_gate_required" },
             "accepted_video_artifact": artifact_ok, "accepted_video_parity": parity_ok,
             "target_width": width, "target_height": height, "frames": frames,
             "frames_written": frames_written, "mux": mux, "fps": WAN22_FPS,
             "steps": steps, "seed": seed, "guidance": guidance, "quant": quant,
-            "flow_shift": if is_i2v { 3.0 } else { 5.0 },
+            "flow_shift": 5.0,
             "image_path": if is_i2v { image_path.as_str() } else { "" },
             "camera_motion": b.get("camera_motion").and_then(Value::as_str).unwrap_or("none"),
             "creator_prompt": b.get("creator_prompt").and_then(Value::as_str).unwrap_or(&prompt),
@@ -6162,20 +6410,31 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
                 "weight": weight,
                 "path": path,
                 "matched_modules": pairs,
-                "merge": "resident_fp8_requantized_once",
+                "merge": if quant == "bf16" {
+                    "exact_bf16_streamed_additive"
+                } else {
+                    "resident_fp8_requantized_once"
+                },
             })),
             "negative_prompt_source": if b.get("negative_prompt").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()) { "request" } else { "creator_default" },
-            "encode_exit_code": enc_rc, "t2v_exit_code": t2v_rc,
+            "encode_exit_code": enc_rc, "first_frame_exit_code": first_frame_rc,
+            "t2v_exit_code": t2v_rc,
             "out_dir": out_dir_s, "conds": conds_s, "mp4": mp4,
+            "first_frame_cache": if is_i2v { first_frame_cache_s.as_str() } else { "" },
             "mp4_url": if artifact_ok { format!("/out/{video_id}/wan22_t2v.mp4") } else { String::new() },
             "probe": probe,
-            "encode_log": enc_log.to_string_lossy(), "t2v_log": t2v_log.to_string_lossy(),
-            "encode_seconds": enc_secs, "t2v_seconds": t2v_secs, "total_wall_seconds": total_wall,
-            "encode_peak_vram_mib": encode_peak_vram_mib, "t2v_peak_vram_mib": t2v_peak_vram_mib,
+            "encode_log": enc_log.to_string_lossy(),
+            "first_frame_log": first_frame_log.to_string_lossy(),
+            "t2v_log": t2v_log.to_string_lossy(),
+            "encode_seconds": enc_secs, "first_frame_seconds": first_frame_secs,
+            "t2v_seconds": t2v_secs, "total_wall_seconds": total_wall,
+            "encode_peak_vram_mib": encode_peak_vram_mib,
+            "first_frame_peak_vram_mib": first_frame_peak_vram_mib,
+            "t2v_peak_vram_mib": t2v_peak_vram_mib,
             "note": if is_i2v {
-                "Wan2.2-TI2V-5B creator I2V profile: cover-resize/center-crop source VAE encode, clean frame-0 replacement before and after each step, per-token zero timestep for conditioned frame patches, Flow-UniPC 40-step shift-3 sampling, and 24 fps MP4 mux."
+                format!("Wan2.2-TI2V-5B creator-native I2V profile: process-isolated cover-resize/center-crop source VAE encode, clean frame-0 replacement before and after each step, per-token zero timestep for conditioned frame patches, {quant} DiT, Flow-UniPC 50-step shift-5 sampling, and 24 fps MP4 mux.")
             } else {
-                "Wan2.2-TI2V-5B creator T2V profile: official UMT5 conditioning and default negative prompt, cached FP8 E4M3 DiT, Flow-UniPC 50-step shift-5 sampling, tiled VAE decode, and 24 fps MP4 mux."
+                format!("Wan2.2-TI2V-5B creator T2V profile: official UMT5 conditioning and default negative prompt, {quant} DiT, Flow-UniPC 50-step shift-5 sampling, tiled VAE decode, and 24 fps MP4 mux.")
             },
         }),
     )
@@ -7367,6 +7626,15 @@ mod tests {
     }
 
     #[test]
+    fn wan_i2v_size_matches_creator_max_area_alignment() {
+        assert_eq!(wan22_creator_i2v_size(544, 960), (704, 1248));
+        assert_eq!(wan22_creator_i2v_size(960, 544), (1248, 704));
+        assert_eq!(wan22_creator_i2v_size(704, 1280), (704, 1280));
+        assert_eq!(wan22_creator_i2v_size(1280, 704), (1280, 704));
+        assert_eq!(wan22_creator_i2v_size(1024, 1024), (960, 928));
+    }
+
+    #[test]
     fn ltx2_mojo_request_accepts_creator_first_and_last_keyframes() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7646,8 +7914,8 @@ mod tests {
             );
         }
         assert_eq!(runners[2].get("target_frame_count").unwrap(), 121);
-        assert_eq!(runners[2].get("target_width").unwrap(), 832);
-        assert_eq!(runners[2].get("target_height").unwrap(), 480);
+        assert_eq!(runners[2].get("target_width").unwrap(), WAN22_WIDTH);
+        assert_eq!(runners[2].get("target_height").unwrap(), WAN22_HEIGHT);
         assert_eq!(
             runners[2].pointer("/native_profiles/1/width").unwrap(),
             WAN22_PORTRAIT_WIDTH
@@ -7656,10 +7924,21 @@ mod tests {
             runners[2].pointer("/native_profiles/1/height").unwrap(),
             WAN22_PORTRAIT_HEIGHT
         );
+        assert_eq!(
+            runners[2].pointer("/native_profiles/2/width").unwrap(),
+            WAN22_I2V_LANDSCAPE_WIDTH
+        );
+        assert_eq!(
+            runners[2].pointer("/native_profiles/3/height").unwrap(),
+            WAN22_I2V_PORTRAIT_HEIGHT
+        );
         assert_eq!(runners[2].get("i2v_steps").unwrap(), WAN22_I2V_STEPS);
         assert_eq!(runners[2].get("default_steps").unwrap(), 50);
         assert_eq!(runners[2].get("default_guidance").unwrap(), 5.0);
-        assert_eq!(runners[2].get("quant_modes").unwrap(), &json!(["fp8"]));
+        assert_eq!(
+            runners[2].get("quant_modes").unwrap(),
+            &json!(["bf16", "fp8"])
+        );
         assert_eq!(runners[2].pointer("/modes/lora/max_count").unwrap(), 1);
         assert_eq!(
             runners[2].pointer("/modes/lora/base_model").unwrap(),

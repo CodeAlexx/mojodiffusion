@@ -213,6 +213,87 @@ struct Krea2OminiLayout(Copyable, Movable):
         return txt_row + self.s_img + self.s_cond
 
 
+# ── block per-segment modulation split (seam B.1) ────────────────────────────
+# THE contract between this module and krea2_block.krea2_single_stream_block_lora:
+# ONE row boundary. Rows [0, split) take the mods(t) chunks, rows [split, L) take
+# the mods(t=0) chunks. Returning -1 when there is no condition segment is what
+# makes the CONDLEN=0 build bit-equal to today's trainer: the block's guard
+# (`split > 0 and split < L`) rejects -1 and runs the pre-existing uniform-
+# modulation code path unchanged, so the caller can pass this value
+# UNCONDITIONALLY and never branch itself.
+#
+# WHY the split is a single boundary and the TXT_pad tail lands in the t=0 span:
+# that is exactly what the ai-toolkit krea2 reference does (mmdit.py
+# SingleStreamBlock.forward tuple-vec branch `(vec, refvec, split)`), and pad
+# rows' values are never read downstream, so matching the reference costs
+# nothing and removes a needless divergence. (An earlier draft of the seam plan
+# in this file's header suggested keeping mods(t) on the pad tail — the
+# reference-identical choice below supersedes it.)
+def krea2_omini_mod_split(lay: Krea2OminiLayout) -> Int:
+    """Row boundary for the block's per-segment modulation, or -1 when the
+    layout has NO condition segment (s_cond == 0 -> unchanged krea2 path)."""
+    if lay.s_cond <= 0:
+        return -1
+    return lay.cond_off()
+
+
+# ── position tables over the new layout (seam D; krea2_cache_reader.mojo:84-100)
+# SOURCE order [TXT zeros(ltmax) | IMG grid(gh*gw) | COND grid(gh*gw)], flattened
+# token-major as [(ltmax + s_img + s_cond) * 3] F32 — index t*3 + a holds token
+# t's position along axis a, which is precisely the flat layout
+# build_krea2_rope consumes (models/dit/krea2_dit.mojo:535, and the trainer's
+# `reshape(pos_re, [LFULL*3])` at train_krea2.mojo:874). The first two sections
+# are byte-for-byte what krea2_build_pos already emits (cache_reader.mojo:88-99);
+# the COND section is appended via krea2_omini_cond_pos() (EDIT: dh=dw=0,
+# scale=1.0 -> cond grid == img grid).
+def krea2_omini_pos_src(
+    lay: Krea2OminiLayout, gh: Int, gw: Int, dh: Int, dw: Int, scale: Float32
+) raises -> List[Float32]:
+    """SOURCE-order flat position table [(ltmax+s_img+s_cond)*3] F32."""
+    lay.validate()
+    if gh <= 0 or gw <= 0:
+        raise Error("krea2_omini_pos_src: gh/gw must be positive")
+    if gh * gw != lay.s_img:
+        raise Error("krea2_omini_pos_src: gh*gw != s_img")
+    if lay.s_cond != 0 and gh * gw != lay.s_cond:
+        raise Error(
+            "krea2_omini_pos_src: EDIT condition grid must equal the img grid"
+        )
+    var host = List[Float32]()
+    for _ in range(lay.ltmax * 3):
+        host.append(Float32(0.0))            # txt positions: all zeros
+    for hi in range(gh):                     # IMG grid (0, hi, wi), row-major
+        for wi in range(gw):
+            host.append(Float32(0.0))
+            host.append(Float32(hi))
+            host.append(Float32(wi))
+    if lay.s_cond > 0:                       # COND grid (0, hi+dh, wi+dw)*scale
+        for hi in range(gh):
+            for wi in range(gw):
+                var p = krea2_omini_cond_pos(hi, wi, dh, dw, scale)
+                host.append(p.g)
+                host.append(p.h)
+                host.append(p.w)
+    return host^
+
+
+def krea2_omini_pos_combined(
+    lay: Krea2OminiLayout, gh: Int, gw: Int, dh: Int, dw: Int, scale: Float32
+) raises -> List[Float32]:
+    """COMBINED-order flat position table [lfull*3] F32 — the SOURCE table
+    gathered through combined_src_row(). Generalizes the trainer's
+    _reorder_pos_for_combined (train_krea2.mojo:880-894): with s_cond == 0 the
+    gather IS that function (checked in main())."""
+    var src = krea2_omini_pos_src(lay, gh, gw, dh, dw, scale)
+    var out = List[Float32]()
+    for row in range(lay.lfull()):
+        var s = lay.combined_src_row(row)
+        out.append(src[s * 3 + 0])
+        out.append(src[s * 3 + 1])
+        out.append(src[s * 3 + 2])
+    return out^
+
+
 # ── condition-token RoPE position (intake §1.2/§3.2) ─────────────────────────
 # OminiControl Condition.encode order (flux_omini.py:128-141): delta FIRST, then
 # scale with bias (scale-1)/2, h/w axes only; global axis stays 0. Units are
@@ -369,5 +450,71 @@ def main() raises:
     _check(ps.h == 0.0 and ps.w == -27.0, "subject delta [0,-32]: w = wi - 32")
     var pc = krea2_omini_cond_pos(3, 1, 0, 0, Float32(2.0))
     _check(pc.h == 6.5 and pc.w == 2.5, "position_scale 2.0: v*2 + 0.5")
+
+    # ── modulation split contract (what krea2_block consumes) ────────────────
+    _check(krea2_omini_mod_split(lay) == 1306, "mod split = cond_off when s_cond>0")
+    _check(
+        krea2_omini_mod_split(l0) == -1,
+        "condlen=0: mod split = -1 (block runs the UNCHANGED uniform path)",
+    )
+
+    # ── position tables (host math; the C2 gate compares these to the CUDA
+    #    oracle's kin_pos_src / kin_pos) ──────────────────────────────────────
+    comptime GRID = 32                       # 64x64 latent, patch 2 -> 32x32
+    var psrc = krea2_omini_pos_src(lay, GRID, GRID, 0, 0, Float32(1.0))
+    _check(len(psrc) == LFULL_EDIT * 3, "pos_src length = LFULL_EDIT*3")
+    var txt_zero = True
+    for i in range(LTMAX * 3):
+        if psrc[i] != 0.0:
+            txt_zero = False
+    _check(txt_zero, "pos_src: text section all-zero (krea2_build_pos:88-89)")
+    var grid_ok = True
+    for hi in range(GRID):
+        for wi in range(GRID):
+            var ti = LTMAX + hi * GRID + wi
+            var tc = LTMAX + S_IMG + hi * GRID + wi
+            if psrc[ti * 3] != 0.0 or psrc[ti * 3 + 1] != Float32(hi):
+                grid_ok = False
+            if psrc[ti * 3 + 2] != Float32(wi):
+                grid_ok = False
+            # EDIT: cond grid EQUALS img grid (delta [0,0], scale 1.0)
+            if psrc[tc * 3] != psrc[ti * 3]:
+                grid_ok = False
+            if psrc[tc * 3 + 1] != psrc[ti * 3 + 1]:
+                grid_ok = False
+            if psrc[tc * 3 + 2] != psrc[ti * 3 + 2]:
+                grid_ok = False
+    _check(grid_ok, "pos_src: img grid (0,hi,wi) and EDIT cond grid == img grid")
+
+    var pcomb = krea2_omini_pos_combined(lay, GRID, GRID, 0, 0, Float32(1.0))
+    _check(len(pcomb) == LFULL_EDIT * 3, "pos_combined length = LFULL_EDIT*3")
+    var gather_ok = True
+    for row in range(lay.lfull()):
+        var s = lay.combined_src_row(row)
+        for a in range(3):
+            if pcomb[row * 3 + a] != psrc[s * 3 + a]:
+                gather_ok = False
+    _check(gather_ok, "pos_combined == pos_src gathered by combined_src_row")
+
+    # condlen=0: the combined pos table must equal the trainer's
+    # _reorder_pos_for_combined output (train_krea2.mojo:886-891) applied to
+    # krea2_build_pos's [txt zeros(LTMAX) | img grid] table.
+    var p0 = krea2_omini_pos_combined(l0, GRID, GRID, 0, 0, Float32(1.0))
+    var p0src = krea2_omini_pos_src(l0, GRID, GRID, 0, 0, Float32(1.0))
+    _check(len(p0) == (LTMAX + S_IMG) * 3, "condlen=0: pos length = LTMAX+S_IMG")
+    var re_ok = True
+    for r in range(282):                                     # TXT_real
+        for a in range(3):
+            if p0[r * 3 + a] != p0src[r * 3 + a]:
+                re_ok = False
+    for r in range(S_IMG):                                   # IMG
+        for a in range(3):
+            if p0[(282 + r) * 3 + a] != p0src[(LTMAX + r) * 3 + a]:
+                re_ok = False
+    for r in range(LTMAX - 282):                             # TXT_pad
+        for a in range(3):
+            if p0[(282 + S_IMG + r) * 3 + a] != p0src[(282 + r) * 3 + a]:
+                re_ok = False
+    _check(re_ok, "condlen=0: pos_combined == _reorder_pos_for_combined")
 
     print("krea2_omini_layout: ALL LAYOUT CHECKS PASSED (structure only)")

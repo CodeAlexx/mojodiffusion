@@ -542,6 +542,53 @@ def _mod6_b2(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OminiControl EDIT — PER-SEGMENT MODULATION (seam B.1 of
+# training/krea2_omini_layout.mojo; intake §3.3)
+#
+# The EDIT row layout is [TXT_real(lt) | IMG | COND | TXT_pad] and the CONDITION
+# rows ride temb(t=0) while text+image ride temb(t) (OminiControl trainer.py:232
+# `timesteps=[t, t] + [zeros]*len(conditions)`). That is ONE row boundary
+# `split` == Krea2OminiLayout.cond_off(): rows [0, split) use the mods(t) chunks,
+# rows [split, L) use the mods(t=0) chunks. The TXT_pad tail therefore sits in
+# the t=0 span — matching the ai-toolkit krea2 reference exactly (mmdit.py
+# SingleStreamBlock.forward tuple-vec branch `(vec, refvec, split)`); pad-row
+# values are never read downstream, so this is a free, divergence-removing
+# choice.
+#
+# Both helpers below are the SAME kernels as the whole-sequence `modulate` /
+# `residual_gate`, run once per span. With identical chunks on both spans they
+# are bit-equal to the unsegmented call (the slice/concat are pure byte moves).
+# ══════════════════════════════════════════════════════════════════════════════
+def _modulate_seg2(
+    x: Tensor, scale_t: Tensor, shift_t: Tensor,
+    scale_c: Tensor, shift_c: Tensor, split: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    """(1+scale)*x + shift with (scale_t,shift_t) on rows [0,split) and
+    (scale_c,shift_c) on rows [split,L). x is [1, L, features]."""
+    var rows = x.shape()[1]
+    var head = slice(x, 1, 0, split, ctx)
+    var tail = slice(x, 1, split, rows - split, ctx)
+    var mh = modulate(head, scale_t, shift_t, ctx)
+    var mt = modulate(tail, scale_c, shift_c, ctx)
+    return concat(1, ctx, mh, mt)
+
+
+def _residual_gate_seg2(
+    x: Tensor, gate_t: Tensor, gate_c: Tensor, y: Tensor,
+    split: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    """x + gate*y with gate_t on rows [0,split) and gate_c on rows [split,L)."""
+    var rows = x.shape()[1]
+    var xh = slice(x, 1, 0, split, ctx)
+    var xt = slice(x, 1, split, rows - split, ctx)
+    var yh = slice(y, 1, 0, split, ctx)
+    var yt = slice(y, 1, split, rows - split, ctx)
+    var rh = residual_gate(xh, gate_t, yh, ctx)
+    var rt = residual_gate(xt, gate_c, yt, ctx)
+    return concat(1, ctx, rh, rt)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FORWARD (saves activations) — mirrors krea2_dit.mojo:812-859 + LoRA on 8 Linears
 # ══════════════════════════════════════════════════════════════════════════════
 def krea2_single_stream_block_lora[
@@ -563,6 +610,24 @@ def krea2_single_stream_block_lora[
         # internally (NO materialized [1,H,L,L] mask, NO materialized scores). The
         # token order MUST be [valid(0:real_len) | pad(real_len:L)] — see the
         # trainer's [TXT_real | IMG | TXT_pad] reorder. real_len threads to bwd too.
+    vec_cond: Optional[TArc] = Optional[TArc](None),  # OminiControl EDIT (C2):
+        # the SECOND modulation vector, tproj(tmlp(temb(t=0))) [1, 6*features],
+        # for the CONDITION rows. Absent = the unchanged uniform-modulation path.
+    cond_off: Optional[Int] = Optional[Int](None),    # the per-segment split row
+        # == Krea2OminiLayout.cond_off(); pass
+        # training/krea2_omini_layout.krea2_omini_mod_split(lay), which returns
+        # -1 when the layout has NO condition segment so the guard below falls
+        # through to the pre-existing code path BIT-FOR-BIT (the CONDLEN=0
+        # regression contract). Only 0 < cond_off < L enables segmentation.
+        #
+        # ⚠ C2 SCOPE: this is FORWARD ONLY. The backward entry points
+        # (`krea2_single_stream_block_lora_backward` :1732, `..._backward_b2`
+        # :2099, `..._backward_b2_dev` :2303, `..._backward_dev` :2450) still
+        # recompute ONE uniform `_mod6(vec)`,
+        # so enabling vec_cond in a TRAINING loop before chunk C4 lands would
+        # silently produce wrong d_x / d_mod on the condition rows. Nothing in
+        # the trainer passes these arguments today; do not wire them into
+        # krea2_stack/train_krea2 until the per-segment backward exists.
 ) raises -> Krea2BlockForward:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -578,10 +643,29 @@ def krea2_single_stream_block_lora[
     var postshift = mods[4]
     var postgate = mods[5]
 
+    # OminiControl EDIT per-segment modulation (opt-in). Enabled ONLY when both
+    # vec_cond and a split strictly inside (0, L) are supplied; otherwise every
+    # line below runs exactly as it did before this chunk.
+    var seg_mod = False
+    var split = 0
+    var mods_c = List[TArc]()
+    if vec_cond:
+        if cond_off:
+            split = cond_off.value()
+            if split > 0 and split < L:
+                mods_c = _mod6(vec_cond.value()[], w.mod_lin[], features, ctx)
+                seg_mod = True
+
     # ── ATTENTION branch ─────────────────────────────────────────────────────
     # xm = (1+prescale)*prenorm(x) + preshift
     var xn = krea2_rmsnorm(x_t[], w.prenorm_scale[], eps, ctx)
-    var xm = modulate(xn, prescale[], preshift[], ctx)          # [1,L,features]
+    var xm: Tensor
+    if seg_mod:
+        xm = _modulate_seg2(
+            xn, prescale[], preshift[], mods_c[0][], mods_c[1][], split, ctx
+        )                                                       # [1,L,features]
+    else:
+        xm = modulate(xn, prescale[], preshift[], ctx)          # [1,L,features]
 
     # projections (+ LoRA). xm is [1,L,features]; linear treats leading dims as rows.
     var q = _base_fwd(xm, w.wq[], w, 0, ctx)             # [1,L,HEADS*HEADDIM]
@@ -688,11 +772,21 @@ def krea2_single_stream_block_lora[
     var a = _linear_lora(gated, w.wo[], lora.wo, M, ctx, _i8w(w, 4), _i8s(w, 4))  # [1,L,features]
 
     # x1 = x + pregate * a
-    var x1 = residual_gate(x_t[], pregate[], a, ctx)
+    var x1: Tensor
+    if seg_mod:
+        x1 = _residual_gate_seg2(x_t[], pregate[], mods_c[2][], a, split, ctx)
+    else:
+        x1 = residual_gate(x_t[], pregate[], a, ctx)
 
     # ── MLP branch ───────────────────────────────────────────────────────────
     var xn2 = krea2_rmsnorm(x1, w.postnorm_scale[], eps, ctx)
-    var xm2 = modulate(xn2, postscale[], postshift[], ctx)     # [1,L,features]
+    var xm2: Tensor
+    if seg_mod:
+        xm2 = _modulate_seg2(
+            xn2, postscale[], postshift[], mods_c[3][], mods_c[4][], split, ctx
+        )                                                      # [1,L,features]
+    else:
+        xm2 = modulate(xn2, postscale[], postshift[], ctx)     # [1,L,features]
 
     var mg = _base_fwd(xm2, w.mlp_gate_w[], w, 5, ctx)  # [1,L,mlpdim]
     var mu = _base_fwd(xm2, w.mlp_up_w[], w, 6, ctx)  # [1,L,mlpdim]
@@ -725,7 +819,11 @@ def krea2_single_stream_block_lora[
     var sw = swiglu(mg, mu, ctx)                                # silu(mg)*mu [1,L,mlpdim]
     var m = _linear_lora(sw, w.mlp_down_w[], lora.mlp_down_w, M, ctx, _i8w(w, 7), _i8s(w, 7))    # [1,L,features]
 
-    var x2 = residual_gate(x1, postgate[], m, ctx)             # x1 + postgate*m
+    var x2: Tensor
+    if seg_mod:
+        x2 = _residual_gate_seg2(x1, postgate[], mods_c[5][], m, split, ctx)
+    else:
+        x2 = residual_gate(x1, postgate[], m, ctx)             # x1 + postgate*m
 
     var saved = Krea2BlockSaved(
         x_t.copy(), TArc(xm^),

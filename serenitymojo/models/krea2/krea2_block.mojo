@@ -194,26 +194,43 @@ def _lora_delta_rows(
     return Optional[Tensor](None)
 
 
+def _row_dim(t: Tensor) raises -> Int:
+    """The ROW axis of a block tensor: dim 1 for the rank-3 [1, L, C] forward
+    activations, dim 0 for the rank-2 [L, C] tensors the backward's
+    ops/linalg_backward.linear_backward_dx allocates ([M, in_features], :631).
+    C4 added this so the same scatter/slice helpers serve both."""
+    return 0 if len(t.shape()) == 2 else 1
+
+
+def _rows(t: Tensor, off: Int, n: Int, ctx: DeviceContext) raises -> Tensor:
+    """Row slice [off, off+n) on whichever axis `_row_dim` names."""
+    return slice(t, _row_dim(t), off, n, ctx)
+
+
 def _add_delta_rows(
     y: Tensor, d: Tensor, c_off: Int, c_len: Int, ctx: DeviceContext
 ) raises -> Tensor:
     """c_off < 0 -> plain y + d (unchanged path). c_off >= 0 -> SCATTER-ADD: d is
     [1,c_len,out] and lands on rows [c_off, c_off+c_len) only; the head and tail
-    rows are the frozen base output copied through byte-for-byte."""
+    rows are the frozen base output copied through byte-for-byte.
+    The row axis comes from `_row_dim` — for the rank-3 forward tensors this is
+    dim 1, i.e. BYTE-FOR-BYTE the pre-C4 helper; rank 2 is the C4 backward's
+    linear_backward_dx output."""
     if c_off < 0:
         return add(y, d, ctx)
-    var rows = y.shape()[1]
-    var mid = add(slice(y, 1, c_off, c_len, ctx), d, ctx)
+    var rdim = _row_dim(y)
+    var rows = y.shape()[rdim]
+    var mid = add(slice(y, rdim, c_off, c_len, ctx), d, ctx)
     var tail_len = rows - c_off - c_len
     if c_off == 0:
         if tail_len == 0:
             return mid^
-        return concat(1, ctx, mid, slice(y, 1, c_off + c_len, tail_len, ctx))
+        return concat(rdim, ctx, mid, slice(y, rdim, c_off + c_len, tail_len, ctx))
     if tail_len == 0:
-        return concat(1, ctx, slice(y, 1, 0, c_off, ctx), mid)
+        return concat(rdim, ctx, slice(y, rdim, 0, c_off, ctx), mid)
     return concat(
-        1, ctx, slice(y, 1, 0, c_off, ctx), mid,
-        slice(y, 1, c_off + c_len, tail_len, ctx),
+        rdim, ctx, slice(y, rdim, 0, c_off, ctx), mid,
+        slice(y, rdim, c_off + c_len, tail_len, ctx),
     )
 
 
@@ -517,6 +534,18 @@ struct Krea2BlockGrads(Movable):
     var mlp_gate_w: Krea2LoraGrad
     var mlp_up_w: Krea2LoraGrad
     var mlp_down_w: Krea2LoraGrad
+    # ── OminiControl EDIT per-segment modulation grads (C4) ──────────────────
+    # PRESENT ONLY when the backward ran the per-segment path (vec_cond + a valid
+    # cond_off). F32 [6*features], in `_mod6` chunk order. d_vec_t is the grad of
+    # the mods(t) vector, accumulated over the TXT_real+IMG rows [0, cond_off);
+    # d_vec_cond is the grad of the mods(t=0) vector, over the COND rows
+    # [cond_off, real_len) — the TXT_pad tail is deliberately excluded, see the
+    # PER-SEGMENT MODULATION BACKWARD box. They feed the trainer's two SEPARATE
+    # temb chains. Both are None on the uniform path, where nothing downstream
+    # consumes a modulation grad (LoRA training freezes mod.lin) and the backward
+    # runs the pre-C4 kernels with compute_param_grads/compute_gate_grad False.
+    var d_vec_t: Optional[TArc]
+    var d_vec_cond: Optional[TArc]
 
     def __init__(
         out self, var d_x: TArc,
@@ -524,6 +553,8 @@ struct Krea2BlockGrads(Movable):
         var gate_w: Krea2LoraGrad, var wo: Krea2LoraGrad,
         var mlp_gate_w: Krea2LoraGrad, var mlp_up_w: Krea2LoraGrad,
         var mlp_down_w: Krea2LoraGrad,
+        var d_vec_t: Optional[TArc] = Optional[TArc](None),
+        var d_vec_cond: Optional[TArc] = Optional[TArc](None),
     ):
         self.d_x = d_x^
         self.wq = wq^
@@ -534,6 +565,8 @@ struct Krea2BlockGrads(Movable):
         self.mlp_gate_w = mlp_gate_w^
         self.mlp_up_w = mlp_up_w^
         self.mlp_down_w = mlp_down_w^
+        self.d_vec_t = d_vec_t^
+        self.d_vec_cond = d_vec_cond^
 
 
 # ── DEVICE-resident per-Linear LoRA grad pair (TArc; None when adapter absent) ─
@@ -563,6 +596,11 @@ struct Krea2BlockGradsT(Movable):
     var mlp_gate_w: Krea2LoraGradT
     var mlp_up_w: Krea2LoraGradT
     var mlp_down_w: Krea2LoraGradT
+    # OminiControl EDIT per-segment modulation grads (C4) — same contract as
+    # Krea2BlockGrads.d_vec_t / .d_vec_cond above (F32 [6*features], present
+    # ONLY on the per-segment path).
+    var d_vec_t: Optional[TArc]
+    var d_vec_cond: Optional[TArc]
 
     def __init__(
         out self, var d_x: TArc,
@@ -570,6 +608,8 @@ struct Krea2BlockGradsT(Movable):
         var gate_w: Krea2LoraGradT, var wo: Krea2LoraGradT,
         var mlp_gate_w: Krea2LoraGradT, var mlp_up_w: Krea2LoraGradT,
         var mlp_down_w: Krea2LoraGradT,
+        var d_vec_t: Optional[TArc] = Optional[TArc](None),
+        var d_vec_cond: Optional[TArc] = Optional[TArc](None),
     ):
         self.d_x = d_x^
         self.wq = wq^
@@ -580,6 +620,8 @@ struct Krea2BlockGradsT(Movable):
         self.mlp_gate_w = mlp_gate_w^
         self.mlp_up_w = mlp_up_w^
         self.mlp_down_w = mlp_down_w^
+        self.d_vec_t = d_vec_t^
+        self.d_vec_cond = d_vec_cond^
 
 
 # ── modulation: out = vec + lin; chunk 6 along last dim → 6 raw [features] ────
@@ -689,15 +731,20 @@ def krea2_single_stream_block_lora[
         # through to the pre-existing code path BIT-FOR-BIT (the CONDLEN=0
         # regression contract). Only 0 < cond_off < L enables segmentation.
         #
-        # ⚠ C2/C3 SCOPE: this is FORWARD ONLY. The backward entry points
-        # (`krea2_single_stream_block_lora_backward` :1732, `..._backward_b2`
-        # :2099, `..._backward_b2_dev` :2303, `..._backward_dev` :2450) still
-        # recompute ONE uniform `_mod6(vec)` and still compute dA/dB from the
-        # FULL sequence, so enabling vec_cond / cond_len in a TRAINING loop
-        # before chunk C4 lands would silently produce wrong d_x / d_mod / dA /
-        # dB on the condition rows. Nothing in the trainer passes these
-        # arguments today; do not wire them into krea2_stack/train_krea2 until
-        # the per-segment, cond-row backward exists.
+        # ⚠ SCOPE (updated by C4). The BATCH-1 backwards —
+        # `krea2_single_stream_block_lora_backward` and
+        # `..._backward_dev` — now take the SAME three switches and implement the
+        # per-segment / cond-row backward (per-span d_mod, cond-row dA/dB,
+        # full-sequence dX). Pass them there too: a per-segment FORWARD with a
+        # uniform BACKWARD is silently wrong on the condition rows.
+        # The BATCH-2 entry points (`..._b2`, `..._backward_b2`,
+        # `..._backward_b2_dev`) do NOT support the EDIT layout in either
+        # direction — the b2 forward has no vec_cond/cond_off/cond_len at all,
+        # and its [2, features] per-sample modulation would need a 4-way
+        # (sample x segment) split that ops/elementwise `modulate` does not
+        # express. b2 + EDIT is not a reachable configuration today; building it
+        # starts with the b2 FORWARD.
+        # Nothing in the trainer passes these arguments yet.
     cond_len: Optional[Int] = Optional[Int](None),    # OminiControl EDIT (C3):
         # the CONDITION segment length == Krea2OminiLayout.cond_len() (S_COND).
         # Present together with a valid cond_off it turns on COND-ROW LoRA
@@ -1168,12 +1215,33 @@ def _linear_bwd_dx(
     M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
     w8t: Optional[TArc] = Optional[TArc](None),
     w8_scale: Optional[TArc] = Optional[TArc](None),
+    c_off: Int = -1,          # OminiControl EDIT cond-row LoRA routing (C4):
+    c_len: Int = 0,           # -1 (default) = the pre-existing full-sequence path.
 ) raises -> _LinBwd:
     """d_x for a LoRA Linear = base backward + LoRA branch d_x. Base W FROZEN (no
     d_w). When w8t/w8_scale present the base dX runs int8 W8A8; LoRA dA/dB (bf16)
-    returned in the pair (None when the adapter is absent)."""
+    returned in the pair (None when the adapter is absent).
+
+    C4 — COND-ROW ROUTING (c_off >= 0): the exact mirror of the C3 forward. The
+    forward added the low-rank delta to rows [c_off, c_off+c_len) ONLY, computed
+    from those rows' input, so the adapter's dA/dB see ONLY those rows and the
+    LoRA branch's d_x lands ONLY on those rows. The FROZEN BASE dX is untouched
+    and still runs the FULL sequence (the base saw every row). c_off < 0 runs the
+    pre-existing kernels with the pre-existing arguments, bit-for-bit."""
     var d_x = _base_dx(d_y, w, M, in_f, out_f, w8t, w8_scale, ctx)
     if lo:
+        if c_off >= 0:
+            var dyc = _rows(d_y, c_off, c_len, ctx)
+            var xc = _rows(x, c_off, c_len, ctx)
+            var gc = klein_lora_bwd_device_resident_unfused(
+                dyc, xc, lo.value(), c_len, ctx
+            )
+            var dxc = _add_delta_rows(d_x, gc.d_x, c_off, c_len, ctx)
+            var pairc = Krea2LoraGrad(
+                Optional[List[Float32]](gc.d_a.copy()),
+                Optional[List[Float32]](gc.d_b.copy()),
+            )
+            return _LinBwd(dxc^, pairc^)
         var g = klein_lora_bwd_device_resident_unfused(d_y, x, lo.value(), M, ctx)
         d_x = add(d_x, g.d_x, ctx)
         var pair = Krea2LoraGrad(
@@ -1204,12 +1272,25 @@ def _linear_bwd_dx_dev(
     M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
     w8t: Optional[TArc] = Optional[TArc](None),
     w8_scale: Optional[TArc] = Optional[TArc](None),
+    c_off: Int = -1,          # OminiControl EDIT cond-row LoRA routing (C4);
+    c_len: Int = 0,           # see _linear_bwd_dx for the contract.
 ) raises -> _LinBwdT:
     """Device-grad d_x for a LoRA Linear. Base W FROZEN (no d_w). LoRA dA/dB stay
     on device (no per-adapter to_host) — the SAME GEMM math as _linear_bwd_dx.
     int8 W8A8 base when w8t/w8_scale present."""
     var d_x = _base_dx(d_y, w, M, in_f, out_f, w8t, w8_scale, ctx)
     if lo:
+        if c_off >= 0:
+            var dyc = _rows(d_y, c_off, c_len, ctx)
+            var xc = _rows(x, c_off, c_len, ctx)
+            var gc = klein_lora_bwd_device_resident_tensors_unfused(
+                dyc, xc, lo.value(), c_len, ctx
+            )
+            var dxc = _add_delta_rows(d_x, gc.d_x[], c_off, c_len, ctx)
+            var pairc = Krea2LoraGradT(
+                Optional[TArc](gc.d_a.copy()), Optional[TArc](gc.d_b.copy()),
+            )
+            return _LinBwdT(dxc^, pairc^)
         var g = klein_lora_bwd_device_resident_tensors_unfused(d_y, x, lo.value(), M, ctx)
         d_x = add(d_x, g.d_x[], ctx)
         var pair = Krea2LoraGradT(
@@ -1842,6 +1923,171 @@ def _opdbg(
           " valid=", k * sqrt(vs), " pad=", k * sqrt(ps))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OminiControl EDIT — PER-SEGMENT MODULATION BACKWARD (C4; seam B.1's reverse)
+#
+# The forward runs rows [0, split) on the mods(t) chunks and rows [split, L) on
+# the mods(t=0) chunks (`_modulate_seg2` / `_residual_gate_seg2`). Its backward
+# therefore has to do TWO things the uniform backward never did:
+#   (1) d_x must be differentiated against the chunk that actually modulated that
+#       row — the same 2-span split, run through the SAME kernels once per span.
+#   (2) the CHUNK grads (d_scale/d_shift/d_gate) must be accumulated PER SPAN:
+#       rows [0, split) (TXT_real + IMG) sum into d_mod(t), rows [split, …) (COND)
+#       into d_mod(t=0). Those are the two separate temb chains the EDIT trainer
+#       carries, so mixing them is not a rounding difference, it is a wrong
+#       gradient.
+#
+# ⚠ THE PAD TAIL IS EXCLUDED FROM (2), AND THAT IS A MEASURED DECISION.
+# The TXT_pad tail sits in the t=0 span, so a naive "rows [split, L)" reduction
+# would add pad-row gradient to d_mod(t=0). Two facts, both measured on the CUDA
+# fixture (scripts/krea2_omini_torch_oracle.py, "[pad-row evidence]"):
+#   * pad rows CANNOT reach the real rows — with the pad KEY columns masked, the
+#     softmax weight on them is exp(-inf) = 0 EXACTLY, so dK/dV on pad rows are
+#     exactly zero. The oracle confirms it: d_x[0:real_len] and all 16 LoRA dA/dB
+#     are BIT-EQUAL whether or not the pad tail carries an upstream gradient.
+#   * they DO reach d_mod(t=0), and hard: cos(d_blk_vec_cond with vs without the
+#     pad-tail gradient) = 0.679 at block 0 and 0.994 at block 27. d_blk_vec_t is
+#     BIT-EQUAL (the t span has no pad rows). So the pad tail's ONLY effect is on
+#     the condition chunk grads.
+# In the Mojo production path those rows are worse than merely different: the
+# cuDNN flash TAIL-padmask kernel masks only KEY columns, so pad QUERY rows carry
+# masked-out garbage BY DESIGN (see the SDPA comment in the forward). Feeding
+# that garbage into the condition temb chain is not a defensible gradient. The
+# reduction therefore stops at `real_rows`; the pad rows still get their d_x
+# (same chunks, param grads off) so the returned d_x is complete.
+# When real_rows == L (no pad) the extra span disappears and the helper is the
+# plain 2-span form.
+# ══════════════════════════════════════════════════════════════════════════════
+struct _ModBwdSeg2(Movable):
+    var d_x: Tensor
+    var d_scale_t: Tensor
+    var d_shift_t: Tensor
+    var d_scale_c: Tensor
+    var d_shift_c: Tensor
+
+    def __init__(
+        out self, var d_x: Tensor, var d_scale_t: Tensor, var d_shift_t: Tensor,
+        var d_scale_c: Tensor, var d_shift_c: Tensor,
+    ):
+        self.d_x = d_x^
+        self.d_scale_t = d_scale_t^
+        self.d_shift_t = d_shift_t^
+        self.d_scale_c = d_scale_c^
+        self.d_shift_c = d_shift_c^
+
+
+def _modulate_backward_seg2(
+    go: Tensor, x: Tensor, scale_t: Tensor, scale_c: Tensor,
+    split: Int, real_rows: Int, ctx: DeviceContext,
+) raises -> _ModBwdSeg2:
+    """Backward of `_modulate_seg2`. d_x over ALL rows; param grads from rows
+    [0,split) (-> t) and [split, real_rows) (-> t=0) only."""
+    var rows = x.shape()[1]
+    if split <= 0 or split >= rows or real_rows < split or real_rows > rows:
+        raise Error("krea2 modulate_backward_seg2: bad split/real_rows")
+    var mh = modulate_backward(
+        slice(go, 1, 0, split, ctx), slice(x, 1, 0, split, ctx), scale_t, ctx,
+        compute_param_grads=True,
+    )
+    var n_real = real_rows - split
+    var mt = modulate_backward(
+        slice(go, 1, split, n_real, ctx), slice(x, 1, split, n_real, ctx),
+        scale_c, ctx, compute_param_grads=True,
+    )
+    if real_rows == rows:
+        return _ModBwdSeg2(
+            concat(1, ctx, mh.d_x, mt.d_x),
+            mh.d_scale.clone(ctx), mh.d_shift.clone(ctx),
+            mt.d_scale.clone(ctx), mt.d_shift.clone(ctx),
+        )
+    var n_pad = rows - real_rows
+    var mp = modulate_backward(
+        slice(go, 1, real_rows, n_pad, ctx), slice(x, 1, real_rows, n_pad, ctx),
+        scale_c, ctx, compute_param_grads=False,
+    )
+    return _ModBwdSeg2(
+        concat(1, ctx, mh.d_x, mt.d_x, mp.d_x),
+        mh.d_scale.clone(ctx), mh.d_shift.clone(ctx),
+        mt.d_scale.clone(ctx), mt.d_shift.clone(ctx),
+    )
+
+
+struct _GateBwdSeg2(Movable):
+    var d_x: Tensor
+    var d_y: Tensor
+    var d_g_t: Tensor
+    var d_g_c: Tensor
+
+    def __init__(
+        out self, var d_x: Tensor, var d_y: Tensor,
+        var d_g_t: Tensor, var d_g_c: Tensor,
+    ):
+        self.d_x = d_x^
+        self.d_y = d_y^
+        self.d_g_t = d_g_t^
+        self.d_g_c = d_g_c^
+
+
+def _gate_residual_backward_seg2(
+    go: Tensor, x: Tensor, gate_t: Tensor, gate_c: Tensor, y: Tensor,
+    split: Int, real_rows: Int, ctx: DeviceContext,
+) raises -> _GateBwdSeg2:
+    """Backward of `_residual_gate_seg2`. d_x/d_y over ALL rows; d_g from rows
+    [0,split) (-> t) and [split, real_rows) (-> t=0) only."""
+    var rows = go.shape()[1]
+    if split <= 0 or split >= rows or real_rows < split or real_rows > rows:
+        raise Error("krea2 gate_residual_backward_seg2: bad split/real_rows")
+    var rh = gate_residual_backward(
+        slice(go, 1, 0, split, ctx), slice(x, 1, 0, split, ctx), gate_t,
+        slice(y, 1, 0, split, ctx), ctx, compute_gate_grad=True,
+    )
+    var n_real = real_rows - split
+    var rt = gate_residual_backward(
+        slice(go, 1, split, n_real, ctx), slice(x, 1, split, n_real, ctx), gate_c,
+        slice(y, 1, split, n_real, ctx), ctx, compute_gate_grad=True,
+    )
+    if real_rows == rows:
+        return _GateBwdSeg2(
+            concat(1, ctx, rh.d_x, rt.d_x), concat(1, ctx, rh.d_y, rt.d_y),
+            rh.d_g.clone(ctx), rt.d_g.clone(ctx),
+        )
+    var n_pad = rows - real_rows
+    var rp = gate_residual_backward(
+        slice(go, 1, real_rows, n_pad, ctx), slice(x, 1, real_rows, n_pad, ctx),
+        gate_c, slice(y, 1, real_rows, n_pad, ctx), ctx, compute_gate_grad=False,
+    )
+    return _GateBwdSeg2(
+        concat(1, ctx, rh.d_x, rt.d_x, rp.d_x),
+        concat(1, ctx, rh.d_y, rt.d_y, rp.d_y),
+        rh.d_g.clone(ctx), rt.d_g.clone(ctx),
+    )
+
+
+def _pack_d_vec(g: List[TArc], ctx: DeviceContext) raises -> Tensor:
+    """The [6*features] grad of ONE modulation vector. `g` is appended in the
+    order the backward produces the chunks — [postgate, postscale, postshift,
+    pregate, prescale, preshift] — and the packed layout is `_mod6`'s chunk
+    order [prescale, preshift, pregate, postscale, postshift, postgate]. Each
+    chunk is cast F32 (the optimizer/oracle boundary; the reductions themselves
+    already accumulate in F32 and round once at store, exactly like the torch
+    bf16 grad the oracle dumps). Since mods = vec + mod_lin, this IS the grad
+    w.r.t. `vec` AND w.r.t. mod.lin — the two differ by nothing."""
+    if len(g) != 6:
+        raise Error(
+            String("krea2 _pack_d_vec: expected 6 chunk grads, got ")
+            + String(len(g))
+        )
+    return concat(
+        0, ctx,
+        cast_tensor(g[4][], STDtype.F32, ctx),   # prescale
+        cast_tensor(g[5][], STDtype.F32, ctx),   # preshift
+        cast_tensor(g[3][], STDtype.F32, ctx),   # pregate
+        cast_tensor(g[1][], STDtype.F32, ctx),   # postscale
+        cast_tensor(g[2][], STDtype.F32, ctx),   # postshift
+        cast_tensor(g[0][], STDtype.F32, ctx),   # postgate
+    )
+
+
 def krea2_single_stream_block_lora_backward[
     L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
 ](
@@ -1860,6 +2106,20 @@ def krea2_single_stream_block_lora_backward[
         # FAIL-LOUD if real_len < L but the saved tape has no flash set (fwd/bwd
         # real_len mismatch).
     dbg_block: Int = -1,   # op-by-op probe: >=0 prints backward intermediates.
+    vec_cond: Optional[TArc] = Optional[TArc](None),  # OminiControl EDIT (C4):
+        # the SECOND modulation vector tproj(tmlp(temb(t=0))) [1, 6*features] —
+        # MUST be the same tensor the forward was given. Present together with a
+        # valid cond_off turns on the PER-SEGMENT backward: d_x differentiated
+        # against the chunk that modulated each row, and d_vec_t / d_vec_cond
+        # accumulated per span (see the PER-SEGMENT MODULATION BACKWARD box).
+    cond_off: Optional[Int] = Optional[Int](None),    # the split row; pass
+        # training/krea2_omini_layout.krea2_omini_mod_split(lay), which is -1 for
+        # a layout with no condition segment so the guard falls through to the
+        # pre-C4 code path BIT-FOR-BIT (the CONDLEN=0 regression contract).
+    cond_len: Optional[Int] = Optional[Int](None),    # the condition segment
+        # length; present with a valid cond_off it routes the 8 adapters' dA/dB
+        # (and their d_x contribution) to rows [cond_off, cond_off+cond_len) —
+        # the exact mirror of the C3 forward. Independent of vec_cond.
 ) raises -> Krea2BlockGrads:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -1874,23 +2134,68 @@ def krea2_single_stream_block_lora_backward[
     var postscale = mods[3]
     var postgate = mods[5]
 
+    # ── OminiControl EDIT switches (C4). Both default OFF, and with both off
+    # every line below is the pre-C4 call with the pre-C4 arguments. ─────────
+    var seg_mod = False
+    var split = 0
+    var mods_c = List[TArc]()
+    if vec_cond:
+        if cond_off:
+            split = cond_off.value()
+            if split > 0 and split < L:
+                mods_c = _mod6(vec_cond.value()[], w.mod_lin[], features, ctx)
+                seg_mod = True
+    var c_off = -1
+    var c_len = 0
+    if cond_off:
+        if cond_len:
+            var co = cond_off.value()
+            var cl = cond_len.value()
+            if co > 0 and cl > 0 and co + cl <= L:
+                c_off = co
+                c_len = cl
+    # rows the per-span CHUNK reductions may read (the pad tail is excluded —
+    # measured decision, see the PER-SEGMENT MODULATION BACKWARD box).
+    var rl_rows = real_len.value() if real_len else L
+    if rl_rows > L:
+        rl_rows = L
+    if seg_mod and rl_rows < split:
+        raise Error("krea2 block bwd: real_len below the modulation split")
+    # chunk grads in production order [postgate, postscale, postshift, pregate,
+    # prescale, preshift]; empty on the uniform path.
+    var dv_t = List[TArc]()
+    var dv_c = List[TArc]()
+
     # ── MLP branch backward: x2 = residual_gate(x1, postgate, m) ──────────────
     # o = x1 + postgate*m  → d_x1(res)=d_out ; d_m = d_out*postgate (per-channel).
     # (`m` is saved; gate_residual_backward only needs y's value for d_g, which we
     # skip with compute_gate_grad=False — but it still shape-checks y.)
-    var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
-    # grg2.d_x = passthrough to x1 ; grg2.d_y = grad into m (= d_out*postgate)
-    var d_m = grg2.d_y.clone(ctx)
+    var grg2_dx: Tensor
+    var d_m: Tensor
+    if seg_mod:
+        var s2 = _gate_residual_backward_seg2(
+            d_out, saved.x1[], postgate[], mods_c[5][], saved.m[],
+            split, rl_rows, ctx,
+        )
+        grg2_dx = s2.d_x.clone(ctx)
+        d_m = s2.d_y.clone(ctx)
+        dv_t.append(TArc(s2.d_g_t.clone(ctx)))
+        dv_c.append(TArc(s2.d_g_c.clone(ctx)))
+    else:
+        var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
+        # grg2.d_x = passthrough to x1 ; grg2.d_y = grad into m (= d_out*postgate)
+        grg2_dx = grg2.d_x.clone(ctx)
+        d_m = grg2.d_y.clone(ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "d_out", d_out, False, L, (real_len.value() if real_len else L), ctx)
-            _opdbg("b1", dbg_block, "grg2.d_x", grg2.d_x, False, L, (real_len.value() if real_len else L), ctx)
+            _opdbg("b1", dbg_block, "grg2.d_x", grg2_dx, False, L, (real_len.value() if real_len else L), ctx)
             _opdbg("b1", dbg_block, "d_m", d_m, False, L, (real_len.value() if real_len else L), ctx)
 
     # m = mlp_down(sw)  → d_sw (base dx + LoRA dx) + mlp_down dA/dB
     var bw_down = _linear_bwd_dx(
         d_m, saved.sw[], w.mlp_down_w[], lora.mlp_down_w, M, mlpdim, features, ctx,
-        _i8w(w,7), _i8s(w, 7),
+        _i8w(w,7), _i8s(w, 7), c_off, c_len,
     )
     var d_sw = bw_down.d_x.clone(ctx)
     var g_down = bw_down.lora.copy()
@@ -1901,16 +2206,37 @@ def krea2_single_stream_block_lora_backward[
     # sw = swiglu(mlp_gate, mlp_up) → d_mlp_gate, d_mlp_up
     var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
     # mlp_gate/mlp_up share xm2, so their LoRA down-projection can batch.
-    var bw_mlp = _linear_bwd_dx_group2(
-        sgb.d_gate, sgb.d_up, saved.xm2[],
-        w.mlp_gate_w[], lora.mlp_gate_w, mlpdim,
-        w.mlp_up_w[], lora.mlp_up_w, mlpdim,
-        M, features, ctx,
-        _i8w(w,5), _i8s(w, 5), _i8w(w,6), _i8s(w, 6),
-    )
-    var g_mg = bw_mlp.g0.copy()
-    var g_mu = bw_mlp.g1.copy()
-    var d_xm2 = bw_mlp.d_x.clone(ctx)             # [1,L,features]
+    # COND-ROW ROUTING (C4) takes the ungrouped pair instead: grouping is a
+    # launch-count optimization whose shared down-projection GEMM would have to
+    # be re-derived for the c_len-row window, and it is not on this chunk's
+    # critical path. The math is the same two backwards the grouped helper falls
+    # back to when an adapter is missing.
+    var g_mg: Krea2LoraGrad
+    var g_mu: Krea2LoraGrad
+    var d_xm2: Tensor                             # [1,L,features] / [L,features]
+    if c_off >= 0:
+        var b_mg = _linear_bwd_dx(
+            sgb.d_gate, saved.xm2[], w.mlp_gate_w[], lora.mlp_gate_w,
+            M, features, mlpdim, ctx, _i8w(w,5), _i8s(w, 5), c_off, c_len,
+        )
+        var b_mu = _linear_bwd_dx(
+            sgb.d_up, saved.xm2[], w.mlp_up_w[], lora.mlp_up_w,
+            M, features, mlpdim, ctx, _i8w(w,6), _i8s(w, 6), c_off, c_len,
+        )
+        g_mg = b_mg.lora.copy()
+        g_mu = b_mu.lora.copy()
+        d_xm2 = add(b_mg.d_x, b_mu.d_x, ctx)
+    else:
+        var bw_mlp = _linear_bwd_dx_group2(
+            sgb.d_gate, sgb.d_up, saved.xm2[],
+            w.mlp_gate_w[], lora.mlp_gate_w, mlpdim,
+            w.mlp_up_w[], lora.mlp_up_w, mlpdim,
+            M, features, ctx,
+            _i8w(w,5), _i8s(w, 5), _i8w(w,6), _i8s(w, 6),
+        )
+        g_mg = bw_mlp.g0.copy()
+        g_mu = bw_mlp.g1.copy()
+        d_xm2 = bw_mlp.d_x.clone(ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "d_xm2", d_xm2, False, L, (real_len.value() if real_len else L), ctx)
@@ -1921,10 +2247,27 @@ def krea2_single_stream_block_lora_backward[
     # Mixed precision: saved.xn2 is F32 (rms_norm w/ F32 scale) but d_xm2 is bf16
     # (matmul-backward grad). modulate operated in F32 in the fwd → cast both grad-in
     # and scale to the F32 acts dtype so modulate_backward is dtype-consistent.
-    var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
+    var mb2_dx: Tensor
+    if seg_mod:
+        var sm2 = _modulate_backward_seg2(
+            reshape(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx),
+                    [1, L, features], ctx),
+            saved.xn2[],
+            cast_tensor(postscale[], saved.xn2[].dtype(), ctx),
+            cast_tensor(mods_c[3][], saved.xn2[].dtype(), ctx),
+            split, rl_rows, ctx,
+        )
+        mb2_dx = sm2.d_x.clone(ctx)
+        dv_t.append(TArc(sm2.d_scale_t.clone(ctx)))
+        dv_t.append(TArc(sm2.d_shift_t.clone(ctx)))
+        dv_c.append(TArc(sm2.d_scale_c.clone(ctx)))
+        dv_c.append(TArc(sm2.d_shift_c.clone(ctx)))
+    else:
+        var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
+        mb2_dx = mb2.d_x.clone(ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
-            _opdbg("b1", dbg_block, "mb2.d_x", mb2.d_x, False, L, (real_len.value() if real_len else L), ctx)
+            _opdbg("b1", dbg_block, "mb2.d_x", mb2_dx, False, L, (real_len.value() if real_len else L), ctx)
     # xn2 = postnorm(x1) (weight=postnorm+1, FROZEN) → d_x1 via rms_norm_backward.
     # Mixed precision: the saved acts are bf16 (block input feeds bf16 through the
     # norm→modulate→matmul chain) but the postnorm scale is F32. The FORWARD
@@ -1934,28 +2277,41 @@ def krea2_single_stream_block_lora_backward[
     # F32-acts-only mixed path. In the F32 gate this cast is F32→F32 (no-op).
     # FROZEN norm scale → d_x only (rms_norm_backward_dx skips the O(cols²) discarded
     # d_g kernel that was 89% of the step; see norm_backward.mojo:374).
-    var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
+    var rb2_dx = krea2_rmsnorm_backward_dx(mb2_dx, saved.x1[], w.postnorm_scale[], eps, ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "rb2_dx", rb2_dx, False, L, (real_len.value() if real_len else L), ctx)
     # x1 feeds the residual (grg2.d_x) AND postnorm(x1) → SUM.
-    var d_x1 = add(grg2.d_x, rb2_dx, ctx)
+    var d_x1 = add(grg2_dx, rb2_dx, ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "d_x1", d_x1, False, L, (real_len.value() if real_len else L), ctx)
 
     # ── ATTENTION branch backward: x1 = residual_gate(x, pregate, a) ──────────
-    var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
-    var d_a = grg1.d_y.clone(ctx)                          # grad into a (=d_x1*pregate)
+    var grg1_dx: Tensor
+    var d_a: Tensor
+    if seg_mod:
+        var s1 = _gate_residual_backward_seg2(
+            d_x1, saved.x[], pregate[], mods_c[2][], saved.a[],
+            split, rl_rows, ctx,
+        )
+        grg1_dx = s1.d_x.clone(ctx)
+        d_a = s1.d_y.clone(ctx)
+        dv_t.append(TArc(s1.d_g_t.clone(ctx)))
+        dv_c.append(TArc(s1.d_g_c.clone(ctx)))
+    else:
+        var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
+        grg1_dx = grg1.d_x.clone(ctx)
+        d_a = grg1.d_y.clone(ctx)               # grad into a (=d_x1*pregate)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
-            _opdbg("b1", dbg_block, "grg1.d_x", grg1.d_x, False, L, (real_len.value() if real_len else L), ctx)
+            _opdbg("b1", dbg_block, "grg1.d_x", grg1_dx, False, L, (real_len.value() if real_len else L), ctx)
             _opdbg("b1", dbg_block, "d_a", d_a, False, L, (real_len.value() if real_len else L), ctx)
 
     # a = wo(gated) → d_gated (base dx + LoRA dx) + wo dA/dB
     var bw_wo = _linear_bwd_dx(
         d_a, saved.gated[], w.wo[], lora.wo, M, features, features, ctx,
-        _i8w(w,4), _i8s(w, 4),
+        _i8w(w,4), _i8s(w, 4), c_off, c_len,
     )
     var d_gated = bw_wo.d_x.clone(ctx)
     var g_wo = bw_wo.lora.copy()
@@ -2042,47 +2398,102 @@ def krea2_single_stream_block_lora_backward[
     var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
 
     # q/k/v/gate share xm, so their LoRA down-projection can batch.
-    var bw_qkvg = _linear_bwd_dx_group4(
-        d_q, d_k, d_v_flat, d_gate_pre, saved.xm[],
-        w.wq[], lora.wq, HEADS * HEADDIM,
-        w.wk[], lora.wk, KVHEADS * HEADDIM,
-        w.wv[], lora.wv, KVHEADS * HEADDIM,
-        w.gate_w[], lora.gate_w, features,
-        M, features, ctx,
-        _i8w(w,0), _i8s(w, 0), _i8w(w,1), _i8s(w, 1),
-        _i8w(w,2), _i8s(w, 2), _i8w(w,3), _i8s(w, 3),
-    )
-    var g_wq = bw_qkvg.g0.copy()
-    var g_wk = bw_qkvg.g1.copy()
-    var g_wv = bw_qkvg.g2.copy()
-    var g_gate = bw_qkvg.g3.copy()
-    var d_xm = bw_qkvg.d_x.clone(ctx)
+    # COND-ROW ROUTING (C4) takes the ungrouped four instead — same reason as the
+    # MLP pair above; this is exactly the fallback the grouped helper itself uses
+    # when one of the four adapters is absent.
+    var g_wq: Krea2LoraGrad
+    var g_wk: Krea2LoraGrad
+    var g_wv: Krea2LoraGrad
+    var g_gate: Krea2LoraGrad
+    var d_xm: Tensor
+    if c_off >= 0:
+        var b_q = _linear_bwd_dx(
+            d_q, saved.xm[], w.wq[], lora.wq, M, features, HEADS * HEADDIM, ctx,
+            _i8w(w,0), _i8s(w, 0), c_off, c_len,
+        )
+        var b_k = _linear_bwd_dx(
+            d_k, saved.xm[], w.wk[], lora.wk, M, features, KVHEADS * HEADDIM, ctx,
+            _i8w(w,1), _i8s(w, 1), c_off, c_len,
+        )
+        var b_v = _linear_bwd_dx(
+            d_v_flat, saved.xm[], w.wv[], lora.wv, M, features, KVHEADS * HEADDIM,
+            ctx, _i8w(w,2), _i8s(w, 2), c_off, c_len,
+        )
+        var b_g = _linear_bwd_dx(
+            d_gate_pre, saved.xm[], w.gate_w[], lora.gate_w, M, features, features,
+            ctx, _i8w(w,3), _i8s(w, 3), c_off, c_len,
+        )
+        g_wq = b_q.lora.copy()
+        g_wk = b_k.lora.copy()
+        g_wv = b_v.lora.copy()
+        g_gate = b_g.lora.copy()
+        d_xm = add(add(b_q.d_x, b_k.d_x, ctx), add(b_v.d_x, b_g.d_x, ctx), ctx)
+    else:
+        var bw_qkvg = _linear_bwd_dx_group4(
+            d_q, d_k, d_v_flat, d_gate_pre, saved.xm[],
+            w.wq[], lora.wq, HEADS * HEADDIM,
+            w.wk[], lora.wk, KVHEADS * HEADDIM,
+            w.wv[], lora.wv, KVHEADS * HEADDIM,
+            w.gate_w[], lora.gate_w, features,
+            M, features, ctx,
+            _i8w(w,0), _i8s(w, 0), _i8w(w,1), _i8s(w, 1),
+            _i8w(w,2), _i8s(w, 2), _i8w(w,3), _i8s(w, 3),
+        )
+        g_wq = bw_qkvg.g0.copy()
+        g_wk = bw_qkvg.g1.copy()
+        g_wv = bw_qkvg.g2.copy()
+        g_gate = bw_qkvg.g3.copy()
+        d_xm = bw_qkvg.d_x.clone(ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "d_xm", d_xm, False, L, (real_len.value() if real_len else L), ctx)
 
     # xm = modulate(xn, prescale, preshift) → d_xn (drop param grads).
-    var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
+    var mb1_dx: Tensor
+    if seg_mod:
+        var sm1 = _modulate_backward_seg2(
+            reshape(cast_tensor(d_xm, saved.xn[].dtype(), ctx),
+                    [1, L, features], ctx),
+            saved.xn[],
+            cast_tensor(prescale[], saved.xn[].dtype(), ctx),
+            cast_tensor(mods_c[0][], saved.xn[].dtype(), ctx),
+            split, rl_rows, ctx,
+        )
+        mb1_dx = sm1.d_x.clone(ctx)
+        dv_t.append(TArc(sm1.d_scale_t.clone(ctx)))
+        dv_t.append(TArc(sm1.d_shift_t.clone(ctx)))
+        dv_c.append(TArc(sm1.d_scale_c.clone(ctx)))
+        dv_c.append(TArc(sm1.d_shift_c.clone(ctx)))
+    else:
+        var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
+        mb1_dx = mb1.d_x.clone(ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
-            _opdbg("b1", dbg_block, "mb1.d_x", mb1.d_x, False, L, (real_len.value() if real_len else L), ctx)
+            _opdbg("b1", dbg_block, "mb1.d_x", mb1_dx, False, L, (real_len.value() if real_len else L), ctx)
     # xn = prenorm(x) (weight=prenorm+1, FROZEN) → d_x via rms_norm_backward. Same
     # mixed-precision mirror: saved.x is the bf16 block input, prenorm scale is F32
     # → cast (scale+1) down to the act dtype for the all-bf16 path (matches fwd).
-    var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)
+    var rb1_dx = krea2_rmsnorm_backward_dx(mb1_dx, saved.x[], w.prenorm_scale[], eps, ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "rb1_dx", rb1_dx, False, L, (real_len.value() if real_len else L), ctx)
 
     # x feeds: residual (grg1.d_x), prenorm(x) (rb1.d_x). SUM.
-    var d_x = add(grg1.d_x, rb1_dx, ctx)
+    var d_x = add(grg1_dx, rb1_dx, ctx)
     comptime if KREA2_OPDBG:
         if dbg_block >= 0:
             _opdbg("b1", dbg_block, "d_x", d_x, False, L, (real_len.value() if real_len else L), ctx)
 
+    var dvt = Optional[TArc](None)
+    var dvc = Optional[TArc](None)
+    if seg_mod:
+        dvt = Optional[TArc](TArc(_pack_d_vec(dv_t, ctx)))
+        dvc = Optional[TArc](TArc(_pack_d_vec(dv_c, ctx)))
+
     return Krea2BlockGrads(
         TArc(d_x^),
         g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
+        dvt^, dvc^,
     )
 
 
@@ -2572,6 +2983,10 @@ def krea2_single_stream_block_lora_backward_dev[
     ctx: DeviceContext,
     real_len: Optional[Int] = Optional[Int](None),  # MUST match the forward call
         # (same contract as the host backward).
+    vec_cond: Optional[TArc] = Optional[TArc](None),  # OminiControl EDIT (C4) —
+    cond_off: Optional[Int] = Optional[Int](None),    # same three switches, same
+    cond_len: Optional[Int] = Optional[Int](None),    # contract, as the host
+        # backward above. Absent (the default) = the pre-C4 path, bit-for-bit.
 ) raises -> Krea2BlockGradsT:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -2585,40 +3000,126 @@ def krea2_single_stream_block_lora_backward_dev[
     var postscale = mods[3]
     var postgate = mods[5]
 
+    # ── OminiControl EDIT switches (C4); see the host backward for the contract.
+    var seg_mod = False
+    var split = 0
+    var mods_c = List[TArc]()
+    if vec_cond:
+        if cond_off:
+            split = cond_off.value()
+            if split > 0 and split < L:
+                mods_c = _mod6(vec_cond.value()[], w.mod_lin[], features, ctx)
+                seg_mod = True
+    var c_off = -1
+    var c_len = 0
+    if cond_off:
+        if cond_len:
+            var co = cond_off.value()
+            var cl = cond_len.value()
+            if co > 0 and cl > 0 and co + cl <= L:
+                c_off = co
+                c_len = cl
+    var rl_rows = real_len.value() if real_len else L
+    if rl_rows > L:
+        rl_rows = L
+    if seg_mod and rl_rows < split:
+        raise Error("krea2 block bwd (dev): real_len below the modulation split")
+    var dv_t = List[TArc]()
+    var dv_c = List[TArc]()
+
     # ── MLP branch backward ──────────────────────────────────────────────────
-    var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
-    var d_m = grg2.d_y.clone(ctx)
+    var grg2_dx: Tensor
+    var d_m: Tensor
+    if seg_mod:
+        var s2 = _gate_residual_backward_seg2(
+            d_out, saved.x1[], postgate[], mods_c[5][], saved.m[],
+            split, rl_rows, ctx,
+        )
+        grg2_dx = s2.d_x.clone(ctx)
+        d_m = s2.d_y.clone(ctx)
+        dv_t.append(TArc(s2.d_g_t.clone(ctx)))
+        dv_c.append(TArc(s2.d_g_c.clone(ctx)))
+    else:
+        var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
+        grg2_dx = grg2.d_x.clone(ctx)
+        d_m = grg2.d_y.clone(ctx)
 
     var bw_down = _linear_bwd_dx_dev(
         d_m, saved.sw[], w.mlp_down_w[], lora.mlp_down_w, M, mlpdim, features, ctx,
-        _i8w(w,7), _i8s(w, 7),
+        _i8w(w,7), _i8s(w, 7), c_off, c_len,
     )
     var d_sw = bw_down.d_x.clone(ctx)
     var g_down = bw_down.lora.copy()
 
     var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
-    var bw_mlp = _linear_bwd_dx_group2_dev(
-        sgb.d_gate, sgb.d_up, saved.xm2[],
-        w.mlp_gate_w[], lora.mlp_gate_w, mlpdim,
-        w.mlp_up_w[], lora.mlp_up_w, mlpdim,
-        M, features, ctx,
-        _i8w(w,5), _i8s(w, 5), _i8w(w,6), _i8s(w, 6),
-    )
-    var g_mg = bw_mlp.g0.copy()
-    var g_mu = bw_mlp.g1.copy()
-    var d_xm2 = bw_mlp.d_x.clone(ctx)
+    var g_mg: Krea2LoraGradT
+    var g_mu: Krea2LoraGradT
+    var d_xm2: Tensor
+    if c_off >= 0:
+        var b_mg = _linear_bwd_dx_dev(
+            sgb.d_gate, saved.xm2[], w.mlp_gate_w[], lora.mlp_gate_w,
+            M, features, mlpdim, ctx, _i8w(w,5), _i8s(w, 5), c_off, c_len,
+        )
+        var b_mu = _linear_bwd_dx_dev(
+            sgb.d_up, saved.xm2[], w.mlp_up_w[], lora.mlp_up_w,
+            M, features, mlpdim, ctx, _i8w(w,6), _i8s(w, 6), c_off, c_len,
+        )
+        g_mg = b_mg.lora.copy()
+        g_mu = b_mu.lora.copy()
+        d_xm2 = add(b_mg.d_x, b_mu.d_x, ctx)
+    else:
+        var bw_mlp = _linear_bwd_dx_group2_dev(
+            sgb.d_gate, sgb.d_up, saved.xm2[],
+            w.mlp_gate_w[], lora.mlp_gate_w, mlpdim,
+            w.mlp_up_w[], lora.mlp_up_w, mlpdim,
+            M, features, ctx,
+            _i8w(w,5), _i8s(w, 5), _i8w(w,6), _i8s(w, 6),
+        )
+        g_mg = bw_mlp.g0.copy()
+        g_mu = bw_mlp.g1.copy()
+        d_xm2 = bw_mlp.d_x.clone(ctx)
 
-    var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
-    var d_x1 = add(grg2.d_x, rb2_dx, ctx)
+    var mb2_dx: Tensor
+    if seg_mod:
+        var sm2 = _modulate_backward_seg2(
+            reshape(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx),
+                    [1, L, features], ctx),
+            saved.xn2[],
+            cast_tensor(postscale[], saved.xn2[].dtype(), ctx),
+            cast_tensor(mods_c[3][], saved.xn2[].dtype(), ctx),
+            split, rl_rows, ctx,
+        )
+        mb2_dx = sm2.d_x.clone(ctx)
+        dv_t.append(TArc(sm2.d_scale_t.clone(ctx)))
+        dv_t.append(TArc(sm2.d_shift_t.clone(ctx)))
+        dv_c.append(TArc(sm2.d_scale_c.clone(ctx)))
+        dv_c.append(TArc(sm2.d_shift_c.clone(ctx)))
+    else:
+        var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
+        mb2_dx = mb2.d_x.clone(ctx)
+    var rb2_dx = krea2_rmsnorm_backward_dx(mb2_dx, saved.x1[], w.postnorm_scale[], eps, ctx)
+    var d_x1 = add(grg2_dx, rb2_dx, ctx)
 
     # ── ATTENTION branch backward ────────────────────────────────────────────
-    var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
-    var d_a = grg1.d_y.clone(ctx)
+    var grg1_dx: Tensor
+    var d_a: Tensor
+    if seg_mod:
+        var s1 = _gate_residual_backward_seg2(
+            d_x1, saved.x[], pregate[], mods_c[2][], saved.a[],
+            split, rl_rows, ctx,
+        )
+        grg1_dx = s1.d_x.clone(ctx)
+        d_a = s1.d_y.clone(ctx)
+        dv_t.append(TArc(s1.d_g_t.clone(ctx)))
+        dv_c.append(TArc(s1.d_g_c.clone(ctx)))
+    else:
+        var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
+        grg1_dx = grg1.d_x.clone(ctx)
+        d_a = grg1.d_y.clone(ctx)
 
     var bw_wo = _linear_bwd_dx_dev(
         d_a, saved.gated[], w.wo[], lora.wo, M, features, features, ctx,
-        _i8w(w,4), _i8s(w, 4),
+        _i8w(w,4), _i8s(w, 4), c_off, c_len,
     )
     var d_gated = bw_wo.d_x.clone(ctx)
     var g_wo = bw_wo.lora.copy()
@@ -2667,31 +3168,82 @@ def krea2_single_stream_block_lora_backward_dev[
     var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
     var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
 
-    var bw_qkvg = _linear_bwd_dx_group4_dev(
-        d_q, d_k, d_v_flat, d_gate_pre, saved.xm[],
-        w.wq[], lora.wq, HEADS * HEADDIM,
-        w.wk[], lora.wk, KVHEADS * HEADDIM,
-        w.wv[], lora.wv, KVHEADS * HEADDIM,
-        w.gate_w[], lora.gate_w, features,
-        M, features, ctx,
-        _i8w(w,0), _i8s(w, 0), _i8w(w,1), _i8s(w, 1),
-        _i8w(w,2), _i8s(w, 2), _i8w(w,3), _i8s(w, 3),
-    )
-    var g_wq = bw_qkvg.g0.copy()
-    var g_wk = bw_qkvg.g1.copy()
-    var g_wv = bw_qkvg.g2.copy()
-    var g_gate = bw_qkvg.g3.copy()
+    var g_wq: Krea2LoraGradT
+    var g_wk: Krea2LoraGradT
+    var g_wv: Krea2LoraGradT
+    var g_gate: Krea2LoraGradT
+    var d_xm: Tensor
+    if c_off >= 0:
+        var b_q = _linear_bwd_dx_dev(
+            d_q, saved.xm[], w.wq[], lora.wq, M, features, HEADS * HEADDIM, ctx,
+            _i8w(w,0), _i8s(w, 0), c_off, c_len,
+        )
+        var b_k = _linear_bwd_dx_dev(
+            d_k, saved.xm[], w.wk[], lora.wk, M, features, KVHEADS * HEADDIM, ctx,
+            _i8w(w,1), _i8s(w, 1), c_off, c_len,
+        )
+        var b_v = _linear_bwd_dx_dev(
+            d_v_flat, saved.xm[], w.wv[], lora.wv, M, features, KVHEADS * HEADDIM,
+            ctx, _i8w(w,2), _i8s(w, 2), c_off, c_len,
+        )
+        var b_g = _linear_bwd_dx_dev(
+            d_gate_pre, saved.xm[], w.gate_w[], lora.gate_w, M, features, features,
+            ctx, _i8w(w,3), _i8s(w, 3), c_off, c_len,
+        )
+        g_wq = b_q.lora.copy()
+        g_wk = b_k.lora.copy()
+        g_wv = b_v.lora.copy()
+        g_gate = b_g.lora.copy()
+        d_xm = add(add(b_q.d_x, b_k.d_x, ctx), add(b_v.d_x, b_g.d_x, ctx), ctx)
+    else:
+        var bw_qkvg = _linear_bwd_dx_group4_dev(
+            d_q, d_k, d_v_flat, d_gate_pre, saved.xm[],
+            w.wq[], lora.wq, HEADS * HEADDIM,
+            w.wk[], lora.wk, KVHEADS * HEADDIM,
+            w.wv[], lora.wv, KVHEADS * HEADDIM,
+            w.gate_w[], lora.gate_w, features,
+            M, features, ctx,
+            _i8w(w,0), _i8s(w, 0), _i8w(w,1), _i8s(w, 1),
+            _i8w(w,2), _i8s(w, 2), _i8w(w,3), _i8s(w, 3),
+        )
+        g_wq = bw_qkvg.g0.copy()
+        g_wk = bw_qkvg.g1.copy()
+        g_wv = bw_qkvg.g2.copy()
+        g_gate = bw_qkvg.g3.copy()
+        d_xm = bw_qkvg.d_x.clone(ctx)
 
-    var d_xm = bw_qkvg.d_x.clone(ctx)
+    var mb1_dx: Tensor
+    if seg_mod:
+        var sm1 = _modulate_backward_seg2(
+            reshape(cast_tensor(d_xm, saved.xn[].dtype(), ctx),
+                    [1, L, features], ctx),
+            saved.xn[],
+            cast_tensor(prescale[], saved.xn[].dtype(), ctx),
+            cast_tensor(mods_c[0][], saved.xn[].dtype(), ctx),
+            split, rl_rows, ctx,
+        )
+        mb1_dx = sm1.d_x.clone(ctx)
+        dv_t.append(TArc(sm1.d_scale_t.clone(ctx)))
+        dv_t.append(TArc(sm1.d_shift_t.clone(ctx)))
+        dv_c.append(TArc(sm1.d_scale_c.clone(ctx)))
+        dv_c.append(TArc(sm1.d_shift_c.clone(ctx)))
+    else:
+        var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
+        mb1_dx = mb1.d_x.clone(ctx)
+    var rb1_dx = krea2_rmsnorm_backward_dx(mb1_dx, saved.x[], w.prenorm_scale[], eps, ctx)
 
-    var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)
+    var d_x = add(grg1_dx, rb1_dx, ctx)
 
-    var d_x = add(grg1.d_x, rb1_dx, ctx)
+    var dvt = Optional[TArc](None)
+    var dvc = Optional[TArc](None)
+    if seg_mod:
+        dvt = Optional[TArc](TArc(_pack_d_vec(dv_t, ctx)))
+        dvc = Optional[TArc](TArc(_pack_d_vec(dv_c, ctx)))
 
     return Krea2BlockGradsT(
         TArc(d_x^),
         g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
+        dvt^, dvc^,
     )
 
 

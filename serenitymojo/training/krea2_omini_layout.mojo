@@ -83,20 +83,42 @@
 #       the add becomes a scatter-add into rows [cond_off, cond_off+s_cond) of
 #       the base output. M (LoRA row count, :569) becomes s_cond, not L.
 #
-# C) BLOCK BACKWARD — krea2_block.mojo
-#    `krea2_single_stream_block_lora_backward` (def :1635, `_mod6` recompute at
-#    :1661) and the device path `krea2_single_stream_block_lora_backward_dev`
-#    (def :2353, `_mod6` at :2372):
-#    1. dX through frozen base stays full-sequence via `_base_dx` (def :222)
-#       inside `_linear_bwd_dx` (:956, site :965), `_linear_bwd_dx_dev` (:992,
-#       site :1001), and the grouped variants `_linear_bwd_dx_group2/4[_dev]`
-#       (:1077/:1148/:1260/:1325; `_base_dx` sites :1110-1111, :1202-1205,
-#       :1293-1294, :1379-1382).
-#    2. dA/dB are computed from the COND-ROW SLICES of (d_y, xm) only —
-#       same slice bounds as B.2; Krea2LoraGrad/Krea2BlockGrads structs reused.
-#    3. d_mod accumulates per segment: grads of mods(t) chunks gather over rows
-#       [0, cond_off), grads of mods(0) chunks over [cond_off, pad_off) —
-#       mirrored at every modulate/residual_gate backward in both paths.
+# C) BLOCK BACKWARD — krea2_block.mojo — LANDED IN C4.
+#    `krea2_single_stream_block_lora_backward` and the device path
+#    `krea2_single_stream_block_lora_backward_dev` both took the same three
+#    optional switches the C2/C3 forward has (vec_cond / cond_off / cond_len),
+#    with all three absent leaving the pre-C4 kernels and arguments untouched.
+#    Gated by parity/krea2_omini_c4_bwd_gate.mojo (PASS on block00 + block27).
+#    1. dX through the frozen base stays FULL-SEQUENCE via `_base_dx` inside
+#       `_linear_bwd_dx` / `_linear_bwd_dx_dev` — as planned, unchanged.
+#    2. dA/dB come from the COND-ROW SLICES of (d_y, x) only: those two helpers
+#       gained c_off/c_len and slice both inputs before the LoRA backward, then
+#       scatter-add the LoRA d_x contribution back with `_add_delta_rows` (now
+#       rank-aware, since the backward's linear_backward_dx returns [L, C]).
+#       The routed path calls them ungrouped (4x / 2x) instead of the batched
+#       `_linear_bwd_dx_group4/2` — grouping is a launch-count optimization
+#       whose shared down-projection GEMM would have to be re-derived for the
+#       c_len-row window; that is left for a speed chunk.
+#    3. d_mod accumulates per segment: `_modulate_backward_seg2` /
+#       `_gate_residual_backward_seg2` run the SAME kernels once per span and
+#       return the chunk grads separately; `_pack_d_vec` packs each set into
+#       Krea2BlockGrads.d_vec_t (rows [0, cond_off)) and .d_vec_cond (rows
+#       [cond_off, REAL_LEN)) — the two temb chains.
+#    4. ⚠ THE PAD TAIL IS EXCLUDED FROM (3), and that was decided WITH EVIDENCE,
+#       not by the "don't-care" note at the top of this file. Under per-segment
+#       modulation the pad tail rides the t=0 span, so the naive [cond_off, L)
+#       reduction would fold pad-row gradient into the CONDITION temb chain.
+#       Measured on the CUDA fixture: pad-row gradient leaves d_x[0:real_len],
+#       d_vec_t and all 16 dA/dB BIT-EQUAL (pad KEY columns get exp(-inf)=0
+#       exactly, so their dK/dV are exactly zero) while moving d_vec_cond to
+#       cos = 0.679 at block 0 / 0.994 at block 27. The reduction therefore
+#       stops at real_len; pad rows still get their d_x (same chunks, param
+#       grads off), so the returned d_x is complete.
+#    5. NOT COVERED: the BATCH-2 backwards. The b2 FORWARD has no EDIT switches
+#       at all and its [2, features] per-sample modulation would need a 4-way
+#       (sample x segment) split that ops/elementwise `modulate` does not
+#       express, so b2 + EDIT is not a reachable configuration. Building it
+#       starts with the b2 forward.
 #
 # D) CACHE READER — serenitymojo/models/krea2/krea2_cache_reader.mojo
 #    `krea2_build_pos` (:84-100) grows a cond grid section built from

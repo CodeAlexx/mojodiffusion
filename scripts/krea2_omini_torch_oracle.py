@@ -310,13 +310,44 @@
 #   there is one and only one F32 reference and both envelopes are measured
 #   against it. Same device, same weights, same inputs.
 #
-#     kref_<key>_f32mod    [same shape/dtype as kref_<key>]  9 keys:
-#       xm attn_raw gated attn out out_img  (LoRA-ON)
-#       attn_raw_nolora out_nolora out_nolora_img  (LoRA-OFF)
-#     env_cos_<key>_f32mod [1] f32   one per key above
-#   x1 / xm2 / swiglu / ff and every BACKWARD key are NOT dumped under schedule
-#   B — no gate targets them today. C4 must add them before it gates a backward
-#   seam, or state plainly which schedule it is using.
+#     kref_<key>_f32mod    [same shape/dtype as kref_<key>]
+#       FORWARD (13): xm attn_raw gated attn x1 xm2 swiglu ff out out_img
+#                     (LoRA-ON) + attn_raw_nolora out_nolora out_nolora_img
+#       BACKWARD (19, added by C4): d_x, d_blk_vec_t, d_blk_vec_cond and the 8
+#                     <slot>_dA / <slot>_dB pairs.
+#     env_cos_<key>_f32mod [1] f32   one per key above — no key is
+#       schedule-A-only any more, and no gate has to borrow another key's number.
+#
+#   ── C4 BACKWARD SPECIFICS (read before gating a gradient) ────────────────
+#   (a) UPSTREAM GRADIENT. Every schedule-B backward key is produced with
+#       kin_d_out_pz = kin_d_out with rows [real_len:] ZEROED, not kin_d_out.
+#       WHY: under per-segment modulation the TXT_pad tail rides the t=0 span
+#       (mmdit.py:509-517), so a nonzero pad-row d_out injects pad-row gradient
+#       straight into d_blk_vec_cond — the condition temb chain. That reference
+#       would be un-matchable AND undesirable: the Mojo production SDPA is the
+#       cuDNN flash TAIL-padmask kernel, which masks only KEY columns, so its
+#       pad QUERY rows carry masked-out garbage BY DESIGN (krea2_block.mojo:
+#       844-850); and the trainer's loss reads the IMG rows only, so the real
+#       pad-row d_out is zero anyway. The SCHEDULE-A backward keys are UNCHANGED
+#       (still the full d_out) and the difference is shipped MEASURED:
+#         env_cos_<key>_padcontrib      cos(schedule-B full-d_out grad,
+#                                           schedule-B pad-zeroed grad)
+#         env_bit_<key>_padzero_equal   1.0 iff the two are BIT-equal
+#       On this fixture d_x[prefix] and all 16 dA/dB are BIT-EQUAL between the
+#       two (pad rows never reach the real rows: pad KEY columns get exp(-inf)=0
+#       exactly, so dK/dV on pad rows are exactly zero) while d_blk_vec_cond is
+#       NOT — i.e. the pad tail's ONLY effect is contaminating the t=0 chunk
+#       grads. See the run log for this block's numbers.
+#   (b) THE F32 SIDE. kref_<key>_f32env_pz is the F32-STORAGE backward driven by
+#       the SAME pad-zeroed gradient — the F32 reference for the early blocks,
+#       where the t=0 modulation makes the bf16 backward fragile (see NUMERICS).
+#   (c) THE UNPADDED FORMULATION. env_cos_<key>_f32unpad = cos(F32 backward on
+#       the REAL PREFIX ONLY — rows [0,real_len), no pad tail, no mask — vs the
+#       padded+masked F32 backward). That is the shape the Mojo F32 gate path
+#       runs (krea2_block.mojo: real_len == L -> sdpa_nomask, "the F32 parity
+#       gate guard"), so this number is the FORMULATION-ONLY component of any
+#       residual such a gate reports. It is INFORMATIONAL: it does not bound
+#       cross-library F32 GEMM/reduction differences, so it is not a threshold.
 #   META (int32/float32 scalars; strings live in safetensors __metadata__)
 #     meta_ltmax meta_s_img meta_s_cond meta_lt meta_lfull meta_real_len
 #     meta_cond_off meta_pad_off meta_block_index meta_rank meta_features
@@ -368,8 +399,9 @@
 #   C3 (cond-row LoRA routing in the forward) then gates, in order:
 #     kref_gated -> kref_attn -> kref_out -> kref_out_img, each against its OWN
 #     env_cos_<key>, and re-runs the C2 keys plus the CONDLEN=0 bit-equality.
-#   C4 adds the backward keys (kref_d_x*, kref_<slot>_dA/dB,
-#   kref_d_blk_vec_{t,cond} — the last pair gates per-segment d_mod).
+#   C4 gates, in order: kref_d_x -> the 8 dA/dB pairs -> kref_d_blk_vec_t and
+#   kref_d_blk_vec_cond (the pair that gates per-segment d_mod), each against
+#   its OWN env_cos_<key>_f32mod, with kin_d_out_pz as the upstream gradient.
 #
 # RUN (never chain after a mojo build with &&)
 #   cd /home/alex/mojodiffusion
@@ -1003,60 +1035,198 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
     #       keys "failed" at block 27 by 1e-7..9e-7 purely from that mismatch.
     #       See "TWO REFERENCE SCHEDULES" in the header.
     global F32_MOD
+
+    # ── the PAD-ZEROED upstream gradient (C4) ───────────────────────────────
+    # kin_d_out is random on EVERY row, pad tail included. That is harmless for
+    # the forward (nothing reads it) and it was harmless for the schedule-A
+    # backward keys, which no gate targets. It is NOT harmless for the C4
+    # per-segment d_mod: the pad tail sits in the t=0 span (mmdit.py:509-517),
+    # so a nonzero pad d_out injects pad-row gradient DIRECTLY into
+    # d_blk_vec_cond — the condition temb chain. Two facts make that reference
+    # ungateable and unwanted:
+    #   * the Mojo production SDPA is the cuDNN flash TAIL-padmask kernel, which
+    #     masks only KEY columns; its pad QUERY rows carry masked-out garbage by
+    #     design (krea2_block.mojo:844-850). Their d_mod contribution is
+    #     meaningless, not merely different.
+    #   * the trainer's loss reads the IMG rows only, so the real d_out is zero
+    #     on the pad tail anyway.
+    # Every SCHEDULE-B backward reference below is therefore produced with
+    # d_out_pz (= kin_d_out with rows [real_len:] zeroed, shipped as
+    # kin_d_out_pz). The pad-row contribution is not hidden: run 1 below repeats
+    # the SAME schedule-B backward with the FULL d_out and the fixture ships the
+    # measured difference as env_cos_*_padcontrib / env_bit_*_padzero_equal.
+    d_out_pz = d_out.clone()
+    d_out_pz[:, REAL_LEN:] = 0
+
+    def _grad_run(Wd, dtype_, dvec, unpad=False, keep_seams=False):
+        """One full fwd+bwd of THIS block under the CURRENT F32_MOD schedule.
+
+        Wd/dtype_  : the weight dict and the storage dtype (bf16 or F32).
+        dvec       : the upstream gradient, [1, LFULL, F] (sliced when unpad).
+        unpad=True : run on the REAL PREFIX only — rows [0, real_len), no pad
+                     tail and no mask. Mathematically identical on the real rows
+                     to the padded+masked run (masked keys contribute exp(-inf)=0
+                     exactly), and it is the shape the Mojo F32 gate path uses
+                     (krea2_block.mojo: real_len == L -> sdpa_nomask, the F32
+                     parity gate guard). Its distance from the padded F32 run is
+                     shipped as env_cos_*_f32unpad so the Mojo F32 gate can tell
+                     the FORMULATION component apart from its own residual.
+        Returns (grads dict of F32 CPU-ready device tensors, seams or None).
+        """
+        if unpad:
+            xin = x_full.detach()[:, :REAL_LEN].contiguous().to(dtype_)
+            cos_u, sin_u = cos[:REAL_LEN], sin[:REAL_LEN]
+            km = torch.ones(REAL_LEN, dtype=torch.bool, device=device)
+            go = dvec[:, :REAL_LEN].contiguous()
+        else:
+            xin = x_full.detach().to(dtype_)
+            cos_u, sin_u, km = cos, sin, keymask
+            go = dvec
+        xin = xin.requires_grad_(True)
+        bt = blk_vec_t.detach().to(dtype_).requires_grad_(True)
+        bc = blk_vec_cond.detach().to(dtype_).requires_grad_(True)
+        ll = {}
+        for s in SLOTS:
+            ll[s] = (lora_params[s][0].detach().to(dtype_).requires_grad_(True),
+                     lora_params[s][1].detach().to(dtype_).requires_grad_(True))
+        o, sm = omini_block_forward(xin, bt, bc, Wd, P, ll, cos_u, sin_u,
+                                    km, km, COND_OFF, S_COND)
+        (o.float() * go.float()).sum().backward()
+        g = {
+            "d_x": xin.grad.detach().float().clone(),
+            "d_blk_vec_t": bt.grad.detach().float().clone(),
+            "d_blk_vec_cond": bc.grad.detach().float().clone(),
+        }
+        for s in SLOTS:
+            g[s + "_dA"] = ll[s][0].grad.detach().float().clone()
+            g[s + "_dB"] = ll[s][1].grad.detach().float().clone()
+        sv = None
+        if keep_seams:
+            sv = {
+                "xm": sm["xm"].detach(),
+                "attn_raw": sm["attn_raw"].detach(),
+                "gated": sm["lora_in"]["wo"].detach(),
+                "attn": sm["attn"].detach(),
+                "x1": sm["x1"].detach(),
+                "xm2": sm["xm2"].detach(),
+                "swiglu": sm["lora_in"]["mlp_down"].detach(),
+                "ff": sm["ff"].detach(),
+                "out": o.detach(),
+                "out_img": o.detach()[:, LT:COND_OFF].contiguous(),
+            }
+        del o, sm, xin, bt, bc, ll
+        torch.cuda.empty_cache()
+        return g, sv
+
     modr = {}
     mrk = {}          # kref_<key>_f32mod, kept on device for the envelope below
     try:
         F32_MOD = True
+        # run 1 — schedule B, bf16, the FULL (pad-nonzero) d_out. Kept ONLY as
+        # the pad-row evidence: everything gated comes from run 2.
+        gB_full, _ = _grad_run(W, dt, d_out)
+        # run 2 — schedule B, bf16, the PAD-ZEROED d_out: the GATED reference
+        # set (forward seams + every backward key).
+        gB_pz, mrk = _grad_run(W, dt, d_out_pz, keep_seams=True)
         with torch.no_grad():
-            o_mr, s_mr = omini_block_forward(
-                x_full.detach(), blk_vec_t.detach(), blk_vec_cond.detach(),
-                W, P, lora, cos, sin, keymask, rowmask, COND_OFF, S_COND)
             o_mr_off, s_mr_off = omini_block_forward(
                 x_full.detach(), blk_vec_t.detach(), blk_vec_cond.detach(),
                 W, P, off, cos, sin, keymask, rowmask, COND_OFF, S_COND)
     finally:
         F32_MOD = False
-    for nm, ka, kb in (
-        ("xm", s_mr["xm"], seams["xm"]),
-        ("attn_raw", s_mr["attn_raw"], seams["attn_raw"]),
-        ("gated", s_mr["lora_in"]["wo"], seams["lora_in"]["wo"]),
-        ("attn", s_mr["attn"], seams["attn"]),
-        ("x1", s_mr["x1"], seams["x1"]),
-        ("xm2", s_mr["xm2"], seams["xm2"]),
-        ("swiglu", s_mr["lora_in"]["mlp_down"], seams["lora_in"]["mlp_down"]),
-        ("ff", s_mr["ff"], seams["ff"]),
-        ("out", o_mr, out),
-        ("out_img", o_mr[:, LT:COND_OFF], out[:, LT:COND_OFF]),
-        ("attn_raw_nolora", s_mr_off["attn_raw"], seams_off["attn_raw"]),
-        ("out_nolora", o_mr_off, out_off),
-        ("out_nolora_img", o_mr_off[:, LT:COND_OFF], out_off[:, LT:COND_OFF]),
-    ):
-        modr[nm] = cos_sim(ka, kb)
-    # Retain ONLY the nine gated seams; everything else in these two forwards is
-    # dropped so the F32 envelope run below sees the same VRAM headroom as before.
-    mrk["xm"] = s_mr["xm"]
-    mrk["attn_raw"] = s_mr["attn_raw"]
-    mrk["gated"] = s_mr["lora_in"]["wo"]
-    mrk["attn"] = s_mr["attn"]
-    mrk["out"] = o_mr
-    mrk["out_img"] = o_mr[:, LT:COND_OFF].contiguous()
     mrk["attn_raw_nolora"] = s_mr_off["attn_raw"]
     mrk["out_nolora"] = o_mr_off
     mrk["out_nolora_img"] = o_mr_off[:, LT:COND_OFF].contiguous()
-    del o_mr, s_mr, o_mr_off, s_mr_off
+    for nm, ka, kb in (
+        ("xm", mrk["xm"], seams["xm"]),
+        ("attn_raw", mrk["attn_raw"], seams["attn_raw"]),
+        ("gated", mrk["gated"], seams["lora_in"]["wo"]),
+        ("attn", mrk["attn"], seams["attn"]),
+        ("x1", mrk["x1"], seams["x1"]),
+        ("xm2", mrk["xm2"], seams["xm2"]),
+        ("swiglu", mrk["swiglu"], seams["lora_in"]["mlp_down"]),
+        ("ff", mrk["ff"], seams["ff"]),
+        ("out", mrk["out"], out),
+        ("out_img", mrk["out_img"], out[:, LT:COND_OFF]),
+        ("attn_raw_nolora", mrk["attn_raw_nolora"], seams_off["attn_raw"]),
+        ("out_nolora", mrk["out_nolora"], out_off),
+        ("out_nolora_img", mrk["out_nolora_img"], out_off[:, LT:COND_OFF]),
+    ):
+        modr[nm] = cos_sim(ka, kb)
+    # BACKWARD modround (schedule B vs schedule A) — both sides use the FULL
+    # d_out here, so this isolates the ROUNDING SCHEDULE exactly as the forward
+    # modround numbers do. Informational; never a threshold.
+    BWD_KEYS = ["d_x", "d_blk_vec_t", "d_blk_vec_cond"]
+    for s in SLOTS:
+        BWD_KEYS += [s + "_dA", s + "_dB"]
+    sched_a_g = {
+        "d_x": x_full.grad, "d_blk_vec_t": blk_vec_t.grad,
+        "d_blk_vec_cond": blk_vec_cond.grad,
+    }
+    for s in SLOTS:
+        sched_a_g[s + "_dA"] = lora_params[s][0].grad
+        sched_a_g[s + "_dB"] = lora_params[s][1].grad
+    for k in BWD_KEYS:
+        modr[k] = cos_sim(gB_full[k], sched_a_g[k])
+    del o_mr_off, s_mr_off
     torch.cuda.empty_cache()
     print("  [modround] cos(bf16 with F32-math modulate, bf16 baseline) — the")
     print("             residual a correct implementation may carry purely from")
     print("             choosing a different modulate rounding point:")
     for k in sorted(modr, key=lambda z: modr[z]):
         print(f"      {k:22s} {modr[k]:.9f}   1-cos = {1.0 - modr[k]:.3e}")
-    print(f"  [schedule B] retained {len(mrk)} kref_*_f32mod reference seams "
-          f"(the GATED set): {', '.join(sorted(mrk))}")
+    print(f"  [schedule B] retained {len(mrk)} kref_*_f32mod forward seams + "
+          f"{len(BWD_KEYS)} backward keys")
+
+    # ── PAD-ROW EVIDENCE (C4 decision, measured — not argued) ───────────────
+    # Same schedule, same weights, same inputs, same seed; the ONLY difference
+    # is whether the FICTITIOUS pad-tail d_out is zeroed.
+    padev = {}
+    for k in BWD_KEYS:
+        padev[k] = cos_sim(gB_full[k], gB_pz[k])
+    padev["d_x_prefix"] = cos_sim(gB_full["d_x"][:, :REAL_LEN],
+                                  gB_pz["d_x"][:, :REAL_LEN])
+    bit = {}
+    bit["d_x_prefix"] = float(torch.equal(gB_full["d_x"][:, :REAL_LEN],
+                                          gB_pz["d_x"][:, :REAL_LEN]))
+    bit["d_blk_vec_t"] = float(torch.equal(gB_full["d_blk_vec_t"],
+                                           gB_pz["d_blk_vec_t"]))
+    for s in SLOTS:
+        bit[s + "_dA"] = float(torch.equal(gB_full[s + "_dA"], gB_pz[s + "_dA"]))
+        bit[s + "_dB"] = float(torch.equal(gB_full[s + "_dB"], gB_pz[s + "_dB"]))
+    print("  [pad-row evidence] FULL-d_out vs PAD-ZEROED d_out, schedule B bf16:")
+    print(f"      d_x [prefix 0:real_len]      cos={padev['d_x_prefix']:.9f}  "
+          f"bit_equal={bool(bit['d_x_prefix'])}")
+    print(f"      d_blk_vec_t                  cos={padev['d_blk_vec_t']:.9f}  "
+          f"bit_equal={bool(bit['d_blk_vec_t'])}")
+    print(f"      d_blk_vec_cond               cos={padev['d_blk_vec_cond']:.9f}"
+          f"   <-- the t=0 chain: this is the pad-row contamination")
+    nbit = sum(int(bit[s + "_dA"]) + int(bit[s + "_dB"]) for s in SLOTS)
+    print(f"      LoRA dA/dB                   {nbit}/16 slots BIT-EQUAL")
+    print(f"      d_x [FULL, pad rows too]     cos={padev['d_x']:.9f}")
+    # The pad-INCLUDED twin of the two gated d_mod keys. It exists so a gate can
+    # DISCRIMINATE without a threshold: a per-segment backward that correctly
+    # stops its chunk reduction at real_len must sit closer to kref_d_blk_vec_*
+    # _f32mod than to these, and one that runs the reduction to L must not. Both
+    # sides are shipped, so the test is "which reference is closer", with no
+    # number to invent and no sensitivity to run-to-run nondeterminism.
+    padincl = {
+        "d_blk_vec_t": gB_full["d_blk_vec_t"],
+        "d_blk_vec_cond": gB_full["d_blk_vec_cond"],
+    }
+    del gB_full
+    torch.cuda.empty_cache()
 
     # ── assemble fixture ─────────────────────────────────────────────────────
     out_t = {}
     for _k, _v in modr.items():           # shipped even with SKIP_F32ENV
         out_t["env_cos_" + _k + "_modround"] = torch.tensor(
+            [_v], dtype=torch.float32)
+    for _k, _v in padev.items():          # C4 pad-row evidence
+        out_t["env_cos_" + _k + "_padcontrib"] = torch.tensor(
+            [_v], dtype=torch.float32)
+    for _k, _v in bit.items():
+        out_t["env_bit_" + _k + "_padzero_equal"] = torch.tensor(
             [_v], dtype=torch.float32)
 
     def put(k, v):
@@ -1087,6 +1257,8 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         put(f"kin_lo_{s}_A", lora_params[s][0])
         put(f"kin_lo_{s}_B", lora_params[s][1])
     put("kin_d_out", d_out)
+    put("kin_d_out_pz", d_out_pz)     # C4: rows [real_len:] zeroed — the d_out
+                                      # EVERY schedule-B backward key uses
 
     put("kref_xm", seams["xm"])
     put("kref_attn_raw", seams["attn_raw"])
@@ -1116,6 +1288,16 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
     # F32-storage run the schedule-A envelopes use.
     for _k in sorted(mrk):
         put("kref_" + _k + "_f32mod", mrk[_k])
+    # ── SCHEDULE B BACKWARD references (C4) — the GATED backward set.
+    # Same schedule-B kernels as the forward seams above, same real weights,
+    # same real cached inputs, same seed, same CUDA device; upstream gradient =
+    # kin_d_out_pz (see the PAD-ZEROED d_out note above). Thresholds are
+    # env_cos_<key>_f32mod, measured below against the F32-storage run driven by
+    # the SAME pad-zeroed gradient.
+    for _k in BWD_KEYS:
+        put("kref_" + _k + "_f32mod", gB_pz[_k])
+    for _k in padincl:      # the pad-INCLUDED twins (discrimination reference)
+        put("kref_" + _k + "_padincl_f32mod", padincl[_k])
 
     put("kref_d_x", x_full.grad.float())
     put("kref_d_blk_vec_t", blk_vec_t.grad.float())
@@ -1238,6 +1420,34 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         del o_off32, s_off32
         torch.cuda.empty_cache()
 
+        # ── C4: the F32-storage BACKWARD driven by the PAD-ZEROED d_out ─────
+        # This is the F32 side of every schedule-B backward key. With F32
+        # storage the two rounding schedules are the identical sequence of F32
+        # ops, so this single run is the F32 reference for BOTH schedules — the
+        # same argument the forward envelopes rest on. Same device, same real
+        # weights (already .float() above), same real cached inputs.
+        g32_pz, _ = _grad_run(W, torch.float32, d_out_pz)
+        for k in BWD_KEYS:
+            put("kref_" + k + "_f32env_pz", g32_pz[k])
+            env[k + "_f32mod"] = cos_sim(gB_pz[k], g32_pz[k])
+        env["d_x_prefix_f32mod"] = cos_sim(gB_pz["d_x"][:, :REAL_LEN],
+                                           g32_pz["d_x"][:, :REAL_LEN])
+        # ── C4: the F32-storage backward on the UNPADDED REAL PREFIX ────────
+        # Rows [0, real_len) only, no pad tail, no mask — the shape the Mojo F32
+        # gate path runs (real_len == L -> sdpa_nomask). Its distance from the
+        # padded+masked F32 run above is the FORMULATION-ONLY component of any
+        # residual the Mojo F32 gate reports, so the gate can separate "my
+        # sequence has no pad tail" from "my implementation differs".
+        g32_up, _ = _grad_run(W, torch.float32, d_out_pz, unpad=True)
+        env["d_x_f32unpad"] = cos_sim(g32_up["d_x"],
+                                      g32_pz["d_x"][:, :REAL_LEN])
+        for k in BWD_KEYS:
+            if k == "d_x":
+                continue
+            env[k + "_f32unpad"] = cos_sim(g32_up[k], g32_pz[k])
+        del g32_up
+        torch.cuda.empty_cache()
+
         for k, v in env.items():
             out_t["env_cos_" + k] = torch.tensor([v], dtype=torch.float32)
         print("  [envelope] bf16-vs-f32 cosine per key "
@@ -1254,6 +1464,20 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
             print(f"      {k:22s} {1.0 - env[k]:22.4e} "
                   f"{1.0 - env[k + '_f32mod']:18.4e} "
                   f"{1.0 - modr[k]:20.4e}")
+        print("  [C4 backward envelopes] the numbers the C4 gate uses. env(B) is")
+        print("             cos(schedule-B bf16, F32) — the bf16 ceiling; f32unpad")
+        print("             is cos(F32 unpadded prefix, F32 padded+masked) — the")
+        print("             FORMULATION-only component for the Mojo F32 path:")
+        print(f"      {'key':22s} {'1-env(B,f32mod)':>18s} "
+              f"{'1-env(f32unpad)':>18s} {'1-padcontrib':>14s}")
+        for k in BWD_KEYS:
+            uk = k + "_f32unpad"
+            print(f"      {k:22s} {1.0 - env[k + '_f32mod']:18.4e} "
+                  f"{(1.0 - env[uk]) if uk in env else float('nan'):18.4e} "
+                  f"{1.0 - padev[k]:14.4e}")
+        print(f"      {'d_x [prefix]':22s} {1.0 - env['d_x_prefix_f32mod']:18.4e} "
+              f"{1.0 - env['d_x_f32unpad']:18.4e} "
+              f"{1.0 - padev['d_x_prefix']:14.4e}")
         print(f"  [isolation] cos(d_x) with UNIFORM mods(t) on every row = "
               f"{env['d_x_uniformmod']:.9f}   vs {env['d_x']:.9f} per-segment "
               f"-> the t=0 condition modulation is "
@@ -1321,9 +1545,25 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
             "measured against the SAME F32-storage run on this device"
         ),
         "schedule_B_keys": (
-            "xm attn_raw gated attn out out_img attn_raw_nolora out_nolora "
-            "out_nolora_img (the gated set). x1/xm2/swiglu/ff and ALL backward "
-            "keys are schedule A only — C4 must extend this before gating them."
+            "FORWARD: xm attn_raw gated attn x1 xm2 swiglu ff out out_img "
+            "attn_raw_nolora out_nolora out_nolora_img. BACKWARD (added by C4): "
+            "d_x, d_blk_vec_t, d_blk_vec_cond and the 8 <slot>_dA/<slot>_dB "
+            "pairs. Every one ships kref_<key>_f32mod AND env_cos_<key>_f32mod; "
+            "the backward keys also ship kref_<key>_f32env_pz (the F32-storage "
+            "reference) and env_cos_<key>_f32unpad (the unpadded-prefix "
+            "formulation distance). NOTHING is schedule-A-only any more."
+        ),
+        "backward_d_out": (
+            "every SCHEDULE-B backward key is produced with kin_d_out_pz = "
+            "kin_d_out with rows [real_len:] zeroed. Reason: under per-segment "
+            "modulation the pad tail rides the t=0 span, so a fictitious "
+            "pad-row d_out injects pad-row gradient straight into "
+            "d_blk_vec_cond; the Mojo production SDPA is the cuDNN flash "
+            "TAIL-padmask kernel whose pad QUERY rows are masked-out garbage by "
+            "design, and the trainer's loss reads the IMG rows only (real pad "
+            "d_out == 0). The SCHEDULE-A backward keys keep the full d_out "
+            "unchanged, and the difference is shipped measured as "
+            "env_cos_<key>_padcontrib / env_bit_<key>_padzero_equal."
         ),
         "lora_routing": "condition rows only (OminiControl trainer.py:57)",
         "cond_position": f"delta [{COND_DELTA_H},{COND_DELTA_W}] scale {COND_POS_SCALE} (EDIT)",
@@ -1346,6 +1586,7 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
     print(f"  WROTE {path}  ({len(out_t)} tensors, {sz/1e6:.1f} MB)", flush=True)
 
     del W, P, x_full, out, seams, lora, lora_params, d_out, mrk
+    del d_out_pz, gB_pz
     torch.cuda.empty_cache()
     return path, out_t
 

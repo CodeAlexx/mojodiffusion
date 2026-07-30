@@ -17,26 +17,26 @@
 #        COUNT as well as cos/relL2/max_abs.
 #        Mojo side: training/krea2_omini_layout.krea2_omini_pos_src /
 #        krea2_omini_pos_combined -> models/dit/krea2_dit.build_krea2_rope.
-#   2. kref_xm
+#   2. kref_xm_f32mod   (schedule B; kref_xm shown as info)
 #        Per-segment modulation: (1+prescale)*prenorm(x)+preshift with the
 #        mods(t) chunks on rows [0,cond_off) and the mods(t=0) chunks on rows
 #        [cond_off, LFULL). ONE elementwise op away from the fixture inputs, so
 #        a mismatch here is unambiguous. Mojo side: krea2_block._modulate_seg2.
-#   3. kref_attn_raw
+#   3. kref_attn_raw_nolora_f32mod  (schedule B; schedule A shown as info)
 #        Masked attention (real-length contiguous prefix, pad tail masked) with
-#        RoPE + GQA over the new layout.
-#        FINDING (proved bit-exactly, see section 3): the SHIPPED kref_attn_raw
-#        is the LoRA-**ON** attention output — the oracle dumps
-#        seams["attn_raw"] from the adapters-enabled forward
-#        (krea2_omini_torch_oracle.py:791-793 -> :880); its only LoRA-off
-#        references are kref_out_nolora / kref_out_nolora_img (:891-892). So a
-#        LoRA-off C2 forward cannot match it, and the C2 brief's ordering of
-#        this key as a LoRA-off target does not hold for the fixture as
-#        generated. This gate therefore (a) reports the LoRA-off numbers as
-#        INFORMATIONAL and (b) GATES the same Mojo masked-attention chain
-#        rebuilt under the reference's own conditions. Fixing the fixture would
-#        mean adding a `kref_attn_raw_nolora` key to the oracle.
-#   4. kref_out_nolora / kref_out_nolora_img
+#        RoPE + GQA over the new layout, ADAPTER DISABLED.
+#        HISTORY — do not lose this, it cost a debugging cycle: the ORIGINAL C2
+#        fixture shipped only `kref_attn_raw`, and that key is the LoRA-**ON**
+#        attention output (the oracle dumps seams["attn_raw"] from the
+#        adapters-enabled forward). A LoRA-off forward cannot match it and no
+#        threshold change can fix that, so C2 had to rebuild the reference's own
+#        conditions with a gate-local cond-row LoRA helper. The oracle now ships
+#        `kref_attn_raw_nolora` — the LoRA-OFF twin — with its own
+#        `env_cos_attn_raw_nolora`, so this gate now compares the plain LoRA-off
+#        Mojo attention against a reference it CAN match. The LoRA-ON
+#        `kref_attn_raw` is gated by the C3 gate against the real cond-row-routed
+#        block forward (parity/krea2_omini_c3_lora_gate.mojo).
+#   4. kref_out_nolora_f32mod / kref_out_nolora_img_f32mod (schedule B)
 #        Whole block forward, LoRA DISABLED (LoRA routing is C3, backward is C4;
 #        neither is touched here).
 #   5. CONDLEN=0 REGRESSION (mandatory): the existing krea2 training path must be
@@ -47,12 +47,63 @@
 # THRESHOLDS — TAKEN FROM THE FIXTURE, NEVER INVENTED
 #   The fixture ships env_cos_<key> = the MEASURED bf16-vs-f32 cosine of the
 #   ORACLE'S OWN forward on the same CUDA device with the same real weights.
-#   That is the ceiling for any bf16 implementation. This gate uses
-#   `env_cos_out` (0.99995387 at block 0, 0.99998802 at block 27) as the
-#   threshold for every forward-activation key. The fixture ships NO per-key
-#   envelope for xm / attn_raw, so env_cos_out — the block-level envelope — is
-#   used for those too and is labelled as such in the output. Nothing is ever
-#   asserted TIGHTER than the shipped envelope, and nothing is loosened.
+#   That is the ceiling for any bf16 implementation OF THAT ROUNDING SCHEDULE.
+#   As of the C3 oracle regeneration EVERY key gated here ships its OWN
+#   envelope — nothing is borrowed.
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  WHICH ROUNDING SCHEDULE THIS GATE TARGETS — the fix that made these      ║
+# ║  comparisons apples-to-apples. READ BEFORE CHANGING A THRESHOLD.          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#   The oracle ships each gated seam under TWO bf16 rounding schedules. Same
+#   seed, same real krea2 weights, same real cached inputs, same layout, mask,
+#   RoPE, LoRA routing, F32 matmul accumulation, same CUDA device. The ONLY
+#   difference is WHERE bf16 rounding happens inside modulate/residual_gate:
+#     SCHEDULE A  kref_<key>         (1+scale)*h+shift done in bf16 -> THREE
+#                 env_cos_<key>      roundings per modulate, TWO per res-gate.
+#                                    Plain torch semantics; this is the schedule
+#                                    the mmdit fidelity check validates.
+#     SCHEDULE B  kref_<key>_f32mod  the same algebra in F32, rounded ONCE at
+#                 env_cos_<key>_f32mod store.
+#   serenitymojo/ops/elementwise.mojo `_modulate_kernel_bf16` and
+#   `_resgate_kernel_bf16` upcast x/scale/shift to F32, compute in F32, and
+#   .cast[bfloat16]() exactly ONCE at the store. THE MOJO FORWARD IS SCHEDULE B.
+#   So the PRIMARY gate here is Mojo vs kref_<key>_f32mod at env_cos_<key>_f32mod.
+#
+#   WHY (this is a criterion bug that was actually shipped, not a hypothetical):
+#   env_cos_<key> measures bf16-storage-vs-f32-storage UNDER SCHEDULE A's OWN
+#   ROUNDING. It therefore does NOT bound a correct implementation that uses
+#   schedule B. The fixture proves it at block 27:
+#       env_cos_out_img          1-cos = 1.043e-05   (the old threshold)
+#       env_cos_out_img_modround 1-cos = 1.097e-05   (A-vs-B distance ALONE)
+#   i.e. merely choosing the F32-math modulate puts a provably-correct
+#   implementation outside that key's envelope. Four keys failed at block 27 by
+#   1e-7..9e-7 for exactly that reason (kref_out_img, kref_attn_raw_nolora
+#   [flash], kref_out_nolora, kref_out_nolora_img).
+#
+#   THIS IS NOT A TOLERANCE WIDENING. At block 27 the schedule-B envelopes are
+#   TIGHTER than the schedule-A ones they replace, e.g. out_nolora_img
+#   1-env: 1.049e-05 (A) -> 7.93e-06 (B); xm 6.74e-06 (A) -> 4.29e-06 (B).
+#   Schedule B rounds less, so it sits closer to F32 and its ceiling is lower.
+#   The gate got STRICTER and simultaneously correct.
+#
+#   HONEST CAVEAT, measured on this GPU: "schedule B is tighter" is TRUE FOR ALL
+#   NINE KEYS AT BLOCK 27 but NOT universally. At BLOCK 0 four of the nine keys
+#   have a slightly LOOSER schedule-B envelope (1-env, A -> B): attn 9.791e-04 ->
+#   9.826e-04, attn_raw 1.5865e-02 -> 1.5892e-02, attn_raw_nolora 1.1297e-02 ->
+#   1.1321e-02, gated 2.2441e-03 -> 2.2460e-03; the other five are tighter (xm
+#   1.1146e-05 -> 8.941e-06, out 4.613e-05 -> 4.399e-05, out_img 1.0765e-04 ->
+#   1.0562e-04, out_nolora 3.266e-05 -> 3.052e-05, out_nolora_img 7.170e-05 ->
+#   6.962e-05). Those four are the attention-dominated seams, where block 0's
+#   bf16 noise is ~1e-2 and the modulate rounding point is irrelevant; the
+#   loosening is 0.2-0.3% RELATIVE on an envelope the Mojo forward clears by
+#   three orders of magnitude (cos 0.99996 vs envelope 0.9887). It is a measured
+#   consequence of matching the schedule, not a threshold anyone chose.
+#
+#   The schedule-A comparison is still run and printed on an `info(schedule A)`
+#   line, with its own envelope and its would-be verdict, so nothing is hidden.
+#   It never sets the verdict. Nothing is asserted TIGHTER than the key's own
+#   shipped envelope for its own schedule, and nothing is ever loosened.
 #
 #   dtype: the forward runs the PRODUCTION bf16 path (env_cos_out >= 0.99995 at
 #   both blocks says bf16 is comfortably gateable for the FORWARD). The F32
@@ -96,19 +147,15 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.tensor_algebra import slice, concat, add, mul_scalar
+from serenitymojo.ops.tensor_algebra import slice, concat
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.attention import sdpa_qwen_keymask
-from serenitymojo.ops.linear import linear
-from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.gqa_backward import repeat_kv_f32
-from serenitymojo.ops.tensor_algebra import reshape_owned
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice
 from serenitymojo.models.krea2.krea2_block import (
     Krea2BlockWeights, Krea2BlockLora, krea2_single_stream_block_lora,
 )
 from serenitymojo.models.dit.krea2_dit import (
-    build_krea2_rope, _tile_rope_table, krea2_rmsnorm,
+    build_krea2_rope, _tile_rope_table,
 )
 from serenitymojo.models.krea2.krea2_cache_reader import krea2_build_pos
 from serenitymojo.training.krea2_omini_layout import (
@@ -270,7 +317,10 @@ def _cmp(a: List[Float32], b: List[Float32], off: Int, n: Int) raises -> Cmp:
     return _cmp2(a, b, off, off, n)
 
 
-def _report(name: String, c: Cmp, thresh: Float64, note: String, mut allok: Bool):
+def _report(
+    name: String, c: Cmp, thresh: Float64, note: String, mut allok: Bool,
+    modround: Float64 = -1.0,
+):
     var ok = c.cos >= thresh
     if not ok:
         allok = False
@@ -283,6 +333,44 @@ def _report(name: String, c: Cmp, thresh: Float64, note: String, mut allok: Bool
         "  n=", c.n,
         "  bitdiff=", c.n_diff,
         "  | envelope=", thresh, " ", note,
+    )
+    # SCALE CONTEXT (informational, never a threshold). env_cos_<key>_modround is
+    # the measured distance between the two rounding schedules. With the PRIMARY
+    # gate now schedule-matched (Mojo schedule B vs kref_*_f32mod at
+    # env_cos_*_f32mod) this is no longer an excuse for a miss — it is printed
+    # only so the size of the effect that caused the old cross-schedule failures
+    # stays visible next to the residual that is actually being measured.
+    if modround >= 0.0:
+        print(
+            "         [scale] 1-cos=", 1.0 - c.cos,
+            "  1-envelope=", 1.0 - thresh,
+            "  1-modround(schedule A vs B, informational)=", 1.0 - modround,
+        )
+
+
+# ── SCHEDULE-A cross-check: INFO ONLY, never sets the verdict ────────────────
+# Mojo (schedule B math) compared against the SCHEDULE-A reference under the
+# SCHEDULE-A envelope. This is a CROSS-SCHEDULE comparison — the two sides round
+# bf16 in different (both correct) places — so it is not a valid pass/fail
+# criterion for this implementation. Printed in full, with its own envelope and
+# the verdict it WOULD have produced, so nothing is hidden by the fix.
+def _report_sched_a(
+    name: String, c: Cmp, env_a: Float64, modround: Float64
+):
+    print(
+        "   info(schedule A) ", name,
+        "  cos=", c.cos,
+        "  relL2=", c.rel,
+        "  max_abs=", c.max_abs,
+        "  bitdiff=", c.n_diff, "/", c.n,
+        "  | env_cos(A)=", env_a,
+        "  would-be verdict=", "PASS" if c.cos >= env_a else "FAIL",
+    )
+    print(
+        "         1-cos=", 1.0 - c.cos, "  1-env(A)=", 1.0 - env_a,
+        "  1-modround(A vs B)=", 1.0 - modround,
+        "  <- DIFFERENT ROUNDING SCHEDULE (bf16-chain, 3 roundings per",
+        " modulate) than the Mojo kernels compute; NOT GATED.",
     )
 
 
@@ -334,32 +422,24 @@ def _block_weights(
     )
 
 
-# ── GATE-LOCAL DIAGNOSTIC ONLY — NOT a C2 seam, NOT wired into krea2_block ───
-# The frozen base projection over the whole sequence + the fixture's low-rank
-# delta added to the CONDITION ROWS only (the oracle's lin_cond_lora,
-# krea2_omini_torch_oracle.py:460-473). Needed here purely to reconstruct the
-# conditions under which the shipped kref_attn_raw was produced, so that the
-# masked-attention/RoPE/GQA math C2 owns can be gated against it. Implementing
-# this routing inside the block is C3 and is deliberately not done.
-def _proj_cond_lora(
-    x: Tensor, wgt: Tensor, fx: ShardedSafeTensors, slot: String,
-    lscale: Float32, ctx: DeviceContext,
-) raises -> Tensor:
-    var nb = Optional[Tensor](None)
-    var y = linear(x, wgt, nb^, ctx)
-    var a = _fv(fx, "kin_lo_" + slot + "_A", ctx)     # [rank, in]
-    var b = _fv(fx, "kin_lo_" + slot + "_B", ctx)     # [out, rank]
-    var xc = slice(x, 1, COND_OFF, S_COND, ctx)
-    var nb2 = Optional[Tensor](None)
-    var t = linear(xc, a, nb2^, ctx)                  # [1, S_COND, rank]
-    var nb3 = Optional[Tensor](None)
-    var d = linear(t, b, nb3^, ctx)                   # [1, S_COND, out]
-    var yc = slice(y, 1, COND_OFF, S_COND, ctx)
-    var yc2 = add(yc, mul_scalar(d, lscale, ctx), ctx)
-    var head = slice(y, 1, 0, COND_OFF, ctx)
-    var tail = slice(y, 1, COND_OFF + S_COND, LFULL - COND_OFF - S_COND, ctx)
-    var h2 = concat(1, ctx, head, yc2)
-    return concat(1, ctx, h2, tail)
+# ── per-key envelope reader ──────────────────────────────────────────────────
+# THE ONLY source of a threshold in this file. Fails loud if the fixture does
+# not ship the key's envelope — a missing envelope must never silently become a
+# borrowed one again.
+def _env(fx: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Float64:
+    var v = _host(fx, "env_cos_" + key, ctx)
+    if len(v) != 1:
+        raise Error("fixture ships no env_cos_" + key)
+    return Float64(v[0])
+
+
+def _modr(fx: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Float64:
+    """env_cos_<key>_modround — INFORMATIONAL ONLY (never a threshold). See the
+    ROUNDING-POINT FREEDOM section of scripts/krea2_omini_torch_oracle.py."""
+    var v = _host(fx, "env_cos_" + key + "_modround", ctx)
+    if len(v) != 1:
+        raise Error("fixture ships no env_cos_" + key + "_modround")
+    return Float64(v[0])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -408,7 +488,7 @@ def _gate_positions(
 # ══════════════════════════════════════════════════════════════════════════════
 def _gate_forward(
     ck: ShardedSafeTensors, fx: ShardedSafeTensors, bi: Int,
-    rcos: Tensor, rsin: Tensor, env: Float64,
+    rcos: Tensor, rsin: Tensor,
     ctx: DeviceContext, mut allok: Bool,
 ) raises:
     var w = _block_weights(ck, fx, bi, ctx)
@@ -442,51 +522,45 @@ def _gate_forward(
     print("")
     print("---- 2. kref_xm — PER-SEGMENT modulation (the new structural code) ----")
     var xm_h = fwd.saved.xm[].to_host(ctx)
-    var xm_r = _host(fx, "kref_xm", ctx)
-    _report("kref_xm [full LFULL]", _cmp(xm_h, xm_r, 0, all_n), env,
-            "(GATED on a BORROWED envelope — no env_cos_xm shipped)", allok)
-    _report_info("kref_xm [prefix]  ", _cmp(xm_h, xm_r, 0, pre_n), "")
-    _report_info("kref_xm [cond rows]",
-                 _cmp(xm_h, xm_r, COND_OFF * FEATURES, S_COND * FEATURES),
+    var xm_b = _host(fx, "kref_xm_f32mod", ctx)      # SCHEDULE B == Mojo's math
+    _report("kref_xm_f32mod [full LFULL]", _cmp(xm_h, xm_b, 0, all_n),
+            _env(fx, "xm_f32mod", ctx),
+            "(PRIMARY: schedule-B ref, gated on env_cos_xm_f32mod)", allok,
+            _modr(fx, "xm", ctx))
+    _report_info("kref_xm_f32mod [prefix]  ", _cmp(xm_h, xm_b, 0, pre_n), "")
+    _report_info("kref_xm_f32mod [cond rows]",
+                 _cmp(xm_h, xm_b, COND_OFF * FEATURES, S_COND * FEATURES),
                  "<- rows that must use mods(t=0)")
-    _report_info("kref_xm [txt+img] ",
-                 _cmp(xm_h, xm_r, 0, COND_OFF * FEATURES),
+    _report_info("kref_xm_f32mod [txt+img] ",
+                 _cmp(xm_h, xm_b, 0, COND_OFF * FEATURES),
                  "<- rows that must use mods(t)")
+    var xm_a = _host(fx, "kref_xm", ctx)             # SCHEDULE A, info only
+    _report_sched_a("kref_xm [full LFULL]", _cmp(xm_h, xm_a, 0, all_n),
+                    _env(fx, "xm", ctx), _modr(fx, "xm", ctx))
 
     # ══════════════════════════════════════════════════════════════════════
-    # 3. MASKED ATTENTION over the new layout.
+    # 3. MASKED ATTENTION over the new layout, ADAPTER DISABLED.
     #
-    # FINDING (measured, see the two blocks below — this is NOT an excuse, it is
-    # a bit-exact demonstration): kref_attn_raw in the shipped fixture is the
-    # LoRA-**ON** attention output. The oracle calls omini_block_forward WITH
-    # the adapters (krea2_omini_torch_oracle.py:791-793) and dumps
-    # seams["attn_raw"] from THAT run (:880); the ONLY LoRA-off references it
-    # writes are kref_out_nolora / kref_out_nolora_img (:891-892, from the
-    # separate `out_off` run at :833-835). kref_xm is unaffected because it is
-    # computed BEFORE any projection, which is why gate 2 passes.
-    # C2 is LoRA-OFF by definition, so a LoRA-off Mojo attention CANNOT match
-    # kref_attn_raw, and gating it that way would be gating the LoRA delta, not
-    # the layout. It is therefore reported here as INFORMATIONAL and NOT counted
-    # in the verdict; it becomes a real gate in C3 when LoRA routing lands.
+    # The reference is kref_attn_raw_NOLORA (new in the C3 oracle) — the LoRA-OFF
+    # attention seam, gated on its own env_cos_attn_raw_nolora. The LoRA-**ON**
+    # kref_attn_raw is a DIFFERENT tensor and is NOT gated here; C3 gates it with
+    # the real cond-row-routed block forward. Both numbers are printed so the
+    # LoRA-attributable gap stays visible.
     #
-    # What IS gated in C2 for this seam:
-    #   (3a) the LoRA-OFF Mojo attention (production cuDNN flash-padmask AND the
-    #        F32 math masked path) vs kref_attn_raw — INFORMATIONAL only, with
-    #        the LoRA-attributable gap quantified.
-    #   (3b) THE ACTUAL GATE: the same Mojo masked-attention chain
-    #        (q/k/v -> QKNorm -> RoPE -> GQA -> masked SDPA over
-    #        [TXT_real|IMG|COND|TXT_pad]) fed the fixture's own kref_xm, with the
-    #        fixture's cond-row LoRA delta added to q/k/v purely as a DIAGNOSTIC
-    #        (10 lines here in the gate; NOTHING is wired into krea2_block —
-    #        cond-row LoRA routing remains C3). This reconstructs kref_attn_raw's
-    #        exact production conditions, so it gates the layout / RoPE / mask /
-    #        GQA math that C2 owns against a reference that is bit-reproducible.
-    #   (4)  kref_out_nolora — the LoRA-off whole-block output, which contains
-    #        the attention path end to end. That is the fixture's own C2 target.
+    # TWO Mojo attention paths are measured:
+    #   * the PRODUCTION cuDNN flash-padmask kernel (what training runs),
+    #   * the deterministic F32 math masked path (sdpa_qwen_keymask) — the same
+    #     math as the oracle's attn_f32, i.e. krea2_block.mojo's documented
+    #     "F32 parity gate guard".
+    # Both are GATED on the same shipped envelope. Flash has a different
+    # accumulation order and is documented in krea2_block.mojo as a
+    # value-tolerance path, so if the two ever disagree in verdict that
+    # disagreement is the finding and is reported, not smoothed over.
     # ══════════════════════════════════════════════════════════════════════
     print("")
-    print("---- 3. masked SDPA (RoPE + GQA) over the new layout ----")
-    var at_r = _host(fx, "kref_attn_raw", ctx)
+    print("---- 3. masked SDPA (RoPE + GQA) over the new layout, LoRA OFF ----")
+    var at_b = _host(fx, "kref_attn_raw_nolora_f32mod", ctx)   # SCHEDULE B
+    var env_arb = _env(fx, "attn_raw_nolora_f32mod", ctx)
 
     var q32 = cast_tensor(fwd.saved.q_rope[], STDtype.F32, ctx)
     var k32 = cast_tensor(fwd.saved.k_full[], STDtype.F32, ctx)
@@ -497,77 +571,74 @@ def _gate_forward(
     )
     var m32_h = att32.to_host(ctx)
     var at_h = fwd.saved.attn_flat[].to_host(ctx)
-    print("  3a. LoRA-OFF Mojo attention vs kref_attn_raw (LoRA-ON reference) —")
-    print("      NOT GATED; the residual IS the cond-row LoRA delta.")
-    _report_info("  LoRA-off flash-padmask [prefix]", _cmp(at_h, at_r, 0, pre_n), "")
-    _report_info("  LoRA-off F32 math      [prefix]", _cmp(m32_h, at_r, 0, pre_n), "")
-    _report_info("  LoRA-off flash [TXT rows]",
-                 _cmp(at_h, at_r, 0, LT * FEATURES),
-                 "<- LoRA reaches these only through attention")
-    _report_info("  LoRA-off flash [IMG rows]",
-                 _cmp(at_h, at_r, LT * FEATURES, S_IMG * FEATURES), "")
-    _report_info("  LoRA-off flash [COND rows]",
-                 _cmp(at_h, at_r, COND_OFF * FEATURES, S_COND * FEATURES),
-                 "<- LoRA acts DIRECTLY here: worst, as the method predicts")
-
-    # ── 3b. THE GATE: Mojo masked attention over the new layout, reconstructed
-    #        under kref_attn_raw's own conditions (kref_xm input + cond-row LoRA
-    #        on q/k/v as a gate-local diagnostic; no block wiring). ───────────
-    var lscale = Float32(_host(fx, "meta_lora_scale", ctx)[0])
-    var xmr = _fv(fx, "kref_xm", ctx)
-
-    var pq = _proj_cond_lora(xmr, w.wq[], fx, "wq", lscale, ctx)
-    var pk = _proj_cond_lora(xmr, w.wk[], fx, "wk", lscale, ctx)
-    var pv = _proj_cond_lora(xmr, w.wv[], fx, "wv", lscale, ctx)
-    var pqr = reshape_owned(pq^, [1, LFULL, HEADS, HEADDIM])
-    var pkr = reshape_owned(pk^, [1, LFULL, KVHEADS, HEADDIM])
-    var pvr = reshape_owned(pv^, [1, LFULL, KVHEADS, HEADDIM])
-    var pqn = krea2_rmsnorm(pqr, w.qnorm_scale[], EPS, ctx)
-    var pkn = krea2_rmsnorm(pkr, w.knorm_scale[], EPS, ctx)
-    var pqo = rope_interleaved(pqn, cos_q, sin_q, ctx)
-    var pko = rope_interleaved(pkn, cos_k, sin_k, ctx)
-    var pkf = repeat_kv_f32(pko, LFULL, KVHEADS, HEADS // KVHEADS, HEADDIM, ctx)
-    var pvf = repeat_kv_f32(pvr, LFULL, KVHEADS, HEADS // KVHEADS, HEADDIM, ctx)
-    var pa = sdpa_qwen_keymask[1, LFULL, HEADS, HEADDIM, LFULL](
-        cast_tensor(pqo, STDtype.F32, ctx),
-        cast_tensor(pkf, STDtype.F32, ctx),
-        cast_tensor(pvf, STDtype.F32, ctx),
-        lay.real_len(), Float32(1.0) / sqrt(Float32(HEADDIM)), ctx,
-    )
-    var pa_h = pa.to_host(ctx)
-    print("")
-    print("  3b. GATED: Mojo masked attention over the EDIT layout, rebuilt from")
-    print("      kref_xm under kref_attn_raw's own (LoRA-on) conditions.")
-    _report("kref_attn_raw [Mojo masked attn over the new layout, prefix]",
-            _cmp(pa_h, at_r, 0, pre_n), env,
-            "(GATED on a BORROWED envelope — no env_cos_attn_raw shipped)",
-            allok)
-    _report_info("  [TXT_real rows]", _cmp(pa_h, at_r, 0, LT * FEATURES), "")
-    _report_info("  [IMG rows]",
-                 _cmp(pa_h, at_r, LT * FEATURES, S_IMG * FEATURES), "")
-    _report_info("  [COND rows]",
-                 _cmp(pa_h, at_r, COND_OFF * FEATURES, S_COND * FEATURES), "")
+    _report("kref_attn_raw_nolora_f32mod [F32 math masked path, prefix]",
+            _cmp(m32_h, at_b, 0, pre_n), env_arb,
+            "(PRIMARY: schedule-B ref + env_cos_attn_raw_nolora_f32mod)", allok,
+            _modr(fx, "attn_raw_nolora", ctx))
+    _report("kref_attn_raw_nolora_f32mod [production flash-padmask, prefix]",
+            _cmp(at_h, at_b, 0, pre_n), env_arb,
+            "(PRIMARY: same schedule-B envelope)", allok,
+            _modr(fx, "attn_raw_nolora", ctx))
+    _report_info("  [TXT_real rows, flash]", _cmp(at_h, at_b, 0, LT * FEATURES), "")
+    _report_info("  [IMG rows, flash]",
+                 _cmp(at_h, at_b, LT * FEATURES, S_IMG * FEATURES), "")
+    _report_info("  [COND rows, flash]",
+                 _cmp(at_h, at_b, COND_OFF * FEATURES, S_COND * FEATURES), "")
     _report_info("  [pad tail rows — oracle zeroes them]",
-                 _cmp(pa_h, at_r, PAD_OFF * FEATURES,
+                 _cmp(at_h, at_b, PAD_OFF * FEATURES,
                       (LFULL - PAD_OFF) * FEATURES),
-                 "<- NOT gated")
+                 "<- NOT gated (flash leaves pad query rows as garbage)")
+
+    # SCHEDULE A cross-check (info only) — this is the comparison that produced
+    # the reported block-27 near-miss on the flash path.
+    var at_a = _host(fx, "kref_attn_raw_nolora", ctx)
+    var env_ar = _env(fx, "attn_raw_nolora", ctx)
+    _report_sched_a("kref_attn_raw_nolora [F32 math masked path, prefix]",
+                    _cmp(m32_h, at_a, 0, pre_n), env_ar,
+                    _modr(fx, "attn_raw_nolora", ctx))
+    _report_sched_a("kref_attn_raw_nolora [production flash-padmask, prefix]",
+                    _cmp(at_h, at_a, 0, pre_n), env_ar,
+                    _modr(fx, "attn_raw_nolora", ctx))
+
+    var at_on = _host(fx, "kref_attn_raw", ctx)
+    print("   the LoRA-ON/LoRA-OFF gap in the FIXTURE itself (why C2 could not")
+    print("   gate kref_attn_raw with a LoRA-off forward):")
+    _report_info("  kref_attn_raw(ON) vs kref_attn_raw_nolora(OFF) [prefix]",
+                 _cmp2(at_on, at_a, 0, 0, pre_n), "<- both are oracle tensors")
+    _report_info("  LoRA-off Mojo flash vs kref_attn_raw (LoRA-ON) [prefix]",
+                 _cmp(at_h, at_on, 0, pre_n), "<- the C2 mismatch, reproduced")
 
     # ── 4. whole block forward, LoRA disabled ────────────────────────────────
     print("")
     print("---- 4. kref_out_nolora — whole block forward, adapter DISABLED ----")
     var out_h = fwd.out[].to_host(ctx)
-    var out_r = _host(fx, "kref_out_nolora", ctx)
-    _report("kref_out_nolora [prefix 0:real_len]", _cmp(out_h, out_r, 0, pre_n),
-            env, "(GATED)", allok)
-    _report_info("kref_out_nolora [full LFULL]", _cmp(out_h, out_r, 0, all_n),
+    var out_b = _host(fx, "kref_out_nolora_f32mod", ctx)       # SCHEDULE B
+    _report("kref_out_nolora_f32mod [prefix 0:real_len]",
+            _cmp(out_h, out_b, 0, pre_n),
+            _env(fx, "out_nolora_f32mod", ctx),
+            "(PRIMARY: schedule-B ref + env_cos_out_nolora_f32mod)", allok,
+            _modr(fx, "out_nolora", ctx))
+    _report_info("kref_out_nolora_f32mod [full LFULL]",
+                 _cmp(out_h, out_b, 0, all_n),
                  "<- NOT gated (pad rows, see header)")
-    _report_info("kref_out_nolora [cond rows]",
-                 _cmp(out_h, out_r, COND_OFF * FEATURES, S_COND * FEATURES), "")
+    _report_info("kref_out_nolora_f32mod [cond rows]",
+                 _cmp(out_h, out_b, COND_OFF * FEATURES, S_COND * FEATURES), "")
+    var out_a = _host(fx, "kref_out_nolora", ctx)              # SCHEDULE A, info
+    _report_sched_a("kref_out_nolora [prefix 0:real_len]",
+                    _cmp(out_h, out_a, 0, pre_n), _env(fx, "out_nolora", ctx),
+                    _modr(fx, "out_nolora", ctx))
 
-    var img_r = _host(fx, "kref_out_nolora_img", ctx)
-    _report("kref_out_nolora_img [IMG rows = what the loss reads]",
-            _cmp2(out_h, img_r, LT * FEATURES, 0, S_IMG * FEATURES), env,
-            "(GATED)", allok)
+    var img_b = _host(fx, "kref_out_nolora_img_f32mod", ctx)
+    _report("kref_out_nolora_img_f32mod [IMG rows = what the loss reads]",
+            _cmp2(out_h, img_b, LT * FEATURES, 0, S_IMG * FEATURES),
+            _env(fx, "out_nolora_img_f32mod", ctx),
+            "(PRIMARY: schedule-B ref + env_cos_out_nolora_img_f32mod)", allok,
+            _modr(fx, "out_nolora_img", ctx))
+    var img_a = _host(fx, "kref_out_nolora_img", ctx)
+    _report_sched_a("kref_out_nolora_img [IMG rows]",
+                    _cmp2(out_h, img_a, LT * FEATURES, 0, S_IMG * FEATURES),
+                    _env(fx, "out_nolora_img", ctx),
+                    _modr(fx, "out_nolora_img", ctx))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -701,22 +772,34 @@ def _run_block(bi: Int, ck: ShardedSafeTensors, ctx: DeviceContext) raises -> Bo
     _expect_i(fx, "meta_cond_delta_h", 0)
     _expect_i(fx, "meta_cond_delta_w", 0)
 
-    # THE THRESHOLD: the fixture's own measured bf16-vs-f32 forward envelope.
-    var envl = _host(fx, "env_cos_out", ctx)
-    var env = Float64(envl[0])
-    print("THRESHOLD (from the fixture, not invented): env_cos_out =", env)
-    print("   = the oracle's OWN bf16-vs-f32 cosine on this block, i.e. the")
-    print("     ceiling for any bf16 implementation. Nothing is gated tighter,")
-    print("     nothing is loosened. Mojo runs the PRODUCTION bf16 path.")
-    print("   NOTE: the fixture ships env_cos ONLY for `out` (and for backward")
-    print("     keys). kref_xm and kref_attn_raw have NO shipped envelope; they")
-    print("     are gated on env_cos_out as a BORROWED threshold and labelled")
-    print("     as such at every line. Adding env_cos_xm / env_cos_attn_raw to")
-    print("     the oracle would remove the borrowing.")
+    # THRESHOLDS: each key's OWN measured bf16-vs-f32 envelope FOR THE ROUNDING
+    # SCHEDULE THE MOJO KERNELS COMPUTE (schedule B, *_f32mod), straight from the
+    # fixture. _env() hard-fails if an envelope is missing.
+    print("THRESHOLDS (from the fixture, not invented).")
+    print("   PRIMARY = schedule B (*_f32mod) — modulate/residual_gate in F32,")
+    print("   rounded ONCE at store, which is exactly what")
+    print("   serenitymojo/ops/elementwise.mojo _modulate_kernel_bf16 and")
+    print("   _resgate_kernel_bf16 compute. Apples-to-apples.")
+    print("   key                        env(B)=GATED        env(A)=info-only")
+    print("   xm                        ", _env(fx, "xm_f32mod", ctx), "  ",
+          _env(fx, "xm", ctx))
+    print("   attn_raw_nolora           ",
+          _env(fx, "attn_raw_nolora_f32mod", ctx), "  ",
+          _env(fx, "attn_raw_nolora", ctx))
+    print("   out_nolora                ", _env(fx, "out_nolora_f32mod", ctx),
+          "  ", _env(fx, "out_nolora", ctx))
+    print("   out_nolora_img            ",
+          _env(fx, "out_nolora_img_f32mod", ctx), "  ",
+          _env(fx, "out_nolora_img", ctx))
+    print("   Each is the oracle's OWN bf16-vs-f32 cosine for THAT seam under")
+    print("   THAT schedule on this block, both measured against the SAME F32-")
+    print("   storage run (with F32 storage the two schedules are the identical")
+    print("   sequence of F32 ops). Nothing gated tighter than its own envelope,")
+    print("   nothing loosened. Mojo runs the PRODUCTION bf16 path.")
 
     var allok = True
     var tables = _gate_positions(fx, ctx, allok)
-    _gate_forward(ck, fx, bi, tables[0], tables[1], env, ctx, allok)
+    _gate_forward(ck, fx, bi, tables[0], tables[1], ctx, allok)
     _gate_condlen0(ck, fx, bi, ctx, allok)
 
     print("")

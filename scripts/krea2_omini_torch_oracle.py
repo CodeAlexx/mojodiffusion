@@ -188,13 +188,31 @@
 #     kin_lo_<slot>_B     [out,rank] bf16   mlp_gate mlp_up mlp_down
 #     kin_d_out           [1,LFULL,F] bf16  the FIXED upstream gradient
 #   FORWARD REFERENCES — the seams the Mojo code checks in order
+#
+#   ⚠ LoRA-ON vs LoRA-OFF — READ THIS BEFORE GATING ANYTHING ⚠
+#   The fixture contains TWO forwards of the same block on the same inputs:
+#     * the ADAPTER-ENABLED run (`out, seams = omini_block_forward(..., lora, ...)`)
+#       — cond-row LoRA active on all 8 Linears. EVERY `kref_*` key below whose
+#       name does NOT end in `_nolora` comes from THIS run. That includes
+#       kref_attn_raw: it is the LoRA-**ON** attention output, because q/k/v/gate
+#       already carry the cond-row delta by the time SDPA runs. (kref_xm is the
+#       one key that is numerically identical either way — it is computed BEFORE
+#       any projection — but it is still dumped from the LoRA-on run.)
+#     * the ADAPTER-DISABLED run (`out_off, seams_off`, adapters replaced by
+#       (None, None)) — the source of every key ending in `_nolora`.
+#   Getting this backwards cost a debugging cycle in C2: a LoRA-off Mojo forward
+#   cannot match kref_attn_raw, and no threshold change can make it. Use
+#   kref_attn_raw_nolora for a LoRA-off attention gate and kref_attn_raw for a
+#   LoRA-on one.
+#
+#     ── from the LoRA-ON run ────────────────────────────────────────────────
 #     kref_xm             [1,LFULL,F]  post pre-modulation ((1+prescale)*prenorm(x)
-#                                      +preshift), PER-SEGMENT
-#     kref_attn_raw       [1,LFULL,F]  SDPA output, flattened, before the sigmoid
-#                                      gate and before wo
-#     kref_gated          [1,LFULL,F]  sdpa * sigmoid(gate) — the wo LoRA input
-#     kref_attn           [1,LFULL,F]  post-attention == wo(sdpa*sigmoid(gate)),
-#                                      LoRA-on-cond-rows already applied
+#                                      +preshift), PER-SEGMENT. Pre-projection, so
+#                                      LoRA-independent in value.
+#     kref_attn_raw       [1,LFULL,F]  LoRA-ON SDPA output, flattened, before the
+#                                      sigmoid gate and before wo
+#     kref_gated          [1,LFULL,F]  LoRA-ON sdpa * sigmoid(gate) — wo's LoRA input
+#     kref_attn           [1,LFULL,F]  LoRA-ON post-attention == wo(sdpa*sigmoid(gate))
 #     kref_x1             [1,LFULL,F]  x + pregate*attn (per-segment pregate)
 #     kref_xm2            [1,LFULL,F]  post post-modulation, PER-SEGMENT
 #     kref_swiglu         [1,LFULL,MLPDIM] silu(mlp_gate)*mlp_up — mlp_down's input
@@ -202,8 +220,12 @@
 #     kref_out            [1,LFULL,F]  BLOCK OUTPUT (x1 + postgate*ff)
 #     kref_out_img        [1,S_IMG,F]  the IMG row slice of the output (the only
 #                                      rows the loss reads — Omini discards cond)
-#     kref_out_nolora     [1,LFULL,F]  SAME forward with the adapter disabled —
-#     kref_out_nolora_img [1,S_IMG,F]  the C2 (LoRA-off) gate target
+#     ── from the LoRA-OFF run (adapters replaced by (None, None)) ───────────
+#     kref_attn_raw_nolora [1,LFULL,F] LoRA-OFF SDPA output — the LoRA-off twin of
+#                                      kref_attn_raw (added for C3; C2 had to
+#                                      reconstruct it inside the gate)
+#     kref_out_nolora     [1,LFULL,F]  LoRA-OFF block output — the C2 gate target
+#     kref_out_nolora_img [1,S_IMG,F]  its IMG row slice
 #   BACKWARD REFERENCES — torch autograd from loss = (out * kin_d_out).sum()
 #     kref_d_x            [1,LFULL,F]  dX for the FULL sequence
 #     kref_<slot>_dA      [rank,in]    cond-row LoRA dA, 8 slots
@@ -217,6 +239,84 @@
 #     env_cos_<key>       [1] f32  measured cos(bf16, f32) for every gateable key
 #     env_cos_d_x_{txt,img,cond,pad,prefix}   per-segment breakdown of d_x
 #     env_cos_d_x_uniformmod  the isolation probe (see NUMERICS below)
+#     PER-SEAM FORWARD ENVELOPES (each key gets its OWN, so no gate ever has to
+#     borrow another key's threshold — C2 had to borrow env_cos_out for xm and
+#     attn_raw):
+#       LoRA-ON  : env_cos_xm env_cos_attn_raw env_cos_gated env_cos_attn
+#                  env_cos_x1 env_cos_xm2 env_cos_swiglu env_cos_ff
+#                  env_cos_out env_cos_out_img
+#       LoRA-OFF : env_cos_attn_raw_nolora env_cos_out_nolora
+#                  env_cos_out_nolora_img
+#     Every one is cos(bf16 seam, f32 seam) of the ORACLE'S OWN two runs on the
+#     same CUDA device with the same real weights — the ceiling for any bf16
+#     implementation of that seam. NEVER gate above it; NEVER loosen it.
+#     env_cos_<key>_modround  [1] f32  ROUNDING-POINT FREEDOM (informational)
+#       cos(this same bf16 forward with the modulate / residual-gate arithmetic
+#       done in F32 and rounded ONCE, vs the bf16-chain baseline every kref_*
+#       tensor is produced with). Same device, same real weights, same inputs,
+#       same seed — the ONLY difference is where bf16 rounding happens, which is
+#       a free and equally correct implementation choice (serenitymojo's
+#       ops/elementwise.modulate makes the F32-math one). This number is the
+#       scale of residual a CORRECT independent bf16 implementation can carry
+#       for that seam. It is NOT a threshold and no gate derives one from it —
+#       it exists so a 1e-7 miss against env_cos_<key> can be told apart from a
+#       bug. MEASURED: at block 27 modround moves `out` by 1-cos = 1.02e-5
+#       while env_cos_out_nolora is 1-cos = 1.03e-5, i.e. the rounding point
+#       ALONE is enough to sit on top of that envelope.
+#
+#   ╔════════════════════════════════════════════════════════════════════════╗
+#   ║  TWO REFERENCE SCHEDULES — READ THIS BEFORE GATING ANYTHING            ║
+#   ╚════════════════════════════════════════════════════════════════════════╝
+#   The fixture ships the SAME nine gated seams computed under TWO different,
+#   both-correct, bf16 ROUNDING SCHEDULES. Everything else (seed, real krea2
+#   weights, real cached activations, layout, mask, RoPE, attention math, LoRA
+#   routing, F32 matmul accumulation, CUDA device) is byte-for-byte identical
+#   between them. The ONLY difference is WHERE bf16 rounding happens inside
+#   `modulate` and `residual_gate`:
+#
+#     SCHEDULE A — "bf16-chain" (the plain-torch one; keys kref_<key>)
+#       (1+scale)*h + shift evaluated in bf16 => THREE roundings per modulate,
+#       TWO per residual gate. This is what torch does when you write the
+#       expression on bf16 tensors, and it is what the mmdit fidelity check
+#       compares against, so these keys stay and prove the hand forward equals
+#       the real reference module.
+#       Envelope: env_cos_<key>          = cos(A_bf16, F32-storage run)
+#
+#     SCHEDULE B — "F32-math modulate" (keys kref_<key>_f32mod)   <-- GATED
+#       the same algebra evaluated in F32 and rounded ONCE at store.
+#       Envelope: env_cos_<key>_f32mod   = cos(B_bf16, the SAME F32-storage run)
+#
+#   THE MOJO GATES TARGET SCHEDULE B, and the reason is a concrete bug that
+#   this section exists to prevent recurring:
+#     serenitymojo/ops/elementwise.mojo `_modulate_kernel_bf16` /
+#     `_resgate_kernel_bf16` upcast x/scale/shift to F32, do the arithmetic in
+#     F32 and cast to bf16 exactly ONCE, at the store ("returns [..., D] (x's
+#     dtype; F32 math)"). That is SCHEDULE B. Gating the Mojo forward against
+#     SCHEDULE A keys with SCHEDULE A envelopes is a MIS-SPECIFIED CRITERION:
+#     env_cos_<key> measures bf16-storage-vs-f32-storage *under schedule A's own
+#     rounding*, so it does not bound an implementation that legitimately uses
+#     schedule B. The proof is in this fixture: at block 27
+#         env_cos_out_img          1-cos = 1.043e-05   (the old threshold)
+#         env_cos_out_img_modround 1-cos = 1.097e-05   (A-vs-B distance alone)
+#     i.e. merely choosing the F32-math modulate puts a PROVABLY CORRECT
+#     implementation outside the key's envelope. Four keys failed at block 27 by
+#     1e-7..9e-7 for exactly that reason (kref_out_img, kref_attn_raw_nolora,
+#     kref_out_nolora, kref_out_nolora_img). This is a criterion bug, not a
+#     tolerance problem, and it is NOT fixed by widening anything.
+#
+#   NOTE the F32-STORAGE run is shared by both envelopes and that is exact, not
+#   an approximation: with F32 storage the two schedules are literally the same
+#   sequence of F32 ops (`.float()` and `.to(float32)` are identities there), so
+#   there is one and only one F32 reference and both envelopes are measured
+#   against it. Same device, same weights, same inputs.
+#
+#     kref_<key>_f32mod    [same shape/dtype as kref_<key>]  9 keys:
+#       xm attn_raw gated attn out out_img  (LoRA-ON)
+#       attn_raw_nolora out_nolora out_nolora_img  (LoRA-OFF)
+#     env_cos_<key>_f32mod [1] f32   one per key above
+#   x1 / xm2 / swiglu / ff and every BACKWARD key are NOT dumped under schedule
+#   B — no gate targets them today. C4 must add them before it gates a backward
+#   seam, or state plainly which schedule it is using.
 #   META (int32/float32 scalars; strings live in safetensors __metadata__)
 #     meta_ltmax meta_s_img meta_s_cond meta_lt meta_lfull meta_real_len
 #     meta_cond_off meta_pad_off meta_block_index meta_rank meta_features
@@ -255,16 +355,21 @@
 #
 # WHAT THE MOJO C2 CHUNK SHOULD GATE FIRST
 # ----------------------------------------
+#   (every kref_* below means the *_f32mod variant against env_cos_*_f32mod —
+#    see "TWO REFERENCE SCHEDULES". The schedule-A key is printed as INFO.)
 #   1. kin_pos / kin_cos / kin_sin   (pure layout+table math, no weights, exact)
 #   2. kref_xm                       (per-segment modulation, LoRA irrelevant —
 #                                     this is THE new structural code, and it is
 #                                     one elementwise op away from the inputs, so
 #                                     a mismatch here is unambiguous)
-#   3. kref_attn_raw                 (mask + RoPE + GQA over the new layout)
+#   3. kref_attn_raw_nolora          (mask + RoPE + GQA over the new layout, LoRA
+#                                     OFF — NOT kref_attn_raw, which is LoRA-ON)
 #   4. kref_out_nolora / _img        (whole block, adapter disabled)
-#   then C3 turns LoRA on (kref_gated, kref_attn, kref_out) and C4 adds the
-#   backward keys (kref_d_x*, kref_<slot>_dA/dB, kref_d_blk_vec_{t,cond} — the
-#   last pair is what gates the per-segment d_mod accumulation).
+#   C3 (cond-row LoRA routing in the forward) then gates, in order:
+#     kref_gated -> kref_attn -> kref_out -> kref_out_img, each against its OWN
+#     env_cos_<key>, and re-runs the C2 keys plus the CONDLEN=0 bit-equality.
+#   C4 adds the backward keys (kref_d_x*, kref_<slot>_dA/dB,
+#   kref_d_blk_vec_{t,cond} — the last pair gates per-segment d_mod).
 #
 # RUN (never chain after a mojo build with &&)
 #   cd /home/alex/mojodiffusion
@@ -299,6 +404,22 @@ OUT_DIR = os.environ.get(
 )
 
 SEED = 20260730
+
+# ── ROUNDING-POINT SWITCH (see "TWO REFERENCE SCHEDULES" in the header) ──────
+# False = SCHEDULE A ("bf16-chain", what every kref_<key> tensor is produced
+#   with): seg()/gate_seg() do their arithmetic in the storage dtype, so a bf16
+#   run rounds THREE times per modulate and TWICE per residual gate — plain
+#   torch semantics, and the schedule the mmdit fidelity check compares against.
+# True  = SCHEDULE B ("F32-math modulate", what every kref_<key>_f32mod tensor
+#   is produced with): the same algebra evaluated in F32 and rounded ONCE at
+#   store. This is what serenitymojo/ops/elementwise.mojo actually computes —
+#   _modulate_kernel_bf16 / _resgate_kernel_bf16 upcast to F32 and
+#   .cast[bfloat16]() exactly once, at the store — so SCHEDULE B is the one the
+#   Mojo gates target.
+# BOTH are correct bf16 implementations. env_cos_<key>_modround measures how far
+# apart they are; the *_f32mod key/envelope pair is what makes the Mojo
+# comparison apples-to-apples instead of cross-schedule.
+F32_MOD = False
 
 FEATURES = 6144
 HEADS = 48
@@ -493,6 +614,11 @@ def omini_block_forward(x, blk_vec_t, blk_vec_cond, W, P, lora, cos, sin,
         cond_off. Rows [split:] (COND + TXT_pad) take mods(0); pad rows are
         don't-care and mmdit puts them in the same span (mmdit.py:509-517
         comment: 'Padding tokens fall in the t=0 span ... never matter')."""
+        if F32_MOD:                       # F32 math, ONE rounding (Mojo's op)
+            return torch.cat([
+                (1 + mt[i].float()) * h[:, :cond_off].float() + mt[i + 1].float(),
+                (1 + mc[i].float()) * h[:, cond_off:].float() + mc[i + 1].float(),
+            ], dim=1).to(h.dtype)
         return torch.cat([
             (1 + mt[i]) * h[:, :cond_off] + mt[i + 1],
             (1 + mc[i]) * h[:, cond_off:] + mc[i + 1],
@@ -500,6 +626,15 @@ def omini_block_forward(x, blk_vec_t, blk_vec_cond, W, P, lora, cos, sin,
 
     def gate_seg(h, i):
         return torch.cat([mt[i] * h[:, :cond_off], mc[i] * h[:, cond_off:]], dim=1)
+
+    def res_gate(r, h, i):
+        """r + gate*h, per segment (== Mojo ops/elementwise.residual_gate)."""
+        if F32_MOD:                       # F32 math, ONE rounding (Mojo's op)
+            return torch.cat([
+                r[:, :cond_off].float() + mt[i].float() * h[:, :cond_off].float(),
+                r[:, cond_off:].float() + mc[i].float() * h[:, cond_off:].float(),
+            ], dim=1).to(r.dtype)
+        return r + gate_seg(h, i)
 
     # ── attention branch ─────────────────────────────────────────────────────
     xn = rmsnorm(x, P["prenorm"])
@@ -522,7 +657,7 @@ def omini_block_forward(x, blk_vec_t, blk_vec_cond, W, P, lora, cos, sin,
     attn_raw = attn_f32(q, k, v, keymask, rowmask)             # [1,L,F]
     gated = attn_raw * torch.sigmoid(g)
     a = lin_cond_lora(gated, W["wo"], *lora["wo"], cond_off, s_cond)
-    x1 = x + gate_seg(a, 2)                                    # pregate
+    x1 = res_gate(x, a, 2)                                     # pregate
 
     # ── MLP branch ───────────────────────────────────────────────────────────
     xn2 = rmsnorm(x1, P["postnorm"])
@@ -531,7 +666,7 @@ def omini_block_forward(x, blk_vec_t, blk_vec_cond, W, P, lora, cos, sin,
     mu = lin_cond_lora(xm2, W["mlp_up"], *lora["mlp_up"], cond_off, s_cond)
     sw = F.silu(mg) * mu
     ff = lin_cond_lora(sw, W["mlp_down"], *lora["mlp_down"], cond_off, s_cond)
-    out = x1 + gate_seg(ff, 5)                                 # postgate
+    out = res_gate(x1, ff, 5)                                  # postgate
 
     seams = {
         "xm": xm, "attn_raw": attn_raw, "attn": a, "x1": x1,
@@ -830,7 +965,9 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         #     reaches the image rows through attention only. Reported as a number
         #     so the Mojo gate can confirm the same coupling exists.
         off = {s: (None, None) for s in SLOTS}
-        out_off, _ = omini_block_forward(
+        # seams_off is the LoRA-OFF twin of `seams`; kref_attn_raw_nolora comes
+        # from here so a LoRA-off Mojo forward has a reference it CAN match.
+        out_off, seams_off = omini_block_forward(
             x_full.detach(), blk_vec_t.detach(), blk_vec_cond.detach(), W, P,
             off, cos, sin, keymask, rowmask, COND_OFF, S_COND)
         img_delta = float((out_off[:, LT:COND_OFF]
@@ -844,8 +981,83 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         raise SystemExit("FATAL: condition LoRA never reached the image rows — "
                          "attention coupling is broken")
 
+    # ── SCHEDULE B: the F32-MATH-MODULATE REFERENCE SEAMS ───────────────────
+    # Re-run BOTH forwards (adapters on and off) with F32_MOD=True: identical
+    # algebra, identical real weights, identical inputs, identical seed,
+    # identical device — the ONLY change is that the modulate / residual-gate
+    # arithmetic happens in F32 and rounds ONCE at store instead of rounding at
+    # every bf16 op. That is a free and equally correct implementation choice,
+    # and it is the one serenitymojo makes: ops/elementwise.mojo's
+    # _modulate_kernel_bf16 upcasts x/scale/shift to F32, computes
+    # (1+sv)*xv+shv in F32 and .cast[bfloat16]()s exactly once, and
+    # _resgate_kernel_bf16 does the same for xv+gv*yv.
+    #
+    # TWO things come out of this run and they must not be confused:
+    #   (a) env_cos_<key>_modround — cos(schedule B, schedule A). INFORMATIONAL
+    #       only; the measured distance between the two rounding schedules.
+    #   (b) kref_<key>_f32mod — the schedule-B REFERENCE SEAMS themselves, which
+    #       (with env_cos_<key>_f32mod, computed against the shared F32-storage
+    #       run further down) are what the Mojo gates actually compare against.
+    #       Before these existed the gates compared a schedule-B implementation
+    #       against schedule-A references under schedule-A envelopes, and four
+    #       keys "failed" at block 27 by 1e-7..9e-7 purely from that mismatch.
+    #       See "TWO REFERENCE SCHEDULES" in the header.
+    global F32_MOD
+    modr = {}
+    mrk = {}          # kref_<key>_f32mod, kept on device for the envelope below
+    try:
+        F32_MOD = True
+        with torch.no_grad():
+            o_mr, s_mr = omini_block_forward(
+                x_full.detach(), blk_vec_t.detach(), blk_vec_cond.detach(),
+                W, P, lora, cos, sin, keymask, rowmask, COND_OFF, S_COND)
+            o_mr_off, s_mr_off = omini_block_forward(
+                x_full.detach(), blk_vec_t.detach(), blk_vec_cond.detach(),
+                W, P, off, cos, sin, keymask, rowmask, COND_OFF, S_COND)
+    finally:
+        F32_MOD = False
+    for nm, ka, kb in (
+        ("xm", s_mr["xm"], seams["xm"]),
+        ("attn_raw", s_mr["attn_raw"], seams["attn_raw"]),
+        ("gated", s_mr["lora_in"]["wo"], seams["lora_in"]["wo"]),
+        ("attn", s_mr["attn"], seams["attn"]),
+        ("x1", s_mr["x1"], seams["x1"]),
+        ("xm2", s_mr["xm2"], seams["xm2"]),
+        ("swiglu", s_mr["lora_in"]["mlp_down"], seams["lora_in"]["mlp_down"]),
+        ("ff", s_mr["ff"], seams["ff"]),
+        ("out", o_mr, out),
+        ("out_img", o_mr[:, LT:COND_OFF], out[:, LT:COND_OFF]),
+        ("attn_raw_nolora", s_mr_off["attn_raw"], seams_off["attn_raw"]),
+        ("out_nolora", o_mr_off, out_off),
+        ("out_nolora_img", o_mr_off[:, LT:COND_OFF], out_off[:, LT:COND_OFF]),
+    ):
+        modr[nm] = cos_sim(ka, kb)
+    # Retain ONLY the nine gated seams; everything else in these two forwards is
+    # dropped so the F32 envelope run below sees the same VRAM headroom as before.
+    mrk["xm"] = s_mr["xm"]
+    mrk["attn_raw"] = s_mr["attn_raw"]
+    mrk["gated"] = s_mr["lora_in"]["wo"]
+    mrk["attn"] = s_mr["attn"]
+    mrk["out"] = o_mr
+    mrk["out_img"] = o_mr[:, LT:COND_OFF].contiguous()
+    mrk["attn_raw_nolora"] = s_mr_off["attn_raw"]
+    mrk["out_nolora"] = o_mr_off
+    mrk["out_nolora_img"] = o_mr_off[:, LT:COND_OFF].contiguous()
+    del o_mr, s_mr, o_mr_off, s_mr_off
+    torch.cuda.empty_cache()
+    print("  [modround] cos(bf16 with F32-math modulate, bf16 baseline) — the")
+    print("             residual a correct implementation may carry purely from")
+    print("             choosing a different modulate rounding point:")
+    for k in sorted(modr, key=lambda z: modr[z]):
+        print(f"      {k:22s} {modr[k]:.9f}   1-cos = {1.0 - modr[k]:.3e}")
+    print(f"  [schedule B] retained {len(mrk)} kref_*_f32mod reference seams "
+          f"(the GATED set): {', '.join(sorted(mrk))}")
+
     # ── assemble fixture ─────────────────────────────────────────────────────
     out_t = {}
+    for _k, _v in modr.items():           # shipped even with SKIP_F32ENV
+        out_t["env_cos_" + _k + "_modround"] = torch.tensor(
+            [_v], dtype=torch.float32)
 
     def put(k, v):
         out_t[k] = v.detach().to("cpu").contiguous()
@@ -886,10 +1098,24 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
     put("kref_ff", seams["ff"])
     put("kref_out", seams["out"])
     put("kref_out_img", seams["out"][:, LT:COND_OFF])
-    # LoRA-OFF block output: the C2 gate target (layout + per-segment modulation
+    # LoRA-OFF references: the C2 gate targets (layout + per-segment modulation
     # + mask + RoPE, with the adapter disabled). Same inputs, B treated as absent.
+    # kref_attn_raw_nolora is the LoRA-OFF attention seam — the twin of
+    # kref_attn_raw, which is LoRA-ON (see the LoRA-ON/LoRA-OFF note in the
+    # header). Without it C2 had to rebuild the reference inside the gate.
+    put("kref_attn_raw_nolora", seams_off["attn_raw"])
     put("kref_out_nolora", out_off)
     put("kref_out_nolora_img", out_off[:, LT:COND_OFF])
+
+    # ── SCHEDULE B references: the SAME nine seams with modulate/residual-gate
+    # done in F32 and rounded ONCE at store — the schedule serenitymojo's
+    # ops/elementwise kernels implement, and therefore the set the Mojo C2/C3
+    # gates compare against. Same seed, same real krea2 weights, same real
+    # cached inputs, same bf16 policy everywhere else, same CUDA device. Their
+    # thresholds are env_cos_<key>_f32mod, measured below against the SAME
+    # F32-storage run the schedule-A envelopes use.
+    for _k in sorted(mrk):
+        put("kref_" + _k + "_f32mod", mrk[_k])
 
     put("kref_d_x", x_full.grad.float())
     put("kref_d_blk_vec_t", blk_vec_t.grad.float())
@@ -911,8 +1137,8 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
             A = lora_params[s][0].detach().float().requires_grad_(True)
             B = lora_params[s][1].detach().float().requires_grad_(True)
             l32[s] = (A, B)
-        o32, _ = omini_block_forward(x32, bt32, bc32, W, P, l32, cos, sin,
-                                     keymask, rowmask, COND_OFF, S_COND)
+        o32, s32 = omini_block_forward(x32, bt32, bc32, W, P, l32, cos, sin,
+                                       keymask, rowmask, COND_OFF, S_COND)
         (o32 * d_out.float()).sum().backward()
         put("kref_out_f32env", o32)
         put("kref_d_x_f32env", x32.grad)
@@ -929,8 +1155,35 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         # construction. Keys whose envelope is < 0.999 must be gated against the
         # *_f32env reference with the Mojo F32 block path instead
         # (krea2_block.mojo documents that path as "the F32 parity gate guard").
+        # NOTE on the two envelope families: with F32 STORAGE the two rounding
+        # schedules are literally the same sequence of F32 ops (`.float()` and
+        # `.to(float32)` are identities), so o32/s32 IS the F32 reference for
+        # both. env_cos_<key> = cos(schedule-A bf16, F32) and
+        # env_cos_<key>_f32mod = cos(schedule-B bf16, F32) — same method, same
+        # device, same weights, same F32 run. Neither is derived from the other.
         env = {}
         env["out"] = cos_sim(out, o32)
+        env["out_img"] = cos_sim(out[:, LT:COND_OFF], o32[:, LT:COND_OFF])
+        env["out_f32mod"] = cos_sim(mrk["out"], o32)
+        env["out_img_f32mod"] = cos_sim(mrk["out_img"], o32[:, LT:COND_OFF])
+        # PER-SEAM FORWARD ENVELOPES (LoRA-ON, both sides). Every forward key the
+        # Mojo gates compare against now ships its OWN ceiling, so no gate has to
+        # borrow env_cos_out (which C2 had to do for xm and attn_raw).
+        for nm, kb, kf in (
+            ("xm", seams["xm"], s32["xm"]),
+            ("attn_raw", seams["attn_raw"], s32["attn_raw"]),
+            ("gated", seams["lora_in"]["wo"], s32["lora_in"]["wo"]),
+            ("attn", seams["attn"], s32["attn"]),
+            ("x1", seams["x1"], s32["x1"]),
+            ("xm2", seams["xm2"], s32["xm2"]),
+            ("swiglu", seams["lora_in"]["mlp_down"], s32["lora_in"]["mlp_down"]),
+            ("ff", seams["ff"], s32["ff"]),
+        ):
+            env[nm] = cos_sim(kb, kf)
+            if nm in mrk:                 # schedule-B envelope, same F32 side
+                env[nm + "_f32mod"] = cos_sim(mrk[nm], kf)
+        del s32
+        torch.cuda.empty_cache()
         env["d_x"] = cos_sim(x_full.grad, x32.grad)
         env["d_blk_vec_t"] = cos_sim(blk_vec_t.grad, bt32.grad)
         env["d_blk_vec_cond"] = cos_sim(blk_vec_cond.grad, bc32.grad)
@@ -962,6 +1215,29 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         del xa, xb, oa, ob, Wb16
         torch.cuda.empty_cache()
 
+        # ── LoRA-OFF envelopes ──────────────────────────────────────────────
+        # The bf16 LoRA-off run above (out_off / seams_off) re-done in F32 storage
+        # on the SAME device with the SAME real weights (W is already F32 here).
+        # no_grad: these keys are forward-only references, and the F32 attention
+        # scores at L=2432 are ~1.1 GB each — the graph is not worth holding.
+        with torch.no_grad():
+            o_off32, s_off32 = omini_block_forward(
+                x32.detach(), bt32.detach(), bc32.detach(), W, P,
+                {s: (None, None) for s in SLOTS}, cos, sin, keymask, rowmask,
+                COND_OFF, S_COND)
+        env["attn_raw_nolora"] = cos_sim(seams_off["attn_raw"],
+                                         s_off32["attn_raw"])
+        env["out_nolora"] = cos_sim(out_off, o_off32)
+        env["out_nolora_img"] = cos_sim(out_off[:, LT:COND_OFF],
+                                        o_off32[:, LT:COND_OFF])
+        env["attn_raw_nolora_f32mod"] = cos_sim(mrk["attn_raw_nolora"],
+                                                s_off32["attn_raw"])
+        env["out_nolora_f32mod"] = cos_sim(mrk["out_nolora"], o_off32)
+        env["out_nolora_img_f32mod"] = cos_sim(mrk["out_nolora_img"],
+                                               o_off32[:, LT:COND_OFF])
+        del o_off32, s_off32
+        torch.cuda.empty_cache()
+
         for k, v in env.items():
             out_t["env_cos_" + k] = torch.tensor([v], dtype=torch.float32)
         print("  [envelope] bf16-vs-f32 cosine per key "
@@ -969,7 +1245,15 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         worst = sorted(env.items(), key=lambda kv: kv[1])
         for k, v in worst:
             flag = "  <-- NOT bf16-gateable, use *_f32env" if v < 0.999 else ""
-            print(f"      {k:20s} {v:.9f}{flag}")
+            print(f"      {k:26s} {v:.9f}{flag}")
+        print("  [schedule A vs B envelopes] the number each Mojo gate now uses")
+        print("             is the _f32mod column (schedule B == the Mojo math):")
+        print(f"      {'key':22s} {'1-env(A, bf16-chain)':>22s} "
+              f"{'1-env(B, f32mod)':>18s} {'1-modround(A vs B)':>20s}")
+        for k in sorted(mrk):
+            print(f"      {k:22s} {1.0 - env[k]:22.4e} "
+                  f"{1.0 - env[k + '_f32mod']:18.4e} "
+                  f"{1.0 - modr[k]:20.4e}")
         print(f"  [isolation] cos(d_x) with UNIFORM mods(t) on every row = "
               f"{env['d_x_uniformmod']:.9f}   vs {env['d_x']:.9f} per-segment "
               f"-> the t=0 condition modulation is "
@@ -1008,6 +1292,39 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
         "accum": "f32 (matmul accumulate, rmsnorm internal, attention softmax)",
         "layout": "[TXT_real(lt) | IMG | COND | TXT_pad]  (krea2_omini_layout.mojo)",
         "modulation": "rows [0,cond_off) -> mods(t); rows [cond_off,LFULL) -> mods(0)",
+        "rounding_schedule_A": (
+            "kref_<key> + env_cos_<key>: modulate/residual_gate evaluated in the "
+            "bf16 STORAGE dtype (3 roundings per modulate, 2 per residual gate) "
+            "— plain torch semantics; this is the schedule the mmdit fidelity "
+            "check validates the hand forward against"
+        ),
+        "rounding_schedule_B": (
+            "kref_<key>_f32mod + env_cos_<key>_f32mod: same algebra evaluated in "
+            "F32 and rounded ONCE at store — the schedule serenitymojo's "
+            "ops/elementwise.mojo _modulate_kernel_bf16/_resgate_kernel_bf16 "
+            "implement, hence the schedule the Mojo C2/C3 gates target"
+        ),
+        "gates_target": (
+            "SCHEDULE B (*_f32mod). Reason: env_cos_<key> measures bf16-vs-f32 "
+            "storage UNDER SCHEDULE A's OWN ROUNDING, so it does not bound a "
+            "correct implementation that uses schedule B. At block 27 "
+            "env_cos_out_img is 1-cos=1.043e-05 while env_cos_out_img_modround "
+            "(the A-vs-B distance alone) is 1.097e-05, i.e. choosing the "
+            "F32-math modulate ALONE puts a provably-correct implementation "
+            "outside the key's envelope. Four keys failed at block 27 by "
+            "1e-7..9e-7 for exactly that reason. Mis-specified criterion, not a "
+            "tolerance problem."
+        ),
+        "shared_f32_reference": (
+            "with F32 storage the two schedules are the identical sequence of "
+            "F32 ops, so env_cos_<key> and env_cos_<key>_f32mod are both "
+            "measured against the SAME F32-storage run on this device"
+        ),
+        "schedule_B_keys": (
+            "xm attn_raw gated attn out out_img attn_raw_nolora out_nolora "
+            "out_nolora_img (the gated set). x1/xm2/swiglu/ff and ALL backward "
+            "keys are schedule A only — C4 must extend this before gating them."
+        ),
         "lora_routing": "condition rows only (OminiControl trainer.py:57)",
         "cond_position": f"delta [{COND_DELTA_H},{COND_DELTA_W}] scale {COND_POS_SCALE} (EDIT)",
         "seed": str(gen_seed),
@@ -1028,7 +1345,7 @@ def run_block(idx, f, C, device, dtype, gen_seed, do_f32env, validate,
     sz = os.path.getsize(path)
     print(f"  WROTE {path}  ({len(out_t)} tensors, {sz/1e6:.1f} MB)", flush=True)
 
-    del W, P, x_full, out, seams, lora, lora_params, d_out
+    del W, P, x_full, out, seams, lora, lora_params, d_out, mrk
     torch.cuda.empty_cache()
     return path, out_t
 

@@ -66,7 +66,14 @@
 #       don't matter (keep mods(t) — cheapest, value never read). Concretely:
 #       slice x at cond_off/pad_off, modulate each slice, concat — or a
 #       segmented modulate/residual_gate op taking (row_off,row_len) pairs.
-#    2. Cond-row LoRA routing (intake §1.3/§3.4 — adapter acts ONLY on cond
+#    2. Cond-row LoRA routing — LANDED IN C3. krea2_block gained a third
+#       optional param `cond_len`; when it is supplied alongside a valid
+#       cond_off the block computes each LoRA delta on the cond row slice and
+#       scatter-adds it back (helpers `_lora_delta_rows` / `_add_delta_rows`,
+#       both with a c_off < 0 sentinel that reduces to the pre-C3 kernels).
+#       Gated by parity/krea2_omini_c3_lora_gate.mojo. Original plan text kept
+#       below for the line references; the M note is now realised as `c_len`.
+#       (intake §1.3/§3.4 — adapter acts ONLY on cond
 #       rows; text+img rows run frozen base): base matmuls stay full-sequence
 #       (`_base_fwd` def :187; sites :587-590 q/k/v/gate and :697-698
 #       mlp_gate/mlp_up; `_linear_lora` sites :688 wo idx4 and :726 mlp_down

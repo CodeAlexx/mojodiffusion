@@ -152,14 +152,83 @@ def _lora_fwd(
     return Optional[Tensor](None)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OminiControl EDIT — COND-ROW LoRA ROUTING (seam B.2 of
+# training/krea2_omini_layout.mojo; intake §1.3/§3.4)
+#
+# OminiControl attaches the adapter to the CONDITION branch only (trainer.py:57
+# `adapter_names=[None, None, "default"]`, confirmed by their own comment at
+# trainer.py:370). Text and image rows run the FROZEN BASE. Concretely, at every
+# one of the 8 block Linears:
+#     y = x @ Wᵀ                                   over the FULL sequence
+#     y[:, c_off : c_off+c_len] += scale * ((x_c @ Aᵀ) @ Bᵀ),  x_c = x[:, c_off:…]
+# i.e. the base matmul shape is unchanged and only the low-rank delta shrinks
+# from L rows to c_len rows (a strict FLOP saving, not a cost).
+#
+# The two helpers below carry a SENTINEL: c_off < 0 means "no cond routing", and
+# both then reduce EXACTLY to the pre-existing `_lora_fwd` + `add` — the same
+# kernels with the same arguments, so every existing caller stays bit-for-bit
+# unchanged (this is what keeps the CONDLEN=0 build bit-equal).
+#
+# NOTE the coupling this deliberately does NOT prevent: the img rows' OUTPUT does
+# change even though no delta is added to them, because the cond rows' K/V feed
+# bidirectional attention (intake §1.4). That is the method working — the oracle
+# measures it (`[coupling] block-out max|delta| img rows`) and asserts it nonzero.
+# ══════════════════════════════════════════════════════════════════════════════
+def _lora_delta_rows(
+    x: Tensor, lo: Optional[LoraAdapterDevice], M: Int,
+    c_off: Int, c_len: Int, ctx: DeviceContext,
+) raises -> Optional[Tensor]:
+    """LoRA delta for one Linear. c_off < 0 -> the whole-sequence delta [1,M,out]
+    (identical to _lora_fwd). c_off >= 0 -> the delta of the COND ROW SLICE only,
+    returned as [1, c_len, out] for _add_delta_rows to scatter back."""
+    if lo:
+        if c_off < 0:
+            return Optional[Tensor](
+                klein_lora_fwd_device_resident_unfused(x, lo.value(), M, ctx)
+            )
+        var xc = slice(x, 1, c_off, c_len, ctx)
+        return Optional[Tensor](
+            klein_lora_fwd_device_resident_unfused(xc, lo.value(), c_len, ctx)
+        )
+    return Optional[Tensor](None)
+
+
+def _add_delta_rows(
+    y: Tensor, d: Tensor, c_off: Int, c_len: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """c_off < 0 -> plain y + d (unchanged path). c_off >= 0 -> SCATTER-ADD: d is
+    [1,c_len,out] and lands on rows [c_off, c_off+c_len) only; the head and tail
+    rows are the frozen base output copied through byte-for-byte."""
+    if c_off < 0:
+        return add(y, d, ctx)
+    var rows = y.shape()[1]
+    var mid = add(slice(y, 1, c_off, c_len, ctx), d, ctx)
+    var tail_len = rows - c_off - c_len
+    if c_off == 0:
+        if tail_len == 0:
+            return mid^
+        return concat(1, ctx, mid, slice(y, 1, c_off + c_len, tail_len, ctx))
+    if tail_len == 0:
+        return concat(1, ctx, slice(y, 1, 0, c_off, ctx), mid)
+    return concat(
+        1, ctx, slice(y, 1, 0, c_off, ctx), mid,
+        slice(y, 1, c_off + c_len, tail_len, ctx),
+    )
+
+
 def _linear_lora(
     x: Tensor, w: Tensor, lo: Optional[LoraAdapterDevice], M: Int, ctx: DeviceContext,
     w8: Optional[TArc] = Optional[TArc](None),
     w8_scale: Optional[TArc] = Optional[TArc](None),
+    c_off: Int = -1,          # OminiControl EDIT cond-row LoRA routing (C3):
+    c_len: Int = 0,           # -1 (default) = the pre-existing full-sequence path.
 ) raises -> Tensor:
     """y = linear(x,W) [no bias] + LoRA delta (if present). When w8/w8_scale are
     present the FROZEN base runs int8 W8A8 (int8_linear_fwd, x cast to BF16 ==
-    reference trainer's bf16 activations) instead of the bf16 `linear`; the LoRA delta stays bf16."""
+    reference trainer's bf16 activations) instead of the bf16 `linear`; the LoRA delta stays bf16.
+    c_off >= 0 restricts the delta to rows [c_off, c_off+c_len) — the base matmul
+    is untouched and still runs the FULL sequence."""
     if w8:
         var base: Tensor
         if x.dtype() == STDtype.BF16:
@@ -167,15 +236,15 @@ def _linear_lora(
         else:
             var xb = cast_tensor(x, STDtype.BF16, ctx)
             base = int8_linear_fwd(xb, w8.value()[], w8_scale.value()[], ctx)
-        var d = _lora_fwd(x, lo, M, ctx)
+        var d = _lora_delta_rows(x, lo, M, c_off, c_len, ctx)
         if d:
-            base = add(base, d.value(), ctx)
+            base = _add_delta_rows(base, d.value(), c_off, c_len, ctx)
         return base^
     var nb = _no_bias()
     var y = linear(x, w, nb^, ctx)
-    var d2 = _lora_fwd(x, lo, M, ctx)
+    var d2 = _lora_delta_rows(x, lo, M, c_off, c_len, ctx)
     if d2:
-        y = add(y, d2.value(), ctx)
+        y = _add_delta_rows(y, d2.value(), c_off, c_len, ctx)
     return y^
 
 
@@ -620,14 +689,27 @@ def krea2_single_stream_block_lora[
         # through to the pre-existing code path BIT-FOR-BIT (the CONDLEN=0
         # regression contract). Only 0 < cond_off < L enables segmentation.
         #
-        # ⚠ C2 SCOPE: this is FORWARD ONLY. The backward entry points
+        # ⚠ C2/C3 SCOPE: this is FORWARD ONLY. The backward entry points
         # (`krea2_single_stream_block_lora_backward` :1732, `..._backward_b2`
         # :2099, `..._backward_b2_dev` :2303, `..._backward_dev` :2450) still
-        # recompute ONE uniform `_mod6(vec)`,
-        # so enabling vec_cond in a TRAINING loop before chunk C4 lands would
-        # silently produce wrong d_x / d_mod on the condition rows. Nothing in
-        # the trainer passes these arguments today; do not wire them into
-        # krea2_stack/train_krea2 until the per-segment backward exists.
+        # recompute ONE uniform `_mod6(vec)` and still compute dA/dB from the
+        # FULL sequence, so enabling vec_cond / cond_len in a TRAINING loop
+        # before chunk C4 lands would silently produce wrong d_x / d_mod / dA /
+        # dB on the condition rows. Nothing in the trainer passes these
+        # arguments today; do not wire them into krea2_stack/train_krea2 until
+        # the per-segment, cond-row backward exists.
+    cond_len: Optional[Int] = Optional[Int](None),    # OminiControl EDIT (C3):
+        # the CONDITION segment length == Krea2OminiLayout.cond_len() (S_COND).
+        # Present together with a valid cond_off it turns on COND-ROW LoRA
+        # ROUTING at all 8 Linears: the frozen base still runs the FULL sequence
+        # and only the low-rank delta is computed on rows
+        # [cond_off, cond_off+cond_len) and scatter-added back there
+        # (OminiControl trainer.py:57 adapter_names [None, None, "default"]).
+        # ABSENT — or cond_len <= 0, or cond_off <= 0, or cond_off+cond_len > L
+        # — leaves the pre-existing full-sequence LoRA path BIT-FOR-BIT intact
+        # (the CONDLEN=0 regression contract). Note cond_len is INDEPENDENT of
+        # vec_cond: modulation segmentation and LoRA routing are separate
+        # switches, so each can be gated on its own.
 ) raises -> Krea2BlockForward:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -655,6 +737,22 @@ def krea2_single_stream_block_lora[
             if split > 0 and split < L:
                 mods_c = _mod6(vec_cond.value()[], w.mod_lin[], features, ctx)
                 seg_mod = True
+
+    # OminiControl EDIT COND-ROW LoRA ROUTING (opt-in, C3). c_off < 0 is the
+    # sentinel for "not routed": every LoRA site below then calls exactly the
+    # kernels it called before this chunk, on the full sequence. Enabled only
+    # when a cond_len is supplied AND the [cond_off, cond_off+cond_len) window is
+    # a strict interior slice of the sequence. The FROZEN BASE is never
+    # restricted — it always runs all L rows.
+    var c_off = -1
+    var c_len = 0
+    if cond_off:
+        if cond_len:
+            var co = cond_off.value()
+            var cl = cond_len.value()
+            if co > 0 and cl > 0 and co + cl <= L:
+                c_off = co
+                c_len = cl
 
     # ── ATTENTION branch ─────────────────────────────────────────────────────
     # xm = (1+prescale)*prenorm(x) + preshift
@@ -687,8 +785,16 @@ def krea2_single_stream_block_lora[
                             and lq.in_f == lk.in_f and lq.in_f == lv.in_f and lq.in_f == lg.in_f
                         ):
                             var a_stack = concat(0, ctx, lq.a[], lk.a[], lv.a[], lg.a[])
-                            var nb_a = _no_bias()
-                            var t_stack = linear(xm, a_stack, nb_a^, ctx)
+                            # Cond-row routing shrinks the SHARED down-projection
+                            # input from L rows to c_len rows; grouping is kept.
+                            var t_stack: Tensor
+                            if c_off >= 0:
+                                var xc = slice(xm, 1, c_off, c_len, ctx)
+                                var nb_ac = _no_bias()
+                                t_stack = linear(xc, a_stack, nb_ac^, ctx)
+                            else:
+                                var nb_a = _no_bias()
+                                t_stack = linear(xm, a_stack, nb_a^, ctx)
                             var last_dim = len(t_stack.shape()) - 1
                             var tq = slice(t_stack, last_dim, 0, lq.rank, ctx)
                             var tk = slice(t_stack, last_dim, lq.rank, lk.rank, ctx)
@@ -696,27 +802,27 @@ def krea2_single_stream_block_lora[
                             var tg = slice(t_stack, last_dim, 3 * lq.rank, lg.rank, ctx)
 
                             var nb_bq = _no_bias()
-                            q = add(q, mul_scalar(linear(tq, lq.b[], nb_bq^, ctx), lq.scale, ctx), ctx)
+                            q = _add_delta_rows(q, mul_scalar(linear(tq, lq.b[], nb_bq^, ctx), lq.scale, ctx), c_off, c_len, ctx)
                             var nb_bk = _no_bias()
-                            k = add(k, mul_scalar(linear(tk, lk.b[], nb_bk^, ctx), lk.scale, ctx), ctx)
+                            k = _add_delta_rows(k, mul_scalar(linear(tk, lk.b[], nb_bk^, ctx), lk.scale, ctx), c_off, c_len, ctx)
                             var nb_bv = _no_bias()
-                            v_lin = add(v_lin, mul_scalar(linear(tv, lv.b[], nb_bv^, ctx), lv.scale, ctx), ctx)
+                            v_lin = _add_delta_rows(v_lin, mul_scalar(linear(tv, lv.b[], nb_bv^, ctx), lv.scale, ctx), c_off, c_len, ctx)
                             var nb_bg = _no_bias()
-                            gate_pre = add(gate_pre, mul_scalar(linear(tg, lg.b[], nb_bg^, ctx), lg.scale, ctx), ctx)
+                            gate_pre = _add_delta_rows(gate_pre, mul_scalar(linear(tg, lg.b[], nb_bg^, ctx), lg.scale, ctx), c_off, c_len, ctx)
                             qkvg_grouped = True
     if not qkvg_grouped:
-        var dq = _lora_fwd(xm, lora.wq, M, ctx)
+        var dq = _lora_delta_rows(xm, lora.wq, M, c_off, c_len, ctx)
         if dq:
-            q = add(q, dq.value(), ctx)
-        var dk = _lora_fwd(xm, lora.wk, M, ctx)
+            q = _add_delta_rows(q, dq.value(), c_off, c_len, ctx)
+        var dk = _lora_delta_rows(xm, lora.wk, M, c_off, c_len, ctx)
         if dk:
-            k = add(k, dk.value(), ctx)
-        var dv = _lora_fwd(xm, lora.wv, M, ctx)
+            k = _add_delta_rows(k, dk.value(), c_off, c_len, ctx)
+        var dv = _lora_delta_rows(xm, lora.wv, M, c_off, c_len, ctx)
         if dv:
-            v_lin = add(v_lin, dv.value(), ctx)
-        var dg = _lora_fwd(xm, lora.gate_w, M, ctx)
+            v_lin = _add_delta_rows(v_lin, dv.value(), c_off, c_len, ctx)
+        var dg = _lora_delta_rows(xm, lora.gate_w, M, c_off, c_len, ctx)
         if dg:
-            gate_pre = add(gate_pre, dg.value(), ctx)
+            gate_pre = _add_delta_rows(gate_pre, dg.value(), c_off, c_len, ctx)
 
     # reshape BSHD.
     var q_pre = reshape_owned(q^, [1, L, HEADS, HEADDIM])
@@ -769,7 +875,7 @@ def krea2_single_stream_block_lora[
     # sigmoid gate + product, then wo.
     var sg = sigmoid(gate_pre, ctx)                             # [1,L,features]
     var gated = mul(attn_flat, sg, ctx)                        # [1,L,features]
-    var a = _linear_lora(gated, w.wo[], lora.wo, M, ctx, _i8w(w, 4), _i8s(w, 4))  # [1,L,features]
+    var a = _linear_lora(gated, w.wo[], lora.wo, M, ctx, _i8w(w, 4), _i8s(w, 4), c_off, c_len)  # [1,L,features]
 
     # x1 = x + pregate * a
     var x1: Tensor
@@ -798,26 +904,32 @@ def krea2_single_stream_block_lora[
                 var lmu = lora.mlp_up_w.value().copy()
                 if lmg.rank == lmu.rank and lmg.in_f == lmu.in_f:
                     var a_stack = concat(0, ctx, lmg.a[], lmu.a[])
-                    var nb_a = _no_bias()
-                    var t_stack = linear(xm2, a_stack, nb_a^, ctx)
+                    var t_stack: Tensor
+                    if c_off >= 0:
+                        var xc2 = slice(xm2, 1, c_off, c_len, ctx)
+                        var nb_ac = _no_bias()
+                        t_stack = linear(xc2, a_stack, nb_ac^, ctx)
+                    else:
+                        var nb_a = _no_bias()
+                        t_stack = linear(xm2, a_stack, nb_a^, ctx)
                     var last_dim = len(t_stack.shape()) - 1
                     var tmg = slice(t_stack, last_dim, 0, lmg.rank, ctx)
                     var tmu = slice(t_stack, last_dim, lmg.rank, lmu.rank, ctx)
 
                     var nb_bmg = _no_bias()
-                    mg = add(mg, mul_scalar(linear(tmg, lmg.b[], nb_bmg^, ctx), lmg.scale, ctx), ctx)
+                    mg = _add_delta_rows(mg, mul_scalar(linear(tmg, lmg.b[], nb_bmg^, ctx), lmg.scale, ctx), c_off, c_len, ctx)
                     var nb_bmu = _no_bias()
-                    mu = add(mu, mul_scalar(linear(tmu, lmu.b[], nb_bmu^, ctx), lmu.scale, ctx), ctx)
+                    mu = _add_delta_rows(mu, mul_scalar(linear(tmu, lmu.b[], nb_bmu^, ctx), lmu.scale, ctx), c_off, c_len, ctx)
                     mlp_grouped = True
     if not mlp_grouped:
-        var dmg = _lora_fwd(xm2, lora.mlp_gate_w, M, ctx)
+        var dmg = _lora_delta_rows(xm2, lora.mlp_gate_w, M, c_off, c_len, ctx)
         if dmg:
-            mg = add(mg, dmg.value(), ctx)
-        var dmu = _lora_fwd(xm2, lora.mlp_up_w, M, ctx)
+            mg = _add_delta_rows(mg, dmg.value(), c_off, c_len, ctx)
+        var dmu = _lora_delta_rows(xm2, lora.mlp_up_w, M, c_off, c_len, ctx)
         if dmu:
-            mu = add(mu, dmu.value(), ctx)
+            mu = _add_delta_rows(mu, dmu.value(), c_off, c_len, ctx)
     var sw = swiglu(mg, mu, ctx)                                # silu(mg)*mu [1,L,mlpdim]
-    var m = _linear_lora(sw, w.mlp_down_w[], lora.mlp_down_w, M, ctx, _i8w(w, 7), _i8s(w, 7))    # [1,L,features]
+    var m = _linear_lora(sw, w.mlp_down_w[], lora.mlp_down_w, M, ctx, _i8w(w, 7), _i8s(w, 7), c_off, c_len)    # [1,L,features]
 
     var x2: Tensor
     if seg_mod:

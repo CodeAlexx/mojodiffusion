@@ -78,7 +78,7 @@ DIT_CKPT = os.environ.get(
 UPSAMPLER = os.environ.get(
     "LTX2_UPSAMPLER",
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
-GEMMA_ROOT = "/home/alex/.cache/huggingface/hub/models--google--gemma-3-12b-it/snapshots/96b6f1eccf38110c56df3a15bffe176da04bfd80"
+GEMMA_ROOT = "/home/alex/.cache/huggingface/hub/models--Lightricks--gemma-3-12b-it-qat-q4_0-unquantized/snapshots/d62fe4f1995ade703b49a0f3c0d0f161237ef437"
 DISTILLED_LORA = os.environ.get(
     "LTX2_DISTILLED_LORA",
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-lora-384-1.1.safetensors",

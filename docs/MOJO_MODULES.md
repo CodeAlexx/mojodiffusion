@@ -595,6 +595,15 @@ peak VRAM. Creator fast-distilled requests use Euler plus `ltx2_distilled`
 with eight stage-1 evaluations; bounded dev requests use `res2s` plus `ltx2`
 for 1-20 steps.
 
+Full LTX 2.3 fine-tunes are registered in the same JSON under `checkpoints`.
+Each entry names the UI/API `id`, model-root-relative `path`, accepted aliases,
+guidance and quant modes, and whether `support_lora` is `official` (dev base
+needs the support LoRA) or `baked` (a distilled full checkpoint must not stack
+it again). The server publishes only installed entries to Generate, resolves
+only registered paths below `SERENITY_MODEL_ROOT`, and passes the resolved
+checkpoint/support contract to each fresh Mojo process. New entries remain
+experimental until their own sampled artifact and parity evidence is accepted.
+
 Long and high-resolution decode uses the Desktop tiled VAE contract and streams
 completed PNG chunks instead of retaining the whole movie tensor. The
 960x544/481f product gate produced a coherent 20.041667-second H.264 video and

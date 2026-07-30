@@ -1,6 +1,33 @@
 {
   "schema": "serenity.ltx2.request_profiles.v1",
   "checkpoint": "ltx-2.3-22b-distilled-1.1",
+  "checkpoints": [
+    {
+      "id": "ltx-2.3-22b-dev-fp8",
+      "label": "LTX 2.3 Dev FP8",
+      "path": "checkpoints/ltx-2.3-22b-dev-fp8.safetensors",
+      "aliases": ["ltx-2.3-22b-dev-fp8.safetensors"],
+      "support_lora": "official",
+      "guidance_modes": ["distilled", "dev"],
+      "quant_modes": ["fp8", "int4"],
+      "readiness_label": "production_ready",
+      "source": "Official LTX 2.3 dev base plus the official 1.1 support LoRA"
+    },
+    {
+      "id": "sulphur-distill-fp8",
+      "label": "Sulphur 2 Distilled FP8 (LTX 2.3 fine-tune)",
+      "path": "checkpoints/sulphur_distill_fp8.safetensors",
+      "aliases": [
+        "sulphur_distill_fp8",
+        "sulphur_distill_fp8.safetensors"
+      ],
+      "support_lora": "baked",
+      "guidance_modes": ["distilled"],
+      "quant_modes": ["fp8"],
+      "readiness_label": "artifact_compatible_experimental",
+      "source": "Winnougan/Sulphur-2-LTX-2.3 distilled full checkpoint"
+    }
+  ],
   "guidance_modes": {
     "distilled": {
       "steps": 8,

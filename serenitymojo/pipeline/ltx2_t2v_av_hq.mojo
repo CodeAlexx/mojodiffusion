@@ -199,6 +199,18 @@ def _request_hq_video_vae_ckpt(request_checkpoint: String) -> String:
     return env_or("LTX2_VIDEO_VAE_CKPT", request_checkpoint)
 
 
+def _refhq_uses_support_lora() raises -> Bool:
+    var mode = String(_env_str("LTX2_REFHQ_SUPPORT_LORA").lower())
+    if mode.byte_length() == 0 or mode == String("official"):
+        return True
+    if mode == String("baked"):
+        return False
+    raise Error(
+        String("LTX2_REFHQ_SUPPORT_LORA must be 'official' or 'baked'; got '")
+        + mode + String("'")
+    )
+
+
 def _audio_ctx_dump() -> String:
     return env_or("LTX2_AUDIO_CONTEXT", serenity_output(String("fixtures/ltx2_audio_context.safetensors")))
 
@@ -685,6 +697,11 @@ struct _RequestHQLoraStack(Movable):
             trained.append(ArcPointer(LoraSet.load(path)))
             trained_mults.append(mult)
             trained_streams.append(streams)
+        var distilled: Optional[LoraSet] = None
+        if _refhq_uses_support_lora():
+            distilled = Optional[LoraSet](
+                LoraSet.load(_refhq_lora_distilled())
+            )
         return _RequestHQLoraStack(
             distilled^, trained^, trained_mults^,
             trained_streams^,

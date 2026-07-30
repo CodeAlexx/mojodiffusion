@@ -158,9 +158,17 @@ def conv3d_fcqrs_cudnn(
     var wo = (wi + 2 * pad_w - s) // stride_w + 1
 
     var dt = x.dtype().to_mojo_dtype()
-    # The generic helper below has only F32 and F16 instantiations. Falling
-    # through with BF16 reinterprets BF16 buffers as FP16 and produces invalid
-    # VAE activations. BF16 must always use the native BF16 cuDNN shim.
+    # BF16 has exactly ONE correct path here: the cshim BF16 kernel. It used to be
+    # gated on `low_startup`, so an ungated bf16 caller fell through to the `else`
+    # branch below, which bitcasts the buffer to Float16 and runs an fp16 cuDNN
+    # conv — bf16 and fp16 share a width but NOT an exponent field (8 bits vs 5),
+    # so that reinterprets every value into garbage. Silent: no shape or dtype
+    # check can catch it, and the bias-add further down handled bfloat16 properly,
+    # so only the conv result was wrong. MEASURED symptom (2026-07-26): the
+    # Qwen-Image VAE decoder (a BF16 checkpoint) rendered PURE WHITE — every krea2
+    # inline sample was blank while the trainer reported success. `low_startup`
+    # now only means "prefer the cshim kernel for f32/f16 startup cost"; for bf16
+    # the cshim kernel is not an optimization, it is the only correct dispatch.
     if dt == DType.bfloat16:
         return cudnn_conv3d_bf16_ndhwc(
             x,
@@ -173,6 +181,13 @@ def conv3d_fcqrs_cudnn(
             pad_h,
             pad_w,
             ctx,
+        )
+    if dt != DType.float32 and dt != DType.float16:
+        # Fail loud instead of silently reinterpreting an unhandled dtype as fp16
+        # (the class of bug this function just had).
+        raise Error(
+            "conv3d_fcqrs_cudnn: unsupported dtype (want float32, float16 or"
+            " bfloat16)"
         )
 
     var out_n = n * do_ * ho * wo * cout

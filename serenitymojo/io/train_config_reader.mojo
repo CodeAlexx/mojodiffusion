@@ -194,6 +194,46 @@ def _read_bool(mut cur: _Cursor) raises -> Bool:
     return _read_scalar(cur).num != 0.0
 
 
+def _read_int_pair(mut cur: _Cursor, field: String) raises -> Tuple[Int, Int]:
+    """Read a JSON `[a, b]` of two INTEGER numbers. Fail loud on a wrong length
+    or a fractional value — a silently truncated position delta is invisible."""
+    cur.skip_ws()
+    cur.expect(0x5B)  # '['
+    var vals = List[Float64]()
+    cur.skip_ws()
+    if cur.peek() != 0x5D:
+        while True:
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                raise Error(
+                    String("JSON config: ") + field + String(" entries must be numbers")
+                )
+            vals.append(sc.num)
+            cur.skip_ws()
+            var ch = cur.peek()
+            if ch == 0x2C:
+                cur.advance()
+                continue
+            if ch == 0x5D:
+                break
+            raise Error(
+                String("JSON config: expected ',' or ']' in ") + field
+                + String(" at byte ") + String(cur.pos)
+            )
+    cur.expect(0x5D)  # ']'
+    if len(vals) != 2:
+        raise Error(
+            String("JSON config: ") + field + String(" must have exactly 2 entries, got ")
+            + String(len(vals))
+        )
+    for i in range(2):
+        if vals[i] != Float64(Int(vals[i])):
+            raise Error(
+                String("JSON config: ") + field + String(" entries must be integers")
+            )
+    return (Int(vals[0]), Int(vals[1]))
+
+
 def _dtype_int(s: String) raises -> Int:
     if s == "NONE":
         return TRAIN_DTYPE_NONE
@@ -1440,6 +1480,43 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             if tb <= Float32(0.0) or tb >= Float32(1.0):
                 raise Error("JSON config: timestep_boundary must be in (0,1)")
             cfg.timestep_boundary = tb
+        # ── OminiControl EDIT condition (krea2 C6) ────────────────────────────
+        # These four keys were previously swallowed by the `_skip_value` unknown-
+        # key arm below, i.e. an omini config loaded WITHOUT its condition
+        # settings and nothing said so. They are now read and validated here;
+        # the krea2 trainer additionally cross-checks them against its build-time
+        # -D KREA2_CONDLEN and against the cache's cond_pos records.
+        elif key == "omini_condition_type":
+            var sc = _read_scalar(cur)
+            if not sc.is_string:
+                raise Error("JSON config: omini_condition_type must be a string")
+            if sc.s != String("") and sc.s != String("edit"):
+                raise Error(
+                    String("JSON config: unsupported omini_condition_type '")
+                    + sc.s + String("' (supported: \"\", \"edit\")")
+                )
+            cfg.omini_condition_type = sc.s
+        elif key == "omini_condition_length":
+            var cl = Int(_read_scalar(cur).num)
+            if cl < 0:
+                raise Error(
+                    "JSON config: omini_condition_length must be >= 0"
+                )
+            cfg.omini_condition_length = cl
+        elif key == "omini_position_delta":
+            # OminiControl position_delta is a 2-element INTEGER array [h, w]
+            # (flux_omini.py adds it to integer position ids). Anything else is
+            # a config error, not something to round.
+            var d = _read_int_pair(cur, String("omini_position_delta"))
+            cfg.omini_position_delta_h = d[0]
+            cfg.omini_position_delta_w = d[1]
+        elif key == "omini_position_scale":
+            var ps = Float32(_read_scalar(cur).num)
+            if ps <= Float32(0.0):
+                raise Error(
+                    "JSON config: omini_position_scale must be > 0"
+                )
+            cfg.omini_position_scale = ps
         else:
             _skip_value(cur)  # skip unknown top-level keys
 

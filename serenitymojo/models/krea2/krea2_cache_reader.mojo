@@ -51,7 +51,9 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import reshape, permute, zeros_device, concat
+from serenitymojo.ops.tensor_algebra import (
+    reshape, permute, zeros_device, concat, slice,
+)
 from serenitymojo.training.krea2_omini_layout import (
     Krea2OminiLayout, krea2_omini_cond_pos,
 )
@@ -150,6 +152,50 @@ def krea2_build_pos[LH: Int, LW: Int](
 ) raises -> Tensor:
     """Build pos [1, LT+imglen, 3] f32 for a krea2 sample (== _build_pos)."""
     return krea2_build_pos_cond[LH, LW](lt, 0, 0, 0, Float32(1.0), ctx)
+
+
+# ── SOURCE -> COMBINED gather for the EDIT sequence (C6) ─────────────────────
+# The device twin of Krea2OminiLayout.combined_src_row(): it turns the SOURCE
+# order this reader emits, [TXT(LTMAX) | IMG | COND], into the COMBINED order the
+# trainer feeds the blocks, [TXT_real(lt) | IMG | COND | TXT_pad]. It lives HERE
+# rather than inside train_krea2.mojo so a GATE can call the very function the
+# trainer calls (krea2_omini_c6_loss_mask_gate section 4 compares it, element for
+# element, against the host layout module's krea2_omini_pos_combined, which C2
+# already gated against the CUDA oracle).
+#
+# The trainer applies this to its pos table; it is written as slices/concats so
+# it works for ANY per-row side data of shape [1, LFULL_E, C], not just pos.
+def krea2_reorder_combined_edit[LTMAX: Int, LFULL_E: Int, CONDL: Int](
+    src: Tensor,        # [1, LFULL_E, C]  SOURCE order [TXT(LTMAX) | IMG | COND]
+    lt: Int,            # this sample's real caption length (<= LTMAX)
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """COMBINED-order [1, LFULL_E, C] = src gathered by combined_src_row()."""
+    comptime IMGL = LFULL_E - LTMAX - CONDL
+    if lt < 0 or lt > LTMAX:
+        raise Error("krea2_reorder_combined_edit: lt out of [0, LTMAX]")
+    if src.shape()[1] != LFULL_E:
+        raise Error(
+            String("krea2_reorder_combined_edit: src rows ")
+            + String(src.shape()[1]) + " != LFULL_E " + String(LFULL_E)
+        )
+    var s_img = slice(src, 1, LTMAX, IMGL, ctx)                  # IMG block
+    var s_cond = slice(src, 1, LTMAX + IMGL, CONDL, ctx)         # COND block
+    # NOTE the two BOUNDARY cases. A zero-length `slice` launches a kernel with
+    # grid_dim 0 and aborts, so neither empty segment may be materialized:
+    #   lt == 0      -> no TXT_real segment  ([IMG | COND | TXT_pad(LTMAX)])
+    #   lt == LTMAX  -> no TXT_pad segment   ([TXT | IMG | COND])
+    if lt <= 0:
+        var h0 = concat(1, ctx, s_img, s_cond)
+        return concat(1, ctx, h0, slice(src, 1, 0, LTMAX, ctx))
+    if lt < LTMAX:
+        var s_real = slice(src, 1, 0, lt, ctx)                   # TXT_real
+        var s_pad = slice(src, 1, lt, LTMAX - lt, ctx)           # TXT_pad
+        var h1 = concat(1, ctx, s_real, s_img)
+        var h2 = concat(1, ctx, h1, s_cond)
+        return concat(1, ctx, h2, s_pad)
+    var h1b = concat(1, ctx, slice(src, 1, 0, LTMAX, ctx), s_img)
+    return concat(1, ctx, h1b, s_cond)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

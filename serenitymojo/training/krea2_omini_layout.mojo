@@ -29,7 +29,53 @@
 # NOTHING in krea2_block.mojo / train_krea2.mojo is touched by this chunk).
 # All line refs verified against the in-tree sources 2026-07-30.
 #
-# A) TRAINER SEQUENCE ASSEMBLY — serenitymojo/models/krea2/train_krea2.mojo
+# A) TRAINER SEQUENCE ASSEMBLY — LANDED IN C6 (train_krea2.mojo). What shipped,
+#    and where the plan below was WRONG:
+#    1. `_build_conditioning_edit` builds `concat(real_text, img_e, cond_e,
+#       pad_text)` at exactly the Krea2OminiLayout offsets below.
+#       ⚠ CORRECTION to the original plan text (kept below): cond_e is
+#       `krea2_first(cond_img_tokens)` and NOTHING ELSE. There is NO img_in_ref
+#       delta on the condition rows. OminiControl SHARES x_embedder between the
+#       image and the condition tokens; krea2's img_in_ref
+#       (krea2_img_in_ref_param.mojo, the KREA2_EDIT=1 path) is a DIFFERENT and
+#       mutually exclusive edit mechanism — an additive reference projection on
+#       the IMAGE rows. Stacking both would count the reference twice, so the
+#       trainer fail-louds when KREA2_EDIT=1 meets -D KREA2_CONDLEN>0.
+#    2. The second modulation vector is built by running the SAME
+#       krea2_temb→krea2_tmlp→krea2_tproj chain on t=0 (`_CondEdit.blk_vec_cond`)
+#       and is passed to every block alongside blk_vec.
+#       ⚠ Its GRADIENT (Krea2BlockGrads.d_vec_cond, and d_vec_t) is DISCARDED,
+#       exactly as the pre-edit trainer already discards its d_vec: both temb
+#       chains are FROZEN (Krea2ResidentCond, no adapters), so there is no
+#       trainable parameter for those grads to reach. The only krea2 consumer of
+#       a block d_vec is the OFT carrier path, which has no EDIT support.
+#    3. pos reorder: `krea2_reorder_combined_edit` (krea2_cache_reader.mojo) is
+#       `combined_src_row()` as four slices. It lives in the READER, not the
+#       trainer, so parity/krea2_omini_c6_loss_mask_gate can call the very
+#       function the trainer calls and compare it EXACTLY against
+#       krea2_omini_pos_combined below (PASS at lt = 0, 1, 16, 283, LTMAX).
+#       ⚠ BOUNDARY: lt == 0 and lt == LTMAX must not materialize an empty text
+#       slice — a zero-length `slice` launches grid_dim 0 and aborts. Both the
+#       reorder and the combined concat special-case them (found by that gate).
+#    4. text grad gather `_combined_text_grad` is NOT reached on the edit path:
+#       the wired arm is the streamed AdamW-device B1 loop, whose LoRA set does
+#       not include the text-fusion adapters, so d_combined's text rows are never
+#       gathered. `text_grad_src_row()` below stays the spec for whoever wires
+#       KREA2_TXTFUSION_LORA + EDIT (fail-loud today).
+#       Loss reads ONLY the IMG rows — and that is now MEASURED, not asserted:
+#       krea2_omini_c6_loss_mask_gate perturbs every COND and TXT_pad row of the
+#       block-stack output and shows the loss operand is BIT-IDENTICAL, with
+#       d_x exactly zero on those rows (intake §1.6).
+#    5. comptime shape: `-D KREA2_CONDLEN` sits beside KREA2_LTMAX
+#       (train_krea2.mojo). CONDLEN=0 compiles the pre-C6 statements (every EDIT
+#       statement is behind `comptime if KREA2_OMINI_EDIT`).
+#       ⚠ "bit-equal to today" is NOT VERIFIABLE end-to-end on this stack: the
+#       pre-C6 trainer is not bit-reproducible against ITSELF (MEASURED
+#       2026-07-30: 6 identical 6-step runs of the pre-C6 binary spread the step-1
+#       loss by 2.7e-7 relative and the step-4 grad_norm by 2.5x). See the C6
+#       report for the statistical regression that replaced it.
+#
+#    ORIGINAL PLAN TEXT (superseded above; kept for the line references):
 #    1. `_build_conditioning` combined concat (train_krea2.mojo:845-853): today
 #       `concat(real_text, img_e, pad_text)`. Edit build inserts the projected
 #       cond tokens: `concat(real_text, img_e, cond_e, pad_text)` — offsets are

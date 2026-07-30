@@ -162,6 +162,13 @@ from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.models.krea2.krea2_cache_reader import (
     KreaTrainCache, KreaTrainSample, krea2_patchify, krea2_build_pos,
     KREA2_LATENT_CHANNELS, KREA2_TXT_LAYERS, KREA2_TXT_DIM,
+    Krea2EditSample, krea2_edit_real_len, krea2_reorder_combined_edit,
+)
+# OminiControl EDIT row layout (C-scaffold; gated by its own main()). The trainer
+# consumes ONLY the offset math — cond_off/cond_len/real_len and the modulation
+# split the block forward/backward take. Unused when KREA2_CONDLEN=0.
+from serenitymojo.training.krea2_omini_layout import (
+    Krea2OminiLayout, krea2_omini_mod_split,
 )
 from serenitymojo.models.krea2.krea2_buckets import (
     KREA2_LADDER_LEN, KREA2_LADDER_X100, krea2_lat_h, krea2_lat_w,
@@ -406,6 +413,28 @@ comptime IMGLEN = (LH // 2) * (LW // 2)   # 1024 (512px) | 4096 (1024px)
 # [LH,LW,LTMAX].)
 comptime LTMAX = get_defined_int["KREA2_LTMAX", 384]()
 comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for ALL samples
+
+# ── OMINICONTROL EDIT CONDITION SEGMENT (-D KREA2_CONDLEN, default 0 = OFF) ───
+# 0 (DEFAULT) = the text-to-image trainer, UNCHANGED. Every EDIT statement below
+# lives behind `comptime if KREA2_OMINI_EDIT`, so a CONDLEN=0 build compiles the
+# pre-C6 code with the pre-C6 arguments (the bit-equal contract; the block/stack
+# switches all default to Optional None).
+#
+# >0 turns on the OminiControl EDIT layout owned by training/krea2_omini_layout:
+#     [ TXT_real(lt) | IMG(IMGLEN) | COND(CONDLEN) | TXT_pad(LTMAX-lt) ]
+#     LFULL_EDIT = LTMAX + IMGLEN + CONDLEN     real_len = lt + IMGLEN + CONDLEN
+# The CONDITION rows carry the CLEAN (never-noised) reference latent through the
+# SAME `first` projection as the image rows (OminiControl x_embedder sharing —
+# NOT the additive img_in_ref hook, which is the older token-free edit mechanism
+# and is mutually exclusive with this one; see the fail-loud in main()).
+# Modulation is per-segment: TXT+IMG ride temb(t), COND rides temb(t=0).
+#
+# For the EDIT condition type the condition shares the target canvas, so
+# CONDLEN MUST equal IMGLEN — anything else is a different (subject/spatial)
+# condition type this chunk does not build. Checked (fail-loud) in main().
+comptime CONDLEN = get_defined_int["KREA2_CONDLEN", 0]()
+comptime KREA2_OMINI_EDIT = CONDLEN > 0
+comptime LFULL_EDIT = LTMAX + IMGLEN + CONDLEN
 
 # ── ASPECT-RATIO BUCKETING (KREA2_BUCKETED, build-gate, DEFAULT OFF) ──────────
 # OFF (default): the trainer is byte-identical to the single-square-canvas path
@@ -892,6 +921,138 @@ def _reorder_pos_for_combined[LT: Int, LFULL: Int](
     else:
         pos_re = pos.clone(ctx)
     return pos_re^
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OMINICONTROL EDIT CONDITIONING (C6). Same chain as _build_conditioning plus:
+#   * the CONDITION rows: cond_img (the CLEAN, never-noised reference latent,
+#     already patchified by the cache reader) through the SAME `first` Linear the
+#     image rows use — OminiControl shares x_embedder between image and condition
+#     tokens (flux_omini.py: `x_embedder(hidden_states)` / `x_embedder(cond)`),
+#     so there is NO separate projection and NO img_in_ref delta here. Adding the
+#     zero-init img_in_ref term (the layout module's seam note A.1 mentioned it as
+#     a possibility) would be the OTHER edit mechanism — an additive reference on
+#     the IMAGE rows — and stacking both would double-count the reference. This
+#     build takes the Omini one; main() fail-louds if KREA2_EDIT=1 is also set.
+#   * a SECOND temb -> tmlp -> tproj evaluation at t = 0 producing blk_vec_cond,
+#     the modulation vector for the condition rows (trainer.py:232
+#     `timesteps = [t, t] + [0]*len(conditions)`).
+#   * the combined concat and the pos reorder both gain the COND segment, exactly
+#     as Krea2OminiLayout.combined_src_row() specifies (source order
+#     [TXT(LTMAX) | IMG | COND], combined order [TXT_real | IMG | COND | TXT_pad]).
+# ══════════════════════════════════════════════════════════════════════════════
+struct _CondEdit(Movable):
+    var combined: TArc        # [1, LFULL_EDIT, F]
+    var blk_vec: Tensor       # [1, 6*F]  mods(t)   -> TXT_real + IMG rows
+    var blk_vec_cond: Tensor  # [1, 6*F]  mods(t=0) -> COND rows
+    var tmlp_out: Tensor      # [1, 1, F] final-layer tvec (t; the final layer is
+        # read ONLY on the image rows, so it never sees a condition row)
+    var cos: Tensor           # [LFULL_EDIT, HEADDIM/2]
+    var sin: Tensor
+
+    def __init__(
+        out self, var combined: TArc, var blk_vec: Tensor,
+        var blk_vec_cond: Tensor, var tmlp_out: Tensor,
+        var cos: Tensor, var sin: Tensor,
+    ):
+        self.combined = combined^
+        self.blk_vec = blk_vec^
+        self.blk_vec_cond = blk_vec_cond^
+        self.tmlp_out = tmlp_out^
+        self.cos = cos^
+        self.sin = sin^
+
+
+def _build_conditioning_edit[LT: Int, LFULL_E: Int, CONDL: Int](
+    cond_w: Krea2ResidentCond,
+    img: Tensor,            # [1, IMGLEN, 64] BF16 patchified NOISED target latent
+    cond_img: Tensor,       # [1, CONDL, 64]  BF16 patchified CLEAN condition latent
+    context: Tensor,        # [1, LT, 12, 2560] BF16
+    pos: Tensor,            # [1, LFULL_E, 3] F32 SOURCE order [TXT|IMG|COND]
+    t: Tensor,              # [1] F32 timestep for TXT+IMG
+    t_zero: Tensor,         # [1] F32 == 0.0, the condition timestep
+    real_text_len: Int,
+    ctx: DeviceContext,
+) raises -> _CondEdit:
+    comptime IMGL = LFULL_E - LT - CONDL
+    var img_bf = cast_tensor(img, STDtype.BF16, ctx)
+    var img_e = krea2_first(img_bf, cond_w.first_w[], cond_w.first_b[], ctx)
+    # CONDITION rows: the SAME `first` Linear, on the CLEAN latent. No noise is
+    # ever added to cond_img (the reader returns ref.<i> un-noised and nothing
+    # between here and the block touches it) and no LoRA/img_in_ref delta is
+    # applied at this projection.
+    var cond_bf = cast_tensor(cond_img, STDtype.BF16, ctx)
+    var cond_e = krea2_first(cond_bf, cond_w.first_w[], cond_w.first_b[], ctx)
+
+    # chain #1 — the EXISTING temb chain at the sample's timestep t.
+    var te = krea2_temb(t, TDIM, ctx, STDtype.BF16)
+    var t_vec = krea2_tmlp(
+        te, cond_w.tmlp0_w[], cond_w.tmlp0_b[],
+        cond_w.tmlp2_w[], cond_w.tmlp2_b[], ctx,
+    )
+    var t3 = reshape(t_vec, [1, 1, FEATURES], ctx)
+    var blk_vec = krea2_tproj(t3, cond_w.tproj1_w[], cond_w.tproj1_b[], ctx)
+    var blk_vec2 = reshape(blk_vec, [1, 6 * FEATURES], ctx)
+
+    # chain #2 — the SAME three ops on t = 0 (the condition timestep). Frozen
+    # weights, so this second evaluation adds no trainable surface; it is a pure
+    # extra forward (~microseconds) whose grad (d_vec_cond) has nowhere to go.
+    var te_c = krea2_temb(t_zero, TDIM, ctx, STDtype.BF16)
+    var t_vec_c = krea2_tmlp(
+        te_c, cond_w.tmlp0_w[], cond_w.tmlp0_b[],
+        cond_w.tmlp2_w[], cond_w.tmlp2_b[], ctx,
+    )
+    var t3_c = reshape(t_vec_c, [1, 1, FEATURES], ctx)
+    var blk_vec_c = krea2_tproj(t3_c, cond_w.tproj1_w[], cond_w.tproj1_b[], ctx)
+    var blk_vec2_c = reshape(blk_vec_c, [1, 6 * FEATURES], ctx)
+
+    var ctx_fused = krea2_text_fusion[LT, NLAYERS_TXT, TXTHEADS, TXTHD](
+        context, cond_w.lw0, cond_w.lw1,
+        cond_w.projector_w[],
+        cond_w.rf0, cond_w.rf1, Optional[Tensor](None), ctx,
+    )
+    var ctx_proj = krea2_txtmlp(
+        ctx_fused,
+        cond_w.txtmlp0_scale[],
+        cond_w.txtmlp1_w[], cond_w.txtmlp1_b[],
+        cond_w.txtmlp3_w[], cond_w.txtmlp3_b[],
+        ctx,
+    )
+
+    # combined = [TXT_real | IMG | COND | TXT_pad] — the flash-padmask needs the
+    # valid tokens (all three of TXT_real/IMG/COND) as a CONTIGUOUS PREFIX.
+    # SAME boundary handling as krea2_reorder_combined_edit: a zero-length slice
+    # launches grid_dim 0 and aborts, so neither empty text segment is built.
+    var combined: Tensor
+    if real_text_len <= 0:
+        var h0 = concat(1, ctx, img_e, cond_e)
+        combined = concat(1, ctx, h0, ctx_proj)
+    elif real_text_len < LT:
+        var real_text = slice(ctx_proj, 1, 0, real_text_len, ctx)
+        var pad_text = slice(ctx_proj, 1, real_text_len, LT - real_text_len, ctx)
+        var head = concat(1, ctx, real_text, img_e)
+        var head2 = concat(1, ctx, head, cond_e)
+        combined = concat(1, ctx, head2, pad_text)
+    else:
+        var head3 = concat(1, ctx, ctx_proj, img_e)
+        combined = concat(1, ctx, head3, cond_e)
+
+    # SOURCE -> COMBINED gather. Shared with the C6 gate (krea2_cache_reader),
+    # which compares it element-for-element against the layout module's
+    # krea2_omini_pos_combined.
+    var pos_re = krea2_reorder_combined_edit[LT, LFULL_E, CONDL](
+        pos, real_text_len, ctx
+    )
+    var pos_flat = reshape(pos_re, [LFULL_E * 3], ctx)
+    var axes = List[Int]()
+    axes.append(32); axes.append(48); axes.append(48)
+    var rope = build_krea2_rope(pos_flat, axes, THETA, ctx, STDtype.F32)
+    var rcos = rope[0].clone(ctx)
+    var rsin = rope[1].clone(ctx)
+    _ = IMGL
+    return _CondEdit(
+        TArc(combined^), blk_vec2^, blk_vec2_c^, t3^, rcos^, rsin^
+    )
 
 
 def _build_conditioning_txtfusion_lora[LT: Int, LFULL: Int](
@@ -1498,6 +1659,137 @@ def _train_one_sample_adamw_device_grads(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OMINICONTROL EDIT DEVICE-GRAD AdamW STEP (C6). The EDIT twin of
+# _train_one_sample_adamw_device_grads above. Differences, all of them:
+#
+#   1. NOISE. Only `clean` (the TARGET latent) is noised. `cond_img` is the CLEAN
+#      condition, passed through untouched — nothing in this function or below
+#      adds noise to it.
+#   2. SEQUENCE. _build_conditioning_edit appends the COND segment and emits the
+#      second (t=0) modulation vector.
+#   3. real_len = lt + IMGLEN + CONDLEN (the flash-padmask valid prefix now
+#      includes the condition rows — they attend and are attended).
+#   4. The three EDIT switches (blk_vec_cond / cond_off / cond_len) go to BOTH
+#      the streamed forward and the streamed backward. They MUST match.
+#   5. LOSS. `target_img` is [1, IMGLEN, 64] from the TARGET latent only, and
+#      fwd.velocity is final[:, lt : lt+IMGLEN, :] — the IMAGE rows. The COND
+#      rows [lt+IMGLEN, lt+IMGLEN+CONDLEN) and the TXT_pad tail are sliced away
+#      before the MSE and get an exactly-zero d_final from
+#      krea2_final_layer_backward's un-slice. No masking code is needed because
+#      the slice IS the mask; gate (c) proves it numerically.
+# ══════════════════════════════════════════════════════════════════════════════
+def _train_one_sample_edit_adamw_device_grads(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor,          # [1,16,LH,LW] BF16 TARGET latent (gets noised)
+    cond_img: Tensor,       # [1,CONDLEN,64] BF16 patchified CLEAN condition
+    context: Tensor,
+    pos: Tensor,            # [1,LFULL_EDIT,3] F32 SOURCE order [TXT|IMG|COND]
+    lt: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,
+    sigma: Float32,
+    noise_seed: UInt64,
+    cfg: TrainConfig,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+    resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
+    host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
+    verbose: Bool = False,   # first step only: print the EXACT switch values
+        # handed to the stack, so "the trainer passes the EDIT switches" is an
+        # observation from the run and not a claim about the source.
+) raises -> _StepOutAdamWDeviceGrads:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
+    # 1) flow-match noise on the TARGET ONLY.
+    var noise = _gaussian_like(clean, noise_seed, ctx)
+    var fm = flow_match_noise_target(clean, sigma, noise, ctx)
+    var noised_lat = fm.x_t.clone(ctx)
+    var img = krea2_patchify[LH, LW](noised_lat, ctx)
+    var target_img = krea2_patchify[LH, LW](fm.target, ctx)   # [1,IMGLEN,64]
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
+
+    # 2) conditioning with the COND segment + the two modulation vectors.
+    var t1 = _t_scalar(sigma, ctx)
+    var t0 = _t_scalar(Float32(0.0), ctx)
+    var cond = _build_conditioning_edit[LTMAX, LFULL_EDIT, CONDLEN](
+        cond_w, img, cond_img, context, pos, t1, t0, lt, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_fwd", _pt, ctx)
+
+    # 3) layout offsets — ONE source of truth (the gated layout module).
+    var lay = Krea2OminiLayout(LTMAX, IMGLEN, CONDLEN, lt)
+    lay.check_flash_prefix()
+    var split = krea2_omini_mod_split(lay)            # == lay.cond_off()
+    var real_len = Optional[Int](krea2_edit_real_len(lt, IMGLEN, CONDLEN))
+    var c_off = Optional[Int](split)
+    var c_len = Optional[Int](CONDLEN)
+    var vcond = Optional[TArc](TArc(cond.blk_vec_cond.clone(ctx)))
+    if verbose:
+        var bvh = cond.blk_vec.to_host(ctx)
+        var bch = cond.blk_vec_cond.to_host(ctx)
+        var vmax = Float32(0.0)
+        for i in range(len(bvh)):
+            var d = bvh[i] - bch[i]
+            if d < 0.0:
+                d = -d
+            if d > vmax:
+                vmax = d
+        print(
+            "[krea2-omini] step arguments: L=", LFULL_EDIT, " lt=", lt,
+            " txtlen=", lt, " imglen=", IMGLEN,
+            " cond_off=", split, " cond_len=", CONDLEN,
+            " real_len=", real_len.value(), " pad_rows=", LFULL_EDIT - real_len.value(),
+        )
+        print(
+            "[krea2-omini]   combined rows=", cond.combined[].shape()[1],
+            " cos rows=", cond.cos.shape()[0],
+            " blk_vec(t) vs blk_vec_cond(t=0) max|delta|=", vmax,
+            " (0.0 would mean the second temb chain is NOT at t=0)",
+        )
+
+    # 4) streamed forward. txtlen=lt, imglen=IMGLEN => velocity slice is exactly
+    # the IMAGE rows (see the loss note in the box above).
+    var fwd = krea2_stack_lora_forward_streamed[LFULL_EDIT, HEADS, KVHEADS, HEADDIM](
+        cond.combined, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len,
+        resident, resident_sq, resident_i8, host_i8,
+        save_tapes=KREA2_SAVE_TAPES,
+        vec_cond=vcond.copy(), cond_off=c_off, cond_len=c_len,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
+
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss", _pt, ctx)
+
+    # 5) streamed backward with the SAME three switches.
+    var wrote = krea2_stack_lora_backward_streamed_adamw_device_grads[
+        LFULL_EDIT, HEADS, KVHEADS, HEADDIM
+    ](
+        d_velocity, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin, fwd,
+        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len,
+        resident, resident_sq, resident_i8, host_i8,
+        vec_cond=vcond.copy(), cond_off=c_off, cond_len=c_len,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_backward_device_grads", _pt, ctx)
+    return _StepOutAdamWDeviceGrads(
+        loss, wrote.grad_count, wrote.streaming_sync_count
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRUE BATCH-2 DEVICE-GRAD AdamW step. Merge of _train_one_sample_b2 (per-sample
 # noise/patchify/conditioning, row-stack, b2 forward, joint 2N-mean MSE — each
 # per-sample d_velocity scaled by 0.5, so the streamed grads equal the MEAN of the
@@ -1862,6 +2154,25 @@ def _train_one_sample_oft(
 # ══════════════════════════════════════════════════════════════════════════════
 # helpers
 # ══════════════════════════════════════════════════════════════════════════════
+# ── BIT-DIAGNOSTIC (KREA2_DBG_BITS=1; default off, prints nothing) ───────────
+# The operator progress line rounds loss/grad_norm to 4 decimals, which cannot
+# tell two different F32 values apart. This prints the same numbers as 1e-9
+# fixed-point INTEGERS: the F32 ULP at the magnitudes a krea2 loss takes (~0.05
+# to ~0.6, exponent -5..-1) is 3.7e-9..6.0e-8, so two values that print the same
+# integer here are the same F32 (and the reverse for any real difference). Used
+# by the C6 CONDLEN=0 regression comparison, where "bit-equal" has to be
+# measured, not eyeballed.
+def _krea2_fixed9(x: Float32) -> String:
+    var v = Float64(x)
+    var neg = v < 0.0
+    if neg:
+        v = -v
+    var s = String(Int(v * 1.0e9 + 0.5))
+    if neg:
+        return String("-") + s
+    return s
+
+
 def _t_scalar(v: Float32, ctx: DeviceContext) raises -> Tensor:
     var h = List[Float32]()
     h.append(v)
@@ -2729,6 +3040,51 @@ def _step_dispatch_adamw_device_grads(
         st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
         sigma, noise_seed, cfg, adamw_state, ctx, resident, resident_sq, resident_i8, host_i8,
         ref_tokens=ref_tokens.copy(), img_in_ref_w=img_in_ref_w.copy())
+
+
+def _step_dispatch_edit_adamw_device_grads(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor, cond_img: Tensor, context: Tensor, pos: Tensor,
+    lt: Int, cache_cond_len: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    sigma: Float32, noise_seed: UInt64, cfg: TrainConfig,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+    resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
+    host_i8: Optional[Krea2HostInt8] = Optional[Krea2HostInt8](None),
+    verbose: Bool = False,
+) raises -> _StepOutAdamWDeviceGrads:
+    if lt > LTMAX:
+        raise Error(
+            String("train_krea2 edit: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
+        )
+    # PER-SAMPLE fail-loud: the comptime -D KREA2_CONDLEN shape MUST match what
+    # this sample actually carries. A mismatch here would silently mis-slice the
+    # sequence, so it stops the run.
+    if cache_cond_len != CONDLEN:
+        raise Error(
+            String("train_krea2 edit: cache sample condition length ")
+            + String(cache_cond_len) + " != build -D KREA2_CONDLEN="
+            + String(CONDLEN) + " (rebuild with the cache's condition length)"
+        )
+    if pos.shape()[1] != LFULL_EDIT:
+        raise Error(
+            String("train_krea2 edit: pos table rows ") + String(pos.shape()[1])
+            + " != LFULL_EDIT=" + String(LFULL_EDIT)
+        )
+    if cond_img.shape()[1] != CONDLEN:
+        raise Error(
+            String("train_krea2 edit: cond token rows ")
+            + String(cond_img.shape()[1]) + " != CONDLEN=" + String(CONDLEN)
+        )
+    return _train_one_sample_edit_adamw_device_grads(
+        st, key_prefix, clean, cond_img, context, pos, lt, lora, fin, cond_w,
+        sigma, noise_seed, cfg, adamw_state, ctx,
+        resident, resident_sq, resident_i8, host_i8, verbose,
+    )
 
 
 def _step_dispatch_b2_adamw_device_grads(
@@ -3652,6 +4008,8 @@ def main() raises:
     # AdamW-device B1 path. Every new statement below is gated by `if edit_mode:`
     # so default-off is code-identical (the flag reads once, then nothing runs).
     var edit_mode = env_int("KREA2_EDIT", 0) != 0
+    # C6 regression instrument (default off => not a single extra print).
+    var dbg_bits = env_int("KREA2_DBG_BITS", 0) != 0
     if krea2_device_grad_smoke:
         if steps <= 0:
             raise Error("krea2devicegrad smoke requires steps > 0")
@@ -3715,6 +4073,130 @@ def main() raises:
     var cache = KreaTrainCache.open(cache_path)
     var n = cache.len()
     print("cache samples=", n)
+
+    # ── OMINICONTROL EDIT build validation (C6). Every check fail-louds; none of
+    # it runs on a CONDLEN=0 build (`comptime if` — the statements are not
+    # compiled at all). Nothing here is a warning: an edit run that quietly
+    # falls back to a text-to-image step, or to the OTHER (img_in_ref) edit
+    # mechanism, would look healthy and train the wrong thing. ────────────────
+    comptime if KREA2_OMINI_EDIT:
+        print(
+            "[krea2-omini] EDIT build: CONDLEN=", CONDLEN,
+            " LFULL_EDIT=", LFULL_EDIT,
+            " layout [TXT_real | IMG(", IMGLEN, ") | COND(", CONDLEN,
+            ") | TXT_pad]",
+        )
+        if CONDLEN != IMGLEN:
+            raise Error(
+                String("krea2 omini: -D KREA2_CONDLEN=") + String(CONDLEN)
+                + " != IMGLEN=" + String(IMGLEN) + " — the EDIT condition type"
+                + " shares the target canvas; other condition types (subject,"
+                + " spatial) are not built"
+            )
+        # CONFIG <-> BUILD <-> CACHE. The config is the human-facing contract;
+        # the -D flag is the compiled shape; the cache is the data. All three
+        # must agree or the run stops.
+        if cfg.omini_condition_type == String(""):
+            raise Error(
+                "krea2 omini: this binary was built with -D KREA2_CONDLEN>0 but"
+                " the config has no omini_condition_type — point it at an"
+                " OminiControl edit config (e.g."
+                " serenitymojo/configs/krea2_omini_edit_512.json)"
+            )
+        if cfg.omini_condition_type != String("edit"):
+            raise Error(
+                String("krea2 omini: omini_condition_type='")
+                + cfg.omini_condition_type
+                + "' is not built; only 'edit' (delta [0,0], scale 1.0) exists"
+            )
+        if cfg.omini_condition_length != CONDLEN:
+            raise Error(
+                String("krea2 omini: config omini_condition_length=")
+                + String(cfg.omini_condition_length)
+                + " != build -D KREA2_CONDLEN=" + String(CONDLEN)
+                + " (resolution/condition length are BUILD-TIME; rebuild or fix"
+                + " the config)"
+            )
+        if cfg.batch_size != 1:
+            raise Error(
+                String("krea2 omini: batch_size=") + String(cfg.batch_size)
+                + " is not expressible with the EDIT layout — per-sample x"
+                + " per-segment modulation needs a 4-way split ops/elementwise"
+                + " `modulate` does not express (krea2_omini_layout seam C.5)."
+                + " Use batch_size=1."
+            )
+        if edit_mode:
+            raise Error(
+                "krea2 omini: KREA2_EDIT=1 (the additive img_in_ref reference"
+                " projection) and -D KREA2_CONDLEN>0 (OminiControl condition"
+                " TOKENS) are two DIFFERENT edit mechanisms over the same"
+                " reference latent. Running both double-counts the reference."
+                " Unset KREA2_EDIT."
+            )
+        comptime if KREA2_V2_GRAPH or KREA2_V2_SLAB:
+            raise Error(
+                "krea2 omini: the EDIT switches are wired on the streamed"
+                " hand-chain backward only; rebuild without KREA2_V2_GRAPH/"
+                "KREA2_V2_SLAB"
+            )
+        comptime if KREA2_DEVICE_LORA_GRAD:
+            raise Error(
+                "krea2 omini: KREA2_DEVICE_LORA_GRAD selects"
+                " krea2_stack_lora_backward_streamed_dev, which has no EDIT"
+                " switches; rebuild with it off"
+            )
+        comptime if KREA2_BUCKETED:
+            raise Error(
+                "krea2 omini: KREA2_BUCKETED (per-sample canvas) is not wired"
+                " for the EDIT layout"
+            )
+        comptime if KREA2_TXTFUSION_LORA:
+            raise Error(
+                "krea2 omini: the txtfusion-LoRA full surface is not wired for"
+                " the EDIT layout"
+            )
+        comptime if KREA2_RES_512_SYNTH:
+            raise Error(
+                "krea2 omini: the synthetic-sample arm has no condition latents"
+            )
+        if cfg.grad_accum_steps > 1:
+            raise Error(
+                "krea2 omini: grad_accum_steps>1 is not wired for the EDIT arm"
+            )
+        # DATA: every sample the loop will touch must be a full Omini record
+        # (ref.<i> + cond_pos_delta.<i> + cond_pos_scale.<i>) with the config's
+        # delta/scale. Checked ONCE here, up front, over the whole cache.
+        var bad_cond = 0
+        var bad_pos = 0
+        for i in range(n):
+            if not cache.has_cond(i):
+                bad_cond += 1
+                continue
+            var meta = cache.cond_pos_at(i, ctx)
+            if (
+                meta[0] != cfg.omini_position_delta_h
+                or meta[1] != cfg.omini_position_delta_w
+                or meta[2] != cfg.omini_position_scale
+            ):
+                bad_pos += 1
+        if bad_cond != 0:
+            raise Error(
+                String("krea2 omini: ") + String(bad_cond) + " of " + String(n)
+                + " cache samples carry no OminiControl condition record"
+                + " (need ref.<i> + cond_pos_delta.<i> + cond_pos_scale.<i>);"
+                + " re-run krea2_prepare_cache on an Omini edit stage dir"
+            )
+        if bad_pos != 0:
+            raise Error(
+                String("krea2 omini: ") + String(bad_pos) + " of " + String(n)
+                + " cache samples disagree with the config's"
+                + " omini_position_delta/omini_position_scale"
+            )
+        print(
+            "[krea2-omini] cache OK:", n,
+            "edit samples, delta [", cfg.omini_position_delta_h, ",",
+            cfg.omini_position_delta_w, "] scale", cfg.omini_position_scale,
+        )
     var st = ShardedSafeTensors.open(cfg.checkpoint)
     var fin = Krea2StreamFinal.load(st, key_prefix, ctx)
     perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
@@ -4034,6 +4516,33 @@ def main() raises:
     var sample_cfg = SamplePromptConfig()
     var sample_every = cfg.sample_every
     var sample_enabled = sample_every > 0
+    # ── EDIT SAMPLING IS DEFERRED (C7), NOT SILENTLY BROKEN ───────────────────
+    # The inline sampler builds a TEXT-TO-IMAGE sequence ([TXT | IMG], LFULL_S,
+    # one temb chain, no cond rows). An OminiControl edit LoRA is COND-ROW ONLY
+    # (C3: the adapter's delta is computed on rows [cond_off, cond_off+cond_len)
+    # and nowhere else), so rendering it through the t2i sampler would evaluate
+    # the adapter on a sequence that HAS no condition rows — i.e. it would render
+    # the frozen base and label the PNG as a trained sample. That is exactly the
+    # "silently produce broken samples" failure, so cadence sampling is turned
+    # OFF for edit builds with a loud message. Wiring a real edit render (cond
+    # latent from a held-out source image + the edit sequence in the sampler) is
+    # C7 work.
+    comptime if KREA2_OMINI_EDIT:
+        if sample_enabled:
+            print(
+                "[krea2-omini] sample_every=", sample_every,
+                " IGNORED: inline sampling is NOT wired for the EDIT layout.",
+            )
+            print(
+                "[krea2-omini]   The sampler builds [TXT | IMG] with no COND",
+                "rows; a cond-row-only edit LoRA contributes NOTHING there, so",
+                "the render would be the frozen base mislabelled as trained.",
+            )
+            print(
+                "[krea2-omini]   Edit rendering is C7. Checkpoints still save",
+                "on cfg.save_every.",
+            )
+            sample_enabled = False
     if sample_enabled:
         if dora_active or oft_active:
             raise Error(
@@ -4709,12 +5218,6 @@ def main() raises:
             # keying as the host-b2 standard loop so the loss band is comparable.
             var pair_lead = (2 * step) if use_b2 else step
             var idx = order[pair_lead % n]
-            var sample: KreaTrainSample
-            comptime if KREA2_RES_512_SYNTH:
-                sample = _synthetic_sample(idx, ctx)
-            else:
-                sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
-            var lt = sample.text_len
             # ai-toolkit krea2 recipe: uniform sigma (linear+balanced) — MJ-1041.
             var sigma = sample_timestep_krea2_aitk_linear_balanced(
                 seed_base + UInt64(pair_lead)
@@ -4722,42 +5225,64 @@ def main() raises:
             var noise_seed = seed_base * UInt64(7919) + UInt64(pair_lead)
 
             var so_dev: _StepOutAdamWDeviceGrads
-            if use_b2:
-                # fetch the pair partner order[pair_lead+1] (its own sigma/noise
-                # stream) and stream the 2-sample batch grad into the resident AdamW.
-                var idx1 = order[(pair_lead + 1) % n]
-                var sample1: KreaTrainSample
-                comptime if KREA2_RES_512_SYNTH:
-                    sample1 = _synthetic_sample(idx1, ctx)
-                else:
-                    sample1 = cache.sample_padded[LH, LW, LTMAX](idx1, ctx)
-                var lt1 = sample1.text_len
-                var sigma1 = sample_timestep_krea2_aitk_linear_balanced(
-                    seed_base + UInt64(pair_lead + 1)
-                )
-                var noise_seed1 = seed_base * UInt64(7919) + UInt64(pair_lead + 1)
-                so_dev = _step_dispatch_b2_adamw_device_grads(
+            comptime if KREA2_OMINI_EDIT:
+                # OminiControl EDIT arm (C6). SAME sample order / sigma / noise
+                # stream as the text-to-image arm — only the sequence changes.
+                # sample_padded_edit fail-louds when a sample has no condition
+                # record, so a mixed cache cannot silently train condition-free.
+                var esample = cache.sample_padded_edit[LH, LW, LTMAX](idx, ctx)
+                so_dev = _step_dispatch_edit_adamw_device_grads(
                     st, key_prefix,
-                    sample.clean[], sample.context[], sample.pos[], lt, sigma, noise_seed,
-                    sample1.clean[], sample1.context[], sample1.pos[], lt1, sigma1, noise_seed1,
-                    resident_dev_lora, fin, cond_w, cfg, adamw_dev, ctx, resident, resident_sq,
-                    resident_i8, host_i8,
-                )
-            else:
-                # img-EDIT (task #7): pass THIS sample's preloaded ref tokens +
-                # the resident img_in_ref weight into the streamed fwd/bwd. Both
-                # Optional None when edit_mode is off → byte-identical text-only.
-                var ref_tok_opt = Optional[TArc](None)
-                if edit_mode:
-                    ref_tok_opt = Optional[TArc](cached_ref_tokens[idx].copy())
-                so_dev = _step_dispatch_adamw_device_grads(
-                    st, key_prefix,
-                    sample.clean[], sample.context[], sample.pos[], lt,
+                    esample.base.clean[], esample.cond_img[],
+                    esample.base.context[], esample.base.pos[],
+                    esample.base.text_len, esample.cond_len,
                     resident_dev_lora, fin, cond_w, sigma, noise_seed, cfg,
                     adamw_dev, ctx, resident, resident_sq, resident_i8, host_i8,
-                    ref_tokens=ref_tok_opt.copy(),
-                    img_in_ref_w=img_in_ref_dev.copy(),
+                    step == start_step,
                 )
+            else:
+                var sample: KreaTrainSample
+                comptime if KREA2_RES_512_SYNTH:
+                    sample = _synthetic_sample(idx, ctx)
+                else:
+                    sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
+                var lt = sample.text_len
+                if use_b2:
+                    # fetch the pair partner order[pair_lead+1] (its own sigma/noise
+                    # stream) and stream the 2-sample batch grad into the resident AdamW.
+                    var idx1 = order[(pair_lead + 1) % n]
+                    var sample1: KreaTrainSample
+                    comptime if KREA2_RES_512_SYNTH:
+                        sample1 = _synthetic_sample(idx1, ctx)
+                    else:
+                        sample1 = cache.sample_padded[LH, LW, LTMAX](idx1, ctx)
+                    var lt1 = sample1.text_len
+                    var sigma1 = sample_timestep_krea2_aitk_linear_balanced(
+                        seed_base + UInt64(pair_lead + 1)
+                    )
+                    var noise_seed1 = seed_base * UInt64(7919) + UInt64(pair_lead + 1)
+                    so_dev = _step_dispatch_b2_adamw_device_grads(
+                        st, key_prefix,
+                        sample.clean[], sample.context[], sample.pos[], lt, sigma, noise_seed,
+                        sample1.clean[], sample1.context[], sample1.pos[], lt1, sigma1, noise_seed1,
+                        resident_dev_lora, fin, cond_w, cfg, adamw_dev, ctx, resident, resident_sq,
+                        resident_i8, host_i8,
+                    )
+                else:
+                    # img-EDIT (task #7): pass THIS sample's preloaded ref tokens +
+                    # the resident img_in_ref weight into the streamed fwd/bwd. Both
+                    # Optional None when edit_mode is off → byte-identical text-only.
+                    var ref_tok_opt = Optional[TArc](None)
+                    if edit_mode:
+                        ref_tok_opt = Optional[TArc](cached_ref_tokens[idx].copy())
+                    so_dev = _step_dispatch_adamw_device_grads(
+                        st, key_prefix,
+                        sample.clean[], sample.context[], sample.pos[], lt,
+                        resident_dev_lora, fin, cond_w, sigma, noise_seed, cfg,
+                        adamw_dev, ctx, resident, resident_sq, resident_i8, host_i8,
+                        ref_tokens=ref_tok_opt.copy(),
+                        img_in_ref_w=img_in_ref_dev.copy(),
+                    )
             if so_dev.grad_count != n_adapters:
                 raise Error(
                     String("[KREA2_ADAMW_DEVICE_FAST] expected ")
@@ -4807,6 +5332,12 @@ def main() raises:
                 String("krea2"), step + 1, steps, n, so_dev.loss, Float64(gn_dev),
                 Float64(_sn_dev - step_t0) / 1.0e9, 0.0, Float64(_sn_dev - t0) / 1.0e9,
             )
+            if dbg_bits:
+                print(
+                    "[krea2-bits] step", step + 1,
+                    "loss_e9", _krea2_fixed9(so_dev.loss),
+                    "gn_e9", _krea2_fixed9(Float32(gn_dev)),
+                )
             ctx.synchronize()   # per-STEP async free discipline (see standard loop note)
             perf_visible_sync_count += 1
             perf_min_free = _krea2_update_min_free(ctx, perf_min_free)

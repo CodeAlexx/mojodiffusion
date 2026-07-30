@@ -502,6 +502,25 @@ struct TrainConfig(Copyable, Movable):
     var audio_ref_mask_cross_attention_to_reference: Bool   # False (audio_ref_only_ic)
     var audio_ref_mask_reference_from_text_attention: Bool  # False (audio_ref_only_ic)
 
+    # ── OMINICONTROL EDIT CONDITION (krea2 C6). Config keys omini_condition_type
+    # / omini_condition_length / omini_position_delta / omini_position_scale.
+    # ALL default-neutral, so a config without them is byte-identical and the
+    # krea2 text-to-image trainer never reads a nonzero value here.
+    #   omini_condition_type  : "" (off) | "edit". OminiControl's condition_type;
+    #                           only "edit" (condition shares the target canvas,
+    #                           delta [0,0], scale 1.0) is built.
+    #   omini_condition_length: condition TOKEN count (== the image token count
+    #                           for "edit"). The trainer cross-checks it against
+    #                           its build-time -D KREA2_CONDLEN and fail-louds.
+    #   omini_position_delta_* : OminiControl position_delta [h, w] (integers, in
+    #                           latent-grid/2 cells; flux_omini.py:128-141).
+    #   omini_position_scale  : OminiControl position_scale (1.0 = no rescale).
+    var omini_condition_type: String
+    var omini_condition_length: Int
+    var omini_position_delta_h: Int
+    var omini_position_delta_w: Int
+    var omini_position_scale: Float32
+
     # ── T2.E ControlNet training (default-off == 0) ─────────────────────────
     # controlnet_layers: number of control blocks (DiT ControlNet pattern —
     #   copies of the first N main transformer blocks + zero-init before/after
@@ -889,6 +908,11 @@ struct TrainConfig(Copyable, Movable):
         start_step: Int = -1,                      # -1 = derive from _step{N}
         warm_resume: Bool = False,                 # True = A/B only, moments 0
         train_timestep_shift: Float32 = -1.0,      # -1 = use timestep_shift
+        var omini_condition_type: String = String(""),   # krea2 C6 — all
+        omini_condition_length: Int = 0,                 # default-neutral
+        omini_position_delta_h: Int = 0,
+        omini_position_delta_w: Int = 0,
+        omini_position_scale: Float32 = Float32(1.0),
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -1128,6 +1152,11 @@ struct TrainConfig(Copyable, Movable):
         self.start_step = start_step
         self.warm_resume = warm_resume
         self.train_timestep_shift = train_timestep_shift
+        self.omini_condition_type = omini_condition_type^
+        self.omini_condition_length = omini_condition_length
+        self.omini_position_delta_h = omini_position_delta_h
+        self.omini_position_delta_w = omini_position_delta_w
+        self.omini_position_scale = omini_position_scale
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA

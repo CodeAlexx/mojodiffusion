@@ -1606,6 +1606,23 @@ def krea2_stack_lora_forward_streamed[
     # EXACT existing text-to-image streamed path, byte-for-byte (C13 flags-off).
     ref_tokens: Optional[TArc] = Optional[TArc](None),
     img_in_ref_w: Optional[TArc] = Optional[TArc](None),
+    # ── OminiControl EDIT (C6 trainer seam) ───────────────────────────────────
+    # The SAME three optional switches krea2_single_stream_block_lora took in
+    # C2/C3, threaded UNCHANGED into every block of the streaming loop:
+    #   vec_cond  = tproj(tmlp(temb(t=0))) [1, 6*features] for the COND rows
+    #   cond_off  = the per-segment split row (Krea2OminiLayout.cond_off())
+    #   cond_len  = the COND segment length (Krea2OminiLayout.cond_len())
+    # ALL THREE ABSENT (the default) => every block call below is the pre-C6 call
+    # with the pre-C6 argument list — the CONDLEN=0 bit-equal contract. The block
+    # itself also guards on 0 < cond_off < L, so a -1 split from
+    # krea2_omini_mod_split() falls through to the uniform path.
+    # NOTE the ROW LAYOUT this implies for `txtlen`/`imglen`: the velocity slice
+    # stays [txtlen : txtlen+imglen], i.e. the IMAGE rows only. With the EDIT
+    # layout [TXT_real | IMG | COND | TXT_pad] that slice is EXACTLY the image
+    # segment — cond rows and pad rows never reach the loss (C6 gate c).
+    vec_cond: Optional[TArc] = Optional[TArc](None),
+    cond_off: Optional[Int] = Optional[Int](None),
+    cond_len: Optional[Int] = Optional[Int](None),
 ) raises -> Krea2StackForward:
     """STREAMING single-stream stack forward WITH LoRA. Identical math to
     krea2_stack_lora_forward, but each block's FROZEN weights are loaded H2D from
@@ -1671,6 +1688,7 @@ def krea2_stack_lora_forward_streamed[
         var fwd = krea2_single_stream_block_lora[L, HEADS, KVHEADS, HEADDIM](
             x, blk_vec, wbi, lora.blocks[bi],
             cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+            vec_cond=vec_cond.copy(), cond_off=cond_off, cond_len=cond_len,
         )
         x = fwd.out.copy()
         if bi < save_tapes:
@@ -2528,6 +2546,23 @@ def krea2_stack_lora_backward_streamed_adamw_device_grads[
     # device-grad write path is byte-identical.
     ref_tokens: Optional[TArc] = Optional[TArc](None),
     img_in_ref_w: Optional[TArc] = Optional[TArc](None),
+    # ── OminiControl EDIT (C6 trainer seam) — the mirror of the streamed
+    # forward's three switches. They MUST match the forward call exactly: a
+    # per-segment forward with a uniform backward is silently wrong on the
+    # condition rows (krea2_block.mojo C2/C3/C4 contract). Threaded into BOTH
+    # the recompute forward and the block backward. All three absent (default)
+    # => every call below is the pre-C6 call with the pre-C6 arguments.
+    #
+    # d_vec_t / d_vec_cond (the two temb chains' modulation-vector grads the C4
+    # backward emits per segment) are DISCARDED here, exactly as the uniform
+    # path already discards its d_vec: krea2's temb->tmlp->tproj chain is FROZEN
+    # (Krea2ResidentCond, no adapters), so neither chain has a trainable
+    # parameter for those grads to reach. The only consumer of a block d_vec in
+    # this trainer is the OFT carrier path (train_krea2.mojo:3185), which does
+    # not support the EDIT layout.
+    vec_cond: Optional[TArc] = Optional[TArc](None),
+    cond_off: Optional[Int] = Optional[Int](None),
+    cond_len: Optional[Int] = Optional[Int](None),
 ) raises -> Krea2StackDeviceGradWrite:
     comptime features = HEADS * HEADDIM
 
@@ -2570,15 +2605,18 @@ def krea2_stack_lora_backward_streamed_adamw_device_grads[
             bg = krea2_single_stream_block_lora_backward_dev[L, HEADS, KVHEADS, HEADDIM](
                 d_x, blk_vec, wbi, lora.blocks[bi], fwd.tapes[bi],
                 cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+                vec_cond=vec_cond.copy(), cond_off=cond_off, cond_len=cond_len,
             )
         else:
             var rb = krea2_single_stream_block_lora[L, HEADS, KVHEADS, HEADDIM](
                 fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
                 cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+                vec_cond=vec_cond.copy(), cond_off=cond_off, cond_len=cond_len,
             )
             bg = krea2_single_stream_block_lora_backward_dev[L, HEADS, KVHEADS, HEADDIM](
                 d_x, blk_vec, wbi, lora.blocks[bi], rb.saved,
                 cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+                vec_cond=vec_cond.copy(), cond_off=cond_off, cond_len=cond_len,
             )
         var base = bi * KREA2_SLOTS_PER_BLOCK
         var grad_keepalive = _copy_krea2_block_grads_to_adamw_state(

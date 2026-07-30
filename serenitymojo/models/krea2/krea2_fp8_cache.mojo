@@ -197,15 +197,32 @@ def _block_prefix(bi: Int) -> String:
 
 
 def load_krea2_fp8_cache(
-    cache_path: String, nblocks: Int, ctx: DeviceContext
+    cache_path: String, nblocks: Int, ctx: DeviceContext,
+    resident_blocks: Int = -1,
 ) raises -> Krea2ResidentFp8:
     """Rebuild the fp8-resident store from a sidecar (assumes caller already
     validated staleness). Verbatim H2D copy per tensor → byte-identical to the
     store the quantizer originally produced. Progress every 7 blocks (the UI
-    tails these lines, same cadence as the fresh-quantize path)."""
+    tails these lines, same cadence as the fresh-quantize path).
+
+    `resident_blocks` mirrors build_krea2_resident_fp8's parameter of the same
+    name: load only the FIRST N blocks to device and leave [N:nblocks] to the
+    caller's per-step stream (the consumers all dispatch on
+    `bi < len(resident.blocks)`, so a short store degrades to streaming rather
+    than misindexing). -1 (default) = all nblocks, the prior behavior for every
+    existing caller.
+
+    This parameter exists because the sidecar path used to ignore the resident
+    budget entirely: a build with -D KREA2_RESIDENT_BLOCKS=4 still loaded all 28
+    blocks (~12GB) whenever a sidecar was present, so the 16GB refit silently did
+    nothing and 1024px OOM'd at identical peak for every flag value (measured
+    2026-07-26 on the 5080: 14.4GB peak at both 12 and 4)."""
     var st = SafeTensors.open(cache_path)
+    var n_res = nblocks if resident_blocks < 0 else (
+        resident_blocks if resident_blocks < nblocks else nblocks
+    )
     var blocks = List[Krea2BlockResidentFp8]()
-    for bi in range(nblocks):
+    for bi in range(n_res):
         var p = _block_prefix(bi)
         var fp8 = List[ArcPointer[Tensor]]()
         var scale = List[ArcPointer[Tensor]]()
@@ -220,8 +237,8 @@ def load_krea2_fp8_cache(
             ArcPointer(_load_raw_h2d(st, p + String("postnorm_scale"), ctx)),
             ArcPointer(_load_raw_h2d(st, p + String("mod_lin"), ctx)),
         ))
-        if (bi + 1) % 7 == 0 or bi + 1 == nblocks:
-            print("[fp8cache] loaded", bi + 1, "/", nblocks, "blocks from sidecar")
+        if (bi + 1) % 7 == 0 or bi + 1 == n_res:
+            print("[fp8cache] loaded", bi + 1, "/", n_res, "blocks from sidecar")
     return Krea2ResidentFp8(blocks^)
 
 

@@ -19,10 +19,13 @@
 #      so this stager writes the RAW caption text unchanged. We must NOT pre-wrap it
 #      (the DROP_IDX=34 prefix-drop in encode_krea2_stack assumes the exact template).
 #
-# Per sample (dataset: <dir>/N.jpg + N.txt):
+# Per sample (dataset: <dir>/N.jpg + N.txt) -> ONE record pair per sample, named
+# sample_NNNNN (5-wide zero pad) exactly as krea2_prepare_cache._stage_name reads:
 #   image: center-crop to selected aspect, resize HxW, RGB f32 [-1,1] CHW
-#          -> image.<i> [1,3,H,W] f32   (the QwenImageVaeEncoder input)
-#   caption: the raw .txt, stripped -> prompt.<i>.txt  (the Mojo prepare wraps it)
+#          -> sample_NNNNN.safetensors key "image" [1,3,H,W] f32
+#          (the QwenImageVaeEncoder input; per-file so the prepare's aspect-ladder
+#           dispatch can read each sample's (IH,IW) on its own)
+#   caption: the raw .txt, stripped -> sample_NNNNN.txt  (the Mojo prepare wraps it)
 #
 # --uncond (caption dropout, flag-gated, default-off): ALSO write uncond.txt = the
 #   empty caption "". The Mojo prepare encodes it through the SAME PREFIX+""+SUFFIX
@@ -52,6 +55,21 @@ from safetensors.numpy import save_file
 # vae_scale_factor (8) * patch (2) — the krea2 bucket divisibility (krea2.py:166-167).
 KREA2_BUCKET_DIV = 16
 
+# ── caption length guard ─────────────────────────────────────────────────────
+# The Qwen3-VL encoder in krea2_prepare_cache fails loud above 2048 SDPA seq
+# ("krea2 encode: L=<n> exceeds 2048"), and it does so MID-RUN — a caption at
+# index 45 kills a 118-sample GPU prepare after 45 VAE+text encodes. Catch it
+# here instead, where re-staging is seconds.
+#
+# We do not tokenize in this stager (no tokenizer dependency on the Python side),
+# so the check is on characters with a MEASURED ratio: the eri2 caption that blew
+# the limit was 8733 chars -> 3112 tokens = 2.81 chars/token on this JSON-shaped
+# caption style. At that ratio the 2048-token wall is ~5750 chars; 5000 is the
+# conservative default (~1780 tokens). Denser text tokenizes worse, so a caption
+# UNDER the threshold can still trip the encoder — the prepare's own fail-loud
+# remains the authority. Raise/lower with --max-caption-chars.
+KREA2_MAX_CAPTION_CHARS = 5000
+
 
 def _parse_bucket(text: str) -> tuple[int, int]:
     text = text.lower().strip()
@@ -78,10 +96,18 @@ def _parse_args(argv: list[str]):
             raise SystemExit("--buckets requires a comma-separated WxH list")
         buckets_arg = args[idx + 1]
         del args[idx : idx + 2]
+    max_caption_chars = KREA2_MAX_CAPTION_CHARS
+    if "--max-caption-chars" in args:
+        idx = args.index("--max-caption-chars")
+        if idx + 1 >= len(args):
+            raise SystemExit("--max-caption-chars requires an integer")
+        max_caption_chars = int(args[idx + 1])
+        del args[idx : idx + 2]
     if len(args) < 2:
         print(
             "usage: krea2_stage_images.py <src_dir> <out_dir> [SIZE|WxH] "
-            "[--buckets WxH,WxH,...] [--uncond] [--edit]\n"
+            "[--buckets WxH,WxH,...] [--uncond] [--edit] "
+            f"[--max-caption-chars N (default {KREA2_MAX_CAPTION_CHARS}, 0=off)]\n"
             "  --edit: IMAGE-EDIT single-dir suffix layout — per <id>.txt, "
             "target=<id>.jpg, reference=<id>-condlabel.png; references staged to "
             "<out_dir>/ref for krea2_prepare_cache's 5th (ref_stage_dir) arg."
@@ -99,7 +125,7 @@ def _parse_args(argv: list[str]):
                 f"bucket {w}x{h} must be divisible by {KREA2_BUCKET_DIV} "
                 f"(vae_scale_factor*patch)"
             )
-    return src, out, buckets, emit_uncond, edit_mode
+    return src, out, buckets, emit_uncond, edit_mode, max_caption_chars
 
 
 def _choose_bucket(width: int, height: int, buckets: list[tuple[int, int]]) -> tuple[int, int]:
@@ -138,7 +164,56 @@ def _decode_to_bucket(path: Path, bucket_w: int, bucket_h: int) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def _stage_edit(src: Path, out: Path, buckets, emit_uncond: bool):
+def _caption_too_long(caption: str, limit: int) -> bool:
+    """True when this caption should be skipped as encoder-overlong (see
+    KREA2_MAX_CAPTION_CHARS). limit <= 0 disables the guard."""
+    return limit > 0 and len(caption) > limit
+
+
+def _report_skipped_captions(skipped: list, limit: int):
+    if not skipped:
+        return
+    print(
+        f"\nSKIPPED {len(skipped)} sample(s): caption over --max-caption-chars "
+        f"{limit} (the Qwen3-VL encoder in krea2_prepare_cache fails loud past "
+        f"2048 tokens, mid-run):"
+    )
+    for name, n_chars in skipped:
+        print(f"  {name}: {n_chars} chars")
+    print(
+        "  Shorten those captions and re-stage to include the samples, or raise "
+        "--max-caption-chars if you believe they tokenize under 2048.\n"
+    )
+
+
+def _stage_name(i: int) -> str:
+    """The record name krea2_prepare_cache reads (_stage_name, 5-wide zero pad)."""
+    return f"sample_{i:05d}"
+
+
+def _write_stage_records(out: Path, tensors: dict, captions: dict):
+    """Write the per-sample records krea2_prepare_cache consumes.
+
+    The consumer (krea2_prepare_cache.mojo _stage_tensor_path/_stage_caption_path)
+    opens ONE safetensors per sample holding a single `image` [1,3,IH,IW] tensor,
+    plus the raw caption alongside it — NOT the ideogram4-style single
+    images.safetensors with image.<i> keys (that layout belongs to
+    pipeline/ideogram4_prepare.mojo + train_hidream_o1_real.mojo, which are
+    unaffected by this function). Per-sample files are also what lets the
+    prepare's aspect-ladder dispatch read each bucket's (IH,IW) independently.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    for old in out.glob("sample_*.safetensors"):
+        old.unlink()
+    for old in out.glob("sample_*.txt"):
+        old.unlink()
+    for i in range(len(tensors)):
+        name = _stage_name(i)
+        save_file({"image": tensors[f"image.{i}"]}, str(out / f"{name}.safetensors"))
+        (out / f"{name}.txt").write_text(captions[str(i)])
+
+
+def _stage_edit(src: Path, out: Path, buckets, emit_uncond: bool, max_caption_chars: int):
     """IMAGE-EDIT stage A (single-dir suffix convention). Per <id>.txt:
     target=<id>.jpg, reference=<id>-condlabel.png, caption=<id>.txt. The reference
     is decoded to the SAME bucket as its target and staged to <out>/ref."""
@@ -153,6 +228,7 @@ def _stage_edit(src: Path, out: Path, buckets, emit_uncond: bool):
     )
     tensors, ref_tensors, captions = {}, {}, {}
     bucket_counts = Counter()
+    skipped_captions = []
     kept = 0
     for stem in stems:
         tgt = src / f"{stem}.jpg"
@@ -164,23 +240,28 @@ def _stage_edit(src: Path, out: Path, buckets, emit_uncond: bool):
         if not ref.exists():
             print(f"skip {stem}: no reference {stem}-condlabel.png")
             continue
+        caption = cap.read_text().strip()
+        if _caption_too_long(caption, max_caption_chars):
+            skipped_captions.append((cap.name, len(caption)))
+            continue
         # Bucket is chosen from the TARGET; the reference is forced to the SAME
         # bucket so the Mojo edit prepare's same-bucket assertion holds.
         w, h = Image.open(tgt).size
         bucket_w, bucket_h = _choose_bucket(w, h, buckets)
         tensors[f"image.{kept}"] = _decode_to_bucket(tgt, bucket_w, bucket_h)
         ref_tensors[f"image.{kept}"] = _decode_to_bucket(ref, bucket_w, bucket_h)
-        captions[str(kept)] = cap.read_text().strip()
+        captions[str(kept)] = caption
         bucket_counts[(bucket_w, bucket_h)] += 1
         kept += 1
 
     if kept == 0:
         raise SystemExit(f"no <id>.txt + <id>.jpg + <id>-condlabel.png trios in {src}")
+    _report_skipped_captions(skipped_captions, max_caption_chars)
 
-    save_file(tensors, str(out / "images.safetensors"))
-    save_file(ref_tensors, str(ref_out / "images.safetensors"))
-    for k, v in captions.items():
-        (out / f"prompt.{k}.txt").write_text(v)
+    # Same record layout for both dirs — the prepare's edit mode reads the
+    # reference at <ref_dir>/sample_NNNNN.safetensors, same index, same bucket.
+    _write_stage_records(out, tensors, captions)
+    _write_stage_records(ref_out, ref_tensors, captions)
     if emit_uncond:
         (out / "uncond.txt").write_text("")
         print(f"staged uncond.txt (empty-caption render) -> {out}")
@@ -198,9 +279,9 @@ def _stage_edit(src: Path, out: Path, buckets, emit_uncond: bool):
 
 
 def main():
-    src, out, buckets, emit_uncond, edit_mode = _parse_args(sys.argv[1:])
+    src, out, buckets, emit_uncond, edit_mode, max_caption_chars = _parse_args(sys.argv[1:])
     if edit_mode:
-        _stage_edit(src, out, buckets, emit_uncond)
+        _stage_edit(src, out, buckets, emit_uncond, max_caption_chars)
         return
     out.mkdir(parents=True, exist_ok=True)
 
@@ -211,11 +292,16 @@ def main():
     )
     tensors, captions = {}, {}
     bucket_counts = Counter()
+    skipped_captions = []
     kept = 0
     for p in imgs:
         cap_path = p.with_suffix(".txt")
         if not cap_path.exists():
             print(f"skip {p.name}: no caption")
+            continue
+        caption = cap_path.read_text().strip()
+        if _caption_too_long(caption, max_caption_chars):
+            skipped_captions.append((cap_path.name, len(caption)))
             continue
         img = Image.open(p).convert("RGB")
         w, h = img.size
@@ -226,16 +312,15 @@ def main():
         arr = arr.transpose(2, 0, 1)[None]                       # [1,3,H,W]
         tensors[f"image.{kept}"] = np.ascontiguousarray(arr)
 
-        captions[str(kept)] = cap_path.read_text().strip()
+        captions[str(kept)] = caption
         bucket_counts[(bucket_w, bucket_h)] += 1
         kept += 1
 
     if kept == 0:
         raise SystemExit(f"no image+caption pairs found in {src}")
+    _report_skipped_captions(skipped_captions, max_caption_chars)
 
-    save_file(tensors, str(out / "images.safetensors"))
-    for k, v in captions.items():
-        (out / f"prompt.{k}.txt").write_text(v)
+    _write_stage_records(out, tensors, captions)
     if emit_uncond:
         # Empty caption: the Mojo prepare wraps it as PREFIX + "" + SUFFIX.
         (out / "uncond.txt").write_text("")

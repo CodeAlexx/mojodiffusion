@@ -73,7 +73,7 @@ from serenitymojo.ops.activations import silu, gelu
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.embeddings import timestep_embedding
-from serenitymojo.ops.tensor_algebra import add, mul, concat, reshape, slice
+from serenitymojo.ops.tensor_algebra import add, mul, concat, reshape_owned, slice
 from serenitymojo.models.dit.sdxl_attention import sdxl_sdpa
 from serenitymojo.models.vae.decoder2d import nchw_to_nhwc, nhwc_to_nchw
 from serenitymojo.models.vae.upsample import upsample_nearest2x_nhwc
@@ -341,10 +341,10 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
         if has_bias:
             ref b = self._w(prefix + ".bias")
             return conv2d[1, H, W, Cin, Kh, Kw, Cout, Sh, Sw, Ph, Pw](
-                x, _clone(w, ctx), Optional[Tensor](_clone(b, ctx)), ctx
+                x, w, Optional[Tensor](_clone(b, ctx)), ctx
             )
         return conv2d[1, H, W, Cin, Kh, Kw, Cout, Sh, Sw, Ph, Pw](
-            x, _clone(w, ctx), None, ctx
+            x, w, None, ctx
         )
 
     # ── timestep + label embedding ──────────────────────────────────────────
@@ -444,11 +444,11 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
         # reshape to BSHD.
         var qsh = List[Int]()
         qsh.append(1); qsh.append(Sq); qsh.append(Heads); qsh.append(HEAD_DIM)
-        q = reshape(q, qsh^, ctx)
+        q = reshape_owned(q^, qsh^)
         var ksh = List[Int]()
         ksh.append(1); ksh.append(Skv); ksh.append(Heads); ksh.append(HEAD_DIM)
-        k = reshape(k, ksh.copy(), ctx)
-        v = reshape(v, ksh^, ctx)
+        k = reshape_owned(k^, ksh.copy())
+        v = reshape_owned(v^, ksh^)
 
         var scale = Float32(1.0) / Float32(8.0)
         var att = sdxl_sdpa[1, Sq, Skv, Heads, HEAD_DIM](q, k, v, scale, ctx)
@@ -456,7 +456,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
         # [1,Sq,Heads,64] -> [1,Sq,C].
         var osh = List[Int]()
         osh.append(1); osh.append(Sq); osh.append(C)
-        att = reshape(att, osh^, ctx)
+        att = reshape_owned(att^, osh^)
         return self._lin_b(att, prefix + ".to_out.0.weight", prefix + ".to_out.0.bias", ctx)
 
     # GEGLU: proj(Linear+bias) to 2*ff -> split halves -> x * gelu(gate).
@@ -486,7 +486,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
         # NHWC [1,H,W,C] is already token-contiguous -> view as [1,S,C].
         var tsh = List[Int]()
         tsh.append(1); tsh.append(S); tsh.append(C)
-        var tok = reshape(xn, tsh^, ctx)
+        var tok = reshape_owned(xn^, tsh^)
         var hid = self._lin_b(tok, prefix + ".proj_in.weight", prefix + ".proj_in.bias", ctx)
 
         for j in range(Depth):
@@ -498,7 +498,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
         # back to NHWC [1,H,W,C].
         var nhwc = List[Int]()
         nhwc.append(1); nhwc.append(H); nhwc.append(W); nhwc.append(C)
-        outp = reshape(outp, nhwc^, ctx)
+        outp = reshape_owned(outp^, nhwc^)
         return add(residual, outp, ctx)
 
     # ── Downsample / Upsample (NHWC) ─────────────────────────────────────────

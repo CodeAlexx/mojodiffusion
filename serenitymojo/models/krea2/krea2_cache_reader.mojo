@@ -42,6 +42,7 @@
 
 from std.gpu.host import DeviceContext
 from std.gpu import global_idx
+from std.math import log
 from std.memory import ArcPointer
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -279,6 +280,142 @@ def krea2_edit_real_len(lt: Int, imglen: Int, condlen: Int) -> Int:
     text pad. == Krea2OminiLayout.real_len(); condlen == 0 gives the pre-edit
     lt + imglen the trainer already uses (train_krea2.mojo:1237)."""
     return lt + imglen + condlen
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OMINICONTROL `condition_scale` ATTENTION BIAS (C8, INFERENCE ONLY)
+#
+# THE SEMANTICS, straight from the reference (flux_omini.py:280-341):
+#   `condition_scale` is a soft strength knob implemented as an ADDITIVE bias of
+#   log(condition_scale) on the attention LOGITS whenever EXACTLY ONE of
+#   {query token, key token} is a CONDITION token — i.e. both cross directions
+#   (img/txt -> cond AND cond -> img/txt). cond<->cond and non-cond<->non-cond
+#   get 0. `condition_scale == 1.0` => log(1) == 0 => the reference passes
+#   attn_mask=None and the attention is byte-identical to the base model. THAT IS
+#   THE IDENTITY VALUE, and this builder is never called for it.
+#   condition_scale <= 0 is defined (their code) as "fully suppress" -> -inf; we
+#   use KREA2_MASK_NEG for the same reason the pad columns do.
+#
+# WHERE IT ENTERS OUR STACK: krea2's block has NO logit hook — the two arms are
+# `sdpa_nomask` (full attention) and the cuDNN flash-padmask (a TAIL mask, no
+# per-element bias). So the bias is materialised HERE as one additive
+# [1, heads, LFULL, LFULL] mask in the COMBINED row order
+# [TXT_real(lt) | IMG | COND | TXT_pad], and krea2_single_stream_block_lora gains
+# ONE optional `attn_bias` argument that routes to the masked math SDPA
+# (ops.attention.sdpa_chunked) instead of flash. The mask is built ONCE per
+# forward and shared by all 28 blocks, exactly like the trainer's pad mask.
+#
+# ⚠ THE PAD COLUMNS MOVE. krea2_build_pad_mask masks key columns [lt, ltmax) —
+# that is the SOURCE order [TXT(LTMAX) | IMG]. In the COMBINED order the text pad
+# is the TAIL [real_len, LFULL), which is why this builder does NOT reuse
+# _krea2_pad_mask_kernel: same idea, different column range.
+#
+# ⚠ COST (arithmetic, not measured): heads*LFULL*LFULL F32. At the 512px EDIT
+# shape (heads 48, LFULL 2432) that is 283,901,952 floats = 1.136 GB F32, and the
+# BF16 copy the block consumes is 0.568 GB. The identity path allocates NEITHER.
+# Nothing about this path has been executed on a GPU — see the C8 verification
+# plan; treat every number here as arithmetic on the shapes, not a measurement.
+def _krea2_edit_bias_kernel(
+    mask: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [heads*L*L] flat
+    lfull: Int, cond_off: Int, cond_end: Int, bias: Float32,
+):
+    var idx = Int(global_idx.x)
+    var total = lfull * lfull
+    if idx >= total:
+        return
+    # This kernel fills ONE head plane [L, L]; the caller broadcasts it to the
+    # remaining heads with a device copy (the bias is head-independent, so
+    # launching heads*L*L threads would be pure waste).
+    var j = idx % lfull
+    var i = idx // lfull
+    if j >= cond_end:
+        mask[idx] = KREA2_MASK_NEG          # TXT_pad key columns (combined tail)
+        return
+    var q_is_cond = i >= cond_off and i < cond_end
+    var k_is_cond = j >= cond_off
+    if q_is_cond != k_is_cond:
+        mask[idx] = bias
+    else:
+        mask[idx] = Float32(0.0)
+
+
+def krea2_edit_cond_bias(condition_scale: Float32) -> Float32:
+    """log(condition_scale), the ONE scalar `condition_scale` reduces to
+    (flux_omini.py:289-292). 1.0 -> 0.0 (identity: no bias tensor is built at
+    all). <= 0 -> KREA2_MASK_NEG ("fully suppress the condition")."""
+    if condition_scale <= Float32(0.0):
+        return KREA2_MASK_NEG
+    return log(condition_scale)
+
+
+def krea2_build_edit_attn_bias(
+    lt: Int, ltmax: Int, imglen: Int, condlen: Int,
+    condition_scale: Float32, heads: Int, dtype: STDtype, ctx: DeviceContext,
+) raises -> Tensor:
+    """Additive attention bias [1, heads, LFULL, LFULL] in COMBINED row order for
+    the OminiControl EDIT sequence, LFULL = ltmax + imglen + condlen.
+
+    Contents: KREA2_MASK_NEG on the TXT_pad key columns [real_len, LFULL) (the
+    same job the flash-padmask does), plus log(condition_scale) on every
+    (query, key) pair where exactly one side is a COND row. `dtype` must be the
+    dtype the block's q/k/v carry (ops.attention.sdpa requires q.dtype ==
+    mask.dtype); inference runs BF16.
+
+    Refuses condition_scale == 1.0: that is the IDENTITY and the caller must take
+    the untouched flash path instead of paying ~1.1 GB for a mask of zeros."""
+    if condlen <= 0:
+        raise Error("krea2_build_edit_attn_bias: condlen must be > 0")
+    if lt < 0 or lt > ltmax:
+        raise Error("krea2_build_edit_attn_bias: lt out of [0, ltmax]")
+    if heads <= 0:
+        raise Error("krea2_build_edit_attn_bias: heads must be > 0")
+    if condition_scale == Float32(1.0):
+        raise Error(
+            "krea2_build_edit_attn_bias: condition_scale == 1.0 is the IDENTITY"
+            " (log(1) == 0); take the unbiased flash path instead of building an"
+            " all-zero bias"
+        )
+    var lay = Krea2OminiLayout(ltmax, imglen, condlen, lt)
+    lay.check_flash_prefix()
+    var lfull = lay.lfull()
+    var cond_off = lay.cond_off()
+    var cond_end = lay.pad_off()               # == real_len
+    var bias = krea2_edit_cond_bias(condition_scale)
+
+    # One head plane, then broadcast.
+    var plane = zeros_device([1, 1, lfull, lfull], STDtype.F32, ctx)
+    var nflat = lfull * lfull
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nflat))
+    var m = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        plane.buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var grid = (nflat + _MASK_BLOCK - 1) // _MASK_BLOCK
+    ctx.enqueue_function[_krea2_edit_bias_kernel, _krea2_edit_bias_kernel](
+        m, lfull, cond_off, cond_end, bias,
+        grid_dim=grid, block_dim=_MASK_BLOCK,
+    )
+    var plane_t: Tensor
+    if dtype != STDtype.F32:
+        plane_t = cast_tensor(plane, dtype, ctx)
+    else:
+        plane_t = plane^
+    if heads == 1:
+        return plane_t^
+    # Broadcast the single plane across the head axis by DOUBLING (log2(heads)
+    # concats, not `heads` of them — the naive append loop copies O(heads^2)
+    # planes, ~14 GB of D2D at heads=48).
+    var full = plane_t.clone(ctx)
+    var have = 1
+    while have < heads:
+        if have * 2 <= heads:
+            full = concat(1, ctx, full, full)
+            have *= 2
+        else:
+            var need = heads - have
+            var part = slice(full, 1, 0, need, ctx)
+            full = concat(1, ctx, full, part)
+            have = heads
+    return full^
 
 
 # Build the additive REFINER txtmask [1, heads, ltmax, ltmax] F32 for the txtfusion

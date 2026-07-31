@@ -76,7 +76,7 @@ from serenitymojo.ops.int8_quant import int8_transpose
 from serenitymojo.ops.activations import swiglu, sigmoid
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_chunked
 from serenitymojo.ops.attention_flash import (
     sdpa_flash_train_fwd_padmask_bf16, sdpa_flash_backward_padmask_bf16,
 )
@@ -757,6 +757,26 @@ def krea2_single_stream_block_lora[
         # (the CONDLEN=0 regression contract). Note cond_len is INDEPENDENT of
         # vec_cond: modulation segmentation and LoRA routing are separate
         # switches, so each can be gated on its own.
+    attn_bias: Optional[TArc] = Optional[TArc](None),  # OminiControl
+        # `condition_scale` (C8, INFERENCE ONLY): an additive [1, HEADS, L, L]
+        # score bias in x's dtype, built ONCE per forward by
+        # krea2_cache_reader.krea2_build_edit_attn_bias and shared by all blocks.
+        # It carries BOTH the TXT_pad key-column mask AND the log(condition_scale)
+        # cross-bias between COND and non-COND tokens (flux_omini.py:280-341).
+        #
+        # ABSENT (the default, and the ONLY thing the trainer ever passes) => not
+        # one instruction of the SDPA dispatch below changes: flash-padmask when
+        # real_len < L, sdpa_nomask otherwise. PRESENT => the masked math SDPA
+        # (sdpa_chunked) runs INSTEAD of both, because neither existing arm has a
+        # per-element logit hook. `real_len` is then IGNORED for masking (the bias
+        # tensor already contains the pad columns) — passing both is not an error,
+        # the bias simply wins.
+        #
+        # ⚠ NO BACKWARD. The biased arm saves no flash tape and nothing in this
+        # repo differentiates through it; `krea2_single_stream_block_lora_backward`
+        # has no attn_bias argument. Training must never set this.
+        # ⚠ UNVERIFIED ON DEVICE as of C8 (authored while the GPU was busy). See
+        # the C8 verification plan's condition_scale gate.
 ) raises -> Krea2BlockForward:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -902,7 +922,21 @@ def krea2_single_stream_block_lora[
     var flash_o = Optional[TArc](None)
     var flash_stats = Optional[TArc](None)
     var use_flash = real_len and real_len.value() < L
-    if use_flash:
+    if attn_bias:
+        # OminiControl condition_scale arm (C8, inference only). The bias tensor
+        # already encodes the TXT_pad key columns, so flash/real_len is bypassed.
+        # sdpa_chunked is bit-identical to sdpa but holds the F32 scores for ONE
+        # head at a time ([L,L]) instead of all HEADS.
+        var bias = attn_bias.value()
+        if bias[].dtype() != q_rope.dtype():
+            raise Error(
+                "krea2_single_stream_block_lora: attn_bias dtype must equal q's"
+                " (ops.attention.sdpa requires q.dtype == mask.dtype)"
+            )
+        att = sdpa_chunked[1, L, HEADS, HEADDIM](
+            q_rope, k_full, v_full, bias[], scale, ctx
+        )
+    elif use_flash:
         var rl = real_len.value()
         var ff = sdpa_flash_train_fwd_padmask_bf16[1, L, HEADS, HEADDIM](
             q_rope, k_full, v_full, rl, scale, ctx

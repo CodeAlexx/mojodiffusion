@@ -1623,6 +1623,14 @@ def krea2_stack_lora_forward_streamed[
     vec_cond: Optional[TArc] = Optional[TArc](None),
     cond_off: Optional[Int] = Optional[Int](None),
     cond_len: Optional[Int] = Optional[Int](None),
+    # ── OminiControl `condition_scale` (C8 inference seam) ────────────────────
+    # An additive [1, HEADS, L, L] score bias in `combined`'s dtype, built ONCE
+    # per forward by krea2_cache_reader.krea2_build_edit_attn_bias and handed to
+    # EVERY block unchanged. Absent (the default, and all the trainer ever
+    # passes) => the block's SDPA dispatch is untouched. Present => every block
+    # takes the masked math SDPA and `real_len` stops mattering for masking (the
+    # bias carries the pad columns). There is NO backward for this arm.
+    attn_bias: Optional[TArc] = Optional[TArc](None),
 ) raises -> Krea2StackForward:
     """STREAMING single-stream stack forward WITH LoRA. Identical math to
     krea2_stack_lora_forward, but each block's FROZEN weights are loaded H2D from
@@ -1689,6 +1697,7 @@ def krea2_stack_lora_forward_streamed[
             x, blk_vec, wbi, lora.blocks[bi],
             cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
             vec_cond=vec_cond.copy(), cond_off=cond_off, cond_len=cond_len,
+            attn_bias=attn_bias.copy(),
         )
         x = fwd.out.copy()
         if bi < save_tapes:

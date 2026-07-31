@@ -44,7 +44,12 @@ from serenitymojo.sampling.inpaint import (
 )
 from serenitymojo.models.krea2.krea2_cache_reader import (
     krea2_patchify, krea2_build_pos, krea2_build_refiner_mask,
-    KREA2_TXT_LAYERS, KREA2_TXT_DIM,
+    krea2_build_pos_cond, krea2_reorder_combined_edit, krea2_edit_real_len,
+    krea2_build_edit_attn_bias, krea2_edit_cond_bias,
+    KREA2_TXT_LAYERS, KREA2_TXT_DIM, KREA2_HEADS,
+)
+from serenitymojo.training.krea2_omini_layout import (
+    Krea2OminiLayout, krea2_omini_mod_split,
 )
 from serenitymojo.models.dit.krea2_dit import (
     krea2_first, krea2_temb, krea2_tmlp, krea2_tproj, krea2_txtmlp,
@@ -57,6 +62,7 @@ from serenitymojo.models.krea2.krea2_stack import (
     krea2_stack_lora_forward_streamed,
     Krea2ResidentFp8, build_krea2_resident_fp8,
     Krea2ResidentInt8, build_krea2_resident_int8,
+    Krea2ResidentSquareq, build_krea2_resident_squareq,
 )
 from serenitymojo.models.dit.krea2_dit import Krea2HostInt8Inf
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice, lora_adapter_to_device
@@ -172,27 +178,74 @@ struct _Cond(Movable):
     var tmlp_out: Tensor
     var cos: Tensor
     var sin: Tensor
+    # OminiControl EDIT (C8): mods(t=0) for the COND rows. Present ONLY on a
+    # CONDL > 0 build — the twin of the trainer's _CondEdit.blk_vec_cond.
+    var blk_vec_cond: Optional[Tensor]
 
     def __init__(
         out self, var combined: TArc, var blk_vec: Tensor, var tmlp_out: Tensor,
         var cos: Tensor, var sin: Tensor,
+        var blk_vec_cond: Optional[Tensor] = Optional[Tensor](None),
     ):
         self.combined = combined^
         self.blk_vec = blk_vec^
         self.tmlp_out = tmlp_out^
         self.cos = cos^
         self.sin = sin^
+        self.blk_vec_cond = blk_vec_cond^
 
 
-def build_conditioning[LT: Int, LFULL: Int](
+# ══════════════════════════════════════════════════════════════════════════════
+# CONDITIONING — extended in C8 with an OPTIONAL OminiControl condition segment.
+#
+# CONDL == 0 (the default, every pre-C8 caller): the statements below are EXACTLY
+# the pre-C8 ones — every EDIT statement sits behind `comptime if CONDL > 0`, the
+# same shape-of-change C2..C6 used in the trainer. CONDL > 0 turns the sequence
+# into [TXT_real(lt) | IMG | COND | TXT_pad], adds the second (t = 0) modulation
+# vector, and reorders the SOURCE-order pos table [TXT(LT) | IMG | COND] with the
+# READER's own krea2_reorder_combined_edit — the very function the trainer calls,
+# so there is no second copy of the gather math (layout seam A.3).
+#
+# WHY THIS IS THE TRAINER'S SEQUENCE, NOT A LOOKALIKE: cond_e is
+# krea2_first(cond_tokens) and nothing else (OminiControl shares x_embedder
+# between image and condition tokens), the second temb chain is the SAME
+# temb->tmlp->tproj on t = 0, and the concat order is the Krea2OminiLayout one.
+# Those are the three things train_krea2._build_conditioning_edit does.
+#
+# ⚠ ONE KNOWN TRAIN/INFER DIVERGENCE, PRE-EXISTING AND NOT INTRODUCED HERE: the
+# TRAINER passes Optional[Tensor](None) for the txtfusion refiner mask (it never
+# builds one, edit or not) while this inference builder masks the text-pad
+# columns by default — the fix that stopped long prompts from blowing up CFG.
+# `use_refiner_mask=False` reproduces the trainer's text conditioning exactly, so
+# the two can be A/B'd; it is NOT the default because every krea2 render in this
+# repo has been made with the mask on.
+def build_conditioning[LT: Int, LFULL: Int, CONDL: Int = 0](
     cond_w: Krea2ResidentCond,
     img: Tensor,            # [1, IMGLEN, 64] BF16 patchified noised latent
     context: Tensor,        # [1, LT, 12, 2560] BF16 (LT == LTMAX)
-    pos: Tensor,            # [1, LFULL, 3] F32
+    pos: Tensor,            # [1, LFULL, 3] F32 (CONDL>0: SOURCE order TXT|IMG|COND)
     t: Tensor,              # [1] F32 timestep
     real_text_len: Int,     # natural caption length lt (<= LT); real_len = lt+IMGLEN
     ctx: DeviceContext,
+    cond_img: Optional[Tensor] = Optional[Tensor](None),
+        # [1, CONDL, 64] BF16 patchified CLEAN condition latent. REQUIRED when
+        # CONDL > 0, ignored (and refused) when CONDL == 0.
+    use_refiner_mask: Bool = True,
 ) raises -> _Cond:
+    comptime IMGL = LFULL - LT - CONDL
+    comptime assert IMGL > 0, "build_conditioning: LFULL must exceed LT + CONDL"
+    comptime if CONDL > 0:
+        if not cond_img:
+            raise Error(
+                "build_conditioning: a CONDL > 0 build needs cond_img"
+                " [1, CONDL, 64] (the patchified CLEAN condition latent)"
+            )
+    else:
+        if cond_img:
+            raise Error(
+                "build_conditioning: cond_img supplied to a CONDL == 0 build"
+                " — rebuild with the OminiControl condition length"
+            )
     var img_bf = cast_tensor(img, STDtype.BF16, ctx)
     var img_e = krea2_first(img_bf, cond_w.first_w[], cond_w.first_b[], ctx)
 
@@ -213,7 +266,7 @@ def build_conditioning[LT: Int, LFULL: Int](
     # NOTE: the masked sdpa (ops/attention.sdpa) requires mask.dtype == q.dtype;
     # the refiner runs BF16 at inference, so cast the F32 additive mask to BF16.
     var refiner_mask: Optional[Tensor]
-    if real_text_len < LT:
+    if real_text_len < LT and use_refiner_mask:
         var rm_f32 = krea2_build_refiner_mask(real_text_len, LT, TXTHEADS, ctx)
         refiner_mask = Optional[Tensor](cast_tensor(rm_f32, STDtype.BF16, ctx))
     else:
@@ -232,26 +285,70 @@ def build_conditioning[LT: Int, LFULL: Int](
         ctx,
     )
 
-    # length-bucket reorder → [TXT_real(0:lt) | IMG | TXT_pad(tail)].
+    # length-bucket reorder → [TXT_real(0:lt) | IMG | TXT_pad(tail)], or, with an
+    # OminiControl condition segment, [TXT_real | IMG | COND | TXT_pad].
     var combined: Tensor
-    if real_text_len < LT:
-        var real_text = slice(ctx_proj, 1, 0, real_text_len, ctx)
-        var pad_text = slice(ctx_proj, 1, real_text_len, LT - real_text_len, ctx)
-        var head = concat(1, ctx, real_text, img_e)
-        combined = concat(1, ctx, head, pad_text)
+    var blk_vec_cond = Optional[Tensor](None)
+    comptime if CONDL > 0:
+        # COND rows: the SAME `first` Linear as the image rows, on the CLEAN
+        # condition latent (never noised, no img_in_ref delta) — the trainer's
+        # _build_conditioning_edit, statement for statement.
+        var cond_bf = cast_tensor(cond_img.value(), STDtype.BF16, ctx)
+        var cond_e = krea2_first(cond_bf, cond_w.first_w[], cond_w.first_b[], ctx)
+        # chain #2: temb->tmlp->tproj on t = 0, the condition-row modulation.
+        var t_zero = _t_scalar(Float32(0.0), ctx)
+        var te_c = krea2_temb(t_zero, TDIM, ctx, STDtype.BF16)
+        var t_vec_c = krea2_tmlp(
+            te_c, cond_w.tmlp0_w[], cond_w.tmlp0_b[],
+            cond_w.tmlp2_w[], cond_w.tmlp2_b[], ctx,
+        )
+        var t3_c = reshape(t_vec_c, [1, 1, FEATURES], ctx)
+        var bvc = krea2_tproj(t3_c, cond_w.tproj1_w[], cond_w.tproj1_b[], ctx)
+        blk_vec_cond = Optional[Tensor](reshape(bvc, [1, 6 * FEATURES], ctx))
+        # BOUNDARY: a zero-length slice launches grid_dim 0 and aborts, so
+        # neither empty text segment is materialized (same guards the reader's
+        # krea2_reorder_combined_edit carries).
+        if real_text_len <= 0:
+            var h0 = concat(1, ctx, img_e, cond_e)
+            combined = concat(1, ctx, h0, ctx_proj)
+        elif real_text_len < LT:
+            var real_text = slice(ctx_proj, 1, 0, real_text_len, ctx)
+            var pad_text = slice(
+                ctx_proj, 1, real_text_len, LT - real_text_len, ctx
+            )
+            var head = concat(1, ctx, real_text, img_e)
+            var head2 = concat(1, ctx, head, cond_e)
+            combined = concat(1, ctx, head2, pad_text)
+        else:
+            var head3 = concat(1, ctx, ctx_proj, img_e)
+            combined = concat(1, ctx, head3, cond_e)
     else:
-        combined = concat(1, ctx, ctx_proj, img_e)
+        if real_text_len < LT:
+            var real_text = slice(ctx_proj, 1, 0, real_text_len, ctx)
+            var pad_text = slice(ctx_proj, 1, real_text_len, LT - real_text_len, ctx)
+            var head = concat(1, ctx, real_text, img_e)
+            combined = concat(1, ctx, head, pad_text)
+        else:
+            combined = concat(1, ctx, ctx_proj, img_e)
 
     # rope: reorder pos to match combined (text positions are all-zero → no rotation change).
     var pos_re: Tensor
-    if real_text_len < LT:
-        var pos_real = slice(pos, 1, 0, real_text_len, ctx)
-        var pos_img = slice(pos, 1, LT, LFULL - LT, ctx)
-        var pos_pad = slice(pos, 1, real_text_len, LT - real_text_len, ctx)
-        var pos_head = concat(1, ctx, pos_real, pos_img)
-        pos_re = concat(1, ctx, pos_head, pos_pad)
+    comptime if CONDL > 0:
+        # THE READER'S OWN GATHER — not a copy of it. krea2_reorder_combined_edit
+        # is the function train_krea2 calls and the C6 gate compares element-for-
+        # element against krea2_omini_pos_combined.
+        pos_re = krea2_reorder_combined_edit[LT, LFULL, CONDL](
+            pos, real_text_len, ctx
+        )
     else:
-        pos_re = pos.clone(ctx)
+        if real_text_len < LT:
+            var pos_real = slice(pos, 1, 0, real_text_len, ctx)
+            var pos_img = slice(pos, 1, LT, LFULL - LT, ctx)
+            var pos_pad = slice(pos, 1, real_text_len, LT - real_text_len, ctx)
+            var pos_head = concat(1, ctx, pos_real, pos_img)
+            pos_re = concat(1, ctx, pos_head, pos_pad)
+        else:
+            pos_re = pos.clone(ctx)
     var pos_flat = reshape(pos_re, [LFULL * 3], ctx)
     var axes = List[Int]()
     axes.append(32); axes.append(48); axes.append(48)
@@ -259,7 +356,9 @@ def build_conditioning[LT: Int, LFULL: Int](
     var rcos = rope[0].clone(ctx)
     var rsin = rope[1].clone(ctx)
 
-    return _Cond(TArc(combined^), blk_vec2^, t3^, rcos^, rsin^)
+    return _Cond(
+        TArc(combined^), blk_vec2^, t3^, rcos^, rsin^, blk_vec_cond^
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -312,6 +411,29 @@ def inline_cond_from_context[LH: Int, LW: Int, LTMAX: Int](
     var lt = sh[1]
     var padded = _pad_context_to_ltmax[LTMAX](context^, lt, ctx)
     var pos = krea2_build_pos[LH, LW](LTMAX, ctx)
+    return Krea2InlineCond(TArc(padded^), TArc(pos^), lt)
+
+
+def inline_cond_from_context_edit[LH: Int, LW: Int, LTMAX: Int, CONDL: Int](
+    var context: Tensor,
+    dh: Int, dw: Int, pos_scale: Float32,
+    ctx: DeviceContext,
+) raises -> Krea2InlineCond:
+    """The EDIT twin of inline_cond_from_context: same LTMAX text padding, but
+    `pos` is the SOURCE-order table [TXT zeros(LTMAX) | IMG grid | COND grid]
+    from krea2_build_pos_cond — the reader's own builder, which the C5 gate
+    compares element-for-element against the layout module's host twin. For the
+    EDIT condition type (dh=dw=0, pos_scale=1.0) the COND grid EQUALS the IMG
+    grid, i.e. the condition overlaps the target canvas."""
+    var sh = context.shape()
+    if (
+        len(sh) != 4 or sh[0] != 1
+        or sh[2] != KREA2_TXT_LAYERS or sh[3] != KREA2_TXT_DIM
+    ):
+        raise Error("krea2_infer: expected context [1, LT, 12, 2560]")
+    var lt = sh[1]
+    var padded = _pad_context_to_ltmax[LTMAX](context^, lt, ctx)
+    var pos = krea2_build_pos_cond[LH, LW](LTMAX, CONDL, dh, dw, pos_scale, ctx)
     return Krea2InlineCond(TArc(padded^), TArc(pos^), lt)
 
 
@@ -514,7 +636,69 @@ def krea2_predict_comfy_velocity_pair[
     return Krea2ComfyVelocityPair(v_normal^, v_big^)
 
 
-def krea2_sample_latent[LH: Int, LW: Int, LTMAX: Int, LFULL: Int](
+# ── ONE OminiControl EDIT forward (C8) ────────────────────────────────────────
+# Everything numeric here is SHARED with the trainer: build_conditioning (the
+# CONDL > 0 arm above), Krea2OminiLayout for the offsets, krea2_omini_mod_split
+# for the modulation boundary, krea2_edit_real_len for the flash prefix, and
+# krea2_stack_lora_forward_streamed with the SAME three EDIT switches the C6
+# trainer step passes. The ONLY thing this adds is the optional attn_bias.
+#
+# The velocity returned is final[:, lt : lt+imglen, :] — the IMAGE rows. The COND
+# rows and the TXT_pad tail are sliced away inside the stack (txtlen=lt,
+# imglen=imglen), which is exactly why the C6 loss-mask gate found the cond rows
+# bit-invisible to the loss. THE COND ROWS ARE NEVER DENOISED: the euler update
+# below only ever touches `latent`, which is unpatchified from this image-row
+# slice, and the condition tokens are rebuilt from the CLEAN source every step.
+def _krea2_edit_velocity[
+    LH: Int, LW: Int, LTMAX: Int, LFULL: Int, CONDL: Int
+](
+    st: ShardedSafeTensors,
+    key_prefix: String,
+    cond_w: Krea2ResidentCond,
+    fin: Krea2StreamFinal,
+    lora: Krea2StackLora,
+    text: Krea2InlineCond,      # text conditioning (positive OR negative)
+    img_tokens: Tensor,         # [1, imglen, 64] BF16 patchified NOISED latent
+    cond_tokens: Tensor,        # [1, CONDL, 64] BF16 patchified CLEAN condition
+    t_t: Tensor,                # [1] F32 timestep
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+    resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
+    host_i8: Optional[Krea2HostInt8Inf] = Optional[Krea2HostInt8Inf](None),
+    attn_bias: Optional[TArc] = Optional[TArc](None),
+    use_refiner_mask: Bool = True,
+) raises -> Tensor:
+    comptime imglen = (LH // 2) * (LW // 2)
+    comptime assert LFULL == LTMAX + imglen + CONDL, "edit LFULL mismatch"
+    comptime assert CONDL > 0, "_krea2_edit_velocity needs a condition segment"
+    var lt = text.text_len
+    var lay = Krea2OminiLayout(LTMAX, imglen, CONDL, lt)
+    lay.check_flash_prefix()
+    var c = build_conditioning[LTMAX, LFULL, CONDL](
+        cond_w, img_tokens, text.context[], text.pos[], t_t, lt, ctx,
+        cond_img=Optional[Tensor](cond_tokens.clone(ctx)),
+        use_refiner_mask=use_refiner_mask,
+    )
+    var real_len = Optional[Int](krea2_edit_real_len(lt, imglen, CONDL))
+    var pred = krea2_stack_lora_forward_streamed[
+        LFULL, HEADS, KVHEADS, HEADDIM
+    ](
+        c.combined, c.blk_vec, c.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        c.cos, c.sin, EPS, lt, imglen, ctx, real_len, resident,
+        resident_sq=resident_sq, resident_i8=resident_i8, host_i8_inf=host_i8,
+        vec_cond=Optional[TArc](TArc(c.blk_vec_cond.value().clone(ctx))),
+        cond_off=Optional[Int](krea2_omini_mod_split(lay)),
+        cond_len=Optional[Int](CONDL),
+        attn_bias=attn_bias.copy(),
+    )
+    return pred.velocity[].clone(ctx)
+
+
+def krea2_sample_latent[
+    LH: Int, LW: Int, LTMAX: Int, LFULL: Int, CONDL: Int = 0
+](
     st: ShardedSafeTensors,
     key_prefix: String,
     cond_w: Krea2ResidentCond,
@@ -529,11 +713,55 @@ def krea2_sample_latent[LH: Int, LW: Int, LTMAX: Int, LFULL: Int](
     ctx: DeviceContext,
     use_fixed_mu_1_15: Bool = False,
     progress_fd: Int32 = Int32(-1),
+    # ── OminiControl EDIT (C8). ALL of these are inert on a CONDL == 0 build:
+    # every statement that reads them is behind `comptime if CONDL > 0`, so the
+    # text-to-image sampler every existing caller compiles is unchanged. ──────
+    cond_tokens: Optional[Tensor] = Optional[Tensor](None),
+        # [1, CONDL, 64] BF16 patchified CLEAN condition latent. REQUIRED when
+        # CONDL > 0.
+    cond_tokens_black: Optional[Tensor] = Optional[Tensor](None),
+        # [1, CONDL, 64] BF16 patchified latent of a BLACK image — the
+        # unconditional branch of OminiControl's image-CFG (Condition.encode(
+        # empty=True), flux_omini.py:125-126, 657-658). REQUIRED when
+        # image_guidance_scale != 1.0.
+    image_guidance_scale: Float32 = Float32(1.0),
+        # flux_omini.py:781  pred = unc + s*(cond - unc). 1.0 = OFF (one forward).
+    condition_scale: Float32 = Float32(1.0),
+        # flux_omini.py:286-292  additive log(scale) attention bias between COND
+        # and non-COND tokens. 1.0 = THE IDENTITY (no bias tensor is built and the
+        # attention takes the untouched flash-padmask path).
+    resident_sq: Optional[Krea2ResidentSquareq] = Optional[Krea2ResidentSquareq](None),
+    resident_i8: Optional[Krea2ResidentInt8] = Optional[Krea2ResidentInt8](None),
+    host_i8: Optional[Krea2HostInt8Inf] = Optional[Krea2HostInt8Inf](None),
+    use_refiner_mask: Bool = True,
 ) raises -> Tensor:
     comptime imglen = (LH // 2) * (LW // 2)
-    comptime assert LFULL == LTMAX + imglen, "Krea2 sample LFULL mismatch"
+    comptime assert LFULL == LTMAX + imglen + CONDL, "Krea2 sample LFULL mismatch"
     if sample_steps < 1:
         raise Error("krea2_infer: sample steps must be >= 1")
+    comptime if CONDL > 0:
+        if not cond_tokens:
+            raise Error(
+                "krea2_sample_latent: a CONDL > 0 (OminiControl EDIT) build needs"
+                " cond_tokens [1, CONDL, 64]"
+            )
+        if image_guidance_scale != Float32(1.0) and not cond_tokens_black:
+            raise Error(
+                "krea2_sample_latent: image_guidance_scale != 1.0 needs"
+                " cond_tokens_black (the BLACK-image condition,"
+                " flux_omini.py Condition.encode(empty=True))"
+            )
+    else:
+        if Bool(cond_tokens) or Bool(cond_tokens_black):
+            raise Error(
+                "krea2_sample_latent: condition tokens supplied to a CONDL == 0"
+                " build — the sequence has no COND rows to put them in"
+            )
+        if condition_scale != Float32(1.0) or image_guidance_scale != Float32(1.0):
+            raise Error(
+                "krea2_sample_latent: condition_scale / image_guidance_scale are"
+                " OminiControl EDIT knobs and do nothing on a CONDL == 0 build"
+            )
 
     # DIAGNOSTIC: inject a fixed noise latent (e.g. a torch-reference dump) instead of
     # generating from `seed`. Isolates whether the noise stream drives composition.
@@ -557,6 +785,36 @@ def krea2_sample_latent[LH: Int, LW: Int, LTMAX: Int, LFULL: Int](
     print("[krea2-infer] steps=", sample_steps, " cfg=", cfg_scale, " seed=", seed,
           " LT(cond)=", cond.text_len, " LT(uncond)=", uncond.text_len)
 
+    # ── OminiControl condition_scale bias, built ONCE (lt is fixed for the run).
+    # 1.0 is THE IDENTITY: log(1) == 0, so no tensor is built and every block
+    # keeps the flash-padmask arm it was trained with.
+    var attn_bias_c = Optional[TArc](None)
+    var attn_bias_u = Optional[TArc](None)
+    comptime if CONDL > 0:
+        if condition_scale != Float32(1.0):
+            print(
+                "[krea2-omini] condition_scale=", condition_scale,
+                " -> additive attention bias log(scale)=",
+                krea2_edit_cond_bias(condition_scale),
+                " on COND<->non-COND logits (flux_omini.py:280-341).",
+            )
+            print(
+                "[krea2-omini]   THIS ARM IS UNVERIFIED ON DEVICE (authored in",
+                "C8 with the GPU busy). It also swaps the cuDNN flash-padmask",
+                "for the masked math SDPA, which is NOT the attention the LoRA",
+                "was trained under. Use condition_scale=1.0 for the honest",
+                "render; treat anything else as an experiment.",
+            )
+            attn_bias_c = Optional[TArc](TArc(krea2_build_edit_attn_bias(
+                cond.text_len, LTMAX, imglen, CONDL, condition_scale,
+                KREA2_HEADS, STDtype.BF16, ctx,
+            )))
+            if cfg_scale > Float32(0.0):
+                attn_bias_u = Optional[TArc](TArc(krea2_build_edit_attn_bias(
+                    uncond.text_len, LTMAX, imglen, CONDL, condition_scale,
+                    KREA2_HEADS, STDtype.BF16, ctx,
+                )))
+
     for si in range(sample_steps):
         var t_cur = ts[si]
         var t_prev = ts[si + 1]
@@ -564,36 +822,75 @@ def krea2_sample_latent[LH: Int, LW: Int, LTMAX: Int, LFULL: Int](
         var img_tokens = torch_f32_to_bf16_rne(img_tokens_f32, ctx)
         var t_t = _t_scalar(t_cur, ctx)
 
-        var c = build_conditioning[LTMAX, LFULL](
-            cond_w, img_tokens, cond.context[], cond.pos[], t_t, cond.text_len, ctx,
-        )
-        var real_len_c = Optional[Int](cond.text_len + imglen)
-        var pred_c = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
-            c.combined, c.blk_vec, c.tmlp_out,
-            st, key_prefix, NBLOCKS, lora, fin,
-            c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
-        )
-
         var v_bf16: Tensor
-        # Creator sampling.py enables CFG only when guidance > 0. Turbo's
-        # recommended guidance=0 therefore executes one conditional forward.
-        if cfg_scale <= Float32(0.0):
-            v_bf16 = pred_c.velocity[].clone(ctx)
+        comptime if CONDL > 0:
+            # ── EDIT step. TWO guidance axes, evaluated in this order:
+            #   1. IMAGE-CFG (OminiControl's own): a second forward whose ONLY
+            #      difference is a BLACK-image condition, then
+            #      unc + s*(cond - unc)  (flux_omini.py:758-781).
+            #   2. TEXT-CFG (krea2's; OminiControl has none — FLUX-dev is
+            #      distilled): the negative-prompt forward keeps the REAL
+            #      condition, and krea2_cfg composes it with the result of (1).
+            # Composing the two is OUR choice, not something the reference does;
+            # with cfg_scale <= 0 (the krea2 Turbo profile) only axis 1 runs.
+            var v_img = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
+                st, key_prefix, cond_w, fin, lora, cond,
+                img_tokens, cond_tokens.value(), t_t, ctx,
+                resident, resident_sq, resident_i8, host_i8,
+                attn_bias_c.copy(), use_refiner_mask,
+            )
+            if image_guidance_scale != Float32(1.0):
+                ctx.synchronize()
+                var v_black = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
+                    st, key_prefix, cond_w, fin, lora, cond,
+                    img_tokens, cond_tokens_black.value(), t_t, ctx,
+                    resident, resident_sq, resident_i8, host_i8,
+                    attn_bias_c.copy(), use_refiner_mask,
+                )
+                v_img = _krea2_comfy_cfg(
+                    v_img, v_black, image_guidance_scale, ctx
+                )
+            if cfg_scale <= Float32(0.0):
+                v_bf16 = v_img^
+            else:
+                ctx.synchronize()
+                var v_txt_u = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
+                    st, key_prefix, cond_w, fin, lora, uncond,
+                    img_tokens, cond_tokens.value(), t_t, ctx,
+                    resident, resident_sq, resident_i8, host_i8,
+                    attn_bias_u.copy(), use_refiner_mask,
+                )
+                v_bf16 = krea2_cfg(v_img, v_txt_u, cfg_scale, ctx)
         else:
-            var v_c = pred_c.velocity[].clone(ctx)
-            _ = pred_c^
-            ctx.synchronize()
-            var u = build_conditioning[LTMAX, LFULL](
-                cond_w, img_tokens, uncond.context[], uncond.pos[], t_t,
-                uncond.text_len, ctx,
+            var c = build_conditioning[LTMAX, LFULL](
+                cond_w, img_tokens, cond.context[], cond.pos[], t_t, cond.text_len, ctx,
             )
-            var real_len_u = Optional[Int](uncond.text_len + imglen)
-            var pred_u = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
-                u.combined, u.blk_vec, u.tmlp_out,
+            var real_len_c = Optional[Int](cond.text_len + imglen)
+            var pred_c = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+                c.combined, c.blk_vec, c.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin,
-                u.cos, u.sin, EPS, uncond.text_len, imglen, ctx, real_len_u, resident,
+                c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
             )
-            v_bf16 = krea2_cfg(v_c, pred_u.velocity[], cfg_scale, ctx)
+
+            # Creator sampling.py enables CFG only when guidance > 0. Turbo's
+            # recommended guidance=0 therefore executes one conditional forward.
+            if cfg_scale <= Float32(0.0):
+                v_bf16 = pred_c.velocity[].clone(ctx)
+            else:
+                var v_c = pred_c.velocity[].clone(ctx)
+                _ = pred_c^
+                ctx.synchronize()
+                var u = build_conditioning[LTMAX, LFULL](
+                    cond_w, img_tokens, uncond.context[], uncond.pos[], t_t,
+                    uncond.text_len, ctx,
+                )
+                var real_len_u = Optional[Int](uncond.text_len + imglen)
+                var pred_u = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+                    u.combined, u.blk_vec, u.tmlp_out,
+                    st, key_prefix, NBLOCKS, lora, fin,
+                    u.cos, u.sin, EPS, uncond.text_len, imglen, ctx, real_len_u, resident,
+                )
+                v_bf16 = krea2_cfg(v_c, pred_u.velocity[], cfg_scale, ctx)
 
         var v_f32 = cast_tensor(v_bf16, STDtype.F32, ctx)
         var v_latent = _unpatch[LH, LW](v_f32, ctx)

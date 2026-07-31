@@ -4010,6 +4010,29 @@ def main() raises:
     var edit_mode = env_int("KREA2_EDIT", 0) != 0
     # C6 regression instrument (default off => not a single extra print).
     var dbg_bits = env_int("KREA2_DBG_BITS", 0) != 0
+
+    # ── `krea2devicegrad` argv token on an EDIT build (C6.1) ───────────────────
+    # The token selects the DEBUG smoke loop further down (`if
+    # krea2_device_grad_smoke:`), which refuses periodic save + resume AND —
+    # decisively — has NO edit dispatch at all: it calls cache.sample_padded /
+    # _step_dispatch_adamw_device_grads, i.e. it would train TEXT-TO-IMAGE on an
+    # edit cache and write checkpoints labelled as an edit LoRA. The arm the
+    # OminiControl EDIT dispatch actually lives on is that same machinery
+    # PROMOTED to production ("[KREA2_ADAMW_DEVICE_FAST]": identical preloaded
+    # device grads + resident fused AdamW, no host grad lists), and that arm
+    # already writes periodic LoRA + `.state` checkpoints and resumes from them.
+    # So on an EDIT build the token is an ALIAS for the promoted arm, never a
+    # route into the debug harness. CONDLEN=0 builds are untouched (comptime).
+    comptime if KREA2_OMINI_EDIT:
+        if krea2_device_grad_smoke:
+            print(
+                "[krea2-omini] argv 'krea2devicegrad' on an EDIT build = ALIAS",
+                "for the promoted AdamW device-fast arm (same preloaded device",
+                "grads + resident fused AdamW). The debug smoke loop is NOT",
+                "entered: it has no edit dispatch and would train text-to-image",
+                "on the edit cache. Periodic save + resume ARE supported here.",
+            )
+            krea2_device_grad_smoke = False
     if krea2_device_grad_smoke:
         if steps <= 0:
             raise Error("krea2devicegrad smoke requires steps > 0")
@@ -4020,9 +4043,21 @@ def main() raises:
                 raise Error("krea2devicegrad txtfusion resume smoke requires 0 < start_step < steps")
         else:
             if start_step != 0:
-                raise Error("krea2devicegrad smoke requires start_step=0")
+                raise Error(
+                    "krea2devicegrad smoke requires start_step=0 — the DEBUG"
+                    " smoke loop never mirrors host_lora mid-run. Drop the"
+                    " 'krea2devicegrad' argv token to get the PROMOTED arm"
+                    " ([KREA2_ADAMW_DEVICE_FAST], same device-grad machinery),"
+                    " which supports resume + periodic save."
+                )
             if resume_path != String(""):
-                raise Error("krea2devicegrad smoke does not support resume")
+                raise Error(
+                    "krea2devicegrad smoke does not support resume — drop the"
+                    " 'krea2devicegrad' argv token to get the PROMOTED arm"
+                    " ([KREA2_ADAMW_DEVICE_FAST], same device-grad machinery),"
+                    " which restores A/B + AdamW moments and continues at"
+                    " start_step."
+                )
         if cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON:
             raise Error("krea2devicegrad smoke requires plain LoRA/LoCon adapters")
         if cfg.optimizer != TRAIN_OPTIMIZER_ADAMW or levers_optimizer_active(cfg):
@@ -4032,7 +4067,15 @@ def main() raises:
         if cfg.sample_every > 0:
             raise Error("krea2devicegrad smoke requires sampling disabled")
         if cfg.save_every > 0:
-            raise Error("krea2devicegrad smoke requires periodic save disabled")
+            raise Error(
+                "krea2devicegrad smoke requires periodic save disabled — the"
+                " DEBUG smoke loop keeps params device-resident and syncs"
+                " host_lora only ONCE at the end, so there is nothing to write"
+                " at a cadence boundary. Drop the 'krea2devicegrad' argv token"
+                " to get the PROMOTED arm ([KREA2_ADAMW_DEVICE_FAST], same"
+                " device-grad machinery), which syncs params+moments at every"
+                " save boundary and writes <ckpt>.safetensors + .state."
+            )
         comptime if KREA2_V2_GRAPH:
             raise Error("krea2devicegrad smoke requires KREA2_V2_GRAPH=False")
         comptime if KREA2_RES_512:
@@ -4162,6 +4205,28 @@ def main() raises:
         if cfg.grad_accum_steps > 1:
             raise Error(
                 "krea2 omini: grad_accum_steps>1 is not wired for the EDIT arm"
+            )
+        # C6.1: the token-alias above bypasses the krea2devicegrad guard block,
+        # so the two checks in it that are NOT re-established by
+        # adamw_device_fast_active (LT pad shape, MSE loss levers) are restated
+        # here for edit builds. Nothing is loosened — an edit run reaches the
+        # SAME set of refusals it did before, by a different door.
+        comptime if KREA2_RES_512:
+            comptime if LTMAX != 384 and LTMAX != 896:
+                raise Error(
+                    "krea2 omini: 512px EDIT build requires KREA2_LTMAX=384 or"
+                    " KREA2_LTMAX=896"
+                )
+        else:
+            comptime if LTMAX != 768:
+                raise Error(
+                    "krea2 omini: 1024px EDIT build requires KREA2_LTMAX=768"
+                )
+        if levers_loss_active(cfg):
+            raise Error(
+                "krea2 omini: the EDIT step computes the default flow-matching"
+                " MSE inside the device dispatch; loss levers would be silently"
+                " ignored. Disable them."
             )
         # DATA: every sample the loop will touch must be a full Omini record
         # (ref.<i> + cond_pos_delta.<i> + cond_pos_scale.<i>) with the config's
@@ -4539,8 +4604,11 @@ def main() raises:
                 "the render would be the frozen base mislabelled as trained.",
             )
             print(
-                "[krea2-omini]   Edit rendering is C7. Checkpoints still save",
-                "on cfg.save_every.",
+                "[krea2-omini]   Edit rendering is C7. Checkpoints are",
+                "unaffected: this arm writes <workspace_dir>/checkpoints/",
+                "<prefix>_<step>.safetensors + .safetensors.state (LoRA A/B +",
+                "AdamW moments) every cfg.save_every steps, and resumes from",
+                "the .state.",
             )
             sample_enabled = False
     if sample_enabled:
@@ -4663,6 +4731,23 @@ def main() raises:
     )
     comptime if KREA2_TXTFUSION_LORA:
         adamw_device_fast_active = False
+
+    # ── C6.1 EDIT ROUTING FENCE. The OminiControl EDIT dispatch
+    # (_step_dispatch_edit_adamw_device_grads) exists on the streamed AdamW
+    # device-fast arm and NOWHERE ELSE. Every other loop in this file builds a
+    # [TXT | IMG] text-to-image sequence from the same cache and would train the
+    # WRONG OBJECTIVE while looking perfectly healthy (finite losses, nonzero
+    # grads, saved "edit" checkpoints). Fail loud instead. ─────────────────────
+    comptime if KREA2_OMINI_EDIT:
+        if not adamw_device_fast_active:
+            raise Error(
+                "krea2 omini: this config does not route to the streamed AdamW"
+                " device-fast arm, which is the ONLY loop carrying the EDIT"
+                " dispatch — every other arm would build a text-to-image"
+                " sequence from the edit cache and train the wrong objective."
+                " Required: optimizer=ADAMW with no levers, network_algorithm="
+                " lora/locon (no LyCORIS/DoRA/OFT), batch_size=1."
+            )
 
     # ── T1.B EMA fail-fast (device-fast arms). The A3/AdamW-device and grad-smoke
     # arms stream grads into a resident fused optimizer and do NOT mirror

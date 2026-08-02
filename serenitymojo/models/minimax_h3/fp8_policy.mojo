@@ -12,60 +12,60 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # THE POLICY  (four classes, applied to every one of the 638 planned keys)
 #
-#   F32_KEEP   the 12 tensors the checkpoint itself stores in fp32. Five
-#              prefixes, no exceptions: the two patch projections, the timestep
-#              embedder, and the two output heads. 17.2 M params — 0.06 GiB.
-#              These are the numerically load-bearing ends of the network and
-#              the vendor already decided they do not survive bf16; quantizing
-#              them to 1 byte to save 0.05 GiB would be a bad trade at any
-#              price.
+#   F32_KEEP   12 keys, 0.0172 B params, 0.064 GiB. The tensors the checkpoint
+#              itself stores in fp32: two patch projections, the timestep
+#              embedder, two output heads. The vendor already decided these do
+#              not survive bf16; taking them to 1 byte to save 0.05 GiB would be
+#              a bad trade at any price.
 #
-#   BF16_KEEP  norms, biases, small vectors — 212 keys, 0.0006 B params, under
-#              1 MiB in total. Per-row fp8 on a [5376] norm gain would save
-#              5 KiB and cost a scale lookup in the hot path.
+#   BF16_KEEP  224 keys, 0.7988 B params, 1.488 GiB. Norms, biases and small
+#              vectors — plus `context_embedder` and the whole `token_refiner`,
+#              which are here because the VENDOR'S OWN consumer recipe refuses
+#              to quantize them (see minimax_h3_fp8_is_vendor_protected).
 #
-#   FP8_ROW    every 2-D projection of >= 1 M elements: qkv, out_proj, fc1,
-#              fc2, condition_proj, the refiner's copies. 314 keys, 20.09 B
-#              params. This is the class that pays: 37.43 GiB bf16 becomes
-#              18.71 GiB of E4M3 bytes plus 12.1 MiB of f32 per-output-row
-#              scales.
+#   FP8_ROW    300 keys, 19.2676 B params. 35.90 GiB bf16 becomes 17.956 GiB of
+#              E4M3 bytes plus per-output-row f32 scales. qkv, out_proj, fc1,
+#              fc2 of the 50 denoiser blocks.
 #
-#   ADALN      the 100 adaptive-layernorm projections, 13.01 B params — 39% of
-#              the whole model, 24.23 GiB bf16. NOT quantized: EVICTED.
-#              See below; this is the entire reason H3 fits.
+#   ADALN      102 keys, 13.0394 B params — 39% of the whole model, 24.288 GiB
+#              bf16. NOT quantized: EVICTED. This is the entire reason H3 fits.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # WHY adaLN IS EVICTED RATHER THAN QUANTIZED
 #
 # `adaln_proj.linear` is [96768, 2688] per block and its INPUT is the timestep
-# embedding — a function of the step index alone, identical for every token in
-# the sequence. A diffusion run visits a fixed, known-in-advance set of
-# timesteps. So the whole 13.01 B of adaLN weight can be consumed in ONE
-# streamed pass before sampling starts:
+# embedding — a function of the timestep alone, identical for every token in the
+# sequence. A diffusion run visits a fixed, known-in-advance set of timesteps.
+# So the whole 13.04 B of adaLN weight can be consumed in ONE streamed pass
+# before sampling starts:
 #
-#     modulation[block][:, step] = adaln_w[block] @ t_emb[:, step] + adaln_b
+#     modulation[block] = adaln_w[block] @ t_emb[:, all_timesteps] + adaln_b
 #
-# a [96768, 2688] x [2688, steps] GEMM per block, after which the weights are
-# never read again. What stays resident is the RESULT — 96768 x steps x 2 bytes
-# per block, 461 MiB for 50 blocks at 50 steps, 231 MiB at 25.
-#
-# 24.23 GiB of weights collapses to 0.45 GiB of cache. This is the same
-# observation the ComfyUI port makes about split modulation; the vendor does
-# not ship it, and it is worth more here than any quantization decision,
-# because 18.78 + 0.45 fits in 24 and 18.78 + 24.23 does not.
+# after which the weights are never read again. What stays resident is the
+# RESULT — see minimax_h3_adaln_distinct_timesteps for how many rows that is;
+# it is 2*steps, not steps, because video and audio run separate schedules.
+# 24.288 GiB of weights collapses to 0.45-0.92 GiB of cache.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # THE VERDICT  (from the real 638-key plan, transformer_key_plan.txt)
 #
-#     bf16, everything resident          61.70 GiB   does not fit, must stream
-#     fp8 + adaLN resident               43.01 GiB   does not fit
-#     fp8 + adaLN evicted, 50 steps      19.24 GiB   FITS, ~4.7 GiB to spare
-#     fp8 + adaLN evicted, 25 steps      19.01 GiB   FITS
+#     bf16, everything resident            61.73 GiB   does not fit
+#     fp8 + adaLN resident                 43.80 GiB   does not fit
+#     fp8 + adaLN evicted, t2va  @25       19.96 GiB   FITS
+#     fp8 + adaLN evicted, ref2va @50      20.43 GiB   FITS, 3.57 GiB spare
 #
-# The margin is for activations and the packed-sequence attention, which are
-# NOT accounted here — this module counts weights and the modulation cache,
-# nothing else. Do not read the spare 4.7 GiB as proven headroom; read it as
-# the budget the runtime has to live inside.
+# For contrast, the reference's OWN recipe for a 24-32 GB card does not make it
+# resident at all: int8 weight-only plus block-level group offload streaming
+# from CPU RAM, with "around 75 GB" of host RAM holding the weights
+# (docs/source/en/api/pipelines/minimax_h3.md, PR 14355 commit abc5e9bf7).
+# Keeping the denoiser resident is this port's claim, not theirs, and it is
+# unproven until it runs.
+#
+# The spare is for activations and the packed-sequence attention, which are NOT
+# accounted here — this module counts weights and the modulation cache, nothing
+# else. It is the budget the runtime has to live inside, not proven headroom.
+# It also excludes the conditioner entirely: H3's own text_encoder is another
+# 62.1 GB, run as a separate pass before denoising.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # ERROR
@@ -117,6 +117,52 @@ def minimax_h3_fp8_is_f32_key(key: String) -> Bool:
     )
 
 
+def minimax_h3_fp8_is_adaln_key(key: String) -> Bool:
+    """AdaLN modulation projections, in the DIFFUSERS namespace.
+
+    `norm_out` has to be named explicitly. It is `final_layer.adaln_proj` in the
+    original checkpoint — a [10752, 2688] modulation projection driven by the
+    timestep alone, exactly like the block ones — but diffusers renames it to
+    `norm_out.linear`, so a `"adaln" in key` test silently misses it. That test
+    was the first version of this function and it classified 28.9 M evictable
+    parameters as FP8_ROW. Found by diffing our policy against the vendor's own
+    `modules_to_not_convert` list, which protects `norm_out`."""
+    # `norm_out.linear`, NOT `norm_out.` — the sibling `norm_out.norm.weight`
+    # is the RMSNorm gain, applied per TOKEN, so it is not evictable and must
+    # stay resident. Only the modulation projection is a function of the
+    # timestep alone.
+    return key.find("adaln") >= 0 or key.startswith("norm_out.linear")
+
+
+def minimax_h3_fp8_is_vendor_protected(key: String) -> Bool:
+    """Modules the reference's own consumer recipe refuses to quantize.
+
+    Copied VERBATIM from `modules_to_not_convert` in the int8 recipe added to
+    docs/source/en/api/pipelines/minimax_h3.md by PR 14355 commit 80453959c
+    ("Use pinnable int8 config and freeze quantized components", 2026-08-02
+    15:55Z):
+
+        proj_in, audio_proj_in, context_embedder, time_embedder, time_proj,
+        token_refiner, norm_out, proj_out, audio_proj_out
+
+    Six of the nine are already covered here by the fp32 rule or the adaLN rule.
+    The two that are not are `context_embedder` (27.5 M) and `token_refiner`
+    (770.7 M) — 798 M parameters this policy quantized until 2026-08-02 22:45Z
+    and the vendor does not.
+
+    Their list is for torchao int8 weight-only and ours is E4M3 per-row, so it
+    is not automatically transferable. It is taken anyway because it is the
+    only sensitivity evidence that exists for this model, and inventing a more
+    aggressive policy than the people who trained it is not a trade worth
+    798 MB. Cost of matching them: resident goes 19.71 -> 20.51 GiB, still
+    inside 24 with 3.49 GiB spare."""
+    return (
+        key.startswith("context_embedder")
+        or key.startswith("token_refiner")
+        or key.startswith("time_proj")
+    )
+
+
 def minimax_h3_fp8_class(key: String, rows: Int, cols: Int) -> Int:
     """`cols == 0` means a 1-D tensor.
 
@@ -125,8 +171,10 @@ def minimax_h3_fp8_class(key: String, rows: Int, cols: Int) -> Int:
     FP8_ROW by size alone."""
     if minimax_h3_fp8_is_f32_key(key):
         return H3_FP8_F32_KEEP
-    if key.find("adaln") >= 0:
+    if minimax_h3_fp8_is_adaln_key(key):
         return H3_FP8_ADALN
+    if minimax_h3_fp8_is_vendor_protected(key):
+        return H3_FP8_BF16_KEEP
     if cols > 0 and rows * cols >= H3_FP8_MIN_ELEMENTS:
         return H3_FP8_ROW
     return H3_FP8_BF16_KEEP

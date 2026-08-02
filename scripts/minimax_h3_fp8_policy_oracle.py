@@ -56,11 +56,30 @@ E4M3_MAX = 448.0
 F32_KEEP, BF16_KEEP, FP8_ROW, ADALN = 0, 1, 2, 3
 
 
+# Copied VERBATIM from `modules_to_not_convert` in the reference's own int8
+# consumer recipe, PR 14355 commit 80453959c (2026-08-02 15:55Z):
+#   proj_in, audio_proj_in, context_embedder, time_embedder, time_proj,
+#   token_refiner, norm_out, proj_out, audio_proj_out
+# Six are already covered by the fp32 and adaLN rules; these three are not.
+VENDOR_PROTECTED = ("context_embedder", "token_refiner", "time_proj")
+
+
+def is_adaln(key):
+    # `norm_out` must be named: it is `final_layer.adaln_proj` in the original
+    # checkpoint but diffusers renames it, so a substring test on "adaln" misses
+    # 28.9 M evictable parameters.
+    # `norm_out.linear`, not `norm_out.`: the sibling norm_out.norm.weight is
+    # the RMSNorm gain, applied per token and therefore not evictable.
+    return "adaln" in key or key.startswith("norm_out.linear")
+
+
 def classify(key, rows, cols):
     if key.startswith(F32_PREFIXES):
         return F32_KEEP
-    if "adaln" in key:
+    if is_adaln(key):
         return ADALN
+    if key.startswith(VENDOR_PROTECTED):
+        return BF16_KEEP
     if cols > 0 and rows * cols >= FP8_MIN_ELEMENTS:
         return FP8_ROW
     return BF16_KEEP

@@ -42,6 +42,7 @@ from serenitymojo.models.minimax_h3.fp8_policy import (
     H3_FP8_F32_KEEP,
     H3_FP8_ROW,
     MiniMaxH3Fp8Budget,
+    minimax_h3_adaln_distinct_timesteps,
     minimax_h3_e4m3_decode,
     minimax_h3_e4m3_encode,
     minimax_h3_e4m3_encode_row,
@@ -160,8 +161,8 @@ def main() raises:
     print("")
     print("[4] the verdict — does it fit 24 GiB")
     var want_bf16 = _load_i64(st, "want.bf16_all_bytes")[0]
-    var want_r25 = _load_i64(st, "want.resident_25")[0]
-    var want_r50 = _load_i64(st, "want.resident_50")[0]
+    var want_r50t = _load_i64(st, "want.resident_50t")[0]
+    var want_r102t = _load_i64(st, "want.resident_102t")[0]
     var want_ada = _load_i64(st, "want.adaln_resident")[0]
     var want_rows = _load_i64(st, "want.adaln_out_rows")[0]
 
@@ -188,27 +189,38 @@ def main() raises:
         failures += 1
         print("  FAIL adaLN-resident", got_ada, "!=", want_ada)
 
-    var got_25 = budget.resident_bytes(25)
-    var got_50 = budget.resident_bytes(50)
+    # DISTINCT TIMESTEPS, not steps. t2va at 25 steps is the cheapest layout
+    # (2*25 = 50 rows); ref2va at 50 steps is the dearest (2*50 + 2 = 102).
+    var d_min = minimax_h3_adaln_distinct_timesteps(25, False, False)
+    var d_max = minimax_h3_adaln_distinct_timesteps(50, True, True)
     checks += 1
-    if got_25 == want_r25 and got_50 == want_r50:
-        print("  ok   fp8, adaLN evicted   ", Float64(got_25) / GIB, "GiB @25 steps")
-        print("  ok   fp8, adaLN evicted   ", Float64(got_50) / GIB, "GiB @50 steps")
+    if d_min == 50 and d_max == 102:
+        print("  ok   distinct timesteps: t2va@25 =", d_min, " ref2va@50 =", d_max)
     else:
         failures += 1
-        print("  FAIL resident", got_25, got_50, "!=", want_r25, want_r50)
+        print("  FAIL distinct timesteps", d_min, d_max, "want 50 and 102")
+
+    var got_min = budget.resident_bytes(d_min)
+    var got_max = budget.resident_bytes(d_max)
+    checks += 1
+    if got_min == want_r50t and got_max == want_r102t:
+        print("  ok   fp8, adaLN evicted   ", Float64(got_min) / GIB, "GiB  t2va @25 steps")
+        print("  ok   fp8, adaLN evicted   ", Float64(got_max) / GIB, "GiB  ref2va @50 steps")
+    else:
+        failures += 1
+        print("  FAIL resident", got_min, got_max, "!=", want_r50t, want_r102t)
 
     # The claim the whole unit exists to make. 24 GiB card, weights only.
     comptime CARD_BYTES = 24 * 1024 * 1024 * 1024
     checks += 1
-    if got_50 < CARD_BYTES and got_ada > CARD_BYTES and got_bf16 > CARD_BYTES:
+    if got_max < CARD_BYTES and got_ada > CARD_BYTES and got_bf16 > CARD_BYTES:
         print(
             "  ok   VERDICT: fp8 + adaLN eviction is the ONLY one of the three",
             "that fits a 24 GiB card",
         )
         print(
             "       spare after weights:",
-            Float64(CARD_BYTES - got_50) / GIB, "GiB for activations",
+            Float64(CARD_BYTES - got_max) / GIB, "GiB for activations (worst case, ref2va @50)",
         )
     else:
         failures += 1

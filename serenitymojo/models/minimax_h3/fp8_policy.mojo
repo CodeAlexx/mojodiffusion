@@ -149,6 +149,37 @@ def minimax_h3_fp8_bytes(cls: Int, rows: Int, cols: Int) -> Int:
     return n * 2
 
 
+def minimax_h3_adaln_distinct_timesteps(
+    steps: Int, has_video_condition: Bool, has_audio_condition: Bool
+) -> Int:
+    """How many rows the adaLN modulation cache actually needs.
+
+    NOT `steps`. MEASURED from the reference's `build_row_timesteps`, which
+    returns `torch.unique` over FOUR values per forward:
+
+        video_timestep                      varies per step
+        audio_timestep                      varies per step, its OWN schedule
+        max(video_timestep, NOISE_AUG)      keyframe conditioning rows
+        1.0                                 audio reference rows, pinned
+
+    H3's dual schedule is the whole point here: video runs shift 12.0 and audio
+    runs shift 3.0, so the two are distinct at every step and the cache needs
+    2 * steps rows, not `steps`. The two conditioning values are pinned for the
+    whole run and contribute at most one row each — `max(t, NOISE_AUG)` collapses
+    onto the video row whenever t >= NOISE_AUG, and 1.0 appears only for ref2va.
+
+    This is the correction to the first version of unit 14, which assumed one
+    row per step and understated the cache by 2.04x — 0.451 GiB against the real
+    0.919 GiB at 50 steps. The fit verdict survives it; the spare does not,
+    dropping from 4.76 GiB to 4.29 GiB."""
+    var distinct = 2 * steps
+    if has_video_condition:
+        distinct += 1
+    if has_audio_condition:
+        distinct += 1
+    return distinct
+
+
 @fieldwise_init
 struct MiniMaxH3Fp8Budget(Copyable, Movable):
     """Weight bytes by class, plus the adaLN modulation cache.
@@ -190,10 +221,15 @@ struct MiniMaxH3Fp8Budget(Copyable, Movable):
             t += self.params[i] * 4 if i == H3_FP8_F32_KEEP else self.params[i] * 2
         return t
 
-    def resident_bytes(self, steps: Int) raises -> Int:
+    def resident_bytes(self, distinct_timesteps: Int) raises -> Int:
         """Weights that stay on the GPU under the policy, adaLN evicted to its
-        per-step cache."""
-        var t = self.adaln_out_rows * steps * 2
+        modulation cache.
+
+        Takes DISTINCT TIMESTEPS, not sampling steps — see
+        `minimax_h3_adaln_distinct_timesteps`. An earlier version of this took
+        `steps` and multiplied by one row per step, which understated the cache
+        by 2.04x."""
+        var t = self.adaln_out_rows * distinct_timesteps * 2
         for i in range(4):
             if i != H3_FP8_ADALN:
                 t += self.bytes[i]

@@ -135,12 +135,19 @@ def main():
     print()
     print(f"  bf16 everything resident        {got_bytes/gib:7.3f} GiB")
     print(f"  fp8, adaLN kept as weights      {(non_adaln+pbytes[ADALN])/gib:7.3f} GiB")
+    # DISTINCT TIMESTEPS, not steps: build_row_timesteps returns torch.unique
+    # over {video_t, audio_t, max(video_t, NOISE_AUG), 1.0}, and H3's video and
+    # audio run SEPARATE schedules (shift 12.0 vs 3.0) so they never coincide.
+    # The two conditioning values are pinned for the whole run.
     for steps in (25, 50):
-        cache = adaln_out_rows * steps * 2
-        print(
-            f"  fp8, adaLN evicted @{steps:3d} steps   "
-            f"{(non_adaln+cache)/gib:7.3f} GiB   (cache {cache/2**20:6.1f} MiB)"
-        )
+        for mode, extra in (("t2va", 0), ("fl2va", 1), ("ref2va", 2)):
+            distinct = 2 * steps + extra
+            cache = adaln_out_rows * distinct * 2
+            print(
+                f"  fp8, adaLN evicted {mode:6s} @{steps:3d} steps  "
+                f"{distinct:4d} distinct  {(non_adaln+cache)/gib:7.3f} GiB "
+                f"  (cache {cache/2**20:6.1f} MiB)"
+            )
 
     tensors = {
         "want.keys": torch.tensor(keys_n, dtype=torch.int64),
@@ -148,11 +155,12 @@ def main():
         "want.bytes": torch.tensor(pbytes, dtype=torch.int64),
         "want.adaln_out_rows": torch.tensor([adaln_out_rows], dtype=torch.int64),
         "want.bf16_all_bytes": torch.tensor([got_bytes], dtype=torch.int64),
-        "want.resident_25": torch.tensor(
-            [non_adaln + adaln_out_rows * 25 * 2], dtype=torch.int64
-        ),
-        "want.resident_50": torch.tensor(
+        # indexed by DISTINCT TIMESTEPS: t2va@25, ref2va@50 — the extremes
+        "want.resident_50t": torch.tensor(
             [non_adaln + adaln_out_rows * 50 * 2], dtype=torch.int64
+        ),
+        "want.resident_102t": torch.tensor(
+            [non_adaln + adaln_out_rows * 102 * 2], dtype=torch.int64
         ),
         "want.adaln_resident": torch.tensor(
             [non_adaln + pbytes[ADALN]], dtype=torch.int64

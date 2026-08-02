@@ -186,6 +186,36 @@ def fetch(patterns, label: str) -> bool:
     return True
 
 
+def preflight() -> None:
+    """Header-only inventory the instant the transformer lands.
+
+    Runs unattended because it reads nothing but each shard's JSON directory —
+    a few hundred KB, about a second — and because its answer decides whether
+    anything else is worth doing. The whole port is built against
+    `transformer_key_plan.txt`, which came from the diffusers converter's
+    --dry_run with NO WEIGHTS: a third party's reading of a model nobody
+    outside MiniMax had seen. This is the first moment that reading can be
+    checked against the real thing, and if it is wrong then gated units 12
+    (loader) and 14 (fp8 policy) are both built on sand."""
+    target = os.path.join(LOCAL_DIR, "transformer")
+    if not os.path.isdir(target):
+        log(f"preflight skipped: {target} is not there")
+        return
+    log("=" * 70)
+    log("PREFLIGHT: header-only inventory against transformer_key_plan.txt")
+    result = subprocess.run(
+        [sys.executable, "/home/alex/mojodiffusion/scripts/h3_preflight.py", target],
+        capture_output=True, text=True,
+    )
+    for line in (result.stdout or "").splitlines():
+        log("  " + line)
+    if result.returncode != 0:
+        for line in (result.stderr or "").splitlines()[-10:]:
+            log("  ! " + line)
+        log("PREFLIGHT FAILED — do not load anything until this is understood")
+    log("=" * 70)
+
+
 def main() -> None:
     announced = announced_release_date()
     log("H3 release watcher armed")
@@ -235,9 +265,19 @@ def main() -> None:
             fetch(["*.json", "*.txt", "*.md"], "configs and indexes")
             fetch(["audio_vae/*"], "audio_vae")
             fetch(["vae/*"], "vae")
+            # MEASURED 2026-08-02 21:35Z: this link caps at ~14 MiB/s. Four
+            # concurrent connections gave 1.07x over one, and hf_transfer gave
+            # 0.97x — it is the link, not the client. So transformer/ is ~75
+            # minutes of transfer and no local knob shortens it.
+            #
+            # transformer_ref/ (ref2va) is NOT fetched: it is another 61.73 GiB
+            # and both do not fit — 123.46 GiB against 119.6 GiB free. Getting
+            # it means freeing space first, which is Alex's call.
             fetch(["transformer/*"], "transformer")
             log("NOTE text_encoder/ deliberately skipped — see this script's docstring")
+            log("NOTE transformer_ref/ skipped — both transformers do not fit (123.5 vs 119.6 GiB)")
             log("fetch sequence complete")
+            preflight()
             return
 
         if check_modelscope():

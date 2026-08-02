@@ -47,16 +47,24 @@ from datetime import datetime, timezone
 # tensors, not the original bf16 layout this port's loader targets.
 HF_REPO = "MiniMaxAI/MiniMax-H3"
 
-# Watched as a SIGNAL ONLY, never fetched: if Comfy-Org publishes it means the
-# release is happening, which is worth knowing while we wait for MiniMax's.
-HF_SIGNAL_REPO = "Comfy-Org/MiniMax-H3"
+# Watched as SIGNALS ONLY, never fetched. If any of these publishes it means
+# the release has happened and MiniMax's own repo is imminent.
+#   Comfy-Org      had weights two days early (Alex, via the ComfyUI author)
+#   DeepBeepMeep   MEASURED 2026-08-02 22:07Z: already hosts the H3 conditioner
+#                  (Qwen3-VL-32B-Instruct truncated at layer 50, 47.97 GiB), so
+#                  he is staging and will likely have the transformer early.
+# None of them is fetched: Alex wants MiniMax's own weights, and every one of
+# these is a repack in someone else's layout.
+HF_SIGNAL_REPOS = ["Comfy-Org/MiniMax-H3", "DeepBeepMeep/MiniMax-H3-Transformer",
+                   "Kijai/MiniMax-H3_comfy"]
+HF_SIGNAL_REPO = HF_SIGNAL_REPOS[0]
 MS_REPO = "MiniMax/MiniMax-H3"
 MS_PAGE = f"https://modelscope.cn/models/{MS_REPO}"
 LOCAL_DIR = "/home/alex/.serenity/models/checkpoints/MiniMax-H3"
 DISK_FLOOR_GIB = 25.0
 
 GIVE_UP_AT = datetime(2026, 8, 3, 12, 0, 0, tzinfo=timezone.utc)
-POLL_SECONDS = 300
+POLL_SECONDS = 60
 
 
 def log(message: str) -> None:
@@ -230,11 +238,11 @@ def main() -> None:
     log("polling now; announced-date changes are reported as they happen")
 
     polls = 0
-    signalled = [False]
+    signalled = set()
     while datetime.now(timezone.utc) < GIVE_UP_AT:
         polls += 1
 
-        if polls % 6 == 1:
+        if polls % 30 == 1:
             current = announced_release_date()
             if current != announced:
                 log(f"ANNOUNCED DATE CHANGED: {announced} -> {current}")
@@ -246,12 +254,14 @@ def main() -> None:
         if creator_name:
             clone_creator(creator_name, creator_url)
 
-        signal_exists, _ = check_hf(HF_SIGNAL_REPO)
-        if signal_exists and not signalled[0]:
-            signalled[0] = True
-            log(f"SIGNAL: {HF_SIGNAL_REPO} is up — release is happening.")
-            log("Not fetching it: Alex wants MiniMax's own weights, and Comfy's")
-            log("are pruned int8 'convrot', not the layout our loader targets.")
+        for candidate in HF_SIGNAL_REPOS:
+            if candidate in signalled:
+                continue
+            if check_hf(candidate)[0]:
+                signalled.add(candidate)
+                log(f"SIGNAL: {candidate} is up — the release has happened.")
+                log("Not fetching it: Alex wants MiniMax's own weights, and every")
+                log("third-party repo is a repack in someone else's layout.")
 
         exists, gated = check_hf(HF_REPO)
         if exists:
@@ -284,7 +294,7 @@ def main() -> None:
             log("MODELSCOPE HAS IT but Hugging Face does not yet.")
             log("Instruction was HF; ModelScope needs a different client. Still polling HF.")
 
-        if polls % 12 == 1:
+        if polls % 15 == 1:
             log(f"still unpublished (poll {polls}, announced {announced}, {free_gib():.1f} GiB free)")
         time.sleep(POLL_SECONDS)
 

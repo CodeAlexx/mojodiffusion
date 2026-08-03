@@ -5,7 +5,7 @@
 # the CPU with `CUDA_VISIBLE_DEVICES=""`, so this whole gate is runnable while
 # the GPU is held by another job.
 #
-# Oracle: scratchpad/h3_kf_torch_cpu_rng_oracle.py, which dumps
+# Oracle: scripts/minimax_h3_torch_cpu_rng_oracle.py, which dumps
 # `torch.rand`/`torch.randn` under `torch.Generator().manual_seed(...)` — the
 # exact call MiniMax-H3's keyframe encode makes at seed 42 (encoders.py:297).
 #
@@ -22,12 +22,12 @@
 #             float16 rounding that immediately follows in the real chain.
 #
 # Run:
-#   CUDA_VISIBLE_DEVICES="" <venv>/bin/python \
-#     <scratch>/h3_kf_torch_cpu_rng_oracle.py <scratch>/h3_torch_cpu_rng_ref.safetensors
+#   CUDA_VISIBLE_DEVICES="" /home/alex/OneTrainer/venv/bin/python \
+#     scripts/minimax_h3_torch_cpu_rng_oracle.py
 #   pixi run mojo build -O0 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_torch_cpu_rng_probe.mojo \
-#     -o <scratch>/h3_torch_cpu_rng_probe \
-#   && <scratch>/h3_torch_cpu_rng_probe <scratch>/h3_torch_cpu_rng_ref.safetensors
+#     -o /tmp/h3_torch_cpu_rng_probe -Xlinker -lm \
+#   && /tmp/h3_torch_cpu_rng_probe output/minimax_h3_keyframe/torch_cpu_rng_ref.safetensors
 
 from std.sys import argv
 from std.collections import List

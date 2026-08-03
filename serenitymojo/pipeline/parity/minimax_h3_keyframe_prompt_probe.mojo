@@ -5,7 +5,7 @@
 # torch.
 #
 # The expected strings are EXTRACTED from the vendor's own
-# VIDEO_PROMPT_WRITING_GUIDE_base_en.md by scratchpad/h3_kf_prompt_oracle.py
+# VIDEO_PROMPT_WRITING_GUIDE_base_en.md by scripts/minimax_h3_keyframe_prompt_oracle.py
 # (its ```text blocks, matched by their opening words), so this compares the
 # emitters against the DOC rather than against a retyped copy of it. That is the
 # only way a byte-exact claim means anything for a template whose whole content
@@ -14,11 +14,11 @@
 # kind of drift a hand-written expectation would reproduce instead of catch.
 #
 # Run:
-#   <venv>/bin/python <scratch>/h3_kf_prompt_oracle.py <scratch>/h3_prompt_ref.json
+#   /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_keyframe_prompt_oracle.py
 #   pixi run mojo build -O0 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_keyframe_prompt_probe.mojo \
-#     -o <scratch>/h3_keyframe_prompt_probe -Xlinker -lm \
-#   && <scratch>/h3_keyframe_prompt_probe <scratch>/h3_prompt_ref.json
+#     -o /tmp/h3_keyframe_prompt_probe -Xlinker -lm \
+#   && /tmp/h3_keyframe_prompt_probe output/minimax_h3_keyframe/keyframe_prompt_ref.json
 
 from std.sys import argv
 from std.collections import List

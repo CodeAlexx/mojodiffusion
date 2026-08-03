@@ -3,7 +3,7 @@
 # Gates `pipeline/minimax_h3_keyframe_image.mojo` BIT-EXACT against Pillow, on
 # real images. Host only — no DeviceContext, no GPU, no model weights.
 #
-# The oracle (scratchpad/h3_kf_image_oracle.py) does not transcribe the vendor's
+# The oracle (scripts/minimax_h3_keyframe_image_oracle.py) does not transcribe the vendor's
 # `prepare_keyframe_image`: it `exec`s the function straight out of
 # /home/alex/minimax_h3_ref/diffusers/packing.py, so both the LANCZOS filter
 # (Pillow's own C) and the stretch/cover-crop policy (the vendor's own Python)
@@ -16,12 +16,13 @@
 # are bugs that would quietly change the conditioning anchor the model sees.
 #
 # Run:
-#   CUDA_VISIBLE_DEVICES="" <venv>/bin/python \
-#     <scratch>/h3_kf_image_oracle.py <scratch>/h3_keyframe_image_ref.safetensors
+#   CUDA_VISIBLE_DEVICES="" /home/alex/OneTrainer/venv/bin/python \
+#     scripts/minimax_h3_keyframe_image_oracle.py
 #   pixi run mojo build -O0 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_keyframe_image_probe.mojo \
-#     -o <scratch>/h3_keyframe_image_probe -Xlinker -lm \
-#   && <scratch>/h3_keyframe_image_probe <scratch>/h3_keyframe_image_ref.safetensors
+#     -o /tmp/h3_keyframe_image_probe -Xlinker -lm \
+#   && /tmp/h3_keyframe_image_probe output/minimax_h3_keyframe/keyframe_image_ref.safetensors \
+#        output/minimax_h3_keyframe/exif_fixtures
 
 from std.sys import argv
 from std.collections import List

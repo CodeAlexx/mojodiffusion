@@ -3117,3 +3117,50 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   conditioning, scheduler, transformer stream, both VAE directions, BF16 LoRA,
   timing, VRAM, prompt-extension provenance, and visual acceptance. The Rust
   server refuses Wan readiness if any pinned check drifts.
+
+## §5 MiniMax-H3 (t2va SHIPPED 2026-08-03; ref2va in build)
+
+The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
+layout (NOT the diffusers conversion). First valid video 2026-08-03
+(960x544, photorealistic, prompt-faithful, clean stereo audio).
+
+- `models/minimax_h3/` — HOST-F32 ORACLES (packing, packing_ref2va, block
+  math, schedulers, audio codec, fp8 policy, tokenizer parity). Gated;
+  runtime must never call them.
+- `models/dit/minimax_h3_{dit,rope,loader_device,modcache,sampling,frontend,
+  stack}.mojo` — the device runtime. Real-weight gates: loader max_abs 0.0,
+  block cos 0.99991, adaLN bit-exact, final layer 0.999999999999.
+  GOTCHAS baked into headers: adaLN rows = timestep*3+tag (final layer =
+  timestep alone); inner 7168 != hidden 5376; qkv de-interleave + fc1
+  [gate;value] swap owned by the LOADER; final-layer modulate runs in BF16
+  with the F32 cast AFTER (transformer_minimax_h3.py:638).
+- `models/dit/minimax_h3_ref_geometry.mojo` — ref2va condition-rows-first
+  layout over the gated packing_ref2va builder. Condition t: video =
+  max(video_t, 0.999) TRACKING, audio = 1.0 const; table collapses below 4 —
+  size modcache off len(values).
+- `models/vae/minimax_h3_video_{encoder,decoder}_device.mojo` — native-key
+  ViT VAE, vendor-oracle cos 0.9999999978 / 0.9999999999998. Fused to_qkv is
+  PER-HEAD interleaved; ff.w1 gate-FIRST.
+- `models/vae/minimax_h3_ref_encode.mojo` — reference encode chain; the
+  vendor's fp16 round-trip BEFORE latent normalize is mandatory
+  (encoders.py:586-588); video refs SAMPLE seed 42 CPU-gen, audio refs MODE.
+- `pipeline/minimax_h3_t2va.mojo` — THE product CLI. Comptime geometry
+  (-D H3_TEXT_TOKENS/H3_FRAMES/H3_HEIGHT/H3_WIDTH; frames must be 17k+5),
+  saves latents every run, `decode_only` argv[6] re-decodes in ~2 min,
+  H3_VAE_TEMPORAL routes decode through the temporal chunk layer (the vendor
+  does this at EVERY size — the direct path emits 4*latent_T frames, 21-27%
+  long, desyncing A/V).
+  DTYPE LAW: DiT denoises in NORMALIZED latent space; decode = z*std+mean
+  per channel (video_vae/config.json latents_mean/std) — missing it renders
+  as fine mosaic with intact global structure.
+  ROW LAW: video rows are CHANNEL-SLOWEST (c,pt,ph,pw); unpatchify3d reads
+  channel-fastest, so reorder before it.
+- `pipeline/minimax_h3_video_vae_{temporal,spatial_tiling,blend,pixel_norm}
+  .mojo` — chunk+tile+blend decode stack; tiled path vendor-oracle 2e-5 at
+  production geometry; ONE shared blend like klvae.
+- `pipeline/minimax_h3_{media_in,ref_prompt,ref2va}.mojo` — ref2va CPU
+  chain (ffmpeg ingest, official structured prompt builder byte-identical to
+  the vendor example, skeleton raising at the encode seam).
+- `pipeline/parity/`, `models/*/parity/` — every gate above; oracle scripts
+  run the vendor's OWN classes (AutoencoderKLLegacy etc.) via the OneTrainer
+  venv, GPU bf16/F32 — never CPU-fp32 references.

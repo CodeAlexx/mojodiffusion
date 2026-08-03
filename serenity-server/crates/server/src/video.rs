@@ -2089,7 +2089,7 @@ fn readiness_doc() -> Value {
                     "audio_parity_report": LTX2_AUDIO_PARITY_REPORT,
                 },
                 "ltx2_mojo_request": {
-                    "runner": "exact AOT runner selected from supported_profiles",
+                    "runner": LTX2_MOJO_REQUEST_RUNNER,
                     "conditioning_runner": LTX2_MOJO_CONDITIONER,
                     "request_schema": "serenity.genparams.v1",
                     "status_schema": "serenity.ltx2.status.v1",
@@ -7957,7 +7957,7 @@ mod tests {
         let request_runner = &runners[1]["modes"]["ltx2_mojo_request"];
         assert_eq!(
             request_runner["runner"],
-            "exact AOT runner selected from supported_profiles"
+            LTX2_MOJO_REQUEST_RUNNER
         );
         assert_eq!(
             request_runner["supported_profiles"]

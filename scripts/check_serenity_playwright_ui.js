@@ -676,7 +676,12 @@ async function run() {
       assert(result.selected === result.name, `${result.name}: picker selected ${result.selected}`);
       assert(result.nodes > 0, `${result.name}: generated an empty workflow`);
       assert(result.sink, `${result.name}: workflow has no media sink`);
-      assert(result.admitted, `${result.name}: route was not admitted ${JSON.stringify(result)}`);
+      if (result.backend === "ltx2" && !result.exactAvailableLtxProfile) {
+        assert(!result.admitted,
+          `${result.name}: LTX route bypassed the unavailable runtime ${JSON.stringify(result)}`);
+      } else {
+        assert(result.admitted, `${result.name}: route was not admitted ${JSON.stringify(result)}`);
+      }
     }
     const ltxModels = modelResults.filter((result) => result.backend === "ltx2");
     const ltxNames = ltxModels.map((result) => result.name);
@@ -1259,7 +1264,13 @@ async function run() {
     for (const result of templateResults) {
       assert(result.nodes > 0, `${result.name}: template serialized an empty workflow`);
       assert(result.sink, `${result.name}: template has no media sink`);
-      assert(result.admitted, `${result.name}: template route was not admitted ${JSON.stringify(result.video || result)}`);
+      if (result.backend === "ltx2" && !result.exactAvailableLtxProfile) {
+        assert(!result.admitted,
+          `${result.name}: LTX template bypassed the unavailable runtime ${JSON.stringify(result.video || result)}`);
+      } else {
+        assert(result.admitted,
+          `${result.name}: template route was not admitted ${JSON.stringify(result.video || result)}`);
+      }
       for (const key of ["model", "width", "height", "steps", "cfg", "scheduler"]) {
         assert(
           result.sync.workflow[key] === result.sync.generate[key],

@@ -357,17 +357,19 @@ var GenerateTab = (function () {
         var profiles = activeLtx2ProfilesForSize(state.width, state.height);
         var exact = exactLtx2RequestProfile();
         if (exact) {
-            profileNote.classList.remove('invalid');
-            profileNote.textContent = 'Supported native profile: ' +
+            profileNote.classList.toggle('invalid', exact.available !== true);
+            profileNote.textContent = (exact.available === true
+                ? 'Available runtime profile: '
+                : 'Registered profile; runtime currently unavailable: ') +
                 state.width + '×' + state.height + ', ' +
                 state.frames + ' frames at ' + state.fps +
-                ' FPS. The exact AOT Mojo runner will be used.';
+                ' FPS.';
             return;
         }
         profileNote.classList.add('invalid');
-        profileNote.textContent = 'No compiled native runner matches ' +
+        profileNote.textContent = 'No registered runtime profile matches ' +
             state.width + '×' + state.height + ', ' + state.frames +
-            ' frames at ' + state.fps + ' FPS. Supported here: ' +
+            ' frames at ' + state.fps + ' FPS. Registered here: ' +
             profiles.map(function (profile) {
                 return profile.duration + 's / ' + profile.frames +
                     'f @ ' + profile.fps;
@@ -454,11 +456,11 @@ var GenerateTab = (function () {
         var profiles = Array.isArray(mode.supported_profiles)
             ? mode.supported_profiles : [];
         return profiles.filter(function (profile) {
-            // Generate always submits video_edit_mode=standard. Only advertise
-            // profiles whose registry explicitly admits standard T2V/I2V;
-            // Retake/Extend-only runners stay out of these controls.
-            return profile && profile.available === true &&
-                Array.isArray(profile.modes) &&
+            // Keep registered standard profiles visible even while the single
+            // runtime executable is absent. Availability controls queue
+            // admission; it must not erase authored geometry or checkpoint
+            // settings from the UI.
+            return profile && Array.isArray(profile.modes) &&
                 profile.modes.indexOf('standard') >= 0;
         });
     }
@@ -504,7 +506,7 @@ var GenerateTab = (function () {
             els.framesInput.step = '8';
             els.framesInput.value = String(state.frames);
             els.framesInput.disabled = false;
-            els.framesInput.title = 'Editable LTX2 frame count; valid native counts match 8*K+1 and an available compiled profile';
+            els.framesInput.title = 'Editable LTX2 frame count; valid native counts match 8*K+1 and a registered runtime profile';
         }
         if (els.secondsInput) {
             els.secondsInput.min = '0.1';
@@ -519,7 +521,7 @@ var GenerateTab = (function () {
             els.fpsInput.min = '1';
             els.fpsInput.max = '60';
             els.fpsInput.disabled = false;
-            els.fpsInput.title = 'Editable FPS; the combination must match an available compiled native profile';
+            els.fpsInput.title = 'Editable FPS; the combination must match a registered runtime profile';
         }
         if (els.fpsRange) {
             els.fpsRange.value = String(state.fps);
@@ -3090,19 +3092,26 @@ var GenerateTab = (function () {
         state.arch = arch;
         var mode = activeLtx2RequestMode();
         var profile = activeLtx2RequestProfile();
-        // `mode.available` historically mirrored one legacy default runner.
-        // A machine can have many admitted native profiles even when that old
-        // default binary is absent, so gate the UI on the actual available
-        // profile inventory instead of disabling every LTX control.
-        if (!mode || !profile || activeLtx2RequestProfiles().length === 0) {
+        if (!mode || !profile) {
             if (els.modelWarn) {
-                els.modelWarn.textContent = 'The selected video request runner is not available on this machine';
+                els.modelWarn.textContent = 'The server did not return registered LTX2 request profiles';
                 els.modelWarn.classList.add('visible');
             }
             return;
         }
-        if (els.modelWarn)
-            els.modelWarn.classList.remove('visible');
+        var runnerReady = activeLtx2RequestProfiles().some(function (entry) {
+            return entry.available === true;
+        });
+        if (els.modelWarn) {
+            if (runnerReady) {
+                els.modelWarn.classList.remove('visible');
+            }
+            else {
+                els.modelWarn.textContent =
+                    'LTX2 settings are available, but generation is blocked until the single runtime runner is installed';
+                els.modelWarn.classList.add('visible');
+            }
+        }
         if (els.videoSection)
             els.videoSection.style.display = '';
         if (els.videoConditioningSection)
@@ -3126,7 +3135,7 @@ var GenerateTab = (function () {
             els.toolbarBatchInput.disabled = true;
         }
         applyLtx2RequestProfile(profile);
-        var profileSelectReason = 'Choose an admitted native size and duration. Each combination dispatches to its exact AOT Mojo runner.';
+        var profileSelectReason = 'Choose a registered native size and duration. The single runtime runner validates the request at queue time.';
         if (els.videoCheckpoint)
             els.videoCheckpoint.value = state.videoCheckpoint;
         if (els.videoQuant)
@@ -3177,7 +3186,9 @@ var GenerateTab = (function () {
         setPreviewModelBadges(state.model, arch);
         var runtimeLabel = document.getElementById('gen-runtime-label');
         if (runtimeLabel)
-            runtimeLabel.textContent = 'LTX2 · Mojo video request runner · admitted';
+            runtimeLabel.textContent = runnerReady
+                ? 'LTX2 · single Mojo runtime runner · ready'
+                : 'LTX2 · single Mojo runtime runner · unavailable';
         updateAdvancedSamplingUI(null);
         renderModelLibrary();
         refreshLtx2PostUpscaleControls();
@@ -4011,7 +4022,7 @@ var GenerateTab = (function () {
             var note = document.getElementById('gen-video-profile-note');
             showError(note
                 ? note.textContent
-                : 'This LTX2 frame/FPS combination has no compiled native runner.');
+                : 'This LTX2 frame/FPS combination has no registered runtime profile.');
             return;
         }
         var seed = state.seed === -1

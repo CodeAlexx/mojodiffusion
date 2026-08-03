@@ -42,6 +42,7 @@
 
 from std.collections import List
 from std.math import fma
+from std.benchmark import black_box
 
 # The released checkpoints' shifts (scheduler_config.json, written by the
 # converter from `model_index.json` `_minimax_h3.sigma_shift_scales`).
@@ -49,8 +50,7 @@ comptime MINIMAX_H3_VIDEO_SHIFT = Float32(12.0)
 comptime MINIMAX_H3_AUDIO_SHIFT = Float32(3.0)
 
 
-@no_inline
-def _round_f32(x: Float32) -> Float32:
+def _round_f32(var x: Float32) -> Float32:
     """Optimization barrier forcing one float32 rounding.
 
     Mojo contracts `a + b*c` into a fused multiply-add — MEASURED: fusing only
@@ -64,7 +64,13 @@ def _round_f32(x: Float32) -> Float32:
     Scalar host code on tiny arrays, so the call overhead is irrelevant here.
     When the blend moves to a device kernel, that kernel must not contract
     either."""
-    return x
+    # MEASURED 2026-08-03: `@no_inline` did NOTHING. The call site is tagged
+    # `call contract float` with an IDENTICAL contract-flag count at -O0 and
+    # -O3 — @no_inline blocks code DUPLICATION, not the fast-math permission
+    # to fuse. -O0 merely never exploited it, which is why this "worked".
+    # `black_box` is a real inline-asm memory clobber the optimizer cannot
+    # prove is a pure identity, so it holds at every level.
+    return black_box(x)
 
 
 def _linspace_1_to_0(steps: Int) -> List[Float32]:
@@ -139,7 +145,13 @@ struct MiniMaxH3Scheduler(Movable):
         var shift_minus_one = self.shift - Float32(1.0)
         for i in range(len(base)):
             var b = base[i]
-            shifted.append((self.shift * b) / (Float32(1.0) + shift_minus_one * b))
+            # Was UNPROTECTED. Only bites when shift-1 is not an exact power of
+            # two: shift 12.0 -> 11.0 breaks (video, 4/30 sigmas), shift 3.0 -> 2.0
+            # is exact so audio never rounded — which is why audio always passed.
+            var num = _round_f32(self.shift * b)
+            var denom_term = _round_f32(shift_minus_one * b)
+            var denom = _round_f32(Float32(1.0) + denom_term)
+            shifted.append(num / denom)
 
         # The shift compresses the grid near sigma = 1; collapse the float32
         # collisions it can create (`torch.unique_consecutive`).
@@ -183,9 +195,12 @@ struct MiniMaxH3Scheduler(Movable):
         and is NOT looked up in the schedule."""
         if len(sample) != len(noise):
             raise Error("MiniMax-H3 scheduler: sample and noise length mismatch")
+        var one_minus_timestep = _round_f32(Float32(1.0) - timestep)
         var out = List[Float32]()
         for i in range(len(sample)):
-            out.append(timestep * sample[i] + (Float32(1.0) - timestep) * noise[i])
+            var a = _round_f32(timestep * sample[i])
+            var bb = _round_f32(one_minus_timestep * noise[i])
+            out.append(_round_f32(a + bb))
         return out^
 
     def step(

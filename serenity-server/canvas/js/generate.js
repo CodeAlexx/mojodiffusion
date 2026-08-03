@@ -325,6 +325,65 @@ var GenerateTab = (function () {
                 'Creator enhancer uses the raw prompt and optional source image with no system prompt.';
         }
     }
+    function activeLtx2Checkpoints() {
+        var mode = activeLtx2RequestMode();
+        var checkpoints = mode && Array.isArray(mode.checkpoints)
+            ? mode.checkpoints : [];
+        return checkpoints.filter(function (checkpoint) {
+            return checkpoint && checkpoint.installed === true;
+        });
+    }
+    function activeLtx2Checkpoint() {
+        var checkpoints = activeLtx2Checkpoints();
+        return checkpoints.find(function (checkpoint) {
+            return checkpoint.id === state.videoCheckpoint;
+        }) || null;
+    }
+    function refreshLtx2CheckpointControls() {
+        var mode = activeLtx2RequestMode() || {};
+        var checkpoints = activeLtx2Checkpoints();
+        var selected = activeLtx2Checkpoint();
+        if (!selected) {
+            selected = checkpoints.find(function (checkpoint) {
+                return checkpoint.id === mode.default_checkpoint;
+            }) || checkpoints[0] || null;
+            if (selected)
+                state.videoCheckpoint = selected.id;
+        }
+        if (els.videoCheckpoint) {
+            els.videoCheckpoint.innerHTML = checkpoints.map(function (checkpoint) {
+                var suffix = checkpoint.readiness_label === 'production_ready'
+                    ? '' : ' · experimental';
+                return '<option value="' + escapeHtml(String(checkpoint.id)) + '">' +
+                    escapeHtml(String(checkpoint.label || checkpoint.id) + suffix) +
+                    '</option>';
+            }).join('');
+            els.videoCheckpoint.value = state.videoCheckpoint;
+            els.videoCheckpoint.disabled = checkpoints.length < 2;
+        }
+        var guidanceModes = selected && Array.isArray(selected.guidance_modes)
+            ? selected.guidance_modes : ['distilled', 'dev'];
+        if (guidanceModes.indexOf(state.videoGuidanceMode) < 0)
+            state.videoGuidanceMode = guidanceModes[0] || 'distilled';
+        if (els.videoGuidanceMode) {
+            els.videoGuidanceMode.innerHTML = guidanceModes.map(function (modeName) {
+                return '<option value="' + modeName + '">' +
+                    (modeName === 'dev' ? 'Dev CFG' : 'Distilled') + '</option>';
+            }).join('');
+            els.videoGuidanceMode.value = state.videoGuidanceMode;
+        }
+        var quantModes = selected && Array.isArray(selected.quant_modes)
+            ? selected.quant_modes : ['fp8'];
+        if (quantModes.indexOf(state.videoQuant) < 0)
+            state.videoQuant = quantModes[0] || 'fp8';
+        if (els.videoQuant) {
+            els.videoQuant.innerHTML = quantModes.map(function (modeName) {
+                return '<option value="' + modeName + '">' +
+                    modeName.toUpperCase() + '</option>';
+            }).join('');
+            els.videoQuant.value = state.videoQuant;
+        }
+    }
     function exactLtx2RequestProfile() {
         var mode = activeLtx2RequestMode();
         if (!mode)
@@ -479,6 +538,7 @@ var GenerateTab = (function () {
             state.videoCheckpoint = state.videoQuant === 'bf16'
                 ? 'ltx-2.3-22b-dev-fp8-dequant-bf16'
                 : String(profile.checkpoint || 'ltx-2.3-22b-dev-fp8');
+        refreshLtx2CheckpointControls();
         state.width = Number(profile.width);
         state.height = Number(profile.height);
         state.frames = Number(profile.frames);
@@ -727,7 +787,7 @@ var GenerateTab = (function () {
         var videoConditioningBody =
             '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
             '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
-            '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-distilled"></div>' +
+            '<select id="gen-video-checkpoint" class="gen-select"><option value="ltx-2.3-22b-dev-fp8">LTX 2.3 Dev FP8</option></select></div>' +
             '<div class="gen-param-row" data-param-search="prompt enhancer sulphur qwen"><label class="gen-label" for="gen-video-prompt-enhancer">Prompt enhancer</label>' +
             '<select id="gen-video-prompt-enhancer" class="gen-select"><option value="none">Raw prompt (creator workflow default)</option></select></div>' +
             '<div id="gen-video-prompt-enhancer-note" class="gen-capability-note">The selected checkpoint has no registered creator prompt enhancer.</div>' +
@@ -1906,8 +1966,9 @@ var GenerateTab = (function () {
                     selectModel(checkpoint);
             });
         if (els.videoCheckpoint)
-            els.videoCheckpoint.addEventListener('input', function () {
+            els.videoCheckpoint.addEventListener('change', function () {
                 state.videoCheckpoint = this.value;
+                refreshLtx2CheckpointControls();
                 var creatorWorkflow = ltx2CheckpointWorkflow(
                     state.videoCheckpoint
                 );
@@ -3014,6 +3075,7 @@ var GenerateTab = (function () {
         return;
     }
     function applyVideoGuidanceMode(preserveSteps) {
+        refreshLtx2CheckpointControls();
         var creatorWorkflow = state.videoWorkflowProfile
             ? ltx2CheckpointWorkflow(state.videoCheckpoint) : null;
         if (creatorWorkflow &&
@@ -3136,6 +3198,7 @@ var GenerateTab = (function () {
         }
         applyLtx2RequestProfile(profile);
         var profileSelectReason = 'Choose a registered native size and duration. The single runtime runner validates the request at queue time.';
+        refreshLtx2CheckpointControls();
         if (els.videoCheckpoint)
             els.videoCheckpoint.value = state.videoCheckpoint;
         if (els.videoQuant)

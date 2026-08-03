@@ -329,9 +329,23 @@ fn bin_x(path: &str) -> bool {
 struct Ltx2RequestProfileRegistry {
     schema: String,
     checkpoint: String,
+    checkpoints: Vec<Ltx2CheckpointProfile>,
     guidance_modes: Value,
     profile_groups: Vec<Ltx2RequestProfileGroup>,
     post_upscalers: Value,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Ltx2CheckpointProfile {
+    id: String,
+    label: String,
+    path: String,
+    aliases: Vec<String>,
+    support_lora: String,
+    guidance_modes: Vec<String>,
+    quant_modes: Vec<String>,
+    readiness_label: String,
+    source: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -471,6 +485,23 @@ fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
             }),
             "each embedded LTX2 profile group must pair frames with durations and declare modes"
         );
+        assert!(
+            registry
+                .checkpoints
+                .iter()
+                .any(|profile| profile.id == registry.checkpoint),
+            "embedded LTX2 default checkpoint must name a checkpoint profile"
+        );
+        assert!(
+            registry.checkpoints.iter().all(|profile| {
+                !profile.id.is_empty()
+                    && !profile.path.is_empty()
+                    && matches!(profile.support_lora.as_str(), "official" | "baked")
+                    && !profile.guidance_modes.is_empty()
+                    && !profile.quant_modes.is_empty()
+            }),
+            "embedded LTX2 checkpoint profiles must be complete"
+        );
         registry
     })
 }
@@ -520,6 +551,43 @@ fn ltx2_request_runner_current(path: &str) -> bool {
         input_modified.push(modified);
     }
     ltx2_runner_mtime_covers_inputs(runner_modified, &input_modified)
+}
+
+fn ltx2_checkpoint_profile(checkpoint: &str) -> Option<&'static Ltx2CheckpointProfile> {
+    let checkpoint = checkpoint.trim();
+    ltx2_request_profile_registry()
+        .checkpoints
+        .iter()
+        .find(|profile| {
+            checkpoint == profile.id
+                || checkpoint == format!("{}.safetensors", profile.id)
+                || profile.aliases.iter().any(|alias| alias == checkpoint)
+        })
+}
+
+fn ltx2_checkpoint_document(profile: &Ltx2CheckpointProfile) -> Value {
+    let path = model_path(&profile.path);
+    json!({
+        "id": profile.id,
+        "label": profile.label,
+        "path": profile.path,
+        "installed": nonempty_file(&path),
+        "support_lora": profile.support_lora,
+        "guidance_modes": profile.guidance_modes,
+        "quant_modes": profile.quant_modes,
+        "readiness_label": profile.readiness_label,
+        "source": profile.source,
+    })
+}
+
+fn ltx2_checkpoint_documents() -> Value {
+    Value::Array(
+        ltx2_request_profile_registry()
+            .checkpoints
+            .iter()
+            .map(ltx2_checkpoint_document)
+            .collect(),
+    )
 }
 
 fn ltx2_resolved_profiles() -> Vec<Ltx2ResolvedRequestProfile> {
@@ -2143,6 +2211,8 @@ fn readiness_doc() -> Value {
                             "dtype_contract": "int4_resident_w4a16_bf16_activations_f32_reductions",
                         }
                     ],
+                    "default_checkpoint": ltx2_request_profile_registry().checkpoint,
+                    "checkpoints": ltx2_checkpoint_documents(),
                     "post_upscalers": ltx2_post_upscaler_documents(),
                     "feature_adapters": crate::models::ltx2_feature_documents(),
                     "available": ltx2_request_ready,
@@ -3485,6 +3555,38 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
             "LTX2 Mojo request requires quant 'bf16', 'fp8', or 'int4'; got '{quant}'"
         ));
     }
+    let checkpoint = body["checkpoint"].as_str().unwrap_or("");
+    let checkpoint_profile = ltx2_checkpoint_profile(checkpoint).ok_or_else(|| {
+        let admitted = ltx2_request_profile_registry()
+            .checkpoints
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "LTX2 checkpoint '{checkpoint}' is not registered; admitted checkpoints: {admitted}"
+        )
+    })?;
+    let checkpoint_path = model_path(&checkpoint_profile.path);
+    if !nonempty_file(&checkpoint_path) {
+        return Err(format!(
+            "LTX2 checkpoint '{}' is registered but missing: {}",
+            checkpoint_profile.id,
+            checkpoint_path.display()
+        ));
+    }
+    if !checkpoint_profile
+        .quant_modes
+        .iter()
+        .any(|mode| mode == quant)
+    {
+        return Err(format!(
+            "LTX2 checkpoint '{}' does not admit quant '{}'; admitted modes: {}",
+            checkpoint_profile.id,
+            quant,
+            checkpoint_profile.quant_modes.join(", ")
+        ));
+    }
     let checkpoint = resolve_ltx2_request_checkpoint(body)?;
     if quant == "int4" {
         let checkpoint_name = checkpoint
@@ -3509,6 +3611,18 @@ fn validate_ltx2_mojo_request(body: &Value) -> Result<(), String> {
     if !matches!(guidance_mode, "distilled" | "dev") {
         return Err(format!(
             "LTX2 guidance_mode must be 'distilled' or 'dev'; got '{guidance_mode}'"
+        ));
+    }
+    if !checkpoint_profile
+        .guidance_modes
+        .iter()
+        .any(|mode| mode == guidance_mode)
+    {
+        return Err(format!(
+            "LTX2 checkpoint '{}' does not admit guidance_mode '{}'; admitted modes: {}",
+            checkpoint_profile.id,
+            guidance_mode,
+            checkpoint_profile.guidance_modes.join(", ")
         ));
     }
     let sampler = body["sampler"].as_str().unwrap_or("");
@@ -4332,6 +4446,22 @@ fn start_ltx2_mojo_request(
         .get("video_edit_mode")
         .and_then(Value::as_str)
         .unwrap_or("standard");
+    let checkpoint_profile = match body
+        .get("checkpoint")
+        .and_then(Value::as_str)
+        .and_then(ltx2_checkpoint_profile)
+    {
+        Some(profile) => profile,
+        None => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "LTX2 request checkpoint is not registered",
+            )
+        }
+    };
+    let checkpoint_path = model_path(&checkpoint_profile.path);
+    let checkpoint_id = checkpoint_profile.id.clone();
+    let support_lora = checkpoint_profile.support_lora.clone();
     let profile = match ltx2_request_profile_for_mode(
         body.get("width").and_then(Value::as_i64).unwrap_or(0),
         body.get("height").and_then(Value::as_i64).unwrap_or(0),
@@ -4551,8 +4681,14 @@ fn start_ltx2_mojo_request(
         .unwrap_or(profile.frames);
     let thread_feature_id = feature_id.clone();
     let thread_edit_mode = edit_mode.to_string();
+    let thread_checkpoint_path = checkpoint_path.clone();
+    let thread_checkpoint_id = checkpoint_id.clone();
+    let thread_support_lora = support_lora.clone();
     let mut thread_request = request_document.clone();
     if let Some(request) = thread_request.as_object_mut() {
+        // The public API accepts registered aliases, but the runner receives
+        // one canonical identity paired with the exact server-resolved path.
+        request.insert("checkpoint".to_string(), json!(checkpoint_id));
         // The denoiser always publishes exact final latents, exits, and lets a
         // fresh invocation of the same profile binary own VAE decode. This is
         // required for 720p+ on 24 GB and also prevents allocator fragmentation
@@ -4799,6 +4935,9 @@ fn start_ltx2_mojo_request(
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", request_ld_path)
             .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .env("LTX2_REFHQ_CKPT_FP8", &thread_checkpoint_path)
+            .env("LTX2_REFHQ_CHECKPOINT_ID", &thread_checkpoint_id)
+            .env("LTX2_REFHQ_SUPPORT_LORA", &thread_support_lora)
             .arg(&thread_request_path)
             .arg(&thread_out_dir)
             .stdout(std::process::Stdio::from(log))
@@ -4914,6 +5053,9 @@ fn start_ltx2_mojo_request(
                 .current_dir(repo_root())
                 .env("LD_LIBRARY_PATH", ltx2_decode_ld_path())
                 .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+                .env("LTX2_REFHQ_CKPT_FP8", &thread_checkpoint_path)
+                .env("LTX2_REFHQ_CHECKPOINT_ID", &thread_checkpoint_id)
+                .env("LTX2_REFHQ_SUPPORT_LORA", &thread_support_lora)
                 .arg("decode")
                 .arg(&thread_request_path)
                 .arg(&thread_out_dir)
@@ -8394,6 +8536,21 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(caps);
+    }
+
+    #[test]
+    fn ltx2_checkpoint_registry_separates_dev_support_lora_from_baked_finetune() {
+        let dev = ltx2_checkpoint_profile("ltx-2.3-22b-dev-fp8").unwrap();
+        assert_eq!(dev.support_lora, "official");
+        assert!(dev.guidance_modes.iter().any(|mode| mode == "dev"));
+        assert!(dev.quant_modes.iter().any(|mode| mode == "int4"));
+
+        let sulphur = ltx2_checkpoint_profile("sulphur_distill_fp8.safetensors").unwrap();
+        assert_eq!(sulphur.id, "sulphur-distill-fp8");
+        assert_eq!(sulphur.support_lora, "baked");
+        assert_eq!(sulphur.guidance_modes, ["distilled"]);
+        assert_eq!(sulphur.quant_modes, ["fp8"]);
+        assert_eq!(sulphur.path, "checkpoints/sulphur_distill_fp8.safetensors");
     }
 
     #[test]

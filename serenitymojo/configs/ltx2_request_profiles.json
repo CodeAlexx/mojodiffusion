@@ -3,13 +3,32 @@
   "checkpoint": "ltx-2.3-22b-distilled-1.1",
   "checkpoints": [
     {
+      "id": "ltx-2.3-22b-distilled-1.1",
+      "label": "LTX 2.3 Distilled 1.1",
+      "path": "checkpoints/ltx-2.3-22b-distilled-1.1.safetensors",
+      "aliases": [
+        "ltx-2.3-22b-distilled-1.1.safetensors",
+        "ltx-2.3-22b-distilled",
+        "ltx-2.3-22b-distilled.safetensors"
+      ],
+      "support_lora": "baked",
+      "guidance_modes": ["distilled"],
+      "quant_modes": ["bf16", "fp8"],
+      "readiness_label": "production_ready",
+      "source": "Official LTX 2.3 directly-distilled full checkpoint (one-stage creator topology)"
+    },
+    {
       "id": "ltx-2.3-22b-dev-fp8",
       "label": "LTX 2.3 Dev FP8",
       "path": "checkpoints/ltx-2.3-22b-dev-fp8.safetensors",
-      "aliases": ["ltx-2.3-22b-dev-fp8.safetensors"],
+      "aliases": [
+        "ltx-2.3-22b-dev-fp8.safetensors",
+        "ltx-2.3-22b-dev-fp8-dequant-bf16",
+        "ltx-2.3-22b-dev-fp8-dequant-bf16.safetensors"
+      ],
       "support_lora": "official",
       "guidance_modes": ["distilled", "dev"],
-      "quant_modes": ["fp8", "int4"],
+      "quant_modes": ["bf16", "fp8", "int4"],
       "readiness_label": "production_ready",
       "source": "Official LTX 2.3 dev base plus the official 1.1 support LoRA"
     },

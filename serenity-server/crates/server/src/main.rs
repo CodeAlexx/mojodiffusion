@@ -618,28 +618,21 @@ fn local_artifact_manifest(
     }
 
     if selected_family == Some(ModelFamily::Chroma) {
-        // Chroma single-file DiT + live T5-XXL encode + flux VAE (paths from
+        // Chroma consolidated DiT + live T5-XXL encode + flux VAE (paths from
+        // serenitymojo/models/dit/chroma_contract.mojo and
         // serenitymojo/pipeline/chroma_pipeline_1024_multistep.mojo, consumed
-        // by chroma_backend.mojo).
+        // by chroma_backend.mojo). `models/chroma/transformer` is intentionally
+        // an installer-managed link to the consolidated checkpoint, not a
+        // diffusers shard directory.
         let root = repository_path("models/chroma");
         let transformer = format!("{root}/transformer");
         let text = repository_path("models/text-encoders");
         let vae = repository_path("models/vae/flux.safetensors");
         let mut specs = if selected_checkpoint.is_empty() {
-            vec![
-                artifact_file(
-                    "chroma DiT shard index",
-                    format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
-                ),
-                artifact_file(
-                    "chroma DiT shard 1",
-                    format!("{transformer}/diffusion_pytorch_model-00001-of-00002.safetensors"),
-                ),
-                artifact_file(
-                    "chroma DiT shard 2",
-                    format!("{transformer}/diffusion_pytorch_model-00002-of-00002.safetensors"),
-                ),
-            ]
+            vec![artifact_file(
+                "chroma consolidated DiT checkpoint",
+                transformer.clone(),
+            )]
         } else {
             vec![artifact_file(
                 "selected Chroma checkpoint",
@@ -1011,17 +1004,40 @@ fn local_artifact_manifest(
         } else {
             "models/klein9b"
         });
-        let specs = vec![
+        let qwen = repository_path(if is_four_b {
+            "models/qwen3-4b"
+        } else {
+            "models/qwen3-8b"
+        });
+        let qwen_shard_count = if is_four_b { 2 } else { 4 };
+        let mut specs = vec![
             artifact_file(
                 "Klein/Flux2 checkpoint",
                 format!("{root}/transformer.safetensors"),
             ),
             artifact_file("Flux2 VAE", repository_path("models/klein/vae.safetensors")),
-            artifact_file(
-                "Qwen3-8B tokenizer",
-                repository_path("models/qwen3-8b/tokenizer.json"),
+            artifact_dir(
+                if is_four_b {
+                    "Qwen3-4B text encoder"
+                } else {
+                    "Qwen3-8B text encoder"
+                },
+                qwen.clone(),
             ),
+            artifact_file("Qwen3 config", format!("{qwen}/config.json")),
+            artifact_file(
+                "Qwen3 shard index",
+                format!("{qwen}/model.safetensors.index.json"),
+            ),
+            artifact_file("Qwen3 tokenizer", format!("{qwen}/tokenizer.json")),
         ];
+        push_safetensor_shards(
+            &mut specs,
+            "Qwen3 text encoder",
+            &qwen,
+            "model",
+            qwen_shard_count,
+        );
         return Some(LocalArtifactManifest {
             profile: if is_four_b {
                 "klein4b_flux2"
@@ -4894,6 +4910,46 @@ mod endpoint_tests {
             report["limits"]["runtime_dependency_on_external_repos"],
             false
         );
+    }
+
+    #[test]
+    fn artifact_manifests_match_chroma_and_klein_runtime_layouts() {
+        let chroma = local_artifact_manifest("chroma", "").expect("chroma manifest");
+        assert_eq!(chroma.profile, "chroma_1024");
+        let chroma_dit = chroma
+            .specs
+            .iter()
+            .find(|spec| spec.label == "chroma consolidated DiT checkpoint")
+            .expect("chroma consolidated checkpoint");
+        assert!(chroma_dit.path.ends_with("/models/chroma/transformer"));
+        assert!(matches!(chroma_dit.kind, ArtifactKind::File));
+        assert!(!chroma
+            .specs
+            .iter()
+            .any(|spec| spec.path.contains("diffusion_pytorch_model-")));
+
+        for (model, encoder, shards) in [
+            ("klein-9b", "/models/qwen3-8b", 4usize),
+            ("klein-4b", "/models/qwen3-4b", 2usize),
+        ] {
+            let manifest = local_artifact_manifest(model, "").expect("Klein manifest");
+            assert!(manifest
+                .specs
+                .iter()
+                .any(|spec| spec.path.ends_with(&format!("{encoder}/tokenizer.json"))));
+            assert_eq!(
+                manifest
+                    .specs
+                    .iter()
+                    .filter(|spec| {
+                        spec.path.contains(encoder)
+                            && spec.path.contains("model-")
+                            && spec.path.ends_with(".safetensors")
+                    })
+                    .count(),
+                shards
+            );
+        }
     }
 
     #[test]

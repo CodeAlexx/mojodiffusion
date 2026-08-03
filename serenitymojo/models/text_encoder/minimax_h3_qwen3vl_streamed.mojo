@@ -78,6 +78,8 @@ from std.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
+from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.text_encoder.qwen3_encoder import (
     Qwen3Encoder,
@@ -102,10 +104,86 @@ comptime H3_EPS = Float32(1.0e-6)
 # are dead weight for H3 and must never be loaded.
 comptime H3_EXTRACT_LAYER = 50
 
+# ── partial-checkout shard opening ──────────────────────────────────────────
+# `ShardedSafeTensors.open(dir)` eagerly opens EVERY shard the index lists
+# and fails on the first missing one (io/sharded.mojo:384-431) — confirmed
+# against this exact checkpoint by
+# models/dit/parity/minimax_h3_block_real_weight_gate.mojo. H3's
+# text_encoder/ is a 62.13 GiB, 14-shard download that lands incrementally,
+# so that path is unusable here until every shard exists. Same fix
+# models/dit/parity/minimax_h3_modcache_real_weight_gate.mojo uses for the
+# transformer checkpoint: build a `ShardedSafeTensors` from its own public
+# constructor (`ShardedSafeTensors(shards, name_to_shard)`, sharded.mojo:375)
+# over independently-`SafeTensors.open`'d single files — but generalized to
+# ALL 14 candidate shard filenames, probed at runtime, rather than a
+# hand-picked one or two. Each shard self-reports its own tensor names
+# (`SafeTensors.names()`), so no index.json parsing is needed at all: this
+# naturally picks up shard 11 (where layer 50 lives) — and any other shard —
+# the moment it lands on disk, no code change required.
+def _h3_shard_filenames() -> List[String]:
+    var out = List[String]()
+    out.append(String("model-00001-of-00014.safetensors"))
+    out.append(String("model-00002-of-00014.safetensors"))
+    out.append(String("model-00003-of-00014.safetensors"))
+    out.append(String("model-00004-of-00014.safetensors"))
+    out.append(String("model-00005-of-00014.safetensors"))
+    out.append(String("model-00006-of-00014.safetensors"))
+    out.append(String("model-00007-of-00014.safetensors"))
+    out.append(String("model-00008-of-00014.safetensors"))
+    out.append(String("model-00009-of-00014.safetensors"))
+    out.append(String("model-00010-of-00014.safetensors"))
+    out.append(String("model-00011-of-00014.safetensors"))
+    out.append(String("model-00012-of-00014.safetensors"))
+    out.append(String("model-00013-of-00014.safetensors"))
+    out.append(String("model-00014-of-00014.safetensors"))
+    return out^
+
+
+def _h3_path_readable(path: String) -> Bool:
+    var fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0:
+        return False
+    _ = sys_close(fd)
+    return True
+
+
+def _h3_open_available_shards(dir: String) raises -> ShardedSafeTensors:
+    """Open only the text_encoder/ shard FILES THAT EXIST on disk right
+    now. Tensors that live in a not-yet-downloaded shard simply are not in
+    the resulting `name_to_shard` map — a lookup for one of them raises a
+    clear "missing tensor" error (from `has_tensor`/`tensor_view`) rather
+    than this function eagerly failing on shards it never needed to open."""
+    var shards = List[ArcPointer[SafeTensors]]()
+    var name_to_shard = Dict[String, Int]()
+    var filenames = _h3_shard_filenames()
+    var opened = 0
+    for i in range(len(filenames)):
+        var path = dir + "/" + filenames[i]
+        if not _h3_path_readable(path):
+            continue
+        var st = SafeTensors.open(path)
+        var idx = len(shards)
+        for ref nm in st.names():
+            name_to_shard[nm] = idx
+        shards.append(ArcPointer(st^))
+        opened += 1
+    if opened == 0:
+        raise Error(
+            "minimax_h3_qwen3vl_streamed: no text_encoder shard files (model-000NN-of-00014.safetensors) present in "
+            + dir
+        )
+    return ShardedSafeTensors(shards^, name_to_shard^)
+
+
 # Candidate decoder-layer key prefixes to probe, in the order tried. The
 # first is the one already OBSERVED on a Qwen3-VL-8B checkpoint of the same
 # `Qwen3VLForConditionalGeneration` architecture class (ideogram_qwen3vl.mojo);
-# the other two are defensive fallbacks, not assumptions.
+# the other two are defensive fallbacks, not assumptions. MEASURED against
+# H3's own real index (2026-08-02, 704 decoder-layer keys): the THIRD
+# candidate, `model.language_model.layers.`, is the one this checkpoint
+# actually uses — neither of the first two has any keys at all. Left in
+# probed order rather than reordered, so the detection is still real and not
+# a hardcoded assumption dressed up as one.
 def _h3_prefix_candidates() -> List[String]:
     var out = List[String]()
     out.append(String("language_model.layers."))
@@ -219,7 +297,7 @@ def minimax_h3_encode_conditioning_streamed(
     if len(ids) == 0:
         raise Error("minimax_h3_encode_conditioning_streamed: empty prompt")
     var seq = len(ids)
-    var st = ShardedSafeTensors.open(dir_or_file)
+    var st = _h3_open_available_shards(dir_or_file)
     var layer_prefix = _detect_layer_prefix(st)
     var embed_prefix = _h3_embed_prefix(layer_prefix)
 

@@ -63,11 +63,18 @@ def main() raises:
         return
 
     # Tiny fixed prompt (token ids are placeholders, not from H3's real
-    # tokenizer/chat template — that step is explicitly not wired yet).
+    # tokenizer/chat template — see minimax_h3_conditioning.mojo/_probe.mojo
+    # for that). Exactly 8 ids: the smallest seq _sdpa_dispatch's h=64
+    # branch (qwen3_encoder.mojo) actually enumerates.
     var ids = List[Int]()
     ids.append(9906)
     ids.append(1917)
     ids.append(0)
+    ids.append(1)
+    ids.append(2)
+    ids.append(3)
+    ids.append(4)
+    ids.append(5)
 
     var hidden = minimax_h3_encode_conditioning_streamed(_TEXT_ENCODER_DIR, ids, ctx)
     var sh = hidden.shape()

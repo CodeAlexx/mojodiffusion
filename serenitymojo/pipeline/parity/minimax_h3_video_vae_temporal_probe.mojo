@@ -9,7 +9,7 @@
 #      token_drop=3): tokens_chunk_size=5, frame_pre_padding=3,
 #      token_overlap=2, frame_overlap=5 — hand-derived from setup_forward's
 #      formulas, asserted exactly.
-#   2. `_blend_frames` in isolation: two small known tensors, full overlap,
+#   2. `minimax_h3_video_blend` in isolation: two small known tensors, full overlap,
 #      output checked against the hand-computed linear-interpolation values.
 #   3. `minimax_h3_video_encode_temporal`, toy scale: a 10-frame input with
 #      clip_length=7 pads to 14 (2 chunks), each chunk's causal-downsample-2
@@ -35,7 +35,8 @@
 #     /tmp/mmh3_temporal_probe
 #
 # (needs the cuDNN shim — the per-volume decode this layer calls uses
-# conv3d_fcqrs_cudnn's BF16 path; plain `mojo run` cannot link it.)
+# conv3d_fcqrs_cudnn, which references the shim's BF16 branch even on this
+# F32 toy checkpoint (linked either way); plain `mojo run` cannot link it.)
 
 from std.collections import List
 from std.gpu.host import DeviceContext
@@ -58,10 +59,11 @@ from serenitymojo.models.vae.minimax_h3_video_decoder_device import (
     minimax_h3_video_decoder_native_key_names, MiniMaxH3VideoDecoderDeviceConfig,
 )
 from serenitymojo.pipeline.minimax_h3_video_vae_temporal import (
-    MiniMaxH3VideoTemporalConfig, _blend_frames, _decode_temporal_pad_frames,
+    MiniMaxH3VideoTemporalConfig, _decode_temporal_pad_frames,
     minimax_h3_video_decode_temporal, minimax_h3_video_encode_temporal,
     minimax_h3_video_released_temporal_config,
 )
+from serenitymojo.pipeline.minimax_h3_video_vae_blend import minimax_h3_video_blend
 
 comptime TArc = ArcPointer[Tensor]
 comptime ENC_CKPT = "/tmp/minimax_h3_temporal_probe_enc.safetensors"
@@ -108,7 +110,7 @@ def _run_config_arithmetic_check() raises:
     print("phase 1 (config arithmetic, real FL2VA numbers) PASS")
 
 
-# ── phase 2: _blend_frames isolated check ───────────────────────────────────────
+# ── phase 2: minimax_h3_video_blend isolated check ───────────────────────────────────────
 def _run_blend_check(ctx: DeviceContext) raises:
     var a = Tensor.from_host(
         [Float32(10.0), Float32(20.0), Float32(30.0)], [1, 3, 1, 1, 1], STDtype.F32, ctx
@@ -116,7 +118,7 @@ def _run_blend_check(ctx: DeviceContext) raises:
     var b = Tensor.from_host(
         [Float32(100.0), Float32(200.0), Float32(300.0)], [1, 3, 1, 1, 1], STDtype.F32, ctx
     )
-    var blended = _blend_frames(a, b, 3, ctx)
+    var blended = minimax_h3_video_blend(a, b, 3, 1, ctx)
     if blended.shape() != [1, 3, 1, 1, 1]:
         raise Error("probe: FAIL blend shape")
     var host = blended.to_host(ctx)
@@ -129,7 +131,7 @@ def _run_blend_check(ctx: DeviceContext) raises:
     print("  blend max_abs vs hand-computed:", diff)
     if diff > Float32(0.01):
         raise Error("probe: FAIL blend does not match hand-computed linear interpolation")
-    print("phase 2 (_blend_frames isolated check) PASS")
+    print("phase 2 (minimax_h3_video_blend isolated check) PASS")
 
 
 # ── phase 3: encode_temporal, toy scale ─────────────────────────────────────────
@@ -204,7 +206,7 @@ def _write_encoder_checkpoint(config: MiniMaxH3VideoEncoderDeviceConfig, ctx: De
         for d in range(len(shape)):
             n *= shape[d]
         var host = _pattern(seed, n)
-        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.BF16, ctx)))
+        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.F32, ctx)))
     save_safetensors(names, tensors, String(ENC_CKPT), ctx)
 
 
@@ -218,7 +220,7 @@ def _run_encode_temporal_smoke(ctx: DeviceContext) raises:
     # still >=2 (the reflect-pad1 minimum) for encoder.conv_out's own
     # kernel-3 reflect pad afterward.
     var pixels = Tensor.from_host(
-        _pattern(700, 1 * 10 * 4 * 4 * 2), [1, 10, 4, 4, 2], STDtype.BF16, ctx
+        _pattern(700, 1 * 10 * 4 * 4 * 2), [1, 10, 4, 4, 2], STDtype.F32, ctx
     )
     var moments = minimax_h3_video_encode_temporal(encoder, pixels, tconfig, ctx)
     print("  encode_temporal output shape:", moments.shape())
@@ -296,7 +298,7 @@ def _write_decoder_checkpoint(config: MiniMaxH3VideoDecoderDeviceConfig, ctx: De
         for d in range(len(shape)):
             n *= shape[d]
         var host = _pattern(seed, n)
-        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.BF16, ctx)))
+        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.F32, ctx)))
     save_safetensors(names, tensors, String(DEC_CKPT), ctx)
 
 
@@ -308,7 +310,7 @@ def _run_decode_temporal_seam_test(ctx: DeviceContext) raises:
 
     # latent_t=8, LATENT_H=LATENT_W=1 -> num_chunks=2, pad_tokens=3 (hand-derived).
     var latents = Tensor.from_host(
-        _pattern(800, 1 * 8 * 1 * 1 * 3), [1, 8, 1, 1, 3], STDtype.BF16, ctx
+        _pattern(800, 1 * 8 * 1 * 1 * 3), [1, 8, 1, 1, 3], STDtype.F32, ctx
     )
 
     var dec = minimax_h3_video_decode_temporal[1, 1, 2, 8, 2, 7](decoder, latents, tconfig, ctx)
@@ -338,7 +340,7 @@ def _run_decode_temporal_seam_test(ctx: DeviceContext) raises:
     # 1's window [4:11) is in range -- the production code pads BEFORE
     # slicing per-chunk windows; this verification must match that.
     var clip1_z_unpadded = Tensor.from_host(
-        _pattern(800, 1 * 8 * 1 * 1 * 3), [1, 8, 1, 1, 3], STDtype.BF16, ctx
+        _pattern(800, 1 * 8 * 1 * 1 * 3), [1, 8, 1, 1, 3], STDtype.F32, ctx
     )
     var clip1_last_tok = slice(clip1_z_unpadded, 1, 7, 1, ctx)
     var clip1_z = clip1_z_unpadded.clone(ctx)
@@ -370,7 +372,7 @@ def main() raises:
     var ctx = DeviceContext()
     print("== phase 1: config arithmetic (real FL2VA numbers) ==")
     _run_config_arithmetic_check()
-    print("== phase 2: _blend_frames isolated check ==")
+    print("== phase 2: minimax_h3_video_blend isolated check ==")
     _run_blend_check(ctx)
     print("== phase 3: encode_temporal (toy scale) ==")
     _run_encode_temporal_smoke(ctx)

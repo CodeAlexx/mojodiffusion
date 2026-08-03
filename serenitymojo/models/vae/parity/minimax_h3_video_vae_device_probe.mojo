@@ -39,10 +39,11 @@
 #   LD_LIBRARY_PATH=serenitymojo/ops/cshim/lib:serenitymojo/ops/cshim/lib/cudnn_stubs \
 #     /tmp/mmh3_vae_probe
 #
-# (needs -lcuda + the cshim libs: conv3d_fcqrs_cudnn's BF16 path calls the
-# cuDNN shim in ops/cshim/cudnn_conv3d.cpp, built into
-# libserenity_cudnn_sdpa.so — plain `mojo run` JIT cannot resolve either the
-# CUDA driver symbols or this shim; `mojo build` also needs -lm for a
+# (needs -lcuda + the cshim libs: conv3d_fcqrs_cudnn references the cuDNN
+# shim in ops/cshim/cudnn_conv3d.cpp, built into libserenity_cudnn_sdpa.so —
+# the symbol is referenced (its BF16 branch) even on this F32 toy checkpoint,
+# so linking is required either way; plain `mojo run` JIT cannot resolve
+# either the CUDA driver symbols or this shim; `mojo build` also needs -lm for a
 # separate known libm `sinf` link gap. Same class of fix as the modcache
 # probe's cu_mem_get_info -lcuda need.)
 

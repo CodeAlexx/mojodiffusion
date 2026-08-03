@@ -1,12 +1,33 @@
 # serenitymojo/models/dit/parity/minimax_h3_forward_e2e_probe.mojo
 #
 # WIRING GATE for `minimax_h3_frontend_embed -> minimax_h3_run_stack ->
-# minimax_h3_final_layer`, end to end on REAL block weights (blocks 0 and 1,
-# via the real checkpoint's shard 1) and REAL frontend weights (video/audio/
-# condition patch-proj, time_embedder, token_refiner blocks 0-1 — all also
-# in shard 1). `final_layer.*` (norm, video_out, audio_out, adaln_proj) is
-# ENTIRELY in shard 13, which has not landed — every final_layer weight AND
-# the final-adaLN modulation table are synthetic, and said so at each use.
+# minimax_h3_final_layer`, end to end on REAL block weights and REAL
+# frontend + REAL final-layer weights. UPDATE (2026-08-02, team-lead): shard
+# 13 has landed, so `final_layer.norm.weight`/`video_out.*`/`audio_out.*`/
+# `adaln_proj.linear.*` are now loaded from REAL bytes too — every weight in
+# this file's forward path is real except the per-block AdaLN table itself
+# (`MiniMaxH3ModCache`, deliberately synthetic to avoid duplicating
+# h3-block-gate's real-weight adaLN oracle work — see below). 11 of 13
+# transformer shards are present (missing 00002/00010, i.e. blocks 2-6 and
+# 34-38); this file opens a SCOPED index over the 11 available shards
+# (`ShardedSafeTensors.open` eagerly opens every shard an index references,
+# so pointing at the real directory with 2 shards missing fails at open()
+# itself — see minimax_h3_stack.mojo's own header for the first time this
+# bit; regen command in this file's CHECKPOINT_DIR comment below).
+#
+# THE FINAL ADALN ROW INDEX (team-lead's specific ask): `final_layer.
+# adaln_proj.linear` is [10752,2688] = 2*5376 (shift then scale), and
+# block_forward.mojo's own step-7 comment says it is indexed by TIMESTEP
+# ALONE, not `timestep_index*3+tag` like the main stack's per-block table.
+# Read `minimax_h3_final_layer` (models/dit/minimax_h3_frontend.mojo): it
+# gathers `final_modulation` with `timestep_indices` directly — no *3+tag
+# anywhere. Check [5] below turns that reading into a RUN rather than a
+# claim: with a 2-distinct-timestep table (`final_modulation.shape[0]==2`),
+# any row using tag>=1 at timestep_index==1 would compute an OUT-OF-RANGE
+# gather index under a *3+tag scheme (`1*3+2=5 >= 2`) and `gather_rows`
+# would raise loud — it does not, and the two same-timestep/different-tag
+# rows come back with IDENTICAL modulation, which is only possible if tag is
+# never part of the index.
 #
 # THIS IS NOT A NUMERIC PARITY GATE. No oracle is compared against here —
 # h3-block-gate owns the real-weight oracles (adaLN, then the 2-layer stack).
@@ -51,6 +72,15 @@
 #       full run. Every boundary is asserted explicitly (named error on
 #       mismatch), not left to a silent broadcast; magnitudes are PRINTED,
 #       not just checked non-NaN.
+#   [5] FINAL ADALN IS INDEXED BY TIMESTEP ALONE (new). 2 distinct real
+#       timesteps -> real `final_modulation` has exactly 2 rows. Two packed
+#       rows share timestep_index=1 but have DIFFERENT tags (video vs
+#       audio, tag 0 vs 2) — under a correct (timestep-alone) index both
+#       gather modulation row 1 and come back IDENTICAL; under a buggy
+#       `timestep*3+tag` index the audio row would compute index 5 against a
+#       2-row table and `gather_rows` would raise loud. Both outcomes are
+#       reported; a silent pass with a wrong index is not possible here
+#       because the bounds check would have fired first.
 #
 # Run (package-relative imports need -I .; sdpa_flash_infer_fwd needs the
 # cuDNN shim explicitly linked — bare `mojo run -I .` fails with
@@ -68,6 +98,8 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.activations import silu
+from serenitymojo.ops.linear import linear_bias
 from serenitymojo.ops.tensor_algebra import gather_rows
 from serenitymojo.models.minimax_h3.dit_frontend import (
     minimax_h3_rope_inv_freq,
@@ -96,7 +128,12 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_final_layer,
 )
 
-comptime CHECKPOINT_FILE = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transformer/model-00001-of-00013.safetensors"
+# Scoped index over the 11 available shards (2, 10 missing). Regenerate with:
+#   mkdir -p <dir> && ln -sf <real_transformer_dir>/model-*-of-00013.safetensors <dir>/
+#   python3 -c "import json,glob,os; wm=json.load(open('<real_transformer_dir>/model.safetensors.index.json'))['weight_map']; \
+#     have={os.path.basename(p) for p in glob.glob('<dir>/model-*-of-00013.safetensors')}; \
+#     json.dump({'weight_map':{k:v for k,v in wm.items() if v in have}}, open('<dir>/model.safetensors.index.json','w'))"
+comptime CHECKPOINT_DIR = "/tmp/claude-1000/-home-alex-mojodiffusion/7e1531cb-f7e2-44a5-9d63-8604853a656a/scratchpad/h3_transformer_11shards"
 comptime TR_S = 3
 comptime TR_H = 56
 comptime TR_DH = 128
@@ -152,10 +189,12 @@ def _build_frontend_weights(
     any tensor name, not block-specific) rather than re-deriving that
     transform a third time.
 
-    `final_layer.*` is SYNTHETIC — shard 13 (where it lives) has not
-    downloaded. That includes `final_layer.norm.weight`, NOT only the adaLN
-    table team-lead flagged: `final_layer.video_out`/`audio_out` are in
-    shard 13 too, confirmed against the real index.json."""
+    `final_layer.*` (norm.weight, video_out.{weight,bias}, audio_out.
+    {weight,bias}, adaln_proj.linear.{weight,bias}) is now REAL too — shard
+    13 landed. norm.weight/adaln_proj are bf16 (loader.mojo's prefix list);
+    video_out/audio_out are 2 of the 12 fp32 dtype-trap tensors — loaded via
+    `Tensor.from_view` (preserves on-disk dtype, no cast) same as every
+    other direct weight here."""
     var w = Dict[String, ArcPointer[Tensor]]()
     var direct = List[String]()
     direct.append("video_patch_proj.weight")
@@ -169,6 +208,13 @@ def _build_frontend_weights(
     direct.append("time_embedder.proj_out.weight")
     direct.append("time_embedder.proj_out.bias")
     direct.append("token_refiner.final_norm.weight")
+    direct.append("final_layer.norm.weight")
+    direct.append("final_layer.video_out.weight")
+    direct.append("final_layer.video_out.bias")
+    direct.append("final_layer.audio_out.weight")
+    direct.append("final_layer.audio_out.bias")
+    direct.append("final_layer.adaln_proj.linear.weight")
+    direct.append("final_layer.adaln_proj.linear.bias")
     for i in range(len(direct)):
         var n = direct[i]
         w[n] = ArcPointer(Tensor.from_view(st.tensor_view(n), ctx))
@@ -191,19 +237,26 @@ def _build_frontend_weights(
         w[p + "mlp.fc1.weight"] = ArcPointer(
             minimax_h3_load_fc1_device(st, p + "mlp.fc1.weight", ffn, hidden, ctx)
         )
-
-    # SYNTHETIC final_layer (shard 13 not downloaded).
-    var norm_shape: List[Int] = [hidden]
-    w["final_layer.norm.weight"] = ArcPointer(randn(norm_shape^, 501, STDtype.BF16, ctx))
-    var vo_w_shape: List[Int] = [config.video_patch_dim(), hidden]
-    var vo_b_shape: List[Int] = [config.video_patch_dim()]
-    w["final_layer.video_out.weight"] = ArcPointer(randn(vo_w_shape^, 502, STDtype.F32, ctx))
-    w["final_layer.video_out.bias"] = ArcPointer(randn(vo_b_shape^, 503, STDtype.F32, ctx))
-    var ao_w_shape: List[Int] = [config.audio_latents_dim, hidden]
-    var ao_b_shape: List[Int] = [config.audio_latents_dim]
-    w["final_layer.audio_out.weight"] = ArcPointer(randn(ao_w_shape^, 504, STDtype.F32, ctx))
-    w["final_layer.audio_out.bias"] = ArcPointer(randn(ao_b_shape^, 505, STDtype.F32, ctx))
     return w^
+
+
+def _real_final_modulation(
+    temb: Tensor, w: Dict[String, ArcPointer[Tensor]], ctx: DeviceContext
+) raises -> Tensor:
+    """`final_modulation = linear_bias(cast_bf16(silu(temb)), adaln_proj_w,
+    adaln_proj_b)` -> `[num_timesteps, 2*hidden]` BF16 (the GEMM's own
+    dtype — x and weight both bf16). Mirrors minimax_h3_modcache.mojo's
+    documented ACTIVATION PRECISION TRAP exactly: silu runs at temb's OWN
+    f32 precision, and ONLY the activated result is rounded down to bf16
+    before the (bf16 x bf16, F32-accumulated) GEMM."""
+    var activated_f32 = silu(temb, ctx)
+    var activated_bf16 = cast_tensor(activated_f32, STDtype.BF16, ctx)
+    return linear_bias(
+        activated_bf16,
+        w["final_layer.adaln_proj.linear.weight"][],
+        w["final_layer.adaln_proj.linear.bias"][],
+        ctx,
+    )
 
 
 def main() raises:
@@ -211,10 +264,10 @@ def main() raises:
     var config = minimax_h3_released_config()
     config.validate()
 
-    var st = ShardedSafeTensors.open(String(CHECKPOINT_FILE))
-    print("checkpoint:", st.num_shards(), "shard(s),", st.num_tensors(), "tensors (shard 1 only)")
+    var st = ShardedSafeTensors.open(String(CHECKPOINT_DIR))
+    print("checkpoint:", st.num_shards(), "shard(s),", st.num_tensors(), "tensors (11/13 shards, scoped index)")
     var w = _build_frontend_weights(st, config, ctx)
-    print("frontend weights built:", len(w), "tensors (real video/audio/condition/time_embedder/token_refiner + synthetic final_layer)")
+    print("frontend weights built:", len(w), "tensors (real video/audio/condition/time_embedder/token_refiner/final_layer)")
 
     var hidden_size = config.hidden_size
     var n_fail = 0
@@ -239,8 +292,12 @@ def main() raises:
     var audio_rows = randn(audio_shape^, 12, STDtype.F32, ctx)
     var text_shape: List[Int] = [NT, config.text_dim]
     var text_rows = randn(text_shape^, 13, STDtype.BF16, ctx)
-    var ts_shape: List[Int] = [1]
-    var timesteps = randn(ts_shape^, 14, STDtype.F32, ctx)  # num_timesteps=1
+    # 2 DISTINCT real timesteps (not 1): checks [1]-[4] still address only
+    # row 0 (timestep_indices_all0 below), unaffected; check [5] needs a
+    # real 2-row final_modulation table to be decisive.
+    var ts_shape: List[Int] = [2]
+    var ts_host: List[Float32] = [0.3, 0.7]
+    var timesteps = Tensor.from_host(ts_host, ts_shape^, STDtype.F32, ctx)
 
     # Assignment A: interleaved, not contiguous blocks.
     var video_idx_A = [0, 3, 6]
@@ -265,6 +322,14 @@ def main() raises:
     if magH[2] != 0:
         print("  FAIL NaN in frontend hidden")
         n_fail += 1
+
+    # REAL final_modulation — replaces the earlier synthetic table for
+    # every minimax_h3_final_layer call below.
+    var final_mod_real = _real_final_modulation(frontend_A.temb, w, ctx)
+    var fmod_shape = final_mod_real.shape()
+    print("  final_modulation shape", fmod_shape[0], fmod_shape[1], " (expect [2,", 2 * hidden_size, "])")
+    if len(fmod_shape) != 2 or fmod_shape[0] != 2 or fmod_shape[1] != 2 * hidden_size:
+        raise Error("E2E: real final_modulation shape mismatch")
 
     # ─────────────────────────────────────────────────────────────────────
     # [1] SCATTER BIT-EXACT ROUND TRIP
@@ -311,15 +376,12 @@ def main() raises:
     for _ in range(S):
         adaln_dummy.append(0)
 
-    var final_mod_uniform_shape: List[Int] = [1, 2 * hidden_size]
-    var final_mod_uniform = randn(final_mod_uniform_shape^, 800, STDtype.F32, ctx)
-
     var hiddenA0 = minimax_h3_run_stack[S](
         frontend_A.hidden.clone(ctx), st, modcache_dummy, adaln_dummy, cos_t, sin_t, rope.rotary_dim,
         config, ctx, 0,
     )
     var outA = minimax_h3_final_layer(
-        hiddenA0, final_mod_uniform, timestep_indices_all0, video_idx_A, audio_idx_A, w, config, ctx,
+        hiddenA0, final_mod_real, timestep_indices_all0, video_idx_A, audio_idx_A, w, config, ctx,
     )
 
     var frontend_B = minimax_h3_frontend_embed[TR_S, TR_H, TR_DH](
@@ -331,7 +393,7 @@ def main() raises:
         config, ctx, 0,
     )
     var outB = minimax_h3_final_layer(
-        hiddenB0, final_mod_uniform, timestep_indices_all0, video_idx_B, audio_idx_B, w, config, ctx,
+        hiddenB0, final_mod_real, timestep_indices_all0, video_idx_B, audio_idx_B, w, config, ctx,
     )
 
     var diff_video_out = _max_abs_diff(outA.video_out, outB.video_out, ctx)

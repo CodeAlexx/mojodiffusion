@@ -172,7 +172,40 @@
 # in this repo for arbitrary nested config keys, only the safetensors
 # flat-header parser (`io/json_header.mojo`), which is a different format.
 #
-# argv: <prompt> <out_dir> [steps=30] [seed=0]
+# ── PARTIAL MODE (`max_blocks`, 5th argv, default = full 50) ────────────────
+# The transformer download is still in progress (8/13 shards as of this
+# writing); full preflight walks all 50 blocks and correctly refuses to run
+# until the last byte lands. `max_blocks < 50` is an EXPLICIT, LOUD bypass
+# for exercising the rest of the chain end to end sooner:
+#   * preflight only checks blocks `[0, max_blocks)` (via a `run_config`
+#     copy of the released config with `num_layers` overridden — every
+#     function that loops per-block already loops `range(config.num_
+#     layers)`, so this needs no changes to any function's own code, only
+#     which config value it is handed) — see PARTIAL-DOWNLOAD SHARD BYPASS
+#     above for how the shard files themselves are opened.
+#   * conditioning is STUBBED: the text_encoder needs its layer-50 weights,
+#     which live in shard 11 (not downloaded), so a real encode is not
+#     possible yet. A fixed-seed random `[1, TEXT_TOKENS, text_dim]` tensor
+#     stands in — see `_minimax_h3_stub_conditioning` below. THE REAL PROMPT
+#     TO WIRE ONCE THE TEXT ENCODER IS COMPLETE:
+#     `output/minimax_h3_prompts/rain_ring_box_shot1.txt` (245 tokens,
+#     tokenizes clean under H3's own processor) — not used tonight because
+#     it does not match this binary's compiled TEXT_TOKENS budget (see file
+#     header FIXED PROMPT LENGTH); wiring it needs H3_TEXT_TOKENS=245 and a
+#     rebuild, same as any other prompt-length change.
+#   * an UNMISSABLE banner prints (stdout, every phase, and result.json):
+#     this is an N-of-50-layer run with STUBBED conditioning. IT IS NOT A
+#     VALID MINIMAX-H3 GENERATION. It is a plumbing test — proving the
+#     chain (tokenize/stub -> conditioning -> frontend embed -> packed
+#     sequence -> modcache -> N real streamed blocks -> Euler steps ->
+#     final layer -> audio latents -> denormalize -> BigVGAN -> audio.wav)
+#     holds together end to end, which no isolated per-module gate can show.
+# Audio decode, video stub, and every other piece of this file are
+# UNCHANGED by `max_blocks` — the audio path is exercised for real even in
+# a 2-of-50-block run, on whatever (meaningless, undertrained-by-omission)
+# audio latents that run produces.
+#
+# argv: <prompt> <out_dir> [steps=30] [seed=0] [max_blocks=50]
 #
 # ── CHECKPOINT LAYOUT (matches every H3 device module's own defaults) ───
 #   transformer:   .../MiniMax-H3/FL2VA/transformer    (61.73 GiB, 13 shards)
@@ -211,7 +244,7 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import reshape
-from serenitymojo.serve.product_manifest import json_escape, write_text_file
+from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
 from serenitymojo.audio.wav import save_wav
 
 from serenitymojo.models.dit.minimax_h3_dit import (
@@ -241,6 +274,7 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_timestep_embedding,
 )
 from serenitymojo.models.text_encoder.minimax_h3_conditioning import (
+    MiniMaxH3ConditioningOutput,
     minimax_h3_encode_conditioning,
 )
 from serenitymojo.models.dit.minimax_h3_sampling import (
@@ -263,6 +297,93 @@ comptime TEXT_ENCODER_DIR = H3_ROOT + "/text_encoder"
 comptime PROCESSOR_DIR = H3_ROOT + "/processor"
 comptime AUDIO_VAE_PATH = H3_ROOT + "/audio_vae/model.safetensors"
 comptime AUDIO_SAMPLE_RATE = 32000
+
+# 13 shards, `model-{i:05d}-of-00013.safetensors` — the released transformer's
+# own layout (minimax_h3_loader_device.mojo header: "61.73 GiB bf16 across 13
+# shards"; confirmed by the exact missing-file name this pipeline's own
+# preflight has reported: "model-00002-of-00013.safetensors").
+comptime TRANSFORMER_SHARD_COUNT = 13
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PARTIAL-DOWNLOAD SHARD BYPASS. `ShardedSafeTensors.open(dir)` parses the
+# index.json's FULL weight_map and eagerly opens EVERY shard file the index
+# references — including ones not yet downloaded — and dies on the first
+# missing one (io/sharded.mojo's own `open`). That is correct default
+# behaviour for a real run, and is why `--max-blocks` (see file header
+# "PARTIAL MODE") does not change the code path when it equals the full
+# layer count. For a PARTIAL run it is exactly the wrong thing: it refuses
+# to serve tensors from shards that ARE present just because SOME other
+# shard isn't.
+#
+# The bypass: build a `ShardedSafeTensors` directly via its public
+# constructor (`ShardedSafeTensors(shards, name_to_shard)`,
+# io/sharded.mojo) over only the shard FILES that exist on disk right now,
+# mapping each shard's own tensor names (read straight off its own header,
+# not the index) to it. This is the SAME technique `models/dit/parity/
+# minimax_h3_real_block_device_probe.mojo::_open_single_shard_no_index`
+# already established for this exact checkpoint (one hardcoded shard);
+# this generalizes it to "however many of the known 13 files happen to be
+# present", tried newest-numbered-file-last so partial in-progress
+# downloads (a shard file existing but only half-written) are the LAST
+# thing this touches, not the first.
+# ═════════════════════════════════════════════════════════════════════════════
+def _h3_zero_pad5(n: Int) -> String:
+    var s = String(n)
+    while s.byte_length() < 5:
+        s = String("0") + s
+    return s
+
+
+def _h3_shard_filename(index_1based: Int, total: Int) -> String:
+    return (
+        String("model-") + _h3_zero_pad5(index_1based) + String("-of-")
+        + _h3_zero_pad5(total) + String(".safetensors")
+    )
+
+
+def _minimax_h3_open_partial_transformer_shards(
+    dir: String,
+) raises -> ShardedSafeTensors:
+    var shards = List[ArcPointer[SafeTensors]]()
+    var name_to_shard = Dict[String, Int]()
+    var present_files = List[String]()
+    for i in range(1, TRANSFORMER_SHARD_COUNT + 1):
+        var fname = _h3_shard_filename(i, TRANSFORMER_SHARD_COUNT)
+        var path = dir + String("/") + fname
+        try:
+            var st = SafeTensors.open(path)
+            var names = st.names()
+            var idx = len(shards)
+            for j in range(len(names)):
+                name_to_shard[names[j]] = idx
+            shards.append(ArcPointer(st^))
+            present_files.append(fname)
+        except e:
+            # Not yet downloaded (or a genuine open failure) — expected
+            # during a partial download; this shard's tensors are simply
+            # absent from `name_to_shard`, and anything that needs one
+            # fails loudly, by name, at the point that actually reads it
+            # (preflight, if it checks that tensor; the loader otherwise).
+            pass
+    if len(shards) == 0:
+        raise Error(
+            String("minimax_h3_t2va: no transformer shard files present at ")
+            + dir
+        )
+    print("  preflight: partial-mode shard bypass — present files:", len(present_files), "of", TRANSFORMER_SHARD_COUNT)
+    return ShardedSafeTensors(shards^, name_to_shard^)
+
+
+def _minimax_h3_open_transformer_shards(dir: String, partial_mode: Bool) raises -> ShardedSafeTensors:
+    """Single call site for `main()` so it only ever declares ONE `var
+    transformer_shards` regardless of which path was taken — Mojo does not
+    support conditionally initializing one outer `var` from two different
+    branches, so the branch lives here instead."""
+    if partial_mode:
+        return _minimax_h3_open_partial_transformer_shards(dir)
+    return ShardedSafeTensors.open(dir)
+
 
 # ── Geometry (COMPTIME — rebuild to change; see file header "FIXED PROMPT
 # LENGTH" for why TEXT_TOKENS is comptime too, not just video/audio). ────────
@@ -768,16 +889,57 @@ def _minimax_h3_decode_audio(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PARTIAL MODE conditioning stand-in. See file header "PARTIAL MODE".
+# ═════════════════════════════════════════════════════════════════════════════
+def _minimax_h3_stub_conditioning(
+    seed: UInt64, config: MiniMaxH3DiTConfig, ctx: DeviceContext
+) raises -> MiniMaxH3ConditioningOutput:
+    """Fixed-seed random `[1, TEXT_TOKENS, text_dim]` BF16 standing in for a
+    real Qwen3-VL-32B encode — the text_encoder's layer-50 weights live in
+    shard 11, not downloaded. Every row tagged TEXT (matches the real path's
+    own convention: t2va has no keyframes, every text row is `packing.
+    MINIMAX_H3_TEXT_TAG = 1`; models/text_encoder/minimax_h3_conditioning.
+    mojo does the same unconditionally for every token). BF16 to match the
+    real path's own dtype (that file's checkpoint is native bf16, no fp8;
+    `condition_proj`, which consumes this, is bf16-native too — not one of
+    the 12 fp32 dtype-trap tensors). Returns the SAME struct the real path
+    returns (`[1,seq,5120]` embeds + token_tags) so `main()` treats both
+    branches identically from here on — no conditional-var-init, no
+    Tuple-move pitfalls."""
+    var token_tags = List[Int](capacity=TEXT_TOKENS)
+    for _ in range(TEXT_TOKENS):
+        token_tags.append(1)
+    var shape: List[Int] = [1, TEXT_TOKENS, config.text_dim]
+    var embeds = randn(shape^, seed, STDtype.BF16, ctx)
+    return MiniMaxH3ConditioningOutput(embeds^, token_tags^)
+
+
+def _minimax_h3_get_conditioning(
+    partial_mode: Bool, prompt: String, seed: UInt64,
+    config: MiniMaxH3DiTConfig, ctx: DeviceContext,
+) raises -> MiniMaxH3ConditioningOutput:
+    """Single call site for `main()`, mirroring `_minimax_h3_open_
+    transformer_shards`'s reason for existing: one `var cond` regardless of
+    branch."""
+    if partial_mode:
+        return _minimax_h3_stub_conditioning(seed, config, ctx)
+    return minimax_h3_encode_conditioning(
+        String(PROCESSOR_DIR), String(TEXT_ENCODER_DIR), prompt, ctx
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # main
 # ═════════════════════════════════════════════════════════════════════════════
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        print("usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0]")
+        print("usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0] [max_blocks=50]")
         print(
             "  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames,",
             "text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
         )
+        print("  max_blocks < 50 is an explicit PARTIAL-MODE plumbing test — see file header")
         return
 
     var prompt = String(args[1])
@@ -788,9 +950,14 @@ def main() raises:
     var seed = UInt64(DEFAULT_SEED)
     if len(args) >= 5:
         seed = UInt64(atol(String(args[4])))
+    var max_blocks = 50
+    if len(args) >= 6:
+        max_blocks = atol(String(args[5]))
 
     if steps < 2:
         raise Error("minimax_h3_t2va: steps must be >= 2 (the schedule needs >= 2 sigmas)")
+    if max_blocks < 1:
+        raise Error("minimax_h3_t2va: max_blocks must be >= 1")
 
     print("=== MiniMax-H3 t2va ===")
     print("  prompt:", prompt)
@@ -799,30 +966,57 @@ def main() raises:
         NUM_LATENT_FRAMES, ",", LATENT_H, ",", LATENT_W, "], audio_latents=",
         NUM_AUDIO_LATENTS, ", text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
     )
-    print("  steps=", steps, " seed=", seed)
+    print("  steps=", steps, " seed=", seed, " max_blocks=", max_blocks)
 
     # ── PREFLIGHT (before DeviceContext) ──────────────────────────────────
     var t_preflight0 = perf_counter_ns()
     _preflight_geometry()
     var config = minimax_h3_released_config()
     config.validate()
-    print("  preflight: opening transformer shards:", String(TRANSFORMER_DIR))
-    var transformer_shards = ShardedSafeTensors.open(String(TRANSFORMER_DIR))
+    if max_blocks > config.num_layers:
+        max_blocks = config.num_layers
+    var partial_mode = max_blocks < config.num_layers
+    var run_config = config  # implicit copy (Copyable/ImplicitlyCopyable)
+    run_config.num_layers = max_blocks
+
+    if partial_mode:
+        print("")
+        print("  ################################################################")
+        print("  # PARTIAL MODE:", max_blocks, "of", config.num_layers, "transformer blocks.")
+        print("  # Conditioning is STUBBED (fixed-seed random, NOT the real prompt).")
+        print("  # THIS IS NOT A VALID MINIMAX-H3 GENERATION. It is a plumbing test:")
+        print("  # tokenize/stub -> conditioning -> frontend -> packed sequence ->")
+        print("  # modcache -> N real streamed blocks -> Euler -> final layer ->")
+        print("  # audio latents -> denormalize -> BigVGAN -> audio.wav.")
+        print("  ################################################################")
+        print("")
+
+    if partial_mode:
+        print("  preflight: opening transformer shards (PARTIAL bypass):", String(TRANSFORMER_DIR))
+    else:
+        print("  preflight: opening transformer shards:", String(TRANSFORMER_DIR))
+    var transformer_shards = _minimax_h3_open_transformer_shards(String(TRANSFORMER_DIR), partial_mode)
     print(
         "  preflight: ", transformer_shards.num_shards(), "shard(s), ",
         transformer_shards.num_tensors(), "tensors",
     )
-    minimax_h3_check_modcache_weights(transformer_shards, config)
-    _preflight_block_tensors(transformer_shards, config)
+    minimax_h3_check_modcache_weights(transformer_shards, run_config)
+    _preflight_block_tensors(transformer_shards, run_config)
     _preflight_frontend_tensors(transformer_shards, config)
-    print("  preflight: transformer OK (adaLN + ", config.num_layers, "blocks + frontend)")
+    if partial_mode:
+        print("  preflight: transformer OK (adaLN + ", max_blocks, "of", config.num_layers, "blocks + frontend) [PARTIAL]")
+    else:
+        print("  preflight: transformer OK (adaLN + ", config.num_layers, "blocks + frontend)")
 
-    print("  preflight: opening text_encoder shards:", String(TEXT_ENCODER_DIR))
-    var text_encoder_shards = ShardedSafeTensors.open(String(TEXT_ENCODER_DIR))
-    print(
-        "  preflight: ", text_encoder_shards.num_shards(), "shard(s), ",
-        text_encoder_shards.num_tensors(), "tensors",
-    )
+    if not partial_mode:
+        print("  preflight: opening text_encoder shards:", String(TEXT_ENCODER_DIR))
+        var text_encoder_shards = ShardedSafeTensors.open(String(TEXT_ENCODER_DIR))
+        print(
+            "  preflight: ", text_encoder_shards.num_shards(), "shard(s), ",
+            text_encoder_shards.num_tensors(), "tensors",
+        )
+    else:
+        print("  preflight: text_encoder SKIPPED (PARTIAL MODE — conditioning is stubbed)")
 
     print("  preflight: opening audio_vae:", String(AUDIO_VAE_PATH))
     _minimax_h3_preflight_audio_vae(String(AUDIO_VAE_PATH))
@@ -835,11 +1029,9 @@ def main() raises:
 
     var ctx = DeviceContext()
 
-    # ── 1. Conditioning ────────────────────────────────────────────────────
+    # ── 1. Conditioning (real, or STUBBED in partial mode — see file header) ──
     var t_cond0 = perf_counter_ns()
-    var cond = minimax_h3_encode_conditioning(
-        String(PROCESSOR_DIR), String(TEXT_ENCODER_DIR), prompt, ctx
-    )
+    var cond = _minimax_h3_get_conditioning(partial_mode, prompt, seed, config, ctx)
     if len(cond.token_tags) != TEXT_TOKENS:
         raise Error(
             String("minimax_h3_t2va: prompt tokenized to ")
@@ -851,8 +1043,8 @@ def main() raises:
     var text_rows = reshape(cond.embeds, [TEXT_TOKENS, config.text_dim], ctx)
     var t_cond1 = perf_counter_ns()
     print(
-        "  conditioning: ", TEXT_TOKENS, " tokens (",
-        Float64(t_cond1 - t_cond0) / 1.0e9, "s)",
+        "  conditioning", "[STUBBED]" if partial_mode else "[real]", ": ",
+        TEXT_TOKENS, " tokens (", Float64(t_cond1 - t_cond0) / 1.0e9, "s)",
     )
 
     # ── 2. Packed-sequence geometry (host scalar, this port's own reproduction) ──
@@ -907,7 +1099,7 @@ def main() raises:
 
     var frontend_w = _minimax_h3_load_frontend_weights(transformer_shards, config, ctx)
     var temb = minimax_h3_timestep_embedding(temb_timesteps_tensor, frontend_w, config, ctx)
-    var modcache = minimax_h3_build_modulation_cache(transformer_shards, temb, config, ctx)
+    var modcache = minimax_h3_build_modulation_cache(transformer_shards, temb, run_config, ctx)
     ctx.synchronize()
     var t_mod1 = perf_counter_ns()
     print(
@@ -950,7 +1142,7 @@ def main() raises:
             SEQ_LEN, frontend_w, config, ctx,
         )
 
-        for layer in range(config.num_layers):
+        for layer in range(run_config.num_layers):  # max_blocks (== 50 unless partial_mode)
             var block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
             embed.hidden = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
                 embed.hidden, block_w, layer, config, modcache.block_mod[layer][],
@@ -989,7 +1181,16 @@ def main() raises:
 
     # ── 8. Result JSON — audio is a real artifact; video/mux are not ───────
     var result_body = String("{\n")
+    result_body += String("  \"partial_mode\":") + json_bool(partial_mode) + String(",\n")
+    result_body += String("  \"max_blocks\":") + String(max_blocks) + String(",\n")
+    result_body += String("  \"total_blocks\":") + String(config.num_layers) + String(",\n")
+    if partial_mode:
+        result_body += String(
+            "  \"WARNING\":\"THIS IS NOT A VALID MINIMAX-H3 GENERATION."
+            " Partial block count + stubbed conditioning. Plumbing test only.\",\n"
+        )
     result_body += String("  \"prompt\":\"") + json_escape(prompt) + String("\",\n")
+    result_body += String("  \"conditioning\":\"") + (String("stubbed") if partial_mode else String("real")) + String("\",\n")
     result_body += String("  \"steps\":") + String(num_steps) + String(",\n")
     result_body += String("  \"seed\":") + String(seed) + String(",\n")
     result_body += String("  \"width\":") + String(WIDTH) + String(",\n")

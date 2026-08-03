@@ -71,7 +71,8 @@ from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
-from serenitymojo.ops.tensor_algebra import add, concat, mul, slice
+from serenitymojo.ops.tensor_algebra import concat, slice
+from serenitymojo.pipeline.minimax_h3_video_vae_blend import minimax_h3_video_blend
 from serenitymojo.models.vae.minimax_h3_video_encoder_device import (
     MiniMaxH3VideoEncoderDevice, minimax_h3_video_encode_device,
 )
@@ -132,42 +133,6 @@ def minimax_h3_video_released_temporal_config() -> MiniMaxH3VideoTemporalConfig:
     `video_vae/source/config.json` — matches
     `minimax_h3_video_released_encoder_config()`'s time_down list."""
     return MiniMaxH3VideoTemporalConfig(17, 4, 3)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# blend — linear cross-fade over the LAST `extent` frames of `a` and the
-# FIRST `extent` frames of `b` (temporal axis 1, NDHWC), `b`'s remaining
-# frames appended untouched. Matches klvae.py `AutoencoderKL.blend`
-# (:220-250, `dim=-3` there is this same frame axis).
-# ─────────────────────────────────────────────────────────────────────────────
-def _blend_frames(a: Tensor, b: Tensor, blend_extent: Int, ctx: DeviceContext) raises -> Tensor:
-    var ash = a.shape()
-    var bsh = b.shape()
-    var extent = blend_extent
-    if ash[1] < extent:
-        extent = ash[1]
-    if bsh[1] < extent:
-        extent = bsh[1]
-    if extent <= 0:
-        return b.clone(ctx)
-
-    var a_overlap = slice(a, 1, ash[1] - extent, extent, ctx)
-    var b_overlap = slice(b, 1, 0, extent, ctx)
-
-    var wb_host = List[Float32](capacity=extent)
-    var wa_host = List[Float32](capacity=extent)
-    for i in range(extent):
-        var t = Float32(i) / Float32(extent)
-        wb_host.append(t)
-        wa_host.append(Float32(1.0) - t)
-    var wb = Tensor.from_host(wb_host, [1, extent, 1, 1, 1], a.dtype(), ctx)
-    var wa = Tensor.from_host(wa_host, [1, extent, 1, 1, 1], a.dtype(), ctx)
-
-    var blended = add(mul(a_overlap, wa, ctx), mul(b_overlap, wb, ctx), ctx)
-    if extent < bsh[1]:
-        var b_rest = slice(b, 1, extent, bsh[1] - extent, ctx)
-        return concat(1, ctx, blended, b_rest)
-    return blended^
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +300,7 @@ def minimax_h3_video_decode_temporal[
             if j == 0:
                 var out_chunk: Tensor
                 if dec_overlap:
-                    out_chunk = _blend_frames(dec_overlap.value(), trimmed, frame_overlap, ctx)
+                    out_chunk = minimax_h3_video_blend(dec_overlap.value(), trimmed, frame_overlap, 1, ctx)
                 else:
                     out_chunk = trimmed^
                 dec_parts.append(TArc(out_chunk^))

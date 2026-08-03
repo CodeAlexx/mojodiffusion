@@ -259,7 +259,7 @@ from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import reshape, permute, slice
+from serenitymojo.ops.tensor_algebra import reshape, permute, slice, add, mul
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
 from serenitymojo.audio.wav import save_wav
 
@@ -738,6 +738,23 @@ def _minimax_h3_decode_video(
         grid_fhwc, [1, latent_frames, latent_h, latent_w, latent_channels], ctx
     )
 
+    # ── VIDEO LATENT DENORMALIZATION. The DiT denoises in NORMALIZED latent
+    # space; the VAE expects its OWN space. Measured in the diffusers PR
+    # (pr15210.diff:1923,1929): encode `(mean - latents_mean)/latents_std`,
+    # decode `z = z * latents_std + latents_mean` — the exact convention the
+    # AUDIO path already applies. Skipping this feeds the decoder
+    # out-of-distribution input and renders as fine mosaic texture with
+    # surviving global structure (observed on the first two full runs).
+    # Values hardcoded VERBATIM from the released
+    # FL2VA/video_vae/config.json `latents_mean`/`latents_std` (24 per-channel
+    # F32 values, verified 2026-08-03). Channel-last NDHWC broadcasts the
+    # [24] tensors directly against the trailing axis.
+    var vid_lat_mean = [Float32(0.858090341091156), Float32(-0.9606591463088989), Float32(1.0661640167236328), Float32(-0.5090325474739075), Float32(-0.2727581858634949), Float32(-1.3675414323806763), Float32(-0.2553254961967468), Float32(-0.26907554268836975), Float32(-0.5376840829849243), Float32(-0.0464097298681736), Float32(0.6657370328903198), Float32(0.19690127670764923), Float32(-0.5460608005523682), Float32(-0.4035342037677765), Float32(-0.23683024942874908), Float32(0.25928452610969543), Float32(-0.30133944749832153), Float32(0.211341992020607), Float32(-1.1206848621368408), Float32(0.3581933379173279), Float32(-0.04225143790245056), Float32(0.2604829967021942), Float32(0.22864092886447906), Float32(0.7056031823158264)]
+    var vid_lat_std = [Float32(1.2223774194717407), Float32(1.2767263650894165), Float32(1.6831774711608887), Float32(1.7549455165863037), Float32(1.5636216402053833), Float32(2.194143533706665), Float32(0.9653137922286987), Float32(1.0569885969161987), Float32(0.841948926448822), Float32(0.7729952931404114), Float32(1.8955937623977661), Float32(0.946841835975647), Float32(0.7996809482574463), Float32(0.44988900423049927), Float32(0.7197399735450745), Float32(0.6936293244361877), Float32(2.961095094680786), Float32(2.7694199085235596), Float32(3.0496184825897217), Float32(2.1088054180145264), Float32(3.276226282119751), Float32(3.1627357006073), Float32(2.2816812992095947), Float32(2.6127843856811523)]
+    var lat_mean_t = Tensor.from_host(vid_lat_mean, [24], latents.dtype(), ctx)
+    var lat_std_t = Tensor.from_host(vid_lat_std, [24], latents.dtype(), ctx)
+    latents = add(mul(latents, lat_std_t, ctx), lat_mean_t, ctx)
+
     var dcfg = minimax_h3_video_released_decoder_config()
     var decoder = minimax_h3_video_decoder_device_load(vae_dir, dcfg, ctx)
     # TILED, not the per-volume call. video_vae/config.json enables tiling BY
@@ -1056,6 +1073,33 @@ def main() raises:
     var max_blocks = 50
     if len(args) >= 6:
         max_blocks = atol(String(args[5]))
+
+    # ── DECODE-ONLY MODE: argv[6] == "decode_only" reuses a prior run's saved
+    # latents (out_dir/latents.safetensors) and runs ONLY the decode tail —
+    # a decode-layer fix costs ~2 minutes instead of a 30-minute denoise.
+    if len(args) >= 7 and String(args[6]) == "decode_only":
+        var ctx2 = DeviceContext()
+        print("  DECODE-ONLY: loading", out_dir + "/latents.safetensors")
+        var lat_st = SafeTensors.open(out_dir + "/latents.safetensors")
+        var vinfo = lat_st.tensor_info("video_state_rows")
+        var video_rows = Tensor.from_view(
+            from_parts(vinfo.dtype, vinfo.shape.copy(), lat_st.tensor_bytes("video_state_rows")), ctx2
+        )
+        var ainfo = lat_st.tensor_info("audio_state_rows")
+        var audio_rows = Tensor.from_view(
+            from_parts(ainfo.dtype, ainfo.shape.copy(), lat_st.tensor_bytes("audio_state_rows")), ctx2
+        )
+        print("  video rows", video_rows.shape(), " audio rows", audio_rows.shape())
+        var config2 = minimax_h3_released_config()
+        _ = _minimax_h3_decode_audio(
+            audio_rows, NUM_AUDIO_LATENTS, config2.audio_latents_dim, out_dir, ctx2
+        )
+        var nframes = _minimax_h3_decode_video(
+            video_rows, NUM_LATENT_FRAMES, LATENT_H, LATENT_W,
+            config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
+        )
+        print("  DECODE-ONLY done:", nframes, "frames +", out_dir + "/audio.wav")
+        return
 
     if steps < 2:
         raise Error("minimax_h3_t2va: steps must be >= 2 (the schedule needs >= 2 sigmas)")

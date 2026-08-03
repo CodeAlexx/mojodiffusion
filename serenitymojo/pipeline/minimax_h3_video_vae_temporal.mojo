@@ -43,18 +43,28 @@
 # that end index is `< (num_chunks+1)*tokens_chunk_size` for every
 # `i <= num_chunks-1` — no chunk is ever truncated at the padded boundary.
 #
-# NOT PORTED (see the audit report to team-lead): SPATIAL TILING
-# (tiled_encode/tiled_decode, klvae.py :297-429) — the reference's
-# `_adaptive_encode`/`_adaptive_decode` call tiled_encode/tiled_decode
-# INSIDE each temporal clip's encode/decode when `encoder_tiling`/
-# `decoder_tiling` are set, and FL2VA's `video_vae/config.json` sets BOTH
-# to 1 (on) with `vae_tile_size: 256` PIXELS — meaning tiling is NOT merely
+# SPATIAL TILING (tiled_encode/tiled_decode, klvae.py :297-429; ported in
+# pipeline/minimax_h3_video_vae_spatial_tiling.mojo) is WIRED IN at exactly
+# the reference's own `_adaptive_encode`/`_adaptive_decode` call sites: this
+# module's per-clip step calls `minimax_h3_video_tiled_encode`/`_tiled_
+# decode`, not the untiled per-volume functions directly. FL2VA's
+# `video_vae/config.json` sets `encoder_tiling`/`decoder_tiling` to 1 (on)
+# by default with `vae_tile_size: 256` PIXELS — tiling is NOT merely
 # large-canvas insurance for this release, it is the release's own default
-# even at moderate resolutions. This module calls the per-volume device
-# functions DIRECTLY at the `_adaptive_encode`/`_adaptive_decode` call
-# sites (`_encode_one_clip`/`_decode_one_clip` below) specifically so
-# spatial tiling can be inserted there later without touching the temporal
-# logic — same layering the reference itself uses.
+# even at moderate resolutions (confirmed: at 1344x768 both axes exceed 256).
+#
+# COMPOSITION SAFETY (tiles-within-chunks): spatial tiling fully resolves
+# every H/W seam INSIDE one `tiled_encode`/`tiled_decode` call (same input/
+# output contract as the untiled per-volume functions), so by the time THIS
+# module's temporal blend runs, it is operating on a complete, already
+# spatially-reconstructed per-clip volume — the temporal blend never sees a
+# partial tile, and the two blends are resolved at different times on
+# disjoint axes. Measured, not just argued: see the composition gate in
+# pipeline/parity/minimax_h3_video_vae_composition_probe.mojo, which checks
+# a volume needing BOTH multiple chunks AND multiple tiles simultaneously,
+# including the corner where a spatial seam meets a temporal seam, against
+# a direct untiled/unchunked decode of the same volume (no oracle needed —
+# tiled+chunked must match the direct path to blend precision).
 #
 # ALSO NOT PORTED: `DiagonalGaussianDistribution.sample()`. This module's
 # encode path returns MOMENTS (2*z_channels wide), matching
@@ -73,11 +83,14 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import concat, slice
 from serenitymojo.pipeline.minimax_h3_video_vae_blend import minimax_h3_video_blend
+from serenitymojo.pipeline.minimax_h3_video_vae_spatial_tiling import (
+    MiniMaxH3TilingConfig, minimax_h3_video_tiled_decode, minimax_h3_video_tiled_encode,
+)
 from serenitymojo.models.vae.minimax_h3_video_encoder_device import (
-    MiniMaxH3VideoEncoderDevice, minimax_h3_video_encode_device,
+    MiniMaxH3VideoEncoderDevice,
 )
 from serenitymojo.models.vae.minimax_h3_video_decoder_device import (
-    MiniMaxH3VideoDecoderDevice, minimax_h3_video_decode_device,
+    MiniMaxH3VideoDecoderDevice,
 )
 
 comptime TArc = ArcPointer[Tensor]
@@ -142,13 +155,17 @@ def minimax_h3_video_encode_temporal(
     encoder: MiniMaxH3VideoEncoderDevice,
     pixels: Tensor,  # [1, T_raw, H, W, in_channels] NDHWC, ImageNet-normalized
     tconfig: MiniMaxH3VideoTemporalConfig,
+    tiling: MiniMaxH3TilingConfig,
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Returns MOMENTS `[1, num_chunks*tokens_chunk_size - token_drop, H',
     W', 2*z_channels]` — the caller samples (DiagonalGaussianDistribution),
     this module does not (see this file's header). Mirrors
     `encode_temporal` (:461-512) for FL2VA's config (all isolated_* flags
-    False, so `offset_frame` is always 0)."""
+    False, so `offset_frame` is always 0). Each clip's encode goes through
+    `minimax_h3_video_tiled_encode` (`_adaptive_encode`'s own composition —
+    tiling fully resolves spatially before this function ever concatenates
+    across the temporal axis)."""
     var s = pixels.shape()
     var t_raw = s[1]
     var clip_length = tconfig.clip_length
@@ -173,7 +190,7 @@ def minimax_h3_video_encode_temporal(
     var z_parts = List[TArc]()
     for i in range(num_chunks):
         var clip_x = slice(x, 1, i * clip_length, clip_length, ctx)
-        var moments = minimax_h3_video_encode_device(encoder, clip_x, ctx)
+        var moments = minimax_h3_video_tiled_encode(encoder, clip_x, tiling, ctx)
         z_parts.append(TArc(moments^))
 
     var z_cat = z_parts[0][].clone(ctx)
@@ -214,19 +231,26 @@ def _decode_temporal_pad_frames(
 
 
 def minimax_h3_video_decode_temporal[
-    LATENT_H: Int, LATENT_W: Int, HEADS: Int, DIM_HEAD: Int, NUM_SUFFIX: Int,
+    LATENT_TILE_H: Int, LATENT_TILE_W: Int, HEADS: Int, DIM_HEAD: Int, NUM_SUFFIX: Int,
     TOKENS_PER_CLIP: Int,
 ](
     decoder: MiniMaxH3VideoDecoderDevice,
-    latents: Tensor,  # [1, latent_T, LATENT_H, LATENT_W, latent_channels] NDHWC, SAMPLED
+    latents: Tensor,  # [1, latent_T, latent_H, latent_W, latent_channels] NDHWC, SAMPLED
     tconfig: MiniMaxH3VideoTemporalConfig,
+    tiling: MiniMaxH3TilingConfig,
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Mirrors `decode_temporal`'s NON-STREAMING branch (:721-788) for
-    FL2VA's config (`z_head`/`z_tail` always None). `TOKENS_PER_CLIP` is the
-    comptime twin of `tconfig.tokens_per_clip()` — required because
-    `ops/attention.sdpa_nomask`'s sequence length is compile-time; see this
-    file's header for why ONE value suffices for every chunk. `NUM_SUFFIX`
+    FL2VA's config (`z_head`/`z_tail` always None). Each clip's decode goes
+    through `minimax_h3_video_tiled_decode` (`_adaptive_decode`'s own
+    composition), so `latents`' own H/W (read at runtime below) need not
+    equal a single tile — `LATENT_TILE_H`/`LATENT_TILE_W` are the comptime
+    SPATIAL TILE size `minimax_h3_video_tiled_decode` will actually use
+    (equal to the full per-clip canvas only when that canvas fits in one
+    tile), required because `ops/attention.sdpa_nomask`'s sequence length
+    is compile-time; see this file's header for why ONE value suffices for
+    every chunk (temporal) and `minimax_h3_video_vae_spatial_tiling.mojo`'s
+    header for why ONE value suffices for every tile (spatial). `NUM_SUFFIX`
     is `1 + decoder.config.num_register_tokens`, `HEADS`/`DIM_HEAD` are
     `decoder.config.heads`/`dim_head` — all four checked against the
     runtime config below, same pattern
@@ -237,8 +261,6 @@ def minimax_h3_video_decode_temporal[
         raise Error("MiniMax-H3 video temporal decode: comptime NUM_SUFFIX mismatch")
     if tconfig.tokens_per_clip() != TOKENS_PER_CLIP:
         raise Error("MiniMax-H3 video temporal decode: comptime TOKENS_PER_CLIP mismatch")
-
-    comptime S_CLIP = TOKENS_PER_CLIP * LATENT_H * LATENT_W + NUM_SUFFIX
 
     var tokens_chunk_size = tconfig.tokens_chunk_size()
     var frame_pre_padding = tconfig.frame_pre_padding()
@@ -278,9 +300,9 @@ def minimax_h3_video_decode_temporal[
     for i in range(num_chunks):
         var t_start = i * tokens_chunk_size
         var clip_z = slice(z, 1, t_start, TOKENS_PER_CLIP, ctx)
-        var clip_dec = minimax_h3_video_decode_device[S_CLIP, HEADS, DIM_HEAD](
-            decoder, clip_z, ctx
-        )
+        var clip_dec = minimax_h3_video_tiled_decode[
+            LATENT_TILE_H, LATENT_TILE_W, HEADS, DIM_HEAD, NUM_SUFFIX, TOKENS_PER_CLIP
+        ](decoder, clip_z, tiling, ctx)
         var clip_frames = clip_dec.shape()[1]
 
         for j in range(split_count):

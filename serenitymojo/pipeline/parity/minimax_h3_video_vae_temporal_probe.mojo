@@ -64,6 +64,16 @@ from serenitymojo.pipeline.minimax_h3_video_vae_temporal import (
     minimax_h3_video_released_temporal_config,
 )
 from serenitymojo.pipeline.minimax_h3_video_vae_blend import minimax_h3_video_blend
+from serenitymojo.pipeline.minimax_h3_video_vae_spatial_tiling import MiniMaxH3TilingConfig
+
+
+def _no_tiling() -> MiniMaxH3TilingConfig:
+    """A tile_size larger than any toy canvas used in this file, so every
+    call below takes minimax_h3_video_tiled_{encode,decode}'s single-tile
+    fast path -- these phases test the TEMPORAL layer, not tiling (tiling
+    has its own probe, minimax_h3_video_vae_spatial_tiling_probe.mojo;
+    both-at-once is minimax_h3_video_vae_composition_probe.mojo)."""
+    return MiniMaxH3TilingConfig(1000, 0, 1000, 0, 1)
 
 comptime TArc = ArcPointer[Tensor]
 comptime ENC_CKPT = "/tmp/minimax_h3_temporal_probe_enc.safetensors"
@@ -222,7 +232,7 @@ def _run_encode_temporal_smoke(ctx: DeviceContext) raises:
     var pixels = Tensor.from_host(
         _pattern(700, 1 * 10 * 4 * 4 * 2), [1, 10, 4, 4, 2], STDtype.F32, ctx
     )
-    var moments = minimax_h3_video_encode_temporal(encoder, pixels, tconfig, ctx)
+    var moments = minimax_h3_video_encode_temporal(encoder, pixels, tconfig, _no_tiling(), ctx)
     print("  encode_temporal output shape:", moments.shape())
     # T_raw=10 pads to 14 (2 chunks of 7); each chunk -> ceil(7/2)=4 latent
     # tokens (causal stride-2 downsample); 2*4=8 tokens total; token_drop=1
@@ -313,7 +323,9 @@ def _run_decode_temporal_seam_test(ctx: DeviceContext) raises:
         _pattern(800, 1 * 8 * 1 * 1 * 3), [1, 8, 1, 1, 3], STDtype.F32, ctx
     )
 
-    var dec = minimax_h3_video_decode_temporal[1, 1, 2, 8, 2, 7](decoder, latents, tconfig, ctx)
+    var dec = minimax_h3_video_decode_temporal[1, 1, 2, 8, 2, 7](
+        decoder, latents, tconfig, _no_tiling(), ctx
+    )
     print("  decode_temporal output shape:", dec.shape())
     # Hand-derived: chunk0(7) + chunk1_blended(7) + final_tail(5) = 19 raw,
     # minus pad_frames=5 (traced through _decode_temporal_pad_frames by hand

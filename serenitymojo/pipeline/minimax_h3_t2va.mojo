@@ -1128,32 +1128,57 @@ def main() raises:
         # (the bf16 packed sequence for the block stack) is used.
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
-        # `embed` is kept alive and its `.hidden` field is REASSIGNED across
-        # the 50-block loop in place, rather than moved out into a separate
-        # `var` — MiniMaxH3FrontendEmbed has two Tensor fields (hidden, temb)
-        # and Mojo does not allow destroying a struct whose field was
-        # partially moved out from under it; field reassignment (drop old
-        # value, assign new) has no such restriction. `.temb` is never read
-        # (the precomputed modcache is the AdaLN source of truth here, not a
-        # per-step recompute) and drops with `embed` at the end of the step.
+        # `embed.hidden` is read by BORROWED reference (via `reshape` below),
+        # never moved out — MiniMaxH3FrontendEmbed has two Tensor fields
+        # (hidden, temb) and Mojo does not allow destroying a struct whose
+        # field was partially moved out from under it, so a borrowed read
+        # (which leaves both fields intact) sidesteps that entirely. `.temb`
+        # is never read (the precomputed modcache is the AdaLN source of
+        # truth here, not a per-step recompute) and drops with `embed`
+        # normally at the end of the step.
         var embed = minimax_h3_frontend_embed[TEXT_TOKENS, H3_HEADS, H3_HEAD_DIM](
             video_state, audio_state, text_rows, placeholder_ts,
             geometry.video_indices, geometry.audio_indices, geometry.text_indices,
             SEQ_LEN, frontend_w, config, ctx,
         )
 
+        # RANK ADAPTER — a real seam bug, diagnosed 2026-08-02, between two
+        # files this pipeline does not own (both models/dit/, neither
+        # models/minimax_h3/): `minimax_h3_frontend.mojo::minimax_h3_
+        # scatter_streams` builds `hidden` from `in_shape = [sequence_length,
+        # hidden_size]` — RANK 2 — and `minimax_h3_frontend_embed`'s own
+        # docstring calls that "ready for the stack". But `minimax_h3_dit.
+        # mojo::minimax_h3_block_forward`'s docstring documents `x: [1, S,
+        # hidden]` — RANK 3 — and its code is not merely documented that way:
+        # `qkv_out = linear(attn_in, ...)` then `slice(qkv_out, 2, ...)`
+        # hard-codes dim INDEX 2, which does not exist on a rank-2 tensor.
+        # MEASURED: this is exactly where a real partial-block run raised
+        # "slice: dim out of range", immediately after modcache, before any
+        # per-block progress — i.e. inside the FIRST block_forward call, at
+        # this exact slice. `minimax_h3_final_layer`'s own docstring, in
+        # turn, wants `hidden: [S, hidden]` — RANK 2 — right back, matching
+        # frontend_embed's convention, not block_forward's. So the two
+        # non-block_forward functions agree with each other and disagree
+        # with block_forward; the adapter belongs at THIS seam (the wiring
+        # this file owns), not inside either upstream file — reshape in
+        # immediately before the block loop, reshape back out immediately
+        # after, and do not touch minimax_h3_frontend.mojo or minimax_h3_dit.
+        # mojo to make this fit.
+        var hidden3 = reshape(embed.hidden, [1, SEQ_LEN, config.hidden_size], ctx)
+
         for layer in range(run_config.num_layers):  # max_blocks (== 50 unless partial_mode)
             var block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
-            embed.hidden = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
-                embed.hidden, block_w, layer, config, modcache.block_mod[layer][],
+            hidden3 = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
+                hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
             )
             # `block_w` drops here: this layer's ~0.77 GiB bf16 is freed
             # before the next layer's load — resident footprint stays at one
             # block, never the full 61.73 GiB stack.
 
+        var hidden2 = reshape(hidden3, [SEQ_LEN, config.hidden_size], ctx)
         var frontend_out = minimax_h3_final_layer(
-            embed.hidden, modcache.final_mod[], global_row,
+            hidden2, modcache.final_mod[], global_row,
             geometry.video_indices, geometry.audio_indices,
             frontend_w, config, ctx,
         )

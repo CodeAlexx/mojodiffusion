@@ -244,19 +244,35 @@ def _real_final_modulation(
     temb: Tensor, w: Dict[String, ArcPointer[Tensor]], ctx: DeviceContext
 ) raises -> Tensor:
     """`final_modulation = linear_bias(cast_bf16(silu(temb)), adaln_proj_w,
-    adaln_proj_b)` -> `[num_timesteps, 2*hidden]` BF16 (the GEMM's own
-    dtype — x and weight both bf16). Mirrors minimax_h3_modcache.mojo's
-    documented ACTIVATION PRECISION TRAP exactly: silu runs at temb's OWN
-    f32 precision, and ONLY the activated result is rounded down to bf16
-    before the (bf16 x bf16, F32-accumulated) GEMM."""
+    adaln_proj_b)` -> `[num_timesteps, 2*hidden]`, then cast to F32.
+    Mirrors minimax_h3_modcache.mojo's documented ACTIVATION PRECISION TRAP
+    for the GEMM itself: silu runs at temb's OWN f32 precision, and ONLY the
+    activated result is rounded down to bf16 before the (bf16 x bf16,
+    F32-accumulated) GEMM.
+
+    REAL FINDING (this file's first run without the cast): unlike the
+    per-block `mod` (dtype-flexible — `minimax_h3_block_forward`'s own
+    docstring says F32 or BF16 both work, since gather_rows/modulate/
+    residual_gate cast internally), `minimax_h3_final_layer` is NOT
+    dtype-flexible — it calls `add_scalar`/`mul`/`add` directly on slices of
+    `final_modulation` against its own F32-cast normed hidden state, with no
+    internal cast step. Passing the natural BF16 GEMM output (mirroring the
+    block path's pattern) crashed with "elementwise: a/b dtype mismatch
+    a=F32 ... b=BF16 ...". The explicit cast below is what
+    minimax_h3_frontend.mojo's own docstring for `final_modulation` already
+    says ("F32... matching the sibling per-block modulation contract");
+    that docstring line also says "UNVERIFIED against a real forward" — this
+    IS that verification, and it confirms F32 is REQUIRED, not merely
+    accepted."""
     var activated_f32 = silu(temb, ctx)
     var activated_bf16 = cast_tensor(activated_f32, STDtype.BF16, ctx)
-    return linear_bias(
+    var mod_bf16 = linear_bias(
         activated_bf16,
         w["final_layer.adaln_proj.linear.weight"][],
         w["final_layer.adaln_proj.linear.bias"][],
         ctx,
     )
+    return cast_tensor(mod_bf16, STDtype.F32, ctx)
 
 
 def main() raises:
@@ -418,9 +434,14 @@ def main() raises:
     for i in range(2):
         var shp2: List[Int] = [3, 6 * hidden_size]  # 1 timestep * 3 tags
         block_mod_real.append(ArcPointer(randn(shp2^, UInt64(900 + i), STDtype.BF16, ctx)))
-    var fmod_real_shape: List[Int] = [1, 2 * hidden_size]
-    var final_mod_real = ArcPointer(randn(fmod_real_shape^, 950, STDtype.BF16, ctx))
-    var modcache_real = MiniMaxH3ModCache(block_mod_real^, final_mod_real^, 1)
+    # placeholder ONLY to satisfy MiniMaxH3ModCache's struct field —
+    # minimax_h3_run_stack never reads modcache.final_mod (the final layer
+    # is a separate unit); the REAL final_modulation is `final_mod_real`
+    # (computed above from real adaln_proj), used below by every
+    # minimax_h3_final_layer call, NOT this placeholder.
+    var fmod_placeholder_shape: List[Int] = [1, 2 * hidden_size]
+    var final_mod_placeholder = ArcPointer(randn(fmod_placeholder_shape^, 950, STDtype.BF16, ctx))
+    var modcache_real = MiniMaxH3ModCache(block_mod_real^, final_mod_placeholder^, 1)
 
     var stacked_real = minimax_h3_run_stack[S](
         frontend_A.hidden.clone(ctx), st, modcache_real, adaln_indices_real, cos_t, sin_t, rope.rotary_dim,
@@ -450,7 +471,7 @@ def main() raises:
         print("  ok   per-(timestep,tag) adaLN differentiation propagates through frontend + 2 real blocks")
 
     var final_out = minimax_h3_final_layer(
-        stacked_real, final_mod_uniform, timestep_indices_all0, video_idx_A, audio_idx_A, w, config, ctx,
+        stacked_real, final_mod_real, timestep_indices_all0, video_idx_A, audio_idx_A, w, config, ctx,
     )
     if len(final_out.video_out.shape()) != 2 or final_out.video_out.shape()[0] != NV or final_out.video_out.shape()[1] != config.video_patch_dim():
         raise Error("E2E: final_layer video_out shape mismatch")
@@ -462,6 +483,48 @@ def main() raises:
     print("  audio_out shape", final_out.audio_out.shape()[0], final_out.audio_out.shape()[1], " mean_abs", magAO[0], " max_abs", magAO[1], " nan", magAO[2])
     if magVO[2] != 0 or magAO[2] != 0:
         print("  FAIL NaN in final_layer output")
+        n_fail += 1
+
+    # ─────────────────────────────────────────────────────────────────────
+    # [5] FINAL ADALN INDEXED BY TIMESTEP ALONE (real finding either way)
+    # ─────────────────────────────────────────────────────────────────────
+    print("")
+    print("[5] final adaLN row index: timestep alone, NOT timestep*3+tag")
+    print("  minimax_h3_final_layer's own signature has no token_tags parameter at")
+    print("  all, so it structurally CANNOT apply a *3+tag formula internally --")
+    print("  the real risk is a CALL SITE passing the block-style adaln_indices")
+    print("  where final_layer wants pure timestep_indices. Prove the two are NOT")
+    print("  interchangeable: 2 distinct real timesteps -> final_modulation has 2")
+    print("  rows; the SAME rows' block-style (timestep*3+tag) indices reach 5.")
+    var timestep_indices_mixed = [0, 0, 0, 1, 1, 1, 1, 1]
+    var final_out5 = minimax_h3_final_layer(
+        stacked_real, final_mod_real, timestep_indices_mixed, video_idx_A, audio_idx_A, w, config, ctx,
+    )
+    var mag5v = _mag(final_out5.video_out, ctx)
+    var mag5a = _mag(final_out5.audio_out, ctx)
+    print("  correct call (pure timestep_indices): video_out mean_abs", mag5v[0], " audio_out mean_abs", mag5a[0])
+    if mag5v[2] != 0 or mag5a[2] != 0:
+        print("  FAIL NaN with pure timestep_indices")
+        n_fail += 1
+    else:
+        print("  ok   ran clean against the real 2-row final_modulation table")
+
+    var adaln_indices_mixed = minimax_h3_adaln_rows(timestep_indices_mixed, token_tags)
+    print("  block-style indices for the same rows:", adaln_indices_mixed, " (final_modulation only has 2 rows)")
+    var wrong_raised = False
+    try:
+        var final_out5_wrong = minimax_h3_final_layer(
+            stacked_real, final_mod_real, adaln_indices_mixed, video_idx_A, audio_idx_A, w, config, ctx,
+        )
+        _ = final_out5_wrong.video_out.to_host(ctx)
+        _ = final_out5_wrong.audio_out.to_host(ctx)
+    except e:
+        wrong_raised = True
+        print("  ok   feeding block-style indices to final_layer instead raised:", e)
+    if not wrong_raised:
+        print("  FAIL block-style (timestep*3+tag) indices did NOT raise against a 2-row"
+              " table — either gather_rows' bounds check is broken or final_modulation"
+              " has more rows than expected; either way a real finding, not a pass")
         n_fail += 1
 
     print("")

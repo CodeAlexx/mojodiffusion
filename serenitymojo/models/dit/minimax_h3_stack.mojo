@@ -84,13 +84,23 @@ def minimax_h3_run_stack[
     config: MiniMaxH3DiTConfig,
     ctx: DeviceContext,
     num_layers: Int = -1,
+    start_layer: Int = 0,
 ) raises -> Tensor:
-    """Stream and run `num_layers` denoiser blocks (default: `config.
-    num_layers`, i.e. all 50 at production). `num_layers` is a separate
-    override — not just `config.num_layers` — so this SAME function runs the
-    partial checkpoint honestly today (only layers 0-1 are fully downloaded
-    as of this writing) without a second copy of the loop; production callers
-    leave it at the default.
+    """Stream and run `num_layers` denoiser blocks starting at `start_layer`
+    (defaults: `start_layer=0`, `num_layers=config.num_layers`, i.e. all 50
+    from the top at production). Both are separate overrides — not just
+    `config.num_layers` — so this SAME function runs whatever CONTIGUOUS
+    range of the partial checkpoint is actually downloaded today (e.g.
+    blocks 7-33) without a second copy of the loop; production callers leave
+    both at their defaults.
+
+    `start_layer` shifts the ABSOLUTE layer number used for weight lookup
+    (`minimax_h3_load_block_device`/`minimax_h3_block_forward`'s `layer`
+    param — this must be the real checkpoint layer, e.g. 7, so the weight
+    key prefix `blocks.7.` is correct) but NOT the modcache index (`modcache
+    .block_mod[i]` stays 0-based over the `num_layers`-long RANGE being run
+    — a caller testing a partial range builds a modcache sized for exactly
+    that range, indexed from 0, not from `start_layer`).
 
     hidden:        [S, hidden_size] bf16 — `minimax_h3_frontend_embed`'s
                    output. Reshaped to [1, S, hidden_size] internally (what
@@ -112,10 +122,13 @@ def minimax_h3_run_stack[
     var n = num_layers
     if n < 0:
         n = config.num_layers
-    if n > config.num_layers:
+    if start_layer < 0:
+        raise Error("minimax_h3_run_stack: start_layer must be >= 0")
+    if start_layer + n > config.num_layers:
         raise Error(
-            String("minimax_h3_run_stack: num_layers ") + String(n)
-            + " exceeds config.num_layers " + String(config.num_layers)
+            String("minimax_h3_run_stack: start_layer+num_layers ")
+            + String(start_layer + n) + " exceeds config.num_layers "
+            + String(config.num_layers)
         )
     if n > modcache.num_layers():
         raise Error(
@@ -127,7 +140,8 @@ def minimax_h3_run_stack[
     var h3_shape: List[Int] = [1, S, config.hidden_size]
     var h = reshape_owned(hidden^, h3_shape^)
 
-    for layer in range(n):
+    for i in range(n):
+        var layer = start_layer + i
         var weights: Dict[String, ArcPointer[Tensor]]
         try:
             weights = minimax_h3_load_block_device(st, layer, config, ctx)
@@ -137,7 +151,7 @@ def minimax_h3_run_stack[
                 + " failed to load: " + String(e)
             )
         h = minimax_h3_block_forward[S, Heads, HeadDim](
-            h, weights, layer, config, modcache.block_mod[layer][],
+            h, weights, layer, config, modcache.block_mod[i][],
             adaln_indices, cos, sin, rotary_dim, ctx,
         )
         # `weights` (this block's ~1.2-1.3 GiB) drops HERE, at loop-scope

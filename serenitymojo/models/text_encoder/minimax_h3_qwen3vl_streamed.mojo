@@ -1,11 +1,27 @@
 # serenitymojo/models/text_encoder/minimax_h3_qwen3vl_streamed.mojo
 #
 # MiniMax-H3's conditioner ("H3-Encoder"): a text-only forward through the
-# first 51 decoder layers (0..50 inclusive) of Qwen3-VL-32B-Instruct's text
-# tower, returning `hidden_states[50]` PRE-final-norm — the tensor
-# `condition_proj` [5376, 5120] in serenitymojo/models/dit/minimax_h3_frontend.mojo
-# consumes. t2va has no conditioning image, so the vision tower
-# (`vision_config`, ~depth 27) is never loaded or run.
+# first 50 decoder layers (0..49) of Qwen3-VL-32B-Instruct's text tower,
+# returning `hidden_states[50]` PRE-final-norm in HF's own
+# `output_hidden_states` indexing — the tensor `condition_proj` [5376, 5120]
+# in serenitymojo/models/dit/minimax_h3_frontend.mojo consumes. t2va has no
+# conditioning image, so the vision tower (`vision_config`, ~depth 27) is
+# never loaded or run.
+#
+# INDEXING, VERIFIED EMPIRICALLY (not assumed) against the installed
+# transformers 4.57.6 Qwen3VLTextModel: `output_hidden_states=True`'s
+# `hidden_states` tuple has index 0 = embeddings, index k (k>=1) = the RAW
+# (pre-norm) output after running layers 0..k-1 (k layers total), and ONLY
+# the LAST tuple entry is overwritten with the post-final-norm
+# `last_hidden_state` (`check_model_inputs(tie_last_hidden_states=True)`,
+# the default for language models). So `hidden_states[50]` is the state
+# after 50 layers have run — layer INDEX 50 itself is never executed. A
+# stack truncated to exactly 50 layers would make index 50 the tied
+# (post-norm) entry, which is exactly why the diffusers reference code
+# raises if `num_hidden_layers <= 50` (encoders.py) — it needs layer 50 to
+# exist so hidden_states[50] stays a genuine intermediate entry, but it
+# never runs it. Verification script:
+# parity/minimax_h3_conditioner_real_weight_oracle.py.
 #
 # STATUS 2026-08-02: builds and typechecks; NOT numerically gated. H3's own
 # text_encoder/ (14 shards, 62.13 GiB) is still downloading — only
@@ -16,7 +32,7 @@
 # CONFIG is the real, landed
 # /home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/text_encoder/config.json
 # (`text_config`), not a guess: hidden_size 5120, num_hidden_layers 64 (only
-# 0..50 executed), num_attention_heads 64, num_key_value_heads 8 (GQA n_rep
+# 0..49 executed, see INDEXING above), num_attention_heads 64, num_key_value_heads 8 (GQA n_rep
 # 8 — verified by REAL RUN, not inferred, in minimax_h3_repeat_kv_probe.mojo;
 # ops/text_encoder/qwen3_encoder.mojo's `_repeat_kv` needed no changes, its
 # n_rep math is `head // n_rep` at runtime, not hardcoded to any preset),
@@ -62,8 +78,8 @@
 # same conclusion as the already-shipped 8B/16GB case.
 #
 # DISK COST (state this plainly, it is real and not hidden by streaming):
-# one encode call reads ~51 layers x 0.95 GiB + 1.45 GiB embed table
-# = ~50 GiB from disk. This happens ONCE PER PROMPT (conditioning is computed
+# one encode call reads ~50 layers x 0.95 GiB + 1.45 GiB embed table
+# = ~49 GiB from disk. This happens ONCE PER PROMPT (conditioning is computed
 # once, outside the denoising loop), not once per diffusion step — a bounded
 # ~15-30s one-time tax per generation at a few GiB/s NVMe, not a per-step cost.
 #
@@ -92,16 +108,18 @@ comptime TArc = ArcPointer[Tensor]
 
 # text_config, MiniMax-H3/FL2VA/text_encoder/config.json (landed 2026-08-02).
 comptime H3_HIDDEN = 5120
-comptime H3_LAYERS_TOTAL = 64  # released layer count; only 0..H3_EXTRACT_LAYER run
+comptime H3_LAYERS_TOTAL = 64  # released layer count; only 0..H3_EXTRACT_LAYER-1 run (see INDEXING above)
 comptime H3_HEADS = 64
 comptime H3_KV_HEADS = 8
 comptime H3_HEAD_DIM = 128
 comptime H3_THETA = Float64(5000000.0)
 comptime H3_EPS = Float32(1.0e-6)
 
-# diffusers PR packing.py MINIMAX_H3_TEXT_ENCODER_LAYER: hidden state AFTER
-# decoder layer 50 (0-indexed), pre-final-norm. Layers 51..63 and the LM head
-# are dead weight for H3 and must never be loaded.
+# diffusers PR packing.py MINIMAX_H3_TEXT_ENCODER_LAYER = 50: the HF
+# `hidden_states` index MiniMax-H3 conditions on. Per INDEXING above, that
+# is the state after 50 layers run (indices 0..49) — layer index 50 itself
+# is NEVER executed. Layers 50..63 and the LM head are dead weight for H3
+# and must never be loaded.
 comptime H3_EXTRACT_LAYER = 50
 
 # ── partial-checkout shard opening ──────────────────────────────────────────
@@ -118,8 +136,11 @@ comptime H3_EXTRACT_LAYER = 50
 # ALL 14 candidate shard filenames, probed at runtime, rather than a
 # hand-picked one or two. Each shard self-reports its own tensor names
 # (`SafeTensors.names()`), so no index.json parsing is needed at all: this
-# naturally picks up shard 11 (where layer 50 lives) — and any other shard —
-# the moment it lands on disk, no code change required.
+# naturally picks up shard 11 and any other shard the moment it lands on
+# disk, no code change required — whichever shards hold the tensors for
+# layers 0..49 (see INDEXING above: layer 50 itself is never executed, so
+# its shard is not actually required, but layers up to 49 may still span
+# shard 11 or others not yet measured).
 def _h3_shard_filenames() -> List[String]:
     var out = List[String]()
     out.append(String("model-00001-of-00014.safetensors"))
@@ -284,18 +305,27 @@ def _h3_embed(
     return emb._embed(ids, ctx)
 
 
-def minimax_h3_encode_conditioning_streamed(
-    dir_or_file: String, ids: List[Int], ctx: DeviceContext
+def minimax_h3_encode_conditioning_streamed_depth(
+    dir_or_file: String, ids: List[Int], num_layers: Int, ctx: DeviceContext
 ) raises -> Tensor:
-    """H3's conditioner forward: text-only, layers 0..H3_EXTRACT_LAYER,
-    pre-final-norm. Returns [1, seq, 5120] — feed straight into
-    `minimax_h3_condition_embed` (models/dit/minimax_h3_frontend.mojo).
-
-    No padding/PAD-id handling here (real_len == seq, full causal, no mask
-    beyond causality) — that is tokenizer/chat-template wiring, explicitly
-    the NEXT step, not this one."""
+    """Run exactly `num_layers` decoder layers (0..num_layers-1) and return
+    that raw (pre-norm) hidden state — i.e. HF's `output_hidden_states`
+    convention `hidden_states[num_layers]` (index 0 = embeddings, index k
+    for k>=1 = raw output after layer k-1, so index k = state after k
+    layers have run). VERIFIED against the installed transformers 4.57.6
+    Qwen3VLTextModel/Qwen3VLModel (`check_model_inputs`'s capture: it
+    records the layer-0 INPUT once, then every layer's OUTPUT, and only the
+    LAST entry of the whole tuple is overwritten with the post-final-norm
+    `last_hidden_state` — everything before that is the raw per-layer
+    output). `minimax_h3_encode_conditioning_streamed` (H3's real
+    contract, num_layers=H3_EXTRACT_LAYER=50) is a thin wrapper over this;
+    this generic depth parameter exists so parity/minimax_h3_conditioner_
+    real_weight_gate.mojo can gate at depths the currently-available shards
+    actually support (e.g. 1 and 23) without waiting for shard 11."""
     if len(ids) == 0:
-        raise Error("minimax_h3_encode_conditioning_streamed: empty prompt")
+        raise Error("minimax_h3_encode_conditioning_streamed_depth: empty prompt")
+    if num_layers <= 0:
+        raise Error("minimax_h3_encode_conditioning_streamed_depth: num_layers must be > 0")
     var seq = len(ids)
     var st = _h3_open_available_shards(dir_or_file)
     var layer_prefix = _detect_layer_prefix(st)
@@ -325,9 +355,32 @@ def minimax_h3_encode_conditioning_streamed(
     mask_sh.append(seq)
     var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)
 
-    for li in range(H3_EXTRACT_LAYER + 1):  # 0..50 inclusive, 51 layers
+    for li in range(num_layers):  # 0..num_layers-1
         var lw = _h3_load_layer(st, li, layer_prefix, ctx)
         hidden = lw._layer(li, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx)
         ctx.synchronize()  # this layer's ~0.95 GiB dropped before the next load
 
     return hidden^
+
+
+def minimax_h3_encode_conditioning_streamed(
+    dir_or_file: String, ids: List[Int], ctx: DeviceContext
+) raises -> Tensor:
+    """H3's real conditioner forward: `hidden_states[H3_EXTRACT_LAYER]` in
+    the sense fixed above — i.e. runs layers 0..H3_EXTRACT_LAYER-1 (50
+    layers total, NOT including layer index 50 itself; see
+    `minimax_h3_encode_conditioning_streamed_depth`'s header for why layer
+    50 is never executed). Returns [1, seq, 5120] — feed straight into
+    `minimax_h3_condition_embed` (models/dit/minimax_h3_frontend.mojo).
+
+    BUG FIXED 2026-08-02: this function previously ran H3_EXTRACT_LAYER+1
+    layers (0..50 inclusive, 51 layers) — one layer too many. Caught before
+    any oracle existed, by empirically verifying transformers 4.57.6's
+    `output_hidden_states` capture semantics (`check_model_inputs`) rather
+    than assuming HF's own indexing convention. See parity/
+    minimax_h3_conditioner_real_weight_oracle.py for the verification script.
+
+    No padding/PAD-id handling here (real_len == seq, full causal, no mask
+    beyond causality) — that is tokenizer/chat-template wiring, already done
+    in minimax_h3_conditioning.mojo."""
+    return minimax_h3_encode_conditioning_streamed_depth(dir_or_file, ids, H3_EXTRACT_LAYER, ctx)

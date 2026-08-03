@@ -74,13 +74,31 @@
 # `final_modulation`, shape [num_timesteps, 2*hidden_size] — is taken as an
 # INPUT to `minimax_h3_final_layer`, indexed PER ROW by that row's OWN
 # timestep (`timestep_indices`, the same table the packer built), not by
-# (timestep, modality) like the main stack's AdaLN. `minimax_h3_modcache.mojo`
-# does not exist yet at the time of writing; when it lands it is the natural
-# producer of this table. Declared F32 here (not bf16), matching the sibling
-# per-block modulation contract in models/dit/minimax_h3_dit.mojo's header
-# ("a [rows, 6*hidden] f32 table") — modulation tables are kept F32 through
-# this port even though the Linear that makes them is bf16-stored. UNVERIFIED
-# against a real forward.
+# (timestep, modality) like the main stack's AdaLN. `models/dit/
+# minimax_h3_modcache.mojo::minimax_h3_build_modulation_cache` is the
+# producer of this table.
+#
+# DTYPE — CORRECTED 2026-08-02, verified against a real forward
+# (models/dit/parity/minimax_h3_final_layer_real_weight_gate.mojo, real
+# `final_layer.adaln_proj`/`norm`/`video_out`/`audio_out` bytes): this table
+# is BF16 in practice, NOT the F32 an earlier version of this comment
+# claimed. `linear_bias` (ops/linear.mojo) returns its input's dtype, and the
+# SiLU'd temb feeding the projection is explicitly cast to BF16 before the
+# GEMM (minimax_h3_modcache.mojo's "ACTIVATION PRECISION TRAP" section) — so
+# `final_mod` comes out BF16. This MATCHES the reference exactly:
+# `MiniMaxH3AdaLayerNormOut.forward` (transformer_minimax_h3.py:149-152)
+# computes RMSNorm and the shift/scale modulate ENTIRELY at the AdaLN
+# linear's own (bf16) dtype and casts to F32 only AFTER, immediately before
+# the two fp32 output heads (transformer_minimax_h3.py:638,
+# `.to(self.proj_out.weight.dtype)`). `minimax_h3_final_layer` mirrors that
+# cast placement: it does NOT upcast before combining with
+# `final_modulation` — an earlier version did, which both stated the wrong
+# dtype in this comment AND crashed the moment a real BF16
+# `final_modulation` was ever fed in (`ops/tensor_algebra.mojo`'s elementwise
+# ops require matching dtypes and raise rather than silently promote/cast).
+# It casts to F32 exactly once, after the modulate, right before
+# `final_layer.video_out`/`final_layer.audio_out` (two of the checkpoint's
+# 12 fp32 tensors) consume it.
 #
 # DTYPE otherwise: bf16 storage, F32 accumulation inside every op (linear,
 # vec_rms_norm, sdpa_nomask) per the house rule. `linear` requires x.dtype()
@@ -416,7 +434,7 @@ struct MiniMaxH3FrontendOutput(Movable):
 
 def minimax_h3_final_layer(
     hidden: Tensor,  # [S, hidden] bf16 — the 50-block stack's output
-    final_modulation: Tensor,  # [num_timesteps, 2*hidden] F32 — PRECOMPUTED (see header)
+    final_modulation: Tensor,  # [num_timesteps, 2*hidden] — PRECOMPUTED (see header). BF16 in production.
     timestep_indices: List[Int],  # length S: row -> its own timestep row
     video_indices: List[Int],
     audio_indices: List[Int],
@@ -427,7 +445,18 @@ def minimax_h3_final_layer(
     """`final_modulation` is NOT computed here — see file header "FINAL
     ADALN". This function only INDEXES it, per ROW, by that row's own
     timestep (`timestep_indices`) — NOT the (timestep, modality) index the
-    main stack's AdaLN uses."""
+    main stack's AdaLN uses.
+
+    DTYPE ORDER matches the reference (transformer_minimax_h3.py:149-152,
+    638): RMSNorm and the shift/scale modulate run at `final_modulation`'s
+    OWN dtype (BF16 in production — see file header "FINAL ADALN"), and the
+    result is cast to F32 exactly once, AFTER the modulate, right before the
+    two fp32 output heads. Do not upcast `final_normed` before combining it
+    with `final_modulation` — besides computing different (higher-precision)
+    arithmetic than the checkpoint's real bf16 modulation, `final_modulation`
+    is not reliably F32 in the first place (see header), and
+    `ops/tensor_algebra.mojo`'s elementwise ops raise on a dtype mismatch
+    rather than silently promoting."""
     var hidden_size = config.hidden_size
     var sequence_length = hidden.shape()[0]
     if len(timestep_indices) != sequence_length:
@@ -437,18 +466,25 @@ def minimax_h3_final_layer(
 
     var final_normed = vec_rms_norm(hidden, w["final_layer.norm.weight"][], config.final_norm_eps, ctx)
     # final_layer.norm is bf16 (not a dtype-trap prefix) so final_normed is
-    # bf16; cast to F32 to match the fp32 modulation table and the fp32
-    # output heads.
-    var final_normed_f32 = cast_tensor(final_normed, STDtype.F32, ctx)
+    # bf16. Match final_modulation's OWN dtype here (bf16 in production) —
+    # do NOT upcast to F32 before combining; see this function's docstring.
+    var final_normed_matched = cast_tensor(final_normed, final_modulation.dtype(), ctx)
 
-    var row_mod = gather_rows(final_modulation, timestep_indices, ctx)  # [S, 2*hidden]
+    var row_mod = gather_rows(final_modulation, timestep_indices, ctx)  # [S, 2*hidden], final_modulation's own dtype
     var shift = slice(row_mod, 1, 0, hidden_size, ctx)
     var scale = slice(row_mod, 1, hidden_size, hidden_size, ctx)
     var scale_p1 = add_scalar(scale, Float32(1.0), ctx)
-    var modulated = add(mul(final_normed_f32, scale_p1, ctx), shift, ctx)
+    var modulated = add(mul(final_normed_matched, scale_p1, ctx), shift, ctx)
+    # ONE cast to F32 here, AFTER the modulate — mirrors
+    # transformer_minimax_h3.py:638's `.to(self.proj_out.weight.dtype)`,
+    # which lands after norm_out returns, not before. final_layer.video_out/
+    # audio_out are two of the checkpoint's 12 fp32 tensors, so this cast is
+    # still required — just later than the earlier version of this function
+    # placed it.
+    var modulated_f32 = cast_tensor(modulated, STDtype.F32, ctx)
 
-    var video_all = _lin(modulated, w, "final_layer.video_out.weight", "final_layer.video_out.bias", ctx)  # [S,96] F32
-    var audio_all = _lin(modulated, w, "final_layer.audio_out.weight", "final_layer.audio_out.bias", ctx)  # [S,32] F32
+    var video_all = _lin(modulated_f32, w, "final_layer.video_out.weight", "final_layer.video_out.bias", ctx)  # [S,96] F32
+    var audio_all = _lin(modulated_f32, w, "final_layer.audio_out.weight", "final_layer.audio_out.bias", ctx)  # [S,32] F32
 
     var video_out = gather_rows(video_all, video_indices, ctx)
     var audio_out = gather_rows(audio_all, audio_indices, ctx)

@@ -405,8 +405,9 @@ def _minimax_h3_load_frontend_weights(
     shards: ShardedSafeTensors, config: MiniMaxH3DiTConfig, ctx: DeviceContext
 ) raises -> Dict[String, ArcPointer[Tensor]]:
     var w = Dict[String, ArcPointer[Tensor]]()
-    for i in range(len(_H3_FP32_FRONTEND_KEYS)):
-        var name = String(_H3_FP32_FRONTEND_KEYS[i])
+    var fp32_keys = _h3_fp32_frontend_keys()
+    for i in range(len(fp32_keys)):
+        var name = fp32_keys[i]
         w[name] = ArcPointer(Tensor.from_view(shards.tensor_view(name), ctx))
 
     w["condition_proj.weight"] = ArcPointer(
@@ -609,10 +610,13 @@ def main() raises:
         positions_f32.append(Float32(geometry.position_ids[i]))
     var positions_shape: List[Int] = [SEQ_LEN * 3]
     var positions_tensor = Tensor.from_host(positions_f32, positions_shape^, STDtype.F32, ctx)
+    # `rope` is kept alive and its cos/sin elements (rope[0]/rope[1]) are
+    # referenced directly at each use site below rather than extracted into
+    # owning `var`s — Tensor is Movable-not-Copyable, so `var cos = rope[0]`
+    # would try to copy out of the Tuple; borrowed indexed access (repeated
+    # `rope[0]`/`rope[1]` reads) works fine and is what every call site needs.
     var rope = build_minimax_h3_rope_tables(positions_tensor, ctx, config.rope_inv_freq_len)
-    var cos = rope[0]
-    var sin = rope[1]
-    var rotary_dim = cos.shape()[1]
+    var rotary_dim = rope[0].shape()[1]
     print("  geometry + rope ready: S=", geometry.sequence_length, " rotary_dim=", rotary_dim)
 
     # ── 4. Dual schedule (video shift 12.0 / audio shift 3.0) ─────────────
@@ -662,25 +666,32 @@ def main() raises:
         # (the bf16 packed sequence for the block stack) is used.
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
+        # `embed` is kept alive and its `.hidden` field is REASSIGNED across
+        # the 50-block loop in place, rather than moved out into a separate
+        # `var` — MiniMaxH3FrontendEmbed has two Tensor fields (hidden, temb)
+        # and Mojo does not allow destroying a struct whose field was
+        # partially moved out from under it; field reassignment (drop old
+        # value, assign new) has no such restriction. `.temb` is never read
+        # (the precomputed modcache is the AdaLN source of truth here, not a
+        # per-step recompute) and drops with `embed` at the end of the step.
         var embed = minimax_h3_frontend_embed[TEXT_TOKENS, H3_HEADS, H3_HEAD_DIM](
             video_state, audio_state, text_rows, placeholder_ts,
             geometry.video_indices, geometry.audio_indices, geometry.text_indices,
             SEQ_LEN, frontend_w, config, ctx,
         )
-        var hidden = embed.hidden
 
         for layer in range(config.num_layers):
             var block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
-            hidden = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
-                hidden, block_w, layer, config, modcache.block_mod[layer][],
-                block_adaln_indices, cos, sin, rotary_dim, ctx,
+            embed.hidden = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
+                embed.hidden, block_w, layer, config, modcache.block_mod[layer][],
+                block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
             )
             # `block_w` drops here: this layer's ~0.77 GiB bf16 is freed
             # before the next layer's load — resident footprint stays at one
             # block, never the full 61.73 GiB stack.
 
         var frontend_out = minimax_h3_final_layer(
-            hidden, modcache.final_mod[], global_row,
+            embed.hidden, modcache.final_mod[], global_row,
             geometry.video_indices, geometry.audio_indices,
             frontend_w, config, ctx,
         )
@@ -699,7 +710,6 @@ def main() raises:
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")
 
     # ── 7. Decode (STUBBED — see file header) ──────────────────────────────
-    var t0 = perf_counter_ns()
     var result_body = String("{\n")
     result_body += String("  \"prompt\":\"") + json_escape(prompt) + String("\",\n")
     result_body += String("  \"steps\":") + String(num_steps) + String(",\n")

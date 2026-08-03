@@ -132,6 +132,7 @@ from serenitymojo.ops.tensor_algebra import reshape, add, mul, add_scalar, slice
 from serenitymojo.ops.shape_backward import index_select_backward
 from serenitymojo.ops.patchify3d import patchify3d
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 
 
 # get_timestep_embedding(flip_sin_to_cos=True, downscale_freq_shift=0,
@@ -366,9 +367,16 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     # consumes is bf16-only (every blocks.* tensor is bf16) — cast down at
     # this boundary. See file header, "IMPLIED CAST BOUNDARY".
     var video_embeds_f32 = minimax_h3_video_patch_embed(video_rows, w, ctx)
-    var video_embeds = cast_tensor(video_embeds_f32, STDtype.BF16, ctx)
+    # torch_f32_to_bf16_rne, NOT cast_tensor. This F32->BF16 boundary runs ONCE
+    # PER DENOISING STEP, and Mojo's native cast differs from PyTorch's
+    # round-to-nearest-even by ~1 bf16 quantum on some values. One cast is
+    # invisible (cos ~1.0); inside an N-step loop the per-element bias compounds
+    # and decorrelates from torch while every single-forward gate still reads
+    # cos 0.9998 and the global std still matches. That is the NAVA failure —
+    # a visibly distorted decode with every component green.
+    var video_embeds = torch_f32_to_bf16_rne(video_embeds_f32, ctx)
     var audio_embeds_f32 = minimax_h3_audio_patch_embed(audio_rows, w, ctx)
-    var audio_embeds = cast_tensor(audio_embeds_f32, STDtype.BF16, ctx)
+    var audio_embeds = torch_f32_to_bf16_rne(audio_embeds_f32, ctx)
 
     var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
     var text_embeds = minimax_h3_token_refiner[TR_S, TR_H, TR_DH](text_embeds0, w, config, ctx)

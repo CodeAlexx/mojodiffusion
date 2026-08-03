@@ -55,18 +55,17 @@ from serenitymojo.models.dit.minimax_h3_stack import minimax_h3_run_stack
 
 # `ShardedSafeTensors.open` eagerly opens EVERY shard the index references
 # (io/sharded.mojo:419-424), not just the tensors a caller ends up reading —
-# so pointing this at the real checkpoint directory (7/13 shards present)
+# so pointing this at the real checkpoint DIRECTORY (7/13 shards present)
 # fails at open() with "failed to open: ...model-00002-of-00013.safetensors",
 # before streaming a single real layer, even though layers 0-1 are 100%
-# present in shard 1 alone. This points at a SCOPED index (real shard-1
-# bytes via symlink, hand-built index.json containing only shard-1's 54
-# tensors — verified by inspecting the real index.json's weight_map, not
-# guessed) so layers 0-1 can genuinely stream today. Regenerate with:
-#   ln -sf <real_dir>/model-00001-of-00013.safetensors <scratch>/h3_shard1_only/
-#   python3 -c "import json; wm=json.load(open('<real_dir>/model.safetensors.index.json'))['weight_map']; \
-#     json.dump({'weight_map': {k:v for k,v in wm.items() if v=='model-00001-of-00013.safetensors'}}, \
-#     open('<scratch>/h3_shard1_only/model.safetensors.index.json','w'))"
-comptime CHECKPOINT_DIR = "/tmp/claude-1000/-home-alex-mojodiffusion/7e1531cb-f7e2-44a5-9d63-8604853a656a/scratchpad/h3_shard1_only"
+# present in shard 1 alone (verified against the real index.json's
+# weight_map, not guessed). Fix (h3-block-gate, cleaner than this file's
+# earlier symlink+hand-trimmed-index workaround): point directly at the
+# shard-1 FILE — `_looks_safetensors_file` detects a single-file path and
+# takes ShardedSafeTensors' documented single-file fallback, which never
+# touches the index or any other shard. No scratch state, works from any
+# sandbox since it's just the real absolute path.
+comptime CHECKPOINT_DIR = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transformer/model-00001-of-00013.safetensors"
 comptime S = 8
 
 

@@ -148,6 +148,41 @@ but unused by the Z-Image pipeline.
 
 ## 4. Gotchas (project-wide invariants)
 
+### FMA contraction: `@no_inline` is NOT a barrier (MEASURED 2026-08-03)
+
+**Symptom.** A gate that passes at `-O0`/`-O2` and FAILS at `-O3` — which is the
+`mojo build` DEFAULT. Or: every component gates clean while an assembled loop is
+subtly wrong.
+
+**Mechanism.** `@no_inline def _f(x): return x` does NOT stop the compiler
+contracting `a + b*c` into an FMA. Emitted LLVM shows the call site tagged
+`call contract float` with an **identical** fast-math flag count at `-O0` and
+`-O3`: `@no_inline` blocks code *duplication*, it never withdraws permission to
+fuse. `-O0` simply never exploits that permission. Proof it was decorative — an
+unwrapped sibling of the same expression produced **bit-identical** output at
+every level.
+
+**Remedy.** `std.benchmark.black_box` — a real inline-asm memory clobber the
+optimizer cannot prove is a pure identity. Applied to `models/minimax_h3/
+scheduler.mojo` at 3 sites (`step()`'s blend, the `set_timesteps` shift formula,
+`scale_noise`): **22/22 bit-exact at `-O0`, `-O2` AND `-O3`**, where `-O3` was
+15/22 FAIL.
+
+**Why it hides.** It can be DATA-SELECTIVE. MiniMax-H3's audio schedule passed
+unprotected for weeks purely because shift 3.0 gives `shift-1 = 2.0`, an exact
+power of two, so that multiply never rounds. Video's 12.0 -> 11.0 does. A defect
+that breaks one modality and not the other reads as a *model* problem, and gets
+debugged in the wrong place.
+
+**Do NOT over-apply.** `models/minimax_h3/packing.mojo` has the same exposure and
+is provably harmless: 3/63 checks diverge at `-O3` by 1 ulp of Float64 (~1e-15),
+but every consumer casts positions to F32 before any arithmetic and that is ~9
+orders below the F32 ulp. Verified end to end — all 14 divergent grid entries are
+bit-identical after the F32 cast, and the real rope table returns 96/96 cos and
+sin bit-identical at both levels. **Fix the barrier where the value is
+load-bearing; measure before patching a gated oracle.**
+
+
 - **Syntax**: this is Mojo 1.0.0b1 — `comptime` (not `alias`), `var`/`ref` (not `let`/`inout`), `def` needs an explicit `raises` if it can raise. `Tensor` is **Movable-not-Copyable** → containers use `List[ArcPointer[Tensor]]` / `Dict[String, ArcPointer[Tensor]]` (a bare `List[Tensor]`/`Dict[…,Tensor]` won't compile; `ArcPointer` copy == refcount bump, drop frees the buffer).
 - **All file I/O routes through `io/ffi.mojo`** (`sys_open`/`sys_write`/`sys_pread`) — NEVER the stdlib builtin `open` or `Path.read_text`. The builtin `open` symbol collides with ffi's `external_call["open"]` and fails LLVM lowering when both are in one compilation unit. `sys_open` also copies+NUL-terminates the path (dynamically-built path Strings aren't reliably NUL-terminated; a held mmap shifts the heap → libc reads past the bytes → spurious ENOENT).
 - **stdlib `nn` closure/TileTensor ops are uncallable from plain LayoutTensor**: `rms_norm_gpu` / `softmax_gpu` / `apply_rope` take `capturing` closures and a `TileTensor gamma` whose `gamma.origin.mut` can't be inferred from a `LayoutTensor` over a `DeviceBuffer` ("depends on an unresolved parameter 'gamma.origin.mut'"). These are **hand-rolled** (`ops/norm`, `ops/softmax`, `ops/rope`). Plain-LayoutTensor SDK kernels (`conv2d_gpu_naive_nhwc_rscf`, `conv3d_gpu_naive_ndhwc_qrscf`, `flash_attention`, vendor `matmul`) ARE callable.

@@ -2,7 +2,7 @@
 
 Reference: the REAL Qwen3-VL image processor, configured from the
 `preprocessor_config.json` we fetched with the conditioner —
-/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3.
+/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor.
 
   transformers/models/qwen2_vl/image_processing_qwen2_vl.py  smart_resize
   transformers/models/qwen2_vl/image_processing_qwen2_vl_fast.py
@@ -35,7 +35,7 @@ Writes: output/minimax_h3_image_grid/image_grid_ref.safetensors
 import json
 import os
 
-CONDITIONER = "/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3"
+CONDITIONER = "/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor"
 OUT_DIR = "/home/alex/mojodiffusion/output/minimax_h3_image_grid"
 
 import numpy as np  # noqa: E402

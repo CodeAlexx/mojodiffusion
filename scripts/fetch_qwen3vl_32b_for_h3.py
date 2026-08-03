@@ -28,7 +28,7 @@ import os
 import sys
 
 REPO = "Qwen/Qwen3-VL-32B-Instruct"
-LOCAL_DIR = "/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3"
+LOCAL_DIR = "/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor"
 
 # Shards holding layers 0..53 (we need 0..49), embeddings, and the vision tower.
 KEEP_SHARDS = [f"model-{i:05d}-of-00014.safetensors" for i in list(range(1, 12)) + [14]]

@@ -18,7 +18,7 @@ Run:
 
 import time
 
-TOKENIZER_DIR = "/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3"
+TOKENIZER_DIR = "/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor"
 
 PROMPTS = [
     ("short", "a cat"),

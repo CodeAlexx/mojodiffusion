@@ -214,9 +214,11 @@ def _run_encode_temporal_smoke(ctx: DeviceContext) raises:
     var encoder = MiniMaxH3VideoEncoderDevice.load(String(ENC_CKPT), econfig, ctx)
     var tconfig = MiniMaxH3VideoTemporalConfig(7, 2, 1)  # toy clip_length/vae_ratio_t/token_drop
 
-    # T_raw=10, H=W=2 (small, still valid for the encoder's reflect-pad1 min size).
+    # T_raw=10, H=W=4 -- after the one 2x spatial downsample level, H=W=2,
+    # still >=2 (the reflect-pad1 minimum) for encoder.conv_out's own
+    # kernel-3 reflect pad afterward.
     var pixels = Tensor.from_host(
-        _pattern(700, 1 * 10 * 2 * 2 * 2), [1, 10, 2, 2, 2], STDtype.BF16, ctx
+        _pattern(700, 1 * 10 * 4 * 4 * 2), [1, 10, 4, 4, 2], STDtype.BF16, ctx
     )
     var moments = minimax_h3_video_encode_temporal(encoder, pixels, tconfig, ctx)
     print("  encode_temporal output shape:", moments.shape())

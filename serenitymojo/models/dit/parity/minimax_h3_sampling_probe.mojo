@@ -23,17 +23,11 @@
 # independent runtime reproduction — and, for the scheduler, the device
 # kernel chain — agrees with it.
 #
-# MUST be built at -O0 (like its two upstream oracle gates — see their own
-# header run commands): MEASURED, this repo's default optimization level
-# (both `mojo run -I .` and plain `mojo build -I .` with no `-O` flag)
-# reassociates the scheduler's float32 chain differently than -O0 and misses
-# the reference by 1 ulp on a large fraction of values. This is NOT a bug
-# introduced here — `models/minimax_h3/parity/minimax_h3_scheduler_parity.
-# mojo` (the oracle's OWN gate, unmodified) fails IDENTICALLY (same first-
-# differing index, same max_abs, per case) under the same non-O0 build, which
-# is why that gate's header documents `-O0 -j 1` explicitly rather than a
-# bare `mojo run`. Confirms this file's reproduction is bit-for-bit faithful
-# to the oracle even in how it breaks, not just in how it passes.
+# BUILD LEVEL: no longer restricted. MEASURED 2026-08-03 after the black_box
+# barrier landed: 38/38 bit-exact at -O0, -O2, -O3 AND bare `mojo run`.
+# The previous 'MUST be built at -O0' note here was stale — it predated the
+# fix and is contradicted by minimax_h3_sampling.mojo's own docstring.
+
 #
 #   pixi run mojo build -O0 -j 1 -I . \
 #     serenitymojo/models/dit/parity/minimax_h3_sampling_probe.mojo \

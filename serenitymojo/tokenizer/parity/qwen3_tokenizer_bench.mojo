@@ -21,7 +21,7 @@ from std.time import perf_counter_ns
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer, _read_utf8_file
 
-comptime TOKENIZER = "/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3/tokenizer.json"
+comptime TOKENIZER = "/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor/tokenizer.json"
 
 comptime PROMPT_SHORT = "a cat"
 comptime PROMPT_TYPICAL = "A red fox trotting through a snowy pine forest, snow crunching underfoot, golden hour light through the branches, shallow depth of field, 35mm"

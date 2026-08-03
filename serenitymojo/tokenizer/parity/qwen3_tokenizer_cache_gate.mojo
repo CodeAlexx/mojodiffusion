@@ -27,7 +27,7 @@ from serenitymojo.tokenizer.tokenizer_cache import (
     qwen3_tokenizer_load_cached,
 )
 
-comptime SOURCE = "/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3/tokenizer.json"
+comptime SOURCE = "/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor/tokenizer.json"
 comptime CACHE = "/home/alex/mojodiffusion/output/checks/qwen3vl_32b_tokenizer.mjtok"
 
 comptime PROMPTS = 12

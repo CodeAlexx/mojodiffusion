@@ -70,6 +70,12 @@ struct MiniMaxH3KeyframePresentation(Copyable, Movable):
     var pad_positions: List[Int]
     var vision_tokens_each: Int
     var num_keyframes: Int
+    # The conditioner PATCH grid the canvas resolved to. Carried so a consumer
+    # can build the tower's `MiniMaxH3VisionGrid(1, grid_h, grid_w)` from the
+    # SAME resolution this presentation counted tokens from — re-resolving it at
+    # the call site is how the pad count and the tower's token count drift apart.
+    var grid_h: Int
+    var grid_w: Int
 
     def num_text_tokens(self) -> Int:
         """The `TEXT_TOKENS` budget a binary must be compiled for."""
@@ -133,7 +139,7 @@ def minimax_h3_keyframe_presentation(
 
     var out = MiniMaxH3KeyframePresentation(
         presentation.ids.copy(), presentation.tags.copy(), pads^,
-        grid.num_vision_tokens, num_keyframes,
+        grid.num_vision_tokens, num_keyframes, grid.grid_h, grid.grid_w,
     )
     out.validate()
     return out^

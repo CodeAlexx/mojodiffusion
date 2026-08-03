@@ -45,12 +45,15 @@
 #          20 canvas/keyframe/prompt cases: token ids, the VIDEO-tagged vision
 #          rows, the TEXT_TOKENS budget, and the `<|image_pad|>` POSITIONS.
 #   BUILT  the vision tower — `models/text_encoder/minimax_h3_qwen3vl_vision.mojo`
-#          (geometry, h3-ref2va) plus `..._vision_forward.mojo` (the weighted
-#          forward), gated 18/18 against transformers' own Qwen3VLVisionModel on
-#          the real FL2VA weights. DO NOT PORT ANOTHER TOWER. In particular do
-#          NOT reach for `lingbot_qwen3vl_vision.mojo`: it is a DIFFERENT model's
-#          tower (depth 18 / hidden 1024 / deepstack [5,11,17] / out 2560) and an
-#          earlier revision of this header wrongly named it as the only option.
+#          h3-ref2va's, geometry AND weighted forward in ONE module, gated on
+#          the real FL2VA weights. This file CONSUMES it:
+#          `minimax_h3_vision_forward` -> `MiniMaxH3VisionOutput`.
+#          DO NOT PORT ANOTHER TOWER, and do NOT reach for
+#          `lingbot_qwen3vl_vision.mojo` — a DIFFERENT model's tower (depth 18 /
+#          hidden 1024 / deepstack [5,11,17] / out 2560). TWO earlier revisions
+#          of this header were wrong here: one named lingbot as the only option,
+#          and one pointed at a second forward file that no longer exists (a
+#          duplicate, removed in favour of the in-module one).
 #   SEAM   (a) the Qwen3-VL IMAGE PREPROCESSOR — pixels to the tower's
 #              `[num_patches, 1536]` patch rows (smart_resize, the processor's
 #              OWN mean=std=0.5 normalization — NOT the video VAE's ImageNet
@@ -171,6 +174,9 @@ from serenitymojo.pipeline.minimax_h3_keyframe_image import (
 from serenitymojo.pipeline.minimax_h3_media_in import (
     minimax_h3_ffmpeg_read_image,
     minimax_h3_jpeg_exif_orientation,
+)
+from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
+    MiniMaxH3VisionGrid,
 )
 from serenitymojo.pipeline.minimax_h3_keyframe_presentation import (
     MiniMaxH3KeyframePresentation,
@@ -881,24 +887,64 @@ def main() raises:
             + String(presentation.num_text_tokens())
         )
 
+    # ── THE VISION PATH, as a CONSUMED interface ────────────────────────────
+    # The tower is h3-ref2va's and is not this file's to reimplement. This file
+    # is a CONSUMER of `MiniMaxH3VisionOutput`; once the two seams below close,
+    # the call is exactly:
+    #
+    #     var vw  = minimax_h3_vision_load_weights(String(TEXT_ENCODER_DIR))
+    #     var vis = minimax_h3_vision_forward(vw, pixel_patches, vision_grids)
+    #     # vis.embeds             [tokens, 5120] -> presentation.pad_positions
+    #     # vis.deepstack_block(i) [tokens, 5120] -> language layers 0/1/2
+    #
+    # Both of the tower's inputs that THIS file owns are already resolved: the
+    # grids (from the canvas the presentation counted tokens from) and the
+    # splice map. The gap is `pixel_patches`.
+    var vision_grids = List[MiniMaxH3VisionGrid]()
+    for _ in range(KEYFRAMES):
+        vision_grids.append(
+            MiniMaxH3VisionGrid(1, presentation.grid_h, presentation.grid_w)
+        )
+    var expected_vision_tokens = 0
+    for gi in range(len(vision_grids)):
+        expected_vision_tokens += vision_grids[gi].num_tokens()
+    # The tower's token count and the presentation's reserved pad rows are
+    # computed by different code from the same canvas; if they ever disagree the
+    # embeds cannot be spliced, and that must fail here rather than produce a
+    # shape-correct, row-shifted conditioning.
+    if expected_vision_tokens != len(presentation.pad_positions):
+        raise Error(
+            String("minimax_h3_i2va: the vision grids imply ")
+            + String(expected_vision_tokens) + " tokens but the presentation"
+            " reserved " + String(len(presentation.pad_positions))
+            + " image_pad rows"
+        )
+    print(
+        "  vision interface: ", len(vision_grids), "grid(s) of 1 x",
+        presentation.grid_h, "x", presentation.grid_w, "->",
+        expected_vision_tokens, "embeds to splice",
+    )
+
     comptime
     if NO_VISION == 0:
         raise Error(
             String("minimax_h3_i2va: SEAM — this request needs ")
-            + String(presentation.vision_tokens_each) + " vision embeds per"
-            " keyframe spliced at " + String(len(presentation.pad_positions))
-            + " image_pad rows, and TWO pieces are still missing."
-            " (a) the Qwen3-VL IMAGE PREPROCESSOR: pixels -> the tower's"
-            " [num_patches, 1536] patch rows (smart_resize + the processor's own"
-            " mean=std=0.5 normalization + patch flattening). models/minimax_h3/"
-            "image_grid.mojo resolves the geometry only."
+            + String(expected_vision_tokens) + " vision embeds spliced at "
+            + String(len(presentation.pad_positions)) + " image_pad rows."
+            " THE TOWER IS AVAILABLE (models/text_encoder/"
+            "minimax_h3_qwen3vl_vision.mojo::minimax_h3_vision_forward ->"
+            " MiniMaxH3VisionOutput) and this file already resolves its grids"
+            " and its splice map. TWO pieces are missing, neither of them the"
+            " tower, neither of them this file's to write:"
+            " (a) the Qwen3-VL IMAGE PREPROCESSOR — canvas pixels -> the tower's"
+            " [num_patches, 1536] patch rows (smart_resize + the processor's OWN"
+            " mean=std=0.5 normalization, NOT the video VAE's ImageNet"
+            " constants, + patch flattening). models/minimax_h3/image_grid.mojo"
+            " resolves the geometry only and says so itself. UNOWNED 2026-08-03."
             " (b) the conditioner's vision splice + deepstack injection into"
-            " models/text_encoder/minimax_h3_qwen3vl_streamed.mojo (h3-ref2va),"
-            " via the MiniMaxH3VisionOutput interface."
-            " ALREADY BUILT AND GATED, do not re-port: the presentation"
-            " (pipeline/minimax_h3_keyframe_presentation.mojo) and the vision"
-            " tower forward (models/text_encoder/minimax_h3_qwen3vl_vision_"
-            "forward.mojo, 18/18 vs transformers on real FL2VA weights)."
+            " models/text_encoder/minimax_h3_qwen3vl_streamed.mojo — h3-ref2va's."
+            " ALREADY BUILT AND GATED, do not re-port: this file's presentation"
+            " (pipeline/minimax_h3_keyframe_presentation.mojo) and the tower."
             " Rebuild with -D H3_KF_NO_VISION=1 for the DEGRADED text-only"
             " presentation — the keyframe still anchors through its VAE"
             " condition rows, but the conditioner never sees it."

@@ -29,6 +29,18 @@
 # runs for real if the checkpoint is present and otherwise says so plainly).
 # Do not treat a clean build here as parity.
 #
+# DEEPSTACK (2026-08-03): `minimax_h3_encode_conditioning_streamed[_depth]`
+# now optionally accept a `MiniMaxH3VisionOutput` (from
+# minimax_h3_qwen3vl_vision.mojo) + its `visual_positions`, splicing the
+# tower's merged embeds into the embedding stream once and adding its three
+# deepstack taps after decoder layers 0/1/2 — see the DEEPSTACK INJECTION
+# header immediately above `minimax_h3_mm_token_type_ids` below for the
+# vendor citation and exact ordering. Both params default to `None`; t2va
+# (text-only, no conditioning image) is unaffected. Gated on CPU-synthesized
+# inputs (injection mechanics only, not the vision tower or the 50-layer H3
+# conditioner) by parity/minimax_h3_deepstack_gate.mojo +
+# scripts/minimax_h3_deepstack_oracle.py.
+#
 # CONFIG is the real, landed
 # /home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/text_encoder/config.json
 # (`text_config`), not a guess: hidden_size 5120, num_hidden_layers 64 (only
@@ -102,6 +114,10 @@ from serenitymojo.models.text_encoder.qwen3_encoder import (
     Qwen3Config,
     _build_rope_tables,
     _build_causal_mask,
+)
+from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
+    MiniMaxH3VisionOutput,
+    minimax_h3_vision_deepstack_lm_layers,
 )
 
 comptime TArc = ArcPointer[Tensor]
@@ -305,8 +321,158 @@ def _h3_embed(
     return emb._embed(ids, ctx)
 
 
+# ── DEEPSTACK INJECTION (2026-08-03) ─────────────────────────────────────────
+#
+# Ground truth: the installed transformers 4.57.6
+# `Qwen3VLTextModel.forward`/`_deepstack_process`
+# (.../transformers/models/qwen3_vl/modeling_qwen3_vl.py:849-883):
+#
+#   for layer_idx, decoder_layer in enumerate(self.layers):
+#       layer_outputs = decoder_layer(hidden_states, ...)
+#       hidden_states = layer_outputs                        # :859
+#       if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+#           hidden_states = self._deepstack_process(          # :862-867
+#               hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx],
+#           )
+#   ...
+#   def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
+#       local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds   # :881
+#       hidden_states[visual_pos_masks, :] = local_this                          # :882
+#       return hidden_states
+#
+# i.e. the tap is ADDED, at VISUAL-TOKEN POSITIONS ONLY, AFTER the decoder
+# layer's own forward has already completed (line 859's assignment runs
+# strictly BEFORE the deepstack check at line 862 — the layer sees the
+# PRE-tap state as its input; the tap only ever modifies that layer's
+# OUTPUT). `minimax_h3_deepstack_add` below reproduces `_deepstack_process`
+# exactly (masked add, nothing else touched); `minimax_h3_splice_vision_embeds`
+# reproduces the SEPARATE, one-time substitution of the vision tower's merged
+# `image_features` into the embedding stream at the placeholder positions
+# (`get_placeholder_mask` + the `inputs_embeds[special_image_mask] = ...`
+# assignment pattern, modeling_qwen3_vl.py:1066-1104) that happens once,
+# before layer 0, not at every deepstack layer.
+#
+# `minimax_h3_mm_token_type_ids`/`minimax_h3_visual_positions` reproduce
+# `processor.create_mm_token_type_ids` (processing_qwen3_vl.py:241-245:
+# `mm_token_type_ids = np.zeros_like(input_ids); mm_token_type_ids[array_ids
+# == self.image_token_id] = 1`) generalized to a 3-way text/image/video
+# scheme, purely from OUR OWN token stream — no HF processor object needed.
+#
+# These four functions are plain host-side List[Int]/List[Float32] helpers
+# (no Tensor, no DeviceContext) so they are directly unit-testable on CPU —
+# see parity/minimax_h3_deepstack_gate.mojo.
+def minimax_h3_mm_token_type_ids(
+    token_ids: List[Int], image_pad_id: Int, video_pad_id: Int
+) -> List[Int]:
+    """0 for text, 1 at an `<|image_pad|>` id, 2 at a `<|video_pad|>` id.
+
+    Reproduces `processor.create_mm_token_type_ids` (see header above),
+    generalized to also mark video-pad positions as 2 (the installed
+    transformers release's own helper only special-cases the image id; H3's
+    Mojo side needs the 3-way scheme since keyframe/video pipelines route
+    through this same file)."""
+    var out = List[Int]()
+    out.reserve(len(token_ids))
+    for i in range(len(token_ids)):
+        var t = token_ids[i]
+        if t == image_pad_id:
+            out.append(1)
+        elif t == video_pad_id:
+            out.append(2)
+        else:
+            out.append(0)
+    return out^
+
+
+def minimax_h3_visual_positions(mm_token_type_ids: List[Int]) -> List[Int]:
+    """Sequence indices where `mm_token_type_ids[i] != 0`, in order — the
+    `visual_pos_masks` equivalent. Ordered so the k-th entry here corresponds
+    to row k of the vision embeds / deepstack tap tensors (the tower emits
+    its tokens in the same left-to-right order they appear in the prompt)."""
+    var out = List[Int]()
+    for i in range(len(mm_token_type_ids)):
+        if mm_token_type_ids[i] != 0:
+            out.append(i)
+    return out^
+
+
+def minimax_h3_splice_vision_embeds(
+    mut inputs_embeds: List[Float32],
+    vision_embeds: List[Float32],
+    visual_positions: List[Int],
+    hidden: Int,
+) raises:
+    """REPLACE (not add) the embedding rows at `visual_positions` with the
+    tower's merged `vision_embeds`, row k -> position `visual_positions[k]`.
+    `inputs_embeds` is `[seq*hidden]` row-major, mutated in place. A plain
+    row copy (no arithmetic) — bit-exact by construction.
+
+    Raises if `len(vision_embeds) != len(visual_positions) * hidden` (the
+    `get_placeholder_mask` count-mismatch check, modeling_qwen3_vl.py:1092-1095,
+    reproduced host-side)."""
+    var n = len(visual_positions)
+    if len(vision_embeds) != n * hidden:
+        raise Error(
+            "minimax_h3_splice_vision_embeds: vision_embeds has "
+            + String(len(vision_embeds))
+            + " floats, expected "
+            + String(n * hidden)
+            + " ("
+            + String(n)
+            + " visual positions x hidden="
+            + String(hidden)
+            + ")"
+        )
+    for k in range(n):
+        var pos = visual_positions[k]
+        var dst0 = pos * hidden
+        var src0 = k * hidden
+        for j in range(hidden):
+            inputs_embeds[dst0 + j] = vision_embeds[src0 + j]
+
+
+def minimax_h3_deepstack_add(
+    mut hidden_states: List[Float32],
+    deepstack_tap: List[Float32],
+    visual_positions: List[Int],
+    hidden: Int,
+) raises:
+    """`_deepstack_process`: ADD `deepstack_tap` rows into `hidden_states` at
+    `visual_positions` ONLY (row k -> position `visual_positions[k]`); every
+    other row of `hidden_states` is left untouched. `hidden_states` is
+    `[seq*hidden]` row-major, mutated in place.
+
+    Raises if `len(deepstack_tap) != len(visual_positions) * hidden` (same
+    shape-mismatch guard as `minimax_h3_splice_vision_embeds`, mirroring
+    `get_placeholder_mask`'s own check)."""
+    var n = len(visual_positions)
+    if len(deepstack_tap) != n * hidden:
+        raise Error(
+            "minimax_h3_deepstack_add: deepstack_tap has "
+            + String(len(deepstack_tap))
+            + " floats, expected "
+            + String(n * hidden)
+            + " ("
+            + String(n)
+            + " visual positions x hidden="
+            + String(hidden)
+            + ")"
+        )
+    for k in range(n):
+        var pos = visual_positions[k]
+        var dst0 = pos * hidden
+        var src0 = k * hidden
+        for j in range(hidden):
+            hidden_states[dst0 + j] = hidden_states[dst0 + j] + deepstack_tap[src0 + j]
+
+
 def minimax_h3_encode_conditioning_streamed_depth(
-    dir_or_file: String, ids: List[Int], num_layers: Int, ctx: DeviceContext
+    dir_or_file: String,
+    ids: List[Int],
+    num_layers: Int,
+    ctx: DeviceContext,
+    vision: Optional[MiniMaxH3VisionOutput] = None,
+    visual_positions: Optional[List[Int]] = None,
 ) raises -> Tensor:
     """Run exactly `num_layers` decoder layers (0..num_layers-1) and return
     that raw (pre-norm) hidden state — i.e. HF's `output_hidden_states`
@@ -321,11 +487,34 @@ def minimax_h3_encode_conditioning_streamed_depth(
     contract, num_layers=H3_EXTRACT_LAYER=50) is a thin wrapper over this;
     this generic depth parameter exists so parity/minimax_h3_conditioner_
     real_weight_gate.mojo can gate at depths the currently-available shards
-    actually support (e.g. 1 and 23) without waiting for shard 11."""
+    actually support (e.g. 1 and 23) without waiting for shard 11.
+
+    DEEPSTACK (optional, backward-compatible): `vision`/`visual_positions`
+    default to `None`, in which case this function behaves EXACTLY as before
+    (t2va is text-only and depends on that). When both are supplied (they
+    must be supplied TOGETHER — passing only one raises), the vision
+    tower's merged embeds are SPLICED into the embedding stream ONCE, before
+    layer 0 (`minimax_h3_splice_vision_embeds`), and its three deepstack
+    taps are ADDED at `visual_positions` ONLY, immediately AFTER decoder
+    layers 0, 1, 2 finish their own forward — matching
+    `Qwen3VLTextModel.forward`'s own ordering exactly
+    (modeling_qwen3_vl.py:849-867, see the DEEPSTACK INJECTION header above
+    `minimax_h3_mm_token_type_ids`). The three taps must already be resident
+    in `vision` (a `MiniMaxH3VisionOutput`) before this call begins — they
+    are consumed immediately at layers 0-2, so there is no lazy mid-decode
+    load path here."""
     if len(ids) == 0:
         raise Error("minimax_h3_encode_conditioning_streamed_depth: empty prompt")
     if num_layers <= 0:
         raise Error("minimax_h3_encode_conditioning_streamed_depth: num_layers must be > 0")
+    var has_vision = vision.__bool__()
+    if has_vision != visual_positions.__bool__():
+        raise Error(
+            "minimax_h3_encode_conditioning_streamed_depth: vision and"
+            " visual_positions must be supplied together (both Some or both"
+            " None) — deepstack injection needs both the tower output and"
+            " the positions it substitutes/adds at."
+        )
     var seq = len(ids)
     var st = _h3_open_available_shards(dir_or_file)
     var layer_prefix = _detect_layer_prefix(st)
@@ -333,6 +522,20 @@ def minimax_h3_encode_conditioning_streamed_depth(
 
     var hidden = _h3_embed(st, embed_prefix, ids, ctx)  # [1, seq, 5120]
     ctx.synchronize()  # embed table (~1.45 GiB) freed before layer streaming starts
+
+    if has_vision:
+        # Splice ONCE, before layer 0 — layer 0 must consume the embedding
+        # stream with the tower's merged embeds already substituted in
+        # (get_placeholder_mask's substitution, modeling_qwen3_vl.py:
+        # 1066-1104). `hidden` is [1, seq, H3_HIDDEN]; the splice helper is a
+        # plain host List[Float32] op, so round-trip it through F32 host
+        # memory via the existing `Tensor.to_host`/`Tensor.from_host`
+        # boundary (a few hundred KB, negligible next to the multi-GiB
+        # per-layer disk streaming this file already pays).
+        var vpos = visual_positions.value().copy()
+        var host_embeds = hidden.to_host(ctx)
+        minimax_h3_splice_vision_embeds(host_embeds, vision.value().embeds, vpos, H3_HIDDEN)
+        hidden = Tensor.from_host(host_embeds, hidden.shape(), hidden.dtype(), ctx)
 
     var dtype = hidden.dtype()
     var q_tables = _build_rope_tables(seq, H3_HEADS, H3_HEAD_DIM, H3_THETA)
@@ -355,16 +558,35 @@ def minimax_h3_encode_conditioning_streamed_depth(
     mask_sh.append(seq)
     var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)
 
+    var deepstack_lm_layers = minimax_h3_vision_deepstack_lm_layers()  # [0, 1, 2]
+
     for li in range(num_layers):  # 0..num_layers-1
         var lw = _h3_load_layer(st, li, layer_prefix, ctx)
         hidden = lw._layer(li, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx)
+        # Deepstack add happens AFTER the layer's own forward completes,
+        # matching modeling_qwen3_vl.py:849-867 EXACTLY: `hidden_states =
+        # layer_outputs` (859) runs BEFORE the `layer_idx in
+        # range(len(deepstack_visual_embeds))` check (862) — the layer sees
+        # the PRE-tap state as its input; the tap is applied to its output.
+        if has_vision:
+            for k in range(len(deepstack_lm_layers)):
+                if deepstack_lm_layers[k] == li:
+                    var vpos2 = visual_positions.value().copy()
+                    var tap = vision.value().deepstack_block(k)
+                    var host_hidden = hidden.to_host(ctx)
+                    minimax_h3_deepstack_add(host_hidden, tap, vpos2, H3_HIDDEN)
+                    hidden = Tensor.from_host(host_hidden, hidden.shape(), hidden.dtype(), ctx)
         ctx.synchronize()  # this layer's ~0.95 GiB dropped before the next load
 
     return hidden^
 
 
 def minimax_h3_encode_conditioning_streamed(
-    dir_or_file: String, ids: List[Int], ctx: DeviceContext
+    dir_or_file: String,
+    ids: List[Int],
+    ctx: DeviceContext,
+    vision: Optional[MiniMaxH3VisionOutput] = None,
+    visual_positions: Optional[List[Int]] = None,
 ) raises -> Tensor:
     """H3's real conditioner forward: `hidden_states[H3_EXTRACT_LAYER]` in
     the sense fixed above — i.e. runs layers 0..H3_EXTRACT_LAYER-1 (50
@@ -382,5 +604,14 @@ def minimax_h3_encode_conditioning_streamed(
 
     No padding/PAD-id handling here (real_len == seq, full causal, no mask
     beyond causality) — that is tokenizer/chat-template wiring, already done
-    in minimax_h3_conditioning.mojo."""
-    return minimax_h3_encode_conditioning_streamed_depth(dir_or_file, ids, H3_EXTRACT_LAYER, ctx)
+    in minimax_h3_conditioning.mojo.
+
+    DEEPSTACK (optional, backward-compatible): `vision`/`visual_positions`
+    default to `None` and are simply forwarded to
+    `minimax_h3_encode_conditioning_streamed_depth` — see that function's
+    header for the full contract. t2va (text-only, no conditioning image)
+    calls this with the 3-positional-argument form and is therefore
+    completely unaffected."""
+    return minimax_h3_encode_conditioning_streamed_depth(
+        dir_or_file, ids, H3_EXTRACT_LAYER, ctx, vision, visual_positions
+    )

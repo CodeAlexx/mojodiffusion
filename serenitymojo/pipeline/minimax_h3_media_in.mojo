@@ -428,6 +428,189 @@ def minimax_h3_ffmpeg_extract_rgb(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ROUTE 3 — a single still IMAGE (a t2va/fl2va KEYFRAME), same ffmpeg route
+# ═════════════════════════════════════════════════════════════════════════════
+def minimax_h3_ffprobe_image_geometry(
+    image_path: String, scratch_path: String
+) raises -> List[Int]:
+    """`[width, height]` of a still image.
+
+    Deliberately NOT `minimax_h3_ffprobe_video_geometry`: a still has no frame
+    rate, and ffprobe reports `avg_frame_rate` as `0/0` for one, which that
+    function correctly rejects as a zero denominator. Asking only for the two
+    axes keeps the failure modes of the two media kinds apart."""
+    var command = (
+        String("ffprobe -v error -select_streams v:0 -show_entries ")
+        + String("stream=width,height -of csv=p=0 ")
+        + shell_quote(image_path) + String(" > ") + shell_quote(scratch_path)
+    )
+    if sys_system(command) != 0:
+        raise Error(
+            String("minimax_h3_media_in: ffprobe failed on ") + image_path
+            + " (is ffprobe installed, and is this a decodable image?)"
+        )
+    var line = _strip_ascii(_read_all_text(scratch_path))
+    var fields = _split_bytes(line, 44)  # ','
+    if len(fields) < 2:
+        raise Error(
+            String("minimax_h3_media_in: unexpected ffprobe output '") + line
+            + "' for " + image_path
+        )
+    var width = atol(_strip_ascii(fields[0]))
+    var height = atol(_strip_ascii(fields[1]))
+    if width <= 0 or height <= 0:
+        raise Error(
+            String("minimax_h3_media_in: ffprobe reported a non-positive size ")
+            + String(width) + "x" + String(height) + " for " + image_path
+        )
+    return [width, height]
+
+
+def minimax_h3_jpeg_exif_orientation(path: String) raises -> Int:
+    """The EXIF `Orientation` tag (0x0112) of a JPEG, or 1 when there is none.
+
+    Needed because the vendor runs `ImageOps.exif_transpose` on every keyframe
+    (before_encoder.py:163) and ffmpeg does NOT: the JPEG EXIF orientation tag
+    is not a container display matrix, and ffmpeg only honours the latter. A
+    phone photo would therefore reach the VAE sideways, on a canvas resolved
+    from the wrong aspect ratio.
+
+    Structural walk over the file's own bytes — no image library. Returns 1 for
+    anything that is not a JPEG carrying a readable IFD0 orientation, which is
+    the same answer PIL gives (`exif_transpose` is a no-op when the tag is
+    absent); a MALFORMED tag is not guessed at, it reads as absent."""
+    var data = _read_all_bytes(path)
+    var n = len(data)
+    if n < 4 or data[0] != UInt8(0xFF) or data[1] != UInt8(0xD8):
+        return 1  # not a JPEG: PNG/WebP carry no EXIF orientation PIL would act on
+
+    var pos = 2
+    while pos + 4 <= n:
+        if data[pos] != UInt8(0xFF):
+            return 1  # marker desync — do not guess
+        var marker = Int(data[pos + 1])
+        # Standalone markers carry no length payload.
+        if marker == 0xD8 or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD7):
+            pos += 2
+            continue
+        if marker == 0xDA or marker == 0xD9:
+            return 1  # entropy-coded data / end of image: no APP1 before it
+        var seg_len = (Int(data[pos + 2]) << 8) | Int(data[pos + 3])
+        if seg_len < 2 or pos + 2 + seg_len > n:
+            return 1
+        if marker == 0xE1 and seg_len >= 8:
+            var p = pos + 4
+            if (
+                data[p] == UInt8(0x45) and data[p + 1] == UInt8(0x78)
+                and data[p + 2] == UInt8(0x69) and data[p + 3] == UInt8(0x66)
+                and data[p + 4] == UInt8(0x00) and data[p + 5] == UInt8(0x00)
+            ):
+                return _exif_orientation_from_tiff(data, p + 6, pos + 2 + seg_len)
+        pos += 2 + seg_len
+    return 1
+
+
+def _read_u16(data: List[UInt8], at: Int, little: Bool) -> Int:
+    if little:
+        return Int(data[at]) | (Int(data[at + 1]) << 8)
+    return (Int(data[at]) << 8) | Int(data[at + 1])
+
+
+def _read_u32(data: List[UInt8], at: Int, little: Bool) -> Int:
+    if little:
+        return (
+            Int(data[at]) | (Int(data[at + 1]) << 8)
+            | (Int(data[at + 2]) << 16) | (Int(data[at + 3]) << 24)
+        )
+    return (
+        (Int(data[at]) << 24) | (Int(data[at + 1]) << 16)
+        | (Int(data[at + 2]) << 8) | Int(data[at + 3])
+    )
+
+
+def _exif_orientation_from_tiff(
+    data: List[UInt8], tiff_start: Int, limit: Int
+) raises -> Int:
+    """IFD0 of the TIFF block inside an EXIF APP1 segment. Offsets inside a TIFF
+    block are relative to the block's own start, not to the file."""
+    if tiff_start + 8 > limit:
+        return 1
+    var little: Bool
+    if data[tiff_start] == UInt8(0x49) and data[tiff_start + 1] == UInt8(0x49):
+        little = True
+    elif data[tiff_start] == UInt8(0x4D) and data[tiff_start + 1] == UInt8(0x4D):
+        little = False
+    else:
+        return 1
+    if _read_u16(data, tiff_start + 2, little) != 42:
+        return 1
+    var ifd = tiff_start + _read_u32(data, tiff_start + 4, little)
+    if ifd + 2 > limit:
+        return 1
+    var count = _read_u16(data, ifd, little)
+    for i in range(count):
+        var entry = ifd + 2 + i * 12
+        if entry + 12 > limit:
+            return 1
+        if _read_u16(data, entry, little) == 0x0112:
+            # SHORT (type 3): the value sits in the first two bytes of the
+            # 4-byte value field, in the block's endianness.
+            var value = _read_u16(data, entry + 8, little)
+            if value >= 1 and value <= 8:
+                return value
+            return 1
+    return 1
+
+
+def minimax_h3_ffmpeg_read_image(
+    image_path: String,
+    rgb_path: String,
+    scratch_path: String,
+) raises -> MiniMaxH3RgbFrames:
+    """Decode ONE still image (PNG / JPEG / anything ffmpeg reads) to `uint8`
+    RGB, as a 1-frame `MiniMaxH3RgbFrames` — the `[1, H, W, 3]` a keyframe is.
+
+    Same rawvideo route the video path uses, so the byte layout is the one
+    reader's, not a second one. `fps` is carried as MiniMax-H3's own 24 purely
+    to satisfy the struct; a still has no rate and nothing downstream reads it.
+
+    ALPHA: `-pix_fmt rgb24` drops an alpha channel without compositing, which is
+    what `PIL.Image.convert("RGB")` does too, so an RGBA PNG lands the same way
+    on both sides. A 16-bit-per-channel PNG does NOT: ffmpeg truncates to 8 bits
+    where PIL rescales, and that is called out rather than silently accepted.
+
+    EXIF orientation is NOT applied here — this returns what the file's pixel
+    grid holds. `minimax_h3_jpeg_exif_orientation` reads the tag and
+    `minimax_h3_exif_transpose` (pipeline/minimax_h3_keyframe_image.mojo)
+    applies it, so the ingest stays a pure decode."""
+    var geometry = minimax_h3_ffprobe_image_geometry(image_path, scratch_path)
+    var width = geometry[0]
+    var height = geometry[1]
+
+    var command = (
+        String("ffmpeg -v error -y -i ") + shell_quote(image_path)
+        + String(" -frames:v 1 -f rawvideo -pix_fmt rgb24 ")
+        + shell_quote(rgb_path)
+    )
+    if sys_system(command) != 0:
+        raise Error(
+            String("minimax_h3_media_in: ffmpeg rawvideo extraction failed for ")
+            + image_path
+        )
+    var pixels = _read_all_bytes(rgb_path)
+    var expected = height * width * 3
+    if len(pixels) != expected:
+        raise Error(
+            String("minimax_h3_media_in: ") + rgb_path + " holds "
+            + String(len(pixels)) + " bytes, but " + String(width) + "x"
+            + String(height) + " rgb24 implies " + String(expected)
+            + " — a multi-frame source (animated GIF/APNG) or a geometry"
+            " mismatch; a keyframe must be a single still"
+        )
+    return MiniMaxH3RgbFrames(pixels^, 1, height, width, MINIMAX_H3_MEDIA_FPS)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Audio
 # ═════════════════════════════════════════════════════════════════════════════
 def minimax_h3_read_wav(path: String) raises -> MiniMaxH3Waveform:

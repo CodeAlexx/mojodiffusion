@@ -64,6 +64,7 @@
 
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
+from std.collections import List
 from std.sys import argv
 
 from serenitymojo.tensor import Tensor
@@ -71,7 +72,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import sub, div
+from serenitymojo.ops.tensor_algebra import sub, div, zeros_device
 from serenitymojo.registry.checkpoints import path_exists
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.vae.qwenimage_encoder import QwenImageVaeEncoder
@@ -80,6 +81,7 @@ from serenitymojo.models.text_encoder.krea2_qwen3vl_4b import (
     load_krea2_qwen3vl_4b,
     encode_krea2_stack,
 )
+from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder
 from serenitymojo.pipeline.krea2_paths import (
     KREA2_TE_DIR,
     KREA2_TOK_JSON,
@@ -128,14 +130,28 @@ def _normalize_latent(
 
 
 def _encode_context(
-    enc_dir: String, tok: Qwen3Tokenizer, caption: String, ctx: DeviceContext
+    enc: Qwen3Encoder, tok: Qwen3Tokenizer, caption: String, ctx: DeviceContext
 ) raises -> Tensor:
     """Tokenize PREFIX + caption + SUFFIX, encode the 12-layer krea2 stack -> context
     [1,LT,12,2560] BF16 (LT = stack.shape()[1] = len(ids) - DROP_IDX). Mirrors
-    krea2_encode_cli._encode_one / ai-toolkit encode_krea_prompt. The encoder is
-    loaded function-local (dropped on return) so its VRAM does not accumulate across
-    the two encode calls."""
-    var enc = load_krea2_qwen3vl_4b(enc_dir, ctx)
+    krea2_encode_cli._encode_one / ai-toolkit encode_krea_prompt.
+
+    TAKES AN ALREADY-LOADED ENCODER. It used to take `enc_dir` and call
+    load_krea2_qwen3vl_4b ITSELF, i.e. it re-loaded the 9.6 GB Qwen3-VL-4B from
+    disk ON EVERY CALL. That was harmless where the pattern came from
+    (krea2_encode_cli encodes exactly two prompts), but pass 1 below calls this
+    ONCE PER SAMPLE — so a 3000-sample prepare did 3000 full model loads.
+    MEASURED 2026-07-30 on the MagicBrush prepare: 59 captions/min (~1.0 s each,
+    flat regardless of caption length), main thread pinned at 100% CPU streaming
+    weights through the pinned host staging buffer while the GPU idled at 20%.
+    That is host-side work on the critical path — the thing the no-CPU-compute
+    rule exists to prevent — and it made the caption pass ~50 min for 3000
+    samples where the actual encode work is seconds. Invisible at the 96-sample
+    dev scale (1.6 min); a wall at production scale.
+
+    The VRAM concern the old docstring cited is handled by SCOPE instead: pass 1
+    owns the encoder and drops it before pass 2 loads any VAE, so the TE and the
+    VAE are still never co-resident."""
     var ids = tok.encode(KREA2_TPL_PREFIX + caption + KREA2_TPL_SUFFIX)
     return encode_krea2_stack(enc, ids, ctx)   # [1, LT, 12, 2560] bf16
 
@@ -216,6 +232,29 @@ def _encode_one_latent[IH: Int, IW: Int](
     return _encode_one_latent_key[IH, IW](
         venc, stage_dir, i, String("image"), mean_ch, std_ch, ctx
     )
+
+
+def _encode_black_latent[IH: Int, IW: Int](
+    venc: QwenImageVaeEncoder[IH, IW],
+    mean_ch: Tensor, std_ch: Tensor, ctx: DeviceContext,
+) raises -> Tensor:
+    """Encode RGB black in the exact staged-image domain (all channels -1).
+
+    Omini condition dropout substitutes the VAE encoding of an empty/black
+    condition; a numeric zero latent is not equivalent because the VAE and its
+    latent normalization are non-zero-affine.
+    """
+    var zh = List[Float32]()
+    zh.append(Float32(-1.0))
+    var neg_one = Tensor.from_host(zh^, [1, 1, 1, 1], STDtype.BF16, ctx)
+    var zero = zeros_device([1, 3, IH, IW], STDtype.BF16, ctx)
+    var black = sub(zero, neg_one, ctx)
+    # zero - (-1) is +1; staged black is -1, so negate via 0 - (+1).
+    var black_img = sub(zero, black, ctx)
+    var lat_mean = venc.encode_mean(black_img, ctx)
+    var lat_f32 = cast_tensor(lat_mean, STDtype.F32, ctx)
+    var clean_f32 = _normalize_latent(lat_f32, mean_ch, std_ch, ctx)
+    return cast_tensor(clean_f32, STDtype.BF16, ctx)
 
 
 def _copy_stage_tensor(
@@ -330,20 +369,22 @@ def _run[E_UNITS: Int](
                 )
 
     # ── pass 1: captions -> context.<i> + text_len.<i> (aspect-independent) ─────
-    # Done BEFORE any VAE is resident (the Qwen3-VL-4B TE is ~9.6GB, loaded+freed
-    # per caption inside _encode_context — no VAE co-resident here).
-    for i in range(n):
-        var prompt = _read_text(_stage_caption_path(stage_dir, i))
-        var context = _encode_context(String(KREA2_TE_DIR), tok, prompt, ctx)
-        var lt = context.shape()[1]   # LT == len(ids) - DROP_IDX
-        names.append(String("context.") + String(i))
-        tensors.append(TArc(context^))
-        var tl_host = List[Float32]()
-        tl_host.append(Float32(lt))
-        var tl = Tensor.from_host(tl_host^, [1], STDtype.F32, ctx)
-        names.append(String("text_len.") + String(i))
-        tensors.append(TArc(tl^))
-        print("[krea2-prepare] caption", i, " LT=", lt)
+    # Done BEFORE any VAE is resident. This lexical scope owns ONE Qwen3-VL-4B
+    # encoder for the whole caption pass and drops it before pass 2 loads a VAE.
+    if n > 0:
+        var enc = load_krea2_qwen3vl_4b(String(KREA2_TE_DIR), ctx)
+        for i in range(n):
+            var prompt = _read_text(_stage_caption_path(stage_dir, i))
+            var context = _encode_context(enc, tok, prompt, ctx)
+            var lt = context.shape()[1]   # LT == len(ids) - DROP_IDX
+            names.append(String("context.") + String(i))
+            tensors.append(TArc(context^))
+            var tl_host = List[Float32]()
+            tl_host.append(Float32(lt))
+            var tl = Tensor.from_host(tl_host^, [1], STDtype.F32, ctx)
+            names.append(String("text_len.") + String(i))
+            tensors.append(TArc(tl^))
+            print("[krea2-prepare] caption", i, " LT=", lt)
 
     # ── pass 2: bucket-by-bucket VAE encode -> clean.<i> [1,16,LH,LW] ───────────
     # comptime for over the krea2 ladder; ONE QwenImageVaeEncoder[IH,IW] resident
@@ -370,6 +411,16 @@ def _run[E_UNITS: Int](
                 " (", n_match, "samples ) loading QwenImageVaeEncoder",
             )
             var venc = QwenImageVaeEncoder[IH_BI, IW_BI].load(KREA2_VAE_ENC_FILE, ctx)
+            if omini_mode:
+                var black_lat = _encode_black_latent[IH_BI, IW_BI](
+                    venc, mean_ch, std_ch, ctx
+                )
+                names.append(
+                    String("ref_uncond.") + String(LH_BI) + String("x") + String(LW_BI)
+                )
+                tensors.append(TArc(black_lat^))
+                print("[krea2-prepare] condition-drop black latent -> ref_uncond.",
+                      LH_BI, "x", LW_BI)
             for i in range(n):
                 if ihs[i] == IH_BI and iws[i] == IW_BI:
                     var clean = _encode_one_latent[IH_BI, IW_BI](
@@ -445,7 +496,10 @@ def _run[E_UNITS: Int](
                 + String(" non-whitespace chars: '") + u_stripped
                 + String("'. Re-stage from a config with caption dropout enabled.")
             )
-        var u_context = _encode_context(String(KREA2_TE_DIR), tok, uprompt, ctx)
+        # Keep this load after pass 2 so names/tensors retain their historical
+        # append order. It is the second and final TE load for this prepare.
+        var u_enc = load_krea2_qwen3vl_4b(String(KREA2_TE_DIR), ctx)
+        var u_context = _encode_context(u_enc, tok, uprompt, ctx)
         var u_lt = u_context.shape()[1]
         names.append(String("context_uncond"))
         tensors.append(TArc(u_context^))

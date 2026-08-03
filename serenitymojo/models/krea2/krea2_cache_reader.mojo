@@ -107,14 +107,15 @@ def krea2_patchify[LH: Int, LW: Int](
 # krea2_omini_pos_src (training/krea2_omini_layout.mojo:278) builds exactly this
 # order; krea2_build_pos_cond below is its device-side twin and the C5 gate proves
 # the two agree element-for-element.
-def krea2_build_pos_cond[LH: Int, LW: Int](
+def krea2_build_pos_cond_grid[
+    LH: Int, LW: Int, COND_LH: Int, COND_LW: Int
+](
     lt: Int, condlen: Int, dh: Int, dw: Int, scale: Float32, ctx: DeviceContext
 ) raises -> Tensor:
     """SOURCE-order pos [1, lt+imglen+condlen, 3] f32 =
-    [txt zeros(lt) | img grid | cond grid]. The cond grid is the img grid pushed
-    through krea2_omini_cond_pos(hi, wi, dh, dw, scale) — for EDIT (dh=dw=0,
-    scale=1.0) it EQUALS the img grid, which is the spatial-overlap property
-    OminiControl's edit/spatial-alignment condition relies on.
+    [txt zeros(lt) | img grid | cond grid]. The condition may use an independent
+    compact grid; `scale` maps its positions into the target canvas following
+    OminiControl2's compact-representation contract.
 
     condlen == 0 reduces to the pre-C5 krea2_build_pos EXACTLY (same loop, same
     float writes, no cond section) — krea2_build_pos delegates here so there is one
@@ -122,12 +123,14 @@ def krea2_build_pos_cond[LH: Int, LW: Int](
     dump taken before this change."""
     comptime gh = LH // KREA2_PATCH
     comptime gw = LW // KREA2_PATCH
+    comptime cond_gh = COND_LH // KREA2_PATCH
+    comptime cond_gw = COND_LW // KREA2_PATCH
     comptime imglen = gh * gw
-    if condlen != 0 and condlen != imglen:
+    comptime cond_grid_len = cond_gh * cond_gw
+    if condlen != 0 and condlen != cond_grid_len:
         raise Error(
             String("krea2_build_pos_cond: condlen=") + String(condlen)
-            + " must be 0 or the img grid size " + String(imglen)
-            + " (EDIT: the condition shares the target canvas)"
+            + " must be 0 or the condition grid size " + String(cond_grid_len)
         )
     var host = List[Float32]()
     for _ in range(lt * 3):
@@ -138,14 +141,23 @@ def krea2_build_pos_cond[LH: Int, LW: Int](
             host.append(Float32(hi))         # axis 1 (h)
             host.append(Float32(wi))         # axis 2 (w)
     if condlen > 0:
-        for hi in range(gh):
-            for wi in range(gw):
+        for hi in range(cond_gh):
+            for wi in range(cond_gw):
                 var p = krea2_omini_cond_pos(hi, wi, dh, dw, scale)
                 host.append(p.g)
                 host.append(p.h)
                 host.append(p.w)
     var lfull = lt + imglen + condlen
     return Tensor.from_host(host^, [1, lfull, 3], STDtype.F32, ctx)
+
+
+def krea2_build_pos_cond[LH: Int, LW: Int](
+    lt: Int, condlen: Int, dh: Int, dw: Int, scale: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Equal-grid compatibility wrapper used by existing cache/training paths."""
+    return krea2_build_pos_cond_grid[LH, LW, LH, LW](
+        lt, condlen, dh, dw, scale, ctx
+    )
 
 
 def krea2_build_pos[LH: Int, LW: Int](
@@ -795,6 +807,44 @@ struct KreaTrainCache(Movable):
         var lt = context.shape()[1]
         var pos = krea2_build_pos[LH, LW](lt, ctx)
         return KreaUncondCond(TArc(context^), TArc(pos^), lt)
+
+    def uncond_padded_edit[LH: Int, LW: Int, LTMAX: Int](
+        self, ctx: DeviceContext
+    ) raises -> KreaUncondCond:
+        """Empty-caption conditioning padded to the Omini EDIT source layout."""
+        comptime imglen = (LH // KREA2_PATCH) * (LW // KREA2_PATCH)
+        var u = self.uncond[LH, LW](ctx)
+        if u.text_len > LTMAX:
+            raise Error("KreaTrainCache: uncond text length exceeds LTMAX")
+        var padded: Tensor
+        if u.text_len < LTMAX:
+            var pad = zeros_device(
+                [1, LTMAX - u.text_len, KREA2_TXT_LAYERS, KREA2_TXT_DIM],
+                STDtype.BF16, ctx,
+            )
+            padded = concat(1, ctx, u.context[], pad)
+        else:
+            padded = u.context[].clone(ctx)
+        var pos = krea2_build_pos_cond[LH, LW](
+            LTMAX, imglen, 0, 0, Float32(1.0), ctx
+        )
+        return KreaUncondCond(TArc(padded^), TArc(pos^), u.text_len)
+
+    def uncond_ref_tokens[LH: Int, LW: Int](
+        self, ctx: DeviceContext
+    ) raises -> TArc:
+        """Patchified normalized VAE latent of a black Omini condition image."""
+        var key = String("ref_uncond.") + String(LH) + String("x") + String(LW)
+        if key not in self.src.name_to_shard:
+            raise Error(
+                String("KreaTrainCache: condition_dropout enabled but cache has no ")
+                + key + String(" (rebuild with corrected krea2_prepare_cache)")
+            )
+        var black = cast_tensor(
+            Tensor.from_view(self.src.tensor_view(key), ctx), STDtype.BF16, ctx
+        )
+        _validate_clean_shape[LH, LW](black)
+        return TArc(krea2_patchify[LH, LW](black, ctx))
 
     def sample[LH: Int, LW: Int](
         self, index: Int, ctx: DeviceContext

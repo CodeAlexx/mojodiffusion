@@ -49,10 +49,23 @@
 # because the vertical needs it, not because it is expected to help this
 # checkpoint. Do not read a bad --image-guidance render as a bug in the wiring.
 #
-# ⚠ NOTHING IN THIS FILE HAS BEEN EXECUTED ON A GPU. It was authored while a
-# 3000-step edit training run owned the card; the only thing verified is that it
-# compiles. Every runtime claim above is a statement about what the code says,
-# not a measurement. See the C8 verification plan.
+# ── DEVICE-VERIFIED 2026-07-30 (was: "nothing here has been executed") ───────
+# V1/V2/V3 all PASS on the RTX 5080, and the --cond-image arm — the one the C8
+# author could never run — is now measured, and it WAS BROKEN. See
+# _load_signed_image for the defect (aspect squash vs the stager's centre-crop)
+# and the numbers. After the fix:
+#   * --cond-image fed the SAME source the cache holds reproduces the --from-cache
+#     render to RMSE 0.98/255 (0.00, i.e. BIT-IDENTICAL, when the resample is a
+#     no-op) — so the VAE-encode, the inline_cond_from_context_edit context/pos
+#     build, and the cond-row LoRA routing on this arm are all correct.
+#   * HELD-OUT (never-trained images, instruction "restore and colorize this
+#     photo", 20 steps, seed 1234, c6_3000): a modern B&W portrait comes back
+#     colorised with structure intact (saturation 0.0 -> 34.4; the --no-lora
+#     partner stays at 3.3 and is the usual checkerboard mush). A synthetically
+#     damaged colour photo (scratches/spots/fade) comes back clean at RMSE 41.9
+#     to its ground truth vs 50.8 for the damaged input and 58.1 for --no-lora.
+#     The vertical GENERALISES; it is not a memoriser of the 96 training pairs.
+# Still unrun: V5 condition_scale != 1, V6 image-CFG, V7 --trainer-text A/B.
 #
 # ── RUN ───────────────────────────────────────────────────────────────────────
 # Two conditioning sources. Pick ONE.
@@ -82,8 +95,32 @@
 #               --trainer-text (drop the txtfusion refiner mask, matching the
 #                               trainer's text conditioning exactly)
 #
-# ── VERIFICATION PLAN (C8 authored these; NONE of them has been run) ─────────
-# Run in order. Every one needs the GPU. BIN = output/bin/krea2_omini_edit_infer,
+# ── VERIFICATION PLAN — ALL SEVEN RUN AND PASSED 2026-07-30 (RTX 5080) ───────
+# Results, index 0, 20 steps, seed 1234 unless stated, c6_3000, distances RMSE/255
+# in 512x512 pixel space against the STAGED tensors (sample_00000.safetensors),
+# which are the trainer's own view of the pair:
+#   V1 PASS  CONDLEN=1024 LFULL_EDIT=2432, "LoRA overlay loaded: 224 adapters".
+#   V2 PASS  LoRA 13.4 from target vs --no-lora 58.7 — the cond-row LoRA reaches
+#            the render. (The --no-lora panel is checkerboard mush, as documented.)
+#   V3 PASS  render 13.4 from target vs the damaged condition's own 42.8: it moves
+#            two thirds of the way to the target. Reproduces the handoff's 13.1
+#            exactly — this binary is bit-identical to the recorded sample.
+#   V4 PASS  seed 999 differs from seed 1234 (10.5) while both land the same
+#            distance from the target (11.4 vs 13.4): the output is being
+#            integrated, the condition is not.
+#   V5 PASS  --condition-scale 1.0001 completes on the masked-SDPA arm, no OOM
+#            (13.4 GB peak headroom held), 39.3 s vs 23.8 s, and the image is 0.52
+#            from the identity render — the arm is sane, not just non-crashing.
+#   V6 PASS(mechanically)  --image-guidance 1.5 completes, 47.6 s ~= 2x (the second
+#            forward), no OOM. QUALITY: pushes 18.1 off the identity render and
+#            AWAY from the target (27.6 vs 13.4) — exactly the off-distribution
+#            degradation the dropout caveat above predicts. Not a wiring bug.
+#   V7 PASS  --trainer-text is 1.24 from the default and marginally CLOSER to the
+#            target (13.05 vs 13.31): the refiner-mask train/infer divergence is
+#            real but tiny. Not worth chasing.
+# Plus the arm C8 could not reach at all — see the DEVICE-VERIFIED block above.
+#
+# Original plan text follows. BIN = output/bin/krea2_omini_edit_infer,
 # CACHE = /home/alex/trainings/krea2_omini_edit_cache/cache.safetensors,
 # CKPT  = /home/alex/trainings/krea2_omini_edit_run1/checkpoints/c6_3000.safetensors
 #
@@ -127,13 +164,15 @@ from std.gpu.host import DeviceContext
 from std.collections import Optional
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
+from std.sys.defines import get_defined_int
 
-from image.transform import resize_bilinear
+from image.buffer import Image
+from image.transform import crop, resize_bicubic
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.io.cap_cache import load_tensor_bin
+from serenitymojo.io.cap_cache import load_tensor_bin, save_tensor_bin
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.serve.image_io import decode_image_any, image_to_signed_nchw
 
@@ -147,10 +186,16 @@ from serenitymojo.models.krea2.krea2_cache_reader import (
 from serenitymojo.models.krea2.krea2_stack import (
     Krea2StreamFinal,
     Krea2ResidentFp8, Krea2ResidentSquareq, build_krea2_resident_squareq,
+    build_krea2_resident_int8,
 )
+from serenitymojo.models.dit.krea2_dit import (
+    Krea2ResidentInt8, Krea2HostInt8Inf, build_krea2_host_int8_inf,
+)
+from serenitymojo.models.klein.lora_block import LoraAdapterDevice
 from serenitymojo.models.krea2.krea2_infer import (
     Krea2InlineCond, Krea2ResidentCond, load_krea2_resident_cond,
-    inline_cond_from_context_edit, load_krea2_stack_lora,
+    inline_cond_from_context_edit, inline_cond_from_context_edit_grid,
+    load_krea2_stack_lora, load_krea2_omini_first_lora,
     empty_krea2_stack_lora, krea2_sample_latent, krea2_decode_latent_to_png,
 )
 from serenitymojo.pipeline.krea2_paths import (
@@ -159,15 +204,26 @@ from serenitymojo.pipeline.krea2_paths import (
 
 comptime TArc = ArcPointer[Tensor]
 
-# ── FIXED SHAPE (the C6 training shape; changing it means retraining) ─────────
-comptime HEIGHT = 512
-comptime WIDTH = 512
-comptime LH = HEIGHT // 8                    # 64
-comptime LW = WIDTH // 8                     # 64
-comptime IMGLEN = (LH // 2) * (LW // 2)      # 1024
-comptime LTMAX = 384                         # train.log: "LTMAX= 384"
-comptime CONDLEN = 1024                      # -D KREA2_CONDLEN=1024 of the run
-comptime LFULL_EDIT = LTMAX + IMGLEN + CONDLEN   # 2432 (train.log agrees)
+# ── COMPILE-TIME SAMPLE SHAPE ─────────────────────────────────────────────────
+# Defaults preserve the device-verified 512 build byte-for-byte. Validation may
+# deliberately render above the training resolution: build with
+#   -DKREA2_EDIT_HEIGHT=1024 -DKREA2_EDIT_WIDTH=1024
+# and the image/condition token counts both derive from that canvas. The edit
+# condition overlaps the output spatially, so CONDLEN must always equal IMGLEN.
+# LTMAX remains 384 by default to preserve the trainer's text layout; it can be
+# raised independently for a cache with longer captions.
+comptime HEIGHT = get_defined_int["KREA2_EDIT_HEIGHT", 512]()
+comptime WIDTH = get_defined_int["KREA2_EDIT_WIDTH", 512]()
+comptime LH = HEIGHT // 8
+comptime LW = WIDTH // 8
+comptime IMGLEN = (LH // 2) * (LW // 2)
+comptime COND_HEIGHT = get_defined_int["KREA2_EDIT_COND_HEIGHT", HEIGHT]()
+comptime COND_WIDTH = get_defined_int["KREA2_EDIT_COND_WIDTH", WIDTH]()
+comptime COND_LH = COND_HEIGHT // 8
+comptime COND_LW = COND_WIDTH // 8
+comptime LTMAX = get_defined_int["KREA2_EDIT_LTMAX", 384]()
+comptime CONDLEN = (COND_LH // 2) * (COND_LW // 2)
+comptime LFULL_EDIT = LTMAX + IMGLEN + CONDLEN
 comptime NBLOCKS = 28
 
 # OminiControl condition type "edit": delta [0,0], scale 1.0 -> the condition
@@ -176,7 +232,7 @@ comptime NBLOCKS = 28
 # trainer fail-louds if a sample disagrees.
 comptime COND_DELTA_H = 0
 comptime COND_DELTA_W = 0
-comptime COND_POS_SCALE = Float32(1.0)
+comptime COND_POS_SCALE = Float32(HEIGHT // COND_HEIGHT)
 
 comptime SQUAREQ_SIDECAR = String("models/krea2/squareq_w4_r32g32")
 comptime STEPS_DEFAULT = 28
@@ -218,8 +274,8 @@ def _arg_f32(args: List[String], flag: String, dflt: Float32) raises -> Float32:
 # F32 -> (z - latents_mean)/latents_std -> BF16 -> krea2_patchify. Anything else
 # here would hand the model a condition in a different space than training.
 def _encode_condition(
-    enc: QwenImageVaeEncoder[HEIGHT, WIDTH],
-    img_signed: Tensor,          # [1,3,HEIGHT,WIDTH] F32 in [-1,1]
+    enc: QwenImageVaeEncoder[COND_HEIGHT, COND_WIDTH],
+    img_signed: Tensor,          # [1,3,COND_HEIGHT,COND_WIDTH] F32 in [-1,1]
     ctx: DeviceContext,
 ) raises -> Tensor:
     var img_bf = cast_tensor(img_signed, STDtype.BF16, ctx)
@@ -229,16 +285,54 @@ def _encode_condition(
     var std_ch = _std_ch(ctx)
     var clean_f32 = _normalize_latent(lat_f32, mean_ch, std_ch, ctx)
     var clean_bf16 = cast_tensor(clean_f32, STDtype.BF16, ctx)
-    return krea2_patchify[LH, LW](clean_bf16, ctx)             # [1,CONDLEN,64]
+    return krea2_patchify[COND_LH, COND_LW](clean_bf16, ctx)  # [1,CONDLEN,64]
 
 
+def _center_crop_to_aspect(img: Image, target_w: Int, target_h: Int) raises -> Image:
+    """Byte-for-byte the stager's `_center_crop_to_aspect`
+    (scripts/krea2_omini_stage_edit.py:153-165): crop the LONG axis so the aspect
+    matches the bucket, keeping the centre. Same integer rounding (round-half-up
+    on positive values) so the crop box agrees with the Python one."""
+    var w = img.width
+    var h = img.height
+    var target_ar = Float64(target_w) / Float64(target_h)
+    var ar = Float64(w) / Float64(h)
+    if ar > target_ar:
+        var new_w = Int(Float64(h) * target_ar + 0.5)
+        var left = (w - new_w) // 2
+        return crop(img, left, 0, new_w, h)
+    var new_h = Int(Float64(w) / target_ar + 0.5)
+    var top = (h - new_h) // 2
+    return crop(img, 0, top, w, new_h)
+
+
+# MEASURED, NOT ASSUMED (2026-07-30, index 0 = dataset stem 1-01, 1696x2624):
+# the original code here was `resize_bilinear(img, 512, 512)` — an ASPECT SQUASH.
+# The trainer's condition came from the stager, which CENTER-CROPS to the bucket
+# aspect first (LANCZOS). On a 1696x2624 portrait the two disagree by RMSE 54.5
+# in pixel space, and the renders they produce disagree by RMSE 57.9: the
+# squashed-condition render sits 53.5 from the ground truth while the
+# correctly-cropped one sits 13.3. So this was not cosmetic — it fed the adapter
+# a geometry it never saw in training and the whole --cond-image path was broken
+# for any non-square source.
+# Filter choice: the vendor resampler has no LANCZOS, and its `resize_bilinear`
+# is PIL-equivalent ANTIALIASED triangle (transform.mojo:90-99 scales the support
+# by the downscale factor), so aliasing was never the issue — the crop was. Of
+# what is available, cubic is closest to the stager's LANCZOS: measured against a
+# PIL LANCZOS reference on this same crop, BICUBIC is 0.61 RMSE away and BILINEAR
+# 1.33 — both negligible next to the 54.5 the crop was worth, cubic simply wins.
 def _load_signed_image(path: String, ctx: DeviceContext) raises -> Tensor:
     var img = decode_image_any(path)
-    var resized = resize_bilinear(img, WIDTH, HEIGHT)
+    var cropped = _center_crop_to_aspect(img, COND_WIDTH, COND_HEIGHT)
+    var resized = resize_bicubic(cropped, COND_WIDTH, COND_HEIGHT)
     var host = image_to_signed_nchw(resized)
     print("[krea2-omini-edit] condition", path, "(", img.width, "x", img.height,
-          ") -> ", WIDTH, "x", HEIGHT)
-    return Tensor.from_host(host, [1, 3, HEIGHT, WIDTH], STDtype.F32, ctx)
+          ") -> centre-crop", cropped.width, "x", cropped.height,
+          "-> resize", COND_WIDTH, "x", COND_HEIGHT,
+          "(the stager's chain: crop-to-aspect then resample)")
+    return Tensor.from_host(
+        host, [1, 3, COND_HEIGHT, COND_WIDTH], STDtype.F32, ctx
+    )
 
 
 def _black_signed_image(ctx: DeviceContext) raises -> Tensor:
@@ -246,13 +340,19 @@ def _black_signed_image(ctx: DeviceContext) raises -> Tensor:
     (flux_omini.py:125). In the [-1,1] convention image_to_signed_nchw uses
     (v = px/127.5 - 1), pixel 0 maps to -1.0 — NOT to a zero tensor, and NOT to
     a zero latent: it still goes through the VAE."""
-    var host = List[Float32](capacity=3 * HEIGHT * WIDTH)
-    for _ in range(3 * HEIGHT * WIDTH):
+    var host = List[Float32](capacity=3 * COND_HEIGHT * COND_WIDTH)
+    for _ in range(3 * COND_HEIGHT * COND_WIDTH):
         host.append(Float32(-1.0))
-    return Tensor.from_host(host^, [1, 3, HEIGHT, WIDTH], STDtype.F32, ctx)
+    return Tensor.from_host(
+        host^, [1, 3, COND_HEIGHT, COND_WIDTH], STDtype.F32, ctx
+    )
 
 
 def main() raises:
+    comptime assert HEIGHT * COND_WIDTH == WIDTH * COND_HEIGHT
+    comptime assert HEIGHT % COND_HEIGHT == 0
+    comptime assert WIDTH % COND_WIDTH == 0
+    comptime assert HEIGHT // COND_HEIGHT == WIDTH // COND_WIDTH
     var ctx = DeviceContext()
     var raw = argv()
     var args = List[String]()
@@ -274,7 +374,12 @@ def main() raises:
     var condition_scale = _arg_f32(args, String("--condition-scale"), Float32(1.0))
     var image_guidance = _arg_f32(args, String("--image-guidance"), Float32(1.0))
     var use_stream = _arg_has(args, String("--stream"))
+    var use_int8 = _arg_has(args, String("--int8"))
+    var i8_resident_blocks = _arg_int(
+        args, String("--i8-resident-blocks"), Int(0)
+    )
     var trainer_text = _arg_has(args, String("--trainer-text"))
+    var latent_only = _arg_has(args, String("--latent-only"))
     var ckpt = _arg_str(args, String("--checkpoint"), String(KREA2_RAW))
     var sidecar = _arg_str(args, String("--squareq-sidecar"), String(SQUAREQ_SIDECAR))
 
@@ -286,7 +391,12 @@ def main() raises:
             "  | --cond-image <img> --ctx-pos <pos.bin> --ctx-neg <neg.bin>)"
             " --out <png> [--lora <p>] [--no-lora] [--steps N] [--seed N]"
             " [--cfg F] [--condition-scale F] [--image-guidance F]"
-            " [--lora-mult F] [--stream] [--trainer-text]"
+            " [--lora-mult F] [--stream|--int8]"
+            " [--i8-resident-blocks N] [--trainer-text] [--latent-only]"
+        )
+    if use_stream and use_int8:
+        raise Error(
+            "krea2_omini_edit_infer: --stream and --int8 are mutually exclusive"
         )
     if not from_cache and ctx_pos_bin == String(""):
         raise Error(
@@ -303,7 +413,9 @@ def main() raises:
         )
 
     print("[krea2-omini-edit] shape", HEIGHT, "x", WIDTH,
-          " LTMAX=", LTMAX, " IMGLEN=", IMGLEN, " CONDLEN=", CONDLEN,
+          " LTMAX=", LTMAX, " IMGLEN=", IMGLEN,
+          " condition=", COND_HEIGHT, "x", COND_WIDTH,
+          " CONDLEN=", CONDLEN, " pos_scale=", COND_POS_SCALE,
           " LFULL_EDIT=", LFULL_EDIT)
     print("[krea2-omini-edit] steps=", steps, " seed=", seed, " cfg=", cfg_scale,
           " condition_scale=", condition_scale,
@@ -364,14 +476,16 @@ def main() raises:
         if image_guidance != Float32(1.0):
             # Even the cache path needs the VAE for the BLACK condition — there
             # is no cached "empty condition" latent.
-            var enc = QwenImageVaeEncoder[HEIGHT, WIDTH].load(
+            var enc = QwenImageVaeEncoder[COND_HEIGHT, COND_WIDTH].load(
                 KREA2_VAE_ENC_FILE, ctx
             )
             cond_black = Optional[Tensor](
                 _encode_condition(enc, _black_signed_image(ctx), ctx)
             )
     else:
-        var enc = QwenImageVaeEncoder[HEIGHT, WIDTH].load(KREA2_VAE_ENC_FILE, ctx)
+        var enc = QwenImageVaeEncoder[COND_HEIGHT, COND_WIDTH].load(
+            KREA2_VAE_ENC_FILE, ctx
+        )
         cond_tokens = _encode_condition(
             enc, _load_signed_image(cond_image, ctx), ctx
         )
@@ -380,12 +494,16 @@ def main() raises:
                 _encode_condition(enc, _black_signed_image(ctx), ctx)
             )
         var cpos = load_tensor_bin(ctx_pos_bin, ctx)
-        pos_cond = inline_cond_from_context_edit[LH, LW, LTMAX, CONDLEN](
+        pos_cond = inline_cond_from_context_edit_grid[
+            LH, LW, COND_LH, COND_LW, LTMAX, CONDLEN
+        ](
             cpos^, COND_DELTA_H, COND_DELTA_W, COND_POS_SCALE, ctx,
         )
         var neg_path = ctx_neg_bin if ctx_neg_bin != String("") else ctx_pos_bin
         var cneg = load_tensor_bin(neg_path, ctx)
-        neg_cond = inline_cond_from_context_edit[LH, LW, LTMAX, CONDLEN](
+        neg_cond = inline_cond_from_context_edit_grid[
+            LH, LW, COND_LH, COND_LW, LTMAX, CONDLEN
+        ](
             cneg^, COND_DELTA_H, COND_DELTA_W, COND_POS_SCALE, ctx,
         )
         print("[krea2-omini-edit] LT(pos)=", pos_cond.text_len,
@@ -406,18 +524,43 @@ def main() raises:
     var cond_w = load_krea2_resident_cond(st, String(KREA2_RAW_KEY_PREFIX), ctx)
     var fin = Krea2StreamFinal.load(st, String(KREA2_RAW_KEY_PREFIX), ctx)
 
-    # DEFAULT = squareq_w4 resident, because that is the base numerics the C6 run
-    # TRAINED against (krea2_omini_edit_512.json quantized_resident="squareq_w4",
-    # train.log "squareq_w4 resident base: ... 28 pinned"). Rendering a LoRA
-    # against a different base quantization is a silent A/B change, so --stream
-    # (bf16 disk) is opt-in and loud.
+    # DEFAULT = squareq_w4 resident, because that is the base numerics the
+    # original C6 edit run trained against. MagicBrush uses the promoted
+    # tensorwise INT8 W8A8 path, selected explicitly with --int8. Rendering a
+    # LoRA against different base numerics is a silent A/B change, so every
+    # non-default base is opt-in and loud.
     var resident_sq = Optional[Krea2ResidentSquareq](None)
+    var resident_i8 = Optional[Krea2ResidentInt8](None)
+    var host_i8 = Optional[Krea2HostInt8Inf](None)
     if use_stream:
         print("[krea2-omini-edit] BASE = per-block bf16 DISK STREAM (opt-in;"
-              " NOT the squareq_w4 numerics this LoRA was trained against).")
+              " use only for a LoRA trained against bf16 base numerics).")
+    elif use_int8:
+        if i8_resident_blocks < 0 or i8_resident_blocks > NBLOCKS:
+            raise Error(
+                "krea2_omini_edit_infer: --i8-resident-blocks must be in [0, 28]"
+            )
+        print("[krea2-omini-edit] BASE = tensorwise INT8 W8A8: resident",
+              i8_resident_blocks, "/", NBLOCKS,
+              "blocks + pinned-host remainder (training numerics) ...")
+        if i8_resident_blocks > 0:
+            resident_i8 = Optional[Krea2ResidentInt8](
+                build_krea2_resident_int8(
+                    st, String(KREA2_RAW_KEY_PREFIX), NBLOCKS,
+                    i8_resident_blocks, ctx,
+                )
+            )
+        if i8_resident_blocks < NBLOCKS:
+            host_i8 = Optional[Krea2HostInt8Inf](
+                build_krea2_host_int8_inf(
+                    st, String(KREA2_RAW_KEY_PREFIX), NBLOCKS,
+                    i8_resident_blocks, ctx,
+                )
+            )
+        print("[krea2-omini-edit] INT8 W8A8 base: DONE.")
     else:
         print("[krea2-omini-edit] BASE = squareq_w4 resident from", sidecar,
-              "(the training numerics) ...")
+              "(original C6 training numerics) ...")
         var sq_sc = ShardedSafeTensors.open(sidecar)
         resident_sq = Optional[Krea2ResidentSquareq](
             build_krea2_resident_squareq(
@@ -432,8 +575,12 @@ def main() raises:
 
     # ── 3) the cond-row LoRA overlay (or an explicit identity overlay) ────────
     var lora = empty_krea2_stack_lora()
+    var first_lora = Optional[LoraAdapterDevice](None)
     if not no_lora:
         lora = load_krea2_stack_lora(lora_path, lora_mult, ctx)
+        first_lora = Optional[LoraAdapterDevice](
+            load_krea2_omini_first_lora(lora_path, lora_mult, ctx)
+        )
     else:
         print("[krea2-omini-edit] --no-lora: identity overlay, FROZEN BASE"
               " render (the A/B partner for a LoRA render).")
@@ -446,16 +593,32 @@ def main() raises:
         use_fixed_mu_1_15=False,
         progress_fd=Int32(-1),
         cond_tokens=Optional[Tensor](cond_tokens^),
+        first_lora=first_lora^,
         cond_tokens_black=cond_black^,
         image_guidance_scale=image_guidance,
         condition_scale=condition_scale,
         resident_sq=resident_sq^,
+        resident_i8=resident_i8^,
+        host_i8=host_i8^,
         use_refiner_mask=not trainer_text,
     )
     ctx.synchronize()
     print("[krea2-omini-edit] PHASE denoise =",
           Float64(Int(perf_counter_ns()) - _t) / 1e9, "s")
 
-    # ── 5) decode ────────────────────────────────────────────────────────────
-    krea2_decode_latent_to_png[LH, LW](latent, String(KREA2_VAE_DIR), out_png, ctx)
-    print("[krea2-omini-edit] wrote", out_png)
+    # ── 5) decode, or persist for a fresh-process decode ─────────────────────
+    # At 1024 EDIT length (IMG 4096 + COND 4096), denoising fits the 16GB card
+    # but the in-process Qwen VAE decoder does not fit beside the DiT allocator.
+    # --latent-only is the production-safe process boundary: save raw F32 latent
+    # bytes, exit (releasing every DiT allocation), then krea2_decode_latent loads
+    # and decodes them in a virgin GPU process. The default inline path remains
+    # unchanged for the device-verified 512 build.
+    if latent_only:
+        var lat_bin = out_png + String(".lat.bin")
+        save_tensor_bin(latent, lat_bin, ctx)
+        print("[krea2-omini-edit] LATENT-ONLY wrote", lat_bin)
+    else:
+        krea2_decode_latent_to_png[LH, LW](
+            latent, String(KREA2_VAE_DIR), out_png, ctx
+        )
+        print("[krea2-omini-edit] wrote", out_png)

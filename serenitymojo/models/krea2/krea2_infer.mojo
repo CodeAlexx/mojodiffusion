@@ -44,7 +44,8 @@ from serenitymojo.sampling.inpaint import (
 )
 from serenitymojo.models.krea2.krea2_cache_reader import (
     krea2_patchify, krea2_build_pos, krea2_build_refiner_mask,
-    krea2_build_pos_cond, krea2_reorder_combined_edit, krea2_edit_real_len,
+    krea2_build_pos_cond, krea2_build_pos_cond_grid,
+    krea2_reorder_combined_edit, krea2_edit_real_len,
     krea2_build_edit_attn_bias, krea2_edit_cond_bias,
     KREA2_TXT_LAYERS, KREA2_TXT_DIM, KREA2_HEADS,
 )
@@ -65,7 +66,10 @@ from serenitymojo.models.krea2.krea2_stack import (
     Krea2ResidentSquareq, build_krea2_resident_squareq,
 )
 from serenitymojo.models.dit.krea2_dit import Krea2HostInt8Inf
-from serenitymojo.models.klein.lora_block import LoraAdapterDevice, lora_adapter_to_device
+from serenitymojo.models.klein.lora_block import (
+    LoraAdapterDevice, lora_adapter_to_device,
+    klein_lora_fwd_device_resident_unfused,
+)
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import NamedLora, load_lora_for_resume
 from serenitymojo.serve.proc_ipc import (
@@ -240,9 +244,9 @@ struct _Cond(Movable):
 # READER's own krea2_reorder_combined_edit — the very function the trainer calls,
 # so there is no second copy of the gather math (layout seam A.3).
 #
-# WHY THIS IS THE TRAINER'S SEQUENCE, NOT A LOOKALIKE: cond_e is
-# krea2_first(cond_tokens) and nothing else (OminiControl shares x_embedder
-# between image and condition tokens), the second temb chain is the SAME
+# WHY THIS IS THE TRAINER'S SEQUENCE, NOT A LOOKALIKE: cond_e is the shared
+# frozen krea2_first(cond_tokens) plus the condition-only `first` LoRA, while
+# image rows receive only the frozen projection. The second temb chain is the SAME
 # temb->tmlp->tproj on t = 0, and the concat order is the Krea2OminiLayout one.
 # Those are the three things train_krea2._build_conditioning_edit does.
 #
@@ -265,6 +269,7 @@ def build_conditioning[LT: Int, LFULL: Int, CONDL: Int = 0](
         # [1, CONDL, 64] BF16 patchified CLEAN condition latent. REQUIRED when
         # CONDL > 0, ignored (and refused) when CONDL == 0.
     use_refiner_mask: Bool = True,
+    first_lora: Optional[LoraAdapterDevice] = Optional[LoraAdapterDevice](None),
 ) raises -> _Cond:
     comptime IMGL = LFULL - LT - CONDL
     comptime assert IMGL > 0, "build_conditioning: LFULL must exceed LT + CONDL"
@@ -324,11 +329,15 @@ def build_conditioning[LT: Int, LFULL: Int, CONDL: Int = 0](
     var combined: Tensor
     var blk_vec_cond = Optional[Tensor](None)
     comptime if CONDL > 0:
-        # COND rows: the SAME `first` Linear as the image rows, on the CLEAN
-        # condition latent (never noised, no img_in_ref delta) — the trainer's
-        # _build_conditioning_edit, statement for statement.
+        # COND rows: shared frozen `first` plus the Omini condition-only LoRA.
+        # Target image rows above deliberately do not receive this delta.
         var cond_bf = cast_tensor(cond_img.value(), STDtype.BF16, ctx)
         var cond_e = krea2_first(cond_bf, cond_w.first_w[], cond_w.first_b[], ctx)
+        if first_lora:
+            var cond_delta = klein_lora_fwd_device_resident_unfused(
+                cond_bf, first_lora.value(), CONDL, ctx
+            )
+            cond_e = add(cond_e, cond_delta, ctx)
         # chain #2: temb->tmlp->tproj on t = 0, the condition-row modulation.
         var t_zero = _t_scalar(Float32(0.0), ctx)
         var te_c = krea2_temb(t_zero, TDIM, ctx, STDtype.BF16)
@@ -471,6 +480,30 @@ def inline_cond_from_context_edit[LH: Int, LW: Int, LTMAX: Int, CONDL: Int](
     return Krea2InlineCond(TArc(padded^), TArc(pos^), lt)
 
 
+def inline_cond_from_context_edit_grid[
+    LH: Int, LW: Int, COND_LH: Int, COND_LW: Int, LTMAX: Int, CONDL: Int
+](
+    var context: Tensor,
+    dh: Int, dw: Int, pos_scale: Float32,
+    ctx: DeviceContext,
+) raises -> Krea2InlineCond:
+    """EDIT conditioning with an independently sized condition-token grid.
+    A compact condition grid plus position scale can span a larger target grid
+    without changing the adapter's condition-row count."""
+    var sh = context.shape()
+    if (
+        len(sh) != 4 or sh[0] != 1
+        or sh[2] != KREA2_TXT_LAYERS or sh[3] != KREA2_TXT_DIM
+    ):
+        raise Error("krea2_infer: expected context [1, LT, 12, 2560]")
+    var lt = sh[1]
+    var padded = _pad_context_to_ltmax[LTMAX](context^, lt, ctx)
+    var pos = krea2_build_pos_cond_grid[LH, LW, COND_LH, COND_LW](
+        LTMAX, CONDL, dh, dw, pos_scale, ctx
+    )
+    return Krea2InlineCond(TArc(padded^), TArc(pos^), lt)
+
+
 def inline_cond_from_bin[LH: Int, LW: Int, LTMAX: Int](
     path: String, ctx: DeviceContext,
 ) raises -> Krea2InlineCond:
@@ -565,6 +598,20 @@ def load_krea2_stack_lora(
     print("[krea2_infer] LoRA overlay loaded:", NBLOCKS * KREA2_SLOTS_PER_BLOCK,
           "adapters  scale=", scale, "  ", path)
     return Krea2StackLora(blocks^)
+
+
+def load_krea2_omini_first_lora(
+    path: String, scale: Float32, ctx: DeviceContext
+) raises -> LoraAdapterDevice:
+    """Load the mandatory condition-only Krea `first`/Omini x_embedder LoRA."""
+    var prefixes = List[String]()
+    prefixes.append(String("diffusion_model.first"))
+    var loaded = load_lora_for_resume(prefixes, scale, path, ctx)
+    if len(loaded) != 1:
+        raise Error("krea2 edit: corrected LoRA is missing diffusion_model.first")
+    if loaded[0].adapter.in_f != 64 or loaded[0].adapter.out_f != FEATURES:
+        raise Error("krea2 edit: diffusion_model.first LoRA shape must be 64->6144")
+    return lora_adapter_to_device(loaded[0].adapter, ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -691,6 +738,7 @@ def _krea2_edit_velocity[
     cond_w: Krea2ResidentCond,
     fin: Krea2StreamFinal,
     lora: Krea2StackLora,
+    first_lora: Optional[LoraAdapterDevice],
     text: Krea2InlineCond,      # text conditioning (positive OR negative)
     img_tokens: Tensor,         # [1, imglen, 64] BF16 patchified NOISED latent
     cond_tokens: Tensor,        # [1, CONDL, 64] BF16 patchified CLEAN condition
@@ -713,6 +761,7 @@ def _krea2_edit_velocity[
         cond_w, img_tokens, text.context[], text.pos[], t_t, lt, ctx,
         cond_img=Optional[Tensor](cond_tokens.clone(ctx)),
         use_refiner_mask=use_refiner_mask,
+        first_lora=first_lora.copy(),
     )
     var real_len = Optional[Int](krea2_edit_real_len(lt, imglen, CONDL))
     var pred = krea2_stack_lora_forward_streamed[
@@ -753,6 +802,9 @@ def krea2_sample_latent[
     cond_tokens: Optional[Tensor] = Optional[Tensor](None),
         # [1, CONDL, 64] BF16 patchified CLEAN condition latent. REQUIRED when
         # CONDL > 0.
+    first_lora: Optional[LoraAdapterDevice] = Optional[LoraAdapterDevice](None),
+        # Corrected Omini `first`/x_embedder adapter. None is valid only for an
+        # explicit frozen-base (--no-lora) render.
     cond_tokens_black: Optional[Tensor] = Optional[Tensor](None),
         # [1, CONDL, 64] BF16 patchified latent of a BLACK image — the
         # unconditional branch of OminiControl's image-CFG (Condition.encode(
@@ -920,7 +972,7 @@ def krea2_sample_latent[
             # Composing the two is OUR choice, not something the reference does;
             # with cfg_scale <= 0 (the krea2 Turbo profile) only axis 1 runs.
             var v_img = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
-                st, key_prefix, cond_w, fin, lora, cond,
+                st, key_prefix, cond_w, fin, lora, first_lora.copy(), cond,
                 img_tokens, cond_tokens.value(), t_t, ctx,
                 resident, resident_sq, resident_i8, host_i8,
                 attn_bias_c.copy(), use_refiner_mask,
@@ -928,7 +980,7 @@ def krea2_sample_latent[
             if image_guidance_scale != Float32(1.0):
                 ctx.synchronize()
                 var v_black = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
-                    st, key_prefix, cond_w, fin, lora, cond,
+                    st, key_prefix, cond_w, fin, lora, first_lora.copy(), cond,
                     img_tokens, cond_tokens_black.value(), t_t, ctx,
                     resident, resident_sq, resident_i8, host_i8,
                     attn_bias_c.copy(), use_refiner_mask,
@@ -941,7 +993,7 @@ def krea2_sample_latent[
             else:
                 ctx.synchronize()
                 var v_txt_u = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
-                    st, key_prefix, cond_w, fin, lora, uncond,
+                    st, key_prefix, cond_w, fin, lora, first_lora.copy(), uncond,
                     img_tokens, cond_tokens.value(), t_t, ctx,
                     resident, resident_sq, resident_i8, host_i8,
                     attn_bias_u.copy(), use_refiner_mask,

@@ -56,7 +56,7 @@ from std.memory import ArcPointer
 from std.sys import argv
 from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
-from serenitymojo.io.env import env_int
+from serenitymojo.io.env import env_int, env_or
 
 
 # ── per-phase timing helper (KREA2_PHASE_TIMING): sync, then ms since `t0` ────
@@ -75,7 +75,7 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import gelu
-from serenitymojo.ops.tensor_algebra import reshape, concat, slice, permute, zeros_device
+from serenitymojo.ops.tensor_algebra import reshape, concat, slice, permute, zeros_device, add
 from serenitymojo.ops.linalg_backward import linear_backward_dx
 from serenitymojo.ops.activation_backward import gelu_backward
 
@@ -88,6 +88,9 @@ from serenitymojo.training.trainer_core import (
     trainer_warn_warm_resume, trainer_resume_meta_guard,
 )
 from serenitymojo.training.train_step import LoraAdapter
+from serenitymojo.training.data_order import (
+    build_epoch_sample_order, deterministic_draw_uniform,
+)
 from serenitymojo.training.schedule import (
     sample_timestep_logit_normal, flow_match_noise_target,
     sample_timestep_krea2_aitk_linear_balanced,
@@ -104,6 +107,7 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     lora_adamw_plain_device_state_sync_moments,
     lora_adamw_plain_device_state_sync_params,
     lora_adamw_plain_preloaded_shared_abi_train_step,
+    lora_adamw_plain_device_state_copy_device_grad_pair,
 )
 from serenitymojo.training.training_arena import TrainingArena
 from serenitymojo.training.levers import (
@@ -162,7 +166,8 @@ from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.models.krea2.krea2_cache_reader import (
     KreaTrainCache, KreaTrainSample, krea2_patchify, krea2_build_pos,
     KREA2_LATENT_CHANNELS, KREA2_TXT_LAYERS, KREA2_TXT_DIM,
-    Krea2EditSample, krea2_edit_real_len, krea2_reorder_combined_edit,
+    Krea2EditSample, KreaUncondCond,
+    krea2_edit_real_len, krea2_reorder_combined_edit,
 )
 # OminiControl EDIT row layout (C-scaffold; gated by its own main()). The trainer
 # consumes ONLY the offset math — cond_off/cond_len/real_len and the modulation
@@ -176,6 +181,8 @@ from serenitymojo.models.krea2.krea2_buckets import (
 from serenitymojo.models.klein.lora_adapter import make_lora_adapter
 from serenitymojo.models.klein.lora_block import (
     LoraAdapterDevice, lora_adapter_to_device,
+    klein_lora_fwd_device_resident_unfused,
+    klein_lora_bwd_device_resident_tensors,
 )
 # LyCORIS carrier dispatch: LoKr/LoHa use the SAME streamed stack through
 # materialized plain-LoRA carriers. DoRA/OFT use the direct streamed W_eff
@@ -435,6 +442,8 @@ comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for
 comptime CONDLEN = get_defined_int["KREA2_CONDLEN", 0]()
 comptime KREA2_OMINI_EDIT = CONDLEN > 0
 comptime LFULL_EDIT = LTMAX + IMGLEN + CONDLEN
+comptime KREA2_OMINI_FIRST_INDEX = KREA2_MAIN_ADAPTERS
+comptime KREA2_OMINI_ADAPTERS = KREA2_MAIN_ADAPTERS + 1
 
 # ── ASPECT-RATIO BUCKETING (KREA2_BUCKETED, build-gate, DEFAULT OFF) ──────────
 # OFF (default): the trainer is byte-identical to the single-square-canvas path
@@ -925,15 +934,10 @@ def _reorder_pos_for_combined[LT: Int, LFULL: Int](
 
 # ══════════════════════════════════════════════════════════════════════════════
 # OMINICONTROL EDIT CONDITIONING (C6). Same chain as _build_conditioning plus:
-#   * the CONDITION rows: cond_img (the CLEAN, never-noised reference latent,
-#     already patchified by the cache reader) through the SAME `first` Linear the
-#     image rows use — OminiControl shares x_embedder between image and condition
-#     tokens (flux_omini.py: `x_embedder(hidden_states)` / `x_embedder(cond)`),
-#     so there is NO separate projection and NO img_in_ref delta here. Adding the
-#     zero-init img_in_ref term (the layout module's seam note A.1 mentioned it as
-#     a possibility) would be the OTHER edit mechanism — an additive reference on
-#     the IMAGE rows — and stacking both would double-count the reference. This
-#     build takes the Omini one; main() fail-louds if KREA2_EDIT=1 is also set.
+#   * the CONDITION rows use the SAME frozen `first` Linear as image rows plus
+#     the trainable Omini x_embedder LoRA. The LoRA is condition-only: target
+#     image rows remain on the frozen base projection. This is the reference
+#     adapter_names=[None,None,"default"] routing, mapped to Krea `first`.
 #   * a SECOND temb -> tmlp -> tproj evaluation at t = 0 producing blk_vec_cond,
 #     the modulation vector for the condition rows (trainer.py:232
 #     `timesteps = [t, t] + [0]*len(conditions)`).
@@ -943,6 +947,7 @@ def _reorder_pos_for_combined[LT: Int, LFULL: Int](
 # ══════════════════════════════════════════════════════════════════════════════
 struct _CondEdit(Movable):
     var combined: TArc        # [1, LFULL_EDIT, F]
+    var cond_first_in: TArc   # [1, CONDL, 64] exact first-LoRA input tape
     var blk_vec: Tensor       # [1, 6*F]  mods(t)   -> TXT_real + IMG rows
     var blk_vec_cond: Tensor  # [1, 6*F]  mods(t=0) -> COND rows
     var tmlp_out: Tensor      # [1, 1, F] final-layer tvec (t; the final layer is
@@ -951,11 +956,13 @@ struct _CondEdit(Movable):
     var sin: Tensor
 
     def __init__(
-        out self, var combined: TArc, var blk_vec: Tensor,
+        out self, var combined: TArc, var cond_first_in: TArc,
+        var blk_vec: Tensor,
         var blk_vec_cond: Tensor, var tmlp_out: Tensor,
         var cos: Tensor, var sin: Tensor,
     ):
         self.combined = combined^
+        self.cond_first_in = cond_first_in^
         self.blk_vec = blk_vec^
         self.blk_vec_cond = blk_vec_cond^
         self.tmlp_out = tmlp_out^
@@ -972,17 +979,20 @@ def _build_conditioning_edit[LT: Int, LFULL_E: Int, CONDL: Int](
     t: Tensor,              # [1] F32 timestep for TXT+IMG
     t_zero: Tensor,         # [1] F32 == 0.0, the condition timestep
     real_text_len: Int,
+    first_lora: LoraAdapterDevice,
     ctx: DeviceContext,
 ) raises -> _CondEdit:
     comptime IMGL = LFULL_E - LT - CONDL
     var img_bf = cast_tensor(img, STDtype.BF16, ctx)
     var img_e = krea2_first(img_bf, cond_w.first_w[], cond_w.first_b[], ctx)
-    # CONDITION rows: the SAME `first` Linear, on the CLEAN latent. No noise is
-    # ever added to cond_img (the reader returns ref.<i> un-noised and nothing
-    # between here and the block touches it) and no LoRA/img_in_ref delta is
-    # applied at this projection.
+    # CONDITION rows: shared frozen base plus the trainable first/x_embedder
+    # LoRA. The target img_e above deliberately receives no first-LoRA delta.
     var cond_bf = cast_tensor(cond_img, STDtype.BF16, ctx)
     var cond_e = krea2_first(cond_bf, cond_w.first_w[], cond_w.first_b[], ctx)
+    var cond_delta = klein_lora_fwd_device_resident_unfused(
+        cond_bf, first_lora, CONDL, ctx
+    )
+    cond_e = add(cond_e, cond_delta, ctx)
 
     # chain #1 — the EXISTING temb chain at the sample's timestep t.
     var te = krea2_temb(t, TDIM, ctx, STDtype.BF16)
@@ -1051,7 +1061,8 @@ def _build_conditioning_edit[LT: Int, LFULL_E: Int, CONDL: Int](
     var rsin = rope[1].clone(ctx)
     _ = IMGL
     return _CondEdit(
-        TArc(combined^), blk_vec2^, blk_vec2_c^, t3^, rcos^, rsin^
+        TArc(combined^), TArc(cond_bf^), blk_vec2^, blk_vec2_c^,
+        t3^, rcos^, rsin^
     )
 
 
@@ -1685,7 +1696,8 @@ def _train_one_sample_edit_adamw_device_grads(
     context: Tensor,
     pos: Tensor,            # [1,LFULL_EDIT,3] F32 SOURCE order [TXT|IMG|COND]
     lt: Int,
-    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    lora: Krea2StackLora, first_lora: LoraAdapterDevice,
+    fin: Krea2StreamFinal,
     cond_w: Krea2ResidentCond,
     sigma: Float32,
     noise_seed: UInt64,
@@ -1717,7 +1729,7 @@ def _train_one_sample_edit_adamw_device_grads(
     var t1 = _t_scalar(sigma, ctx)
     var t0 = _t_scalar(Float32(0.0), ctx)
     var cond = _build_conditioning_edit[LTMAX, LFULL_EDIT, CONDLEN](
-        cond_w, img, cond_img, context, pos, t1, t0, lt, ctx,
+        cond_w, img, cond_img, context, pos, t1, t0, lt, first_lora, ctx,
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("conditioning_fwd", _pt, ctx)
@@ -1784,8 +1796,24 @@ def _train_one_sample_edit_adamw_device_grads(
     )
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_backward_device_grads", _pt, ctx)
+
+    # The block stack returns d(combined). Slice the condition rows and chain
+    # them through the same first-LoRA used in forward. Its dA/dB are copied into
+    # adapter 224 of the SAME resident AdamW state, so global norm/clipping and
+    # the parameter step cover all 225 adapters together.
+    var d_cond_e = slice(wrote.d_combined[], 1, split, CONDLEN, ctx)
+    var first_g = klein_lora_bwd_device_resident_tensors(
+        d_cond_e, cond.cond_first_in[], first_lora, CONDLEN, ctx
+    )
+    var first_da = TArc(cast_tensor(first_g.d_a[], adamw_state.grad_dtype, ctx))
+    var first_db = TArc(cast_tensor(first_g.d_b[], adamw_state.grad_dtype, ctx))
+    lora_adamw_plain_device_state_copy_device_grad_pair(
+        adamw_state, KREA2_OMINI_FIRST_INDEX, first_da.copy(), first_db.copy(), ctx
+    )
+    # Keep transient gradient buffers live until their D2D copies complete.
+    ctx.synchronize()
     return _StepOutAdamWDeviceGrads(
-        loss, wrote.grad_count, wrote.streaming_sync_count
+        loss, wrote.grad_count + 1, wrote.streaming_sync_count + 1
     )
 
 
@@ -2277,6 +2305,20 @@ def _build_host_lora(rank: Int, alpha: Float32) -> List[LoraAdapter]:
     return ad^
 
 
+def _build_host_lora_omini_edit(
+    rank: Int, alpha: Float32
+) raises -> List[LoraAdapter]:
+    """Main 224 block adapters plus the condition-only Krea `first` adapter."""
+    var ad = _build_host_lora(rank, alpha)
+    ad.append(make_lora_adapter(
+        rank, alpha, OUT_CH, FEATURES,
+        UInt64(7000 + KREA2_OMINI_FIRST_INDEX),
+    ))
+    if len(ad) != KREA2_OMINI_ADAPTERS:
+        raise Error("_build_host_lora_omini_edit: adapter count mismatch")
+    return ad^
+
+
 def _build_host_lora_full_surface(rank: Int, alpha: Float32) raises -> List[LoraAdapter]:
     """Build ai-toolkit's full Krea2 LoRA surface in optimizer order.
 
@@ -2514,6 +2556,13 @@ def save_krea2_lora(
                 _krea2_lora_prefix(bi, s),
                 host_lora[bi * KREA2_SLOTS_PER_BLOCK + s].copy(),
             ))
+    comptime if KREA2_OMINI_EDIT:
+        if len(host_lora) != KREA2_OMINI_ADAPTERS:
+            raise Error("save_krea2_lora: Omini edit requires 225 adapters")
+        named.append(NamedLora(
+            String("diffusion_model.first"),
+            host_lora[KREA2_OMINI_FIRST_INDEX].copy(),
+        ))
     return save_lora_peft(named, path, ctx)
 
 
@@ -2558,9 +2607,9 @@ def _save_krea2_lora_ema(
 
 
 # ── resume-scope guard meta (item #3/#4) ─────────────────────────────────────
-# Our training noise is seed+step-derived and our data order is order[step % n],
-# so there is NO torch-RNG snapshot and NO dataloader cursor to persist — position
-# == step by construction. What CAN silently break a resume is a change to the
+# Our noise and shuffled-epoch data order are both seed+absolute-step-derived,
+# so there is no mutable RNG/dataloader cursor to persist. What CAN silently
+# break a resume is a change to the
 # KNOBS that shape those derived streams. We snapshot them in the `.state`
 # `__meta__` vector on save and warn loudly on any resume-time mismatch.
 #   meta = [step_t, seed_base, n_samples, LTMAX, cache_hash24]
@@ -2591,6 +2640,13 @@ def save_krea2_lora_state(
                 _krea2_lora_prefix(bi, s),
                 host_lora[bi * KREA2_SLOTS_PER_BLOCK + s].copy(),
             ))
+    comptime if KREA2_OMINI_EDIT:
+        if len(host_lora) != KREA2_OMINI_ADAPTERS:
+            raise Error("save_krea2_lora_state: Omini edit requires 225 adapters")
+        named.append(NamedLora(
+            String("diffusion_model.first"),
+            host_lora[KREA2_OMINI_FIRST_INDEX].copy(),
+        ))
     return save_lora_train_state(named, path, ctx, meta^)
 
 
@@ -2642,9 +2698,9 @@ def _krea2_resume_meta_guard(
     resolved_path: String, is_full: Bool, start_step: Int,
     cfg_seed: UInt64, n_samples: Int, cache_path: String, ctx: DeviceContext,
 ) raises:
-    """Item #3/#4 honest guard. Our noise is seed+step-derived and our data order is
-    order[step % n] — position == step BY CONSTRUCTION (no RNG/cursor snapshot to
-    restore, and none faked). But the KNOBS that shape those derived streams (seed,
+    """Item #3/#4 honest guard. Noise and shuffled epochs are deterministic from
+    seed plus absolute step/draw (no mutable RNG cursor to restore). The knobs
+    that shape those derived streams (seed,
     dataset sample count + identity, LTMAX) must match the saved run or the resumed
     trajectory silently diverges. We stored them in the `.state` __meta__; warn
     LOUDLY on any mismatch. Thin wrapper → shared trainer_core (binds the krea2 log
@@ -2670,6 +2726,8 @@ def _krea2_lora_resume(
     for bi in range(NBLOCKS):
         for s in range(KREA2_SLOTS_PER_BLOCK):
             prefixes.append(_krea2_lora_prefix(bi, s))
+    comptime if KREA2_OMINI_EDIT:
+        prefixes.append(String("diffusion_model.first"))
     var loaded: List[NamedLora]
     if is_full:
         loaded = load_lora_train_state(prefixes, scale, path, ctx)
@@ -3046,7 +3104,8 @@ def _step_dispatch_edit_adamw_device_grads(
     st: ShardedSafeTensors, key_prefix: String,
     clean: Tensor, cond_img: Tensor, context: Tensor, pos: Tensor,
     lt: Int, cache_cond_len: Int,
-    lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    lora: Krea2StackLora, first_lora: LoraAdapterDevice,
+    fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     sigma: Float32, noise_seed: UInt64, cfg: TrainConfig,
     mut adamw_state: LoraAdamWPlainDeviceState,
     ctx: DeviceContext,
@@ -3081,7 +3140,8 @@ def _step_dispatch_edit_adamw_device_grads(
             + String(cond_img.shape()[1]) + " != CONDLEN=" + String(CONDLEN)
         )
     return _train_one_sample_edit_adamw_device_grads(
-        st, key_prefix, clean, cond_img, context, pos, lt, lora, fin, cond_w,
+        st, key_prefix, clean, cond_img, context, pos, lt,
+        lora, first_lora, fin, cond_w,
         sigma, noise_seed, cfg, adamw_state, ctx,
         resident, resident_sq, resident_i8, host_i8, verbose,
     )
@@ -3859,6 +3919,10 @@ def _krea2_full_ft_run(
             order[a] = order[mx]
             order[mx] = t
 
+    # The LT-desc list is only a deterministic base permutation.  Training
+    # consumes a fresh seeded Fisher-Yates permutation each epoch, indexed by
+    # absolute global step so resume is identical to an uninterrupted run.
+    var sample_order = build_epoch_sample_order(order, cfg.seed, steps)
     var seed_base = cfg.seed
 
     # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08) ─────────
@@ -3885,7 +3949,7 @@ def _krea2_full_ft_run(
     var t0 = perf_counter_ns()
 
     for step in range(start_step, steps):
-        var idx = order[step % n]
+        var idx = sample_order[step]
         var sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
         var lt = sample.text_len
         if lt > LTMAX:
@@ -4116,6 +4180,18 @@ def main() raises:
     var cache = KreaTrainCache.open(cache_path)
     var n = cache.len()
     print("cache samples=", n)
+    var edit_uncond = Optional[KreaUncondCond](None)
+    var edit_black_ref = Optional[TArc](None)
+    var dropout_cache = Optional[KreaTrainCache](None)
+    comptime if KREA2_OMINI_EDIT:
+        var dropout_cache_path = env_or(
+            "KREA2_OMINI_DROPOUT_CACHE", cache_path
+        )
+        dropout_cache = Optional[KreaTrainCache](
+            KreaTrainCache.open(dropout_cache_path)
+        )
+        if dropout_cache_path != cache_path:
+            print("[krea2-omini] dropout assets cache:", dropout_cache_path)
 
     # ── OMINICONTROL EDIT build validation (C6). Every check fail-louds; none of
     # it runs on a CONDLEN=0 build (`comptime if` — the statements are not
@@ -4262,6 +4338,20 @@ def main() raises:
             "edit samples, delta [", cfg.omini_position_delta_h, ",",
             cfg.omini_position_delta_w, "] scale", cfg.omini_position_scale,
         )
+        if cfg.caption_dropout_prob > Float32(0.0):
+            if cfg.caption_dropout_prob >= Float32(1.0):
+                raise Error("krea2 omini: dropout probability must be in [0,1)")
+            edit_uncond = Optional[KreaUncondCond](
+                dropout_cache.value().uncond_padded_edit[LH, LW, LTMAX](ctx)
+            )
+            edit_black_ref = Optional[TArc](
+                dropout_cache.value().uncond_ref_tokens[LH, LW](ctx)
+            )
+            print(
+                "[krea2-omini] independent text/condition dropout p=",
+                cfg.caption_dropout_prob,
+                " (empty-caption context + VAE-encoded black condition)",
+            )
     var st = ShardedSafeTensors.open(cfg.checkpoint)
     var fin = Krea2StreamFinal.load(st, key_prefix, ctx)
     perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
@@ -4489,6 +4579,8 @@ def main() raises:
     if not dora_active and not oft_active:
         comptime if KREA2_TXTFUSION_LORA:
             host_lora = _build_host_lora_full_surface(cfg.lora_rank, cfg.lora_alpha)
+        elif KREA2_OMINI_EDIT:
+            host_lora = _build_host_lora_omini_edit(cfg.lora_rank, cfg.lora_alpha)
         else:
             host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
     # RESUME (plain LoRA only): overwrite the B=0-init host_lora with the saved
@@ -4516,6 +4608,8 @@ def main() raises:
     var n_adapters = KREA2_MAIN_ADAPTERS
     comptime if KREA2_TXTFUSION_LORA:
         n_adapters = KREA2_FULL_SURFACE_ADAPTERS
+    elif KREA2_OMINI_EDIT:
+        n_adapters = KREA2_OMINI_ADAPTERS
     var lokr_masters = empty_krea2_lokr_set()
     var loha_masters = empty_krea2_loha_set()
     var dora_masters = empty_krea2_direct_dora_set()
@@ -4695,6 +4789,22 @@ def main() raises:
         order = grouped^
         print("[KREA2_BUCKETED] bucket-major order: step0 = sample", order[0],
               " canvas-key", hws[order[0]])
+
+    # Fixed-canvas training must shuffle every epoch (the reference Omini
+    # DataLoader does).  Index by absolute sample draw so a resumed process
+    # reconstructs exactly the same stream without serializing RNG cursor state.
+    # Aspect-bucket training keeps bucket-major scheduling because interleaving
+    # canvas sizes recreates the measured allocator fragmentation; that distinct
+    # arm remains explicitly ordered until it has a bucket-aware shuffle.
+    var sample_order = List[Int]()
+    comptime if KREA2_BUCKETED:
+        for draw in range(2 * steps + 2):
+            sample_order.append(order[draw % n])
+        print("[KREA2_BUCKETED] bucket-major scheduling retained (not shuffled)")
+    else:
+        sample_order = build_epoch_sample_order(order, cfg.seed, 2 * steps + 2)
+        print("Epoch-shuffled sample order: deterministic seed", cfg.seed,
+              "| resume keyed by absolute draw")
 
     var seed_base = cfg.seed
     print("")
@@ -4940,7 +5050,7 @@ def main() raises:
 
         for step in range(start_step, steps):
             var step_t0 = perf_counter_ns()
-            var idx = order[step % n]
+            var idx = sample_order[step]
             var sample: KreaTrainSample
             comptime if KREA2_RES_512_SYNTH:
                 sample = _synthetic_sample(idx, ctx)
@@ -5118,7 +5228,7 @@ def main() raises:
 
         for step in range(start_step, steps):
             var step_t0 = perf_counter_ns()
-            var idx = order[step % n]
+            var idx = sample_order[step]
             var sample: KreaTrainSample
             comptime if KREA2_RES_512_SYNTH:
                 sample = _synthetic_sample(idx, ctx)
@@ -5268,6 +5378,14 @@ def main() raises:
             host_lora, 0, n_adapters, ctx
         )
         var resident_dev_lora = _host_to_device_lora_resident(host_lora, adamw_dev)
+        # Default initializes a valid view for non-edit builds; the edit
+        # specialization replaces it with the appended condition-only adapter.
+        var resident_first_lora = _resident_lora_adapter(host_lora[0], adamw_dev, 0)
+        comptime if KREA2_OMINI_EDIT:
+            resident_first_lora = _resident_lora_adapter(
+                host_lora[KREA2_OMINI_FIRST_INDEX], adamw_dev,
+                KREA2_OMINI_FIRST_INDEX,
+            )
         var adamw_arena = TrainingArena(ctx, 8192, 1)
         perf_fast_path_kind = PERF_FAST_PATH_DEVICE
         perf_visible_transfer_count += 3
@@ -5294,6 +5412,11 @@ def main() raises:
             cu_mempool_trim_current(0)
             lora_adamw_plain_device_state_restore_from_host(adamw_dev, aw_snap0^, ctx)
             resident_dev_lora = _host_to_device_lora_resident(host_lora, adamw_dev)
+            comptime if KREA2_OMINI_EDIT:
+                resident_first_lora = _resident_lora_adapter(
+                    host_lora[KREA2_OMINI_FIRST_INDEX], adamw_dev,
+                    KREA2_OMINI_FIRST_INDEX,
+                )
             perf_visible_sync_count += 2
             perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
 
@@ -5302,11 +5425,18 @@ def main() raises:
             # b2: process a sample PAIR per optimizer step (pair_lead=2*step), same
             # keying as the host-b2 standard loop so the loss band is comparable.
             var pair_lead = (2 * step) if use_b2 else step
-            var idx = order[pair_lead % n]
-            # ai-toolkit krea2 recipe: uniform sigma (linear+balanced) — MJ-1041.
-            var sigma = sample_timestep_krea2_aitk_linear_balanced(
-                seed_base + UInt64(pair_lead)
-            )
+            var idx = sample_order[pair_lead]
+            var sigma: Float32
+            comptime if KREA2_OMINI_EDIT:
+                # Omini reference objective: t = sigmoid(N(0,1)).
+                sigma = sample_timestep_logit_normal(
+                    seed_base + UInt64(pair_lead), Float32(1.0)
+                )
+            else:
+                # Generic Krea T2I recipe remains linear-balanced.
+                sigma = sample_timestep_krea2_aitk_linear_balanced(
+                    seed_base + UInt64(pair_lead)
+                )
             var noise_seed = seed_base * UInt64(7919) + UInt64(pair_lead)
 
             var so_dev: _StepOutAdamWDeviceGrads
@@ -5316,12 +5446,24 @@ def main() raises:
                 # sample_padded_edit fail-louds when a sample has no condition
                 # record, so a mixed cache cannot silently train condition-free.
                 var esample = cache.sample_padded_edit[LH, LW, LTMAX](idx, ctx)
+                if cfg.caption_dropout_prob > Float32(0.0):
+                    if deterministic_draw_uniform(
+                        seed_base, pair_lead, UInt64(1)
+                    ) < cfg.caption_dropout_prob:
+                        esample.base.context = edit_uncond.value().context.copy()
+                        esample.base.pos = edit_uncond.value().pos.copy()
+                        esample.base.text_len = edit_uncond.value().text_len
+                    if deterministic_draw_uniform(
+                        seed_base, pair_lead, UInt64(2)
+                    ) < cfg.caption_dropout_prob:
+                        esample.cond_img = edit_black_ref.value().copy()
                 so_dev = _step_dispatch_edit_adamw_device_grads(
                     st, key_prefix,
                     esample.base.clean[], esample.cond_img[],
                     esample.base.context[], esample.base.pos[],
                     esample.base.text_len, esample.cond_len,
-                    resident_dev_lora, fin, cond_w, sigma, noise_seed, cfg,
+                    resident_dev_lora, resident_first_lora, fin, cond_w,
+                    sigma, noise_seed, cfg,
                     adamw_dev, ctx, resident, resident_sq, resident_i8, host_i8,
                     step == start_step,
                 )
@@ -5333,9 +5475,9 @@ def main() raises:
                     sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
                 var lt = sample.text_len
                 if use_b2:
-                    # fetch the pair partner order[pair_lead+1] (its own sigma/noise
+                    # fetch the pair partner sample_order[pair_lead+1] (its own sigma/noise
                     # stream) and stream the 2-sample batch grad into the resident AdamW.
-                    var idx1 = order[(pair_lead + 1) % n]
+                    var idx1 = sample_order[pair_lead + 1]
                     var sample1: KreaTrainSample
                     comptime if KREA2_RES_512_SYNTH:
                         sample1 = _synthetic_sample(idx1, ctx)
@@ -5476,6 +5618,11 @@ def main() raises:
                 cu_mempool_trim_current(0)
                 lora_adamw_plain_device_state_restore_from_host(adamw_dev, aw_snap^, ctx)
                 resident_dev_lora = _host_to_device_lora_resident(host_lora, adamw_dev)
+                comptime if KREA2_OMINI_EDIT:
+                    resident_first_lora = _resident_lora_adapter(
+                        host_lora[KREA2_OMINI_FIRST_INDEX], adamw_dev,
+                        KREA2_OMINI_FIRST_INDEX,
+                    )
                 perf_visible_sync_count += 2
                 perf_visible_transfer_count += 2
                 perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
@@ -5529,12 +5676,10 @@ def main() raises:
 
     for step in range(standard_loop_start, steps):
         var step_t0 = perf_counter_ns()   # per-step wall clock (standard progress line)
-        # b2: each optimizer step consumes a NON-OVERLAPPING pair (order[2k], order[2k+1])
-        # round-robin (odd tail wraps via %n = self-dup). b1: pair_lead == step (byte-
-        # identical sample/sigma/noise streams to the pre-b2 loop).
+        # b2 consumes a non-overlapping pair in the absolute shuffled draw
+        # stream. b1 uses one draw per optimizer step.
         var pair_lead = (2 * step) if use_b2 else step
-        var idx = order[pair_lead % n]   # LT-bucketed order kept (harmless; padding makes all
-        # samples one LFULL size class — the real pool fragmentation fix).
+        var idx = sample_order[pair_lead]
         var sample: KreaTrainSample
         comptime if KREA2_BUCKETED:
             # ASPECT BUCKETING: read at the sample's cached aspect canvas (ladder
@@ -5669,8 +5814,8 @@ def main() raises:
             )
         else:
             if use_b2:
-                # fetch the pair partner order[2k+1]; its own sigma/noise stream.
-                var idx1 = order[(pair_lead + 1) % n]
+                # Fetch the pair partner; it has its own sigma/noise stream.
+                var idx1 = sample_order[pair_lead + 1]
                 var sample1: KreaTrainSample
                 comptime if KREA2_RES_512_SYNTH:
                     sample1 = _synthetic_sample(idx1, ctx)

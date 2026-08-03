@@ -279,7 +279,7 @@ def _write_encoder_checkpoint(config: MiniMaxH3VideoEncoderDeviceConfig, ctx: De
         for d in range(len(shape)):
             n *= shape[d]
         var host = _pattern(seed, n)
-        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.BF16, ctx)))
+        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.F32, ctx)))
     save_safetensors(names, tensors, String(ENC_CKPT), ctx)
 
 
@@ -339,7 +339,7 @@ def _run_encoder_smoke(ctx: DeviceContext) raises:
     _write_encoder_checkpoint(config, ctx)
     var encoder = MiniMaxH3VideoEncoderDevice.load(String(ENC_CKPT), config, ctx)
     var pixels = Tensor.from_host(
-        _pattern(500, 1 * 2 * 4 * 4 * 2), [1, 2, 4, 4, 2], STDtype.BF16, ctx
+        _pattern(500, 1 * 2 * 4 * 4 * 2), [1, 2, 4, 4, 2], STDtype.F32, ctx
     )
     var moments = minimax_h3_video_encode_device(encoder, pixels, ctx)
     print("  encoder output shape:", moments.shape())
@@ -413,7 +413,7 @@ def _write_decoder_checkpoint(config: MiniMaxH3VideoDecoderDeviceConfig, ctx: De
         for d in range(len(shape)):
             n *= shape[d]
         var host = _pattern(seed, n)
-        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.BF16, ctx)))
+        tensors.append(TArc(Tensor.from_host(host, shape^, STDtype.F32, ctx)))
     save_safetensors(names, tensors, String(DEC_CKPT), ctx)
 
 
@@ -423,7 +423,7 @@ def _run_decoder_smoke(ctx: DeviceContext) raises:
     var decoder = minimax_h3_video_decoder_device_load(String(DEC_CKPT), config, ctx)
     # latent_T=1, latent_H=2, latent_W=2 -> num_tokens=4, num_suffix=1+1=2, S=6.
     var latents = Tensor.from_host(
-        _pattern(600, 1 * 1 * 2 * 2 * 3), [1, 1, 2, 2, 3], STDtype.BF16, ctx
+        _pattern(600, 1 * 1 * 2 * 2 * 3), [1, 1, 2, 2, 3], STDtype.F32, ctx
     )
     var pixels = minimax_h3_video_decode_device[6, 2, 8](decoder, latents, ctx)
     print("  decoder output shape:", pixels.shape())

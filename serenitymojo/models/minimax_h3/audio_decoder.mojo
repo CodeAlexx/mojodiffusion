@@ -390,36 +390,79 @@ struct MiniMaxH3AudioWeights(Movable):
         )
 
 
-def minimax_h3_audio_decode(
+@fieldwise_init
+struct MiniMaxH3AudioSignal(Copyable, Movable):
+    """A `[channels, length]` intermediate on the decoder's way to a waveform.
+
+    The decoder's stages change BOTH axes at once — every upsample halves the
+    channels and multiplies the length by its rate — so an intermediate that
+    carries only its data is not interpretable. Both numbers travel with it."""
+
+    var data: List[Float32]
+    var channels: Int
+    var length: Int
+
+
+def minimax_h3_audio_decode_pre(
     ref weights: MiniMaxH3AudioWeights,
     config: MiniMaxH3AudioDecoderConfig,
     latents: List[Float32],
     num_latents: Int,
-) raises -> List[Float32]:
-    """`[latent_channels, num_latents]` -> `[1, num_latents * prod(rates)]` mono
-    waveform, clamped to [-1, 1]."""
-    var empty = List[Float32]()
+) raises -> MiniMaxH3AudioSignal:
+    """`dec_in_proj` then `conv_pre`: [latent_channels, T] -> [decoder_dim, T].
 
-    # dec_in_proj: a plain 1x1 convolution, NOT weight-normed.
+    Split out because these two convolutions are the only place a latent-side
+    mistake can enter, and they are trivially cheap to check — if this stage
+    matches, every later divergence is in the upsample stack."""
+    # dec_in_proj: a plain 1x1 convolution, NOT weight-normed. Every other
+    # convolution in this file is, so it is the one that breaks a loop written
+    # to fold unconditionally.
     var hidden = conv1d(
         latents, config.latent_channels, num_latents,
         weights.get("dec_in_proj.weight"), config.latent_dim, 1, 1, 0, 1, 1,
         weights.get("dec_in_proj.bias"), True,
     )
-    var length = num_latents
-    var channels = config.latent_dim
-
-    # conv_pre
     hidden = conv1d(
-        hidden, channels, length,
-        weights.folded("decoder.conv_pre", config.decoder_dim, channels * 7),
+        hidden, config.latent_dim, num_latents,
+        weights.folded(
+            "decoder.conv_pre", config.decoder_dim, config.latent_dim * 7
+        ),
         config.decoder_dim, 7, 1, 3, 1, 1,
         weights.get("decoder.conv_pre.bias"), True,
     )
-    channels = config.decoder_dim
+    return MiniMaxH3AudioSignal(hidden^, config.decoder_dim, num_latents)
 
+
+def minimax_h3_audio_decode_stages(
+    ref weights: MiniMaxH3AudioWeights,
+    config: MiniMaxH3AudioDecoderConfig,
+    latents: List[Float32],
+    num_latents: Int,
+    num_stages: Int,
+) raises -> MiniMaxH3AudioSignal:
+    """`minimax_h3_audio_decode_pre` plus the first `num_stages` upsample
+    stages. `num_stages < 0` or `>= len(decoder_rates)` runs all of them.
+
+    Stage-by-stage because this is the deepest part of the audio path — seven
+    stages of an upsample followed by `len(resblock_kernel_sizes)` AMP blocks,
+    each with its own dilations and alias-free activations. A single number at
+    the waveform tells you something is wrong; this tells you WHICH stage, and
+    the stages differ from each other (rates 5,5,2,2,2,2,2 with kernels
+    9,9,4,4,4,4,4) so "it works at stage 0" does not imply stage 2."""
+    var pre = minimax_h3_audio_decode_pre(weights, config, latents, num_latents)
+    # `.copy()` rather than `^`: Mojo will not destroy one field out of the
+    # middle of a live struct, and the pre-stage buffer is [decoder_dim, T] —
+    # 1.6 MB for ten seconds of audio, against a multi-second decode. Not worth
+    # a consuming accessor to avoid.
+    var channels = pre.channels
+    var length = pre.length
+    var hidden = pre.data.copy()
+
+    var total = len(config.decoder_rates)
+    var run = total if num_stages < 0 or num_stages > total else num_stages
     var num_kernels = len(config.resblock_kernel_sizes)
-    for i in range(len(config.decoder_rates)):
+
+    for i in range(run):
         var rate = config.decoder_rates[i]
         var kernel = config.decoder_kernel_sizes[i]
         var out_channels = channels // 2
@@ -435,6 +478,9 @@ def minimax_h3_audio_decode(
         length = (length - 1) * rate - 2 * ((kernel - rate) // 2) + kernel
         channels = out_channels
 
+        # The AMP blocks of a stage are AVERAGED, not summed and not
+        # concatenated — dropping the divide leaves the output plausible and
+        # `num_kernels` times too loud.
         var accumulated = List[Float32]()
         for j in range(num_kernels):
             var block = _amp_block(
@@ -452,17 +498,28 @@ def minimax_h3_audio_decode(
             accumulated[k] = accumulated[k] / Float32(num_kernels)
         hidden = accumulated^
 
-    hidden = activation1d(
-        hidden, channels, length,
+    return MiniMaxH3AudioSignal(hidden^, channels, length)
+
+
+def minimax_h3_audio_decode_tail(
+    ref weights: MiniMaxH3AudioWeights,
+    signal: MiniMaxH3AudioSignal,
+) raises -> List[Float32]:
+    """`activation_post` -> `conv_post` -> clamp: [C, L] -> [L] mono waveform.
+
+    `conv_post` has NO bias — the only convolution in the decoder without one —
+    and the clamp to [-1, 1] is part of the model, not a display convenience."""
+    var empty = List[Float32]()
+    var hidden = activation1d(
+        signal.data, signal.channels, signal.length,
         weights.get("decoder.activation_post.act.alpha"),
         weights.get("decoder.activation_post.act.beta"),
         weights.get("decoder.activation_post.upsample.filter"),
         weights.get("decoder.activation_post.downsample.lowpass.filter"),
     )
-
     hidden = conv1d(
-        hidden, channels, length,
-        weights.folded("decoder.conv_post", 1, channels * 7),
+        hidden, signal.channels, signal.length,
+        weights.folded("decoder.conv_post", 1, signal.channels * 7),
         1, 7, 1, 3, 1, 1, empty, False,
     )
     for i in range(len(hidden)):
@@ -471,3 +528,21 @@ def minimax_h3_audio_decode(
         elif hidden[i] > 1.0:
             hidden[i] = Float32(1.0)
     return hidden^
+
+
+def minimax_h3_audio_decode(
+    ref weights: MiniMaxH3AudioWeights,
+    config: MiniMaxH3AudioDecoderConfig,
+    latents: List[Float32],
+    num_latents: Int,
+) raises -> List[Float32]:
+    """`[latent_channels, num_latents]` -> `[1, num_latents * prod(rates)]` mono
+    waveform, clamped to [-1, 1].
+
+    Composed from the staged entry points above rather than duplicating them,
+    so the stages and the whole are the same code by construction and cannot
+    drift apart."""
+    var stages = minimax_h3_audio_decode_stages(
+        weights, config, latents, num_latents, -1
+    )
+    return minimax_h3_audio_decode_tail(weights, stages)

@@ -78,6 +78,30 @@ def main():
         decoded = model.decode(mean).sample
         tensors["out.waveform"] = decoded[0, 0].contiguous()
 
+        # ── decoder intermediates, stage by stage ────────────────────────────
+        # Re-walks MiniMaxH3AudioBigVGANDecoder.forward using the reference's
+        # OWN submodules, so these are the reference's numbers and not a second
+        # implementation. Without them the Mojo decoder's staged entry points
+        # have nothing to be compared against and the split buys only tidiness.
+        dec = model.decoder
+        h = model.dec_in_proj(mean)
+        tensors["dec.in_proj"] = h[0].contiguous()
+        h = dec.conv_pre(h)
+        tensors["dec.pre"] = h[0].contiguous()
+        print()
+        print("  decoder stages:")
+        print(f"    dec_in_proj -> {tuple(h.shape)}")
+        for i in range(dec.num_upsamples):
+            h = dec.ups[i][0](h)
+            residual = None
+            for j in range(dec.num_kernels):
+                block = dec.resblocks[i * dec.num_kernels + j](h)
+                residual = block if residual is None else residual + block
+            h = residual / dec.num_kernels
+            tensors[f"dec.stage{i}"] = h[0].contiguous()
+            print(f"    stage {i}: rate {dec.ups[i][0].stride[0]:2d} -> "
+                  f"[{h.shape[1]:5d}, {h.shape[2]:5d}]")
+
     print()
     print(f"  samples    {tuple(wave.shape)}")
     print(f"  trunk      {tuple(trunk.shape)}")

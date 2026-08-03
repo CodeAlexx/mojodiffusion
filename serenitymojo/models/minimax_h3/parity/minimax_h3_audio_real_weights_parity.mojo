@@ -47,6 +47,8 @@ from serenitymojo.models.minimax_h3.audio_decoder import (
     MiniMaxH3AudioDecoderConfig,
     MiniMaxH3AudioWeights,
     minimax_h3_audio_decode,
+    minimax_h3_audio_decode_pre,
+    minimax_h3_audio_decode_stages,
 )
 from serenitymojo.models.minimax_h3.audio_encoder import (
     MiniMaxH3AudioEncoderConfig,
@@ -226,6 +228,57 @@ def main() raises:
 
     # Decode the REFERENCE's own mean, not ours, so a decoder failure cannot be
     # blamed on the encoder — the two halves stay independently attributable.
+    #
+    # STAGE BY STAGE FIRST. The upsample stack is seven stages deep and they are
+    # not copies of each other — rates 5,5,2,2,2,2,2 with kernels 9,9,4,4,4,4,4,
+    # so passing at stage 0 says nothing about stage 2. A single number at the
+    # waveform would only say "wrong"; these say WHERE.
+    print("  stages (reference mean in, each compared before the next runs):")
+    var dpre = minimax_h3_audio_decode_pre(dec_w, dec_cfg, want_mean, 4)
+    var want_pre_dec = _load_f32(orc, "dec.pre")
+    checks += 1
+    if len(dpre.data) != len(want_pre_dec):
+        failures += 1
+        print("    FAIL conv_pre length", len(dpre.data), "!=", len(want_pre_dec))
+    else:
+        var w = _max_abs(dpre.data, want_pre_dec)
+        if w <= TOL:
+            print(
+                "    ok   conv_pre  [", dpre.channels, ",", dpre.length,
+                "] max_abs", w,
+            )
+        else:
+            failures += 1
+            print("    FAIL conv_pre max_abs", w, "> tol", TOL)
+
+    var stage_names = [
+        String("dec.stage0"), String("dec.stage1"), String("dec.stage2"),
+        String("dec.stage3"), String("dec.stage4"), String("dec.stage5"),
+        String("dec.stage6"),
+    ]
+    for s in range(7):
+        var st = minimax_h3_audio_decode_stages(
+            dec_w, dec_cfg, want_mean, 4, s + 1
+        )
+        var want_st = _load_f32(orc, stage_names[s])
+        checks += 1
+        if len(st.data) != len(want_st):
+            failures += 1
+            print(
+                "    FAIL stage", s, "length", len(st.data), "!=", len(want_st),
+            )
+        else:
+            var w = _max_abs(st.data, want_st)
+            var rel = w / _rms(want_st)
+            if w <= TOL:
+                print(
+                    "    ok   stage", s, " [", st.channels, ",", st.length,
+                    "] max_abs", w, " rel_rms", rel,
+                )
+            else:
+                failures += 1
+                print("    FAIL stage", s, "max_abs", w, "rel_rms", rel)
+
     t0 = perf_counter_ns()
     var wave = minimax_h3_audio_decode(dec_w, dec_cfg, want_mean, 4)
     var dec_ms = Float64(perf_counter_ns() - t0) / 1.0e6

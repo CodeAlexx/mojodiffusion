@@ -13,17 +13,21 @@
 #          of resident weight with ~0.92 GiB of precomputed rows)
 #   N steps x [frontend embed -> 50 streamed blocks -> final layer -> Euler
 #          step (video + audio, independently scheduled)]
-#   -> video/audio patch-token latents (decode NOT wired this pass — see
-#          "VIDEO/AUDIO DECODE" below)
+#   -> video/audio patch-token latents -> AUDIO: unpack -> denormalize
+#          (latents_mean/latents_std) -> host BigVGAN decode (per stereo
+#          channel) -> audio.wav.  VIDEO: stubbed, see "VIDEO/AUDIO DECODE".
 #
-# ── THIS PASS'S SCOPE (team-lead instruction) ────────────────────────────
-# "Start with structure + preflight + the denoise loop over real streamed
-# blocks; report before wiring decode." Both video AND audio VAE decode are
-# STUBBED with a loud "not wired" error — see `_minimax_h3_decode_stub`
-# below. The denoise loop itself is real: real streamed block loads via
-# `minimax_h3_load_block_device`, a real modulation cache, real Euler steps
-# through real `ops/tensor_algebra` GPU kernels. Nothing between the initial
-# noise and the final patch-token state is a stand-in.
+# ── THIS PASS'S SCOPE (team-lead instruction, second pass) ───────────────
+# First pass: "structure + preflight + the denoise loop over real streamed
+# blocks; report before wiring decode" — done, both decodes stubbed.
+# THIS pass: "wire the audio decode... video stays stubbed, audio does not
+# have to be" — the audio VAE is the ONLY model surface in this whole port
+# verified against REAL released weights (12 checks, ~1e-6,
+# minimax_h3_audio_real_weights_parity.mojo). Video remains STUBBED with a
+# loud "not wired" error — see `_minimax_h3_decode_video_stub` below. The
+# denoise loop is real (unchanged from pass 1): real streamed block loads
+# via `minimax_h3_load_block_device`, a real modulation cache, real Euler
+# steps through real `ops/tensor_algebra` GPU kernels.
 #
 # ── PATCH-TOKEN-SPACE ACCUMULATION (not latent-grid space) ────────────────
 # The Euler-accumulating video/audio state is kept in PATCH-TOKEN row form
@@ -38,9 +42,12 @@
 # i.i.d. Gaussian values) — a valid simplification, not a numerical
 # shortcut, though it does mean a given seed produces DIFFERENT exact bytes
 # than "sample in latent space, then patchify" would; (3) unpatchify/audio-
-# unpack (models/minimax_h3/rearrange.mojo's job, not yet reproduced on the
-# device path) is then needed exactly ONCE, at the very end, not every
-# step — and this pass stops before that point anyway (decode is stubbed).
+# unpack is then needed exactly ONCE, at the very end, not every step. Audio
+# unpack REUSES `models/minimax_h3/rearrange.mojo::minimax_h3_unpack_audio`
+# directly (host index arithmetic, no float math, explicitly authorized —
+# team-lead: "import from them") rather than re-deriving it; video unpatchify
+# is not reached this pass (video decode is stubbed before it would be
+# needed).
 #
 # ── DUAL SCHEDULE / GLOBAL ADALN ADDRESSING (the part most likely to be
 # gotten wrong by inspection alone) ──────────────────────────────────────
@@ -120,21 +127,50 @@
 # here; the fix, if judged real, is a one-line swap at that file's two
 # `cast_tensor(..._f32, STDtype.BF16, ctx)` call sites.
 #
-# ── VIDEO/AUDIO DECODE: STUBBED, NOT WIRED ──────────────────────────────
-# Video VAE: team-lead instruction — the existing device port(s) are
-# unverified/being rebuilt against the creator's own source (FFN gate/value
-# order, fused-qkv split). `models/vae/minimax_h3_video_decoder_device.mojo`
-# exists on disk but its gate status is unknown to this file; it is
-# deliberately NOT imported here. `_minimax_h3_decode_stub` below is the
-# seam: it takes exactly the row-form tensors the denoise loop already
-# produces and raises a named "not wired" error. Dropping in the corrected
-# decoder later means adding one unpatchify call + one decoder call inside
-# that function — this file's structure does not change.
-# Audio VAE: the host-float32 oracle (`models/minimax_h3/audio_decoder.
-# mojo`) is reported verified against real released weights, but no DEVICE
-# port of it exists yet in this repo (searched; only video has a `_device`
-# module). Building one is a separate unit, not this pass's — audio decode
-# is stubbed the same way as video, not partially wired.
+# ── VIDEO DECODE: STUBBED, NOT WIRED ──────────────────────────────────────
+# Team-lead instruction, unchanged from pass 1: the existing device port(s)
+# are unverified/being rebuilt against the creator's own source (FFN
+# gate/value order, fused-qkv split). `models/vae/minimax_h3_video_decoder_
+# device.mojo` exists on disk but its gate status is unknown to this file;
+# it is deliberately NOT imported here. `_minimax_h3_decode_video_stub`
+# below is the seam: it takes exactly the row-form tensor the denoise loop
+# already produces and raises a named "not wired" error. Dropping in the
+# corrected decoder later means adding one unpatchify call + one decoder
+# call inside that function — this file's structure does not change.
+#
+# ── AUDIO DECODE: WIRED, HOST-SIDE (the model itself is host float32) ────
+# `models/minimax_h3/audio_decoder.mojo` — `minimax_h3_audio_decode` and its
+# staged siblings — is imported directly (not reimplemented; team-lead:
+# "import from them", and this file only ever CALLS it, never edits it).
+# It is entirely `List[Float32]` host arithmetic (its own header: "Host
+# float32, batch 1"); no GPU/Tensor/DeviceContext anywhere inside it. This
+# pipeline's boundary is therefore: `audio_state.to_host(ctx)` once, after
+# the denoise loop, then everything through the waveform is host-side, then
+# ONE upload (`Tensor.from_host`) to hand the finished stereo waveform to
+# `serenitymojo/audio/wav.mojo::save_wav` (which does its own `to_host`
+# internally — this file's upload is so `save_wav`'s existing [2,L] Tensor
+# contract does not need a second, Tensor-accepting overload).
+#
+# STEREO: per the vendor's own README (team-lead) and confirmed structurally
+# by `models/minimax_h3/rearrange.mojo::minimax_h3_unpack_audio`'s own
+# layout (`[2, C, T]`, "one batch item per stereo channel" — that file's own
+# header), H3's audio VAE runs the SAME mono decoder independently on each
+# of 2 channel-major latent blocks and the two are recombined by the
+# caller — it is not a stereo-aware model. `minimax_h3_audio_decode` is
+# therefore called TWICE here, once per unpacked stereo item.
+#
+# DENORMALIZATION: the DiT's audio output lives in NORMALIZED latent space
+# (the standard latent-diffusion convention — train/sample on whitened
+# latents, denormalize only at the VAE boundary); `minimax_h3_audio_decode`
+# expects the VAE's OWN latent space. `FL2VA/audio_vae/config.json`'s
+# `latents_mean`/`latents_std` (32 values each, one per channel) are the
+# fix: `latent = normalized*std + mean`, applied per-channel before decode.
+# Hardcoded below from that real, landed config.json (verified 2026-08-02)
+# rather than parsed at runtime — the SAME convention `minimax_h3_dit.mojo::
+# minimax_h3_released_config` already uses for the transformer's config
+# ("the vendor's own, not inferred"); no general JSON-value parser exists
+# in this repo for arbitrary nested config keys, only the safetensors
+# flat-header parser (`io/json_header.mojo`), which is a different format.
 #
 # argv: <prompt> <out_dir> [steps=30] [seed=0]
 #
@@ -142,10 +178,16 @@
 #   transformer:   .../MiniMax-H3/FL2VA/transformer    (61.73 GiB, 13 shards)
 #   text_encoder:  .../MiniMax-H3/FL2VA/text_encoder    (62.13 GiB, 14 shards)
 #   processor:     .../MiniMax-H3/FL2VA/processor       (tokenizer.json + config)
+#   audio_vae:     .../MiniMax-H3/FL2VA/audio_vae/model.safetensors
+#                  (single file, 605 MB, COMPLETE on disk — confirmed by
+#                  `ls`, 2026-08-02 — unlike the other three checkpoints)
 # As of this writing (team-lead status): transformer shards landing (6/13);
 # text_encoder shards not yet down. Preflight below fails loudly and
 # specifically on whichever is still incomplete — that is a VALID outcome
-# of running this file today, not a bug in it.
+# of running this file today, not a bug in it. The audio_vae path is the
+# real product location (`.../FL2VA/audio_vae/model.safetensors`), NOT the
+# gate's own dev-time path (`/home/alex/Downloads/MiniMax-H3-audio_vae.
+# safetensors`, checked: no longer present).
 #
 # LINKER: the block stack's `sdpa_flash_infer_fwd` needs the cuDNN SDPA
 # shim; plain `mojo run -I .` fails at the first block's attention call
@@ -165,9 +207,12 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import reshape
 from serenitymojo.serve.product_manifest import json_escape, write_text_file
+from serenitymojo.audio.wav import save_wav
 
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
@@ -203,6 +248,12 @@ from serenitymojo.models.dit.minimax_h3_sampling import (
     MiniMaxH3SamplingGeometry,
     minimax_h3_build_sampling_geometry,
 )
+from serenitymojo.models.minimax_h3.rearrange import minimax_h3_unpack_audio
+from serenitymojo.models.minimax_h3.audio_decoder import (
+    MiniMaxH3AudioDecoderConfig,
+    MiniMaxH3AudioWeights,
+    minimax_h3_audio_decode,
+)
 
 
 # ── Checkpoint paths (matches every other H3 device module's own defaults) ──
@@ -210,6 +261,8 @@ comptime H3_ROOT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA"
 comptime TRANSFORMER_DIR = H3_ROOT + "/transformer"
 comptime TEXT_ENCODER_DIR = H3_ROOT + "/text_encoder"
 comptime PROCESSOR_DIR = H3_ROOT + "/processor"
+comptime AUDIO_VAE_PATH = H3_ROOT + "/audio_vae/model.safetensors"
+comptime AUDIO_SAMPLE_RATE = 32000
 
 # ── Geometry (COMPTIME — rebuild to change; see file header "FIXED PROMPT
 # LENGTH" for why TEXT_TOKENS is comptime too, not just video/audio). ────────
@@ -484,22 +537,235 @@ def _minimax_h3_global_timestep_row(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Video/audio decode seam — STUBBED. See file header "VIDEO/AUDIO DECODE".
+# Video decode seam — STUBBED. See file header "VIDEO DECODE".
 # ═════════════════════════════════════════════════════════════════════════════
-def _minimax_h3_decode_stub(
+def _minimax_h3_decode_video_stub(
     video_state: Tensor,  # [NUM_VIDEO_ROWS, video_patch_dim] F32, patch-token space
-    audio_state: Tensor,  # [NUM_AUDIO_ROWS, audio_latents_dim] F32, row space
 ) raises:
     raise Error(
-        String("minimax_h3_t2va: video/audio VAE decode is NOT WIRED. The")
-        + " denoise loop completed and produced final patch-token latents"
+        String("minimax_h3_t2va: video VAE decode is NOT WIRED. The denoise")
+        + " loop completed and produced the final patch-token video latent"
         " video_state=" + String(video_state.shape())
-        + " audio_state=" + String(audio_state.shape())
         + " — video VAE is being rebuilt against the creator's own source"
-        " (FFN gate/value order, fused-qkv split) and no device audio VAE"
-        " exists yet in this repo. See this file's header, VIDEO/AUDIO"
-        " DECODE, for the exact seam to fill in."
+        " (FFN gate/value order, fused-qkv split). See this file's header,"
+        " VIDEO DECODE, for the exact seam to fill in. (Audio decode, if"
+        " you got this far, already ran and wrote a real audio.wav.)"
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Audio decode — WIRED. See file header "AUDIO DECODE: WIRED, HOST-SIDE".
+# ═════════════════════════════════════════════════════════════════════════════
+
+# The released BigVGAN decoder config, taken VERBATIM from the already-gated
+# `minimax_h3_audio_real_weights_parity.mojo` (12/12 PASS at ~1e-6 against
+# the real released weights) rather than re-derived — same values, same
+# source of truth.
+comptime AUDIO_LATENT_DIM = 2048
+comptime AUDIO_DECODER_DIM = 1024
+
+
+def _h3_audio_decoder_rates() -> List[Int]:
+    return [5, 5, 2, 2, 2, 2, 2]
+
+
+def _h3_audio_decoder_kernels() -> List[Int]:
+    return [9, 9, 4, 4, 4, 4, 4]
+
+
+def _h3_audio_resblock_kernels() -> List[Int]:
+    return [3, 7, 11]
+
+
+def _h3_audio_resblock_dilations() -> List[List[Int]]:
+    var d: List[Int] = [1, 3, 5]
+    return [d.copy(), d.copy(), d.copy()]
+
+
+def _minimax_h3_audio_decoder_config(latent_channels: Int) -> MiniMaxH3AudioDecoderConfig:
+    return MiniMaxH3AudioDecoderConfig(
+        latent_channels,
+        AUDIO_LATENT_DIM,
+        AUDIO_DECODER_DIM,
+        _h3_audio_decoder_rates(),
+        _h3_audio_decoder_kernels(),
+        _h3_audio_resblock_kernels(),
+        _h3_audio_resblock_dilations(),
+    )
+
+
+# `latents_mean`/`latents_std` — hardcoded VERBATIM from the real, landed
+# `FL2VA/audio_vae/config.json` (verified 2026-08-02; 32 values each, one
+# per latent channel). See file header "AUDIO DECODE" for why this is
+# hardcoded rather than parsed.
+def _h3_audio_latents_mean() -> List[Float32]:
+    return [
+        Float32(-0.020211687488382354), Float32(0.3876466479950502),
+        Float32(-0.04398279799186767), Float32(-0.28591514936373),
+        Float32(0.08179686214561671), Float32(-0.35782641352446604),
+        Float32(0.040623809960919084), Float32(-0.01552534501956604),
+        Float32(-0.223362481667332), Float32(0.1821006842509091),
+        Float32(0.2941778783780663), Float32(-0.07901167601970885),
+        Float32(-0.056815072777201), Float32(-0.3699028221860095),
+        Float32(-0.31616315591624855), Float32(0.5905951377425391),
+        Float32(-0.052139568068853864), Float32(0.013673160263486295),
+        Float32(-0.03691647864630577), Float32(0.09732660653298163),
+        Float32(-0.3394662328788498), Float32(-0.30685677538541667),
+        Float32(-0.24504598907458763), Float32(-0.034698524462007344),
+        Float32(0.02868032184767538), Float32(-0.21217779266454084),
+        Float32(-0.1678263169941987), Float32(0.3221287889040614),
+        Float32(-0.1223055851554907), Float32(0.4356604928128464),
+        Float32(-0.0502599202236253), Float32(0.3979258376211797),
+    ]
+
+
+def _h3_audio_latents_std() -> List[Float32]:
+    return [
+        Float32(1.6895524230479284), Float32(2.76263727217653),
+        Float32(1.7945344281264435), Float32(1.6801681847309828),
+        Float32(1.6390226546605453), Float32(2.7788298348882177),
+        Float32(1.7659090095747236), Float32(1.6199757612137327),
+        Float32(2.6336525640336896), Float32(1.8539356672817833),
+        Float32(2.5056497896915633), Float32(1.811019237886178),
+        Float32(1.9579657790720237), Float32(1.6685498243529284),
+        Float32(1.4922469314453364), Float32(3.298670198067373),
+        Float32(1.9491804496832168), Float32(1.8720003270431442),
+        Float32(1.8334080103291832), Float32(1.6488070416529093),
+        Float32(1.6176957696319716), Float32(1.9131449234774398),
+        Float32(1.5695245398428617), Float32(1.6943659940415912),
+        Float32(1.8318420762504692), Float32(1.5540637421583379),
+        Float32(1.9344930328968526), Float32(1.599198216109855),
+        Float32(1.718045989838149), Float32(1.6307219190837705),
+        Float32(1.8661226051202384), Float32(1.5613768203168363),
+    ]
+
+
+def _minimax_h3_preflight_audio_vae(path: String) raises:
+    """Index-only check (mmap header lookups, no tensor bytes read, no
+    DeviceContext) — the audio decoder's own three structurally-load-bearing
+    tensors: `dec_in_proj` (the latent-side entry point unit 10's own
+    docstring calls out as "the only place a latent-side mistake can
+    enter"), and `decoder.conv_pre`/`decoder.conv_post`'s weight_norm pair
+    (every conv in this decoder is weight-normed except dec_in_proj — a
+    missing `weight_g`/`weight_v` pair means `fold_weight_norm` fails deep
+    inside the first stage instead of here)."""
+    var st = SafeTensors.open(path)
+    var required = [
+        String("dec_in_proj.weight"), String("dec_in_proj.bias"),
+        String("decoder.conv_pre.weight_g"), String("decoder.conv_pre.weight_v"),
+        String("decoder.conv_pre.bias"),
+        String("decoder.conv_post.weight_g"), String("decoder.conv_post.weight_v"),
+    ]
+    for i in range(len(required)):
+        if required[i] not in st.names():
+            raise Error(
+                String("minimax_h3_t2va preflight: audio_vae missing tensor ")
+                + required[i]
+            )
+
+
+def _minimax_h3_load_audio_vae_weights(path: String) raises -> MiniMaxH3AudioWeights:
+    """Mirrors `minimax_h3_audio_real_weights_parity.mojo`'s own loading loop
+    (same exclusion of `zero_k_bias`, a frozen zero buffer the decoder
+    deliberately never reads) rather than a shared generic loader — this
+    is a single small mmap-and-copy loop, not fragile numeric math, and
+    every other H3 parity/pipeline file in this repo writes its own small
+    version of it too."""
+    var st = SafeTensors.open(path)
+    var all_names = st.names()
+    var names = List[String]()
+    var values = List[List[Float32]]()
+    for i in range(len(all_names)):
+        ref n = all_names[i]
+        if n.find("zero_k_bias") >= 0:
+            continue
+        var info = st.tensor_info(n)
+        var bytes = st.tensor_bytes(n)
+        var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+        if tv.dtype != STDtype.F32:
+            raise Error(
+                String("minimax_h3_t2va: audio_vae tensor ") + n + " is not F32"
+            )
+        var p = tv.data.unsafe_ptr().bitcast[Float32]()
+        var v = List[Float32](capacity=tv.numel())
+        for j in range(tv.numel()):
+            v.append(p[j])
+        names.append(String(n))
+        values.append(v^)
+    return MiniMaxH3AudioWeights(names^, values^)
+
+
+def _minimax_h3_denormalize_audio_channel(
+    latent: List[Float32], channels: Int, num_latents: Int,
+    mean: List[Float32], std: List[Float32],
+) raises -> List[Float32]:
+    """`latent` is one stereo item's `[C, T]` channel-major block (as
+    `minimax_h3_unpack_audio` produces): `latent = normalized*std + mean`,
+    per channel, broadcast over T. See file header "DENORMALIZATION"."""
+    if len(latent) != channels * num_latents:
+        raise Error("minimax_h3_t2va: audio latent channel/length mismatch")
+    var out = List[Float32](capacity=len(latent))
+    for c in range(channels):
+        var m = mean[c]
+        var s = std[c]
+        for t in range(num_latents):
+            out.append(latent[c * num_latents + t] * s + m)
+    return out^
+
+
+def _minimax_h3_decode_audio(
+    audio_state: Tensor,  # [NUM_AUDIO_ROWS, audio_latents_dim] F32, row space
+    num_audio_latents: Int,
+    audio_channels: Int,  # config.audio_latents_dim (32)
+    out_dir: String,
+    ctx: DeviceContext,
+) raises -> Int:
+    """Unpack -> denormalize -> host BigVGAN decode x2 (stereo, independent
+    per channel per the vendor's own convention) -> interleave -> WAV.
+    Returns the waveform length in samples (for the result JSON)."""
+    var rows_host = audio_state.to_host(ctx)  # [Na*C] row-major: row*C+c
+    var latents_2ct = minimax_h3_unpack_audio(rows_host, num_audio_latents, audio_channels)
+
+    var block = audio_channels * num_audio_latents
+    var ch0_normalized = List[Float32](capacity=block)
+    var ch1_normalized = List[Float32](capacity=block)
+    for i in range(block):
+        ch0_normalized.append(latents_2ct[i])
+        ch1_normalized.append(latents_2ct[block + i])
+
+    var mean = _h3_audio_latents_mean()
+    var std = _h3_audio_latents_std()
+    if len(mean) != audio_channels or len(std) != audio_channels:
+        raise Error(
+            "minimax_h3_t2va: hardcoded latents_mean/latents_std length !="
+            " config.audio_latents_dim — config.json drifted from what this"
+            " file hardcoded; re-read FL2VA/audio_vae/config.json"
+        )
+    var ch0 = _minimax_h3_denormalize_audio_channel(ch0_normalized, audio_channels, num_audio_latents, mean, std)
+    var ch1 = _minimax_h3_denormalize_audio_channel(ch1_normalized, audio_channels, num_audio_latents, mean, std)
+
+    var dec_cfg = _minimax_h3_audio_decoder_config()
+    dec_cfg.latent_channels = audio_channels
+    var weights = _minimax_h3_load_audio_vae_weights(String(AUDIO_VAE_PATH))
+
+    var wave_l = minimax_h3_audio_decode(weights, dec_cfg, ch0, num_audio_latents)
+    var wave_r = minimax_h3_audio_decode(weights, dec_cfg, ch1, num_audio_latents)
+    if len(wave_l) != len(wave_r):
+        raise Error("minimax_h3_t2va: L/R waveform length mismatch")
+
+    var stereo_host = List[Float32](capacity=2 * len(wave_l))
+    for i in range(len(wave_l)):
+        stereo_host.append(wave_l[i])
+    for i in range(len(wave_r)):
+        stereo_host.append(wave_r[i])
+    var stereo_shape: List[Int] = [2, len(wave_l)]
+    var stereo_tensor = Tensor.from_host(stereo_host, stereo_shape^, STDtype.F32, ctx)
+
+    var wav_path = out_dir + String("/audio.wav")
+    save_wav(stereo_tensor, wav_path, AUDIO_SAMPLE_RATE, ctx)
+    print("  wrote", wav_path, " (", len(wave_l), "samples/channel,",
+          Float64(len(wave_l)) / Float64(AUDIO_SAMPLE_RATE), "s )")
+    return len(wave_l)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

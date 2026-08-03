@@ -213,7 +213,7 @@ def minimax_h3_video_encode_temporal(
 
     var z_cat = z_parts[0][].clone(ctx)
     for i in range(1, num_chunks):
-        z_cat = concat(2, ctx, z_cat, z_parts[i][])
+        z_cat = concat(1, ctx, z_cat, z_parts[i][])
 
     if tconfig.token_drop > 0:
         var keep = z_cat.shape()[1] - tconfig.token_drop

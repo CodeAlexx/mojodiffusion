@@ -46,7 +46,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.ffi import sys_remove
-from serenitymojo.ops.tensor_algebra import slice
+from serenitymojo.ops.tensor_algebra import concat, slice
 
 from serenitymojo.models.vae.minimax_h3_video_encoder_device import (
     MiniMaxH3VideoEncoderDevice, MiniMaxH3VideoEncoderDeviceConfig,
@@ -333,9 +333,17 @@ def _run_decode_temporal_seam_test(ctx: DeviceContext) raises:
     # a real blend must differ (except in the vanishingly unlikely case the
     # two source segments are already identical, ruled out by construction
     # since dec_overlap comes from chunk0 and this comes from chunk1).
-    var clip1_z = Tensor.from_host(
+    # Reconstruct the SAME padded z the production function builds
+    # internally (latent_t=8, pad_tokens=3 replicated-last-token) so chunk
+    # 1's window [4:11) is in range -- the production code pads BEFORE
+    # slicing per-chunk windows; this verification must match that.
+    var clip1_z_unpadded = Tensor.from_host(
         _pattern(800, 1 * 8 * 1 * 1 * 3), [1, 8, 1, 1, 3], STDtype.BF16, ctx
     )
+    var clip1_last_tok = slice(clip1_z_unpadded, 1, 7, 1, ctx)
+    var clip1_z = clip1_z_unpadded.clone(ctx)
+    for _ in range(3):
+        clip1_z = concat(1, ctx, clip1_z, clip1_last_tok)
     var clip1_tokens = slice(clip1_z, 1, 4, 7, ctx)
     var clip1_dec = minimax_h3_video_decode_device[9, 2, 8](decoder, clip1_tokens, ctx)
     var clip1_seg = slice(clip1_dec, 1, 0, 8, ctx)          # j=0 segment before trim

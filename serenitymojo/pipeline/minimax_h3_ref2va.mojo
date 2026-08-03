@@ -93,9 +93,14 @@ from serenitymojo.models.dit.minimax_h3_ref_geometry import (
 )
 from serenitymojo.pipeline.minimax_h3_media_in import (
     MINIMAX_H3_MEDIA_SAMPLE_RATE,
+    minimax_h3_ffmpeg_extract_rgb,
     minimax_h3_ffprobe_video_geometry,
     minimax_h3_has_audio_stream,
     minimax_h3_read_wav,
+)
+from serenitymojo.models.vae.minimax_h3_ref_encode import (
+    minimax_h3_encode_reference_visual_seam,
+    minimax_h3_pixel_normalize_frames,
 )
 
 
@@ -341,37 +346,92 @@ def _probe_reference_media(
     )
 
 
+def _minimax_h3_encode_references(
+    specs: List[MiniMaxH3ReferenceSpec],
+    references: List[MiniMaxH3PreparedReference],
+) raises:
+    """Reference encode, stage 2 — the CPU half, then THE SEAM.
+
+    Runs for real, per reference, in packed order:
+      * decode the frames (unit A, ffmpeg -> rgb24 + sidecar)
+      * pixel-normalize onto the video VAE's ImageNet convention, channels-first
+
+    Then raises at the VAE forward, which needs a `DeviceContext`. The steps
+    AFTER the forward — fp16 round, latent normalize, channel-slowest patchify,
+    the 0.999 noise mix, the audio branch's channel-major packing — are BUILT
+    and gated host-side (models/vae/parity/minimax_h3_ref_encode_probe.mojo,
+    12 bit-exact checks); they are simply unreachable until the forward exists."""
+    for i in range(len(specs)):
+        if specs[i].kind != MINIMAX_H3_REF_VIDEO:
+            continue
+        var rgb_path = specs[i].path + String(".rgb")
+        var sidecar_path = specs[i].path + String(".rgb.json")
+        var scratch_path = specs[i].path + String(".h3probe")
+        print("    decoding", specs[i].path, "-> rgb24")
+        var frames = minimax_h3_ffmpeg_extract_rgb(
+            specs[i].path, rgb_path, sidecar_path, scratch_path
+        )
+        print(
+            "      ", frames.num_frames, "frames", frames.width, "x",
+            frames.height, "@", frames.fps, "fps",
+        )
+
+        # TRUNCATE TO THE TARGET FRAME COUNT FIRST. `prepare_reference_frames`
+        # does `frames[:num_frames]` before anything else (packing_ref2va.py:675),
+        # and the packed layout above was resolved on that truncated count — a
+        # reference longer than the generated video must not contribute more
+        # latent frames than the layout reserved rows for.
+        var used_frames = frames.num_frames
+        if used_frames > FRAMES:
+            used_frames = FRAMES
+            print("      truncated to the target's", FRAMES, "frames")
+        var frame_bytes = frames.height * frames.width * 3
+        var kept = List[UInt8]()
+        kept.resize(used_frames * frame_bytes, 0)
+        for i in range(used_frames * frame_bytes):
+            kept[i] = frames.pixels[i]
+
+        # NOT DONE HERE, and it must be before the encode: the LANCZOS resize
+        # onto the reference's own canvas (`prepare_reference_frames` resolves
+        # `resolve_canvas_size(width, height)` and resizes frame by frame). The
+        # geometry printed above already assumes the canvas; these pixels are
+        # still at source resolution. Wiring the resize belongs with the encode.
+        var pixels = minimax_h3_pixel_normalize_frames(
+            kept, used_frames, frames.height, frames.width
+        )
+        print(
+            "      pixel-normalized ->", len(pixels),
+            "f32 values [3,", used_frames, ",", frames.height, ",",
+            frames.width, "]",
+        )
+        # THE SEAM. Raises.
+        var _latents = minimax_h3_encode_reference_visual_seam(
+            pixels, 3, used_frames, frames.height, frames.width
+        )
+        _ = len(_latents)
+    _ = references
+    raise Error(
+        "minimax_h3_ref2va: SEAM — no video reference reached the VAE encode."
+        " Pass at least one video:PATH reference."
+    )
+
+
 def _minimax_h3_ref2va_generate(
+    specs: List[MiniMaxH3ReferenceSpec],
     references: List[MiniMaxH3PreparedReference],
     num_audio_latents: Int,
     steps: Int,
     seed: UInt64,
     out_dir: String,
 ) raises:
-    """THE SEAM. Everything above this is built; this is not.
-
-    The `DeviceContext()` belongs HERE, inside this function, once the encode
+    """The generation tail. The `DeviceContext()` belongs HERE, once the encode
     lands — deliberately not at the call site, so that today this whole file
     runs without ever touching the GPU."""
-    _ = references
     _ = num_audio_latents
     _ = steps
     _ = seed
     _ = out_dir
-    raise Error(
-        "minimax_h3_ref2va: SEAM — reference ENCODE is not built (stage 2 of"
-        " 7). Needed, in order: pixel-normalize the reference frames"
-        " (MINIMAX_H3_PIXEL_MEAN/STD), run the video VAE encoder tiled at the"
-        " reference's own canvas, SAMPLE the posterior under a generator seeded"
-        " 42 independently of the request seed, round the sampled latent to"
-        " float16 before normalizing (~11 bits of every conditioning latent —"
-        " the released model's conditioning cannot be reproduced without it),"
-        " normalize by latents_mean/latents_std and patchify channel-slowest;"
-        " and for soundtracks run the audio VAE and take the posterior MODE,"
-        " never a sample. Reference: encoders.py:537-604. The layout, the"
-        " prompt, the media reader and the row timesteps ARE built and are"
-        " printed above."
-    )
+    _minimax_h3_encode_references(specs, references)
 
 
 def main() raises:
@@ -511,4 +571,7 @@ def main() raises:
     _ = sys_system(String("mkdir -p '") + out_dir + "'")
 
     print("")
-    _minimax_h3_ref2va_generate(references, num_audio_latents, steps, seed, out_dir)
+    print("  ── stage 2: reference encode ──")
+    _minimax_h3_ref2va_generate(
+        specs, references, num_audio_latents, steps, seed, out_dir
+    )

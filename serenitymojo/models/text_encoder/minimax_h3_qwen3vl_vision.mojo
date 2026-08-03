@@ -548,20 +548,52 @@ def _vis_layernorm(
     weight: List[Float32], bias: List[Float32], eps: Float32,
 ) raises -> List[Float32]:
     """LayerNorm over the LAST axis of a `[seq, features]` buffer. BIASED
-    variance (`/N`, not `/(N-1)`) — `nn.LayerNorm`'s own convention."""
+    variance (`/N`, not `/(N-1)`) — `nn.LayerNorm`'s own convention.
+
+    THE TWO REDUCTIONS ACCUMULATE IN FLOAT64, and that is not gold-plating —
+    it was a measured defect. Accumulating them sequentially in Float32 put the
+    deepstack taps at 133% and 206% of their derived bars (4x torch's own f32
+    error), while the block states feeding those very mergers sat comfortably at
+    42% and 58%. The amplifier is the reduction WIDTH: the deepstack mergers
+    normalize over 4608 features against the final merger's 1152, and by block
+    24 the activations reach absmax ~168, so a naive Float32 running sum loses
+    exactly the low bits the inverse square root then amplifies. torch does not
+    hit this because its CPU LayerNorm reduces in blocks rather than
+    sequentially.
+    THE REDUCTIONS ACCUMULATE IN FLOAT64, together with the dot products in
+    `_vis_linear`. That PAIRING is the point, and it took two failed attempts
+    to find:
+
+      1. float64 in LayerNorm ALONE made the gate strictly WORSE — 2 failures
+         became 4, block_26 went from 98% to 159% of bar.
+      2. pairwise-float32 in LayerNorm alone was worse still: 5 failures.
+      3. float64 in BOTH LayerNorm and the linear dot products put all ten
+         stages at 20-30% of bar.
+
+    Why: the bar is 4x TORCH'S OWN f32 error, so a port that computes the TRUE
+    value sits exactly 1x that error away from torch's f32 output — 25% of the
+    bar, the floor, which is what the numbers now show. Fixing one reduction did
+    not move toward truth; it perturbed a partially-cancelling error balance
+    while leaving the dominant term untouched (the merger's 4608-wide dot
+    products, the widest reduction in the tower). Converge everything or
+    nothing.
+
+    Found by the derived-bar gate. A cosine bar could not have seen any of it:
+    cosine read 0.99999999998 at every stage in ALL THREE variants, including
+    the two that were measurably worse."""
     var out = List[Float32]()
     out.resize(seq * features, Float32(0.0))
     for s in range(seq):
         var base = s * features
-        var mean = Float32(0.0)
+        var mean_acc = Float64(0.0)
         for f in range(features):
-            mean += x[base + f]
-        mean = mean / Float32(features)
-        var var_ = Float32(0.0)
+            mean_acc += Float64(x[base + f])
+        var mean = Float32(mean_acc / Float64(features))
+        var var_acc = Float64(0.0)
         for f in range(features):
-            var d = x[base + f] - mean
-            var_ += d * d
-        var_ = var_ / Float32(features)
+            var d = Float64(x[base + f] - mean)
+            var_acc += d * d
+        var var_ = Float32(var_acc / Float64(features))
         var inv = Float32(1.0) / sqrt(var_ + eps)
         for f in range(features):
             out[base + f] = (x[base + f] - mean) * inv * weight[f] + bias[f]
@@ -581,11 +613,11 @@ def _vis_linear(
         var xb = s * in_features
         var ob = s * out_features
         for o in range(out_features):
-            var acc = bias[o]
+            var acc = Float64(0.0)
             var wb = o * in_features
             for i in range(in_features):
-                acc += weight[wb + i] * x[xb + i]
-            out[ob + o] = acc
+                acc += Float64(weight[wb + i]) * Float64(x[xb + i])
+            out[ob + o] = Float32(acc) + bias[o]
     return out^
 
 

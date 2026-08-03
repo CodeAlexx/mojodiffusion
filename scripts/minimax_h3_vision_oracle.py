@@ -142,6 +142,68 @@ def main() -> None:
     for name, tensor in captured.items():
         tensors[name] = tensor.contiguous()
 
+    # ── THE TOLERANCE BASELINE (methodology adopted from h3-keyframe's forward
+    # oracle, de3ba5c — it is better than the hand-picked bars this gate used
+    # before, so it replaces them) ───────────────────────────────────────────
+    # Run the SAME tower in float64 and record how far torch's OWN float32 path
+    # lands from it, per stage. The gate then sets each bar as a multiple of
+    # THESE numbers rather than a constant, so a bar can never be quietly
+    # widened until a bug slips through: the only way to raise one is for
+    # torch's own f32 error to rise, which is a property of the model, not of
+    # the port.
+    #
+    # It matters most at depth. By block 26 the activations reach std ~94 and
+    # torch's own f32 answer is already far from the true one — a flat
+    # "max_abs < 1e-3" there would fail a CORRECT implementation, while a flat
+    # loose bar would wave through a broken one at block 0.
+    #
+    # ORDER IS LOAD-BEARING: `nn.Module.to()` converts parameters IN PLACE, so
+    # the float32 pass must be fully captured before this runs.
+    print("\ncomputing the float64 baseline (torch f32 vs torch f64)...")
+    captured64 = {}
+
+    def make_hook64(name):
+        def hook(_module, _inputs, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            captured64[name] = tensor.detach().clone()
+        return hook
+
+    model64 = model.to(torch.float64)
+    handles64 = [
+        model64.blocks[i].register_forward_hook(make_hook64(f"out.block_{i:02d}"))
+        for i in [0] + TAPS + [config.depth - 1]
+    ]
+
+    def pre_hook64(_module, args, kwargs):
+        captured64["out.after_patch"] = args[0].detach().clone()
+        return None
+    handles64.append(
+        model64.blocks[0].register_forward_pre_hook(pre_hook64, with_kwargs=True)
+    )
+    with torch.no_grad():
+        embeds64, deepstack64 = model64(pixel_values.to(torch.float64), grid_thw)
+    for h in handles64:
+        h.remove()
+
+    captured64["out.embeds"] = embeds64
+    baseline = {}
+    for name, ref64 in captured64.items():
+        a = tensors[name].double().flatten()
+        b = ref64.double().flatten()
+        baseline[name] = float((a - b).abs().max())
+    # The three deepstack taps get SEPARATE baselines, because the gate checks
+    # them separately — a single stacked number would let the loosest tap set
+    # the bar for the other two.
+    for i, tap64 in enumerate(deepstack64):
+        a = tensors["out.deepstack"][i].double().flatten()
+        baseline[f"out.deepstack_{i}"] = float((a - tap64.double().flatten()).abs().max())
+
+    print("  torch's own f32 error, per stage (the gate bars at 4x these):")
+    for name in sorted(baseline):
+        err = baseline[name]
+        tensors["f32err." + name] = torch.tensor([err], dtype=torch.float32)
+        print(f"    f32err.{name:20s} {err:.6g}   -> bar {4.0 * err:.6g}")
+
     save_file(tensors, out_path)
     print(f"\nwrote {out_path}")
     for name in sorted(tensors):

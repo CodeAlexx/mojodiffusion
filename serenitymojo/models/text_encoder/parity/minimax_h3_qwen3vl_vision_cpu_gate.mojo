@@ -26,13 +26,25 @@
 # gate raises at the end if any stage missed its bar — so one bad block does
 # not hide whether the ones after it also broke.
 #
-# BARS (cosine similarity; max_abs_diff is reported alongside for context, not
-# gated — see the report for why a flat absolute tolerance is the wrong bar
+# BARS ARE DERIVED, NOT PICKED. Methodology adopted from h3-keyframe's forward
+# oracle (de3ba5c) because it is better than the hand-picked cosine constants
+# this gate used before.
+#
+# The oracle runs the SAME tower a second time in float64 and records how far
+# TORCH'S OWN float32 path lands from it, per stage, as `f32err.<stage>`. Each
+# bar here is `BAR_MULTIPLE * f32err`, on max_abs_diff. The only way to raise a
+# bar is for torch's own f32 error to rise — a property of the model, not of
+# this port — so a bar can never be quietly widened until a bug slips through.
+#
+# WHY A FLAT BAR IS WRONG HERE, concretely: torch's own f32 error is 8.3e-06 at
+# after_patch and 4.2e-02 at block_26, five orders of magnitude apart, because
+# the activations grow to std ~94 by the last block. A flat `max_abs < 1e-3`
+# would FAIL a correct implementation at block 26; a flat loose bar would PASS a
+# broken one at block 0. Cosine is still reported, but it is NOT the bar — at
+# these magnitudes cosine stays ~0.9999999999 while max_abs moves by orders of
+# magnitude, which is exactly how a real defect would hide.
 # across a growing-magnitude residual stack):
-#   out.after_patch   cos >= 0.9999
-#   out.block_NN      cos >= 0.999  each
-#   out.deepstack      cos >= 0.999  each of the 3 taps
-#   out.embeds        cos >= 0.999
+#   every stage:  max_abs_diff <= 4.0 * f32err.<stage>  (from the oracle dump)
 #
 # Run:
 #   python3 scripts/minimax_h3_vision_oracle.py [out.safetensors]
@@ -73,10 +85,11 @@ comptime TEXT_ENCODER_DIR = (
     "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/text_encoder"
 )
 
-comptime BAR_AFTER_PATCH = Float64(0.9999)
-comptime BAR_BLOCK = Float64(0.999)
-comptime BAR_DEEPSTACK = Float64(0.999)
-comptime BAR_EMBEDS = Float64(0.999)
+# Bars are `BAR_MULTIPLE * torch's own measured f32 error` per stage. 4x leaves
+# room for a different-but-correct summation order without admitting a real
+# defect: a genuine arithmetic bug moves max_abs by orders of magnitude, not by
+# a factor of four.
+comptime BAR_MULTIPLE = Float64(4.0)
 
 
 struct Report(Movable):
@@ -89,13 +102,18 @@ struct Report(Movable):
         self.failures = 0
         self.first_failure = String("")
 
-    def row(mut self, label: String, cos: Float64, max_abs: Float32, bar: Float64):
+    def row(
+        mut self, label: String, cos: Float64, max_abs: Float32,
+        bar: Float64, f32err: Float64,
+    ):
         self.checks += 1
-        var passed = cos >= bar
+        var passed = Float64(max_abs) <= bar
         var tag = String("ok  ") if passed else String("FAIL")
+        var margin = Float64(max_abs) / bar if bar > 0.0 else Float64(0.0)
         print(
-            "  ", tag, " ", label, "  cos=", cos, " max_abs_diff=", max_abs,
-            " (bar cos>=", bar, ")",
+            "  ", tag, " ", label, "  max_abs=", max_abs, " bar=", bar,
+            " (", BAR_MULTIPLE, "x torch f32err ", f32err, ")  used=",
+            margin * 100.0, "% of bar   cos=", cos,
         )
         if not passed:
             self.failures += 1
@@ -161,12 +179,33 @@ def _max_abs(a: List[Float32], b: List[Float32]) raises -> Float32:
     return worst
 
 
+def _read_f32err(ref st: SafeTensors, stage: String) raises -> Float64:
+    """`f32err.<stage>` from the oracle — torch's OWN f32 error at that stage.
+
+    A missing entry is a hard error, not a fallback to some default bar: an
+    ungated stage must never look like a passing one."""
+    var key = String("f32err.") + stage
+    if not st.has_tensor(key):
+        raise Error(
+            String("cpu_gate: oracle has no ") + key + " — regenerate it with"
+            " scripts/minimax_h3_vision_oracle.py, which computes the float64"
+            " baseline every bar is derived from"
+        )
+    var values = _read_f32(st, key)
+    if len(values) != 1:
+        raise Error(String("cpu_gate: ") + key + " is not a scalar")
+    return Float64(values[0])
+
+
 def _compare(
-    mut report: Report, label: String, got: List[Float32], want: List[Float32], bar: Float64
+    mut report: Report, ref st: SafeTensors, label: String, stage: String,
+    got: List[Float32], want: List[Float32],
 ) raises:
+    var f32err = _read_f32err(st, stage)
+    var bar = BAR_MULTIPLE * f32err
     var cos = _cosine(got, want)
     var mx = _max_abs(got, want)
-    report.row(label, cos, mx, bar)
+    report.row(label, cos, mx, bar, f32err)
 
 
 def main() raises:
@@ -218,28 +257,28 @@ def main() raises:
     var report = Report()
 
     _compare(
-        report, String("out.after_patch"), trace.after_patch,
-        _read_f32(st, String("out.after_patch")), BAR_AFTER_PATCH,
+        report, st, String("out.after_patch"), String("out.after_patch"), trace.after_patch,
+        _read_f32(st, String("out.after_patch")),
     )
     _compare(
-        report, String("out.block_00"), trace.block_00,
-        _read_f32(st, String("out.block_00")), BAR_BLOCK,
+        report, st, String("out.block_00"), String("out.block_00"), trace.block_00,
+        _read_f32(st, String("out.block_00")),
     )
     _compare(
-        report, String("out.block_08"), trace.block_08,
-        _read_f32(st, String("out.block_08")), BAR_BLOCK,
+        report, st, String("out.block_08"), String("out.block_08"), trace.block_08,
+        _read_f32(st, String("out.block_08")),
     )
     _compare(
-        report, String("out.block_16"), trace.block_16,
-        _read_f32(st, String("out.block_16")), BAR_BLOCK,
+        report, st, String("out.block_16"), String("out.block_16"), trace.block_16,
+        _read_f32(st, String("out.block_16")),
     )
     _compare(
-        report, String("out.block_24"), trace.block_24,
-        _read_f32(st, String("out.block_24")), BAR_BLOCK,
+        report, st, String("out.block_24"), String("out.block_24"), trace.block_24,
+        _read_f32(st, String("out.block_24")),
     )
     _compare(
-        report, String("out.block_26"), trace.block_26,
-        _read_f32(st, String("out.block_26")), BAR_BLOCK,
+        report, st, String("out.block_26"), String("out.block_26"), trace.block_26,
+        _read_f32(st, String("out.block_26")),
     )
 
     var want_deepstack = _read_f32(st, String("out.deepstack"))
@@ -256,13 +295,13 @@ def main() raises:
             want_tap.append(want_deepstack[tap * tap_stride + i])
         var got_tap = trace.output.deepstack_block(tap)
         _compare(
-            report, String("out.deepstack[") + String(tap) + String("]"),
-            got_tap, want_tap, BAR_DEEPSTACK,
+            report, st, String("out.deepstack[") + String(tap) + String("]"),
+            String("out.deepstack_") + String(tap), got_tap, want_tap,
         )
 
     _compare(
-        report, String("out.embeds"), trace.output.embeds,
-        _read_f32(st, String("out.embeds")), BAR_EMBEDS,
+        report, st, String("out.embeds"), String("out.embeds"),
+        trace.output.embeds, _read_f32(st, String("out.embeds")),
     )
 
     print("")

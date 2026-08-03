@@ -628,6 +628,77 @@ struct Qwen3Tokenizer(Movable):
             else:
                 p += 1
 
+    def merge_additional_special_tokens(
+        mut self, config_json_path: String
+    ) raises -> Int:
+        """Append `additional_special_tokens` declared only in a
+        `tokenizer_config.json`. Returns how many were actually new.
+
+        WHY THIS EXISTS. MiniMax-H3 ships seven tokens that appear in NEITHER
+        `tokenizer.json`'s vocab NOR its `added_tokens` array — they are listed
+        only in `tokenizer_config.json`:
+
+            <d> </d> <|cutoff|> <|lyrics_start|> <|lyrics_end|>
+            <|caption_start|> <|caption_end|>
+
+        `transformers` appends them at load time, so the real H3 tokenizer is
+        151676 tokens, not the 151669 that `tokenizer.json` alone describes.
+        MEASURED against `Qwen2TokenizerFast` on H3's own processor/ directory:
+        they land at 151669..151675, in the order the config lists them.
+
+        Without this, a prompt containing `<d>` — which H3's README explicitly
+        says it uses — tokenizes as the three pieces `<`, `d`, `>`, producing
+        different ids, a different text embedding, and a different video. The
+        vendor is explicit: "When using H3, the tokenizer and associated
+        configuration files provided in the H3 repository are required."
+
+        ASSIGNMENT RULE, matching what transformers does: a token already known
+        (by content) keeps its existing id and is skipped; a genuinely new one
+        takes the next id after the current maximum, in config order. So this is
+        idempotent — running it twice adds nothing the second time."""
+        var text = _read_utf8_file(config_json_path)
+        var bytes = text.as_bytes()
+        var p = _find_key(bytes, String("additional_special_tokens"), 0)
+        if p < 0:
+            return 0
+        _skip_ws(bytes, p)
+        if p >= len(bytes) or bytes[p] != 0x5B:  # '['
+            return 0
+        p += 1
+
+        var next_id = -1
+        for i in range(len(self.special_ids)):
+            if self.special_ids[i] > next_id:
+                next_id = self.special_ids[i]
+        next_id += 1
+
+        var added = 0
+        var n = len(bytes)
+        while p < n:
+            _skip_ws(bytes, p)
+            if p >= n:
+                break
+            var b = Int(bytes[p])
+            if b == 0x5D:  # ']'
+                break
+            if b == 0x2C:  # ','
+                p += 1
+                continue
+            if b != 0x22:  # anything but a string ends the array we understand
+                break
+            var content = _cps_to_string(_parse_json_string(bytes, p))
+            var known = False
+            for i in range(len(self.special_tokens)):
+                if self.special_tokens[i] == content:
+                    known = True
+                    break
+            if not known:
+                self.special_tokens.append(content)
+                self.special_ids.append(next_id)
+                next_id += 1
+                added += 1
+        return added
+
     def _parse_added_tokens_map(mut self, bytes: Span[Byte, _]) raises:
         var p = 0
         _skip_ws(bytes, p)

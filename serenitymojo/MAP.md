@@ -3118,11 +3118,14 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   timing, VRAM, prompt-extension provenance, and visual acceptance. The Rust
   server refuses Wan readiness if any pinned check drifts.
 
-## §5 MiniMax-H3 (t2va SHIPPED 2026-08-03; ref2va in build)
+## §5 MiniMax-H3 (t2va + i2va SHIPPED 2026-08-03; ref2va in build)
 
 The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
 layout (NOT the diffusers conversion). First valid video 2026-08-03
-(960x544, photorealistic, prompt-faithful, clean stereo audio).
+(960x544, photorealistic, prompt-faithful, clean stereo audio). Same day:
+7-shot storyboard sequence, 10s single-generation multi-shot hero (F=243,
+S=38,397 fits 24GB; S=51,431 does not), and the FIRST vision-conditioned
+i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 
 - `models/minimax_h3/` — HOST-F32 ORACLES (packing, packing_ref2va, block
   math, schedulers, audio codec, fp8 policy, tokenizer parity). Gated;
@@ -3144,6 +3147,24 @@ layout (NOT the diffusers conversion). First valid video 2026-08-03
 - `models/vae/minimax_h3_ref_encode.mojo` — reference encode chain; the
   vendor's fp16 round-trip BEFORE latent normalize is mandatory
   (encoders.py:586-588); video refs SAMPLE seed 42 CPU-gen, audio refs MODE.
+- `models/minimax_h3_device/audio_decoder_device.mojo` — device BigVGAN,
+  weight-norm folded at upload (dec_in_proj is the ONE un-normed conv), one
+  readback at the end. Gate 11/11 vs host oracle (e2e waveform cos
+  0.999999999994677); production A/B on hero10s latents: 3.16s vs 932.7s
+  host (295x), wav within 1 int16 LSB. BOTH pipelines call this now.
+- `models/text_encoder/minimax_h3_qwen3vl_vision.mojo` — the ONE Qwen3-VL
+  vision tower (arbitration 3069b71): geometry + weighted forward, f64
+  accumulation in LayerNorm+linears (sequential-f32 was a MEASURED defect vs
+  derived bars), `_torch_linspace_f32` halfway-split pos-embed interpolation.
+  Deepstack taps at ViT blocks 8/16/24 -> consumed at LANGUAGE layers 0/1/2.
+- `models/text_encoder/minimax_h3_qwen3vl_streamed.mojo` — streamed 50-layer
+  conditioner; deepstack splice-once-before-layer-0 + add-after-layers-0/1/2
+  (modeling_qwen3_vl.py:849-883). Composed GPU gate on real weights:
+  parity/minimax_h3_deepstack_gpu_gate.mojo (depths 1/2/3 vs torch oracle).
+- `pipeline/minimax_h3_i2va.mojo` — keyframe (I2VA/FL2VA/L2VA) product CLI:
+  canvas law = 768 short edge, SQUARE keyframe -> 768x768 (16:9 canvas at
+  S≈74k does not fit 24GB), preprocessor normalize (u8-127.5)/127.5
+  bit-exact, condition rows pinned at cond_t=0.999 (video tracking-max law).
 - `pipeline/minimax_h3_t2va.mojo` — THE product CLI. Comptime geometry
   (-D H3_TEXT_TOKENS/H3_FRAMES/H3_HEIGHT/H3_WIDTH; frames must be 17k+5),
   saves latents every run, `decode_only` argv[6] re-decodes in ~2 min,

@@ -309,6 +309,10 @@ from serenitymojo.models.minimax_h3.audio_decoder import (
     MiniMaxH3AudioWeights,
     minimax_h3_audio_decode,
 )
+from serenitymojo.models.minimax_h3_device.audio_decoder_device import (
+    minimax_h3_audio_device_weights,
+    minimax_h3_audio_decode_device,
+)
 
 
 # ── Checkpoint paths (matches every other H3 device module's own defaults) ──
@@ -1144,8 +1148,11 @@ def _minimax_h3_decode_audio(
     var dec_cfg = _minimax_h3_audio_decoder_config(audio_channels)
     var weights = _minimax_h3_load_audio_vae_weights(String(AUDIO_VAE_PATH))
 
-    var wave_l = minimax_h3_audio_decode(weights, dec_cfg, ch0, num_audio_latents)
-    var wave_r = minimax_h3_audio_decode(weights, dec_cfg, ch1, num_audio_latents)
+    # Device BigVGAN (gate: models/minimax_h3_device/parity/, 11/11 vs host
+    # oracle, e2e waveform cos 0.999999999994677 / max_abs 5.7e-6).
+    var dev_weights = minimax_h3_audio_device_weights(weights, dec_cfg, ctx)
+    var wave_l = minimax_h3_audio_decode_device(dev_weights, dec_cfg, ch0, num_audio_latents, ctx)
+    var wave_r = minimax_h3_audio_decode_device(dev_weights, dec_cfg, ch1, num_audio_latents, ctx)
     if len(wave_l) != len(wave_r):
         raise Error("minimax_h3_t2va: L/R waveform length mismatch")
 

@@ -145,7 +145,11 @@ from serenitymojo.models.dit.minimax_h3_sampling import (
     MiniMaxH3DualSchedule,
     minimax_h3_build_sampling_geometry,
 )
+from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
+    minimax_h3_encode_conditioning_streamed,
+)
 from serenitymojo.models.text_encoder.minimax_h3_conditioning import (
+    MiniMaxH3ConditioningOutput,
     minimax_h3_encode_conditioning,
 )
 from serenitymojo.models.minimax_h3.packing import (
@@ -157,6 +161,10 @@ from serenitymojo.models.minimax_h3.audio_decoder import (
     MiniMaxH3AudioDecoderConfig,
     MiniMaxH3AudioWeights,
     minimax_h3_audio_decode,
+)
+from serenitymojo.models.minimax_h3_device.audio_decoder_device import (
+    minimax_h3_audio_device_weights,
+    minimax_h3_audio_decode_device,
 )
 from serenitymojo.models.vae.minimax_h3_video_encoder_device import (
     MiniMaxH3VideoEncoderDevice,
@@ -611,8 +619,11 @@ def _decode_audio(
     var d1 = _denormalize_audio_channel(ch1, audio_channels, num_audio_latents, mean, std)
     var dec_cfg = _audio_decoder_config(audio_channels)
     var weights = _load_audio_vae_weights(String(AUDIO_VAE_PATH))
-    var wave_l = minimax_h3_audio_decode(weights, dec_cfg, d0, num_audio_latents)
-    var wave_r = minimax_h3_audio_decode(weights, dec_cfg, d1, num_audio_latents)
+    # Device BigVGAN (gate: models/minimax_h3_device/parity/, 11/11 vs host
+    # oracle, e2e waveform cos 0.999999999994677 / max_abs 5.7e-6).
+    var dev_weights = minimax_h3_audio_device_weights(weights, dec_cfg, ctx)
+    var wave_l = minimax_h3_audio_decode_device(dev_weights, dec_cfg, d0, num_audio_latents, ctx)
+    var wave_r = minimax_h3_audio_decode_device(dev_weights, dec_cfg, d1, num_audio_latents, ctx)
     if len(wave_l) != len(wave_r):
         raise Error("minimax_h3_i2va: L/R waveform length mismatch")
     var stereo = List[Float32](capacity=2 * len(wave_l))
@@ -939,6 +950,7 @@ def main() raises:
         expected_vision_tokens, "embeds to splice",
     )
 
+    var vision_out = Optional[MiniMaxH3VisionOutput](None)
     comptime
     if NO_VISION == 0:
         # ── (a) preprocess, then the tower. Both host, both before any
@@ -966,21 +978,11 @@ def main() raises:
         print("  vision tower:", vision.num_tokens, "embeds +",
               "3 deepstack blocks, ready to splice")
 
-        # ── (b) the ONLY remaining seam. ───────────────────────────────────
-        raise Error(
-            String("minimax_h3_i2va: SEAM (b) — the vision tower ran and")
-            + " produced " + String(vision.num_tokens) + " embeds plus 3"
-            " deepstack blocks, and this file has the splice map"
-            " (presentation.pad_positions). What is missing is the CONDITIONER"
-            " side: models/text_encoder/minimax_h3_qwen3vl_streamed.mojo must"
-            " accept a MiniMaxH3VisionOutput, substitute the embeds at the"
-            " <|image_pad|> rows, and add the three deepstack tensors at"
-            " LANGUAGE decoder layers 0/1/2 at visual positions only. That file"
-            " is h3-ref2va's. Everything on THIS side is built and gated:"
-            " presentation (12/12), preprocessor (11/11 bit-exact), tower."
-            " Rebuild with -D H3_KF_NO_VISION=1 for the DEGRADED text-only"
-            " path."
-        )
+        # ── (b) CLOSED 2026-08-03: the streamed conditioner accepts
+        # MiniMaxH3VisionOutput + visual_positions (deepstack gate 7/7,
+        # capstone 6/6). Carry the tower output to the conditioning call,
+        # which must run AFTER DeviceContext exists.
+        vision_out = Optional[MiniMaxH3VisionOutput](vision^)
 
 
     var config = minimax_h3_released_config()
@@ -1065,9 +1067,35 @@ def main() raises:
 
     # ── 2. Conditioning (degraded, text-only — see the seam above) ─────────
     var t_cond0 = perf_counter_ns()
-    var cond = minimax_h3_encode_conditioning(
-        String(PROCESSOR_DIR), String(TEXT_ENCODER_DIR), prompt, ctx
-    )
+    var cond: MiniMaxH3ConditioningOutput
+    comptime
+    if NO_VISION == 0:
+        # REAL vision conditioning: the presentation's exact token ids (pads,
+        # labels, alignment line — gated 12/12) through the streamed
+        # conditioner with the tower output spliced at the pad rows and the
+        # deepstack taps at language layers 0/1/2 (gate 7/7). Same
+        # pad-to-dispatch-case treatment as minimax_h3_encode_conditioning:
+        # trailing <|endoftext|> pads cannot alter earlier positions (causal),
+        # sliced back after.
+        var vids = presentation.token_ids.copy()
+        var vreal = len(vids)
+        var vpad = 8
+        while vpad < vreal:
+            vpad *= 2
+        if vpad > 2048:
+            raise Error("minimax_h3_i2va: presentation exceeds the sdpa dispatch table (2048)")
+        for _ in range(vpad - vreal):
+            vids.append(151643)
+        var vemb_p = minimax_h3_encode_conditioning_streamed(
+            String(TEXT_ENCODER_DIR), vids, ctx, vision_out^,
+            Optional(presentation.pad_positions.copy()),
+        )
+        var vemb = slice(vemb_p, 1, 0, vreal, ctx)
+        cond = MiniMaxH3ConditioningOutput(vemb^, presentation.token_tags.copy())
+    else:
+        cond = minimax_h3_encode_conditioning(
+            String(PROCESSOR_DIR), String(TEXT_ENCODER_DIR), prompt, ctx
+        )
     if len(cond.token_tags) != TEXT_TOKENS:
         raise Error(
             String("minimax_h3_i2va: the prompt tokenized to ")

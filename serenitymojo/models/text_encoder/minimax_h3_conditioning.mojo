@@ -72,6 +72,7 @@
 
 from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
+from serenitymojo.ops.tensor_algebra import slice
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
@@ -119,5 +120,29 @@ def minimax_h3_encode_conditioning(
     var token_tags = List[Int]()
     for _ in range(len(ids)):
         token_tags.append(MINIMAX_H3_TEXT_TAG)
-    var embeds = minimax_h3_encode_conditioning_streamed(text_encoder_dir, ids, ctx)
+
+    # PAD-TO-DISPATCH-CASE. ops/attention's sdpa_dispatch enumerates comptime
+    # sequence lengths (8..2048 powers of two for h=64/dh=128); an arbitrary
+    # prompt length (e.g. 245) has no case and raises. The encoder is CAUSAL,
+    # so trailing pad tokens cannot alter hidden states at positions before
+    # them — pad up to the next enumerated size, run, slice the rows back.
+    # Pad id 151643 (<|endoftext|>) — any id works; its rows are discarded.
+    var real_len = len(ids)
+    var padded_len = 8
+    while padded_len < real_len:
+        padded_len *= 2
+    if padded_len > 2048:
+        raise Error(
+            String("minimax_h3_encode_conditioning: prompt is ")
+            + String(real_len)
+            + " tokens; the sdpa dispatch table tops out at 2048"
+        )
+    var padded_ids = ids.copy()
+    for _ in range(padded_len - real_len):
+        padded_ids.append(151643)
+
+    var embeds_padded = minimax_h3_encode_conditioning_streamed(
+        text_encoder_dir, padded_ids, ctx
+    )
+    var embeds = slice(embeds_padded, 1, 0, real_len, ctx)
     return MiniMaxH3ConditioningOutput(embeds^, token_tags^)

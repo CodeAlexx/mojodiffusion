@@ -345,3 +345,361 @@ def minimax_h3_video_decode_temporal[
             raise Error("MiniMax-H3 video temporal decode: pad_frames >= total decoded frames")
         dec = slice(dec, 1, 0, keep, ctx)
     return dec^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMING DECODE. Same math, same order, same values — the whole-video
+# tensor is never materialized.
+#
+# WHY: `minimax_h3_video_decode_temporal` above accumulates every part in
+# `dec_parts` and then folds them with a progressive `concat` (:337-339). That
+# is O(n^2) in allocation churn AND it holds the ENTIRE decoded video on device
+# twice at the fold's peak. Measured cost at the 14-second hero geometry (328
+# frames, 960x544, F32): the pixel volume alone is 2.06 GiB, the progressive
+# fold peaks near 4.2 GiB, and the pixel-denormalize adds another 2.06 GiB
+# copy — on a card with ~2.3 GiB of headroom after the denoise loop.
+#
+# WHAT THE VENDOR DOES, AND WHY THIS GOES FURTHER. `_decode_temporal_streaming`
+# (klvae.py:571-676) removes the CONCAT but not the VOLUME: it preallocates the
+# full `[..., output_frames, ...]` output with `torch.empty` on the first write
+# (:597-600) and `copy_`s each part into its slot (:605-607). Peak is therefore
+# still one whole video plus one clip — better than the fold, but it does not
+# stop growing with duration, and porting it would need a write-into-tensor-at-
+# offset op this repo does not have (no `slice_assign`/`copy_into` in
+# ops/tensor_algebra.mojo — checked).
+#
+# So this ports the vendor's LOOP STRUCTURE and its FRAME BOOKKEEPING exactly,
+# but hands each finished part to the caller instead of writing it into a
+# preallocated buffer. The caller (pipeline/minimax_h3_t2va.mojo) denormalizes
+# and writes that part's PNGs, then drops it. Peak becomes ONE CLIP DECODE plus
+# ONE PART — ~50 frames — INDEPENDENT OF VIDEO LENGTH. At the hero geometry
+# that is ~0.31 GiB instead of ~4.2 GiB.
+#
+# BIT-EXACTNESS vs the non-streaming path is not an aspiration, it is
+# structural: every part is produced by the identical sequence of slice /
+# tiled-decode / blend calls in the identical order. Only the accumulation
+# differs, and concat of the streamed parts must reproduce the folded tensor
+# exactly. `minimax_h3_video_decode_temporal_streamed` below exists to let a
+# gate assert precisely that (max_abs diff == 0), and
+# pipeline/parity/minimax_h3_video_temporal_streaming_probe.mojo does.
+#
+# TRUNCATION. The vendor does NOT slice `pad_frames` off the tail in the
+# streaming path the way the non-streaming path does (:341-346). It simply
+# stops copying once the preallocated buffer is full (:602-609:
+# `copy_frames = min(part_frames, max(0, remaining))`) and counts the remainder
+# as `dropped_frames`. Since the pad frames are by construction at the END,
+# truncating the write is exactly equivalent to trimming the tail. This port
+# does the same, clamping each emitted part against the planned
+# `output_frames`; a part that is fully truncated is reported as `None` rather
+# than as a zero-length tensor. For every geometry the pipeline can actually
+# produce (`latent_T = 5n+2` => `pseudo_total = 5n+5`, divisible by
+# `tokens_chunk_size`) `pad_tokens` is 0 and this path never fires, but
+# decode_only mode can hand over an arbitrary latent length, so it is
+# implemented rather than assumed away.
+#
+# THE VENDOR'S OWN INVARIANT IS PORTED TOO (:668-674): after the last part,
+# `finish()` checks `logical_frames == total_frames`, `dropped == pad_frames`
+# and `emitted == output_frames`, and raises naming all six numbers otherwise.
+# That is a real end-of-decode assertion on host integers, not a comment.
+# ─────────────────────────────────────────────────────────────────────────────
+@fieldwise_init
+struct MiniMaxH3TemporalFramePlan(Copyable, Movable):
+    """`_decode_temporal_output_frame_plan`'s three return values (:569), for
+    the `z_head is None and z_tail is None` case FL2VA always takes (see this
+    file's header SCOPE note)."""
+
+    var total_frames: Int
+    var pad_frames: Int
+    var output_frames: Int
+
+
+def minimax_h3_temporal_output_frame_plan(
+    tconfig: MiniMaxH3VideoTemporalConfig,
+    z_len_after_pad: Int,
+    num_chunks: Int,
+    pad_tokens: Int,
+) raises -> MiniMaxH3TemporalFramePlan:
+    """Port of `_decode_temporal_output_frame_plan` (:531-569). PURE HOST
+    INTEGER ARITHMETIC — no tensor, no device, no weights — which is what lets
+    it be gated on CPU against the vendor's own function while the GPU is
+    busy."""
+    var tcs = tconfig.tokens_chunk_size()
+    var rt = tconfig.vae_ratio_t
+    var chunk_dec = tcs * rt
+    var split_count = 2 if tconfig.token_drop > 0 else 1
+    var fpp = tconfig.frame_pre_padding()
+    var token_overlap = tconfig.token_overlap()
+
+    var total = 0
+    var final_overlap = 0
+    for i in range(num_chunks):
+        var t_start = i * tcs
+        var t_end = t_start + tcs + token_overlap
+        # `min(idx, z_len)` on BOTH ends, exactly as the reference writes it
+        # (:543) — that is what makes a past-the-end window contribute 0
+        # rather than a negative length.
+        var lo = t_start if t_start < z_len_after_pad else z_len_after_pad
+        var hi = t_end if t_end < z_len_after_pad else z_len_after_pad
+        var clip_token_len = hi - lo
+        if clip_token_len < 0:
+            clip_token_len = 0
+        var clip_frame_len = clip_token_len * rt
+        for j in range(split_count):
+            var f_start = j * chunk_dec
+            var f_end = f_start + chunk_dec
+            if f_end > clip_frame_len:
+                f_end = clip_frame_len
+            var chunk_frames = f_end - f_start - fpp
+            if chunk_frames < 0:
+                chunk_frames = 0
+            if j == 0:
+                total += chunk_frames
+            else:
+                final_overlap = chunk_frames
+    total += final_overlap
+
+    var pad = _decode_temporal_pad_frames(tconfig, z_len_after_pad, pad_tokens)
+    return MiniMaxH3TemporalFramePlan(total, pad, total - pad)
+
+
+struct MiniMaxH3TemporalDecodeStream(Movable):
+    """Emits `decode_temporal`'s output ONE PART AT A TIME. Construct, then
+    call `next_part` while `has_next()`, then `finish()`.
+
+    A "part" is one iteration's `j == 0` group (`clip_length` frames after the
+    `frame_pre_padding` trim and the cross-fade with the previous clip's tail),
+    plus — once, at the end — the final carried `dec_overlap`. That is exactly
+    the sequence the non-streaming path appends to `dec_parts`, so
+    concatenating every emitted part reproduces its output bit for bit."""
+
+    var z: Tensor                       # alignment-padded latents
+    var tconfig: MiniMaxH3VideoTemporalConfig
+    var tiling: MiniMaxH3TilingConfig
+    var num_chunks: Int
+    var num_parts: Int
+    var plan: MiniMaxH3TemporalFramePlan
+    var part_index: Int
+    var dec_overlap: Optional[Tensor]
+    var emitted: Int                    # frames handed to the caller
+    var logical: Int                    # frames produced before truncation
+    var dropped: Int                    # frames truncated as alignment padding
+
+    def __init__(
+        out self,
+        latents: Tensor,  # [1, latent_T, latent_H, latent_W, latent_channels] NDHWC
+        tconfig: MiniMaxH3VideoTemporalConfig,
+        tiling: MiniMaxH3TilingConfig,
+        ctx: DeviceContext,
+    ) raises:
+        """Mirrors `decode_temporal`'s prologue (:678-713) — the same
+        `pseudo_total_tokens` / `pad_tokens` / `num_chunks` arithmetic and the
+        same last-token alignment padding — then plans the output."""
+        var tcs = tconfig.tokens_chunk_size()
+        var latent_t = latents.shape()[1]
+        var pseudo_total_tokens = latent_t + tconfig.token_drop
+        var remainder = pseudo_total_tokens % tcs
+        var pad_tokens = 0
+        if remainder != 0:
+            pad_tokens = tcs - remainder
+            pseudo_total_tokens += pad_tokens
+        var pseudo_num_chunks = pseudo_total_tokens // tcs
+        var num_chunks = pseudo_num_chunks - (1 if tconfig.token_drop > 0 else 0)
+        if num_chunks <= 0:
+            raise Error(
+                "MiniMax-H3 video temporal stream: computed non-positive num_chunks"
+            )
+
+        if pad_tokens > 0:
+            var last_tok = slice(latents, 1, latent_t - 1, 1, ctx)
+            var padded = latents.clone(ctx)
+            for _ in range(pad_tokens):
+                padded = concat(1, ctx, padded, last_tok)
+            self.z = padded^
+        else:
+            self.z = latents.clone(ctx)
+
+        var z_len_after_pad = latent_t + pad_tokens
+        self.plan = minimax_h3_temporal_output_frame_plan(
+            tconfig, z_len_after_pad, num_chunks, pad_tokens
+        )
+        if self.plan.output_frames <= 0:
+            raise Error(
+                String("MiniMax-H3 video temporal stream: planned non-positive")
+                + " output_frames=" + String(self.plan.output_frames)
+                + " total_frames=" + String(self.plan.total_frames)
+                + " pad_frames=" + String(self.plan.pad_frames)
+            )
+
+        self.tconfig = tconfig.copy()
+        self.tiling = tiling.copy()
+        self.num_chunks = num_chunks
+        # One part per chunk (the j==0 group) plus the final carried overlap,
+        # which only exists when token_drop > 0 creates a j==1 split.
+        self.num_parts = num_chunks + (1 if tconfig.token_drop > 0 else 0)
+        self.part_index = 0
+        self.dec_overlap = Optional[Tensor](None)
+        self.emitted = 0
+        self.logical = 0
+        self.dropped = 0
+
+    def output_frames(self) -> Int:
+        """How many frames the caller will receive in total."""
+        return self.plan.output_frames
+
+    def frames_emitted(self) -> Int:
+        """Frames handed over so far — the global index of the next part's
+        first frame, which is what a PNG-writing caller needs for numbering."""
+        return self.emitted
+
+    def has_next(self) -> Bool:
+        return self.part_index < self.num_parts
+
+    def _clamp_and_account(mut self, var part: Tensor, ctx: DeviceContext) raises -> Optional[Tensor]:
+        """`write_part`'s accounting (:591-609) with the buffer write replaced
+        by handing the part back. Returns None for a part that is entirely
+        alignment padding."""
+        var part_frames = part.shape()[1]
+        if part_frames <= 0:
+            return Optional[Tensor](None)
+        self.logical += part_frames
+        var remaining = self.plan.output_frames - self.emitted
+        if remaining < 0:
+            remaining = 0
+        var copy_frames = part_frames if part_frames < remaining else remaining
+        self.dropped += part_frames - copy_frames
+        if copy_frames <= 0:
+            return Optional[Tensor](None)
+        self.emitted += copy_frames
+        if copy_frames < part_frames:
+            return Optional[Tensor](slice(part, 1, 0, copy_frames, ctx))
+        return Optional[Tensor](part^)
+
+    def next_part[
+        LATENT_TILE_H: Int, LATENT_TILE_W: Int, HEADS: Int, DIM_HEAD: Int,
+        NUM_SUFFIX: Int, TOKENS_PER_CLIP: Int,
+    ](mut self, decoder: MiniMaxH3VideoDecoderDevice, ctx: DeviceContext) raises -> Optional[Tensor]:
+        """Decode and return the next part. Comptime parameters are the same
+        six `minimax_h3_video_decode_temporal` takes and carry the same
+        meaning; they are re-checked against the runtime config here for the
+        same reason."""
+        if decoder.config.heads != HEADS or decoder.config.dim_head != DIM_HEAD:
+            raise Error("MiniMax-H3 video temporal stream: comptime HEADS/DIM_HEAD mismatch")
+        if decoder.config.num_register_tokens + 1 != NUM_SUFFIX:
+            raise Error("MiniMax-H3 video temporal stream: comptime NUM_SUFFIX mismatch")
+        if self.tconfig.tokens_per_clip() != TOKENS_PER_CLIP:
+            raise Error("MiniMax-H3 video temporal stream: comptime TOKENS_PER_CLIP mismatch")
+        if not self.has_next():
+            raise Error("MiniMax-H3 video temporal stream: next_part past the end")
+
+        var tcs = self.tconfig.tokens_chunk_size()
+        var fpp = self.tconfig.frame_pre_padding()
+        var frame_overlap = self.tconfig.frame_overlap()
+        var chunk_dec = tcs * self.tconfig.vae_ratio_t
+        var split_count = 2 if self.tconfig.token_drop > 0 else 1
+
+        var i = self.part_index
+        self.part_index += 1
+
+        # The trailing part: the carried overlap, no decode (:657-660).
+        if i >= self.num_chunks:
+            if not self.dec_overlap:
+                raise Error(
+                    "MiniMax-H3 video temporal stream: final part expected a carried"
+                    " overlap but none exists"
+                )
+            var tail = self.dec_overlap.value().clone(ctx)
+            self.dec_overlap = Optional[Tensor](None)
+            return self._clamp_and_account(tail^, ctx)
+
+        var clip_z = slice(self.z, 1, i * tcs, TOKENS_PER_CLIP, ctx)
+        var clip_dec = minimax_h3_video_tiled_decode[
+            LATENT_TILE_H, LATENT_TILE_W, HEADS, DIM_HEAD, NUM_SUFFIX, TOKENS_PER_CLIP
+        ](decoder, clip_z, self.tiling, ctx)
+        var clip_frames = clip_dec.shape()[1]
+
+        var out = Optional[Tensor](None)
+        for j in range(split_count):
+            var f_start = j * chunk_dec
+            if f_start >= clip_frames:
+                continue
+            var f_end = f_start + chunk_dec
+            if f_end > clip_frames:
+                f_end = clip_frames
+            var seg = slice(clip_dec, 1, f_start, f_end - f_start, ctx)
+            var trimmed_len = seg.shape()[1] - fpp
+            if trimmed_len <= 0:
+                continue
+            var trimmed = slice(seg, 1, fpp, trimmed_len, ctx)
+
+            if j == 0:
+                var group: Tensor
+                if self.dec_overlap:
+                    group = minimax_h3_video_blend(
+                        self.dec_overlap.value(), trimmed, frame_overlap, 1, ctx
+                    )
+                    self.dec_overlap = Optional[Tensor](None)
+                else:
+                    group = trimmed^
+                out = self._clamp_and_account(group^, ctx)
+            else:
+                self.dec_overlap = Optional[Tensor](trimmed^)
+        return out^
+
+    def finish(self) raises:
+        """`_decode_temporal_streaming`'s closing invariant (:668-674), which
+        is the whole reason that function can be trusted without re-reading its
+        output: if the three counters do not match the plan, the frame
+        bookkeeping diverged somewhere in the loop and the video is wrong."""
+        if self.has_next():
+            raise Error(
+                String("MiniMax-H3 video temporal stream: finish() called with ")
+                + String(self.num_parts - self.part_index) + " parts unconsumed"
+            )
+        if (
+            self.logical != self.plan.total_frames
+            or self.dropped != self.plan.pad_frames
+            or self.emitted != self.plan.output_frames
+        ):
+            raise Error(
+                String("MiniMax-H3 video temporal stream: frame plan mismatch:")
+                + " logical_frames=" + String(self.logical)
+                + " total_frames=" + String(self.plan.total_frames)
+                + " dropped_frames=" + String(self.dropped)
+                + " pad_frames=" + String(self.plan.pad_frames)
+                + " emitted=" + String(self.emitted)
+                + " output_frames=" + String(self.plan.output_frames)
+            )
+
+
+def minimax_h3_video_decode_temporal_streamed[
+    LATENT_TILE_H: Int, LATENT_TILE_W: Int, HEADS: Int, DIM_HEAD: Int, NUM_SUFFIX: Int,
+    TOKENS_PER_CLIP: Int,
+](
+    decoder: MiniMaxH3VideoDecoderDevice,
+    latents: Tensor,
+    tconfig: MiniMaxH3VideoTemporalConfig,
+    tiling: MiniMaxH3TilingConfig,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Drives the stream and concatenates — SAME RESULT as
+    `minimax_h3_video_decode_temporal`, same peak memory as it too, so this is
+    NOT the memory win. It exists so a gate can assert the streaming loop and
+    the folded loop agree bit for bit before the pipeline is allowed to trust
+    the incremental path (see minimax_h3_video_temporal_streaming_probe.mojo).
+    Real callers should drive `MiniMaxH3TemporalDecodeStream` directly and
+    consume each part."""
+    var stream = MiniMaxH3TemporalDecodeStream(latents, tconfig, tiling, ctx)
+    var parts = List[TArc]()
+    while stream.has_next():
+        var p = stream.next_part[
+            LATENT_TILE_H, LATENT_TILE_W, HEADS, DIM_HEAD, NUM_SUFFIX, TOKENS_PER_CLIP
+        ](decoder, ctx)
+        if p:
+            parts.append(TArc(p.value().clone(ctx)))
+    stream.finish()
+    if len(parts) == 0:
+        raise Error("MiniMax-H3 video temporal streamed decode: produced zero parts")
+    var dec = parts[0][].clone(ctx)
+    for i in range(1, len(parts)):
+        dec = concat(1, ctx, dec, parts[i][])
+    return dec^

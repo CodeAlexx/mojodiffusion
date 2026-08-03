@@ -251,6 +251,7 @@ from serenitymojo.pipeline.minimax_h3_video_vae_spatial_tiling import (
 from serenitymojo.pipeline.minimax_h3_video_vae_temporal import (
     minimax_h3_video_decode_temporal,
     minimax_h3_video_released_temporal_config,
+    MiniMaxH3TemporalDecodeStream,
 )
 from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
     minimax_h3_video_pixel_denormalize,
@@ -724,9 +725,59 @@ comptime VAE_TOKEN_OVERLAP = (
 ) % VAE_TOKENS_CHUNK
 comptime VAE_TOKENS_PER_CLIP = VAE_TOKENS_CHUNK + VAE_TOKEN_OVERLAP
 
+# ── STREAMING DECODE (H3_VAE_STREAM_DECODE, default OFF) ─────────────────────
+# IMPLIES temporal chunking (it IS the temporal loop, consumed one part at a
+# time), so it does not need H3_VAE_TEMPORAL set as well and ignores it.
+#
+# WHAT IT CHANGES: the non-streaming decode builds the ENTIRE video as one
+# device tensor, then denormalizes it (a second full copy), then writes PNGs.
+# At the 14-second hero geometry that is a 2.06 GiB pixel volume, a fold that
+# peaks near 4.2 GiB, and a 2.06 GiB denormalize copy — against roughly 2.3 GiB
+# of headroom left after the denoise loop. This path decodes ONE temporal part,
+# denormalizes THAT PART, writes its PNGs, and drops it, so the peak is one
+# clip decode plus one part (~50 frames) NO MATTER HOW LONG THE VIDEO IS.
+#
+# Frame numbering and the resulting files are identical to the non-streaming
+# path (shared `_write_rgb_frames`, running offset), so nothing downstream —
+# ffmpeg's `frame_%05d.png`, the muxer, the sequence concat — changes.
+#
+# The vendor's own `_decode_temporal_streaming` (klvae.py:571-676) is the
+# structural authority here, but note it preallocates the full output and
+# writes into it (:597-607); it removes the fold, not the volume. This goes one
+# step further because we can hand each part straight to the PNG writer. See
+# the long header note in pipeline/minimax_h3_video_vae_temporal.mojo.
+comptime VIDEO_DECODE_STREAM = get_defined_int["H3_VAE_STREAM_DECODE", 0]()
+
 
 def num_video_rows_of(f: Int, h: Int, w: Int) -> Int:
     return f * (h // 2) * (w // 2)
+
+
+def _write_rgb_frames(
+    rgb: Tensor,          # [1, F, H, W, 3] denormalized, UNIT range
+    out_dir: String,
+    first_index: Int,     # global frame number of rgb's frame 0
+    ctx: DeviceContext,
+) raises -> Int:
+    """Write one PNG per frame, numbered from `first_index`. Factored out of
+    `_minimax_h3_decode_video` so the STREAMING decode path can call it once
+    per temporal part with a running offset and never hold the whole video —
+    the numbering is identical either way, which is what keeps
+    `ffmpeg -i frame_%05d.png` working unchanged."""
+    var ps = rgb.shape()
+    var frames = ps[1]
+    var height = ps[2]
+    var width = ps[3]
+    for f in range(frames):
+        var one = slice(rgb, 1, f, 1, ctx)                       # [1,1,H,W,3]
+        var hwc = reshape(one, [height, width, 3], ctx)
+        var chw = permute(hwc, [2, 0, 1], ctx)                   # [3,H,W]
+        var img = reshape(chw, [1, 3, height, width], ctx)
+        var name = String(first_index + f)
+        while len(name) < 5:
+            name = String("0") + name
+        save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
+    return frames
 
 
 def _minimax_h3_decode_video(
@@ -809,6 +860,46 @@ def _minimax_h3_decode_video(
     # 2048 wide does not fit 24 GiB across 32 heads. Tiling drops each call to
     # TOKENS_PER_CLIP*16*16 + 5 = 1,797.
     var tiling = minimax_h3_video_released_tiling_config()
+
+    # ── STREAMING: decode -> denormalize -> write PNGs, one temporal part at a
+    # time. The whole-video tensor is never built. Returns early; everything
+    # below is the non-streaming path, unchanged.
+    @parameter
+    if VIDEO_DECODE_STREAM != 0:
+        var stcfg = minimax_h3_video_released_temporal_config()
+        var stream = MiniMaxH3TemporalDecodeStream(latents, stcfg, tiling, ctx)
+        var planned = stream.output_frames()
+        var norm = minimax_h3_pixel_norm_constants(String("imagenet"))
+        var written = 0
+        var last_h = 0
+        var last_w = 0
+        while stream.has_next():
+            var part = stream.next_part[
+                LATENT_TILE, LATENT_TILE, 32, 64, 5, VAE_TOKENS_PER_CLIP
+            ](decoder, ctx)
+            if part:
+                var rgb_part = minimax_h3_video_pixel_denormalize(
+                    part.value(), norm, ctx
+                )
+                var pshape = rgb_part.shape()
+                last_h = pshape[2]
+                last_w = pshape[3]
+                written += _write_rgb_frames(rgb_part, out_dir, written, ctx)
+        # Ports the vendor's closing invariant (:668-674) — if the frame
+        # bookkeeping drifted anywhere in the loop this raises instead of
+        # silently shipping a short or long video.
+        stream.finish()
+        if written != planned:
+            raise Error(
+                String("minimax_h3_t2va: streaming decode wrote ") + String(written)
+                + " frames but planned " + String(planned)
+            )
+        print(
+            "  wrote", written, "frames", last_h, "x", last_w, "to", out_dir,
+            "(STREAMING temporal decode — whole-video tensor never materialized)",
+        )
+        return written
+
     var pixels: Tensor
     @parameter
     if VIDEO_DECODE_TEMPORAL != 0:
@@ -833,6 +924,14 @@ def _minimax_h3_decode_video(
         pixels, minimax_h3_pixel_norm_constants(String("imagenet")), ctx
     )
 
+    # DELIBERATELY NOT refactored to call `_write_rgb_frames` (which is the
+    # same loop with `first_index` added). Factoring it out is the obvious
+    # cleanup and it was done, then REVERTED: it changed this binary — .text
+    # +864 bytes, .rodata -16 (a deduplicated string) — and the six-shot batch
+    # builds its remaining per-shot binaries FROM THIS SOURCE on demand, so the
+    # default path has to stay byte-for-byte what shots 2-4 already ran. The
+    # duplication buys a provable no-op for the in-flight batch and should be
+    # collapsed the moment that batch is done.
     var ps = rgb.shape()
     var frames = ps[1]
     var height = ps[2]

@@ -244,6 +244,10 @@ from serenitymojo.models.vae.minimax_h3_video_decoder_device import (
     minimax_h3_video_decoder_device_load,
     minimax_h3_video_decode_device,
 )
+from serenitymojo.pipeline.minimax_h3_video_vae_spatial_tiling import (
+    minimax_h3_video_tiled_decode,
+    minimax_h3_video_released_tiling_config,
+)
 from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
     minimax_h3_video_pixel_denormalize,
     minimax_h3_pixel_norm_constants,
@@ -672,7 +676,12 @@ def _minimax_h3_global_timestep_row(
 # ═════════════════════════════════════════════════════════════════════════════
 # Video decode seam — STUBBED. See file header "VIDEO DECODE".
 # ═════════════════════════════════════════════════════════════════════════════
-comptime VIDEO_DECODE_S = NUM_LATENT_FRAMES * LATENT_H * LATENT_W + 5
+# 256 px tile / vae_ratio 16 = 16 latent cells per tile side.
+comptime LATENT_TILE = 16
+
+
+def num_video_rows_of(f: Int, h: Int, w: Int) -> Int:
+    return f * (h // 2) * (w // 2)
 
 
 def _minimax_h3_decode_video(
@@ -703,9 +712,22 @@ def _minimax_h3_decode_video(
     model's output linear, documented in that op's own docstring; using
     patchify3d's order here would scramble every frame while producing a
     perfectly-shaped tensor."""
+    # ROW ORDER FIX (measured against the vendor's packing.py, 2026-08-03):
+    # H3 packs each video row CHANNEL-SLOWEST -- patchify_video_latents
+    # permutes to (..., channels, pt, ph, pw) before the flatten, and
+    # unpatchify_video_tokens reshapes rows as (c, pt, ph, pw). Our
+    # ops/patchify3d.unpatchify3d reads within-patch CHANNEL-FASTEST
+    # (pf, ph, pw, c) -- the wan/cosmos convention its docstring says is
+    # model-specific. Decoding H3 rows without this reorder scrambles every
+    # 2x2 latent patch, which the VAE renders as a 16-px periodic tile
+    # artifact (observed on the first full run). Reorder (c,pt,ph,pw) ->
+    # (pt,ph,pw,c) per row, then the shared unpatchify is correct.
+    var rows5 = reshape(video_state, [num_video_rows_of(latent_frames, latent_h, latent_w), latent_channels, 1, 2, 2], ctx)
+    var rows5p = permute(rows5, [0, 2, 3, 4, 1], ctx)
+    var rows_cf = reshape(rows5p, [num_video_rows_of(latent_frames, latent_h, latent_w), latent_channels * 4], ctx)
     # [n_patches, C*pf*ph*pw] -> [C, F, H, W]
     var grid_cfhw = unpatchify3d(
-        video_state, latent_channels, latent_frames, latent_h, latent_w,
+        rows_cf, latent_channels, latent_frames, latent_h, latent_w,
         1, 2, 2, ctx,
     )
     # [C,F,H,W] -> [1,F,H,W,C] NDHWC, the house layout the device VAE expects
@@ -717,9 +739,17 @@ def _minimax_h3_decode_video(
 
     var dcfg = minimax_h3_video_released_decoder_config()
     var decoder = minimax_h3_video_decoder_device_load(vae_dir, dcfg, ctx)
-    var pixels = minimax_h3_video_decode_device[
-        VIDEO_DECODE_S, 32, 64
-    ](decoder, latents, ctx)
+    # TILED, not the per-volume call. video_vae/config.json enables tiling BY
+    # DEFAULT (vae_encoder_tiling/vae_decoder_tiling = 1) at vae_tile_size 256
+    # PIXELS, and split_tiles only skips when the tile covers the whole input —
+    # at 832x480 both axes exceed it. MEASURED: the untiled path OOMs, because
+    # VIDEO_DECODE_S = latent_T*latent_H*latent_W + 5 = 10,925 ViT tokens at
+    # 2048 wide does not fit 24 GiB across 32 heads. Tiling drops each call to
+    # TOKENS_PER_CLIP*16*16 + 5 = 1,797.
+    var tiling = minimax_h3_video_released_tiling_config()
+    var pixels = minimax_h3_video_tiled_decode[
+        LATENT_TILE, LATENT_TILE, 32, 64, 5, NUM_LATENT_FRAMES
+    ](decoder, latents, tiling, ctx)
 
     # ImageNet denormalize — the exact inverse of the pre-encode transform.
     # Neither original video unit had this; without it every frame is off by a

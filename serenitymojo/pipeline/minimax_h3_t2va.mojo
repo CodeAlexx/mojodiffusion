@@ -248,6 +248,10 @@ from serenitymojo.pipeline.minimax_h3_video_vae_spatial_tiling import (
     minimax_h3_video_tiled_decode,
     minimax_h3_video_released_tiling_config,
 )
+from serenitymojo.pipeline.minimax_h3_video_vae_temporal import (
+    minimax_h3_video_decode_temporal,
+    minimax_h3_video_released_temporal_config,
+)
 from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
     minimax_h3_video_pixel_denormalize,
     minimax_h3_pixel_norm_constants,
@@ -680,6 +684,46 @@ def _minimax_h3_global_timestep_row(
 # 256 px tile / vae_ratio 16 = 16 latent cells per tile side.
 comptime LATENT_TILE = 16
 
+# ── TEMPORAL CHUNKING (H3_VAE_TEMPORAL, default OFF) ─────────────────────────
+# The vendor NEVER decodes video as one volume: `klvae.py::decode_base` (:790-
+# 797) routes every `use_3d_conv` decode through `decode_temporal` (:678), which
+# splits the latent into `tokens_chunk_size + token_overlap` = 7-token clips and
+# cross-fades them (`_adaptive_decode` per clip at :733 -> `tiled_decode` at
+# :437-441, so TEMPORAL is the OUTER loop and SPATIAL TILING the inner one —
+# exactly the nesting pipeline/minimax_h3_video_vae_temporal.mojo implements).
+# There is no size threshold in the reference: even a 7-token latent goes
+# through it, because the pre-padding trim and the tail split are part of the
+# decode, not a large-input accommodation.
+#
+# MEASURED CONSEQUENCE OF THE DIRECT PATH (this file's default, 2026-08-03):
+# it emits `4 * latent_T` frames instead of the requested FRAMES — shot 2 wrote
+# 68 frames for H3_FRAMES=56, shot 3 wrote 48 for 39 (output/logs/h3_shots.log
+# :73,:148). `decode_temporal` emits exactly `17n+5 = FRAMES`. The direct path
+# also runs the ViT decoder at a temporal length it was never trained on
+# (latent_T tokens rather than 7) and never trims `frame_pre_padding`.
+#
+# DEFAULT IS OFF ANYWAY, deliberately: the six-shot batch running as this was
+# written builds its remaining per-shot binaries FROM THIS SOURCE on demand
+# (output/logs/h3_shots_orchestrator.sh's `if [ ! -x "$BIN" ]` build step), so
+# flipping the default mid-batch would silently change shots 5-7. Build with
+# `-D H3_VAE_TEMPORAL=1` to get the vendor's composition. Recommendation once
+# the GPU frees and the composition gate below passes: make 1 the default.
+comptime VIDEO_DECODE_TEMPORAL = get_defined_int["H3_VAE_TEMPORAL", 0]()
+
+# `video_vae/config.json`, mirrored as comptime integers because
+# `minimax_h3_video_decode_temporal`'s per-clip sequence length is a compile-
+# time parameter. These duplicate `minimax_h3_video_released_temporal_config()`
+# and are CHECKED against it at runtime (that function raises on a
+# `tokens_per_clip()` mismatch), so the duplication cannot drift silently.
+comptime VAE_CLIP_LENGTH = 17
+comptime VAE_RATIO_T = 4
+comptime VAE_TOKEN_DROP = 3
+comptime VAE_TOKENS_CHUNK = (VAE_CLIP_LENGTH + VAE_RATIO_T - 1) // VAE_RATIO_T
+comptime VAE_TOKEN_OVERLAP = (
+    VAE_TOKENS_CHUNK - VAE_TOKEN_DROP % VAE_TOKENS_CHUNK
+) % VAE_TOKENS_CHUNK
+comptime VAE_TOKENS_PER_CLIP = VAE_TOKENS_CHUNK + VAE_TOKEN_OVERLAP
+
 
 def num_video_rows_of(f: Int, h: Int, w: Int) -> Int:
     return f * (h // 2) * (w // 2)
@@ -765,9 +809,22 @@ def _minimax_h3_decode_video(
     # 2048 wide does not fit 24 GiB across 32 heads. Tiling drops each call to
     # TOKENS_PER_CLIP*16*16 + 5 = 1,797.
     var tiling = minimax_h3_video_released_tiling_config()
-    var pixels = minimax_h3_video_tiled_decode[
-        LATENT_TILE, LATENT_TILE, 32, 64, 5, NUM_LATENT_FRAMES
-    ](decoder, latents, tiling, ctx)
+    var pixels: Tensor
+    @parameter
+    if VIDEO_DECODE_TEMPORAL != 0:
+        # Vendor composition: temporal chunks OUTSIDE, spatial tiles INSIDE.
+        # Per-clip ViT sequence is VAE_TOKENS_PER_CLIP*16*16 + 5 = 1797 tokens
+        # REGARDLESS of total video length — that constant is what makes a
+        # 14-second decode possible at all, where the direct path's
+        # NUM_LATENT_FRAMES*16*16 + 5 grows without bound.
+        var tcfg = minimax_h3_video_released_temporal_config()
+        pixels = minimax_h3_video_decode_temporal[
+            LATENT_TILE, LATENT_TILE, 32, 64, 5, VAE_TOKENS_PER_CLIP
+        ](decoder, latents, tcfg, tiling, ctx)
+    else:
+        pixels = minimax_h3_video_tiled_decode[
+            LATENT_TILE, LATENT_TILE, 32, 64, 5, NUM_LATENT_FRAMES
+        ](decoder, latents, tiling, ctx)
 
     # ImageNet denormalize — the exact inverse of the pre-encode transform.
     # Neither original video unit had this; without it every frame is off by a

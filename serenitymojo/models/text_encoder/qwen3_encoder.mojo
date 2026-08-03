@@ -926,6 +926,29 @@ def _sdpa_dispatch(
             return sdpa[1, 256, 16, 128](q, k, v, mask, scale, ctx)
         if seq == 512:
             return sdpa[1, 512, 16, 128](q, k, v, mask, scale, ctx)
+    # MiniMax-H3 conditioner (Qwen3-VL-32B-Instruct text tower): H=64, Dh=128.
+    # Same enumeration as the H=32 branch above — real H3 prompt window is not
+    # wired yet (tokenizer/chat-template step), so this covers the common
+    # padding windows other encoders in this repo already use.
+    if h == 64 and dh == 128:
+        if seq == 8:
+            return sdpa[1, 8, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 16:
+            return sdpa[1, 16, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 32:
+            return sdpa[1, 32, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 64:
+            return sdpa[1, 64, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 128:
+            return sdpa[1, 128, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 256:
+            return sdpa[1, 256, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 512:
+            return sdpa[1, 512, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 1024:
+            return sdpa[1, 1024, 64, 128](q, k, v, mask, scale, ctx)
+        if seq == 2048:
+            return sdpa[1, 2048, 64, 128](q, k, v, mask, scale, ctx)
     raise Error(
         String("sdpa_dispatch: unsupported (seq,h,dh)=(")
         + String(seq) + "," + String(h) + "," + String(dh)

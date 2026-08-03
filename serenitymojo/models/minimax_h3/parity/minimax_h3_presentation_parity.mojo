@@ -44,7 +44,7 @@ from serenitymojo.models.minimax_h3.presentation import (
 )
 
 comptime REF = "/home/alex/mojodiffusion/output/minimax_h3_presentation/presentation_ref.safetensors"
-comptime TOKENIZER = "/home/alex/.serenity/models/text_encoders/qwen3vl-32b-instruct-h3/tokenizer.json"
+comptime TOKENIZER = "/home/alex/minimax_h3_ref/creator-MiniMax-H3/FL2VA/processor/tokenizer.json"
 
 comptime PROMPT_PLAIN = "A red fox trotting through a snowy pine forest, snow crunching underfoot"
 comptime PROMPT_PUNCT = "Close-up: the subject's face, lit by neon. 35mm, f/1.4 — shallow depth!"

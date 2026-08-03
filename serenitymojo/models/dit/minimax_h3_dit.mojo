@@ -362,9 +362,50 @@ def minimax_h3_check_block_weights(
 # out_proj and fc2 need no transform in either convention: `models/minimax_h3
 # /loader.mojo`'s header lists exactly three transforms (qkv, fc1,
 # rope.inv_freq) and out_proj/fc2 are not among them.
+#
+# GUARD: `minimax_h3_check_block_weights` (above) cannot detect a caller
+# passing RAW weights instead of `minimax_h3_load_block_device` output —
+# de-interleaving/swapping rows never changes shape, so shape-only
+# validation accepts either convention silently, and this exact bug
+# (double-permuted qkv, reversed fc1 halves) nearly shipped twice. The two
+# marker keys below close that hole: `minimax_h3_load_block_device` stamps
+# both into the Dict it returns (one tiny presence-only tensor each, no data
+# scan), and `minimax_h3_require_transformed_weights` — called unconditionally
+# as the FIRST statement of `minimax_h3_block_forward`, so it cannot be
+# skipped by a caller who doesn't separately call a preflight — raises a
+# named error naming the likely cause if either is absent.
 # ─────────────────────────────────────────────────────────────────────────────
 comptime MINIMAX_H3_HEADS = 56
 comptime MINIMAX_H3_HEAD_DIM = 128
+
+comptime MINIMAX_H3_QKV_DEINTERLEAVED_MARKER = "__h3_qkv_deinterleaved__"
+comptime MINIMAX_H3_FC1_SWAPPED_MARKER = "__h3_fc1_swapped__"
+
+
+def minimax_h3_require_transformed_weights(
+    weights: Dict[String, ArcPointer[Tensor]], layer: Int
+) raises:
+    """Fail loudly if `weights` looks like it came straight from
+    `ShardedSafeTensors`/`BlockLoader` instead of `minimax_h3_load_block_
+    device`. One dict `in` lookup per marker — O(1), no data scan — so this
+    is cheap enough to run unconditionally on every block-forward call, not
+    just when a caller remembers to preflight."""
+    if (
+        MINIMAX_H3_QKV_DEINTERLEAVED_MARKER not in weights
+        or MINIMAX_H3_FC1_SWAPPED_MARKER not in weights
+    ):
+        raise Error(
+            String("MiniMax-H3: layer ") + String(layer) + " weights are"
+            " missing the qkv-deinterleave/fc1-swap marker ("
+            + MINIMAX_H3_QKV_DEINTERLEAVED_MARKER + "/"
+            + MINIMAX_H3_FC1_SWAPPED_MARKER + "). This means they were NOT"
+            " built by minimax_h3_load_block_device — passing raw"
+            " ShardedSafeTensors/BlockLoader tensors here silently scrambles"
+            " q/k/v and reverses the SwiGLU gate/value roles (no shape"
+            " error, no NaN; see minimax_h3_block_forward's WEIGHT CONTRACT"
+            " note above). Call minimax_h3_load_block_device to load this"
+            " block instead of building the weight Dict directly."
+        )
 
 
 def _minimax_h3_expand_rope_per_head(
@@ -447,7 +488,12 @@ def minimax_h3_block_forward[
                    passed for `layer` — preflight is the caller's job) AND
                    right ROW ORDER per this function's WEIGHT CONTRACT note
                    above (`minimax_h3_load_block_device` output, not raw
-                   `ShardedSafeTensors`/`BlockLoader` tensors).
+                   `ShardedSafeTensors`/`BlockLoader` tensors). The row-order
+                   half of that contract IS enforced here, unconditionally:
+                   `minimax_h3_require_transformed_weights` (this file) is
+                   this function's first statement and raises if `weights`
+                   is missing either of the two marker keys
+                   `minimax_h3_load_block_device` stamps after transforming.
     layer:         which of the 50 blocks (keys the weight lookup via
                    `minimax_h3_block_prefix`).
     mod:           THIS LAYER's precomputed AdaLN modulation table,
@@ -471,6 +517,8 @@ def minimax_h3_block_forward[
     rotary_dim:    rotated channel count (96 at the released geometry);
                    `head_dim - rotary_dim` channels pass through untouched.
     """
+    minimax_h3_require_transformed_weights(weights, layer)
+
     var prefix = minimax_h3_block_prefix(layer)
     var hidden = config.hidden_size
     var heads = config.num_attention_heads

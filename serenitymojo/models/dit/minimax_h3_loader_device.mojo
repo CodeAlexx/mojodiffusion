@@ -80,6 +80,8 @@ from serenitymojo.io.tensor_view import TensorView
 from serenitymojo.tensor import Tensor
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
+    MINIMAX_H3_QKV_DEINTERLEAVED_MARKER,
+    MINIMAX_H3_FC1_SWAPPED_MARKER,
     minimax_h3_block_prefix,
     minimax_h3_block_tensor_names,
     minimax_h3_check_block_weights,
@@ -225,11 +227,25 @@ def minimax_h3_load_fc1_device(
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-block streaming loader — the deliverable. Loads exactly the 8 tensors
 # `minimax_h3_block_tensor_names` lists for one layer (never adaln_proj),
-# applies the two rewrites above where needed, and preflights the result with
-# `minimax_h3_check_block_weights` (shape + bf16-dtype) before handing it back.
-# The caller is responsible for letting the returned Dict drop before loading
-# the next layer, so only one block's device memory is resident at a time.
+# applies the two rewrites above where needed, preflights the result with
+# `minimax_h3_check_block_weights` (shape + bf16-dtype), and STAMPS two
+# marker keys so `minimax_h3_block_forward`'s guard
+# (`minimax_h3_require_transformed_weights`, minimax_h3_dit.mojo) can tell
+# these tensors apart from raw `ShardedSafeTensors`/`BlockLoader` output —
+# shape alone can't, since a row permutation never changes it. The caller is
+# responsible for letting the returned Dict drop before loading the next
+# layer, so only one block's device memory is resident at a time.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _minimax_h3_marker_tensor(ctx: DeviceContext) raises -> Tensor:
+    """Presence-only sentinel: `minimax_h3_require_transformed_weights` only
+    checks the DICT KEY, never reads this tensor's bytes, so there is nothing
+    to initialize — one 2-byte device allocation, no fill kernel, no host
+    round trip. Negligible next to the ~0.77 GiB this stamps."""
+    var buf = ctx.enqueue_create_buffer[DType.uint8](2)
+    var shape: List[Int] = [1]
+    return Tensor(buf^, shape^, STDtype.BF16)
 
 
 def minimax_h3_load_block_device(
@@ -261,6 +277,8 @@ def minimax_h3_load_block_device(
             weights[name] = ArcPointer(Tensor.from_view(st.tensor_view(name), ctx))
 
     minimax_h3_check_block_weights(weights, layer, config)
+    weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(_minimax_h3_marker_tensor(ctx))
+    weights[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(_minimax_h3_marker_tensor(ctx))
     return weights^
 
 

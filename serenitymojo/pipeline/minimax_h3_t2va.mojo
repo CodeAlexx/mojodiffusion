@@ -255,6 +255,7 @@ from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.random import randn
@@ -1294,6 +1295,18 @@ def main() raises:
             " video_t=", video_ts, " audio_t=", audio_ts,
             " (", Float64(t_step1 - t_step0) / 1.0e9, "s)",
         )
+
+    # ── SAVE FINAL LATENTS. A decode-layer fix should cost a re-decode, not a
+    # 30-minute denoise rerun (learned 2026-08-03: the row-order fix forced a
+    # full rerun because the latent was gone). Row-space, pre-unpatchify.
+    var lat_names = List[String]()
+    lat_names.append(String("video_state_rows"))
+    lat_names.append(String("audio_state_rows"))
+    var lat_tensors = List[ArcPointer[Tensor]]()
+    lat_tensors.append(ArcPointer[Tensor](slice(video_state, 0, 0, video_state.shape()[0], ctx)))
+    lat_tensors.append(ArcPointer[Tensor](slice(audio_state, 0, 0, audio_state.shape()[0], ctx)))
+    save_safetensors(lat_names, lat_tensors, out_dir + "/latents.safetensors", ctx)
+    print("  saved final latents ->", out_dir + "/latents.safetensors")
 
     var t_denoise1 = perf_counter_ns()
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")

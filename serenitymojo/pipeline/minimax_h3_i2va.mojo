@@ -36,26 +36,40 @@
 #     unpatchify (decoders.py:95-96); they are anchors, not output.
 #
 # ── SEAM: THE CONDITIONER CANNOT SEE THE PICTURE YET ────────────────────────
-# Step 2 above needs the Qwen3-VL VISION tower to turn `<|image_pad|>` rows into
-# real embeddings. `models/text_encoder/minimax_h3_conditioning.mojo` is
-# TEXT-ONLY by its own header, and the one vision tower in this repo
-# (`lingbot_qwen3vl_vision.mojo`) is hardcoded to LingBot's shape — depth 18,
-# hidden 1024, deepstack [5,11,17], out 2560 — while H3's text_encoder/config.json
-# carries depth 27, hidden 1152, deepstack [8,16,24], out_hidden_size 5120 (the
-# 351 `model.visual.*` tensors ARE in the checkpoint; only the runtime is
-# missing). So:
+# STATUS 2026-08-03. The keyframe's `<Picture i>` vision block needs three
+# things. TWO NOW EXIST; the seam is what is left, and it is named precisely so
+# nobody re-ports something that is already here:
 #
-#   DEFAULT: a keyframe request RAISES at that seam, by name, rather than
-#            feeding the raw `<|image_pad|>` token embedding to the conditioner
-#            and silently producing a request the released model never sees.
-#   -D H3_KF_NO_VISION=1: an EXPLICIT degraded mode that drops the vision block
-#            from the presentation entirely. The keyframe still conditions
-#            through its VAE condition rows — the strong path, and the one the
-#            denoise loop anchors on — but the conditioner never sees it, and
-#            the §2.1 alignment line's `<Picture 1>` then refers to nothing.
-#            THIS IS NOT THE RELEASED MODEL'S CONDITIONING. It is a way to
-#            exercise the rest of the chain end to end, and it says so in
-#            result.json.
+#   BUILT  the presentation — `pipeline/minimax_h3_keyframe_presentation.mojo`,
+#          gated bit-exact against the real tokenizer and image processor over
+#          20 canvas/keyframe/prompt cases: token ids, the VIDEO-tagged vision
+#          rows, the TEXT_TOKENS budget, and the `<|image_pad|>` POSITIONS.
+#   BUILT  the vision tower — `models/text_encoder/minimax_h3_qwen3vl_vision.mojo`
+#          (geometry, h3-ref2va) plus `..._vision_forward.mojo` (the weighted
+#          forward), gated 18/18 against transformers' own Qwen3VLVisionModel on
+#          the real FL2VA weights. DO NOT PORT ANOTHER TOWER. In particular do
+#          NOT reach for `lingbot_qwen3vl_vision.mojo`: it is a DIFFERENT model's
+#          tower (depth 18 / hidden 1024 / deepstack [5,11,17] / out 2560) and an
+#          earlier revision of this header wrongly named it as the only option.
+#   SEAM   (a) the Qwen3-VL IMAGE PREPROCESSOR — pixels to the tower's
+#              `[num_patches, 1536]` patch rows (smart_resize, the processor's
+#              OWN mean=std=0.5 normalization — NOT the video VAE's ImageNet
+#              constants — and the patch flattening). `models/minimax_h3/
+#              image_grid.mojo` resolves the GEOMETRY and says in its own header
+#              that the resampling is a separate unit. It still is.
+#          (b) the conditioner's vision splice + DEEPSTACK INJECTION —
+#              h3-ref2va owns this in `minimax_h3_qwen3vl_streamed.mojo`: the
+#              tower's embeds substituted at the pad positions this file already
+#              computes, and the three deepstack tensors added at LANGUAGE
+#              decoder layers 0/1/2 at visual positions only. The interface is
+#              `MiniMaxH3VisionOutput`.
+#
+#   -D H3_KF_NO_VISION=1 remains an EXPLICIT degraded mode that drops the vision
+#   block entirely. The keyframe still conditions through its VAE condition rows
+#   — the strong path, and the one the denoise loop anchors on — but the
+#   conditioner never sees it and the §2.1 line's `<Picture 1>` refers to
+#   nothing. THIS IS NOT THE RELEASED MODEL'S CONDITIONING, and it says so in
+#   result.json.
 #
 # ── ARGUMENTS ───────────────────────────────────────────────────────────────
 #   minimax_h3_i2va i2va  <prompt> <image>              <out_dir> [steps] [seed] [max_blocks]
@@ -124,9 +138,6 @@ from serenitymojo.models.dit.minimax_h3_sampling import (
 from serenitymojo.models.text_encoder.minimax_h3_conditioning import (
     minimax_h3_encode_conditioning,
 )
-from serenitymojo.models.minimax_h3.image_grid import (
-    minimax_h3_image_grid,
-)
 from serenitymojo.models.minimax_h3.packing import (
     minimax_h3_align_num_frames,
     minimax_h3_resolve_canvas_size,
@@ -161,6 +172,11 @@ from serenitymojo.pipeline.minimax_h3_media_in import (
     minimax_h3_ffmpeg_read_image,
     minimax_h3_jpeg_exif_orientation,
 )
+from serenitymojo.pipeline.minimax_h3_keyframe_presentation import (
+    MiniMaxH3KeyframePresentation,
+    minimax_h3_keyframe_presentation,
+)
+from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.pipeline.minimax_h3_ref_prompt import (
     MINIMAX_H3_TASK_FL2VA,
     MINIMAX_H3_TASK_I2VA,
@@ -840,40 +856,54 @@ def main() raises:
             " above now states a duration outside that range.",
         )
 
-    # The vision block's token count, which sets the text length.
-    var grid = minimax_h3_image_grid(HEIGHT, WIDTH)
-    print(
-        "  conditioner vision grid:", grid.width, "x", grid.height, "->",
-        grid.num_vision_tokens, "vision tokens per keyframe",
+    # ── The PRESENTATION: the vision block's rows are part of the text run ──
+    # Built through the gated composition module, which resolves the conditioner
+    # grid from the CANVAS (the keyframes are already on it) and returns the
+    # token ids, the VIDEO-tagged rows, and the `<|image_pad|>` positions the
+    # tower's embeds are spliced into.
+    var tokenizer = Qwen3Tokenizer(String(PROCESSOR_DIR) + "/tokenizer.json")
+    var presentation = minimax_h3_keyframe_presentation(
+        tokenizer, prompt, HEIGHT, WIDTH, KEYFRAMES
     )
+    print(
+        "  presentation:", presentation.vision_tokens_each,
+        "vision tokens per keyframe,", presentation.num_text_tokens(),
+        "text rows total,", len(presentation.pad_positions), "image_pad rows",
+    )
+    if presentation.num_text_tokens() != TEXT_TOKENS:
+        raise Error(
+            String("minimax_h3_i2va: this request's presentation is ")
+            + String(presentation.num_text_tokens()) + " text rows (prompt +"
+            " a <Picture i> label + 2 + " + String(presentation.vision_tokens_each)
+            + " vision rows per keyframe), but this binary was compiled for"
+            " H3_TEXT_TOKENS=" + String(TEXT_TOKENS) + " (S is comptime);"
+            " rebuild with -D H3_TEXT_TOKENS="
+            + String(presentation.num_text_tokens())
+        )
 
     comptime
     if NO_VISION == 0:
         raise Error(
-            String("minimax_h3_i2va: SEAM — the Qwen3-VL VISION tower is not")
-            + " wired, so a `<Picture i>` vision block cannot be encoded."
-            " models/text_encoder/minimax_h3_conditioning.mojo is text-only by"
-            " its own header, and models/text_encoder/lingbot_qwen3vl_vision.mojo"
-            " is hardcoded to LingBot's shape (depth 18, hidden 1024, deepstack"
-            " [5,11,17], out 2560) while H3's text_encoder/config.json carries"
-            " depth 27, hidden 1152, deepstack [8,16,24], out_hidden_size 5120."
-            " The 351 model.visual.* tensors ARE in the checkpoint; only the"
-            " runtime is missing. This keyframe request needs "
-            + String(grid.num_vision_tokens) + " vision tokens per keyframe."
-            " Rebuild with -D H3_KF_NO_VISION=1 to run the DEGRADED text-only"
-            " presentation (the keyframe still conditions through its VAE"
-            " condition rows, but the conditioner never sees it — NOT the"
-            " released model's conditioning)."
+            String("minimax_h3_i2va: SEAM — this request needs ")
+            + String(presentation.vision_tokens_each) + " vision embeds per"
+            " keyframe spliced at " + String(len(presentation.pad_positions))
+            + " image_pad rows, and TWO pieces are still missing."
+            " (a) the Qwen3-VL IMAGE PREPROCESSOR: pixels -> the tower's"
+            " [num_patches, 1536] patch rows (smart_resize + the processor's own"
+            " mean=std=0.5 normalization + patch flattening). models/minimax_h3/"
+            "image_grid.mojo resolves the geometry only."
+            " (b) the conditioner's vision splice + deepstack injection into"
+            " models/text_encoder/minimax_h3_qwen3vl_streamed.mojo (h3-ref2va),"
+            " via the MiniMaxH3VisionOutput interface."
+            " ALREADY BUILT AND GATED, do not re-port: the presentation"
+            " (pipeline/minimax_h3_keyframe_presentation.mojo) and the vision"
+            " tower forward (models/text_encoder/minimax_h3_qwen3vl_vision_"
+            "forward.mojo, 18/18 vs transformers on real FL2VA weights)."
+            " Rebuild with -D H3_KF_NO_VISION=1 for the DEGRADED text-only"
+            " presentation — the keyframe still anchors through its VAE"
+            " condition rows, but the conditioner never sees it."
         )
 
-    print("")
-    print("  ################################################################")
-    print("  # H3_KF_NO_VISION=1: the conditioner does NOT see the keyframe.")
-    print("  # The VAE condition rows still anchor the denoise loop, but the")
-    print("  # prompt's <Picture i> reference has no vision block behind it.")
-    print("  # THIS IS NOT THE RELEASED MODEL'S CONDITIONING.")
-    print("  ################################################################")
-    print("")
 
     var config = minimax_h3_released_config()
     config.validate()

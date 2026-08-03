@@ -374,7 +374,7 @@ def load_final_weights(
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var ctx = DeviceContext()
     print("=== ERNIE-Image 1024x1024 Mojo pipeline ===")
     print("  steps:", NUM_STEPS, " cfg:", CFG_SCALE, " shift:", SHIFT)
@@ -453,3 +453,10 @@ def main() raises:
 
     save_png(img, String(OUT_PATH), ctx, ValueRange.SIGNED)
     print("\n[done] saved", OUT_PATH)
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy ERNIE executable reads checkpoint weights "
+        "during denoise; no memory-resident product route is admitted"
+    )

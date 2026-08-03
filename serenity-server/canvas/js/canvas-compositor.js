@@ -413,4 +413,3 @@ var Compositor = (function () {
         applyAdjustments: applyAdjustments,
     };
 })();
-//# sourceMappingURL=canvas-compositor.js.map

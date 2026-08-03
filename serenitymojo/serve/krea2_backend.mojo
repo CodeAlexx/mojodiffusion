@@ -26,13 +26,16 @@
 
 from std.gpu.host import DeviceContext
 from std.collections import Optional
+from std.memory import ArcPointer
 from std.time import perf_counter_ns
 
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
     has_lanpaint_runtime_params, has_lanpaint_sampler_runtime_params,
 )
-from serenitymojo.serve.proc_ipc import write_msg
+from serenitymojo.serve.proc_ipc import (
+    write_msg, wait_sampling_ack, prefault_self_executable,
+)
 from serenitymojo.serve.model_scan import LORAS_DIR
 from serenitymojo.io.env import env_int
 from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
@@ -46,6 +49,7 @@ from serenitymojo.models.krea2.krea2_infer import (
     Krea2ResidentCond, load_krea2_resident_cond,
     Krea2InlineCond, inline_cond_from_bin,
     load_krea2_stack_lora, empty_krea2_stack_lora,
+    krea2_resident_cond_from_shared, krea2_stream_final_from_shared,
     krea2_sample_latent, krea2_sample_lanpaint_latent,
     krea2_decode_latent_to_png,
 )
@@ -77,6 +81,7 @@ from serenitymojo.models.dit.krea2_dit import (
 from serenitymojo.models.krea2.krea2_stack import build_krea2_resident_int8
 from serenitymojo.models.krea2.krea2_int8_cache import (
     krea2_int8_cache_path, krea2_int8_cache_valid,
+    krea2_same_checkpoint_file,
     load_krea2_int8_cache_resident, load_krea2_int8_cache_host,
     load_krea2_int8_cache_shared, save_krea2_int8_cache,
 )
@@ -125,6 +130,8 @@ def _emit_flowedit_progress(fd: Int32, step: Int, total: Int):
             + String(total)
             + String(",\"phase\":\"sampling\",\"preview\":\"\"}"),
         )
+        if step == total:
+            wait_sampling_ack(fd)
     except e:
         print("[krea2-edit] progress IPC skipped:", String(e))
 
@@ -211,6 +218,15 @@ struct Krea2Backend(GenBackend, Movable):
     var lora_path: String        # resolved file ("" = base / zero overlay)
     var lora_mult: Float32
     var progress_fd: Int32
+    # Plain T2I model store. The v2 INT8 sidecar is read exactly once when this
+    # worker activates Krea, then retained as pinned-host block bytes plus the
+    # small shared device store. Sampling never reopens the checkpoint/cache.
+    var t2i_base_cache_valid: Bool
+    var t2i_base_cache_checkpoint: String
+    var t2i_base_cache_sidecar: String
+    var t2i_checkpoint_store: List[ArcPointer[ShardedSafeTensors]]
+    var t2i_base_host_i8: Optional[Krea2HostInt8Inf]
+    var t2i_base_shared: Optional[Krea2SharedResident]
     # Last-request FlowEdit caches. Context bins are keyed by all four authored
     # strings; the source latent is keyed by the server's unique upload path and
     # compiled geometry. These mirror Comfy's unchanged-node reuse without
@@ -266,6 +282,13 @@ struct Krea2Backend(GenBackend, Movable):
         self.lora_path = String("")
         self.lora_mult = Float32(1.0)
         self.progress_fd = Int32(-1)
+        self.t2i_base_cache_valid = False
+        self.t2i_base_cache_checkpoint = String("")
+        self.t2i_base_cache_sidecar = String("")
+        self.t2i_checkpoint_store = List[ArcPointer[ShardedSafeTensors]]()
+        self.t2i_base_host_i8 = Optional[Krea2HostInt8Inf](None)
+        self.t2i_base_shared = Optional[Krea2SharedResident](None)
+        self.t2i_checkpoint_store = List[ArcPointer[ShardedSafeTensors]]()
         self.edit_ctx_cache_valid = False
         self.edit_ctx_cache_src_prompt = String("")
         self.edit_ctx_cache_src_negative = String("")
@@ -431,6 +454,20 @@ struct Krea2Backend(GenBackend, Movable):
             return True
         return False
 
+    def _drop_t2i_base_cache(mut self) raises:
+        if not self.t2i_base_cache_valid:
+            return
+        self.t2i_base_host_i8 = Optional[Krea2HostInt8Inf](None)
+        self.t2i_base_shared = Optional[Krea2SharedResident](None)
+        self.t2i_checkpoint_store = List[ArcPointer[ShardedSafeTensors]]()
+        self.t2i_base_cache_valid = False
+        self.t2i_base_cache_checkpoint = String("")
+        self.t2i_base_cache_sidecar = String("")
+        self.ctx.synchronize()
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
+        print("[krea2] released T2I resident host/device store")
+
     def _drop_edit_base_cache(mut self) raises:
         """Release the FlowEdit DiT before a TE/VAE cache miss or base change."""
         if not self.edit_base_cache_valid:
@@ -466,12 +503,16 @@ struct Krea2Backend(GenBackend, Movable):
         """Run the existing inference path at serenity trainer-parity bucket arm."""
         var r = StepResult()
         r.total = self.params.steps
+        var job_t0 = perf_counter_ns()
 
         # 2) load the two contexts (small H2D; LT derived from tensor shape).
         var cond = inline_cond_from_bin[LH_, LW_, LTMAX_](pos_bin, self.ctx)
         var uncond = inline_cond_from_bin[LH_, LW_, LTMAX_](neg_bin, self.ctx)
+        var context_done = perf_counter_ns()
 
-        # 3) build the fp8-resident base + conditioning weights + final layer.
+        # 3) Acquire the worker-lifetime INT8 host store. Product T2I has no
+        # safetensors-per-block fallback: a missing/stale sidecar fails before
+        # sampling, and all 28 denoise blocks come from pinned host memory.
         var turbo = self.params.model.lower().find("turbo") >= 0
         var checkpoint = (
             self.params.checkpoint_path.copy()
@@ -480,23 +521,71 @@ struct Krea2Backend(GenBackend, Movable):
         )
         print("[krea2] model=", "Krea-2-Turbo" if turbo else "Krea-2-Raw",
               " checkpoint=", checkpoint)
-        var st = ShardedSafeTensors.open(checkpoint)
-        var cond_w = load_krea2_resident_cond(st, String(KREA2_RAW_KEY_PREFIX), self.ctx)
-        var fin = Krea2StreamFinal.load(st, String(KREA2_RAW_KEY_PREFIX), self.ctx)
-        # 16GB fit: PARTIAL fp8 residency. The full 28-block fp8 base (~12GB) +
-        # 1024-area activations OOMs on a 16GB card, so keep only the FIRST K
-        # blocks resident and stream the remainder through the same block math.
-        var res_k = env_int(String("KREA2_FP8_RESIDENT_BLOCKS"), 14)
-        if res_k < 0:
-            res_k = 0
-        if res_k > KREA2_NBLOCKS:
-            res_k = KREA2_NBLOCKS
-        print("[krea2] building fp8-resident base (", res_k, "of", KREA2_NBLOCKS,
-              "blocks resident, rest streamed per step) ...")
-        var resident = Optional[Krea2ResidentFp8](
-            build_krea2_resident_fp8(
-                st, String(KREA2_RAW_KEY_PREFIX), KREA2_NBLOCKS, res_k, self.ctx,
+        var resident = Optional[Krea2ResidentFp8](None)
+        var resident_i8 = Optional[Krea2ResidentInt8](None)
+        var host_i8 = Optional[Krea2HostInt8Inf](None)
+        var i8_source = checkpoint.copy()
+        var i8_cache = krea2_int8_cache_path(i8_source)
+        var i8_valid = krea2_int8_cache_valid(
+            i8_cache, i8_source, KREA2_NBLOCKS
+        )
+        if not i8_valid:
+            var canonical_source = (
+                String(KREA2_TURBO) if turbo else String(KREA2_RAW)
             )
+            var canonical_cache = krea2_int8_cache_path(canonical_source)
+            if (
+                krea2_same_checkpoint_file(checkpoint, canonical_source)
+                and krea2_int8_cache_valid(
+                    canonical_cache, canonical_source, KREA2_NBLOCKS
+                )
+            ):
+                i8_source = canonical_source^
+                i8_cache = canonical_cache^
+                i8_valid = True
+        if not i8_valid:
+            raise Error(
+                String("krea2 T2I refuses disk-stream sampling: missing/stale INT8 sidecar for ")
+                + checkpoint
+            )
+
+        var base_cache_hit = (
+            self.t2i_base_cache_valid
+            and self.t2i_base_cache_checkpoint == checkpoint
+            and self.t2i_base_cache_sidecar == i8_cache
+            and len(self.t2i_checkpoint_store) == 1
+            and Bool(self.t2i_base_host_i8)
+            and Bool(self.t2i_base_shared)
+        )
+        if base_cache_hit:
+            host_i8 = self.t2i_base_host_i8.copy()
+            print("[krea2] T2I model store HIT; zero weight-file reload")
+        else:
+            self._drop_t2i_base_cache()
+            self.t2i_checkpoint_store.append(
+                ArcPointer(ShardedSafeTensors.open(checkpoint))
+            )
+            var loaded_shared = load_krea2_int8_cache_shared(i8_cache, self.ctx)
+            host_i8 = Optional[Krea2HostInt8Inf](
+                load_krea2_int8_cache_host(
+                    i8_cache, KREA2_NBLOCKS, 0, self.ctx
+                )
+            )
+            self.t2i_base_host_i8 = host_i8.copy()
+            self.t2i_base_shared = Optional[Krea2SharedResident](loaded_shared^)
+            self.t2i_base_cache_checkpoint = checkpoint.copy()
+            self.t2i_base_cache_sidecar = i8_cache.copy()
+            self.t2i_base_cache_valid = True
+            print("[krea2] T2I model store loaded once: 0 GPU / 28 pinned-host blocks")
+
+        ref shared_store = self.t2i_base_shared.value()
+        var cond_w = krea2_resident_cond_from_shared(shared_store)
+        var fin = krea2_stream_final_from_shared(shared_store)
+        self.ctx.synchronize()
+        var base_done = perf_counter_ns()
+        print(
+            "[krea2] T2I PHASE base-load =",
+            Float64(base_done - context_done) / 1.0e9, "s",
         )
         if self._cancelled(r):
             return r^
@@ -515,12 +604,20 @@ struct Krea2Backend(GenBackend, Movable):
         var krea_guidance = Float32(self.params.cfg)
         print("[krea2] creator CFG=", self.params.cfg,
               " fixed_mu_1_15=", turbo)
+        ref st = self.t2i_checkpoint_store[0]
         var latent = krea2_sample_latent[LH_, LW_, LTMAX_, LFULL_](
-            st, String(KREA2_RAW_KEY_PREFIX), cond_w, fin, lora, cond, uncond,
+            st[], String(KREA2_RAW_KEY_PREFIX), cond_w, fin, lora, cond, uncond,
             self.params.steps, krea_guidance, UInt64(self.params.seed),
             resident, self.ctx,
+            resident_i8=resident_i8, host_i8=host_i8,
             use_fixed_mu_1_15=turbo,
             progress_fd=self.progress_fd,
+        )
+        self.ctx.synchronize()
+        var denoise_done = perf_counter_ns()
+        print(
+            "[krea2] T2I PHASE denoise =",
+            Float64(denoise_done - base_done) / 1.0e9, "s",
         )
         if self._cancelled(r):
             return r^
@@ -529,6 +626,14 @@ struct Krea2Backend(GenBackend, Movable):
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
         krea2_decode_latent_to_png[LH_, LW_](
             latent, String(KREA2_VAE_DIR), png_path, self.ctx,
+        )
+        self.ctx.synchronize()
+        var decode_done = perf_counter_ns()
+        print(
+            "[krea2] T2I PHASE decode =",
+            Float64(decode_done - denoise_done) / 1.0e9, "s",
+            " total-after-encode =",
+            Float64(decode_done - job_t0) / 1.0e9, "s",
         )
 
         self.active = False
@@ -614,11 +719,6 @@ struct Krea2Backend(GenBackend, Movable):
             " checkpoint=", checkpoint,
         )
         var st = ShardedSafeTensors.open(checkpoint)
-        var res_k = env_int(String("KREA2_FP8_RESIDENT_BLOCKS"), 14)
-        if res_k < 0:
-            res_k = 0
-        if res_k > KREA2_NBLOCKS:
-            res_k = KREA2_NBLOCKS
         var resident = Optional[Krea2ResidentFp8](None)
         var resident_i8 = Optional[Krea2ResidentInt8](None)
         var host_i8 = Optional[Krea2HostInt8Inf](None)
@@ -633,6 +733,22 @@ struct Krea2Backend(GenBackend, Movable):
         var i8_cache_valid = krea2_int8_cache_valid(
             i8_cache, checkpoint, KREA2_NBLOCKS
         )
+        if not i8_cache_valid:
+            var canonical_source = String(KREA2_TURBO) if turbo else String(KREA2_RAW)
+            var canonical_cache = krea2_int8_cache_path(canonical_source)
+            if (
+                krea2_same_checkpoint_file(checkpoint, canonical_source)
+                and krea2_int8_cache_valid(
+                    canonical_cache, canonical_source, KREA2_NBLOCKS
+                )
+            ):
+                i8_cache = canonical_cache^
+                i8_cache_valid = True
+        if not i8_cache_valid:
+            raise Error(
+                String("krea2 LanPaint refuses disk-stream sampling: missing/stale INT8 sidecar for ")
+                + checkpoint
+            )
         var base_cache_hit = (
             i8_cache_valid
             and self.lanpaint_base_cache_valid
@@ -650,7 +766,7 @@ struct Krea2Backend(GenBackend, Movable):
             resident_i8 = self.lanpaint_base_resident_i8.copy()
             host_i8 = self.lanpaint_base_host_i8.copy()
             print("[krea2-lanpaint] resident DiT cache HIT (checkpoint/profile unchanged)")
-        elif i8_cache_valid:
+        else:
             self._drop_lanpaint_base_cache()
             cond_w = load_krea2_resident_cond(
                 st, String(KREA2_RAW_KEY_PREFIX), self.ctx
@@ -682,24 +798,6 @@ struct Krea2Backend(GenBackend, Movable):
             self.lanpaint_base_cache_checkpoint = checkpoint.copy()
             self.lanpaint_base_cache_resident_blocks = i8_res_blocks
             self.lanpaint_base_cache_valid = True
-        else:
-            self._drop_lanpaint_base_cache()
-            cond_w = load_krea2_resident_cond(
-                st, String(KREA2_RAW_KEY_PREFIX), self.ctx
-            )
-            fin = Krea2StreamFinal.load(
-                st, String(KREA2_RAW_KEY_PREFIX), self.ctx
-            )
-            print(
-                "[krea2-lanpaint] WARN no fresh int8 sidecar; using bounded ",
-                res_k, "-block FP8 resident fallback",
-            )
-            resident = Optional[Krea2ResidentFp8](
-                build_krea2_resident_fp8(
-                    st, String(KREA2_RAW_KEY_PREFIX), KREA2_NBLOCKS,
-                    res_k, self.ctx,
-                )
-            )
         var lora: Krea2StackLora
         if self.lora_path != String(""):
             lora = load_krea2_stack_lora(
@@ -779,9 +877,12 @@ struct Krea2Backend(GenBackend, Movable):
             return r^
         try:
             if self.params.edit_src_image != String(""):
+                self._drop_t2i_base_cache()
                 self._drop_lanpaint_base_cache()
                 return self._step_flowedit()
             var lanpaint = has_lanpaint_sampler_runtime_params(self.params)
+            if lanpaint:
+                self._drop_t2i_base_cache()
             # FlowEdit and LanPaint use distinct resident carriers. Never let a
             # preceding FlowEdit base collide with either path's text encoder.
             self._drop_edit_base_cache()
@@ -800,6 +901,7 @@ struct Krea2Backend(GenBackend, Movable):
                 and _path_exists(self.lanpaint_ctx_cache_pos_bin)
                 and _path_exists(self.lanpaint_ctx_cache_neg_bin)
             )
+            var encode_t0 = perf_counter_ns()
             if lanpaint_ctx_hit:
                 pos_bin = self.lanpaint_ctx_cache_pos_bin.copy()
                 neg_bin = self.lanpaint_ctx_cache_neg_bin.copy()
@@ -816,6 +918,11 @@ struct Krea2Backend(GenBackend, Movable):
                     self.lanpaint_ctx_cache_negative = self.params.negative.copy()
                     self.lanpaint_ctx_cache_pos_bin = pos_bin.copy()
                     self.lanpaint_ctx_cache_neg_bin = neg_bin.copy()
+            print(
+                "[krea2] PHASE text-encode =",
+                Float64(perf_counter_ns() - encode_t0) / 1.0e9, "s",
+                " cache_hit=", lanpaint_ctx_hit,
+            )
             if self._cancelled(r):
                 return r^
 
@@ -1095,7 +1202,6 @@ struct Krea2Backend(GenBackend, Movable):
               " window=[", skip_before, ",", stop_at, ") src_cfg=", src_cfg,
               " tgt_cfg=", tgt_cfg, " seed=", seed, " auto_mask=", auto_mask)
         var denoise_t0 = perf_counter_ns()
-
         var z_edit = z0_src.clone(self.ctx)
         var z0_host = List[Float32]()
         if auto_mask:
@@ -1103,6 +1209,46 @@ struct Krea2Backend(GenBackend, Movable):
         var sal = List[Float32]()
         for _ in range(FE_NTOK_):
             sal.append(Float32(0.0))
+
+        # FlowEdit's first active iteration uses a different call graph from
+        # plain Krea T2I: CFG velocity, GPU-to-host saliency, host mask work,
+        # and host-to-GPU latent restoration. Exercise that exact graph before
+        # the server arms its physical-read gate. The results are discarded,
+        # so the authored latent, saliency, seed, and schedule remain unchanged.
+        if skip_before < stop_at:
+            var warm_t_cur = ts[skip_before]
+            var warm_t = Tensor.from_host(
+                [warm_t_cur], [1], STDtype.F32, self.ctx
+            )
+            var warm_v = _velocity_shape[FE_LH_, FE_LW_, FE_LT_SHARED](
+                st, z0_src, ctx_src_pos, lt_src_pos, ctx_src_neg, lt_src_neg,
+                pos_grid, warm_t, src_cfg, resident_i8, host_i8, shared,
+                self.ctx,
+            )
+            if auto_mask:
+                var warm_dv_host = warm_v.to_host(self.ctx)
+                var warm_sal = List[Float32]()
+                for _ in range(FE_NTOK_):
+                    warm_sal.append(Float32(0.0))
+                _accum_saliency_shape[FE_LH_, FE_LW_](warm_dv_host, warm_sal)
+                var warm_mask = _mask_from_saliency_shape[FE_LH_, FE_LW_](
+                    warm_sal, mask_q, mask_dilate
+                )
+                var warm_z_host = z0_host.copy()
+                _blend_outside_mask_shape[FE_LH_, FE_LW_](
+                    warm_z_host, z0_host, warm_mask
+                )
+                var warm_z = Tensor.from_host(
+                    warm_z_host^, [1, 16, FE_LH_, FE_LW_], STDtype.F32,
+                    self.ctx,
+                )
+                _ = warm_z^
+            _ = warm_v^
+            self.ctx.synchronize()
+            print("[krea2-edit] pre-step-0 FlowEdit kernel/host warm-up complete")
+        print("[krea2-edit] prefaulted worker image bytes=", prefault_self_executable())
+        _emit_flowedit_progress(self.progress_fd, 0, steps)
+
         var active_count = 0
         for si in range(steps):
             if si < skip_before or si >= stop_at:

@@ -7,15 +7,11 @@ the existing Rust control-plane API, Mojo inference backends, workflow graph
 schema, workflow builders, templates, model identifiers, and saved-workflow
 compatibility unless a separately reviewed contract migration changes them.
 
-## Source and generated artifacts
+## Browser source
 
-- JavaScript and its checked-in `.map` file are one versioned artifact. A
-  change that alters generated JavaScript must preserve or regenerate its valid
-  source map; source maps are not cleanup debris.
-- When the historical TypeScript source is absent, regenerate each touched map
-  from the current production JavaScript with
-  `scripts/regenerate_canvas_identity_maps.py`; the embedded source must match
-  the served `.js` bytes.
+- The checked-in JavaScript is the authoritative browser source and is served
+  directly. Identity source maps that embed a second copy of the same JavaScript
+  are not tracked or regenerated.
 - `index.html`, CSS, assets, and JavaScript are served directly by the Rust
   server. Production behavior must not depend on an unrecorded local build
   directory, developer-home path, or another checkout.
@@ -54,9 +50,27 @@ compatibility unless a separately reviewed contract migration changes them.
   operate on the same active state as the parameter rail, uploaded init images
   are represented by the returned server path, and gallery/current-batch
   metadata records the executed sampler separately from the noise scheduler.
+- Generate History is one continuous, vertically scrollable thumbnail gallery
+  grouped into full-width local-calendar-date sections. Thumbnails wrap within
+  each date, date headers stay visible while scrolling, and the region supports
+  wheel, scrollbar, and keyboard navigation. It has no page state or Prev/Next
+  controls. Completed Current Batch artifacts also enter History immediately;
+  server-owned completed jobs are reconciled after reload, while outputs that
+  have actually been removed return no broken thumbnail row.
+- The Generate LoRA rail is capability-driven for the selected architecture,
+  not reserved for one advanced-video model. Every admitted image or video
+  family exposes its own supported count and validation contract; unsupported
+  families hide the control instead of accepting a value that the worker will
+  ignore.
+- Generate Source Assets are a persistent server inventory of the real
+  `<out_dir>/uploads/` media returned by `/v1/assets`, separate from generated
+  History results. Uploading adds an Asset rather than fabricating a gallery
+  result; `Use as source` selects the exact server path for admitted img2img or
+  I2V requests, and Asset deletion is confined to one regular media file under
+  the uploads directory.
 - A Generate-to-Workflow handoff writes the selected sampler and noise
-  scheduler into the staged sampler node. Legacy saved workflows that used one
-  combined scheduler value remain loadable.
+  scheduler into the staged sampler node. There is no second
+  `noiseScheduler` parameter alias.
 - Create mode keeps the Canvas dominant. Ordinary edit modes use two equal
   center panes: immutable source preview and editable result/mask Canvas. Style
   mode uses stacked source/style previews on the left and a larger result Canvas
@@ -154,6 +168,10 @@ compatibility unless a separately reviewed contract migration changes them.
   submission, model and conditioning load, sampling progress, output decode and
   save, completion, interruption, and failure. Progress and completion state
   are driven by server job events rather than browser timers.
+- Switching from a running Workflow to Generate preserves the shared in-flight
+  phase in Generate's activity indicator. The Workflow job does not become a
+  Generate-owned batch: Generate's button, pending count, and Current Batch
+  remain scoped to requests submitted from Generate itself.
 - The active execution path uses a persistent, high-contrast state: amber for
   active nodes and connections, green for completed work, and red for failures.
   Completion coloring remains until the next workflow execution begins.
@@ -168,11 +186,16 @@ compatibility unless a separately reviewed contract migration changes them.
   Optional post-upscale is a separate admitted object and must never be
   presented as native inference geometry. Incomplete legacy fallbacks are
   forbidden, and any submission rejection must clear the Generating state
-  immediately.
+  immediately. Seconds are authored directly: when the current native size
+  lacks that duration, the browser may move to the highest-resolution compiled
+  profile of the same orientation that supports it. Native 540p reaches 20
+  seconds, 720p reaches 10 seconds, and 1080p reaches 5 seconds; longer work is
+  assembled through Extend rather than advertised as an unavailable native
+  one-minute profile.
 
 ## Verification
 
 A production canvas change must pass the Rust server tests, JavaScript syntax
-checks for touched files, source-map JSON validation for touched mapped files,
-and a browser smoke covering the changed route. Inference changes additionally
-require a decoded output artifact and completion evidence from the real worker.
+checks for touched files, and a browser smoke covering the changed route.
+Inference changes additionally require a decoded output artifact and completion
+evidence from the real worker.

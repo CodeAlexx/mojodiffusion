@@ -72,7 +72,11 @@ function loadWorkflow(canvas, data, nodeInfo) {
             }
         }
         if (loaded && typeof WorkflowSync !== 'undefined') {
-            WorkflowSync.onWorkflowLoaded(serializeWorkflow(canvas).prompt);
+            // Keep the exact source graph for the Generate handoff. A ComfyUI
+            // subgraph is intentionally represented by one outer canvas node,
+            // so serializing only the visible canvas would discard the loader,
+            // prompt, sampler, and latent nodes stored in definitions.subgraphs.
+            WorkflowSync.onWorkflowLoaded(data, serializeWorkflow(canvas).prompt);
         }
     }
     catch (err) {
@@ -82,47 +86,17 @@ function loadWorkflow(canvas, data, nodeInfo) {
 }
 /**
  * Load ComfyUI graph format (nodes[] + links[]).
- * Handles subgraph expansion.
+ * Comfy subgraphs stay as their serialized outer nodes. Expanding their
+ * definitions without translating negative interface IDs and link namespaces
+ * corrupts the graph; the outer node already carries the correct ports.
  */
 function loadComfyUIGraph(canvas, graphData, nodeInfo) {
     // Clear
     const existingIds = [...canvas.nodes.keys()];
     existingIds.forEach(id => canvas.removeNode(id));
     canvas.connections = [];
-    // Collect subgraph definitions
-    const subgraphDefs = {};
-    if (graphData.definitions && graphData.definitions.subgraphs) {
-        for (const sg of graphData.definitions.subgraphs) {
-            subgraphDefs[sg.id] = sg;
-        }
-    }
-    console.log('[workflow] Subgraph defs:', Object.keys(subgraphDefs).length);
-    // Flatten: expand subgraphs into top-level nodes
-    const allNodes = [];
-    const allLinks = [];
-    const skipTypes = new Set(['MarkdownNote', 'Reroute', 'Note']);
-    for (const node of graphData.nodes) {
-        const ntype = node.type || '';
-        if (subgraphDefs[ntype]) {
-            // Expand subgraph
-            const sg = subgraphDefs[ntype];
-            for (const inner of (sg.nodes || [])) {
-                if (inner.id >= 0)
-                    allNodes.push(inner);
-            }
-            for (const link of (sg.links || [])) {
-                allLinks.push(link);
-            }
-            console.log('[workflow] Expanded subgraph:', ntype.substring(0, 8) + '...');
-        }
-        else {
-            allNodes.push(node);
-        }
-    }
-    // Add outer links
-    for (const link of (graphData.links || [])) {
-        allLinks.push(link);
-    }
+    const allNodes = Array.isArray(graphData.nodes) ? graphData.nodes : [];
+    const allLinks = Array.isArray(graphData.links) ? graphData.links : [];
     // Build link map: link_id -> { srcId, srcSlot, dstId, dstSlot, type }
     const linkMap = {};
     for (const link of allLinks) {
@@ -140,26 +114,16 @@ function loadComfyUIGraph(canvas, graphData, nodeInfo) {
         }
         linkMap[String(id)] = { srcId: String(srcId), srcSlot: srcSlot, dstId: String(dstId), dstSlot: dstSlot, type: String(ltype) };
     }
-    // Build a map of graph node inputs: graphNodeId -> [{name, link_id, slot}]
-    const graphNodeInputs = {};
-    for (const node of allNodes) {
-        const nid = String(node.id);
-        const inputs = node.inputs || [];
-        graphNodeInputs[nid] = inputs.map((inp, idx) => ({
-            name: inp.name || inp.label || '',
-            link: inp.link,
-            slot: idx,
-        }));
-    }
     // Create canvas nodes
     const idMap = {}; // graph node id -> canvas node id
     let created = 0;
     for (const node of allNodes) {
         const nid = String(node.id);
         const ntype = node.type || '';
-        if (skipTypes.has(ntype) || !ntype || node.id < 0)
+        if (!ntype || node.id < 0)
             continue;
-        const info = nodeInfo ? (nodeInfo[ntype] || {}) : {};
+        const registeredInfo = nodeInfo ? nodeInfo[ntype] : null;
+        const info = _comfyNodeInfo(node, registeredInfo);
         // Position
         let px = 0, py = 0;
         const pos = node.pos;
@@ -231,6 +195,45 @@ function loadComfyUIGraph(canvas, graphData, nodeInfo) {
     canvas.fitView(true);
     // Update topbar model badge from the primary loader node
     _updateModelBadgeFromWorkflow(allNodes);
+}
+/**
+ * Merge registered object_info with the ports serialized by ComfyUI.
+ *
+ * Imported custom nodes are often absent from Serenity's runtime. Drawing them
+ * with an empty info object drops every input/output and therefore every link.
+ * The graph JSON already has authoritative port names, types, and ordering, so
+ * use those for visual fidelity while retaining registered widget definitions.
+ */
+function _comfyNodeInfo(node, registeredInfo) {
+    const registeredInput = registeredInfo && registeredInfo.input
+        ? registeredInfo.input : {};
+    const required = Object.assign({}, registeredInput.required || {});
+    const optional = Object.assign({}, registeredInput.optional || {});
+    (node.inputs || []).forEach(function (input, index) {
+        const name = input.name || input.label || ('input_' + index);
+        if (required[name] || optional[name])
+            return;
+        required[name] = [String(input.type || '*')];
+    });
+    const serializedOutputs = Array.isArray(node.outputs) ? node.outputs : [];
+    return {
+        input: { required: required, optional: optional },
+        output: serializedOutputs.length
+            ? serializedOutputs.map(function (output) {
+                return String(output.type || '*');
+            })
+            : (registeredInfo && registeredInfo.output || []),
+        output_name: serializedOutputs.length
+            ? serializedOutputs.map(function (output, index) {
+                return String(output.name || output.label ||
+                    output.type || ('output_' + index));
+            })
+            : (registeredInfo && registeredInfo.output_name || []),
+        display_name: node.title ||
+            (registeredInfo && registeredInfo.display_name) || node.type,
+        category: registeredInfo && registeredInfo.category ||
+            'Imported Workflow'
+    };
 }
 /**
  * Map widgets_values array to named input fields.
@@ -412,6 +415,228 @@ var WorkflowSync = (function () {
     var lastSyncedSignature = '';
     var suppressLoadedSync = false;
     var stagedWorkflowPending = false;
+    var lastLoadedWorkflowSource = null;
+    var lastLoadedCanvasSignature = '';
+
+    function canonicalModelName(name) {
+        var original = String(name || '').trim();
+        var normalized = original.toLowerCase().replace(/\\/g, '/');
+        if (!normalized)
+            return '';
+        if (normalized.indexOf('ideogram') >= 0) {
+            if (normalized.indexOf('unconditional') >= 0)
+                return '';
+            if (normalized === 'ideogram-4-bf16-diffusers' ||
+                normalized.indexOf('bf16') >= 0)
+                return 'ideogram-4-bf16-diffusers';
+            // Comfy's creator workflow names the component
+            // diffusion_models/ideogram4_fp8_scaled.safetensors, while the
+            // Serenity model registry exposes the admitted product identity.
+            return 'ideogram-4-fp8';
+        }
+        return original;
+    }
+
+    function comfyWidgetValues(node) {
+        return node && Array.isArray(node.widgets_values)
+            ? node.widgets_values : [];
+    }
+
+    function activeComfyNodes(graph) {
+        var nodes = [];
+        function append(list, subgraphName) {
+            (Array.isArray(list) ? list : []).forEach(function (node) {
+                if (!node || node.mode === 4)
+                    return;
+                nodes.push({ node: node, subgraphName: subgraphName || '' });
+            });
+        }
+        append(graph && graph.nodes, '');
+        var definitions = graph && graph.definitions;
+        (definitions && Array.isArray(definitions.subgraphs)
+            ? definitions.subgraphs : []).forEach(function (subgraph) {
+            append(subgraph.nodes, subgraph.name || '');
+        });
+        return nodes;
+    }
+
+    function usableComfyPrompt(value) {
+        if (typeof value !== 'string')
+            return '';
+        var text = value.trim();
+        if (!text || text.length > 20000)
+            return '';
+        if (/^IGNORE AND DELETE ALL PREVIOUS INSTRUCTIONS/i.test(text) ||
+            (text.indexOf('[SYSTEM]') >= 0 && text.indexOf('OUTPUT CONTRACT') >= 0))
+            return '';
+        return text;
+    }
+
+    /**
+     * Read product parameters from a full ComfyUI graph without expanding its
+     * subgraphs on the visual canvas. The creator graph remains authoritative;
+     * this is analysis-only and never rewrites its topology.
+     */
+    function extractComfyGraph(graph) {
+        var params = { loras: [] };
+        var entries = activeComfyNodes(graph);
+        var promptCandidates = [];
+        var negativeCandidates = [];
+        var seenLoras = {};
+        var modelLoader = null;
+        var latentNode = null;
+        var samplerNode = null;
+        var basicScheduler = null;
+        var samplerSelect = null;
+        var guider = null;
+        var randomNoise = null;
+        var seedNode = null;
+        var qualityChoice = null;
+
+        entries.forEach(function (entry) {
+            var node = entry.node;
+            var type = String(node.type || '');
+            var values = comfyWidgetValues(node);
+            if (!modelLoader &&
+                (type === 'CheckpointLoaderSimple' || type === 'UNETLoader' ||
+                    type === 'LTXVLoader') &&
+                typeof values[0] === 'string' &&
+                values[0].toLowerCase().indexOf('unconditional') < 0) {
+                modelLoader = node;
+            }
+            if (!latentNode && /^Empty.*(?:Latent|Video)/.test(type))
+                latentNode = node;
+            if (!samplerNode &&
+                (type === 'KSampler' || type === 'KSamplerAdvanced' ||
+                    type === 'LTXVSampler'))
+                samplerNode = node;
+            if (!basicScheduler && type === 'BasicScheduler')
+                basicScheduler = node;
+            if (!samplerSelect && type === 'KSamplerSelect')
+                samplerSelect = node;
+            if (!guider && (type === 'DualModelGuider' || type === 'CFGGuider'))
+                guider = node;
+            if (!randomNoise && type === 'RandomNoise')
+                randomNoise = node;
+            if (!seedNode && type === 'Seed (rgthree)')
+                seedNode = node;
+            if (!qualityChoice && type === 'CustomCombo' &&
+                typeof values[0] === 'string')
+                qualityChoice = values[0];
+
+            if (type === 'CLIPTextEncode' || type === 'TextEncodeQwenImageEditPlus') {
+                var encoded = usableComfyPrompt(values[0]);
+                if (encoded)
+                    promptCandidates.push({ priority: 100, text: encoded });
+            }
+            if (type === 'PrimitiveStringMultiline') {
+                var primitive = usableComfyPrompt(values[0]);
+                if (primitive) {
+                    promptCandidates.push({
+                        priority: /caption prompt/i.test(entry.subgraphName) ? 80 : 40,
+                        text: primitive
+                    });
+                }
+            }
+            if ((type === 'LoraLoader' || type === 'LoraLoaderModelOnly') &&
+                typeof values[0] === 'string' && values[0]) {
+                var loraName = values[0];
+                if (!seenLoras[loraName]) {
+                    seenLoras[loraName] = true;
+                    params.loras.push({
+                        name: loraName,
+                        strength: Number(values[1] == null ? 1 : values[1]),
+                        enabled: true
+                    });
+                }
+            }
+        });
+
+        // Subgraph instance widgets can hold the concrete prompt while the
+        // definition contains only a placeholder/default.
+        var definitionsById = {};
+        var definitions = graph && graph.definitions;
+        (definitions && Array.isArray(definitions.subgraphs)
+            ? definitions.subgraphs : []).forEach(function (subgraph) {
+            definitionsById[String(subgraph.id)] = subgraph;
+        });
+        (Array.isArray(graph && graph.nodes) ? graph.nodes : []).forEach(function (node) {
+            var definition = definitionsById[String(node.type || '')];
+            if (!definition)
+                return;
+            var values = comfyWidgetValues(node);
+            var widgetInputs = (definition.inputs || []).filter(function (input) {
+                return !!input.widget;
+            });
+            widgetInputs.forEach(function (input, index) {
+                if (!/prompt|text|value/i.test(String(input.name || '') + ' ' +
+                    String(input.label || '')))
+                    return;
+                var candidate = usableComfyPrompt(values[index]);
+                if (candidate) {
+                    promptCandidates.push({
+                        priority: /caption prompt/i.test(definition.name || '') ? 120 : 90,
+                        text: candidate
+                    });
+                }
+            });
+        });
+
+        if (modelLoader)
+            params.model = canonicalModelName(comfyWidgetValues(modelLoader)[0]);
+        if (latentNode) {
+            var latentValues = comfyWidgetValues(latentNode);
+            if (Number.isFinite(Number(latentValues[0])))
+                params.width = Number(latentValues[0]);
+            if (Number.isFinite(Number(latentValues[1])))
+                params.height = Number(latentValues[1]);
+            if (Number.isFinite(Number(latentValues[2])) &&
+                /Video/.test(String(latentNode.type || '')))
+                params.frames = Number(latentValues[2]);
+        }
+        if (samplerNode) {
+            var samplerValues = comfyWidgetValues(samplerNode);
+            if (samplerNode.type === 'KSampler' ||
+                samplerNode.type === 'KSamplerAdvanced') {
+                params.seed = Number(samplerValues[0]);
+                params.steps = Number(samplerValues[2]);
+                params.cfg = Number(samplerValues[3]);
+                params.sampler = samplerValues[4] || 'euler';
+                params.noiseScheduler = samplerValues[5] || 'simple';
+                params.scheduler = params.sampler;
+            }
+        }
+        if (basicScheduler) {
+            var schedulerValues = comfyWidgetValues(basicScheduler);
+            params.noiseScheduler = schedulerValues[0] || 'simple';
+            params.steps = Number(schedulerValues[1]);
+        }
+        if (qualityChoice && params.model === 'ideogram-4-fp8') {
+            var ideogramSteps = { Quality: 48, Default: 20, Turbo: 12 };
+            if (ideogramSteps[qualityChoice] != null)
+                params.steps = ideogramSteps[qualityChoice];
+        }
+        if (samplerSelect) {
+            params.sampler = comfyWidgetValues(samplerSelect)[0] || 'euler';
+            params.scheduler = params.sampler;
+        }
+        if (guider)
+            params.cfg = Number(comfyWidgetValues(guider)[0]);
+        if (seedNode)
+            params.seed = Number(comfyWidgetValues(seedNode)[0]);
+        else if (randomNoise)
+            params.seed = Number(comfyWidgetValues(randomNoise)[0]);
+
+        promptCandidates.sort(function (a, b) { return b.priority - a.priority; });
+        negativeCandidates.sort(function (a, b) { return b.priority - a.priority; });
+        params.prompt = promptCandidates.length ? promptCandidates[0].text : '';
+        params.negPrompt = negativeCandidates.length ? negativeCandidates[0].text : '';
+        Object.keys(params).forEach(function (key) {
+            if (typeof params[key] === 'number' && !Number.isFinite(params[key]))
+                delete params[key];
+        });
+        return params;
+    }
 
     function valueRef(prompt, ref) {
         if (!Array.isArray(ref) || ref.length < 1)
@@ -446,14 +671,13 @@ var WorkflowSync = (function () {
         return '';
     }
 
-    function combinedScheduler(inputs) {
-        var sampler = inputs.sampler_name || 'euler';
-        if (sampler === 'euler' || sampler === 'flowmatch_euler')
-            return 'euler';
-        return inputs.scheduler === 'karras' ? sampler + '_k' : sampler;
-    }
-
     function extract(prompt) {
+        if (prompt && prompt.workflow && Array.isArray(prompt.workflow.nodes))
+            return extractComfyGraph(prompt.workflow);
+        if (prompt && Array.isArray(prompt.nodes))
+            return extractComfyGraph(prompt);
+        if (prompt && prompt.version && prompt.prompt)
+            return extract(prompt.prompt);
         var params = { loras: [] };
         var nodes = prompt || {};
         var sampler = null;
@@ -503,8 +727,7 @@ var WorkflowSync = (function () {
                 params.cfg = Number(sinputs.cfg);
                 params.seed = Number(sinputs.seed);
                 params.sampler = sinputs.sampler || 'euler';
-                params.noiseScheduler = sinputs.scheduler || 'simple';
-                params.scheduler = 'euler';
+                params.scheduler = sinputs.scheduler || 'simple';
             }
             else {
                 params.prompt = findText(nodes, sinputs.positive);
@@ -515,8 +738,7 @@ var WorkflowSync = (function () {
                 params.cfg = Number(sinputs.cfg);
                 params.seed = Number(sinputs.seed != null ? sinputs.seed : sinputs.noise_seed);
                 params.sampler = sinputs.sampler_name || 'euler';
-                params.noiseScheduler = sinputs.scheduler || 'simple';
-                params.scheduler = combinedScheduler(sinputs);
+                params.scheduler = sinputs.scheduler || 'simple';
                 var latent = valueRef(nodes, sinputs.latent_image);
                 if (latent && latent.inputs) {
                     if (latent.inputs.width != null)
@@ -536,6 +758,8 @@ var WorkflowSync = (function () {
             params.negPrompt = textNodes.length > 1 && typeof textNodes[1].inputs.text === 'string'
                 ? textNodes[1].inputs.text : '';
         }
+        if (params.model)
+            params.model = canonicalModelName(params.model);
         Object.keys(params).forEach(function (key) {
             if (typeof params[key] === 'number' && !Number.isFinite(params[key]))
                 delete params[key];
@@ -550,7 +774,6 @@ var WorkflowSync = (function () {
             width: Number(p.width), height: Number(p.height), steps: Number(p.steps),
             cfg: Number(p.cfg), guidance: Number(p.guidance),
             sampler: p.sampler || '', scheduler: p.scheduler || '',
-            noiseScheduler: p.noiseScheduler || '',
             seed: Number(p.seed), frames: Number(p.frames), fps: Number(p.fps),
             loras: Array.isArray(p.loras) ? p.loras.map(function (l) {
                 return { name: l.name || '', strength: Number(l.strength), enabled: l.enabled !== false };
@@ -568,10 +791,12 @@ var WorkflowSync = (function () {
         lastSyncedSignature = signature(params);
     }
 
-    function onWorkflowLoaded(prompt) {
+    function onWorkflowLoaded(source, serializedPrompt) {
+        lastLoadedWorkflowSource = source || null;
+        lastLoadedCanvasSignature = JSON.stringify(serializedPrompt || {});
         if (suppressLoadedSync)
             return;
-        var params = extract(prompt);
+        var params = extract(source);
         applyToGenerate(params);
         markSynced(typeof GenerateTab !== 'undefined' && GenerateTab.getParams
             ? GenerateTab.getParams() : params);
@@ -583,7 +808,13 @@ var WorkflowSync = (function () {
         var serialized = serializeWorkflow(sfCanvas).prompt;
         if (!Object.keys(serialized).length)
             return false;
-        var params = extract(serialized);
+        var serializedSignature = JSON.stringify(serialized);
+        var source = lastLoadedWorkflowSource &&
+            serializedSignature === lastLoadedCanvasSignature
+            ? lastLoadedWorkflowSource : serialized;
+        if (source === serialized)
+            lastLoadedWorkflowSource = null;
+        var params = extract(source);
         applyToGenerate(params);
         markSynced(typeof GenerateTab !== 'undefined' && GenerateTab.getParams
             ? GenerateTab.getParams() : params);
@@ -660,4 +891,3 @@ var WorkflowSync = (function () {
         consumeStagedWorkflow: consumeStagedWorkflow
     };
 })();
-//# sourceMappingURL=workflow.js.map

@@ -54,7 +54,7 @@ from serenitymojo.training.krea2_omini_layout import (
 from serenitymojo.models.dit.krea2_dit import (
     krea2_first, krea2_temb, krea2_tmlp, krea2_tproj, krea2_txtmlp,
     krea2_text_fusion, build_krea2_rope,
-    _wb, _scale, _txtf_bundle, Krea2TextFusionWeights,
+    _wb, _scale, _txtf_bundle, Krea2TextFusionWeights, Krea2SharedResident,
 )
 from serenitymojo.models.krea2.krea2_block import Krea2BlockLora
 from serenitymojo.models.krea2.krea2_stack import (
@@ -68,7 +68,10 @@ from serenitymojo.models.dit.krea2_dit import Krea2HostInt8Inf
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice, lora_adapter_to_device
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import NamedLora, load_lora_for_resume
-from serenitymojo.serve.proc_ipc import write_msg
+from serenitymojo.serve.proc_ipc import (
+    write_msg, wait_sampling_ack, prefault_self_executable,
+    prefault_mapped_shared_libraries,
+)
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -164,6 +167,37 @@ def load_krea2_resident_cond(
         TArc(_wb(st, key_prefix + "txtmlp.1.bias", ctx)),
         TArc(_wb(st, key_prefix + "txtmlp.3.weight", ctx)),
         TArc(_wb(st, key_prefix + "txtmlp.3.bias", ctx)),
+    )
+
+
+def krea2_resident_cond_from_shared(
+    shared: Krea2SharedResident,
+) raises -> Krea2ResidentCond:
+    """View the v2 sidecar's resident shared store as T2I conditioning weights."""
+    if len(shared.t) != 18 or len(shared.txtf) != 4:
+        raise Error("krea2 shared sidecar has an invalid conditioning layout")
+    return Krea2ResidentCond(
+        shared.t[0].copy(), shared.t[1].copy(),
+        shared.t[2].copy(), shared.t[3].copy(),
+        shared.t[4].copy(), shared.t[5].copy(),
+        shared.t[6].copy(), shared.t[7].copy(),
+        shared.txtf[0].copy(), shared.txtf[1].copy(),
+        shared.txtf[2].copy(), shared.txtf[3].copy(),
+        shared.t[8].copy(), shared.t[9].copy(),
+        shared.t[10].copy(), shared.t[11].copy(),
+        shared.t[12].copy(), shared.t[13].copy(),
+    )
+
+
+def krea2_stream_final_from_shared(
+    shared: Krea2SharedResident,
+) raises -> Krea2StreamFinal:
+    """View the v2 sidecar's resident shared store as the T2I final layer."""
+    if len(shared.t) != 18:
+        raise Error("krea2 shared sidecar has an invalid final-layer layout")
+    return Krea2StreamFinal(
+        shared.t[14].copy(), shared.t[15].copy(),
+        shared.t[16].copy(), shared.t[17].copy(),
     )
 
 
@@ -815,6 +849,58 @@ def krea2_sample_latent[
                     KREA2_HEADS, STDtype.BF16, ctx,
                 )))
 
+    # Activate lazy CUDA/cuDNN kernels without advancing the latent or schedule.
+    # The first real forward otherwise loads NVVM/GPU compiler DSOs and CUDA
+    # ComputeCache entries after the hardware I/O fence.
+    var warm_img_f32 = krea2_patchify[LH, LW](latent, ctx)
+    var warm_img = torch_f32_to_bf16_rne(warm_img_f32, ctx)
+    var warm_t = _t_scalar(ts[0], ctx)
+    comptime if CONDL > 0:
+        var warm_v = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
+            st, key_prefix, cond_w, fin, lora, cond,
+            warm_img, cond_tokens.value(), warm_t, ctx,
+            resident, resident_sq, resident_i8, host_i8,
+            attn_bias_c.copy(), use_refiner_mask,
+        )
+        _ = warm_v^
+    else:
+        var warm_c = build_conditioning[LTMAX, LFULL](
+            cond_w, warm_img, cond.context[], cond.pos[], warm_t,
+            cond.text_len, ctx,
+        )
+        var warm_real_len = Optional[Int](cond.text_len + imglen)
+        var warm_pred = krea2_stack_lora_forward_streamed[
+            LFULL, HEADS, KVHEADS, HEADDIM
+        ](
+            warm_c.combined, warm_c.blk_vec, warm_c.tmlp_out,
+            st, key_prefix, NBLOCKS, lora, fin,
+            warm_c.cos, warm_c.sin, EPS, cond.text_len, imglen, ctx,
+            warm_real_len, resident,
+            resident_i8=resident_i8, host_i8_inf=host_i8,
+        )
+        _ = warm_pred^
+    ctx.synchronize()
+    print("[krea2-infer] pre-step-0 denoiser kernel warm-up complete")
+    print("[krea2-infer] prefaulted worker image bytes=", prefault_self_executable())
+    print(
+        "[krea2-infer] prefaulted mapped shared-library bytes=",
+        prefault_mapped_shared_libraries(),
+    )
+
+    # This is the hard boundary for the no-disk-during-denoise gate.  Model
+    # activation, sidecar validation, and host/GPU population are complete;
+    # no checkpoint-backed path may be touched after this event.
+    if progress_fd >= 0:
+        try:
+            write_msg(
+                progress_fd,
+                String("{\"ev\":\"progress\",\"step\":0,\"total\":")
+                + String(sample_steps)
+                + String(",\"phase\":\"sampling\",\"preview\":\"\"}"),
+            )
+        except e:
+            print("[krea2-infer] progress IPC skipped:", String(e))
+
     for si in range(sample_steps):
         var t_cur = ts[si]
         var t_prev = ts[si + 1]
@@ -870,6 +956,7 @@ def krea2_sample_latent[
                 c.combined, c.blk_vec, c.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin,
                 c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
+                resident_i8=resident_i8, host_i8_inf=host_i8,
             )
 
             # Creator sampling.py enables CFG only when guidance > 0. Turbo's
@@ -889,6 +976,7 @@ def krea2_sample_latent[
                     u.combined, u.blk_vec, u.tmlp_out,
                     st, key_prefix, NBLOCKS, lora, fin,
                     u.cos, u.sin, EPS, uncond.text_len, imglen, ctx, real_len_u, resident,
+                    resident_i8=resident_i8, host_i8_inf=host_i8,
                 )
                 v_bf16 = krea2_cfg(v_c, pred_u.velocity[], cfg_scale, ctx)
 
@@ -909,6 +997,8 @@ def krea2_sample_latent[
                     + String(sample_steps)
                     + String(",\"phase\":\"sampling\",\"preview\":\"\"}"),
                 )
+                if si + 1 == sample_steps:
+                    wait_sampling_ack(progress_fd)
             except e:
                 print("[krea2-infer] progress IPC skipped:", String(e))
         if si == 0 or si + 1 == sample_steps or (si + 1) % 5 == 0:
@@ -1094,6 +1184,24 @@ def krea2_sample_lanpaint_latent[
         " step_size=", lanpaint_step_size, " beta=", lanpaint_beta,
         " friction=", lanpaint_friction, " mode=", lanpaint_prompt_mode,
     )
+    print("[krea2-lanpaint] prefaulted worker image bytes=", prefault_self_executable())
+    print(
+        "[krea2-lanpaint] prefaulted mapped shared-library bytes=",
+        prefault_mapped_shared_libraries(),
+    )
+
+    # All checkpoint/sidecar population must be finished before this boundary.
+    # The product I/O gate treats any physical read after this event as fatal.
+    if progress_fd >= 0:
+        try:
+            write_msg(
+                progress_fd,
+                String("{\"ev\":\"progress\",\"step\":0,\"total\":")
+                + String(sample_steps)
+                + String(",\"phase\":\"sampling\",\"preview\":\"\"}"),
+            )
+        except e:
+            print("[krea2-lanpaint] progress IPC skipped:", String(e))
 
     for si in range(sample_steps):
         var t_cur = ts[si]
@@ -1265,6 +1373,8 @@ def krea2_sample_lanpaint_latent[
                     + String(sample_steps)
                     + String(",\"phase\":\"sampling\",\"preview\":\"\"}"),
                 )
+                if si + 1 == sample_steps:
+                    wait_sampling_ack(progress_fd)
             except e:
                 print("[krea2-lanpaint] progress IPC skipped:", String(e))
         print("[krea2-lanpaint] step", si + 1, "/", sample_steps, " t=", t_cur)

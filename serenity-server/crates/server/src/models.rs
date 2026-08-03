@@ -379,6 +379,81 @@ fn normalize_user_model_type(raw: &str) -> Option<String> {
         .then_some(normalized)
 }
 
+fn architecture_has_selected_checkpoint_loader(arch: &str) -> bool {
+    matches!(
+        arch,
+        "sdxl"
+            | "krea2"
+            | "zimage"
+            | "qwen-image"
+            | "sd3"
+            | "flux"
+            | "chroma"
+            | "anima"
+            | "ltx2"
+    )
+}
+
+fn selected_checkpoint_scope(
+    arch: &str,
+    format: &str,
+    name: &str,
+    arch_source: &str,
+    arch_override: &str,
+) -> Option<&'static str> {
+    match (arch, format) {
+        ("sdxl", "diffusion_model" | "full_checkpoint") => Some("denoiser"),
+        ("krea2", "diffusion_model") => Some("denoiser"),
+        ("zimage", "diffusion_model") => Some("denoiser"),
+        ("qwen-image", "diffusion_model")
+            if !name.to_ascii_lowercase().contains("edit") =>
+        {
+            Some("denoiser")
+        }
+        ("sd3", "sd3_large_full_checkpoint") => Some("full_checkpoint"),
+        ("flux", "diffusion_model") => Some("denoiser"),
+        ("chroma", "diffusion_model") => Some("denoiser"),
+        ("anima", "diffusion_model") => Some("denoiser"),
+        ("ltx2", "diffusion_model" | "full_checkpoint") => {
+            let stem = name.strip_suffix(".safetensors").unwrap_or(name);
+            let known_ltx23_single_file = matches!(
+                stem,
+                "ltx-2.3-22b-dev-fp8"
+                    | "ltx-2.3-22b-dev-fp8-dequant-bf16"
+                    | "ltx-2.3-22b-distilled-fp8"
+                    | "ltx-2.3-22b-distilled-fp8-dequant-bf16"
+            );
+            (arch_source != "filename"
+                || !arch_override.is_empty()
+                || known_ltx23_single_file)
+                .then_some("video_denoiser")
+        }
+        _ => None,
+    }
+}
+
+fn entry_selected_checkpoint_scope(e: &ScanEntry) -> Option<&'static str> {
+    selected_checkpoint_scope(
+        &entry_arch(e),
+        &e.format,
+        &e.name,
+        &e.arch_source,
+        &e.arch_override,
+    )
+}
+
+pub(crate) fn selected_checkpoint_scope_for_resolved(
+    checkpoint: &ResolvedCheckpoint,
+) -> Option<&'static str> {
+    selected_checkpoint_scope(
+        &checkpoint.arch,
+        &checkpoint.format,
+        &checkpoint.name,
+        &checkpoint.arch_source,
+        &checkpoint.arch_override,
+    )
+}
+
 fn model_type_options_json() -> Value {
     Value::Array(
         MODEL_TYPE_OPTIONS
@@ -394,7 +469,7 @@ fn model_type_options_json() -> Value {
                     } else {
                         "unsupported"
                     },
-                    "arbitrary_checkpoint_supported": matches!(*id, "krea2" | "sdxl" | "ltx2"),
+                    "arbitrary_checkpoint_supported": architecture_has_selected_checkpoint_loader(id),
                 })
             })
             .collect(),
@@ -586,6 +661,21 @@ fn detect_checkpoint_format(header: &str, arch: &str) -> &'static str {
         && header.contains("\"conditioner.embedders.")
     {
         "full_checkpoint"
+    } else if arch == "sd3" {
+        let pos_embed_shape = serde_json::from_str::<Value>(header)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("model.diffusion_model.pos_embed")
+                    .and_then(|tensor| tensor.get("shape"))
+                    .and_then(Value::as_array)
+                    .map(|shape| shape.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+            });
+        match pos_embed_shape.as_deref() {
+            Some([1, 36_864, 2_432]) => "sd3_large_full_checkpoint",
+            Some([1, 147_456, 1_536]) => "sd3_medium_full_checkpoint",
+            _ => "sd3_unknown_checkpoint",
+        }
     } else {
         "diffusion_model"
     }
@@ -1886,24 +1976,13 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
         crate::capabilities::generation_defaults_for_model_arch(&e.name, &arch);
     let loaded = !resident.is_empty() && e.name == resident;
     let preview = e.sidecar.preview.clone();
-    let known_ltx23_single_file = matches!(
-        e.name.strip_suffix(".safetensors").unwrap_or(&e.name),
-        "ltx-2.3-22b-dev-fp8"
-            | "ltx-2.3-22b-dev-fp8-dequant-bf16"
-            | "ltx-2.3-22b-distilled-fp8"
-            | "ltx-2.3-22b-distilled-fp8-dequant-bf16"
-    );
-    let selected_checkpoint_supported = matches!(arch.as_str(), "krea2" | "sdxl")
-        || (arch == "ltx2"
-            && matches!(e.format.as_str(), "diffusion_model" | "full_checkpoint")
-            && (e.arch_source != "filename"
-                || !e.arch_override.is_empty()
-                || known_ltx23_single_file));
+    let selected_checkpoint_scope = entry_selected_checkpoint_scope(e);
+    let selected_checkpoint_supported = selected_checkpoint_scope.is_some();
     // These are the finite, pre-existing product profiles whose workers choose
     // a bundled artifact by profile identity. Keep them selectable, but never
     // pretend that an arbitrary same-architecture filename reaches the worker.
-    // New user checkpoints must use a selected-checkpoint loader (currently
-    // Krea-2 and SDXL) instead of being added to this compatibility list.
+    // New user checkpoints must use a selected-checkpoint loader instead of
+    // being added to this compatibility list.
     let bundled_profile = matches!(
         (arch.as_str(), e.name.as_str()),
         ("anima", "anima")
@@ -1916,9 +1995,6 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
             | ("lens", "microsoft_lens")
             | ("qwen-image", "qwen-image-2512")
             | ("sd3", "sd3.5_large")
-            | ("sd3", "sd3.5_medium")
-            | ("sd3", "stablediffusion35_medium")
-            | ("zimage", "z_image_base_bf16")
             | ("zimage", "zimage_base")
     );
     let route = if matches!(
@@ -1943,13 +2019,11 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
                 | ("bernini", "Bernini-R-Diffusers")
                 | ("scail2", "SCAIL-2-Mojo")
         );
-    let runtime_supported = video_profile || selected_checkpoint_supported || bundled_profile;
-    let selected_checkpoint_scope = if selected_checkpoint_supported {
-        if arch == "ltx2" {
-            "video_denoiser"
-        } else {
-            "denoiser"
-        }
+    let blocked_reason = crate::capabilities::blocked_image_model_reason(&e.name);
+    let runtime_supported = blocked_reason.is_none()
+        && (video_profile || selected_checkpoint_supported || bundled_profile);
+    let selected_checkpoint_scope = if let Some(scope) = selected_checkpoint_scope {
+        scope
     } else if bundled_profile {
         "bundled_profile"
     } else if video_profile {
@@ -1957,7 +2031,9 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     } else {
         ""
     };
-    let runtime_reason = if runtime_supported {
+    let runtime_reason = if let Some(reason) = blocked_reason {
+        reason.to_string()
+    } else if runtime_supported {
         String::new()
     } else if route == "video" {
         format!(
@@ -2619,6 +2695,20 @@ mod tests {
             ),
             "ideogram4"
         );
+        assert_eq!(
+            detect_checkpoint_format(
+                r#"{"model.diffusion_model.pos_embed":{"shape":[1,36864,2432]}}"#,
+                "sd3"
+            ),
+            "sd3_large_full_checkpoint"
+        );
+        assert_eq!(
+            detect_checkpoint_format(
+                r#"{"model.diffusion_model.pos_embed":{"shape":[1,147456,1536]}}"#,
+                "sd3"
+            ),
+            "sd3_medium_full_checkpoint"
+        );
     }
 
     #[test]
@@ -2726,19 +2816,39 @@ mod tests {
 
         let arbitrary_qwen =
             model_entry_json(&entry("creator-name", "qwen-image", "diffusion_model"), "");
-        assert_eq!(arbitrary_qwen["runtime_supported"], false);
-        assert_eq!(arbitrary_qwen["uses_selected_checkpoint"], false);
-        assert!(
-            arbitrary_qwen["runtime_reason"]
-                .as_str()
-                .unwrap()
-                .contains("prevent silently loading different weights")
-        );
+        assert_eq!(arbitrary_qwen["runtime_supported"], true);
+        assert_eq!(arbitrary_qwen["uses_selected_checkpoint"], true);
+        assert_eq!(arbitrary_qwen["selected_checkpoint_scope"], "denoiser");
+
+        let qwen_edit =
+            model_entry_json(&entry("qwen-image-edit-2511", "qwen-image", "diffusion_model"), "");
+        assert_eq!(qwen_edit["runtime_supported"], false);
+        assert_eq!(qwen_edit["uses_selected_checkpoint"], false);
 
         let bundled_flux = model_entry_json(&entry("flux1-dev", "flux", "diffusion_model"), "");
         assert_eq!(bundled_flux["runtime_supported"], true);
-        assert_eq!(bundled_flux["uses_selected_checkpoint"], false);
-        assert_eq!(bundled_flux["selected_checkpoint_scope"], "bundled_profile");
+        assert_eq!(bundled_flux["uses_selected_checkpoint"], true);
+        assert_eq!(bundled_flux["selected_checkpoint_scope"], "denoiser");
+
+        for arch in ["chroma", "anima"] {
+            let arbitrary =
+                model_entry_json(&entry("creator-name", arch, "diffusion_model"), "");
+            assert_eq!(arbitrary["runtime_supported"], true, "{arch}");
+            assert_eq!(arbitrary["uses_selected_checkpoint"], true, "{arch}");
+            assert_eq!(arbitrary["selected_checkpoint_scope"], "denoiser", "{arch}");
+        }
+
+        let arbitrary_sd3 =
+            model_entry_json(
+                &entry("creator-name", "sd3", "sd3_large_full_checkpoint"),
+                "",
+            );
+        assert_eq!(arbitrary_sd3["runtime_supported"], true);
+        assert_eq!(arbitrary_sd3["uses_selected_checkpoint"], true);
+        assert_eq!(
+            arbitrary_sd3["selected_checkpoint_scope"],
+            "full_checkpoint"
+        );
 
         let bundled_lens =
             model_entry_json(&entry("microsoft_lens", "lens", "diffusers_directory"), "");
@@ -2747,18 +2857,34 @@ mod tests {
         assert_eq!(bundled_lens["generation_defaults"]["steps"], 20);
         assert_eq!(bundled_lens["card"]["generation_defaults"]["cfg"], 5.0);
 
-        let unbound_zimage_turbo = model_entry_json(
+        let arbitrary_zimage_turbo = model_entry_json(
             &entry("z_image_turbo_bf16", "zimage", "diffusion_model"),
             "",
         );
-        assert_eq!(unbound_zimage_turbo["runtime_supported"], false);
-        assert_eq!(unbound_zimage_turbo["generation_defaults"]["steps"], 8);
-        assert!(
-            unbound_zimage_turbo["runtime_reason"]
-                .as_str()
-                .unwrap()
-                .contains("does not yet consume arbitrary selected checkpoints")
+        assert_eq!(arbitrary_zimage_turbo["runtime_supported"], true);
+        assert_eq!(arbitrary_zimage_turbo["uses_selected_checkpoint"], true);
+        assert_eq!(
+            arbitrary_zimage_turbo["selected_checkpoint_scope"],
+            "denoiser"
         );
+        assert_eq!(arbitrary_zimage_turbo["generation_defaults"]["steps"], 8);
+
+        let arbitrary_zimage = model_entry_json(
+            &entry("creator-custom-name", "zimage", "diffusion_model"),
+            "",
+        );
+        assert_eq!(arbitrary_zimage["runtime_supported"], true);
+        assert_eq!(arbitrary_zimage["uses_selected_checkpoint"], true);
+
+        let blocked_l2p = model_entry_json(
+            &entry("L2P/model-1k-merge", "zimage", "diffusion_model"),
+            "",
+        );
+        assert_eq!(blocked_l2p["runtime_supported"], false);
+        assert!(blocked_l2p["runtime_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no production serenity-server worker route"));
 
         let ltx_product =
             model_entry_json(&entry("ltx-2.3-22b-dev-fp8", "ltx2", "diffusion_model"), "");

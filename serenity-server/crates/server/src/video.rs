@@ -20,7 +20,9 @@ use serenity_wire::WorkerEvent;
 use crate::AppState;
 
 const RUNNER: &str = "output/bin/ltx2_video_smoke_runner";
-const LTX2_MOJO_REQUEST_RUNNER: &str = "output/bin/ltx2_serenity_cli";
+// One request-driven runner. Geometry is request data, never encoded in the
+// executable name or selected through a per-profile fallback.
+const LTX2_MOJO_REQUEST_RUNNER: &str = "output/bin/ltx2_serenity_runtime";
 const REALESRGAN_X4_RUNNER: &str = "output/bin/serenity_realesrgan_x4";
 const REALESRGAN_X4_WEIGHTS: &str = "upscalers/realesrgan-x4plus/RealESRGAN_x4.safetensors";
 const REALESRGAN_FAST_X4_WEIGHTS: &str =
@@ -51,12 +53,7 @@ const LTX2_REFHQ_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8";
 const LTX2_REFHQ_BF16_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8-dequant-bf16";
 const LTX2_REFHQ_DISTILLATION_ADAPTER: &str =
     "checkpoints/ltx-2.3-22b-distilled-lora-384-1.1.safetensors";
-// Backward-compatible creator profile. New native LTX2 profiles are selected
-// from LTX2_REQUEST_PROFILES_JSON and dispatched to an exact AOT Mojo runner.
-const LTX2_REQUEST_WIDTH: i64 = 512;
-const LTX2_REQUEST_HEIGHT: i64 = 768;
-const LTX2_REQUEST_FRAMES: i64 = 121;
-const LTX2_REQUEST_FPS: f64 = 25.0;
+const LTX2_CUDA_CACHE: &str = "/dev/shm/serenity-ltx2-cuda-cache";
 const LTX2_SAMPLER_PARITY_REPORT: &str = "output/checks/ltx2_sampler_parity.json";
 const LTX2_VAE_PARITY_REPORT: &str = "output/checks/ltx2_vae_frame_parity.json";
 const LTX2_AUDIO_PARITY_REPORT: &str = "output/checks/ltx2_audio_parity.json";
@@ -70,9 +67,7 @@ const BACKEND_NAME: &str = "mojo";
 /// packaged/two-machine deployments.  Never silently jump to a different local
 /// clone: the Mojo runner, scripts, and product UI must come from one codebase.
 fn repo_root() -> std::path::PathBuf {
-    std::env::var_os("SERENITY_REPO_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
+    crate::repository_root_path()
 }
 
 fn repo_path(path: &str) -> std::path::PathBuf {
@@ -161,9 +156,10 @@ const WAN22_VAE_SHA256: &str =
 const WAN22_RUNNER_SOURCE_BUNDLE_SHA256: &str =
     "ea317b6ae0914c4828d85489c1e5a2d0952d2ca3880a122e56287771f65d24fe";
 const WAN22_DEFAULT_NEGATIVE: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
+const WAN22_CUDA_CACHE: &str = "/dev/shm/serenity-wan22-cuda-cache";
 const MOJO_CUDNN_RUNTIME: &str = "cudnn/lib/libcudnn.so.9";
 /// Pixi runtime libs + cshim (cuDNN/int4) shims — required by the Mojo binaries.
-fn mojo_ld_path() -> std::ffi::OsString {
+pub(crate) fn mojo_ld_path() -> std::ffi::OsString {
     let root = repo_root();
     let mut parts = vec![
         root.join(".pixi/envs/default/lib"),
@@ -368,7 +364,6 @@ struct Ltx2ResolvedRequestProfile {
     modes: Vec<String>,
     duration: f64,
     source: String,
-    runner: String,
 }
 
 fn ltx2_checkpoint_workflow_registry() -> &'static Value {
@@ -480,16 +475,16 @@ fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
     })
 }
 
-fn ltx2_profile_runner_name(width: i64, height: i64, frames: i64, fps: i64) -> String {
-    format!("output/bin/ltx2_serenity_{width}x{height}_{frames}f_{fps}fps")
-}
-
 const LTX2_REQUEST_RUNNER_BUILD_INPUTS: &[&str] = &[
     "serenitymojo/configs/ltx2_request_profiles.json",
-    "serenitymojo/configs/ltx2_checkpoint_workflows.json",
+    // Checkpoint workflow aliases and authored defaults are embedded in this
+    // Rust server, which normalizes the request before launching Mojo. The AOT
+    // runner never reads that registry, so changing an alias must not
+    // invalidate every geometry-specialized executable.
     "serenitymojo/sampling/ltx2_request_cli.mojo",
     "serenitymojo/sampling/ltx2_sampling.mojo",
     "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo",
+    "serenitymojo/serve/proc_ipc.mojo",
     "serenitymojo/models/vae/ltx2_tiled_decode.mojo",
     "serenitymojo/models/vae/ltx2_vae_encoder.mojo",
     "serenitymojo/models/vae/conv3d.mojo",
@@ -507,10 +502,7 @@ fn ltx2_runner_mtime_covers_inputs(
         .all(|modified| *modified <= runner_modified)
 }
 
-/// An executable alone is not an available LTX profile. These runners contain
-/// compile-time geometry and request-routing code, so a binary older than any
-/// of its build inputs can execute a different checkpoint contract than the
-/// server publishes. Fail closed until the exact profile is rebuilt.
+/// Fail closed when the single runtime-geometry runner is missing or stale.
 fn ltx2_request_runner_current(path: &str) -> bool {
     if !bin_x(path) {
         return false;
@@ -552,34 +544,13 @@ fn ltx2_resolved_profiles() -> Vec<Ltx2ResolvedRequestProfile> {
                     modes: group.modes.clone(),
                     duration,
                     source: group.source.clone(),
-                    runner: ltx2_profile_runner_name(group.width, group.height, frames, group.fps),
                 })
         })
         .collect()
 }
 
-fn ltx2_profile_runner_available(profile: &Ltx2ResolvedRequestProfile) -> bool {
-    ltx2_request_runner_current(&profile.runner)
-        || (profile.width == LTX2_REQUEST_WIDTH
-            && profile.height == LTX2_REQUEST_HEIGHT
-            && profile.frames == LTX2_REQUEST_FRAMES
-            && profile.fps as f64 == LTX2_REQUEST_FPS
-            && ltx2_request_runner_current(LTX2_MOJO_REQUEST_RUNNER))
-}
-
-fn ltx2_effective_profile_runner(profile: &Ltx2ResolvedRequestProfile) -> String {
-    if ltx2_request_runner_current(&profile.runner) {
-        profile.runner.clone()
-    } else if profile.width == LTX2_REQUEST_WIDTH
-        && profile.height == LTX2_REQUEST_HEIGHT
-        && profile.frames == LTX2_REQUEST_FRAMES
-        && profile.fps as f64 == LTX2_REQUEST_FPS
-        && ltx2_request_runner_current(LTX2_MOJO_REQUEST_RUNNER)
-    {
-        LTX2_MOJO_REQUEST_RUNNER.to_string()
-    } else {
-        profile.runner.clone()
-    }
+fn ltx2_profile_runner_available(_profile: &Ltx2ResolvedRequestProfile) -> bool {
+    ltx2_request_runner_current(LTX2_MOJO_REQUEST_RUNNER)
 }
 
 fn ltx2_request_profile_for_mode(
@@ -598,15 +569,6 @@ fn ltx2_request_profile_for_mode(
     })
 }
 
-fn ltx2_request_profile(
-    width: i64,
-    height: i64,
-    frames: i64,
-    fps: f64,
-) -> Option<Ltx2ResolvedRequestProfile> {
-    ltx2_request_profile_for_mode(width, height, frames, fps, "standard")
-}
-
 fn ltx2_profile_document(profile: &Ltx2ResolvedRequestProfile) -> Value {
     json!({
         "id": profile.group_id,
@@ -621,7 +583,7 @@ fn ltx2_profile_document(profile: &Ltx2ResolvedRequestProfile) -> Value {
         "modes": profile.modes,
         "duration": profile.duration,
         "source": profile.source,
-        "runner": ltx2_effective_profile_runner(profile),
+        "runner": LTX2_MOJO_REQUEST_RUNNER,
         "available": ltx2_profile_runner_available(profile),
         "output_format": "mp4",
         "guidance_modes": ltx2_request_profile_registry().guidance_modes,
@@ -1709,7 +1671,7 @@ fn wan22_ti2v5b_lora(
 
 /// Read acceptance only from the machine-local evidence gate. The report is
 /// regenerated by scripts/check_wan22_product_gate.py after verifying the
-/// pinned native BF16 shards/VAE, streamed-runtime parity, representative frame
+/// pinned native BF16 shards/VAE, runtime parity, representative frame
 /// bytes, muxed T2V/I2V artifacts, visual inspection, wall time, and peak VRAM.
 fn wan22_product_gate_passed() -> bool {
     let Ok(bytes) = std::fs::read(repo_path(WAN22_PRODUCT_GATE)) else {
@@ -2028,17 +1990,8 @@ fn readiness_doc() -> Value {
     let ltx2_bf16_available = nonempty_file(&ltx2_bf16_checkpoint);
     let ltx2_default_profile = ltx2_profiles
         .iter()
-        .find(|profile| {
-            profile.width == LTX2_REQUEST_WIDTH
-                && profile.height == LTX2_REQUEST_HEIGHT
-                && profile.frames == LTX2_REQUEST_FRAMES
-                && profile.fps as f64 == LTX2_REQUEST_FPS
-        })
-        .or_else(|| {
-            ltx2_profiles
-                .iter()
-                .find(|profile| ltx2_profile_runner_available(profile))
-        })
+        .find(|profile| ltx2_profile_runner_available(profile))
+        .or_else(|| ltx2_profiles.first())
         .map(ltx2_profile_document)
         .unwrap_or(Value::Null);
     let ltx2_conditioning_missing = ltx2_mojo_conditioning_missing();
@@ -2168,17 +2121,7 @@ fn readiness_doc() -> Value {
                     "compiled_profile": ltx2_default_profile,
                     "supported_profiles": ltx2_profile_documents,
                     "checkpoint_workflows": ltx2_checkpoint_workflow_documents(),
-                    "camera_motions": [
-                        { "id": "none", "label": "None", "prompt_suffix": "" },
-                        { "id": "static", "label": "Static", "prompt_suffix": ", static camera, locked off shot, no camera movement" },
-                        { "id": "focus_shift", "label": "Focus shift", "prompt_suffix": ", focus shift, rack focus, changing focal point" },
-                        { "id": "dolly_in", "label": "Dolly in", "prompt_suffix": ", dolly in, camera pushing forward, smooth forward movement" },
-                        { "id": "dolly_out", "label": "Dolly out", "prompt_suffix": ", dolly out, camera pulling back, smooth backward movement" },
-                        { "id": "dolly_left", "label": "Dolly left", "prompt_suffix": ", dolly left, camera tracking left, lateral movement" },
-                        { "id": "dolly_right", "label": "Dolly right", "prompt_suffix": ", dolly right, camera tracking right, lateral movement" },
-                        { "id": "jib_up", "label": "Jib up", "prompt_suffix": ", jib up, camera rising up, upward crane movement" },
-                        { "id": "jib_down", "label": "Jib down", "prompt_suffix": ", jib down, camera lowering down, downward crane movement" }
-                    ],
+                    "camera_motions": ltx2_camera_motion_documents(),
                     "quant_modes": [
                         {
                             "id": "bf16",
@@ -2288,7 +2231,7 @@ fn readiness_doc() -> Value {
                     "max_count": 1,
                     "base_model": "Wan-AI/Wan2.2-TI2V-5B",
                     "format": "AI Toolkit/DiffusionModel block LoRA",
-                    "merge": "BF16: additive delta on each exact streamed block; FP8: one-time resident dequant-add-requant",
+                    "merge": "BF16: additive delta on each RAM-staged block; FP8: one-time resident dequant-add-requant",
                 }
             },
             "camera_motions": [
@@ -2304,7 +2247,7 @@ fn readiness_doc() -> Value {
             ],
             "sampler": "Flow-UniPC order 2, predict_x0; creator-native T2V/I2V shift 5",
             "quant_modes": ["bf16", "fp8"],
-            "quant_note": "BF16 block-streams the official converted transformer shards and is the admitted quality default; FP8 uses the persistent row-scaled E4M3 cache with BF16 on-use compute.",
+            "quant_note": "BF16 copies the official converted transformer shards into one complete pinned-host store before sampling and is the admitted quality default; FP8 uses the persistent row-scaled E4M3 cache with BF16 on-use compute.",
             "note": "Creator-native TI2V-5B: T2V uses the 1280x704/704x1280 native shapes; I2V treats that as a max-area bucket and preserves source aspect on a 32-pixel grid. The common 1248x704/704x1248 I2V shapes are precompiled. All profiles use 121 frames, 24 fps, and CFG 5. The visual product gate uses Wan's recommended local-Qwen prompt extension; raw prompts remain valid but may be less detailed.",
             "limit": "requires the existing isolated GPU lease; machine-local product acceptance requires the pinned parity, visual, mux, timing, and peak-VRAM gate",
         },
@@ -2411,6 +2354,98 @@ fn normalize_ltx2_prompt_fields(body: &Value) -> Value {
     normalized
 }
 
+#[derive(Clone, Copy)]
+struct Ltx2CameraMotionSpec {
+    id: &'static str,
+    label: &'static str,
+    prompt_suffix: &'static str,
+    adapter_filename: Option<&'static str>,
+}
+
+const LTX2_CAMERA_MOTIONS: [Ltx2CameraMotionSpec; 9] = [
+    Ltx2CameraMotionSpec {
+        id: "none",
+        label: "None",
+        prompt_suffix: "",
+        adapter_filename: None,
+    },
+    Ltx2CameraMotionSpec {
+        id: "static",
+        label: "Static",
+        prompt_suffix: ", static camera, locked off shot, no camera movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-static.safetensors"),
+    },
+    Ltx2CameraMotionSpec {
+        id: "focus_shift",
+        label: "Focus shift (prompt)",
+        prompt_suffix: ", focus shift, rack focus, changing focal point",
+        adapter_filename: None,
+    },
+    Ltx2CameraMotionSpec {
+        id: "dolly_in",
+        label: "Dolly in",
+        prompt_suffix: ", dolly in, camera pushing forward, smooth forward movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-dolly-in.safetensors"),
+    },
+    Ltx2CameraMotionSpec {
+        id: "dolly_out",
+        label: "Dolly out",
+        prompt_suffix: ", dolly out, camera pulling back, smooth backward movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-dolly-out.safetensors"),
+    },
+    Ltx2CameraMotionSpec {
+        id: "dolly_left",
+        label: "Dolly left",
+        prompt_suffix: ", dolly left, camera tracking left, lateral movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-dolly-left.safetensors"),
+    },
+    Ltx2CameraMotionSpec {
+        id: "dolly_right",
+        label: "Dolly right",
+        prompt_suffix: ", dolly right, camera tracking right, lateral movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-dolly-right.safetensors"),
+    },
+    Ltx2CameraMotionSpec {
+        id: "jib_up",
+        label: "Jib up",
+        prompt_suffix: ", jib up, camera rising up, upward crane movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-jib-up.safetensors"),
+    },
+    Ltx2CameraMotionSpec {
+        id: "jib_down",
+        label: "Jib down",
+        prompt_suffix: ", jib down, camera lowering down, downward crane movement",
+        adapter_filename: Some("ltx-2-19b-lora-camera-control-jib-down.safetensors"),
+    },
+];
+
+fn ltx2_camera_motion_spec(id: &str) -> Option<Ltx2CameraMotionSpec> {
+    LTX2_CAMERA_MOTIONS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.id == id)
+}
+
+fn ltx2_camera_motion_documents() -> Vec<Value> {
+    LTX2_CAMERA_MOTIONS
+        .iter()
+        .map(|motion| {
+            let adapter_path = motion
+                .adapter_filename
+                .map(|filename| model_path(&format!("loras/{filename}")));
+            let adapter_available = adapter_path.as_deref().is_some_and(nonempty_file);
+            json!({
+                "id": motion.id,
+                "label": motion.label,
+                "prompt_suffix": motion.prompt_suffix,
+                "control": if motion.adapter_filename.is_some() { "lora" } else if motion.id == "none" { "none" } else { "prompt" },
+                "adapter": motion.adapter_filename,
+                "available": motion.adapter_filename.is_none() || adapter_available,
+            })
+        })
+        .collect()
+}
+
 fn normalized_ltx2_camera_motion_request(body: &Value) -> Result<Value, String> {
     let mut normalized = body.clone();
     let motion = body
@@ -2418,27 +2453,13 @@ fn normalized_ltx2_camera_motion_request(body: &Value) -> Result<Value, String> 
         .and_then(Value::as_str)
         .unwrap_or("none")
         .trim();
-    let suffix = match motion {
-        "none" => "",
-        "static" => ", static camera, locked off shot, no camera movement",
-        "focus_shift" => ", focus shift, rack focus, changing focal point",
-        "dolly_in" => ", dolly in, camera pushing forward, smooth forward movement",
-        "dolly_out" => ", dolly out, camera pulling back, smooth backward movement",
-        "dolly_left" => ", dolly left, camera tracking left, lateral movement",
-        "dolly_right" => ", dolly right, camera tracking right, lateral movement",
-        "jib_up" => ", jib up, camera rising up, upward crane movement",
-        "jib_down" => ", jib down, camera lowering down, downward crane movement",
-        other => {
-            return Err(format!(
-                "unsupported LTX Desktop camera_motion '{other}'"
-            ));
-        }
-    };
+    let spec = ltx2_camera_motion_spec(motion)
+        .ok_or_else(|| format!("unsupported LTX camera_motion '{motion}'"))?;
     let object = normalized
         .as_object_mut()
         .ok_or_else(|| "LTX2 request must be an object".to_string())?;
     object.insert("camera_motion".to_string(), json!(motion));
-    if !suffix.is_empty()
+    if !spec.prompt_suffix.is_empty()
         && object
             .get("creator_camera_motion_applied")
             .and_then(Value::as_bool)
@@ -2450,14 +2471,39 @@ fn normalized_ltx2_camera_motion_request(body: &Value) -> Result<Value, String> 
             .unwrap_or("")
             .to_string();
         object.insert("creator_prompt".to_string(), json!(prompt));
-        object.insert("prompt".to_string(), json!(format!("{prompt}{suffix}")));
+        object.insert(
+            "prompt".to_string(),
+            json!(format!("{prompt}{}", spec.prompt_suffix)),
+        );
         object.insert(
             "creator_camera_motion_suffix".to_string(),
-            json!(suffix),
+            json!(spec.prompt_suffix),
         );
         object.insert(
             "creator_camera_motion_applied".to_string(),
             json!(true),
+        );
+    }
+    if let Some(filename) = spec.adapter_filename {
+        let adapter_path = model_path(&format!("loras/{filename}"));
+        let rows = object
+            .entry("lora".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| "LTX2 'lora' must be an array".to_string())?;
+        rows.retain(|row| {
+            row.get("source").and_then(Value::as_str) != Some("camera_control")
+        });
+        rows.push(json!({
+            "name": filename,
+            "weight": 1.0,
+            "role": "overlay",
+            "source": "camera_control",
+            "camera_motion": motion,
+        }));
+        object.insert(
+            "creator_camera_motion_adapter".to_string(),
+            json!(adapter_path.to_string_lossy()),
         );
     }
     Ok(normalized)
@@ -2621,8 +2667,9 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!(
-                    "LTX2 profile {}x{}, {} frames at {} FPS is supported but its exact Mojo runner is not built: {}",
-                    profile.width, profile.height, profile.frames, profile.fps, profile.runner,
+                    "LTX2 runtime-geometry Mojo runner is unavailable for {}x{}, {} frames at {} FPS: {}",
+                    profile.width, profile.height, profile.frames, profile.fps,
+                    LTX2_MOJO_REQUEST_RUNNER,
                 ),
             );
         }
@@ -3185,6 +3232,19 @@ struct Ltx2DistillationAdapter {
     source: &'static str,
 }
 
+fn is_official_ltx2_dev_checkpoint_name(name: &str) -> bool {
+    matches!(
+        name.strip_suffix(".safetensors").unwrap_or(name),
+        "ltx-2.3-22b-dev"
+            | LTX2_REFHQ_CHECKPOINT
+            | LTX2_REFHQ_BF16_CHECKPOINT
+    )
+}
+
+fn is_official_ltx2_dev_checkpoint(checkpoint: &crate::models::ResolvedCheckpoint) -> bool {
+    is_official_ltx2_dev_checkpoint_name(&checkpoint.name)
+}
+
 /// Resolve the sampling adapter that belongs to the selected checkpoint.
 ///
 /// Ordinary authored LoRAs remain in `lora[]`. A row explicitly marked
@@ -3319,10 +3379,7 @@ fn resolve_ltx2_distillation_adapter(
     if let Some(adapter) = explicit {
         return Ok(Some(adapter));
     }
-    if matches!(
-        checkpoint_id,
-        LTX2_REFHQ_CHECKPOINT | LTX2_REFHQ_BF16_CHECKPOINT
-    ) {
+    if is_official_ltx2_dev_checkpoint(checkpoint) {
         let path = model_path(LTX2_REFHQ_DISTILLATION_ADAPTER);
         if !nonempty_file(&path) {
             return Err(format!(
@@ -3367,10 +3424,7 @@ fn resolve_ltx2_retake_checkpoint(
         }
         return Ok(selected);
     }
-    if matches!(
-        selected_id,
-        LTX2_REFHQ_CHECKPOINT | LTX2_REFHQ_BF16_CHECKPOINT
-    ) {
+    if is_official_ltx2_dev_checkpoint(&selected) {
         for direct_distilled in ["ltx-2.3-22b-distilled-1.1", "ltx-2.3-22b-distilled"] {
             if let Some(candidate) = crate::models::resolve_checkpoint(direct_distilled) {
                 if ltx2_checkpoint_has_creator_edit_components(&candidate.path) {
@@ -4286,10 +4340,13 @@ fn start_ltx2_mojo_request(
         edit_mode,
     ) {
         Some(profile) if ltx2_profile_runner_available(&profile) => profile,
-        Some(profile) => {
+        Some(_profile) => {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                &format!("missing exact LTX2 Mojo runner {}", profile.runner),
+                &format!(
+                    "LTX2 runtime-geometry Mojo runner is unavailable: {}",
+                    LTX2_MOJO_REQUEST_RUNNER
+                ),
             );
         }
         None => {
@@ -4299,7 +4356,7 @@ fn start_ltx2_mojo_request(
             );
         }
     };
-    let request_runner = ltx2_effective_profile_runner(&profile);
+    let request_runner = LTX2_MOJO_REQUEST_RUNNER.to_string();
     let quant = body
         .get("quant")
         .and_then(Value::as_str)
@@ -4737,13 +4794,18 @@ fn start_ltx2_mojo_request(
         };
         let mut command = std::process::Command::new(repo_path(&thread_request_runner));
         let request_ld_path = ltx2_request_ld_path(&thread_edit_mode);
+        let ram_cache_ready = std::fs::create_dir_all(LTX2_CUDA_CACHE).is_ok();
         command
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", request_ld_path)
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
             .arg(&thread_request_path)
             .arg(&thread_out_dir)
             .stdout(std::process::Stdio::from(log))
             .stderr(std::process::Stdio::from(stderr));
+        if !ram_cache_ready {
+            command.env("CUDA_CACHE_DISABLE", "1");
+        }
         if let Some(path) = int4_slab {
             command.env("LTX2_INT4_SLAB", path);
         }
@@ -4851,11 +4913,15 @@ fn start_ltx2_mojo_request(
             decode
                 .current_dir(repo_root())
                 .env("LD_LIBRARY_PATH", ltx2_decode_ld_path())
+                .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
                 .arg("decode")
                 .arg(&thread_request_path)
                 .arg(&thread_out_dir)
                 .stdout(std::process::Stdio::from(decode_log))
                 .stderr(std::process::Stdio::from(decode_stderr));
+            if !ram_cache_ready {
+                decode.env("CUDA_CACHE_DISABLE", "1");
+            }
             let mut decode_child = match decode.spawn() {
                 Ok(child) => child,
                 Err(error) => {
@@ -5867,10 +5933,44 @@ fn post_video_ltx2_refhq(st: &AppState, b: &Value) -> Response {
 /// caller owns logging and peak-VRAM measurement through
 /// run_logged_with_gpu_peak.
 fn wan22_command(bin_abs: &std::path::Path) -> std::process::Command {
+    let root = repo_root();
+    let pixi_lib = root.join(".pixi/envs/default/lib");
+    let mut preload = [
+        "libcudnn_graph.so.9",
+        "libcudnn_engines_precompiled.so.9",
+        "libcudnn_engines_runtime_compiled.so.9",
+        "libcudnn_engines_tensor_ir.so.9",
+        "libcudnn_heuristic.so.9",
+    ]
+    .into_iter()
+    .map(|name| pixi_lib.join(name))
+    .collect::<Vec<_>>();
+    preload.extend([
+        std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1"),
+        std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu/libnvidia-nvvm70.so.4"),
+    ]);
+    if let Ok(entries) = std::fs::read_dir("/usr/lib/x86_64-linux-gnu") {
+        if let Some(gpucomp) = entries.flatten().map(|entry| entry.path()).find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("libnvidia-gpucomp.so."))
+        }) {
+            preload.push(gpucomp);
+        }
+    }
+    if let Some(existing) = std::env::var_os("LD_PRELOAD") {
+        preload.extend(std::env::split_paths(&existing));
+    }
+    let ram_cache_ready = std::fs::create_dir_all(WAN22_CUDA_CACHE).is_ok();
     let mut command = std::process::Command::new(bin_abs);
     command
-        .current_dir(repo_root())
-        .env("LD_LIBRARY_PATH", mojo_ld_path());
+        .current_dir(root)
+        .env("LD_LIBRARY_PATH", mojo_ld_path())
+        .env("LD_PRELOAD", std::env::join_paths(preload).unwrap_or_default())
+        .env("CUDA_CACHE_PATH", WAN22_CUDA_CACHE);
+    if !ram_cache_ready {
+        command.env("CUDA_CACHE_DISABLE", "1");
+    }
     command
 }
 
@@ -6394,7 +6494,7 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
         &json!({
             "schema": "serenity.video_result.v1", "video_id": video_id, "model": "wan22",
             "backend": BACKEND_NAME, "control_plane": "serenity-server",
-            "resident": if quant == "bf16" { "bf16_native_shards_block_streamed" } else { "fp8_e4m3_cached" },
+            "resident": if quant == "bf16" { "bf16_native_shards_pinned_host" } else { "fp8_e4m3_cached" },
             "mode": if is_i2v { "i2v_first_frame" } else { "t2v" },
             "readiness_label": if parity_ok { "quality_profile_ready" } else { "product_gate_required" },
             "accepted_video_artifact": artifact_ok, "accepted_video_parity": parity_ok,
@@ -6411,7 +6511,7 @@ fn post_video_wan22(st: &AppState, b: &Value) -> Response {
                 "path": path,
                 "matched_modules": pairs,
                 "merge": if quant == "bf16" {
-                    "exact_bf16_streamed_additive"
+                    "exact_bf16_pinned_host_additive"
                 } else {
                     "resident_fp8_requantized_once"
                 },
@@ -7574,7 +7674,7 @@ mod tests {
     }
 
     #[test]
-    fn ltx2_camera_motion_uses_the_ltx_desktop_prompt_contract_once() {
+    fn ltx2_camera_motion_attaches_one_real_adapter_and_one_prompt_suffix() {
         let normalized = normalized_ltx2_camera_motion_request(&json!({
             "prompt": "A woman turns toward the camera",
             "camera_motion": "dolly_in",
@@ -7589,14 +7689,21 @@ mod tests {
             "A woman turns toward the camera"
         );
         assert_eq!(normalized["creator_camera_motion_applied"], true);
+        assert_eq!(normalized["lora"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            normalized["lora"][0]["name"],
+            "ltx-2-19b-lora-camera-control-dolly-in.safetensors"
+        );
+        assert_eq!(normalized["lora"][0]["source"], "camera_control");
         let repeated = normalized_ltx2_camera_motion_request(&normalized).unwrap();
         assert_eq!(repeated["prompt"], normalized["prompt"]);
+        assert_eq!(repeated["lora"].as_array().unwrap().len(), 1);
         assert!(normalized_ltx2_camera_motion_request(&json!({
             "prompt": "probe",
             "camera_motion": "orbit",
         }))
         .unwrap_err()
-        .contains("unsupported LTX Desktop camera_motion"));
+        .contains("unsupported LTX camera_motion"));
     }
 
     #[test]
@@ -7688,38 +7795,68 @@ mod tests {
 
     #[test]
     fn sulphur_checkpoint_defaults_to_the_creator_workflow() {
-        let normalized = normalized_ltx2_checkpoint_workflow_request(&json!({
-            "checkpoint": "sulphur_dev_bf16",
-            "prompt": "creator workflow probe",
-            "negative": "",
-            "guidance_mode": "dev",
-            "sampler": "res2s",
-            "scheduler": "ltx2",
-            "steps": 20,
-            "workflow_profile": "",
-        }))
-        .unwrap();
-        assert_eq!(
-            normalized["workflow_profile"],
-            "sulphur-2-base-distilled-v1"
-        );
-        assert_eq!(normalized["guidance_mode"], "distilled");
-        assert_eq!(normalized["sampler"], "euler_ancestral_cfg_pp");
-        assert_eq!(normalized["scheduler"], "sulphur_creator_8_3");
-        assert_eq!(normalized["steps"], 8);
-        assert_eq!(
-            normalized["negative"],
-            "pc game, console game, video game, cartoon, childish, ugly"
-        );
-        assert_eq!(
-            normalized["creator_workflow_source"],
-            "https://huggingface.co/SulphurAI/Sulphur-2-base/blob/main/workflows/ltx23_t2v%20distilled.json"
-        );
+        for checkpoint in [
+            "sulphur_dev_bf16",
+            "sulphur_dev_fp8mixed",
+            "sulphur_dev_fp8_serenity",
+        ] {
+            let normalized = normalized_ltx2_checkpoint_workflow_request(&json!({
+                "checkpoint": checkpoint,
+                "prompt": "creator workflow probe",
+                "negative": "",
+                "guidance_mode": "dev",
+                "sampler": "res2s",
+                "scheduler": "ltx2",
+                "steps": 20,
+                "workflow_profile": "",
+            }))
+            .unwrap();
+            assert_eq!(
+                normalized["workflow_profile"],
+                "sulphur-2-base-distilled-v1"
+            );
+            assert_eq!(normalized["guidance_mode"], "distilled");
+            assert_eq!(normalized["sampler"], "euler_ancestral_cfg_pp");
+            assert_eq!(normalized["scheduler"], "sulphur_creator_8_3");
+            assert_eq!(normalized["steps"], 8);
+            assert_eq!(
+                normalized["negative"],
+                "pc game, console game, video game, cartoon, childish, ugly"
+            );
+            assert_eq!(
+                normalized["creator_workflow_source"],
+                "https://huggingface.co/SulphurAI/Sulphur-2-base/blob/main/workflows/ltx23_t2v%20distilled.json"
+            );
+        }
+    }
+
+    #[test]
+    fn official_ltx2_dev_aliases_share_the_creator_fast_identity() {
+        for checkpoint in [
+            "ltx-2.3-22b-dev",
+            "ltx-2.3-22b-dev.safetensors",
+            LTX2_REFHQ_CHECKPOINT,
+            "ltx-2.3-22b-dev-fp8.safetensors",
+            LTX2_REFHQ_BF16_CHECKPOINT,
+            "ltx-2.3-22b-dev-fp8-dequant-bf16.safetensors",
+        ] {
+            assert!(
+                is_official_ltx2_dev_checkpoint_name(checkpoint),
+                "official alias was not recognized: {checkpoint}"
+            );
+        }
+        assert!(!is_official_ltx2_dev_checkpoint_name(
+            "a-user-ltx23-full-finetune"
+        ));
     }
 
     #[test]
     fn sulphur_creator_registry_uses_the_published_enhancer_artifacts() {
-        let profile = ltx2_checkpoint_workflow("sulphur_dev_bf16.safetensors").unwrap();
+        let bf16_profile =
+            ltx2_checkpoint_workflow("sulphur_dev_bf16.safetensors").unwrap();
+        let profile =
+            ltx2_checkpoint_workflow("sulphur_dev_fp8_serenity.safetensors").unwrap();
+        assert_eq!(profile["id"], bf16_profile["id"]);
         assert_eq!(
             profile["prompt_enhancer"]["weights"],
             "prompt_enhancer/sulphur_prompt_enhancer_model-q8_0.gguf"
@@ -7758,6 +7895,11 @@ mod tests {
     fn ltx2_profile_runner_rejects_stale_build_inputs() {
         let base = std::time::UNIX_EPOCH;
         let runner = base + std::time::Duration::from_secs(20);
+        assert!(
+            !LTX2_REQUEST_RUNNER_BUILD_INPUTS
+                .contains(&"serenitymojo/configs/ltx2_checkpoint_workflows.json"),
+            "server-only workflow aliases must not stale every AOT geometry runner"
+        );
         assert!(ltx2_runner_mtime_covers_inputs(
             runner,
             &[
@@ -8117,6 +8259,37 @@ mod tests {
             WAN22_FPS,
             false,
         ));
+    }
+
+    #[test]
+    fn wan22_command_keeps_cuda_runtime_io_before_sampling() {
+        let command = wan22_command(std::path::Path::new("/tmp/wan22-test-runner"));
+        let cache = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CUDA_CACHE_PATH"))
+            .and_then(|(_, value)| value)
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap();
+        assert_eq!(cache, WAN22_CUDA_CACHE);
+
+        let preload = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("LD_PRELOAD"))
+            .and_then(|(_, value)| value)
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap();
+        for required in [
+            "libcudnn_graph.so.9",
+            "libcudnn_engines_precompiled.so.9",
+            "libcudnn_engines_runtime_compiled.so.9",
+            "libcudnn_engines_tensor_ir.so.9",
+            "libcudnn_heuristic.so.9",
+            "libnvidia-ptxjitcompiler.so.1",
+            "libnvidia-nvvm70.so.4",
+            "libnvidia-gpucomp.so.",
+        ] {
+            assert!(preload.contains(required), "missing preload: {required}");
+        }
     }
 
     #[test]
@@ -8651,10 +8824,10 @@ mod tests {
             "caps_positive": "/not/reached",
             "width": 1024,
             "height": 1024,
-            "frames": LTX2_REQUEST_FRAMES,
+            "frames": 121,
             "steps": 8,
             "seed": 42,
-            "fps": LTX2_REQUEST_FPS,
+            "fps": 24,
             "include_audio": false,
             "lora": [],
         });

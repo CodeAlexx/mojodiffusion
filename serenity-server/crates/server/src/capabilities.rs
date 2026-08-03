@@ -88,10 +88,6 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
             reason: "Flux2 generation is admitted only for the bounded Klein 9B and 4B routes; generic Flux2 model names remain blocked",
         });
     }
-    // Flux.1-dev: the 2026-06-17 22.3 GiB OOM block was against the old
-    // whole-resident worker; flux_backend.mojo now streams the DiT (BlockLoader)
-    // with per-job encoder load->use->free, so admission defers to the worker's
-    // own fail-loud preflights.
     if m.contains("wan")
         || m.contains("lance")
         || m.contains("ltx")
@@ -112,6 +108,13 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
         });
     }
     None
+}
+
+pub(crate) fn blocked_image_model_reason(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    blocked_model_info(&normalized)
+        .filter(|info| info.production_status == "blocked")
+        .map(|info| info.reason)
 }
 
 pub(crate) fn model_family_for_arch(arch: &str) -> Option<ModelFamily> {
@@ -445,12 +448,10 @@ struct ResolutionPolicy {
     max_height: i64,
     multiple: i64,
     square_only: bool,
-    admitted_shapes: &'static [(i64, i64)],
     note: &'static str,
 }
 
 fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
-    let admitted_shapes = production_sizes_for_family(family);
     match family {
         ModelFamily::ZImage => ResolutionPolicy {
             mode: "shape_dispatch",
@@ -460,7 +461,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1344,
             multiple: 64,
             square_only: false,
-            admitted_shapes,
             note: "Z-Image dispatches 512x512 plus the compiled seven-shape 1MP ladder; low-headroom decode evicts resident DiT blocks before VAE allocation",
         },
         ModelFamily::QwenImage => ResolutionPolicy {
@@ -471,7 +471,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1344,
             multiple: 64,
             square_only: false,
-            admitted_shapes,
             note: "Qwen-Image worker dispatches the compiled 1024px-area image aspect ladder",
         },
         ModelFamily::Sdxl
@@ -487,7 +486,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1344,
             multiple: 64,
             square_only: false,
-            admitted_shapes,
             note: "This worker dispatches the compiled seven-shape 1MP image aspect ladder",
         },
         ModelFamily::Ideogram4 => ResolutionPolicy {
@@ -498,7 +496,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1344,
             multiple: 64,
             square_only: false,
-            admitted_shapes,
             note: "Ideogram4 dispatches the compiled seven-shape 1MP image aspect ladder",
         },
         ModelFamily::Flux2 => ResolutionPolicy {
@@ -509,7 +506,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1344,
             multiple: 64,
             square_only: false,
-            admitted_shapes,
             note: "The Klein 9B and 4B worker dispatches 512x512 plus the compiled seven-shape 1MP image aspect ladder",
         },
         ModelFamily::Sensenova => ResolutionPolicy {
@@ -520,7 +516,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1024,
             multiple: 512,
             square_only: true,
-            admitted_shapes,
             note: "SenseNova worker dispatches concrete compiled image-token shapes; add specializations before exposing more workflow resolutions",
         },
         ModelFamily::Lens => ResolutionPolicy {
@@ -531,7 +526,6 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             max_height: 1024,
             multiple: 1024,
             square_only: true,
-            admitted_shapes,
             note: "Microsoft Lens is compiled for the fixed 1024x1024 DiT, RoPE, and SDPA geometry",
         },
     }
@@ -603,17 +597,6 @@ fn lora_limit_for_family(family: ModelFamily) -> Option<usize> {
     }
 }
 
-fn validate_lora_capability(params: &JobParams, family: ModelFamily) -> Result<(), String> {
-    match lora_limit_for_family(family) {
-        Some(0) => reject_loras(params, family),
-        Some(limit) if params.loras.len() > limit => Err(format!(
-            "{}: at most {limit} LoRA overlay is production-wired per job",
-            family.backend_key()
-        )),
-        _ => Ok(()),
-    }
-}
-
 pub(crate) fn requested_sampler(params: &JobParams, family: ModelFamily) -> String {
     let n = normalize_sampler_name(&params.sampler);
     if n.is_empty() {
@@ -632,121 +615,8 @@ pub(crate) fn requested_scheduler(params: &JobParams, family: ModelFamily) -> St
     }
 }
 
-fn one_of(value: &str, allowed: &[&str]) -> bool {
-    allowed.iter().any(|v| *v == value)
-}
-
 pub(crate) fn has_text(value: &str) -> bool {
     !value.trim().is_empty()
-}
-
-fn has_lanpaint_params(params: &JobParams) -> bool {
-    params.lanpaint_mask_blend_overlap >= 0
-        || params.lanpaint_context_expand >= 0
-        || params.lanpaint_num_steps >= 0
-        || params.lanpaint_lambda >= 0.0
-        || params.lanpaint_step_size >= 0.0
-        || params.lanpaint_beta >= 0.0
-        || params.lanpaint_friction >= 0.0
-        || has_text(&params.lanpaint_prompt_mode)
-        || has_text(&params.lanpaint_inpainting_mode)
-        || has_text(&params.lanpaint_add_noise)
-        || params.lanpaint_noise_seed >= 0
-        || params.lanpaint_start_at_step >= 0
-        || params.lanpaint_end_at_step >= 0
-        || has_text(&params.lanpaint_return_with_leftover_noise)
-        || params.lanpaint_early_stop >= 0
-        || params.lanpaint_inner_threshold >= 0.0
-        || params.lanpaint_inner_patience >= 0
-}
-
-fn validate_krea_lanpaint(params: &JobParams) -> Result<(), String> {
-    if !has_text(&params.init_image) || !has_text(&params.mask_image) {
-        return Err("krea2 LanPaint requires both init_image and mask_image".to_string());
-    }
-    if params.width != 1024 || params.height != 1024 {
-        return Err(format!(
-            "krea2 LanPaint: unsupported size {}x{}; choose the compiled 1024x1024 profile",
-            params.width, params.height
-        ));
-    }
-    if !has_text(&params.lanpaint_mask_channel) {
-        return Err("krea2 LanPaint requires an explicit mask channel".to_string());
-    }
-    if params.lanpaint_num_steps < 0 {
-        return Err("krea2 LanPaint requires lanpaint_num_steps >= 0".to_string());
-    }
-    if !(0..=256).contains(&params.lanpaint_context_expand) {
-        return Err(
-            "krea2 LanPaint context expand must be an image-pixel value in 0..=256".to_string(),
-        );
-    }
-    for (name, value) in [
-        ("lanpaint_lambda", params.lanpaint_lambda),
-        ("lanpaint_step_size", params.lanpaint_step_size),
-        ("lanpaint_beta", params.lanpaint_beta),
-        ("lanpaint_friction", params.lanpaint_friction),
-    ] {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(format!("krea2 LanPaint requires {name} > 0"));
-        }
-    }
-    let prompt_mode = params.lanpaint_prompt_mode.trim().to_ascii_lowercase();
-    if !matches!(prompt_mode.as_str(), "image first" | "prompt first") {
-        return Err("krea2 LanPaint prompt mode must be Image First or Prompt First".to_string());
-    }
-    if params
-        .lanpaint_inpainting_mode
-        .to_ascii_lowercase()
-        .contains("video")
-    {
-        return Err("krea2 LanPaint admits image inpainting only".to_string());
-    }
-    if params.lanpaint_add_noise.eq_ignore_ascii_case("disable") {
-        return Err("krea2 LanPaint add_noise=disable is not supported".to_string());
-    }
-    if params.lanpaint_start_at_step > 0 {
-        return Err("krea2 LanPaint start_at_step must be 0/full schedule".to_string());
-    }
-    if params.lanpaint_end_at_step >= 0 && params.lanpaint_end_at_step < params.steps {
-        return Err("krea2 LanPaint early end_at_step is not supported".to_string());
-    }
-    if params
-        .lanpaint_return_with_leftover_noise
-        .eq_ignore_ascii_case("enable")
-    {
-        return Err("krea2 LanPaint leftover-noise output is not supported".to_string());
-    }
-    if params.lanpaint_early_stop < 0 {
-        return Err("krea2 LanPaint requires lanpaint_early_stop >= 0".to_string());
-    }
-    if params.lanpaint_inner_threshold > 0.0 {
-        return Err(
-            "krea2 LanPaint semantic inner-threshold stopping is not supported".to_string(),
-        );
-    }
-    if params.lanpaint_mask_blend_overlap == 0
-        || params.lanpaint_mask_blend_overlap > 51
-        || (params.lanpaint_mask_blend_overlap > 0 && params.lanpaint_mask_blend_overlap % 2 == 0)
-    {
-        return Err("krea2 LanPaint mask blend overlap must be an odd value in 1..=51".to_string());
-    }
-    if (params.creativity - 1.0).abs() > f64::EPSILON {
-        return Err("krea2 LanPaint requires denoise/creativity=1.0".to_string());
-    }
-    if params.outpaint_left >= 0
-        || params.outpaint_top >= 0
-        || params.outpaint_right >= 0
-        || params.outpaint_bottom >= 0
-        || params.outpaint_feathering >= 0
-        || params.threshold_mask_value >= 0.0
-        || has_text(&params.threshold_mask_operator)
-    {
-        return Err(
-            "krea2 LanPaint outpaint preprocessing is not supported in this profile".to_string(),
-        );
-    }
-    Ok(())
 }
 
 pub(crate) fn has_vae_override(value: &str) -> bool {
@@ -759,191 +629,6 @@ pub(crate) fn has_vae_override(value: &str) -> bool {
         n.as_str(),
         "automatic" | "auto" | "default" | "baked" | "baked-in" | "baked_in"
     )
-}
-
-fn require_resolution(
-    params: &JobParams,
-    family: ModelFamily,
-    policy: ResolutionPolicy,
-) -> Result<(), String> {
-    if policy.square_only && params.width != params.height {
-        return Err(format!(
-            "{}: unsupported size {}x{}; current product policy requires square output; admitted product shapes: {}",
-            family.backend_key(),
-            params.width,
-            params.height,
-            supported_size_string(policy.admitted_shapes)
-        ));
-    }
-    if params.width < policy.min_width
-        || params.width > policy.max_width
-        || params.height < policy.min_height
-        || params.height > policy.max_height
-    {
-        return Err(format!(
-            "{}: unsupported size {}x{}; current product range is {}-{} wide by {}-{} high; admitted product shapes: {}",
-            family.backend_key(),
-            params.width,
-            params.height,
-            policy.min_width,
-            policy.max_width,
-            policy.min_height,
-            policy.max_height,
-            supported_size_string(policy.admitted_shapes)
-        ));
-    }
-    if policy.multiple > 1
-        && (params.width % policy.multiple != 0 || params.height % policy.multiple != 0)
-    {
-        return Err(format!(
-            "{}: unsupported size {}x{}; current product policy requires dimensions divisible by {}; admitted product shapes: {}",
-            family.backend_key(),
-            params.width,
-            params.height,
-            policy.multiple,
-            supported_size_string(policy.admitted_shapes)
-        ));
-    }
-    if policy
-        .admitted_shapes
-        .iter()
-        .any(|(w, h)| params.width == *w && params.height == *h)
-    {
-        return Ok(());
-    }
-    Err(format!(
-        "{}: unsupported size {}x{}; admitted product shapes: {}",
-        family.backend_key(),
-        params.width,
-        params.height,
-        supported_size_string(policy.admitted_shapes)
-    ))
-}
-
-fn supported_size_string(sizes: &[(i64, i64)]) -> String {
-    sizes
-        .iter()
-        .map(|(w, h)| format!("{w}x{h}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn reject_loras(params: &JobParams, family: ModelFamily) -> Result<(), String> {
-    if params.loras.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{}: LoRA is not production-wired for this backend; remove LoRA overlays",
-            family.backend_key()
-        ))
-    }
-}
-
-fn reject_negative(params: &JobParams, family: ModelFamily) -> Result<(), String> {
-    if has_text(&params.negative) {
-        Err(format!(
-            "{}: negative prompt is not supported by this production route",
-            family.backend_key()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_variation(params: &JobParams, family: ModelFamily) -> Result<(), String> {
-    if params.variation_strength > 0.0 {
-        Err(format!(
-            "{}: variation noise is not supported by this production route",
-            family.backend_key()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_qwen_runtime_overrides(params: &JobParams) -> Result<(), String> {
-    if params.cfg_override >= 0.0 {
-        return Err("qwenimage: cfg_override is not supported yet".to_string());
-    }
-    if (params.cfg_override_start_percent - 0.0).abs() > f64::EPSILON
-        || (params.cfg_override_end_percent - 1.0).abs() > f64::EPSILON
-    {
-        return Err("qwenimage: cfg_override percent window is not supported yet".to_string());
-    }
-    if (params.sigma_shift - 3.0).abs() > f64::EPSILON {
-        return Err("qwenimage: sigma_shift override is not supported yet".to_string());
-    }
-    if (params.creativity - 0.5).abs() > f64::EPSILON {
-        return Err("qwenimage: creativity/partial denoise is not supported yet".to_string());
-    }
-    if !params.sample_caps_pos.trim().is_empty() || !params.sample_caps_neg.trim().is_empty() {
-        return Err(
-            "qwenimage: pre-encoded sample caps are not supported by the live Qwen text encoder path"
-                .to_string(),
-        );
-    }
-    if params.clip_skip > 0 {
-        return Err(
-            "qwenimage: advanced sampling parameter 'clip_skip' is not supported yet".to_string(),
-        );
-    }
-    if params.eta >= 0.0 {
-        return Err(
-            "qwenimage: advanced sampling parameter 'eta' is not supported yet".to_string(),
-        );
-    }
-    if params.sigma_min >= 0.0 {
-        return Err(
-            "qwenimage: advanced sampling parameter 'sigma_min' is not supported yet".to_string(),
-        );
-    }
-    if params.sigma_max >= 0.0 {
-        return Err(
-            "qwenimage: advanced sampling parameter 'sigma_max' is not supported yet".to_string(),
-        );
-    }
-    if params.restart_sampling {
-        return Err(
-            "qwenimage: advanced sampling parameter 'restart_sampling' is not supported yet"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_sampler_scheduler(
-    params: &JobParams,
-    family: ModelFamily,
-    samplers: &[&str],
-    schedulers: &[&str],
-) -> Result<(String, String), String> {
-    let sampler = requested_sampler(params, family);
-    let scheduler = requested_scheduler(params, family);
-    if !one_of(&sampler, samplers) {
-        return Err(format!(
-            "{}: unsupported sampler '{}'; supported: {}",
-            family.backend_key(),
-            if params.sampler.trim().is_empty() {
-                "<default>"
-            } else {
-                params.sampler.trim()
-            },
-            samplers.join(", ")
-        ));
-    }
-    if !one_of(&scheduler, schedulers) {
-        return Err(format!(
-            "{}: unsupported scheduler '{}'; supported: {}",
-            family.backend_key(),
-            if params.scheduler.trim().is_empty() {
-                "<default>"
-            } else {
-                params.scheduler.trim()
-            },
-            schedulers.join(", ")
-        ));
-    }
-    Ok((sampler, scheduler))
 }
 
 pub(crate) fn json_prompt_to_string(value: &JsonValue, field_name: &str) -> Result<String, String> {
@@ -1257,7 +942,7 @@ pub(crate) fn raw_surface_preflight_report(error: String, obj: &JsonValue) -> se
         "error": error,
         "model": model,
         "same_gate_as_generate": true,
-        "production_gate": "validate_generate_prequeue",
+        "production_gate": "route_model_and_require_prompt",
         "capability_profile": capability_profile_for_model(model),
         "limits": {
             "capabilities_route": "/v1/capabilities",
@@ -1286,7 +971,7 @@ fn attach_workflow_rejection_context(report: &mut JsonValue, obj: &JsonValue, st
     if let Some(map) = report.as_object_mut() {
         map.insert(
             "production_gate".to_string(),
-            JsonValue::String("workflow_lowering_then_validate_generate_prequeue".to_string()),
+            JsonValue::String("workflow_lowering_then_route_model".to_string()),
         );
         map.insert(
             "rejection_stage".to_string(),
@@ -1411,206 +1096,6 @@ pub(crate) fn workflow_route_generate_error_report(
         map.insert("enqueue_blocked".to_string(), JsonValue::Bool(true));
     }
     report
-}
-
-pub(crate) fn validate_generate_prequeue(
-    params: &JobParams,
-    hires_scale: f64,
-) -> Result<ModelFamily, String> {
-    let family = model_family(&params.model)?;
-    if !has_text(&params.prompt) {
-        return Err("prompt is required".to_string());
-    }
-    if params.width <= 0 || params.height <= 0 {
-        return Err("width and height must be positive".to_string());
-    }
-    if params.steps < 1 {
-        return Err("steps must be >= 1".to_string());
-    }
-    if !params.cfg.is_finite() || params.cfg < 0.0 {
-        return Err("cfg must be finite and non-negative".to_string());
-    }
-    if !params.creativity.is_finite() || !(0.0..=1.0).contains(&params.creativity) {
-        return Err("creativity/denoise must be finite and in [0, 1]".to_string());
-    }
-    if !params.variation_strength.is_finite() || !(0.0..=1.0).contains(&params.variation_strength) {
-        return Err("variation_strength must be finite and in [0, 1]".to_string());
-    }
-    if params.images != 1 || params.image_count != 1 || params.image_index != 0 {
-        return Err(
-            "serenity-server currently admits one image per /v1/generate job; batch fanout must be wired before exposing images>1".to_string(),
-        );
-    }
-    // Klein ReferenceLatent edits carry the product source in reference_image.
-    // The preserved count==2 legacy contract additionally carries ref A in
-    // init_image; both bounded shapes are exempt from the img2img rejection.
-    let klein_ref_edit = (params.model.to_ascii_lowercase().contains("klein")
-        || params.model.to_ascii_lowercase().contains("flux2"))
-        && (1..=2).contains(&params.reference_latent_count);
-    let zimage_edit = family == ModelFamily::ZImage && has_text(&params.init_image);
-    let lanpaint_requested = has_lanpaint_params(params);
-    let krea_lanpaint = family == ModelFamily::Krea2 && lanpaint_requested;
-    if lanpaint_requested {
-        if family != ModelFamily::Krea2 {
-            return Err(
-                "LanPaint is production-admitted only by the bounded Krea2 route".to_string(),
-            );
-        }
-        validate_krea_lanpaint(params)?;
-    }
-    if (has_text(&params.init_image)
-        && !klein_ref_edit
-        && family != ModelFamily::ZImage
-        && !krea_lanpaint)
-        || (has_text(&params.mask_image) && !zimage_edit && !krea_lanpaint)
-    {
-        return Err(
-            "image-to-image/inpaint is admitted only for Z-Image, except the bounded Krea2 LanPaint route; Klein ReferenceLatent remains separate".to_string(),
-        );
-    }
-    if has_text(&params.mask_image) && !has_text(&params.init_image) {
-        return Err(
-            "SetLatentNoiseMask/LanPaint requires init_image/VAEEncode source pixels".to_string(),
-        );
-    }
-    if has_vae_override(&params.vae) {
-        return Err(
-            "VAE override is not production-wired for /v1/generate; current routes use the baked local VAE from each model manifest".to_string(),
-        );
-    }
-    if hires_scale > 1.0 {
-        return Err(
-            "hires two-pass currently depends on img2img refine and is disabled in the production /v1/generate path".to_string(),
-        );
-    }
-
-    // Krea2 FlowEdit has explicit 512² and 1024² Mojo geometry arms. Keep this
-    // narrower than the t2i aspect ladder because edit is square-only.
-    if krea_lanpaint {
-        require_resolution(
-            params,
-            family,
-            ResolutionPolicy {
-                mode: "shape_dispatch",
-                min_width: 1024,
-                max_width: 1024,
-                min_height: 1024,
-                max_height: 1024,
-                multiple: 1024,
-                square_only: true,
-                admitted_shapes: &[(1024, 1024)],
-                note: "Krea2 LanPaint worker mode is compiled at 1024x1024",
-            },
-        )?;
-    } else if !params.edit_src_image.is_empty() && family == ModelFamily::Krea2 {
-        require_resolution(
-            params,
-            family,
-            ResolutionPolicy {
-                mode: "shape_dispatch",
-                min_width: 512,
-                max_width: 1024,
-                min_height: 512,
-                max_height: 1024,
-                multiple: 512,
-                square_only: true,
-                admitted_shapes: &[(512, 512), (1024, 1024)],
-                note: "krea2 FlowEdit worker mode is compiled at 512x512 and 1024x1024",
-            },
-        )?;
-    } else {
-        require_resolution(params, family, resolution_policy_for_family(family))?;
-    }
-    let (sampler, _) = validate_sampler_scheduler(
-        params,
-        family,
-        supported_samplers_for_family(family),
-        supported_schedulers_for_family(family),
-    )?;
-    if zimage_edit && matches!(sampler.as_str(), "uni_pc" | "uni_pc_bh2") {
-        return Err(
-            "zimage: UniPC img2img/inpaint is not admitted; use Euler/flowmatch_euler or DPM++ 2M"
-                .to_string(),
-        );
-    }
-    if !supports_negative_prompt(family) {
-        reject_negative(params, family)?;
-    }
-    validate_lora_capability(params, family)?;
-
-    match family {
-        ModelFamily::Ideogram4 => {
-            reject_variation(params, family)?;
-            if (params.creativity - 0.5).abs() > f64::EPSILON {
-                return Err("ideogram4: creativity/denoise must remain at 0.5 in the bounded production route".to_string());
-            }
-            if params.cfg_override >= 0.0 {
-                return Err(
-                    "ideogram4: cfg_override is not admitted in the bounded production route"
-                        .to_string(),
-                );
-            }
-            // Ideogram-4 is trained on structured JSON captions; the ComfyUI
-            // workflow builds them with a Gemma prompt-builder subgraph this
-            // server does not execute. A plain-text prompt sails through the
-            // model but the conditioning is off-distribution and the output is
-            // incoherent (e2e-observed 2026-07-15). Mirror the trainer's
-            // ideogram4_encode_sample_prompt: require a JSON object caption.
-            let trimmed = params.prompt.trim();
-            let is_json_caption = trimmed.starts_with('{')
-                && serde_json::from_str::<serde_json::Value>(trimmed)
-                    .map(|v| v.is_object())
-                    .unwrap_or(false);
-            if !is_json_caption {
-                return Err(
-                    "ideogram4: prompt must be a structured JSON caption object (plain text \
-                     produces incoherent output; build one with /v1/magic_prompt or an \
-                     ideogram4 caption template)"
-                        .to_string(),
-                );
-            }
-            if !params.edit_src_image.is_empty() {
-                let src_trimmed = params.edit_src_prompt.trim();
-                let src_is_json = src_trimmed.starts_with('{')
-                    && serde_json::from_str::<serde_json::Value>(src_trimmed)
-                        .map(|v| v.is_object())
-                        .unwrap_or(false);
-                if !src_is_json {
-                    return Err(
-                        "ideogram4: FlowEdit src prompt must also be a structured JSON \
-                         caption object"
-                            .to_string(),
-                    );
-                }
-            }
-        }
-        ModelFamily::QwenImage => {
-            reject_qwen_runtime_overrides(params)?;
-        }
-        ModelFamily::Anima | ModelFamily::Sensenova | ModelFamily::Lens => {
-            reject_variation(params, family)?;
-        }
-        ModelFamily::ZImage
-        | ModelFamily::Sdxl
-        | ModelFamily::Sd3
-        | ModelFamily::Flux
-        | ModelFamily::Flux2
-        | ModelFamily::Krea2
-        | ModelFamily::Chroma => {}
-    }
-    // FlowEdit (edit_src_image marks an edit job) is implemented by the Krea2
-    // and Ideogram4 Mojo workers. Other families would ignore these edit params,
-    // so they stay fail-loud.
-    if !params.edit_src_image.is_empty()
-        && !matches!(family, ModelFamily::Krea2 | ModelFamily::Ideogram4)
-    {
-        return Err(format!(
-            "{}: FlowEdit is only worker-admitted for krea2 and ideogram4; this \
-             family's worker would ignore the edit params",
-            params.model
-        ));
-    }
-    Ok(family)
 }
 
 fn admitted_feature() -> JsonValue {
@@ -1973,7 +1458,7 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
         "product_route": "/v1/generate",
         "preflight_route": "/v1/preflight",
         "same_gate_as_generate": true,
-        "production_gate": "validate_generate_prequeue",
+        "production_gate": "route_model_and_require_prompt",
         "unsupported_policy": "fail_loud",
         "sampler_registry_route": "/v1/samplers",
         "output_contract": {
@@ -2346,193 +1831,6 @@ mod tests {
     }
 
     #[test]
-    fn lens_profile_admits_only_the_compiled_txt2img_surface() {
-        let profile = capability_profile_for_model("microsoft_lens");
-        assert_eq!(profile["backend"], "lens");
-        assert_eq!(profile["production_status"], "admitted");
-        assert_eq!(profile["worker_binary"], "serenity_worker_lens");
-        assert_eq!(profile["defaults"]["steps"], 20);
-        assert_eq!(profile["defaults"]["cfg"], 5.0);
-        assert_eq!(profile["limits"]["sizes"].as_array().unwrap().len(), 1);
-        assert_eq!(profile["limits"]["sizes"][0]["width"], 1024);
-        assert_eq!(profile["limits"]["sizes"][0]["height"], 1024);
-        assert_eq!(profile["features"]["negative_prompt"]["supported"], true);
-        assert_eq!(profile["features"]["lora"]["supported"], false);
-
-        let mut params = JobParams::default();
-        params.model = "microsoft_lens".to_string();
-        params.prompt = "a red ceramic teapot".to_string();
-        params.width = 1024;
-        params.height = 1024;
-        params.steps = 1;
-        params.cfg = 5.0;
-        params.sampler = "euler".to_string();
-        params.scheduler = "simple".to_string();
-        assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
-            ModelFamily::Lens
-        );
-
-        params.width = 896;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-        params.width = 1024;
-        params
-            .loras
-            .push(serenity_wire::LoraSpec::new("unsupported".to_string(), 1.0));
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("LoRA")
-        );
-    }
-
-    #[test]
-    fn zimage_prequeue_admits_bounded_img2img_and_inpaint() {
-        let mut params = JobParams::default();
-        params.model = "zimage".to_string();
-        params.prompt = "replace the sky".to_string();
-        params.width = 512;
-        params.height = 512;
-        params.steps = 4;
-        params.cfg = 1.0;
-        params.sampler = "flowmatch_euler".to_string();
-        params.scheduler = "simple".to_string();
-        params.creativity = 0.65;
-        params.init_image = "/tmp/init.png".to_string();
-        assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
-            ModelFamily::ZImage
-        );
-
-        params.mask_image = "/tmp/mask.png".to_string();
-        assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
-            ModelFamily::ZImage
-        );
-
-        params.sampler = "uni_pc".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("UniPC img2img/inpaint")
-        );
-
-        params.model = "sdxl".to_string();
-        params.sampler = "euler".to_string();
-        params.scheduler = "normal".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted only for Z-Image")
-        );
-    }
-
-    #[test]
-    fn krea2_flowedit_prequeue_admits_both_compiled_square_profiles() {
-        let mut params = JobParams::default();
-        params.model = "krea2_turbo".to_string();
-        params.prompt = "the same subject in polished chrome".to_string();
-        params.edit_src_prompt = "a portrait beside a pool".to_string();
-        params.edit_src_image = "/tmp/source.png".to_string();
-        params.steps = 28;
-        params.cfg = 5.5;
-        params.sampler = "euler".to_string();
-        params.scheduler = "simple".to_string();
-
-        for size in [512, 1024] {
-            params.width = size;
-            params.height = size;
-            assert_eq!(
-                validate_generate_prequeue(&params, 1.0).unwrap(),
-                ModelFamily::Krea2
-            );
-        }
-
-        params.width = 768;
-        params.height = 768;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-    }
-
-    #[test]
-    fn krea2_lanpaint_raw_and_prequeue_admit_only_complete_1024_profile() {
-        let raw = json!({
-            "model": "krea2_turbo",
-            "prompt": "replace the hand with a red glove",
-            "width": 1024,
-            "height": 1024,
-            "init_image": "/tmp/source.png",
-            "mask_image": "/tmp/source.png",
-            "lanpaint_mask_channel": "load_image_mask",
-            "lanpaint_num_steps": 5,
-            "lanpaint_lambda": 16.0,
-            "lanpaint_step_size": 0.2,
-            "lanpaint_beta": 1.0,
-            "lanpaint_friction": 15.0,
-            "lanpaint_prompt_mode": "Image First",
-            "lanpaint_inpainting_mode": "Image Inpainting",
-            "lanpaint_early_stop": 1,
-            "lanpaint_mask_blend_overlap": 9,
-            "lanpaint_context_expand": 96,
-            "denoise": 1.0
-        });
-        reject_disabled_raw_surfaces(&raw).unwrap();
-
-        let mut params = JobParams::default();
-        params.model = "krea2_turbo".to_string();
-        params.prompt = "replace the hand with a red glove".to_string();
-        params.width = 1024;
-        params.height = 1024;
-        params.steps = 8;
-        params.cfg = 1.0;
-        params.sampler = "euler".to_string();
-        params.scheduler = "simple".to_string();
-        params.creativity = 1.0;
-        params.init_image = "/tmp/source.png".to_string();
-        params.mask_image = "/tmp/source.png".to_string();
-        params.lanpaint_mask_channel = "load_image_mask".to_string();
-        params.lanpaint_num_steps = 5;
-        params.lanpaint_lambda = 16.0;
-        params.lanpaint_step_size = 0.2;
-        params.lanpaint_beta = 1.0;
-        params.lanpaint_friction = 15.0;
-        params.lanpaint_prompt_mode = "Image First".to_string();
-        params.lanpaint_inpainting_mode = "Image Inpainting".to_string();
-        params.lanpaint_early_stop = 1;
-        params.lanpaint_inner_threshold = 0.0;
-        params.lanpaint_inner_patience = 1;
-        params.lanpaint_mask_blend_overlap = 9;
-        params.lanpaint_context_expand = 96;
-        assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
-            ModelFamily::Krea2
-        );
-
-        params.width = 512;
-        params.height = 512;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("1024x1024")
-        );
-        params.width = 1024;
-        params.height = 1024;
-        params.lanpaint_friction = -1.0;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("lanpaint_friction")
-        );
-    }
-
-    #[test]
     fn capability_document_exposes_only_verified_edit_backends() {
         let zimage = capability_for_family(ModelFamily::ZImage);
         assert_eq!(zimage["limits"]["txt2img_only"], false);
@@ -2623,7 +1921,7 @@ mod tests {
         assert_eq!(report["rejection_stage"], "workflow_lowering");
         assert_eq!(
             report["production_gate"],
-            "workflow_lowering_then_validate_generate_prequeue"
+            "workflow_lowering_then_route_model"
         );
         assert_eq!(report["capability_profile"]["backend"], "zimage");
         assert_eq!(

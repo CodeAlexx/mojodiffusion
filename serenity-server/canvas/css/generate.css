@@ -20,7 +20,7 @@
     background: var(--shell-bg-surface);
     border-right: 1px solid var(--shell-border);
     padding: 12px;
-    overflow-y: auto;
+    overflow-y: scroll;
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -1135,15 +1135,16 @@
 }
 
 .gen-gallery-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    grid-auto-rows: max-content;
-    gap: 6px;
+    --gen-history-thumb-size: 90px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
     padding: 8px;
+    overflow-x: hidden;
     overflow-y: auto;
     flex: 1;
     min-height: 0;
-    align-content: start;
     scrollbar-gutter: stable;
     scrollbar-width: thin;
     scrollbar-color: var(--shell-text-muted) transparent;
@@ -1202,19 +1203,175 @@
     stroke: #fff;
 }
 
-/* Gallery pagination */
-.gen-gallery-pagination {
+.gen-gallery-date-group {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--shell-border);
+}
+.gen-gallery-date-group:last-child {
+    padding-bottom: 0;
+    border-bottom: 0;
+}
+.gen-gallery-date-heading {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    min-height: 20px;
+    margin: 0;
+    background: var(--shell-bg-base);
+    color: var(--shell-text-muted);
+    font: 600 10px/18px var(--shell-font);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.gen-gallery-date-items {
+    display: flex;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-height: 0;
+}
+.gen-gallery-date-items .gen-thumb-wrap {
+    flex: 0 0 var(--gen-history-thumb-size);
+    width: var(--gen-history-thumb-size);
+    height: var(--gen-history-thumb-size);
+    max-height: 145px;
+}
+.gen-thumb-unavailable {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    padding: 8px;
-    border-top: 1px solid var(--shell-border);
-    font-size: 11px;
+    background: var(--shell-bg-panel);
+    border-color: var(--shell-border);
+}
+.gen-thumb-unavailable-label {
+    max-width: 80%;
     color: var(--shell-text-muted);
+    font: 10px/1.25 var(--shell-font);
+    text-align: center;
 }
 
-/* Gallery assets placeholder */
+/* Persistent source assets */
+.gen-assets-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+    gap: 10px;
+    padding: 10px;
+    overflow-y: auto;
+}
+
+.gen-asset-card {
+    min-width: 0;
+    padding: 7px;
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    background: var(--shell-bg-panel);
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.gen-asset-card:hover {
+    border-color: var(--shell-text-muted);
+}
+
+.gen-asset-card.selected {
+    border-color: var(--shell-accent);
+    box-shadow: 0 0 0 1px var(--shell-accent);
+}
+
+.gen-asset-preview {
+    display: block;
+    width: 100%;
+    height: 104px;
+    object-fit: cover;
+    border-radius: 5px;
+    background: #090a0e;
+}
+
+.gen-asset-name {
+    margin-top: 7px;
+    overflow: hidden;
+    color: var(--shell-text);
+    font-size: 11px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.gen-asset-meta {
+    margin-top: 2px;
+    color: var(--shell-text-muted);
+    font-size: 10px;
+}
+
+.gen-asset-actions {
+    display: flex;
+    gap: 5px;
+    margin-top: 7px;
+}
+
+.gen-asset-actions button {
+    min-width: 0;
+    padding: 5px 7px;
+    border: 1px solid var(--shell-border);
+    border-radius: 5px;
+    background: var(--shell-bg-surface);
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    font-size: 10px;
+}
+
+.gen-asset-use {
+    flex: 1;
+}
+
+.gen-asset-actions .gen-asset-use:hover {
+    border-color: var(--shell-accent);
+    color: var(--shell-text);
+}
+
+.gen-asset-actions .gen-asset-delete:hover {
+    border-color: var(--shell-error);
+    color: var(--shell-error);
+}
+
+.gen-library-panel .gen-assets-grid {
+    min-height: 0;
+    flex: 1;
+    grid-auto-flow: column;
+    grid-template-columns: none;
+    grid-template-rows: 1fr;
+    grid-auto-columns: minmax(132px, 154px);
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+.gen-library-panel .gen-asset-card {
+    height: 100%;
+    box-sizing: border-box;
+    padding: 5px;
+}
+
+.gen-library-panel .gen-asset-preview {
+    height: 60px;
+}
+
+.gen-library-panel .gen-asset-name {
+    margin-top: 4px;
+}
+
+.gen-library-panel .gen-asset-actions {
+    margin-top: 4px;
+}
+
+.gen-library-panel .gen-asset-actions button {
+    padding: 3px 5px;
+}
+
 .gen-assets-placeholder {
     padding: 24px 16px;
     text-align: center;
@@ -1840,27 +1997,6 @@
 .gen-popover-slider {
     flex: 1;
     max-width: 80px;
-}
-
-/* ── Pagination controls ── */
-.gen-gallery-pagination button {
-    background: var(--shell-bg-panel);
-    border: 1px solid var(--shell-border);
-    border-radius: 4px;
-    color: var(--shell-text-muted);
-    cursor: pointer;
-    font-size: 11px;
-    font-family: var(--shell-font);
-    padding: 3px 8px;
-    transition: all 120ms ease;
-}
-.gen-gallery-pagination button:hover {
-    border-color: var(--shell-text-muted);
-    color: var(--shell-text);
-}
-.gen-gallery-pagination button:disabled {
-    opacity: 0.35;
-    cursor: default;
 }
 
 /* ── Image metadata panel ── */
@@ -2516,8 +2652,8 @@
 .gen-workspace-stage .gen-action-bar {
     position: absolute;
     left: 50%;
-    bottom: 49px;
-    z-index: 3;
+    bottom: 7px;
+    z-index: 4;
     transform: translateX(-50%);
     margin-top: 0;
     padding: 5px;
@@ -2528,7 +2664,7 @@
 .gen-workspace-stage .gen-metadata-panel {
     position: absolute;
     left: 50%;
-    bottom: 5px;
+    bottom: 51px;
     z-index: 3;
     transform: translateX(-50%);
     margin-top: 0;
@@ -2749,21 +2885,13 @@
 }
 .gen-library-panel .gen-gallery-grid {
     height: 100%;
-    display: grid;
-    grid-auto-flow: column;
-    grid-template-rows: 1fr !important;
-    grid-template-columns: none !important;
-    grid-auto-columns: minmax(90px, 125px);
-    overflow-x: auto;
-    overflow-y: hidden;
+    display: flex;
+    flex-direction: column;
+    overflow-x: hidden;
+    overflow-y: scroll;
 }
 .gen-library-panel .gen-thumb-wrap {
-    width: 100%;
-    height: 100%;
     max-height: 145px;
-}
-.gen-library-panel .gen-gallery-pagination {
-    min-height: 28px;
 }
 .gen-library-card-grid {
     padding: 10px;
@@ -2783,6 +2911,42 @@
     background: #20232b;
     color: var(--shell-text);
     font: 11px var(--shell-font);
+}
+.gen-workflow-library-note {
+    padding: 8px 10px 0;
+    color: var(--shell-text-muted);
+    font: 11px/1.4 var(--shell-font);
+}
+.gen-workflow-card {
+    min-height: 72px;
+    justify-content: space-between;
+}
+.gen-workflow-card-copy {
+    min-width: 0;
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 5px;
+}
+.gen-workflow-card-copy strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gen-workflow-card-status {
+    color: var(--shell-text-muted);
+    font-size: 10px;
+    line-height: 1.35;
+}
+.gen-workflow-card-status.is-ready {
+    color: #55d69e;
+}
+.gen-workflow-card-status.is-missing {
+    color: #e4b15d;
+}
+.gen-workflow-card .gen-small-btn {
+    flex: none;
+    white-space: nowrap;
 }
 .gen-library-model-card {
     text-align: left;
@@ -2882,6 +3046,15 @@
 }
 .gen-prompt-compact .gen-workspace-generate-column .gen-btn {
     min-height: 40px;
+}
+.gen-prompt-hidden .gen-workspace-prompt-dock {
+    visibility: hidden;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+}
+.gen-library-tabs-only .gen-library-panel {
+    display: none;
 }
 .gen-workspace-layout.gen-left-collapsed {
     grid-template-columns: 0 0 minmax(320px, 1fr) var(--gen-resizer-size) var(--gen-right-width);

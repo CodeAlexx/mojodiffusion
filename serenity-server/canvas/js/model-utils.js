@@ -159,9 +159,11 @@ var ModelUtils = (function () {
     function clampDimension(val) {
         return Math.min(4096, Math.max(256, snapTo64(val)));
     }
-    // Validate and clamp a video dimension: min 64, max 1280, divisible by 32
+    // Normalize a video dimension to the model grid. The backend profile
+    // registry owns admission; a shared UI clamp must not corrupt valid LTX2
+    // profiles such as 1920x1088 into unsupported hybrid dimensions.
     function clampVideoDimension(val) {
-        return Math.min(1280, Math.max(64, snapTo32(val)));
+        return Math.max(64, snapTo32(val));
     }
     // Fetch exact model cards from the disk registry. Architecture and format
     // come from safetensors metadata/key signatures; filenames are fallback-only.
@@ -297,4 +299,3 @@ var ModelUtils = (function () {
         clearCache: clearCache
     };
 })();
-//# sourceMappingURL=model-utils.js.map

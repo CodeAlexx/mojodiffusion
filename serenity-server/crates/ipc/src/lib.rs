@@ -32,6 +32,8 @@ use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use serenity_wire::{JobParams, WorkerEvent, CANCEL_LINE};
 
 const MOJO_SYNC_MODE_ENV: &str = "MODULAR_DEVICE_CONTEXT_SYNC_MODE";
+const CUDA_RAM_CACHE_DIR: &str = "/dev/shm/serenity-image-cuda-cache";
+const CUDA_CACHE_MAXSIZE_BYTES: &str = "1073741824";
 
 fn worker_requires_sync_mode(worker_bin: &Path) -> bool {
     worker_bin
@@ -93,7 +95,11 @@ pub struct WorkerHandle {
 /// the child inherits `child_end` ACROSS exec at the SAME fd number we pass as the
 /// last argv (so FD_CLOEXEC must be cleared on it), and the parent closes its copy
 /// of `child_end` and marks `parent_end` O_NONBLOCK.
-pub fn spawn_worker(worker_bin: &Path, pre_args: &[&str]) -> Result<WorkerHandle> {
+pub fn spawn_worker(
+    worker_bin: &Path,
+    pre_args: &[&str],
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<WorkerHandle> {
     // 1. socketpair(AF_UNIX, SOCK_STREAM, 0) -> (parent_end, child_end).
     // No SOCK_CLOEXEC: the default (no CLOEXEC) is what we want on child_end so it
     // survives exec; we belt-and-braces clear FD_CLOEXEC in pre_exec below.
@@ -116,6 +122,29 @@ pub fn spawn_worker(worker_bin: &Path, pre_args: &[&str]) -> Result<WorkerHandle
     // 3. Build the Command BEFORE spawn: pre_args..., then the child fd number last.
     //    e.g. `serenity_worker_stub <child_fd>`.
     let mut cmd = Command::new(worker_bin);
+    cmd.envs(environment.iter().cloned());
+    // Product workers must not fault CUDA kernel modules from disk after their
+    // exact step-0 denoise boundary.  Eager module loading moves that one-time
+    // driver work into worker startup, before Ready/model activation, instead
+    // of letting the first GEMM trigger physical reads during sampling.
+    cmd.env("CUDA_MODULE_LOADING", "EAGER");
+    // Resolve dynamic symbols before Ready as well.  Without this, the first
+    // model GEMM can fault a few remaining shared-library pages after step 0.
+    cmd.env("LD_BIND_NOW", "1");
+    // The CUDA driver defaults its JIT cache to ~/.nv/ComputeCache. A measured
+    // Krea job revisited that disk-backed index at step 7/8 (20,480 physical
+    // bytes), so the fail-closed denoise gate correctly terminated the worker.
+    // Keep JIT reuse, but put the cache on tmpfs so cache lookups can never hit
+    // the SSD. If tmpfs setup fails, disable the cache rather than falling back
+    // to the driver's disk default. Force the JIT support libraries to load at
+    // worker initialization as an additional pre-step boundary guarantee.
+    if std::fs::create_dir_all(CUDA_RAM_CACHE_DIR).is_ok() {
+        cmd.env("CUDA_CACHE_PATH", CUDA_RAM_CACHE_DIR);
+        cmd.env("CUDA_CACHE_MAXSIZE", CUDA_CACHE_MAXSIZE_BYTES);
+    } else {
+        cmd.env("CUDA_CACHE_DISABLE", "1");
+    }
+    cmd.env("CUDA_FORCE_PRELOAD_LIBRARIES", "1");
     // Measured on the 16 GiB product card: ZImage completes denoise in either
     // mode, but the async DeviceContext allocator can OOM while constructing
     // the already-shipped 64-grid VAE decoder (jobs 0105/0106). The identical
@@ -176,6 +205,12 @@ pub fn spawn_worker(worker_bin: &Path, pre_args: &[&str]) -> Result<WorkerHandle
 }
 
 impl WorkerHandle {
+    /// OS process id of the live worker. The server uses this for read-only
+    /// `/proc/<pid>/io` hardware-safety accounting during denoise.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Send `{"cmd":"start", ...}\n` (JobParams::to_start_line + newline frame).
     /// Mirrors `proc_ipc.write_msg` (append '\n', send with MSG_NOSIGNAL, loop
     /// until all bytes written).
@@ -187,6 +222,12 @@ impl WorkerHandle {
     /// Send `{"cmd":"cancel"}\n` (serenity_wire::CANCEL_LINE).
     pub fn send_cancel(&mut self) -> Result<()> {
         self.write_line(CANCEL_LINE)
+    }
+
+    /// Release a worker that fenced itself at the exact final denoise boundary.
+    /// The server sends this only after the physical-read gate samples `/proc`.
+    pub fn send_sampling_ack(&mut self) -> Result<()> {
+        self.write_line(r#"{"cmd":"sampling_ack"}"#)
     }
 
     /// Non-blocking poll for one worker event, with a TYPED outcome.

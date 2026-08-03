@@ -24,7 +24,7 @@
 #
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA. GPU-only compute.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.tensor_view import TensorView
 from serenitymojo.io.ffi import BytePtr, sys_memcpy
@@ -472,3 +472,94 @@ struct Tensor(Movable):
         ctx.enqueue_copy(dst_buf=dev, src_buf=host)
         ctx.synchronize()
         return Tensor(dev^, shape^, STDtype.F16)
+
+
+struct BatchedTensorUploader(Movable):
+    """Bounded pinned staging for checkpoint tensors.
+
+    `Tensor.from_view` must fence each upload because its temporary pinned
+    buffer dies at function return. This uploader keeps one bounded host slab
+    alive, queues independent device-buffer copies, and fences only when the
+    slab is reused or `finish()` is called. Returned tensors own their device
+    allocations; they do not borrow this uploader.
+    """
+
+    var host: HostBuffer[DType.uint8]
+    var capacity: Int
+    var cursor: Int
+    var pending: Bool
+    var tensors_uploaded: Int
+    var bytes_uploaded: Int
+    var fence_count: Int
+
+    def __init__(out self, capacity: Int, ctx: DeviceContext) raises:
+        if capacity <= 0:
+            raise Error("BatchedTensorUploader: capacity must be positive")
+        self.host = ctx.enqueue_create_host_buffer[DType.uint8](capacity)
+        self.capacity = capacity
+        self.cursor = 0
+        self.pending = False
+        self.tensors_uploaded = 0
+        self.bytes_uploaded = 0
+        self.fence_count = 0
+
+    def finish(mut self, ctx: DeviceContext) raises:
+        if self.pending:
+            ctx.synchronize()
+            self.fence_count += 1
+            self.cursor = 0
+            self.pending = False
+
+    def from_view[
+        mut: Bool, //, origin: Origin[mut=mut]
+    ](mut self, tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+        _ = tv.dtype.to_mojo_dtype()
+        var nbytes = tv.nbytes()
+        var expected = tv.numel() * tv.dtype.byte_size()
+        if nbytes != expected:
+            raise Error(
+                String("BatchedTensorUploader: view nbytes=")
+                + String(nbytes)
+                + " != numel*byte_size="
+                + String(expected)
+            )
+
+        # Keep every source address naturally aligned inside the pinned slab.
+        var offset = (self.cursor + 255) & ~255
+        if offset + nbytes > self.capacity:
+            self.finish(ctx)
+            offset = 0
+
+        # Oversized tensors are uncommon; retain the bounded normal slab and
+        # use one dedicated, fenced transfer rather than increasing persistent
+        # pinned memory for every model.
+        if nbytes > self.capacity:
+            var large_host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+            var large_dst = BytePtr(
+                unsafe_from_address=Int(large_host.unsafe_ptr())
+            )
+            var large_src = BytePtr(
+                unsafe_from_address=Int(tv.data.unsafe_ptr())
+            )
+            _ = sys_memcpy(large_dst, large_src, nbytes)
+            var large_dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+            ctx.enqueue_copy(dst_buf=large_dev, src_buf=large_host)
+            ctx.synchronize()
+            self.fence_count += 1
+            self.tensors_uploaded += 1
+            self.bytes_uploaded += nbytes
+            return Tensor(large_dev^, tv.shape.copy(), tv.dtype)
+
+        var dst = BytePtr(
+            unsafe_from_address=Int(self.host.unsafe_ptr()) + offset
+        )
+        var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+        _ = sys_memcpy(dst, src, nbytes)
+        var host_view = self.host.create_sub_buffer[DType.uint8](offset, nbytes)
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host_view)
+        self.cursor = offset + nbytes
+        self.pending = True
+        self.tensors_uploaded += 1
+        self.bytes_uploaded += nbytes
+        return Tensor(dev^, tv.shape.copy(), tv.dtype)

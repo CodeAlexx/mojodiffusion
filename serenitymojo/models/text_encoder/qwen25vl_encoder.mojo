@@ -44,7 +44,7 @@ from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.norm import rms_norm
@@ -440,14 +440,21 @@ struct Qwen25VLEncoder:
         var sharded = ShardedSafeTensors.open(dir)
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
-        for ref nm in sharded.names():
+        var names = sharded.names_storage_order()
+        var uploader = BatchedTensorUploader(256 * 1024 * 1024, ctx)
+        for ref nm in names:
             if not nm.startswith("model."):
                 continue
             var tv = sharded.tensor_view(nm)
-            var t = Tensor.from_view(tv, ctx)
+            var t = uploader.from_view(tv, ctx)
             var idx = len(weights)
             weights.append(ArcPointer(t^))
             name_to_idx[nm] = idx
+        uploader.finish(ctx)
+        print(
+            "[Qwen25VLEncoder] batched H2D tensors", uploader.tensors_uploaded,
+            "bytes", uploader.bytes_uploaded, "fences", uploader.fence_count,
+        )
         return Qwen25VLEncoder(weights^, name_to_idx^, config)
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:

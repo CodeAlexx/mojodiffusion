@@ -43,8 +43,8 @@ from std.sys.defines import get_defined_int
 from std.time import perf_counter
 
 from serenitymojo.io.ffi import (
-    sys_open, sys_pwrite, sys_close, sys_system, sys_rename,
-    O_WRONLY, O_CREAT, O_TRUNC, BytePtr,
+    sys_open, sys_pread, sys_pwrite, sys_close, sys_system, sys_rename,
+    O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, BytePtr,
 )
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -125,6 +125,10 @@ from serenitymojo.lora import (
 )
 from serenitymojo.serve.product_manifest import (
     json_bool, json_escape, peak_vram_mib, write_text_file,
+)
+from serenitymojo.serve.proc_ipc import (
+    prefault_self_executable, lock_mapped_runtime_files, lock_future_mappings,
+    unlock_all_mappings,
 )
 
 
@@ -853,11 +857,17 @@ def _load_global_weights_dict(
         gw[fam] = ArcPointer[Tensor](_load_global_bf16(st, fam, ctx))
     for ref fam in adaln_families:
         var k1 = fam + ".emb.timestep_embedder.linear_1.weight"
+        var b1 = fam + ".emb.timestep_embedder.linear_1.bias"
         var k2 = fam + ".emb.timestep_embedder.linear_2.weight"
+        var b2 = fam + ".emb.timestep_embedder.linear_2.bias"
         var k3 = fam + ".linear.weight"
+        var b3 = fam + ".linear.bias"
         gw[k1] = ArcPointer[Tensor](_load_global_bf16(st, k1, ctx))
+        gw[b1] = ArcPointer[Tensor](_load_global_bf16(st, b1, ctx))
         gw[k2] = ArcPointer[Tensor](_load_global_bf16(st, k2, ctx))
+        gw[b2] = ArcPointer[Tensor](_load_global_bf16(st, b2, ctx))
         gw[k3] = ArcPointer[Tensor](_load_global_bf16(st, k3, ctx))
+        gw[b3] = ArcPointer[Tensor](_load_global_bf16(st, b3, ctx))
     return gw^
 
 
@@ -1019,15 +1029,15 @@ def _adaln_single(
 ) raises -> Tuple[Tensor, Tensor]:
     var emb = _timestep_embedding(ts_vals, 256, STDtype.BF16, ctx)
     var w1 = _clone(gw[base + ".emb.timestep_embedder.linear_1.weight"][], ctx)
-    var b1 = _load_global_bf16(st, base + ".emb.timestep_embedder.linear_1.bias", ctx)
+    var b1 = _clone(gw[base + ".emb.timestep_embedder.linear_1.bias"][], ctx)
     var h = _linear_b(emb, w1, b1, ctx)
     h = silu(h, ctx)
     var w2 = _clone(gw[base + ".emb.timestep_embedder.linear_2.weight"][], ctx)
-    var b2 = _load_global_bf16(st, base + ".emb.timestep_embedder.linear_2.bias", ctx)
+    var b2 = _clone(gw[base + ".emb.timestep_embedder.linear_2.bias"][], ctx)
     var embedded = _linear_b(h, w2, b2, ctx)
     var h2 = silu(embedded, ctx)
     var lw = _clone(gw[base + ".linear.weight"][], ctx)
-    var lb = _load_global_bf16(st, base + ".linear.bias", ctx)
+    var lb = _clone(gw[base + ".linear.bias"][], ctx)
     var mod = _linear_b(h2, lw, lb, ctx)
     return (mod^, embedded^)
 
@@ -1634,6 +1644,24 @@ def _refhq_spatial_upscale_scoped(
     return _ndhwc_to_ncdhw(up_ndhwc, ctx)
 
 
+def _refhq_spatial_upscale_resident(
+    video_ncdhw: Tensor,
+    upsampler: LatentUpsampler,
+    std_t: Tensor,
+    mean_t: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Run the official x2 upscaler from request-owned resident weights."""
+    var up_ndhwc = upsample_video(
+        _ncdhw_to_ndhwc(video_ncdhw, ctx),
+        std_t,
+        mean_t,
+        upsampler,
+        ctx,
+    )
+    return _ndhwc_to_ncdhw(up_ndhwc, ctx)
+
+
 # Stage-2 forward-noise the upscaled latent at noise_scale (GaussianNoiser, mask=1):
 #   x = noise * noise_scale + upscaled * (1 - noise_scale)
 # (ltx-core components/noisers.py GaussianNoiser.__call__, denoise_mask all-ones.)
@@ -1706,6 +1734,60 @@ def _write_ltx2_status(
     body += String('  "message":"') + json_escape(message) + String('"\n')
     body += String("}\n")
     _write_ltx2_atomic(out_dir + String("/status.json"), body)
+
+
+def _ltx2_proc_read_bytes() raises -> Int:
+    """Read the kernel's physical-I/O counter for this exact Mojo process."""
+    var fd = sys_open(String("/proc/self/io"), O_RDONLY, 0)
+    if fd < 0:
+        raise Error("LTX2 hardware safety gate: cannot open /proc/self/io")
+    var cap = 4096
+    var buf = alloc[UInt8](cap)
+    var n = sys_pread(fd, buf, cap, 0)
+    _ = sys_close(fd)
+    if n <= 0:
+        buf.free()
+        raise Error("LTX2 hardware safety gate: cannot read /proc/self/io")
+    var text = String(StringSlice(ptr=buf, length=n))
+    buf.free()
+    for line in text.split("\n"):
+        var row = String(line)
+        if row.startswith("read_bytes:"):
+            var fields = row.split(":")
+            if len(fields) != 2:
+                break
+            return atol(String(fields[1]).strip())
+    raise Error(
+        "LTX2 hardware safety gate: /proc/self/io has no read_bytes field"
+    )
+
+
+def _write_ltx2_denoise_io(
+    out_dir: String, state: String, start_bytes: Int, current_bytes: Int
+) raises:
+    var body = String("{\n")
+    body += String('  "schema":"serenity.denoise_io.v1",\n')
+    body += String('  "state":"') + json_escape(state) + String('",\n')
+    body += String('  "read_bytes_start":') + String(start_bytes) + String(",\n")
+    body += String('  "read_bytes_current":') + String(current_bytes) + String(",\n")
+    body += String('  "read_bytes_delta":') \
+        + String(current_bytes - start_bytes) + String("\n}\n")
+    _write_ltx2_atomic(out_dir + String("/denoise_io.json"), body)
+
+
+def _assert_ltx2_no_denoise_disk_reads(
+    out_dir: String, start_bytes: Int
+) raises:
+    var current = _ltx2_proc_read_bytes()
+    if current != start_bytes:
+        _write_ltx2_denoise_io(
+            out_dir, String("failed"), start_bytes, current
+        )
+        raise Error(
+            String("LTX2 hardware safety gate: process read ")
+            + String(current - start_bytes)
+            + String(" physical bytes after the denoise boundary")
+        )
 
 
 def _record_ltx2_min_free(current: Int) raises -> Int:
@@ -3720,7 +3802,7 @@ def _request_hq_forward_flat[
     distilled_mult: Float32,
     cfg: LTX2Config,
     g: _Globals,
-    stream: LTX2BlockStream,
+    mut stream: LTX2BlockStream,
     v_flat: Tensor, a_flat: Tensor,
     enc: Tensor, aenc: Tensor,
     mod: _Mod,
@@ -3735,7 +3817,7 @@ def _request_hq_forward_flat[
     var ahs = _linear_b(a_flat, g.a_pin_w, g.a_pin_b, ctx)
     var n_lora_total = 0
     for i in range(NUM_LAYERS):
-        var blk = stream.load_block_bf16(i, ctx)
+        var blk = stream.load_block_bf16_product(i, ctx)
         var w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
         if factorized_lora:
             n_lora_total += loras.attach_to_av_block(
@@ -3780,7 +3862,7 @@ def _request_edit_forward_flat[
     distillation_mult: Float32,
     cfg: LTX2Config,
     g: _Globals,
-    stream: LTX2BlockStream,
+    mut stream: LTX2BlockStream,
     v_flat: Tensor, a_flat: Tensor,
     enc: Tensor, aenc: Tensor,
     mod: _Mod,
@@ -3791,7 +3873,7 @@ def _request_edit_forward_flat[
     var hs = _linear_b(v_flat, g.v_pin_w, g.v_pin_b, ctx)
     var ahs = _linear_b(a_flat, g.a_pin_w, g.a_pin_b, ctx)
     for i in range(NUM_LAYERS):
-        var blk = stream.load_block_bf16(i, ctx)
+        var blk = stream.load_block_bf16_product(i, ctx)
         var w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
         if distillation_mult != Float32(0.0):
             _ = loras.apply_to_av_block(
@@ -6441,6 +6523,27 @@ def run_request_hq(
         _load_global_bf16(ck, "scale_shift_table", ctx),
         _load_global_bf16(ck, "audio_scale_shift_table", ctx),
     )
+    # Stage 2 uses a different distillation multiplier. Build its complete
+    # global set before the denoise boundary so the stage transition never
+    # returns to the checkpoint mapping.
+    print("  [load] stage-2 globals before denoise")
+    var gw_stage2 = _load_global_weights_dict(ck, ctx)
+    var n_global2 = loras.apply_to_globals(
+        gw_stage2, request_distill_s2, ctx
+    )
+    print("  [lora] stage-2 global deltas:", n_global2)
+    var g_stage2 = _Globals(
+        _clone(gw_stage2[String("patchify_proj.weight")][], ctx),
+        _load_global_bf16(ck, "patchify_proj.bias", ctx),
+        _clone(gw_stage2[String("audio_patchify_proj.weight")][], ctx),
+        _load_global_bf16(ck, "audio_patchify_proj.bias", ctx),
+        _clone(gw_stage2[String("proj_out.weight")][], ctx),
+        _load_global_bf16(ck, "proj_out.bias", ctx),
+        _clone(gw_stage2[String("audio_proj_out.weight")][], ctx),
+        _load_global_bf16(ck, "audio_proj_out.bias", ctx),
+        _load_global_bf16(ck, "scale_shift_table", ctx),
+        _load_global_bf16(ck, "audio_scale_shift_table", ctx),
+    )
     ctx.synchronize()
     load_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
@@ -6573,6 +6676,32 @@ def run_request_hq(
         print("  [int4-resident] preloading all 48 dev-model blocks:", int4_slab)
         stream.enable_int4_resident_range(0, NUM_LAYERS - 1, ctx)
         print("  [int4-resident] resident storage bytes:", stream.resident_bytes())
+    _write_ltx2_status(
+        out_dir, String("running"), String("preloading_denoiser"), 0,
+        progress_total,
+        String("Copying every denoiser block into memory before step 0"),
+    )
+    var memory_blocks = stream.enable_product_memory_resident(ctx)
+    ck.release_to_os()
+    print(
+        "  [memory-resident] denoiser blocks:", memory_blocks, "/",
+        NUM_LAYERS, "host bytes:", stream.product_host_bytes(),
+    )
+    # The official spatial upscaler sits between the two denoise stages. Keep
+    # its weights and VAE statistics resident for the whole request; reopening
+    # its safetensors after stage 1 would perform physical I/O inside the
+    # protected generation interval.
+    _write_ltx2_status(
+        out_dir, String("running"), String("preloading_upscaler"), 0,
+        progress_total,
+        String("Loading the stage-2 upscaler into memory before step 0"),
+    )
+    var request_up_st = ShardedSafeTensors.open(_refhq_spatial_upscaler())
+    var request_upsampler = LatentUpsampler(request_up_st, False, ctx)
+    var request_up_std = _load_vae_stat(String("std-of-means"), ctx)
+    var request_up_mean = _load_vae_stat(String("mean-of-means"), ctx)
+    ctx.synchronize()
+    request_up_st.release_to_os()
     var ns: NoiseSource
     var video_x: Tensor
     var audio_x: Tensor
@@ -6679,9 +6808,161 @@ def run_request_hq(
     var sig1 = _ltx2_scheduler_sigmas(steps, REQUEST_HQ_S_V1)
     if sulphur_creator:
         sig1 = ltx2_sulphur_stage1_sigmas(REQUEST_HQ_S_V1)
+    # Execute throwaway exact-shape forwards before arming the physical-I/O
+    # counter. CUDA/cuDNN lazily page in kernel modules on their first exact
+    # invocation. The warmups use only request-owned resident weights and do
+    # not mutate the scheduled latent trajectory.
+    _write_ltx2_status(
+        out_dir, String("running"), String("warming_denoiser"), 0,
+        progress_total,
+        String("Warming stage-1, upscaler, and stage-2 GPU paths before step 0"),
+    )
+    var warm_sigma = sig1[0]
+    var warm_s_v1 = (
+        REQUEST_HQ_S_V1_KEYFRAME
+        if last_keyframe_enabled else REQUEST_HQ_S_V1
+    )
+    var warm_mod = _build_mod_dims(
+        ck, gw, warm_sigma, warm_s_v1, REQUEST_HQ_S_A, ctx,
+        conditioned_video_tokens=source_mod_tokens1,
+        conditioned_video_denoise=source_conditioned_denoise,
+        conditioned_video_denoise_values=_request_hq_optional_mask_values(
+            source_mask_values1
+        ),
+    )
+    var warm_s1_out: Tuple[Tensor, Tensor]
+    if last_keyframe_enabled:
+        warm_s1_out = _request_hq_forward_flat[
+            REQUEST_HQ_S_V1_KEYFRAME, REQUEST_HQ_S_A,
+            REQUEST_HQ_VPAD1_KEYFRAME, REQUEST_HQ_APAD,
+        ](
+            loras, request_distill_s1, cfg, g, stream,
+            video_x, audio_x, enc, aenc, warm_mod, vr1,
+            a_cos, a_sin, ca_a_cos, ca_a_sin,
+            False, False, True, ctx,
+        )
+    else:
+        warm_s1_out = _request_hq_forward_flat[
+            REQUEST_HQ_S_V1, REQUEST_HQ_S_A,
+            REQUEST_HQ_VPAD1, REQUEST_HQ_APAD,
+        ](
+            loras, request_distill_s1, cfg, g, stream,
+            video_x, audio_x, enc, aenc, warm_mod, vr1,
+            a_cos, a_sin, ca_a_cos, ca_a_sin,
+            False, False, True, ctx,
+        )
+    # Warm the resident upscaler and the larger stage-2 denoiser shape too.
+    # Both are first used after stage 1, so a stage-1-only warmup is not enough
+    # to prove the complete two-stage request is physically I/O-free.
+    var warm_generated_video1 = video_x.clone(ctx)
+    if last_keyframe_enabled:
+        warm_generated_video1 = slice(
+            video_x, 1, 0, REQUEST_HQ_S_V1, ctx
+        )
+    var warm_v_lat1 = _refhq_unpatchify_video(
+        warm_generated_video1,
+        REQUEST_HQ_NF,
+        REQUEST_HQ_NH1,
+        REQUEST_HQ_NW1,
+        ctx,
+    )
+    var warm_upscaled = _refhq_spatial_upscale_resident(
+        warm_v_lat1,
+        request_upsampler,
+        request_up_std,
+        request_up_mean,
+        ctx,
+    )
+    var warm_vx2 = cast_tensor(
+        _refhq_patchify_video(warm_upscaled, REQUEST_HQ_S_V2, ctx),
+        STDtype.BF16,
+        ctx,
+    )
+    var warm_s2sig = ltx2_stage2_distilled_sigmas()
+    if sulphur_creator:
+        warm_s2sig = ltx2_sulphur_stage2_sigmas()
+    var warm_mod2 = _build_mod_dims(
+        ck,
+        gw_stage2,
+        warm_s2sig[0],
+        REQUEST_HQ_S_V2,
+        REQUEST_HQ_S_A,
+        ctx,
+        uniform_timestep=True,
+    )
+    var warm_s2_out = _request_hq_forward_flat[
+        REQUEST_HQ_S_V2, REQUEST_HQ_S_A,
+        REQUEST_HQ_VPAD2, REQUEST_HQ_APAD,
+    ](
+        loras, request_distill_s2, cfg, g_stage2, stream,
+        warm_vx2, audio_x, enc, aenc, warm_mod2, vr2,
+        a_cos, a_sin, ca_a_cos, ca_a_sin,
+        False, False, True, ctx,
+    )
+    # The denoiser warmups above execute every model/LoRA path, but distilled
+    # generation also launches Euler update kernels after each forward. Warm
+    # those exact stage shapes before the physical-I/O fence; otherwise their
+    # first CUDA module fault can occur at step 0 even though all weights are
+    # already resident (measured as one 4096-byte read with camera LoRA).
+    if guidance_mode == String("distilled"):
+        var warm_s1_sched_sigmas = ltx2_distilled_sigmas()
+        var warm_s2_sched_sigmas = ltx2_stage2_distilled_sigmas()
+        if sulphur_creator:
+            warm_s1_sched_sigmas = ltx2_sulphur_stage1_sigmas(
+                REQUEST_HQ_S_V1
+            )
+            warm_s2_sched_sigmas = ltx2_sulphur_stage2_sigmas()
+        var warm_s1_sched = LTX2Scheduler(warm_s1_sched_sigmas^)
+        var warm_s2_sched = LTX2Scheduler(warm_s2_sched_sigmas^)
+        if sulphur_creator:
+            _ = ltx2_euler_ancestral_cfgpp_step(
+                video_x, warm_s1_out[0], warm_s1_out[0], video_x,
+                warm_s1_sched.sigma(0), warm_s1_sched.sigma(1), ctx,
+            )
+            _ = ltx2_euler_ancestral_cfgpp_step(
+                audio_x, warm_s1_out[1], warm_s1_out[1], audio_x,
+                warm_s1_sched.sigma(0), warm_s1_sched.sigma(1), ctx,
+            )
+            _ = ltx2_euler_ancestral_cfgpp_step(
+                warm_vx2, warm_s2_out[0], warm_s2_out[0], warm_vx2,
+                warm_s2_sched.sigma(0), warm_s2_sched.sigma(1), ctx,
+            )
+            _ = ltx2_euler_ancestral_cfgpp_step(
+                audio_x, warm_s2_out[1], warm_s2_out[1], audio_x,
+                warm_s2_sched.sigma(0), warm_s2_sched.sigma(1), ctx,
+            )
+        else:
+            _ = warm_s1_sched.step(video_x, warm_s1_out[0], 0, ctx)
+            _ = warm_s1_sched.step(audio_x, warm_s1_out[1], 0, ctx)
+            _ = warm_s2_sched.step(warm_vx2, warm_s2_out[0], 0, ctx)
+            _ = warm_s2_sched.step(audio_x, warm_s2_out[1], 0, ctx)
     ctx.synchronize()
     prepare_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    # The complete checkpoint-to-RAM pass is large enough to evict cold pages
+    # from this runner image. Re-read the small executable once before arming
+    # the zero-I/O boundary so first-use sampler/stat code cannot fault from
+    # disk during denoise. This is the same measured product boundary used by
+    # the resident Krea worker; it does not touch checkpoint data.
+    print(
+        "  [hardware-safety] prefaulted runner image bytes:",
+        prefault_self_executable(),
+    )
+    print(
+        "  [hardware-safety] locked mapped runtime bytes:",
+        lock_mapped_runtime_files(),
+    )
+    lock_future_mappings()
+    print("  [hardware-safety] future runtime mappings locked")
+    var denoise_read_bytes_start = _ltx2_proc_read_bytes()
+    _write_ltx2_denoise_io(
+        out_dir, String("armed"), denoise_read_bytes_start,
+        denoise_read_bytes_start,
+    )
+    print(
+        "  [hardware-safety] denoise read_bytes baseline:",
+        denoise_read_bytes_start,
+    )
 
     if guidance_mode == String("distilled"):
         if sulphur_creator:
@@ -6781,16 +7062,18 @@ def run_request_hq(
         var c_a = _refhq_x0(ax, c[1], sigma, ctx)
         var u_a = _refhq_x0(ax, u[1], sigma, ctx)
         var m_a = _refhq_x0(ax, m[1], sigma, ctx)
-        return (
-            guider_calculate(
-                c_v, u_v, m_v, REFHQ_V_CFG, 0.0, REFHQ_V_RESCALE,
-                REFHQ_MOD_SCALE, ctx,
-            )^,
-            guider_calculate(
-                c_a, u_a, m_a, REFHQ_A_CFG, 0.0, REFHQ_A_RESCALE,
-                REFHQ_MOD_SCALE, ctx,
-            )^,
+        var guided_v = guider_calculate(
+            c_v, u_v, m_v, REFHQ_V_CFG, 0.0, REFHQ_V_RESCALE,
+            REFHQ_MOD_SCALE, ctx,
         )
+        var guided_a = guider_calculate(
+            c_a, u_a, m_a, REFHQ_A_CFG, 0.0, REFHQ_A_RESCALE,
+            REFHQ_MOD_SCALE, ctx,
+        )
+        _assert_ltx2_no_denoise_disk_reads(
+            out_dir, denoise_read_bytes_start
+        )
+        return (guided_v^, guided_a^)
 
     t0 = perf_counter()
     if guidance_mode == String("distilled"):
@@ -6905,6 +7188,9 @@ def run_request_hq(
                 video_x = res2s_post_process_latent(
                     video_x, source_mask1.value(), source_clean1.value(), ctx
                 )
+            _assert_ltx2_no_denoise_disk_reads(
+                out_dir, denoise_read_bytes_start
+            )
     else:
         var s1_names = List[String]()
         var s1_tensors = List[ArcPointer[Tensor]]()
@@ -6916,6 +7202,11 @@ def run_request_hq(
         )
         video_x = s1_out[0].clone(ctx)
         audio_x = s1_out[1].clone(ctx)
+    _assert_ltx2_no_denoise_disk_reads(out_dir, denoise_read_bytes_start)
+    _write_ltx2_denoise_io(
+        out_dir, String("stage1_passed"), denoise_read_bytes_start,
+        denoise_read_bytes_start,
+    )
     print("  [Stage1] complete")
 
     _write_ltx2_status(
@@ -6932,25 +7223,19 @@ def run_request_hq(
         generated_video1,
         REQUEST_HQ_NF, REQUEST_HQ_NH1, REQUEST_HQ_NW1, ctx,
     )
-    var upscaled = _refhq_spatial_upscale_scoped(v_lat1, ctx)
-    _ = _stats(String("upscaled"), upscaled, ctx)
-
-    print("  [load] stage-2 globals")
-    gw = _load_global_weights_dict(ck, ctx)
-    var n_global2 = loras.apply_to_globals(gw, request_distill_s2, ctx)
-    print("  [lora] stage-2 global deltas:", n_global2)
-    g = _Globals(
-        _clone(gw[String("patchify_proj.weight")][], ctx),
-        _load_global_bf16(ck, "patchify_proj.bias", ctx),
-        _clone(gw[String("audio_patchify_proj.weight")][], ctx),
-        _load_global_bf16(ck, "audio_patchify_proj.bias", ctx),
-        _clone(gw[String("proj_out.weight")][], ctx),
-        _load_global_bf16(ck, "proj_out.bias", ctx),
-        _clone(gw[String("audio_proj_out.weight")][], ctx),
-        _load_global_bf16(ck, "audio_proj_out.bias", ctx),
-        _load_global_bf16(ck, "scale_shift_table", ctx),
-        _load_global_bf16(ck, "audio_scale_shift_table", ctx),
+    var upscaled = _refhq_spatial_upscale_resident(
+        v_lat1,
+        request_upsampler,
+        request_up_std,
+        request_up_mean,
+        ctx,
     )
+    _ = _stats(String("upscaled"), upscaled, ctx)
+    ctx.synchronize()
+
+    print("  [memory-resident] activating preloaded stage-2 globals")
+    gw = gw_stage2^
+    g = g_stage2^
 
     var s2sig = ltx2_stage2_distilled_sigmas()
     if sulphur_creator:
@@ -7060,6 +7345,26 @@ def run_request_hq(
     else:
         vx2 = _refhq_noise_blend(up_flat, s2n_v, s2_scale, ctx)
     var ax2 = _refhq_noise_blend(audio_x, s2n_a, s2_scale, ctx)
+    ctx.synchronize()
+    print(
+        "  [hardware-safety] stage-2 prefaulted runner image bytes:",
+        prefault_self_executable(),
+    )
+    print(
+        "  [hardware-safety] stage-2 locked mapped runtime bytes:",
+        lock_mapped_runtime_files(),
+    )
+    lock_future_mappings()
+    print("  [hardware-safety] stage-2 future runtime mappings locked")
+    denoise_read_bytes_start = _ltx2_proc_read_bytes()
+    _write_ltx2_denoise_io(
+        out_dir, String("stage2_armed"), denoise_read_bytes_start,
+        denoise_read_bytes_start,
+    )
+    print(
+        "  [hardware-safety] stage-2 denoise read_bytes baseline:",
+        denoise_read_bytes_start,
+    )
     var s2_eval = 0
     var first_s2_eval = True
     @parameter
@@ -7112,10 +7417,12 @@ def run_request_hq(
                 first_s2_eval, True, ctx,
             )
         first_s2_eval = False
-        return (
-            _refhq_x0(vx, c[0], sigma, ctx),
-            _refhq_x0(ax, c[1], sigma, ctx),
+        var denoised_v = _refhq_x0(vx, c[0], sigma, ctx)
+        var denoised_a = _refhq_x0(ax, c[1], sigma, ctx)
+        _assert_ltx2_no_denoise_disk_reads(
+            out_dir, denoise_read_bytes_start
         )
+        return (denoised_v^, denoised_a^)
 
     if guidance_mode == String("distilled"):
         if sulphur_creator:
@@ -7200,6 +7507,9 @@ def run_request_hq(
                 vx2 = res2s_post_process_latent(
                     vx2, source_mask2.value(), source_clean2.value(), ctx
                 )
+            _assert_ltx2_no_denoise_disk_reads(
+                out_dir, denoise_read_bytes_start
+            )
     else:
         var s2_names = List[String]()
         var s2_tensors = List[ArcPointer[Tensor]]()
@@ -7211,6 +7521,13 @@ def run_request_hq(
         vx2 = s2_out[0].clone(ctx)
         ax2 = s2_out[1].clone(ctx)
     ctx.synchronize()
+    _assert_ltx2_no_denoise_disk_reads(out_dir, denoise_read_bytes_start)
+    _write_ltx2_denoise_io(
+        out_dir, String("passed"), denoise_read_bytes_start,
+        denoise_read_bytes_start,
+    )
+    unlock_all_mappings()
+    print("  [hardware-safety] runtime mapping locks released after denoise")
     denoise_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
 

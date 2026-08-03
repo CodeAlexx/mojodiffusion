@@ -903,7 +903,7 @@ def _unpack_latent(packed: Tensor, ctx: DeviceContext) raises -> Tensor:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var ctx = DeviceContext()
     print("============================================================")
     print("Chroma 1024x1024 — 30-step shifted flow CFG 4.0 seed 42")
@@ -1035,3 +1035,10 @@ def main() raises:
     print("\n============================================================")
     print("DONE:", OUT_PNG)
     print("============================================================")
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Chroma executable reads checkpoint weights "
+        "during denoise; use the fail-closed memory-resident product worker"
+    )

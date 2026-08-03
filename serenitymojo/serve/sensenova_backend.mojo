@@ -21,11 +21,10 @@
 #
 # Residency model (single-GPU):
 #   * The SenseNovaU1[L_TOKENS, TEXT_LEN] handle (sharded checkpoint mmap +
-#     PlannedBlockLoader + the T2I-resident shared tensors ~1.2 GiB) is loaded
-#     ONCE (first job) and STAYS RESIDENT across jobs. Per-layer transformer
-#     weights stream from disk one block at a time (PlannedBlockLoader), so the
-#     full 8B weight set is NOT all-resident — the residency win is the loader
-#     state + shared tensors, like Qwen-Image's offloader handle.
+#     complete pinned-host FP8 denoiser store + the T2I-resident shared tensors)
+#     is loaded ONCE (first job) and STAYS RESIDENT across jobs. All 42 planned
+#     transformer blocks are copied to the host store before generation; the
+#     checkpoint mapping is never a denoise-time weight source.
 #   * The two prefix KV caches (cond + uncond, from forward_und) are built PER
 #     JOB inside ENCODE and freed at job end.
 #
@@ -54,7 +53,7 @@
 # WEIGHTS RISK: the checkpoint at WEIGHTS_DIR may be ABSENT (HF cache holds only
 # config.json + the safetensors index, no shards; models/
 # sensenova_u1/ does not exist). When weights are missing, the first job FAILS
-# LOUD at SenseNovaU1.load (a clear BlockLoader.open error) — it does NOT fake an
+# LOUD at SenseNovaU1.load (a clear checkpoint-open error) — it does NOT fake an
 # image.
 #
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in ops.
@@ -448,7 +447,7 @@ struct SensenovaBackendShape[
 
     def between_jobs_trim(mut self) raises:
         """Reclaim the per-job transient peak (the two prefix KV caches, the
-        per-step gen-path activations, the streamed per-layer block buffers) back
+        per-step gen-path activations, the staged per-layer block buffers) back
         to the OS via cuMemPoolTrimTo. The resident model handle + shared tensors
         have live suballocations and are NOT reclaimed."""
         var before = cu_mem_get_info()
@@ -531,7 +530,7 @@ struct SensenovaBackendShape[
     # ── per-job prep ───────────────────────────────────────────────────────────
     def _load_model(mut self) raises:
         """Load the SenseNovaU1 handle (once; stays resident). FAILS LOUD here if
-        the checkpoint shards are absent (BlockLoader.open error) — no fake
+        the checkpoint shards are absent (checkpoint-open error) — no fake
         image."""
         if self.loaded:
             return
@@ -727,7 +726,7 @@ struct SensenovaBackendShape[
             if self.phase == SPHASE_ENCODE:
                 if not self.announced:
                     # announce BEFORE the long blocking encode tick (tokenize +
-                    # 2x forward_und over the streamed 42-layer prefix).
+                    # 2x forward_und over the host-resident 42-layer prefix).
                     self.announced = True
                     r.step = 0
                     r.phase = String("encoding")
@@ -743,6 +742,7 @@ struct SensenovaBackendShape[
                 self.announced = False
                 self.phase = SPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == SPHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -751,6 +751,7 @@ struct SensenovaBackendShape[
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.params.steps:
                     self.phase = SPHASE_DECODE
                 return r^

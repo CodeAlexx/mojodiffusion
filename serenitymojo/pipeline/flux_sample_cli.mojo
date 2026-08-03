@@ -375,7 +375,7 @@ def _load_prompt_json(
 
 # ── Main entry ──────────────────────────────────────────────────────────────
 
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var a = argv()
     if len(a) < 6:
         print(
@@ -448,3 +448,10 @@ def main() raises:
     # Save.
     save_png(img, out_png, ctx, ValueRange.SIGNED)
     print("[done] saved:", out_png)
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Flux CLI reads checkpoint weights during "
+        "denoise; use the fail-closed memory-resident product worker"
+    )

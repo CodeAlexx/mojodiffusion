@@ -9,7 +9,7 @@
 #
 # Oracle: captures/reference_image.png (zeroed text, 20 steps, cfg=5.0, seed=42).
 #
-# Architecture: 48 dual-stream MMDiT blocks (lens_dit.rs), streaming via BlockLoader.
+# Architecture: 48 dual-stream MMDiT blocks staged from a complete FP8 host store.
 
 from std.gpu.host import DeviceContext
 from std.math import sqrt, exp as fexp, cos as fcos, sin as fsin, log as flog, pow as fpow
@@ -18,7 +18,9 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
+from serenitymojo.offload.block_loader import Block
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.offload.plan import OffloadConfig, build_lens_block_plan
 from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
 from serenitymojo.ops.activations import silu, swiglu
 from serenitymojo.ops.attention import sdpa_nomask
@@ -652,7 +654,7 @@ def lens_forward(
     txt_cond: Tensor,  # [1, N_TXT, DIM] BF16
     sigma: Float32,
     resident: LensResident,
-    loader: BlockLoader,
+    mut loader: TurboPlannedLoader,
     rope: LensRopeTables,
     ctx: DeviceContext,
 ) raises -> Tensor:
@@ -667,13 +669,14 @@ def lens_forward(
     # Timestep embedding
     var temb = make_temb(sigma, resident, ctx)  # [1, DIM]
 
-    # 48-block streaming loop
+    # 48-block host-resident staging loop
+    loader.set_config(OffloadConfig.synchronous_single())
+    loader.prefetch_with_ctx(0, ctx)
     for i in range(NUM_LAYERS):
-        var prefix = String("transformer_blocks.") + String(i)
-        loader.prefetch_block(prefix)
-        var blk = loader.load_block(prefix, ctx)
-        lens_block_forward(h, e, temb, blk, prefix, rope, ctx)
-        unload_block(blk^)
+        var handle = loader.await_block(i, ctx)
+        loader.prefetch_next_with_ctx(i, ctx)
+        lens_block_forward(h, e, temb, handle.block, handle.prefix, rope, ctx)
+        loader.mark_active_block_done(ctx)
         if i % 8 == 0:
             print("    block", i + 1, "/", NUM_LAYERS)
 
@@ -782,7 +785,15 @@ def denoise(
     else:
         print("  [cfg] real prompt: two-forward CFG with norm-rescale")
 
-    var loader = BlockLoader.open(String(TRANSFORMER_DIR))
+    var plan = build_lens_block_plan()
+    var loader = TurboPlannedLoader.open(
+        String(TRANSFORMER_DIR), plan^, OffloadConfig.synchronous_single(), ctx,
+        fill_block_store=False,
+    )
+    _ = loader.pin_residents_fp8_host(1 << 60, ctx)
+    loader.require_all_blocks_memory_resident()
+    loader.release_checkpoint_pages()
+    loader.set_fp8h_overlap(True)
     var latents = initial_noise(ctx)
     _stats("init_noise", latents, ctx)
 

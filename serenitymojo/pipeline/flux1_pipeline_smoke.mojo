@@ -154,7 +154,7 @@ def _to_bf16(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     return cast_tensor(x, STDtype.BF16, ctx)
 
 
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var manifest = default_manifest_by_id(String("flux1_dev"))
     validate_flux1_pipeline_contract(manifest)
     var plan = build_flux1_packed_latent_plan(WIDTH, HEIGHT, N_TXT)
@@ -244,3 +244,10 @@ def main() raises:
     # 5. PNG.
     save_png(rgb, OUT, ctx, ValueRange.SIGNED)
     print("[done] saved", OUT)
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Flux smoke reads checkpoint weights during "
+        "denoise; use the fail-closed memory-resident product worker"
+    )

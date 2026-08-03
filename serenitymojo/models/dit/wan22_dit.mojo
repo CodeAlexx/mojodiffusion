@@ -63,7 +63,10 @@ from serenitymojo.ops.tensor_algebra import (
     add, mul, add_scalar, mul_scalar, slice, reshape, permute, transpose,
     full_device, concat,
 )
-from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
+from serenitymojo.offload.block_loader import Block, unload_block
+from serenitymojo.offload.plan import OffloadConfig
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.offload.wan22_plan import build_wan22_block_plan
 
 
 def wan22_canonical_weight_key(name: String) raises -> String:
@@ -986,7 +989,7 @@ struct Wan22DiT(Movable):
 
 
 struct Wan22CfgPreds(Movable):
-    """Paired creator-CFG velocities from one exact-BF16 block stream."""
+    """Paired creator-CFG velocities from one exact-BF16 pinned-host store."""
 
     var cond: Tensor
     var uncond: Tensor
@@ -997,17 +1000,18 @@ struct Wan22CfgPreds(Movable):
 
 
 struct Wan22DiTOffloaded(Movable):
-    """Exact-BF16 Wan TI2V-5B with creator-CFG paired block streaming.
+    """Exact-BF16 Wan TI2V-5B with creator-CFG paired RAM staging.
 
     Only the non-block patch/time/text/head tensors stay resident. Each of the
-    30 transformer blocks is loaded from the pinned BF16 artifact view, used by
-    both positive and negative branches, and then released. This preserves the
-    creator's two-branch CFG math while avoiding the resident-5B-plus-active-
-    block peak that exceeds a 24 GB card at the native 1280x704 profile.
+    30 transformer blocks is copied into one complete pinned-host store before
+    sampling, staged from RAM for both positive and negative branches, and then
+    released from VRAM. Sampling fails closed unless all blocks are memory-
+    resident. This preserves the creator's two-branch CFG math while avoiding
+    both denoise-time disk reads and the resident-5B-plus-activation peak.
     """
 
     var shared: Wan22DiT
-    var loader: BlockLoader
+    var loader: TurboPlannedLoader
     var lora: Optional[LoraSet]
     var lora_multiplier: Float32
 
@@ -1028,10 +1032,16 @@ struct Wan22DiTOffloaded(Movable):
             )
             shared_count += 1
         var shared = Wan22DiT(weights^, cfg)
-        var loader = BlockLoader.open(dir)
+        var plan = build_wan22_block_plan(cfg.num_layers)
+        var loader = TurboPlannedLoader.open(
+            dir, plan^, OffloadConfig.bf16_cfg_paired(), ctx
+        )
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        st.release_to_os()
         print(
-            "  Wan BF16 block stream: shared_tensors=", shared_count,
-            " streamed_blocks=", cfg.num_layers,
+            "  Wan BF16 pinned-host store: shared_tensors=", shared_count,
+            " resident_blocks=", cfg.num_layers, "/", cfg.num_layers,
         )
         return Wan22DiTOffloaded(
             shared^, loader^, Optional[LoraSet](), Float32(1.0)
@@ -1045,9 +1055,9 @@ struct Wan22DiTOffloaded(Movable):
         multiplier: Float32,
         ctx: DeviceContext,
     ) raises -> Wan22DiTOffloaded:
-        """Load exact BF16 blocks and attach a fail-closed streamed LoRA.
+        """Load exact BF16 blocks and attach a fail-closed staged LoRA.
 
-        Block deltas are added to each freshly streamed BF16 block in memory;
+        Block deltas are added to each RAM-staged BF16 block;
         global deltas are merged once into the small resident shared set.
         Nothing is written back to the base checkpoint or adapter.
         """
@@ -1059,8 +1069,10 @@ struct Wan22DiTOffloaded(Movable):
         var inventory = Dict[String, Bool]()
         for ref entry in model.shared.weights.items():
             inventory[entry.key] = True
-        for ref name in model.loader.sharded.names():
+        var inventory_source = ShardedSafeTensors.open(dir)
+        for ref name in inventory_source.names():
             inventory[name] = True
+        inventory_source.release_to_os()
         var matched = 0
         var global_mappings = 0
         for ref mapping in lora.mappings:
@@ -1085,7 +1097,7 @@ struct Wan22DiTOffloaded(Movable):
         model.lora = Optional[LoraSet](lora^)
         model.lora_multiplier = multiplier
         print(
-            "  Wan BF16 streamed LoRA attached: mappings=", matched,
+            "  Wan BF16 pinned-host LoRA attached: mappings=", matched,
             " global=", globals_merged, " multiplier=", multiplier,
         )
         return model^
@@ -1093,7 +1105,7 @@ struct Wan22DiTOffloaded(Movable):
     def __init__(
         out self,
         var shared: Wan22DiT,
-        var loader: BlockLoader,
+        var loader: TurboPlannedLoader,
         var lora: Optional[LoraSet],
         lora_multiplier: Float32,
     ):
@@ -1103,14 +1115,14 @@ struct Wan22DiTOffloaded(Movable):
         self.lora_multiplier = lora_multiplier
 
     def _load_block(
-        self, index: Int, ctx: DeviceContext
+        mut self, index: Int, ctx: DeviceContext
     ) raises -> Block:
         var prefix = String("blocks.") + String(index)
-        self.loader.prefetch_block(prefix)
-        var loaded = self.loader.load_block_as_bf16(prefix, ctx)
+        var handle = self.loader.await_block(index, ctx)
+        self.loader.prefetch_next_with_ctx(index, ctx)
         if self.lora:
             var merged = self.lora.value().merge_into(
-                loaded, self.lora_multiplier, ctx
+                handle.block, self.lora_multiplier, ctx
             )
             if merged == 0:
                 # A partial LoRA may intentionally omit this block. The entire
@@ -1119,11 +1131,11 @@ struct Wan22DiTOffloaded(Movable):
                 pass
         var local = Block()
         var dotted = prefix + String(".")
-        for ref entry in loaded.items():
+        for ref entry in handle.block.items():
             var canonical = wan22_canonical_weight_key(entry.key)
             if not canonical.startswith(dotted):
                 raise Error(
-                    String("Wan streamed block key escaped prefix: ")
+                    String("Wan pinned-host block key escaped prefix: ")
                     + canonical
                 )
             local[canonical.replace(dotted, String(""))] = entry.value
@@ -1189,14 +1201,14 @@ struct Wan22DiTOffloaded(Movable):
         FG: Int, HG: Int, WG: Int, S: Int,
         TXT: Int, CTXL: Int, H: Int, DH: Int,
     ](
-        self,
+        mut self,
         x_lat: Tensor,
         timestep_tokens: Tensor,
         context_cond: Tensor,
         context_uncond: Tensor,
         ctx: DeviceContext,
     ) raises -> Wan22CfgPreds:
-        """Run the creator's cond/uncond calls through one BF16 block stream."""
+        """Run creator cond/uncond through one complete BF16 host store."""
         var cfg = self.shared.config
         var dim = cfg.dim
         var in_dim = cfg.in_dim
@@ -1275,6 +1287,7 @@ struct Wan22DiTOffloaded(Movable):
             img_uncond = wan22_block_forward[S, TXT, H, DH](
                 img_uncond, e0, txt_uncond, cs[0], cs[1], block, cfg, ctx
             )
+            self.loader.mark_active_block_done(ctx)
             unload_block(block^)
 
         var cond = self._head[FG, HG, WG, S](

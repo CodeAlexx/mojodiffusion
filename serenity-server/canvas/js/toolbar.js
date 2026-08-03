@@ -99,6 +99,7 @@ class SFToolbar {
         this.api.on('execution_start', (data) => {
             if (!this._acceptJobEvent(data))
                 return;
+            this._isRunning = true;
             this._setRunControls(true);
             this._setStatus('running');
             this._setWorkflowStatus('loading', 'Loading model and conditioning…');
@@ -141,17 +142,21 @@ class SFToolbar {
                 // Check for image outputs
                 if (data.output && data.output.images) {
                     data.output.images.forEach((img) => {
+                        const src = this.api.viewUrl(img.filename, img.subfolder, img.type);
                         if (sfPreview) {
-                            sfPreview.showImage(this.api.viewUrl(img.filename, img.subfolder, img.type));
+                            sfPreview.showImage(src);
                         }
+                        this._publishGenerateResult(src, false, data.prompt_id);
                     });
                 }
                 // Check for video outputs (SaveVideo, SaveAnimatedWEBP)
                 if (data.output && data.output.videos) {
                     data.output.videos.forEach((vid) => {
+                        const src = this.api.viewUrl(vid.filename, vid.subfolder, vid.type);
                         if (sfPreview) {
-                            sfPreview.showVideo(this.api.viewUrl(vid.filename, vid.subfolder, vid.type));
+                            sfPreview.showVideo(src);
                         }
+                        this._publishGenerateResult(src, true, data.prompt_id);
                     });
                 }
             }
@@ -329,6 +334,26 @@ class SFToolbar {
             this.workflowStatusLine.className = 'wf-status-line is-' + this._executionPhase;
         if (this.workflowStatusText)
             this.workflowStatusText.textContent = text || 'Ready';
+        this._notifyGenerateActivity();
+    }
+    getSharedGenerationActivity() {
+        const active = this._executionPhase === 'loading' ||
+            this._executionPhase === 'running' ||
+            this._executionPhase === 'output';
+        return {
+            active: active,
+            promptId: String(this._activePromptId || ''),
+            phase: this._executionPhase,
+            label: this.workflowStatusText
+                ? this.workflowStatusText.textContent
+                : (active ? 'Workflow running' : '')
+        };
+    }
+    _notifyGenerateActivity() {
+        if (typeof GenerateTab === 'undefined' ||
+            !GenerateTab.setExternalActivity)
+            return;
+        GenerateTab.setExternalActivity(this.getSharedGenerationActivity());
     }
     _setRunControls(running) {
         const label = this.queueBtn ? this.queueBtn.querySelector('span') : null;
@@ -348,6 +373,29 @@ class SFToolbar {
         if (!this._activePromptId && promptId)
             this._activePromptId = promptId;
         return true;
+    }
+    _publishGenerateResult(src, isVideo, promptId) {
+        if (!src)
+            return;
+        const result = {
+            src: src,
+            isVideo: isVideo === true,
+            promptId: String(promptId || this._activePromptId || '')
+        };
+        try {
+            localStorage.setItem('sf-view-image', JSON.stringify(result));
+        }
+        catch (_) { }
+        if ((localStorage.getItem('sf-active-tab') || 'generate') === 'generate' &&
+            typeof GenerateTab !== 'undefined' &&
+            GenerateTab.displayCompletedJob) {
+            try {
+                localStorage.removeItem('sf-view-image');
+            }
+            catch (_) { }
+            GenerateTab.displayCompletedJob(
+                result.src, result.isVideo, result.promptId);
+        }
     }
     _nodePhase(node) {
         const type = node ? String(node.nodeType || '').toLowerCase() : '';
@@ -597,4 +645,3 @@ class SFToolbar {
         this._notes.push({ element: note, id: noteId });
     }
 }
-//# sourceMappingURL=toolbar.js.map

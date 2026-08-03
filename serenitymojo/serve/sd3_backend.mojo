@@ -41,29 +41,27 @@
 #      (pad id 0). We replicate the second push to match the reference token stream.
 #
 # The denoise (28-step shifted rectified-flow CFG Euler) and VAE decode reuse
-# sd3_sample_cli's exact math (_sd3_large_forward streams 38 joint blocks via
-# BlockLoader; sd3_cfg/sd3_euler_step; load_sd3_embedded_ldm_decoder).
+# sd3_sample_cli's exact block math (_sd3_large_forward visits 38 joint blocks;
+# sd3_cfg/sd3_euler_step; load_sd3_embedded_ldm_decoder).
 #
 # Residency model (single-GPU, 24 GB):
-#   * The SD3.5 Large MMDiT is BLOCK-STREAMED from disk (38 joint blocks, ~426 MB
-#     each, streamed one at a time inside the forward). The RESIDENT win is the
-#     small pre/post-block gate (SD3MMDiTPreBlockGate: patch/pos/context/cond/final
-#     weights) PLUS the BlockLoader handle (mmap'd checkpoint) — both loaded ONCE
-#     (first job) and kept across jobs. The 38 block weights are never all-resident
-#     (they cannot fit); the per-forward peak is one block + activations.
+#   * All 38 SD3.5 Large MMDiT blocks live in a complete pinned-host FP8 store.
+#     Denoise stages from RAM only. The small pre/post-block gate
+#     (SD3MMDiTPreBlockGate: patch/pos/context/cond/final weights) is loaded on
+#     the GPU per job; the host store survives VAE decode and repeat jobs.
 #   * The CLIP-L (~250 MB) + CLIP-G (~1.4 GB) + T5-XXL (~9.5 GB BF16) encoders are
 #     loaded -> used -> freed PER JOB inside the ENCODE step (Movable-not-Copyable
 #     Tensors drop at scope exit; the encode is staged so they never co-reside with
 #     the resident gate at peak beyond the encoder footprint).
 #   * The VAE decoder (~330 MB) is loaded PER JOB inside the DECODE step and freed.
-#     SD3 keeps no large resident denoiser at decode (blocks are streamed, freed).
-#     The pre/post gate is also released before VAE decode so the strict server
+#     SD3 drops only transient GPU staging before decode and keeps the host
+#     store warm. The pre/post gate is released before VAE decode so the strict server
 #     product gate can fit on a 24 GB card even when another small GPU context is
-#     present; a later job reloads the gate/BlockLoader.
+#     present; a later job reloads only the gate.
 #
 # step() state machine: ENCODE (per-job, blocking — announced phase="encoding")
-#   → LOAD (gate + BlockLoader, once, announced phase="loading") → DENOISE×steps
-#   (two streamed forwards + Euler update per tick) → DECODE (announced
+#   → LOAD (gate + complete host store, once, announced phase="loading") → DENOISE×steps
+#   (two RAM-staged forwards + Euler update per tick) → DECODE (announced
 #   phase="decoding") → done. cancel() makes the next step() return cancelled and
 #   frees all per-job tensors.
 #
@@ -89,7 +87,12 @@ from serenitymojo.io.ffi import BytePtr
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.image.png import _quantize, ValueRange
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
-from serenitymojo.offload.block_loader import BlockLoader, unload_block
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.offload.plan import (
+    OffloadConfig,
+    build_sd35_large_block_plan,
+)
+from serenitymojo.registry.checkpoints import path_exists
 
 from serenitymojo.tokenizer.clip_tokenizer import ClipTokenizer
 from serenitymojo.tokenizer.t5_tokenizer import T5Tokenizer
@@ -204,7 +207,7 @@ comptime S3PHASE_DENOISE = 3
 comptime S3PHASE_DECODE = 4
 
 # Whole-image VAE decode is preferred when it fits: tiled decode is MEASURED to
-# degrade output (MJ-1054). SD3 streams its blocks and releases the resident gate
+# degrade output (MJ-1054). SD3 releases GPU staging and its resident gate
 # before decode, so free VRAM is usually ample. After that release + mempool trim
 # we query free VRAM and decode whole when it clears this bar, else fall back to
 # the (degrading) 5x5-lowmem tiled path. 14 GiB is a conservative estimate to be
@@ -470,7 +473,7 @@ def _sd3_large_forward[LH_: Int, LW_: Int, N_IMG_: Int, S_JOINT_: Int](
     context: Tensor,         # [1, N_CTX, 4096] BF16
     pooled: Tensor,          # [1, 2048] BF16
     gate: SD3MMDiTPreBlockGate,
-    loader: BlockLoader,
+    mut loader: TurboPlannedLoader,
     ctx: DeviceContext,
     lora: Optional[ArcPointer[Sd3LokrOverlay]] = None,
 ) raises -> Tensor:
@@ -478,16 +481,18 @@ def _sd3_large_forward[LH_: Int, LW_: Int, N_IMG_: Int, S_JOINT_: Int](
     var c = gate.conditioning(sigma, pooled, ctx)
     var ctx_tokens = gate.context_embed[N_CTX](context, ctx)
 
+    loader.set_config(OffloadConfig.synchronous_single())
+    loader.prefetch_with_ctx(0, ctx)
     for i in range(DEPTH):
         var is_last = (i == DEPTH - 1)
-        var block_prefix = String("model.diffusion_model.joint_blocks.") + String(i)
-        loader.prefetch_block(block_prefix)
-        var blk = loader.load_block(block_prefix, ctx)
+        var handle = loader.await_block(i, ctx)
+        loader.prefetch_next_with_ctx(i, ctx)
         _sd3_joint_block[1, S_JOINT_, N_CTX, N_IMG_, H_HEADS, H_DIM](
-            ctx_tokens, x_tokens, c, blk, i, is_last, DUAL_BLOCKS, HIDDEN, ctx,
+            ctx_tokens, x_tokens, c, handle.block, i, is_last,
+            DUAL_BLOCKS, HIDDEN, ctx,
             lora,
         )
-        unload_block(blk^)
+        loader.mark_active_block_done(ctx)
 
     var patch_out = gate.final_layer_tokens(x_tokens, c, ctx)
     return gate.final_unpatchify[LH_, LW_](patch_out, ctx)
@@ -496,10 +501,11 @@ def _sd3_large_forward[LH_: Int, LW_: Int, N_IMG_: Int, S_JOINT_: Int](
 struct Sd3Backend(GenBackend, Movable):
     var ctx: DeviceContext
 
-    # ── resident across jobs (pre/post gate + BlockLoader handle, loaded once) ──
+    # ── resident across jobs (pre/post gate + complete host store) ────────────
     var loaded: Bool
     var gate: List[ArcPointer[SD3MMDiTPreBlockGate]]  # 0/1 (resident gate)
-    var loader: List[ArcPointer[BlockLoader]]         # 0/1 (mmap handle)
+    var loader: List[ArcPointer[TurboPlannedLoader]]  # 0/1 (complete host store)
+    var loader_checkpoint: String
     var lora: List[ArcPointer[Sd3LokrOverlay]]         # 0/1 runtime LoKr
     var lora_target_count: Int
 
@@ -531,7 +537,8 @@ struct Sd3Backend(GenBackend, Movable):
         self.ctx = DeviceContext()
         self.loaded = False
         self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
-        self.loader = List[ArcPointer[BlockLoader]]()
+        self.loader = List[ArcPointer[TurboPlannedLoader]]()
+        self.loader_checkpoint = String("")
         self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.lora_target_count = 0
         self.active = False
@@ -561,12 +568,19 @@ struct Sd3Backend(GenBackend, Movable):
         return String("sd3")
 
     def model_name(self) -> String:
-        return String("SD3.5 Large")
+        return (
+            self.params.model.copy()
+            if self.params.model.byte_length() > 0
+            else String("SD3.5 Large")
+        )
 
     def resident_model(self) -> String:
-        """Matches the /v1/models scan entry for the resident checkpoint
-        (the sd3.5_large.safetensors checkpoint)."""
-        return String("sd3.5_large.safetensors") if self.loaded else String("")
+        return self.params.model.copy() if self.loaded else String("")
+
+    def _checkpoint_path(self) -> String:
+        if self.params.checkpoint_path.byte_length() > 0:
+            return self.params.checkpoint_path.copy()
+        return String(MODEL_PATH)
 
     # ── job admission ─────────────────────────────────────────────────────────
     def start(mut self, params: JobParams) raises:
@@ -608,18 +622,30 @@ struct Sd3Backend(GenBackend, Movable):
                 "sd3: img2img is not supported for SD3.5 Large yet;"
                 " submit without an init image"
             )
+        if params.checkpoint_path.byte_length() > 0 and not path_exists(params.checkpoint_path):
+            raise Error(
+                String("sd3: selected checkpoint not found: ")
+                + params.checkpoint_path
+            )
         # Warn-loud (never silently drop) on any advanced-sampling knob set but
         # unsupported by this fixed flow-match Euler path.
         warn_unsupported_advanced_sampling_params(params, String("sd3"), List[String]())
-        # Normal completion already releases this streamed model before VAE
-        # decode. A cancelled/failed job can leave it resident; never reuse that
-        # state across a changed LoKr request.
+        var next_checkpoint = (
+            params.checkpoint_path.copy()
+            if params.checkpoint_path.byte_length() > 0
+            else String(MODEL_PATH)
+        )
+        # A cancelled/failed job can leave GPU gate/LoKr state resident. Drop
+        # that per-job state, but retain a matching complete host store.
         if self.loaded:
             self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
-            self.loader = List[ArcPointer[BlockLoader]]()
             self.lora = List[ArcPointer[Sd3LokrOverlay]]()
             self.lora_target_count = 0
             self.loaded = False
+        if len(self.loader) == 1 and self.loader_checkpoint != next_checkpoint:
+            print("[sd3] selected checkpoint changed; dropping old host store")
+            self.loader = List[ArcPointer[TurboPlannedLoader]]()
+            self.loader_checkpoint = String("")
         self.params = params.copy()
         self.executed_sampler = sampler_admission.executed
         self.dpmpp_history = MultistepHistory(1)
@@ -658,10 +684,10 @@ struct Sd3Backend(GenBackend, Movable):
 
     def between_jobs_trim(mut self) raises:
         """Reclaim the per-job transient peak (CLIP-L+G+T5 encoders ~11 GB, the VAE
-        decoder ~330 MB, per-forward streamed block + activations) back to the OS via
+        decoder ~330 MB, per-forward staged block + activations) back to the OS via
         cuMemPoolTrimTo. The pre/post gate is released before VAE decode on the
-        product path, so this mostly clears allocator residue; the BlockLoader
-        holds an mmap (no device weights)."""
+        product path, so this mostly clears allocator residue; denoiser weights
+        are staged from the complete FP8 host store, never the checkpoint."""
         var before = cu_mem_get_info()
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
@@ -680,11 +706,13 @@ struct Sd3Backend(GenBackend, Movable):
             self.min_free_bytes = mem.free_bytes
 
     def _release_resident_for_decode(mut self) raises:
-        """Drop SD3 MMDiT resident state before VAE decode to lower peak VRAM."""
+        """Drop SD3 GPU state before VAE while preserving the host store."""
         if self.loaded:
-            print("[sd3] releasing resident SD3 gate + BlockLoader before VAE decode")
+            print("[sd3] releasing SD3 gate + GPU staging; preserving host store")
+        self.ctx.synchronize()
+        if len(self.loader) == 1:
+            self.loader[0][].discard_fp8h_device_staging()
         self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
-        self.loader = List[ArcPointer[BlockLoader]]()
         self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.loaded = False
         self.ctx.synchronize()
@@ -706,7 +734,8 @@ struct Sd3Backend(GenBackend, Movable):
         var content = String("{\n")
         content += String('  "schema":"serenity.sd3.daemon_result.v1",\n')
         content += String('  "backend":"sd3_daemon",\n')
-        content += String('  "model":"sd3.5-large",\n')
+        content += String('  "model":"') + json_escape(self.model_name()) + String('",\n')
+        content += String('  "checkpoint_path":"') + json_escape(self._checkpoint_path()) + String('",\n')
         content += String('  "readiness_label":"experimental",\n')
         content += String('  "accepted_sampler_parity":false,\n')
         content += String('  "accepted_speed_parity":false,\n')
@@ -726,7 +755,7 @@ struct Sd3Backend(GenBackend, Movable):
         ) + String('",\n')
         content += String('    "executed_scheduler":"sd3_simple_flowmatch",\n')
         content += String('    "schedule_source":"sd3_large_shifted_flowmatch",\n')
-        content += String('    "streamed_blocks":') + String(DEPTH) + String(",\n")
+        content += String('    "host_resident_blocks":') + String(DEPTH) + String(",\n")
         content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
         content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
         content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
@@ -770,7 +799,7 @@ struct Sd3Backend(GenBackend, Movable):
         content += String('    "artifact_paths":["') + json_escape(png_path) + String('","') + json_escape(manifest_path) + String('"]\n')
         content += String("  },\n")
         content += String('  "output_png":"') + json_escape(png_path) + String('",\n')
-        content += String('  "note":"Rust-server Mojo worker product-path result; SD3 blocks are streamed through the local BlockLoader. Speed parity remains unaccepted until paired baseline evidence exists."\n')
+        content += String('  "note":"Rust-server Mojo worker product-path result; SD3 blocks stage from a complete FP8 host-resident store with no denoise checkpoint I/O. Speed parity remains unaccepted until paired baseline evidence exists."\n')
         content += String("}\n")
         write_text_file(manifest_path, content)
         return manifest_path
@@ -845,23 +874,43 @@ struct Sd3Backend(GenBackend, Movable):
         _print_vram("after process-isolated conditioning load")
 
     def _load_model_shape[LH_: Int, LW_: Int](mut self) raises:
-        """Load the SD3.5 Large pre/post gate + BlockLoader (once; stays resident)."""
+        """Load the SD3.5 Large gate + complete FP8 host block store."""
         if self.loaded:
             if self.gate[0][].latent_h == LH_ and self.gate[0][].latent_w == LW_:
                 return
             print("[sd3] admitted shape changed; reloading rectangular pre/post gate")
             self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
-            self.loader = List[ArcPointer[BlockLoader]]()
             self.loaded = False
-        _print_vram("before SD3 gate + BlockLoader load")
+        _print_vram("before SD3 gate + host-store load")
         print("[sd3] loading SD3.5 Large pre/post gate", LH_, "x", LW_,
-              "(resident) + block loader for", DEPTH, "blocks")
+              "(resident) + FP8 host store for", DEPTH, "blocks")
         self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
+        var checkpoint_path = self._checkpoint_path()
         self.gate.append(ArcPointer(
-            SD3MMDiTPreBlockGate.load_large_shape[LH_, LW_](self.ctx)
+            SD3MMDiTPreBlockGate.load_large_shape_from_path[LH_, LW_](
+                checkpoint_path.copy(), self.ctx
+            )
         ))
-        self.loader = List[ArcPointer[BlockLoader]]()
-        self.loader.append(ArcPointer(BlockLoader.open(String(MODEL_PATH))))
+        if len(self.loader) == 0:
+            var plan = build_sd35_large_block_plan()
+            var loader = TurboPlannedLoader.open(
+                checkpoint_path.copy(),
+                plan^,
+                OffloadConfig.synchronous_single(),
+                self.ctx,
+                fill_block_store=False,
+            )
+            var host_blocks = loader.pin_residents_fp8_host(1 << 60, self.ctx)
+            loader.require_all_blocks_memory_resident()
+            loader.release_checkpoint_pages()
+            loader.discard_unused_raw_streaming_slots(self.ctx)
+            loader.set_fp8h_overlap(True)
+            print("[sd3] host-resident FP8 denoiser blocks:", host_blocks, "/", DEPTH)
+            self.loader.append(ArcPointer(loader^))
+            self.loader_checkpoint = checkpoint_path.copy()
+        else:
+            self.loader[0][].require_all_blocks_memory_resident()
+            print("[sd3] reusing complete host-resident denoiser store:", DEPTH, "/", DEPTH)
         self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.lora_target_count = 0
         if len(self.params.loras) == 1:
@@ -882,7 +931,7 @@ struct Sd3Backend(GenBackend, Movable):
             print("[sd3] loaded", self.lora_target_count, "LoKr attention targets")
             self.lora.append(ArcPointer(overlay^))
         self.loaded = True
-        _print_vram("after SD3 gate + BlockLoader load (resident)")
+        _print_vram("after SD3 gate + host-store load (resident)")
 
     def _load_model(mut self) raises:
         comptime for bi in range(DEFAULT_ASPECT_LADDER_LEN):
@@ -1011,9 +1060,8 @@ struct Sd3Backend(GenBackend, Movable):
         self.caps = List[ArcPointer[Sd3Caps]]()
         self.sched = List[ArcPointer[SD3FlowMatchScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
-        # SD3 streams its blocks; release the remaining resident gate before VAE
-        # decode to avoid product-path OOM on 24 GB cards with another small GPU
-        # context present. A later job reloads the gate/BlockLoader.
+        # Release GPU gate/staging before VAE while retaining the pinned-host
+        # store. A later job reloads only the much smaller gate.
         self._release_resident_for_decode()
         # Prefer whole-image decode when VRAM allows; tiled degrades output (MJ-1054).
         var mem = cu_mem_get_info()
@@ -1021,13 +1069,17 @@ struct Sd3Backend(GenBackend, Movable):
         if mem.free_bytes > WHOLE_DECODE_MIN_FREE_BYTES:
             print("[sd3] WHOLE-image decode (free=", free_gib,
                   "GiB) — tiled measured to degrade output (MJ-1054)")
-            var dec = load_sd3_embedded_ldm_decoder[LH_, LW_](String(MODEL_PATH), self.ctx)
+            var dec = load_sd3_embedded_ldm_decoder[LH_, LW_](
+                self._checkpoint_path(), self.ctx
+            )
             var wimg = dec.decode(latent, self.ctx)
             _save_rgb_png_with_text(wimg, png_path, self.params.params_json, self.ctx)
             return png_path
         print("[sd3] tiled VAE decode FALLBACK (5x5 lowmem overlap+blend) — free=",
               free_gib, "GiB below whole-image threshold; tiled degrades output (MJ-1054)")
-        var img = sd3_tiled_decode_5x5_lowmem[LH_, LW_](latent, String(MODEL_PATH), self.ctx)
+        var img = sd3_tiled_decode_5x5_lowmem[LH_, LW_](
+            latent, self._checkpoint_path(), self.ctx
+        )
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 
@@ -1104,6 +1156,7 @@ struct Sd3Backend(GenBackend, Movable):
                 self._record_vram()
                 self.phase = S3PHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == S3PHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -1112,6 +1165,7 @@ struct Sd3Backend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.params.steps:
                     self.phase = S3PHASE_DECODE
                 return r^

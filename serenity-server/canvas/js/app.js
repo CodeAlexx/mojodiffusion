@@ -365,4 +365,3 @@ function setupCanvasDragDrop(canvas) {
         }
     });
 }
-//# sourceMappingURL=app.js.map

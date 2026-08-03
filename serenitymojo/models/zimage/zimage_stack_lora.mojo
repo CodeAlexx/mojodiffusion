@@ -1938,7 +1938,12 @@ def zimage_refine_x_seq[
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> List[Float32]:
-    var xs_arc = TArc(_t(x_seq, [N_IMG, D], ctx))
+    # Creator inference keeps the transformer hidden state in checkpoint dtype.
+    # The host List widened BF16 values only for transport, so narrow once at
+    # the stack boundary instead of recasting the full activation per Linear.
+    var xs_arc = TArc(Tensor.from_host(
+        x_seq, [N_IMG, D], STDtype.BF16, ctx
+    ))
     for i in range(len(nr_blocks)):
         var mv_dev = zimage_modvecs_to_device(nr_mod[i], D, ctx)
         xs_arc = zimage_block_forward_device_moddev[H, Dh, N_IMG](
@@ -1989,13 +1994,17 @@ def zimage_stack_lora_predict_main_from_refined_moddev_tensor[
     var num_cr = len(cr_blocks)
     var num_main = len(main_blocks)
 
-    var cs_arc = TArc(_t(cap_seq, [N_TXT, D], ctx))
+    var cs_arc = TArc(Tensor.from_host(
+        cap_seq, [N_TXT, D], STDtype.BF16, ctx
+    ))
     for i in range(num_cr):
         cs_arc = zimage_refiner_forward_device[H, Dh, N_TXT](
             cs_arc.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
         )
 
-    var xs_arc = TArc(_t(xs, [N_IMG, D], ctx))
+    var xs_arc = TArc(Tensor.from_host(
+        xs, [N_IMG, D], STDtype.BF16, ctx
+    ))
     var x_arc = TArc(concat(0, ctx, xs_arc[], cs_arc[]))
 
     for i in range(num_main):

@@ -951,4 +951,3 @@ var SettingsTab = (function () {
     }
     return { init: init };
 })();
-//# sourceMappingURL=settings.js.map

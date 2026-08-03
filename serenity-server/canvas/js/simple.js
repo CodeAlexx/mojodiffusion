@@ -1175,4 +1175,3 @@ var SimpleMode = (function () {
         generate: generate
     };
 })();
-//# sourceMappingURL=simple.js.map

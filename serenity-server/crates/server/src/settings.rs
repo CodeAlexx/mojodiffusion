@@ -97,8 +97,6 @@ pub(crate) fn configured_extra_model_roots(out: &Path) -> Vec<PathBuf> {
 
 // ── GET /templates ───────────────────────────────────────────────────────────────
 
-const BUILTIN_TEMPLATES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../canvas/workflows");
-
 fn collect_template_dir(entries: &mut BTreeMap<String, Value>, dir: &Path, url_prefix: &str) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -113,10 +111,11 @@ fn collect_template_dir(entries: &mut BTreeMap<String, Value>, dir: &Path, url_p
             .strip_suffix(".json")
             .unwrap_or(&filename)
             .to_string();
+        let display_name = name.replace('_', " ");
         entries.insert(
             name.clone(),
             json!({
-                "name": name,
+                "name": display_name,
                 "file": filename,
                 "path": path.to_string_lossy(),
                 "url": format!("{url_prefix}/{filename}"),
@@ -141,7 +140,8 @@ fn template_entries(builtin_dir: &Path, user_dir: &Path) -> Vec<Value> {
 pub async fn get_templates(State(st): State<AppState>) -> Response {
     let user_dir = st.out_dir.join("templates");
     let _ = std::fs::create_dir_all(&user_dir);
-    let out = template_entries(Path::new(BUILTIN_TEMPLATES_DIR), &user_dir);
+    let builtin_dir = crate::repository_root_path().join("serenity-server/canvas/workflows");
+    let out = template_entries(&builtin_dir, &user_dir);
     json_ok(&Value::Array(out))
 }
 
@@ -430,15 +430,15 @@ mod tests {
         let user = root.join("user");
         std::fs::create_dir_all(&builtin).unwrap();
         std::fs::create_dir_all(&user).unwrap();
-        std::fs::write(builtin.join("alpha.json"), b"{}").unwrap();
+        std::fs::write(builtin.join("alpha_beta.json"), b"{}").unwrap();
         std::fs::write(builtin.join("beta.json"), b"{}").unwrap();
         std::fs::write(user.join("beta.json"), b"{\"user\":true}").unwrap();
         std::fs::write(user.join("notes.txt"), b"ignored").unwrap();
 
         let entries = template_entries(&builtin, &user);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["name"], "alpha");
-        assert_eq!(entries[0]["url"], "/workflows/alpha.json");
+        assert_eq!(entries[0]["name"], "alpha beta");
+        assert_eq!(entries[0]["url"], "/workflows/alpha_beta.json");
         assert_eq!(entries[1]["name"], "beta");
         assert_eq!(entries[1]["url"], "/out/templates/beta.json");
         std::fs::remove_dir_all(&root).unwrap();

@@ -4,7 +4,7 @@
 # serenity_worker_zimage.mojo / serenity_worker_ideogram4.mojo: the SAME AF_UNIX
 # newline-JSON IPC loop, but driving the REAL Sd3Backend (GPU/MAX SD3.5 Large
 # pipeline — runtime CLIP-L+CLIP-G+T5-XXL text encode + SD3 MMDiT 28-step shifted
-# flow-match CFG Euler denoise, blocks streamed via BlockLoader + embedded SD3 VAE
+# flow-match CFG Euler denoise, complete pinned-host FP8 block store + embedded SD3 VAE
 # decode). The Rust control plane (serenity-server) spawns one of these per resident
 # model, identically to the sdxl/zimage/qwenimage/ideogram4 workers:
 # `serenity_worker_sd3 <fd>`.

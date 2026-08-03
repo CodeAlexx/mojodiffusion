@@ -573,4 +573,3 @@ var CanvasStaging = (function () {
         isPartialMaskMode: isPartialMaskMode,
     };
 })();
-//# sourceMappingURL=canvas-staging.js.map

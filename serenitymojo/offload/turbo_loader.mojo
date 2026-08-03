@@ -201,6 +201,7 @@ struct TurboBlockLoader(Movable):
     var index_starts: List[Int]
     var index_lengths: List[Int]
     var index_names: List[String]
+    var index_records: List[_TensorRecord]
     var store_offsets: List[Int]
     var store_nbytes: List[Int]
 
@@ -247,12 +248,13 @@ struct TurboBlockLoader(Movable):
         against the production copy-stream path without editing this file.
         """
         var sharded = ShardedSafeTensors.open(dir)
+        var storage_names = sharded.names_storage_order()
 
         # Pass 1: compute max bytes across all blocks.
         # A block is all tensors sharing the same "X.N." prefix.
         var prefix_bytes = Dict[String, Int]()
         var prefixes = List[String]()
-        for ref nm in sharded.names():
+        for ref nm in storage_names:
             var p = _extract_block_prefix(nm)
             var tv = sharded.tensor_view(nm)
             var nb = tv.nbytes()
@@ -273,13 +275,24 @@ struct TurboBlockLoader(Movable):
         var index_starts = List[Int]()
         var index_lengths = List[Int]()
         var index_names = List[String]()
+        var index_records = List[_TensorRecord]()
         for pi in range(len(prefixes)):
             var p = prefixes[pi].copy()
             var start = len(index_names)
             var count = 0
-            for ref nm in sharded.names():
+            var block_offset = 0
+            for ref nm in storage_names:
                 if _extract_block_prefix(nm) == p:
+                    var tv = sharded.tensor_view(nm)
+                    var nb = tv.nbytes()
                     index_names.append(nm)
+                    index_records.append(
+                        _TensorRecord(
+                            nm, block_offset, nb,
+                            ArcPointer(tv.shape.copy()), tv.dtype,
+                        )
+                    )
+                    block_offset += nb
                     count += 1
             index_starts.append(start)
             index_lengths.append(count)
@@ -317,6 +330,10 @@ struct TurboBlockLoader(Movable):
                     var dst = BytePtr(unsafe_from_address=Int(block_store.unsafe_ptr())) + dst_base + offset
                     _ = sys_memcpy(dst, src, nb)
                     offset += nb
+            # The complete weight source now lives in pinned host RAM. Drop the
+            # checkpoint-backed page-cache copy immediately so load-once does
+            # not retain both copies and pressure the host into OOM.
+            sharded.release_to_os()
         else:
             block_store = ctx.enqueue_create_host_buffer[DType.uint8](1)
 
@@ -343,6 +360,7 @@ struct TurboBlockLoader(Movable):
             compute_done0^, compute_done1^,
             copy_stream^,
             prefixes^, index_starts^, index_lengths^, index_names^,
+            index_records^,
             store_offsets^, store_nbytes^,
             max_bytes,
             use_default_stream_copy,
@@ -366,6 +384,7 @@ struct TurboBlockLoader(Movable):
         var index_starts: List[Int],
         var index_lengths: List[Int],
         var index_names: List[String],
+        var index_records: List[_TensorRecord],
         var store_offsets: List[Int],
         var store_nbytes: List[Int],
         slab_capacity: Int,
@@ -391,6 +410,7 @@ struct TurboBlockLoader(Movable):
         self.index_starts = index_starts^
         self.index_lengths = index_lengths^
         self.index_names = index_names^
+        self.index_records = index_records^
         self.store_offsets = store_offsets^
         self.store_nbytes = store_nbytes^
         self.prefix0 = String("")
@@ -412,6 +432,30 @@ struct TurboBlockLoader(Movable):
     def _idle_slot(self) -> Int:
         """The slot NOT currently being read by compute (the prefetch target)."""
         return 1 - self.active_slot
+
+    def discard_streaming_slots(mut self, ctx: DeviceContext) raises:
+        """Release the raw-BF16 host/device staging slabs after a higher-level
+        loader has made every block resident elsewhere.
+
+        This loader remains usable for index metadata and its copy stream, but
+        `prefetch` must not be called afterwards. The plan-level owner enforces
+        complete residency before exposing this operation."""
+        self.copy_stream.synchronize()
+        ctx.synchronize()
+        self.host0 = ctx.enqueue_create_host_buffer[DType.uint8](1)
+        self.host1 = ctx.enqueue_create_host_buffer[DType.uint8](1)
+        self.dev0 = ctx.enqueue_create_buffer[DType.uint8](1)
+        self.dev1 = ctx.enqueue_create_buffer[DType.uint8](1)
+        self.recs0 = List[_TensorRecord]()
+        self.recs1 = List[_TensorRecord]()
+        self.prefix0 = String("")
+        self.prefix1 = String("")
+        self.staged0 = False
+        self.staged1 = False
+        self.used0 = 0
+        self.used1 = 0
+        self.slab_capacity = 1
+        ctx.synchronize()
 
     def prefetch(
         mut self,
@@ -462,14 +506,9 @@ struct TurboBlockLoader(Movable):
         var start = self.index_starts[prefix_idx]
         var end = start + self.index_lengths[prefix_idx]
         for ni in range(start, end):
-            var nm = self.index_names[ni].copy()
-            var tv = self.sharded.tensor_view(nm)
-            var nb = tv.nbytes()
-            var sh = ArcPointer(tv.shape.copy())
-            new_recs.append(
-                _TensorRecord(nm, offset, nb, sh, tv.dtype)
-            )
-            offset += nb
+            var rec = self.index_records[ni].copy()
+            offset += rec.nbytes
+            new_recs.append(rec^)
 
         if offset == 0:
             raise Error(

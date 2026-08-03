@@ -77,13 +77,10 @@ var WorkflowBuilder = (function () {
                 workflow = buildSD15(params);
                 break;
         }
-        // Generate exposes sampler and noise schedule as separate Serenity
-        // controls. Builders retain legacy combined-scheduler compatibility,
-        // then this final pass makes a staged Workflow graph match the exact
-        // admitted values chosen in Generate.
-        if (params.sampler || params.noiseScheduler) {
+        // Keep the sampler and scheduler from the submitted request exact.
+        if (params.sampler || params.scheduler) {
             var requestedSampler = params.sampler || '';
-            var requestedScheduler = params.noiseScheduler || '';
+            var requestedScheduler = params.scheduler || '';
             Object.keys(workflow).forEach(function (id) {
                 var node = workflow[id];
                 if (!node || !node.inputs)
@@ -1197,6 +1194,8 @@ var WorkflowBuilder = (function () {
         // generic Wan multiple-of-32 display clamp must not round it to 864.
         workflow['5'].inputs.width = 848;
         workflow['5'].inputs.height = 480;
+        workflow['6'].inputs.steps = 40;
+        workflow['6'].inputs.cfg = 4.0;
         return workflow;
     }
     // SCAIL-2 is reference/driving-video animation, not text-to-video. Keep
@@ -1376,4 +1375,3 @@ var WorkflowBuilder = (function () {
     }
     return { build: build, buildImg2Img: buildImg2Img, buildEditModel: buildEditModel, buildInpaint: buildInpaint, buildLanPaintCandidate: buildLanPaintCandidate, buildKrea2LanPaint: buildKrea2LanPaint, buildFlowEdit: buildFlowEdit, applyControlNetNodes: applyControlNetNodes, applyIPAdapterNodes: applyIPAdapterNodes };
 })();
-//# sourceMappingURL=workflow-builder.js.map

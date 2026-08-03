@@ -101,7 +101,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
 | `models/text_encoder/gemma3_ltx_streamed.mojo` | Pure-Mojo layer-streamed Gemma-3-12B FP8 text encoder for LTX2 positive/negative prompts. It preserves the 49-state FeatureExtractorV2 contract, exact Gemma RMSNorm/RoPE/padding semantics, shares each streamed layer load across both prompts, and releases clean mmap-backed checkpoint pages after each synchronized device upload. | ✅ exact tokenizer IDs; context cosine 0.99923-0.99973; real product V2V conditioner/runner scope peaked at 17.8GB after page release instead of the prior 54.9GB desktop-OOM path |
 | `pipeline/ltx2_encode_prompt.mojo` | Pure-Mojo automatic LTX2 prompt conditioner: tokenizes positive/negative text, runs streamed Gemma, packs the 49-state feature order, applies video/audio aggregate projections, and writes the six pre-connector safetensors consumed by the request CLI. The server caches by prompt, negative prompt, and conditioner digest and publishes tokenization plus 48-layer progress. | ✅ optimized real prompt 17.19s; no Python runtime |
-| `sampling/ltx2_request_cli.mojo` + `configs/ltx2_request_profiles.json` + `configs/ltx2_checkpoint_workflows.json` + `configs/ltx2_feature_adapters.json` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and pre/post-connector conditioning sidecars, resolves the selected full checkpoint plus every requested LoRA/scale, accepts the request's `model_quant`, preserves an exact request copy, and dispatches one of 31 mode-qualified AOT width/height/frame-count/FPS tuples. The checkpoint-workflow registry pins creator-authored schedules and support adapters; Sulphur BF16 auto-selects its published 8-step Euler ancestral CFG++ / 3-step LCM workflow and stage-specific CondSafe weights even when the UI sends an empty workflow ID. Ordinary Desktop-style 540p uses 960x512/512x960 after authored conditioning; Retake/Extend use separate 960x544/544x960 source-native profiles. The feature registry remains the stable-ID contract for Cinemagraph/Foley, while reference-token IC-LoRAs fail closed. Emits atomic `status.json` and hands final latents to a clean decode process. | 🟠 experimental; BF16 creator profile is default, arbitrary registry-classified LTX2 full finetunes remain selectable for ordinary generation/I2V, and temporal edits force the complete distilled BF16 checkpoint |
+| `sampling/ltx2_request_cli.mojo` + `configs/ltx2_request_profiles.json` + `configs/ltx2_checkpoint_workflows.json` + `configs/ltx2_feature_adapters.json` | Pure-Mojo request-driven LTX2 adapter for `serenity.genparams.v1`: validates prompt and conditioning sidecars, resolves the selected checkpoint plus requested LoRAs/scales, accepts `model_quant`, and preserves the authored request. The server owns one fail-closed `output/bin/ltx2_serenity_runtime` path; the deleted per-profile build script and `ltx2_serenity_<geometry>` lookup cannot be used as fallbacks. The profile and workflow registries remain UI/recipe metadata, not executable selection. | 🟠 runtime-geometry conversion in progress; the server intentionally reports the LTX request surface unavailable until the single runner is built and measured across multiple resolutions |
 | `sampling/parity/ltx2_conditioning_mask_parity.mojo` + `scripts/check_ltx2_conditioning_mask_parity.sh` | Deterministic request-path parity gate for I2V/V2V clean-latent noiser masks, per-token model timesteps, painted V2V spatial masks, and the T2V uniform broadcast control. | ✅ seven focused gates pass |
 | `pipeline/ltx2_t2v_av_hq.mojo` + `scripts/ltx2_creator_image_preprocess.py` | LTX2 single/staged/RefHQ runners plus the request-profile execution surface. Ordinary I2V copies the Desktop fit/fill contract and uses the creator's PyAV/libx264 CRF-33 round trip pixel-for-pixel, separate half/full-resolution source VAE encodes, two-stage distilled denoise, and spatial latent upscaler. Optional final-frame conditioning follows Lightricks keyframe interpolation: clean guide tokens are appended at the final frame's FPS-normalized coordinates, receive their own denoise mask, participate in both stages, and are sliced away before decode; first-frame I2V remains Desktop-style in-place conditioning. Retake/Extend use the creator one-stage full-resolution distilled BF16 topology: 256/64 spatial + 24/16 temporal source-video tiles, complete-checkpoint video/audio VAE encoders, binary temporal masks, source-audio freeze for replace-video Retake, zero-padded video/audio latents for Extend, regenerated extension audio, and the 0.5-second seam. Fresh request decode uses the Desktop tiled contract and streams finalized PNG chunks instead of allocating the complete movie tensor. Writes atomic progress and result manifests with executed sampler/scheduler, timings, geometry, frame count, duration, dtype contract, quant mode, and sampled peak VRAM. | 🟠 experimental; real Sulphur BF16 first+last `video-0016` produced 704x1280 121f@24 in 192.20s at 14,583 MiB peak with stable inspected frames and exact creator-preprocess pixels; sampler/speed parity remain unaccepted |
 | `models/vae/ltx2_audio_processor.mojo` + `models/vae/ltx2_audio_vae.mojo` + `scripts/ltx2_decode_source_audio.py` | LTX Desktop-compatible source-audio path: creator PyAV sample staging, stereo waveform normalization/resampling contract, log-mel AudioProcessor, complete-checkpoint AudioVAE encode, and existing vocoder/decode. Retake may freeze the clean audio latent; Extend zero-pads and regenerates its masked region. | ✅ paired protected audio measured 172.2-172.3 dB PSNR |
@@ -3042,9 +3042,11 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   profile is 121 frames at 24 fps. Rust validates the creator-derived size,
   sequences UMT5 -> process-isolated first-frame VAE encode -> DiT -> fresh
   VAE decode/mux, and rejects uncompiled sizes instead of stretching content.
-- The quality default is exact BF16 block streaming: 15 shared tensors stay
-  resident and each of the 30 blocks is loaded once per step for paired
-  cond/uncond CFG. The optional FP8 path retains the persistent row-scaled
+- The quality default is exact BF16 pinned-host staging: 15 shared tensors stay
+  resident and all 30 blocks plus their tensor metadata are copied into one
+  complete host store before step 0. Each block is staged from RAM for paired
+  cond/uncond CFG; sampling fails closed if any block could fall through to a
+  checkpoint mapping. The optional FP8 path retains the persistent row-scaled
   E4M3 cache. No second base checkpoint is copied.
 - Numeric creator gates: positive/negative conditioning cosine >=0.999731;
   scheduler source max-abs 0 and Mojo per-step cosine >=0.99999929;
@@ -3056,7 +3058,7 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   preprocessing; inspected source identity, natural/mechanical eyes, facial
   detail, metal, hair, clothing, and background remain coherent.
 - TI2V-5B block LoRAs work on both precision paths. BF16 applies each adapter
-  delta to the freshly streamed block; FP8 dequantizes, applies, and
+  delta to the RAM-staged block; FP8 dequantizes, applies, and
   requantizes only the in-memory resident matrix. Rust header preflight checks
   the 3072/14336 5B dimensions and rejects 14B adapters before CUDA. The
   161 MB `ostris/wan22_5b_i2v_crush_it_lora` fixture matched all 300 intended
@@ -3068,7 +3070,13 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   FLF2V last-frame conditioning, arbitrary frame counts, and installed 14B
   LoRAs remain explicitly unavailable because their compatible weights/runtime
   are not installed.
-- Rebuild with `scripts/build_wan22.sh`; regenerate the machine-local gate with
+- Clean no-I/O gate (1280x704, 121 frames, BF16, CFG 5, decode off): 30/30
+  blocks resident, 9.879 s to synchronized step 0, 19.615 s for one denoise
+  step, and exactly 0 physical bytes read from step 0 through step 1. The Rust
+  launcher preloads lazy cuDNN/NVIDIA components and puts CUDA JIT cache files
+  under `/dev/shm/serenity-wan22-cuda-cache`.
+- Rebuild with the exact direct `pixi run mojo build -O2 -j1` product command;
+  regenerate the machine-local gate with
   `python3 scripts/check_wan22_product_gate.py --visual-accepted`. The gate
   schema is `serenity.wan22.product_gate.v3` and pins artifact/source hashes,
   conditioning, scheduler, transformer stream, both VAE directions, BF16 LoRA,

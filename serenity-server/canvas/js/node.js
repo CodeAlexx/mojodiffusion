@@ -402,4 +402,3 @@ class SFNode {
         };
     }
 }
-//# sourceMappingURL=node.js.map

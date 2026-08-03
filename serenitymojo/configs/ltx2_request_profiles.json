@@ -59,7 +59,7 @@
       "width": 960,
       "height": 544,
       "fps": 24,
-      "modes": ["retake", "extend_start", "extend_end"],
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [5, 6, 8, 10, 20],
       "frames": [121, 145, 193, 241, 481],
       "source": "LTX Desktop one-stage source-native temporal edit profile"
@@ -70,7 +70,7 @@
       "width": 544,
       "height": 960,
       "fps": 24,
-      "modes": ["retake", "extend_start", "extend_end"],
+      "modes": ["standard", "retake", "extend_start", "extend_end"],
       "durations": [5, 6, 8, 10, 20],
       "frames": [121, 145, 193, 241, 481],
       "source": "LTX Desktop one-stage source-native temporal edit profile"

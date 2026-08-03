@@ -80,7 +80,10 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.ops.fp8_quant import (
     fp8_e4m3_rowscale, fp8_e4m3_encode_perrow,
 )
-from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
+from serenitymojo.ops.fp8 import (
+    fp8_e4m3_dequant_perrow_to_bf16,
+    fp8_e4m3_dequant_to_bf16,
+)
 # int8-resident weight quant (Klein int8-W8A8 slice 4). Same tensorwise weight
 # quant slices 1-3 use for the block-direct int8 payload, so the loader-quantized
 # int8 == the block's quantize_*_int8 (parity-gated in klein_loader_int8_parity).
@@ -96,6 +99,7 @@ from serenitymojo.ops.squareq import squareq_reconstruct_weight, squareq_w8_reco
 # payload under "::"-suffixed keys (the Klein blocks' native-fp4 forward).
 from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_reconstruct_weight
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.safetensors import read_f32_scalar_bytes
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -247,9 +251,13 @@ struct _HostFp8Tensor(Copyable, Movable):
     footprint does not fit device-resident with training state, e.g. qwenimage
     ~20GB fp8 on a 24GB card). If `is_fp8`: `bytes_h` holds E4M3 bytes [out,in]
     and `scale_h` the per-row F32 scale bytes; await H2Ds both and dequants.
-    Else `bytes_h` holds raw BF16 bytes (`scale_h` is a 1-byte dummy)."""
+    Else `bytes_h` holds BF16 bytes (`scale_h` is a 1-byte dummy). F32
+    checkpoint tables are converted to BF16 once while this host store is
+    built; denoise never revisits the checkpoint mapping."""
     var name: String
     var is_fp8: Bool
+    var per_row_scale: Bool
+    var scalar_scale: Float32
     var bytes_h: HArc
     var bytes_nbytes: Int
     var bytes_shape: List[Int]
@@ -259,13 +267,16 @@ struct _HostFp8Tensor(Copyable, Movable):
     var scale_shape: List[Int]
 
     def __init__(
-        out self, var name: String, is_fp8: Bool,
+        out self, var name: String, is_fp8: Bool, per_row_scale: Bool,
+        scalar_scale: Float32,
         var bytes_h: HArc, bytes_nbytes: Int,
         var bytes_shape: List[Int], bytes_dtype: STDtype,
         var scale_h: HArc, scale_nbytes: Int, var scale_shape: List[Int],
     ):
         self.name = name^
         self.is_fp8 = is_fp8
+        self.per_row_scale = per_row_scale
+        self.scalar_scale = scalar_scale
         self.bytes_h = bytes_h^
         self.bytes_nbytes = bytes_nbytes
         self.bytes_shape = bytes_shape^
@@ -1164,7 +1175,7 @@ struct TurboPlannedLoader(Movable):
                     ctx.synchronize()  # D2H done + fences transient device tensors
                     block_bytes += bytes.nbytes() + scale.nbytes()
                     tensors.append(_HostFp8Tensor(
-                        nm, True,
+                        nm, True, True, Float32(1.0),
                         HArc(bh^), bytes.nbytes(), bytes.shape(), bytes.dtype(),
                         HArc(sh_h^), scale.nbytes(), scale.shape(),
                     ))
@@ -1178,7 +1189,7 @@ struct TurboPlannedLoader(Movable):
                     ctx.synchronize()
                     block_bytes += t.nbytes()
                     tensors.append(_HostFp8Tensor(
-                        nm, False,
+                        nm, False, False, Float32(1.0),
                         HArc(bh^), t.nbytes(), t.shape(), t.dtype(),
                         HArc(dummy^), 1, List[Int](),
                     ))
@@ -1257,7 +1268,7 @@ struct TurboPlannedLoader(Movable):
                     ctx.synchronize()
                     block_bytes += bytes.nbytes() + scale.nbytes()
                     tensors.append(_HostFp8Tensor(
-                        nm, True,
+                        nm, True, True, Float32(1.0),
                         HArc(bh^), bytes.nbytes(), bytes.shape(), bytes.dtype(),
                         HArc(sh_h^), scale.nbytes(), scale.shape(),
                     ))
@@ -1269,7 +1280,7 @@ struct TurboPlannedLoader(Movable):
                     ctx.synchronize()
                     block_bytes += t.nbytes()
                     tensors.append(_HostFp8Tensor(
-                        nm, False,
+                        nm, False, False, Float32(1.0),
                         HArc(bh^), t.nbytes(), t.shape(), t.dtype(),
                         HArc(dummy^), 1, List[Int](),
                     ))
@@ -1279,6 +1290,137 @@ struct TurboPlannedLoader(Movable):
             self._fp8h_blocks.append(tensors^)
             used += block_bytes
             pinned += 1
+        return pinned
+
+    def pin_residents_fp8_host_raw(
+        mut self, budget_bytes: Int, ctx: DeviceContext
+    ) raises -> Int:
+        """Pin raw-E4M3/BF16 blocks, with F32 tables converted once to BF16.
+
+        This one path covers both Serenity formats used by product inference:
+        Qwen stores unscaled E4M3 (`scale=1`), while Klein stores an F32 scalar
+        sidecar per E4M3 weight. Sidecars are consumed once during the complete
+        checkpoint-to-RAM copy and are never staged or reread during denoise.
+        LTX stores its six small modulation tables per block as F32; match the
+        normal LTX block loader by casting those tables to BF16 during this
+        pre-denoise copy, then retain only their BF16 bytes in pinned RAM."""
+        var used = 0
+        var pinned = 0
+        var scale_suffix = String("_scale")
+        # Scaled raw-E4M3 exports do not share one global sentinel name. Klein
+        # uses `img_in.weight_scale`, while LTX-2 namespaces every key under
+        # `model.diffusion_model.*`. Detect the format from the actual header
+        # suffix instead of one model-specific key, then fail closed if any
+        # FP8 tensor is missing its scalar sidecar.
+        var scalar_format = False
+        for ref nm in self._turbo.sharded.names():
+            if self._turbo.sharded.has_tensor(nm + scale_suffix):
+                scalar_format = True
+                break
+        for i in range(self._plan.count()):
+            var p = self._plan.normalized_prefix(i)
+            if (
+                self._fp8h_slot(p) >= 0 or self._fp8_slot(p) >= 0
+                or self._resident_slot(p) >= 0
+            ):
+                continue
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                raise Error(
+                    String("pin_residents_fp8_host_raw: no tensors for prefix: ")
+                    + p
+                )
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            var block_bytes = 0
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni]
+                if nm.endswith(scale_suffix):
+                    continue
+                var tv = self._turbo.sharded.tensor_view(nm)
+                if (
+                    tv.dtype != STDtype.F8_E4M3
+                    and tv.dtype != STDtype.BF16
+                    and tv.dtype != STDtype.F32
+                ):
+                    raise Error(
+                        String("pin_residents_fp8_host_raw: expected E4M3, ")
+                        + String("BF16, or F32 tensor, got ") + tv.dtype.name()
+                        + String(" for ") + nm
+                    )
+                if tv.dtype == STDtype.F32:
+                    block_bytes += tv.numel() * STDtype.BF16.byte_size()
+                else:
+                    block_bytes += tv.nbytes()
+            if used + block_bytes > budget_bytes:
+                break
+
+            var tensors = List[_HostFp8Tensor]()
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                if nm.endswith(scale_suffix):
+                    continue
+                var tv = self._turbo.sharded.tensor_view(nm)
+                if tv.dtype == STDtype.F32:
+                    # The ordinary LTX AV loader casts these modulation tables
+                    # with `Tensor.from_view_as_bf16`. Do the identical cast once
+                    # here, before denoise, and copy only the BF16 result to the
+                    # pinned host store. This is intentionally not a raw F32
+                    # reinterpretation and cannot fall back to disk at await.
+                    var t = Tensor.from_view_as_bf16(tv, ctx)
+                    var bh = ctx.enqueue_create_host_buffer[DType.uint8](t.nbytes())
+                    var dummy = ctx.enqueue_create_host_buffer[DType.uint8](1)
+                    ctx.enqueue_copy(bh, t.buf)
+                    ctx.synchronize()
+                    tensors.append(_HostFp8Tensor(
+                        nm, False, False, Float32(1.0),
+                        HArc(bh^), t.nbytes(), t.shape(), STDtype.BF16,
+                        HArc(dummy^), 0, List[Int](),
+                    ))
+                    continue
+                var scalar_scale = Float32(1.0)
+                if tv.dtype == STDtype.F8_E4M3:
+                    var scale_name = nm + scale_suffix
+                    if self._turbo.sharded.has_tensor(scale_name):
+                        var scale_tv = self._turbo.sharded.tensor_view(scale_name)
+                        if scale_tv.dtype != STDtype.F32 or len(scale_tv.shape) != 0:
+                            raise Error(
+                                String("FP8 scale must be an F32 scalar: ")
+                                + scale_name
+                            )
+                        scalar_scale = read_f32_scalar_bytes(scale_tv.data)
+                    elif scalar_format:
+                        raise Error(
+                            String("scalar-FP8 checkpoint is missing sidecar: ")
+                            + scale_name
+                        )
+                var bh = ctx.enqueue_create_host_buffer[DType.uint8](tv.nbytes())
+                var dst = BytePtr(unsafe_from_address=Int(bh.unsafe_ptr()))
+                var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+                _ = sys_memcpy(dst, src, tv.nbytes())
+                var dummy = ctx.enqueue_create_host_buffer[DType.uint8](1)
+                tensors.append(_HostFp8Tensor(
+                    nm,
+                    tv.dtype == STDtype.F8_E4M3,
+                    False,
+                    scalar_scale,
+                    HArc(bh^), tv.nbytes(), tv.shape.copy(), tv.dtype,
+                    HArc(dummy^), 0, List[Int](),
+                ))
+            self._fp8h_prefixes.append(p)
+            self._fp8h_blocks.append(tensors^)
+            used += block_bytes
+            pinned += 1
+            # The complete host store can be tens of GiB. Drop checkpoint-backed
+            # pages after each synchronously-copied block so pinned RAM and page
+            # cache do not coexist at full-checkpoint size and OOM the machine.
+            # Future blocks fault in once here, before sampling; denoise never
+            # falls through to this mapping after the all-resident gate below.
+            self._turbo.sharded.release_to_os()
         return pinned
 
     def pin_residents_int8(mut self, budget_bytes: Int, ctx: DeviceContext) raises -> Int:
@@ -1711,7 +1853,7 @@ struct TurboPlannedLoader(Movable):
                 rt.bytes_nbytes,
                 self._turbo.copy_stream,
             )
-            if rt.is_fp8:
+            if rt.is_fp8 and rt.per_row_scale:
                 _h2d_dma_copy(
                     base + UInt64(offs[2 * t + 1]),
                     rt.scale_h[].unsafe_ptr(),
@@ -1723,6 +1865,70 @@ struct TurboPlannedLoader(Movable):
 
     def block_count(self) -> Int:
         return self._plan.count()
+
+    def memory_resident_block_count(self) raises -> Int:
+        """Count plan blocks whose sampling source is RAM or device memory.
+
+        A complete TurboBlockLoader block store covers every plan block. When
+        that store is disabled, every prefix must be present in one of the
+        explicit resident stores. Anything else would fall through to mmap.
+        """
+        if self._turbo.use_block_store:
+            return self._plan.count()
+        var resident = 0
+        for i in range(self._plan.count()):
+            var p = self._plan.normalized_prefix(i)
+            if (
+                self._resident_slot(p) >= 0
+                or self._fp8_slot(p) >= 0
+                or self._fp8h_slot(p) >= 0
+                or self._squareq_slot(p) >= 0
+                or self._nvfp4_slot(p) >= 0
+                or self._int8_slot(p) >= 0
+                or self._int8h_slot(p) >= 0
+            ):
+                resident += 1
+        return resident
+
+    def require_all_blocks_memory_resident(self) raises:
+        """Fail closed unless no plan block can fall through to checkpoint mmap."""
+        var resident = self.memory_resident_block_count()
+        var total = self._plan.count()
+        if resident != total:
+            raise Error(
+                String("TurboPlannedLoader refuses sampling: only ")
+                + String(resident) + String("/") + String(total)
+                + String(" blocks are memory-resident; checkpoint reads during ")
+                + String("denoise are forbidden")
+            )
+
+    def release_checkpoint_pages(mut self):
+        """Drop checkpoint-backed page-cache residency after the RAM copy."""
+        self._turbo.sharded.release_to_os()
+
+    def discard_unused_raw_streaming_slots(
+        mut self, ctx: DeviceContext
+    ) raises:
+        """Release duplicate raw-BF16 staging after complete explicit residency.
+
+        Full host-FP8 and device-resident paths stage from their own stores and
+        never use TurboBlockLoader's raw mmap/block-store slabs. Keeping those
+        two raw slots wastes both pinned RAM and VRAM."""
+        self.require_all_blocks_memory_resident()
+        if self._turbo.use_block_store:
+            raise Error(
+                "cannot discard raw streaming slots while the raw block store "
+                "is the resident sampling source"
+            )
+        self._turbo.discard_streaming_slots(ctx)
+
+    def discard_fp8h_device_staging(mut self):
+        """Drop transient FP8-host GPU slabs while retaining every host block.
+
+        The caller must synchronize first. The next prefetch recreates the two
+        device slabs lazily, so VAE decode can reclaim VRAM without forcing the
+        next job to reread or requantize the checkpoint."""
+        self._f8h = ArcPointer[Fp8hStage](Fp8hStage())
 
     def count(self) -> Int:
         return self._plan.count()
@@ -2103,14 +2309,18 @@ struct TurboPlannedLoader(Movable):
                 )
                 var wt = Tensor(wsub^, rt.bytes_shape.copy(), rt.bytes_dtype)
                 if rt.is_fp8:
-                    var ssub = self._f8h[].devs[oslot].create_sub_buffer[DType.uint8](
-                        ooffs[2 * t + 1], rt.scale_nbytes
-                    )
-                    var st = Tensor(ssub^, rt.scale_shape.copy(), STDtype.F32)
+                    var w: Tensor
+                    if rt.per_row_scale:
+                        var ssub = self._f8h[].devs[oslot].create_sub_buffer[DType.uint8](
+                            ooffs[2 * t + 1], rt.scale_nbytes
+                        )
+                        var st = Tensor(ssub^, rt.scale_shape.copy(), STDtype.F32)
+                        w = fp8_e4m3_dequant_perrow_to_bf16(wt, st, ctx)
+                    else:
+                        w = fp8_e4m3_dequant_to_bf16(wt, rt.scalar_scale, ctx)
                     # dequant allocates its own output, so the slab views are read
                     # only by this kernel; the BF16 smalls below stay as views and
                     # are protected by the compute-done fence like int8h's.
-                    var w = fp8_e4m3_dequant_perrow_to_bf16(wt, st, ctx)
                     oblock[rt.name] = ArcPointer(w^)
                 else:
                     oblock[rt.name] = ArcPointer(wt^)
@@ -2126,12 +2336,16 @@ struct TurboPlannedLoader(Movable):
                 ctx.enqueue_copy(dbuf, rt.bytes_h[])
                 var wt = Tensor(dbuf^, rt.bytes_shape.copy(), rt.bytes_dtype)
                 if rt.is_fp8:
-                    var sbuf = ctx.enqueue_create_buffer[DType.uint8](
-                        rt.scale_nbytes
-                    )
-                    ctx.enqueue_copy(sbuf, rt.scale_h[])
-                    var st = Tensor(sbuf^, rt.scale_shape.copy(), STDtype.F32)
-                    var w = fp8_e4m3_dequant_perrow_to_bf16(wt, st, ctx)
+                    var w: Tensor
+                    if rt.per_row_scale:
+                        var sbuf = ctx.enqueue_create_buffer[DType.uint8](
+                            rt.scale_nbytes
+                        )
+                        ctx.enqueue_copy(sbuf, rt.scale_h[])
+                        var st = Tensor(sbuf^, rt.scale_shape.copy(), STDtype.F32)
+                        w = fp8_e4m3_dequant_perrow_to_bf16(wt, st, ctx)
+                    else:
+                        w = fp8_e4m3_dequant_to_bf16(wt, rt.scalar_scale, ctx)
                     hblock[rt.name] = ArcPointer(w^)
                 else:
                     hblock[rt.name] = ArcPointer(wt^)

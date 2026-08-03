@@ -389,4 +389,3 @@ var BlendModeUtil = (function () {
         labelFor: labelFor,
     };
 })();
-//# sourceMappingURL=layer-types.js.map

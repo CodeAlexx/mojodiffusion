@@ -98,7 +98,7 @@ struct BlockLoader(Movable):
         `prefetch_tensor` — `ShardedSafeTensors` doesn't expose prefetch directly,
         so we go through its public `shards` list."""
         var p = self._block_prefix(prefix)
-        for ref nm in self.sharded.names():
+        for ref nm in self.sharded.names_storage_order():
             if nm.startswith(p):
                 var idx = self.sharded.shard_index(nm)
                 self.sharded.shards[idx][].prefetch_tensor(nm)

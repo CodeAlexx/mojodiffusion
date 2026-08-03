@@ -136,7 +136,7 @@ def _byte_exact(a: List[Float32], b: List[Float32]) raises -> Bool:
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     print("=== Klein9B Turbo Parity Smoke — Phase 3 Gate ===")
     print()
     print("[config] N_IMG=" + String(N_IMG)
@@ -298,3 +298,10 @@ def main() raises:
     print("  Async active:  YES (copy_stream + DeviceEvent fence)")
     print()
     print("KLEIN9B TURBO PARITY SMOKE: PASS")
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Klein parity executable includes a disk-backed "
+        "loader baseline; use the complete memory-resident sampler gate"
+    )

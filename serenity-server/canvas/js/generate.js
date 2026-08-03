@@ -6,6 +6,7 @@
  */
 var GenerateTab = (function () {
     'use strict';
+    var ensureLibraryExpanded = function () { };
     var state = {
         model: null,
         prompt: '',
@@ -27,11 +28,17 @@ var GenerateTab = (function () {
         initImageHeight: 0,
         creativity: 0.5,
         generating: false,
+        externalActivity: null,
         currentImage: null,
         currentIsVideo: false,
         currentVideoFrames: null,
         currentVideoFps: null,
         gallery: [],
+        assets: [],
+        assetsLoaded: false,
+        assetsLoading: false,
+        assetsReloadPending: false,
+        assetsError: '',
         arch: 'sd15',
         frames: 121,
         fps: 24,
@@ -63,9 +70,9 @@ var GenerateTab = (function () {
         videoGuidanceMode: 'distilled',
         videoWorkflowProfile: '',
         videoPromptEnhancer: 'none',
-        videoQuant: 'bf16',
+        videoQuant: 'fp8',
         cameraMotion: 'none',
-        videoCheckpoint: 'ltx-2.3-22b-dev-fp8-dequant-bf16',
+        videoCheckpoint: 'ltx-2.3-22b-distilled',
         capsPositive: '',
         capsNegative: '',
         noiseFixture: '',
@@ -93,8 +100,6 @@ var GenerateTab = (function () {
         sortNewestFirst: true,
         starredFirst: false,
         autoSwitchNew: true,
-        galleryPage: 0,
-        galleryPageSize: 50,
         contextMenuIndex: -1,
         gallerySettingsOpen: false,
         metadataExpanded: false,
@@ -239,6 +244,34 @@ var GenerateTab = (function () {
         });
         return runner && runner.modes && runner.modes.ltx2_mojo_request || null;
     }
+    function refreshCameraMotionControls(motions) {
+        if (!els.cameraMotion)
+            return;
+        var rows = Array.isArray(motions) ? motions.filter(function (motion) {
+            return motion && typeof motion.id === 'string';
+        }) : [];
+        if (!rows.length)
+            rows = [{ id: 'none', label: 'None', available: true }];
+        els.cameraMotion.innerHTML = '';
+        rows.forEach(function (motion) {
+            var option = document.createElement('option');
+            option.value = motion.id;
+            option.textContent = motion.label || motion.id.replace(/_/g, ' ');
+            if (motion.control === 'lora')
+                option.textContent += ' · camera LoRA';
+            else if (motion.control === 'prompt')
+                option.textContent += ' · prompt guidance';
+            option.disabled = motion.available === false;
+            els.cameraMotion.appendChild(option);
+        });
+        var selected = rows.some(function (motion) {
+            return motion.id === state.cameraMotion && motion.available !== false;
+        }) ? state.cameraMotion : 'none';
+        state.cameraMotion = selected;
+        els.cameraMotion.value = selected;
+        els.cameraMotion.disabled = false;
+        els.cameraMotion.title = 'Camera LoRA controls are attached by the server; prompt-only controls are labeled explicitly.';
+    }
     function ltx2CheckpointWorkflow(checkpoint) {
         var mode = activeLtx2RequestMode();
         var profiles = mode && Array.isArray(mode.checkpoint_workflows)
@@ -309,7 +342,11 @@ var GenerateTab = (function () {
         if (!mode)
             return null;
         var profiles = activeLtx2RequestProfiles();
-        return exactLtx2RequestProfile() ||
+        var portrait = Number(state.height) > Number(state.width);
+        var sameOrientation = profiles.find(function (profile) {
+            return (Number(profile.height) > Number(profile.width)) === portrait;
+        });
+        return exactLtx2RequestProfile() || sameOrientation ||
             (mode.compiled_profile && mode.compiled_profile.available !== false
             ? mode.compiled_profile : null) || profiles[0] || null;
     }
@@ -417,10 +454,9 @@ var GenerateTab = (function () {
         var profiles = Array.isArray(mode.supported_profiles)
             ? mode.supported_profiles : [];
         return profiles.filter(function (profile) {
-            // Generate always submits video_edit_mode=standard. Source-native
-            // 960x544/544x960 profiles belong only to Retake/Extend and Rust
-            // correctly rejects them for ordinary generation. Never advertise
-            // a temporal-edit runner as a standard T2V/I2V profile.
+            // Generate always submits video_edit_mode=standard. Only advertise
+            // profiles whose registry explicitly admits standard T2V/I2V;
+            // Retake/Extend-only runners stay out of these controls.
             return profile && profile.available === true &&
                 Array.isArray(profile.modes) &&
                 profile.modes.indexOf('standard') >= 0;
@@ -476,7 +512,7 @@ var GenerateTab = (function () {
             els.secondsInput.step = '0.01';
             els.secondsInput.value = String(state.seconds);
             els.secondsInput.disabled = false;
-            els.secondsInput.title = 'Editable duration; frame count is resolved with the LTX2 8*K+1 rule';
+            els.secondsInput.title = 'Editable duration; LTX2 frame count follows the 8*K+1 rule without changing the selected resolution';
         }
         if (els.fpsInput) {
             els.fpsInput.value = String(state.fps);
@@ -560,7 +596,7 @@ var GenerateTab = (function () {
         var promptResizer = document.createElement('div');
         promptResizer.id = 'gen-prompt-resizer';
         promptResizer.className = 'gen-layout-resizer gen-layout-resizer-horizontal gen-prompt-resizer';
-        promptResizer.title = 'Drag down to enlarge the preview · double-click to minimize prompts';
+        promptResizer.title = 'Drag down to enlarge the preview · double-click to hide/show prompts';
         layout.appendChild(promptResizer);
         var promptDock = document.createElement('div');
         promptDock.className = 'gen-workspace-prompt-dock';
@@ -569,7 +605,7 @@ var GenerateTab = (function () {
         var libraryResizer = document.createElement('div');
         libraryResizer.id = 'gen-library-resizer';
         libraryResizer.className = 'gen-layout-resizer gen-layout-resizer-horizontal gen-library-resizer';
-        libraryResizer.title = 'Drag to resize History';
+        libraryResizer.title = 'Drag down to shrink History · double-click to show/hide its contents';
         layout.appendChild(libraryResizer);
         var library = document.createElement('div');
         library.className = 'gen-workspace-library';
@@ -645,6 +681,14 @@ var GenerateTab = (function () {
             '<div class="gen-dim-row"><span class="gen-dim-label">Height</span><input type="range" id="gen-height-slider" class="gen-range" min="256" max="2048" step="64" value="1024" disabled>' +
             '<input type="number" id="gen-custom-height" class="gen-number-input" value="1024" disabled></div>' +
             '<div id="gen-aspect-preview" class="gen-aspect-preview"><span>1024×1024</span></div></div>';
+        var sourceBody =
+            '<div id="gen-init-drop" class="gen-init-drop">' +
+            '<input id="gen-init-image-input" type="file" accept="image/*" aria-label="Choose source image">' +
+            '<div id="gen-init-empty"><i data-lucide="image-plus"></i><span>Choose or drop a source image</span></div>' +
+            '<img id="gen-init-preview" style="display:none" alt="Selected source image"></div>' +
+            '<div id="gen-init-name" class="gen-init-name">No source image</div>' +
+            '<button id="gen-init-clear" type="button" class="gen-small-btn destructive" disabled>Clear source</button>' +
+            '<div class="gen-capability-note">The selected source is used for admitted img2img and I2V routes. Source Assets can select the same field without uploading again.</div>';
         var samplingBody =
             '<div class="gen-param-row" data-param-search="sampler algorithm"><label class="gen-label" for="gen-sampler">Sampler</label><select id="gen-sampler" class="gen-select"></select></div>' +
             '<div class="gen-param-row" data-param-search="scheduler noise schedule"><label class="gen-label" for="gen-scheduler">Scheduler</label><select id="gen-scheduler" class="gen-select"></select></div>' +
@@ -677,15 +721,11 @@ var GenerateTab = (function () {
             '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>' +
             '<div class="gen-param-row" data-param-search="camera motion dolly jib focus static"><label class="gen-label" for="gen-camera-motion">Camera Motion</label>' +
             '<select id="gen-camera-motion" class="gen-select">' +
-            '<option value="none">None / prompt only</option><option value="static">Static</option>' +
-            '<option value="focus_shift">Focus shift</option><option value="dolly_in">Dolly in</option>' +
-            '<option value="dolly_out">Dolly out</option><option value="dolly_left">Dolly left</option>' +
-            '<option value="dolly_right">Dolly right</option><option value="jib_up">Jib up</option>' +
-            '<option value="jib_down">Jib down</option></select></div>';
+            '<option value="none">None</option></select></div>';
         var videoConditioningBody =
             '<div class="gen-capability-note">Prompt conditioning is generated automatically by the Mojo Gemma encoder. The path fields are optional expert overrides for an existing prompt-matched cache.</div>' +
             '<div class="gen-param-row" data-param-search="checkpoint compiled profile"><label class="gen-label" for="gen-video-checkpoint">Checkpoint</label>' +
-            '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-dev-fp8-dequant-bf16"></div>' +
+            '<input id="gen-video-checkpoint" class="gen-select gen-path-input" value="ltx-2.3-22b-distilled"></div>' +
             '<div class="gen-param-row" data-param-search="prompt enhancer sulphur qwen"><label class="gen-label" for="gen-video-prompt-enhancer">Prompt enhancer</label>' +
             '<select id="gen-video-prompt-enhancer" class="gen-select"><option value="none">Raw prompt (creator workflow default)</option></select></div>' +
             '<div id="gen-video-prompt-enhancer-note" class="gen-capability-note">The selected checkpoint has no registered creator prompt enhancer.</div>' +
@@ -845,6 +885,7 @@ var GenerateTab = (function () {
             generateGroup('gen-core-header', 'Core Parameters', coreBody, true, 'The controls used by every admitted generation backend.') +
             '<section id="gen-variation-section">' + generateGroup('gen-variation-header', 'Variation Seed', variationBody, false, 'Blend deterministic secondary noise into supported model families.') + '</section>' +
             generateGroup('gen-image-header', 'Resolution', resolutionBody, false, 'Only compiled, production-admitted shapes are listed.') +
+            generateGroup('gen-source-header', 'Source Image', sourceBody, false, 'Upload once or reuse an Asset for admitted img2img and I2V generation.') +
             generateGroup('gen-sampling-header', 'Sampling', samplingBody, false, 'Sampler and scheduler values come from the selected backend capability report.') +
             '<section id="gen-video-section">' + generateGroup('gen-video-header', 'Video', videoBody, false, 'Video duration, frame rate, guidance, quantization, and audio parameters.') + '</section>' +
             '<section id="gen-video-conditioning-section">' + generateGroup('gen-video-conditioning-header', 'Video Conditioning', videoConditioningBody, false, 'Prompt-matched LTX2 conditioning and optional deterministic noise artifacts.') + '</section>' +
@@ -897,388 +938,36 @@ var GenerateTab = (function () {
     function buildGenerateLibraryHTML() {
         return '<div class="gen-workspace-library-tabs">' +
             '<button class="gen-library-tab active" data-library="history">History</button>' +
+            '<button class="gen-library-tab" data-library="assets">Assets</button>' +
             '<button class="gen-library-tab" data-library="presets">Presets</button>' +
+            '<button class="gen-library-tab" data-library="workflows">Workflows</button>' +
             '<button class="gen-library-tab" data-library="models">Models</button>' +
             '<button class="gen-library-tab" data-library="loras">LoRAs</button>' +
             '<div class="gen-library-spacer"></div>' +
-            '<button id="gen-gallery-upload-btn" class="gen-gallery-subtab-btn" title="Import image into history"><i data-lucide="upload"></i></button>' +
+            '<button id="gen-gallery-upload-btn" class="gen-gallery-subtab-btn" title="Upload source image"><i data-lucide="upload"></i></button>' +
             '<input type="file" id="gen-gallery-upload-input" accept="image/*" multiple style="display:none">' +
-            '<button id="gen-gallery-search-btn" class="gen-gallery-subtab-btn" title="Search history"><i data-lucide="search"></i></button>' +
-            '<input id="gen-gallery-search-input" class="gen-gallery-search" type="text" placeholder="Search history...">' +
+            '<button id="gen-gallery-search-btn" class="gen-gallery-subtab-btn" title="Search current library"><i data-lucide="search"></i></button>' +
+            '<input id="gen-gallery-search-input" class="gen-gallery-search" type="text" placeholder="Search current library...">' +
             '<button id="gen-gallery-settings-btn" class="gen-gallery-subtab-btn" title="History display settings"><i data-lucide="settings"></i></button>' +
-            '<button id="gen-gallery-clear" class="gen-gallery-clear">Clear</button></div>' +
+            '<button id="gen-gallery-clear" class="gen-gallery-clear">Delete all</button></div>' +
             '<div id="gen-gallery-popover" class="gen-gallery-popover"><div class="gen-popover-row"><span class="gen-popover-label">Thumbnail size</span>' +
             '<input type="range" id="gen-thumb-size-slider" class="gen-range gen-popover-slider" min="45" max="200" step="5" value="90"><span id="gen-thumb-size-val">90</span></div>' +
             '<div class="gen-popover-row"><span class="gen-popover-label">Newest first</span><button id="gen-sort-direction-toggle" class="gen-toggle on"></button><span id="gen-sort-direction-label">Newest</span></div>' +
             '<div class="gen-popover-row"><span class="gen-popover-label">Starred first</span><button id="gen-starred-first-toggle" class="gen-toggle"></button></div>' +
             '<div class="gen-popover-row"><span class="gen-popover-label">Auto-switch new</span><button id="gen-auto-switch-toggle" class="gen-toggle on"></button></div></div>' +
             '<div class="gen-library-panel active" data-library-panel="history"><div id="gen-images-content"><div class="gen-gallery-grid-wrap">' +
-            '<div id="gen-gallery-grid" class="gen-gallery-grid"></div><div id="gen-selection-badge" class="gen-selection-badge"></div></div></div>' +
+            '<div id="gen-gallery-grid" class="gen-gallery-grid" tabindex="0" role="region" aria-label="Generation history grouped by date"></div><div id="gen-selection-badge" class="gen-selection-badge"></div></div></div>' +
             '<div id="gen-bulk-bar" class="gen-bulk-bar"><button id="gen-bulk-star" class="gen-bulk-btn">Star All</button><button id="gen-bulk-unstar" class="gen-bulk-btn">Unstar All</button>' +
-            '<button id="gen-bulk-download" class="gen-bulk-btn">Download</button><button id="gen-bulk-delete" class="gen-bulk-btn destructive">Delete</button></div>' +
-            '<div id="gen-gallery-pagination" class="gen-gallery-pagination"><button id="gen-page-prev" disabled>&lt; Prev</button><span id="gen-page-info">Page 1</span><button id="gen-page-next">Next &gt;</button></div></div>' +
+            '<button id="gen-bulk-download" class="gen-bulk-btn">Download</button><button id="gen-bulk-delete" class="gen-bulk-btn destructive">Delete</button></div></div>' +
+            '<div id="gen-assets-content" class="gen-library-panel" data-library-panel="assets">' +
+            '<div id="gen-assets-grid" class="gen-assets-grid"></div>' +
+            '<div id="gen-assets-placeholder" class="gen-assets-placeholder">Loading assets…</div></div>' +
             '<div class="gen-library-panel" data-library-panel="presets"><div class="gen-preset-toolbar"><input id="gen-preset-name" class="gen-select" placeholder="Preset name">' +
             '<button id="gen-preset-save" class="gen-small-btn">Save current</button></div><div id="gen-preset-list" class="gen-library-card-grid"></div></div>' +
+            '<div class="gen-library-panel" data-library-panel="workflows"><div class="gen-workflow-library-note">Bundled and user workflows open in Canvas. Compatibility is checked against this Serenity runtime before you open them.</div>' +
+            '<div id="gen-workflow-list" class="gen-library-card-grid"></div></div>' +
             '<div class="gen-library-panel" data-library-panel="models"><div id="gen-library-models" class="gen-library-card-grid"></div></div>' +
             '<div class="gen-library-panel" data-library-panel="loras"><div id="gen-library-loras" class="gen-library-card-grid"></div></div>';
-    }
-    function buildLeftHTML() {
-        return '' +
-            // Generate button + progress bar at top
-            '<div class="gen-section gen-top-actions">' +
-            '<button id="gen-btn" class="gen-btn"><i data-lucide="wand-2"></i> Generate</button>' +
-            '<div id="gen-left-progress" class="gen-progress gen-left-progress"><div id="gen-left-progress-bar" class="gen-progress-bar"></div></div>' +
-            '<div id="gen-left-progress-label" class="gen-left-progress-label"></div>' +
-            '</div>' +
-            // Prompt
-            '<div class="gen-section">' +
-            '<div class="gen-prompt-label-row">' +
-            '<label class="gen-label">Positive Prompt</label>' +
-            '<div class="gen-prompt-label-actions">' +
-            '<button class="gen-prompt-label-btn" title="Dynamic prompts">' +
-            '&lt;/&gt;' +
-            '<span class="gen-tooltip">Dynamic prompts coming soon</span>' +
-            '</button>' +
-            '<button class="gen-prompt-label-btn" title="Templates">' +
-            '{}' +
-            '<span class="gen-tooltip">Templates coming soon</span>' +
-            '</button>' +
-            '</div>' +
-            '</div>' +
-            '<textarea id="gen-prompt" class="gen-textarea" rows="4" placeholder="Describe your image..."></textarea>' +
-            '<div id="gen-token-count" class="gen-token-count">~0 tokens</div>' +
-            // Style preset dropdown
-            '<div style="margin-top:6px">' +
-            '<label class="gen-label">Style</label>' +
-            '<select id="gen-style-preset" class="gen-select">' +
-            buildStyleOptions() +
-            '</select>' +
-            '<div id="gen-style-preview" class="gen-style-preview" style="display:none"></div>' +
-            '</div>' +
-            '</div>' +
-            // Negative prompt
-            '<div class="gen-section" id="gen-neg-section">' +
-            '<label class="gen-label">Negative Prompt</label>' +
-            '<textarea id="gen-neg-prompt" class="gen-textarea" rows="2" placeholder="What to avoid..."></textarea>' +
-            '</div>' +
-            // Image Settings accordion
-            '<div class="gen-section">' +
-            '<div id="gen-image-header" class="gen-accordion-header">' +
-            '<span>Image</span>' +
-            '<span class="gen-accordion-arrow"><i data-lucide="chevron-down"></i></span>' +
-            '</div>' +
-            '<div id="gen-image-body" class="gen-accordion-body" style="margin-top:8px">' +
-            // Aspect row: dropdown + swap + lock + optimal
-            '<div class="gen-image-content">' +
-            '<div class="gen-image-controls">' +
-            '<div class="gen-aspect-row">' +
-            '<span class="gen-label" style="margin-bottom:0;min-width:44px">Aspect</span>' +
-            '<select id="gen-aspect-dropdown" class="gen-select" style="flex:1">' +
-            buildAspectOptions() +
-            '</select>' +
-            '<button id="gen-swap-btn" class="gen-aspect-action" title="Swap width and height">' +
-            '<i data-lucide="arrow-left-right"></i>' +
-            '</button>' +
-            '<button id="gen-aspect-lock" class="gen-aspect-action' + (state.aspectLocked ? ' active' : '') + '" title="Lock aspect ratio">' +
-            '<i data-lucide="lock"></i>' +
-            '</button>' +
-            '<button id="gen-optimal-btn" class="gen-aspect-action" title="Set optimal size for model">' +
-            '<i data-lucide="sparkles"></i>' +
-            '</button>' +
-            '</div>' +
-            '<div class="gen-dim-row">' +
-            '<span class="gen-dim-label">Width</span>' +
-            '<input type="range" id="gen-width-slider" class="gen-range" min="256" max="2048" step="64" value="1024">' +
-            '<input type="number" id="gen-custom-width" class="gen-number-input" min="256" max="4096" step="64" value="1024">' +
-            '</div>' +
-            '<div class="gen-dim-row">' +
-            '<span class="gen-dim-label">Height</span>' +
-            '<input type="range" id="gen-height-slider" class="gen-range" min="256" max="2048" step="64" value="1024">' +
-            '<input type="number" id="gen-custom-height" class="gen-number-input" min="256" max="4096" step="64" value="1024">' +
-            '</div>' +
-            // Seed inside Image section
-            '<div style="margin-top:8px">' +
-            '<label class="gen-label">Seed</label>' +
-            '<div class="gen-seed-row">' +
-            '<input id="gen-seed" type="number" class="gen-number-input" value="-1">' +
-            '<button id="gen-seed-shuffle" class="gen-seed-btn" title="Shuffle seed">\u21BB</button>' +
-            '<button id="gen-seed-prev" class="gen-seed-btn" title="Use previous seed">\u21BA</button>' +
-            '<span class="gen-seed-random-label">Random</span>' +
-            '<button id="gen-seed-random-toggle" class="gen-toggle' + (state.seed === -1 ? ' on' : '') + '"></button>' +
-            '</div>' +
-            '</div>' +
-            // Advanced Options disclosure
-            '<div id="gen-image-adv-disclosure" class="gen-adv-disclosure">' +
-            '<i data-lucide="chevron-right"></i>' +
-            '<span>Advanced Options</span>' +
-            '</div>' +
-            '<div id="gen-image-adv-body" class="gen-adv-body"></div>' +
-            '</div>' +
-            // Visual aspect preview box
-            '<div class="gen-image-preview-col">' +
-            '<div id="gen-aspect-preview" class="gen-aspect-preview" style="width:100px;height:100px">' +
-            '<span>1:1</span>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            // Generation Settings accordion
-            '<div class="gen-section">' +
-            '<div id="gen-settings-header" class="gen-accordion-header">' +
-            '<div class="gen-section-header-row">' +
-            '<span>Generation</span>' +
-            '<span id="gen-model-badge" class="gen-model-badge" style="display:none"></span>' +
-            '<span id="gen-arch-badge" class="gen-arch-badge">SD1.5</span>' +
-            '</div>' +
-            '<span class="gen-accordion-arrow"><i data-lucide="chevron-down"></i></span>' +
-            '</div>' +
-            '<div id="gen-settings-body" class="gen-accordion-body" style="margin-top:8px">' +
-            // Model
-            '<label class="gen-label">Model</label>' +
-            '<div class="gen-model-row">' +
-            '<div class="gen-model-picker-wrap" id="gen-model-picker-wrap">' +
-            '<input type="text" id="gen-model-search" class="gen-select gen-model-search-input" placeholder="Loading models..." autocomplete="off">' +
-            '<div id="gen-model-dropdown" class="gen-model-dropdown" style="display:none">' +
-            '<div id="gen-model-dropdown-list" class="gen-model-dropdown-list"></div>' +
-            '</div>' +
-            '</div>' +
-            '<button id="gen-model-refresh" class="gen-model-action-btn" title="Refresh models"><i data-lucide="refresh-cw"></i></button>' +
-            '<button class="gen-model-action-btn" title="Model settings (coming soon)"><i data-lucide="settings"></i></button>' +
-            '</div>' +
-            '<input type="hidden" id="gen-model" value="">' +
-            '<div id="gen-model-warn" class="gen-model-warning"></div>' +
-            // Concepts / LoRA
-            '<label class="gen-label" style="margin-top:8px">Concepts</label>' +
-            '<div id="gen-lora-list" class="gen-lora-list"></div>' +
-            '<select id="gen-lora-picker" class="gen-lora-dropdown">' +
-            '<option value="" disabled selected>Select a LoRA…</option>' +
-            '</select>' +
-            // Advanced Options for Generation (default OPEN)
-            '<div id="gen-gen-adv-disclosure" class="gen-adv-disclosure open" style="margin-top:8px">' +
-            '<i data-lucide="chevron-right"></i>' +
-            '<span>Advanced Options</span>' +
-            '</div>' +
-            '<div id="gen-gen-adv-body" class="gen-adv-body open">' +
-            // Steps
-            '<div class="gen-setting-row" style="margin-top:6px">' +
-            '<span class="gen-label">Steps</span>' +
-            '<input id="gen-steps-range" type="range" class="gen-range" min="1" max="150" value="20">' +
-            '<input id="gen-steps" type="number" class="gen-number-input" min="1" max="500" value="20">' +
-            '</div>' +
-            // CFG
-            '<div id="gen-cfg-row" class="gen-setting-row">' +
-            '<span class="gen-label">CFG</span>' +
-            '<input id="gen-cfg-range" type="range" class="gen-range" min="1" max="20" step="0.5" value="7.0">' +
-            '<input id="gen-cfg" type="number" class="gen-number-input" min="1" max="200" step="0.5" value="7.0">' +
-            '</div>' +
-            // Guidance (FLUX only)
-            '<div id="gen-guidance-row" class="gen-setting-row" style="display:none">' +
-            '<span class="gen-label">Guidance</span>' +
-            '<input id="gen-guidance-range" type="range" class="gen-range" min="1" max="10" step="0.5" value="3.5">' +
-            '<input id="gen-guidance" type="number" class="gen-number-input" min="1" max="10" step="0.5" value="3.5">' +
-            '</div>' +
-            // Scheduler
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label">Sampler</span>' +
-            '<select id="gen-scheduler" class="gen-select" style="flex:1">' +
-            buildSchedulerOptions() +
-            '</select>' +
-            '</div>' +
-            // Batch
-            '<div class="gen-setting-row" id="gen-batch-section">' +
-            '<span class="gen-label">Batch</span>' +
-            '<input id="gen-batch" type="number" class="gen-number-input" min="1" max="8" value="1">' +
-            '<span class="gen-batch-hint">images per run</span>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            // Video controls (hidden by default, shown for video models)
-            '<div class="gen-section" id="gen-video-section" style="display:none">' +
-            '<label class="gen-label">Video</label>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:52px;margin-bottom:0">Seconds</span>' +
-            '<input type="number" id="gen-seconds" class="gen-number-input" min="1" max="30" step="1" value="10" style="width:64px">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:52px;margin-bottom:0">FPS</span>' +
-            '<input type="range" id="gen-fps-range" class="gen-range" min="8" max="60" step="1" value="24">' +
-            '<input type="number" id="gen-fps" class="gen-number-input" min="8" max="60" step="1" value="24">' +
-            '</div>' +
-            '<div id="gen-duration-hint" class="gen-duration-hint"></div>' +
-            '</div>' +
-            '<div class="gen-section" id="gen-scail2-section" style="display:none">' +
-            '<label class="gen-label">SCAIL-2 Inputs</label>' +
-            '<div class="gen-duration-hint">Reference image + mask and driving video + mask are required. Audio is preserved from the driving video.</div>' +
-            '<label class="gen-label" style="margin-top:8px">Mode<select id="gen-scail2-mode" class="gen-select"><option value="animation">Animation</option><option value="replacement">Character replacement</option></select></label>' +
-            '<label class="gen-label">Reference image<input id="gen-scail2-reference-image" type="file" accept="image/*" class="gen-select"></label>' +
-            '<label class="gen-label">Reference mask<input id="gen-scail2-reference-mask" type="file" accept="image/*" class="gen-select"></label>' +
-            '<label class="gen-label">Driving video<input id="gen-scail2-driving-video" type="file" accept="video/*" class="gen-select"></label>' +
-            '<label class="gen-label">Driving mask video<input id="gen-scail2-driving-mask-video" type="file" accept="video/*" class="gen-select"></label>' +
-            '<label class="gen-label">Additional references (optional, up to 3)<input id="gen-scail2-additional-images" type="file" accept="image/*" multiple class="gen-select"></label>' +
-            '<label class="gen-label">Additional reference masks<input id="gen-scail2-additional-masks" type="file" accept="image/*" multiple class="gen-select"></label>' +
-            '<div id="gen-scail2-upload-status" class="gen-duration-hint"></div>' +
-            '</div>' +
-            // Compositing section
-            '<div class="gen-section">' +
-            '<div id="gen-compositing-header" class="gen-accordion-header closed">' +
-            '<span>Compositing</span>' +
-            '<span class="gen-accordion-arrow"><i data-lucide="chevron-down"></i></span>' +
-            '</div>' +
-            '<div id="gen-compositing-body" class="gen-accordion-body closed" style="margin-top:8px">' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Coherence</span>' +
-            '<select id="gen-coherence-mode" class="gen-select" style="flex:1">' +
-            '<option value="gaussian">Gaussian Blur</option>' +
-            '<option value="box">Box Blur</option>' +
-            '<option value="staged">Staged</option>' +
-            '</select>' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Edge Size</span>' +
-            '<input type="range" id="gen-edge-size-range" class="gen-range" min="0" max="128" step="4" value="32">' +
-            '<input type="number" id="gen-edge-size" class="gen-number-input" min="0" max="128" step="4" value="32">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Min Denoise</span>' +
-            '<input type="range" id="gen-min-denoise-range" class="gen-range" min="0" max="1" step="0.05" value="0">' +
-            '<input type="number" id="gen-min-denoise" class="gen-number-input" min="0" max="1" step="0.05" value="0">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Mask Blur</span>' +
-            '<input type="range" id="gen-mask-blur-range" class="gen-range" min="0" max="128" step="1" value="4">' +
-            '<input type="number" id="gen-mask-blur" class="gen-number-input" min="0" max="128" step="1" value="4">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Infill</span>' +
-            '<select id="gen-infill-method" class="gen-select" style="flex:1">' +
-            '<option value="patchmatch">PatchMatch</option>' +
-            '<option value="lama">LaMa</option>' +
-            '<option value="cv2">CV2 Inpaint</option>' +
-            '<option value="color">Solid Color</option>' +
-            '<option value="tile">Tile</option>' +
-            '</select>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            // Refiner section (SDXL only)
-            '<div class="gen-section" id="gen-refiner-section">' +
-            '<div id="gen-refiner-header" class="gen-accordion-header closed">' +
-            '<span>Refiner</span>' +
-            '<span class="gen-accordion-arrow"><i data-lucide="chevron-down"></i></span>' +
-            '</div>' +
-            '<div id="gen-refiner-body" class="gen-accordion-body closed" style="margin-top:8px">' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Model</span>' +
-            '<select id="gen-refiner-model" class="gen-select" style="flex:1">' +
-            '<option value="">None</option>' +
-            '</select>' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Scheduler</span>' +
-            '<select id="gen-refiner-scheduler" class="gen-select" style="flex:1">' +
-            buildSchedulerOptions() +
-            '</select>' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Steps</span>' +
-            '<input type="range" id="gen-refiner-steps-range" class="gen-range" min="1" max="100" value="20">' +
-            '<input type="number" id="gen-refiner-steps" class="gen-number-input" min="1" max="500" value="20">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">CFG</span>' +
-            '<input type="range" id="gen-refiner-cfg-range" class="gen-range" min="1" max="20" step="0.5" value="7.0">' +
-            '<input type="number" id="gen-refiner-cfg" class="gen-number-input" min="1" max="200" step="0.5" value="7.0">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Start</span>' +
-            '<input type="range" id="gen-refiner-start-range" class="gen-range" min="0" max="1" step="0.05" value="0.8">' +
-            '<input type="number" id="gen-refiner-start" class="gen-number-input" min="0" max="1" step="0.05" value="0.80">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Aesthetic +</span>' +
-            '<input type="range" id="gen-aesthetic-pos-range" class="gen-range" min="1" max="10" step="0.5" value="6.0">' +
-            '<input type="number" id="gen-aesthetic-pos" class="gen-number-input" min="1" max="10" step="0.5" value="6.0">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Aesthetic -</span>' +
-            '<input type="range" id="gen-aesthetic-neg-range" class="gen-range" min="1" max="10" step="0.5" value="2.5">' +
-            '<input type="number" id="gen-aesthetic-neg" class="gen-number-input" min="1" max="10" step="0.5" value="2.5">' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            // Advanced section
-            '<div class="gen-section">' +
-            '<div id="gen-advanced-header" class="gen-accordion-header closed">' +
-            '<span>Advanced</span>' +
-            '<span class="gen-accordion-arrow"><i data-lucide="chevron-down"></i></span>' +
-            '</div>' +
-            '<div id="gen-advanced-body" class="gen-accordion-body closed" style="margin-top:8px">' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">VAE</span>' +
-            '<select id="gen-vae-picker" class="gen-select" style="flex:1">' +
-            '<option value="default">Default (from checkpoint)</option>' +
-            '</select>' +
-            '</div>' +
-            '<div class="gen-setting-row" id="gen-clip-skip-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">CLIP Skip</span>' +
-            '<input type="range" id="gen-clip-skip-range" class="gen-range" min="0" max="12" step="1" value="0">' +
-            '<input type="number" id="gen-clip-skip" class="gen-number-input" min="0" max="12" step="1" value="0">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">CFG Rescale</span>' +
-            '<input type="range" id="gen-cfg-rescale-range" class="gen-range" min="0" max="0.99" step="0.01" value="0">' +
-            '<input type="number" id="gen-cfg-rescale" class="gen-number-input" min="0" max="0.99" step="0.01" value="0">' +
-            '</div>' +
-            '<div class="gen-setting-row">' +
-            '<span class="gen-label" style="min-width:80px;margin-bottom:0">Seamless</span>' +
-            '<div style="display:flex;gap:8px;align-items:center">' +
-            '<button id="gen-seamless-x" class="gen-seamless-btn" title="Tile horizontally">X</button>' +
-            '<button id="gen-seamless-y" class="gen-seamless-btn" title="Tile vertically">Y</button>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            '</div>';
-    }
-    function buildTopToolbarHTML() {
-        return '' +
-            '<div class="gen-top-toolbar" id="gen-top-toolbar">' +
-            // Generate button
-            '<button id="gen-toolbar-generate" class="gen-toolbar-btn gen-toolbar-generate" title="Generate">' +
-            '<i data-lucide="wand-2"></i>' +
-            '<span>Generate</span>' +
-            '</button>' +
-            // Batch count with spinners
-            '<div class="gen-toolbar-batch">' +
-            '<input type="number" id="gen-toolbar-batch-input" class="gen-toolbar-batch-input" min="1" max="8" value="1">' +
-            '<div class="gen-toolbar-batch-spin">' +
-            '<button id="gen-toolbar-batch-up" title="Increase batch">\u25B2</button>' +
-            '<button id="gen-toolbar-batch-down" title="Decrease batch">\u25BC</button>' +
-            '</div>' +
-            '</div>' +
-            '<span class="gen-toolbar-sep"></span>' +
-            // View mode icons (stubs)
-            '<button class="gen-toolbar-btn active" title="Image viewer"><i data-lucide="eye"></i></button>' +
-            '<button class="gen-toolbar-btn" title="Brush mode"><i data-lucide="paintbrush"></i></button>' +
-            '<button class="gen-toolbar-btn" title="List view"><i data-lucide="list"></i></button>' +
-            '<button class="gen-toolbar-btn" title="Close view"><i data-lucide="x"></i></button>' +
-            '<span class="gen-toolbar-sep"></span>' +
-            // Center: info
-            '<button class="gen-toolbar-btn" title="Image info"><i data-lucide="info"></i></button>' +
-            '<span class="gen-toolbar-spacer"></span>' +
-            // Toggle gallery panel
-            '<button id="gen-toolbar-toggle-gallery" class="gen-toolbar-btn active" title="Toggle gallery"><i data-lucide="image"></i></button>' +
-            '<span class="gen-toolbar-sep"></span>' +
-            // Right group: undo, redo, flip-h, flip-v, star, copy, delete
-            '<button class="gen-toolbar-btn" title="Undo" disabled><i data-lucide="undo-2"></i></button>' +
-            '<button class="gen-toolbar-btn" title="Redo" disabled><i data-lucide="redo-2"></i></button>' +
-            '<button class="gen-toolbar-btn" title="Flip horizontal" disabled><i data-lucide="flip-horizontal"></i></button>' +
-            '<button class="gen-toolbar-btn" title="Flip vertical" disabled><i data-lucide="flip-vertical"></i></button>' +
-            '<button class="gen-toolbar-btn" title="Favorite" disabled><i data-lucide="star"></i></button>' +
-            '<button id="gen-toolbar-copy" class="gen-toolbar-btn" title="Copy image URL"><i data-lucide="copy"></i></button>' +
-            '<button id="gen-toolbar-delete" class="gen-toolbar-btn" title="Delete"><i data-lucide="trash-2"></i></button>' +
-            '</div>';
     }
     function buildFloatingToolbarHTML() {
         return '' +
@@ -1313,91 +1002,6 @@ var GenerateTab = (function () {
             '<div id="gen-progress" class="gen-progress"><div id="gen-progress-bar" class="gen-progress-bar"></div></div>' +
             '<div id="gen-error-banner" class="gen-error-banner"></div>' +
             '<div id="gen-ws-indicator" class="gen-ws-indicator"><span class="gen-ws-dot"></span><span>Reconnecting...</span></div>';
-    }
-    function buildRightHTML() {
-        return '' +
-            // Tab switcher: Layers | Gallery | close
-            '<div class="gen-gallery-tabs">' +
-            '<button id="gen-tab-layers" class="gen-gallery-tab">Layers</button>' +
-            '<button id="gen-tab-gallery" class="gen-gallery-tab active">Gallery</button>' +
-            '<button id="gen-gallery-close" class="gen-gallery-close-btn" title="Close panel"><i data-lucide="x"></i></button>' +
-            '</div>' +
-            // Layers tab content
-            '<div id="gen-layers-content" class="gen-gallery-tab-content">' +
-            '<div class="gen-layers-placeholder">Coming soon</div>' +
-            '</div>' +
-            // Gallery tab content
-            '<div id="gen-gallery-content" class="gen-gallery-tab-content active">' +
-            // Boards section
-            '<div class="gen-boards-section">' +
-            '<div id="gen-boards-header" class="gen-boards-header">' +
-            '<span>Hide Boards</span>' +
-            '<span class="gen-accordion-arrow"><i data-lucide="chevron-up"></i></span>' +
-            '</div>' +
-            '<div id="gen-boards-body" class="gen-boards-body">' +
-            '<div class="gen-board-item">' +
-            '<span><span class="gen-board-icon">\uD83D\uDCC1</span> Uncategorized</span>' +
-            '<span class="gen-board-badge">AUTO</span>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            // Sub-tabs: Images | Assets | actions
-            '<div class="gen-gallery-subtabs" style="position:relative">' +
-            '<button id="gen-subtab-images" class="gen-gallery-subtab active">Images</button>' +
-            '<button id="gen-subtab-assets" class="gen-gallery-subtab">Assets</button>' +
-            '<div class="gen-gallery-subtab-actions">' +
-            '<button id="gen-gallery-upload-btn" class="gen-gallery-subtab-btn" title="Upload image"><i data-lucide="upload"></i></button>' +
-            '<input type="file" id="gen-gallery-upload-input" accept="image/*" multiple style="display:none">' +
-            '<button id="gen-gallery-settings-btn" class="gen-gallery-subtab-btn" title="Gallery settings"><i data-lucide="settings"></i></button>' +
-            '<button id="gen-gallery-search-btn" class="gen-gallery-subtab-btn" title="Search"><i data-lucide="search"></i></button>' +
-            '<input id="gen-gallery-search-input" class="gen-gallery-search" type="text" placeholder="Search...">' +
-            '</div>' +
-            '<div id="gen-gallery-popover" class="gen-gallery-popover">' +
-            '<div class="gen-popover-row">' +
-            '<span class="gen-popover-label">Image Size</span>' +
-            '<input type="range" id="gen-thumb-size-slider" class="gen-range gen-popover-slider" min="45" max="200" step="5" value="90">' +
-            '<span id="gen-thumb-size-val" style="color:var(--shell-text);font-size:11px;min-width:28px;text-align:right">90</span>' +
-            '</div>' +
-            '<div class="gen-popover-row">' +
-            '<span class="gen-popover-label">Sort Direction</span>' +
-            '<button id="gen-sort-direction-toggle" class="gen-toggle on"></button>' +
-            '<span id="gen-sort-direction-label" style="color:var(--shell-text-muted);font-size:10px;min-width:60px">Newest</span>' +
-            '</div>' +
-            '<div class="gen-popover-row">' +
-            '<span class="gen-popover-label">Starred First</span>' +
-            '<button id="gen-starred-first-toggle" class="gen-toggle"></button>' +
-            '</div>' +
-            '<div class="gen-popover-row">' +
-            '<span class="gen-popover-label">Auto-Switch New</span>' +
-            '<button id="gen-auto-switch-toggle" class="gen-toggle on"></button>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            '<div id="gen-images-content">' +
-            '<div class="gen-gallery-header">' +
-            '<span class="gen-gallery-title">Gallery</span>' +
-            '<button id="gen-gallery-clear" class="gen-gallery-clear">Clear</button>' +
-            '</div>' +
-            '<div class="gen-gallery-grid-wrap">' +
-            '<div id="gen-gallery-grid" class="gen-gallery-grid"></div>' +
-            '<div id="gen-selection-badge" class="gen-selection-badge"></div>' +
-            '</div>' +
-            '</div>' +
-            '<div id="gen-assets-content" style="display:none">' +
-            '<div class="gen-assets-placeholder">No assets uploaded</div>' +
-            '</div>' +
-            '<div id="gen-bulk-bar" class="gen-bulk-bar">' +
-            '<button id="gen-bulk-star" class="gen-bulk-btn">Star All</button>' +
-            '<button id="gen-bulk-unstar" class="gen-bulk-btn">Unstar All</button>' +
-            '<button id="gen-bulk-download" class="gen-bulk-btn">Download</button>' +
-            '<button id="gen-bulk-delete" class="gen-bulk-btn destructive">Delete</button>' +
-            '</div>' +
-            '<div id="gen-gallery-pagination" class="gen-gallery-pagination">' +
-            '<button id="gen-page-prev" disabled>&lt; Prev</button>' +
-            '<span id="gen-page-info">Page 1</span>' +
-            '<button id="gen-page-next">&gt; Next</button>' +
-            '</div>' +
-            '</div>';
     }
     function cacheElements() {
         els.model = document.getElementById('gen-model');
@@ -1481,6 +1085,9 @@ var GenerateTab = (function () {
         els.wsIndicator = document.getElementById('gen-ws-indicator');
         els.galleryGrid = document.getElementById('gen-gallery-grid');
         els.galleryClear = document.getElementById('gen-gallery-clear');
+        els.assetsContent = document.getElementById('gen-assets-content');
+        els.assetsGrid = document.getElementById('gen-assets-grid');
+        els.assetsPlaceholder = document.getElementById('gen-assets-placeholder');
         // New elements
         els.leftPanel = document.getElementById('gen-left-panel');
         els.rightPanel = document.getElementById('gen-right-panel');
@@ -1643,8 +1250,10 @@ var GenerateTab = (function () {
     function bindLayoutResizers() {
         if (!els.layout)
             return;
-        var minPromptHeight = 96;
-        var minLibraryHeight = 42;
+        // Generate is a primary action and must remain reachable. The prompt
+        // dock may collapse to one compact button row, but never to zero.
+        var minPromptHeight = 54;
+        var minLibraryHeight = 38;
         var minStageHeight = 160;
         var hasStoredVerticalLayout = localStorage.getItem('sf-gen-prompt-height') != null ||
             localStorage.getItem('sf-gen-library-height') != null;
@@ -1679,6 +1288,8 @@ var GenerateTab = (function () {
             els.layout.style.setProperty('--gen-prompt-height', promptHeight + 'px');
             els.layout.style.setProperty('--gen-library-height', libraryHeight + 'px');
             els.layout.classList.toggle('gen-prompt-compact', promptHeight < 132);
+            els.layout.classList.remove('gen-prompt-hidden');
+            els.layout.classList.toggle('gen-library-tabs-only', libraryHeight <= minLibraryHeight);
         }
         function drag(handle, axis, update, persist) {
             if (!handle)
@@ -1757,20 +1368,29 @@ var GenerateTab = (function () {
         });
         if (els.promptResizer) {
             els.promptResizer.addEventListener('dblclick', function () {
-                promptHeight = minPromptHeight;
-                libraryHeight = minLibraryHeight;
+                promptHeight = promptHeight <= minPromptHeight ? 154 : minPromptHeight;
                 apply(false);
-                localStorage.setItem('sf-gen-prompt-height', String(minPromptHeight));
-                localStorage.setItem('sf-gen-library-height', String(minLibraryHeight));
+                localStorage.setItem('sf-gen-prompt-height', String(Math.round(promptHeight)));
             });
         }
         if (els.libraryResizer) {
             els.libraryResizer.addEventListener('dblclick', function () {
-                libraryHeight = minLibraryHeight;
+                libraryHeight = libraryHeight <= minLibraryHeight ? 230 : minLibraryHeight;
                 apply(false);
-                localStorage.setItem('sf-gen-library-height', String(minLibraryHeight));
+                localStorage.setItem('sf-gen-library-height', String(Math.round(libraryHeight)));
             });
         }
+        ensureLibraryExpanded = function () {
+            if (libraryHeight > minLibraryHeight)
+                return;
+            var max = Math.max(
+                minLibraryHeight,
+                els.layout.clientHeight - 12 - minStageHeight - promptHeight
+            );
+            libraryHeight = Math.max(minLibraryHeight, Math.min(230, max));
+            apply(false);
+            localStorage.setItem('sf-gen-library-height', String(Math.round(libraryHeight)));
+        };
         window.addEventListener('resize', function () { apply(false); });
         apply(!hasStoredVerticalLayout);
         syncPanelLayoutState();
@@ -2463,15 +2083,20 @@ var GenerateTab = (function () {
         els.galleryClear.addEventListener('click', function () {
             if (state.gallery.length === 0)
                 return;
-            if (!confirm('Clear all ' + state.gallery.length + ' gallery items?'))
+            if (!confirm('Permanently delete all ' + state.gallery.length + ' history items?'))
                 return;
-            state.gallery = [];
-            state.selectedImages = [];
-            state.galleryPage = 0;
-            renderGallery();
-            updateSelectionUI();
-            updateMetadataPanel();
-            localStorage.removeItem('sf-gallery');
+            var doomed = state.gallery.slice();
+            Promise.all(doomed.map(deleteHistoryArtifact)).then(function () {
+                state.gallery = [];
+                state.selectedImages = [];
+                renderGallery();
+                updateSelectionUI();
+                updateMetadataPanel();
+                clearPreview();
+            }).catch(function (error) {
+                showError('Could not delete every output: ' + error.message);
+                refreshHistory();
+            });
         });
         // ── Top Toolbar ──
         var toolbarGenerate = document.getElementById('gen-toolbar-generate');
@@ -2582,20 +2207,17 @@ var GenerateTab = (function () {
         var assetsContent = document.getElementById('gen-assets-content');
         if (subtabImages && subtabAssets) {
             subtabImages.addEventListener('click', function () {
-                state.gallerySubTab = 'images';
-                subtabImages.classList.add('active');
-                subtabAssets.classList.remove('active');
-                imagesContent.style.display = '';
-                assetsContent.style.display = 'none';
+                setGallerySubTab('images');
             });
             subtabAssets.addEventListener('click', function () {
-                state.gallerySubTab = 'assets';
-                subtabAssets.classList.add('active');
-                subtabImages.classList.remove('active');
-                assetsContent.style.display = '';
-                imagesContent.style.display = 'none';
+                setGallerySubTab('assets');
             });
         }
+        var assetsRefresh = document.getElementById('gen-assets-refresh');
+        if (assetsRefresh)
+            assetsRefresh.addEventListener('click', function () {
+                loadAssets(true);
+            });
         // Gallery search toggle + filtering
         var searchBtn = document.getElementById('gen-gallery-search-btn');
         var searchInput = document.getElementById('gen-gallery-search-input');
@@ -2608,14 +2230,18 @@ var GenerateTab = (function () {
                 else {
                     searchInput.value = '';
                     state.gallerySearch = '';
-                    state.galleryPage = 0;
-                    renderGallery();
+                    if (state.gallerySubTab === 'assets')
+                        renderAssets();
+                    else
+                        renderGallery();
                 }
             });
             searchInput.addEventListener('input', function () {
                 state.gallerySearch = this.value;
-                state.galleryPage = 0;
-                renderGallery();
+                if (state.gallerySubTab === 'assets')
+                    renderAssets();
+                else
+                    renderGallery();
             });
         }
         // ── Style Preset ──
@@ -2761,7 +2387,7 @@ var GenerateTab = (function () {
     }
     function bindGenerateControls() {
         ['gen-core', 'gen-variation', 'gen-sampling', 'gen-video',
-            'gen-video-conditioning', 'gen-lora', 'gen-advanced-runtime',
+            'gen-source', 'gen-video-conditioning', 'gen-lora', 'gen-advanced-runtime',
             'gen-output'].forEach(function (prefix) {
             bindAccordion(prefix + '-header', prefix + '-body');
         });
@@ -2808,19 +2434,7 @@ var GenerateTab = (function () {
         }
         document.querySelectorAll('.gen-library-tab').forEach(function (button) {
             button.addEventListener('click', function () {
-                var target = this.dataset.library;
-                document.querySelectorAll('.gen-library-tab').forEach(function (tab) {
-                    tab.classList.toggle('active', tab.dataset.library === target);
-                });
-                document.querySelectorAll('.gen-library-panel').forEach(function (panel) {
-                    panel.classList.toggle('active', panel.dataset.libraryPanel === target);
-                });
-                if (target === 'presets')
-                    loadGenerationPresets();
-                if (target === 'models')
-                    renderModelLibrary();
-                if (target === 'loras')
-                    renderLoraLibrary();
+                activateLibraryPanel(this.dataset.library);
             });
         });
         var presetSave = document.getElementById('gen-preset-save');
@@ -2894,6 +2508,176 @@ var GenerateTab = (function () {
         })
             .catch(function (err) {
             showError('Preset load failed: ' + err.message);
+        });
+    }
+    function workflowGraphStats(graph, objectInfo) {
+        var definitions = {};
+        var subgraphs = graph && graph.definitions && Array.isArray(graph.definitions.subgraphs)
+            ? graph.definitions.subgraphs : [];
+        subgraphs.forEach(function (subgraph) {
+            if (subgraph && subgraph.id)
+                definitions[subgraph.id] = subgraph;
+        });
+        var skipped = new Set(['MarkdownNote', 'Note']);
+        var topLevelNodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+        var typesSeen = new Set();
+        function collectTypes(nodes, visiting) {
+            (nodes || []).forEach(function (node) {
+                if (!node || node.id < 0 || !node.type || skipped.has(node.type))
+                    return;
+                var subgraph = definitions[node.type];
+                if (subgraph && !visiting.has(node.type)) {
+                    var next = new Set(visiting);
+                    next.add(node.type);
+                    collectTypes(subgraph.nodes, next);
+                    return;
+                }
+                typesSeen.add(String(node.type));
+            });
+        }
+        collectTypes(topLevelNodes, new Set());
+        var types = Array.from(typesSeen).sort(function (a, b) {
+            return a.localeCompare(b);
+        });
+        var missing = types.filter(function (type) {
+            return !objectInfo || !Object.prototype.hasOwnProperty.call(objectInfo, type);
+        });
+        return { nodeCount: topLevelNodes.length, nodeTypes: types, missing: missing };
+    }
+    function openGenerationWorkflow(template) {
+        if (!template) {
+            showError('Workflow template is missing');
+            return;
+        }
+        if (typeof switchTab !== 'function') {
+            showError('Canvas navigation is unavailable');
+            return;
+        }
+        if (template.preset) {
+            applyParams(template.preset);
+            switchTab('workflows');
+            var presetNameInput = document.getElementById('workflow-name');
+            if (presetNameInput)
+                presetNameInput.value = template.name || 'Untitled Workflow';
+            return;
+        }
+        if (!template.url) {
+            showError('Workflow template URL is missing');
+            return;
+        }
+        switchTab('workflows');
+        var nameInput = document.getElementById('workflow-name');
+        if (nameInput)
+            nameInput.value = template.name || 'Untitled Workflow';
+        requestAnimationFrame(function () {
+            if (typeof sfToolbar !== 'undefined' && sfToolbar) {
+                sfToolbar.loadWorkflowFromUrl(template.url);
+                return;
+            }
+            showError('Canvas is still initializing; try opening the workflow again');
+        });
+    }
+    function loadGenerationWorkflows() {
+        var list = document.getElementById('gen-workflow-list');
+        if (!list)
+            return;
+        list.innerHTML = '<div class="gen-library-empty">Inspecting workflow compatibility…</div>';
+        Promise.all([
+            fetch('/templates', { cache: 'no-store' }).then(function (resp) {
+                if (!resp.ok)
+                    throw new Error('templates HTTP ' + resp.status);
+                return resp.json();
+            }),
+            ModelUtils.loadObjectInfo()
+        ]).then(function (values) {
+            var templates = Array.isArray(values[0]) ? values[0] : [];
+            var objectInfo = values[1] || {};
+            var availableModels = new Set((state.allModels || []).map(function (model) {
+                return model.name;
+            }));
+            var builtins = (typeof SerenityWorkflowPresets !== 'undefined'
+                ? SerenityWorkflowPresets : []).filter(function (template) {
+                return !template.preset || availableModels.has(template.preset.model);
+            });
+            var merged = new Map();
+            builtins.concat(templates).forEach(function (template) {
+                merged.set(template.name || template.file || template.url, template);
+            });
+            templates = Array.from(merged.values());
+            return Promise.all(templates.map(function (template) {
+                if (template.preset) {
+                    return Promise.resolve({
+                        template: template,
+                        stats: { nodeCount: 0, nodeTypes: [], missing: [] },
+                        error: '',
+                        builtin: true
+                    });
+                }
+                return fetch(template.url, { cache: 'no-store' })
+                    .then(function (resp) {
+                    if (!resp.ok)
+                        throw new Error('HTTP ' + resp.status);
+                    return resp.json();
+                }).then(function (graph) {
+                    return {
+                        template: template,
+                        stats: workflowGraphStats(graph, objectInfo),
+                        error: ''
+                    };
+                }).catch(function (error) {
+                    return { template: template, stats: null, error: error.message };
+                });
+            }));
+        }).then(function (entries) {
+            list.innerHTML = '';
+            entries.forEach(function (entry) {
+                var template = entry.template;
+                var card = document.createElement('div');
+                card.className = 'gen-library-card gen-workflow-card';
+                var copy = document.createElement('div');
+                copy.className = 'gen-workflow-card-copy';
+                var title = document.createElement('strong');
+                title.textContent = template.name || template.file || 'Workflow';
+                copy.appendChild(title);
+                var status = document.createElement('span');
+                status.className = 'gen-workflow-card-status';
+                if (entry.error) {
+                    status.classList.add('is-missing');
+                    status.textContent = 'Could not inspect · ' + entry.error;
+                }
+                else if (entry.builtin) {
+                    status.classList.add('is-ready');
+                    status.textContent = 'Built-in product workflow · current runtime';
+                }
+                else if (entry.stats.missing.length) {
+                    status.classList.add('is-missing');
+                    status.textContent = 'Reference workflow · ' + entry.stats.nodeCount +
+                        ' nodes · ' + entry.stats.missing.length + ' custom node type' +
+                        (entry.stats.missing.length === 1 ? '' : 's') + ' missing';
+                    status.title = 'Missing: ' + entry.stats.missing.join(', ');
+                }
+                else {
+                    status.classList.add('is-ready');
+                    status.textContent = entry.stats.nodeCount +
+                        ' nodes · all node types registered';
+                }
+                copy.appendChild(status);
+                var open = document.createElement('button');
+                open.type = 'button';
+                open.className = 'gen-small-btn';
+                open.textContent = 'Open in Canvas';
+                open.addEventListener('click', function () {
+                    openGenerationWorkflow(template);
+                });
+                card.appendChild(copy);
+                card.appendChild(open);
+                list.appendChild(card);
+            });
+            if (!list.children.length)
+                list.innerHTML = '<div class="gen-library-empty">No workflow templates found</div>';
+        }).catch(function (error) {
+            list.innerHTML = '<div class="gen-library-empty">Workflow catalog failed: ' +
+                escapeHtml(error.message) + '</div>';
         });
     }
     function renderModelLibrary() {
@@ -3118,11 +2902,10 @@ var GenerateTab = (function () {
         Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities(), videoReadiness])
             .then(function (loaded) {
             state.videoStatus = loaded[2];
-            var ltxReady = !!(state.videoStatus && state.videoStatus.arms_ready &&
-                state.videoStatus.arms_ready.ltx2_t2v_av);
-            var models = loaded[0].filter(function (model) {
-                return ModelUtils.archForModel(model.name) !== 'ltxv' || ltxReady;
-            });
+            // Keep installed LTX/Sulphur checkpoints selectable even when the
+            // readiness request is transiently unavailable. Admission still
+            // reports precise missing runtime artifacts when Generate is used.
+            var models = loaded[0];
             state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');
@@ -3203,13 +2986,13 @@ var GenerateTab = (function () {
             .catch(function () { });
     }
     function setPreviewModelBadges(model, arch) {
-        // These badges describe the active request controls. Result-specific
-        // identity is rendered in the metadata panel and must not silently
-        // rewrite the selected model when an older History item is viewed.
-        var resolvedModel = state.model || model || '';
-        var resolvedArch = state.arch ||
+        // Callers pass either the active request or the previewed History item.
+        // Prefer that explicit identity; do not let another selected model
+        // overwrite the output being inspected.
+        var resolvedModel = model || state.model || '';
+        var resolvedArch = arch ||
             (resolvedModel && ModelUtils.archForModel(resolvedModel)) ||
-            arch || 'other';
+            state.arch || 'other';
         var archBadge = document.getElementById('gen-arch-badge');
         if (archBadge) {
             var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', lens: 'MICROSOFT LENS', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
@@ -3227,152 +3010,6 @@ var GenerateTab = (function () {
     function updateUIForArch(arch) {
         updateGenerateUIForArch(arch);
         return;
-        /* Legacy layout logic retained below only for source-map compatibility.
-           The Serenity Generate surface uses the capability-driven path. */
-        state.arch = arch;
-        var isFlux = arch === 'flux' || arch === 'klein';
-        var noNegative = isFlux || arch === 'ideogram4' || arch === 'sensenova';
-        var isVideo = arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2';
-        // Each admitted product exposes only its measured sampler. Wan uses
-        // creator-parity Flow-UniPC; image families and LTX keep their current
-        // Euler-facing workflow control.
-        if (els.scheduler) {
-            var admittedScheduler = arch === 'wan' || arch === 'bernini' || arch === 'scail2'
-                ? { value: 'uni_pc', label: arch === 'bernini' ? 'UniPC (Bernini-R)' : (arch === 'scail2' ? 'UniPC (SCAIL-2)' : 'UniPC (Wan)') }
-                : { value: 'euler', label: 'Euler' };
-            els.scheduler.innerHTML = '<option value="' + admittedScheduler.value + '">' +
-                admittedScheduler.label + '</option>';
-            state.scheduler = admittedScheduler.value;
-            els.scheduler.value = state.scheduler;
-        }
-        // Krea creator semantics use cfg=0 to disable CFG (Turbo default).
-        // Set the DOM bounds before assigning the model default so a range
-        // input cannot silently clamp 0 back to 1.
-        var cfgMin = arch === 'krea2' ? 0 : 1;
-        if (els.cfg) els.cfg.min = String(cfgMin);
-        if (els.cfgRange) els.cfgRange.min = String(cfgMin);
-        var productDefaults = {
-            zimage: { steps: 28, cfg: 4.0 }, qwen: { steps: 50, cfg: 4.0 },
-            ideogram4: { steps: 48, cfg: 7.0 }, sdxl: { steps: 50, cfg: 7.0 },
-            anima: { steps: 30, cfg: 4.5 }, sd3: { steps: 28, cfg: 4.5 },
-            flux: { steps: 50, cfg: 3.5 },
-            // BFL: undistilled Klein Base is 50-step / CFG 4; the distilled
-            // production checkpoint is 4-step / guidance 1.
-            klein: /base/i.test(state.model) ? { steps: 50, cfg: 4.0 } : { steps: 4, cfg: 1.0 },
-            sensenova: { steps: 50, cfg: 4.0 },
-            krea2: /turbo/i.test(state.model) ? { steps: 8, cfg: 0.0 } : { steps: 52, cfg: 3.5 },
-            chroma: { steps: 40, cfg: 3.0 }
-        };
-        var defaults = productDefaults[arch];
-        if (defaults) {
-            state.steps = defaults.steps;
-            state.cfg = defaults.cfg;
-            if (els.steps) els.steps.value = String(state.steps);
-            if (els.stepsRange) els.stepsRange.value = String(state.steps);
-            if (els.cfg) els.cfg.value = String(state.cfg);
-            if (els.cfgRange) els.cfgRange.value = String(state.cfg);
-        }
-        // Neg prompt: hide for flux only (video needs it for CFG)
-        els.negSection.style.display = noNegative ? 'none' : 'block';
-        if (noNegative)
-            state.negPrompt = '';
-        // CFG: hide for flux only (Wan's admitted profile uses CFG 5.0)
-        els.cfgRow.style.display = isFlux ? 'none' : 'flex';
-        // Guidance: flux only
-        els.guidanceRow.style.display = isFlux ? 'flex' : 'none';
-        // Keep the complete Serenity video surface discoverable for image
-        // models, but only enable it for an admitted video runner.
-        if (els.videoSection)
-            els.videoSection.style.display = 'block';
-        if (els.scail2Section)
-            els.scail2Section.style.display = arch === 'scail2' ? 'block' : 'none';
-        setVideoControlsForMode(isVideo);
-        // Batch: hide for video models
-        var batchSection = document.getElementById('gen-batch-section');
-        if (batchSection)
-            batchSection.style.display = isVideo ? 'none' : 'flex';
-        // Button label
-        els.btn.innerHTML = isVideo
-            ? '<i data-lucide="wand-2"></i> Generate Video'
-            : '<i data-lucide="wand-2"></i> Generate';
-        if (typeof lucide !== 'undefined')
-            lucide.createIcons({ nameAttr: 'data-lucide' });
-        setPreviewModelBadges(state.model, arch);
-        // Refiner: SDXL only
-        var refinerSection = document.getElementById('gen-refiner-section');
-        if (refinerSection)
-            refinerSection.style.display = (arch === 'sdxl') ? '' : 'none';
-        // CLIP Skip: SD1.5 only
-        var clipSkipRow = document.getElementById('gen-clip-skip-row');
-        if (clipSkipRow)
-            clipSkipRow.style.display = (arch === 'sd15') ? 'flex' : 'none';
-        // Update custom res input constraints
-        var ws = document.getElementById('gen-width-slider');
-        var hs = document.getElementById('gen-height-slider');
-        // Resolution specializations are compiled and parity-gated. Keep raw
-        // dimensions read-only and drive them from the admitted shape picker.
-        if (els.customWidth) els.customWidth.disabled = true;
-        if (els.customHeight) els.customHeight.disabled = true;
-        if (els.customWidth) els.customWidth.title = 'Use the Aspect picker for compiled model sizes';
-        if (els.customHeight) els.customHeight.title = 'Use the Aspect picker for compiled model sizes';
-        if (ws) ws.disabled = true;
-        if (hs) hs.disabled = true;
-        var swap = document.getElementById('gen-swap-btn');
-        var lock = document.getElementById('gen-aspect-lock');
-        var admittedAspects = getActiveAspects();
-        var hasSwappedShape = admittedAspects.some(function (a) {
-            return admittedAspects.some(function (b) { return a.w === b.h && a.h === b.w; });
-        });
-        if (swap) swap.style.display = admittedAspects.length > 1 && hasSwappedShape ? '' : 'none';
-        if (lock) lock.style.display = 'none';
-        // Update aspect dropdown options for video vs image
-        if (els.aspectDropdown) {
-            els.aspectDropdown.innerHTML = buildAspectOptions();
-            els.aspectDropdown.value = '1:1';
-        }
-        // Select default aspect ratio for the new mode
-        var aspects = admittedAspects;
-        if (aspects.length > 0) {
-            var preferredSize = getDefaultsForArch(arch);
-            var defaultIdx = aspects.findIndex(function (a) {
-                return a.w === preferredSize.w && a.h === preferredSize.h;
-            });
-            if (defaultIdx < 0)
-                defaultIdx = 0;
-            var defaultAspect = aspects[defaultIdx];
-            state.width = defaultAspect.w;
-            state.height = defaultAspect.h;
-            syncDimensionInputs();
-            syncAspectDropdown();
-            updateAspectPreview();
-        }
-        // Set video-appropriate defaults
-        if (isVideo) {
-            state.cfg = arch === 'wan' ? 5.0 : (arch === 'bernini' ? 4.0 : (arch === 'scail2' ? 5.0 : 3.0));
-            state.frames = arch === 'bernini' ? 81 : (arch === 'scail2' ? 65 : 121);
-            state.fps = arch === 'bernini' || arch === 'scail2' ? 16 : 24;
-            if (arch === 'scail2') {
-                state.seconds = 4;
-                if (els.secondsInput) els.secondsInput.value = '4';
-            }
-            if (arch === 'ltxv')
-                state.steps = 15;
-            if (arch === 'wan')
-                state.steps = 50;
-            if (arch === 'bernini')
-                state.steps = 40;
-            if (arch === 'scail2')
-                state.steps = 40;
-            if (els.steps) els.steps.value = String(state.steps);
-            if (els.stepsRange) els.stepsRange.value = String(state.steps);
-            if (els.fpsInput) els.fpsInput.value = String(state.fps);
-            if (els.fpsRange) els.fpsRange.value = String(state.fps);
-            if (els.cfg)
-                els.cfg.value = String(state.cfg);
-            if (els.cfgRange)
-                els.cfgRange.value = String(state.cfg);
-            updateDurationHint();
-        }
     }
     function applyVideoGuidanceMode(preserveSteps) {
         var creatorWorkflow = state.videoWorkflowProfile
@@ -3453,7 +3090,11 @@ var GenerateTab = (function () {
         state.arch = arch;
         var mode = activeLtx2RequestMode();
         var profile = activeLtx2RequestProfile();
-        if (!mode || mode.available !== true || !profile) {
+        // `mode.available` historically mirrored one legacy default runner.
+        // A machine can have many admitted native profiles even when that old
+        // default binary is absent, so gate the UI on the actual available
+        // profile inventory instead of disabling every LTX control.
+        if (!mode || !profile || activeLtx2RequestProfiles().length === 0) {
             if (els.modelWarn) {
                 els.modelWarn.textContent = 'The selected video request runner is not available on this machine';
                 els.modelWarn.classList.add('visible');
@@ -3498,6 +3139,7 @@ var GenerateTab = (function () {
             els.capsNegative.value = state.capsNegative;
         if (els.noiseFixture)
             els.noiseFixture.value = state.noiseFixture;
+        refreshCameraMotionControls(mode.camera_motions);
         applyVideoGuidanceMode(false);
         refreshVideoPromptEnhancer();
         syncDimensionInputs();
@@ -3627,17 +3269,18 @@ var GenerateTab = (function () {
     function updateWanVideoUI(arch) {
         state.arch = arch;
         var runner = activeWan22Runner();
-        if (!runner || runner.status !== 'quality_profile_ready') {
+        var runnerReady = !!runner && runner.status === 'quality_profile_ready';
+        if (!runnerReady) {
             if (els.modelWarn) {
                 els.modelWarn.textContent = runner
-                    ? 'Wan2.2 is installed but its machine-local T2V/I2V product gate has not passed'
-                    : 'The Wan2.2 Mojo runner is not available on this machine';
+                    ? 'Wan2.2 request controls are available; generation will report any missing runner prerequisites'
+                    : 'Wan2.2 request controls are available; no runner status was returned';
                 els.modelWarn.classList.add('visible');
             }
-            return;
         }
-        if (els.modelWarn)
+        else if (els.modelWarn)
             els.modelWarn.classList.remove('visible');
+        runner = runner || {};
         setVideoControlsForMode(true);
         if (els.videoSection)
             els.videoSection.style.display = '';
@@ -3668,11 +3311,14 @@ var GenerateTab = (function () {
         state.fps = 24;
         state.seconds = state.frames / state.fps;
         state.cfg = Number(runner.default_guidance) || 5;
+        state.guidance = state.cfg;
         state.videoQuant = 'bf16';
         state.sampler = 'uni_pc';
         state.scheduler = 'normal';
         if (els.cfg) els.cfg.value = String(state.cfg);
         if (els.cfgRange) els.cfgRange.value = String(state.cfg);
+        if (els.guidance) els.guidance.value = String(state.guidance);
+        if (els.guidanceRange) els.guidanceRange.value = String(state.guidance);
         if (els.framesInput) {
             els.framesInput.value = String(state.frames);
             els.framesInput.disabled = true;
@@ -3691,10 +3337,7 @@ var GenerateTab = (function () {
             els.scheduler.innerHTML = '<option value="normal">Wan flow schedule</option>';
             els.scheduler.value = state.scheduler;
         }
-        if (els.cameraMotion) {
-            els.cameraMotion.disabled = false;
-            els.cameraMotion.value = state.cameraMotion || 'none';
-        }
+        refreshCameraMotionControls(runner.camera_motions);
         syncWanI2vSteps();
         syncDimensionInputs();
         if (els.customWidth) els.customWidth.disabled = true;
@@ -3728,7 +3371,9 @@ var GenerateTab = (function () {
         setPreviewModelBadges(state.model, arch);
         var runtimeLabel = document.getElementById('gen-runtime-label');
         if (runtimeLabel)
-            runtimeLabel.textContent = 'Wan2.2 TI2V-5B · Mojo creator T2V/I2V runner · admitted';
+            runtimeLabel.textContent = runnerReady
+                ? 'Wan2.2 TI2V-5B · Mojo creator T2V/I2V runner · ready'
+                : 'Wan2.2 TI2V-5B · Mojo creator request route';
         updateAdvancedSamplingUI(null);
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
@@ -4096,7 +3741,6 @@ var GenerateTab = (function () {
             guidance: state.guidance,
             sampler: state.sampler,
             scheduler: state.scheduler,
-            noiseScheduler: state.scheduler,
             sigmaShift: state.sigmaShift,
             seed: state.seed,
             frames: state.frames,
@@ -4109,6 +3753,13 @@ var GenerateTab = (function () {
             additionalReferenceImagePaths: state.additionalReferenceImagePaths.slice(),
             additionalReferenceMaskPaths: state.additionalReferenceMaskPaths.slice(),
             initImageName: state.initImagePath || state.initImageName || '',
+            ltx2Mode: state.videoGuidanceMode,
+            quantization: state.videoQuant,
+            ltx2WorkflowProfile: state.videoWorkflowProfile,
+            ltx2PromptEnhancer: state.videoPromptEnhancer,
+            ltx2AudioPolicy: state.audioPolicy,
+            ltx2PostUpscaler: state.postUpscaler,
+            ltx2PostUpscaleFactor: state.postUpscaleFactor,
             ltx2CameraMotion: state.cameraMotion || 'none',
             loras: enabledLoras,
             // Phase 3: Advanced
@@ -4212,6 +3863,10 @@ var GenerateTab = (function () {
                 })
             };
         }
+        // Guidance mode owns the complete sampler tuple. Re-normalize at the
+        // submission boundary so a reused dev request cannot leave distilled
+        // mode paired with the stale dev step count (or vice versa).
+        applyVideoGuidanceMode(false);
         var request = {
             schema: 'serenity.genparams.v1',
             model: 'ltx2',
@@ -4237,6 +3892,7 @@ var GenerateTab = (function () {
             include_audio: state.includeAudio === true,
             audio_policy: state.audioPolicy ||
                 (state.includeAudio === true ? 'generate' : 'none'),
+            camera_motion: state.cameraMotion || 'none',
             post_upscale: state.postUpscaler === 'none'
                 ? { id: 'none', factor: 1 }
                 : {
@@ -4321,8 +3977,6 @@ var GenerateTab = (function () {
                     throw new Error('completed video manifest has no playable MP4');
                 var metadata = Object.assign({}, reusable, {
                     params: reusable,
-                    cfg: null,
-                    guidance: null,
                     frame_count: request.frames,
                     fps: request.fps
                 });
@@ -4369,6 +4023,18 @@ var GenerateTab = (function () {
         var request = buildVideoRequest(seed);
         var reusable = getParams();
         reusable.seed = seed;
+        reusable.arch = ModelUtils.archForModel(reusable.model);
+        reusable.width = request.width;
+        reusable.height = request.height;
+        reusable.steps = request.steps;
+        reusable.sampler = request.sampler;
+        reusable.scheduler = request.scheduler;
+        reusable.frames = request.frames;
+        reusable.fps = request.fps;
+        if (Number.isFinite(Number(request.guidance))) {
+            reusable.cfg = Number(request.guidance);
+            reusable.guidance = Number(request.guidance);
+        }
         setGenerating(true);
         updateGenerationActivity('Preparing GPU · unloading image model if resident', 0, 0);
         SerenityAPI.postVideo(request)
@@ -4377,8 +4043,6 @@ var GenerateTab = (function () {
                 var videoId = String(job.video_id || '');
                 var metadata = Object.assign({}, reusable, {
                     params: reusable,
-                    cfg: null,
-                    guidance: null,
                     frame_count: request.frames,
                     fps: request.fps,
                     mode: job.mode ||
@@ -4564,6 +4228,37 @@ var GenerateTab = (function () {
         els.activityStatus.dataset.state = 'idle';
         els.activityStatus.title = 'No generation is running';
     }
+    function renderExternalActivity() {
+        var activity = state.externalActivity;
+        if (!activity || activity.active !== true) {
+            if (!state.generating)
+                setGenerationIdle();
+            return;
+        }
+        updateGenerationActivity(
+            activity.label || activity.phase || 'Workflow running',
+            activity.step || 0,
+            activity.total || 0
+        );
+        if (els.activityText)
+            els.activityText.textContent = 'Workflow · ' + els.activityText.textContent;
+        if (els.activityStatus)
+            els.activityStatus.title = activity.label || activity.phase || 'Workflow running';
+    }
+    function setExternalActivity(activity) {
+        state.externalActivity = activity && activity.active === true
+            ? {
+                active: true,
+                promptId: String(activity.promptId || ''),
+                phase: String(activity.phase || ''),
+                label: String(activity.label || ''),
+                step: Number(activity.step) || 0,
+                total: Number(activity.total) || 0
+            }
+            : null;
+        if (initialized && !state.generating)
+            renderExternalActivity();
+    }
     function setGenerating(v) {
         state.generating = v;
         var isVideo = ModelUtils.isVideoModel(state.model);
@@ -4593,7 +4288,7 @@ var GenerateTab = (function () {
             }
         }
         else {
-            setGenerationIdle();
+            renderExternalActivity();
             els.progress.classList.remove('active');
             els.progressBar.style.width = '0%';
             els.progressLabel.classList.remove('visible');
@@ -4706,8 +4401,8 @@ var GenerateTab = (function () {
         updateMetadataPanel();
         setPreviewModelBadges(state.model, state.arch);
     }
-    function videoArtifactKey(src, isVideo) {
-        if (!isVideo || !src)
+    function mediaArtifactKey(src) {
+        if (!src)
             return '';
         try {
             var url = new URL(String(src), window.location.origin);
@@ -4726,7 +4421,7 @@ var GenerateTab = (function () {
             }
             if (!filename)
                 return '';
-            return 'video:' + subfolder.replace(/^\/+|\/+$/g, '') + '/' +
+            return 'output:' + subfolder.replace(/^\/+|\/+$/g, '') + '/' +
                 filename.replace(/^\/+/, '');
         }
         catch (error) {
@@ -4736,7 +4431,26 @@ var GenerateTab = (function () {
     function galleryItemKey(item) {
         if (!item || !item.src)
             return '';
-        return videoArtifactKey(item.src, item.isVideo) || 'media:' + String(item.src);
+        return mediaArtifactKey(item.src) || 'media:' + String(item.src);
+    }
+    function deleteHistoryArtifact(item) {
+        return fetch('/v1/history/artifacts', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: String(item && item.historyId || ''),
+                url: String(item && item.src || '')
+            })
+        }).then(function (response) {
+            return response.text().then(function (body) {
+                var result = {};
+                try { result = JSON.parse(body); }
+                catch (error) { result = { detail: body }; }
+                if (!response.ok || result.deleted !== true)
+                    throw new Error(result.detail || ('HTTP ' + response.status));
+                return result;
+            });
+        });
     }
     function beginCurrentBatch() {
         state.currentBatchKeys = {};
@@ -4789,13 +4503,13 @@ var GenerateTab = (function () {
             params: metadata && metadata.params
                 ? JSON.parse(JSON.stringify(metadata.params))
                 : null,
-            timestamp: Date.now(),
+            timestamp: Number(value('timestamp', Date.now())) || Date.now(),
             starred: false
         };
-        var artifactKey = videoArtifactKey(item.src, item.isVideo);
+        var artifactKey = mediaArtifactKey(item.src);
         if (artifactKey) {
             var existingIndex = state.gallery.findIndex(function (existing) {
-                return videoArtifactKey(existing.src, existing.isVideo) === artifactKey;
+                return mediaArtifactKey(existing.src) === artifactKey;
             });
             if (existingIndex >= 0) {
                 if (!state.gallery[existingIndex].params && item.params)
@@ -4803,16 +4517,12 @@ var GenerateTab = (function () {
                 if (state.generating || state.pendingBatch > 0)
                     state.currentBatchKeys[galleryItemKey(state.gallery[existingIndex])] = true;
                 renderGallery();
-                saveGallery();
                 return;
             }
         }
         state.gallery.unshift(item);
         if (state.generating || state.pendingBatch > 0)
             state.currentBatchKeys[galleryItemKey(item)] = true;
-        if (state.gallery.length > 200)
-            state.gallery.pop();
-        state.galleryPage = 0;
         renderGallery();
         // Auto-switch to new image
         if (state.autoSwitchNew) {
@@ -4824,7 +4534,6 @@ var GenerateTab = (function () {
             state.currentGalleryIndex = 0;
             state.currentResultParams = reusableParamsForItem(item);
         }
-        saveGallery();
     }
     function createThumb(item, galleryIndex) {
         var src = item.src;
@@ -4850,12 +4559,24 @@ var GenerateTab = (function () {
                     '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>' +
                     '</div>';
         }
+        var media = wrap.querySelector(isVideo ? 'video' : 'img');
+        if (media) {
+            media.addEventListener('error', function () {
+                if (wrap.querySelector('.gen-thumb-unavailable-label'))
+                    return;
+                media.style.display = 'none';
+                wrap.classList.add('gen-thumb-unavailable');
+                var label = document.createElement('span');
+                label.className = 'gen-thumb-unavailable-label';
+                label.textContent = 'Output unavailable';
+                wrap.appendChild(label);
+            });
+        }
         // Star click
         wrap.querySelector('.gen-thumb-star').addEventListener('click', function (e) {
             e.stopPropagation();
             var idx = parseInt(this.dataset.idx);
             state.gallery[idx].starred = !state.gallery[idx].starred;
-            saveGallery();
             renderGallery();
         });
         // Click with multi-select support
@@ -4868,12 +4589,6 @@ var GenerateTab = (function () {
             showContextMenu(e, galleryIndex);
         });
         return wrap;
-    }
-    function saveGallery() {
-        try {
-            localStorage.setItem('sf-gallery', JSON.stringify(state.gallery));
-        }
-        catch (e) { /* quota exceeded */ }
     }
     function galleryMetadataFromJob(job) {
         var meta = (job && job.metadata) || {};
@@ -4927,89 +4642,72 @@ var GenerateTab = (function () {
             negPrompt: reusable.negPrompt,
             stylePreset: reusable.stylePreset,
             loras: reusable.loras,
+            timestamp: Date.parse(job && job.created || '') || Date.now(),
             params: reusable
         };
     }
-    function restoredGalleryJobId(item) {
-        try {
-            var filename = new URL(item.src, location.origin).searchParams.get('filename') || '';
-            var match = filename.match(/^(job-\d+)\.png$/);
-            return match ? match[1] : '';
-        }
-        catch (e) {
-            return '';
-        }
-    }
-    function repairRestoredGalleryMetadata() {
-        fetch('/v1/jobs')
-            .then(function (resp) {
-            if (!resp.ok)
-                throw new Error('HTTP ' + resp.status);
-            return resp.json();
+    function refreshHistory() {
+        fetch('/v1/history/artifacts', { cache: 'no-store' })
+            .then(function (response) {
+            if (!response.ok)
+                throw new Error('HTTP ' + response.status);
+            return response.json();
         })
-            .then(function (jobs) {
-            var byId = {};
-            (Array.isArray(jobs) ? jobs : []).forEach(function (job) {
-                if (job && job.id)
-                    byId[job.id] = job;
-            });
-            var changed = false;
+            .then(function (history) {
+            var byKey = {};
             state.gallery.forEach(function (item) {
-                var id = restoredGalleryJobId(item);
-                var job = id ? byId[id] : null;
-                if (!job)
-                    return;
-                var corrected = galleryMetadataFromJob(job);
-                Object.keys(corrected).forEach(function (key) {
-                    if (corrected[key] != null && corrected[key] !== '' && item[key] !== corrected[key]) {
-                        item[key] = corrected[key];
-                        changed = true;
-                    }
-                });
+                var key = galleryItemKey(item);
+                if (key)
+                    byKey[key] = item;
             });
-            if (changed) {
-                saveGallery();
-                renderGallery();
-                updateMetadataPanel();
-            }
+            var discovered = [];
+            var artifacts = history && Array.isArray(history.items)
+                ? history.items : [];
+            artifacts.forEach(function (artifact) {
+                var src = String(artifact && artifact.url || '');
+                if (!src || !/\.(png|jpe?g|webp|gif|mp4|webm)$/i.test(src))
+                    return;
+                var key = mediaArtifactKey(src) || ('media:' + src);
+                var params = artifact.params || {};
+                var timestamp = Number(artifact.timestamp) || 0;
+                var metadata = galleryMetadataFromJob({
+                    model: params.model || '',
+                    params: params,
+                    created: timestamp ? new Date(timestamp).toISOString() : ''
+                });
+                metadata.timestamp = timestamp || metadata.timestamp;
+                var isVideo = artifact.media_type === 'video' ||
+                    /\.(gif|mp4|webm)$/i.test(src);
+                var existing = byKey[key];
+                var item = Object.assign({
+                    src: src,
+                    isVideo: isVideo,
+                    historyId: String(artifact.id || ''),
+                    starred: existing && existing.starred === true
+                }, metadata);
+                discovered.push(item);
+            });
+            // The server inventory is authoritative. In particular, discard
+            // stale /out/job-* aliases created when a benchmark directory was
+            // incorrectly used as the product output root.
+            state.gallery = discovered;
+            return state.gallery;
         })
-            .catch(function (err) {
-            console.error('Saved gallery metadata repair failed: ' + err.message);
+            .then(function (items) {
+            state.gallery = items.sort(function (left, right) {
+                return (Number(right.timestamp) || 0) -
+                    (Number(left.timestamp) || 0);
+            });
+            renderGallery();
+        })
+            .catch(function (error) {
+            console.error('History output sync failed: ' + error.message);
         });
     }
-    function restoreGallery() {
-        try {
-            var saved = JSON.parse(localStorage.getItem('sf-gallery'));
-            if (saved && Array.isArray(saved)) {
-                var restored = [];
-                var videoKeys = {};
-                saved.slice(0, 200).forEach(function (item) {
-                    if (typeof item === 'string')
-                        item = { src: item, isVideo: false, prompt: '', starred: false, timestamp: 0 };
-                    // Ensure backward compat: add missing fields
-                    if (item.starred === undefined)
-                        item.starred = false;
-                    if (item.timestamp === undefined)
-                        item.timestamp = 0;
-                    var key = videoArtifactKey(item.src, item.isVideo);
-                    if (key && Object.prototype.hasOwnProperty.call(videoKeys, key)) {
-                        var existingIndex = videoKeys[key];
-                        if (!restored[existingIndex].params && item.params)
-                            restored[existingIndex] = item;
-                        return;
-                    }
-                    if (key)
-                        videoKeys[key] = restored.length;
-                    restored.push(item);
-                });
-                state.gallery = restored;
-                if (restored.length !== saved.slice(0, 200).length)
-                    saveGallery();
-                renderGallery();
-                repairRestoredGalleryMetadata();
-            }
-        }
-        catch (e) { /* ignore */ }
+    function loadHistory() {
+        state.gallery = [];
+        renderGallery();
+        refreshHistory();
         // Restore thumb size
         try {
             var ts = parseInt(localStorage.getItem('sf-thumb-size'));
@@ -5168,9 +4866,12 @@ var GenerateTab = (function () {
         closeModelDropdown();
         var checkpoint = name.replace(/\.safetensors$/i, '');
         if (ModelUtils.archForModel(name) === 'ltxv') {
-            if (/bf16/i.test(checkpoint))
+            var normalizedCheckpoint = checkpoint.toLowerCase();
+            if (/dequant-bf16|bf16/.test(normalizedCheckpoint))
                 state.videoQuant = 'bf16';
-            else if (/fp8/i.test(checkpoint))
+            else if (/fp8/.test(normalizedCheckpoint) ||
+                normalizedCheckpoint === 'ltx-2.3-22b-dev' ||
+                normalizedCheckpoint === 'ltx-2.3-22b-distilled')
                 state.videoQuant = 'fp8';
             state.videoCheckpoint = checkpoint;
             var creatorWorkflow = ltx2CheckpointWorkflow(checkpoint);
@@ -5182,9 +4883,7 @@ var GenerateTab = (function () {
                 );
             }
             else {
-                var officialDev = checkpoint === 'ltx-2.3-22b-dev-fp8' ||
-                    checkpoint === 'ltx-2.3-22b-dev-fp8-dequant-bf16';
-                state.videoGuidanceMode = officialDev || /distill/i.test(checkpoint)
+                state.videoGuidanceMode = /distill/i.test(checkpoint)
                     ? 'distilled' : 'dev';
             }
             if (els.videoQuant)
@@ -5322,7 +5021,12 @@ var GenerateTab = (function () {
         SerenityWS.on('disconnected', function () {
             els.wsIndicator.classList.add('visible');
         });
-        SerenityWS.on('execution_start', function () {
+        SerenityWS.on('execution_start', function (data) {
+            var startPromptId = String(data && data.prompt_id || '');
+            if (!startPromptId ||
+                (!state.pendingImageJobs[startPromptId] &&
+                    !state.pendingVideoJobs[startPromptId]))
+                return;
             setGenerating(true);
         });
         SerenityWS.on('progress', function (data) {
@@ -5472,11 +5176,10 @@ var GenerateTab = (function () {
     }
     // ── Phase 2: Gallery Rendering ──
     function getFilteredGallery() {
-        // A fresh result belongs to Current Batch until the next Generate.
-        // Do not render that same artifact a second time in History.
-        var items = state.gallery.filter(function (item) {
-            return !state.currentBatchKeys[galleryItemKey(item)];
-        });
+        // Completed artifacts belong in persistent History immediately. The
+        // Current Batch strip is a convenient second view, not a holding area
+        // that makes the gallery appear empty after generation completes.
+        var items = state.gallery.slice();
         // Search filter
         if (state.gallerySearch) {
             var q = state.gallerySearch.toLowerCase();
@@ -5484,10 +5187,13 @@ var GenerateTab = (function () {
                 return (item.prompt && item.prompt.toLowerCase().indexOf(q) >= 0);
             });
         }
-        // Sort
-        if (!state.sortNewestFirst) {
-            items = items.slice().reverse();
-        }
+        // Sort from timestamps rather than insertion order so restored and
+        // server-discovered outputs land under the correct date.
+        items.sort(function (left, right) {
+            var delta = (Number(right.timestamp) || 0) -
+                (Number(left.timestamp) || 0);
+            return state.sortNewestFirst ? delta : -delta;
+        });
         // Starred first
         if (state.starredFirst) {
             var starred = items.filter(function (i) { return i.starred; });
@@ -5505,38 +5211,59 @@ var GenerateTab = (function () {
         });
         return map;
     }
+    function galleryDateInfo(item) {
+        var timestamp = Number(item && item.timestamp) || 0;
+        if (timestamp <= 0)
+            return { key: 'unknown', label: 'Date unavailable' };
+        var date = new Date(timestamp);
+        if (Number.isNaN(date.getTime()))
+            return { key: 'unknown', label: 'Date unavailable' };
+        var key = date.getFullYear() + '-' +
+            String(date.getMonth() + 1).padStart(2, '0') + '-' +
+            String(date.getDate()).padStart(2, '0');
+        var today = new Date();
+        var todayStart = new Date(
+            today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+        var dateStart = new Date(
+            date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+        var dayDelta = Math.round((todayStart - dateStart) / 86400000);
+        var label = dayDelta === 0
+            ? 'Today'
+            : (dayDelta === 1
+                ? 'Yesterday'
+                : date.toLocaleDateString(undefined, {
+                    year: 'numeric',
+                    month: 'short',
+                    day: 'numeric'
+                }));
+        return { key: key, label: label };
+    }
     function renderGallery() {
         if (!els.galleryGrid)
             return;
         var filtered = getFilteredGallery();
         var indexMap = getGalleryIndexMap();
-        var pageSize = state.galleryPageSize;
-        var totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
-        if (state.galleryPage >= totalPages)
-            state.galleryPage = totalPages - 1;
-        if (state.galleryPage < 0)
-            state.galleryPage = 0;
-        var startIdx = state.galleryPage * pageSize;
-        var pageItems = filtered.slice(startIdx, startIdx + pageSize);
-        var pageIndices = indexMap.slice(startIdx, startIdx + pageSize);
         els.galleryGrid.innerHTML = '';
-        pageItems.forEach(function (item, i) {
-            var realIdx = pageIndices[i];
-            var thumb = createThumb(item, realIdx);
-            els.galleryGrid.appendChild(thumb);
+        var groups = {};
+        filtered.forEach(function (item, i) {
+            var date = galleryDateInfo(item);
+            var group = groups[date.key];
+            if (!group) {
+                var section = document.createElement('section');
+                section.className = 'gen-gallery-date-group';
+                var heading = document.createElement('h3');
+                heading.className = 'gen-gallery-date-heading';
+                heading.textContent = date.label;
+                var items = document.createElement('div');
+                items.className = 'gen-gallery-date-items';
+                section.appendChild(heading);
+                section.appendChild(items);
+                els.galleryGrid.appendChild(section);
+                group = groups[date.key] = items;
+            }
+            group.appendChild(createThumb(item, indexMap[i]));
         });
-        // Update grid template based on thumb size
         applyThumbSize();
-        // Pagination
-        var pageInfo = document.getElementById('gen-page-info');
-        var prevBtn = document.getElementById('gen-page-prev');
-        var nextBtn = document.getElementById('gen-page-next');
-        if (pageInfo)
-            pageInfo.textContent = 'Page ' + (state.galleryPage + 1) + ' of ' + totalPages;
-        if (prevBtn)
-            prevBtn.disabled = state.galleryPage <= 0;
-        if (nextBtn)
-            nextBtn.disabled = state.galleryPage >= totalPages - 1;
         renderBatchStrip();
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
@@ -5586,7 +5313,8 @@ var GenerateTab = (function () {
     function applyThumbSize() {
         if (!els.galleryGrid)
             return;
-        els.galleryGrid.style.gridTemplateColumns = 'repeat(auto-fill, minmax(' + state.thumbSize + 'px, 1fr))';
+        els.galleryGrid.style.setProperty(
+            '--gen-history-thumb-size', state.thumbSize + 'px');
     }
     // ── Phase 2: Multi-select ──
     function handleThumbClick(galleryIndex, e) {
@@ -5788,7 +5516,6 @@ var GenerateTab = (function () {
                 break;
             case 'star':
                 item.starred = !item.starred;
-                saveGallery();
                 renderGallery();
                 break;
             case 'use-prompt':
@@ -5813,12 +5540,15 @@ var GenerateTab = (function () {
                 applyParams(reusableParamsForItem(item));
                 break;
             case 'delete':
-                state.gallery.splice(idx, 1);
-                state.selectedImages = state.selectedImages.filter(function (si) { return si !== idx; }).map(function (si) { return si > idx ? si - 1 : si; });
-                saveGallery();
-                renderGallery();
-                updateSelectionUI();
-                updateMetadataPanel();
+                deleteHistoryArtifact(item).then(function () {
+                    state.gallery.splice(idx, 1);
+                    state.selectedImages = state.selectedImages.filter(function (si) { return si !== idx; }).map(function (si) { return si > idx ? si - 1 : si; });
+                    renderGallery();
+                    updateSelectionUI();
+                    updateMetadataPanel();
+                }).catch(function (error) {
+                    showError('Could not delete output: ' + error.message);
+                });
                 break;
         }
     }
@@ -5834,7 +5564,6 @@ var GenerateTab = (function () {
                     if (state.gallery[idx])
                         state.gallery[idx].starred = true;
                 });
-                saveGallery();
                 renderGallery();
             });
         if (bulkUnstar)
@@ -5843,7 +5572,6 @@ var GenerateTab = (function () {
                     if (state.gallery[idx])
                         state.gallery[idx].starred = false;
                 });
-                saveGallery();
                 renderGallery();
             });
         if (bulkDownload)
@@ -5862,18 +5590,284 @@ var GenerateTab = (function () {
             bulkDelete.addEventListener('click', function () {
                 if (!confirm('Delete ' + state.selectedImages.length + ' images?'))
                     return;
-                // Sort descending to splice safely
-                var sorted = state.selectedImages.slice().sort(function (a, b) { return b - a; });
-                sorted.forEach(function (idx) { state.gallery.splice(idx, 1); });
-                state.selectedImages = [];
-                saveGallery();
-                renderGallery();
-                updateSelectionUI();
-                updateMetadataPanel();
-                clearPreview();
+                var selected = state.selectedImages.map(function (idx) {
+                    return state.gallery[idx];
+                }).filter(Boolean);
+                Promise.all(selected.map(deleteHistoryArtifact)).then(function () {
+                    state.gallery = state.gallery.filter(function (item) {
+                        return selected.indexOf(item) < 0;
+                    });
+                    state.selectedImages = [];
+                    renderGallery();
+                    updateSelectionUI();
+                    updateMetadataPanel();
+                    clearPreview();
+                }).catch(function (error) {
+                    showError('Could not delete every output: ' + error.message);
+                    refreshHistory();
+                });
             });
     }
     // ── Phase 7: Gallery Upload & Drag-Drop ──
+    function activateLibraryPanel(target) {
+        if (target !== 'history')
+            ensureLibraryExpanded();
+        document.querySelectorAll('.gen-library-tab').forEach(function (tab) {
+            tab.classList.toggle('active', tab.dataset.library === target);
+        });
+        document.querySelectorAll('.gen-library-panel').forEach(function (panel) {
+            panel.classList.toggle('active', panel.dataset.libraryPanel === target);
+        });
+        if (els.galleryClear)
+            els.galleryClear.style.display = target === 'history' ? '' : 'none';
+        var gallerySettings = document.getElementById('gen-gallery-settings-btn');
+        if (gallerySettings)
+            gallerySettings.style.display = target === 'history' ? '' : 'none';
+        state.gallerySubTab = target === 'assets' ? 'assets' : 'images';
+        if (target === 'assets')
+            loadAssets(true);
+        if (target === 'history')
+            renderGallery();
+        if (target === 'presets')
+            loadGenerationPresets();
+        if (target === 'workflows')
+            loadGenerationWorkflows();
+        if (target === 'models')
+            renderModelLibrary();
+        if (target === 'loras')
+            renderLoraLibrary();
+    }
+    function setGallerySubTab(tab) {
+        var assets = tab === 'assets';
+        state.gallerySubTab = assets ? 'assets' : 'images';
+        var subtabImages = document.getElementById('gen-subtab-images');
+        var subtabAssets = document.getElementById('gen-subtab-assets');
+        var imagesContent = document.getElementById('gen-images-content');
+        var assetsContent = document.getElementById('gen-assets-content');
+        var bulkBar = document.getElementById('gen-bulk-bar');
+        if (subtabImages)
+            subtabImages.classList.toggle('active', !assets);
+        if (subtabAssets)
+            subtabAssets.classList.toggle('active', assets);
+        if (imagesContent)
+            imagesContent.style.display = assets ? 'none' : '';
+        if (assetsContent)
+            assetsContent.style.display = assets ? '' : 'none';
+        if (bulkBar && assets)
+            bulkBar.classList.remove('visible');
+        if (assets)
+            loadAssets(false);
+        else
+            renderGallery();
+    }
+    function loadAssets(force) {
+        if (state.assetsLoading) {
+            if (force)
+                state.assetsReloadPending = true;
+            renderAssets();
+            return Promise.resolve(state.assets);
+        }
+        if (state.assetsLoaded && !force) {
+            renderAssets();
+            return Promise.resolve(state.assets);
+        }
+        state.assetsLoading = true;
+        state.assetsError = '';
+        if (els.assetsPlaceholder) {
+            els.assetsPlaceholder.style.display = '';
+            els.assetsPlaceholder.textContent = 'Loading assets…';
+        }
+        return fetch('/v1/assets', { cache: 'no-store' })
+            .then(function (response) {
+            return response.text().then(function (body) {
+                var data = {};
+                try {
+                    data = JSON.parse(body);
+                }
+                catch (error) {
+                    data = { detail: body };
+                }
+                if (!response.ok)
+                    throw new Error(data.detail || ('HTTP ' + response.status));
+                if (data.schema !== 'serenity.assets.v1' || !Array.isArray(data.assets))
+                    throw new Error('server returned an invalid assets inventory');
+                return data.assets;
+            });
+        })
+            .then(function (assets) {
+            state.assets = assets;
+            state.assetsLoaded = true;
+            state.assetsError = '';
+            return assets;
+        })
+            .catch(function (error) {
+            state.assets = [];
+            state.assetsLoaded = false;
+            state.assetsError = error.message;
+            return [];
+        })
+            .finally(function () {
+            state.assetsLoading = false;
+            renderAssets();
+            if (state.assetsReloadPending) {
+                state.assetsReloadPending = false;
+                loadAssets(true);
+            }
+        });
+    }
+    function assetSizeLabel(bytes) {
+        var size = Number(bytes) || 0;
+        if (size >= 1024 * 1024)
+            return (size / (1024 * 1024)).toFixed(size >= 10 * 1024 * 1024 ? 0 : 1) + ' MB';
+        if (size >= 1024)
+            return Math.round(size / 1024) + ' KB';
+        return size + ' B';
+    }
+    function useAssetAsSource(asset) {
+        if (!asset || asset.media_type !== 'image') {
+            showError('Only image assets can be used as an I2V/img2img source here');
+            return;
+        }
+        state.initImagePath = String(asset.path || '');
+        state.initImageName = String(asset.name || state.initImagePath);
+        state.initImageWidth = Number(asset.width) || 0;
+        state.initImageHeight = Number(asset.height) || 0;
+        if (!state.initImagePath) {
+            showError('This asset has no worker-readable source path');
+            return;
+        }
+        var preview = document.getElementById('gen-init-preview');
+        var empty = document.getElementById('gen-init-empty');
+        var name = document.getElementById('gen-init-name');
+        var clear = document.getElementById('gen-init-clear');
+        if (preview) {
+            preview.src = String(asset.url || '');
+            preview.style.display = 'block';
+        }
+        if (empty)
+            empty.style.display = 'none';
+        if (name)
+            name.textContent = state.initImageName;
+        if (clear)
+            clear.disabled = false;
+        if ((!state.initImageWidth || !state.initImageHeight) && asset.url) {
+            var probe = new Image();
+            probe.onload = function () {
+                state.initImageWidth = probe.naturalWidth;
+                state.initImageHeight = probe.naturalHeight;
+                syncWanI2vSteps();
+            };
+            probe.src = asset.url;
+        }
+        syncWanI2vSteps();
+        renderAssets();
+    }
+    function deleteAsset(asset) {
+        if (!asset || !asset.name)
+            return;
+        if (!confirm('Delete source asset ' + asset.name + '?'))
+            return;
+        fetch('/v1/assets/' + encodeURIComponent(asset.name), {
+            method: 'DELETE'
+        })
+            .then(function (response) {
+            return response.text().then(function (body) {
+                var data = {};
+                try {
+                    data = JSON.parse(body);
+                }
+                catch (error) {
+                    data = { detail: body };
+                }
+                if (!response.ok)
+                    throw new Error(data.detail || ('HTTP ' + response.status));
+                return data;
+            });
+        })
+            .then(function () {
+            if (state.initImagePath === asset.path)
+                clearInitImage();
+            return loadAssets(true);
+        })
+            .catch(function (error) {
+            showError('Asset delete failed: ' + error.message);
+        });
+    }
+    function renderAssets() {
+        if (!els.assetsGrid || !els.assetsPlaceholder)
+            return;
+        var query = String(state.gallerySearch || '').toLowerCase();
+        var assets = (state.assets || []).filter(function (asset) {
+            return !query || String(asset.name || '').toLowerCase().indexOf(query) >= 0;
+        });
+        els.assetsGrid.innerHTML = '';
+        els.assetsPlaceholder.style.display = assets.length ? 'none' : '';
+        if (!state.assetsLoading) {
+            els.assetsPlaceholder.textContent = state.assetsError
+                ? 'Could not load assets: ' + state.assetsError
+                : state.assetsLoaded
+                ? (query ? 'No assets match this search' : 'No source assets uploaded')
+                : 'Assets are unavailable';
+        }
+        assets.forEach(function (asset) {
+            var card = document.createElement('div');
+            card.className = 'gen-asset-card' +
+                (state.initImagePath === asset.path ? ' selected' : '');
+            var media = asset.media_type === 'video'
+                ? document.createElement('video')
+                : document.createElement('img');
+            media.className = 'gen-asset-preview';
+            media.src = String(asset.url || '');
+            if (asset.media_type === 'video') {
+                media.muted = true;
+                media.preload = 'metadata';
+            }
+            else {
+                media.loading = 'lazy';
+                media.alt = String(asset.name || 'source asset');
+                card.addEventListener('dblclick', function () {
+                    useAssetAsSource(asset);
+                });
+            }
+            card.appendChild(media);
+            var name = document.createElement('div');
+            name.className = 'gen-asset-name';
+            name.textContent = String(asset.name || 'asset');
+            name.title = name.textContent;
+            card.appendChild(name);
+            var meta = document.createElement('div');
+            meta.className = 'gen-asset-meta';
+            var dimensions = asset.width && asset.height
+                ? asset.width + '×' + asset.height + ' · '
+                : '';
+            meta.textContent = dimensions + assetSizeLabel(asset.size);
+            card.appendChild(meta);
+            var actions = document.createElement('div');
+            actions.className = 'gen-asset-actions';
+            if (asset.media_type === 'image') {
+                var use = document.createElement('button');
+                use.type = 'button';
+                use.className = 'gen-asset-use';
+                use.textContent = state.initImagePath === asset.path
+                    ? 'Source selected'
+                    : 'Use as source';
+                use.addEventListener('click', function () {
+                    useAssetAsSource(asset);
+                });
+                actions.appendChild(use);
+            }
+            var remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'gen-asset-delete';
+            remove.textContent = 'Delete';
+            remove.addEventListener('click', function () {
+                deleteAsset(asset);
+            });
+            actions.appendChild(remove);
+            card.appendChild(actions);
+            els.assetsGrid.appendChild(card);
+        });
+    }
     function bindGalleryUpload() {
         var uploadBtn = document.getElementById('gen-gallery-upload-btn');
         var uploadInput = document.getElementById('gen-gallery-upload-input');
@@ -5910,28 +5904,36 @@ var GenerateTab = (function () {
     }
     function handleUploadFiles(files) {
         Array.prototype.forEach.call(files, function (file) {
-            if (!file.type.startsWith('image/'))
+            if (!file.type.startsWith('image/')) {
+                showError('Assets currently accept source images');
                 return;
+            }
             // Upload to server
             var formData = new FormData();
             formData.append('image', file);
             fetch('/upload/image', { method: 'POST', body: formData })
-                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (response) {
+                return response.text().then(function (body) {
+                    var data = {};
+                    try {
+                        data = JSON.parse(body);
+                    }
+                    catch (error) {
+                        data = { detail: body };
+                    }
+                    if (!response.ok)
+                        throw new Error(data.detail || ('HTTP ' + response.status));
+                    return data;
+                });
+            })
                 .then(function (data) {
-                if (data && data.name) {
-                    var src = SerenityAPI.viewUrl(data.name, data.subfolder || '', data.type || 'input');
-                    addToGallery(src, false, { prompt: '(uploaded)' });
-                    renderGallery();
-                }
+                if (!data || !data.path || !data.url)
+                    throw new Error('upload returned no persistent asset path');
+                activateLibraryPanel('assets');
+                return loadAssets(true);
             })
                 .catch(function (err) {
-                // Fallback: add as local blob URL
-                var reader = new FileReader();
-                reader.onload = function (ev) {
-                    addToGallery(ev.target.result, false, { prompt: '(uploaded)' });
-                    renderGallery();
-                };
-                reader.readAsDataURL(file);
+                showError('Asset upload failed: ' + err.message);
             });
         });
     }
@@ -5980,7 +5982,6 @@ var GenerateTab = (function () {
                 this.classList.toggle('on', state.sortNewestFirst);
                 if (sortLabel)
                     sortLabel.textContent = state.sortNewestFirst ? 'Newest' : 'Oldest';
-                state.galleryPage = 0;
                 renderGallery();
             });
         }
@@ -5990,7 +5991,6 @@ var GenerateTab = (function () {
             starredToggle.addEventListener('click', function () {
                 state.starredFirst = !state.starredFirst;
                 this.classList.toggle('on', state.starredFirst);
-                state.galleryPage = 0;
                 renderGallery();
             });
         }
@@ -6000,28 +6000,6 @@ var GenerateTab = (function () {
             autoToggle.addEventListener('click', function () {
                 state.autoSwitchNew = !state.autoSwitchNew;
                 this.classList.toggle('on', state.autoSwitchNew);
-            });
-        }
-    }
-    // ── Phase 2: Pagination ──
-    function bindPagination() {
-        var prevBtn = document.getElementById('gen-page-prev');
-        var nextBtn = document.getElementById('gen-page-next');
-        if (prevBtn) {
-            prevBtn.addEventListener('click', function () {
-                if (state.galleryPage > 0) {
-                    state.galleryPage--;
-                    renderGallery();
-                }
-            });
-        }
-        if (nextBtn) {
-            nextBtn.addEventListener('click', function () {
-                var totalPages = Math.ceil(getFilteredGallery().length / state.galleryPageSize);
-                if (state.galleryPage < totalPages - 1) {
-                    state.galleryPage++;
-                    renderGallery();
-                }
             });
         }
     }
@@ -6046,12 +6024,11 @@ var GenerateTab = (function () {
             width: state.width,
             height: state.height,
             steps: state.steps,
-            cfg: ModelUtils.isVideoModel(state.model) ? null : state.cfg,
-            guidance: ModelUtils.isVideoModel(state.model) ? null : state.guidance,
+            cfg: state.cfg,
+            guidance: state.guidance,
             sigmaShift: state.sigmaShift,
             sampler: state.sampler,
             scheduler: state.scheduler,
-            noiseScheduler: state.scheduler,
             seed: state.seed,
             frames: state.frames,
             fps: state.fps,
@@ -6062,18 +6039,26 @@ var GenerateTab = (function () {
             batchCount: state.batchCount,
             stylePreset: state.stylePreset,
             videoGuidanceMode: state.videoGuidanceMode,
+            ltx2Mode: state.videoGuidanceMode,
             videoWorkflowProfile: state.videoWorkflowProfile,
+            ltx2WorkflowProfile: state.videoWorkflowProfile,
             videoPromptEnhancer: state.videoPromptEnhancer,
+            ltx2PromptEnhancer: state.videoPromptEnhancer,
             videoQuant: state.videoQuant,
+            quantization: state.videoQuant,
             videoCheckpoint: state.videoCheckpoint,
             capsPositive: state.capsPositive,
             capsNegative: state.capsNegative,
             noiseFixture: state.noiseFixture,
             includeAudio: state.includeAudio,
             audioPolicy: state.audioPolicy,
+            ltx2AudioPolicy: state.audioPolicy,
             postUpscaler: state.postUpscaler,
+            ltx2PostUpscaler: state.postUpscaler,
             postUpscaleFactor: state.postUpscaleFactor,
+            ltx2PostUpscaleFactor: state.postUpscaleFactor,
             cameraMotion: state.cameraMotion,
+            ltx2CameraMotion: state.cameraMotion,
             initImagePath: state.initImagePath,
             initImageName: state.initImageName,
             noSeedIncrement: state.noSeedIncrement,
@@ -6113,9 +6098,10 @@ var GenerateTab = (function () {
         params = normalized;
         if (typeof params.model === 'string' && params.model) {
             var requestedModel = params.model === 'ltx2'
-                ? ((params.videoQuant || params.quant) === 'bf16'
-                    ? 'ltx-2.3-22b-dev-fp8-dequant-bf16'
-                    : 'ltx-2.3-22b-dev-fp8')
+                ? String(params.videoCheckpoint || params.checkpoint ||
+                    (((params.videoQuant || params.quant) === 'bf16')
+                        ? 'ltx-2.3-22b-distilled-fp8-dequant-bf16'
+                        : 'ltx-2.3-22b-distilled'))
                 : params.model;
             state.model = requestedModel;
             if (els.model)
@@ -6151,9 +6137,6 @@ var GenerateTab = (function () {
             else if (supportedSamplers.indexOf(params.scheduler) >= 0)
                 state.sampler = params.scheduler;
         }
-        if (typeof params.noiseScheduler === 'string' &&
-            supportedSchedulers.indexOf(params.noiseScheduler) >= 0)
-            state.scheduler = params.noiseScheduler;
         if (typeof params.stylePreset === 'string')
             state.stylePreset = params.stylePreset;
         if (typeof params.videoGuidanceMode === 'string')
@@ -6245,8 +6228,8 @@ var GenerateTab = (function () {
             if (reusedProfile)
                 applyLtx2RequestProfile(reusedProfile);
         }
-        if (isVideo)
-            applyVideoGuidanceMode(true);
+        if (ModelUtils.archForModel(state.model) === 'ltxv')
+            applyVideoGuidanceMode(false);
         if (els.prompt) {
             els.prompt.value = state.prompt;
             els.prompt.style.height = 'auto';
@@ -6338,14 +6321,14 @@ var GenerateTab = (function () {
         loadModels();
         loadLoras();
         loadAdvancedOptions();
-        restoreGallery();
+        loadHistory();
         loadPromptHistory();
         connectWS();
+        renderExternalActivity();
         updateAspectPreview();
         bindBulkActions();
         bindGalleryUpload();
         bindGallerySettings();
-        bindPagination();
         bindGlobalPhase2();
         updateAdvancedVisibility();
         // Render lucide icons
@@ -6358,8 +6341,10 @@ var GenerateTab = (function () {
         init: init,
         selectModel: selectModel,
         generate: generate,
+        buildWorkflow: buildWorkflow,
         getParams: getParams,
         applyParams: applyParams,
+        setExternalActivity: setExternalActivity,
         displayResult: function (src, isVideo, metadata) {
             if (!initialized)
                 init();
@@ -6367,7 +6352,41 @@ var GenerateTab = (function () {
                 displayVideo(src, metadata);
             else
                 displayImage(src, metadata);
+        },
+        displayCompletedJob: function (src, isVideo, promptId) {
+            if (!initialized)
+                init();
+            var id = String(promptId || '');
+            if (!id) {
+                if (isVideo)
+                    displayVideo(src);
+                else
+                    displayImage(src);
+                return Promise.resolve();
+            }
+            return fetch('/v1/job/' + encodeURIComponent(id), { cache: 'no-store' })
+                .then(function (response) {
+                if (!response.ok)
+                    throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+                .then(function (job) {
+                var metadata = galleryMetadataFromJob(job);
+                if (isVideo)
+                    displayVideo(src, metadata);
+                else
+                    displayImage(src, metadata);
+                addToGallery(src, isVideo, metadata);
+            })
+                .catch(function (error) {
+                console.error('Completed Workflow result metadata unavailable for ' +
+                    id + ': ' + error.message);
+                if (isVideo)
+                    displayVideo(src);
+                else
+                    displayImage(src);
+                refreshHistory();
+            });
         }
     };
 })();
-//# sourceMappingURL=generate.js.map

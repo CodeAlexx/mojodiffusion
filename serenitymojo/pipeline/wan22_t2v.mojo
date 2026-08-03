@@ -1,7 +1,8 @@
 # serenitymojo/pipeline/wan22_t2v.mojo — Wan2.2-TI2V-5B text-to-video, pure Mojo.
 #
-# First-video generation pipeline for the ON-DISK Wan2.2-TI2V-5B checkpoint
-# (pinned official five-shard artifact view plus Mojo-generated E4M3 sidecar).
+# First-video generation pipeline for the Wan2.2-TI2V-5B checkpoint. BF16
+# blocks are copied once into a complete pinned-host store before step 0;
+# denoise stages from RAM only. FP8 uses the Mojo-generated resident sidecar.
 # Wraps the parity-gated DiT spine with the creator's flow-UniPC scheduler + CFG
 # denoise loop, then the temporal VAE decoder
 # (models/vae/wan22_decoder.Wan22VaeImageDecoder) → PNG frames.
@@ -308,17 +309,17 @@ def _denoise_scoped(
     var cfg = Wan22Config.ti2v_5b()
     if precision == String("bf16"):
         print(
-            "  loading Wan2.2-TI2V-5B exact-BF16 block stream from",
+            "  loading Wan2.2-TI2V-5B exact-BF16 pinned-host store from",
             CKPT_DIR,
         )
-        var streamed: Wan22DiTOffloaded
+        var offloaded: Wan22DiTOffloaded
         if lora_path.byte_length() > 0 and lora_path != String("-"):
-            print("  loading Wan TI2V-5B BF16 streamed LoRA:", lora_path)
-            streamed = Wan22DiTOffloaded.load_with_lora(
+            print("  loading Wan TI2V-5B BF16 host-resident LoRA:", lora_path)
+            offloaded = Wan22DiTOffloaded.load_with_lora(
                 String(CKPT_DIR), cfg, lora_path, lora_mult, ctx
             )
         else:
-            streamed = Wan22DiTOffloaded.load(
+            offloaded = Wan22DiTOffloaded.load(
                 String(CKPT_DIR), cfg, ctx
             )
         print("  weights ready.")
@@ -331,6 +332,8 @@ def _denoise_scoped(
             1000, steps, Float64(shift), 2
         )
         var sigmas = scheduler.sigmas()
+        ctx.synchronize()
+        print("  phase=sampling step=0 total=", steps)
         for i in range(steps):
             var t = Float32(sigmas[i]) * NUM_TRAIN_TIMESTEPS
             var token_timesteps: Tensor
@@ -341,7 +344,7 @@ def _denoise_scoped(
                     [S], t, STDtype.F32, ctx
                 )
             var x_bf = cast_tensor(x, STDtype.BF16, ctx)
-            var preds = streamed.forward_cfg_timesteps[
+            var preds = offloaded.forward_cfg_timesteps[
                 FG, HG, WG, S, TXT, CTXL, NH, HD
             ](x_bf, token_timesteps, pos, neg, ctx)
             var vc = cast_tensor(preds.cond, STDtype.F32, ctx)
@@ -359,7 +362,7 @@ def _denoise_scoped(
             # high-water mark before the next CFG pair begins.
             ctx.synchronize()
             print(
-                "  step", i + 1, "/", steps,
+                "  phase=sampling step=", i + 1, " total=", steps,
                 " sigma=", sigmas[i], " t=", t,
             )
         return x^
@@ -381,6 +384,8 @@ def _denoise_scoped(
         1000, steps, Float64(shift), 2
     )
     var sigmas = scheduler.sigmas()
+    ctx.synchronize()
+    print("  phase=sampling step=0 total=", steps)
     for i in range(steps):
         var t = Float32(sigmas[i]) * NUM_TRAIN_TIMESTEPS
         var x_bf = cast_tensor(x, STDtype.BF16, ctx)
@@ -412,7 +417,10 @@ def _denoise_scoped(
         if i2v:
             x = _clamp_creator_first_frame(x, condition, ctx)
         ctx.synchronize()
-        print("  step", i + 1, "/", steps, " sigma=", sigmas[i], " t=", t)
+        print(
+            "  phase=sampling step=", i + 1, " total=", steps,
+            " sigma=", sigmas[i], " t=", t,
+        )
     return x^
 
 

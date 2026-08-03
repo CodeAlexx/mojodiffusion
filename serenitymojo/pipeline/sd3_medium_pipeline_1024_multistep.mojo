@@ -166,7 +166,7 @@ def _sd3_forward(
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var ctx = DeviceContext()
     print("============================================================")
     print("SD3.5 Medium 1024x1024 — 28-step shifted flow CFG 4.5 seed 42")
@@ -253,3 +253,10 @@ def main() raises:
     print("\n============================================================")
     print("SD3.5 Medium pipeline COMPLETE")
     print("============================================================")
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy SD3 Medium executable reads checkpoint weights "
+        "during denoise; no memory-resident product route is admitted"
+    )

@@ -17,12 +17,9 @@
 # DiT). params.cfg is the guidance scalar fed to the model.
 #
 # Residency model (24 GB GPU, FLUX.1-dev ~23 GB on disk — TIGHT):
-#   * The FLUX.1-dev DiT is BLOCK-STREAMED from disk (Flux1Offloaded: the shared
-#     non-block weights + a BlockLoader that mmaps and streams one block at a
-#     time). The OFFLOADER HANDLE + the RoPE tables are loaded ONCE (first job)
-#     and STAY RESIDENT across jobs — the residency win for an offloaded model
-#     (subsequent base jobs skip the loader rebuild + rope build). Exactly like
-#     qwenimage_backend's offloader handle.
+#   * The FLUX.1-dev DiT uses a complete pinned-host FP8 store. All 57 blocks
+#     are copied before step 0, required resident, and staged from RAM during
+#     denoise. Checkpoint pages are released after store construction.
 #   * The CLIP-L (~250 MB) + T5-XXL (~9.5 GB F16) encoders are loaded → used →
 #     freed PER JOB inside the ENCODE step (encode_text does the load+free).
 #   * The FLUX VAE (~330 MB) is loaded PER JOB inside the TILED DECODE step.
@@ -63,7 +60,8 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr
 from serenitymojo.image.png import _quantize, ValueRange
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
-from serenitymojo.offload.turbo_loader import TurboBlockLoader
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.offload.plan import OffloadConfig, build_flux1_dev_block_plan
 
 from serenitymojo.models.dit.flux1_dit import (
     Flux1Config, Flux1Offloaded, build_flux1_rope_tables,
@@ -96,6 +94,9 @@ from serenitymojo.pipeline.flux_sample_cli import (
     AE_IN_CHANNELS, N_TXT,
 )
 from serenitymojo.serve.flux_encode_subprocess import encode_text_subprocess
+from serenitymojo.serve.proc_ipc import (
+    prefault_self_executable, prefault_mapped_shared_libraries,
+)
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, LoraSpec,
     reject_unsupported_common_runtime_params,
@@ -222,10 +223,9 @@ def _select_lora_signature(loras: List[LoraSpec]) -> String:
 # linears, same _double_block/_single_block calls (via the same transient
 # _block_model / _block_model_lora weight tables, so the LoRA overlay path is
 # unchanged), same final layer. ONLY the weight staging changes: the offloader's
-# internal naive synchronous BlockLoader (madvise prefetch + blocking H2D per
-# block — GPU idle during every transfer; measured 4.18 s/step) is bypassed in
-# favor of TurboBlockLoader's async double-buffered rotation: block i+1 is
-# DMA-staged from the pinned host store on the explicit copy stream WHILE block
+# internal naive synchronous BlockLoader is bypassed in favor of the complete
+# FP8 host-resident store: block i+1 is DMA-staged from RAM on the explicit copy
+# stream WHILE block
 # i computes on the default stream (await_block fences via DeviceEvent;
 # mark_active_slot_compute_done lets the copy stream reuse a slot only after
 # the block's kernels are queued).
@@ -233,7 +233,7 @@ def _flux_forward_turbo[
     FN_IMG: Int, FN_TXT: Int, FS: Int
 ](
     model: Flux1Offloaded,
-    mut tloader: TurboBlockLoader,
+    mut tloader: TurboPlannedLoader,
     img_tokens: Tensor,
     txt_tokens: Tensor,
     timestep: Tensor,
@@ -247,7 +247,8 @@ def _flux_forward_turbo[
     var cfg = model.shared.config
 
     # Stage block 0 first: its DMA overlaps the input projections + vec embed.
-    tloader.prefetch(String("double_blocks.0"), ctx)
+    tloader.set_config(OffloadConfig.synchronous_single())
+    tloader.prefetch_with_ctx(0, ctx)
 
     # input projections (with bias).
     var img = linear(
@@ -270,12 +271,9 @@ def _flux_forward_turbo[
     # into the idle slot, then queue this block's compute.
     for bi in range(cfg.num_double):
         var prefix = String("double_blocks.") + String(bi)
-        var block = tloader.await_block(prefix, ctx)
-        if bi + 1 < cfg.num_double:
-            tloader.prefetch(String("double_blocks.") + String(bi + 1), ctx)
-        else:
-            tloader.prefetch(String("single_blocks.0"), ctx)
-        var bm = model._block_model(block) if model.lora.count() == 0 else model._block_model_lora(block, ctx)
+        var handle = tloader.await_block(bi, ctx)
+        tloader.prefetch_next_with_ctx(bi, ctx)
+        var bm = model._block_model(handle.block) if model.lora.count() == 0 else model._block_model_lora(handle.block, ctx)
         var vec_silu = silu(vec, ctx)
         var img_mod = linear(
             vec_silu,
@@ -294,16 +292,16 @@ def _flux_forward_turbo[
         )
         txt = slice(merged, 1, 0, FN_TXT, ctx)
         img = slice(merged, 1, FN_TXT, FN_IMG, ctx)
-        tloader.mark_active_slot_compute_done(ctx)
+        tloader.mark_active_block_done(ctx)
 
     # merge cat([txt, img]) for the single-stream blocks.
     var x = concat(1, ctx, txt, img)
     for bi in range(cfg.num_single):
         var prefix = String("single_blocks.") + String(bi)
-        var block = tloader.await_block(prefix, ctx)
-        if bi + 1 < cfg.num_single:
-            tloader.prefetch(String("single_blocks.") + String(bi + 1), ctx)
-        var bm = model._block_model(block) if model.lora.count() == 0 else model._block_model_lora(block, ctx)
+        var plan_idx = cfg.num_double + bi
+        var handle = tloader.await_block(plan_idx, ctx)
+        tloader.prefetch_next_with_ctx(plan_idx, ctx)
+        var bm = model._block_model(handle.block) if model.lora.count() == 0 else model._block_model_lora(handle.block, ctx)
         var vec_silu = silu(vec, ctx)
         var single_mod = linear(
             vec_silu,
@@ -312,7 +310,7 @@ def _flux_forward_turbo[
             ctx,
         )
         x = bm._single_block[FS](prefix, bm, x, single_mod, cos, sin, ctx)
-        tloader.mark_active_slot_compute_done(ctx)
+        tloader.mark_active_block_done(ctx)
 
     # extract image tokens (txt first in the merged seq) and run final layer.
     var img_out = slice(x, 1, FN_TXT, FN_IMG, ctx)
@@ -333,9 +331,10 @@ struct FluxBackend(GenBackend, Movable):
     var loaded_width: Int
     var loaded_height: Int
     var model: List[ArcPointer[Flux1Offloaded]]  # 0/1 (resident offloader)
-    var tloader: List[ArcPointer[TurboBlockLoader]]  # 0/1 (async block streamer)
+    var tloader: List[ArcPointer[TurboPlannedLoader]]  # 0/1 complete host store
     var rope_cos: List[ArcPointer[Tensor]]       # 0/1 (resident rope cos)
     var rope_sin: List[ArcPointer[Tensor]]       # 0/1 (resident rope sin)
+    var warmed_shapes: List[String]              # CUDA kernels activated per WxH
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -372,9 +371,10 @@ struct FluxBackend(GenBackend, Movable):
         self.loaded_width = 0
         self.loaded_height = 0
         self.model = List[ArcPointer[Flux1Offloaded]]()
-        self.tloader = List[ArcPointer[TurboBlockLoader]]()
+        self.tloader = List[ArcPointer[TurboPlannedLoader]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
+        self.warmed_shapes = List[String]()
         self.active = False
         self.cancel_flag = False
         self.phase = FPHASE_IDLE
@@ -566,7 +566,7 @@ struct FluxBackend(GenBackend, Movable):
         content += String(self.dpmpp_update_steps) + String(',"dpmpp_second_order_steps":')
         content += String(self.dpmpp_second_order_steps) + String("},\n")
         content += String('    "vae_decode_tile_grid":"') + json_escape(self.vae_decode_grid) + String('",\n')
-        content += String('    "dtype":"bf16_dit_f32_latent"\n')
+        content += String('    "dtype":"fp8_e4m3_host_to_bf16_dit_f32_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
         content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
@@ -604,12 +604,13 @@ struct FluxBackend(GenBackend, Movable):
         self.caps.append(ArcPointer(caps^))
 
     def _free_dit(mut self):
-        """Drop the resident DiT offloader handle + rope tables and reset the
-        residency flags (so the next LOAD reloads)."""
+        """Drop GPU-resident shared weights and RoPE before VAE decode.
+
+        The complete pinned-host block store survives across jobs. Its transient
+        GPU staging slabs are discarded separately after synchronization."""
         if self.loaded:
-            print("[flux] releasing resident FLUX DiT offloader + turbo loader + rope before VAE decode")
+            print("[flux] releasing FLUX shared weights + rope; preserving host denoiser store")
         self.model = List[ArcPointer[Flux1Offloaded]]()
-        self.tloader = List[ArcPointer[TurboBlockLoader]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.loaded = False
@@ -653,19 +654,27 @@ struct FluxBackend(GenBackend, Movable):
             self.model.append(ArcPointer(Flux1Offloaded.load(
                 DIT_PATH, Flux1Config.dev(), self.ctx
             )))
-        # TurboBlockLoader: async double-buffered block streaming for the
-        # denoise loop (pinned host store populated once here; per-block
-        # prefetch is then pure async DMA on the copy stream, overlapped with
-        # compute). Replaces the offloader's internal naive synchronous
-        # BlockLoader in _flux_forward_turbo — the offloader handle stays for
-        # shared weights, LoRA overlay, and the _block_model weight tables.
-        self.tloader = List[ArcPointer[TurboBlockLoader]]()
-        # fill_block_store=False: the persistent pinned host store would be ~23.8 GiB
-        # for FLUX.1-dev — the same unswappable-host class that froze the box on
-        # qwen-image (journalctl 2026-07-16: shmem-rss 56 GB OOM). Bounded 2-slot
-        # staging fills each pinned slab from the mmap per prefetch instead.
-        self.tloader.append(ArcPointer(TurboBlockLoader.open_with_copy_mode(
-            String(DIT_PATH), self.ctx, False, fill_block_store=False)))
+        # Complete FP8 host-resident store for the denoise loop. Per-block
+        # prefetch is pure async DMA from RAM on the copy stream, overlapped with
+        # compute. The offloader handle stays for shared weights, LoRA overlay,
+        # and the _block_model weight tables; its mmap pages are dropped below.
+        if len(self.tloader) == 0:
+            var plan = build_flux1_dev_block_plan()
+            var tloader = TurboPlannedLoader.open(
+                String(DIT_PATH), plan^, OffloadConfig.synchronous_single(), self.ctx,
+                fill_block_store=False,
+            )
+            var host_blocks = tloader.pin_residents_fp8_host(1 << 60, self.ctx)
+            tloader.require_all_blocks_memory_resident()
+            tloader.release_checkpoint_pages()
+            tloader.discard_unused_raw_streaming_slots(self.ctx)
+            tloader.set_fp8h_overlap(True)
+            print("[flux] host-resident denoiser blocks:", host_blocks, "/57")
+            self.tloader.append(ArcPointer(tloader^))
+        else:
+            self.tloader[0][].require_all_blocks_memory_resident()
+            print("[flux] reusing complete host-resident denoiser store: 57/57")
+        self.model[0][].loader.sharded.release_to_os()
         # RoPE tables (resident with the offloader; rebuilt only on reload).
         var rope = build_flux1_rope_tables[N_IMG_, N_TXT, 24, 128](
             IMG_H2_, IMG_W2_, self.ctx, STDtype.BF16
@@ -811,6 +820,28 @@ struct FluxBackend(GenBackend, Movable):
                 return
         raise Error("flux: admitted denoise shape was not compiled")
 
+    def _warm_denoiser_for_shape(mut self) raises:
+        """Activate lazy CUDA/cuDNN kernels once per compiled image shape.
+
+        The warm forward is non-mutating: it forces the Euler branch, restores
+        the original latent and sampler selection, and never advances `cur`.
+        """
+        var key = String(self.params.width) + String("x") + String(self.params.height)
+        for warmed in self.warmed_shapes:
+            if warmed == key:
+                print("[flux] denoiser kernel warm-up HIT for", key)
+                return
+        var saved_sampler = self.executed_sampler.copy()
+        var saved_latent = self.latent[0][].clone(self.ctx)
+        self.executed_sampler = String("euler")
+        self._denoise_one()
+        self.ctx.synchronize()
+        self.latent = List[ArcPointer[Tensor]]()
+        self.latent.append(ArcPointer(saved_latent^))
+        self.executed_sampler = saved_sampler^
+        self.warmed_shapes.append(key^)
+        print("[flux] pre-step-0 denoiser kernel warm-up complete")
+
     # ── final decode + PNG(tEXt) ──────────────────────────────────────────────
     def _decode_and_save_shape[LATENT_H_: Int, LATENT_W_: Int](
         mut self
@@ -824,8 +855,10 @@ struct FluxBackend(GenBackend, Movable):
         self.latent = List[ArcPointer[Tensor]]()
         self.dpmpp_history_final_len = self.dpmpp_history.len()
         self.dpmpp_history = MultistepHistory(1)
-        self._free_dit()
         self.ctx.synchronize()
+        if len(self.tloader) == 1:
+            self.tloader[0][].discard_fp8h_device_staging()
+        self._free_dit()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
         _print_vram("after resident release before VAE")
@@ -925,10 +958,17 @@ struct FluxBackend(GenBackend, Movable):
                 self.announced = False
                 var prep_t0 = perf_counter_ns()
                 self._prepare_job()
-                self.prepare_seconds += Float64(perf_counter_ns() - prep_t0) / 1.0e9
+                self._warm_denoiser_for_shape()
                 self._record_vram()
+                print("[flux] prefaulted worker image bytes=", prefault_self_executable())
+                print(
+                    "[flux] prefaulted mapped shared-library bytes=",
+                    prefault_mapped_shared_libraries(),
+                )
+                self.prepare_seconds += Float64(perf_counter_ns() - prep_t0) / 1.0e9
                 self.phase = FPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == FPHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -937,6 +977,7 @@ struct FluxBackend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.runtime_steps:
                     self.phase = FPHASE_DECODE
                 return r^

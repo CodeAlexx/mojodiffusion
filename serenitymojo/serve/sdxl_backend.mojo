@@ -948,6 +948,7 @@ struct SdxlBackend(GenBackend, Movable):
                 self._record_vram()
                 self.phase = SPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == SPHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -956,6 +957,7 @@ struct SdxlBackend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.params.steps:
                     self.phase = SPHASE_DECODE
                 return r^

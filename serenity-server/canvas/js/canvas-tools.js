@@ -1262,4 +1262,3 @@ var CanvasTools = (function () {
         getLassoAutoMask: getLassoAutoMask,
     };
 })();
-//# sourceMappingURL=canvas-tools.js.map

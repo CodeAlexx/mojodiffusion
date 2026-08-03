@@ -491,4 +491,3 @@ var QueueTab = (function () {
         state: state
     };
 })();
-//# sourceMappingURL=queue.js.map

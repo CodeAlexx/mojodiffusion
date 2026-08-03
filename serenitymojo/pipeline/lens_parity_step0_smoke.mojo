@@ -596,7 +596,7 @@ def mean_abs_diff(a: List[Float32], b: List[Float32]) raises -> Float32:
 
 
 # ── Main: one-step parity test ─────────────────────────────────────────────────
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var ctx = DeviceContext()
     print("=== Lens DiT one-step parity (Mojo vs Python captures) ===")
     print("  hs_step0 :", String(HS_STEP0_PATH))
@@ -654,3 +654,10 @@ def main() raises:
         verdict = String("PASS")
     print("  verdict  =", verdict, "(target cos >= 0.999)")
     print("============================================================")
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Lens parity executable reads checkpoint weights "
+        "during denoise; use the fail-closed memory-resident product worker"
+    )

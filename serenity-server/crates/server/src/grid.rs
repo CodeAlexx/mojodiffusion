@@ -65,7 +65,7 @@ use crate::capabilities::{
 use crate::jobs;
 use crate::{
     AppState, DriverCtl, JobChannel, generate_prequeue_error_report,
-    validate_generate_prequeue_for_enqueue,
+    validate_transport_for_enqueue,
 };
 use serenity_graph::lower_request;
 use serenity_wire::JobParams;
@@ -1527,7 +1527,7 @@ pub async fn post_grid(State(st): State<AppState>, Json(mut req): Json<Value>) -
                 } else {
                     String::new()
                 };
-                if let Err(e) = validate_generate_prequeue_for_enqueue(&p, 1.0) {
+                if let Err(e) = validate_transport_for_enqueue(&p, 1.0) {
                     let mut label = format!("x={x_label}");
                     if !y_label.is_empty() {
                         label.push_str(&format!(", y={y_label}"));

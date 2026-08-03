@@ -329,6 +329,15 @@ struct SD3MMDiTPreBlockGate(Movable):
     def load_large_shape[LH: Int, LW: Int](
         ctx: DeviceContext
     ) raises -> SD3MMDiTPreBlockGate:
+        var manifest = sd3_5_large_default_manifest()
+        return SD3MMDiTPreBlockGate.load_large_shape_from_path[LH, LW](
+            manifest.denoiser_path, ctx
+        )
+
+    @staticmethod
+    def load_large_shape_from_path[LH: Int, LW: Int](
+        checkpoint_path: String, ctx: DeviceContext
+    ) raises -> SD3MMDiTPreBlockGate:
         comptime assert LH % SD3_LARGE_PATCH_SIZE == 0, "SD3 Large latent H must divide by patch size"
         comptime assert LW % SD3_LARGE_PATCH_SIZE == 0, "SD3 Large latent W must divide by patch size"
         comptime PH = LH // SD3_LARGE_PATCH_SIZE
@@ -336,6 +345,7 @@ struct SD3MMDiTPreBlockGate(Movable):
         comptime assert PH <= SD3_LARGE_POS_EMBED_GRID, "SD3 Large patch H exceeds learned position grid"
         comptime assert PW <= SD3_LARGE_POS_EMBED_GRID, "SD3 Large patch W exceeds learned position grid"
         var manifest = sd3_5_large_default_manifest()
+        manifest.denoiser_path = checkpoint_path.copy()
         validate_sd3_large_checkpoint_header(manifest)
         return SD3MMDiTPreBlockGate._load(
             manifest^,

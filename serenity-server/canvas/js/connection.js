@@ -140,4 +140,3 @@ class SFConnection {
         this.line.destroy();
     }
 }
-//# sourceMappingURL=connection.js.map

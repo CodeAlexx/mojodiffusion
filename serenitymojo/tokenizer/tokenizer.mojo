@@ -416,6 +416,28 @@ struct Qwen3Tokenizer(Movable):
         var added_text = _read_utf8_file(added_tokens_json_path)
         self._parse_added_tokens_map(added_text.as_bytes())
 
+    def __init__(
+        out self,
+        var vocab: Dict[String, Int],
+        var merge_rank: Dict[String, Int],
+        var special_tokens: List[String],
+        var special_ids: List[Int],
+        pre_o200k: Bool,
+    ):
+        """Build from already-parsed tables.
+
+        Used by `tokenizer_cache.mojo` to restore a tokenizer from its binary
+        sidecar without re-parsing tokenizer.json. `byte_to_uni` is recomputed
+        (256 entries, free) and `id_to_token` stays lazy, exactly as the JSON
+        constructors leave them."""
+        self.vocab = vocab^
+        self.merge_rank = merge_rank^
+        self.special_tokens = special_tokens^
+        self.special_ids = special_ids^
+        self.byte_to_uni = build_byte_to_unicode()
+        self.id_to_token = Dict[Int, String]()
+        self.pre_o200k = pre_o200k
+
     def _parse_vocab_object(mut self, bytes: Span[Byte, _]) raises:
         var p = 0
         _skip_ws(bytes, p)

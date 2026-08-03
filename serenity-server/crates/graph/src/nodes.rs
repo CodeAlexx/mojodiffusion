@@ -130,6 +130,7 @@ pub fn is_allowed_type(t: &str) -> bool {
             | "StringConstantMultiline"
             | "BOOLConstant"
             | "SeedNode"
+            | "Seed (rgthree)"
             | "easy int"
             | "easy float"
             | "easy string"

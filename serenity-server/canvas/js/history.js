@@ -104,4 +104,3 @@ class SFHistory {
         this._paused = false;
     }
 }
-//# sourceMappingURL=history.js.map

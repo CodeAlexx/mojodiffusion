@@ -169,7 +169,7 @@ def _sd3_large_forward(
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var ctx = DeviceContext()
     print("============================================================")
     print("SD3.5 Large 1024x1024 — 28-step shifted flow CFG 4.5 seed 42")
@@ -257,3 +257,10 @@ def main() raises:
     print("\n============================================================")
     print("SD3.5 Large pipeline COMPLETE")
     print("============================================================")
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy SD3 Large executable reads checkpoint weights "
+        "during denoise; use the fail-closed memory-resident product worker"
+    )

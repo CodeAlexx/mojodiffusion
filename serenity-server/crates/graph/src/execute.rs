@@ -169,12 +169,6 @@ fn exec_refiner_upscale_intent(fields: &JsonValue, out: &mut JsonValue) -> Graph
     Ok(Fire::Done)
 }
 
-/// `_workflow_append_lora` (Mojo 176): append `{name, weight}` to `out["lora"]`,
-/// skipping zero-weight; the float weight is emitted as JSON number.
-fn append_lora(out: &mut JsonValue, name: &str, weight: f64) -> GraphResult<()> {
-    append_lora_role(out, name, weight, "overlay")
-}
-
 fn append_lora_role(out: &mut JsonValue, name: &str, weight: f64, role: &str) -> GraphResult<()> {
     if name.is_empty() {
         return Err(GraphError::unsupported(

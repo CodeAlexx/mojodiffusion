@@ -363,6 +363,10 @@ struct ZImageBackend(GenBackend, Movable):
 
     # ── resident across jobs (loaded once, first job) ──
     var loaded: Bool
+    # Exact denoiser artifact currently represented by aux/block state.  This
+    # prevents a model switch from reusing any tensors from the prior file.
+    var loaded_checkpoint_path: String
+    var loaded_model_name: String
     var aux: List[ArcPointer[ZImageRealAux]]            # 0/1
     var nr_blocks: List[ZImageBlockWeights]
     var cr_blocks: List[ZImageBlockWeights]
@@ -441,6 +445,8 @@ struct ZImageBackend(GenBackend, Movable):
     def __init__(out self) raises:
         self.ctx = DeviceContext()
         self.loaded = False
+        self.loaded_checkpoint_path = String("")
+        self.loaded_model_name = String("")
         self.aux = List[ArcPointer[ZImageRealAux]]()
         self.nr_blocks = List[ZImageBlockWeights]()
         self.cr_blocks = List[ZImageBlockWeights]()
@@ -516,9 +522,40 @@ struct ZImageBackend(GenBackend, Movable):
         return String("Z-Image")
 
     def resident_model(self) -> String:
-        """Matches the /v1/models scan entry name for the resident checkpoint
-        (the zimage_base/ directory entry)."""
-        return String("zimage_base") if self.loaded else String("")
+        """Exact registry model identity whose selected weights are resident."""
+        return self.loaded_model_name.copy() if self.loaded else String("")
+
+    def _requested_checkpoint_path(self) -> String:
+        if self.params.checkpoint_path.byte_length() > 0:
+            return self.params.checkpoint_path.copy()
+        return String(TRANSFORMER)
+
+    def _drop_dit_checkpoint_state(mut self, reason: String) raises:
+        """Drop every tensor derived from a selected denoiser checkpoint."""
+        if (
+            self.loaded
+            or len(self.st_open) > 0
+            or len(self.aux) > 0
+            or len(self.nr_blocks) > 0
+            or len(self.cr_blocks) > 0
+            or len(self.main_blocks) > 0
+        ):
+            print("[zimage] dropping DiT checkpoint state:", reason)
+        self.nr_blocks = List[ZImageBlockWeights]()
+        self.cr_blocks = List[ZImageBlockWeights]()
+        self.main_blocks = List[ZImageBlockWeights]()
+        self.st_open = List[ArcPointer[ShardedSafeTensors]]()
+        self.aux = List[ArcPointer[ZImageRealAux]]()
+        self.final_lin = List[TArc]()
+        self.x_pad_h = List[Float32]()
+        self.cap_pad_h = List[Float32]()
+        self.load_cursor = 0
+        self.loaded = False
+        self.loaded_checkpoint_path = String("")
+        self.loaded_model_name = String("")
+        self.ctx.synchronize()
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
 
     # ── job admission ─────────────────────────────────────────────────────────
     def start(mut self, params: JobParams) raises:
@@ -607,6 +644,24 @@ struct ZImageBackend(GenBackend, Movable):
                 raise Error(
                     String("zimage: mask image not found: ") + params.mask_image
                 )
+        var requested_checkpoint = params.checkpoint_path.copy()
+        if requested_checkpoint.byte_length() == 0:
+            requested_checkpoint = String(TRANSFORMER)
+        if not _path_exists(requested_checkpoint):
+            raise Error(
+                String("zimage: selected checkpoint not found: ")
+                + requested_checkpoint
+            )
+        if (
+            self.loaded_checkpoint_path.byte_length() > 0
+            and self.loaded_checkpoint_path != requested_checkpoint
+        ):
+            self._drop_dit_checkpoint_state(
+                String("switch ")
+                + self.loaded_checkpoint_path
+                + String(" -> ")
+                + requested_checkpoint
+            )
         self.params = params.copy()
         self.hl = hl
         self.wl = wl
@@ -680,12 +735,19 @@ struct ZImageBackend(GenBackend, Movable):
         if self.loaded:
             return True
         if len(self.st_open) == 0:
+            var checkpoint_path = self._requested_checkpoint_path()
             _print_vram("before resident load")
-            print("[zimage] loading resident DiT weights from", TRANSFORMER,
+            print("[zimage] loading selected DiT weights from", checkpoint_path,
                   "(chunked:", LOAD_BLOCKS_PER_TICK, "blocks/tick)")
             self.st_open.append(
-                ArcPointer(ShardedSafeTensors.open(String(TRANSFORMER)))
+                ArcPointer(ShardedSafeTensors.open(checkpoint_path))
             )
+            # Preserve the exact, parity-gated device allocation order below,
+            # but ask Linux to populate the mmap sequentially before those
+            # calls revisit tensors in model-structure order.
+            self.st_open[0][].prefetch_all_storage_order()
+            self.loaded_checkpoint_path = checkpoint_path.copy()
+            self.loaded_model_name = self.params.model.copy()
             # aux survives a 16GB encode-eviction (_evict_dit_blocks_for_encode)
             # — reload only the DiT blocks, never duplicate the aux set.
             if len(self.aux) == 0:
@@ -735,6 +797,7 @@ struct ZImageBackend(GenBackend, Movable):
         # stay resident): the 128-grid decode is VRAM-critical and must
         # allocate AFTER the DiT release, not before the first job.
         self.loaded = True
+        self.loaded_model_name = self.params.model.copy()
         var dit_bytes = (
             _blocks_bytes(self.nr_blocks) + _blocks_bytes(self.cr_blocks)
             + _blocks_bytes(self.main_blocks)
@@ -784,6 +847,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.cap_pad_h = List[Float32]()
         self.load_cursor = 0
         self.loaded = False
+        self.loaded_checkpoint_path = String("")
+        self.loaded_model_name = String("")
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
@@ -815,6 +880,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.final_lin = List[TArc]()
         self.x_pad_h = List[Float32]()
         self.cap_pad_h = List[Float32]()
+        self.loaded_checkpoint_path = String("")
+        self.loaded_model_name = String("")
 
     # ── per-job prep: text encode + rope + noise + sigmas + LoRA overlay ─────
     def _prepare_job(mut self) raises:
@@ -1421,7 +1488,8 @@ struct ZImageBackend(GenBackend, Movable):
         var content = String("{\n")
         content += String('  "schema":"serenity.zimage.daemon_result.v1",\n')
         content += String('  "backend":"zimage_daemon",\n')
-        content += String('  "model":"zimage",\n')
+        content += String('  "model":"') + _json_escape(self.params.model) + String('",\n')
+        content += String('  "checkpoint_path":"') + _json_escape(self._requested_checkpoint_path()) + String('",\n')
         content += String('  "readiness_label":"experimental",\n')
         content += String('  "accepted_sampler_parity":false,\n')
         content += String('  "accepted_speed_parity":false,\n')
@@ -1730,11 +1798,12 @@ struct ZImageBackend(GenBackend, Movable):
                     return r^
                 var encode_t0 = perf_counter_ns()
                 self._prepare_job()
-                self.text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+                self.text_encode_seconds += Float64(perf_counter_ns() - encode_t0) / 1.0e9
                 self._record_vram()
                 self.announced = False
                 if self.loaded:
                     self.phase = PHASE_DENOISE
+                    r.phase = String("sampling")
                 else:
                     # DiT blocks are not resident (encode ran first on the
                     # 16GB order flip, or was evicted for the encoder child)
@@ -1744,6 +1813,7 @@ struct ZImageBackend(GenBackend, Movable):
                 r.step = 0
                 return r^
             if self.phase == PHASE_DENOISE:
+                r.phase = String("sampling")
                 while self.cur < self.params.steps and not self._denoise_step_has_update(self.cur):
                     self.cur += 1
                 if self.cur >= self.params.steps:

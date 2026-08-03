@@ -61,7 +61,7 @@ fn stub_seam_runs_one_job_to_done() {
     std::fs::create_dir_all(&out_dir).expect("create out_dir");
 
     // Spawn the stub worker: `serenity_worker_stub <child_fd>` (no kind arg).
-    let mut h = spawn_worker(bin, &[]).expect("spawn_worker(serenity_worker_stub)");
+    let mut h = spawn_worker(bin, &[], &[]).expect("spawn_worker(serenity_worker_stub)");
 
     // 1. The worker emits {"ev":"ready"} immediately on startup.
     let ready_deadline = Instant::now() + Duration::from_secs(10);

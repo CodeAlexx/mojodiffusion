@@ -214,7 +214,13 @@ def _workflow_worker_supports_scheduler(name: String) -> Bool:
 
 
 def _workflow_is_int_scalar_node(type_id: String) -> Bool:
-    return type_id == "PrimitiveInt" or type_id == "INTConstant" or type_id == "easy int" or type_id == "SeedNode"
+    return (
+        type_id == "PrimitiveInt"
+        or type_id == "INTConstant"
+        or type_id == "easy int"
+        or type_id == "SeedNode"
+        or type_id == "Seed (rgthree)"
+    )
 
 
 def _workflow_is_float_scalar_node(type_id: String) -> Bool:
@@ -2053,6 +2059,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "StringConstantMultiline"
             or type_id == "BOOLConstant"
             or type_id == "SeedNode"
+            or type_id == "Seed (rgthree)"
             or type_id == "easy int"
             or type_id == "easy float"
             or type_id == "easy string"

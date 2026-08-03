@@ -198,7 +198,7 @@ def denoise_cached(inputs_path: String, denoiser_path: String) raises -> List[Fl
     return packed_h^
 
 
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var manifest = default_manifest_by_id(String("flux1_dev"))
     validate_flux1_pipeline_contract(manifest)
     var inputs_path = flux1_default_cached_inputs_path()
@@ -227,3 +227,10 @@ def main() raises:
     _print_vram("flux decode phase end")
     save_png(rgb, OUT, ctx, ValueRange.SIGNED)
     print("[done] saved", OUT)
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Flux smoke reads checkpoint weights during "
+        "denoise; use the fail-closed memory-resident product worker"
+    )

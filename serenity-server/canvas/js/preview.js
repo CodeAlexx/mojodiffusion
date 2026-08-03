@@ -84,4 +84,3 @@ class SFPreview {
         }
     }
 }
-//# sourceMappingURL=preview.js.map

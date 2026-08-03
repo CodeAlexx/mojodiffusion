@@ -428,6 +428,8 @@ pub async fn get_object_info() -> Response {
             "output": ["SAMPLER"], "output_name": ["SAMPLER"], "name": "KSamplerSelect", "category": "sampling" },
         "RandomNoise": { "input": { "required": { "noise_seed": int(0,0,281474976710655) } },
             "output": ["NOISE"], "output_name": ["NOISE"], "name": "RandomNoise", "category": "sampling" },
+        "Seed (rgthree)": { "input": { "required": { "seed": int(0,0,4294967295) } },
+            "output": ["INT"], "output_name": ["INT"], "name": "Seed (rgthree)", "category": "utils/seed" },
         "CFGGuider": { "input": { "required": { "model": lk("MODEL"), "positive": lk("CONDITIONING"), "negative": lk("CONDITIONING"), "cfg": fl(4.5,0.0,100.0) } },
             "output": ["GUIDER"], "output_name": ["GUIDER"], "name": "CFGGuider", "category": "sampling" },
         "Flux2Scheduler": { "input": { "required": { "model": lk("MODEL"), "steps": int(35,1,4096), "width": int(1024,64,8192), "height": int(1024,64,8192) } },

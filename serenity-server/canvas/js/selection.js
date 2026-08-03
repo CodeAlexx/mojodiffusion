@@ -304,4 +304,3 @@ class SFSelection {
         }));
     }
 }
-//# sourceMappingURL=selection.js.map

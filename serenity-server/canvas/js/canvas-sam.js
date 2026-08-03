@@ -554,4 +554,3 @@ var CanvasSAM = (function () {
         triggerTextDetect: triggerTextDetect,
     };
 })();
-//# sourceMappingURL=canvas-sam.js.map

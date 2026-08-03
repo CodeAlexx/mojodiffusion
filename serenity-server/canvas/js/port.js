@@ -125,4 +125,3 @@ function createInputPort(node, slotIndex, x, y, typeName, label) {
     });
     return group;
 }
-//# sourceMappingURL=port.js.map

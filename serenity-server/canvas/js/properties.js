@@ -275,4 +275,3 @@ class SFProperties {
         parent.appendChild(container);
     }
 }
-//# sourceMappingURL=properties.js.map

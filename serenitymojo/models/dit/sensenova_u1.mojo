@@ -66,7 +66,7 @@ from serenitymojo.ops.tensor_algebra import (
 )
 from serenitymojo.offload.block_loader import BlockLoader, Block
 from serenitymojo.offload.plan import OffloadConfig, build_sensenova_u1_block_plan
-from serenitymojo.offload.planned_loader import PlannedBlockLoader
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -688,9 +688,9 @@ def _is_sensenova_t2i_shared(name: String) -> Bool:
 # SenseNovaU1 model
 # ─────────────────────────────────────────────────────────────────────────────
 struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
-    """SenseNova-U1-8B-MoT T2I model. Per-layer transformer weights stream from
-    the sharded checkpoint via PlannedBlockLoader; shared weights (embed_tokens, final
-    norms, fm_modules, vision_model_mot_gen embedder) are resident.
+    """SenseNova-U1-8B-MoT T2I model. Per-layer transformer weights stage from
+    a complete FP8 host-resident store; shared weights (embed_tokens, final
+    norms, fm_modules, vision_model_mot_gen embedder) are device-resident.
 
     Comptime params:
       L_TOKENS : number of image gen tokens (token_h * token_w). The gen-path
@@ -706,13 +706,13 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
     var config: SenseNovaU1Config
     var shared: Dict[String, ArcPointer[Tensor]]
-    var loader: PlannedBlockLoader
+    var loader: TurboPlannedLoader
 
     def __init__(
         out self,
         config: SenseNovaU1Config,
         var shared: Dict[String, ArcPointer[Tensor]],
-        var loader: PlannedBlockLoader,
+        var loader: TurboPlannedLoader,
     ):
         self.config = config
         self.shared = shared^
@@ -720,8 +720,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
     @staticmethod
     def load(dir: String, ctx: DeviceContext) raises -> SenseNovaU1[Self.L_TOKENS, Self.TEXT_LEN]:
-        """Open the sharded checkpoint. Per-layer weights stream via PlannedBlockLoader;
-        T2I-required shared tensors are loaded resident into a Dict."""
+        """Load shared tensors and build the complete no-disk host block store."""
         var raw_loader = BlockLoader.open(dir)
         var shared = Dict[String, ArcPointer[Tensor]]()
         for ref nm in raw_loader.sharded.names():
@@ -730,9 +729,18 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
                 var t = Tensor.from_view(tv, ctx)
                 shared[nm] = ArcPointer(t^)
         var plan = build_sensenova_u1_block_plan()
-        var loader = PlannedBlockLoader(
-            raw_loader^, plan^, OffloadConfig.single_pass()
+        var loader = TurboPlannedLoader.open(
+            dir,
+            plan^,
+            OffloadConfig.single_pass(),
+            ctx,
+            fill_block_store=False,
         )
+        _ = loader.pin_residents_fp8_host(1 << 60, ctx)
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        loader.discard_unused_raw_streaming_slots(ctx)
+        loader.set_fp8h_overlap(True)
         return SenseNovaU1[Self.L_TOKENS, Self.TEXT_LEN](
             SenseNovaU1Config.sensenova_u1_8b(), shared^, loader^
         )
@@ -879,7 +887,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
         var k_layers = List[ArcPointer[Tensor]]()
         var v_layers = List[ArcPointer[Tensor]]()
         var total = cfg.num_layers
-        self.loader.config = OffloadConfig.single_pass()
+        self.loader.set_config(OffloadConfig.single_pass())
         self.loader.prefetch_with_ctx(0, ctx)
         for i in range(total):
             var handle = self.loader.await_block(i, ctx)
@@ -1067,7 +1075,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
         var hidden = _clone(image_embeds, ctx)
         var total = cfg.num_layers
-        self.loader.config = OffloadConfig.single_pass()
+        self.loader.set_config(OffloadConfig.single_pass())
         self.loader.prefetch_with_ctx(0, ctx)
         for i in range(total):
             var handle = self.loader.await_block(i, ctx)

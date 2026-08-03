@@ -71,6 +71,7 @@ from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_qwen_flash_padmask
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
 from serenitymojo.ops.tensor_algebra import (
     reshape,
     slice,
@@ -425,6 +426,43 @@ struct QwenImageDit(Movable):
             var idx = len(weights)
             weights.append(ArcPointer(t^))
             name_to_idx[nm] = idx
+        return QwenImageDit(weights^, name_to_idx^, QwenImageConfig.qwen_image())
+
+    @staticmethod
+    def load_shared_fp8_unscaled(
+        checkpoint: String, ctx: DeviceContext
+    ) raises -> QwenImageDit:
+        """Load Qwen's small shared set from a raw unscaled-E4M3 checkpoint.
+
+        The installed Serenity FP8 checkpoint stores every tensor directly as
+        F8_E4M3 with no scale sidecar. Decode once with scalar scale 1.0 and keep
+        the resulting BF16 shared tensors resident on device."""
+        var sharded = ShardedSafeTensors.open(checkpoint)
+        var weights = List[ArcPointer[Tensor]]()
+        var name_to_idx = Dict[String, Int]()
+        for ref nm in sharded.names():
+            var keep = (
+                nm.startswith("img_in.")
+                or nm.startswith("txt_norm.")
+                or nm.startswith("txt_in.")
+                or nm.startswith("time_text_embed.")
+                or nm.startswith("norm_out.")
+                or nm.startswith("proj_out.")
+            )
+            if not keep:
+                continue
+            var tv = sharded.tensor_view(nm)
+            if tv.dtype != STDtype.F8_E4M3:
+                raise Error(
+                    String("Qwen raw-FP8 shared load expected F8_E4M3 for ")
+                    + nm + String(", got ") + tv.dtype.name()
+                )
+            var raw = Tensor.from_view_raw(tv, ctx)
+            var t = fp8_e4m3_dequant_to_bf16(raw, Float32(1.0), ctx)
+            var idx = len(weights)
+            weights.append(ArcPointer(t^))
+            name_to_idx[nm] = idx
+        sharded.release_to_os()
         return QwenImageDit(weights^, name_to_idx^, QwenImageConfig.qwen_image())
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
@@ -1004,6 +1042,32 @@ struct QwenImageDitOffloaded(Movable):
             dir, plan^, OffloadConfig.synchronous_cfg_paired(), ctx,
             fill_block_store=False,
         )
+        return QwenImageDitOffloaded(shared^, loader^)
+
+    @staticmethod
+    def load_fp8_host_resident(
+        checkpoint: String, ctx: DeviceContext
+    ) raises -> QwenImageDitOffloaded:
+        """Load the installed raw-E4M3 Qwen checkpoint without denoise I/O.
+
+        Shared tensors decode once to BF16 device memory. All 60 transformer
+        blocks are copied once into pinned host memory, then staged/dequantized
+        from RAM during each forward. Sampling is refused unless every block is
+        present in a memory-resident source."""
+        var shared = QwenImageDit.load_shared_fp8_unscaled(checkpoint, ctx)
+        var plan = build_qwenimage_block_plan()
+        var loader = TurboPlannedLoader.open(
+            checkpoint,
+            plan^,
+            OffloadConfig.synchronous_cfg_paired(),
+            ctx,
+            fill_block_store=False,
+        )
+        _ = loader.pin_residents_fp8_host_raw(1 << 60, ctx)
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        loader.discard_unused_raw_streaming_slots(ctx)
+        loader.set_fp8h_overlap(True)
         return QwenImageDitOffloaded(shared^, loader^)
 
     def _block_model(self, block: Block) -> QwenImageDit:

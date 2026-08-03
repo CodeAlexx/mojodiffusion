@@ -469,4 +469,3 @@ function SFApi() {
     };
     this.getClientId = function () { return SerenityWS.getClientId(); };
 }
-//# sourceMappingURL=api.js.map

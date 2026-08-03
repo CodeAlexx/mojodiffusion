@@ -38,6 +38,7 @@
 
 from std.collections import Optional
 from std.memory import alloc, UnsafePointer, ArcPointer
+from std.ffi import external_call
 from std.gpu.host import DeviceContext, HostBuffer
 
 from serenitymojo.tensor import Tensor
@@ -83,6 +84,40 @@ def krea2_int8_cache_path(checkpoint: String) -> String:
     """The sidecar path for a given base checkpoint: `<ckpt>.int8cache.safetensors`
     right next to the checkpoint (deterministic; no config needed)."""
     return checkpoint + String(".int8cache.safetensors")
+
+
+def _stat_dev_ino(path: String) -> List[Int]:
+    """Return Linux stat(2) [st_dev, st_ino], or [-1, -1] on failure."""
+    var n = path.byte_length()
+    var cbuf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        cbuf[i] = src[i]
+    cbuf[n] = 0
+    var statbuf = alloc[UInt8](160)
+    var rc = Int(
+        external_call["stat", Int32](
+            BytePtr(unsafe_from_address=Int(cbuf)),
+            BytePtr(unsafe_from_address=Int(statbuf)),
+        )
+    )
+    var dev = -1
+    var ino = -1
+    if rc == 0:
+        var q = statbuf.bitcast[Int64]()
+        dev = Int(q[0])
+        ino = Int(q[1])
+    cbuf.free()
+    statbuf.free()
+    var out: List[Int] = [dev, ino]
+    return out^
+
+
+def krea2_same_checkpoint_file(left: String, right: String) -> Bool:
+    """True only when both paths resolve through stat(2) to one exact file."""
+    var a = _stat_dev_ino(left)
+    var b = _stat_dev_ino(right)
+    return a[0] >= 0 and a[0] == b[0] and a[1] == b[1]
 
 
 def krea2_int8_cache_valid(

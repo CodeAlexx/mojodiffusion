@@ -1,6 +1,6 @@
 # Serenity Generate UI
 
-Status: implemented and browser/product-path verified through 2026-07-28.
+Status: implemented and browser/product-path verified through 2026-07-31.
 
 ## Scope
 
@@ -142,18 +142,21 @@ worker/model loading, tokenization, Gemma layer progress, sampling steps,
 decode, save, completion, and failures from the actual server status stream.
 Status and result manifests are polled without blocking the browser.
 
-Presets use the server `/v1/presets` API. Result History and Current Batch
-retain the full reusable request, not only display metadata. A visible
+Presets use the server `/v1/presets` API. Result History is loaded only from
+`/v1/history/artifacts`; browser storage is not a second gallery authority.
+History and Current Batch retain the full reusable request, not only display
+metadata. A visible
 **Reuse parameters** action restores model, prompt/negative, size, steps,
 sampler/scheduler, seed, variation/style, LoRAs, post-upscale choice, and all
 video-specific fields.
 The older History context-menu action uses the same restoration function.
 
 Video results render as playable `<video>` elements in the center viewer and
-Current Batch. A current result is intentionally omitted from History until
-the next Generate action, so the same movie is not shown in two thumbnail
-strips. The center player is muted for reliable autoplay, retains native
-controls, loops, and can be sent to the Timeline.
+Current Batch. Completed artifacts enter History immediately and are
+de-duplicated by their server identity. Deleting an item calls the server
+artifact endpoint; the browser does not hide deleted items locally. The center
+player is muted for reliable autoplay, retains native controls, loops, and can
+be sent to the Timeline.
 
 LTX2 completion is idempotent across its two notification transports. HTTP
 status/result polling owns normal video completion; an in-flight or late
@@ -163,8 +166,8 @@ and `/view?...` URLs and removes already-persisted duplicates while retaining
 the copy with complete generation parameters.
 
 The Generate-to-Workflow synchronization preserves the selected sampler and
-noise scheduler in the staged sampler node while retaining compatibility with
-older workflows that stored one combined scheduler value.
+noise scheduler in the staged sampler node. Generate and Workflow use the same
+`scheduler` field; the retired `noiseScheduler` alias is not accepted.
 
 ## Automated verification
 

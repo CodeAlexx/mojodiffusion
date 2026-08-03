@@ -36,9 +36,9 @@ def build_wan22_block_plan(
     """Build the block-swap offload plan for a Wan2.2-T2V checkpoint.
 
     Each entry maps to prefix "{prefix}blocks.{i}" in the safetensors file. The
-    TurboPlannedLoader will stream block i's tensors when that prefix is
-    awaited. Prefixes are WITHOUT trailing dots; the loader adds "." when
-    building the full key.
+    TurboPlannedLoader copies every product block into pinned host memory before
+    sampling and stages block i from RAM when that prefix is awaited. Prefixes
+    are WITHOUT trailing dots; the loader adds "." when building the full key.
 
     `prefix` is "" for bare Wan2.2 keys ("blocks.0.self_attn.q.weight") and
     "model.diffusion_model." for the ComfyUI Wan2.1 layout
@@ -49,7 +49,7 @@ def build_wan22_block_plan(
     key indexes under "model.diffusion_model.blocks.N." — which normalizes to
     exactly the plan prefix built here.
 
-    num_blocks=40 for wan2.2_t2v_low_noise_14b (14B param model).
+    num_blocks=30 for TI2V-5B and 40 for wan2.2_t2v_low_noise_14b.
     """
     var plan = BlockPlan(String("wan22"))
     for i in range(num_blocks):

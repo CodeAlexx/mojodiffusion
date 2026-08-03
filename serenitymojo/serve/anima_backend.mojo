@@ -979,6 +979,7 @@ struct AnimaBackend(GenBackend, Movable):
                 self._record_vram()
                 self.phase = APHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == APHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -987,6 +988,7 @@ struct AnimaBackend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.steps:
                     self.phase = APHASE_DECODE
                 return r^

@@ -64,7 +64,7 @@ from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.conv import conv2d
@@ -73,7 +73,7 @@ from serenitymojo.ops.activations import silu, gelu
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.embeddings import timestep_embedding
-from serenitymojo.ops.tensor_algebra import add, mul, concat, reshape_owned, slice
+from serenitymojo.ops.tensor_algebra import add, mul, concat, permute, reshape_owned, slice
 from serenitymojo.models.dit.sdxl_attention import sdxl_sdpa
 from serenitymojo.models.vae.decoder2d import nchw_to_nhwc, nhwc_to_nchw
 from serenitymojo.models.vae.upsample import upsample_nearest2x_nhwc
@@ -91,35 +91,12 @@ comptime GN_EPS_RES = Float32(1e-5)
 comptime GN_EPS_ST = Float32(1e-6)
 
 
-# ── conv-weight RSCF host loader (OIHW [Co,Ci,Kh,Kw] -> RSCF [Kh,Kw,Ci,Co]) ──
-# Same remap as decoder2d._load_conv_weight_rscf; duplicated here so the UNet
-# does not depend on a VAE-private helper. Pure host index remap, re-upload BF16.
+# ── conv-weight RSCF device remap (OIHW [Co,Ci,Kh,Kw] -> [Kh,Kw,Ci,Co]) ──
 def _to_rscf(w: Tensor, ctx: DeviceContext) raises -> Tensor:
     var sh = w.shape()
     if len(sh) != 4:
         raise Error("conv weight not rank-4 OIHW")
-    var cout = sh[0]
-    var cin = sh[1]
-    var kh = sh[2]
-    var kw = sh[3]
-    var host = w.to_host(ctx)
-    var rscf = List[Float32]()
-    var total = kh * kw * cin * cout
-    for _ in range(total):
-        rscf.append(0.0)
-    for o in range(cout):
-        for ci in range(cin):
-            for r in range(kh):
-                for s in range(kw):
-                    var src = ((o * cin + ci) * kh + r) * kw + s
-                    var dst = ((r * kw + s) * cin + ci) * cout + o
-                    rscf[dst] = host[src]
-    var rshape = List[Int]()
-    rshape.append(kh)
-    rshape.append(kw)
-    rshape.append(cin)
-    rshape.append(cout)
-    return Tensor.from_host(rscf, rshape^, w.dtype(), ctx)
+    return permute(w, [2, 3, 1, 0], ctx)
 
 
 # Per-channel broadcast add: o[.., c] = x[.., c] + b[c], over NHWC flat [rows, C].
@@ -254,6 +231,10 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
                 break
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
+        # A bounded 256 MiB pinned slab amortizes checkpoint H2D fences without
+        # retaining a whole-model host cache. The selected UNet tensors keep
+        # independent device allocations after this uploader drops.
+        var uploader = BatchedTensorUploader(256 * 1024 * 1024, ctx)
         for ref nm in st.names():
             if embedded and not nm.startswith("model.diffusion_model."):
                 continue
@@ -262,7 +243,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
                 if embedded else nm.copy()
             )
             var tv = st.tensor_view(nm)
-            var t = Tensor.from_view(tv, ctx)
+            var t = uploader.from_view(tv, ctx)
             # Downloaded SDXL checkpoints are commonly FP16 while Serenity's
             # resident SDXL kernels and conditioning execute BF16. Normalize
             # every selected UNet tensor at this load boundary so the chosen
@@ -273,6 +254,12 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
             var idx = len(weights)
             weights.append(ArcPointer(t^))
             name_to_idx[key] = idx
+
+        uploader.finish(ctx)
+        print(
+            "[sdxl] batched H2D tensors", uploader.tensors_uploaded,
+            "bytes", uploader.bytes_uploaded, "fences", uploader.fence_count,
+        )
 
         for i in range(len(lora_paths)):
             var overlay = LoraSet.load(lora_paths[i])

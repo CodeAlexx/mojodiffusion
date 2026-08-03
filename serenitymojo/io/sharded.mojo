@@ -468,6 +468,31 @@ struct ShardedSafeTensors(Movable):
             out.append(e.key)
         return out^
 
+    def names_storage_order(self) raises -> List[String]:
+        """Tensor names grouped by shard and ordered by byte offset in each."""
+        var out = List[String]()
+        for idx in range(len(self.shards)):
+            var shard_names = self.shards[idx][].names_storage_order()
+            for ref nm in shard_names:
+                # Indexed files may contain tensors not named by the selected
+                # weight map; include only the unified collection's entries.
+                if nm in self.name_to_shard and self.name_to_shard[nm] == idx:
+                    out.append(nm.copy())
+        return out^
+
+    def prefetch_all_storage_order(self) raises:
+        """Ask Linux to read every selected tensor ahead in physical order.
+
+        This preserves the caller's device-allocation order while avoiding
+        backward disk traversal when that allocation order differs from the
+        safetensors writer's layout.
+        """
+        for idx in range(len(self.shards)):
+            var shard_names = self.shards[idx][].names_storage_order()
+            for ref nm in shard_names:
+                if nm in self.name_to_shard and self.name_to_shard[nm] == idx:
+                    self.shards[idx][].prefetch_tensor(nm)
+
     def shard_index(self, name: String) raises -> Int:
         """The shard index that owns `name`."""
         if name not in self.name_to_shard:

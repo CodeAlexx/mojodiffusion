@@ -113,4 +113,3 @@ var CanvasStatusBar = (function () {
         getModelName: getModelName,
     };
 })();
-//# sourceMappingURL=canvas-statusbar.js.map

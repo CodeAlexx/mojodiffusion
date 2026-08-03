@@ -21,12 +21,7 @@ const CAPTION_START: &str = "=== CAPTION ===";
 const CAPTION_END: &str = "=== END ===";
 
 fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("repository root")
-        .to_path_buf()
+    crate::repository_root_path()
 }
 
 fn mojo_library_path(root: &Path) -> std::ffi::OsString {

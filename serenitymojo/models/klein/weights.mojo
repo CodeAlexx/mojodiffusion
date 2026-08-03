@@ -25,9 +25,10 @@ from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.safetensors import SafeTensors, read_f32_scalar_bytes
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import t_embedder
@@ -407,9 +408,26 @@ def build_klein_step_mods_device_cached(
     )
 
 
-# load a named tensor as a device Tensor (BF16 stored) without casting to host.
+# Load a named tensor as BF16 device storage. Serenity's Klein FP8 export uses
+# raw E4M3 weights plus one F32 scalar at `<weight>_scale`; decode that exact
+# format here so shared projections and modulation weights follow the same
+# policy as block weights.
 def _load_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+    if info.dtype == STDtype.F8_E4M3:
+        var scale_name = name + String("_scale")
+        if not st.has_tensor(scale_name):
+            raise Error(
+                String("Klein FP8 tensor is missing scalar sidecar: ") + scale_name
+            )
+        var scale_info = st.tensor_info(scale_name)
+        if scale_info.dtype != STDtype.F32 or len(scale_info.shape) != 0:
+            raise Error(
+                String("Klein FP8 scale must be an F32 scalar: ") + scale_name
+            )
+        var scale = read_f32_scalar_bytes(st.tensor_bytes(scale_name))
+        var raw = Tensor.from_view_raw(tv, ctx)
+        return fp8_e4m3_dequant_to_bf16(raw, scale, ctx)
     return Tensor.from_view(tv, ctx)

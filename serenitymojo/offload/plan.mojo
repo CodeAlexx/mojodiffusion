@@ -247,6 +247,16 @@ def build_sensenova_u1_block_plan() -> BlockPlan:
     return plan^
 
 
+def build_lens_block_plan() -> BlockPlan:
+    var plan = BlockPlan(String("microsoft_lens"))
+    for i in range(48):
+        plan.append(
+            String("transformer_blocks.") + String(i),
+            BlockKind.double_stream(),
+        )
+    return plan^
+
+
 def build_flux_block_plan(num_double: Int, num_single: Int) -> BlockPlan:
     # flux1-dev block order (BFL keys, verified against
     # flux1-dev.safetensors header): 19 double_blocks.<i> then 38

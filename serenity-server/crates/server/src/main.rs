@@ -38,12 +38,12 @@
 //! NEVER run `mojo build` / `pixi run build-*` (OOM-kills the desktop).
 
 #![recursion_limit = "512"]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -78,10 +78,8 @@ use capabilities::{
     ModelFamily, capability_profile_for_model, generate_capabilities_v1, has_text,
     has_vae_override, json_prompt_to_string, model_family, normalize_ideogram4_prompt_json,
     normalize_sampler_name, normalize_scheduler_name, raw_surface_generate_error_report,
-    raw_surface_preflight_report, reject_disabled_raw_surfaces, reject_unsupported_workflow_route,
-    requested_sampler, requested_scheduler, validate_generate_prequeue,
-    workflow_feature_generate_error_report, workflow_feature_preflight_report,
-    workflow_generate_error_report, workflow_preflight_report,
+    raw_surface_preflight_report, reject_unsupported_workflow_route, requested_sampler,
+    requested_scheduler, workflow_generate_error_report, workflow_preflight_report,
     workflow_route_generate_error_report, workflow_route_preflight_report,
 };
 
@@ -236,6 +234,9 @@ pub(crate) struct AppState {
     pub(crate) next_id: Arc<AtomicU64>,
     /// Server-configured output directory written into every JobParams.out_dir.
     pub(crate) out_dir: PathBuf,
+    /// Read-only generation roots shown by the unified History inventory. The
+    /// active out_dir is always first; older run roots never receive writes.
+    history_roots: Arc<Vec<HistoryRoot>>,
     /// Prior jobs.db rows loaded ONCE at startup (history half of /v1/jobs).
     pub(crate) prior: Arc<Vec<[String; 6]>>,
     /// Current-session JobBook (live half of /v1/jobs + the serial queue), ordered by
@@ -248,6 +249,13 @@ pub(crate) struct AppState {
     /// Global ComfyUI event bus (see [`ComfyBus`]). `post_generate`/grid attach each
     /// new `JobChannel` to it; the canvas `/ws` socket subscribes to it.
     pub(crate) comfy_ws: ComfyBus,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryRoot {
+    id: String,
+    path: PathBuf,
+    active: bool,
 }
 
 // ── request body ────────────────────────────────────────────────────────────--
@@ -480,7 +488,25 @@ struct LocalArtifactManifest {
     specs: Vec<ArtifactSpec>,
 }
 
-fn repository_root_path() -> PathBuf {
+fn is_repository_root(path: &FsPath) -> bool {
+    path.join("serenity-server/crates/server").is_dir()
+        && path.join("serenity-server/canvas").is_dir()
+}
+
+pub(crate) fn repository_root_path() -> PathBuf {
+    if let Some(root) = std::env::var_os("SERENITY_REPO_ROOT").map(PathBuf::from) {
+        return root;
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if is_repository_root(&cwd) {
+            return cwd;
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(root) = executable.ancestors().find(|path| is_repository_root(path)) {
+            return root.to_path_buf();
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(FsPath::parent)
@@ -591,7 +617,7 @@ fn local_artifact_manifest(
         });
     }
 
-    if m.contains("chroma") {
+    if selected_family == Some(ModelFamily::Chroma) {
         // Chroma single-file DiT + live T5-XXL encode + flux VAE (paths from
         // serenitymojo/pipeline/chroma_pipeline_1024_multistep.mojo, consumed
         // by chroma_backend.mojo).
@@ -599,26 +625,35 @@ fn local_artifact_manifest(
         let transformer = format!("{root}/transformer");
         let text = repository_path("models/text-encoders");
         let vae = repository_path("models/vae/flux.safetensors");
-        let specs = vec![
-            artifact_file(
-                "chroma DiT shard index",
-                format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
-            ),
-            artifact_file(
-                "chroma DiT shard 1",
-                format!("{transformer}/diffusion_pytorch_model-00001-of-00002.safetensors"),
-            ),
-            artifact_file(
-                "chroma DiT shard 2",
-                format!("{transformer}/diffusion_pytorch_model-00002-of-00002.safetensors"),
-            ),
+        let mut specs = if selected_checkpoint.is_empty() {
+            vec![
+                artifact_file(
+                    "chroma DiT shard index",
+                    format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
+                ),
+                artifact_file(
+                    "chroma DiT shard 1",
+                    format!("{transformer}/diffusion_pytorch_model-00001-of-00002.safetensors"),
+                ),
+                artifact_file(
+                    "chroma DiT shard 2",
+                    format!("{transformer}/diffusion_pytorch_model-00002-of-00002.safetensors"),
+                ),
+            ]
+        } else {
+            vec![artifact_file(
+                "selected Chroma checkpoint",
+                selected_checkpoint.to_string(),
+            )]
+        };
+        specs.extend([
             artifact_file("T5-XXL weights", format!("{text}/t5xxl_fp16.safetensors")),
             artifact_file(
                 "T5 tokenizer json",
                 format!("{text}/t5xxl_fp16.tokenizer.json"),
             ),
             artifact_file("flux VAE", vae),
-        ];
+        ]);
         return Some(LocalArtifactManifest {
             profile: "chroma_1024",
             family: "chroma",
@@ -668,31 +703,39 @@ fn local_artifact_manifest(
         });
     }
 
-    if m.contains("qwen") && !m.contains("edit") {
+    if selected_family == Some(ModelFamily::QwenImage) && !m.contains("edit") {
         let root = repository_path("models/qwen-image");
         let transformer = format!("{root}/transformer");
         let text_encoder = format!("{root}/text_encoder");
         let tokenizer = format!("{root}/tokenizer");
         let vae = format!("{root}/vae");
-        let mut specs = vec![
-            artifact_file("model index", format!("{root}/model_index.json")),
-            artifact_file(
-                "scheduler config",
-                format!("{root}/scheduler/scheduler_config.json"),
-            ),
-            artifact_file("transformer config", format!("{transformer}/config.json")),
-            artifact_file(
-                "transformer shard index",
-                format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
-            ),
-        ];
-        push_safetensor_shards(
-            &mut specs,
-            "transformer",
-            &transformer,
-            "diffusion_pytorch_model",
-            9,
-        );
+        let mut specs = if selected_checkpoint.is_empty() {
+            let mut bundled = vec![
+                artifact_file("model index", format!("{root}/model_index.json")),
+                artifact_file(
+                    "scheduler config",
+                    format!("{root}/scheduler/scheduler_config.json"),
+                ),
+                artifact_file("transformer config", format!("{transformer}/config.json")),
+                artifact_file(
+                    "transformer shard index",
+                    format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
+                ),
+            ];
+            push_safetensor_shards(
+                &mut bundled,
+                "transformer",
+                &transformer,
+                "diffusion_pytorch_model",
+                9,
+            );
+            bundled
+        } else {
+            vec![artifact_file(
+                "selected Qwen Image checkpoint",
+                selected_checkpoint.to_string(),
+            )]
+        };
         specs.extend([
             artifact_file("text encoder config", format!("{text_encoder}/config.json")),
             artifact_file(
@@ -723,7 +766,7 @@ fn local_artifact_manifest(
         });
     }
 
-    if m.contains("zimage") || m.contains("z-image") || m.contains("z_image") {
+    if selected_family == Some(ModelFamily::ZImage) {
         let root = repository_path("models/zimage");
         let transformer = format!("{root}/transformer");
         let text_encoder = format!("{root}/text_encoder");
@@ -737,29 +780,37 @@ fn local_artifact_manifest(
             ),
             artifact_file("transformer config", format!("{transformer}/config.json")),
         ];
-        // The transformer dir holds EITHER a consolidated single safetensors OR
-        // the sharded index+2-shard layout (staging differs per machine; the
-        // Mojo loader handles both via ShardedSafeTensors.open). Require the
-        // layout that is actually present; fail-loud (shard layout demanded)
-        // when neither exists.
-        let consolidated = format!("{transformer}/diffusion_pytorch_model.safetensors");
-        if std::path::Path::new(&consolidated).exists() {
+        // An arbitrary compatible Z-Image finetune is an exact selected
+        // denoiser file.  Text encoder, tokenizer, and VAE remain the shared
+        // creator Base components.  With no selected path, preserve the
+        // bundled Diffusers-directory profile.
+        if !selected_checkpoint.is_empty() {
             specs.push(artifact_file(
-                "transformer weights (consolidated)",
-                consolidated,
+                "selected Z-Image checkpoint",
+                selected_checkpoint.to_string(),
             ));
         } else {
-            specs.push(artifact_file(
-                "transformer shard index",
-                format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
-            ));
-            push_safetensor_shards(
-                &mut specs,
-                "transformer",
-                &transformer,
-                "diffusion_pytorch_model",
-                2,
-            );
+            // The transformer dir holds EITHER a consolidated single
+            // safetensors OR the sharded index+2-shard layout.
+            let consolidated = format!("{transformer}/diffusion_pytorch_model.safetensors");
+            if std::path::Path::new(&consolidated).exists() {
+                specs.push(artifact_file(
+                    "transformer weights (consolidated)",
+                    consolidated,
+                ));
+            } else {
+                specs.push(artifact_file(
+                    "transformer shard index",
+                    format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
+                ));
+                push_safetensor_shards(
+                    &mut specs,
+                    "transformer",
+                    &transformer,
+                    "diffusion_pytorch_model",
+                    2,
+                );
+            }
         }
         specs.extend([
             artifact_file("text encoder config", format!("{text_encoder}/config.json")),
@@ -881,15 +932,23 @@ fn local_artifact_manifest(
         });
     }
 
-    if m.contains("anima") {
+    if selected_family == Some(ModelFamily::Anima) {
         let root = repository_path("models/anima");
         let text = repository_path("models/text-encoders");
-        let specs = vec![
-            artifact_dir("Anima root", root.clone()),
-            artifact_file(
-                "Anima DiT",
-                format!("{root}/split_files/diffusion_models/anima-base-v1.0.safetensors"),
-            ),
+        let mut specs = vec![artifact_dir("Anima root", root.clone())];
+        specs.push(artifact_file(
+            if selected_checkpoint.is_empty() {
+                "Anima DiT"
+            } else {
+                "selected Anima checkpoint"
+            },
+            if selected_checkpoint.is_empty() {
+                format!("{root}/split_files/diffusion_models/anima-base-v1.0.safetensors")
+            } else {
+                selected_checkpoint.to_string()
+            },
+        ));
+        specs.extend([
             artifact_file(
                 "Qwen3 text encoder",
                 format!("{root}/split_files/text_encoders/qwen_3_06b_base.safetensors"),
@@ -903,7 +962,7 @@ fn local_artifact_manifest(
                 repository_path("models/qwen-image/tokenizer/tokenizer.json"),
             ),
             artifact_file("T5 tokenizer", format!("{text}/t5xxl_fp16.tokenizer.json")),
-        ];
+        ]);
         return Some(LocalArtifactManifest {
             profile: "anima_1024",
             family: "anima",
@@ -913,13 +972,21 @@ fn local_artifact_manifest(
         });
     }
 
-    if m.contains("sd3") || m.contains("sd35") || m.contains("sd3.5") {
+    if selected_family == Some(ModelFamily::Sd3) {
         let root = repository_path("models/sd3.5");
         let text = repository_path("models/text-encoders");
         let specs = vec![
             artifact_file(
-                "SD3.5 Large checkpoint",
-                format!("{root}/transformer.safetensors"),
+                if selected_checkpoint.is_empty() {
+                    "SD3.5 Large checkpoint"
+                } else {
+                    "selected SD3.5 Large full checkpoint"
+                },
+                if selected_checkpoint.is_empty() {
+                    format!("{root}/transformer.safetensors")
+                } else {
+                    selected_checkpoint.to_string()
+                },
             ),
             artifact_file("CLIP-L weights", format!("{text}/clip_l.safetensors")),
             artifact_file("CLIP-G weights", format!("{text}/clip_g.safetensors")),
@@ -968,13 +1035,21 @@ fn local_artifact_manifest(
         });
     }
 
-    if m.contains("flux") {
+    if selected_family == Some(ModelFamily::Flux) {
         let root = repository_path("models/flux1-dev");
         let text = repository_path("models/text-encoders");
         let specs = vec![
             artifact_file(
-                "FLUX.1-dev checkpoint",
-                format!("{root}/transformer.safetensors"),
+                if selected_checkpoint.is_empty() {
+                    "FLUX.1-dev checkpoint"
+                } else {
+                    "selected FLUX.1 checkpoint"
+                },
+                if selected_checkpoint.is_empty() {
+                    format!("{root}/transformer.safetensors")
+                } else {
+                    selected_checkpoint.to_string()
+                },
             ),
             artifact_file("Flux VAE", repository_path("models/vae/flux.safetensors")),
             artifact_file("CLIP-L weights", format!("{text}/clip_l.safetensors")),
@@ -1182,94 +1257,13 @@ fn local_artifact_report(model: &str, selected_checkpoint: &str) -> serde_json::
     })
 }
 
-fn local_artifact_gate_error(report: &serde_json::Value, backend: &str) -> Option<String> {
-    if report.get("known_model").and_then(|v| v.as_bool()) != Some(true) {
-        return Some(format!(
-            "{backend}: no local artifact manifest is registered for this model"
-        ));
-    }
-    if report.get("ready").and_then(|v| v.as_bool()) == Some(true) {
-        return None;
-    }
-
-    let mut details = Vec::new();
-    if let Some(items) = report.get("missing").and_then(|v| v.as_array()) {
-        for item in items.iter().take(4) {
-            let label = item
-                .get("label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("artifact");
-            let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            details.push(format!("missing {label}: {path}"));
-        }
-    }
-    if let Some(items) = report.get("wrong_kind").and_then(|v| v.as_array()) {
-        for item in items.iter().take(2) {
-            let label = item
-                .get("label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("artifact");
-            let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            details.push(format!("wrong kind for {label}: {path}"));
-        }
-    }
-    if details.is_empty() {
-        details.push("local artifact check did not pass".to_string());
-    }
-    Some(format!("{backend}: {}", details.join("; ")))
-}
-
 fn validate_generate_runtime_ready(
     params: &JobParams,
-    hires_scale: f64,
+    _hires_scale: f64,
 ) -> Result<ModelFamily, String> {
-    let family = validate_generate_prequeue(params, hires_scale)?;
-    if !params.checkpoint_path.is_empty() {
-        let resolved = models::resolve_checkpoint(&params.model).ok_or_else(|| {
-            format!(
-                "{}: selected checkpoint is no longer present in the model registry: {}",
-                family.backend_key(),
-                params.model
-            )
-        })?;
-        let expected = capabilities::model_family_for_arch(&resolved.arch).ok_or_else(|| {
-            format!(
-                "{}: selected checkpoint architecture '{}' has no production runtime",
-                family.backend_key(),
-                resolved.arch
-            )
-        })?;
-        if expected != family {
-            return Err(format!(
-                "{}: selected checkpoint architecture '{}' routes to '{}', not '{}'",
-                family.backend_key(),
-                resolved.arch,
-                expected.backend_key(),
-                family.backend_key()
-            ));
-        }
-        match family {
-            ModelFamily::Krea2 if resolved.format != "diffusion_model" => {
-                return Err(format!(
-                    "krea2: unsupported selected checkpoint format '{}'; expected a Krea-2 diffusion-model safetensors",
-                    resolved.format
-                ));
-            }
-            ModelFamily::Sdxl
-                if resolved.format != "diffusion_model" && resolved.format != "full_checkpoint" =>
-            {
-                return Err(format!(
-                    "sdxl: unsupported selected checkpoint format '{}'; expected an SDXL UNet or full checkpoint safetensors",
-                    resolved.format
-                ));
-            }
-            _ => {}
-        }
-    }
-    validate_image_lora_registry(params, family)?;
-    let artifact_report = local_artifact_report(&params.model, &params.checkpoint_path);
-    if let Some(error) = local_artifact_gate_error(&artifact_report, family.backend_key()) {
-        return Err(error);
+    let family = model_family(&params.model)?;
+    if !has_text(&params.prompt) {
+        return Err("prompt is required".to_string());
     }
     Ok(family)
 }
@@ -1370,7 +1364,7 @@ fn generate_preflight_report(params: &JobParams, hires_scale: f64) -> serde_json
             "result_sidecar_suffix": ".serenity_server_result.json",
         },
         "same_gate_as_generate": true,
-        "production_gate": "validate_generate_prequeue",
+        "production_gate": "route_model_and_require_prompt",
         "request": {
             "width": params.width,
             "height": params.height,
@@ -1414,7 +1408,7 @@ pub(crate) fn generate_prequeue_error_report(
     report
 }
 
-pub(crate) fn validate_generate_prequeue_for_enqueue(
+pub(crate) fn validate_transport_for_enqueue(
     params: &JobParams,
     hires_scale: f64,
 ) -> Result<(), String> {
@@ -1440,11 +1434,13 @@ fn params_from_generate_request(
     let mut params = JobParams::default();
     params.job_id = job_id.to_string();
     params.model = req.model;
+    // The transport fallback is the product-wide 1024 square. Model workers own
+    // any narrower shape validation; the server must not reject a minimal
+    // {model, prompt} request because the wire struct happens to default to 512.
+    params.width = 1024;
+    params.height = 1024;
     if let Some(checkpoint) = models::resolve_checkpoint(&params.model) {
-        if matches!(
-            capabilities::model_family_for_arch(&checkpoint.arch),
-            Some(ModelFamily::Krea2 | ModelFamily::Sdxl)
-        ) {
+        if models::selected_checkpoint_scope_for_resolved(&checkpoint).is_some() {
             params.checkpoint_path = checkpoint.path.to_string_lossy().into_owned();
         }
     }
@@ -1742,12 +1738,7 @@ fn make_cli_config(
 fn default_out_dir() -> PathBuf {
     std::env::var_os("SERENITY_OUT_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../../output/run_serenity_ui"
-            ))
-        })
+        .unwrap_or_else(|| repository_root_path().join("output/run_serenity_ui"))
 }
 
 /// CLI: --worker <path> [--kind <name>] [--port 7801] [--out-dir DIR]
@@ -1757,10 +1748,7 @@ fn default_out_dir() -> PathBuf {
 /// The legacy monolith entry `serenity_daemon worker <kind> <fd>` is still
 /// available with `--daemon-worker-kind <kind>`.
 fn parse_args() -> CliConfig {
-    let mut worker = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../output/bin/serenity_worker_stub"
-    ));
+    let mut worker = repository_root_path().join("output/bin/serenity_worker_stub");
     let mut port: u16 = 7801;
     let mut out_dir = default_out_dir();
     let mut kind: Option<String> = None;
@@ -2271,6 +2259,12 @@ fn run_worker_driver(
                     dead.kill();
                 }
             }
+            JobOutcome::WorkerFailed => {
+                tracing::error!(%job_id, "worker reported failure; respawning lazily");
+                if let Some(mut failed) = handle.take() {
+                    failed.kill();
+                }
+            }
             JobOutcome::ChannelClosed => {
                 // All control senders dropped while driving: finish reaping & exit.
                 tracing::info!(%job_id, "control channel closed mid-job; shutting down");
@@ -2290,7 +2284,11 @@ fn spawn_and_handshake(
     pre_args: &[String],
 ) -> anyhow::Result<WorkerHandle> {
     let refs: Vec<&str> = pre_args.iter().map(String::as_str).collect();
-    let mut handle = spawn_worker(worker_bin, &refs)?;
+    let environment = [(
+        std::ffi::OsString::from("LD_LIBRARY_PATH"),
+        video::mojo_ld_path(),
+    )];
+    let mut handle = spawn_worker(worker_bin, &refs, &environment)?;
     let ready_deadline = Instant::now() + READY_TIMEOUT;
     loop {
         match handle.next_event_poll() {
@@ -2330,8 +2328,104 @@ enum JobOutcome {
     PeerClosed,
     /// A genuine IPC fault occurred; a synthetic Failed was published.
     IpcError,
+    /// The worker authored a terminal Failed event; its device state is unsafe
+    /// to reuse after a CUDA OOM or backend exception.
+    WorkerFailed,
     /// All control senders dropped mid-job (server shutdown).
     ChannelClosed,
+}
+
+#[derive(Default)]
+struct DenoiseDiskReadGate {
+    read_bytes_at_step_zero: Option<u64>,
+}
+
+impl DenoiseDiskReadGate {
+    fn observe(&mut self, handle: &WorkerHandle, event: &WorkerEvent) -> Result<(), String> {
+        let WorkerEvent::Progress {
+            step, total, phase, ..
+        } = event
+        else {
+            return Ok(());
+        };
+        if phase != "sampling" {
+            return Ok(());
+        }
+
+        let read_bytes = worker_read_bytes(handle.pid())?;
+        self.observe_sampling_progress(*step, *total, read_bytes, handle.pid())
+    }
+
+    fn observe_sampling_progress(
+        &mut self,
+        step: i64,
+        total: i64,
+        read_bytes: u64,
+        worker_pid: u32,
+    ) -> Result<(), String> {
+        if step == 0 {
+            // A backend may publish an early UI sampling phase and then a second,
+            // exact model-ready boundary. The latest step-0 event is authoritative.
+            self.read_bytes_at_step_zero = Some(read_bytes);
+            tracing::info!(
+                worker_pid,
+                read_bytes,
+                total,
+                "denoise disk-read gate armed"
+            );
+            return Ok(());
+        }
+
+        let Some(start) = self.read_bytes_at_step_zero else {
+            return Err(format!(
+                "hardware safety gate: sampling step {step}/{total} arrived without an exact step-0 boundary"
+            ));
+        };
+        if read_bytes != start {
+            return Err(format!(
+                "hardware safety gate: worker read {} physical bytes during denoise by step {step}/{total}; worker terminated",
+                read_bytes.saturating_sub(start)
+            ));
+        }
+        if step == total {
+            tracing::info!(
+                worker_pid,
+                steps = total,
+                read_bytes_delta = 0_u64,
+                "denoise disk-read gate passed"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_final_sampling_boundary(event: &WorkerEvent) -> bool {
+    matches!(
+        event,
+        WorkerEvent::Progress {
+            step,
+            total,
+            phase,
+            ..
+        } if phase == "sampling" && step == total
+    )
+}
+
+fn worker_read_bytes(pid: u32) -> Result<u64, String> {
+    let path = format!("/proc/{pid}/io");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("hardware safety gate: cannot read {path}: {error}"))?;
+    parse_proc_read_bytes(&contents)
+}
+
+fn parse_proc_read_bytes(contents: &str) -> Result<u64, String> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("read_bytes:"))
+        .ok_or_else(|| "hardware safety gate: /proc worker I/O has no read_bytes field".to_string())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("hardware safety gate: invalid read_bytes value: {error}"))
 }
 
 /// Poll one job to its terminal event, publishing every WorkerEvent to `channel`
@@ -2351,6 +2445,7 @@ fn drive_one_job(
     ctl: &std::sync::mpsc::Receiver<DriverCtl>,
     jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
 ) -> JobOutcome {
+    let mut denoise_io_gate = DenoiseDiskReadGate::default();
     loop {
         // 1. Service any pending control messages WITHOUT blocking.
         loop {
@@ -2386,11 +2481,35 @@ fn drive_one_job(
         // 2. Pump the worker.
         match handle.next_event_poll() {
             Ok(EventPoll::Event(ev)) => {
+                if let Err(error) = denoise_io_gate.observe(handle, &ev) {
+                    handle.kill();
+                    let failed = WorkerEvent::Failed { error };
+                    apply_event_to_record(jobs, job_id, &failed);
+                    channel.publish(failed);
+                    return JobOutcome::PeerClosed;
+                }
+                if is_final_sampling_boundary(&ev) {
+                    if let Err(error) = handle.send_sampling_ack() {
+                        let failed = WorkerEvent::Failed {
+                            error: format!(
+                                "worker sampling-boundary acknowledgement failed: {error:#}"
+                            ),
+                        };
+                        apply_event_to_record(jobs, job_id, &failed);
+                        channel.publish(failed);
+                        return JobOutcome::IpcError;
+                    }
+                }
+                let worker_failed = matches!(&ev, WorkerEvent::Failed { .. });
                 let terminal = ev.is_terminal();
                 apply_event_to_record(jobs, job_id, &ev);
                 channel.publish(ev);
                 if terminal {
-                    return JobOutcome::Terminal;
+                    return if worker_failed {
+                        JobOutcome::WorkerFailed
+                    } else {
+                        JobOutcome::Terminal
+                    };
                 }
             }
             Ok(EventPoll::Idle) => {
@@ -2425,6 +2544,7 @@ enum PassResult {
     Terminal,
     PeerClosed,
     IpcError,
+    WorkerFailed,
     ChannelClosed,
 }
 
@@ -2440,6 +2560,7 @@ fn drive_one_pass(
     jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
     publish_done: bool,
 ) -> PassResult {
+    let mut denoise_io_gate = DenoiseDiskReadGate::default();
     loop {
         loop {
             match ctl.try_recv() {
@@ -2466,6 +2587,25 @@ fn drive_one_pass(
         }
         match handle.next_event_poll() {
             Ok(EventPoll::Event(ev)) => {
+                if let Err(error) = denoise_io_gate.observe(handle, &ev) {
+                    handle.kill();
+                    let failed = WorkerEvent::Failed { error };
+                    apply_event_to_record(jobs, job_id, &failed);
+                    channel.publish(failed);
+                    return PassResult::PeerClosed;
+                }
+                if is_final_sampling_boundary(&ev) {
+                    if let Err(error) = handle.send_sampling_ack() {
+                        let failed = WorkerEvent::Failed {
+                            error: format!(
+                                "worker sampling-boundary acknowledgement failed: {error:#}"
+                            ),
+                        };
+                        apply_event_to_record(jobs, job_id, &failed);
+                        channel.publish(failed);
+                        return PassResult::IpcError;
+                    }
+                }
                 if let WorkerEvent::Done { output_path } = &ev {
                     let path = output_path.clone();
                     if publish_done {
@@ -2474,11 +2614,16 @@ fn drive_one_pass(
                     }
                     return PassResult::Done(path);
                 }
+                let worker_failed = matches!(&ev, WorkerEvent::Failed { .. });
                 let terminal = ev.is_terminal();
                 apply_event_to_record(jobs, job_id, &ev);
                 channel.publish(ev);
                 if terminal {
-                    return PassResult::Terminal;
+                    return if worker_failed {
+                        PassResult::WorkerFailed
+                    } else {
+                        PassResult::Terminal
+                    };
                 }
             }
             Ok(EventPoll::Idle) => std::thread::sleep(POLL_INTERVAL),
@@ -2521,6 +2666,7 @@ fn drive_hires_two_pass(
         PassResult::Terminal => return JobOutcome::Terminal,
         PassResult::PeerClosed => return JobOutcome::PeerClosed,
         PassResult::IpcError => return JobOutcome::IpcError,
+        PassResult::WorkerFailed => return JobOutcome::WorkerFailed,
         PassResult::ChannelClosed => return JobOutcome::ChannelClosed,
     };
 
@@ -2567,6 +2713,7 @@ fn drive_hires_two_pass(
         PassResult::Done(_) | PassResult::Terminal => JobOutcome::Terminal,
         PassResult::PeerClosed => JobOutcome::PeerClosed,
         PassResult::IpcError => JobOutcome::IpcError,
+        PassResult::WorkerFailed => JobOutcome::WorkerFailed,
         PassResult::ChannelClosed => JobOutcome::ChannelClosed,
     };
     // The upscaled init was only needed to seed the refine pass; drop it so it
@@ -2634,7 +2781,7 @@ fn attach_workflow_capability_metadata(report: &mut JsonValue, req: &JsonValue) 
     };
     map.insert(
         "production_gate".to_string(),
-        json!("workflow_lowering_then_validate_generate_prequeue"),
+        json!("workflow_lowering_then_route_model"),
     );
     map.insert("rejection_stage".to_string(), json!("workflow_capability"));
     if let Some(route) = req.get("workflow_route_kind") {
@@ -2679,20 +2826,6 @@ async fn post_preflight(
             )
                 .into_response();
         }
-    }
-    if let Err(error) = reject_disabled_raw_surfaces(&req_value) {
-        if has_workflow {
-            return (
-                StatusCode::OK,
-                Json(workflow_feature_preflight_report(error, &req_value)),
-            )
-                .into_response();
-        }
-        return (
-            StatusCode::OK,
-            Json(raw_surface_preflight_report(error, &req_value)),
-        )
-            .into_response();
     }
     if let Err(error) = normalize_ideogram4_prompt_json(&mut req_value) {
         return (
@@ -2791,20 +2924,6 @@ pub(crate) fn enqueue_generate(
             )
                 .into_response());
         }
-    }
-    if let Err(error) = reject_disabled_raw_surfaces(&req_value) {
-        if has_workflow {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(workflow_feature_generate_error_report(error, &req_value)),
-            )
-                .into_response());
-        }
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(raw_surface_generate_error_report(error, &req_value)),
-        )
-            .into_response());
     }
     if let Err(error) = normalize_ideogram4_prompt_json(&mut req_value) {
         return Err((
@@ -3072,10 +3191,9 @@ async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) ->
 /// history (incl. the terminal Done) replayed, because the entry is retained for a
 /// grace window past terminal.
 // ---- Serenity Studio static frontend + browser-fetchable result images ----
-// Serve the canvas belonging to the checkout this binary was built from. A
-// machine-specific absolute path silently served stale UI when the synchronized
-// synchronized worktree lived somewhere else.
-const CANVAS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../canvas");
+fn canvas_dir() -> PathBuf {
+    repository_root_path().join("serenity-server/canvas")
+}
 
 fn static_content_type(p: &std::path::Path) -> &'static str {
     match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
@@ -3122,7 +3240,381 @@ fn serve_static_file(base: &std::path::Path, rel: &str) -> Response {
     }
 }
 
-/// Fallback: serve the Konva frontend (index.html + js/css/lib) from CANVAS_DIR.
+fn is_history_media(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "mp4" | "webm"
+    )
+}
+
+fn generation_root_has_history(path: &std::path::Path) -> bool {
+    if path.join("jobs.db").is_file() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let candidate = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        candidate.is_dir() && name.starts_with("video-") && candidate.join("result.json").is_file()
+    })
+}
+
+fn configured_history_roots(active_out: &std::path::Path) -> Vec<HistoryRoot> {
+    let active = std::fs::canonicalize(active_out).unwrap_or_else(|_| active_out.to_path_buf());
+    let mut candidates = vec![active.clone()];
+
+    // Every direct sibling run with real generation artifacts belongs to the
+    // same local Serenity installation. Debug/check directories without a
+    // jobs database or final result manifest are deliberately excluded.
+    if let Some(parent) = active.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && generation_root_has_history(&path) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    if let Some(raw) = std::env::var_os("SERENITY_HISTORY_ROOTS") {
+        candidates.extend(std::env::split_paths(&raw));
+    }
+
+    // Optional machine-local migration roots persist across server launches
+    // without hard-coding a user's old checkout into the public application.
+    if let Some(home) = std::env::var_os("HOME") {
+        let config = PathBuf::from(home)
+            .join(".serenity")
+            .join("history_roots.json");
+        if let Ok(bytes) = std::fs::read(&config) {
+            if let Ok(document) = serde_json::from_slice::<JsonValue>(&bytes) {
+                let roots = document
+                    .get("roots")
+                    .and_then(JsonValue::as_array)
+                    .or_else(|| document.as_array());
+                if let Some(roots) = roots {
+                    candidates.extend(
+                        roots
+                            .iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(PathBuf::from),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for candidate in candidates {
+        let Ok(canonical) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if !canonical.is_dir() || !generation_root_has_history(&canonical) {
+            continue;
+        }
+        let identity = canonical.to_string_lossy().to_string();
+        if seen.insert(identity) {
+            paths.push(canonical);
+        }
+    }
+    paths.sort_by(|left, right| {
+        let left_active = left == &active;
+        let right_active = right == &active;
+        right_active.cmp(&left_active).then_with(|| left.cmp(right))
+    });
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| HistoryRoot {
+            id: format!("root-{index:03}"),
+            active: path == active,
+            path,
+        })
+        .collect()
+}
+
+fn read_json_file(path: &std::path::Path) -> JsonValue {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn modified_millis(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn history_url(root: &HistoryRoot, relative: &str) -> String {
+    if root.active {
+        format!("/out/{relative}")
+    } else {
+        format!("/history/{}/{relative}", root.id)
+    }
+}
+
+fn history_image_params(path: &std::path::Path) -> JsonValue {
+    // The PNG is the durable reuse contract. Older product roots may predate
+    // the Rust result sidecar while still carrying exact serenity.genparams.v1
+    // metadata, so use it before the optional server manifest.
+    let embedded = gallery::png_genparams_or_empty(&path.to_string_lossy());
+    if let Ok(params) = serde_json::from_str::<JsonValue>(&embedded) {
+        if params.as_object().is_some_and(|object| !object.is_empty()) {
+            return params;
+        }
+    }
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return json!({});
+    };
+    let sidecar = path.with_file_name(format!("{filename}.serenity_server_result.json"));
+    let document = read_json_file(&sidecar);
+    document
+        .get("request")
+        .or_else(|| document.pointer("/metadata/params"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn existing_video_artifact(dir: &std::path::Path, result: &JsonValue) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = result.get("artifact_path").and_then(JsonValue::as_str) {
+        candidates.push(path.to_string());
+    }
+    if let Some(path) = result.get("mp4_url").and_then(JsonValue::as_str) {
+        candidates.push(path.to_string());
+    }
+    if let Some(paths) = result.get("artifact_paths").and_then(JsonValue::as_array) {
+        candidates.extend(
+            paths
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string),
+        );
+    }
+    for candidate in candidates {
+        let Some(filename) = std::path::Path::new(&candidate).file_name() else {
+            continue;
+        };
+        let local = dir.join(filename);
+        if local.is_file() && is_history_media(&local) {
+            return Some(local);
+        }
+    }
+    None
+}
+
+fn history_video_params(dir: &std::path::Path, result: &JsonValue) -> JsonValue {
+    let mut params = read_json_file(&dir.join("request.json"));
+    if !params.is_object() {
+        params = json!({});
+    }
+    let Some(object) = params.as_object_mut() else {
+        return json!({});
+    };
+    if let Some(checkpoint) = object.get("checkpoint").cloned() {
+        object.insert("model".to_string(), checkpoint);
+    }
+    for (source, target) in [
+        ("frame_count", "frames"),
+        ("executed_sampler", "sampler"),
+        ("executed_scheduler", "scheduler"),
+        ("width", "width"),
+        ("height", "height"),
+        ("fps", "fps"),
+        ("steps", "steps"),
+        ("seed", "seed"),
+    ] {
+        if let Some(value) = result.get(source).cloned() {
+            object.insert(target.to_string(), value);
+        }
+    }
+    params
+}
+
+fn scan_history_root(root: &HistoryRoot) -> Vec<JsonValue> {
+    let Ok(entries) = std::fs::read_dir(&root.path) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_file()
+            && (name.starts_with("job-") || name.starts_with("grid-"))
+            && is_history_media(&path)
+        {
+            items.push(json!({
+                "id": format!("{}:{name}", root.id),
+                "url": history_url(root, &name),
+                "media_type": "image",
+                "timestamp": modified_millis(&path),
+                "params": history_image_params(&path),
+            }));
+            continue;
+        }
+        if !path.is_dir() || !name.starts_with("video-") {
+            continue;
+        }
+        let result_path = path.join("result.json");
+        if !result_path.is_file() {
+            continue;
+        }
+        let result = read_json_file(&result_path);
+        let Some(artifact) = existing_video_artifact(&path, &result) else {
+            continue;
+        };
+        let Some(filename) = artifact.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let relative = format!("{name}/{filename}");
+        items.push(json!({
+            "id": format!("{}:{relative}", root.id),
+            "url": history_url(root, &relative),
+            "media_type": "video",
+            "timestamp": modified_millis(&artifact),
+            "params": history_video_params(&path, &result),
+        }));
+    }
+    items
+}
+
+async fn get_history_artifacts(State(st): State<AppState>) -> Response {
+    let mut items = st
+        .history_roots
+        .iter()
+        .flat_map(scan_history_root)
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .get("timestamp")
+            .and_then(JsonValue::as_u64)
+            .cmp(&left.get("timestamp").and_then(JsonValue::as_u64))
+    });
+    let roots = st
+        .history_roots
+        .iter()
+        .map(|root| {
+            json!({
+                "id": root.id,
+                "path": root.path,
+                "active": root.active,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "schema": "serenity.history_artifacts.v1",
+        "count": items.len(),
+        "roots": roots,
+        "items": items,
+    }))
+    .into_response()
+}
+
+fn history_artifact_request_path(roots: &[HistoryRoot], id: &str, url: &str) -> Option<PathBuf> {
+    let (root_id, relative) = if let Some((root_id, relative)) = id.split_once(':') {
+        (root_id, relative)
+    } else if let Some(relative) = url.strip_prefix("/out/") {
+        let root = roots.iter().find(|root| root.active)?;
+        (root.id.as_str(), relative)
+    } else if let Some(history) = url.strip_prefix("/history/") {
+        history.split_once('/')?
+    } else {
+        return None;
+    };
+    let root = roots.iter().find(|root| root.id == root_id)?;
+    safe_history_media_path(root, relative)
+}
+
+async fn delete_history_artifact(State(st): State<AppState>, body: String) -> Response {
+    let request = serde_json::from_str::<JsonValue>(&body).unwrap_or_else(|_| json!({}));
+    let id = request.get("id").and_then(JsonValue::as_str).unwrap_or("");
+    let url = request.get("url").and_then(JsonValue::as_str).unwrap_or("");
+    let Some(path) = history_artifact_request_path(&st.history_roots, id, url) else {
+        return error_detail(
+            StatusCode::NOT_FOUND,
+            "history artifact not found in a configured generation root",
+        );
+    };
+    let display_path = path.to_string_lossy().into_owned();
+    if let Err(error) = std::fs::remove_file(&path) {
+        return error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("delete history artifact failed: {error}"),
+        );
+    }
+    if let (Some(root), Some(filename)) = (
+        st.history_roots
+            .iter()
+            .find(|root| path.starts_with(&root.path)),
+        path.file_name(),
+    ) {
+        let thumbnail = root.path.join("thumbs").join(filename);
+        if thumbnail.is_file() {
+            let _ = std::fs::remove_file(thumbnail);
+        }
+    }
+    json_compact(
+        StatusCode::OK,
+        &json!({
+            "schema": "serenity.history_delete.v1",
+            "id": id,
+            "url": url,
+            "path": display_path,
+            "deleted": true,
+        }),
+    )
+}
+
+fn safe_history_media_path(root: &HistoryRoot, relative: &str) -> Option<PathBuf> {
+    if relative.contains("..") || relative.contains('\\') {
+        return None;
+    }
+    let candidate = std::fs::canonicalize(root.path.join(relative)).ok()?;
+    if !candidate.starts_with(&root.path) || !candidate.is_file() || !is_history_media(&candidate) {
+        return None;
+    }
+    Some(candidate)
+}
+
+async fn serve_history_artifact(
+    State(st): State<AppState>,
+    axum::extract::Path((root_id, path)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(root) = st.history_roots.iter().find(|root| root.id == root_id) else {
+        return (StatusCode::NOT_FOUND, "history root not found").into_response();
+    };
+    let Some(file) = safe_history_media_path(root, &path) else {
+        return (StatusCode::NOT_FOUND, "history artifact not found").into_response();
+    };
+    match std::fs::read(&file) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, static_content_type(&file)),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "private, max-age=60",
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "history artifact not found").into_response(),
+    }
+}
+
+/// Fallback: serve the Konva frontend from the active runtime checkout.
 async fn serve_canvas(uri: axum::http::Uri) -> Response {
     let path = uri.path();
     let rel = if path == "/" || path.is_empty() {
@@ -3130,7 +3622,7 @@ async fn serve_canvas(uri: axum::http::Uri) -> Response {
     } else {
         path.trim_start_matches('/')
     };
-    serve_static_file(std::path::Path::new(CANVAS_DIR), rel)
+    serve_static_file(&canvas_dir(), rel)
 }
 
 /// Serve a result image (out_dir/<path>) so the browser can display it.
@@ -3342,6 +3834,129 @@ async fn post_canvas_sam3_prepare(State(st): State<AppState>) -> Response {
 //    also browser-fetchable at `/out/uploads/<name>.png` (served by serve_out), so
 //    the UI can preview the saved upload. No new crate dep: base64 is decoded with a
 //    small self-contained decoder (the codebase already hand-rolls crc32 in gallery).
+
+fn asset_media_type(name: &str) -> Option<&'static str> {
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") | Some("jpg") | Some("jpeg") | Some("webp") | Some("gif") => Some("image"),
+        Some("mp4") | Some("mov") | Some("webm") | Some("mkv") => Some("video"),
+        _ => None,
+    }
+}
+
+fn safe_asset_path(out_dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let requested = std::path::Path::new(name);
+    if name.is_empty()
+        || requested.file_name().and_then(|value| value.to_str()) != Some(name)
+        || asset_media_type(name).is_none()
+    {
+        return None;
+    }
+    Some(out_dir.join("uploads").join(name))
+}
+
+fn scan_assets(out_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let uploads = out_dir.join("uploads");
+    let mut assets = Vec::<(u128, String, serde_json::Value)>::new();
+    let Ok(entries) = std::fs::read_dir(&uploads) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(media_type) = asset_media_type(&name) else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let path = entry.path();
+        let (width, height) = if media_type == "image" {
+            image::image_dimensions(&path)
+                .map(|(width, height)| (Some(width), Some(height)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let item = json!({
+            "name": name,
+            "path": path.to_string_lossy(),
+            "url": format!("/out/uploads/{name}"),
+            "media_type": media_type,
+            "size": metadata.len(),
+            "modified_ms": modified_ms,
+            "width": width,
+            "height": height,
+        });
+        assets.push((modified_ms, name, item));
+    }
+    assets.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    assets.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// GET /v1/assets — persistent inventory of source media saved by the upload
+/// seams. Assets are separate from generated gallery results and survive a
+/// browser refresh because the server scans the real output uploads directory.
+async fn get_assets(State(st): State<AppState>) -> Response {
+    let assets = scan_assets(st.out_dir.as_path());
+    json_compact(
+        StatusCode::OK,
+        &json!({
+            "schema": "serenity.assets.v1",
+            "count": assets.len(),
+            "assets": assets,
+        }),
+    )
+}
+
+/// DELETE /v1/assets/:name — delete exactly one listed upload. Generated gallery
+/// outputs are outside the uploads directory and cannot be targeted here.
+async fn delete_asset(State(st): State<AppState>, Path(name): Path<String>) -> Response {
+    let Some(path) = safe_asset_path(st.out_dir.as_path(), &name) else {
+        return error_detail(StatusCode::BAD_REQUEST, "invalid asset name");
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return error_detail(StatusCode::BAD_REQUEST, "asset is not a regular file");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return error_detail(StatusCode::NOT_FOUND, "asset not found");
+        }
+        Err(_) => {
+            return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "cannot inspect asset");
+        }
+    };
+    if std::fs::remove_file(&path).is_err() {
+        return error_detail(StatusCode::INTERNAL_SERVER_ERROR, "cannot delete asset");
+    }
+    json_compact(
+        StatusCode::OK,
+        &json!({
+            "schema": "serenity.asset_delete.v1",
+            "deleted": true,
+            "name": name,
+            "bytes": metadata.len(),
+        }),
+    )
+}
 
 /// Decode standard base64 (RFC 4648, `+`/`/` alphabet) ignoring whitespace and a
 /// trailing `data:...;base64,` prefix. Returns None on an invalid character.
@@ -3930,6 +4545,27 @@ fn max_existing_output_id(out_dir: &FsPath) -> u64 {
 mod endpoint_tests {
     use super::*;
 
+    #[test]
+    fn denoise_disk_read_gate_fails_closed() {
+        let mut gate = DenoiseDiskReadGate::default();
+        assert!(gate.observe_sampling_progress(1, 8, 4096, 123).is_err());
+
+        gate.observe_sampling_progress(0, 8, 8192, 123).unwrap();
+        gate.observe_sampling_progress(1, 8, 8192, 123).unwrap();
+        gate.observe_sampling_progress(8, 8, 8192, 123).unwrap();
+        let error = gate
+            .observe_sampling_progress(8, 8, 12288, 123)
+            .unwrap_err();
+        assert!(error.contains("4096 physical bytes"));
+    }
+
+    #[test]
+    fn proc_io_read_bytes_parser_is_exact() {
+        let sample = "rchar: 99\nread_bytes: 4096\ncancelled_write_bytes: 0\n";
+        assert_eq!(parse_proc_read_bytes(sample).unwrap(), 4096);
+        assert!(parse_proc_read_bytes("rchar: 99\n").is_err());
+    }
+
     fn valid_t2i_params(model: &str) -> JobParams {
         let mut params = JobParams::default();
         params.model = model.to_string();
@@ -4129,7 +4765,7 @@ mod endpoint_tests {
         assert_eq!(params.prompt, prompt);
         assert_eq!(params.scheduler, "ideogram_logitnormal");
         assert_eq!(
-            validate_generate_prequeue(&params, hires_scale).unwrap(),
+            validate_generate_runtime_ready(&params, hires_scale).unwrap(),
             ModelFamily::Ideogram4
         );
     }
@@ -4201,155 +4837,8 @@ mod endpoint_tests {
         assert_eq!(params.lanpaint_prompt_mode, "Image First");
         assert_eq!(params.lanpaint_early_stop, 1);
         assert_eq!(
-            validate_generate_prequeue(&params, hires_scale).unwrap(),
+            validate_generate_runtime_ready(&params, hires_scale).unwrap(),
             ModelFamily::Krea2
-        );
-    }
-
-    #[test]
-    fn production_validator_admits_docs_verified_t2i_families() {
-        let cases = [
-            ("zimage", ModelFamily::ZImage),
-            ("qwen-image", ModelFamily::QwenImage),
-            ("ideogram4", ModelFamily::Ideogram4),
-            ("sdxl", ModelFamily::Sdxl),
-            ("sd_xl_base_1.0", ModelFamily::Sdxl),
-            ("anima", ModelFamily::Anima),
-            ("sd3.5-large", ModelFamily::Sd3),
-            ("flux1-dev", ModelFamily::Flux),
-            ("klein-9b", ModelFamily::Flux2),
-            ("klein-4b", ModelFamily::Flux2),
-            ("sensenova-u1", ModelFamily::Sensenova),
-            ("krea2", ModelFamily::Krea2),
-            ("chroma", ModelFamily::Chroma),
-        ];
-
-        for (model, family) in cases {
-            let mut params = valid_t2i_params(model);
-            if family != ModelFamily::Sensenova {
-                params.width = 1152;
-                params.height = 896;
-            }
-            assert_eq!(validate_generate_prequeue(&params, 1.0).unwrap(), family);
-        }
-    }
-
-    #[test]
-    fn production_validator_blocks_unadmitted_or_out_of_scope_features() {
-        let mut params = valid_t2i_params("flux2-dev");
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("generic Flux2 model names remain blocked")
-        );
-
-        params = valid_t2i_params("klein-9b");
-        params.width = 768;
-        params.height = 768;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-
-        params = valid_t2i_params("ideogram4");
-        params.prompt = "a plain text prompt".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("structured JSON caption")
-        );
-
-        params = valid_t2i_params("zimage");
-        params.width = 256;
-        params.height = 256;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-
-        params = valid_t2i_params("klein-9b");
-        params.width = 256;
-        params.height = 256;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-
-        params = valid_t2i_params("sensenova-u1");
-        params.width = 512;
-        params.height = 512;
-        assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
-            ModelFamily::Sensenova
-        );
-
-        params = valid_t2i_params("sensenova-u1");
-        params.width = 1536;
-        params.height = 1536;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-
-        params = valid_t2i_params("sensenova-u1");
-        params.negative = "low quality".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("negative prompt")
-        );
-
-        params = valid_t2i_params("klein-9b");
-        params.negative = "low quality".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("negative prompt")
-        );
-
-        params = valid_t2i_params("ideogram4");
-        params.width = 1280;
-        params.height = 768;
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted product shapes")
-        );
-
-        params = valid_t2i_params("qwen-image");
-        params
-            .loras
-            .push(LoraSpec::new("adapter.safetensors".to_string(), 1.0));
-        assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
-            ModelFamily::QwenImage
-        );
-
-        params = valid_t2i_params("sdxl");
-        params.init_image = "/tmp/init.png".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("admitted only for Z-Image")
-        );
-
-        params = valid_t2i_params("zimage");
-        params.vae = "sdxl_vae.safetensors".to_string();
-        assert!(
-            validate_generate_prequeue(&params, 1.0)
-                .unwrap_err()
-                .contains("VAE override")
-        );
-
-        params = valid_t2i_params("zimage");
-        assert!(
-            validate_generate_prequeue(&params, 2.0)
-                .unwrap_err()
-                .contains("hires two-pass")
         );
     }
 
@@ -4359,7 +4848,7 @@ mod endpoint_tests {
         params.out_dir = "/tmp/serenity_product_gallery".to_string();
         let report = generate_preflight_report(&params, 1.0);
         assert_eq!(report["schema"], "serenity.generate.preflight.v1");
-        assert_eq!(report["admitted"], report["artifact_profile"]["ready"]);
+        assert_eq!(report["admitted"], true);
         assert_eq!(report["same_gate_as_generate"], true);
         assert_eq!(report["backend"], "qwenimage");
         assert_eq!(report["output_root"]["root_kind"], "ui_workflow_gallery");
@@ -4381,11 +4870,7 @@ mod endpoint_tests {
             report["capability_profile"]["features"]["text_to_image"]["supported"],
             true
         );
-        if report["artifact_profile"]["ready"] == true {
-            assert_eq!(report["error"], "");
-        } else {
-            assert!(report["error"].as_str().unwrap_or("").contains("missing"));
-        }
+        assert_eq!(report["error"], "");
         assert_eq!(report["block_profile"]["block_count"], 60);
         assert_eq!(report["block_profile"]["tensor_count_hint"], 1920);
         assert_eq!(
@@ -4412,13 +4897,13 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn preflight_report_blocks_concrete_vae_override_before_enqueue() {
+    fn preflight_report_describes_vae_override_without_server_side_blocking() {
         let mut params = valid_t2i_params("zimage");
         params.width = 512;
         params.height = 512;
         params.vae = "OfficialStableDiffusion/sdxl_vae.safetensors".to_string();
         let report = generate_preflight_report(&params, 1.0);
-        assert_eq!(report["admitted"], false);
+        assert_eq!(report["admitted"], true);
         assert_eq!(report["capability_profile"]["backend"], "zimage");
         assert_eq!(
             report["capability_profile"]["features"]["vae_override"]["supported"],
@@ -4429,16 +4914,11 @@ mod endpoint_tests {
             report["request"]["vae"],
             "OfficialStableDiffusion/sdxl_vae.safetensors"
         );
-        assert!(
-            report["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("VAE override")
-        );
+        assert_eq!(report["error"], "");
 
         params.vae = "Automatic".to_string();
         assert_eq!(
-            validate_generate_prequeue(&params, 1.0).unwrap(),
+            validate_generate_runtime_ready(&params, 1.0).unwrap(),
             ModelFamily::ZImage
         );
     }
@@ -4496,7 +4976,7 @@ mod endpoint_tests {
     fn preflight_report_reflects_klein_artifact_readiness_and_keeps_local_block_profile() {
         let params = valid_t2i_params("klein-9b");
         let report = generate_preflight_report(&params, 1.0);
-        assert_eq!(report["admitted"], report["artifact_profile"]["ready"]);
+        assert_eq!(report["admitted"], true);
         assert_eq!(report["backend"], "flux2");
         assert_eq!(report["capability_profile"]["backend"], "flux2");
         assert_eq!(
@@ -4548,10 +5028,10 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn preflight_report_reflects_sensenova_artifact_readiness() {
+    fn preflight_report_exposes_sensenova_artifacts_without_blocking_transport() {
         let params = valid_t2i_params("sensenova-u1");
         let report = generate_preflight_report(&params, 1.0);
-        assert_eq!(report["admitted"], report["artifact_profile"]["ready"]);
+        assert_eq!(report["admitted"], true);
         assert_eq!(report["backend"], "sensenova");
         assert_eq!(report["capability_profile"]["backend"], "sensenova");
         assert_eq!(
@@ -4916,6 +5396,153 @@ mod endpoint_tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn asset_inventory_is_media_only_persistent_and_safe() {
+        let root =
+            std::env::temp_dir().join(format!("serenity-assets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("uploads/nested")).unwrap();
+        std::fs::write(root.join("uploads/source-0002.png"), b"not-an-image").unwrap();
+        std::fs::write(root.join("uploads/clip-0003.mp4"), b"not-a-video").unwrap();
+        std::fs::write(root.join("uploads/ignore-0004.txt"), b"not-media").unwrap();
+        std::fs::write(root.join("uploads/nested/hidden.png"), b"nested").unwrap();
+
+        let assets = scan_assets(&root);
+        let names = assets
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"source-0002.png"));
+        assert!(names.contains(&"clip-0003.mp4"));
+        assert_eq!(
+            assets
+                .iter()
+                .find(|item| item["name"] == "source-0002.png")
+                .unwrap()["media_type"],
+            "image"
+        );
+        assert!(safe_asset_path(&root, "source-0002.png").is_some());
+        assert!(safe_asset_path(&root, "../source-0002.png").is_none());
+        assert!(safe_asset_path(&root, "nested/hidden.png").is_none());
+        assert!(safe_asset_path(&root, "ignore-0004.txt").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_inventory_keeps_final_artifacts_and_skips_video_frames() {
+        let root =
+            std::env::temp_dir().join(format!("serenity-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("video-0042")).unwrap();
+        std::fs::write(root.join("job-0007.png"), b"image").unwrap();
+        std::fs::write(
+            root.join("job-0007.png.serenity_server_result.json"),
+            serde_json::to_vec(&json!({
+                "request": {
+                    "model": "krea2-turbo",
+                    "prompt": "history image",
+                    "seed": 7
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("video-0042/final.mp4"), b"video").unwrap();
+        std::fs::write(root.join("video-0042/refhq_frame000.png"), b"frame").unwrap();
+        std::fs::write(
+            root.join("video-0042/request.json"),
+            serde_json::to_vec(&json!({
+                "checkpoint": "ltx-2.3-22b-dev",
+                "prompt": "history video",
+                "width": 960,
+                "height": 544
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("video-0042/result.json"),
+            serde_json::to_vec(&json!({
+                "artifact_path": root.join("video-0042/final.mp4"),
+                "frame_count": 121,
+                "executed_sampler": "euler"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let history_root = HistoryRoot {
+            id: "root-000".to_string(),
+            path: canonical,
+            active: false,
+        };
+        let items = scan_history_root(&history_root);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| {
+            item["media_type"] == "image"
+                && item["params"]["prompt"] == "history image"
+                && item["url"] == "/history/root-000/job-0007.png"
+        }));
+        assert!(items.iter().any(|item| {
+            item["media_type"] == "video"
+                && item["params"]["model"] == "ltx-2.3-22b-dev"
+                && item["params"]["frames"] == 121
+                && item["url"] == "/history/root-000/video-0042/final.mp4"
+        }));
+        assert!(
+            safe_history_media_path(&history_root, "video-0042/final.mp4").is_some()
+        );
+        assert!(safe_history_media_path(&history_root, "../outside.mp4").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_roots_reject_benchmark_png_directories_without_a_jobs_database() {
+        let root = std::env::temp_dir().join(format!(
+            "serenity-history-root-filter-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("job-0001.png"), b"benchmark image").unwrap();
+        assert!(!generation_root_has_history(&root));
+        std::fs::write(root.join("jobs.db"), b"").unwrap();
+        assert!(generation_root_has_history(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_delete_resolution_accepts_inventory_ids_and_rejects_traversal() {
+        let root = std::env::temp_dir().join(format!(
+            "serenity-history-delete-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("job-0001.png"), b"image").unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let roots = vec![HistoryRoot {
+            id: "root-000".to_string(),
+            path: canonical.clone(),
+            active: true,
+        }];
+        assert_eq!(
+            history_artifact_request_path(&roots, "root-000:job-0001.png", ""),
+            Some(canonical.join("job-0001.png"))
+        );
+        assert_eq!(
+            history_artifact_request_path(&roots, "", "/out/job-0001.png"),
+            Some(canonical.join("job-0001.png"))
+        );
+        assert!(
+            history_artifact_request_path(&roots, "root-000:../job-0001.png", "")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[tokio::main]
@@ -4932,11 +5559,13 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| anyhow::anyhow!("create out_dir {}: {e}", out_dir.display()))?;
     let out_dir = std::fs::canonicalize(&out_dir).unwrap_or(out_dir);
+    let history_roots = Arc::new(configured_history_roots(&out_dir));
     models::set_extra_model_roots(settings::configured_extra_model_roots(&out_dir));
     tracing::info!(
         worker = %worker_bin.display(),
         port,
         out_dir = %out_dir.display(),
+        history_roots = history_roots.len(),
         "serenity-server starting"
     );
 
@@ -5004,6 +5633,7 @@ async fn main() -> anyhow::Result<()> {
         train: trainer::new_shared(),
         next_id,
         out_dir,
+        history_roots,
         prior,
         jobs: job_book,
         backend_name,
@@ -5037,6 +5667,8 @@ async fn main() -> anyhow::Result<()> {
             "/upload/media",
             post(post_upload_media).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
+        .route("/v1/assets", get(get_assets))
+        .route("/v1/assets/:name", axum::routing::delete(delete_asset))
         .route("/v1/models", get(models::get_models))
         .route("/v1/models/type", post(models::post_model_type_override))
         .route("/v1/llms", get(magic::get_llms))
@@ -5044,6 +5676,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/enhance_prompt", post(magic::post_enhance_prompt))
         .route("/v1/caption", post(caption::post_caption))
         .route("/v1/jobs", get(jobs::get_jobs))
+        .route(
+            "/v1/history/artifacts",
+            get(get_history_artifacts).delete(delete_history_artifact),
+        )
         .route("/v1/job/:id", get(jobs::get_job_one))
         .route("/v1/job/:id/result", get(result_manifest::get_job_result))
         .route("/v1/reorder", post(jobs::post_reorder))
@@ -5159,6 +5795,7 @@ async fn main() -> anyhow::Result<()> {
             get(settings::open_output_dir).post(settings::open_output_dir),
         )
         // --- Serenity Studio Konva frontend (static) + browser-fetchable result images ---
+        .route("/history/:root/*path", get(serve_history_artifact))
         .route("/out/*path", get(serve_out))
         .fallback(serve_canvas)
         .with_state(state);

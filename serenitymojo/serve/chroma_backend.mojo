@@ -8,7 +8,8 @@
 #   T5-XXL Unigram tokenizer (bit-exact vs HF, same tokenizer flux_backend
 #   uses) → T5-XXL hidden [1,512,4096] cond + uncond (LIVE per-job encode —
 #   Chroma is T5-ONLY, no CLIP) →
-#   Chroma DiT (19 double + 38 single blocks, BLOCK-STREAMED via BlockLoader;
+#   Chroma DiT (19 double + 38 single blocks staged from a complete pinned-host
+#   FP8 store; no checkpoint access during denoise;
 #   guidance via the distilled_guidance_layer approximator, NOT guidance_in) →
 #   real CFG: pred = uncond + cfg * (cond - uncond) + flow-match Euler update →
 #   FLUX VAE WHOLE-image decode (the pipeline's proven decode; ae.safetensors)
@@ -18,9 +19,9 @@
 # CFG: the negative prompt IS encoded and drives the uncond forward; params.cfg
 # is the CFG multiplier (publisher profile default 3.0).
 #
-# Residency model (16 GB GPU, Chroma1-HD ~17.8 GB BF16 on disk — must stream):
-#   * The Chroma DiT is NEVER fully resident: ChromaShared (approximator +
-#     x/context embedders + proj_out, small) + a TurboBlockLoader that streams
+# Residency model (16 GB GPU, Chroma1-HD ~17.8 GB BF16 on disk):
+#   * The Chroma DiT is host-resident: ChromaShared (approximator +
+#     x/context embedders + proj_out, small) + a complete FP8 host store that stages
 #     ONE block at a time with ASYNC DOUBLE-BUFFERING (pinned host store +
 #     two device slots + explicit copy stream: block i+1 DMA-stages while
 #     block i computes — replaces the naive synchronous BlockLoader that
@@ -46,7 +47,7 @@
 #     the result manifest (vae_decode_tile_grid).
 #
 # step() state machine: ENCODE (per-job, blocking — announced phase="encoding")
-#   → LOAD (ChromaShared + BlockLoader + rope, announced phase="loading")
+#   → LOAD (ChromaShared + complete host store + rope, announced phase="loading")
 #   → DENOISE×steps (one CFG step per tick: cond forward + uncond forward +
 #   CFG combine + Euler update) → DECODE (announced phase="decoding") → done.
 #   cancel() makes the next step() return cancelled and frees per-job tensors.
@@ -74,7 +75,8 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr
 from serenitymojo.image.png import _quantize, ValueRange
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
-from serenitymojo.offload.turbo_loader import TurboBlockLoader
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.offload.plan import OffloadConfig, build_chroma1_hd_block_plan
 
 from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
 from serenitymojo.models.chroma.chroma_lora_overlay import (
@@ -106,7 +108,7 @@ from serenitymojo.training.aspect_buckets import (
 )
 
 # The PROVEN Chroma pipeline math — imported, never re-derived. Its helpers run
-# the approximator + 19 double + 38 single blocks (BlockLoader-streamed) plus
+# the approximator + 19 double + 38 single blocks plus
 # norm_out/proj_out; the shape helpers are the same 2x2 patch pack.
 from serenitymojo.pipeline.chroma_pipeline_1024_multistep import (
     ChromaShared, _pack_latent_shape, _unpack_latent_shape, _clone,
@@ -206,16 +208,14 @@ def _save_rgb_png_with_text(
 # BYTE-IDENTICAL math to chroma_pipeline_1024_multistep._chroma_forward: the
 # same imported _approximator_forward / _double_block / _single_block calls, in
 # the same order, with the same mod-slice offsets and the same norm_out/proj_out
-# tail. ONLY the weight staging changes: the naive synchronous BlockLoader
-# (madvise prefetch + blocking H2D per block — GPU idle during every transfer;
-# measured 4.78 s/step) is replaced by TurboBlockLoader's async double-buffered
-# rotation: block i+1 is DMA-staged from the pinned host store on the explicit
+# tail. ONLY the weight staging changes: block i+1 is DMA-staged from the
+# complete FP8 host-resident store on the explicit
 # copy stream WHILE block i computes on the default stream (await_block fences
-# via DeviceEvent; mark_active_slot_compute_done lets the copy stream reuse a
+# via DeviceEvent; mark_active_block_done lets the copy stream reuse a
 # slot only after the block's kernels are queued).
 def _chroma_forward_turbo[N_IMG_: Int](
     shared: ChromaShared,
-    mut loader: TurboBlockLoader,
+    mut loader: TurboPlannedLoader,
     img_packed: Tensor,
     txt: Tensor,
     timestep: Float32,
@@ -226,7 +226,8 @@ def _chroma_forward_turbo[N_IMG_: Int](
     ctx: DeviceContext,
 ) raises -> Tensor:
     # Stage block 0 first: its DMA overlaps the approximator + embedder compute.
-    loader.prefetch(String("transformer_blocks.0"), ctx)
+    loader.set_config(OffloadConfig.synchronous_single())
+    loader.prefetch_with_ctx(0, ctx)
 
     # 1. Approximator: build per-step modulation table [1, 344, 3072]
     var approx_in = _build_approximator_input(timestep, ctx)
@@ -249,12 +250,8 @@ def _chroma_forward_turbo[N_IMG_: Int](
     # 3. Double blocks (19) — await this block's slot, immediately stage the
     #    NEXT block into the idle slot, then queue this block's compute.
     for i in range(N_DBL):
-        var prefix = String("transformer_blocks.") + String(i)
-        var block = loader.await_block(prefix, ctx)
-        if i + 1 < N_DBL:
-            loader.prefetch(String("transformer_blocks.") + String(i + 1), ctx)
-        else:
-            loader.prefetch(String("single_transformer_blocks.0"), ctx)
+        var handle = loader.await_block(i, ctx)
+        loader.prefetch_next_with_ctx(i, ctx)
 
         # Slice mod params: img [114+6i : 114+6i+6], txt [228+6i : 228+6i+6]
         var img_mod_s = slice(pooled_temb, 1, MOD_DBL_IMG_OFF + 6 * i, 6, ctx)
@@ -262,29 +259,29 @@ def _chroma_forward_turbo[N_IMG_: Int](
 
         var res = _double_block_shape[N_IMG_](
             i, img, x_txt, img_mod_s, txt_mod_s, rope_cos, rope_sin,
-            real_txt_len, block, ctx, lora,
+            real_txt_len, handle.block, ctx, lora,
         )
         img = _clone(res[0], ctx)
         x_txt = _clone(res[1], ctx)
-        loader.mark_active_slot_compute_done(ctx)
+        loader.mark_active_block_done(ctx)
 
     # 4. Concat [txt | img] -> [1, S, HIDDEN] for single blocks
     var x = concat(1, ctx, x_txt, img)
 
     # 5. Single blocks (38) — same await → prefetch-next → compute rotation.
     for i in range(N_SGL):
-        var prefix = String("single_transformer_blocks.") + String(i)
-        var block = loader.await_block(prefix, ctx)
-        if i + 1 < N_SGL:
-            loader.prefetch(String("single_transformer_blocks.") + String(i + 1), ctx)
+        var plan_idx = N_DBL + i
+        var handle = loader.await_block(plan_idx, ctx)
+        loader.prefetch_next_with_ctx(plan_idx, ctx)
 
         # Slice mod params: [3*i : 3*i+3]
         var sgl_mod_s = slice(pooled_temb, 1, MOD_SGL_OFF + 3 * i, 3, ctx)
 
         x = _single_block_shape[N_IMG_](
-            i, x, sgl_mod_s, rope_cos, rope_sin, real_txt_len, block, ctx, lora,
+            i, x, sgl_mod_s, rope_cos, rope_sin, real_txt_len,
+            handle.block, ctx, lora,
         )
-        loader.mark_active_slot_compute_done(ctx)
+        loader.mark_active_block_done(ctx)
 
     # 6. Extract img portion, apply norm_out + proj_out (identical to pipeline)
     var img_out = slice(x, 1, N_TXT, N_IMG_, ctx)
@@ -303,13 +300,13 @@ def _chroma_forward_turbo[N_IMG_: Int](
 struct ChromaBackend(GenBackend, Movable):
     var ctx: DeviceContext
 
-    # ── DiT handles (loaded in the LOAD phase, freed before VAE decode) ──
-    # ArcPointer wrappers: ChromaShared / BlockLoader / Tensor are
+    # ── DiT handles (GPU state freed before VAE; host store kept warm) ─────
+    # ArcPointer wrappers: ChromaShared / TurboPlannedLoader / Tensor are
     # Movable-not-Copyable and List[T] requires T: Copyable — Arc is Copyable
     # (refcount), so List[Arc[..]] holds the 0/1.
     var loaded: Bool
     var shared: List[ArcPointer[ChromaShared]]   # 0/1 (approximator+embedders)
-    var loader: List[ArcPointer[TurboBlockLoader]]  # 0/1 (async block-stream handle)
+    var loader: List[ArcPointer[TurboPlannedLoader]]  # 0/1 complete host store
     var rope_cos: List[ArcPointer[Tensor]]       # 0/1
     var rope_sin: List[ArcPointer[Tensor]]       # 0/1
     var lora: List[ArcPointer[ChromaLoraOverlay]]  # 0/1 additive runtime overlay
@@ -350,7 +347,7 @@ struct ChromaBackend(GenBackend, Movable):
         self.ctx = DeviceContext()
         self.loaded = False
         self.shared = List[ArcPointer[ChromaShared]]()
-        self.loader = List[ArcPointer[TurboBlockLoader]]()
+        self.loader = List[ArcPointer[TurboPlannedLoader]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.lora = List[ArcPointer[ChromaLoraOverlay]]()
@@ -503,10 +500,10 @@ struct ChromaBackend(GenBackend, Movable):
         self.cancel_flag = True
 
     def between_jobs_trim(mut self) raises:
-        """Reclaim the per-job transient peak (T5-XXL encoder ~9.5 GB, streamed
+        """Reclaim the per-job transient peak (T5-XXL encoder ~9.5 GB, staged
         DiT blocks, the VAE decoder, 1024² forward + decode activations) back to
-        the OS via cuMemPoolTrimTo. Nothing stays resident between chroma jobs
-        (the DiT handles are freed before decode), so this reclaims it all."""
+        the OS via cuMemPoolTrimTo. The host denoiser store survives; GPU state
+        is released before decode."""
         var before = cu_mem_get_info()
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
@@ -593,7 +590,7 @@ struct ChromaBackend(GenBackend, Movable):
         content += String('    "artifact_paths":["') + json_escape(png_path) + String('","') + json_escape(manifest_path) + String('"]\n')
         content += String("  },\n")
         content += String('  "output_png":"') + json_escape(png_path) + String('",\n')
-        content += String('  "note":"Rust-server Mojo worker product-path result; Chroma1-HD uses live per-job T5-XXL encode, block-streamed DiT with distilled-guidance approximator, and real CFG. Speed parity remains unaccepted until paired baseline evidence exists."\n')
+        content += String('  "note":"Rust-server Mojo worker product-path result; Chroma1-HD uses live per-job T5-XXL encode, a complete host-resident FP8 DiT store with RAM-to-GPU staging, distilled-guidance approximator, and real CFG. Speed parity remains unaccepted until paired baseline evidence exists."\n')
         content += String("}\n")
         write_text_file(manifest_path, content)
         return manifest_path
@@ -627,12 +624,10 @@ struct ChromaBackend(GenBackend, Movable):
         self.t5_uncond.append(ArcPointer(_clone(caps.uncond, self.ctx)))
 
     def _free_dit(mut self):
-        """Drop the ChromaShared weights + BlockLoader handle + rope tables and
-        reset the residency flag (so the next LOAD reloads)."""
+        """Drop GPU shared weights and RoPE while preserving the host store."""
         if self.loaded:
-            print("[chroma] releasing Chroma shared weights + turbo loader + rope before VAE decode")
+            print("[chroma] releasing shared weights + rope; preserving host denoiser store")
         self.shared = List[ArcPointer[ChromaShared]]()
-        self.loader = List[ArcPointer[TurboBlockLoader]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.lora = List[ArcPointer[ChromaLoraOverlay]]()
@@ -640,9 +635,8 @@ struct ChromaBackend(GenBackend, Movable):
 
     def _load_model_shape[LH_: Int, LW_: Int, N_IMG_: Int](mut self) raises:
         """Load the Chroma shared weights (approximator + embedders + proj_out),
-        open the BlockLoader stream handle, and build the rope tables — exactly
-        the pipeline's Stage 2/3/4. The DiT blocks themselves are NEVER fully
-        resident: _chroma_forward streams them one at a time (16 GB card)."""
+        build the complete FP8 host store, and build the rope tables. Every DiT
+        block is host-resident before the first denoise step."""
         if self.loaded:
             return
         _print_vram("before Chroma shared-weight load")
@@ -669,15 +663,24 @@ struct ChromaBackend(GenBackend, Movable):
         print("[chroma] loading Chroma1-HD shared weights from", CHROMA_CKPT)
         self.shared = List[ArcPointer[ChromaShared]]()
         self.shared.append(ArcPointer(ChromaShared.load(String(CHROMA_CKPT), self.ctx)))
-        # TurboBlockLoader: async double-buffered block streaming (pinned host
-        # store populated once here; per-block prefetch is then pure async DMA
-        # on the copy stream, overlapped with compute — replaces the naive
-        # synchronous BlockLoader that idled the GPU on every transfer).
-        self.loader = List[ArcPointer[TurboBlockLoader]]()
-        # fill_block_store=False: bounded 2-slot pinned staging (the ~17.8 GiB
-        # persistent host store is the qwen-freeze class; see qwenimage_dit.mojo).
-        self.loader.append(ArcPointer(TurboBlockLoader.open_with_copy_mode(
-            String(CHROMA_CKPT), self.ctx, False, fill_block_store=False)))
+        # Complete FP8 host-resident store: every block is copied once before
+        # step 0, then staged from RAM. The raw ~17.8 GiB pinned store is avoided.
+        if len(self.loader) == 0:
+            var plan = build_chroma1_hd_block_plan()
+            var loader = TurboPlannedLoader.open(
+                String(CHROMA_CKPT), plan^, OffloadConfig.synchronous_single(), self.ctx,
+                fill_block_store=False,
+            )
+            var host_blocks = loader.pin_residents_fp8_host(1 << 60, self.ctx)
+            loader.require_all_blocks_memory_resident()
+            loader.release_checkpoint_pages()
+            loader.discard_unused_raw_streaming_slots(self.ctx)
+            loader.set_fp8h_overlap(True)
+            print("[chroma] host-resident denoiser blocks:", host_blocks, "/57")
+            self.loader.append(ArcPointer(loader^))
+        else:
+            self.loader[0][].require_all_blocks_memory_resident()
+            print("[chroma] reusing complete host-resident denoiser store: 57/57")
         # RoPE tables — the pipeline's Stage 4 (same for all steps).
         var rope = build_flux1_rope_tables[N_IMG_, N_TXT, HEADS, HEAD_DIM](
             LH_ // 2, LW_ // 2, self.ctx, STDtype.BF16
@@ -755,7 +758,7 @@ struct ChromaBackend(GenBackend, Movable):
         var t_next = self.sched[i + 1]
         var dt = t_next - t_curr  # negative (descending schedule)
 
-        # Conditioned forward (turbo-streamed; math identical to _chroma_forward)
+        # Conditioned forward (host-resident; math identical to _chroma_forward)
         var pred_cond = _chroma_forward_turbo[N_IMG_](
             self.shared[0][], self.loader[0][], self.latent[0][],
             self.t5_cond[0][], t_curr, self.rope_cos[0][], self.rope_sin[0][],
@@ -832,8 +835,10 @@ struct ChromaBackend(GenBackend, Movable):
         self.latent = List[ArcPointer[Tensor]]()
         self.dpmpp_history_final_len = self.dpmpp_history.len()
         self.dpmpp_history = MultistepHistory(1)
-        self._free_dit()
         self.ctx.synchronize()
+        if len(self.loader) == 1:
+            self.loader[0][].discard_fp8h_device_staging()
+        self._free_dit()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
         _print_vram("after DiT release before VAE")
@@ -948,6 +953,7 @@ struct ChromaBackend(GenBackend, Movable):
                 self._record_vram()
                 self.phase = CPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == CPHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -956,6 +962,7 @@ struct ChromaBackend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.runtime_steps:
                     self.phase = CPHASE_DECODE
                 return r^

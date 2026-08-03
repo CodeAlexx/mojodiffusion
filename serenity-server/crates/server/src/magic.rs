@@ -18,12 +18,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 
 fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("repository root")
-        .to_path_buf()
+    crate::repository_root_path()
 }
 
 fn llm_root() -> PathBuf {

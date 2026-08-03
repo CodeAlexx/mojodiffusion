@@ -442,10 +442,6 @@ pub(crate) fn output_location_for_root(output_path: &str, output_root: Option<&P
     })
 }
 
-pub(crate) fn result_document_for_output(job_id: &str, output_path: &str) -> Value {
-    result_document_for_output_with_root(job_id, output_path, None)
-}
-
 pub(crate) fn result_document_for_output_with_root(
     job_id: &str,
     output_path: &str,
@@ -941,7 +937,7 @@ mod tests {
         let server_path = server_result_manifest_path(&output);
         fs::write(&server_path, b"not json").unwrap();
 
-        let doc = result_document_for_output("job-0103", &output);
+        let doc = result_document_for_output_with_root("job-0103", &output, None);
         assert_eq!(doc["server_result"].is_null(), true);
         assert!(
             doc["server_result_error"]

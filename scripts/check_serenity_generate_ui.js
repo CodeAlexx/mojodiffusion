@@ -357,7 +357,6 @@ async function run() {
       });
       videoBodies.length = 0;
       videoStatusPolls = 0;
-      await page.evaluate(() => localStorage.removeItem("sf-gallery"));
       await page.reload({ waitUntil: "networkidle" });
       await page.locator('.nav-btn[data-tab="generate"]').click();
       await page.waitForFunction(() =>
@@ -465,7 +464,6 @@ async function run() {
         seed: 42,
         sampler: "uni_pc_bh2",
         scheduler: "sgm_uniform",
-        noiseScheduler: "sgm_uniform",
         loras: [],
       });
       const sampler = Object.values(graph).find((node) =>
@@ -624,11 +622,11 @@ async function run() {
     }));
     assert(videoUi.sectionVisible && videoUi.conditioningVisible, "LTX2 video controls did not open");
     assert(
-      videoUi.width === 512 && videoUi.height === 768 && videoUi.frames === 121 && videoUi.fps === 25,
+      videoUi.width === 960 && videoUi.height === 512 && videoUi.frames === 121 && videoUi.fps === 24,
       `LTX2 UI did not use the published compiled profile: ${JSON.stringify(videoUi)}`
     );
     assert(
-      videoUi.sampler === "euler" && videoUi.scheduler === "ltx2_distilled" && videoUi.output === "MP4",
+      videoUi.sampler === "res2s" && videoUi.scheduler === "ltx2" && videoUi.output === "MP4",
       `LTX2 sampling/output profile drifted: ${JSON.stringify(videoUi)}`
     );
     assert(
@@ -757,6 +755,7 @@ async function run() {
     );
     await page.locator("#gen-prompt").fill("Playwright LTX2 request");
     await page.locator("#gen-neg-prompt").fill("watermark");
+    await page.locator("#gen-camera-motion").selectOption("dolly_left");
     await page.locator("#gen-video-conditioning-header").click();
     await page.locator("#gen-btn").click();
     await page.waitForFunction(() => {
@@ -784,6 +783,10 @@ async function run() {
       `video request did not preserve the published profile: ${JSON.stringify(videoBodies[0])}`
     );
     assert(
+      videoBodies[0].camera_motion === "dolly_left",
+      `LTX2 Camera Motion did not reach the direct video request: ${JSON.stringify(videoBodies[0])}`
+    );
+    assert(
       Array.isArray(videoBodies[0].lora) &&
         videoBodies[0].lora.length === 1 &&
         videoBodies[0].lora[0].name === eriLoraName &&
@@ -796,6 +799,10 @@ async function run() {
       videoBodies[0].post_upscale.factor === 2,
       `LTX2 post-upscale did not reach the video request: ${JSON.stringify(videoBodies[0])}`
     );
+    await page.waitForFunction(() => {
+      const video = document.querySelector("#gen-preview-video");
+      return video && video.readyState >= 2 && !video.paused;
+    });
     const videoPlayback = await page.evaluate(() => {
       const video = document.querySelector("#gen-preview-video");
       return {
@@ -812,10 +819,17 @@ async function run() {
     assert(videoPlayback.controls && videoPlayback.muted, "video preview is not configured for reliable playback");
     assert(videoPlayback.readyState >= 2 && !videoPlayback.paused, `video did not play: ${JSON.stringify(videoPlayback)}`);
     assert(videoPlayback.batchVideos === 1, "video result is missing from Current Batch");
-    const historyVideosBeforeLateEvent = await page.locator("#gen-gallery-grid .gen-thumb-video").count();
+    // The product server may already have real videos in History. Assert the
+    // completed fixture's identity/deduplication, not an empty-gallery precondition.
+    const historyVideosBeforeLateEvent = await page.locator(
+      '#gen-gallery-grid .gen-thumb-video video[src*="1784913017255-ltx2_t2v_hq.mp4"]'
+    ).count();
+    const historyVideoTotalBeforeLateEvent = await page.locator(
+      "#gen-gallery-grid .gen-thumb-video"
+    ).count();
     assert(
-      historyVideosBeforeLateEvent === 0,
-      `Current Batch movie was also duplicated in History: ${historyVideosBeforeLateEvent}`
+      historyVideosBeforeLateEvent === 1,
+      `Completed movie was not represented exactly once in History: ${historyVideosBeforeLateEvent}`
     );
     const previewBeforeUnownedEvent = await page.evaluate(() => ({
       videoDisplay: getComputedStyle(document.querySelector("#gen-preview-video")).display,
@@ -861,8 +875,8 @@ async function run() {
     await page.waitForTimeout(500);
     const historyVideosAfterLateEvent = await page.locator("#gen-gallery-grid .gen-thumb-video").count();
     assert(
-      historyVideosAfterLateEvent === 0,
-      `late WebSocket completion duplicated the LTX2 movie: ${historyVideosAfterLateEvent}`
+      historyVideosAfterLateEvent === historyVideoTotalBeforeLateEvent,
+      `late WebSocket completion changed History: before=${historyVideoTotalBeforeLateEvent} after=${historyVideosAfterLateEvent}`
     );
 
     await page.locator("#gen-prompt").fill("mutated after render");
@@ -876,6 +890,7 @@ async function run() {
       fps: Number(document.querySelector("#gen-fps").value),
       postUpscaler: GenerateTab.state.postUpscaler,
       postUpscaleFactor: GenerateTab.state.postUpscaleFactor,
+      cameraMotion: GenerateTab.state.cameraMotion,
     }));
     assert(
       reused.prompt === "Playwright LTX2 request" &&
@@ -883,7 +898,8 @@ async function run() {
       reused.caps === "" &&
       reused.frames === 193 && reused.fps === 24 &&
       reused.postUpscaler === "realesrgan-x4plus" &&
-      reused.postUpscaleFactor === 2,
+      reused.postUpscaleFactor === 2 &&
+      reused.cameraMotion === "dolly_left",
       `Reuse parameters did not restore the full request: ${JSON.stringify(reused)}`
     );
     fs.mkdirSync(path.join(process.cwd(), "output", "checks"), { recursive: true });
@@ -935,35 +951,35 @@ async function run() {
     await page.locator(".gen-workspace-parameters").screenshot({
       path: path.join(process.cwd(), "output", "checks", "serenity_generate_full_parameters_2026-07-24.png"),
     });
-    await page.evaluate(() => {
-      localStorage.setItem("sf-gallery", JSON.stringify([
-        {
-          src: "/view?filename=ltx2_t2v_hq.mp4&subfolder=video-restore-probe&type=output",
-          isVideo: true,
-          prompt: "",
-          timestamp: 2,
-        },
-        {
-          src: "/out/video-restore-probe/ltx2_t2v_hq.mp4",
-          isVideo: true,
-          prompt: "metadata-bearing copy",
-          params: { prompt: "metadata-bearing copy", model: "ltx-2.3-22b-dev-fp8" },
-          timestamp: 1,
-        },
-      ]));
+    await page.route("**/v1/history/artifacts", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          schema: "serenity.history_artifacts.v1",
+          items: [{
+            id: "root-000:video-restore-probe/ltx2_t2v_hq.mp4",
+            url: "/out/video-restore-probe/ltx2_t2v_hq.mp4",
+            media_type: "video",
+            timestamp: 2,
+            params: {
+              prompt: "metadata-bearing copy",
+              model: "ltx-2.3-22b-dev-fp8",
+            },
+          }],
+        }),
+      });
     });
     await page.reload({ waitUntil: "networkidle" });
     await page.waitForFunction(() => window.GenerateTab && GenerateTab.state.gallery.length > 0);
     const restoredVideoDedup = await page.evaluate(() => ({
       count: GenerateTab.state.gallery.filter((item) => item.isVideo).length,
       prompt: GenerateTab.state.gallery[0] && GenerateTab.state.gallery[0].prompt,
-      persistedCount: JSON.parse(localStorage.getItem("sf-gallery") || "[]").length,
     }));
     assert(
       restoredVideoDedup.count === 1 &&
-      restoredVideoDedup.persistedCount === 1 &&
       restoredVideoDedup.prompt === "metadata-bearing copy",
-      `persisted LTX2 duplicate cleanup failed: ${JSON.stringify(restoredVideoDedup)}`
+      `server history identity failed: ${JSON.stringify(restoredVideoDedup)}`
     );
     const shortPage = await browser.newPage({ viewport: { width: 1920, height: 576 } });
     const shortErrors = [];
@@ -1013,6 +1029,7 @@ async function run() {
       `stage=${shortBefore.stage.height}->${shortStageAfterLibraryRaise.height}`
     );
     await shortPage.locator("#gen-prompt-resizer").dblclick();
+    await shortPage.locator("#gen-library-resizer").dblclick();
     const shortExpanded = await shortPage.locator(".gen-workspace-stage").boundingBox();
     assert(
       shortExpanded.height > shortBefore.stage.height + 70,

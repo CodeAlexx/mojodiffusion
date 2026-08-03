@@ -66,6 +66,10 @@ from serenitymojo.training.progress_display import (
     print_sample_setup, print_sample_step, print_sample_saved,
 )
 from serenitymojo.io.ffi import BytePtr
+from serenitymojo.serve.proc_ipc import (
+    prefault_self_executable, prefault_mapped_shared_libraries,
+    wait_sampling_ack,
+)
 
 comptime TArc = ArcPointer[Tensor]
 comptime SAMPLE_SCREEN_EVERY = 5
@@ -105,6 +109,8 @@ def _emit_server_progress(progress_fd: Int32, step: Int, total: Int) raises:
         + String(",\"phase\":\"sampling\",\"preview\":\"\"}")
     )
     _write_progress_msg(progress_fd, line)
+    if step == total:
+        wait_sampling_ack(progress_fd)
 
 
 # Klein rope host tables [S*H*(Dh//2)] — the layout klein_stack_lora_forward
@@ -305,9 +311,48 @@ def _reference_latent_tokens[N_IMG: Int, LH: Int, LW: Int](
     return reshape_owned(nhwc^, out_sh^)
 
 
-# ── STAGE 2: denoise on a freshly-loaded base stack + LIVE LoRA. The stack is
-# local here, so its weights FREE on return (before the VAE loads).
-def _denoise_lora_from_initial[
+def build_klein_memory_resident_loader(
+    cfg: TrainConfig, ctx: DeviceContext
+) raises -> TurboPlannedLoader:
+    """Build one complete pre-step-0 host store for the selected checkpoint.
+
+    Serenity's 9B FP8 export uses E4M3 weights with scalar `_scale` sidecars;
+    BF16 checkpoints use TurboBlockLoader's complete pinned raw store. Both
+    branches fail closed unless every block is resident before returning."""
+    var header = SafeTensors.open(cfg.checkpoint)
+    var scalar_fp8 = header.has_tensor(String("img_in.weight_scale"))
+    var plan = build_klein_block_plan(cfg.num_double, cfg.num_single)
+    var loader = TurboPlannedLoader.open(
+        cfg.checkpoint,
+        plan^,
+        OffloadConfig.synchronous_cfg_paired(),
+        ctx,
+        fill_block_store=not scalar_fp8,
+    )
+    if scalar_fp8:
+        var pinned = loader.pin_residents_fp8_host_raw(1 << 60, ctx)
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        loader.discard_unused_raw_streaming_slots(ctx)
+        loader.set_fp8h_overlap(True)
+        print(
+            "[Klein-sample] Serenity scalar-FP8 host store:", pinned, "/",
+            cfg.n_layers(), "blocks"
+        )
+    else:
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        print(
+            "[Klein-sample] BF16 pinned host store:", cfg.n_layers(), "/",
+            cfg.n_layers(), "blocks"
+        )
+    return loader^
+
+
+# ── STAGE 2: denoise with a complete memory-resident block loader + LIVE LoRA.
+# Shared/base GPU weights are local and free on return before the VAE loads; the
+# caller may retain `loader` across jobs without retaining those GPU allocations.
+def _denoise_lora_from_initial_with_loader[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
 ](
     cfg: TrainConfig,
@@ -318,6 +363,7 @@ def _denoise_lora_from_initial[
     num_steps: Int,
     var x: Tensor,              # [N_IMG, in_ch] initial latent/noise tokens
     ctx: DeviceContext,
+    mut loader: TurboPlannedLoader,
     lora_multiplier: Float32 = Float32(1.0),
     progress_fd: Int32 = Int32(-1),
     feed_bf16: Bool = True,
@@ -331,10 +377,7 @@ def _denoise_lora_from_initial[
     var seed_vec_silu = build_klein_vec_silu(st, seed_ts, cfg.timestep_dim, cfg.d_model, ctx)
     var base = load_klein_stack_base(st, seed_vec_silu, cfg.d_model, ctx)
     var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)
-    var plan = build_klein_block_plan(cfg.num_double, cfg.num_single)
-    var loader = TurboPlannedLoader.open(
-        cfg.checkpoint, plan^, OffloadConfig.synchronous_cfg_paired(), ctx
-    )
+    loader.require_all_blocks_memory_resident()
 
     # LIVE LoRA adapters (PEFT load), NOT merged into the base weights.
     var lora: KleinLoraSet
@@ -361,6 +404,50 @@ def _denoise_lora_from_initial[
     # per streamed block, so one scratch frame covers both branches for a step.
     var scratch = ScratchRingAllocator(ctx, 512 * 1024 * 1024, 2)
     print_sample_setup(String("Klein-sample"), cfg.name, num_steps, cfg_scale, N_IMG, cfg.n_layers())
+
+    # The first DiT forward activates lazy CUDA/cuDNN kernels and ComputeCache
+    # entries. Run it without advancing `x` or the schedule, before step 0.
+    scratch.reset()
+    var warm_sigma = sigmas[0]
+    var warm_mods = build_klein_step_mods_device_cached(
+        mod_weights, warm_sigma, cfg.timestep_dim, cfg.d_model, ctx
+    )
+    base.final_shift = warm_mods[3].copy()
+    base.final_scale = warm_mods[4].copy()
+    var warm_x = cast_tensor(x, STDtype.BF16, ctx) if feed_bf16 else x.clone(ctx)
+    if cfg_scale == Float32(1.0):
+        var warm_v = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            TArc(warm_x^), txt_tokens_t, base,
+            loader, lora_dev, warm_mods[0].copy(), warm_mods[1].copy(),
+            warm_mods[2].copy(), cos_dev, sin_dev,
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx, scratch,
+        )
+        _ = warm_v^
+    else:
+        var warm_preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            TArc(warm_x^), txt_tokens_t, neg_tokens_t, base,
+            loader, lora_dev, warm_mods[0].copy(), warm_mods[1].copy(),
+            warm_mods[2].copy(), cos_dev, sin_dev,
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx, scratch,
+        )
+        var warm_cfg = flux2_cfg(warm_preds.pos, warm_preds.neg, cfg_scale, ctx)
+        _ = warm_cfg^
+    ctx.synchronize()
+    scratch.reset()
+    print("[Klein-sample] pre-step-0 denoiser kernel warm-up complete")
+    print("[Klein-sample] prefaulted worker image bytes=", prefault_self_executable())
+    print(
+        "[Klein-sample] prefaulted mapped shared-library bytes=",
+        prefault_mapped_shared_libraries(),
+    )
+    if progress_fd >= 0:
+        _emit_server_progress(progress_fd, 0, num_steps)
 
     for i in range(num_steps):
         scratch.reset()
@@ -417,6 +504,30 @@ def _denoise_lora_from_initial[
     return x.clone(ctx)
 
 
+def _denoise_lora_from_initial[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    var x: Tensor,
+    ctx: DeviceContext,
+    lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
+    feed_bf16: Bool = True,
+) raises -> Tensor:
+    var loader = build_klein_memory_resident_loader(cfg, ctx)
+    return _denoise_lora_from_initial_with_loader[
+        H, Dh, N_IMG, N_TXT, S, LH, LW
+    ](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
+        loader, lora_multiplier, progress_fd, feed_bf16,
+    )
+
+
 def _denoise_lora[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
 ](
@@ -435,6 +546,30 @@ def _denoise_lora[
     return _denoise_lora_from_initial[H, Dh, N_IMG, N_TXT, S, LH, LW](
         cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
         lora_multiplier, progress_fd,
+    )
+
+
+def _denoise_lora_with_loader[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    seed: UInt64,
+    ctx: DeviceContext,
+    mut loader: TurboPlannedLoader,
+    lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
+) raises -> Tensor:
+    var x = _initial_noise_tokens[N_IMG, LH, LW](cfg.in_channels, seed, ctx)
+    return _denoise_lora_from_initial_with_loader[
+        H, Dh, N_IMG, N_TXT, S, LH, LW
+    ](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
+        loader, lora_multiplier, progress_fd,
     )
 
 
@@ -465,10 +600,7 @@ def _denoise_lora_reference_from_initial[
     var seed_vec_silu = build_klein_vec_silu(st, seed_ts, cfg.timestep_dim, cfg.d_model, ctx)
     var base = load_klein_stack_base(st, seed_vec_silu, cfg.d_model, ctx)
     var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)
-    var plan = build_klein_block_plan(cfg.num_double, cfg.num_single)
-    var loader = TurboPlannedLoader.open(
-        cfg.checkpoint, plan^, OffloadConfig.synchronous_cfg_paired(), ctx
-    )
+    var loader = build_klein_memory_resident_loader(cfg, ctx)
 
     var lora: KleinLoraSet
     if lora_path == String(""):
@@ -556,6 +688,32 @@ def _denoise_lora_reference_from_initial[
     return x.clone(ctx)
 
 
+def _decode_klein_latent[LH: Int, LW: Int](
+    cfg: TrainConfig,
+    latent: Tensor,
+    out_png: String,
+    ctx: DeviceContext,
+    allow_child_decode: Bool,
+) raises -> Tensor:
+    """Decode/save after all per-job DiT GPU state has left scope."""
+    var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
+    var img: Tensor
+    if allow_child_decode:
+        try:
+            img = klein_decode_whole_subprocess(packed, cfg.vae, LH, LW, ctx)
+            print("[klein] whole-image VAE decode via child process (no tiling)")
+        except e:
+            print("[klein] whole-image child decode unavailable (", e,
+                  ") → tiled VAE decode")
+            img = klein_tiled_decode[LH, LW](packed, cfg.vae, ctx)
+    else:
+        img = klein_tiled_decode[LH, LW](packed, cfg.vae, ctx)
+    if out_png != String(""):
+        save_image(img, out_png, ctx)
+        print_sample_saved(String("Klein-sample"), out_png)
+    return img^
+
+
 # ── PUBLIC: sample one Klein image, staged (stack freed before VAE). ──────────
 def klein_sample[
     N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int, H: Int, Dh: Int
@@ -586,37 +744,53 @@ def klein_sample[
         lora_multiplier, progress_fd,
     )
 
-    # STAGE 3 — VAE decode (loaded only now that the DiT stack is gone).
-    # TILED decode: the monolithic KleinVaeDecoder[LH,LW].decode of the 1024²
-    # packed latent peaks past 24 GB IN-PROCESS (MEASURED: all steps run, then
-    # CUDA_OUT_OF_MEMORY at decode, peak ~22 GB — dominated by the just-freed
-    # stack pool the allocator retains). klein_tiled_decode loads a half-size
-    # KleinVaeDecoder[LH//2,LW//2] and decodes 3x3 overlapping packed quadrants at
-    # latent stride TILE/2, feathered-blended (flux2-family packed precedent:
-    # flux_tiled_decode). Same [1,3,16*LH,16*LW] output, fits 24 GB — but tiling
-    # measurably degrades output (MJ-1054).
-    #
-    # allow_child_decode (worker-only, default OFF): try the WHOLE decode in a
-    # fork+execv child with its own clean pool FIRST (klein_decode_whole_subprocess
-    # trims the retained stack pool, then decodes the whole latent), falling back to
-    # the tiled path on guard-fail or child failure. CLI/validation callers leave it
-    # OFF and keep the tiled path (no fork from a non-worker binary).
-    var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
-    var img: Tensor
-    if allow_child_decode:
-        try:
-            img = klein_decode_whole_subprocess(packed, cfg.vae, LH, LW, ctx)
-            print("[klein] whole-image VAE decode via child process (no tiling)")
-        except e:
-            print("[klein] whole-image child decode unavailable (", e,
-                  ") → tiled VAE decode")
-            img = klein_tiled_decode[LH, LW](packed, cfg.vae, ctx)
-    else:
-        img = klein_tiled_decode[LH, LW](packed, cfg.vae, ctx)
-    if out_png != String(""):
-        save_image(img, out_png, ctx)
-        print_sample_saved(String("Klein-sample"), out_png)
-    return img^
+    return _decode_klein_latent[LH, LW](
+        cfg, latent, out_png, ctx, allow_child_decode
+    )
+
+
+def klein_sample_with_loader[
+    N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int, H: Int, Dh: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    seed: UInt64,
+    out_png: String,
+    ctx: DeviceContext,
+    mut loader: TurboPlannedLoader,
+    lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
+    allow_child_decode: Bool = False,
+) raises -> Tensor:
+    """Product sampler using a backend-owned complete host block store."""
+    if cfg.n_heads != H:
+        raise Error(
+            String("klein_sample_with_loader: cfg.n_heads ") + String(cfg.n_heads)
+            + " != comptime H " + String(H)
+        )
+    if cfg.head_dim != Dh:
+        raise Error(
+            String("klein_sample_with_loader: cfg.head_dim ") + String(cfg.head_dim)
+            + " != comptime Dh " + String(Dh)
+        )
+    loader.require_all_blocks_memory_resident()
+    var latent = _denoise_lora_with_loader[
+        H, Dh, N_IMG, N_TXT, S, LH, LW
+    ](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, ctx,
+        loader, lora_multiplier, progress_fd,
+    )
+    # Retain every host-resident block for the next job, but release the two
+    # transient GPU staging slabs before VAE decode.
+    ctx.synchronize()
+    loader.discard_fp8h_device_staging()
+    return _decode_klein_latent[LH, LW](
+        cfg, latent, out_png, ctx, allow_child_decode
+    )
 
 
 # Explicit parity/debug entry for SerenityTrainer trajectory replay. `initial_noise`

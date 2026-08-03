@@ -458,4 +458,3 @@ var CanvasVideo = (function () {
         getFrameData: getFrameData,
     };
 })();
-//# sourceMappingURL=canvas-video.js.map

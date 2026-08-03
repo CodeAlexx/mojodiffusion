@@ -13,9 +13,9 @@
 #     wrapper, 512-token pad with PAD_ID=151643, encode_klein stacked layers
 #     [8,17,26] -> [1,512,joint]). The only difference: the embedding lands in a
 #     device Tensor instead of a cap-cache .bin file.
-#   * Klein denoise + VAE + save — sampling/klein_sampler.klein_sample[...], the
-#     EXACT comptime-specialized entry klein_sample_cli.mojo dispatches (Euler
-#     flow-match, live LoRA, TurboPlannedLoader block offload, KleinVaeDecoder).
+#   * Klein denoise + VAE + save — sampling/klein_sampler's shared denoise/decode
+#     math with a backend-owned TurboPlannedLoader (Euler flow-match, live LoRA,
+#     memory-resident blocks, KleinVaeDecoder).
 #   * Model arch + paths — read_model_config(klein9b.json | klein4b.json) ->
 #     TrainConfig (the single source of truth, same as the staged CLI).
 #
@@ -27,12 +27,10 @@
 #     each for 9B) survive into the SAMPLE tick — so the encoder and the Klein
 #     DiT do not intentionally co-reside, exactly like the SDXL/Qwen-Image
 #     backends free their encoders before the denoiser loads.
-#   * klein_sample itself is STAGED internally: it loads the base stack + LoRA,
-#     denoises, FREES the stack (RAII on return from _denoise_lora) BEFORE the
-#     KleinVaeDecoder loads. Nothing is left resident across jobs here (the DiT
-#     is block-streamed from disk each job via TurboPlannedLoader), so
-#     resident_model() reports "" and between_jobs_trim is a no-op — there is no
-#     persistent device handle to trim.
+#   * The selected checkpoint's complete block store stays in pinned host RAM
+#     across jobs. Per-job base/LoRA GPU weights free before VAE decode, and the
+#     two transient block-staging GPU slabs are explicitly discarded. This keeps
+#     repeat jobs warm without retaining a full DiT in VRAM during decode.
 #
 # step() state machine (pull-based announce ticks; the sampler loop emits
 # machine-readable progress events for every denoise step over the worker IPC fd):
@@ -72,9 +70,11 @@ from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.ops.tensor_algebra import concat, reshape
 from serenitymojo.sampling.klein_sampler import (
-    klein_sample, klein_sample_with_reference_latent,
+    build_klein_memory_resident_loader, klein_sample_with_loader,
+    klein_sample_with_reference_latent,
     klein_sample_with_reference_latents2,
 )
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.models.vae.klein_encoder import KleinVaeEncoder
 from serenitymojo.training.aspect_buckets import (
     DEFAULT_ASPECT_LADDER_LEN, DEFAULT_ASPECT_LADDER_X100,
@@ -104,6 +104,10 @@ comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
 comptime KLEIN9B_CONFIG = "serenitymojo/configs/klein9b.json"
 comptime KLEIN4B_CONFIG = "serenitymojo/configs/klein4b.json"
+comptime KLEIN9B_SERENITY_FP8 = (
+    "/home/alex/.serenity/models/checkpoints/"
+    "flux-2-klein-base-9b_fp8_e4m3fn.safetensors"
+)
 comptime QWEN4_DIR = "models/qwen3-4b"
 comptime QWEN8_DIR = "models/qwen3-8b"
 comptime PAD_ID = 151643
@@ -344,6 +348,18 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     # pos/neg are [N_TXT, joint] (already reshaped for klein_sample).
     var pos_txt: List[ArcPointer[Tensor]]    # 0/1
     var neg_txt: List[ArcPointer[Tensor]]    # 0/1
+    # One exact conditioning entry, matching the existing Z-Image policy.
+    # It is tiny (~25 MiB for Klein 9B) and avoids reloading Qwen3 when only
+    # seed, steps, guidance, or sampler controls change.
+    var cap_cache_variant: String
+    var cap_cache_prompt: String
+    var cap_cache_negative: String
+    var cap_cache_pos: List[ArcPointer[Tensor]]
+    var cap_cache_neg: List[ArcPointer[Tensor]]
+    # Complete block store survives VAE decode and repeat jobs. GPU staging is
+    # discarded before each decode; only pinned host bytes remain resident.
+    var loader: List[ArcPointer[TurboPlannedLoader]]
+    var loader_checkpoint: String
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
@@ -366,6 +382,13 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.progress_fd = Int32(-1)
         self.pos_txt = List[ArcPointer[Tensor]]()
         self.neg_txt = List[ArcPointer[Tensor]]()
+        self.cap_cache_variant = String("")
+        self.cap_cache_prompt = String("")
+        self.cap_cache_negative = String("")
+        self.cap_cache_pos = List[ArcPointer[Tensor]]()
+        self.cap_cache_neg = List[ArcPointer[Tensor]]()
+        self.loader = List[ArcPointer[TurboPlannedLoader]]()
+        self.loader_checkpoint = String("")
 
     def backend_name(self) -> String:
         return String("klein")
@@ -376,9 +399,8 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         return String("flux2-klein")
 
     def resident_model(self) -> String:
-        # Nothing stays resident across jobs: the DiT is block-streamed from disk
-        # each job and freed before the VAE; the encoder is freed per job. So no
-        # persistent checkpoint is "loaded" between jobs.
+        if len(self.loader) == 1:
+            return self.loader_checkpoint.copy()
         return String("")
 
     def set_progress_fd(mut self, fd: Int32):
@@ -472,6 +494,17 @@ struct KleinRuntimeBackend(GenBackend, Movable):
 
         # Read the model config (arch + paths) and validate the required files.
         var loaded_cfg = read_model_config(self.config_path)
+        # The product selection owns the checkpoint. For 9B, default to the
+        # installed Serenity scalar-FP8 artifact instead of the config's legacy
+        # BF16 training path when an explicit path was not supplied.
+        var selected_checkpoint = params.checkpoint_path.copy()
+        if self.variant == String("9b"):
+            # The current UI's "Klein 9B Base" preset still resolves the 18.16 GB
+            # BF16 file. Product inference deliberately uses the installed
+            # 9.28 GB Serenity FP8 counterpart; training configs remain untouched.
+            selected_checkpoint = String(KLEIN9B_SERENITY_FP8)
+        if selected_checkpoint.byte_length() > 0:
+            loaded_cfg.checkpoint = selected_checkpoint.copy()
         _require_file(String("checkpoint"), loaded_cfg.checkpoint)
         _require_file(String("VAE"), loaded_cfg.vae)
         # Sanity: the config head/dim must match the variant comptime specializations.
@@ -490,6 +523,16 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 String("klein_runtime: 4b config n_heads ") + String(loaded_cfg.n_heads)
                 + " != " + String(H_4B)
             )
+
+        if (
+            len(self.loader) == 1
+            and self.loader_checkpoint != loaded_cfg.checkpoint
+        ):
+            print(
+                "[klein_runtime] selected checkpoint changed; dropping old host store"
+            )
+            self.loader = List[ArcPointer[TurboPlannedLoader]]()
+            self.loader_checkpoint = String("")
 
         self.lora_path = _klein_lora_path(params)
         self.lora_multiplier = (
@@ -526,9 +569,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.cancel_flag = True
 
     def between_jobs_trim(mut self) raises:
-        """No persistent device handle survives a job (encoder freed per job; DiT
-        block-streamed + freed before the VAE). Trim the mempool anyway to return
-        the per-job transient peak to the OS, mirroring the other workers."""
+        """Return per-job GPU allocations while retaining the host block store."""
         var before = cu_mem_get_info()
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
@@ -545,6 +586,22 @@ struct KleinRuntimeBackend(GenBackend, Movable):
             self.total_vram_bytes = mem.total_bytes
         if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
             self.min_free_bytes = mem.free_bytes
+
+    def _ensure_loader(mut self) raises:
+        if len(self.loader) == 1:
+            self.loader[0][].require_all_blocks_memory_resident()
+            print(
+                "[klein_runtime] reusing complete host store for",
+                self.loader_checkpoint,
+            )
+            return
+        print(
+            "[klein_runtime] building complete host store from",
+            self.cfg[0][].checkpoint,
+        )
+        var built = build_klein_memory_resident_loader(self.cfg[0][], self.ctx)
+        self.loader.append(ArcPointer(built^))
+        self.loader_checkpoint = self.cfg[0][].checkpoint.copy()
 
     def _clear_job(mut self):
         self.active = False
@@ -568,6 +625,22 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         land in device Tensors (kept in ArcPointers), not cap-cache .bin files."""
         var t0 = perf_counter_ns()
         self._record_vram()
+        if (
+            len(self.cap_cache_pos) == 1
+            and len(self.cap_cache_neg) == 1
+            and self.cap_cache_variant == self.variant
+            and self.cap_cache_prompt == self.params.prompt
+            and self.cap_cache_negative == self.params.negative
+        ):
+            self.pos_txt = List[ArcPointer[Tensor]]()
+            self.neg_txt = List[ArcPointer[Tensor]]()
+            self.pos_txt.append(ArcPointer(self.cap_cache_pos[0][].clone(self.ctx)))
+            self.neg_txt.append(ArcPointer(self.cap_cache_neg[0][].clone(self.ctx)))
+            self.ctx.synchronize()
+            self.encode_seconds = Float64(perf_counter_ns() - t0) / 1.0e9
+            self._record_vram()
+            print("[klein_runtime] conditioning cache HIT")
+            return
         var joint = self.cfg[0][].joint_attention_dim
         # Encode INTO the ArcPointer slots directly: _encode_text_pair loads the
         # Qwen3 encoder, encodes pos+neg, appends the [N_TXT, joint] embeddings, and
@@ -581,6 +654,13 @@ struct KleinRuntimeBackend(GenBackend, Movable):
             self.variant, self.params.prompt, self.params.negative, joint, self.ctx,
             self.pos_txt, self.neg_txt,
         )
+        self.cap_cache_pos = List[ArcPointer[Tensor]]()
+        self.cap_cache_neg = List[ArcPointer[Tensor]]()
+        self.cap_cache_pos.append(ArcPointer(self.pos_txt[0][].clone(self.ctx)))
+        self.cap_cache_neg.append(ArcPointer(self.neg_txt[0][].clone(self.ctx)))
+        self.cap_cache_variant = self.variant.copy()
+        self.cap_cache_prompt = self.params.prompt.copy()
+        self.cap_cache_negative = self.params.negative.copy()
 
         var before = cu_mem_get_info()
         self.ctx.synchronize()
@@ -634,7 +714,14 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
         content += String('    "lora_path":"') + json_escape(self.lora_path) + String('",\n')
         content += String('    "lora_weight":') + String(self.lora_multiplier) + String(",\n")
-        content += String('    "dtype":"bf16_klein_runtime"\n')
+        content += String('    "checkpoint_path":"') + json_escape(self.cfg[0][].checkpoint) + String('",\n')
+        content += String('    "dtype":"')
+        content += (
+            String("serenity_fp8_e4m3_scalar_to_bf16")
+            if _lower(self.cfg[0][].checkpoint).find("fp8") >= 0
+            else String("bf16_klein_runtime")
+        )
+        content += String('"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
         content += String('    "text_encode_seconds":') + String(self.encode_seconds) + String(",\n")
@@ -682,17 +769,24 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         mut self, pos: Tensor, neg: Tensor, cfg_scale: Float32,
         steps: Int, seed: UInt64,
     ) raises:
+        self._ensure_loader()
         if self.variant == String("9b"):
-            var _img = klein_sample[N_IMG_, N_TXT, S_, LH_, LW_, H_9B, Dh](
+            var _img = klein_sample_with_loader[
+                N_IMG_, N_TXT, S_, LH_, LW_, H_9B, Dh
+            ](
                 self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
+                seed, self.out_png, self.ctx, self.loader[0][],
+                progress_fd=self.progress_fd,
                 allow_child_decode=True,
                 lora_multiplier=self.lora_multiplier,
             )
         else:
-            var _img = klein_sample[N_IMG_, N_TXT, S_, LH_, LW_, H_4B, Dh](
+            var _img = klein_sample_with_loader[
+                N_IMG_, N_TXT, S_, LH_, LW_, H_4B, Dh
+            ](
                 self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
+                seed, self.out_png, self.ctx, self.loader[0][],
+                progress_fd=self.progress_fd,
                 allow_child_decode=True,
                 lora_multiplier=self.lora_multiplier,
             )
@@ -787,17 +881,24 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     lora_multiplier=self.lora_multiplier,
                 )
         elif self.params.width == 512 and self.params.height == 512:
+            self._ensure_loader()
             if self.variant == String("9b"):
-                var _img = klein_sample[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_9B, Dh](
+                var _img = klein_sample_with_loader[
+                    N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_9B, Dh
+                ](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
+                    seed, self.out_png, self.ctx, self.loader[0][],
+                    progress_fd=self.progress_fd,
                     allow_child_decode=True,
                     lora_multiplier=self.lora_multiplier,
                 )
             else:
-                var _img = klein_sample[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_4B, Dh](
+                var _img = klein_sample_with_loader[
+                    N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_4B, Dh
+                ](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
+                    seed, self.out_png, self.ctx, self.loader[0][],
+                    progress_fd=self.progress_fd,
                     allow_child_decode=True,
                     lora_multiplier=self.lora_multiplier,
                 )
@@ -841,10 +942,12 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 return r^
             if self.phase == KRPHASE_SAMPLE:
                 if not self.announced:
-                    # announce BEFORE the long blocking denoise+VAE+save tick.
+                    # Loader construction and kernel activation occur inside the
+                    # next blocking tick. Keep the UI in loading until the sampler
+                    # emits its exact post-warm-up sampling step-0 IPC event.
                     self.announced = True
                     r.step = 0
-                    r.phase = String("sampling")
+                    r.phase = String("loading")
                     return r^
                 var path = self._sample_and_save()
                 r.step = self.params.steps

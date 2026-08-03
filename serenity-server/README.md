@@ -200,14 +200,13 @@ and JSON result under
 Properties auto-opens the clip under the playhead when a project loads and
 falls back to editable project settings when there is no clip selection.
 
-## Verify the desktop-style image Generate screen
+## Verify the desktop-style Generate screen
 
-Generate is an image-only, capability-driven workspace modeled on reference UI's
-working layout: filterable parameters on the left, a large result viewer in the
-center, Current Batch on the right, the prompt and Generate action below the
-viewer, and History/Presets/Models/LoRAs in the lower library. Video and
-inpainting remain on their dedicated Serenity screens and must not appear in
-Generate.
+Generate is a capability-driven image and admitted text-to-video workspace:
+filterable parameters on the left, a large result viewer in the center, Current
+Batch on the right, the prompt and Generate action below the viewer, and
+History/Presets/Models/LoRAs in the lower library. Inpainting and source-image
+editing remain Canvas-owned.
 
 The browser preflights and then submits the same flat request directly to
 `/v1/generate`. It exposes only controls admitted by the selected model's
@@ -216,7 +215,7 @@ compiled resolution choices, sampler and noise scheduler, CFG or distilled
 guidance, seed, batch count, compatible LoRAs, variation seed where the worker
 implements it, and init image plus creativity where img2img is admitted.
 Unsupported VAE override, refiner, ControlNet, upscale, hires, video, and mask
-fields are deliberately absent rather than decorative.
+fields are absent unless the selected server-published profile admits them.
 
 With the server running, execute the focused browser contract:
 
@@ -225,11 +224,11 @@ SERENITY_BASE_URL=http://127.0.0.1:7811 \
   node scripts/check_serenity_generate_ui.js
 ```
 
-The gate verifies the three-column layout and library, image-only model
-filtering, Z-Image's sampler/scheduler and init-image surfaces, parameter
-filtering, exact sampler handoff into Workflow, identical preflight/generate
-bodies, and the flat `/v1/generate` request. The full design and current
-real-generation evidence are recorded in
+The gate verifies the three-column layout and server-owned History, runnable
+model filtering, Krea parameter reuse, Z-Image's sampler/scheduler surfaces,
+exact Generate-to-Workflow values, admitted LTX/Sulphur/WAN profiles, identical
+image preflight/generate bodies, and the flat `/v1/generate` request. The full
+design and current real-generation evidence are recorded in
 `../docs/SERENITY_GENERATE_UI_2026-07-24.md`.
 
 To inspect a particular persisted project through the same browser gate:
@@ -270,8 +269,8 @@ preflight admits the exact body. A browser/UI repair must first capture:
 
 1. Confirm the page came from the current server with the health and root
    checks above.
-2. Read `canvas/CONTRACT.md`, the deployed JavaScript, and its checked-in
-   `.map`; do not infer behavior from an old TypeScript or build directory.
+2. Read `canvas/CONTRACT.md` and the deployed JavaScript; do not infer behavior
+   from an old TypeScript, identity source map, or build directory.
 3. Follow the same body through browser assembly, `/v1/preflight`, workflow
    lowering, production admission, worker dispatch, queue/progress, result
    manifest, and gallery.
@@ -293,7 +292,6 @@ Run the narrow checks for the touched surface:
 ```bash
 pixi run cargo test --manifest-path serenity-server/Cargo.toml --workspace
 node --check serenity-server/canvas/js/<touched-file>.js
-python3 -m json.tool serenity-server/canvas/js/<touched-file>.js.map >/dev/null
 ```
 
 Also run the relevant `scripts/check_*` product contract and a real browser

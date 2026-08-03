@@ -141,4 +141,3 @@ var CanvasPreprocess = (function () {
         processActiveControlLayer: processActiveControlLayer,
     };
 })();
-//# sourceMappingURL=canvas-preprocess.js.map

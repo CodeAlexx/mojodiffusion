@@ -135,6 +135,16 @@ struct ZImageRealAux(Movable):
 def load_zimage_real_aux(
     st: ShardedSafeTensors, num_nr: Int, num_main: Int, ctx: DeviceContext
 ) raises -> ZImageRealAux:
+    # Official/creator single-file Z-Image checkpoints use the compact
+    # x_embedder/final_layer names.  Diffusers directories use the equivalent
+    # all_x_embedder/all_final_layer names.  Resolve from the actual tensor
+    # inventory so any compatible finetune can be selected by path.
+    var x_prefix = String("all_x_embedder.2-1")
+    var final_prefix = String("all_final_layer.2-1")
+    if st.has_tensor(String("x_embedder.weight")):
+        x_prefix = String("x_embedder")
+    if st.has_tensor(String("final_layer.linear.weight")):
+        final_prefix = String("final_layer")
     var nr_mod_w = List[TArc]()
     var nr_mod_b = List[TArc]()
     for i in range(num_nr):
@@ -155,15 +165,15 @@ def load_zimage_real_aux(
         TArc(_load_device_preserve(st, String("cap_embedder.0.weight"), ctx)),
         TArc(_load_device_preserve(st, String("cap_embedder.1.weight"), ctx)),
         TArc(_load_device_preserve(st, String("cap_embedder.1.bias"), ctx)),
-        TArc(_load_device_preserve(st, String("all_x_embedder.2-1.weight"), ctx)),
-        TArc(_load_device_preserve(st, String("all_x_embedder.2-1.bias"), ctx)),
+        TArc(_load_device_preserve(st, x_prefix + String(".weight"), ctx)),
+        TArc(_load_device_preserve(st, x_prefix + String(".bias"), ctx)),
         TArc(_load_device_preserve(st, String("x_pad_token"), ctx)),
         TArc(_load_device_preserve(st, String("cap_pad_token"), ctx)),
         nr_mod_w^, nr_mod_b^, main_mod_w^, main_mod_b^,
-        TArc(_load_device_preserve(st, String("all_final_layer.2-1.adaLN_modulation.1.weight"), ctx)),
-        TArc(_load_device_preserve(st, String("all_final_layer.2-1.adaLN_modulation.1.bias"), ctx)),
-        TArc(_load_device_preserve(st, String("all_final_layer.2-1.linear.weight"), ctx)),
-        TArc(_load_device_preserve(st, String("all_final_layer.2-1.linear.bias"), ctx)),
+        TArc(_load_device_preserve(st, final_prefix + String(".adaLN_modulation.1.weight"), ctx)),
+        TArc(_load_device_preserve(st, final_prefix + String(".adaLN_modulation.1.bias"), ctx)),
+        TArc(_load_device_preserve(st, final_prefix + String(".linear.weight"), ctx)),
+        TArc(_load_device_preserve(st, final_prefix + String(".linear.bias"), ctx)),
     )
 
 

@@ -18,13 +18,16 @@ Cinemagraph, Foley, LoRA loading, and the movable Canvas panels.
 
 Choose **Native resolution** from the complete compiled LTX 2.3 matrix, then
 enter a supported value in **Seconds**. Canvas automatically resolves the
-corresponding native frame count and FPS; those implementation details remain
-read-only so a request cannot be sent to an incompatible runner.
+corresponding native frame count and FPS. If the current resolution does not
+have that duration, Canvas selects the highest-resolution compiled native
+profile with the same orientation that does. An unsupported combination is
+shown before submission and never falls through to a different sampler.
 
 The native resolutions are Creator portrait, 540p landscape/portrait, 720p
 landscape/portrait, and 1080p landscape/portrait. Seconds availability depends
 on resolution: 540p reaches 20 seconds, 720p reaches 10 seconds, and 1080p is
-currently compiled for 5 seconds.
+currently compiled for 5 seconds. Longer sequences use **Extend** in admitted
+native segments; one minute is not presented as a single native LTX render.
 
 **Quality** selects real transformer weight storage. The LTX Desktop creator
 profile defaults to BF16:
@@ -36,12 +39,14 @@ profile defaults to BF16:
 - **INT4** uses the resident W4A16 reconstruction path for lower memory.
 
 Registered custom checkpoints may publish their own creator workflow. For
-example, selecting `sulphur_dev_bf16` automatically selects Sulphur's published
-eight-step Euler ancestral CFG++ stage, three-step LCM refinement, and
-stage-specific CondSafe distillation-adapter strengths. Users do not need an
-assistant to add or re-enter those settings. The Sulphur prompt enhancer stays
-disabled unless its published GGUF/mmproj artifacts and execution route are
-actually available; Serenity never labels a raw prompt as enhanced.
+example, selecting Sulphur's `sulphur_dev_bf16` source checkpoint, its published
+`sulphur_dev_fp8mixed` checkpoint, or Serenity's locally converted
+`sulphur_dev_fp8_serenity` checkpoint automatically selects Sulphur's eight-step
+Euler ancestral CFG++ stage, three-step LCM refinement, and stage-specific
+CondSafe distillation-adapter strengths. Users do not need an assistant to add
+or re-enter those settings. The Sulphur prompt enhancer stays disabled unless
+its published GGUF/mmproj artifacts and execution route are actually available;
+Serenity never labels a raw prompt as enhanced.
 
 Retake and Extend require BF16 plus a complete checkpoint because their source
 video and source audio both pass through the bundled creator VAE encoders. The

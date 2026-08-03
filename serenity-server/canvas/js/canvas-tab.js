@@ -89,7 +89,7 @@ var CanvasTab = (function () {
         ltx2ExtendDirection: 'end',
         ltx2ExtendSeconds: 3,
         editMode: 'create',
-        editEngine: 'krea2_raw_1024',
+        editEngine: 'krea2_turbo_1024',
         editModelEngine: 'klein9b',
         editSourcePrompt: '',
         editSourceNegative: '',
@@ -8406,4 +8406,3 @@ var CanvasTab = (function () {
         getStage: function () { return stage; },
     };
 })();
-//# sourceMappingURL=canvas-tab.js.map

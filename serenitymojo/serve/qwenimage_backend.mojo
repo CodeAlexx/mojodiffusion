@@ -9,14 +9,11 @@
 #   decode → PNG SIGNED (with serenity.genparams.v1 tEXt).
 #
 # Residency model (24 GB GPU):
-#   * The Qwen-Image MMDiT is BLOCK-STREAMED from disk (QwenImageDitOffloaded:
-#     60 layers, ~40 GB on disk, streamed one block at a time). The OFFLOADER
-#     HANDLE (mmap'd shards + offload buffers + RoPE/config) is loaded ONCE
-#     (first job) and STAYS RESIDENT across jobs — this is the residency win
-#     available for an offloaded model: subsequent jobs skip the loader rebuild
-#     + the on-device offload-buffer reservation.  (Unlike Z-Image, the full
-#     weight set is NOT all-resident — it cannot fit — so the win is the loader
-#     state, not the weights.)
+#   * The Qwen-Image MMDiT uses the installed Serenity raw-E4M3 safetensors.
+#     All 60 blocks are copied into pinned host memory before sampling step 0,
+#     then staged/dequantized from RAM. The checkpoint mmap is never consulted
+#     during denoise. The worker fails closed if the complete host store cannot
+#     be built.
 #   * The Qwen2.5-VL text encoder (~16 GB across 4 shards) is loaded → used →
 #     freed PER JOB inside the ENCODE step, exactly like Z-Image's encoder.
 #
@@ -56,7 +53,6 @@ from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.dit.qwenimage_dit import (
     QwenImageDitOffloaded,
     QwenImageCfgPreds,
-    qwenimage_resident_pin_budget,
 )
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     QwenLoraDeviceSet,
@@ -79,7 +75,7 @@ from serenitymojo.sampling.sampler_registry import (
 from serenitymojo.sampling.variation_noise import variation_noise_chw
 from serenitymojo.pipeline.qwenimage_sample_cli import (
     QwenCaps, encode_captions_from_strings,
-    QWENIMAGE_DIR, DIT_DIR, VAE_DIR,
+    VAE_DIR,
     PATCH, N_TXT_KEPT,
 )
 from serenitymojo.training.aspect_buckets import (
@@ -116,6 +112,9 @@ comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 # a deliberate 4.5, so only cfg<=0 gets the gate default (do NOT touch JobParams).
 comptime QWENIMAGE_DEFAULT_CFG = Float32(4.0)
 comptime QWENIMAGE_EDGE_UNITS = 16
+comptime QWENIMAGE_FP8_CHECKPOINT = (
+    "/home/alex/.serenity/models/checkpoints/qwen_image_fp8_e4m3fn.safetensors"
+)
 
 
 comptime QPHASE_IDLE = 0
@@ -475,22 +474,20 @@ struct QwenImageBackend(GenBackend, Movable):
         self.caps.append(ArcPointer(caps^))
 
     def _load_model(mut self) raises:
-        """Load the resident base offloader and the current job's LoRA."""
+        """Load the no-disk raw-FP8 host store and the current job's LoRA."""
         if not self.loaded:
             _print_vram("before DiT offloader load")
-            print("[qwenimage] loading Qwen-Image MMDiT offloader from", DIT_DIR)
-            self.model = List[ArcPointer[QwenImageDitOffloaded]]()
-            self.model.append(ArcPointer(QwenImageDitOffloaded.load(DIT_DIR, self.ctx)))
-            var free_info = cu_mem_get_info()
-            var resident_budget = qwenimage_resident_pin_budget(free_info.free_bytes)
-            var pinned_blocks = self.model[0][].pin_resident_blocks(
-                resident_budget, self.ctx
-            )
             print(
-                "[qwenimage] resident block prefix pinned:", pinned_blocks,
-                "budget_bytes=", resident_budget,
-                "free_before_pin_mib=", free_info.free_bytes // (1024 * 1024),
+                "[qwenimage] loading Qwen-Image raw-FP8 host store from",
+                QWENIMAGE_FP8_CHECKPOINT,
             )
+            self.model = List[ArcPointer[QwenImageDitOffloaded]]()
+            self.model.append(ArcPointer(
+                QwenImageDitOffloaded.load_fp8_host_resident(
+                    String(QWENIMAGE_FP8_CHECKPOINT), self.ctx
+                )
+            ))
+            print("[qwenimage] 60/60 denoiser blocks resident in host RAM")
             self.loaded = True
             _print_vram("after DiT offloader load (resident)")
 
@@ -743,11 +740,13 @@ struct QwenImageBackend(GenBackend, Movable):
                 self._prepare_job()
                 self.phase = QPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == QPHASE_DENOISE:
                 self._denoise_one()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.params.steps:
                     self.phase = QPHASE_DECODE
                 return r^

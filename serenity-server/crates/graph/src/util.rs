@@ -26,7 +26,10 @@ pub fn wf_string(obj: &JsonValue, key: &str) -> String {
 // --- scalar node classification (Mojo 46-110) ----------------------------------
 
 pub fn is_int_scalar_node(t: &str) -> bool {
-    matches!(t, "PrimitiveInt" | "INTConstant" | "easy int" | "SeedNode")
+    matches!(
+        t,
+        "PrimitiveInt" | "INTConstant" | "easy int" | "SeedNode" | "Seed (rgthree)"
+    )
 }
 
 pub fn is_float_scalar_node(t: &str) -> bool {

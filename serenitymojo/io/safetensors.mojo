@@ -17,7 +17,7 @@
 # bytes ARE read via pread (small, bounded by 100MB cap) — this is the only
 # eager I/O, matching the Rust reference which read_exact's the header.
 
-from std.memory import alloc, UnsafePointer, Span
+from std.memory import alloc, UnsafePointer, Span, bitcast
 from .dtype import STDtype
 from .mmap import MmapRegion
 from .json_header import parse_header, HeaderEntry
@@ -32,6 +32,23 @@ from .ffi import (
 
 
 comptime MAX_HEADER_LEN = 100 * 1024 * 1024  # mmap.rs:180
+
+
+@always_inline
+def read_f32_scalar_bytes[
+    mut: Bool, //, origin: Origin[mut=mut]
+](data: Span[UInt8, origin]) raises -> Float32:
+    """Decode one little-endian F32 scalar from safetensors bytes."""
+    if len(data) != 4:
+        raise Error(
+            String("expected one F32 scalar (4 bytes), got ") + String(len(data))
+        )
+    var b0 = UInt32(Int(data[0]))
+    var b1 = UInt32(Int(data[1]))
+    var b2 = UInt32(Int(data[2]))
+    var b3 = UInt32(Int(data[3]))
+    var bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    return bitcast[DType.float32, 1](SIMD[DType.uint32, 1](bits))
 
 
 def _pread_exact(fd: Int, buf: BytePtr, count: Int, offset: Int) raises:
@@ -67,10 +84,17 @@ struct SafeTensors(Movable):
 
     var region: MmapRegion
     var tensors: Dict[String, TensorRef]
+    var storage_names: List[String]
 
-    def __init__(out self, var region: MmapRegion, var tensors: Dict[String, TensorRef]):
+    def __init__(
+        out self,
+        var region: MmapRegion,
+        var tensors: Dict[String, TensorRef],
+        var storage_names: List[String],
+    ):
         self.region = region^
         self.tensors = tensors^
+        self.storage_names = storage_names^
 
     @staticmethod
     def open(path: String) raises -> SafeTensors:
@@ -152,6 +176,10 @@ struct SafeTensors(Movable):
 
         # mmap.rs:204-235 — build the tensor index.
         var tensors = Dict[String, TensorRef]()
+        var storage_names = List[String]()
+        var storage_offsets = List[Int]()
+        var header_is_storage_order = True
+        var last_offset = -1
         for ref e in entries:
             # __metadata__ is already skipped by parse_header (mmap.rs:207-209).
             var start = e.off_start
@@ -177,8 +205,30 @@ struct SafeTensors(Movable):
                 dtype=dt,
                 shape=e.shape.copy(),
             )
+            storage_names.append(e.name.copy())
+            storage_offsets.append(start)
+            if start < last_offset:
+                header_is_storage_order = False
+            last_offset = start
 
-        return SafeTensors(region^, tensors^)
+        # Safetensors writers normally emit header entries in data-offset
+        # order. Preserve that order for sequential mmap traversal. For a
+        # valid non-canonical file, sort the small name index by byte offset
+        # once at open rather than page-faulting model data in hash-map order.
+        if not header_is_storage_order:
+            var sorted_names = List[String]()
+            var sorted_offsets = List[Int]()
+            for i in range(len(storage_names)):
+                var pos = len(sorted_offsets)
+                for j in range(len(sorted_offsets)):
+                    if storage_offsets[i] < sorted_offsets[j]:
+                        pos = j
+                        break
+                sorted_names.insert(pos, storage_names[i])
+                sorted_offsets.insert(pos, storage_offsets[i])
+            storage_names = sorted_names^
+
+        return SafeTensors(region^, tensors^, storage_names^)
 
     def tensor_bytes(
         self, name: String
@@ -231,6 +281,18 @@ struct SafeTensors(Movable):
         for ref e in self.tensors.items():
             out.append(e.key)
         return out^
+
+    def has_tensor(self, name: String) -> Bool:
+        """Non-raising tensor existence check."""
+        return name in self.tensors
+
+    def names_storage_order(self) -> List[String]:
+        """Tensor names in ascending on-disk data-offset order.
+
+        Use this for bulk loading so mmap faults and copies traverse each file
+        sequentially. Name lookup remains the same dictionary-backed path.
+        """
+        return self.storage_names.copy()
 
     def count(self) -> Int:
         """Number of tensors."""

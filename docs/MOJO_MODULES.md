@@ -520,16 +520,11 @@ noiser/scheduler phase parity is not lost in fused tensor algebra.
 `sampling/ltx2_request_cli.mojo` is the pure-Mojo product adapter for canonical
 `serenity.genparams.v1` video requests. It preserves the exact authored JSON,
 checks conditioning sidecar prompt identity, resolves an arbitrary LoRA list
-under the shared model root, carries the request's `model_quant`, and dispatches
-only profiles listed in `configs/ltx2_request_profiles.json` through
-`pipeline/ltx2_t2v_av_hq.mojo::run_request_profile`. The registry currently
-admits 31 mode-qualified width/height/frame-count/FPS tuples. Ordinary LTX
-Desktop-style generation uses 960x512 or 512x960 after the creator's authored
-960x544/544x960 conditioning size is rounded to 64 pixels. Retake and Extend
-publish separate 960x544/544x960 source-native profiles, while the remaining
-matrix reaches 20 seconds at 540p, 10 seconds at 720p, and 5 seconds at 1080p.
-Unsupported tuples fail before model load; the UI must select from the
-published registry rather than round or substitute dimensions.
+under the shared model root, and carries the request's `model_quant`. LTX uses
+one `output/bin/ltx2_serenity_runtime` executable. The old per-geometry binary
+naming, lookup fallback, and 31-binary build task were removed; profile metadata
+may inform the UI but cannot select an alternate executable. The server fails
+closed while the runtime-shape Mojo path is absent or stale.
 
 `configs/ltx2_checkpoint_workflows.json` separately binds checkpoint identities
 to publisher-authored inference recipes without hard-coding those recipes into
@@ -608,8 +603,8 @@ an exact 48 kHz stereo A/V mux, but its 19,621 MiB peak is not accepted on a
 admitted 2x/4x post-upscale request: RRDB x4plus is functional but
 experimental-slow, while SRVGG x4v3 and the imported SeedVR2 source remain
 disabled when their local weights or complete user-video route are absent.
-Build the production request matrix with
-`pixi run bash scripts/build_ltx2_request_profiles.sh`.
+Build the single runtime-geometry request runner with
+`pixi run build-ltx2-request`.
 
 The 2026-07-27 creator-parity product gate used the same checkpoint, source,
 prompt, and locked seed in LTX Desktop and Serenity. Paired Retake measured

@@ -70,7 +70,7 @@
 #          decoder is a MONOLITHIC (non-tiled) decode. MEMORY LESSON from the
 #          orchestrator note: a 1024² monolithic VAE decode OOMs a 24 GB card. The
 #          mitigation here is STRICT PHASE SEPARATION + mempool trim: the encoder
-#          is freed before the DiT loads; per-job conditioning + the streamed DiT
+#          is freed before the DiT host store loads; per-job conditioning + staged DiT
 #          loader are freed before the VAE decode; cu_mempool_trim_current(0) is
 #          called at each boundary. If the monolithic Flux2 decode still OOMs, a
 #          tiled Flux2 decoder is required (none exists yet for the Flux2 VAE —
@@ -114,7 +114,8 @@ from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import concat, slice as t_slice, reshape, permute
-from serenitymojo.offload.block_loader import BlockLoader
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.offload.plan import OffloadConfig, build_lens_block_plan
 
 # Reuse the VERIFIED Lens pipeline stages verbatim (imported, never re-derived).
 from serenitymojo.pipeline.lens_pipeline_1024_multistep import (
@@ -361,12 +362,12 @@ struct LensBackend(GenBackend, Movable):
 
     # ── resident across jobs: Lens DiT resident weights + RoPE tables ──
     # (img_in / txt_in / txt_norm / temb / norm_out / proj_out — everything except
-    #  the 48 streamed transformer blocks — plus the 3-axis RoPE tables, both built
-    #  once and reused. The 48 blocks are streamed per forward by lens_forward's
-    #  internal BlockLoader.)
+    #  the 48 transformer blocks — plus the 3-axis RoPE tables. The blocks are
+    #  copied once into the complete FP8 host store before sampling.)
     var loaded: Bool
     var resident: List[ArcPointer[LensResident]]   # 0/1
     var rope: List[ArcPointer[LensRopeTables]]     # 0/1
+    var loader: List[ArcPointer[TurboPlannedLoader]]  # 0/1 complete host store
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -386,6 +387,7 @@ struct LensBackend(GenBackend, Movable):
         self.loaded = False
         self.resident = List[ArcPointer[LensResident]]()
         self.rope = List[ArcPointer[LensRopeTables]]()
+        self.loader = List[ArcPointer[TurboPlannedLoader]]()
         self.active = False
         self.cancel_flag = False
         self.phase = LPHASE_IDLE
@@ -455,7 +457,7 @@ struct LensBackend(GenBackend, Movable):
 
     def between_jobs_trim(mut self) raises:
         """Reclaim the per-job transient peak (GPT-OSS encoder per-layer dequant
-        scratch + embedding table, the streamed DiT block buffers, the 1024² Flux2
+        scratch + embedding table, the staged DiT block buffers, the 1024² Flux2
         VAE decode activations) back to the OS via cuMemPoolTrimTo. The resident
         Lens DiT non-block weights + RoPE tables have live suballocations and are
         NOT reclaimed."""
@@ -497,10 +499,7 @@ struct LensBackend(GenBackend, Movable):
         self.txt_uncond.append(ArcPointer(uncond^))
 
     def _load_model(mut self) raises:
-        """Load the Lens DiT resident (non-block) weights + build the 3-axis RoPE
-        tables (once; both stay resident). The 48 transformer blocks are NOT
-        loaded here — lens_forward streams them per forward via its own
-        BlockLoader over LENS_TRANSFORMER_DIR."""
+        """Load Lens non-block weights and build the 3-axis RoPE tables."""
         if self.loaded:
             return
         _print_vram("before Lens resident weights load")
@@ -512,6 +511,28 @@ struct LensBackend(GenBackend, Movable):
         self.rope.append(ArcPointer(build_lens_rope_tables(self.ctx)))
         self.loaded = True
         _print_vram("after Lens resident weights + RoPE (resident)")
+
+    def _load_denoiser_store(mut self) raises:
+        """Build all 48 host-resident FP8 blocks before sampling step 0."""
+        if len(self.loader) == 1:
+            return
+        print("[lens] building complete FP8 host store from", LENS_TRANSFORMER_DIR)
+        var plan = build_lens_block_plan()
+        var loader = TurboPlannedLoader.open(
+            String(LENS_TRANSFORMER_DIR),
+            plan^,
+            OffloadConfig.synchronous_single(),
+            self.ctx,
+            fill_block_store=False,
+        )
+        var host_blocks = loader.pin_residents_fp8_host(1 << 60, self.ctx)
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        loader.discard_unused_raw_streaming_slots(self.ctx)
+        loader.set_fp8h_overlap(True)
+        print("[lens] host-resident denoiser blocks:", host_blocks, "/48")
+        self.loader = List[ArcPointer[TurboPlannedLoader]]()
+        self.loader.append(ArcPointer(loader^))
 
     def _prepare_job(mut self) raises:
         """Flow-match scheduler (honors steps) + seeded initial noise (honors seed).
@@ -538,15 +559,13 @@ struct LensBackend(GenBackend, Movable):
         var i = self.cur
         var sigma_curr = self.sched[0][].sigmas()[i]
         var sigma_next = self.sched[0][].sigma_next(i)
-        # The streamed BlockLoader is rebuilt inside lens_forward each call (it is
-        # cheap mmap state); the resident set + RoPE tables are reused.
         var noise_cond = lens_forward(
             self.latent[0][], self.txt_cond[0][], sigma_curr,
-            self.resident[0][], _block_loader(self.ctx), self.rope[0][], self.ctx,
+            self.resident[0][], self.loader[0][], self.rope[0][], self.ctx,
         )
         var noise_uncond = lens_forward(
             self.latent[0][], self.txt_uncond[0][], sigma_curr,
-            self.resident[0][], _block_loader(self.ctx), self.rope[0][], self.ctx,
+            self.resident[0][], self.loader[0][], self.rope[0][], self.ctx,
         )
         var noise_pred = cfg_norm_rescale_pair(
             noise_cond, noise_uncond, self.cfg, self.ctx
@@ -565,8 +584,7 @@ struct LensBackend(GenBackend, Movable):
         # trim the mempool BEFORE the (memory-heavy) Flux2 VAE decode. The decode is
         # now TILED (3x3 overlapping LATENT/2 crops) so the full 1024² frame is never
         # allocated at once — the trim + tiling together address MEMORY RISK (D).
-        # The resident DiT non-block weights stay (small); the streamed block
-        # buffers are already freed by lens_forward.
+        # The resident DiT and host store stay warm for the next job.
         self.txt_cond = List[ArcPointer[Tensor]]()
         self.txt_uncond = List[ArcPointer[Tensor]]()
         self.sched = List[ArcPointer[LensFlowMatchScheduler]]()
@@ -641,22 +659,24 @@ struct LensBackend(GenBackend, Movable):
                 r.step = 0
                 return r^
             if self.phase == LPHASE_LOAD:
-                if not self.loaded:
+                if len(self.loader) == 0:
                     if not self.announced:
                         self.announced = True
                         r.step = 0
                         r.phase = String("loading")
                         return r^
-                    self._load_model()
+                    self._load_denoiser_store()
                     self.announced = False
                 self._prepare_job()
                 self.phase = LPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == LPHASE_DENOISE:
                 self._denoise_one()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.params.steps:
                     self.phase = LPHASE_DECODE
                 return r^
@@ -677,17 +697,6 @@ struct LensBackend(GenBackend, Movable):
             r.failed = True
             r.error = String(e)
             return r^
-
-
-# ── streamed-block loader factory (mirrors the pipeline's per-forward loader) ──
-# lens_forward takes a BlockLoader and streams the 48 blocks itself. The pipeline
-# opens one loader per denoise() call and reuses it across steps; we open one per
-# forward (cheap mmap state) to keep the backend's residency surface to the
-# resident weights + RoPE tables only.
-def _block_loader(ctx: DeviceContext) raises -> BlockLoader:
-    return BlockLoader.open(String(LENS_TRANSFORMER_DIR))
-
-
 # ── PNG(tEXt) save — identical math to sdxl/qwenimage backends ────────────────
 def _save_rgb_png_with_text(
     rgb: Tensor, path: String, params_json: String, ctx: DeviceContext

@@ -108,4 +108,3 @@ class SFSidebar {
         return this.canvas.addNode(nodeType, worldPos.x, worldPos.y, info);
     }
 }
-//# sourceMappingURL=sidebar.js.map

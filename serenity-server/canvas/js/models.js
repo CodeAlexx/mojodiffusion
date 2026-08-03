@@ -705,4 +705,3 @@ var ModelsTab = (function () {
     }
     return { init: init, load: load };
 })();
-//# sourceMappingURL=models.js.map

@@ -1290,6 +1290,7 @@ struct Ideogram4Backend(GenBackend, Movable):
                 self.announced = False
                 self.phase = IPHASE_DENOISE
                 r.step = 0
+                r.phase = String("sampling")
                 return r^
             if self.phase == IPHASE_DENOISE:
                 var denoise_t0 = perf_counter_ns()
@@ -1298,6 +1299,7 @@ struct Ideogram4Backend(GenBackend, Movable):
                 self._record_vram()
                 self.cur += 1
                 r.step = self.cur
+                r.phase = String("sampling")
                 if self.cur >= self.params.steps:
                     self.phase = IPHASE_DECODE
                 return r^

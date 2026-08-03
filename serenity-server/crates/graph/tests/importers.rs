@@ -525,6 +525,24 @@ fn sampler_custom_lowers_to_flat_params() {
     assert_eq!(req["height"].as_i64(), Some(512));
 }
 
+/// rgthree's seed control is a UI scalar producer. Serenity lowers its fixed
+/// seed through the same typed INT path as PrimitiveInt/SeedNode, so imported
+/// workflows keep deterministic product seeds without loading a Python pack.
+#[test]
+fn rgthree_seed_node_drives_ksampler_seed() {
+    let dir = refs_dir();
+    let mut req: JsonValue = serde_json::from_slice(
+        &fs::read(dir.join("serenityflow__rgthree_seed.request.json")).expect("read request"),
+    )
+    .expect("parse");
+    lower_request(&mut req).expect("fixed rgthree seed must lower cleanly");
+    assert_eq!(req["seed"].as_i64(), Some(123456));
+    assert_eq!(
+        req["workflow_source"].as_str(),
+        Some("comfy_api_prompt_graph")
+    );
+}
+
 /// A named SAMPLER node (SamplerEulerAncestral → euler_ancestral) is NOT in the
 /// zimage worker's supported list, so the lowering fails loud [501] rather than
 /// silently substituting a different sampler.

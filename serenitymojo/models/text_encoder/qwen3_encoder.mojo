@@ -38,7 +38,7 @@ from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.norm import rms_norm
@@ -486,8 +486,9 @@ struct Qwen3Encoder:
         var sharded = ShardedSafeTensors.open(dir)
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
+        var uploader = BatchedTensorUploader(256 * 1024 * 1024, ctx)
         # Deterministic order is irrelevant; we look up by name.
-        for ref nm in sharded.names():
+        for ref nm in sharded.names_storage_order():
             if max_layer >= 0:
                 if nm == "lm_head.weight":
                     continue
@@ -502,10 +503,15 @@ struct Qwen3Encoder:
                     if li > max_layer:
                         continue
             var tv = sharded.tensor_view(nm)
-            var t = Tensor.from_view(tv, ctx)
+            var t = uploader.from_view(tv, ctx)
             var idx = len(weights)
             weights.append(ArcPointer(t^))
             name_to_idx[nm] = idx
+        uploader.finish(ctx)
+        print(
+            "[qwen3] batched H2D tensors", uploader.tensors_uploaded,
+            "bytes", uploader.bytes_uploaded, "fences", uploader.fence_count,
+        )
         return Qwen3Encoder(weights^, name_to_idx^, config)
 
     def lm_logits_last(self, token_ids: List[Int], pos: Int, ctx: DeviceContext) raises -> Tensor:

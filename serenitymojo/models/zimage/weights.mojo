@@ -40,6 +40,7 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.ops.tensor_algebra import slice
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -109,6 +110,43 @@ def load_zimage_block_weights_prefixed_mixed(
 ) raises -> ZImageBlockWeights:
     var ap = prefix + String(".attention")
     var fp = prefix + String(".feed_forward")
+    # Creator/Comfy single-file checkpoints store one fused qkv matrix plus
+    # `out`, `q_norm`, and `k_norm`.  The original Diffusers directory stores
+    # the same values as separate to_q/to_k/to_v tensors.  Detect the tensor
+    # layout itself; never infer it from a filename and never substitute the
+    # bundled Base directory for a selected checkpoint.
+    if st.has_tensor(ap + String(".qkv.weight")):
+        var qkv = _load_device_preserve(st, ap + String(".qkv.weight"), ctx)
+        var qkv_shape = qkv.shape()
+        if len(qkv_shape) != 2 or qkv_shape[0] % 3 != 0:
+            raise Error(
+                String("Z-Image fused qkv must have shape [3D,D] for ")
+                + prefix
+            )
+        var d = qkv_shape[0] // 3
+        if qkv_shape[1] != d:
+            raise Error(
+                String("Z-Image fused qkv shape mismatch for ") + prefix
+                + String(": expected [3D,D]")
+            )
+        var wq = slice(qkv, 0, 0, d, ctx)
+        var wk = slice(qkv, 0, d, d, ctx)
+        var wv = slice(qkv, 0, 2 * d, d, ctx)
+        return ZImageBlockWeights(
+            TArc(_load_device_preserve(st, prefix + String(".attention_norm1.weight"), ctx)),
+            TArc(wq^),
+            TArc(wk^),
+            TArc(wv^),
+            TArc(_load_device_preserve(st, ap + String(".out.weight"), ctx)),
+            TArc(_load_device_preserve(st, ap + String(".q_norm.weight"), ctx)),
+            TArc(_load_device_preserve(st, ap + String(".k_norm.weight"), ctx)),
+            TArc(_load_device_preserve(st, prefix + String(".attention_norm2.weight"), ctx)),
+            TArc(_load_device_preserve(st, prefix + String(".ffn_norm1.weight"), ctx)),
+            TArc(_load_device_preserve(st, fp + String(".w1.weight"), ctx)),
+            TArc(_load_device_preserve(st, fp + String(".w3.weight"), ctx)),
+            TArc(_load_device_preserve(st, fp + String(".w2.weight"), ctx)),
+            TArc(_load_device_preserve(st, prefix + String(".ffn_norm2.weight"), ctx)),
+        )
     return ZImageBlockWeights(
         TArc(_load_device_preserve(st, prefix + String(".attention_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_q.weight"), ctx)),

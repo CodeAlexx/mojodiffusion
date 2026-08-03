@@ -724,4 +724,3 @@ class SFCanvas {
         this.stage.destroy();
     }
 }
-//# sourceMappingURL=canvas.js.map

@@ -76,4 +76,3 @@ function typesCompatible(outputType, inputType) {
         });
     });
 }
-//# sourceMappingURL=types.js.map

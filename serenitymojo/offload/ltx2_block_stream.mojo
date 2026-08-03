@@ -39,6 +39,8 @@ from serenitymojo.ops.fp8 import (
 from serenitymojo.ops.svdquant import (
     SvdquantLinearA, svdquant_reconstruct_weight, svdquant_reconstruct_weight_raw,
 )
+from serenitymojo.offload.plan import BlockKind, BlockPlan, OffloadConfig
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 
 
 # A streamed block: tensor-name (prefix-stripped) -> BF16 device Tensor.
@@ -241,6 +243,13 @@ struct LTX2BlockStream(Movable):
     var resident_bytes_: Int
     var scale_cache: Dict[String, Float32]
     var int4_slab: Optional[ShardedSafeTensors]   # attached svdint4 slab (else fp8)
+    var checkpoint_path: String
+    # Product sampling uses the shared complete host-resident loader. Keeping it
+    # behind the existing LTX2 block-source surface avoids a second denoiser
+    # orchestration path while making mmap fallback impossible after step 0.
+    var product_host_loaders: List[ArcPointer[TurboPlannedLoader]]
+    var product_host_active: Bool
+    var product_host_bytes_: Int
 
     @staticmethod
     def open(checkpoint_path: String) raises -> LTX2BlockStream:
@@ -288,7 +297,7 @@ struct LTX2BlockStream(Movable):
                 )
                 var tv = st.tensor_view(nm)
                 scales[base_key + ".weight"] = _read_f32_scalar(tv.data)
-        return LTX2BlockStream(st^, prefix, n, scales^)
+        return LTX2BlockStream(st^, prefix, n, scales^, checkpoint_path)
 
     def __init__(
         out self,
@@ -296,6 +305,7 @@ struct LTX2BlockStream(Movable):
         prefix: String,
         n_blocks: Int,
         var scale_cache: Dict[String, Float32],
+        checkpoint_path: String,
     ):
         self.sharded = sharded^
         self.prefix = prefix
@@ -307,6 +317,10 @@ struct LTX2BlockStream(Movable):
         self.resident_bytes_ = 0
         self.scale_cache = scale_cache^
         self.int4_slab = None
+        self.checkpoint_path = checkpoint_path
+        self.product_host_loaders = List[ArcPointer[TurboPlannedLoader]]()
+        self.product_host_active = False
+        self.product_host_bytes_ = 0
 
     def block_count(self) -> Int:
         return self.n_blocks
@@ -322,6 +336,97 @@ struct LTX2BlockStream(Movable):
 
     def resident_bytes(self) -> Int:
         return self.resident_bytes_
+
+    def product_host_bytes(self) -> Int:
+        return self.product_host_bytes_
+
+    def enable_product_memory_resident(mut self, ctx: DeviceContext) raises -> Int:
+        """Copy every FP8/BF16 block byte into pinned RAM before denoise.
+
+        The shared TurboPlannedLoader supplies double-buffered copy-stream H2D
+        and FP8 dequant. Sampling is admitted only after all 48 plan entries are
+        present in RAM (or, for int4, already present in the complete GPU store).
+        No product call can silently fall back to the checkpoint mapping.
+        """
+        if self.int4_slab:
+            if len(self.resident_loaded) != self.n_blocks:
+                raise Error(
+                    "LTX2 product refuses int4 sampling without a complete "
+                    "device-resident block store"
+                )
+            for i in range(self.n_blocks):
+                if not self.resident_loaded[i]:
+                    raise Error(
+                        String("LTX2 product int4 block is not resident: ")
+                        + String(i)
+                    )
+            return self.n_blocks
+        if len(self.product_host_loaders) != 0:
+            self.product_host_loaders[0][].require_all_blocks_memory_resident()
+            return self.n_blocks
+
+        var plan = BlockPlan(String("ltx2_product"))
+        self.product_host_bytes_ = 0
+        for block_idx in range(self.n_blocks):
+            var bp = self.prefix + String(block_idx) + "."
+            plan.append(bp, BlockKind.transformer())
+            for ref nm in self.sharded.names():
+                if not nm.startswith(bp):
+                    continue
+                if (
+                    nm.endswith("_scale")
+                    or nm.endswith("input_scale")
+                    or nm.endswith(".scale_weight")
+                    or nm.endswith(".scale_input")
+                ):
+                    continue
+                self.product_host_bytes_ += self.sharded.tensor_view(nm).nbytes()
+
+        var loader = TurboPlannedLoader.open(
+            self.checkpoint_path,
+            plan^,
+            OffloadConfig.synchronous_cfg_paired(),
+            ctx,
+            fill_block_store=False,
+        )
+        var pinned = loader.pin_residents_fp8_host_raw(1 << 60, ctx)
+        loader.require_all_blocks_memory_resident()
+        loader.release_checkpoint_pages()
+        loader.discard_unused_raw_streaming_slots(ctx)
+        loader.set_fp8h_overlap(True)
+        loader.prefetch_with_ctx(0, ctx)
+        self.sharded.release_to_os()
+        self.product_host_loaders.append(ArcPointer(loader^))
+        return pinned
+
+    def load_block_bf16_product(
+        mut self, block_idx: Int, ctx: DeviceContext
+    ) raises -> FP8Block:
+        """Product-only block load that cannot touch the checkpoint mapping."""
+        if self.int4_slab:
+            return self.load_block_bf16(block_idx, ctx)
+        if len(self.product_host_loaders) != 1:
+            raise Error(
+                "LTX2 product refuses sampling: complete host-resident block "
+                "store was not prepared before denoise"
+            )
+        if self.product_host_active:
+            self.product_host_loaders[0][].mark_active_block_done(ctx)
+        var handle = self.product_host_loaders[0][].await_block(block_idx, ctx)
+        self.product_host_loaders[0][].prefetch_next_with_ctx(block_idx, ctx)
+
+        var block = FP8Block()
+        var bp = self.prefix + String(block_idx) + "."
+        for ref e in handle.block.items():
+            if not e.key.startswith(bp):
+                raise Error(
+                    String("LTX2 product loader returned key outside block prefix: ")
+                    + e.key
+                )
+            var canon = _substr(e.key, len(bp), len(e.key))
+            block[canon] = e.value
+        self.product_host_active = True
+        return block^
 
     def _scale_for(self, weight_key: String) raises -> Float32:
         """Return the per-tensor scale for an FP8 weight, or 1.0 if absent.

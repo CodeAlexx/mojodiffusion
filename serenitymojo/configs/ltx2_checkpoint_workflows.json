@@ -6,7 +6,11 @@
       "label": "Sulphur 2 Creator Distilled",
       "checkpoints": [
         "sulphur_dev_bf16",
-        "sulphur_dev_bf16.safetensors"
+        "sulphur_dev_bf16.safetensors",
+        "sulphur_dev_fp8mixed",
+        "sulphur_dev_fp8mixed.safetensors",
+        "sulphur_dev_fp8_serenity",
+        "sulphur_dev_fp8_serenity.safetensors"
       ],
       "source": "https://huggingface.co/SulphurAI/Sulphur-2-base/blob/main/workflows/ltx23_t2v%20distilled.json",
       "model_card": "https://huggingface.co/SulphurAI/Sulphur-2-base",

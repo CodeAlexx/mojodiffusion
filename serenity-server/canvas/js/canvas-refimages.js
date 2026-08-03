@@ -639,4 +639,3 @@ var LayerSolo = (function () {
         isActive: isActive,
     };
 })();
-//# sourceMappingURL=canvas-refimages.js.map

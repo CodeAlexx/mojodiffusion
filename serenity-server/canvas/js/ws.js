@@ -134,4 +134,3 @@ var SerenityWS = (function () {
         _emit: emit
     };
 })();
-//# sourceMappingURL=ws.js.map

@@ -11,6 +11,9 @@ if (typeof Settings !== 'undefined') {
     Settings.applyAccentColor(Settings.get('accentColor'));
 }
 var currentMode = 'advanced'; // single-mode UI (Simple mode removed)
+// One product workflow catalog shared by both the toolbar menu and the
+// Generate screen's bottom Workflows library.
+var SerenityWorkflowPresets = [];
 function setMode(mode) {
     mode = 'advanced'; // single-mode UI (Simple mode removed)
     currentMode = mode;
@@ -63,13 +66,24 @@ function switchTab(tabId) {
     // Init Generate tab on first switch
     if (tabId === 'generate' && typeof GenerateTab !== 'undefined') {
         GenerateTab.init();
+        if (typeof sfToolbar !== 'undefined' && sfToolbar &&
+            sfToolbar.getSharedGenerationActivity &&
+            GenerateTab.setExternalActivity) {
+            GenerateTab.setExternalActivity(
+                sfToolbar.getSharedGenerationActivity());
+        }
         // Check for pending image from Queue tab
         var pendingView = localStorage.getItem('sf-view-image');
         if (pendingView) {
             localStorage.removeItem('sf-view-image');
             try {
                 var viewData = JSON.parse(pendingView);
-                if (viewData.src && GenerateTab.displayResult) {
+                if (viewData.src && viewData.promptId &&
+                    GenerateTab.displayCompletedJob) {
+                    GenerateTab.displayCompletedJob(
+                        viewData.src, viewData.isVideo, viewData.promptId);
+                }
+                else if (viewData.src && GenerateTab.displayResult) {
                     GenerateTab.displayResult(viewData.src, viewData.isVideo);
                 }
             }
@@ -147,11 +161,27 @@ function setupTopbarWS() {
         return;
     var dot = document.querySelector('.queue-dot');
     var label = document.querySelector('.queue-label');
+    var activePrompts = {};
+    var queueRemaining = 0;
     if (!dot || !label)
         return;
+    function renderActivity() {
+        var activeCount = Object.keys(activePrompts).length;
+        // Servers differ on whether queue_remaining includes the active job.
+        // Use the larger count so one execution is never displayed twice.
+        var total = Math.max(
+            activeCount, Math.max(0, Number(queueRemaining) || 0));
+        if (total > 0) {
+            dot.className = 'queue-dot running';
+            label.textContent = 'Running (' + total + ')';
+        }
+        else {
+            dot.className = 'queue-dot idle';
+            label.textContent = 'Idle';
+        }
+    }
     SerenityWS.on('connected', function () {
-        dot.className = 'queue-dot idle';
-        label.textContent = 'Idle';
+        renderActivity();
     });
     SerenityWS.on('disconnected', function () {
         dot.className = 'queue-dot';
@@ -161,16 +191,26 @@ function setupTopbarWS() {
     SerenityWS.on('status', function (data) {
         if (!data || !data.status)
             return;
-        var qr = data.status.exec_info ? data.status.exec_info.queue_remaining : 0;
-        if (qr > 0) {
-            dot.className = 'queue-dot running';
-            label.textContent = 'Running (' + qr + ')';
-        }
-        else {
-            dot.className = 'queue-dot idle';
-            label.textContent = 'Idle';
-        }
+        queueRemaining = data.status.exec_info
+            ? data.status.exec_info.queue_remaining : 0;
+        renderActivity();
     });
+    SerenityWS.on('execution_start', function (data) {
+        var promptId = String(data && data.prompt_id || '__active__');
+        activePrompts[promptId] = true;
+        renderActivity();
+    });
+    function finishPrompt(data) {
+        var promptId = String(data && data.prompt_id || '');
+        if (promptId)
+            delete activePrompts[promptId];
+        else
+            activePrompts = {};
+        renderActivity();
+    }
+    SerenityWS.on('execution_success', finishPrompt);
+    SerenityWS.on('execution_error', finishPrompt);
+    SerenityWS.on('execution_interrupted', finishPrompt);
 }
 /**
  * Setup the workflow execution state — enable/disable Stop button,
@@ -216,20 +256,23 @@ function setupTemplatesDropdown() {
     // Built-in production presets use the same WorkflowBuilder as Generate, so
     // model contracts cannot drift between the two screens. User templates from
     // /templates still take precedence when present.
-    const fallbackTemplates = [
+    SerenityWorkflowPresets = [
         { name: 'FLUX.1 Dev · Text to Image', preset: { model: 'flux1-dev', prompt: 'a lighthouse on a rocky coast at sunset, dramatic sky', steps: 20, cfg: 1, guidance: 4, scheduler: 'euler' } },
-        { name: 'SDXL · Text to Image', preset: { model: 'sdxl_unet_bf16', prompt: 'a red vintage bicycle against a blue garden wall, morning sunlight', steps: 20, cfg: 7, scheduler: 'euler' } },
+        { name: 'SDXL · Text to Image', preset: { model: 'sdxl_unet_bf16', prompt: 'a red vintage bicycle against a blue garden wall, morning sunlight', steps: 20, cfg: 7, sampler: 'euler', scheduler: 'normal' } },
         { name: 'Klein 9B Base · Text to Image', preset: { model: 'flux-2-klein-base-9b', prompt: 'a green ceramic teapot beside yellow lemons on linen', steps: 50, cfg: 4, scheduler: 'euler' } },
         { name: 'Krea 2 Turbo · Text to Image', preset: { model: 'krea2-turbo', prompt: 'a white owl on a mossy branch in a moonlit forest', steps: 8, cfg: 0, scheduler: 'euler' } },
         { name: 'Chroma HD · Text to Image', preset: { model: 'chroma1_hd_bf16', prompt: 'a lighthouse on a rocky coast at sunset, dramatic sky', steps: 30, cfg: 4, scheduler: 'euler' } },
         { name: 'Qwen Image · Text to Image', preset: { model: 'qwen_image_fp8_e4m3fn', prompt: 'a wooden rowboat on a misty lake at dawn', steps: 20, cfg: 4, scheduler: 'euler' } },
-        { name: 'Z-Image · Text to Image', preset: { model: 'zimage_base', prompt: 'a glass terrarium filled with tiny ferns on a wooden table', width: 512, height: 512, steps: 16, cfg: 5, scheduler: 'euler' } },
+        { name: 'Z-Image · Text to Image', preset: { model: 'zimage_base', prompt: 'a glass terrarium filled with tiny ferns on a wooden table', width: 1024, height: 1024, steps: 16, cfg: 5, scheduler: 'euler' } },
         { name: 'Anima · Text to Image', preset: { model: 'anima', prompt: 'a red fox in a field of lavender, detailed illustration', steps: 20, cfg: 4.5, scheduler: 'euler' } },
         { name: 'Ideogram 4 · Text to Image', preset: { model: 'ideogram-4-fp8', prompt: 'a bakery storefront sign reading SERENITY, warm evening light', steps: 20, cfg: 7, scheduler: 'euler' } },
         { name: 'SenseNova · Text to Image', preset: { model: 'sensenova_u1', prompt: 'a silver robot watering orange flowers in a greenhouse', steps: 30, cfg: 4, scheduler: 'euler' } },
-        { name: 'Wan 2.2 5B · Text to Video', preset: { model: 'Wan2.2-TI2V-5B-Mojo', prompt: 'two anthropomorphic cats in comfortable boxing gear and bright gloves fight intensely on a spotlighted stage, cinematic lighting, dynamic camera movement', width: 1280, height: 704, steps: 50, cfg: 5, scheduler: 'uni_pc', frames: 121, fps: 24, quant: 'bf16' } },
-        { name: 'Bernini-R · Text to Video', preset: { model: 'Bernini-R-Diffusers', prompt: 'a woman in a flowing red coat walks through a rain-soaked neon city at night, cinematic tracking shot, natural motion, detailed reflections, atmospheric depth', width: 848, height: 480, steps: 40, cfg: 4, scheduler: 'uni_pc', frames: 81, fps: 16 } },
+        { name: 'LTX 2.3 Distilled · Text to Video', preset: { model: 'ltx-2.3-22b-distilled', prompt: 'a lighthouse at sunset, cinematic camera movement, natural motion', steps: 8, cfg: 1, guidance: 1, sampler: 'euler', scheduler: 'ltx2_distilled', videoGuidanceMode: 'distilled', videoQuant: 'fp8', videoCheckpoint: 'ltx-2.3-22b-distilled' } },
+        { name: 'Sulphur 2 · Text to Video', preset: { model: 'sulphur_dev_fp8_serenity', prompt: 'a red car drives along a sunlit coastal road, realistic motion, cinematic tracking shot', steps: 8, cfg: 1, guidance: 1, sampler: 'euler_ancestral_cfg_pp', scheduler: 'sulphur_creator_8_3', videoGuidanceMode: 'distilled', videoWorkflowProfile: 'sulphur-2-base-distilled-v1', videoQuant: 'fp8', videoCheckpoint: 'sulphur_dev_fp8_serenity' } },
+        { name: 'Wan 2.2 5B · Text to Video', preset: { model: 'Wan2.2-TI2V-5B-Mojo', prompt: 'two anthropomorphic cats in comfortable boxing gear and bright gloves fight intensely on a spotlighted stage, cinematic lighting, dynamic camera movement', steps: 50, cfg: 5, sampler: 'uni_pc', scheduler: 'normal', quant: 'bf16' } },
+        { name: 'Bernini-R · Text to Video', preset: { model: 'Bernini-R-Diffusers', prompt: 'a woman in a flowing red coat walks through a rain-soaked neon city at night, cinematic tracking shot, natural motion, detailed reflections, atmospheric depth', steps: 40, cfg: 4, sampler: 'uni_pc', scheduler: 'normal' } },
     ];
+    var fallbackTemplates = SerenityWorkflowPresets;
     function admittedFallbackTemplates() {
         // A preset is one-click production UI, so it must never advertise a
         // model absent from the server's gated model inventory. Bernini enters
@@ -269,18 +312,23 @@ function setupTemplatesDropdown() {
             return;
         }
         if (template.preset) {
-            var p = Object.assign({
-                negPrompt: '', width: 1024, height: 1024, seed: -1,
-                guidance: 4, frames: 121, fps: 24, loras: []
+            // Model readiness owns geometry, frames, and FPS. Supplying generic
+            // fallback numbers here silently overwrote exact video profiles.
+            var requested = Object.assign({
+                negPrompt: '', seed: -1, guidance: 4, loras: []
             }, template.preset);
-            var graph = WorkflowBuilder.build(p);
+            if (typeof GenerateTab !== 'undefined' && GenerateTab.applyParams)
+                GenerateTab.applyParams(requested, { source: 'template' });
+            var p = Object.assign({}, requested,
+                typeof GenerateTab !== 'undefined' && GenerateTab.getParams
+                    ? GenerateTab.getParams() : {});
+            var graph = typeof GenerateTab !== 'undefined' && GenerateTab.buildWorkflow
+                ? GenerateTab.buildWorkflow() : WorkflowBuilder.build(p);
             var presetNameInput = document.getElementById('workflow-name');
             if (presetNameInput)
                 presetNameInput.value = template.name || 'Untitled Workflow';
             if (typeof loadWorkflow !== 'undefined' && typeof sfCanvas !== 'undefined') {
                 loadWorkflow(sfCanvas, graph, sfCanvas.nodeInfo);
-                if (typeof GenerateTab !== 'undefined' && GenerateTab.applyParams)
-                    GenerateTab.applyParams(p, { source: 'template' });
                 if (typeof WorkflowSync !== 'undefined')
                     WorkflowSync.markSynced(typeof GenerateTab !== 'undefined' && GenerateTab.getParams
                         ? GenerateTab.getParams() : p);
@@ -552,11 +600,6 @@ document.addEventListener('DOMContentLoaded', function () {
                         }
                     }
                 });
-                // Persist
-                try {
-                    localStorage.setItem('sf-gallery', JSON.stringify(st.gallery));
-                }
-                catch (ex) { }
             }
             return;
         }
@@ -649,4 +692,3 @@ document.addEventListener('DOMContentLoaded', function () {
 
     logToConsole('connected', 'Console ready. Press ` (backtick) to toggle.');
 });
-//# sourceMappingURL=shell.js.map

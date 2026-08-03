@@ -78,6 +78,7 @@ from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
     build_f_scale, build_cap_seq, build_x_seq, build_rope, build_positions,
 )
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import reshape, permute, mul_scalar, add, sub, slice
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.training.sample_prompt_config import (
@@ -373,8 +374,9 @@ def _latent_velocity_overlay[
         x_cos, x_sin, cap_cos, cap_sin, uni_cos, uni_sin,
         D, F, OUT_CH, EPS, FINAL_EPS, ctx,
     )
+    var patches_f32 = cast_tensor(patches^, STDtype.F32, ctx, False)
     return zimage_unpatchify_image_rows_channel_minor(
-        patches^, LAT_C, HL, WL, PATCH, ctx
+        patches_f32^, LAT_C, HL, WL, PATCH, ctx
     )
 
 
@@ -398,8 +400,10 @@ def _latent_velocity_overlay_from_refined[
         cap_cos, cap_sin, uni_cos, uni_sin,
         D, F, OUT_CH, EPS, FINAL_EPS, ctx,
     )
+    # The scheduler owns the F32 boundary; the transformer prediction is BF16.
+    var patches_f32 = cast_tensor(patches^, STDtype.F32, ctx, False)
     return zimage_unpatchify_image_rows_channel_minor(
-        patches^, LAT_C, HL, WL, PATCH, ctx
+        patches_f32^, LAT_C, HL, WL, PATCH, ctx
     )
 
 
@@ -461,10 +465,9 @@ def _cfg_pred_overlay[
     if trace:
         trace_t0 = _trace_stage("noise_refiner", trace_t0, ctx)
 
-    var cfg_delta = cfg - Float32(1.0)
-    if cfg_delta < Float32(0.0):
-        cfg_delta = -cfg_delta
-    if cfg_delta <= Float32(1.0e-6):
+    # Creator CFG is admitted only above one. Turbo CFG 0/1 is one positive
+    # forward, never an unconditional image or a duplicated transformer pass.
+    if cfg <= Float32(1.0) + Float32(1.0e-6):
         var vc = _latent_velocity_overlay_from_refined[HL, WL, N_IMG, N_TXT, S](
             xs.copy(), cap_seq_cond,
             cr_blocks, main_blocks, main_mod_dev.copy(), lora,
@@ -495,7 +498,7 @@ def _cfg_pred_overlay[
         _stats("v_cond", vc, ctx)
         _stats("v_uncond", vu, ctx)
 
-    var pred = add(vu, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
+    var pred = add(vc, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
     if trace:
         _ = _trace_stage("cfg_combine", trace_t0, ctx)
     return mul_scalar(pred, -1.0, ctx)

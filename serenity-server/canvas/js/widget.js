@@ -722,4 +722,3 @@ class SFWidgetManager {
 }
 // Global widget manager
 const sfWidgets = new SFWidgetManager();
-//# sourceMappingURL=widget.js.map

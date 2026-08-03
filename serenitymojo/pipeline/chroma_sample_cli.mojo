@@ -755,7 +755,7 @@ def _load_prompt_json(
 
 # ── Main entry ──────────────────────────────────────────────────────────────
 
-def main() raises:
+def _legacy_disk_streaming_main_disabled() raises:
     var a = argv()
     if len(a) < 6:
         print(
@@ -917,3 +917,10 @@ def main() raises:
     print("\n--- Stage 9: Save PNG ---")
     save_png(rgb, out_png, ctx, ValueRange.SIGNED)
     print("[done] saved:", out_png)
+
+
+def main() raises:
+    raise Error(
+        "disabled: this legacy Chroma CLI reads checkpoint weights during "
+        "denoise; use the fail-closed memory-resident product worker"
+    )

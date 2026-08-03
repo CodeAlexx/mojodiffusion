@@ -237,13 +237,24 @@ from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
+from serenitymojo.ops.patchify3d import unpatchify3d
+from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.models.vae.minimax_h3_video_decoder_device import (
+    minimax_h3_video_released_decoder_config,
+    minimax_h3_video_decoder_device_load,
+    minimax_h3_video_decode_device,
+)
+from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
+    minimax_h3_video_pixel_denormalize,
+    minimax_h3_pixel_norm_constants,
+)
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import reshape
+from serenitymojo.ops.tensor_algebra import reshape, permute, slice
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
 from serenitymojo.audio.wav import save_wav
 
@@ -296,6 +307,7 @@ comptime TRANSFORMER_DIR = H3_ROOT + "/transformer"
 comptime TEXT_ENCODER_DIR = H3_ROOT + "/text_encoder"
 comptime PROCESSOR_DIR = H3_ROOT + "/processor"
 comptime AUDIO_VAE_PATH = H3_ROOT + "/audio_vae/model.safetensors"
+comptime VIDEO_VAE_DIR  = H3_ROOT + "/video_vae/source"
 comptime AUDIO_SAMPLE_RATE = 32000
 
 # 13 shards, `model-{i:05d}-of-00013.safetensors` — the released transformer's
@@ -660,18 +672,78 @@ def _minimax_h3_global_timestep_row(
 # ═════════════════════════════════════════════════════════════════════════════
 # Video decode seam — STUBBED. See file header "VIDEO DECODE".
 # ═════════════════════════════════════════════════════════════════════════════
-def _minimax_h3_decode_video_stub(
-    video_state: Tensor,  # [NUM_VIDEO_ROWS, video_patch_dim] F32, patch-token space
-) raises:
-    raise Error(
-        String("minimax_h3_t2va: video VAE decode is NOT WIRED. The denoise")
-        + " loop completed and produced the final patch-token video latent"
-        " video_state=" + String(video_state.shape())
-        + " — video VAE is being rebuilt against the creator's own source"
-        " (FFN gate/value order, fused-qkv split). See this file's header,"
-        " VIDEO DECODE, for the exact seam to fill in. (Audio decode, if"
-        " you got this far, already ran and wrote a real audio.wav.)"
+comptime VIDEO_DECODE_S = NUM_LATENT_FRAMES * LATENT_H * LATENT_W + 5
+
+
+def _minimax_h3_decode_video(
+    video_state: Tensor,   # [NUM_VIDEO_ROWS, video_patch_dim] F32, patch-token space
+    latent_frames: Int,
+    latent_h: Int,
+    latent_w: Int,
+    latent_channels: Int,  # config.latents_dim (24)
+    vae_dir: String,
+    out_dir: String,
+    ctx: DeviceContext,
+) raises -> Int:
+    """Patch tokens -> latent grid -> ViT decoder -> denormalize -> PNG frames.
+    Returns the number of frames written.
+
+    WIRED 2026-08-03. The stub this replaces existed because our ORIGINAL video
+    decoder was ported from the diffusers rewrite and targeted key names the
+    released checkpoint does not contain (measured: zero occurrences of proj_in,
+    to_q/to_k/to_v, to_out.0, ff.net.*, conv_shortcut across all 560 tensors) —
+    it could not have loaded these weights at all. The rebuild under
+    models/vae/ targets the NATIVE names and is gated against the vendor's own
+    AutoencoderKLLegacy at cos 0.9999999978 (encoder) / 0.9999999999998
+    (decoder), essentially F32 noise floor. That is why the stub can go.
+
+    UNPATCHIFY READ ORDER: ops/patchify3d.unpatchify3d reads within-patch as
+    (pf, ph, pw, c) — channel FASTEST — which is deliberately NOT the inverse of
+    patchify3d's c-slowest order. That asymmetry is the trained convention of the
+    model's output linear, documented in that op's own docstring; using
+    patchify3d's order here would scramble every frame while producing a
+    perfectly-shaped tensor."""
+    # [n_patches, C*pf*ph*pw] -> [C, F, H, W]
+    var grid_cfhw = unpatchify3d(
+        video_state, latent_channels, latent_frames, latent_h, latent_w,
+        1, 2, 2, ctx,
     )
+    # [C,F,H,W] -> [1,F,H,W,C] NDHWC, the house layout the device VAE expects
+    var perm = [1, 2, 3, 0]
+    var grid_fhwc = permute(grid_cfhw, perm^, ctx)
+    var latents = reshape(
+        grid_fhwc, [1, latent_frames, latent_h, latent_w, latent_channels], ctx
+    )
+
+    var dcfg = minimax_h3_video_released_decoder_config()
+    var decoder = minimax_h3_video_decoder_device_load(vae_dir, dcfg, ctx)
+    var pixels = minimax_h3_video_decode_device[
+        VIDEO_DECODE_S, 32, 64
+    ](decoder, latents, ctx)
+
+    # ImageNet denormalize — the exact inverse of the pre-encode transform.
+    # Neither original video unit had this; without it every frame is off by a
+    # per-channel affine that reads as a colour bug and gets blamed on the DiT.
+    var rgb = minimax_h3_video_pixel_denormalize(
+        pixels, minimax_h3_pixel_norm_constants(String("imagenet")), ctx
+    )
+
+    var ps = rgb.shape()
+    var frames = ps[1]
+    var height = ps[2]
+    var width = ps[3]
+    for f in range(frames):
+        var one = slice(rgb, 1, f, 1, ctx)                       # [1,1,H,W,3]
+        var hwc = reshape(one, [height, width, 3], ctx)
+        var chw = permute(hwc, [2, 0, 1], ctx)                   # [3,H,W]
+        var img = reshape(chw, [1, 3, height, width], ctx)
+        var name = String(f)
+        while len(name) < 5:
+            name = String("0") + name
+        save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
+    print("  wrote", frames, "frames", height, "x", width, "to", out_dir)
+    return frames
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1238,4 +1310,10 @@ def main() raises:
     write_text_file(out_dir + String("/result.json"), result_body)
     print("  wrote", out_dir + String("/result.json"))
 
-    _minimax_h3_decode_video_stub(video_state)
+    var t_vid0 = perf_counter_ns()
+    var frames_written = _minimax_h3_decode_video(
+        video_state, NUM_LATENT_FRAMES, LATENT_H, LATENT_W,
+        config.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx,
+    )
+    var t_vid1 = perf_counter_ns()
+    print("  video decode done (", Float64(t_vid1 - t_vid0) / 1.0e9, "s)")

@@ -54,7 +54,14 @@
 #          of this header were wrong here: one named lingbot as the only option,
 #          and one pointed at a second forward file that no longer exists (a
 #          duplicate, removed in favour of the in-module one).
-#   SEAM   (a) the Qwen3-VL IMAGE PREPROCESSOR — pixels to the tower's
+#   BUILT  the image preprocessor — `pipeline/minimax_h3_vision_preprocess.mojo`,
+#          gated BIT-EXACT against the real processor's own `pixel_values` over
+#          five real canvases (23M values). It has no resampler and refuses a
+#          size `smart_resize` would change: every real keyframe canvas is
+#          identity there (768 short edge => >= 589,824 px, far above the
+#          65,536 min_pixels), so the resampler is unreachable from a real
+#          request. That refusal is gated too.
+#   WAS-SEAM (a) the Qwen3-VL IMAGE PREPROCESSOR — pixels to the tower's
 #              `[num_patches, 1536]` patch rows (smart_resize, the processor's
 #              OWN mean=std=0.5 normalization — NOT the video VAE's ImageNet
 #              constants — and the patch flattening). `models/minimax_h3/
@@ -177,7 +184,14 @@ from serenitymojo.pipeline.minimax_h3_media_in import (
 )
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
     MiniMaxH3VisionGrid,
+    MiniMaxH3VisionOutput,
+    minimax_h3_vision_forward,
+    minimax_h3_vision_load_weights,
 )
+from serenitymojo.pipeline.minimax_h3_vision_preprocess import (
+    minimax_h3_vision_patch_rows,
+)
+from serenitymojo.pipeline.gpu_free_vram_guard import require_free_vram
 from serenitymojo.pipeline.minimax_h3_keyframe_presentation import (
     MiniMaxH3KeyframePresentation,
     minimax_h3_keyframe_presentation,
@@ -927,27 +941,45 @@ def main() raises:
 
     comptime
     if NO_VISION == 0:
+        # ── (a) preprocess, then the tower. Both host, both before any
+        # DeviceContext. The tower is ~115 GMAC of host float32 per keyframe —
+        # slow on purpose: it is the gated host implementation, and a device
+        # port of it is a separate unit that owes its own bf16 gate.
+        var patch_rows = List[Float32]()
+        for ki in range(len(keyframes)):
+            var rows = minimax_h3_vision_patch_rows(keyframes[ki])
+            for i in range(len(rows)):
+                patch_rows.append(rows[i])
+        print("  preprocessed", len(keyframes), "keyframe(s) ->",
+              len(patch_rows) // 1536, "patch rows")
+
+        var vision_weights = minimax_h3_vision_load_weights(String(TEXT_ENCODER_DIR))
+        var vision = minimax_h3_vision_forward(
+            vision_weights, patch_rows, vision_grids
+        )
+        if vision.num_tokens != len(presentation.pad_positions):
+            raise Error(
+                String("minimax_h3_i2va: the tower returned ")
+                + String(vision.num_tokens) + " embeds but the presentation"
+                " reserved " + String(len(presentation.pad_positions)) + " rows"
+            )
+        print("  vision tower:", vision.num_tokens, "embeds +",
+              "3 deepstack blocks, ready to splice")
+
+        # ── (b) the ONLY remaining seam. ───────────────────────────────────
         raise Error(
-            String("minimax_h3_i2va: SEAM — this request needs ")
-            + String(expected_vision_tokens) + " vision embeds spliced at "
-            + String(len(presentation.pad_positions)) + " image_pad rows."
-            " THE TOWER IS AVAILABLE (models/text_encoder/"
-            "minimax_h3_qwen3vl_vision.mojo::minimax_h3_vision_forward ->"
-            " MiniMaxH3VisionOutput) and this file already resolves its grids"
-            " and its splice map. TWO pieces are missing, neither of them the"
-            " tower, neither of them this file's to write:"
-            " (a) the Qwen3-VL IMAGE PREPROCESSOR — canvas pixels -> the tower's"
-            " [num_patches, 1536] patch rows (smart_resize + the processor's OWN"
-            " mean=std=0.5 normalization, NOT the video VAE's ImageNet"
-            " constants, + patch flattening). models/minimax_h3/image_grid.mojo"
-            " resolves the geometry only and says so itself. UNOWNED 2026-08-03."
-            " (b) the conditioner's vision splice + deepstack injection into"
-            " models/text_encoder/minimax_h3_qwen3vl_streamed.mojo — h3-ref2va's."
-            " ALREADY BUILT AND GATED, do not re-port: this file's presentation"
-            " (pipeline/minimax_h3_keyframe_presentation.mojo) and the tower."
+            String("minimax_h3_i2va: SEAM (b) — the vision tower ran and")
+            + " produced " + String(vision.num_tokens) + " embeds plus 3"
+            " deepstack blocks, and this file has the splice map"
+            " (presentation.pad_positions). What is missing is the CONDITIONER"
+            " side: models/text_encoder/minimax_h3_qwen3vl_streamed.mojo must"
+            " accept a MiniMaxH3VisionOutput, substitute the embeds at the"
+            " <|image_pad|> rows, and add the three deepstack tensors at"
+            " LANGUAGE decoder layers 0/1/2 at visual positions only. That file"
+            " is h3-ref2va's. Everything on THIS side is built and gated:"
+            " presentation (12/12), preprocessor (11/11 bit-exact), tower."
             " Rebuild with -D H3_KF_NO_VISION=1 for the DEGRADED text-only"
-            " presentation — the keyframe still anchors through its VAE"
-            " condition rows, but the conditioner never sees it."
+            " path."
         )
 
 
@@ -964,6 +996,21 @@ def main() raises:
     minimax_h3_check_modcache_weights(transformer_shards, run_config)
     _preflight_block_tensors(transformer_shards, run_config)
     print("  preflight: transformer OK")
+
+    # ── GPU GUARD — the LAST thing before a DeviceContext exists ───────────
+    # Placed here, in the binary, and not only in scripts/minimax_h3_i2va_smoke.sh:
+    # that wrapper has had this check all along and it did not prevent the
+    # 2026-08-03 near-miss, because the binary was invoked directly. A guard
+    # outside the binary only protects the invocation that remembered to use it.
+    #
+    # The budget: this pipeline streams ONE transformer block at a time (~0.77
+    # GiB) on top of a resident modcache, the video VAE, and the packed
+    # sequence. 20 GiB is the figure the smoke script already used and is the
+    # measured working set of a 124-frame run, not a guess at a safety margin.
+    require_free_vram(
+        20000, out_dir + "/.gpu_guard", String("H3"),
+        String("minimax_h3_i2va (") + mode + ")",
+    )
 
     var t_pre1 = perf_counter_ns()
     print("  preflight OK (", Float64(t_pre1 - t_pre0) / 1.0e6, "ms)")

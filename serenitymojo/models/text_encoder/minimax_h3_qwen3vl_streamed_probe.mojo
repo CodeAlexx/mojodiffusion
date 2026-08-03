@@ -15,7 +15,16 @@
 #     way; execution is skipped and said so PLAINLY, exit 0. Do not read a
 #     clean build here as a pass on the actual encoder.
 #
-# Run: pixi run mojo run -I . serenitymojo/models/text_encoder/minimax_h3_qwen3vl_streamed_probe.mojo
+# LINKER: once the weights-present branch actually reaches `_layer`'s sdpa
+# call, expect plain `mojo run -I .` to fail with
+# "Symbols not found: flame_cudnn_sdpa_bf16" (two other agents lost time to
+# this same night). Build/run with:
+#   pixi run mojo run -I . \
+#     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa \
+#     serenitymojo/models/text_encoder/minimax_h3_qwen3vl_streamed_probe.mojo
+#
+# Run (SKIPPED branch only needs the plain form):
+#   pixi run mojo run -I . serenitymojo/models/text_encoder/minimax_h3_qwen3vl_streamed_probe.mojo
 
 from std.gpu.host import DeviceContext
 from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY

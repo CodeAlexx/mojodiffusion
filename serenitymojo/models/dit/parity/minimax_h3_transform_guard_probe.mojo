@@ -51,10 +51,8 @@ from serenitymojo.models.minimax_h3.dit_frontend import (
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     minimax_h3_released_config,
-    minimax_h3_block_prefix,
     minimax_h3_block_tensor_names,
     minimax_h3_require_transformed_weights,
-    minimax_h3_adaln_rows,
     minimax_h3_block_forward,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (

@@ -46,8 +46,9 @@
 # reported alongside — cos alone is magnitude-blind.
 #
 # Run — `mojo run` (JIT) CANNOT resolve the cuDNN shim's `flame_cudnn_sdpa_bf16`
-# external symbol (link-time only, no `-Xlinker` support in JIT mode); build a
-# binary instead, exactly as scripts/build_wan22.sh does for the same shim:
+# external symbol bare (`mojo run -I .` alone fails: "JIT session error:
+# Symbols not found: [ flame_cudnn_sdpa_bf16 ]"); build a binary instead,
+# exactly as scripts/build_wan22.sh does for the same shim:
 #
 #   cd /home/alex/mojodiffusion
 #   pixi run scripts/mem_safe.sh mojo build --optimization-level 2 -j 1 -I . \
@@ -59,6 +60,16 @@
 #     serenitymojo/models/dit/parity/minimax_h3_block_device_gate.mojo \
 #     -o output/checks/minimax_h3_block_device_gate \
 #   && output/checks/minimax_h3_block_device_gate
+#
+# CORRECTION (verified 2026-08-02): `-Xlinker` flags DO reach `mojo run`'s
+# JIT linker — the earlier claim above that JIT has "no -Xlinker support" is
+# wrong. The minimal flag set that actually resolves the shim (no -lcuda, no
+# cudnn_stubs, no rpath needed) works for BOTH `mojo build` and `mojo run`:
+#   pixi run mojo run -I . -Xlinker -lm \
+#     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa \
+#     serenitymojo/models/dit/parity/minimax_h3_block_device_gate.mojo
+# (LD_LIBRARY_PATH=serenitymojo/ops/cshim/lib is also needed at RUN time for
+# a separately-built binary, since it isn't rpath'd by the minimal command.)
 #
 # GEOMETRY: `minimax_h3_block_forward[S, Heads, HeadDim]` takes heads/head_dim
 # as its OWN comptime parameters (defaulted to the released 56/128) — this
@@ -96,6 +107,8 @@ from serenitymojo.models.minimax_h3.dit_frontend import (
 )
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
+    MINIMAX_H3_QKV_DEINTERLEAVED_MARKER,
+    MINIMAX_H3_FC1_SWAPPED_MARKER,
     minimax_h3_block_prefix,
     minimax_h3_block_forward,
 )
@@ -396,6 +409,20 @@ def main() raises:
     )
     dev_weights[prefix + "mlp.fc2.weight"] = ArcPointer(
         Tensor.from_host(weights.get(w_prefix + "ff.net.2.weight"), [hidden_size, host_config.ffn_dim], STDtype.BF16, ctx)
+    )
+    # minimax_h3_block_forward now REQUIRES these two markers (minimax_h3_dit
+    # .mojo::minimax_h3_require_transformed_weights) — real production weights
+    # get them from minimax_h3_load_block_device, but this gate builds
+    # dev_weights directly from the fixture's already-in-the-right-convention
+    # diffusers tensors (see header), which IS the transformed layout, just
+    # assembled by a different, non-loader code path. Stamping here is
+    # truthful, not a bypass: this gate's own passing cos result is the
+    # evidence the row order is correct.
+    dev_weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(
+        Tensor.from_host([Float32(0.0)], [1], STDtype.BF16, ctx)
+    )
+    dev_weights[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(
+        Tensor.from_host([Float32(0.0)], [1], STDtype.BF16, ctx)
     )
 
     var x = Tensor.from_host(hidden_in.copy(), [1, sequence_length, hidden_size], STDtype.BF16, ctx)

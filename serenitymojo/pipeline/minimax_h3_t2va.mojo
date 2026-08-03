@@ -657,7 +657,7 @@ def _minimax_h3_preflight_audio_vae(path: String) raises:
         String("decoder.conv_post.weight_g"), String("decoder.conv_post.weight_v"),
     ]
     for i in range(len(required)):
-        if required[i] not in st.names():
+        if not st.has_tensor(required[i]):
             raise Error(
                 String("minimax_h3_t2va preflight: audio_vae missing tensor ")
                 + required[i]
@@ -744,8 +744,7 @@ def _minimax_h3_decode_audio(
     var ch0 = _minimax_h3_denormalize_audio_channel(ch0_normalized, audio_channels, num_audio_latents, mean, std)
     var ch1 = _minimax_h3_denormalize_audio_channel(ch1_normalized, audio_channels, num_audio_latents, mean, std)
 
-    var dec_cfg = _minimax_h3_audio_decoder_config()
-    dec_cfg.latent_channels = audio_channels
+    var dec_cfg = _minimax_h3_audio_decoder_config(audio_channels)
     var weights = _minimax_h3_load_audio_vae_weights(String(AUDIO_VAE_PATH))
 
     var wave_l = minimax_h3_audio_decode(weights, dec_cfg, ch0, num_audio_latents)
@@ -824,6 +823,11 @@ def main() raises:
         "  preflight: ", text_encoder_shards.num_shards(), "shard(s), ",
         text_encoder_shards.num_tensors(), "tensors",
     )
+
+    print("  preflight: opening audio_vae:", String(AUDIO_VAE_PATH))
+    _minimax_h3_preflight_audio_vae(String(AUDIO_VAE_PATH))
+    print("  preflight: audio_vae OK")
+
     var t_preflight1 = perf_counter_ns()
     print("  preflight OK (", Float64(t_preflight1 - t_preflight0) / 1.0e6, "ms)")
 
@@ -975,7 +979,15 @@ def main() raises:
     var t_denoise1 = perf_counter_ns()
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")
 
-    # ── 7. Decode (STUBBED — see file header) ──────────────────────────────
+    # ── 7. Audio decode (WIRED, real waveform) ─────────────────────────────
+    var t_vae0 = perf_counter_ns()
+    var audio_samples = _minimax_h3_decode_audio(
+        audio_state, NUM_AUDIO_LATENTS, config.audio_latents_dim, out_dir, ctx
+    )
+    var t_vae1 = perf_counter_ns()
+    print("  audio decode done (", Float64(t_vae1 - t_vae0) / 1.0e9, "s)")
+
+    # ── 8. Result JSON — audio is a real artifact; video/mux are not ───────
     var result_body = String("{\n")
     result_body += String("  \"prompt\":\"") + json_escape(prompt) + String("\",\n")
     result_body += String("  \"steps\":") + String(num_steps) + String(",\n")
@@ -984,15 +996,20 @@ def main() raises:
     result_body += String("  \"height\":") + String(HEIGHT) + String(",\n")
     result_body += String("  \"frames\":") + String(FRAMES) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(SEQ_LEN) + String(",\n")
+    result_body += String("  \"audio_sample_rate\":") + String(AUDIO_SAMPLE_RATE) + String(",\n")
+    result_body += String("  \"audio_samples_per_channel\":") + String(audio_samples) + String(",\n")
     result_body += String("  \"timings_ms\":{\n")
     result_body += String("    \"preflight\":") + String(Float64(t_preflight1 - t_preflight0) / 1.0e6) + String(",\n")
     result_body += String("    \"conditioning\":") + String(Float64(t_cond1 - t_cond0) / 1.0e6) + String(",\n")
     result_body += String("    \"modcache\":") + String(Float64(t_mod1 - t_mod0) / 1.0e6) + String(",\n")
-    result_body += String("    \"denoise\":") + String(Float64(t_denoise1 - t_denoise0) / 1.0e6) + String("\n")
+    result_body += String("    \"denoise\":") + String(Float64(t_denoise1 - t_denoise0) / 1.0e6) + String(",\n")
+    result_body += String("    \"audio_vae\":") + String(Float64(t_vae1 - t_vae0) / 1.0e6) + String("\n")
     result_body += String("  },\n")
-    result_body += String("  \"decode\":\"not_wired\"\n")
+    result_body += String("  \"artifacts\":{\"audio\":\"") + json_escape(out_dir + String("/audio.wav")) + String("\"},\n")
+    result_body += String("  \"video_decode\":\"not_wired\",\n")
+    result_body += String("  \"mux\":\"not_applicable_video_not_wired\"\n")
     result_body += String("}\n")
     write_text_file(out_dir + String("/result.json"), result_body)
     print("  wrote", out_dir + String("/result.json"))
 
-    _minimax_h3_decode_stub(video_state, audio_state)
+    _minimax_h3_decode_video_stub(video_state)

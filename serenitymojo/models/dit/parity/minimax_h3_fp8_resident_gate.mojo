@@ -4,6 +4,15 @@
 # the correctness gate for `models/dit/minimax_h3_fp8_resident.mojo` (the
 # krea2-precedent fp8-resident base). REAL FL2VA weights, all 13 shards.
 #
+# SCHEME NOTE (2026-08-04): the store's default scheme is now INT8-WEIGHT-
+# ONLY per-row (see its header — E4M3 measured 0.998347/0.997255/0.988741
+# here vs the 0.999 bar and was swapped on Alex's decision). This gate's
+# `fp8` MODE NAME is historical: it runs the store's DEFAULT scheme, and the
+# store prints which at build. The `ref` arm and its saved references are
+# scheme-independent (bf16-streamed) and remain valid across scheme swaps.
+# The `sens` mode is still the E4M3 round-trip diagnostic (kept: it is the
+# record of WHY the swap happened).
+#
 # TWO CHECKS, both A/B of the SAME code path with only the weight SOURCE
 # changed (`minimax_h3_run_stack`'s `resident` arg — everything else,
 # including `minimax_h3_block_forward`, is shared bit-for-bit):
@@ -538,12 +547,13 @@ def main() raises:
     print("  frontend/final-layer weights built:", len(w), "tensors (real)")
 
     print("")
-    print("[store] quantizing all", NUM_LAYERS, "blocks to fp8-resident ...")
+    print("[store] quantizing all", NUM_LAYERS, "blocks to 1-byte resident",
+          "(store default scheme; printed below) ...")
     var store = minimax_h3_build_resident_fp8(st, config, ctx, NUM_LAYERS)
     print(
         "  resident:",
         Float64(store.resident_bytes()) / (1024.0 * 1024.0 * 1024.0),
-        "GiB on device (E4M3 + per-row F32 scales + bf16 norms + scratch)",
+        "GiB on device (1B/param + per-row F32 scales + bf16 norms + scratch)",
     )
     var resident = Optional[MiniMaxH3ResidentFp8](store^)
     var harness = ParityHarness(COS_BAR)

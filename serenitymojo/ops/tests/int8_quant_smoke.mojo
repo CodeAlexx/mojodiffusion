@@ -11,7 +11,12 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, pi
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.int8_quant import int8_rowscale, int8_encode_perrow
+from serenitymojo.ops.int8_quant import (
+    int8_dequant_perrow_to_bf16,
+    int8_dequant_perrow_to_bf16_into,
+    int8_encode_perrow,
+    int8_rowscale,
+)
 
 
 def _gaussian(n: Int, seed: Int) -> List[Float32]:
@@ -85,4 +90,35 @@ def main() raises:
         print("FAIL: element exceeds one quant step", max_abs_over_step); return
     if cos < 0.999:
         print("FAIL: cosine too low", cos); return
-    print("PASS: int8 quantizer compiles + round-trips (cos>=0.999, <=1 step)")
+
+    # ── GPU dequant (decode half, 2026-08-04) vs the host decode above:
+    # BIT-EXACT. Kernel computes bf16(Float32(q) * scale[row]); the host
+    # replays the identical F32 multiply + RNE bf16 cast, so any mismatch is
+    # a kernel bug (sign extension, row indexing), not precision. ──
+    var deq = int8_dequant_perrow_to_bf16(q, scale, ctx)
+    if deq.dtype() != STDtype.BF16:
+        print("FAIL: deq dtype", deq.dtype().name()); return
+    var deq_h = deq.to_host(ctx)                    # exact F32 upcast of bf16
+    var n_mismatch = 0
+    for i in range(rows * cols):
+        var r = i // cols
+        var exp = (q_h[i] * s_h[r]).cast[DType.bfloat16]().cast[DType.float32]()
+        if deq_h[i] != exp:
+            n_mismatch += 1
+    if n_mismatch > 0:
+        print("FAIL: GPU dequant != host decode at", n_mismatch, "elements"); return
+    # `_into` variant (caller-owned dst, the resident-store hot path): same bytes.
+    var dst_buf = ctx.enqueue_create_buffer[DType.uint8](rows * cols * 2)
+    var dst_shape: List[Int] = [rows, cols]
+    var dst = Tensor(dst_buf^, dst_shape^, STDtype.BF16)
+    int8_dequant_perrow_to_bf16_into(q, scale, dst, ctx)
+    var dst_h = dst.to_host(ctx)
+    var n_into_mismatch = 0
+    for i in range(rows * cols):
+        if dst_h[i] != deq_h[i]:
+            n_into_mismatch += 1
+    if n_into_mismatch > 0:
+        print("FAIL: _into dequant != allocating dequant at", n_into_mismatch,
+              "elements"); return
+    print("PASS: int8 quantizer compiles + round-trips (cos>=0.999, <=1 step)"
+          " + dequant kernels bit-exact vs host decode (both wrappers)")

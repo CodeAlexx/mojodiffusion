@@ -460,8 +460,10 @@ comptime DEFAULT_SEED = 0
 
 # ── FP8-RESIDENT DENOISER (H3_FP8_RESIDENT, default OFF) ─────────────────────
 # Build with `-D H3_FP8_RESIDENT=1` to quantize all 50 blocks' big GEMM
-# weights ONCE (bf16 -> E4M3 + per-row F32 scale, on device, ~18 GiB
-# resident) and dequant per block per step instead of re-streaming ~36 GiB of
+# weights ONCE (bf16 -> 1 byte/param + per-row F32 scale, on device, ~18 GiB
+# resident; scheme = the store's default, INT8-weight-only per-row since
+# 2026-08-04 — E4M3 missed the 0.999 gate bar, see the store's header)
+# and dequant per block per step instead of re-streaming ~36 GiB of
 # block weights from disk EVERY denoise step. The residency arithmetic is
 # `models/minimax_h3/fp8_policy.mojo`'s (fits 24 GiB with spare, adaLN already
 # evicted to the modcache); the runtime is `models/dit/minimax_h3_fp8_resident

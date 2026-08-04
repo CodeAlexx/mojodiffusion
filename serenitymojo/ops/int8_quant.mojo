@@ -511,3 +511,161 @@ def int8_transpose(w_i8: Tensor, ctx: DeviceContext) raises -> Tensor:
         )
     var outsh: List[Int] = [K, N]
     return Tensor(out_buf^, outsh^, STDtype.I8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-ROW int8 → BF16 WEIGHT DEQUANT — the weight-only-int8 resident-store
+# decode half. Inverse of int8_rowscale + int8_encode_perrow above:
+#   w[r,c] = bf16(Float32(q[r,c]) * scale[r])
+# (q sign-extended from the stored two's-complement byte; product in F32,
+# stored bf16 — the SAME dtype path as ops/fp8.mojo's
+# _fp8_dequant_perrow_kernel, whose allocating/`_into` wrapper contracts the
+# two functions below mirror exactly). First consumer:
+# models/dit/minimax_h3_fp8_resident.mojo's int8 scheme (2026-08-04): E4M3's
+# 3-bit mantissa floored that store's gate at blockCos 0.9983 vs the 0.999
+# bar; int8-weight-only per-row carries ~4x finer rounding at the same
+# 1 byte/param + per-row F32 scale residency. Smoke (host-decode
+# bit-identity, both wrappers): ops/tests/int8_quant_smoke.mojo.
+# ─────────────────────────────────────────────────────────────────────────────
+def _int8_dequant_perrow_kernel(
+    x: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],      # [n] int8 bits
+    s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [n]
+    cols: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var i = idx
+    while i < n:
+        var b = Int(rebind[Scalar[DType.uint8]](x[i]))
+        if b >= 128:
+            b -= 256                        # two's-complement sign extend
+        var sc = rebind[Scalar[DType.float32]](s[i // cols])
+        var v = Float32(b) * sc
+        o[i] = rebind[o.element_type](v.cast[DType.bfloat16]())
+        i += stride
+
+
+def int8_dequant_perrow_to_bf16(
+    w: Tensor,
+    scale: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Dequantize a weight-only int8 Linear weight with PER-ROW F32 scales.
+
+    out[o, i] = bf16(Float32(q[o, i]) * scale[o]) — inverse of
+    int8_rowscale + int8_encode_perrow (per-output-row symmetric absmax)."""
+    if w.dtype() != STDtype.I8:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16: w must be I8, got ")
+            + w.dtype().name()
+        )
+    if scale.dtype() != STDtype.F32:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16: scale must be F32, got ")
+            + scale.dtype().name()
+        )
+    var wshape = w.shape()
+    if len(wshape) != 2:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16: w must be 2-D [out,in], rank=")
+            + String(len(wshape))
+        )
+    var out_rows = wshape[0]
+    var cols = wshape[1]
+    var n = w.numel()
+    if n == 0:
+        raise Error("int8_dequant_perrow_to_bf16: empty input")
+    if scale.numel() != out_rows:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16: scale len ")
+            + String(scale.numel()) + " != out rows " + String(out_rows)
+        )
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 2)
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_rows))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), x_rl)
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+    )
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    ctx.enqueue_function[_int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel](
+        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    )
+    return Tensor(out_buf^, w.shape(), STDtype.BF16)
+
+
+def int8_dequant_perrow_to_bf16_into(
+    w: Tensor,
+    scale: Tensor,
+    dst: Tensor,
+    ctx: DeviceContext,
+) raises:
+    """`int8_dequant_perrow_to_bf16` writing into a CALLER-OWNED BF16 tensor
+    instead of allocating — same kernel, same bytes. Mirrors
+    ops/fp8.mojo::fp8_e4m3_dequant_perrow_to_bf16_into's contract EXACTLY
+    (that function's header records the measured 50-block-loop OOM that
+    forced the `_into` shape). The CALLER owns the hazard ordering: `dst`
+    must not still be read by previously enqueued kernels (drain with
+    ctx.synchronize() before overwrite)."""
+    if w.dtype() != STDtype.I8:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16_into: w must be I8, got ")
+            + w.dtype().name()
+        )
+    if scale.dtype() != STDtype.F32:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16_into: scale must be F32, got ")
+            + scale.dtype().name()
+        )
+    if dst.dtype() != STDtype.BF16:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16_into: dst must be BF16, got ")
+            + dst.dtype().name()
+        )
+    var wshape = w.shape()
+    if len(wshape) != 2:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16_into: w must be 2-D [out,in], rank=")
+            + String(len(wshape))
+        )
+    var out_rows = wshape[0]
+    var cols = wshape[1]
+    var n = w.numel()
+    if n == 0:
+        raise Error("int8_dequant_perrow_to_bf16_into: empty input")
+    if scale.numel() != out_rows:
+        raise Error(
+            String("int8_dequant_perrow_to_bf16_into: scale len ")
+            + String(scale.numel()) + " != out rows " + String(out_rows)
+        )
+    var osh = dst.shape()
+    if len(osh) != 2 or osh[0] != out_rows or osh[1] != cols:
+        raise Error(
+            "int8_dequant_perrow_to_bf16_into: dst shape does not match w"
+        )
+
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_rows))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), x_rl)
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        dst.buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+    )
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    ctx.enqueue_function[_int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel](
+        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    )

@@ -1,19 +1,31 @@
 # serenitymojo/models/text_encoder/parity/minimax_h3_qwen3vl_vision_gate.mojo
 #
-# ███ PENDING-GPU ███  Qwen3-VL VISION TOWER forward parity gate.
+# ███ SUPERSEDED ███  Qwen3-VL VISION TOWER forward parity gate — this file's
+# ORACLE CONTRACT (below) has been FULFILLED elsewhere; run those gates:
 #
-# Written now so the oracle contract is fixed before the forward is
-# implemented. Blocked on TWO things:
-#   1. the weights — all 351 vision tensors live in
-#      text_encoder/model-00014-of-00014.safetensors, which has NOT downloaded;
-#   2. the forward — `minimax_h3_vision_forward_seam` still raises.
-# It never reports a pass, so it cannot be mistaken for green in a sweep.
+#   1. HOST forward, CPU/f32, derived bars (4x torch's own f32 error):
+#        minimax_h3_qwen3vl_vision_cpu_gate.mojo
+#        + scripts/minimax_h3_vision_oracle.py                — 10/10 green
+#   2. DEVICE forward, GPU/bf16, matching dtype, at the REAL 2304-patch
+#      keyframe geometry, per-stage bars derived from torch's own measured
+#      bf16 noise floor:
+#        models/minimax_h3_device/parity/minimax_h3_vision_tower_device_parity.mojo
+#        + scripts/minimax_h3_vision_tower_device_oracle.py   — 12/12 green
 #
-# The tower's GEOMETRY is already gated, host-side, with no GPU and no weights:
+# The two blockers this file was written against are both RESOLVED:
+#   1. the weights — all 351 vision tensors landed in FL2VA's
+#      text_encoder/model-00014-of-00014.safetensors (present, checked below);
+#   2. the forward — the seam stub was replaced by the arbitration-kept
+#      `minimax_h3_vision_forward` (host) in minimax_h3_qwen3vl_vision.mojo,
+#      and by `minimax_h3_vision_forward_device` (GPU) in
+#      models/minimax_h3_device/vision_tower_device.mojo.
+# This file still never reports a pass, so it cannot be mistaken for green in
+# a sweep — it raises SUPERSEDED, naming the real gates.
+#
+# The tower's GEOMETRY gate is unchanged and still green, host-side:
 # `minimax_h3_qwen3vl_vision_probe.mojo` (25 checks) covers cu_seqlens, the 2-D
 # rotary coordinates, the f32 inv_freq table, the bilinear position-embed
 # interpolation, token counts, the deepstack index spaces and the manifest.
-# What is left here is the weighted forward.
 #
 # ── ORACLE CONTRACT ──────────────────────────────────────────────────────────
 # `scripts/minimax_h3_vision_oracle.py`, run on the GPU in BF16 against the real
@@ -111,12 +123,13 @@ def main() raises:
     print("MiniMax-H3 Qwen3-VL VISION TOWER parity gate")
     print("")
     print("  ###################################################################")
-    print("  # PENDING-GPU. Written, not runnable. Blocked on BOTH:            #")
-    print("  #   1. weights — all 351 vision tensors are in text_encoder shard #")
-    print("  #      14 of 14, which has not downloaded                         #")
-    print("  #   2. minimax_h3_vision_forward_seam, which still raises         #")
-    print("  # The tower's GEOMETRY is gated host-side, no GPU, 25 checks:     #")
-    print("  #   .../parity/minimax_h3_qwen3vl_vision_probe.mojo               #")
+    print("  # SUPERSEDED. This file's oracle contract was fulfilled by:       #")
+    print("  #   CPU/f32 host gate  (10/10):                                   #")
+    print("  #     .../parity/minimax_h3_qwen3vl_vision_cpu_gate.mojo          #")
+    print("  #   GPU/bf16 device gate at 2304 patches (12/12):                 #")
+    print("  #     models/minimax_h3_device/parity/                            #")
+    print("  #       minimax_h3_vision_tower_device_parity.mojo                #")
+    print("  # Run THOSE. This file only checks artifact presence and raises.  #")
     print("  ###################################################################")
     print("")
 
@@ -161,15 +174,17 @@ def main() raises:
 
     print("")
     raise Error(
-        String("minimax_h3_qwen3vl_vision_gate: PENDING-GPU — weights ")
+        String("minimax_h3_qwen3vl_vision_gate: SUPERSEDED — weights ")
         + ("present" if have_weights else "MISSING")
         + " ("
         + String(present)
         + "/351), oracle "
         + ("present" if have_oracle else "MISSING")
-        + ", and minimax_h3_vision_forward_seam is not implemented. See this"
-        " file's ORACLE CONTRACT header for the exact key set and the per-key"
-        " bars, and remember the integration check it records: the three"
-        " deepstack tensors are consumed at LANGUAGE layers 0/1/2, not at the"
-        " vision blocks 8/16/24 where they are tapped."
+        + ". The weighted forward exists and is gated elsewhere: CPU/f32 by"
+        " minimax_h3_qwen3vl_vision_cpu_gate.mojo (10/10) and GPU/bf16 by"
+        " models/minimax_h3_device/parity/minimax_h3_vision_tower_device_parity"
+        ".mojo (12/12, real 2304-patch keyframe geometry). Run those. The"
+        " integration check this file records still stands: the three deepstack"
+        " tensors are consumed at LANGUAGE layers 0/1/2, not at the vision"
+        " blocks 8/16/24 where they are tapped."
     )

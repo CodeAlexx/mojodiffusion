@@ -10,22 +10,27 @@
 # ── SCOPE OF THIS FILE ───────────────────────────────────────────────────────
 # This is the entry point, the PLAN, and — WITH `--partial` (see below) — the
 # full device denoise chain, run against STUBBED conditioning and STUBBED (or
-# injected) condition rows, because the two real inputs that would feed it
-# (the reference video-VAE encode, the Qwen3-VL vision tower) are not built
-# yet. WITHOUT `--partial` this file's original behavior is UNCHANGED: it
-# prints the plan and raises at the reference-encode seam, never touching the
-# GPU.
+# injected) condition rows. WITHOUT `--partial` it now runs the REAL reference
+# encode chain — ffmpeg decode -> 24 fps resample -> canvas LANCZOS resize ->
+# pixel norm -> the GATED video-VAE seam — and raises at the NEXT unbuilt
+# stage (condition-row packing + the Qwen3-VL conditioning), so a plain
+# invocation now touches the GPU up to that seam and can still never be
+# mistaken for a full generation.
 #
 # ── PIPELINE STAGES, AND WHAT EXISTS ─────────────────────────────────────────
 #   1. media-in           BUILT  `pipeline/minimax_h3_media_in.mojo` (unit A)
 #                                probe: pipeline/parity/minimax_h3_media_in_probe
-#   2. ref-encode         SEAM   references -> pixel norm -> video VAE (tiled)
-#                                -> sample posterior (seed 42) -> fp16 round ->
-#                                normalize -> patchify; waveform -> audio VAE
-#                                posterior MODE -> normalize. WITHOUT
-#                                `--partial`, THIS FILE RAISES HERE. WITH
-#                                `--partial`, this stage is STUBBED (Stage A
-#                                below) instead of run for real.
+#   2. ref-encode         BUILT  references -> 24 fps resample -> canvas
+#                                LANCZOS resize (`pipeline/minimax_h3_
+#                                ref_frames.mojo`, gated bit-exact) -> pixel
+#                                norm -> video VAE (tiled) -> sample posterior
+#                                (seed 42) — runs FOR REAL without `--partial`
+#                                through the gated seam, then raises at the
+#                                condition-row packing / conditioning seam.
+#                                The fp16 round -> normalize -> patchify tail
+#                                and the audio branch are built and gated but
+#                                not yet consumed there. WITH `--partial`,
+#                                this stage is STUBBED (Stage A below).
 #   3. ref-pack           BUILT  `models/dit/minimax_h3_ref_geometry.mojo`
 #                                (unit B) over the gated
 #                                `models/minimax_h3/packing_ref2va.mojo`
@@ -158,6 +163,7 @@ from serenitymojo.models.minimax_h3.packing_ref2va import (
     MINIMAX_H3_REF_IMAGE,
     MINIMAX_H3_REF_VIDEO,
     MiniMaxH3PreparedReference,
+    minimax_h3_trim_reference_num_frames,
 )
 from serenitymojo.models.dit.minimax_h3_ref_geometry import (
     MiniMaxH3ReferenceMedia,
@@ -177,8 +183,21 @@ from serenitymojo.pipeline.minimax_h3_media_in import (
     minimax_h3_read_wav,
 )
 from serenitymojo.models.vae.minimax_h3_ref_encode import (
+    MINIMAX_H3_VIDEO_LATENT_CHANNELS,
+    minimax_h3_encode_reference_visual_seam,
     minimax_h3_pixel_normalize_frames,
     minimax_h3_mix_condition_rows,
+)
+from serenitymojo.models.vae.minimax_h3_video_encoder_device import (
+    MiniMaxH3VideoEncoderDevice,
+    minimax_h3_video_released_encoder_config,
+)
+from serenitymojo.pipeline.minimax_h3_ref_frames import (
+    minimax_h3_prepare_reference_frames,
+    minimax_h3_resample_reference_frames,
+)
+from serenitymojo.pipeline.minimax_h3_video_vae_spatial_tiling import (
+    minimax_h3_video_released_tiling_config,
 )
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
@@ -492,19 +511,40 @@ def _minimax_h3_encode_references(
     specs: List[MiniMaxH3ReferenceSpec],
     references: List[MiniMaxH3PreparedReference],
 ) raises:
-    """Reference encode, stage 2 — the CPU half, then THE SEAM.
+    """Reference encode, stage 2 — the CPU prep chain, then THE GATED SEAM.
 
-    Runs for real, per reference, in packed order:
+    Runs for real, per video reference, in packed order:
       * decode the frames (unit A, ffmpeg -> rgb24 + sidecar)
-      * pixel-normalize onto the video VAE's ImageNet convention, channels-first
+      * 24 fps resample (vendor order: before_encoder.py:371 runs it BEFORE
+        the resize; index math gated in minimax_h3_ref2va_parity)
+      * truncate + LANCZOS resize onto the reference's OWN canvas
+        (`prepare_reference_frames`, packing_ref2va.py:654-681 — 768 short
+        edge; gated BIT-EXACT against the vendor's own function by
+        pipeline/parity/minimax_h3_ref_frames_probe.mojo)
+      * 17n+5 trim (`trim_reference_num_frames`, encoders.py:574)
+      * pixel-normalize onto the video VAE's ImageNet convention (gated)
+      * `minimax_h3_encode_reference_visual_seam` — the REAL device encode
+        (tiled, temporal-chunked) + posterior sample at seed 42, gated by
+        models/vae/parity/minimax_h3_ref_encode_gate.mojo
 
-    Then raises at the VAE forward, which needs a `DeviceContext`. The steps
-    AFTER the forward — fp16 round, latent normalize, channel-slowest patchify,
-    the 0.999 noise mix, the audio branch's channel-major packing — are BUILT
-    and gated host-side (models/vae/parity/minimax_h3_ref_encode_probe.mojo,
-    12 bit-exact checks); they are simply unreachable until the forward exists.
+    then raises at the NEXT unbuilt stage: packing the sampled latents into
+    this request's condition rows, and the Qwen3-VL conditioning (stage 4's
+    seam — text_encoder shard 14 of 14 carries no vision-tower weights). The
+    steps between the sample and the rows — fp16 round, latent normalize,
+    channel-slowest patchify, the 0.999 noise mix — are BUILT and gated
+    host-side (models/vae/parity/minimax_h3_ref_encode_probe.mojo).
 
-    Only reached WITHOUT `--partial` — see `_minimax_h3_ref2va_generate`."""
+    Only reached WITHOUT `--partial` — see `_minimax_h3_ref2va_generate`.
+    Constructs the `DeviceContext`: this stage IS the real encode now, so a
+    plain invocation touches the GPU up to the conditioning seam."""
+    var ctx = DeviceContext()
+    var enc_cfg = minimax_h3_video_released_encoder_config()
+    var encoder = MiniMaxH3VideoEncoderDevice.load(
+        String(VIDEO_VAE_DIR), enc_cfg, ctx
+    )
+    var tiling = minimax_h3_video_released_tiling_config()
+
+    var encoded = 0
     for i in range(len(specs)):
         if specs[i].kind != MINIMAX_H3_REF_VIDEO:
             continue
@@ -520,55 +560,99 @@ def _minimax_h3_encode_references(
             frames.height, "@", frames.fps, "fps",
         )
 
-        # TRUNCATE TO THE TARGET FRAME COUNT FIRST. `prepare_reference_frames`
-        # does `frames[:num_frames]` before anything else (packing_ref2va.py:675),
-        # and the packed layout above was resolved on that truncated count — a
-        # reference longer than the generated video must not contribute more
-        # latent frames than the layout reserved rows for.
-        var used_frames = frames.num_frames
-        if used_frames > FRAMES:
-            used_frames = FRAMES
-            print("      truncated to the target's", FRAMES, "frames")
-        var frame_bytes = frames.height * frames.width * 3
-        var kept = List[UInt8]()
-        kept.resize(used_frames * frame_bytes, 0)
-        for i in range(used_frames * frame_bytes):
-            kept[i] = frames.pixels[i]
+        # Vendor order (before_encoder.py:371-372): 24 fps resample FIRST,
+        # then truncate + canvas resize. The resample output is capped at the
+        # target's frame count because `prepare_reference_frames` truncates
+        # there anyway (packing_ref2va.py:675) — a pure output truncation,
+        # gated as such in the ref_frames probe.
+        var on_grid = minimax_h3_resample_reference_frames(frames, FRAMES)
+        if frames.fps != Float64(24.0):
+            print(
+                "      24 fps resample ->", on_grid.num_frames, "frames kept",
+            )
+        var prepared = minimax_h3_prepare_reference_frames(on_grid, FRAMES)
+        print(
+            "      canvas resize ->", prepared.num_frames, "frames",
+            prepared.width, "x", prepared.height,
+        )
 
-        # NOT DONE HERE, and it must be before the encode: the LANCZOS resize
-        # onto the reference's own canvas (`prepare_reference_frames` resolves
-        # `resolve_canvas_size(width, height)` and resizes frame by frame). The
-        # geometry printed above already assumes the canvas; these pixels are
-        # still at source resolution. Wiring the resize belongs with the encode.
+        # `frames[: trim_reference_num_frames(...)]` (encoders.py:574): snap
+        # DOWN to a 17n+5 the VAE encodes without padding. The plan
+        # (`minimax_h3_resolve_reference`) already refused references shorter
+        # than 22 frames, so tripping this here means the decode and the plan
+        # disagree — fail loud, the layout reserved rows on the plan's count.
+        var encode_frames = minimax_h3_trim_reference_num_frames(
+            prepared.num_frames
+        )
+        if encode_frames > prepared.num_frames:
+            raise Error(
+                String("minimax_h3_ref2va: reference ") + specs[i].path
+                + " decodes to " + String(prepared.num_frames)
+                + " frames on the 24 fps grid but the VAE's 17n+5 chunking"
+                " needs " + String(encode_frames)
+                + " — shorter than the plan assumed. The plan probes geometry"
+                " only (no frame count); supply a reference of at least 22"
+                " frames at 24 fps."
+            )
+        var frame_bytes = prepared.height * prepared.width * 3
+        var kept = List[UInt8]()
+        kept.resize(encode_frames * frame_bytes, 0)
+        for b in range(encode_frames * frame_bytes):
+            kept[b] = prepared.pixels[b]
+
         var pixels = minimax_h3_pixel_normalize_frames(
-            kept, used_frames, frames.height, frames.width
+            kept, encode_frames, prepared.height, prepared.width
         )
         print(
             "      pixel-normalized ->", len(pixels),
-            "f32 values [3,", used_frames, ",", frames.height, ",",
-            frames.width, "]",
+            "f32 values [3,", encode_frames, ",", prepared.height, ",",
+            prepared.width, "]",
         )
-        # THE SEAM IS NOW BUILT — `minimax_h3_encode_reference_visual_seam`
-        # (models/vae/minimax_h3_ref_encode.mojo) runs the real device encode
-        # and is gated against the vendor's own encode by
-        # models/vae/parity/minimax_h3_ref_encode_gate.mojo. It is NOT wired
-        # here yet: it now takes the loaded device encoder + tiling +
-        # DeviceContext, and this stage still lacks the LANCZOS canvas resize
-        # noted above — encoding at source resolution would condition at the
-        # wrong canvas. Fail loud rather than encode the wrong pixels.
-        _ = len(pixels)
+
+        # THE SEAM, now wired: real device encode + posterior sample.
+        var sampled = minimax_h3_encode_reference_visual_seam(
+            encoder, pixels, 3, encode_frames, prepared.height,
+            prepared.width, tiling, ctx,
+        )
+
+        # The plan predicted this reference's latent grid from the SAME
+        # canvas law (`minimax_h3_resolve_reference`); the encode must land
+        # exactly on it — the packed layout reserved rows for it.
+        var expected = (
+            MINIMAX_H3_VIDEO_LATENT_CHANNELS * references[i].num_latent_frames
+            * references[i].latent_height * references[i].latent_width
+        )
+        if references[i].kind != MINIMAX_H3_REF_VIDEO or len(sampled) != expected:
+            raise Error(
+                String("minimax_h3_ref2va: reference ") + specs[i].path
+                + " encoded to " + String(len(sampled))
+                + " latent values but the plan reserved rows for "
+                + String(expected)
+                + " — the encode and the plan disagree on the latent grid"
+            )
+        print(
+            "      encoded + sampled ->", len(sampled), "latent f32 values ["
+            , MINIMAX_H3_VIDEO_LATENT_CHANNELS, ",",
+            references[i].num_latent_frames, ",",
+            references[i].latent_height, ",", references[i].latent_width, "]",
+        )
+        encoded += 1
+
+    if encoded == 0:
         raise Error(
-            "minimax_h3_ref2va: reference-encode NOT WIRED in this pipeline —"
-            " the seam (minimax_h3_encode_reference_visual_seam) is built and"
-            " GPU-gated, but this stage still needs the reference-canvas"
-            " LANCZOS resize before it and the device encoder handle."
-            " See models/vae/minimax_h3_ref_encode.mojo."
+            "minimax_h3_ref2va: SEAM — no video reference reached the VAE"
+            " encode. Pass at least one video:PATH reference, or pass"
+            " --partial to run the full-plumbing chain with this stage"
+            " STUBBED instead."
         )
-    _ = references
     raise Error(
-        "minimax_h3_ref2va: SEAM — no video reference reached the VAE encode."
-        " Pass at least one video:PATH reference, or pass --partial to run the"
-        " full-plumbing chain with this stage STUBBED instead."
+        "minimax_h3_ref2va: SEAM — the reference video-VAE encode ran for"
+        " real (canvas resize -> pixel norm ->"
+        " minimax_h3_encode_reference_visual_seam, all gated), but packing"
+        " the sampled latents into this request's condition rows and the"
+        " Qwen3-VL conditioning (stage 4 — text_encoder shard 14 of 14 has"
+        " no vision-tower weights) are not wired in this path. Use --partial"
+        " for the full-plumbing chain."
     )
 
 
@@ -1029,11 +1113,11 @@ def _minimax_h3_ref2va_generate(
 ) raises:
     """The generation tail. Two shapes:
 
-      * WITHOUT `--partial` (the file's ORIGINAL skeleton behavior,
-        UNCHANGED): attempts the real reference video-VAE encode and raises
-        at its seam (`minimax_h3_encode_reference_visual_seam`) — proves the
-        chain up through Stage A's CPU half and no further. Never touches
-        the GPU.
+      * WITHOUT `--partial`: runs the REAL reference encode — ffmpeg decode,
+        24 fps resample, the gated canvas LANCZOS resize, pixel norm, and
+        the GATED device seam (`minimax_h3_encode_reference_visual_seam`) —
+        then raises at the condition-row packing / Qwen3-VL conditioning
+        seam. Touches the GPU exactly as far as the encode.
 
       * WITH `--partial` (this pass): the FULL plumbing chain, with the two
         stages that cannot run today — Stage A's video-VAE forward and Stage
@@ -1042,8 +1126,9 @@ def _minimax_h3_ref2va_generate(
         modulation cache, the REAL `config.num_layers`-block streamed
         denoise, Euler steps restricted to target rows, the save — is real.
 
-    `DeviceContext()` is constructed HERE, inside the `--partial` branch
-    only, so a plain invocation still never touches the GPU."""
+    `DeviceContext()` is constructed inside the branch taken — the
+    `--partial` chain here, the encode chain in
+    `_minimax_h3_encode_references` — never before the preflight."""
     if not partial_mode:
         _minimax_h3_encode_references(specs, references)
         return

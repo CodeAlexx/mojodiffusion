@@ -196,6 +196,10 @@ from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
     minimax_h3_vision_forward,
     minimax_h3_vision_load_weights,
 )
+from serenitymojo.models.minimax_h3_device.vision_tower_device import (
+    minimax_h3_vision_device_weights,
+    minimax_h3_vision_forward_device,
+)
 from serenitymojo.pipeline.minimax_h3_vision_preprocess import (
     minimax_h3_vision_patch_rows,
 )
@@ -950,13 +954,21 @@ def main() raises:
         expected_vision_tokens, "embeds to splice",
     )
 
+    # ── GPU GUARD + DeviceContext, MOVED ABOVE THE VISION TOWER 2026-08-04:
+    # the device tower (12/12 gated, 5931x over host) needs a DeviceContext.
+    # The guard stays the LAST thing before the context exists — the invariant
+    # the original placement protected — it just happens earlier now. The
+    # transformer preflight below remains host-side and order-independent.
+    require_free_vram(
+        20000, out_dir + "/.gpu_guard", String("H3"),
+        String("minimax_h3_i2va (") + mode + ")",
+    )
+    var ctx = DeviceContext()
+
     var vision_out = Optional[MiniMaxH3VisionOutput](None)
     comptime
     if NO_VISION == 0:
-        # ── (a) preprocess, then the tower. Both host, both before any
-        # DeviceContext. The tower is ~115 GMAC of host float32 per keyframe —
-        # slow on purpose: it is the gated host implementation, and a device
-        # port of it is a separate unit that owes its own bf16 gate.
+        # ── (a) preprocess, then the tower.
         var patch_rows = List[Float32]()
         for ki in range(len(keyframes)):
             var rows = minimax_h3_vision_patch_rows(keyframes[ki])
@@ -965,10 +977,30 @@ def main() raises:
         print("  preprocessed", len(keyframes), "keyframe(s) ->",
               len(patch_rows) // 1536, "patch rows")
 
-        var vision_weights = minimax_h3_vision_load_weights(String(TEXT_ENCODER_DIR))
-        var vision = minimax_h3_vision_forward(
-            vision_weights, patch_rows, vision_grids
+        # DEVICE tower when the geometry matches its gated comptime
+        # instantiation (ONE grid, 48x48 = 2304 patches — the square-768
+        # canvas every current i2va run uses; gate: models/minimax_h3_device/
+        # parity/, 12/12 vs GPU torch, 0.22 s vs 1290 s host). Any other
+        # geometry falls back to the gated HOST tower rather than raising —
+        # slow is better than dead, and the device module raises loudly for
+        # uninstantiated segment lengths by design.
+        var use_device_tower = (
+            len(vision_grids) == 1
+            and vision_grids[0].t == 1
+            and vision_grids[0].h == 48
+            and vision_grids[0].w == 48
         )
+        var vision: MiniMaxH3VisionOutput
+        if use_device_tower:
+            var vis_dev = minimax_h3_vision_device_weights(String(TEXT_ENCODER_DIR), ctx)
+            vision = minimax_h3_vision_forward_device(vis_dev, patch_rows, vision_grids, ctx)
+            print("  vision tower: DEVICE path (2304-patch gated geometry)")
+        else:
+            var vision_weights = minimax_h3_vision_load_weights(String(TEXT_ENCODER_DIR))
+            vision = minimax_h3_vision_forward(
+                vision_weights, patch_rows, vision_grids
+            )
+            print("  vision tower: HOST path (geometry outside the device gate)")
         if vision.num_tokens != len(presentation.pad_positions):
             raise Error(
                 String("minimax_h3_i2va: the tower returned ")
@@ -1009,15 +1041,10 @@ def main() raises:
     # GiB) on top of a resident modcache, the video VAE, and the packed
     # sequence. 20 GiB is the figure the smoke script already used and is the
     # measured working set of a 124-frame run, not a guess at a safety margin.
-    require_free_vram(
-        20000, out_dir + "/.gpu_guard", String("H3"),
-        String("minimax_h3_i2va (") + mode + ")",
-    )
+    # (Guard + DeviceContext now run ABOVE the vision tower — see that block.)
 
     var t_pre1 = perf_counter_ns()
     print("  preflight OK (", Float64(t_pre1 - t_pre0) / 1.0e6, "ms)")
-
-    var ctx = DeviceContext()
 
     # ── 1. Keyframe encode -> condition rows ───────────────────────────────
     var t_kf0 = perf_counter_ns()

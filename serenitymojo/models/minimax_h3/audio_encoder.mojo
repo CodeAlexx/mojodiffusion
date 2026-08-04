@@ -121,7 +121,18 @@ def minimax_h3_audio_conv1d(
 
     Output length is the floor form `(L + 2p - d*(k-1) - 1)//stride + 1`; see
     trap 3 — for the stride-5 stages this is not L/5 and the encoder only lands
-    on samples/800 because the caller padded first."""
+    on samples/800 because the caller padded first.
+
+    THE REDUCTION ACCUMULATES IN FLOAT64, and the bias no longer seeds the
+    accumulator — the 34a648c fix pattern, applied on the same evidence. The
+    trunk's widest reductions (block.5.block.4 at 10240, the residual units at
+    7168, block.7 at 6144) ran sequential Float32 at activation rms ~18; a
+    single 10240-wide conv measured 2.04e-4 absolute seq-f32-vs-f64 error on
+    real weights, and the whole trunk sat at 2.33e-4 against an f64-regenerated
+    torch reference — 116% of the gate's own 2e-4 bar (torch's own f32 error
+    there is 1.55e-4; the host was 1.5x it). The shipped gate read 1.79e-4 and
+    "passed" only because the f32 anchor's error partially cancels the host's —
+    exactly the silent weakening the vision gate's derived bars caught."""
     var eff = dilation * (kernel - 1) + 1
     var out_len = (length + 2 * padding - eff) // stride + 1
     if out_len <= 0:
@@ -131,7 +142,7 @@ def minimax_h3_audio_conv1d(
     for oc in range(out_channels):
         var obase = oc * out_len
         for o in range(out_len):
-            var acc = bias[oc]
+            var acc = Float64(0.0)
             var start = o * stride - padding
             for ic in range(in_channels):
                 var wbase = (oc * in_channels + ic) * kernel
@@ -139,8 +150,8 @@ def minimax_h3_audio_conv1d(
                 for k in range(kernel):
                     var t = start + k * dilation
                     if t >= 0 and t < length:
-                        acc += weight[wbase + k] * x[xbase + t]
-            out[obase + o] = acc
+                        acc += Float64(weight[wbase + k]) * Float64(x[xbase + t])
+            out[obase + o] = Float32(acc) + bias[oc]
     return out^
 
 
@@ -155,19 +166,23 @@ def minimax_h3_audio_layernorm(
     bias: List[Float32],
     eps: Float32,
 ) raises -> List[Float32]:
+    """Both reductions accumulate in Float64 — 34a648c fix pattern, together
+    with `minimax_h3_audio_conv1d`/`minimax_h3_audio_linear` (converge
+    everything or nothing; the vision fix measured that converging one
+    reduction family alone made its gate WORSE)."""
     var out = List[Float32]()
     out.resize(seq * features, Float32(0.0))
     for s in range(seq):
         var base = s * features
-        var mean = Float32(0.0)
+        var mean_acc = Float64(0.0)
         for f in range(features):
-            mean += x[base + f]
-        mean = mean / Float32(features)
-        var var_ = Float32(0.0)
+            mean_acc += Float64(x[base + f])
+        var mean = Float32(mean_acc / Float64(features))
+        var var_acc = Float64(0.0)
         for f in range(features):
-            var d = x[base + f] - mean
-            var_ += d * d
-        var_ = var_ / Float32(features)
+            var d = Float64(x[base + f] - mean)
+            var_acc += d * d
+        var var_ = Float32(var_acc / Float64(features))
         var inv = Float32(1.0) / sqrt(var_ + eps)
         for f in range(features):
             out[base + f] = (x[base + f] - mean) * inv * weight[f] + bias[f]
@@ -183,17 +198,22 @@ def minimax_h3_audio_linear(
     out_features: Int,
     has_bias: Bool,
 ) raises -> List[Float32]:
+    """Float64 accumulation, bias added AFTER the cast (torch does GEMM then
+    bias) — 34a648c fix pattern. The 2048-wide qkv/proj dot products were the
+    dominant term in pre_block's 2.1e-5 distance from an f64-regenerated
+    reference (3.65x torch's own 5.7e-6 f32 error at that stage); the qkv
+    micro-probe alone measured 1.5e-5 of it."""
     var out = List[Float32]()
     out.resize(seq * out_features, Float32(0.0))
     for s in range(seq):
         var xb = s * in_features
         var ob = s * out_features
         for o in range(out_features):
-            var acc = bias[o] if has_bias else Float32(0.0)
+            var acc = Float64(0.0)
             var wb = o * in_features
             for i in range(in_features):
-                acc += weight[wb + i] * x[xb + i]
-            out[ob + o] = acc
+                acc += Float64(weight[wb + i]) * Float64(x[xb + i])
+            out[ob + o] = Float32(acc) + bias[o] if has_bias else Float32(acc)
     return out^
 
 
@@ -252,10 +272,13 @@ def minimax_h3_audio_causal_attention(
         var xb = s * in_dim
         var ob = s * 3 * in_dim
         for o in range(3 * in_dim):
-            var acc = Float32(0.0)
+            # Float64 accumulation over the 2048-wide dot — 34a648c pattern,
+            # with `minimax_h3_audio_linear` and the LayerNorm above.
+            var acc64 = Float64(0.0)
             var wb = o * in_dim
             for i in range(in_dim):
-                acc += qkv_weight[wb + i] * x[xb + i]
+                acc64 += Float64(qkv_weight[wb + i]) * Float64(x[xb + i])
+            var acc = Float32(acc64)
             if o < in_dim:
                 acc += q_bias[o]
             elif o >= 2 * in_dim:

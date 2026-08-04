@@ -58,7 +58,11 @@ from serenitymojo.models.minimax_h3.audio_encoder import (
     minimax_h3_audio_encode_trunk,
 )
 
-comptime CKPT = "/home/alex/Downloads/MiniMax-H3-audio_vae.safetensors"
+# The dev-time copy (/home/alex/Downloads/MiniMax-H3-audio_vae.safetensors)
+# was cleaned up; this is the product location the t2va pipeline reads
+# (H3_ROOT in pipeline/minimax_h3_t2va.mojo) — same 1086-tensor file, verified
+# by re-running this gate against it: 12/12 with identical stage numbers.
+comptime CKPT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/audio_vae/model.safetensors"
 comptime REF = "/home/alex/mojodiffusion/output/minimax_h3_audio/audio_real_weights_ref.safetensors"
 comptime TOL = Float32(2.0e-4)
 

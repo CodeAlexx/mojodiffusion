@@ -6,6 +6,17 @@ were gated on tiny random-weight fixtures because no checkpoint existed. This
 runs the reference on the ACTUAL released audio VAE at its ACTUAL config, so
 the Mojo port can be diffed against it at full width for the first time.
 
+THE REFERENCE PASS RUNS IN FLOAT64 and stores float32 downcasts — the 34a648c
+vision-oracle precedent, adopted here after the precision sweep measured WHY it
+matters: against the original f32-pass reference the Mojo trunk read 1.79e-4
+(90% of the 2e-4 bar) and "passed", but torch's own f32-vs-f64 error at the
+trunk is 1.554e-4 — 78% of the bar was the ANCHOR's own accumulation noise,
+partially cancelling the port's. Anchored to this f64 pass, the pre-fix port
+FAILED the trunk at 2.33e-4 (116% of bar) — a real sequential-f32 accumulation
+defect in the encoder's 10240-wide convs, invisible against the noisy anchor —
+and the fixed port sits at 7.6e-6 (3.8%). An anchor at truth makes the bar
+mean what it says. Bars are unchanged.
+
 Weights come from the released file directly and are NOT copied into the
 reference output — the Mojo gate opens the same file. The only thing written
 here is the input waveform and the reference's intermediates, a few hundred KB
@@ -27,6 +38,12 @@ INPUT: 3200 samples, 4 latent frames. Deliberately NOT 2 — `_decode` in the
 reference raises on 2 latent frames, a defect unit 10 recorded rather than
 worked around.
 
+DECODER SELF-CONSISTENCY: the gate decodes the STORED `out.mean` (float32), so
+the decoder references here are computed from that same stored float32 mean
+upcast to float64 — not from the float64 mean the encoder pass produced. The
+encoder and decoder halves stay independently attributable, exactly as the
+gate assumes.
+
 Usage:
     python3 scripts/minimax_h3_audio_real_weights_oracle.py [path/to/audio_vae.safetensors]
 """
@@ -43,7 +60,10 @@ from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # n
     AutoencoderKLMiniMaxH3Audio,
 )
 
-DEFAULT_CKPT = "/home/alex/Downloads/MiniMax-H3-audio_vae.safetensors"
+# The dev-time copy (/home/alex/Downloads/MiniMax-H3-audio_vae.safetensors) was
+# cleaned up; this is the product location the t2va pipeline reads (H3_ROOT in
+# pipeline/minimax_h3_t2va.mojo) — same 1086-tensor file.
+DEFAULT_CKPT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/audio_vae/model.safetensors"
 OUT_DIR = "/home/alex/mojodiffusion/output/minimax_h3_audio"
 SAMPLES = 3200
 
@@ -55,28 +75,36 @@ def main():
     print(f"            {os.path.getsize(ckpt)/1024**2:.1f} MiB")
 
     state = load_file(ckpt)
-    model = AutoencoderKLMiniMaxH3Audio().eval()
-    missing, unexpected = model.load_state_dict(state, strict=True), None
-    print(f"loaded strict=True: {missing}")
+    model = AutoencoderKLMiniMaxH3Audio().double().eval()
+    missing, unexpected = (
+        model.load_state_dict({k: v.double() for k, v in state.items()}, strict=True),
+        None,
+    )
+    print(f"loaded strict=True (float64 pass): {missing}")
     print(f"hop_length {model.hop_length}, sampling_rate "
           f"{model.config.sampling_rate}")
 
+    # The input stays the FLOAT32 waveform, stored bit-identically — the port
+    # reads the same f32 samples; only the reference ARITHMETIC is float64.
     torch.manual_seed(0x48_33_AA)
-    wave = torch.randn(1, 1, SAMPLES, dtype=torch.float32) * 0.1
+    wave32 = torch.randn(1, 1, SAMPLES, dtype=torch.float32) * 0.1
+    wave = wave32.double()
 
-    tensors = {"in.samples": wave[0, 0].contiguous()}
+    tensors = {"in.samples": wave32[0, 0].contiguous()}
     with torch.no_grad():
         trunk = model.encoder(wave)
-        tensors["out.trunk"] = trunk[0].contiguous()
+        tensors["out.trunk"] = trunk[0].float().contiguous()
 
         pre = model.pre_block(trunk.transpose(1, 2)).transpose(1, 2)
-        tensors["out.pre_block"] = pre[0].contiguous()
+        tensors["out.pre_block"] = pre[0].float().contiguous()
 
         mean = model.encode(wave).latent_dist.mode()
-        tensors["out.mean"] = mean[0].contiguous()
+        tensors["out.mean"] = mean[0].float().contiguous()
 
-        decoded = model.decode(mean).sample
-        tensors["out.waveform"] = decoded[0, 0].contiguous()
+        # The decoder is driven from the STORED float32 mean (see header).
+        mean_in = tensors["out.mean"].unsqueeze(0).double()
+        decoded = model.decode(mean_in).sample
+        tensors["out.waveform"] = decoded[0, 0].float().contiguous()
 
         # ── decoder intermediates, stage by stage ────────────────────────────
         # Re-walks MiniMaxH3AudioBigVGANDecoder.forward using the reference's
@@ -84,10 +112,10 @@ def main():
         # implementation. Without them the Mojo decoder's staged entry points
         # have nothing to be compared against and the split buys only tidiness.
         dec = model.decoder
-        h = model.dec_in_proj(mean)
-        tensors["dec.in_proj"] = h[0].contiguous()
+        h = model.dec_in_proj(mean_in)
+        tensors["dec.in_proj"] = h[0].float().contiguous()
         h = dec.conv_pre(h)
-        tensors["dec.pre"] = h[0].contiguous()
+        tensors["dec.pre"] = h[0].float().contiguous()
         print()
         print("  decoder stages:")
         print(f"    dec_in_proj -> {tuple(h.shape)}")
@@ -98,7 +126,7 @@ def main():
                 block = dec.resblocks[i * dec.num_kernels + j](h)
                 residual = block if residual is None else residual + block
             h = residual / dec.num_kernels
-            tensors[f"dec.stage{i}"] = h[0].contiguous()
+            tensors[f"dec.stage{i}"] = h[0].float().contiguous()
             print(f"    stage {i}: rate {dec.ups[i][0].stride[0]:2d} -> "
                   f"[{h.shape[1]:5d}, {h.shape[2]:5d}]")
 

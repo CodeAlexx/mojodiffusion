@@ -3129,7 +3129,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 
 - `models/minimax_h3/` — HOST-F32 ORACLES (packing, packing_ref2va, block
   math, schedulers, audio codec, fp8 policy, tokenizer parity). Gated;
-  runtime must never call them.
+  runtime must never call them. PRECISION LAW (derived-bar sweep 2026-08-04):
+  reductions wider than ~2048 accumulate in F64 (audio encoder trunk convs at
+  width 10240 measured 116% of bar in seq-f32; f64 fix -> 3.8%); the audio
+  real-weights reference is generated from a torch F64 pass (f32-anchored
+  references waste ~78% of the bar on the anchor's own noise).
 - `models/dit/minimax_h3_{dit,rope,loader_device,modcache,sampling,frontend,
   stack}.mojo` — the device runtime. Real-weight gates: loader max_abs 0.0,
   block cos 0.99991, adaLN bit-exact, final layer 0.999999999999.

@@ -60,14 +60,23 @@ def fold_weight_norm(
     """`torch.nn.utils.weight_norm` with the default `dim=0`.
 
     `w = g * v / ||v||`, the norm taken per output channel over every other
-    dimension. `g` is `[out_channels, 1, 1]` and `v` has the weight's shape."""
+    dimension. `g` is `[out_channels, 1, 1]` and `v` has the weight's shape.
+
+    THE SUM OF SQUARES ACCUMULATES IN FLOAT64 — same defect class as the
+    vision tower's 34a648c fix, found by the same probe. This fold runs up to
+    14336 wide (decoder.conv_pre) and 10240 wide (encoder.block.5.block.4);
+    sequential Float32 there put the folded weights 2.5-3.4e-6 RELATIVE off
+    truth (measured on the released checkpoint), which the ENCODER's rms-18
+    trunk activations amplify to ~5e-5 ABSOLUTE — a quarter of the encoder
+    gate's 2e-4 bar from this one site. The decoder's own stages run at rms
+    0.19-0.63 and never cared; the fix is here because the fold is shared."""
     var out = List[Float32]()
     for c in range(out_channels):
-        var sum_squares = Float32(0.0)
+        var sum_squares = Float64(0.0)
         for i in range(elements_per_channel):
-            var value = weight_v[c * elements_per_channel + i]
+            var value = Float64(weight_v[c * elements_per_channel + i])
             sum_squares += value * value
-        var scale = weight_g[c] / sqrt(sum_squares)
+        var scale = weight_g[c] / Float32(sqrt(sum_squares))
         for i in range(elements_per_channel):
             out.append(weight_v[c * elements_per_channel + i] * scale)
     return out^

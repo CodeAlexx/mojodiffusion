@@ -3147,12 +3147,20 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   size modcache off len(values).
 - `models/dit/minimax_h3_fp8_resident.mojo` — OPT-IN quantized-RESIDENT
   base (-D H3_FP8_RESIDENT=1 — flag name historical, selects the
-  scheme-agnostic store; default build UNCHANGED). SHIPPED SCHEME:
-  INT8-weight-only per-row (the vendor's own consumer recipe), GATE GREEN:
-  block 0.99989986 / e2e video 0.9998776 / e2e audio 0.99976134 (E4M3 kept
-  selectable; it measured 0.99835/0.99726/0.98874 = the 3-bit-mantissa
-  floor — per-class sens all >=0.9993 composing independently, no
-  affordable selective-keep, per-group scales provably useless for e4m3).
+  scheme-agnostic store; default build UNCHANGED). SCHEME: INT8-weight-only
+  per-row (the vendor's own consumer recipe). HOST-GATE TRUTH (3090 Ti,
+  06:27Z — CORRECTS 2184e75's commit message and this entry's own prior
+  "GATE GREEN" text, which relayed phantom sandbox numbers whose ref shapes
+  contradicted the on-disk refs): block 0.9996933 PASS / e2e video
+  0.9994361 PASS / e2e AUDIO 0.9965372 FAIL vs 0.999. int8 cut error
+  3.3-5.4x vs E4M3 (0.99835/0.99726/0.98874 = the 3-bit-mantissa floor;
+  per-class sens all >=0.9993 composing independently, no affordable
+  selective-keep, per-group scales provably useless for e4m3) exactly as
+  the ~4x noise theory predicted; the audio miss is compounded per-block
+  noise over 2 steps x 50 blocks on n=64 audio latents — headroom, not a
+  kernel bug (dequant smoke bit-exact on host). OPEN RUNG: group-wise int8
+  scales (~128/group, negligible bytes) or audio-class selective-keep, or
+  a ruling on the e2e-audio bar vs perceptual evidence.
   STEP-TIME A/B (S=3049, same build env, same prompt/seed): streamed
   66.6-72.8 s/step vs resident 4.65 s/step = 14.9x; one-time store build
   198 s (18.67 GiB resident) amortizes in 3 steps. Speedup shrinks as S

@@ -121,6 +121,16 @@
 #   ops/attention.mojo               sdpa_nomask (1852)          — refiner self-attn
 #                                     (math-mode for all Dh, so Dh=128 is fine on
 #                                     this sm_86 GPU where the flash path is not)
+#                                    sdpa_nomask_tiled (1924)    — refiner self-attn
+#                                     at LARGE S (ref2va: reference videos land
+#                                     thousands of vision tokens in the text
+#                                     region). The math path materializes F32
+#                                     scores [H,S,S]; at S=7300, H=56 that is
+#                                     ~11.1 GiB -> CUDA OOM. The tiled path is
+#                                     exact online softmax, O(S*Dh) peak, no
+#                                     padding and no mask — routing is a comptime
+#                                     score-budget select mirroring
+#                                     ops/attention.sdpa_cross_nomask (:2092).
 #   ops/activations.mojo             swiglu (711)                — refiner FFN
 #   ops/tensor_algebra.mojo          reshape (1080), add (548), mul (565),
 #                                     add_scalar (766), slice (1910),
@@ -145,7 +155,7 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.vec_rms_norm import vec_rms_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.embeddings import t_embedder
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_tiled
 from serenitymojo.ops.tensor_algebra import reshape, add, mul, add_scalar, slice, gather_rows
 from serenitymojo.ops.shape_backward import index_select_backward
 from serenitymojo.ops.patchify3d import patchify3d
@@ -251,7 +261,9 @@ def minimax_h3_condition_embed(
 # 3. Token refiner: 2 plain pre-norm blocks over the TEXT stream only. No
 #    AdaLN, no rope (block_forward.mojo _token_refiner, lines 392-444).
 # ─────────────────────────────────────────────────────────────────────────────
-def _minimax_h3_token_refiner_block[S: Int, H: Int, Dh: Int](
+def _minimax_h3_token_refiner_block[
+    S: Int, H: Int, Dh: Int, FORCE_TILED: Bool = False
+](
     hidden_in: Tensor,  # [S, hidden_size] bf16
     w: Dict[String, ArcPointer[Tensor]],
     prefix: String,  # e.g. "token_refiner.blocks.0" (NO trailing dot)
@@ -285,7 +297,28 @@ def _minimax_h3_token_refiner_block[S: Int, H: Int, Dh: Int](
     q4 = vec_rms_norm(q4, w[prefix + ".attn.q_norm.weight"][], qk_eps, ctx)
     k4 = vec_rms_norm(k4, w[prefix + ".attn.k_norm.weight"][], qk_eps, ctx)
 
-    var attn4 = sdpa_nomask[1, S, H, Dh](q4, k4, v4, scale, ctx)
+    # SCORE-BUDGET ROUTE, mirroring ops/attention.sdpa_cross_nomask (:2092).
+    # The math path (`sdpa_nomask`) materializes the F32 scores [H, S, S]:
+    # at ref2va's S=7300 with H=56 that is 56*7300^2*4 B = 11,384 MiB — a
+    # guaranteed CUDA OOM on this 24 GiB card. t2va never hits it (S<=~1000
+    # -> ~213 MiB). Above the budget, route through `sdpa_nomask_tiled`:
+    # EXACT online softmax (ops/attention.mojo:714 "equals _sdpa_math"),
+    # O(S*Dh) peak, and — because the refiner is full-bidirectional with NO
+    # mask (oracle: block_forward.mojo _token_refiner passes attention() an
+    # empty mask) and S stays the exact row count — no pad rows are ever
+    # introduced, so there is no pad-through-softmax hazard to mask away.
+    # Small S keeps the EXACT old kernel so every existing t2va/i2va gate
+    # stays bit-identical. 3584 MiB = ops/attention._MATH_SCORE_BUDGET_MIB
+    # (private to that file; value mirrored here, same as its own use at
+    # sdpa_cross_nomask). FORCE_TILED exists for the parity gate
+    # (models/dit/parity/minimax_h3_refiner_tiled_gate.mojo) to run BOTH
+    # paths at one small S; production callers leave it defaulted False.
+    comptime score_mib = (H * S * S * 4) // (1024 * 1024)
+    var attn4: Tensor
+    comptime if FORCE_TILED or score_mib >= 3584:
+        attn4 = sdpa_nomask_tiled[1, S, H, Dh](q4, k4, v4, scale, ctx)
+    else:
+        attn4 = sdpa_nomask[1, S, H, Dh](q4, k4, v4, scale, ctx)
     var attn = reshape(attn4, [S, inner], ctx)
     var attn_out = linear(attn, w[prefix + ".attn.out_proj.weight"][], None, ctx)
     state = add(state, attn_out, ctx)
@@ -306,7 +339,9 @@ def _minimax_h3_token_refiner_block[S: Int, H: Int, Dh: Int](
     return state^
 
 
-def minimax_h3_token_refiner[S: Int, H: Int, Dh: Int](
+def minimax_h3_token_refiner[
+    S: Int, H: Int, Dh: Int, FORCE_TILED: Bool = False
+](
     text_embeds: Tensor,  # [S, hidden_size] bf16, condition_proj output
     w: Dict[String, ArcPointer[Tensor]],
     config: MiniMaxH3DiTConfig,
@@ -314,13 +349,16 @@ def minimax_h3_token_refiner[S: Int, H: Int, Dh: Int](
 ) raises -> Tensor:
     """`token_refiner.blocks.{0,1}` + `token_refiner.final_norm`. S/H/Dh are
     comptime — the whole port follows this convention for any sdpa-bearing
-    block (see e.g. models/dit/hunyuan15_dit.mojo)."""
+    block (see e.g. models/dit/hunyuan15_dit.mojo). FORCE_TILED is gate-only
+    (see the routing comment in `_minimax_h3_token_refiner_block`)."""
     if text_embeds.shape()[0] != S:
         raise Error("minimax_h3_token_refiner: text row count != comptime S")
     var state = text_embeds.clone(ctx)
     for layer in range(config.token_refiner_num_layers):
         var prefix = String("token_refiner.blocks.") + String(layer)
-        state = _minimax_h3_token_refiner_block[S, H, Dh](state, w, prefix, config, ctx)
+        state = _minimax_h3_token_refiner_block[S, H, Dh, FORCE_TILED](
+            state, w, prefix, config, ctx
+        )
     return vec_rms_norm(state, w["token_refiner.final_norm.weight"][], config.final_norm_eps, ctx)
 
 

@@ -22,6 +22,10 @@
 # [1] Pixel normalize doubles as a LAYOUT check: input is channels-LAST uint8
 #     (what media-in produces) and output channels-FIRST f32 (what the VAE
 #     wants), so a transpose bug shows up as a value mismatch, not just a shape.
+#     Its expected values are the vendor's DEVICE execution (torch-CUDA's
+#     cpu-scalar div == reciprocal multiply — see the function's docstring),
+#     not a numpy true-division transcription, which is 1 ULP off on some
+#     bytes. Measured, then pinned here.
 # [2] The fp16 round trip is step 5 of the visual recipe and is load-bearing for
 #     bit-exactness ("~11 bits of every conditioning latent"). 1e-8 flushing to
 #     zero and 1/3 landing on 0.333251953125 are what prove it is a REAL fp16
@@ -123,13 +127,21 @@ def main() raises:
         UInt8(7), UInt8(200), UInt8(99),
         UInt8(250), UInt8(5), UInt8(180),
     ]
+    # Expected values recomputed 2026-08-03 under the VENDOR'S DEVICE
+    # semantics: the /255 is torch-CUDA's cpu-scalar true-div, i.e.
+    # `x * (1.0f/255.0f)` (reciprocal formed once in f32) — NOT a true f32
+    # division, which lands 1 ULP away on 3 of these 12 values. Verified
+    # bit-equal against the actual CUDA op (`torch.equal(new, cuda)` True);
+    # the ref-encode GPU gate caught the old CPU-division values at
+    # max_abs 7.15e-7 over a real clip. See the docstring of
+    # `minimax_h3_pixel_normalize_frames`.
     var want_pix: List[Float32] = [
         Float32(-2.1179039478302), Float32(2.248908281326294),
-        Float32(-1.998030662536621), Float32(2.1632845401763916),
+        Float32(-1.998030662536621), Float32(2.1632847785949707),
         Float32(-0.9152660369873047), Float32(-1.4754900932312012),
-        Float32(1.465686321258545), Float32(-1.9481792449951172),
+        Float32(1.465686559677124), Float32(-1.9481792449951172),
         Float32(0.4264925718307495), Float32(-1.5255773067474365),
-        Float32(-0.07895416766405106), Float32(1.332810640335083),
+        Float32(-0.07895403355360031), Float32(1.332810640335083),
     ]
     var got_pix = minimax_h3_pixel_normalize_frames(rgb, 1, 2, 2)
     report.eq_f32("pixel normalize + transpose", got_pix, want_pix)

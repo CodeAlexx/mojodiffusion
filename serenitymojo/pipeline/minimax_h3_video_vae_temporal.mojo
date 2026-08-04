@@ -174,11 +174,27 @@ def minimax_h3_video_encode_temporal(
     var remainder = t_raw % clip_length
     if remainder != 0:
         var pad_size = clip_length - remainder
+        # Build the pad block FIRST (doubling the single last frame), then
+        # attach it in ONE concat. Byte-identical to the reference's
+        # `x[:, :, -1:].repeat(1,1,pad,1,1)` + single `torch.cat`
+        # (encode_temporal:466-467 — concat is a pure copy), but materially
+        # different in allocation: the previous one-frame-at-a-time loop
+        # allocated `pad_size` full-video-sized intermediates back to back
+        # (~1.8 GiB each at the 1344x768 canvas) faster than the runtime
+        # retires their frees, and a REAL 141-frame ref2va encode died
+        # CUDA_ERROR_OUT_OF_MEMORY at pad iteration 10 with device VRAM
+        # nearly idle (measured 2026-08-03, ref-encode gate + oom_bisect
+        # probe). With the doubling, every intermediate is a pad-block of at
+        # most `pad_size` frames, and only the final concat is video-sized.
         var last = slice(pixels, 1, t_raw - 1, 1, ctx)
-        var padded = pixels.clone(ctx)
-        for _ in range(pad_size):
-            padded = concat(1, ctx, padded, last)
-        x = padded^
+        var pad = last^
+        while pad.shape()[1] * 2 <= pad_size:
+            pad = concat(1, ctx, pad, pad)
+        var have = pad.shape()[1]
+        if have < pad_size:
+            var rest = slice(pad, 1, 0, pad_size - have, ctx)
+            pad = concat(1, ctx, pad, rest)
+        x = concat(1, ctx, pixels, pad)
     else:
         x = pixels.clone(ctx)
 

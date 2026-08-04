@@ -29,9 +29,11 @@
 # `minimax_h3_block_forward` is completely unchanged — it consumes the Dict this
 # file returns exactly as it consumes `minimax_h3_load_block_device`'s.
 #
-# TRANSFORM ORDER MATTERS: quantization happens on the OUTPUT of
-# `minimax_h3_load_block_device` — i.e. AFTER the qkv de-interleave and fc1
-# half-swap (both gated max_abs 0.0 vs the f32 oracle). Dequant therefore
+# TRANSFORM ORDER MATTERS: quantization happens AFTER the qkv de-interleave
+# and fc1 half-swap — the build stages every big tensor through the SAME
+# gated bf16 rewrite functions the streaming loader uses
+# (`minimax_h3_deinterleave_qkv_bf16` / `minimax_h3_swap_fc1_bf16`,
+# loader_device.mojo, selfcheck-pinned to the f32 oracle). Dequant therefore
 # reproduces the TRANSFORMED row order, which is why
 # `minimax_h3_resident_block_weights` may honestly re-stamp the two transform
 # markers `minimax_h3_require_transformed_weights` checks. Quantizing the raw
@@ -69,8 +71,9 @@ from serenitymojo.models.dit.minimax_h3_dit import (
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     _minimax_h3_marker_tensor,
-    minimax_h3_load_fc1_device,
-    minimax_h3_load_qkv_device,
+    _tensor_view_bf16_host,
+    minimax_h3_deinterleave_qkv_bf16,
+    minimax_h3_swap_fc1_bf16,
 )
 
 
@@ -148,6 +151,28 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
         return total
 
 
+def _fill_from_host_bf16(
+    data: List[BFloat16], dst: Tensor, ctx: DeviceContext
+) raises:
+    """Upload a host bf16 list into an EXISTING device tensor, verbatim —
+    the zero-churn analogue of `Tensor.from_host_bf16`. Reusing `dst`'s
+    allocation is the whole point: a fresh device allocation per staged
+    tensor is exactly the pool churn that left runs 3+4 with no contiguous
+    block for anything after the store."""
+    var n = len(data)
+    if n != dst.numel():
+        raise Error(
+            String("_fill_from_host_bf16: size mismatch, host ") + String(n)
+            + " vs dst " + String(dst.numel())
+        )
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](n * 2)
+    var hp = host.unsafe_ptr().bitcast[BFloat16]()
+    for i in range(n):
+        hp[i] = data[i]
+    ctx.enqueue_copy(dst_buf=dst.buf, src_buf=host)
+    ctx.synchronize()
+
+
 def _check_tensor(
     t: Tensor, name: String, want: List[Int], layer: Int
 ) raises:
@@ -175,17 +200,21 @@ def _check_tensor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build: stream and quantize ONE TENSOR AT A TIME, through the SAME
-# per-tensor loaders the production streaming path uses (qkv de-interleave /
-# fc1 half-swap included, so quantize still happens post-transform). The
-# first version of this loop loaded a whole block Dict (~0.77 GiB bf16) and
-# quantized from it; the pool retained those per-block transients as
-# size-bucketed slack, and with the finished 18.67 GiB store on device the
-# process sat at ~23 GiB reserved — the NEXT large allocation (the
-# frontend weights) OOM'd (measured 2026-08-03, fp8-mode run 3). Per-tensor
-# lifetimes bound the build's transient high-water to ONE tensor (~0.31 GiB
-# max) instead of one block, and the per-tensor ctx.synchronize() retires
-# the encode kernels before the bf16 source drops.
+# Build: ZERO-CHURN staging. Every big tensor is host-read (with the gated
+# qkv/fc1 rewrite where required), FILLED INTO the preallocated scratch for
+# its slot, and quantized FROM scratch — the only device allocations the
+# whole build makes are the persistent fp8 bytes + scales (the store) and
+# the tiny norm keeps. This is the third shape of this loop, each forced by
+# a measured OOM on the 24 GiB card (2026-08-03):
+#   run 2-3: whole-block Dict transients (~0.77 GiB/layer churn) left the
+#            pool at ~23 GiB reserved around the 18.7 GiB store — the next
+#            large allocation (frontend weights) failed;
+#   run 4:   per-tensor transient lifetimes did NOT lower the end state
+#            (23.2 GiB again) — churn is churn to the pool; the post-build
+#            scratch allocation failed.
+# Staging through the scratch eliminates the churn class entirely: reserved
+# ends at approximately (store + scratch + whatever the caller loaded), and
+# NOTHING large allocates after the build.
 # ─────────────────────────────────────────────────────────────────────────────
 def minimax_h3_build_resident_fp8(
     st: ShardedSafeTensors,
@@ -204,6 +233,31 @@ def minimax_h3_build_resident_fp8(
             + ") exceeds config.num_layers " + String(config.num_layers)
         )
 
+    # SCRATCH FIRST — before the store grows. Its shapes are a pure function
+    # of `config` (all 50 blocks share them), and it is the LAST large
+    # allocation this store ever needs: run 4 (2026-08-03) put it after the
+    # build and the 231-308 MB allocations OOM'd at 23.2 GiB reserved even
+    # though the arithmetic total fit — post-build pool fragmentation leaves
+    # no large contiguous block. Law (measured across runs 3+4): every
+    # large persistent allocation happens BEFORE the store build; after it,
+    # only small activations.
+    var scratch = List[ArcPointer[Tensor]]()
+    var template_names = minimax_h3_block_tensor_names(start_layer)
+    for k in range(len(template_names)):
+        ref tn = template_names[k]
+        var tw = minimax_h3_expected_shape(tn, config)
+        var trows = tw[0]
+        var tcols = tw[1] if len(tw) == 2 else 0
+        if minimax_h3_fp8_class(tn, trows, tcols) == H3_FP8_ROW:
+            var buf = ctx.enqueue_create_buffer[DType.uint8](trows * tcols * 2)
+            var shape: List[Int] = [trows, tcols]
+            scratch.append(ArcPointer(Tensor(buf^, shape^, STDtype.BF16)))
+
+    var heads = config.num_attention_heads
+    var head_dim = config.attention_head_dim
+    var hidden = config.hidden_size
+    var ffn = config.ffn_hidden_size
+
     var blocks = List[MiniMaxH3BlockResidentFp8]()
     for i in range(n):
         var layer = start_layer + i
@@ -216,6 +270,7 @@ def minimax_h3_build_resident_fp8(
         var scale = List[ArcPointer[Tensor]]()
         var bf16_names = List[String]()
         var bf16 = List[ArcPointer[Tensor]]()
+        var slot = 0
         for k in range(len(names)):
             ref name = names[k]
             var want = minimax_h3_expected_shape(name, config)
@@ -223,28 +278,41 @@ def minimax_h3_build_resident_fp8(
             var cols = want[1] if len(want) == 2 else 0
             var cls = minimax_h3_fp8_class(name, rows, cols)
             if cls == H3_FP8_ROW:
-                # Load THIS tensor (transformed where the contract requires),
-                # quantize, drain, drop the bf16 — one-tensor high-water.
-                var t: Tensor
+                # Stage THROUGH THE SCRATCH tensor for this slot: host-read
+                # (+ the loader's own gated bf16 rewrite where the contract
+                # requires one), fill scratch in place, quantize FROM
+                # scratch. ZERO fresh device allocations besides the
+                # persistent fp8 bytes + scale — the per-layer transient
+                # churn of the first three build shapes is what left the
+                # pool with no contiguous block for anything afterwards.
+                var tv = st.tensor_view(name)
+                var tsh = tv.shape.copy()
+                if len(tsh) != 2 or tsh[0] != rows or tsh[1] != cols:
+                    raise Error(
+                        String("MiniMax-H3 fp8 build: shard shape mismatch for ")
+                        + name
+                    )
+                var raw = _tensor_view_bf16_host(tv)
+                ref dst = scratch[slot][]
                 if name == qkv_name:
-                    t = minimax_h3_load_qkv_device(
-                        st, name, config.num_attention_heads,
-                        config.attention_head_dim, config.hidden_size, ctx,
+                    _fill_from_host_bf16(
+                        minimax_h3_deinterleave_qkv_bf16(raw, heads, head_dim, hidden),
+                        dst, ctx,
                     )
                 elif name == fc1_name:
-                    t = minimax_h3_load_fc1_device(
-                        st, name, config.ffn_hidden_size, config.hidden_size, ctx,
+                    _fill_from_host_bf16(
+                        minimax_h3_swap_fc1_bf16(raw, ffn, hidden), dst, ctx,
                     )
                 else:
-                    t = Tensor.from_view(st.tensor_view(name), ctx)
-                _check_tensor(t, name, want, layer)
-                var s = fp8_e4m3_rowscale(t, ctx)
-                var q = fp8_e4m3_encode_perrow(t, s, ctx)
-                # Encode must retire before `t` (the bf16 source) drops.
+                    _fill_from_host_bf16(raw, dst, ctx)
+                var s = fp8_e4m3_rowscale(dst, ctx)
+                var q = fp8_e4m3_encode_perrow(dst, s, ctx)
+                # Encode must retire before scratch is refilled next slot.
                 ctx.synchronize()
                 fp8_names.append(name.copy())
                 fp8.append(ArcPointer(q^))
                 scale.append(ArcPointer(s^))
+                slot += 1
             elif cls == H3_FP8_BF16_KEEP:
                 var t2 = Tensor.from_view(st.tensor_view(name), ctx)
                 _check_tensor(t2, name, want, layer)
@@ -269,20 +337,14 @@ def minimax_h3_build_resident_fp8(
                 "(layer", layer, ")",
             )
 
-    # Preallocate the shared dequant scratch (one bf16 tensor per fp8 slot;
-    # every block has the same 4 shapes — block 0's are the template). No
-    # fill needed: every byte is overwritten by the dequant kernel before any
-    # consumer reads it.
-    var scratch = List[ArcPointer[Tensor]]()
-    if len(blocks) > 0:
-        ref b0 = blocks[0]
-        for k in range(len(b0.fp8)):
-            var sh = b0.fp8[k][].shape()
-            var buf = ctx.enqueue_create_buffer[DType.uint8](
-                sh[0] * sh[1] * 2
-            )
-            var shape: List[Int] = [sh[0], sh[1]]
-            scratch.append(ArcPointer(Tensor(buf^, shape^, STDtype.BF16)))
+    # Sanity: the pre-allocated scratch must line up slot-for-slot with what
+    # the per-layer loop actually quantized (both derive from
+    # minimax_h3_block_tensor_names order filtered by class).
+    if len(blocks) > 0 and len(scratch) != len(blocks[0].fp8):
+        raise Error(
+            "minimax_h3_build_resident_fp8: scratch slots do not match the"
+            " quantized slot count — template/loop classification drifted"
+        )
     return MiniMaxH3ResidentFp8(blocks^, start_layer, scratch^)
 
 

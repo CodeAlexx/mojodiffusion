@@ -177,7 +177,6 @@ from serenitymojo.pipeline.minimax_h3_media_in import (
     minimax_h3_read_wav,
 )
 from serenitymojo.models.vae.minimax_h3_ref_encode import (
-    minimax_h3_encode_reference_visual_seam,
     minimax_h3_pixel_normalize_frames,
     minimax_h3_mix_condition_rows,
 )
@@ -549,11 +548,22 @@ def _minimax_h3_encode_references(
             "f32 values [3,", used_frames, ",", frames.height, ",",
             frames.width, "]",
         )
-        # THE SEAM. Raises.
-        var _latents = minimax_h3_encode_reference_visual_seam(
-            pixels, 3, used_frames, frames.height, frames.width
+        # THE SEAM IS NOW BUILT — `minimax_h3_encode_reference_visual_seam`
+        # (models/vae/minimax_h3_ref_encode.mojo) runs the real device encode
+        # and is gated against the vendor's own encode by
+        # models/vae/parity/minimax_h3_ref_encode_gate.mojo. It is NOT wired
+        # here yet: it now takes the loaded device encoder + tiling +
+        # DeviceContext, and this stage still lacks the LANCZOS canvas resize
+        # noted above — encoding at source resolution would condition at the
+        # wrong canvas. Fail loud rather than encode the wrong pixels.
+        _ = len(pixels)
+        raise Error(
+            "minimax_h3_ref2va: reference-encode NOT WIRED in this pipeline —"
+            " the seam (minimax_h3_encode_reference_visual_seam) is built and"
+            " GPU-gated, but this stage still needs the reference-canvas"
+            " LANCZOS resize before it and the device encoder handle."
+            " See models/vae/minimax_h3_ref_encode.mojo."
         )
-        _ = len(_latents)
     _ = references
     raise Error(
         "minimax_h3_ref2va: SEAM — no video reference reached the VAE encode."
@@ -801,6 +811,36 @@ def _minimax_h3_ref2va_global_timestep_row(
     return out^
 
 
+def _h3_ref2va_concat_rows(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """dim=0 concat of two rank-2, same-dtype, same-trailing-dim tensors.
+    WORKAROUND for a SIGSEGV localized (GDB, 2026-08-04) in
+    ops.tensor_algebra.concat's variadic `*tensors` pack at THIS call site
+    only: indexing the pack inside the heavily-inlined ref2va denoise loop
+    dereferences a garbage pointer while materializing `tensors[0].shape()`.
+    Isolated repros at identical shapes run clean — the trigger is the
+    instantiation context, not the shapes. Row-major dim=0 concat needs no
+    interleaving — A's bytes then B's bytes — so two D2D enqueue_copys into
+    sub-buffer views reproduce concat's own output without the variadic
+    pack."""
+    var ash = a.shape()
+    var bsh = b.shape()
+    if len(ash) != 2 or len(bsh) != 2:
+        raise Error("_h3_ref2va_concat_rows: both inputs must be rank-2")
+    if ash[1] != bsh[1]:
+        raise Error("_h3_ref2va_concat_rows: trailing dim mismatch")
+    if a.dtype() != b.dtype():
+        raise Error("_h3_ref2va_concat_rows: dtype mismatch")
+    var a_bytes = a.nbytes()
+    var b_bytes = b.nbytes()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](a_bytes + b_bytes)
+    var a_dst = out_buf.create_sub_buffer[DType.uint8](0, a_bytes)
+    ctx.enqueue_copy(dst_buf=a_dst, src_buf=a.buf)
+    var b_dst = out_buf.create_sub_buffer[DType.uint8](a_bytes, b_bytes)
+    ctx.enqueue_copy(dst_buf=b_dst, src_buf=b.buf)
+    var out_shape: List[Int] = [ash[0] + bsh[0], ash[1]]
+    return Tensor(out_buf^, out_shape^, a.dtype())
+
+
 def _h3_ref2va_scatter_rows(
     condition: Tensor, target: Tensor, num_condition: Int, ctx: DeviceContext
 ) raises -> Tensor:
@@ -813,7 +853,7 @@ def _h3_ref2va_scatter_rows(
     need a copy that does not exist for this type)."""
     if num_condition == 0:
         return slice(target, 0, 0, target.shape()[0], ctx)
-    return concat(0, ctx, condition, target)
+    return _h3_ref2va_concat_rows(condition, target, ctx)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

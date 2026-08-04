@@ -281,6 +281,11 @@ from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_qkv_device,
     minimax_h3_load_fc1_device,
 )
+from serenitymojo.models.dit.minimax_h3_fp8_resident import (
+    MiniMaxH3ResidentFp8,
+    minimax_h3_build_resident_fp8,
+    minimax_h3_resident_block_weights,
+)
 from serenitymojo.models.dit.minimax_h3_modcache import (
     MiniMaxH3ModCache,
     minimax_h3_check_modcache_weights,
@@ -452,6 +457,19 @@ comptime H3_HEAD_DIM = 128
 
 comptime DEFAULT_STEPS = 30
 comptime DEFAULT_SEED = 0
+
+# ── FP8-RESIDENT DENOISER (H3_FP8_RESIDENT, default OFF) ─────────────────────
+# Build with `-D H3_FP8_RESIDENT=1` to quantize all 50 blocks' big GEMM
+# weights ONCE (bf16 -> E4M3 + per-row F32 scale, on device, ~18 GiB
+# resident) and dequant per block per step instead of re-streaming ~36 GiB of
+# block weights from disk EVERY denoise step. The residency arithmetic is
+# `models/minimax_h3/fp8_policy.mojo`'s (fits 24 GiB with spare, adaLN already
+# evicted to the modcache); the runtime is `models/dit/minimax_h3_fp8_resident
+# .mojo` (krea2 fp8-resident precedent, same gated encode/dequant kernels).
+# Gated vs the bf16-streamed path by models/dit/parity/
+# minimax_h3_fp8_resident_gate.mojo. Default OFF: a normal build takes the
+# `@parameter else` branch below, which is the unmodified streaming loop.
+comptime DIT_FP8_RESIDENT = get_defined_int["H3_FP8_RESIDENT", 0]()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1418,6 +1436,30 @@ def main() raises:
         Float64(t_mod1 - t_mod0) / 1.0e9, "s)",
     )
 
+    # ── 5b. OPTIONAL fp8-resident base (H3_FP8_RESIDENT=1 builds only) ─────
+    # One more streamed pass over the 50 blocks, quantizing each to E4M3 +
+    # per-row scales on device; every denoise step below then dequants from
+    # residency instead of re-reading ~36 GiB from disk. Declared
+    # unconditionally (an empty Optional costs nothing); populated only under
+    # the comptime flag, so a default build's denoise loop is untouched.
+    var fp8_resident = Optional[MiniMaxH3ResidentFp8](None)
+
+    @parameter
+    if DIT_FP8_RESIDENT != 0:
+        var t_q0 = perf_counter_ns()
+        fp8_resident = Optional[MiniMaxH3ResidentFp8](
+            minimax_h3_build_resident_fp8(
+                transformer_shards, config, ctx, run_config.num_layers
+            )
+        )
+        var t_q1 = perf_counter_ns()
+        print(
+            "  fp8-resident: ", run_config.num_layers, " blocks, ",
+            Float64(fp8_resident.value().resident_bytes())
+            / (1024.0 * 1024.0 * 1024.0),
+            " GiB resident (", Float64(t_q1 - t_q0) / 1.0e9, "s one-time)",
+        )
+
     # ── 6. Denoise loop — real streamed blocks, real Euler steps ───────────
     var t_denoise0 = perf_counter_ns()
     var video_shape: List[Int] = [NUM_VIDEO_ROWS, config.video_patch_dim()]
@@ -1477,7 +1519,18 @@ def main() raises:
         var hidden3 = reshape(embed.hidden, [1, SEQ_LEN, config.hidden_size], ctx)
 
         for layer in range(run_config.num_layers):  # max_blocks (== 50 unless partial_mode)
-            var block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
+            var block_w: Dict[String, ArcPointer[Tensor]]
+
+            @parameter
+            if DIT_FP8_RESIDENT != 0:
+                # NO disk: dequant this block's E4M3 bytes back to bf16 on
+                # device. Same Dict contract (shapes, dtype, transformed row
+                # order, markers) — block_forward below is unchanged.
+                block_w = minimax_h3_resident_block_weights(
+                    fp8_resident.value(), layer, config, ctx
+                )
+            else:
+                block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
             hidden3 = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,

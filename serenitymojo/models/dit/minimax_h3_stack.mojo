@@ -68,6 +68,10 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_forward,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import minimax_h3_load_block_device
+from serenitymojo.models.dit.minimax_h3_fp8_resident import (
+    MiniMaxH3ResidentFp8,
+    minimax_h3_resident_block_weights,
+)
 from serenitymojo.models.dit.minimax_h3_modcache import MiniMaxH3ModCache
 
 
@@ -85,6 +89,7 @@ def minimax_h3_run_stack[
     ctx: DeviceContext,
     num_layers: Int = -1,
     start_layer: Int = 0,
+    resident: Optional[MiniMaxH3ResidentFp8] = Optional[MiniMaxH3ResidentFp8](None),
 ) raises -> Tensor:
     """Stream and run `num_layers` denoiser blocks starting at `start_layer`
     (defaults: `start_layer=0`, `num_layers=config.num_layers`, i.e. all 50
@@ -118,6 +123,14 @@ def minimax_h3_run_stack[
                    given sequence position reads is a property of the packed
                    sequence, not the layer).
     cos/sin/rotary_dim: rope table, shared by every block unchanged.
+    resident:      OPTIONAL fp8-resident store (models/dit/
+                   minimax_h3_fp8_resident.mojo). When present, each block's
+                   weights come from an on-device E4M3 dequant instead of a
+                   per-step disk stream — same Dict contract, same
+                   block_forward, ~0.99+ cos vs the streamed base (the
+                   documented krea2-precedent tradeoff). When absent
+                   (default), this function is byte-for-byte the streaming
+                   loop it always was.
     """
     var n = num_layers
     if n < 0:
@@ -144,7 +157,12 @@ def minimax_h3_run_stack[
         var layer = start_layer + i
         var weights: Dict[String, ArcPointer[Tensor]]
         try:
-            weights = minimax_h3_load_block_device(st, layer, config, ctx)
+            if resident:
+                weights = minimax_h3_resident_block_weights(
+                    resident.value(), layer, config, ctx
+                )
+            else:
+                weights = minimax_h3_load_block_device(st, layer, config, ctx)
         except e:
             raise Error(
                 String("minimax_h3_run_stack: layer ") + String(layer)

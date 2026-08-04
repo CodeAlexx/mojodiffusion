@@ -275,6 +275,79 @@ def fp8_e4m3_dequant_perrow_to_bf16(
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
 
 
+def fp8_e4m3_dequant_perrow_to_bf16_into(
+    w: Tensor,
+    scale: Tensor,
+    dst: Tensor,
+    ctx: DeviceContext,
+) raises:
+    """`fp8_e4m3_dequant_perrow_to_bf16` writing into a CALLER-OWNED BF16
+    tensor instead of allocating — same kernel, same bytes. Exists for
+    resident-fp8 hot loops that dequant hundreds of times per run: the
+    allocating variant makes the per-block weight a FRESH ~0.19-0.31 GiB
+    device allocation each call, and with no sync in the loop the host
+    enqueues allocations far ahead of the stream-ordered frees — measured
+    OOM on the MiniMax-H3 50-block loop next to its 17.96 GiB store
+    (2026-08-03, minimax_h3_fp8_resident_gate first fp8-mode run). Reusing
+    one preallocated scratch per weight slot makes the loop allocation-free.
+    The CALLER owns the hazard ordering: `dst` must not still be read by
+    previously enqueued kernels (drain with ctx.synchronize() before
+    overwrite)."""
+    if w.dtype() != STDtype.U8 and w.dtype() != STDtype.F8_E4M3:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16_into: w must be U8/F8_E4M3, got ")
+            + w.dtype().name()
+        )
+    if scale.dtype() != STDtype.F32:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16_into: scale must be F32, got ")
+            + scale.dtype().name()
+        )
+    if dst.dtype() != STDtype.BF16:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16_into: dst must be BF16, got ")
+            + dst.dtype().name()
+        )
+    var wshape = w.shape()
+    if len(wshape) != 2:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16_into: w must be 2-D [out,in], rank=")
+            + String(len(wshape))
+        )
+    var out_rows = wshape[0]
+    var cols = wshape[1]
+    var n = w.numel()
+    if n == 0:
+        raise Error("fp8_e4m3_dequant_perrow_to_bf16_into: empty input")
+    if scale.numel() != out_rows:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16_into: scale len ")
+            + String(scale.numel()) + " != out rows " + String(out_rows)
+        )
+    var osh = dst.shape()
+    if len(osh) != 2 or osh[0] != out_rows or osh[1] != cols:
+        raise Error(
+            "fp8_e4m3_dequant_perrow_to_bf16_into: dst shape does not match w"
+        )
+
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_rows))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), x_rl)
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        dst.buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+    )
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    ctx.enqueue_function[_fp8_dequant_perrow_kernel, _fp8_dequant_perrow_kernel](
+        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    )
+
+
 def load_fp8_dequant(
     st: ShardedSafeTensors,
     weight_name: String,

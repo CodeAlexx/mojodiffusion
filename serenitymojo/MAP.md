@@ -3145,18 +3145,24 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   layout over the gated packing_ref2va builder. Condition t: video =
   max(video_t, 0.999) TRACKING, audio = 1.0 const; table collapses below 4 —
   size modcache off len(values).
-- `models/dit/minimax_h3_fp8_resident.mojo` — OPT-IN (-D H3_FP8_RESIDENT=1,
-  default build UNCHANGED, both variants compile-verified) E4M3-resident
-  base: all 50 blocks quantized on device (per-row scales, krea2 kernels
-  reused; ops/fp8.mojo gained a caller-owned-dst dequant variant, pure
-  append). STATUS: NOT gate-green — block cos 0.99835 vs 0.999 bar,
-  MEASURED as the E4M3 3-bit-mantissa floor (per-class sens all >=0.9993,
-  composing independently; selective-keep can't clear the bar in 24 GiB);
-  e2e + A/B pending; int8-weight-only (vendor consumer recipe, ~4x lower
-  noise, same bytes) is the flagged alternative. MEMORY LAWS from three
-  distinct OOMs on the 18.7 GiB store (~5 GiB pool headroom): per-TENSOR
-  build transients, PREALLOCATED dequant scratch (no per-layer allocs),
-  frontend weights upload BEFORE the store.
+- `models/dit/minimax_h3_fp8_resident.mojo` — OPT-IN quantized-RESIDENT
+  base (-D H3_FP8_RESIDENT=1 — flag name historical, selects the
+  scheme-agnostic store; default build UNCHANGED). SHIPPED SCHEME:
+  INT8-weight-only per-row (the vendor's own consumer recipe), GATE GREEN:
+  block 0.99989986 / e2e video 0.9998776 / e2e audio 0.99976134 (E4M3 kept
+  selectable; it measured 0.99835/0.99726/0.98874 = the 3-bit-mantissa
+  floor — per-class sens all >=0.9993 composing independently, no
+  affordable selective-keep, per-group scales provably useless for e4m3).
+  STEP-TIME A/B (S=3049, same build env, same prompt/seed): streamed
+  66.6-72.8 s/step vs resident 4.65 s/step = 14.9x; one-time store build
+  198 s (18.67 GiB resident) amortizes in 3 steps. Speedup shrinks as S
+  grows (eliminated streaming cost is constant ~65 s/step).
+  MEMORY LAWS from three distinct OOMs (~5 GiB pool headroom over the
+  store): per-TENSOR build transients (zero-churn staged build),
+  PREALLOCATED dequant scratch (no per-layer allocs — unsync'd fresh
+  allocs race stream-ordered frees), frontend weights upload BEFORE the
+  store. ops/int8_quant.mojo: encode reused (krea2/W8A8), dequant half new
+  with a bit-exact GPU-vs-host smoke.
 - `models/vae/minimax_h3_video_{encoder,decoder}_device.mojo` — native-key
   ViT VAE, vendor-oracle cos 0.9999999978 / 0.9999999999998. Fused to_qkv is
   PER-HEAD interleaved; ff.w1 gate-FIRST.

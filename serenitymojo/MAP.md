@@ -3183,9 +3183,18 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - `pipeline/minimax_h3_video_vae_{temporal,spatial_tiling,blend,pixel_norm}
   .mojo` — chunk+tile+blend decode stack; tiled path vendor-oracle 2e-5 at
   production geometry; ONE shared blend like klvae.
-- `pipeline/minimax_h3_{media_in,ref_prompt,ref2va}.mojo` — ref2va CPU
-  chain (ffmpeg ingest, official structured prompt builder byte-identical to
-  the vendor example, skeleton raising at the encode seam).
+- `pipeline/minimax_h3_{media_in,ref_prompt,ref2va}.mojo` — ref2va: FIRST
+  REAL-CONDITIONED GENERATION DELIVERED 2026-08-04 (character transfer
+  verified by frames). Real presentation (token ids ID-EXACT vs vendor
+  build_ref2va_presentation incl. the <d>/</d> merge fix — tokenizer_config
+  specials must merge, ids 151669/151670), real condition rows via the gated
+  encode chain, real conditioner w/ tower splice + deepstack. Tower output
+  memoized to out_dir/vision_cache.safetensors; latents checkpointed EVERY
+  step to latents_ckpt.safetensors (two external SIGKILLs taught this).
+  Audio-ref rows use the vendor truncation int(num_frames/24*sr)
+  (before_encoder.py:374-378) — NOT the ref's full duration.
+  Discovery loop: run w/ default comptime; each raise prints the exact
+  -D value (H3_TEXT_TOKENS, H3_REF_SEQ_LEN).
 - `pipeline/parity/`, `models/*/parity/` — every gate above; oracle scripts
   run the vendor's OWN classes (AutoencoderKLLegacy etc.) via the OneTrainer
   venv, GPU bf16/F32 — never CPU-fp32 references.

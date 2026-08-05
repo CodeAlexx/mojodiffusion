@@ -5,23 +5,24 @@
 # krea2-precedent fp8-resident base). REAL FL2VA weights, all 13 shards.
 #
 # SCHEME NOTE (2026-08-04): the store's default scheme is now INT8-WEIGHT-
-# ONLY per-row (see its header — E4M3 measured 0.998347/0.997255/0.988741
-# here vs the 0.999 bar and was swapped on Alex's decision). This gate's
+# ONLY class-groupwise (see its header for the measured group-size ladder
+# rungs that still left audio below the 0.999 bar).
+# This gate's
 # `fp8` MODE NAME is historical: it runs the store's DEFAULT scheme, and the
 # store prints which at build. The `ref` arm and its saved references are
 # scheme-independent (bf16-streamed) and remain valid across scheme swaps.
-# The `sens` mode is still the E4M3 round-trip diagnostic (kept: it is the
-# record of WHY the swap happened).
+# `sage` changes only attention on the streamed-BF16 arm; `fp8-sage` combines
+# groupwise resident weights with Sage attention. The `sens` mode is the
+# per-class resident-INT8 diagnostic.
 #
-# TWO CHECKS, both A/B of the SAME code path with only the weight SOURCE
-# changed (`minimax_h3_run_stack`'s `resident` arg — everything else,
-# including `minimax_h3_block_forward`, is shared bit-for-bit):
+# TWO CHECKS, both A/B of the SAME stack/block path. Resident modes change the
+# weight source; Sage modes change the attention selector. Each mode names the
+# one or two deliberate deltas relative to the saved BF16+cuDNN reference:
 #
 #   [1] ONE BLOCK (layer 0): identical random [S, hidden] bf16 input through
 #       `minimax_h3_run_stack[S](..., num_layers=1)` twice — bf16-streamed vs
-#       fp8-resident-dequant. cos + max_abs reported. BAR: cos >= 0.999
-#       (E4M3 per-row quantization noise; krea2 precedent ~0.99 documented in
-#       krea2_dit.mojo's _blk_w8).
+#       quantized-resident dequant and/or Sage attention. cos + max_abs
+#       reported. BAR: cos >= 0.999.
 #   [2] FULL 50-BLOCK E2E, 2 REAL EULER STEPS: frontend_embed -> 50-block
 #       stack -> final_layer -> MiniMaxH3DualSchedule step, twice per arm,
 #       compounding any quantization drift through the ENTIRE composition
@@ -54,10 +55,10 @@
 # resident path itself was fine (check [1]'s dequant arm had already passed
 # in the same process). The fix is a process boundary: `ref` mode runs the
 # two bf16-streamed arms and SAVES the three reference tensors to a
-# safetensors; `fp8` mode starts a FRESH process (fresh pool), loads the
-# references, builds the store, runs the two resident arms, compares. Every
+# safetensors; resident modes start a FRESH process (fresh pool), load the
+# references, build the store, run the two resident arms, and compare. Every
 # generated input (randn seeds, rope, mod tables) is deterministic, so the
-# two processes see byte-identical inputs. In `fp8` mode the e2e arm runs
+# two processes see byte-identical inputs. In resident modes the e2e arm runs
 # FIRST (it is the memory-heavy one — fail fast), then the block arm.
 #
 # Run (binary build — mojo run/JIT cannot resolve flame_cudnn_sdpa_bf16; same
@@ -74,6 +75,8 @@
 #   && output/checks/minimax_h3_fp8_resident_gate sens \
 #   && output/checks/minimax_h3_fp8_resident_gate ref \
 #   && output/checks/minimax_h3_fp8_resident_gate fp8
+#   && output/checks/minimax_h3_fp8_resident_gate sage
+#   && output/checks/minimax_h3_fp8_resident_gate fp8-sage
 
 from std.collections import Dict, List
 from std.gpu.host import DeviceContext
@@ -90,8 +93,14 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.parity import ParityHarness
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
-from serenitymojo.ops.fp8_quant import fp8_e4m3_encode_perrow, fp8_e4m3_rowscale
+from serenitymojo.ops.int8_quant import (
+    int8_dequant_groupwise_to_bf16,
+    int8_dequant_perrow_to_bf16,
+    int8_encode_groupwise,
+    int8_encode_perrow,
+    int8_groupscale,
+    int8_rowscale,
+)
 from serenitymojo.ops.linear import linear_bias
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import full_device, reshape
@@ -101,6 +110,8 @@ from serenitymojo.models.minimax_h3.dit_frontend import (
     minimax_h3_rope_table,
 )
 from serenitymojo.models.dit.minimax_h3_dit import (
+    MINIMAX_H3_ATTN_CUDNN,
+    MINIMAX_H3_ATTN_SAGE_INT8,
     MINIMAX_H3_FC1_SWAPPED_MARKER,
     MINIMAX_H3_QKV_DEINTERLEAVED_MARKER,
     MiniMaxH3DiTConfig,
@@ -111,8 +122,13 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_released_config,
 )
 from serenitymojo.models.dit.minimax_h3_fp8_resident import (
+    MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3ResidentFp8,
     minimax_h3_build_resident_fp8,
+    minimax_h3_int8_group_size,
+)
+from serenitymojo.models.dit.minimax_h3_runtime_cache import (
+    load_minimax_h3_resident_cache,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     _minimax_h3_marker_tensor,
@@ -133,6 +149,13 @@ comptime CHECKPOINT_DIR = (
 )
 comptime REF_PATH = (
     "/home/alex/mojodiffusion/output/minimax_h3_block/fp8_resident_ref.safetensors"
+)
+comptime W8A8_CACHE_PATH = (
+    "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/"
+    "serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors"
+)
+comptime TRANSFORMER_INDEX = (
+    CHECKPOINT_DIR + "/model.safetensors.index.json"
 )
 
 comptime S = 8            # packed sequence, same tiny geometry as the e2e probe
@@ -259,12 +282,14 @@ def _run_denoise_arm(
     sin_t: Tensor,
     rotary_dim: Int,
     arm_name: String,
+    attention_backend: Int,
     ctx: DeviceContext,
 ) raises -> _ArmLatents:
     """NUM_STEPS real Euler steps of the t2va denoise-loop shape at S=8:
     frontend_embed -> 50-block stack (weight source = `resident` when present,
-    else disk stream) -> final_layer -> dual-schedule step. Everything except
-    the weight source is identical between arms by construction."""
+    else disk stream) -> final_layer -> dual-schedule step. Weight source and
+    attention backend are explicit inputs; every other input is deterministic
+    and identical between arms."""
     var vstate = video_init.clone(ctx)
     var astate = audio_init.clone(ctx)
     var sched = MiniMaxH3DualSchedule()
@@ -293,6 +318,7 @@ def _run_denoise_arm(
         var hidden_out = minimax_h3_run_stack[S](
             embed.hidden.clone(ctx), st, mc, adaln_idx, cos_t, sin_t,
             rotary_dim, config, ctx, NUM_LAYERS, 0, resident,
+            attention_backend,
         )
         var final_mod = _real_final_modulation(embed.temb, w, ctx)
         var out = minimax_h3_final_layer(
@@ -361,12 +387,16 @@ def _shared_adaln_rows() raises -> List[Int]:
 # ─────────────────────────────────────────────────────────────────────────────
 # `sens` mode: per-GEMM-class sensitivity on block 0 (diagnostic, no bar).
 # ─────────────────────────────────────────────────────────────────────────────
-def _roundtrip_fp8(w: Tensor, ctx: DeviceContext) raises -> Tensor:
+def _roundtrip_resident_int8(
+    w: Tensor, name: String, ctx: DeviceContext
+) raises -> Tensor:
     """encode -> dequant through the SAME two gated kernels the store uses:
     the exact bf16 weight the resident path hands the block forward."""
-    var s = fp8_e4m3_rowscale(w, ctx)
-    var q = fp8_e4m3_encode_perrow(w, s, ctx)
-    return fp8_e4m3_dequant_perrow_to_bf16(q, s, ctx)
+    var group_size = minimax_h3_int8_group_size(name)
+    var s = int8_groupscale(w, group_size, ctx)
+    var q = int8_encode_groupwise(w, s, group_size, ctx)
+    var s_f16 = cast_tensor(s, STDtype.F16, ctx)
+    return int8_dequant_groupwise_to_bf16(q, s_f16, group_size, ctx)
 
 
 def _sens_variant_weights(
@@ -375,7 +405,8 @@ def _sens_variant_weights(
     ctx: DeviceContext,
 ) raises -> Dict[String, ArcPointer[Tensor]]:
     """Copy of block 0's weight Dict with ONLY the tensors named in
-    `quantize` round-tripped through fp8; everything else (including the
+    `quantize` round-tripped through the class-selected resident INT8 profile;
+    everything else (including the
     transform markers, legitimately — `base` came from
     minimax_h3_load_block_device) carried over by ArcPointer."""
     var out = Dict[String, ArcPointer[Tensor]]()
@@ -387,7 +418,9 @@ def _sens_variant_weights(
             if quantize[j] == name:
                 hit = True
         if hit:
-            out[name] = ArcPointer(_roundtrip_fp8(base[name][], ctx))
+            out[name] = ArcPointer(
+                _roundtrip_resident_int8(base[name][], name, ctx)
+            )
         else:
             out[name] = base[name].copy()
     out[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(_minimax_h3_marker_tensor(ctx))
@@ -431,7 +464,8 @@ def _run_sens(
             x3, wv, 0, config, mod, adaln_idx, cos_t, sin_t, rotary_dim, ctx,
         )
         var r = harness.compare(cast_tensor(out_k, STDtype.F32, ctx), ref_host, ctx)
-        print("  sens ONLY", kinds[k], " fp8: cos=", r.cos, " max_abs=", r.max_abs)
+        print("  sens ONLY", kinds[k], " resident-int8: cos=", r.cos,
+              " max_abs=", r.max_abs)
 
     var all4 = List[String]()
     for k in range(len(kinds)):
@@ -441,19 +475,152 @@ def _run_sens(
         x3, wall, 0, config, mod, adaln_idx, cos_t, sin_t, rotary_dim, ctx,
     )
     var r_all = harness.compare(cast_tensor(out_all, STDtype.F32, ctx), ref_host, ctx)
-    print("  sens ALL FOUR fp8: cos=", r_all.cos, " max_abs=", r_all.max_abs,
+    print("  sens ALL FOUR resident-int8: cos=", r_all.cos,
+          " max_abs=", r_all.max_abs,
           " (must reproduce the store-path blockCos — internal consistency)")
+
+
+def _w8a8_variant_weights(
+    base: Dict[String, ArcPointer[Tensor]],
+    quantize: List[String],
+    ctx: DeviceContext,
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """Copy block weights while converting selected projections to the exact
+    direct-W8A8 representation used by the fast product cache."""
+    var out = Dict[String, ArcPointer[Tensor]]()
+    var names = minimax_h3_block_tensor_names(0)
+    for i in range(len(names)):
+        ref name = names[i]
+        var hit = False
+        for j in range(len(quantize)):
+            if quantize[j] == name:
+                hit = True
+        if hit:
+            var scale = int8_rowscale(base[name][], ctx)
+            var quantized = int8_encode_perrow(base[name][], scale, ctx)
+            out[name] = ArcPointer(quantized^)
+            out[name + String(".scale")] = ArcPointer(scale^)
+        else:
+            out[name] = base[name].copy()
+    out[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    out[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    return out^
+
+
+def _w8_weight_only_variant_weights(
+    base: Dict[String, ArcPointer[Tensor]],
+    quantize: List[String],
+    ctx: DeviceContext,
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """Per-row INT8 weight round trip with BF16 activation math. Comparing
+    this with direct W8A8 isolates the activation-quantization contribution."""
+    var out = Dict[String, ArcPointer[Tensor]]()
+    var names = minimax_h3_block_tensor_names(0)
+    for i in range(len(names)):
+        ref name = names[i]
+        var hit = False
+        for j in range(len(quantize)):
+            if quantize[j] == name:
+                hit = True
+        if hit:
+            var scale = int8_rowscale(base[name][], ctx)
+            var quantized = int8_encode_perrow(base[name][], scale, ctx)
+            out[name] = ArcPointer(
+                int8_dequant_perrow_to_bf16(quantized, scale, ctx)
+            )
+        else:
+            out[name] = base[name].copy()
+    out[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    out[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    return out^
+
+
+def _run_w8a8_sens(
+    st: ShardedSafeTensors, config: MiniMaxH3DiTConfig, ctx: DeviceContext,
+    cos_t: Tensor, sin_t: Tensor, rotary_dim: Int,
+) raises:
+    """Direct W8A8 per-projection sensitivity using real block-0 weights."""
+    var hidden = config.hidden_size
+    var p = minimax_h3_block_prefix(0)
+    var base = minimax_h3_load_block_device(st, 0, config, ctx)
+    var adaln_idx = _shared_adaln_rows()
+    var mod = randn([3, 6 * hidden], UInt64(5000), STDtype.BF16, ctx)
+    var block_in = _block_input(hidden, ctx)
+    var x3 = reshape(block_in, [1, S, hidden], ctx)
+
+    var ref_out = minimax_h3_block_forward[S](
+        x3, base, 0, config, mod, adaln_idx, cos_t, sin_t, rotary_dim, ctx,
+    )
+    var ref_host = cast_tensor(ref_out, STDtype.F32, ctx).to_host(ctx)
+    var kinds = List[String]()
+    kinds.append(p + "attn.qkv_proj.weight")
+    kinds.append(p + "attn.out_proj.weight")
+    kinds.append(p + "mlp.fc1.weight")
+    kinds.append(p + "mlp.fc2.weight")
+
+    var harness = ParityHarness(COS_BAR)
+    for k in range(len(kinds)):
+        var one = List[String]()
+        one.append(kinds[k].copy())
+        var wv = _w8a8_variant_weights(base, one, ctx)
+        var out_k = minimax_h3_block_forward[S](
+            x3, wv, 0, config, mod, adaln_idx, cos_t, sin_t, rotary_dim, ctx,
+        )
+        var r = harness.compare(
+            cast_tensor(out_k, STDtype.F32, ctx), ref_host, ctx
+        )
+        print("  w8a8 ONLY", kinds[k], " direct: cos=", r.cos,
+              " max_abs=", r.max_abs)
+    var all4 = List[String]()
+    for k in range(len(kinds)):
+        all4.append(kinds[k].copy())
+    var wall = _w8a8_variant_weights(base, all4, ctx)
+    var out_all = minimax_h3_block_forward[S](
+        x3, wall, 0, config, mod, adaln_idx, cos_t, sin_t, rotary_dim, ctx,
+    )
+    var r_all = harness.compare(
+        cast_tensor(out_all, STDtype.F32, ctx), ref_host, ctx
+    )
+    print("  w8a8 ALL FOUR direct: cos=", r_all.cos,
+          " max_abs=", r_all.max_abs)
+
+    var w_weight_only = _w8_weight_only_variant_weights(base, all4, ctx)
+    var out_weight_only = minimax_h3_block_forward[S](
+        x3, w_weight_only, 0, config, mod, adaln_idx,
+        cos_t, sin_t, rotary_dim, ctx,
+    )
+    var r_weight_only = harness.compare(
+        cast_tensor(out_weight_only, STDtype.F32, ctx), ref_host, ctx
+    )
+    print("  w8 ONLY ALL FOUR bf16-activation: cos=", r_weight_only.cos,
+          " max_abs=", r_weight_only.max_abs)
 
 
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        raise Error("usage: minimax_h3_fp8_resident_gate <sens|ref|fp8>")
+        raise Error(
+            "usage: minimax_h3_fp8_resident_gate"
+            " <sens|w8a8-sens|ref|fp8|w8a8|sage|fp8-sage>"
+        )
     var mode = String(args[1])
-    if mode != "sens" and mode != "ref" and mode != "fp8":
-        raise Error("usage: minimax_h3_fp8_resident_gate <sens|ref|fp8>")
+    if mode != "sens" and mode != "w8a8-sens" and mode != "ref" and mode != "fp8" \
+            and mode != "w8a8" \
+            and mode != "sage" and mode != "fp8-sage":
+        raise Error(
+            "usage: minimax_h3_fp8_resident_gate"
+            " <sens|w8a8-sens|ref|fp8|w8a8|sage|fp8-sage>"
+        )
 
-    print("MiniMax-H3 FP8-RESIDENT vs BF16-STREAMED parity gate — mode:", mode)
+    print("MiniMax-H3 resident/Sage vs BF16-cuDNN parity gate — mode:", mode)
     print("  checkpoint:", String(CHECKPOINT_DIR))
 
     var ctx = DeviceContext()
@@ -477,10 +644,18 @@ def main() raises:
 
     if mode == "sens":
         print("")
-        print("[sens] per-GEMM-class fp8 sensitivity, block 0, real weights")
+        print("[sens] per-GEMM-class resident-int8 sensitivity, block 0, real weights")
         _run_sens(st, config, ctx, cos_t, sin_t, rope.rotary_dim)
         print("")
         print("SENS DONE")
+        return
+
+    if mode == "w8a8-sens":
+        print("")
+        print("[w8a8-sens] direct per-GEMM-class W8A8 sensitivity, block 0")
+        _run_w8a8_sens(st, config, ctx, cos_t, sin_t, rope.rotary_dim)
+        print("")
+        print("W8A8 SENS DONE")
         return
 
     # Deterministic shared inputs (identical in both processes).
@@ -510,7 +685,8 @@ def main() raises:
         print("[ref-2] e2e", NUM_STEPS, "steps x", NUM_LAYERS, "blocks, bf16-STREAMED")
         var ref_arm = _run_denoise_arm(
             no_resident, st, w, config, video_init, audio_init, text_rows,
-            cos_t, sin_t, rope.rotary_dim, String("streamed"), ctx,
+            cos_t, sin_t, rope.rotary_dim, String("streamed"),
+            MINIMAX_H3_ATTN_CUDNN, ctx,
         )
         var vid_mag = _mag_stats(ref_arm.video.to_host(ctx))
         var aud_mag = _mag_stats(ref_arm.audio.to_host(ctx))
@@ -537,7 +713,63 @@ def main() raises:
     var ref_audio_host = _load_f32(st_ref, String("audio_ref"))
     print("  references loaded from", String(REF_PATH))
 
-    # Frontend weights BEFORE the store — run 3 measured why this order is
+    if mode == "sage":
+        # Same streamed BF16 weights and deterministic inputs as `ref`; only
+        # the self-attention backend changes. This isolates accumulated Sage
+        # drift from resident-weight quantization.
+        var w_sage = _build_frontend_weights(st, config, ctx)
+        var no_resident = Optional[MiniMaxH3ResidentFp8](None)
+        var harness_sage = ParityHarness(COS_BAR)
+        var n_fail_sage = 0
+        print("")
+        print("[sage-2] e2e", NUM_STEPS, "steps x", NUM_LAYERS,
+              "blocks, BF16-STREAMED + SAGE-INT8 attention")
+        var sage_arm = _run_denoise_arm(
+            no_resident, st, w_sage, config, video_init, audio_init,
+            text_rows, cos_t, sin_t, rope.rotary_dim,
+            String("streamed-sage"), MINIMAX_H3_ATTN_SAGE_INT8, ctx,
+        )
+        var r_video_sage = harness_sage.compare(
+            sage_arm.video, ref_video_host, ctx
+        )
+        var r_audio_sage = harness_sage.compare(
+            sage_arm.audio, ref_audio_host, ctx
+        )
+        print("  e2eVideoCos=", r_video_sage.cos,
+              " e2eVideoMaxAbs=", r_video_sage.max_abs)
+        print("  e2eAudioCos=", r_audio_sage.cos,
+              " e2eAudioMaxAbs=", r_audio_sage.max_abs)
+        if not r_video_sage.passed or not r_audio_sage.passed:
+            n_fail_sage += 1
+
+        print("")
+        print("[sage-1] block 0, BF16-STREAMED + SAGE-INT8 attention")
+        var block_sage = minimax_h3_run_stack[S](
+            block_in.clone(ctx), st, mc0, adaln_idx, cos_t, sin_t,
+            rope.rotary_dim, config, ctx, 1, 0, no_resident,
+            MINIMAX_H3_ATTN_SAGE_INT8,
+        )
+        var block_sage_f32 = cast_tensor(block_sage, STDtype.F32, ctx)
+        var r_block_sage = harness_sage.compare(
+            block_sage_f32, block_ref_host, ctx
+        )
+        print("  blockCos=", r_block_sage.cos,
+              " blockMaxAbs=", r_block_sage.max_abs)
+        if not r_block_sage.passed:
+            n_fail_sage += 1
+
+        print("")
+        if n_fail_sage == 0:
+            print("SAGE GATE PASS blockCos=", r_block_sage.cos,
+                  " e2eVideoCos=", r_video_sage.cos,
+                  " e2eAudioCos=", r_audio_sage.cos)
+            return
+        print("SAGE GATE FAIL (", n_fail_sage, "check(s) below",
+              COS_BAR, ")")
+        raise Error("MiniMax-H3 Sage attention parity gate failed")
+
+    # Resident modes: frontend weights BEFORE the store — run 3 measured why
+    # this order is
     # mandatory: the store build leaves the pool's reserved memory well above
     # the store's own bytes (size-bucketed retention of the build
     # transients), so any LARGE allocation after the build OOMs. After the
@@ -547,24 +779,41 @@ def main() raises:
     print("  frontend/final-layer weights built:", len(w), "tensors (real)")
 
     print("")
-    print("[store] quantizing all", NUM_LAYERS, "blocks to 1-byte resident",
-          "(store default scheme; printed below) ...")
-    var store = minimax_h3_build_resident_fp8(st, config, ctx, NUM_LAYERS)
+    var store: MiniMaxH3ResidentFp8
+    if mode == "w8a8":
+        print("[store] loading all", NUM_LAYERS,
+              "blocks from the product W8A8 cache ...")
+        store = load_minimax_h3_resident_cache(
+            String(W8A8_CACHE_PATH),
+            String(TRANSFORMER_INDEX), config, ctx, NUM_LAYERS, 0,
+            MINIMAX_H3_RESIDENT_INT8_W8A8,
+        )
+    else:
+        print("[store] quantizing all", NUM_LAYERS, "blocks to 1-byte resident",
+              "(store default scheme; printed below) ...")
+        store = minimax_h3_build_resident_fp8(st, config, ctx, NUM_LAYERS)
     print(
         "  resident:",
         Float64(store.resident_bytes()) / (1024.0 * 1024.0 * 1024.0),
-        "GiB on device (1B/param + per-row F32 scales + bf16 norms + scratch)",
+        "GiB on device (1B/param + scheme scales + bf16 norms + scratch)",
     )
     var resident = Optional[MiniMaxH3ResidentFp8](store^)
     var harness = ParityHarness(COS_BAR)
     var n_fail = 0
+    var attention_backend = MINIMAX_H3_ATTN_CUDNN
+    var resident_arm_name = String("resident-cudnn")
+    if mode == "fp8-sage":
+        attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
+        resident_arm_name = String("resident-sage")
 
     # E2E arm FIRST — the memory-heavy check fails fast if the fit is wrong.
     print("")
-    print("[2b] e2e", NUM_STEPS, "steps x", NUM_LAYERS, "blocks, FP8-RESIDENT arm")
+    print("[2b] e2e", NUM_STEPS, "steps x", NUM_LAYERS,
+          "blocks, quantized-RESIDENT arm")
     var fp8_arm = _run_denoise_arm(
         resident, st, w, config, video_init, audio_init, text_rows,
-        cos_t, sin_t, rope.rotary_dim, String("fp8-resident"), ctx,
+        cos_t, sin_t, rope.rotary_dim, resident_arm_name,
+        attention_backend, ctx,
     )
     var r_video = harness.compare(fp8_arm.video, ref_video_host, ctx)
     var r_audio = harness.compare(fp8_arm.audio, ref_audio_host, ctx)
@@ -579,20 +828,23 @@ def main() raises:
     var vref_mag = _mag_stats(ref_video_host)
     var aref_mag = _mag_stats(ref_audio_host)
     print("  e2eVideoCos=", r_video.cos, " e2eVideoMaxAbs=", r_video.max_abs,
-          " (ref max_abs=", vref_mag[1], ") |fp8|/|bf16|=", video_ratio, " n=", r_video.n)
+          " (ref max_abs=", vref_mag[1], ") |resident|/|bf16|=", video_ratio,
+          " n=", r_video.n)
     print("  e2eAudioCos=", r_audio.cos, " e2eAudioMaxAbs=", r_audio.max_abs,
-          " (ref max_abs=", aref_mag[1], ") |fp8|/|bf16|=", audio_ratio, " n=", r_audio.n)
+          " (ref max_abs=", aref_mag[1], ") |resident|/|bf16|=", audio_ratio,
+          " n=", r_audio.n)
     if r_video.passed and r_audio.passed:
-        print("  ok   [2] e2e latents fp8-resident cos >=", COS_BAR, "(video AND audio)")
+        print("  ok   [2] e2e latents resident cos >=", COS_BAR,
+              "(video AND audio)")
     else:
-        print("  FAIL [2] e2e latents fp8-resident cos <", COS_BAR)
+        print("  FAIL [2] e2e latents resident cos <", COS_BAR)
         n_fail += 1
 
     print("")
-    print("[1b] block 0, FP8-RESIDENT dequant arm")
+    print("[1b] block 0, quantized-RESIDENT dequant arm")
     var block_fp8 = minimax_h3_run_stack[S](
         block_in.clone(ctx), st, mc0, adaln_idx, cos_t, sin_t,
-        rope.rotary_dim, config, ctx, 1, 0, resident,
+        rope.rotary_dim, config, ctx, 1, 0, resident, attention_backend,
     )
     var block_fp8_f32 = cast_tensor(block_fp8, STDtype.F32, ctx)
     var r_block = harness.compare(block_fp8_f32, block_ref_host, ctx)
@@ -602,11 +854,12 @@ def main() raises:
         block_ratio = _norm(block_fp8_f32.to_host(ctx)) / block_ref_norm
     var bref_mag = _mag_stats(block_ref_host)
     print("  blockCos=", r_block.cos, " blockMaxAbs=", r_block.max_abs,
-          " (ref max_abs=", bref_mag[1], ") |fp8|/|bf16|=", block_ratio, " n=", r_block.n)
+          " (ref max_abs=", bref_mag[1], ") |resident|/|bf16|=", block_ratio,
+          " n=", r_block.n)
     if r_block.passed:
-        print("  ok   [1] single-block fp8-resident cos >=", COS_BAR)
+        print("  ok   [1] single-block resident cos >=", COS_BAR)
     else:
-        print("  FAIL [1] single-block fp8-resident cos <", COS_BAR)
+        print("  FAIL [1] single-block resident cos <", COS_BAR)
         n_fail += 1
 
     print("")
@@ -615,4 +868,4 @@ def main() raises:
               " e2eAudioCos=", r_audio.cos)
     else:
         print("GATE FAIL (", n_fail, "check(s) below the", COS_BAR, "bar — numbers above )")
-        raise Error("MiniMax-H3 fp8-resident parity gate failed")
+        raise Error("MiniMax-H3 quantized-resident parity gate failed")

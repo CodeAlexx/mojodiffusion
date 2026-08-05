@@ -88,6 +88,12 @@
 # previous layer's buffer is actually reclaimed before the next `_h3_load_layer`
 # allocates. Peak VRAM stays in the low single-digit GiB on a 24 GiB card —
 # same conclusion as the already-shipped 8B/16GB case.
+# After each synchronization the source mmap pages are also released with
+# `MADV_DONTNEED` via `ShardedSafeTensors.release_to_os()`. The device copy is
+# complete at that point, so retaining those clean file-backed pages only grows
+# the host cgroup by roughly one checkpoint layer per iteration. This mirrors
+# the bounded-residency contract in `gemma3_ltx_streamed.mojo` and is required
+# for H3's 62.13 GiB text checkpoint to encode inside a regular user scope.
 #
 # DISK COST (state this plainly, it is real and not hidden by streaming):
 # one encode call reads ~50 layers x 0.95 GiB + 1.45 GiB embed table
@@ -104,7 +110,7 @@
 from std.memory import ArcPointer
 from std.gpu.host import DeviceContext
 
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
 from serenitymojo.io.safetensors import SafeTensors
@@ -130,6 +136,15 @@ comptime H3_KV_HEADS = 8
 comptime H3_HEAD_DIM = 128
 comptime H3_THETA = Float64(5000000.0)
 comptime H3_EPS = Float32(1.0e-6)
+
+# One persistent pinned-host slab for every checkpoint upload in an encode.
+# The largest tensor is embed_tokens [151936,5120] BF16 = 1,555,824,640 B;
+# 1536 MiB fits it with 54.8 MiB spare. Every complete decoder layer is
+# smaller (~0.95 GiB), so the same allocation is reused for all 50 layers.
+# This avoids `Tensor.from_view()`'s one-pinned-buffer-per-tensor churn, whose
+# retained CUDA/MAX staging allocations measured 10.0 GiB in the product
+# cgroup before layer streaming could finish.
+comptime H3_UPLOAD_STAGE_BYTES = 1536 * 1024 * 1024
 
 # diffusers PR packing.py MINIMAX_H3_TEXT_ENCODER_LAYER = 50: the HF
 # `hidden_states` index MiniMax-H3 conditions on. Per INDEXING above, that
@@ -277,17 +292,22 @@ def _h3_embed_prefix(layer_prefix: String) raises -> String:
 # on-disk key (whatever `_detect_layer_prefix` found).
 def _h3_add(
     st: ShardedSafeTensors,
+    mut uploader: BatchedTensorUploader,
     mut weights: List[TArc],
     mut n2i: Dict[String, Int],
     dst: String, src: String, ctx: DeviceContext,
 ) raises:
-    var t = Tensor.from_view(st.tensor_view(src), ctx)
+    var t = uploader.from_view(st.tensor_view(src), ctx)
     n2i[dst] = len(weights)
     weights.append(ArcPointer(t^))
 
 
 def _h3_load_layer(
-    st: ShardedSafeTensors, li: Int, layer_prefix: String, ctx: DeviceContext
+    st: ShardedSafeTensors,
+    mut uploader: BatchedTensorUploader,
+    li: Int,
+    layer_prefix: String,
+    ctx: DeviceContext,
 ) raises -> Qwen3Encoder:
     """One decoder layer's 11 tensors -> mini Qwen3Encoder, native bf16
     (no dequant). Mirrors ideogram_qwen3vl_streamed.mojo's `_load_layer`."""
@@ -295,28 +315,34 @@ def _h3_load_layer(
     var n2i = Dict[String, Int]()
     var ps = layer_prefix + String(li) + "."
     var pd = String("model.layers.") + String(li) + "."
-    _h3_add(st, weights, n2i, pd + "input_layernorm.weight", ps + "input_layernorm.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "self_attn.q_proj.weight", ps + "self_attn.q_proj.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "self_attn.k_proj.weight", ps + "self_attn.k_proj.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "self_attn.v_proj.weight", ps + "self_attn.v_proj.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "self_attn.o_proj.weight", ps + "self_attn.o_proj.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "self_attn.q_norm.weight", ps + "self_attn.q_norm.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "self_attn.k_norm.weight", ps + "self_attn.k_norm.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "post_attention_layernorm.weight", ps + "post_attention_layernorm.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "mlp.gate_proj.weight", ps + "mlp.gate_proj.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "mlp.up_proj.weight", ps + "mlp.up_proj.weight", ctx)
-    _h3_add(st, weights, n2i, pd + "mlp.down_proj.weight", ps + "mlp.down_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "input_layernorm.weight", ps + "input_layernorm.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "self_attn.q_proj.weight", ps + "self_attn.q_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "self_attn.k_proj.weight", ps + "self_attn.k_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "self_attn.v_proj.weight", ps + "self_attn.v_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "self_attn.o_proj.weight", ps + "self_attn.o_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "self_attn.q_norm.weight", ps + "self_attn.q_norm.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "self_attn.k_norm.weight", ps + "self_attn.k_norm.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "post_attention_layernorm.weight", ps + "post_attention_layernorm.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "mlp.gate_proj.weight", ps + "mlp.gate_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "mlp.up_proj.weight", ps + "mlp.up_proj.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, pd + "mlp.down_proj.weight", ps + "mlp.down_proj.weight", ctx)
+    uploader.finish(ctx)
     return Qwen3Encoder(weights^, n2i^, _h3_cfg())
 
 
 def _h3_embed(
-    st: ShardedSafeTensors, embed_prefix: String, ids: List[Int], ctx: DeviceContext
+    st: ShardedSafeTensors,
+    mut uploader: BatchedTensorUploader,
+    embed_prefix: String,
+    ids: List[Int],
+    ctx: DeviceContext,
 ) raises -> Tensor:
     """Transient mini-encoder holding ONLY embed_tokens (~1.45 GiB bf16);
     freed on return (mirrors ideogram_qwen3vl_streamed.mojo's `_embed_all`)."""
     var weights = List[TArc]()
     var n2i = Dict[String, Int]()
-    _h3_add(st, weights, n2i, String("model.embed_tokens.weight"), embed_prefix + "embed_tokens.weight", ctx)
+    _h3_add(st, uploader, weights, n2i, String("model.embed_tokens.weight"), embed_prefix + "embed_tokens.weight", ctx)
+    uploader.finish(ctx)
     var emb = Qwen3Encoder(weights^, n2i^, _h3_cfg())
     return emb._embed(ids, ctx)
 
@@ -519,9 +545,11 @@ def minimax_h3_encode_conditioning_streamed_depth(
     var st = _h3_open_available_shards(dir_or_file)
     var layer_prefix = _detect_layer_prefix(st)
     var embed_prefix = _h3_embed_prefix(layer_prefix)
+    var uploader = BatchedTensorUploader(H3_UPLOAD_STAGE_BYTES, ctx)
 
-    var hidden = _h3_embed(st, embed_prefix, ids, ctx)  # [1, seq, 5120]
+    var hidden = _h3_embed(st, uploader, embed_prefix, ids, ctx)  # [1, seq, 5120]
     ctx.synchronize()  # embed table (~1.45 GiB) freed before layer streaming starts
+    st.release_to_os()  # H2D is complete; drop clean embed-table mmap pages
 
     if has_vision:
         # Splice ONCE, before layer 0 — layer 0 must consume the embedding
@@ -561,7 +589,7 @@ def minimax_h3_encode_conditioning_streamed_depth(
     var deepstack_lm_layers = minimax_h3_vision_deepstack_lm_layers()  # [0, 1, 2]
 
     for li in range(num_layers):  # 0..num_layers-1
-        var lw = _h3_load_layer(st, li, layer_prefix, ctx)
+        var lw = _h3_load_layer(st, uploader, li, layer_prefix, ctx)
         hidden = lw._layer(li, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx)
         # Deepstack add happens AFTER the layer's own forward completes,
         # matching modeling_qwen3_vl.py:849-867 EXACTLY: `hidden_states =
@@ -577,6 +605,13 @@ def minimax_h3_encode_conditioning_streamed_depth(
                     minimax_h3_deepstack_add(host_hidden, tap, vpos2, H3_HIDDEN)
                     hidden = Tensor.from_host(host_hidden, hidden.shape(), hidden.dtype(), ctx)
         ctx.synchronize()  # this layer's ~0.95 GiB dropped before the next load
+        st.release_to_os()  # H2D/compute complete; bound host mmap residency
+
+    print(
+        "  H3 conditioner uploads:", uploader.tensors_uploaded, "tensors,",
+        uploader.bytes_uploaded, "bytes,", uploader.fence_count,
+        "fences through one", H3_UPLOAD_STAGE_BYTES, "byte pinned slab",
+    )
 
     return hidden^
 

@@ -247,6 +247,8 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     MINIMAX_H3_HEADS,
     MINIMAX_H3_HEAD_DIM,
+    MINIMAX_H3_ATTN_CUDNN,
+    MINIMAX_H3_ATTN_SAGE_INT8,
     minimax_h3_released_config,
     minimax_h3_adaln_rows,
     minimax_h3_block_tensor_names,
@@ -1503,6 +1505,8 @@ def _minimax_h3_ref2va_generate(
     steps: Int,
     seed: UInt64,
     out_dir: String,
+    attention_backend: Int,
+    attention_backend_name: String,
 ) raises:
     """The generation tail. Two shapes:
 
@@ -1531,7 +1535,7 @@ def _minimax_h3_ref2va_generate(
                 )
             _minimax_h3_ref2va_generate_real(
                 plan, specs, references, real_pres.value(), steps, seed,
-                out_dir,
+                out_dir, attention_backend, attention_backend_name,
             )
             return
         else:
@@ -1634,7 +1638,7 @@ def _minimax_h3_ref2va_generate(
     _minimax_h3_ref2va_denoise_and_save(
         plan, config, transformer_shards, cond[0], cond[1], video_target^,
         audio_target^, text_rows, steps, seed, out_dir, True, injected,
-        condition_rows_path, ctx,
+        condition_rows_path, attention_backend, attention_backend_name, ctx,
     )
 
 
@@ -1653,6 +1657,8 @@ def _minimax_h3_ref2va_denoise_and_save(
     partial_mode: Bool,
     injected: Bool,
     condition_rows_path: String,
+    attention_backend: Int,
+    attention_backend_name: String,
     ctx: DeviceContext,
 ) raises:
     """The SHARED generation tail: RoPE, dual schedule, the 4-row-per-step
@@ -1779,6 +1785,7 @@ def _minimax_h3_ref2va_denoise_and_save(
                 hidden3 = minimax_h3_block_forward[H3_REF_SEQ_LEN, MINIMAX_H3_HEADS, MINIMAX_H3_HEAD_DIM](
                     hidden3, block_w, layer, config, modcache.block_mod[layer][],
                     block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
+                    attention_backend,
                 )
                 # `block_w` drops here: one block's ~0.77 GiB bf16 is freed
                 # before the next layer's load, exactly like t2va.
@@ -1898,6 +1905,9 @@ def _minimax_h3_ref2va_denoise_and_save(
     result_body += String("  \"steps\":") + String(num_steps) + String(",\n")
     result_body += String("  \"seed\":") + String(seed) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(plan.sequence_length()) + String(",\n")
+    result_body += String("  \"attention_backend\":\"") \
+        + attention_backend_name + String("\",\n")
+    result_body += String("  \"weight_storage\":\"streamed-bf16\",\n")
     result_body += String("  \"num_condition_video_rows\":") + String(plan.num_condition_video_rows) + String(",\n")
     result_body += String("  \"num_condition_audio_rows\":") + String(plan.num_condition_audio_rows) + String(",\n")
     result_body += String("  \"num_target_video_rows\":") + String(plan.num_target_video_rows) + String(",\n")
@@ -1942,6 +1952,8 @@ def _minimax_h3_ref2va_generate_real(
     steps: Int,
     seed: UInt64,
     out_dir: String,
+    attention_backend: Int,
+    attention_backend_name: String,
 ) raises:
     """THE REAL ref2va generation — every stage the partial mode stubbed,
     wired to its gated implementation:
@@ -2311,13 +2323,16 @@ def _minimax_h3_ref2va_generate_real(
     _minimax_h3_ref2va_denoise_and_save(
         plan, config, transformer_shards, cond_video, cond_audio,
         video_target^, audio_target^, text_rows, steps, seed, out_dir,
-        False, False, String(""), ctx,
+        False, False, String(""), attention_backend,
+        attention_backend_name, ctx,
     )
 
 
 def main() raises:
     var raw_args = argv()
     var partial_mode = False
+    var attention_backend = MINIMAX_H3_ATTN_CUDNN
+    var attention_backend_name = String("cudnn")
     var condition_rows_path = String("")
     var condition_rows_prefix = String("--condition-rows=")
     var args = List[String]()
@@ -2326,6 +2341,19 @@ def main() raises:
         if a == String("--partial"):
             partial_mode = True
             continue
+        if a == String("--attention-backend=sage-int8"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
+            attention_backend_name = String("sage-int8")
+            continue
+        if a == String("--attention-backend=cudnn"):
+            attention_backend = MINIMAX_H3_ATTN_CUDNN
+            attention_backend_name = String("cudnn")
+            continue
+        if a.startswith("--attention-backend="):
+            raise Error(
+                String("unknown attention backend flag: ") + a
+                + String(" (expected cudnn or sage-int8)")
+            )
         if a.startswith(condition_rows_prefix):
             condition_rows_path = String(a[byte = condition_rows_prefix.byte_length() :])
             continue
@@ -2334,7 +2362,8 @@ def main() raises:
     if len(args) < 3:
         print(
             "usage: minimax_h3_ref2va <prompt_file> <out_dir> [steps=30]"
-            " [seed=0] [--partial] [--condition-rows=PATH] [kind:path ...]"
+            " [seed=0] [--partial] [--condition-rows=PATH]"
+            " [--attention-backend=cudnn|sage-int8] [kind:path ...]"
         )
         print(
             "  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES,
@@ -2373,6 +2402,7 @@ def main() raises:
     print("  prompt file:", prompt_file)
     print("  out_dir:", out_dir)
     print("  steps=", steps, " seed=", seed)
+    print("  attention_backend=", attention_backend_name)
 
     var t0 = perf_counter_ns()
     _preflight_geometry()
@@ -2504,4 +2534,5 @@ def main() raises:
     _minimax_h3_ref2va_generate(
         plan, specs, references, real_pres, partial_mode,
         condition_rows_path, steps, seed, out_dir,
+        attention_backend, attention_backend_name,
     )

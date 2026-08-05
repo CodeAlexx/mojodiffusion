@@ -3118,7 +3118,7 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   timing, VRAM, prompt-extension provenance, and visual acceptance. The Rust
   server refuses Wan readiness if any pinned check drifts.
 
-## §5 MiniMax-H3 (t2va + i2va SHIPPED 2026-08-03; ref2va in build)
+## §5 MiniMax-H3 (t2va + i2va + ref2va SHIPPED 2026-08-04)
 
 The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
 layout (NOT the diffusers conversion). First valid video 2026-08-03
@@ -3141,6 +3141,26 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   timestep alone); inner 7168 != hidden 5376; qkv de-interleave + fc1
   [gate;value] swap owned by the LOADER; final-layer modulate runs in BF16
   with the F32 cast AFTER (transformer_minimax_h3.py:638).
+- `ops/sage_attention_int8.mojo` — OPT-IN Mojo-native Sage-style backend at
+  the block self-attention seam: BF16 Q/K/V -> Q128/K64 signed-INT8 QK tensor
+  cores -> online-softmax/BF16-PV with F32 accumulation -> BF16 output. Runtime flag on t2va, i2va,
+  and ref2va: `--attention-backend=cudnn|sage-int8` (default cuDNN; invalid
+  values/geometry fail loud, no fallback). It serves both streamed-BF16 and
+  resident one-byte weight modes because weight dequant precedes QKV and both
+  paths enter attention as BF16. This is INT8-QK, not native FP8 attention:
+  RTX 3090 Ti/sm86 has no FP8 tensor-core instruction. Host-exact MMA gate:
+  mismatches 0. Attention-vs-cuDNN gates (cosine bar 0.999, 5 warmups/20
+  iterations, allocation+quantization included): S=1024 cos 0.99990849,
+  463.893/509.051 us = 1.097x; t2va S=2836 cos 0.99990528,
+  2495.228/3682.929 us = 1.476x; i2va S=3226 cos 0.99990465,
+  3289.148/4706.811 us = 1.431x; long-sequence S=8192/16384/32768 remains
+  above bar at 0.99989797/0.99988690/0.99986473 and
+  1.480x/1.437x/1.454x. Non-multiple-of-64 tails are explicitly
+  softmax-masked; both small product gates exercise that path. These are
+  attention-only timings. Accumulated BF16-streamed+Sage vs BF16-cuDNN over
+  2 Euler steps x 50 real-weight blocks passes: block 0.99993783, video
+  0.99986713, audio 0.99946248. Those smaller pre-closure fixtures are
+  historical; the real S=9145 production decision below supersedes them.
 - `models/dit/minimax_h3_ref_geometry.mojo` — ref2va condition-rows-first
   layout over the gated packing_ref2va builder. Condition t: video =
   max(video_t, 0.999) TRACKING, audio = 1.0 const; table collapses below 4 —
@@ -3148,22 +3168,23 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - `models/dit/minimax_h3_fp8_resident.mojo` — OPT-IN quantized-RESIDENT
   base (-D H3_FP8_RESIDENT=1 — flag name historical, selects the
   scheme-agnostic store; default build UNCHANGED). SCHEME: INT8-weight-only
-  per-row (the vendor's own consumer recipe). HOST-GATE TRUTH (3090 Ti,
-  06:27Z — CORRECTS 2184e75's commit message and this entry's own prior
-  "GATE GREEN" text, which relayed phantom sandbox numbers whose ref shapes
-  contradicted the on-disk refs): block 0.9996933 PASS / e2e video
-  0.9994361 PASS / e2e AUDIO 0.9965372 FAIL vs 0.999. int8 cut error
-  3.3-5.4x vs E4M3 (0.99835/0.99726/0.98874 = the 3-bit-mantissa floor;
-  per-class sens all >=0.9993 composing independently, no affordable
-  selective-keep, per-group scales provably useless for e4m3) exactly as
-  the ~4x noise theory predicted; the audio miss is compounded per-block
-  noise over 2 steps x 50 blocks on n=64 audio latents — headroom, not a
-  kernel bug (dequant smoke bit-exact on host). OPEN RUNG: group-wise int8
-  scales (~128/group, negligible bytes) or audio-class selective-keep, or
-  a ruling on the e2e-audio bar vs perceptual evidence.
+  groupwise with FP16 persistent scales, QKV=16/out=64/FC1=32/FC2=64. The
+  encode/dequant wrappers are bit-exact vs host decode. This is the closest
+  fitting rung, not a parity acceptance: block 0.99989784 PASS, e2e video
+  0.99977180 PASS, e2e AUDIO 0.99895621 FAIL vs 0.999; resident 19.952884
+  GiB, sampled peak 22,026 MiB. F32 group scales reached audio 0.99864308 at
+  QKV32/others64 but QKV16 OOMed; compact scales made QKV16 viable. QKV12,
+  FC1-24, and out32 regressed; FC1-16 and F32-QKV16 OOMed at sampled
+  24,033/23,870 MiB. Per-row INT8 was 0.9996933/0.9994361/0.9965372 and E4M3
+  was 0.99835/0.99726/0.98874. The residual audio miss remains compounded
+  50-block noise on n=64 audio latents — headroom, not a kernel bug — and the
+  0.999 bar was not weakened. Combined groupwise-resident+Sage is likewise
+  not accepted: block 0.99986027 PASS, video 0.99969342 PASS, audio
+  0.99896282 FAIL.
   STEP-TIME A/B (S=3049, same build env, same prompt/seed): streamed
   66.6-72.8 s/step vs resident 4.65 s/step = 14.9x; one-time store build
-  198 s (18.67 GiB resident) amortizes in 3 steps. Speedup shrinks as S
+  198 s (18.67 GiB per-row resident) amortizes in 3 steps. That existing A/B
+  was not rerun for the 19.95-GiB groupwise profile. Speedup shrinks as S
   grows (eliminated streaming cost is constant ~65 s/step).
   MEMORY LAWS from three distinct OOMs (~5 GiB pool headroom over the
   store): per-TENSOR build transients (zero-churn staged build),
@@ -3171,6 +3192,115 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   allocs race stream-ordered frees), frontend weights upload BEFORE the
   store. ops/int8_quant.mojo: encode reused (krea2/W8A8), dequant half new
   with a bit-exact GPU-vs-host smoke.
+- **2026-08-04 24-GB product closure (512x320x175, 24 FPS, synchronized
+  audio):** the Qwen3-VL conditioner now has a GPU-built/consumed per-row INT8
+  cache (`serenity_int8_rowscale_v1`, 702 nonempty files) and direct W8A8 GEMM;
+  the full 241-token cat prompt completed all 50 layers with GPU finite
+  `l2=14242.48, nonfinite=0`. A full 50-block resident store remains rejected
+  after measured OOM at 48, 46, and 45 resident blocks. The admitted quality
+  layout is **43 group-wise INT8 resident blocks + 7 streamed BF16 tail
+  blocks**, 17.259968 GiB resident. It loads the contained prefix from one
+  canonical 48-block cache rather than duplicating a 19.83-GB sidecar. Its
+  optimized 20-step cU-DNN render completed 19 evaluations in 377.2288 s
+  (~19.1-19.8 s/step), sampled process VRAM 23,268 MiB, final video/audio
+  nonfinite=0/0, and zero swap. A fresh GPU streaming VAE process decoded 175
+  frames and NVENC-muxed stereo audio in 78.81 s (10.39-GB process RSS, zero
+  swap). Five-frame visual inspection (0/48/96/144/174) passed, including the
+  close-up, camera push, and action-shot progression.
+  The companion **streamed BF16 DiT + INT8 text encoder** render also passed
+  all 19 evaluations and both finite gates; denoise=1412.227 s, fresh decode +
+  NVENC=79.62 s, and the same five-frame visual gate passed. Full-schedule
+  quality-INT8-vs-BF16 final-latent cosine is video 0.97470209 / audio
+  0.99773147:
+  both decoded outputs are accepted perceptually, but they are not represented
+  as numerically identical trajectories.
+- **2026-08-04 direct-W8A8 fast arm:** a model-scoped cuBLAS INT8 GEMM accepts
+  H3's unaligned product row count (M=9145), with GPU per-token activation
+  quantization and GPU BF16 output scaling. The 20-step product schedule cannot
+  hold all 50 blocks beside its 351.46-MiB modulation cache; 50 and a 49+BF16
+  tail both OOMed. The admitted layout keeps 48 blocks resident and streams the
+  final two from the already-quantized full W8A8 cache (never BF16 weights): 19
+  evaluations now complete in **174.5774 s** (~8.98-9.26 s/eval), sampled
+  process VRAM 23,172 MiB, zero swap, and both final latent nonfinite counts are
+  zero. This is 1.2385x faster than the prior 216.2208-s W8A8 run, 2.1608x
+  faster than the current groupwise-quality denoise, and 8.09x faster than
+  streamed BF16. The speedup came from removing block-local copies: compact
+  RoPE tables broadcast directly across heads, Q/K/V and attention merge use
+  owned reshapes, and packed FC1 `[value|gate]` feeds SwiGLU without slicing
+  two ~250-MiB tensors. The optimized final latents are byte-identical to the
+  previously inspected fast render (`sha256=10b044d0...ff6a9`). Five-frame inspection
+  (0/48/96/144/174) passed and audio is non-silent (RMS -19.45 dB), but final
+  latent cosine against the current groupwise-quality arm is video 0.93862942 /
+  audio 0.98805401. It is therefore exposed as the separate `int8-fast` perceptually
+  accepted choice, not mislabeled as numerical parity; `int8` quality and
+  streamed `bf16` remain available. The fast arm is gated only with cU-DNN;
+  stacking experimental Sage attention is rejected by request validation. A
+  real HTTP queue smoke (`video-0005`, two requested steps/one evaluation)
+  selected the fast runner, denoised in 10.2355 s with finite latents, completed
+  the fresh GPU decode, and published 175 H.264/NVENC frames plus stereo AAC as
+  `serenity.minimax_h3.result.v1 state=done`.
+- **Sage production decision:** the original FP16 P×V accumulator overflowed
+  at real S=9145 (saved video/audio latents were entirely non-finite), while
+  cU-DNN with identical encoder/resident weights was finite; this isolated the
+  fault to Sage rather than the encoder, weight store, or decoders. BF16 P/V +
+  F32 accumulation fixes it. Exact S=9145 gate: 65,551,360 values,
+  nonfinite=0/0, cosine 0.999907662, max_abs 0.00341797, attention-only 1.276x
+  faster. A real resident-model step is finite and 22.98 s vs cU-DNN 23.72 s,
+  but final latent cosine is video 0.998918 / audio 0.996266, below the 0.999
+  product bar. On the direct-W8A8 fast block path Sage also measured slower
+  than cU-DNN (12.12 vs 10.24 s/eval). Therefore `sage-int8` is switchable but explicitly
+  **experimental and OFF by default**; cU-DNN remains the quality default.
+- **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with a
+  registry of exact compiled profiles: 512x320x175 (7.29 s), 832x480x73
+  (3.04 s), and 960x544x56 (2.33 s), all at 24 FPS/20 steps. The higher
+  resolutions deliberately reduce frame count so DiT sequence length and
+  decoded pixel-frames remain near the proven 24-GB workload. `/v1/video`
+  validates the exact 241-token test prompt and resolves all geometry fields to
+  a profile-specific runner before the cross-product GPU lease, launches
+  `int8-fast`, `int8`, or `bf16` asynchronously, exits after denoise, invokes
+  the same runner in fresh `decode_only` mode, requires
+  `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
+  URLs. UI and Canvas workflow controls expose Fast-W8A8 vs Quality-groupwise
+  vs streamed-BF16 and
+  cU-DNN-vs-Sage. H3 owns a separate precision state so BF16 selected on a
+  different video model cannot leak into H3; first entry defaults to
+  `int8-fast`, while an explicit H3 Quality/BF16 choice remains switchable.
+  cU-DNN is the default and Sage is labeled experimental. On 2026-08-05 both
+  added profiles passed 19-evaluation Fast trajectories, zero finite-gate
+  failures, fresh streaming GPU VAE decode, NVENC H.264 + stereo AAC probe, and
+  three-frame visual inspection. Their denoise times were 147.089 s at
+  832x480 and 147.067 s at 960x544. Shape-specific full-trajectory OOM gates
+  rejected 48 Fast resident blocks for both higher profiles; the admitted
+  layout is 46 W8A8 resident + 4 compact W8A8 tail, with sampled peaks 22,560
+  and 22,672 MiB. Higher-profile Quality uses 41 groupwise resident + 9 BF16
+  tail; BF16 stays fully streamed. A live HTTP smoke (`video-0009`) selected
+  the exact 960x544 runner, completed one real eval in 7.948 s, decoded 56
+  frames, and published the synchronized MP4.
+- **Runtime cold-start closure (2026-08-04):** the exact product prompt now uses
+  three versioned, source-stat-validated sidecars under
+  `FL2VA/serenity_runtime_cache_v1`: BF16 conditioner output, BF16 AdaLN
+  modulation rows keyed by step/block count, one canonical 48-block group-wise
+  INT8 cache (Quality loads its first 43), and one full 50-block W8A8 cache
+  (Fast keeps 48 resident and streams two compact tail blocks). Reload is
+  dtype/shape checked and byte preserving; a cached
+  one-evaluation run matched the prior uncached video and audio latents with
+  `rel_l2=0.0` and no non-finites. The original fresh build took 243.54 s;
+  subsequent pre-denoise preparation measured 20.76 s hot, 31.29 s in the
+  rebuilt INT8 product binary after disk-cache eviction, and 8.17 s in the BF16
+  product binary (which does not load the INT8 resident store), all with zero
+  swap. This replaces the per-job 72.5 s encoder + 30.1 s modcache + 139.3 s
+  resident rebuild without changing denoise math. Serenity passes the explicit
+  cache flag, reports cache and real denoise progress from the runner log, and
+  fails readiness closed if the default 20-step caches are missing. A
+  long-lived GPU daemon is deliberately not used: retaining the 17.26-GiB DiT
+  store beside the fresh 10.4-GiB VAE decode process would exceed a 24-GiB GPU.
+  The rebuilt release server then completed a real asynchronous HTTP smoke
+  (`video-0004`, two requested steps/one evaluation) end to end in 263.12 s:
+  cache-hit denoise remained finite, the fresh decode produced 175 H.264/NVENC
+  frames at 512x320/24 FPS plus stereo AAC at 32 kHz, duration 7.291667 s, and
+  both `status.json` and `result.json` reached `state=done`. This one-evaluation
+  artifact is a transport/decode proof only; the existing 20-step inspected
+  INT8 and BF16 renders remain the quality evidence.
 - `models/vae/minimax_h3_video_{encoder,decoder}_device.mojo` — native-key
   ViT VAE, vendor-oracle cos 0.9999999978 / 0.9999999999998. Fused to_qkv is
   PER-HEAD interleaved; ff.w1 gate-FIRST.

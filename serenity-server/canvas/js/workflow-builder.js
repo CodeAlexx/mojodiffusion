@@ -49,6 +49,9 @@ var WorkflowBuilder = (function () {
             case 'ltxv':
                 workflow = buildLTXV(params);
                 break;
+            case 'minimax_h3':
+                workflow = buildMiniMaxH3(params);
+                break;
             case 'wan':
                 workflow = buildWan(params);
                 break;
@@ -164,8 +167,9 @@ var WorkflowBuilder = (function () {
             return zimageWorkflow;
         }
         // Video models: fall back to txt2vid
-        if (arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2') {
+        if (arch === 'ltxv' || arch === 'minimax_h3' || arch === 'wan' || arch === 'bernini' || arch === 'scail2') {
             if (arch === 'ltxv') return buildLTXV(params);
+            if (arch === 'minimax_h3') return buildMiniMaxH3(params);
             if (arch === 'bernini') return buildBernini(params);
             if (arch === 'scail2') return buildScail2(params);
             return buildWan(params);
@@ -1003,6 +1007,45 @@ var WorkflowBuilder = (function () {
             '8': { class_type: 'SaveImage', inputs: { images: ['7', 0], filename_prefix: 'sf_canvas' } }
         };
     }
+    // ─── MiniMax-H3 (native synchronized audio/video) ───────────────────
+    function buildMiniMaxH3(p) {
+        var seed = resolveSeed(p.seed);
+        return {
+            '1': {
+                class_type: 'MiniMaxH3Loader',
+                inputs: {
+                    precision: p.quantization === 'bf16'
+                        ? 'bf16'
+                        : (p.quantization === 'int8' ? 'int8' : 'int8-fast'),
+                    attention_backend: p.h3AttentionBackend === 'sage-int8'
+                        ? 'sage-int8' : 'cudnn'
+                }
+            },
+            '2': {
+                class_type: 'MiniMaxH3Sampler',
+                inputs: {
+                    model: ['1', 0],
+                    prompt: p.prompt || '',
+                    width: Number(p.width) || 512,
+                    height: Number(p.height) || 320,
+                    num_frames: Number(p.frames) || 175,
+                    frame_rate: Number(p.fps) || 24,
+                    steps: Number(p.steps) || 20,
+                    seed: seed,
+                    include_audio: true
+                }
+            },
+            '3': {
+                class_type: 'SaveVideo',
+                inputs: {
+                    video: ['2', 0],
+                    filename_prefix: 'sf_minimax_h3',
+                    format: 'mp4'
+                }
+            }
+        };
+    }
+
     // ─── LTX-V (Video) ──────────────────────────────────────────────────
     function buildLTXV(p) {
         function requiredNumber(key) {
@@ -1339,7 +1382,7 @@ var WorkflowBuilder = (function () {
         // Find the Save node that receives decoded images/video
         var saveNodeId = null;
         var sourceRef = null;
-        var isVideo = (arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2');
+        var isVideo = (arch === 'ltxv' || arch === 'minimax_h3' || arch === 'wan' || arch === 'bernini' || arch === 'scail2');
         Object.keys(workflow).forEach(function (key) {
             var node = workflow[key];
             if (isVideo && node.class_type === 'SaveVideo') {

@@ -35,6 +35,37 @@ var SerenityAPI = (function () {
                 };
             }
         }
+        var h3Loader = null;
+        for (var hi = 0; hi < keys.length; hi++) {
+            var h3Candidate = nodes[keys[hi]];
+            if (h3Candidate && h3Candidate.class_type === 'MiniMaxH3Loader')
+                h3Loader = h3Candidate.inputs || {};
+        }
+        for (var hs = 0; hs < keys.length; hs++) {
+            var h3Sampler = nodes[keys[hs]];
+            if (h3Sampler && h3Sampler.class_type === 'MiniMaxH3Sampler') {
+                var h3 = h3Sampler.inputs || {};
+                return {
+                    schema: 'serenity.genparams.v1',
+                    model: 'minimax_h3',
+                    runner: 'minimax_h3_mojo_request',
+                    prompt: h3.prompt || '',
+                    width: Number(h3.width) || 512,
+                    height: Number(h3.height) || 320,
+                    frames: Number(h3.num_frames) || 175,
+                    fps: Number(h3.frame_rate) || 24,
+                    steps: Number(h3.steps) || 20,
+                    seed: Number(h3.seed) || 0,
+                    quant: h3Loader && h3Loader.precision === 'bf16'
+                        ? 'bf16'
+                        : (h3Loader && h3Loader.precision === 'int8'
+                            ? 'int8' : 'int8-fast'),
+                    attention_backend: h3Loader && h3Loader.attention_backend === 'sage-int8'
+                        ? 'sage-int8' : 'cudnn',
+                    include_audio: true
+                };
+            }
+        }
         var ltxCheckpoint = '';
         var ltxQuantization = '';
         for (var i = 0; i < keys.length; i++) {

@@ -1,24 +1,33 @@
 # serenitymojo/models/dit/minimax_h3_fp8_resident.mojo
 #
-# MiniMax-H3 FP8-RESIDENT denoiser base — quantize each frozen block's big GEMM
-# weights ONCE (bf16 -> E4M3 bytes + per-output-row F32 scale, on device), keep
+# MiniMax-H3 quantized-RESIDENT denoiser base — quantize each frozen block's big
+# GEMM weights ONCE (bf16 -> one-byte values + scales, on device), keep
 # them resident, and rebuild a block's bf16 weight Dict per step by DEQUANT
 # instead of re-streaming ~0.77 GiB/block from disk. The streaming loop re-reads
 # the full ~36 GiB of block weights EVERY denoise step; this store replaces that
-# with a ~18 GiB one-time residency + a cheap per-block dequant kernel.
+# with a ~20 GiB one-time residency + a cheap per-block dequant kernel.
 #
-# SCHEME (2026-08-04): the store now defaults to INT8-WEIGHT-ONLY PER-ROW
-# (symmetric absmax, scale = row_absmax/127, F32 scales) — Alex's decision on
+# SCHEME (2026-08-04): the store defaults to INT8-WEIGHT-ONLY GROUPWISE
+# (QKV=16, out_proj=64, fc1=32, fc2=64 input columns/group; symmetric absmax;
+# persistent FP16 scales). Per-row INT8 produced block/video PASS but audio
+# 0.9965372. F32 group scales improved audio to 0.9986431 at QKV32/others64,
+# but QKV16 OOMed. Compact FP16 scales made QKV16 viable; the measured class
+# ladder then selected FC1=32. The final fitting profile is block 0.99989784,
+# video 0.99977180, audio 0.99895621: closest measured audio, but still an
+# explicit FAIL vs the unchanged 0.999 bar. Finer FC1=16 and F32 QKV16 scales
+# both cross allocator cliffs and OOM (24,033/23,870 MiB sampled). Groupwise
+# scales preserve the bar rather than negotiating it. This follows Alex's
+# earlier decision on
 # this lane's measured E4M3 evidence: blockCos 0.998347 / e2eVideoCos
 # 0.997255 / e2eAudioCos 0.988741 vs the 0.999 bar (the E4M3 3-bit-mantissa
 # floor), while int8-weight-only per-row is the vendor's own consumer recipe
 # for this model (fp8_policy header) with ~4x finer rounding at the SAME
-# residency cost (1 byte/param + per-row F32 scale — resident_bytes is
-# scheme-invariant). The swap is exactly the two-function pair the original
-# design isolated: encode in the build (ops/int8_quant.mojo int8_rowscale /
-# int8_encode_perrow — the parity-gated W8A8 encode) and dequant in the
-# rebuild (int8_dequant_perrow_to_bf16_into, new, mirroring the fp8 `_into`
-# contract; smoke-gated bit-exact in ops/tests/int8_quant_smoke.mojo). E4M3
+# residency cost class. The final profile measures 19.952884 GiB of store and
+# 22,026 MiB sampled peak; scale memory is material and is live-VRAM gated.
+# Encode uses
+# ops/int8_quant.mojo int8_groupscale/int8_encode_groupwise and rebuild uses
+# int8_dequant_groupwise_to_bf16_into; their shared smoke is bit-exact against
+# host decode. E4M3
 # stays available behind the `scheme` argument (MINIMAX_H3_RESIDENT_E4M3)
 # for A/B comparison. NAMING: "fp8" in this file's public names is HISTORICAL
 # — kept to avoid churning the stack/t2va/gate call sites — read it as
@@ -43,9 +52,9 @@
 #   ops/fp8.mojo        fp8_e4m3_dequant_perrow_to_bf16             (decode)
 # Same per-output-row symmetric-absmax E4M3 scheme (the quantized_loading.py
 # convention the Ideogram-4 checkpoints already ship in). The dequant output is
-# bf16 with the SAME shape/row-order the streamed path produces, so
-# `minimax_h3_block_forward` is completely unchanged — it consumes the Dict this
-# file returns exactly as it consumes `minimax_h3_load_block_device`'s.
+# bf16 with the SAME shape/row-order the streamed path produces, so the block's
+# weight-consumption path is unchanged — it consumes the Dict this file returns
+# exactly as it consumes `minimax_h3_load_block_device`'s.
 #
 # TRANSFORM ORDER MATTERS: quantization happens AFTER the qkv de-interleave
 # and fc1 half-swap — the build stages every big tensor through the SAME
@@ -73,9 +82,12 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16_into
 from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.int8_quant import (
-    int8_dequant_perrow_to_bf16_into,
+    int8_dequant_groupwise_to_bf16_into,
+    int8_encode_groupwise,
     int8_encode_perrow,
+    int8_groupscale,
     int8_rowscale,
 )
 from serenitymojo.models.minimax_h3.fp8_policy import (
@@ -102,11 +114,32 @@ from serenitymojo.models.dit.minimax_h3_loader_device import (
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Quantization scheme selectors (the store's ONE variable design point — see
-# the file header's SCHEME note). Both are 1 byte/param + per-row F32 scale;
-# only the byte encoding and the kernel pair differ.
+# the file header's SCHEME note). Both are 1 byte/param, but INT8 uses
+# class-selected group FP16 scales while E4M3 keeps its original F32 per-row
+# scales.
 # ─────────────────────────────────────────────────────────────────────────────
 comptime MINIMAX_H3_RESIDENT_E4M3 = 0  # fp8 E4M3 per-row (the original lane)
-comptime MINIMAX_H3_RESIDENT_INT8 = 1  # int8-weight-only per-row (DEFAULT)
+comptime MINIMAX_H3_RESIDENT_INT8 = 1  # int8 weight-only groupwise (DEFAULT)
+comptime MINIMAX_H3_RESIDENT_INT8_W8A8 = 2  # per-row store, direct INT8 GEMM
+comptime MINIMAX_H3_INT8_QKV_GROUP_SIZE = 16
+comptime MINIMAX_H3_INT8_OUT_GROUP_SIZE = 64
+comptime MINIMAX_H3_INT8_FC1_GROUP_SIZE = 32
+comptime MINIMAX_H3_INT8_FC2_GROUP_SIZE = 64
+
+
+def minimax_h3_int8_group_size(name: String) raises -> Int:
+    """Measured resident profile: class-specific scale-memory budget."""
+    if name.endswith("attn.qkv_proj.weight"):
+        return MINIMAX_H3_INT8_QKV_GROUP_SIZE
+    if name.endswith("attn.out_proj.weight"):
+        return MINIMAX_H3_INT8_OUT_GROUP_SIZE
+    if name.endswith("mlp.fc1.weight"):
+        return MINIMAX_H3_INT8_FC1_GROUP_SIZE
+    if name.endswith("mlp.fc2.weight"):
+        return MINIMAX_H3_INT8_FC2_GROUP_SIZE
+    raise Error(
+        String("MiniMax-H3 int8 group profile has no class for ") + name
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,7 +154,8 @@ struct MiniMaxH3BlockResidentFp8(Copyable, Movable):
     var fp8: List[ArcPointer[Tensor]]    # quantized bytes [out,in] (E4M3 or
     #                                      int8 per the store's `scheme`),
     #                                      TRANSFORMED rows
-    var scale: List[ArcPointer[Tensor]]  # F32 [out] per-output-row scales
+    var scale: List[ArcPointer[Tensor]]  # FP16 [out, in/group] for INT8;
+    #                                      F32 [out] for E4M3
     var bf16_names: List[String]         # BF16_KEEP keys (the 1-D norm gains)
     var bf16: List[ArcPointer[Tensor]]   # bf16, kept resident verbatim
 
@@ -176,20 +210,23 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
         self.scheme = scheme
 
     def resident_bytes(self) raises -> Int:
-        """Actual device bytes held by this store (quantized 1B/param + F32
-        scales + bf16 keeps + the shared dequant scratch; scheme-invariant) —
+        """Actual device bytes held by this store (quantized 1B/param + the
+        scheme's scales + bf16 keeps + shared dequant scratch) —
         printed at build so the fit claim is a measurement, not fp8_policy's
         prediction restated."""
         var total = 0
         for bi in range(len(self.blocks)):
             ref b = self.blocks[bi]
             for k in range(len(b.fp8)):
-                total += b.fp8[k][].numel()
-                total += b.scale[k][].numel() * 4
+                total += b.fp8[k][].numel() * b.fp8[k][].dtype().byte_size()
+                total += b.scale[k][].numel() \
+                    * b.scale[k][].dtype().byte_size()
             for k in range(len(b.bf16)):
-                total += b.bf16[k][].numel() * 2
+                total += b.bf16[k][].numel() \
+                    * b.bf16[k][].dtype().byte_size()
         for k in range(len(self.scratch)):
-            total += self.scratch[k][].numel() * 2
+            total += self.scratch[k][].numel() \
+                * self.scratch[k][].dtype().byte_size()
         return total
 
 
@@ -241,6 +278,31 @@ def _check_tensor(
         )
 
 
+def minimax_h3_allocate_resident_scratch(
+    config: MiniMaxH3DiTConfig,
+    start_layer: Int,
+    ctx: DeviceContext,
+) raises -> List[ArcPointer[Tensor]]:
+    """Allocate the shared BF16 dequant destinations before the store grows.
+
+    Cache reload and fresh quantization must use the same slot order and
+    allocation timing.  Keeping that derivation here prevents a disk-sidecar
+    loader from silently drifting from `minimax_h3_resident_block_weights`.
+    """
+    var scratch = List[ArcPointer[Tensor]]()
+    var template_names = minimax_h3_block_tensor_names(start_layer)
+    for k in range(len(template_names)):
+        ref tn = template_names[k]
+        var tw = minimax_h3_expected_shape(tn, config)
+        var trows = tw[0]
+        var tcols = tw[1] if len(tw) == 2 else 0
+        if minimax_h3_fp8_class(tn, trows, tcols) == H3_FP8_ROW:
+            var buf = ctx.enqueue_create_buffer[DType.uint8](trows * tcols * 2)
+            var shape: List[Int] = [trows, tcols]
+            scratch.append(ArcPointer(Tensor(buf^, shape^, STDtype.BF16)))
+    return scratch^
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Build: ZERO-CHURN staging. Every big tensor is host-read (with the gated
 # qkv/fc1 rewrite where required), FILLED INTO the preallocated scratch for
@@ -266,16 +328,27 @@ def minimax_h3_build_resident_fp8(
     start_layer: Int = 0,
     scheme: Int = MINIMAX_H3_RESIDENT_INT8,
 ) raises -> MiniMaxH3ResidentFp8:
-    if scheme != MINIMAX_H3_RESIDENT_E4M3 and scheme != MINIMAX_H3_RESIDENT_INT8:
+    if (
+        scheme != MINIMAX_H3_RESIDENT_E4M3
+        and scheme != MINIMAX_H3_RESIDENT_INT8
+        and scheme != MINIMAX_H3_RESIDENT_INT8_W8A8
+    ):
         raise Error(
             String("minimax_h3_build_resident_fp8: unknown scheme ")
-            + String(scheme) + " (want MINIMAX_H3_RESIDENT_INT8 or _E4M3)"
+            + String(scheme)
         )
-    print(
-        "  resident scheme:",
-        "int8-weight-only per-row" if scheme == MINIMAX_H3_RESIDENT_INT8
-        else "fp8 E4M3 per-row",
-    )
+    if scheme == MINIMAX_H3_RESIDENT_INT8:
+        print(
+            "  resident scheme: int8-weight-only groupwise fp16-scales qkv=",
+            MINIMAX_H3_INT8_QKV_GROUP_SIZE,
+            " out=", MINIMAX_H3_INT8_OUT_GROUP_SIZE,
+            " fc1=", MINIMAX_H3_INT8_FC1_GROUP_SIZE,
+            " fc2=", MINIMAX_H3_INT8_FC2_GROUP_SIZE,
+        )
+    elif scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+        print("  resident scheme: direct W8A8 per-row F32 scales")
+    else:
+        print("  resident scheme: fp8 E4M3 per-row F32 scales")
     var n = num_layers
     if n < 0:
         n = config.num_layers
@@ -294,17 +367,9 @@ def minimax_h3_build_resident_fp8(
     # no large contiguous block. Law (measured across runs 3+4): every
     # large persistent allocation happens BEFORE the store build; after it,
     # only small activations.
-    var scratch = List[ArcPointer[Tensor]]()
-    var template_names = minimax_h3_block_tensor_names(start_layer)
-    for k in range(len(template_names)):
-        ref tn = template_names[k]
-        var tw = minimax_h3_expected_shape(tn, config)
-        var trows = tw[0]
-        var tcols = tw[1] if len(tw) == 2 else 0
-        if minimax_h3_fp8_class(tn, trows, tcols) == H3_FP8_ROW:
-            var buf = ctx.enqueue_create_buffer[DType.uint8](trows * tcols * 2)
-            var shape: List[Int] = [trows, tcols]
-            scratch.append(ArcPointer(Tensor(buf^, shape^, STDtype.BF16)))
+    var scratch = minimax_h3_allocate_resident_scratch(
+        config, start_layer, ctx
+    )
 
     var heads = config.num_attention_heads
     var head_dim = config.attention_head_dim
@@ -363,6 +428,20 @@ def minimax_h3_build_resident_fp8(
                 var s: Tensor
                 var q: Tensor
                 if scheme == MINIMAX_H3_RESIDENT_INT8:
+                    var group_size = minimax_h3_int8_group_size(name)
+                    if cols % group_size != 0:
+                        raise Error(
+                            String("MiniMax-H3 int8 groupwise: input width ")
+                            + String(cols) + " for " + name
+                            + " is not divisible by group size "
+                            + String(group_size)
+                        )
+                    var s_f32 = int8_groupscale(dst, group_size, ctx)
+                    q = int8_encode_groupwise(dst, s_f32, group_size, ctx)
+                    # Compact persistent scales to FP16; this recovers enough
+                    # residency for the measured QKV16/out64/FC1-32 profile.
+                    s = cast_tensor(s_f32, STDtype.F16, ctx)
+                elif scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
                     s = int8_rowscale(dst, ctx)
                     q = int8_encode_perrow(dst, s, ctx)
                 else:
@@ -392,6 +471,11 @@ def minimax_h3_build_resident_fp8(
                 fp8_names^, fp8^, scale^, bf16_names^, bf16^
             )
         )
+        # Every tensor needed for this block has synchronized into persistent
+        # device storage. Drop its clean mmap pages before the next block so a
+        # long resident build does not leave the entire 36+ GiB transformer
+        # charged as file RSS alongside the growing GPU store.
+        st.release_to_os()
         if (i + 1) % 10 == 0 or i + 1 == n:
             print(
                 "  fp8-resident: quantized block", i + 1, "/", n,
@@ -405,6 +489,14 @@ def minimax_h3_build_resident_fp8(
         raise Error(
             "minimax_h3_build_resident_fp8: scratch slots do not match the"
             " quantized slot count — template/loop classification drifted"
+        )
+    if scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+        # Scratch is staging-only for the direct path. Releasing it leaves
+        # headroom for the INT32 GEMM output while cache-hit runs allocate no
+        # dequant destinations at all.
+        var no_scratch = List[ArcPointer[Tensor]]()
+        return MiniMaxH3ResidentFp8(
+            blocks^, start_layer, no_scratch^, scheme
         )
     return MiniMaxH3ResidentFp8(blocks^, start_layer, scratch^, scheme)
 
@@ -426,6 +518,10 @@ def minimax_h3_resident_block_weights(
     config: MiniMaxH3DiTConfig,
     ctx: DeviceContext,
 ) raises -> Dict[String, ArcPointer[Tensor]]:
+    if resident.scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+        raise Error(
+            "direct W8A8 store requires minimax_h3_resident_block_weights_w8a8"
+        )
     var i = layer - resident.start_layer
     if i < 0 or i >= len(resident.blocks):
         raise Error(
@@ -449,8 +545,10 @@ def minimax_h3_resident_block_weights(
         # variants share the caller-owned-dst contract (fp8.mojo's header
         # records the measured OOM that forced it).
         if resident.scheme == MINIMAX_H3_RESIDENT_INT8:
-            int8_dequant_perrow_to_bf16_into(
-                b.fp8[k][], b.scale[k][], resident.scratch[k][], ctx
+            var group_size = minimax_h3_int8_group_size(b.fp8_names[k])
+            int8_dequant_groupwise_to_bf16_into(
+                b.fp8[k][], b.scale[k][], group_size,
+                resident.scratch[k][], ctx,
             )
         else:
             fp8_e4m3_dequant_perrow_to_bf16_into(
@@ -465,6 +563,40 @@ def minimax_h3_resident_block_weights(
     # tensors (minimax_h3_load_block_device output), and dequant is
     # elementwise — row order is preserved through the round trip. See the
     # file header's TRANSFORM ORDER note.
+    weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    weights[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    return weights^
+
+
+def minimax_h3_resident_block_weights_w8a8(
+    resident: MiniMaxH3ResidentFp8,
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """Expose one per-row INT8 block without materializing BF16 weights."""
+    if resident.scheme != MINIMAX_H3_RESIDENT_INT8_W8A8:
+        raise Error("MiniMax-H3 direct block requested from a non-W8A8 store")
+    var i = layer - resident.start_layer
+    if i < 0 or i >= len(resident.blocks):
+        raise Error("MiniMax-H3 direct W8A8 layer outside resident range")
+    ref block = resident.blocks[i]
+    var weights = Dict[String, ArcPointer[Tensor]]()
+    for k in range(len(block.fp8)):
+        ref weight = block.fp8[k][]
+        ref scale = block.scale[k][]
+        if weight.dtype() != STDtype.I8 or scale.dtype() != STDtype.F32:
+            raise Error("MiniMax-H3 direct W8A8 cache dtype mismatch")
+        if scale.numel() != weight.shape()[0]:
+            raise Error("MiniMax-H3 direct W8A8 cache scale mismatch")
+        weights[block.fp8_names[k]] = block.fp8[k].copy()
+        weights[block.fp8_names[k] + String(".scale")] = block.scale[k].copy()
+    for k in range(len(block.bf16)):
+        weights[block.bf16_names[k]] = block.bf16[k].copy()
     weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(
         _minimax_h3_marker_tensor(ctx)
     )

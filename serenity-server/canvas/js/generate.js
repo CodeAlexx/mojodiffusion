@@ -71,6 +71,8 @@ var GenerateTab = (function () {
         videoWorkflowProfile: '',
         videoPromptEnhancer: 'none',
         videoQuant: 'fp8',
+        h3Quant: 'int8-fast',
+        h3AttentionBackend: 'cudnn',
         cameraMotion: 'none',
         videoCheckpoint: 'ltx-2.3-22b-distilled',
         capsPositive: '',
@@ -188,6 +190,17 @@ var GenerateTab = (function () {
     ];
     function getActiveAspects() {
         var arch = ModelUtils.archForModel(state.model);
+        if (arch === 'minimax_h3') {
+            return activeMinimaxH3Profiles().map(function (profile) {
+                return {
+                    label: profile.width + '×' + profile.height,
+                    w: Number(profile.width),
+                    h: Number(profile.height),
+                    vw: Number(profile.width) / 64,
+                    vh: Number(profile.height) / 64
+                };
+            });
+        }
         if (arch === 'ltxv') {
             var seen = {};
             return activeLtx2RequestProfiles().filter(function (profile) {
@@ -778,7 +791,9 @@ var GenerateTab = (function () {
             '<div class="gen-param-row" data-param-search="guidance mode distilled dev"><label class="gen-label" for="gen-video-guidance-mode">Guidance mode</label>' +
             '<select id="gen-video-guidance-mode" class="gen-select"><option value="distilled">Distilled</option><option value="dev">Dev CFG</option></select></div>' +
             '<div class="gen-param-row" data-param-search="quant bf16 fp8 int4"><label class="gen-label" for="gen-video-quant">Precision</label>' +
-            '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int4">INT4</option></select></div>' +
+            '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int8">INT8</option><option value="int4">INT4</option></select></div>' +
+            '<div id="gen-h3-attention-row" class="gen-param-row" data-param-search="attention cudnn sage int8"><label class="gen-label" for="gen-h3-attention">Attention</label>' +
+            '<select id="gen-h3-attention" class="gen-select"><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
             '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>' +
             '<div class="gen-param-row" data-param-search="camera motion dolly jib focus static"><label class="gen-label" for="gen-camera-motion">Camera Motion</label>' +
@@ -1091,6 +1106,8 @@ var GenerateTab = (function () {
         els.durationHint = document.getElementById('gen-duration-hint');
         els.videoGuidanceMode = document.getElementById('gen-video-guidance-mode');
         els.videoQuant = document.getElementById('gen-video-quant');
+        els.h3Attention = document.getElementById('gen-h3-attention');
+        els.h3AttentionRow = document.getElementById('gen-h3-attention-row');
         els.cameraMotion = document.getElementById('gen-camera-motion');
         els.videoCheckpoint = document.getElementById('gen-video-checkpoint');
         els.videoPromptEnhancer = document.getElementById('gen-video-prompt-enhancer');
@@ -1633,7 +1650,14 @@ var GenerateTab = (function () {
                     if (aspects[i].label === val) {
                         state.width = aspects[i].w;
                         state.height = aspects[i].h;
-                        if (ModelUtils.archForModel(state.model) === 'ltxv') {
+                        if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
+                            var h3Profile = activeMinimaxH3Profiles().find(function (profile) {
+                                return Number(profile.width) === state.width &&
+                                    Number(profile.height) === state.height;
+                            });
+                            applyMinimaxH3RequestProfile(h3Profile);
+                        }
+                        else if (ModelUtils.archForModel(state.model) === 'ltxv') {
                             var sizeProfiles = activeLtx2ProfilesForSize(
                                 state.width, state.height
                             );
@@ -1951,6 +1975,17 @@ var GenerateTab = (function () {
         if (els.videoQuant)
             els.videoQuant.addEventListener('change', function () {
                 state.videoQuant = this.value;
+                if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
+                    state.h3Quant = state.videoQuant;
+                    if (state.videoQuant === 'int8-fast') {
+                        state.h3AttentionBackend = 'cudnn';
+                        if (els.h3Attention)
+                            els.h3Attention.value = 'cudnn';
+                    }
+                    if (els.h3Attention)
+                        els.h3Attention.disabled = state.videoQuant === 'int8-fast';
+                    return;
+                }
                 var selectedIsLtx = ModelUtils.archForModel(state.model) === 'ltxv';
                 var checkpoint = selectedIsLtx
                     ? String(state.model).replace(/\.safetensors$/i, '')
@@ -1964,6 +1999,16 @@ var GenerateTab = (function () {
                     return model.name.replace(/\.safetensors$/i, '') === checkpoint;
                 }))
                     selectModel(checkpoint);
+            });
+        if (els.h3Attention)
+            els.h3Attention.addEventListener('change', function () {
+                if (state.videoQuant === 'int8-fast') {
+                    state.h3AttentionBackend = 'cudnn';
+                    this.value = 'cudnn';
+                    return;
+                }
+                state.h3AttentionBackend = this.value === 'sage-int8'
+                    ? 'sage-int8' : 'cudnn';
             });
         if (els.videoCheckpoint)
             els.videoCheckpoint.addEventListener('change', function () {
@@ -2836,6 +2881,7 @@ var GenerateTab = (function () {
             krea2: { w: 1024, h: 1024 },
             qwen: { w: 1024, h: 1024 },
             ltxv: { w: 1920, h: 1088 },
+            minimax_h3: { w: 512, h: 320 },
             wan: { w: 1280, h: 704 },
             bernini: { w: 848, h: 480 },
             scail2: { w: 896, h: 512 }
@@ -2913,6 +2959,14 @@ var GenerateTab = (function () {
             if (control)
                 control.disabled = true;
         });
+        if (els.h3AttentionRow)
+            els.h3AttentionRow.style.display = state.arch === 'minimax_h3' ? '' : 'none';
+        if (state.arch !== 'minimax_h3') {
+            if (els.videoGuidanceMode && els.videoGuidanceMode.closest('.gen-param-row'))
+                els.videoGuidanceMode.closest('.gen-param-row').style.display = '';
+            if (els.cameraMotion && els.cameraMotion.closest('.gen-param-row'))
+                els.cameraMotion.closest('.gen-param-row').style.display = '';
+        }
     }
     function updateAdvancedVisibility() {
         var visible = state.showAdvanced !== false;
@@ -3058,7 +3112,7 @@ var GenerateTab = (function () {
             state.arch || 'other';
         var archBadge = document.getElementById('gen-arch-badge');
         if (archBadge) {
-            var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', lens: 'MICROSOFT LENS', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
+            var archNames = { flux: 'FLUX', sdxl: 'SDXL', anima: 'ANIMA', sd3: 'SD3', sd15: 'SD1.5', ltxv: 'LTX-V', minimax_h3: 'MINIMAX-H3', wan: 'WAN', bernini: 'BERNINI-R', scail2: 'SCAIL-2', klein: 'KLEIN', krea2: 'KREA2', chroma: 'CHROMA', lens: 'MICROSOFT LENS', qwen: 'QWEN', zimage: 'Z-IMAGE', ideogram4: 'IDEOGRAM 4', sensenova: 'SENSENOVA' };
             archBadge.textContent = archNames[resolvedArch] || resolvedArch.toUpperCase();
             archBadge.dataset.arch = resolvedArch;
         }
@@ -3255,6 +3309,206 @@ var GenerateTab = (function () {
         updateAdvancedSamplingUI(null);
         renderModelLibrary();
         refreshLtx2PostUpscaleControls();
+        if (typeof lucide !== 'undefined')
+            lucide.createIcons({ nameAttr: 'data-lucide' });
+    }
+
+    function activeMinimaxH3Runner() {
+        var candidates = state.videoStatus && state.videoStatus.candidate_runners;
+        if (!Array.isArray(candidates))
+            return null;
+        return candidates.find(function (entry) {
+            return entry && entry.model === 'minimax_h3_t2va';
+        }) || null;
+    }
+
+    function activeMinimaxH3Profiles() {
+        var runner = activeMinimaxH3Runner();
+        return runner && Array.isArray(runner.supported_profiles)
+            ? runner.supported_profiles : [];
+    }
+
+    function applyMinimaxH3RequestProfile(profile) {
+        if (!profile)
+            return;
+        state.width = Number(profile.width);
+        state.height = Number(profile.height);
+        state.frames = Number(profile.frames);
+        state.fps = Number(profile.fps);
+        state.steps = Number(profile.steps) || 20;
+        state.seconds = Number(profile.duration) || state.frames / state.fps;
+        syncDimensionInputs();
+        if (els.framesInput)
+            els.framesInput.value = String(state.frames);
+        if (els.secondsInput)
+            els.secondsInput.value = state.seconds.toFixed(3);
+        if (els.fpsInput)
+            els.fpsInput.value = String(state.fps);
+        if (els.fpsRange)
+            els.fpsRange.value = String(state.fps);
+        if (els.steps)
+            els.steps.value = String(state.steps);
+        if (els.stepsRange)
+            els.stepsRange.value = String(state.steps);
+        updateAspectPreview();
+        updateDurationHint();
+    }
+
+    function updateMinimaxH3VideoUI(arch) {
+        state.arch = arch;
+        var runner = activeMinimaxH3Runner();
+        var runnerReady = !!(runner && runner.available === true);
+        var profiles = activeMinimaxH3Profiles();
+        var profile = profiles.find(function (candidate) {
+            return Number(candidate.width) === state.width &&
+                Number(candidate.height) === state.height &&
+                Number(candidate.frames) === state.frames &&
+                Number(candidate.fps) === state.fps;
+        }) || profiles[0] || {
+            width: 512, height: 320, frames: 175, fps: 24, steps: 20,
+            duration: 175 / 24
+        };
+        applyMinimaxH3RequestProfile(profile);
+        state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.h3Quant) >= 0
+            ? state.h3Quant : 'int8-fast';
+        state.videoQuant = state.h3Quant;
+        state.h3AttentionBackend = state.h3AttentionBackend === 'sage-int8'
+            ? 'sage-int8' : 'cudnn';
+        state.includeAudio = true;
+        state.audioPolicy = 'generate';
+        state.batchCount = 1;
+        if (runner && typeof runner.test_prompt === 'string') {
+            state.prompt = runner.test_prompt;
+            if (els.prompt)
+                els.prompt.value = runner.test_prompt;
+        }
+        setVideoControlsForMode(true);
+        if (els.videoSection)
+            els.videoSection.style.display = '';
+        if (els.videoConditioningSection)
+            els.videoConditioningSection.style.display = 'none';
+        if (els.negSection)
+            els.negSection.style.display = 'none';
+        if (els.cfgRow)
+            els.cfgRow.style.display = 'none';
+        if (els.guidanceRow)
+            els.guidanceRow.style.display = 'none';
+        var batchSection = document.getElementById('gen-batch-section');
+        if (batchSection)
+            batchSection.style.display = 'none';
+        if (els.toolbarBatchInput) {
+            els.toolbarBatchInput.value = '1';
+            els.toolbarBatchInput.disabled = true;
+        }
+        if (els.videoQuant) {
+            var modes = runner && Array.isArray(runner.quant_modes)
+                ? runner.quant_modes : [];
+            els.videoQuant.innerHTML = modes.map(function (mode) {
+                return '<option value="' + mode.id + '"' +
+                    (mode.available === true ? '' : ' disabled') + '>' +
+                    mode.label + '</option>';
+            }).join('') || '<option value="int8-fast">INT8 Fast · W8A8 48 + 2</option><option value="int8">INT8 Quality · groupwise 43 + BF16 tail 7</option><option value="bf16">BF16 DiT quality · streamed</option>';
+            if (!Array.from(els.videoQuant.options).some(function (option) {
+                return option.value === state.videoQuant && !option.disabled;
+            })) {
+                var firstReadyMode = Array.from(els.videoQuant.options).find(function (option) {
+                    return !option.disabled;
+                });
+                state.videoQuant = firstReadyMode ? firstReadyMode.value : 'int8-fast';
+                state.h3Quant = state.videoQuant;
+            }
+            els.videoQuant.value = state.videoQuant;
+        }
+        if (els.h3Attention) {
+            var attentionBackends = runner && Array.isArray(runner.attention_backends)
+                ? runner.attention_backends : [];
+            els.h3Attention.innerHTML = attentionBackends.map(function (backend) {
+                return '<option value="' + backend.id + '"' +
+                    (backend.available === true ? '' : ' disabled') + '>' +
+                    backend.label + '</option>';
+            }).join('') || '<option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option>';
+            if (state.videoQuant === 'int8-fast')
+                state.h3AttentionBackend = 'cudnn';
+            els.h3Attention.value = state.h3AttentionBackend;
+            els.h3Attention.disabled = state.videoQuant === 'int8-fast';
+        }
+        if (els.audioPolicy) {
+            els.audioPolicy.innerHTML = '<option value="generate">Generate synchronized audio</option>';
+            els.audioPolicy.value = 'generate';
+            els.audioPolicy.disabled = true;
+        }
+        [els.framesInput, els.secondsInput, els.fpsInput, els.fpsRange].forEach(function (control) {
+            if (control)
+                control.disabled = true;
+        });
+        if (els.framesInput)
+            els.framesInput.value = String(state.frames);
+        if (els.secondsInput)
+            els.secondsInput.value = state.seconds.toFixed(3);
+        if (els.fpsInput)
+            els.fpsInput.value = String(state.fps);
+        if (els.fpsRange)
+            els.fpsRange.value = String(state.fps);
+        if (els.steps) {
+            els.steps.min = '1';
+            els.steps.max = '50';
+            els.steps.value = String(state.steps);
+        }
+        if (els.stepsRange) {
+            els.stepsRange.min = '1';
+            els.stepsRange.max = '50';
+            els.stepsRange.value = String(state.steps);
+        }
+        syncDimensionInputs();
+        [els.customWidth, els.customHeight,
+            document.getElementById('gen-width-slider'),
+            document.getElementById('gen-height-slider')].forEach(function (control) {
+            if (control)
+                control.disabled = true;
+        });
+        if (els.aspectDropdown) {
+            els.aspectDropdown.innerHTML = profiles.map(function (candidate) {
+                var value = candidate.width + '×' + candidate.height;
+                var duration = Number(candidate.duration || candidate.frames / candidate.fps);
+                return '<option value="' + value + '">' + value + ' · ' +
+                    candidate.frames + ' frames · ' + duration.toFixed(2) + 's' +
+                    (candidate.available === true ? '' : ' · unavailable') + '</option>';
+            }).join('') || '<option value="512×320">512×320 · 175 frames · 7.29s</option>';
+            els.aspectDropdown.value = state.width + '×' + state.height;
+            els.aspectDropdown.disabled = profiles.length <= 1;
+        }
+        if (els.videoGuidanceMode && els.videoGuidanceMode.closest('.gen-param-row'))
+            els.videoGuidanceMode.closest('.gen-param-row').style.display = 'none';
+        if (els.cameraMotion && els.cameraMotion.closest('.gen-param-row'))
+            els.cameraMotion.closest('.gen-param-row').style.display = 'none';
+        var profileNote = document.getElementById('gen-video-profile-note');
+        if (profileNote)
+            profileNote.textContent = runnerReady
+                ? 'Compiled H3 profiles: exact 241-token prompt · synchronized audio · fixed 24 GB workload. Higher resolution uses fewer frames to preserve speed and VRAM safety. INT8 Fast is full-render visually gated with cU-DNN; INT8 Quality and BF16 remain switchable.'
+                : 'MiniMax-H3 profiles remain visible, but the selected local binaries, INT8 encoder cache, or quality gate are unavailable.';
+        var advancedNote = document.getElementById('gen-video-advanced-note');
+        if (advancedNote)
+            advancedNote.textContent = 'H3 runs entirely on GPU, exits after denoising, decodes in a fresh GPU process, and muxes with NVENC.';
+        if (els.modelWarn) {
+            els.modelWarn.textContent = runnerReady
+                ? '' : 'MiniMax-H3 is not admitted by the current machine-local quality gate';
+            els.modelWarn.classList.toggle('visible', !runnerReady);
+        }
+        if (els.btn)
+            els.btn.innerHTML = '<i data-lucide="wand-2"></i><span>Generate H3 Video + Audio</span>';
+        var output = document.getElementById('gen-output-format');
+        if (output)
+            output.value = 'MP4';
+        var runtimeLabel = document.getElementById('gen-runtime-label');
+        if (runtimeLabel)
+            runtimeLabel.textContent = runnerReady
+                ? 'MiniMax-H3 · Mojo GPU runtime · ready'
+                : 'MiniMax-H3 · Mojo GPU runtime · unavailable';
+        setPreviewModelBadges(state.model, arch);
+        updateAspectPreview();
+        updateDurationHint();
+        updateAdvancedSamplingUI(null);
+        renderModelLibrary();
         if (typeof lucide !== 'undefined')
             lucide.createIcons({ nameAttr: 'data-lucide' });
     }
@@ -3478,6 +3732,10 @@ var GenerateTab = (function () {
     function updateGenerateUIForArch(arch) {
         if (arch === 'ltxv') {
             updateVideoUIForArch(arch);
+            return;
+        }
+        if (arch === 'minimax_h3') {
+            updateMinimaxH3VideoUI(arch);
             return;
         }
         if (arch === 'wan') {
@@ -3829,6 +4087,7 @@ var GenerateTab = (function () {
             initImageName: state.initImagePath || state.initImageName || '',
             ltx2Mode: state.videoGuidanceMode,
             quantization: state.videoQuant,
+            h3AttentionBackend: state.h3AttentionBackend,
             ltx2WorkflowProfile: state.videoWorkflowProfile,
             ltx2PromptEnhancer: state.videoPromptEnhancer,
             ltx2AudioPolicy: state.audioPolicy,
@@ -3907,6 +4166,26 @@ var GenerateTab = (function () {
                     break;
                 }
             }
+        }
+        if (state.arch === 'minimax_h3') {
+            return {
+                schema: 'serenity.genparams.v1',
+                model: 'minimax_h3',
+                runner: 'minimax_h3_mojo_request',
+                prompt: finalPrompt.trim(),
+                width: state.width,
+                height: state.height,
+                frames: state.frames,
+                fps: state.fps,
+                steps: Number(state.steps) || 20,
+                seed: seed,
+                quant: state.videoQuant === 'bf16'
+                    ? 'bf16'
+                    : (state.videoQuant === 'int8' ? 'int8' : 'int8-fast'),
+                attention_backend: state.h3AttentionBackend === 'sage-int8'
+                    ? 'sage-int8' : 'cudnn',
+                include_audio: true
+            };
         }
         if (state.arch === 'wan') {
             var wanI2v = !!state.initImagePath;
@@ -4982,8 +5261,8 @@ var GenerateTab = (function () {
         });
         // Group by architecture
         var groups = {};
-        var groupOrder = ['krea2', 'klein', 'flux2', 'flux', 'ideogram4', 'lens', 'sdxl', 'sd3', 'zimage', 'qwen', 'hunyuan', 'sd15', 'ltxv', 'wan', 'bernini', 'scail2', 'other'];
-        var groupLabels = { krea2: 'KREA2', klein: 'KLEIN', flux2: 'FLUX 2', flux: 'FLUX', ideogram4: 'IDEOGRAM 4', lens: 'MICROSOFT LENS', sdxl: 'SDXL', sd3: 'SD3', zimage: 'Z-IMAGE', qwen: 'QWEN', hunyuan: 'HUNYUAN', sd15: 'SD 1.5', ltxv: 'Video (LTX)', wan: 'Video (WAN)', bernini: 'Video (BERNINI-R)', scail2: 'Video (SCAIL-2)', other: 'Other' };
+        var groupOrder = ['krea2', 'klein', 'flux2', 'flux', 'ideogram4', 'lens', 'sdxl', 'sd3', 'zimage', 'qwen', 'hunyuan', 'sd15', 'ltxv', 'minimax_h3', 'wan', 'bernini', 'scail2', 'other'];
+        var groupLabels = { krea2: 'KREA2', klein: 'KLEIN', flux2: 'FLUX 2', flux: 'FLUX', ideogram4: 'IDEOGRAM 4', lens: 'MICROSOFT LENS', sdxl: 'SDXL', sd3: 'SD3', zimage: 'Z-IMAGE', qwen: 'QWEN', hunyuan: 'HUNYUAN', sd15: 'SD 1.5', ltxv: 'Video (LTX)', minimax_h3: 'Video (MiniMax-H3)', wan: 'Video (WAN)', bernini: 'Video (BERNINI-R)', scail2: 'Video (SCAIL-2)', other: 'Other' };
         filtered.forEach(function (m) {
             var arch = ModelUtils.archForModel(m.name) || 'other';
             if (!groups[arch])
@@ -6120,6 +6399,7 @@ var GenerateTab = (function () {
             ltx2PromptEnhancer: state.videoPromptEnhancer,
             videoQuant: state.videoQuant,
             quantization: state.videoQuant,
+            h3AttentionBackend: state.h3AttentionBackend,
             videoCheckpoint: state.videoCheckpoint,
             capsPositive: state.capsPositive,
             capsNegative: state.capsNegative,
@@ -6176,7 +6456,7 @@ var GenerateTab = (function () {
                     (((params.videoQuant || params.quant) === 'bf16')
                         ? 'ltx-2.3-22b-distilled-fp8-dequant-bf16'
                         : 'ltx-2.3-22b-distilled'))
-                : params.model;
+                : (params.model === 'minimax_h3' ? 'MiniMax-H3-Mojo' : params.model);
             state.model = requestedModel;
             if (els.model)
                 els.model.value = requestedModel;
@@ -6229,6 +6509,15 @@ var GenerateTab = (function () {
             state.videoQuant = params.videoQuant;
         else if (typeof params.quant === 'string')
             state.videoQuant = params.quant;
+        if (ModelUtils.archForModel(state.model) === 'minimax_h3')
+            state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.videoQuant) >= 0
+                ? state.videoQuant : 'int8-fast';
+        if (typeof params.h3AttentionBackend === 'string')
+            state.h3AttentionBackend = params.h3AttentionBackend === 'sage-int8'
+                ? 'sage-int8' : 'cudnn';
+        else if (typeof params.attention_backend === 'string')
+            state.h3AttentionBackend = params.attention_backend === 'sage-int8'
+                ? 'sage-int8' : 'cudnn';
         if (typeof params.videoCheckpoint === 'string')
             state.videoCheckpoint = params.videoCheckpoint;
         else if (typeof params.checkpoint === 'string')
@@ -6341,6 +6630,8 @@ var GenerateTab = (function () {
             els.videoGuidanceMode.value = state.videoGuidanceMode;
         if (els.videoQuant)
             els.videoQuant.value = state.videoQuant;
+        if (els.h3Attention)
+            els.h3Attention.value = state.h3AttentionBackend;
         if (els.videoCheckpoint)
             els.videoCheckpoint.value = state.videoCheckpoint;
         if (els.capsPositive)

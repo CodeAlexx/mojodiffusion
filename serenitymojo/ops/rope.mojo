@@ -302,6 +302,34 @@ def _rope_halfsplit_full_kernel_f16(
         o[r, i + half] = rebind[o.element_type]((x1 * cv1 + x0 * sv1).cast[DType.float16]())
 
 
+def _rope_halfsplit_full_head_broadcast_kernel[
+    x_dtype: DType, table_dtype: DType
+](
+    x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    cos: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
+    sin: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    rows: Int,
+    half: Int,
+    heads: Int,
+):
+    """Full-width half-split RoPE with one compact table row per token."""
+    var idx = Int(global_idx.x)
+    var total = rows * half
+    if idx < total:
+        var r = idx // half
+        var i = idx % half
+        var token = r // heads
+        var x0 = rebind[Scalar[x_dtype]](x[r, i]).cast[DType.float32]()
+        var x1 = rebind[Scalar[x_dtype]](x[r, i + half]).cast[DType.float32]()
+        var cv0 = rebind[Scalar[table_dtype]](cos[token, i]).cast[DType.float32]()
+        var sv0 = rebind[Scalar[table_dtype]](sin[token, i]).cast[DType.float32]()
+        var cv1 = rebind[Scalar[table_dtype]](cos[token, i + half]).cast[DType.float32]()
+        var sv1 = rebind[Scalar[table_dtype]](sin[token, i + half]).cast[DType.float32]()
+        o[r, i] = rebind[o.element_type]((x0 * cv0 - x1 * sv0).cast[x_dtype]())
+        o[r, i + half] = rebind[o.element_type]((x1 * cv1 + x0 * sv1).cast[x_dtype]())
+
+
 def _rope_halfsplit_full_kernel_f32_tables[x_dtype: DType](
     x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
@@ -1017,4 +1045,144 @@ def rope_halfsplit_full(
                 _rope_halfsplit_full_kernel_f16, _rope_halfsplit_full_kernel_f16
             ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+def rope_halfsplit_full_head_broadcast(
+    x: Tensor, cos: Tensor, sin: Tensor, heads: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Full-width half-split RoPE with compact per-token frequency tables.
+
+    `x` is token-major `[...tokens, heads, D]`; `cos` and `sin` are compact
+    `[tokens, D]`. The kernel maps flattened activation row `r` to table row
+    `r // heads`, avoiding a heads-fold materialization. Arithmetic and BF16
+    rounding are identical to `rope_halfsplit_full` on explicitly repeated
+    tables.
+    """
+    if heads <= 0:
+        raise Error("rope_halfsplit_full_head_broadcast: heads must be positive")
+    var xshape = x.shape()
+    if len(xshape) < 1:
+        raise Error("rope_halfsplit_full_head_broadcast: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    if d % 2 != 0:
+        raise Error("rope_halfsplit_full_head_broadcast: last dim must be even")
+    var rows = x.numel() // d
+    if rows % heads != 0:
+        raise Error("rope_halfsplit_full_head_broadcast: row/head mismatch")
+    var tokens = rows // heads
+    if cos.numel() != tokens * d or sin.numel() != tokens * d:
+        raise Error("rope_halfsplit_full_head_broadcast: compact table mismatch")
+    if cos.dtype() != sin.dtype():
+        raise Error("rope_halfsplit_full_head_broadcast: table dtype mismatch")
+    var x_dt = x.dtype()
+    var table_dt = cos.dtype()
+    if x_dt != table_dt:
+        if table_dt != STDtype.F32 or x_dt == STDtype.F32:
+            raise Error("rope_halfsplit_full_head_broadcast: x/table dtype mismatch")
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](tokens, d))
+    var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var total = rows * (d // 2)
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    var mojo_x_dt = x_dt.to_mojo_dtype()
+    var mojo_table_dt = table_dt.to_mojo_dtype()
+
+    if mojo_x_dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[
+            _rope_halfsplit_full_head_broadcast_kernel[
+                DType.float32, DType.float32
+            ],
+            _rope_halfsplit_full_head_broadcast_kernel[
+                DType.float32, DType.float32
+            ],
+        ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+    elif mojo_x_dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        if mojo_table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.bfloat16, DType.float32
+                ],
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.bfloat16, DType.float32
+                ],
+            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+            )
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.bfloat16, DType.bfloat16
+                ],
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.bfloat16, DType.bfloat16
+                ],
+            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        if mojo_table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.float16, DType.float32
+                ],
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.float16, DType.float32
+                ],
+            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
+            )
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.float16, DType.float16
+                ],
+                _rope_halfsplit_full_head_broadcast_kernel[
+                    DType.float16, DType.float16
+                ],
+            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x.dtype())

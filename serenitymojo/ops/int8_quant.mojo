@@ -1,4 +1,4 @@
-# ops/int8_quant.mojo — BF16 → INT8 per-row/per-token QUANTIZATION (W8A8).
+# ops/int8_quant.mojo — BF16 → INT8 row/group/token QUANTIZATION (W8A8).
 #
 # Mirrors SerenityTrainer LinearW8A8 (modules/module/quantized/LinearW8A8.py +
 # quantization_util.quantize_int8_axiswise): symmetric absmax int8.
@@ -11,6 +11,16 @@
 # last. The int32 GEMM (cshim serenity_cublas_gemm_s8s8s32_rowmajor_nt) then
 # accumulates int8×int8, and the caller rescales by weight_scale × x_scale → bf16
 # (ops/int8_linear.mojo), exactly as reference trainer's int8_forward_tokenwise.
+#
+# Weight-only resident stores may instead use fixed contiguous column groups:
+#   scale[r,g] = max_{i in group g} |x[r,i]| / 127
+# The groupwise wrappers below deliberately reuse the same scale/encode/decode
+# kernels by flattening a divisible [rows, cols] tensor into
+# [rows * (cols/group_size), group_size]. There is one canonical arithmetic
+# implementation, and non-divisible widths fail loudly instead of acquiring a
+# tail convention that could drift between encode and decode.
+# Persistent consumers may cast the resulting F32 scales to FP16 after encode;
+# the groupwise dequant wrappers accept both and decode from the stored value.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -254,6 +264,117 @@ def int8_encode_perrow(w: Tensor, scale: Tensor, ctx: DeviceContext) raises -> T
         grid = 65535
     ctx.enqueue_function[_int8_encode_perrow_kernel, _int8_encode_perrow_kernel](
         X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    )
+    return Tensor(out_buf^, w.shape(), STDtype.I8)
+
+
+def int8_groupscale(
+    w: Tensor, group_size: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Fixed-column-group absmax scales for BF16 [rows, cols].
+
+    Returns F32 [rows, cols/group_size]. `cols` must be exactly divisible by
+    `group_size`; this keeps the contiguous-group reinterpret exact and makes
+    the scale layout unambiguous for persistent stores.
+    """
+    if w.dtype() != STDtype.BF16:
+        raise Error(
+            String("int8_groupscale: w must be BF16, got ") + w.dtype().name()
+        )
+    var wsh = w.shape()
+    if len(wsh) != 2:
+        raise Error(
+            String("int8_groupscale: w must be 2-D [rows,cols], rank=")
+            + String(len(wsh))
+        )
+    var rows = wsh[0]
+    var cols = wsh[1]
+    if rows <= 0 or cols <= 0:
+        raise Error("int8_groupscale: empty input")
+    if group_size <= 0 or cols % group_size != 0:
+        raise Error(
+            String("int8_groupscale: cols ") + String(cols)
+            + " must be exactly divisible by positive group_size "
+            + String(group_size)
+        )
+    var groups_per_row = cols // group_size
+    var groups = rows * groups_per_row
+    var n = rows * cols
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](groups * 4)
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups))
+    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+    )
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[Float32](), s_rl
+    )
+    ctx.enqueue_function[_int8_rowscale_kernel, _int8_rowscale_kernel](
+        X, S, group_size, groups, grid_dim=groups, block_dim=_BLOCK,
+    )
+    var s_shape: List[Int] = [rows, groups_per_row]
+    return Tensor(out_buf^, s_shape^, STDtype.F32)
+
+
+def int8_encode_groupwise(
+    w: Tensor, scale: Tensor, group_size: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Quantize BF16 [rows,cols] to INT8 with F32 [rows,groups] scales."""
+    if w.dtype() != STDtype.BF16:
+        raise Error(
+            String("int8_encode_groupwise: w must be BF16, got ")
+            + w.dtype().name()
+        )
+    if scale.dtype() != STDtype.F32:
+        raise Error(
+            String("int8_encode_groupwise: scale must be F32, got ")
+            + scale.dtype().name()
+        )
+    var wsh = w.shape()
+    if len(wsh) != 2:
+        raise Error("int8_encode_groupwise: w must be 2-D [rows,cols]")
+    var rows = wsh[0]
+    var cols = wsh[1]
+    if rows <= 0 or cols <= 0:
+        raise Error("int8_encode_groupwise: empty input")
+    if group_size <= 0 or cols % group_size != 0:
+        raise Error(
+            String("int8_encode_groupwise: cols ") + String(cols)
+            + " must be exactly divisible by positive group_size "
+            + String(group_size)
+        )
+    var groups = rows * (cols // group_size)
+    var ssh = scale.shape()
+    if len(ssh) != 2 or ssh[0] != rows \
+            or ssh[1] != cols // group_size:
+        raise Error(
+            "int8_encode_groupwise: scale shape must be"
+            " [rows,cols/group_size]"
+        )
+    if scale.numel() != groups:
+        raise Error(
+            String("int8_encode_groupwise: scale numel ")
+            + String(scale.numel()) + " != groups " + String(groups)
+        )
+    var n = w.numel()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n)
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+    )
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+    )
+    var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr(), o_rl
+    )
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    ctx.enqueue_function[_int8_encode_perrow_kernel, _int8_encode_perrow_kernel](
+        X, S, O, group_size, n, grid_dim=grid, block_dim=_BLOCK,
     )
     return Tensor(out_buf^, w.shape(), STDtype.I8)
 
@@ -547,6 +668,27 @@ def _int8_dequant_perrow_kernel(
         i += stride
 
 
+def _int8_dequant_groupwise_f16scale_kernel(
+    x: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    s: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    group_size: Int,
+    n: Int,
+):
+    """Groupwise decode variant for compact FP16 resident scales."""
+    var idx = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var i = idx
+    while i < n:
+        var b = Int(rebind[Scalar[DType.uint8]](x[i]))
+        if b >= 128:
+            b -= 256
+        var sc = Float32(rebind[Scalar[DType.float16]](s[i // group_size]))
+        var v = Float32(b) * sc
+        o[i] = rebind[o.element_type](v.cast[DType.bfloat16]())
+        i += stride
+
+
 def int8_dequant_perrow_to_bf16(
     w: Tensor,
     scale: Tensor,
@@ -669,3 +811,105 @@ def int8_dequant_perrow_to_bf16_into(
     ctx.enqueue_function[_int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel](
         X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
     )
+
+
+def int8_dequant_groupwise_to_bf16(
+    w: Tensor,
+    scale: Tensor,
+    group_size: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Dequantize INT8 [rows,cols] with F32/FP16 group scales to BF16."""
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](w.numel() * 2)
+    var out = Tensor(out_buf^, w.shape(), STDtype.BF16)
+    int8_dequant_groupwise_to_bf16_into(w, scale, group_size, out, ctx)
+    return out^
+
+
+def int8_dequant_groupwise_to_bf16_into(
+    w: Tensor,
+    scale: Tensor,
+    group_size: Int,
+    dst: Tensor,
+    ctx: DeviceContext,
+) raises:
+    """Groupwise dequant into caller-owned BF16 storage.
+
+    The caller owns the same overwrite hazard fence as the per-row `_into`
+    wrapper. Encode/decode both index scales by contiguous `i // group_size`.
+    """
+    if w.dtype() != STDtype.I8:
+        raise Error(
+            String("int8_dequant_groupwise_to_bf16_into: w must be I8, got ")
+            + w.dtype().name()
+        )
+    if scale.dtype() != STDtype.F32 and scale.dtype() != STDtype.F16:
+        raise Error(
+            "int8_dequant_groupwise_to_bf16_into: scale must be F32 or F16"
+        )
+    if dst.dtype() != STDtype.BF16:
+        raise Error(
+            "int8_dequant_groupwise_to_bf16_into: dst must be BF16"
+        )
+    var wshape = w.shape()
+    if len(wshape) != 2:
+        raise Error(
+            "int8_dequant_groupwise_to_bf16_into: w must be 2-D [rows,cols]"
+        )
+    var rows = wshape[0]
+    var cols = wshape[1]
+    var n = w.numel()
+    if rows <= 0 or cols <= 0:
+        raise Error("int8_dequant_groupwise_to_bf16_into: empty input")
+    if group_size <= 0 or cols % group_size != 0:
+        raise Error(
+            String("int8_dequant_groupwise_to_bf16_into: cols ")
+            + String(cols)
+            + " must be exactly divisible by positive group_size "
+            + String(group_size)
+        )
+    var groups = rows * (cols // group_size)
+    var ssh = scale.shape()
+    if len(ssh) != 2 or ssh[0] != rows \
+            or ssh[1] != cols // group_size:
+        raise Error(
+            "int8_dequant_groupwise_to_bf16_into: scale shape must be"
+            " [rows,cols/group_size]"
+        )
+    if scale.numel() != groups:
+        raise Error(
+            String("int8_dequant_groupwise_to_bf16_into: scale numel ")
+            + String(scale.numel()) + " != groups " + String(groups)
+        )
+    var osh = dst.shape()
+    if len(osh) != 2 or osh[0] != rows or osh[1] != cols:
+        raise Error(
+            "int8_dequant_groupwise_to_bf16_into: dst shape does not match w"
+        )
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        w.buf.unsafe_ptr(), x_rl
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        dst.buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+    )
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    if scale.dtype() == STDtype.F32:
+        var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        )
+        ctx.enqueue_function[
+            _int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel
+        ](X, S, O, group_size, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var S = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float16](), s_rl
+        )
+        ctx.enqueue_function[
+            _int8_dequant_groupwise_f16scale_kernel,
+            _int8_dequant_groupwise_f16scale_kernel,
+        ](X, S, O, group_size, n, grid_dim=grid, block_dim=_BLOCK)

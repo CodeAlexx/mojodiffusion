@@ -1,9 +1,10 @@
-# ops/tests/int8_quant_smoke.mojo — verify int8_quant.mojo compiles + round-trips
-# within int8 precision (per-row absmax symmetric, == reference trainer quantize_int8_axiswise).
+# ops/tests/int8_quant_smoke.mojo — verify row/group int8 quantization compiles
+# and round-trips within symmetric-absmax int8 precision.
 #
 # Build:
-#   pixi run mojo build --optimization-level 2 --target-accelerator sm_120 -I . \
-#     serenitymojo/ops/tests/int8_quant_smoke.mojo -o /tmp/int8_quant_smoke
+#   pixi run scripts/mem_safe.sh mojo build --optimization-level 2 -j 1 -I . \
+#     -Xlinker -lm serenitymojo/ops/tests/int8_quant_smoke.mojo \
+#     -o /tmp/int8_quant_smoke
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -11,10 +12,15 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, pi
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.int8_quant import (
+    int8_dequant_groupwise_to_bf16,
+    int8_dequant_groupwise_to_bf16_into,
     int8_dequant_perrow_to_bf16,
     int8_dequant_perrow_to_bf16_into,
+    int8_encode_groupwise,
     int8_encode_perrow,
+    int8_groupscale,
     int8_rowscale,
 )
 
@@ -120,5 +126,63 @@ def main() raises:
     if n_into_mismatch > 0:
         print("FAIL: _into dequant != allocating dequant at", n_into_mismatch,
               "elements"); return
-    print("PASS: int8 quantizer compiles + round-trips (cos>=0.999, <=1 step)"
-          " + dequant kernels bit-exact vs host decode (both wrappers)")
+
+    # ── Fixed 64-column group scales. The wrappers reinterpret this exactly
+    # divisible [rows,cols] storage as contiguous groups and must agree bit for
+    # bit with the host scale-index rule `i // group_size`. ──
+    comptime group_size = 64
+    comptime groups_per_row = cols // group_size
+    var gs = int8_groupscale(w, group_size, ctx)
+    if gs.shape()[0] != rows or gs.shape()[1] != groups_per_row:
+        print("FAIL: group scale shape", gs.shape()); return
+    var gq = int8_encode_groupwise(w, gs, group_size, ctx)
+    var gd = int8_dequant_groupwise_to_bf16(gq, gs, group_size, ctx)
+    var gs_h = gs.to_host(ctx)
+    var gqhost = ctx.enqueue_create_host_buffer[DType.uint8](gq.numel())
+    ctx.enqueue_copy(dst_buf=gqhost, src_buf=gq.buf)
+    ctx.synchronize()
+    var gd_h = gd.to_host(ctx)
+    var g_mismatch = 0
+    for i in range(rows * cols):
+        var b = Int(gqhost.unsafe_ptr()[i])
+        var sv = b if b < 128 else b - 256
+        var exp = (
+            Float32(sv) * gs_h[i // group_size]
+        ).cast[DType.bfloat16]().cast[DType.float32]()
+        if gd_h[i] != exp:
+            g_mismatch += 1
+    if g_mismatch > 0:
+        print("FAIL: groupwise GPU dequant != host decode at", g_mismatch,
+              "elements"); return
+    var gdst_buf = ctx.enqueue_create_buffer[DType.uint8](rows * cols * 2)
+    var gdst = Tensor(gdst_buf^, [rows, cols], STDtype.BF16)
+    int8_dequant_groupwise_to_bf16_into(gq, gs, group_size, gdst, ctx)
+    var gdst_h = gdst.to_host(ctx)
+    var g_into_mismatch = 0
+    for i in range(rows * cols):
+        if gdst_h[i] != gd_h[i]:
+            g_into_mismatch += 1
+    if g_into_mismatch > 0:
+        print("FAIL: groupwise _into != allocating dequant at",
+              g_into_mismatch, "elements"); return
+    # Compact resident-scale path: host truth uses the FP16-rounded scale.
+    var gs_f16 = cast_tensor(gs, STDtype.F16, ctx)
+    var gd_f16 = int8_dequant_groupwise_to_bf16(
+        gq, gs_f16, group_size, ctx
+    )
+    var gs_f16_h = gs_f16.to_host(ctx)
+    var gd_f16_h = gd_f16.to_host(ctx)
+    var g_f16_mismatch = 0
+    for i in range(rows * cols):
+        var b = Int(gqhost.unsafe_ptr()[i])
+        var sv = b if b < 128 else b - 256
+        var exp = (
+            Float32(sv) * gs_f16_h[i // group_size]
+        ).cast[DType.bfloat16]().cast[DType.float32]()
+        if gd_f16_h[i] != exp:
+            g_f16_mismatch += 1
+    if g_f16_mismatch > 0:
+        print("FAIL: FP16-scale group dequant != host decode at",
+              g_f16_mismatch, "elements"); return
+    print("PASS: int8 row/group quantizers compile + round-trip; dequant"
+          " bit-exact vs host decode (F32/FP16 scales, allocating/_into)")

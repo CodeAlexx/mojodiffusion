@@ -864,6 +864,82 @@ def swiglu_packed(gate_up: Tensor, ctx: DeviceContext) raises -> Tensor:
     return Tensor(out_buf^, out_shape^, gate_up.dtype())
 
 
+# MiniMax-H3 persists its transformed FC1 rows as [value|gate], the reverse of
+# `swiglu_packed`'s canonical [gate|up]. This twin reads that representation
+# directly so the block does not materialize two 250+ MiB channel slices.
+def _swiglu_packed_value_gate_kernel[
+    dtype: DType
+](
+    vg: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    n_out: Int,
+    f: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n_out:
+        var base = (i // f) * (2 * f)
+        var c = i % f
+        var uv = rebind[Scalar[dtype]](vg[base + c]).cast[DType.float32]()
+        var gv = rebind[Scalar[dtype]](vg[base + f + c]).cast[DType.float32]()
+        var silu_g = _silu_f32(gv)
+        if dtype == DType.bfloat16:
+            # Preserve the existing BF16 boundary exactly.
+            silu_g = silu_g.cast[DType.bfloat16]().cast[DType.float32]()
+        o[i] = rebind[o.element_type]((silu_g * uv).cast[dtype]())
+
+
+def swiglu_packed_value_gate(
+    value_gate: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    """SwiGLU from packed `[value|gate]` halves, without slice buffers."""
+    var shape = value_gate.shape()
+    if len(shape) < 1 or shape[len(shape) - 1] % 2 != 0:
+        raise Error("swiglu_packed_value_gate: last dim must be even")
+    var f = shape[len(shape) - 1] // 2
+    var n_out = value_gate.numel() // 2
+    var out_shape = shape.copy()
+    out_shape[len(out_shape) - 1] = f
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](value_gate.nbytes() // 2)
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](value_gate.numel()))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_out))
+    var grid = (n_out + _BLOCK - 1) // _BLOCK
+    var dt = value_gate.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            value_gate.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[
+            _swiglu_packed_value_gate_kernel[DType.float32],
+            _swiglu_packed_value_gate_kernel[DType.float32],
+        ](X, O, n_out, f, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            value_gate.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[
+            _swiglu_packed_value_gate_kernel[DType.bfloat16],
+            _swiglu_packed_value_gate_kernel[DType.bfloat16],
+        ](X, O, n_out, f, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            value_gate.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[
+            _swiglu_packed_value_gate_kernel[DType.float16],
+            _swiglu_packed_value_gate_kernel[DType.float16],
+        ](X, O, n_out, f, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, out_shape^, value_gate.dtype())
+
+
 def swiglu_slab(
     x_gate: Tensor, x_up: Tensor, ctx: DeviceContext, mut slab: StepSlab
 ) raises -> Tensor:

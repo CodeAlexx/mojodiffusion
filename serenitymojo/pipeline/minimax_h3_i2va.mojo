@@ -120,6 +120,8 @@ from serenitymojo.audio.wav import save_wav
 
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
+    MINIMAX_H3_ATTN_CUDNN,
+    MINIMAX_H3_ATTN_SAGE_INT8,
     minimax_h3_released_config,
     minimax_h3_adaln_rows,
     minimax_h3_block_tensor_names,
@@ -773,10 +775,30 @@ def _usage():
         "keyframes=", KEYFRAMES, ", text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
     )
     print("  <prompt> is the BODY text; the §2.1 alignment instruction is prepended for you")
+    print("  optional flag: --attention-backend=cudnn|sage-int8 (default cudnn)")
 
 
 def main() raises:
-    var args = argv()
+    var raw_args = argv()
+    var args = List[String]()
+    var attention_backend = MINIMAX_H3_ATTN_CUDNN
+    var attention_backend_name = String("cudnn")
+    for i in range(len(raw_args)):
+        var arg = String(raw_args[i])
+        if arg == String("--attention-backend=sage-int8"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
+            attention_backend_name = String("sage-int8")
+            continue
+        if arg == String("--attention-backend=cudnn"):
+            attention_backend = MINIMAX_H3_ATTN_CUDNN
+            attention_backend_name = String("cudnn")
+            continue
+        if arg.startswith("--attention-backend="):
+            raise Error(
+                String("unknown attention backend flag: ") + arg
+                + String(" (expected cudnn or sage-int8)")
+            )
+        args.append(arg)
     if len(args) < 5:
         _usage()
         return
@@ -842,6 +864,7 @@ def main() raises:
         ", text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
     )
     print("  steps=", steps, " seed=", seed, " max_blocks=", max_blocks)
+    print("  attention_backend=", attention_backend_name)
 
     # ── PREFLIGHT, all before DeviceContext ────────────────────────────────
     var t_pre0 = perf_counter_ns()
@@ -1213,6 +1236,7 @@ def main() raises:
             hidden3 = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
+                attention_backend,
             )
         var hidden2 = reshape(hidden3, [SEQ_LEN, config.hidden_size], ctx)
         var frontend_out = minimax_h3_final_layer(
@@ -1280,6 +1304,9 @@ def main() raises:
     body += String("  \"keyframes\":") + String(KEYFRAMES) + String(",\n")
     body += String("  \"condition_rows\":") + String(NUM_CONDITION_ROWS) + String(",\n")
     body += String("  \"sequence_length\":") + String(SEQ_LEN) + String(",\n")
+    body += String("  \"attention_backend\":\"") \
+        + attention_backend_name + String("\",\n")
+    body += String("  \"weight_storage\":\"streamed-bf16\",\n")
     body += String("  \"frames_written\":") + String(frames_written) + String(",\n")
     body += String("  \"audio_samples_per_channel\":") + String(audio_samples) + String("\n")
     body += String("}\n")

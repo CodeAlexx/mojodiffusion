@@ -263,6 +263,8 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.io.cap_cache import save_tensor_bin, load_tensor_bin
+from serenitymojo.components.artifacts import shell_quote
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import reshape, permute, slice, add, mul
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
@@ -270,6 +272,8 @@ from serenitymojo.audio.wav import save_wav
 
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
+    MINIMAX_H3_ATTN_CUDNN,
+    MINIMAX_H3_ATTN_SAGE_INT8,
     minimax_h3_released_config,
     minimax_h3_adaln_rows,
     minimax_h3_block_tensor_names,
@@ -282,14 +286,23 @@ from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_fc1_device,
 )
 from serenitymojo.models.dit.minimax_h3_fp8_resident import (
+    MINIMAX_H3_RESIDENT_INT8,
+    MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3ResidentFp8,
     minimax_h3_build_resident_fp8,
     minimax_h3_resident_block_weights,
+    minimax_h3_resident_block_weights_w8a8,
 )
 from serenitymojo.models.dit.minimax_h3_modcache import (
     MiniMaxH3ModCache,
     minimax_h3_check_modcache_weights,
     minimax_h3_build_modulation_cache,
+)
+from serenitymojo.models.dit.minimax_h3_runtime_cache import (
+    load_minimax_h3_modcache,
+    load_minimax_h3_resident_cache,
+    save_minimax_h3_modcache,
+    save_minimax_h3_resident_cache,
 )
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 from serenitymojo.models.dit.minimax_h3_frontend import (
@@ -300,6 +313,8 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_timestep_embedding,
 )
 from serenitymojo.models.text_encoder.minimax_h3_conditioning import (
+    MINIMAX_H3_ENCODER_BF16,
+    MINIMAX_H3_ENCODER_INT8,
     MiniMaxH3ConditioningOutput,
     minimax_h3_encode_conditioning,
 )
@@ -309,6 +324,8 @@ from serenitymojo.models.dit.minimax_h3_sampling import (
     minimax_h3_build_sampling_geometry,
 )
 from serenitymojo.models.minimax_h3.rearrange import minimax_h3_unpack_audio
+from serenitymojo.models.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
+from serenitymojo.training.on_device_global_norm import on_device_grad_stats
 from serenitymojo.models.minimax_h3.audio_decoder import (
     MiniMaxH3AudioDecoderConfig,
     MiniMaxH3AudioWeights,
@@ -323,11 +340,22 @@ from serenitymojo.models.minimax_h3_device.audio_decoder_device import (
 # ── Checkpoint paths (matches every other H3 device module's own defaults) ──
 comptime H3_ROOT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA"
 comptime TRANSFORMER_DIR = H3_ROOT + "/transformer"
+comptime TRANSFORMER_INDEX = TRANSFORMER_DIR + "/model.safetensors.index.json"
 comptime TEXT_ENCODER_DIR = H3_ROOT + "/text_encoder"
 comptime PROCESSOR_DIR = H3_ROOT + "/processor"
 comptime AUDIO_VAE_PATH = H3_ROOT + "/audio_vae/model.safetensors"
 comptime VIDEO_VAE_DIR  = H3_ROOT + "/video_vae/source"
 comptime AUDIO_SAMPLE_RATE = 32000
+comptime RUNTIME_CACHE_DIR = H3_ROOT + "/serenity_runtime_cache_v1"
+# The measured 24 GiB quality configuration keeps 43 blocks resident, but
+# loads that prefix from the canonical 48-block groupwise cache. Keeping one
+# cache artifact avoids duplicate 17+ GiB sidecars while leaving seven BF16
+# tail blocks for the quality-preserving compute path.
+comptime GROUPWISE_RUNTIME_CACHE_BLOCKS = 48
+comptime PRODUCT_CONDITIONING_CACHE = (
+    RUNTIME_CACHE_DIR
+    + "/conditioning_ff21f1ebd1c73098_int8_bf16_output.bin"
+)
 
 # 13 shards, `model-{i:05d}-of-00013.safetensors` — the released transformer's
 # own layout (minimax_h3_loader_device.mojo header: "61.73 GiB bf16 across 13
@@ -425,6 +453,7 @@ comptime WIDTH = get_defined_int["H3_WIDTH", 832]()
 # fails loudly instead (see _preflight_geometry).
 comptime FRAMES = get_defined_int["H3_FRAMES", 22]()
 comptime TEXT_TOKENS = get_defined_int["H3_TEXT_TOKENS", 32]()
+comptime FPS = 24
 
 comptime LATENT_H = HEIGHT // 16
 comptime LATENT_W = WIDTH // 16
@@ -460,8 +489,8 @@ comptime DEFAULT_SEED = 0
 
 # ── FP8-RESIDENT DENOISER (H3_FP8_RESIDENT, default OFF) ─────────────────────
 # Build with `-D H3_FP8_RESIDENT=1` to quantize all 50 blocks' big GEMM
-# weights ONCE (bf16 -> 1 byte/param + per-row F32 scale, on device, ~18 GiB
-# resident; scheme = the store's default, INT8-weight-only per-row since
+# weights ONCE (bf16 -> 1 byte/param + class-groupwise scales, on device,
+# resident; scheme = the store's default, class-groupwise INT8 since
 # 2026-08-04 — E4M3 missed the 0.999 gate bar, see the store's header)
 # and dequant per block per step instead of re-streaming ~36 GiB of
 # block weights from disk EVERY denoise step. The residency arithmetic is
@@ -472,6 +501,12 @@ comptime DEFAULT_SEED = 0
 # minimax_h3_fp8_resident_gate.mojo. Default OFF: a normal build takes the
 # `@parameter else` branch below, which is the unmodified streaming loop.
 comptime DIT_FP8_RESIDENT = get_defined_int["H3_FP8_RESIDENT", 0]()
+# A full 50-block store leaves insufficient activation headroom for long
+# sequences (S=9145 at 512x320x175). Keep the switch independent from the
+# on/off flag so a build may hold the first N blocks resident and stream the
+# tail in BF16. Default remains 50 for backwards compatibility and parity
+# gates; production long-video builds set this from measured VRAM headroom.
+comptime DIT_RESIDENT_BLOCKS = get_defined_int["H3_RESIDENT_BLOCKS", 50]()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -973,6 +1008,40 @@ def _minimax_h3_decode_video(
     return frames
 
 
+def _minimax_h3_mux_av(out_dir: String, frames: Int) raises -> String:
+    """Mux decoded PNG/WAV artifacts with NVIDIA NVENC, never CPU video encode."""
+    var mp4 = out_dir + String("/video.mp4")
+    var cmd = String("ffmpeg -v error -y -framerate ") + String(FPS)
+    cmd += String(" -start_number 0 -i ")
+    cmd += shell_quote(out_dir + String("/frame_%05d.png"))
+    cmd += String(" -i ") + shell_quote(out_dir + String("/audio.wav"))
+    cmd += String(" -frames:v ") + String(frames)
+    cmd += String(" -c:v h264_nvenc -preset p7 -tune hq -rc vbr -cq 18")
+    cmd += String(" -b:v 0 -pix_fmt yuv420p -af apad -c:a aac -shortest")
+    cmd += String(" -movflags +faststart ") + shell_quote(mp4)
+    if sys_system(cmd) != 0:
+        raise Error("minimax_h3_t2va: GPU NVENC A/V mux failed")
+    print("  muxed", mp4, "with h264_nvenc")
+    return mp4^
+
+
+def _minimax_h3_write_decode_result(
+    out_dir: String, artifact: String, frames: Int
+) raises:
+    var body = String("{\n")
+    body += String("  \"schema\":\"serenity.minimax_h3.result.v1\",\n")
+    body += String("  \"state\":\"done\",\n")
+    body += String("  \"artifact_path\":\"") + json_escape(artifact) + String("\",\n")
+    body += String("  \"width\":") + String(WIDTH) + String(",\n")
+    body += String("  \"height\":") + String(HEIGHT) + String(",\n")
+    body += String("  \"frames\":") + String(frames) + String(",\n")
+    body += String("  \"fps\":") + String(FPS) + String(",\n")
+    body += String("  \"audio\":true,\n")
+    body += String("  \"video_encoder\":\"h264_nvenc\"\n")
+    body += String("}\n")
+    write_text_file(out_dir + String("/result.json"), body)
+
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Audio decode — WIRED. See file header "AUDIO DECODE: WIRED, HOST-SIDE".
@@ -1219,7 +1288,7 @@ def _minimax_h3_stub_conditioning(
 
 def _minimax_h3_get_conditioning(
     partial_mode: Bool, prompt: String, seed: UInt64,
-    config: MiniMaxH3DiTConfig, ctx: DeviceContext,
+    config: MiniMaxH3DiTConfig, encoder_storage: Int, ctx: DeviceContext,
 ) raises -> MiniMaxH3ConditioningOutput:
     """Single call site for `main()`, mirroring `_minimax_h3_open_
     transformer_shards`'s reason for existing: one `var cond` regardless of
@@ -1227,17 +1296,242 @@ def _minimax_h3_get_conditioning(
     if partial_mode:
         return _minimax_h3_stub_conditioning(seed, config, ctx)
     return minimax_h3_encode_conditioning(
-        String(PROCESSOR_DIR), String(TEXT_ENCODER_DIR), prompt, ctx
+        String(PROCESSOR_DIR), String(TEXT_ENCODER_DIR), prompt, ctx,
+        encoder_storage,
     )
+
+
+def _minimax_h3_get_conditioning_cached(
+    partial_mode: Bool,
+    prompt: String,
+    seed: UInt64,
+    config: MiniMaxH3DiTConfig,
+    encoder_storage: Int,
+    cache_path: String,
+    ctx: DeviceContext,
+) raises -> MiniMaxH3ConditioningOutput:
+    """Load an explicitly request-keyed conditioning sidecar or encode once.
+
+    The product server supplies a path whose filename includes the compiled
+    prompt digest and encoder format.  Direct CLI callers get the original
+    behavior unless they opt into a cache path themselves.
+    """
+    if not partial_mode and cache_path != String(""):
+        try:
+            var embeds = load_tensor_bin(cache_path, ctx)
+            var shape = embeds.shape()
+            if (
+                embeds.dtype() != STDtype.BF16
+                or len(shape) != 3
+                or shape[0] != 1
+                or shape[1] != TEXT_TOKENS
+                or shape[2] != config.text_dim
+            ):
+                raise Error("MiniMax-H3 conditioning cache shape/dtype mismatch")
+            var tags = List[Int]()
+            for _ in range(TEXT_TOKENS):
+                tags.append(MINIMAX_H3_TEXT_TAG)
+            print("  conditioning cache: HIT", cache_path)
+            return MiniMaxH3ConditioningOutput(embeds^, tags^)
+        except e:
+            print("  conditioning cache: MISS", String(e))
+
+    var output = _minimax_h3_get_conditioning(
+        partial_mode, prompt, seed, config, encoder_storage, ctx
+    )
+    if not partial_mode and cache_path != String(""):
+        try:
+            save_tensor_bin(output.embeds, cache_path, ctx)
+            print("  conditioning cache: SAVED", cache_path)
+        except e:
+            # A cache write is an optimization failure, never permission to
+            # discard the valid GPU conditioning already computed.
+            print("  conditioning cache: SAVE FAILED", String(e))
+    return output^
+
+
+def _assert_finite_rows(
+    name: String, tensor: Tensor, ctx: DeviceContext
+) raises:
+    """Scan an inference tensor on GPU and read back scalar summaries only."""
+    var tensors = List[ArcPointer[Tensor]]()
+    tensors.append(ArcPointer[Tensor](tensor.clone(ctx)))
+    var stats = on_device_grad_stats(tensors, ctx)
+    print(
+        "  finite gate", name, "l2=", stats.grad_norm,
+        "nonfinite=", stats.nonfinite_count,
+    )
+    if stats.nonfinite_count != 0:
+        raise Error(
+            String("minimax_h3_t2va: ") + name + String(" contains ")
+            + String(stats.nonfinite_count) + String(" non-finite values")
+        )
+
+
+def _minimax_h3_get_modcache_cached(
+    shards: ShardedSafeTensors,
+    temb: Tensor,
+    config: MiniMaxH3DiTConfig,
+    steps: Int,
+    distinct_timesteps: Int,
+    cache_path: String,
+    ctx: DeviceContext,
+) raises -> MiniMaxH3ModCache:
+    if cache_path != String(""):
+        try:
+            var cached = load_minimax_h3_modcache(
+                cache_path,
+                String(TRANSFORMER_INDEX),
+                config,
+                steps,
+                distinct_timesteps,
+                ctx,
+            )
+            print("  modcache: HIT", cache_path)
+            return cached^
+        except e:
+            print("  modcache: MISS", String(e))
+    var built = minimax_h3_build_modulation_cache(shards, temb, config, ctx)
+    if cache_path != String(""):
+        try:
+            save_minimax_h3_modcache(
+                built, String(TRANSFORMER_INDEX), cache_path, steps, ctx
+            )
+            print("  modcache: SAVED", cache_path)
+        except e:
+            print("  modcache: SAVE FAILED", String(e))
+    return built^
+
+
+def _minimax_h3_get_resident_cached(
+    shards: ShardedSafeTensors,
+    config: MiniMaxH3DiTConfig,
+    resident_blocks: Int,
+    resident_scheme: Int,
+    cache_path: String,
+    ctx: DeviceContext,
+    cache_save_allowed: Bool = True,
+) raises -> MiniMaxH3ResidentFp8:
+    if cache_path != String(""):
+        try:
+            var cached = load_minimax_h3_resident_cache(
+                cache_path,
+                String(TRANSFORMER_INDEX),
+                config,
+                ctx,
+                resident_blocks,
+                0,
+                resident_scheme,
+            )
+            print("  resident cache: HIT", cache_path)
+            return cached^
+        except e:
+            print("  resident cache: MISS", String(e))
+    var built = minimax_h3_build_resident_fp8(
+        shards, config, ctx, resident_blocks, scheme=resident_scheme
+    )
+    if cache_path != String("") and cache_save_allowed:
+        try:
+            save_minimax_h3_resident_cache(
+                built, String(TRANSFORMER_INDEX), cache_path, ctx
+            )
+            print("  resident cache: SAVED", cache_path)
+        except e:
+            print("  resident cache: SAVE FAILED", String(e))
+    return built^
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # main
 # ═════════════════════════════════════════════════════════════════════════════
 def main() raises:
-    var args = argv()
+    var raw_args = argv()
+    var args = List[String]()
+    var attention_backend = MINIMAX_H3_ATTN_CUDNN
+    var attention_backend_name = String("cudnn")
+    var resident_scheme = MINIMAX_H3_RESIDENT_INT8
+    var resident_backend_name = String("groupwise")
+    var encoder_storage = MINIMAX_H3_ENCODER_BF16
+    var encoder_storage_name = String("bf16")
+    var defer_video_decode = False
+    var runtime_cache = False
+    var prepare_runtime_cache = False
+    var eval_start = 0
+    var eval_stop = -1
+    for i in range(len(raw_args)):
+        var arg = String(raw_args[i])
+        if arg == String("--attention-backend=sage-int8"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
+            attention_backend_name = String("sage-int8")
+            continue
+        if arg == String("--attention-backend=cudnn"):
+            attention_backend = MINIMAX_H3_ATTN_CUDNN
+            attention_backend_name = String("cudnn")
+            continue
+        if arg.startswith("--attention-backend="):
+            raise Error(
+                String("unknown attention backend flag: ") + arg
+                + String(" (expected cudnn or sage-int8)")
+            )
+        if arg == String("--resident-backend=w8a8"):
+            resident_scheme = MINIMAX_H3_RESIDENT_INT8_W8A8
+            resident_backend_name = String("w8a8")
+            continue
+        if arg == String("--resident-backend=groupwise"):
+            resident_scheme = MINIMAX_H3_RESIDENT_INT8
+            resident_backend_name = String("groupwise")
+            continue
+        if arg.startswith("--resident-backend="):
+            raise Error(
+                String("unknown resident backend flag: ") + arg
+                + String(" (expected groupwise or w8a8)")
+            )
+        if arg == String("--encoder-storage=int8"):
+            encoder_storage = MINIMAX_H3_ENCODER_INT8
+            encoder_storage_name = String("int8")
+            continue
+        if arg == String("--encoder-storage=bf16"):
+            encoder_storage = MINIMAX_H3_ENCODER_BF16
+            encoder_storage_name = String("bf16")
+            continue
+        if arg.startswith("--encoder-storage="):
+            raise Error(
+                String("unknown encoder storage flag: ") + arg
+                + String(" (expected bf16 or int8)")
+            )
+        if arg == String("--defer-video-decode"):
+            defer_video_decode = True
+            continue
+        if arg == String("--runtime-cache-exact-product-prompt"):
+            runtime_cache = True
+            continue
+        if arg == String("--prepare-runtime-cache"):
+            prepare_runtime_cache = True
+            continue
+        if arg.startswith("--eval-start="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --eval-start flag")
+            eval_start = atol(String(fields[1]))
+            continue
+        if arg.startswith("--eval-stop="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --eval-stop flag")
+            eval_stop = atol(String(fields[1]))
+            continue
+        args.append(arg)
     if len(args) < 3:
-        print("usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0] [max_blocks=50]")
+        print(
+            "usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0]"
+            " [max_blocks=50] [--attention-backend=cudnn|sage-int8]"
+            " [--resident-backend=groupwise|w8a8]"
+            " [--encoder-storage=bf16|int8]"
+            " [--runtime-cache-exact-product-prompt]"
+            " [--prepare-runtime-cache]"
+            " [--eval-start=N] [--eval-stop=N]"
+            " [--defer-video-decode]"
+        )
         print(
             "  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames,",
             "text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
@@ -1257,6 +1551,23 @@ def main() raises:
     if len(args) >= 6:
         max_blocks = atol(String(args[5]))
 
+    if runtime_cache and encoder_storage != MINIMAX_H3_ENCODER_INT8:
+        raise Error(
+            "MiniMax-H3 product runtime cache is keyed to the INT8 text"
+            " encoder output; use --encoder-storage=int8"
+        )
+    if prepare_runtime_cache and not runtime_cache:
+        raise Error(
+            "--prepare-runtime-cache requires"
+            " --runtime-cache-exact-product-prompt"
+        )
+    if runtime_cache:
+        var mkdir_rc = sys_system(
+            String("mkdir -p ") + shell_quote(String(RUNTIME_CACHE_DIR))
+        )
+        if mkdir_rc != 0:
+            raise Error("MiniMax-H3 could not create the runtime cache directory")
+
     # ── DECODE-ONLY MODE: argv[6] == "decode_only" reuses a prior run's saved
     # latents (out_dir/latents.safetensors) and runs ONLY the decode tail —
     # a decode-layer fix costs ~2 minutes instead of a 30-minute denoise.
@@ -1273,6 +1584,8 @@ def main() raises:
             from_parts(ainfo.dtype, ainfo.shape.copy(), lat_st.tensor_bytes("audio_state_rows")), ctx2
         )
         print("  video rows", video_rows.shape(), " audio rows", audio_rows.shape())
+        _assert_finite_rows("video_state_rows", video_rows, ctx2)
+        _assert_finite_rows("audio_state_rows", audio_rows, ctx2)
         var config2 = minimax_h3_released_config()
         _ = _minimax_h3_decode_audio(
             audio_rows, NUM_AUDIO_LATENTS, config2.audio_latents_dim, out_dir, ctx2
@@ -1281,7 +1594,12 @@ def main() raises:
             video_rows, NUM_LATENT_FRAMES, LATENT_H, LATENT_W,
             config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
         )
-        print("  DECODE-ONLY done:", nframes, "frames +", out_dir + "/audio.wav")
+        var artifact = _minimax_h3_mux_av(out_dir, nframes)
+        _minimax_h3_write_decode_result(out_dir, artifact, nframes)
+        print(
+            "  DECODE-ONLY done:", nframes, "frames +",
+            out_dir + "/audio.wav +", artifact,
+        )
         return
 
     if steps < 2:
@@ -1297,6 +1615,9 @@ def main() raises:
         NUM_AUDIO_LATENTS, ", text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
     )
     print("  steps=", steps, " seed=", seed, " max_blocks=", max_blocks)
+    print("  attention_backend=", attention_backend_name)
+    print("  resident_backend=", resident_backend_name)
+    print("  encoder_storage=", encoder_storage_name)
 
     # ── PREFLIGHT (before DeviceContext) ──────────────────────────────────
     var t_preflight0 = perf_counter_ns()
@@ -1361,7 +1682,13 @@ def main() raises:
 
     # ── 1. Conditioning (real, or STUBBED in partial mode — see file header) ──
     var t_cond0 = perf_counter_ns()
-    var cond = _minimax_h3_get_conditioning(partial_mode, prompt, seed, config, ctx)
+    var conditioning_cache = (
+        String(PRODUCT_CONDITIONING_CACHE) if runtime_cache else String("")
+    )
+    var cond = _minimax_h3_get_conditioning_cached(
+        partial_mode, prompt, seed, config, encoder_storage,
+        conditioning_cache, ctx,
+    )
     if len(cond.token_tags) != TEXT_TOKENS:
         raise Error(
             String("minimax_h3_t2va: prompt tokenized to ")
@@ -1415,7 +1742,17 @@ def main() raises:
     var schedule = MiniMaxH3DualSchedule()
     schedule.set_timesteps(steps)
     var num_steps = schedule.num_inference_steps()
+    if eval_stop < 0:
+        eval_stop = num_steps
+    if (
+        eval_start < 0
+        or eval_start >= num_steps
+        or eval_stop <= eval_start
+        or eval_stop > num_steps
+    ):
+        raise Error("MiniMax-H3 evaluation range is outside the schedule")
     print("  schedule: ", num_steps, " model evaluations")
+    print("  evaluation range: [", eval_start, ",", eval_stop, ")")
 
     # ── 5. AdaLN modulation cache — ONE streamed pass, built ONCE ──────────
     var t_mod0 = perf_counter_ns()
@@ -1429,7 +1766,22 @@ def main() raises:
 
     var frontend_w = _minimax_h3_load_frontend_weights(transformer_shards, config, ctx)
     var temb = minimax_h3_timestep_embedding(temb_timesteps_tensor, frontend_w, config, ctx)
-    var modcache = minimax_h3_build_modulation_cache(transformer_shards, temb, run_config, ctx)
+    var modcache_path = String("")
+    if runtime_cache:
+        modcache_path = (
+            String(RUNTIME_CACHE_DIR) + String("/modcache_steps_")
+            + String(steps) + String("_blocks_")
+            + String(run_config.num_layers) + String(".safetensors")
+        )
+    var modcache = _minimax_h3_get_modcache_cached(
+        transformer_shards,
+        temb,
+        run_config,
+        steps,
+        distinct_timesteps,
+        modcache_path,
+        ctx,
+    )
     ctx.synchronize()
     var t_mod1 = perf_counter_ns()
     print(
@@ -1440,36 +1792,112 @@ def main() raises:
 
     # ── 5b. OPTIONAL fp8-resident base (H3_FP8_RESIDENT=1 builds only) ─────
     # One more streamed pass over the 50 blocks, quantizing each to E4M3 +
-    # per-row scales on device; every denoise step below then dequants from
+    # scheme-specific scales on device; every denoise step below then dequants from
     # residency instead of re-reading ~36 GiB from disk. Declared
     # unconditionally (an empty Optional costs nothing); populated only under
     # the comptime flag, so a default build's denoise loop is untouched.
     var fp8_resident = Optional[MiniMaxH3ResidentFp8](None)
+    var resident_cache_path = String("")
 
     @parameter
     if DIT_FP8_RESIDENT != 0:
+        var resident_blocks = DIT_RESIDENT_BLOCKS
+        if resident_blocks < 0:
+            raise Error("H3_RESIDENT_BLOCKS must be non-negative")
+        if resident_blocks > run_config.num_layers:
+            resident_blocks = run_config.num_layers
         var t_q0 = perf_counter_ns()
+        var resident_cache_save_allowed = True
+        if runtime_cache:
+            if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+                # The direct store can load a strict prefix from the full
+                # 50-block cache.  Production uses 48 resident blocks so the
+                # 20-step modulation cache and activations retain VRAM
+                # headroom; do not overwrite the full cache if that prefix
+                # load ever misses validation.
+                resident_cache_path = (
+                    String(RUNTIME_CACHE_DIR)
+                    + String("/resident_w8a8_row_blocks_")
+                    + String(run_config.num_layers) + String(".safetensors")
+                )
+                resident_cache_save_allowed = (
+                    resident_blocks == run_config.num_layers
+                )
+            else:
+                resident_cache_path = (
+                    String(RUNTIME_CACHE_DIR)
+                    + String("/resident_groupwise_q16_o64_fc132_fc264_blocks_")
+                    + String(GROUPWISE_RUNTIME_CACHE_BLOCKS)
+                    + String(".safetensors")
+                )
+                resident_cache_save_allowed = (
+                    resident_blocks == GROUPWISE_RUNTIME_CACHE_BLOCKS
+                )
         fp8_resident = Optional[MiniMaxH3ResidentFp8](
-            minimax_h3_build_resident_fp8(
-                transformer_shards, config, ctx, run_config.num_layers
+            _minimax_h3_get_resident_cached(
+                transformer_shards,
+                config,
+                resident_blocks,
+                resident_scheme,
+                resident_cache_path,
+                ctx,
+                resident_cache_save_allowed,
             )
         )
         var t_q1 = perf_counter_ns()
         print(
-            "  fp8-resident: ", run_config.num_layers, " blocks, ",
+            "  fp8-resident: ", resident_blocks, " blocks + ",
+            run_config.num_layers - resident_blocks, " streamed tail, ",
             Float64(fp8_resident.value().resident_bytes())
             / (1024.0 * 1024.0 * 1024.0),
             " GiB resident (", Float64(t_q1 - t_q0) / 1.0e9, "s one-time)",
         )
 
+    if prepare_runtime_cache:
+        print("  runtime cache preparation complete; denoise intentionally skipped")
+        return
+
     # ── 6. Denoise loop — real streamed blocks, real Euler steps ───────────
     var t_denoise0 = perf_counter_ns()
     var video_shape: List[Int] = [NUM_VIDEO_ROWS, config.video_patch_dim()]
-    var video_state = randn(video_shape^, seed, STDtype.F32, ctx)
     var audio_shape: List[Int] = [NUM_AUDIO_ROWS, config.audio_latents_dim]
-    var audio_state = randn(audio_shape^, seed + 1, STDtype.F32, ctx)
+    var video_state: Tensor
+    var audio_state: Tensor
+    if eval_start == 0:
+        video_state = randn(video_shape^, seed, STDtype.F32, ctx)
+        audio_state = randn(audio_shape^, seed + 1, STDtype.F32, ctx)
+    else:
+        var resume_path = out_dir + String("/resume_latents.safetensors")
+        var resume_st = SafeTensors.open(resume_path)
+        var vinfo = resume_st.tensor_info(String("video_state_rows"))
+        var ainfo = resume_st.tensor_info(String("audio_state_rows"))
+        if (
+            vinfo.dtype != STDtype.F32
+            or vinfo.shape != video_shape
+            or ainfo.dtype != STDtype.F32
+            or ainfo.shape != audio_shape
+        ):
+            raise Error("MiniMax-H3 resume latent dtype/shape mismatch")
+        video_state = Tensor.from_view(
+            from_parts(
+                vinfo.dtype, vinfo.shape.copy(),
+                resume_st.tensor_bytes(String("video_state_rows")),
+            ),
+            ctx,
+        )
+        audio_state = Tensor.from_view(
+            from_parts(
+                ainfo.dtype, ainfo.shape.copy(),
+                resume_st.tensor_bytes(String("audio_state_rows")),
+            ),
+            ctx,
+        )
+        print(
+            "  resumed latent rows at evaluation", eval_start,
+            "from", resume_path,
+        )
 
-    for i in range(num_steps):
+    for i in range(eval_start, eval_stop):
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
         var audio_ts = schedule.audio_timestep(i)
@@ -1525,17 +1953,50 @@ def main() raises:
 
             @parameter
             if DIT_FP8_RESIDENT != 0:
-                # NO disk: dequant this block's E4M3 bytes back to bf16 on
-                # device. Same Dict contract (shapes, dtype, transformed row
-                # order, markers) — block_forward below is unchanged.
-                block_w = minimax_h3_resident_block_weights(
-                    fp8_resident.value(), layer, config, ctx
-                )
+                if layer < len(fp8_resident.value().blocks):
+                    if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+                        block_w = minimax_h3_resident_block_weights_w8a8(
+                            fp8_resident.value(), layer, config, ctx
+                        )
+                    else:
+                        # Quality path: groupwise bytes dequantize on GPU.
+                        block_w = minimax_h3_resident_block_weights(
+                            fp8_resident.value(), layer, config, ctx
+                        )
+                else:
+                    if (
+                        resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+                        and resident_cache_path != String("")
+                    ):
+                        # Stream the already-quantized tail one block at a
+                        # time from the full runtime cache.  A BF16 tail block
+                        # is about twice as large and OOMs beside the 20-step
+                        # modulation cache; this path keeps all math on GPU
+                        # while bounding tail residency to one W8A8 block.
+                        var tail = load_minimax_h3_resident_cache(
+                            resident_cache_path,
+                            String(TRANSFORMER_INDEX),
+                            config,
+                            ctx,
+                            1,
+                            layer,
+                            resident_scheme,
+                        )
+                        block_w = minimax_h3_resident_block_weights_w8a8(
+                            tail, layer, config, ctx
+                        )
+                    else:
+                        # BF16-streamed tail preserves the exact existing
+                        # block math for the quality groupwise backend.
+                        block_w = minimax_h3_load_block_device(
+                            transformer_shards, layer, config, ctx
+                        )
             else:
                 block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
             hidden3 = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
+                attention_backend,
             )
             # `block_w` drops here: this layer's ~0.77 GiB bf16 is freed
             # before the next layer's load — resident footprint stays at one
@@ -1557,6 +2018,32 @@ def main() raises:
             " video_t=", video_ts, " audio_t=", audio_ts,
             " (", Float64(t_step1 - t_step0) / 1.0e9, "s)",
         )
+
+    # Quantized product paths fail at the latent boundary instead of surfacing
+    # later as a misleading VAE/pixel error.  The scans and reductions run on
+    # GPU; only scalar summaries cross back to the host.
+    _assert_finite_rows("video_state_rows", video_state, ctx)
+    _assert_finite_rows("audio_state_rows", audio_state, ctx)
+
+    if eval_stop < num_steps:
+        var resume_names = List[String]()
+        resume_names.append(String("video_state_rows"))
+        resume_names.append(String("audio_state_rows"))
+        var resume_tensors = List[ArcPointer[Tensor]]()
+        resume_tensors.append(ArcPointer[Tensor](
+            slice(video_state, 0, 0, video_state.shape()[0], ctx)
+        ))
+        resume_tensors.append(ArcPointer[Tensor](
+            slice(audio_state, 0, 0, audio_state.shape()[0], ctx)
+        ))
+        var resume_path = out_dir + String("/resume_latents.safetensors")
+        save_safetensors(resume_names, resume_tensors, resume_path, ctx)
+        print(
+            "  saved resume latents at evaluation", eval_stop,
+            "->", resume_path,
+        )
+        print("  partial denoise phase complete; decode intentionally skipped")
+        return
 
     # ── SAVE FINAL LATENTS. A decode-layer fix should cost a re-decode, not a
     # 30-minute denoise rerun (learned 2026-08-03: the row-order fix forced a
@@ -1599,6 +2086,22 @@ def main() raises:
     result_body += String("  \"height\":") + String(HEIGHT) + String(",\n")
     result_body += String("  \"frames\":") + String(FRAMES) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(SEQ_LEN) + String(",\n")
+    result_body += String("  \"attention_backend\":\"") \
+        + attention_backend_name + String("\",\n")
+    result_body += String("  \"weight_storage\":\"") + (
+        (
+            String("resident-int8-") + resident_backend_name + String("-")
+            + String(DIT_RESIDENT_BLOCKS)
+            + (
+                String("+streamed-w8a8-cache-tail")
+                if (
+                    resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+                )
+                else String("+streamed-bf16-tail")
+            )
+        ) if DIT_FP8_RESIDENT != 0
+        else String("streamed-bf16")
+    ) + String("\",\n")
     result_body += String("  \"audio_sample_rate\":") + String(AUDIO_SAMPLE_RATE) + String(",\n")
     result_body += String("  \"audio_samples_per_channel\":") + String(audio_samples) + String(",\n")
     result_body += String("  \"timings_ms\":{\n")
@@ -1615,6 +2118,17 @@ def main() raises:
     write_text_file(out_dir + String("/result.json"), result_body)
     print("  wrote", out_dir + String("/result.json"))
 
+    # A resident DiT store and the GPU video VAE cannot coexist in 24 GiB.
+    # A wrapper can now end this process, release its CUDA context, and invoke
+    # decode_only in a fresh GPU process.  There is no CPU inference fallback.
+    if defer_video_decode:
+        print("  video decode deferred; run in a fresh GPU process:")
+        print(
+            "   ", String(args[0]), "decode", out_dir, steps, seed,
+            max_blocks, "decode_only",
+        )
+        return
+
     var t_vid0 = perf_counter_ns()
     var frames_written = _minimax_h3_decode_video(
         video_state, NUM_LATENT_FRAMES, LATENT_H, LATENT_W,
@@ -1622,3 +2136,5 @@ def main() raises:
     )
     var t_vid1 = perf_counter_ns()
     print("  video decode done (", Float64(t_vid1 - t_vid0) / 1.0e9, "s)")
+    var artifact = _minimax_h3_mux_av(out_dir, frames_written)
+    _minimax_h3_write_decode_result(out_dir, artifact, frames_written)

@@ -90,6 +90,31 @@ def _int8_dequant_scalar_kernel(
         i += stride
 
 
+# Per-output-row weight scale variant used by streamed inference weights.
+# C is [M,N]; ws[n] belongs to output row n of W[N,K].  Keeping the scale
+# vector outside the K contraction preserves per-row weight quantization while
+# still issuing one ordinary INT8 tensor-core GEMM.
+def _int8_dequant_rowscale_kernel(
+    c: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],     # [M*N]
+    rs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [M]
+    ws: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [N]
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [M*N]
+    M: Int, N: Int,
+):
+    var idx = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var i = idx
+    var total = M * N
+    while i < total:
+        var m = i // N
+        var n = i - m * N
+        var acc = Float32(rebind[Scalar[DType.int32]](c[i]))
+        var val = acc * rebind[Scalar[DType.float32]](rs[m]) \
+            * rebind[Scalar[DType.float32]](ws[n])
+        o[i] = rebind[o.element_type](val.cast[DType.bfloat16]())
+        i += stride
+
+
 # ── dequant int32 → F32 (Klein cast-fusion, 2026-07-11) ───────────────────────
 # The Klein call sites are F32-activation: the legacy chain was dequant→bf16 then
 # a full-tensor cast_tensor(o, F32). This kernel keeps the EXACT bf16 storage
@@ -254,6 +279,83 @@ def int8_linear_fwd(x: Tensor, w_i8: Tensor, w_scale: Tensor, ctx: DeviceContext
     if xsh[len(xsh) - 1] != w_i8.shape()[1]:
         raise Error("int8_linear_fwd: K mismatch")
     return _int8_matmul_dequant(x, w_i8, w_scale, ctx)     # B=w_8[N,K] → out[...,N]
+
+
+def int8_linear_fwd_rowscale(
+    x: Tensor, w_i8: Tensor, w_scale: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    """Inference W8A8 linear with PER-OUTPUT-ROW F32 weight scales.
+
+    x[...,K] is quantized per token on GPU, W[N,K] is already INT8, cuBLAS
+    computes INT8xINT8->INT32, and the small output is rescaled directly to
+    BF16 as `acc[m,n] * x_scale[m] * w_scale[n]`.  No BF16 weight tensor is
+    materialized.
+    """
+    if x.dtype() != STDtype.BF16:
+        raise Error(
+            String("int8_linear_fwd_rowscale: x must be BF16, got ")
+            + x.dtype().name()
+        )
+    if w_i8.dtype() != STDtype.I8:
+        raise Error(
+            String("int8_linear_fwd_rowscale: w must be I8, got ")
+            + w_i8.dtype().name()
+        )
+    if w_scale.dtype() != STDtype.F32:
+        raise Error(
+            String("int8_linear_fwd_rowscale: scale must be F32, got ")
+            + w_scale.dtype().name()
+        )
+    var wsh = w_i8.shape()
+    if len(wsh) != 2:
+        raise Error("int8_linear_fwd_rowscale: w must be [N,K]")
+    var xsh = x.shape()
+    var K = xsh[len(xsh) - 1]
+    var N = wsh[0]
+    if K != wsh[1]:
+        raise Error("int8_linear_fwd_rowscale: K mismatch")
+    if w_scale.numel() != N:
+        raise Error(
+            String("int8_linear_fwd_rowscale: scale len ")
+            + String(w_scale.numel()) + " != output rows " + String(N)
+        )
+
+    var M = x.numel() // K
+    var x_scale = int8_rowscale(x, ctx)
+    var x_i8 = int8_encode_perrow(x, x_scale, ctx)
+    var c_buf = ctx.enqueue_create_buffer[DType.uint8](M * N * 4)
+    cublas_gemm_s8s8s32_nt(x_i8.buf, w_i8.buf, c_buf, M, N, K, ctx)
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](M * N * 2)
+    var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M * N))
+    var rs_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M))
+    var ws_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](N))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M * N))
+    var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        c_buf.unsafe_ptr().bitcast[Int32](), c_rl
+    )
+    var RS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        x_scale.buf.unsafe_ptr().bitcast[Float32](), rs_rl
+    )
+    var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        w_scale.buf.unsafe_ptr().bitcast[Float32](), ws_rl
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+    )
+    var total = M * N
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    ctx.enqueue_function[
+        _int8_dequant_rowscale_kernel, _int8_dequant_rowscale_kernel
+    ](C, RS, WS, O, M, N, grid_dim=grid, block_dim=_BLOCK)
+
+    var outsh = List[Int]()
+    for i in range(len(xsh) - 1):
+        outsh.append(xsh[i])
+    outsh.append(N)
+    return Tensor(out_buf^, outsh^, STDtype.BF16)
 
 
 # ── backward: dX[M,K] bf16 = grad[M,N] @ W[N,K]  (needs w_8T[K,N]) ─────────────

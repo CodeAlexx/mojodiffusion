@@ -78,6 +78,13 @@ from serenitymojo.models.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
     minimax_h3_encode_conditioning_streamed,
 )
+from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_int8 import (
+    minimax_h3_encode_conditioning_int8_streamed,
+)
+
+
+comptime MINIMAX_H3_ENCODER_BF16 = 0
+comptime MINIMAX_H3_ENCODER_INT8 = 1
 
 
 struct MiniMaxH3ConditioningOutput(Movable):
@@ -111,6 +118,7 @@ def minimax_h3_encode_conditioning(
     text_encoder_dir: String,
     prompt: String,
     ctx: DeviceContext,
+    encoder_storage: Int = MINIMAX_H3_ENCODER_BF16,
 ) raises -> MiniMaxH3ConditioningOutput:
     """End-to-end: prompt string -> ids -> streamed encode -> hidden_states[50].
     t2va only (no keyframes/images — see file header)."""
@@ -141,8 +149,19 @@ def minimax_h3_encode_conditioning(
     for _ in range(padded_len - real_len):
         padded_ids.append(151643)
 
-    var embeds_padded = minimax_h3_encode_conditioning_streamed(
-        text_encoder_dir, padded_ids, ctx
-    )
+    var embeds_padded: Tensor
+    if encoder_storage == MINIMAX_H3_ENCODER_BF16:
+        embeds_padded = minimax_h3_encode_conditioning_streamed(
+            text_encoder_dir, padded_ids, ctx
+        )
+    elif encoder_storage == MINIMAX_H3_ENCODER_INT8:
+        embeds_padded = minimax_h3_encode_conditioning_int8_streamed(
+            text_encoder_dir, padded_ids, ctx
+        )
+    else:
+        raise Error(
+            String("minimax_h3_encode_conditioning: unknown encoder storage ")
+            + String(encoder_storage)
+        )
     var embeds = slice(embeds_padded, 1, 0, real_len, ctx)
     return MiniMaxH3ConditioningOutput(embeds^, token_tags^)

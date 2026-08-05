@@ -108,6 +108,7 @@ const MODEL_TYPE_OPTIONS: &[(&str, &str)] = &[
     ("sensenova", "SenseNova"),
     ("lens", "Microsoft Lens"),
     ("ltx2", "LTX 2 / 2.3 video"),
+    ("minimax-h3", "MiniMax-H3 audio/video"),
     ("wan2.2", "Wan 2.2 video"),
     ("nava", "NAVA audio/video"),
     ("bernini", "Bernini video"),
@@ -352,6 +353,8 @@ fn normalize_architecture_id(raw: &str) -> String {
         "sd3".to_string()
     } else if value.contains("lens") {
         "lens".to_string()
+    } else if value.contains("minimax") && value.contains("h3") {
+        "minimax-h3".to_string()
     } else if value.contains("nava") {
         "nava".to_string()
     } else if value.contains("ltx") {
@@ -684,7 +687,9 @@ fn detect_checkpoint_format(header: &str, arch: &str) -> &'static str {
 fn detect_arch_from_name(name: &str) -> &'static str {
     let lo = name.to_lowercase();
     let c = |s: &str| lo.contains(s);
-    if c("nava") {
+    if c("minimax") && c("h3") {
+        "minimax-h3"
+    } else if c("nava") {
         "nava"
     } else if c("scail") {
         "scail2"
@@ -1721,6 +1726,28 @@ fn scan_checkpoints_uncached() -> Vec<ScanEntry> {
             });
         }
     }
+    // MiniMax-H3 is a multi-directory audio/video model. Its product identity
+    // is selectable only after the exact compiled profile has current binaries,
+    // a complete GPU INT8 encoder cache, finite full-render evidence, and a
+    // visually inspected NVENC artifact.
+    if crate::video::minimax_h3_product_gate_passed() {
+        let name = "MiniMax-H3-Mojo";
+        let dir = format!("{checkpoints}/MiniMax-H3");
+        if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
+            out.push(ScanEntry {
+                name: name.to_string(),
+                path: dir.clone(),
+                arch: "minimax-h3".to_string(),
+                detected_arch: "minimax-h3".to_string(),
+                arch_source: "bundled_identity".to_string(),
+                arch_override: String::new(),
+                format: "diffusers_directory".to_string(),
+                size: du_sb(&dir),
+                folder: folder_relative_to(&dir, &checkpoints),
+                sidecar: sidecar_for_dir(&dir),
+            });
+        }
+    }
     // known multi-shard checkpoint subdirs under checkpoints/.
     for (name, arch) in [
         ("qwen-image-2512", "qwen-image"),
@@ -1999,7 +2026,7 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     );
     let route = if matches!(
         arch.as_str(),
-        "ltx2" | "wan2.2" | "nava" | "bernini" | "scail2"
+        "ltx2" | "minimax-h3" | "wan2.2" | "nava" | "bernini" | "scail2"
     ) {
         "video"
     } else if crate::capabilities::model_family_for_arch(&arch).is_some() {
@@ -2018,6 +2045,7 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
                 | ("wan2.2", "wan2.2_t2v_a14b_fp8_e4m3")
                 | ("bernini", "Bernini-R-Diffusers")
                 | ("scail2", "SCAIL-2-Mojo")
+                | ("minimax-h3", "MiniMax-H3-Mojo")
         );
     let blocked_reason = crate::capabilities::blocked_image_model_reason(&e.name);
     let runtime_supported = blocked_reason.is_none()
@@ -2632,6 +2660,7 @@ mod tests {
         assert_eq!(detect_arch_from_name("NAVA/NAVA_fp8"), "nava");
         assert_eq!(detect_arch_from_name("Bernini-R-Diffusers"), "bernini");
         assert_eq!(detect_arch_from_name("SCAIL-2-Mojo"), "scail2");
+        assert_eq!(detect_arch_from_name("MiniMax-H3-Mojo"), "minimax-h3");
         assert_eq!(detect_arch_from_name("some-random-checkpoint"), "unknown");
     }
 

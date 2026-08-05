@@ -53,6 +53,8 @@ var ModelUtils = (function () {
         if (!filename)
             return 'sd15';
         var f = filename.toLowerCase();
+        if (f.includes('minimax') && f.includes('h3'))
+            return 'minimax_h3';
         if (f.includes('scail'))
             return 'scail2';
         if (f.includes('bernini'))
@@ -99,6 +101,7 @@ var ModelUtils = (function () {
             'flux-2': 'klein',
             'flux-2/klein': 'klein',
             'ltx2': 'ltxv',
+            'minimax-h3': 'minimax_h3',
             'wan2.2': 'wan'
         };
         return aliases[value] || value || 'unknown';
@@ -137,7 +140,7 @@ var ModelUtils = (function () {
     // Check if a detected architecture is a video model
     function isVideoModel(filename) {
         var arch = archForModel(filename);
-        return arch === 'ltxv' || arch === 'wan' || arch === 'bernini' || arch === 'scail2';
+        return arch === 'ltxv' || arch === 'minimax_h3' || arch === 'wan' || arch === 'bernini' || arch === 'scail2';
     }
     // Standard video resolutions (smaller, snap to 32 for video VAE)
     var VIDEO_RESOLUTIONS = [

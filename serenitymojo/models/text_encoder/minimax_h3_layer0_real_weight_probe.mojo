@@ -29,7 +29,7 @@
 
 from std.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
     _h3_open_available_shards,
     _detect_layer_prefix,
@@ -39,6 +39,7 @@ from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
     H3_KV_HEADS,
     H3_HEAD_DIM,
     H3_THETA,
+    H3_UPLOAD_STAGE_BYTES,
 )
 from serenitymojo.models.text_encoder.qwen3_encoder import (
     _build_rope_tables,
@@ -75,7 +76,8 @@ def main() raises:
 
     print("")
     print("[2] layer 0 real tensor shapes/dtypes vs _h3_cfg()")
-    var lw = _h3_load_layer(st, 0, prefix, ctx)
+    var uploader = BatchedTensorUploader(H3_UPLOAD_STAGE_BYTES, ctx)
+    var lw = _h3_load_layer(st, uploader, 0, prefix, ctx)
     var inner = H3_HEADS * H3_HEAD_DIM  # 8192
     var kv_inner = H3_KV_HEADS * H3_HEAD_DIM  # 1024
 

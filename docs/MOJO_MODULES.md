@@ -818,6 +818,43 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
+## MiniMax-H3 audio-video inference runtime (2026-08-05)
+
+- `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
+  modulation, and resident-weight sidecars used by the product runners. Cache
+  reload is dtype/shape validated and byte preserving; CPU work is limited to
+  file I/O and staging, while model execution remains on the GPU.
+- `models/dit/minimax_h3_fp8_resident.mojo` is the historically named,
+  scheme-selectable resident store. The admitted product schemes are group-wise
+  INT8 weights for the Quality arm and direct W8A8 weights for the Fast arm.
+  `models/dit/minimax_h3_int8_linear.mojo` plus the model-scoped cshim implement
+  GPU activation quantization, INT8 GEMM, and BF16 output scaling.
+- `models/text_encoder/minimax_h3_qwen3vl_int8.mojo` and
+  `minimax_h3_qwen3vl_int8_cache_cli.mojo` provide the shared per-row INT8
+  Qwen3-VL text-encoder cache and GPU forward. The BF16 conditioning output is
+  shared by BF16, INT8 Quality, and INT8 Fast DiT runners.
+- `ops/sage_attention_int8.mojo` is an opt-in Sage-style INT8-QK attention
+  backend with F32 accumulation and explicit tail masking. It is experimental
+  and off by default: cU-DNN remains the accepted product backend, and Fast
+  rejects Sage because the measured end-to-end path was slower and below the
+  audio parity bar.
+- `pipeline/minimax_h3_t2va.mojo` is the AOT-specialized product CLI. The
+  tracked profile registry builds three geometries at 24 FPS/20 steps
+  (512x320x175, 832x480x73, and 960x544x56), each with BF16, INT8 Quality, and
+  INT8 Fast runners. All nine small executables share external weight caches;
+  higher spatial resolutions shorten duration to keep the 24-GB attention and
+  decode workload bounded. Denoise and fresh-process GPU VAE decode/NVENC mux
+  remain phase isolated.
+- `serenity-server/crates/server/src/video.rs` and the Canvas Generate/Workflow
+  modules resolve exact profile geometry and precision before acquiring the GPU
+  lease. Unsupported geometry, missing runners/caches, stale machine gates, and
+  invalid attention combinations fail queue admission closed.
+
+**Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
+separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and
+streamed BF16 preserve the quality choices, and no claim is made that their
+full denoise trajectories are numerically identical.
+
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 
 Gates for the process-isolated **worker** runtime (`serve/`): they exercise the

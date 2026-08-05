@@ -35,6 +35,8 @@ const SEEDVR2_WEIGHTS: [&str; 3] = [
 ];
 const LTX2_REQUEST_PROFILES_JSON: &str =
     include_str!("../../../../serenitymojo/configs/ltx2_request_profiles.json");
+const MINIMAX_H3_REQUEST_PROFILES_JSON: &str =
+    include_str!("../../../../serenitymojo/configs/minimax_h3_request_profiles.json");
 const LTX2_CHECKPOINT_WORKFLOWS_JSON: &str =
     include_str!("../../../../serenitymojo/configs/ltx2_checkpoint_workflows.json");
 const LTX2_MOJO_CONDITIONER: &str = "output/bin/ltx2_encode_prompt";
@@ -57,6 +59,37 @@ const LTX2_CUDA_CACHE: &str = "/dev/shm/serenity-ltx2-cuda-cache";
 const LTX2_SAMPLER_PARITY_REPORT: &str = "output/checks/ltx2_sampler_parity.json";
 const LTX2_VAE_PARITY_REPORT: &str = "output/checks/ltx2_vae_frame_parity.json";
 const LTX2_AUDIO_PARITY_REPORT: &str = "output/checks/ltx2_audio_parity.json";
+const MINIMAX_H3_INT8_RUNNER: &str = "output/bin/minimax_h3_t2va_512x320x175_int8";
+const MINIMAX_H3_INT8_FAST_RUNNER: &str =
+    "output/bin/minimax_h3_t2va_512x320x175_int8_fast";
+const MINIMAX_H3_BF16_RUNNER: &str = "output/bin/minimax_h3_t2va_512x320x175_bf16";
+const MINIMAX_H3_INT8_FAST_SHIM: &str = "output/lib/libserenity_minimax_h3_int8.so";
+const MINIMAX_H3_PRODUCT_GATE: &str = "output/checks/minimax_h3_product_gate.json";
+const MINIMAX_H3_RESOLUTION_PROFILES_GATE: &str =
+    "output/checks/minimax_h3_resolution_profiles_gate.json";
+const MINIMAX_H3_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/FL2VA";
+const MINIMAX_H3_ENCODER_CACHE: &str =
+    "checkpoints/MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1";
+const MINIMAX_H3_CONDITIONING_CACHE: &str =
+    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/conditioning_ff21f1ebd1c73098_int8_bf16_output.bin";
+const MINIMAX_H3_MODULATION_CACHE: &str =
+    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/modcache_steps_20_blocks_50.safetensors";
+const MINIMAX_H3_INT8_RESIDENT_CACHE: &str =
+    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors";
+const MINIMAX_H3_INT8_FAST_RESIDENT_CACHE: &str =
+    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors";
+const MINIMAX_H3_WIDTH: i64 = 512;
+const MINIMAX_H3_HEIGHT: i64 = 320;
+const MINIMAX_H3_FRAMES: i64 = 175;
+const MINIMAX_H3_FPS: i64 = 24;
+const MINIMAX_H3_STEPS: i64 = 20;
+const MINIMAX_H3_TEXT_TOKENS: i64 = 241;
+const MINIMAX_H3_TEST_PROMPT: &str = r#"integrated_multimodal_description: [Shot 1] Cinematic live-action. A close-up shot of a fluffy ginger tabby cat sitting on a sun-drenched wooden windowsill. The cat has bright green eyes and white paws. The cat slowly blinks and then lets out a soft, high-pitched meow. The camera pushes in with small amplitude at slow speed toward the cat's face as it tilts its head curiously to the right. At 00:06.000, the shot cuts to a medium shot from a side angle. The cat suddenly pounces forward with a quick burst of energy, batting at a floating dust mote in the sunlight with its right paw. The cat's claws retract and extend rapidly as it misses the mote and lands softly on the wood with a slight slide.
+
+overall_soundscape: Soft ambient wind whistling outside the window, the rhythmic purring of a cat, the light thud of paws hitting a wooden surface, and the sound of fabric rustling.
+
+non_diegetic_music: A light, plucking pizzicato string melody with a medium tempo and a playful, bouncing rhythm.
+ -"#;
 const LTX2_CREATOR_CUDNN_LIB_CANDIDATES: [&str; 2] = [
     "LTX-Desktop/backend/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
     ".local/share/LTXDesktop/python/lib/python3.13/site-packages/nvidia/cudnn/lib",
@@ -349,6 +382,31 @@ struct Ltx2CheckpointProfile {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
+struct MiniMaxH3RequestProfileRegistry {
+    schema: String,
+    default_profile: String,
+    profiles: Vec<MiniMaxH3RequestProfile>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct MiniMaxH3RequestProfile {
+    id: String,
+    label: String,
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: i64,
+    steps: i64,
+    text_tokens: i64,
+    sequence_tokens: i64,
+    duration: f64,
+    fast_resident_blocks: i64,
+    quality_resident_blocks: i64,
+    gate: String,
+    runners: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
 struct Ltx2RequestProfileGroup {
     id: String,
     label: String,
@@ -504,6 +562,86 @@ fn ltx2_request_profile_registry() -> &'static Ltx2RequestProfileRegistry {
         );
         registry
     })
+}
+
+fn minimax_h3_request_profile_registry() -> &'static MiniMaxH3RequestProfileRegistry {
+    static REGISTRY: std::sync::OnceLock<MiniMaxH3RequestProfileRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry: MiniMaxH3RequestProfileRegistry =
+            serde_json::from_str(MINIMAX_H3_REQUEST_PROFILES_JSON)
+                .expect("embedded MiniMax-H3 request profile registry must be valid JSON");
+        assert_eq!(
+            registry.schema, "serenity.minimax_h3.request_profiles.v1",
+            "embedded MiniMax-H3 request profile registry schema mismatch"
+        );
+        assert!(
+            registry.profiles.iter().any(|profile| profile.id == registry.default_profile),
+            "embedded MiniMax-H3 default profile must name a registered profile"
+        );
+        assert!(
+            registry.profiles.iter().all(|profile| {
+                profile.width > 0
+                    && profile.height > 0
+                    && profile.frames > 0
+                    && profile.fps > 0
+                    && profile.steps == MINIMAX_H3_STEPS
+                    && profile.text_tokens == MINIMAX_H3_TEXT_TOKENS
+                    && profile.sequence_tokens > 0
+                    && profile.duration > 0.0
+                    && profile.fast_resident_blocks > 0
+                    && profile.quality_resident_blocks > 0
+                    && matches!(profile.gate.as_str(), "base" | "resolution")
+                    && ["int8-fast", "int8", "bf16"]
+                        .iter()
+                        .all(|mode| profile.runners.get(*mode).is_some_and(|path| !path.is_empty()))
+            }),
+            "embedded MiniMax-H3 profiles must declare complete geometry and runners"
+        );
+        registry
+    })
+}
+
+fn minimax_h3_default_profile() -> &'static MiniMaxH3RequestProfile {
+    let registry = minimax_h3_request_profile_registry();
+    registry
+        .profiles
+        .iter()
+        .find(|profile| profile.id == registry.default_profile)
+        .expect("validated MiniMax-H3 registry must contain its default profile")
+}
+
+fn minimax_h3_profile_for_geometry(
+    width: i64,
+    height: i64,
+    frames: i64,
+    fps: i64,
+) -> Option<&'static MiniMaxH3RequestProfile> {
+    minimax_h3_request_profile_registry()
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.width == width
+                && profile.height == height
+                && profile.frames == frames
+                && profile.fps == fps
+        })
+}
+
+fn minimax_h3_profile_from_request(body: &Value) -> Option<&'static MiniMaxH3RequestProfile> {
+    minimax_h3_profile_for_geometry(
+        body.get("width").and_then(Value::as_i64).unwrap_or(0),
+        body.get("height").and_then(Value::as_i64).unwrap_or(0),
+        body.get("frames").and_then(Value::as_i64).unwrap_or(0),
+        body.get("fps").and_then(Value::as_i64).unwrap_or(0),
+    )
+}
+
+fn minimax_h3_profile_runner<'a>(
+    profile: &'a MiniMaxH3RequestProfile,
+    quant: &str,
+) -> Option<&'a str> {
+    profile.runners.get(quant).map(String::as_str)
 }
 
 const LTX2_REQUEST_RUNNER_BUILD_INPUTS: &[&str] = &[
@@ -2013,7 +2151,7 @@ pub(crate) fn scail2_product_gate_passed() -> bool {
     ];
     if binaries.iter().any(|(key, path)| {
         let Some(actual) = sha256sum(&repo_path(path)) else {
-            return true;
+            return false;
         };
         doc.pointer(&format!("/pins/{key}")).and_then(Value::as_str) != Some(actual.as_str())
     }) {
@@ -2042,6 +2180,473 @@ pub(crate) fn scail2_product_gate_passed() -> bool {
             .pointer("/performance/requires_isolated_process_stages")
             .and_then(Value::as_bool)
             == Some(true)
+}
+
+fn minimax_h3_encoder_cache_complete() -> bool {
+    let root = model_path(MINIMAX_H3_ENCODER_CACHE);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return false;
+    };
+    let files = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .collect::<Vec<_>>();
+    files.len() == 702
+        && files.iter().all(|entry| {
+            let name = entry.file_name();
+            !name.to_string_lossy().ends_with(".tmp")
+                && entry.metadata().is_ok_and(|metadata| metadata.len() > 0)
+        })
+}
+
+fn minimax_h3_missing(profile: &MiniMaxH3RequestProfile, quant: &str) -> Vec<String> {
+    let mut missing = Vec::new();
+    let runner = minimax_h3_profile_runner(profile, quant);
+    if let Some(runner) = runner {
+        if !bin_x(runner) {
+            missing.push(runner.to_string());
+        }
+    } else {
+        missing.push(format!("{} runner for quant={quant}", profile.id));
+    }
+    let root = model_path(MINIMAX_H3_MODEL_ROOT);
+    for relative in [
+        "transformer/model.safetensors.index.json",
+        "text_encoder/model.safetensors.index.json",
+        "audio_vae/model.safetensors",
+        "video_vae/source/model.safetensors",
+    ] {
+        let path = root.join(relative);
+        if !nonempty_file(&path) {
+            missing.push(path.to_string_lossy().into_owned());
+        }
+    }
+    if !minimax_h3_encoder_cache_complete() {
+        missing.push(model_path(MINIMAX_H3_ENCODER_CACHE).to_string_lossy().into_owned());
+    }
+    for cache in [MINIMAX_H3_CONDITIONING_CACHE, MINIMAX_H3_MODULATION_CACHE] {
+        let path = model_path(cache);
+        if !nonempty_file(&path) {
+            missing.push(path.to_string_lossy().into_owned());
+        }
+    }
+    if quant == "int8" {
+        let path = model_path(MINIMAX_H3_INT8_RESIDENT_CACHE);
+        if !nonempty_file(&path) {
+            missing.push(path.to_string_lossy().into_owned());
+        }
+    }
+    if quant == "int8-fast" {
+        for path in [
+            model_path(MINIMAX_H3_INT8_FAST_RESIDENT_CACHE),
+            repo_path(MINIMAX_H3_INT8_FAST_SHIM),
+        ] {
+            if !nonempty_file(&path) {
+                missing.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let cshim = repo_path(LTX2_CSHIM);
+    if !nonempty_file(&cshim) {
+        missing.push(cshim.to_string_lossy().into_owned());
+    }
+    missing
+}
+
+pub(crate) fn minimax_h3_product_gate_passed() -> bool {
+    let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_PRODUCT_GATE)) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let binaries = [
+        ("int8_runner_sha256", MINIMAX_H3_INT8_RUNNER),
+        ("bf16_runner_sha256", MINIMAX_H3_BF16_RUNNER),
+        ("cudnn_shim_sha256", LTX2_CSHIM),
+        (
+            "int8_full20_artifact_sha256",
+            "output/h3_cat_groupwise43_cudnn_optimized_full20_20260804/video.mp4",
+        ),
+        (
+            "bf16_full20_artifact_sha256",
+            "output/h3_cat_bf16dit_int8enc_cudnn_full20_20260804/video.mp4",
+        ),
+    ];
+    if binaries.iter().any(|(key, path)| {
+        let Some(actual) = sha256sum(&repo_path(path)) else {
+            return true;
+        };
+        doc.pointer(&format!("/pins/{key}")).and_then(Value::as_str) != Some(actual.as_str())
+    }) {
+        return false;
+    }
+    let Some(artifact) = doc
+        .pointer("/evidence/int8_full20_artifact")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(bf16_artifact) = doc
+        .pointer("/evidence/bf16_full20_artifact")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    doc.get("schema").and_then(Value::as_str) == Some("serenity.minimax_h3.product_gate.v1")
+        && doc.get("passed").and_then(Value::as_bool) == Some(true)
+        && doc.pointer("/profile/width").and_then(Value::as_i64) == Some(MINIMAX_H3_WIDTH)
+        && doc.pointer("/profile/height").and_then(Value::as_i64) == Some(MINIMAX_H3_HEIGHT)
+        && doc.pointer("/profile/frames").and_then(Value::as_i64) == Some(MINIMAX_H3_FRAMES)
+        && doc.pointer("/profile/fps").and_then(Value::as_i64) == Some(MINIMAX_H3_FPS)
+        && doc.pointer("/profile/steps").and_then(Value::as_i64) == Some(MINIMAX_H3_STEPS)
+        && doc.pointer("/profile/text_tokens").and_then(Value::as_i64)
+            == Some(MINIMAX_H3_TEXT_TOKENS)
+        && doc
+            .pointer("/evidence/int8_full20_video_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && doc
+            .pointer("/evidence/int8_full20_audio_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && doc
+            .pointer("/evidence/bf16_one_step_finite")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && doc
+            .pointer("/evidence/bf16_full20_video_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && doc
+            .pointer("/evidence/bf16_full20_audio_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && doc
+            .pointer("/evidence/bf16_full20_visual_inspection_passed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && doc
+            .pointer("/evidence/visual_inspection_passed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && repo_path(artifact).is_file()
+        && repo_path(bf16_artifact).is_file()
+}
+
+fn minimax_h3_fast_product_gate_passed() -> bool {
+    let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_PRODUCT_GATE)) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    for (key, path) in [
+        ("int8_fast_runner_sha256", MINIMAX_H3_INT8_FAST_RUNNER),
+        ("int8_fast_shim_sha256", MINIMAX_H3_INT8_FAST_SHIM),
+        (
+            "int8_fast_full20_artifact_sha256",
+            "output/h3_cat_w8a8_48_cudnn_full20_20260804/video.mp4",
+        ),
+    ] {
+        let Some(actual) = sha256sum(&repo_path(path)) else {
+            return false;
+        };
+        if doc.pointer(&format!("/pins/{key}")).and_then(Value::as_str)
+            != Some(actual.as_str())
+        {
+            return false;
+        }
+    }
+    let Some(artifact) = doc
+        .pointer("/evidence/int8_fast_full20_artifact")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    doc.pointer("/evidence/int8_fast_full20_video_nonfinite")
+        .and_then(Value::as_i64)
+        == Some(0)
+        && doc
+            .pointer("/evidence/int8_fast_full20_audio_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && doc
+            .pointer("/evidence/int8_fast_full20_visual_inspection_passed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && doc
+            .pointer("/performance/int8_fast_resident_blocks")
+            .and_then(Value::as_i64)
+            == Some(48)
+        && doc
+            .pointer("/performance/int8_fast_w8a8_tail_blocks")
+            .and_then(Value::as_i64)
+            == Some(2)
+        && repo_path(artifact).is_file()
+}
+
+fn minimax_h3_resolution_profile_gate_passed(profile: &MiniMaxH3RequestProfile) -> bool {
+    let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_RESOLUTION_PROFILES_GATE)) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    if doc.get("schema").and_then(Value::as_str)
+        != Some("serenity.minimax_h3.resolution_profiles_gate.v1")
+        || doc.get("passed").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(gate) = doc
+        .get("profiles")
+        .and_then(Value::as_array)
+        .and_then(|profiles| {
+            profiles
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(&profile.id))
+        })
+    else {
+        return false;
+    };
+    for (quant, pin) in [
+        ("int8-fast", "int8_fast_runner_sha256"),
+        ("int8", "int8_runner_sha256"),
+        ("bf16", "bf16_runner_sha256"),
+    ] {
+        let Some(runner) = minimax_h3_profile_runner(profile, quant) else {
+            return false;
+        };
+        let Some(actual) = sha256sum(&repo_path(runner)) else {
+            return false;
+        };
+        if gate.pointer(&format!("/pins/{pin}")).and_then(Value::as_str)
+            != Some(actual.as_str())
+        {
+            return false;
+        }
+    }
+    let Some(artifact) = gate
+        .pointer("/evidence/int8_fast_full20_artifact")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(artifact_sha) = sha256sum(&repo_path(artifact)) else {
+        return false;
+    };
+    gate.get("passed").and_then(Value::as_bool) == Some(true)
+        && gate.pointer("/profile/width").and_then(Value::as_i64) == Some(profile.width)
+        && gate.pointer("/profile/height").and_then(Value::as_i64) == Some(profile.height)
+        && gate.pointer("/profile/frames").and_then(Value::as_i64) == Some(profile.frames)
+        && gate.pointer("/profile/fps").and_then(Value::as_i64) == Some(profile.fps)
+        && gate.pointer("/profile/steps").and_then(Value::as_i64) == Some(profile.steps)
+        && gate.pointer("/profile/text_tokens").and_then(Value::as_i64)
+            == Some(profile.text_tokens)
+        && gate.pointer("/profile/sequence_tokens").and_then(Value::as_i64)
+            == Some(profile.sequence_tokens)
+        && gate
+            .pointer("/pins/int8_fast_full20_artifact_sha256")
+            .and_then(Value::as_str)
+            == Some(artifact_sha.as_str())
+        && gate
+            .pointer("/evidence/int8_fast_full20_video_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && gate
+            .pointer("/evidence/int8_fast_full20_audio_nonfinite")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && gate
+            .pointer("/evidence/int8_fast_full20_visual_inspection_passed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && gate
+            .pointer("/evidence/int8_quality_one_eval_finite")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && gate
+            .pointer("/evidence/bf16_one_eval_finite")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && gate.pointer("/evidence/mux_probe_passed").and_then(Value::as_bool)
+            == Some(true)
+}
+
+fn minimax_h3_profile_mode_product_gate_passed(
+    profile: &MiniMaxH3RequestProfile,
+    quant: &str,
+) -> bool {
+    if !minimax_h3_product_gate_passed() {
+        return false;
+    }
+    match profile.gate.as_str() {
+        "base" => quant != "int8-fast" || minimax_h3_fast_product_gate_passed(),
+        "resolution" => minimax_h3_resolution_profile_gate_passed(profile),
+        _ => false,
+    }
+}
+
+fn minimax_h3_profile_mode_ready(profile: &MiniMaxH3RequestProfile, quant: &str) -> bool {
+    minimax_h3_profile_mode_product_gate_passed(profile, quant)
+        && minimax_h3_missing(profile, quant).is_empty()
+}
+
+fn minimax_h3_profile_document(profile: &MiniMaxH3RequestProfile) -> Value {
+    let fast_ready = minimax_h3_profile_mode_ready(profile, "int8-fast");
+    let quality_ready = minimax_h3_profile_mode_ready(profile, "int8");
+    let bf16_ready = minimax_h3_profile_mode_ready(profile, "bf16");
+    json!({
+        "id": profile.id,
+        "label": profile.label,
+        "width": profile.width,
+        "height": profile.height,
+        "frames": profile.frames,
+        "fps": profile.fps,
+        "steps": profile.steps,
+        "text_tokens": profile.text_tokens,
+        "sequence_tokens": profile.sequence_tokens,
+        "duration": profile.duration,
+        "available": fast_ready || quality_ready || bf16_ready,
+        "available_modes": {
+            "int8-fast": fast_ready,
+            "int8": quality_ready,
+            "bf16": bf16_ready,
+        },
+        "resident_blocks": {
+            "int8-fast": profile.fast_resident_blocks,
+            "int8": profile.quality_resident_blocks,
+        },
+        "runners": profile.runners,
+        "memory_policy": "constant_budget_higher_resolution_shorter_duration",
+    })
+}
+
+fn minimax_h3_ld_path() -> std::ffi::OsString {
+    let mut paths = vec![
+        repo_path("output/lib"),
+        repo_path("serenitymojo/ops/cshim/lib"),
+    ];
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).unwrap_or_default()
+}
+
+fn write_minimax_h3_job_status(
+    out_dir: &std::path::Path,
+    state: &str,
+    phase: &str,
+    step: i64,
+    total: i64,
+    message: &str,
+) -> Result<(), String> {
+    let path = out_dir.join("status.json");
+    let tmp = out_dir.join("status.json.tmp");
+    let document = json!({
+        "schema": "serenity.minimax_h3.status.v1",
+        "state": state,
+        "phase": phase,
+        "step": step,
+        "total": total,
+        "message": message,
+    });
+    let bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("serialize MiniMax-H3 status: {error}"))?;
+    std::fs::write(&tmp, bytes)
+        .map_err(|error| format!("write MiniMax-H3 status: {error}"))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("publish MiniMax-H3 status: {error}"))
+}
+
+fn minimax_h3_log_number(line: &str, marker: &str) -> Option<i64> {
+    let tail = line.split_once(marker)?.1.trim_start_matches([' ', '=']);
+    let digits = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn minimax_h3_progress_from_log(
+    log: &str,
+    requested_steps: i64,
+) -> Option<(String, i64, i64, String)> {
+    let mut progress = None;
+    for line in log.lines() {
+        if line.contains("conditioning cache: HIT") {
+            progress = Some((
+                "conditioning_cache".to_string(),
+                0,
+                requested_steps,
+                "Loaded cached GPU text conditioning".to_string(),
+            ));
+        } else if line.contains("conditioning [real]") {
+            progress = Some((
+                "conditioning".to_string(),
+                0,
+                requested_steps,
+                "GPU text conditioning complete".to_string(),
+            ));
+        } else if line.contains("modcache: HIT") {
+            progress = Some((
+                "modulation_cache".to_string(),
+                0,
+                requested_steps,
+                "Loaded cached AdaLN modulation".to_string(),
+            ));
+        } else if line.contains("modcache: SAVED") || line.contains("modcache:") {
+            progress = Some((
+                "modulation_cache".to_string(),
+                0,
+                requested_steps,
+                "Preparing AdaLN modulation cache".to_string(),
+            ));
+        } else if line.contains("resident cache: loaded block") {
+            let block = minimax_h3_log_number(line, "loaded block").unwrap_or(0);
+            let total = line
+                .split_once('/')
+                .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+                .unwrap_or(40);
+            progress = Some((
+                "resident_cache".to_string(),
+                0,
+                requested_steps,
+                format!("Loading cached INT8 DiT block {block} of {total}"),
+            ));
+        } else if line.contains("resident cache: HIT") {
+            progress = Some((
+                "resident_cache".to_string(),
+                0,
+                requested_steps,
+                "INT8 resident DiT cache ready".to_string(),
+            ));
+        } else if line.contains("fp8-resident: quantized block") {
+            let block = minimax_h3_log_number(line, "quantized block").unwrap_or(0);
+            let total = line
+                .split_once('/')
+                .and_then(|(_, value)| value.split_whitespace().next())
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(48);
+            progress = Some((
+                "resident_cache_build".to_string(),
+                0,
+                requested_steps,
+                format!("One-time INT8 cache build: block {block} of {total}"),
+            ));
+        } else if line.contains("phase=denoise") {
+            let step = minimax_h3_log_number(line, "step=").unwrap_or(0);
+            let evaluations = minimax_h3_log_number(line, "total=").unwrap_or(0);
+            progress = Some((
+                "denoise".to_string(),
+                step,
+                requested_steps,
+                format!("Denoising evaluation {step} of {evaluations}"),
+            ));
+        }
+    }
+    progress
 }
 
 fn readiness_doc() -> Value {
@@ -2091,9 +2696,30 @@ fn readiness_doc() -> Value {
     let scail2_absent = scail2_missing();
     let scail2_ready = scail2_absent.is_empty();
     let scail2_product_accepted = scail2_ready && scail2_product_gate_passed();
+    let minimax_h3_profiles = &minimax_h3_request_profile_registry().profiles;
+    let minimax_h3_default = minimax_h3_default_profile();
+    let minimax_h3_profile_documents = minimax_h3_profiles
+        .iter()
+        .map(minimax_h3_profile_document)
+        .collect::<Vec<_>>();
+    let minimax_h3_int8_missing = minimax_h3_missing(minimax_h3_default, "int8");
+    let minimax_h3_int8_fast_missing =
+        minimax_h3_missing(minimax_h3_default, "int8-fast");
+    let minimax_h3_bf16_missing = minimax_h3_missing(minimax_h3_default, "bf16");
+    let minimax_h3_int8_ready = minimax_h3_profiles
+        .iter()
+        .any(|profile| minimax_h3_profile_mode_ready(profile, "int8"));
+    let minimax_h3_int8_fast_ready = minimax_h3_profiles
+        .iter()
+        .any(|profile| minimax_h3_profile_mode_ready(profile, "int8-fast"));
+    let minimax_h3_bf16_ready = minimax_h3_profiles
+        .iter()
+        .any(|profile| minimax_h3_profile_mode_ready(profile, "bf16"));
+    let minimax_h3_ready =
+        minimax_h3_int8_fast_ready || minimax_h3_int8_ready || minimax_h3_bf16_ready;
     // top-level state reflects whether ANY arm is runnable.
-    let any_ready = ltx2_ready || wan22_ready || bernini_ready || scail2_ready;
-    let state = if ltx2_request_ready {
+    let any_ready = ltx2_ready || wan22_ready || bernini_ready || scail2_ready || minimax_h3_ready;
+    let state = if ltx2_request_ready || minimax_h3_ready {
         "request_runner_ready"
     } else if any_ready {
         "bounded_smoke_ready"
@@ -2222,6 +2848,83 @@ fn readiness_doc() -> Value {
             "quant_modes": ["bf16", "fp8", "int4"],
             "quant_note": "request runner: dequantized dev BF16, native dev FP8, or W4A16 int4-resident. All execute BF16 activations with F32 reductions; W4A4 int4-compute is NOT integrated.",
             "limit": "staged is bounded smoke; refhq parity claims are admitted only from current machine-local Creator reports at the 0.999 bar",
+        },
+        {
+            "model": "minimax_h3_t2va",
+            "status": if minimax_h3_ready { "quality_profile_ready" } else { "gate_required" },
+            "runner": if minimax_h3_int8_fast_ready {
+                minimax_h3_profile_runner(minimax_h3_default, "int8-fast").unwrap_or("")
+            } else {
+                minimax_h3_profile_runner(minimax_h3_default, "int8").unwrap_or("")
+            },
+            "runners": {
+                "int8-fast": minimax_h3_profile_runner(minimax_h3_default, "int8-fast"),
+                "int8": minimax_h3_profile_runner(minimax_h3_default, "int8"),
+                "bf16": minimax_h3_profile_runner(minimax_h3_default, "bf16"),
+            },
+            "mode": "phase-isolated: GPU text encode + denoise -> fresh GPU VAE decode -> NVENC mux",
+            "request_schema": "serenity.genparams.v1",
+            "status_schema": "serenity.minimax_h3.status.v1",
+            "result_schema": "serenity.minimax_h3.result.v1",
+            "asynchronous": true,
+            "process_separated_decode": true,
+            "runtime_cache": {
+                "conditioning": MINIMAX_H3_CONDITIONING_CACHE,
+                "modulation_steps_20": MINIMAX_H3_MODULATION_CACHE,
+                "int8_groupwise_cache_blocks_48": MINIMAX_H3_INT8_RESIDENT_CACHE,
+                "int8_fast_w8a8_blocks_50": MINIMAX_H3_INT8_FAST_RESIDENT_CACHE,
+                "byte_exact_latent_parity": true,
+                "gpu_model_execution_only": true,
+            },
+            "supported_profiles": minimax_h3_profile_documents,
+            "quant_modes": [
+                {
+                    "id": "int8-fast",
+                    "label": "INT8 Fast · profile-tuned W8A8 resident",
+                    "available": minimax_h3_int8_fast_ready,
+                    "missing": minimax_h3_int8_fast_missing,
+                    "dtype_contract": "direct_w8a8_profile_resident_prefix_w8a8_cached_tail_int8_text_encoder_bf16_outputs_f32_reductions",
+                    "full20_denoise_seconds": 174.577378981_f64,
+                    "visual_inspection_passed": true,
+                },
+                {
+                    "id": "int8",
+                    "label": "INT8 Quality · profile-tuned groupwise + BF16 tail",
+                    "available": minimax_h3_int8_ready,
+                    "missing": minimax_h3_int8_missing,
+                    "dtype_contract": "groupwise_int8_profile_resident_prefix_bf16_tail_int8_text_encoder_bf16_activations_f32_reductions",
+                    "full20_denoise_seconds": 377.228794159_f64,
+                },
+                {
+                    "id": "bf16",
+                    "label": "BF16 DiT quality · streamed",
+                    "available": minimax_h3_bf16_ready,
+                    "missing": minimax_h3_bf16_missing,
+                    "dtype_contract": "bf16_dit_streamed_int8_text_encoder_bf16_activations_f32_reductions",
+                }
+            ],
+            "attention_backends": [
+                {
+                    "id": "cudnn",
+                    "label": "cU-DNN · quality default",
+                    "available": minimax_h3_ready,
+                    "accepted_quality_default": true,
+                },
+                {
+                    "id": "sage-int8",
+                    "label": "Sage INT8 · experimental",
+                    "available": minimax_h3_ready,
+                    "accepted_quality_default": false,
+                    "kernel_cosine": 0.9999076619386169_f64,
+                    "one_step_video_cosine": 0.9989187544839178_f64,
+                    "one_step_audio_cosine": 0.9962658226306607_f64,
+                }
+            ],
+            "test_prompt": MINIMAX_H3_TEST_PROMPT,
+            "prompt_contract": "exact_241_token_compiled_test_prompt",
+            "include_audio": true,
+            "available": minimax_h3_ready,
+            "product_gate": MINIMAX_H3_PRODUCT_GATE,
         },
         {
             "model": "wan22_t2v",
@@ -2383,7 +3086,7 @@ fn readiness_doc() -> Value {
         "schema": "serenity.video_status.v1",
         "endpoint": "/v1/video",
         "state": state,
-        "readiness_label": if ltx2_request_ready { "experimental_request_runner_ready" } else if any_ready { "bounded_daemon_smoke" } else { "build_required" },
+        "readiness_label": if ltx2_request_ready || minimax_h3_ready { "experimental_request_runner_ready" } else if any_ready { "bounded_daemon_smoke" } else { "build_required" },
         "accepted": false,
         "backend": BACKEND_NAME,
         "control_plane": "serenity-server",
@@ -2395,6 +3098,7 @@ fn readiness_doc() -> Value {
         "audio": false,
         "arms_ready": {
             "ltx2_t2v_av": ltx2_ready,
+            "minimax_h3_t2va": minimax_h3_ready,
             "wan22_t2v": wan22_ready,
             "bernini_r_t2v": bernini_product_accepted,
             "scail2_animation": scail2_product_accepted,
@@ -2694,11 +3398,12 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
         && model != "wan22_a14b"
         && model != "bernini"
         && model != "scail2"
+        && model != "minimax_h3"
     {
         return err_detail(
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!(
-                "unsupported video model '{model}'; use ltx2, wan22, wan22_a14b, bernini, or scail2"
+                "unsupported video model '{model}'; use ltx2, minimax_h3, wan22, wan22_a14b, bernini, or scail2"
             ),
         );
     }
@@ -2752,6 +3457,30 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     }
     // Fail closed before taking the GPU lease or evicting an idle image model.
     // A partially installed or non-accepted video arm is not a GPU operation.
+    if model == "minimax_h3" {
+        if let Err(error) = validate_minimax_h3_request(&b) {
+            return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
+        }
+        let profile = minimax_h3_profile_from_request(&b)
+            .expect("validated MiniMax-H3 request must resolve to a registered profile");
+        let quant = b.get("quant").and_then(Value::as_str).unwrap_or("int8");
+        let missing = minimax_h3_missing(profile, quant);
+        if !missing.is_empty() {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("MiniMax-H3 runtime prerequisites missing: {}", missing.join(", ")),
+            );
+        }
+        if !minimax_h3_profile_mode_product_gate_passed(profile, quant) {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "MiniMax-H3 profile {} is installed but its machine-local full-trajectory quality gate is not current for quant={quant}",
+                    profile.id,
+                ),
+            );
+        }
+    }
     if model == "wan22" {
         let missing = wan22_missing();
         if !missing.is_empty() {
@@ -2882,6 +3611,9 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     }
     if is_ltx2_mojo_request {
         return start_ltx2_mojo_request(&st, &b, gpu);
+    }
+    if model == "minimax_h3" {
+        return start_minimax_h3_request(&st, &b, gpu);
     }
     match model.as_str() {
         "ltx2" => post_video_ltx2(&st, &b),
@@ -4422,6 +5154,401 @@ fn remux_ltx2_generated_audio(
         ));
     }
     Ok((artifact, probe))
+}
+
+fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
+    if prompt != MINIMAX_H3_TEST_PROMPT {
+        return Err(
+            "MiniMax-H3 currently accepts only the exact compiled 241-token test prompt published by GET /v1/video"
+                .to_string(),
+        );
+    }
+    if minimax_h3_profile_from_request(body).is_none() {
+        let supported = minimax_h3_request_profile_registry()
+            .profiles
+            .iter()
+            .map(|profile| {
+                format!(
+                    "{}x{}, {} frames at {} FPS",
+                    profile.width, profile.height, profile.frames, profile.fps
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "unsupported MiniMax-H3 compiled profile; admitted profiles: {supported}"
+        ));
+    }
+    let steps = body
+        .get("steps")
+        .and_then(Value::as_i64)
+        .unwrap_or(MINIMAX_H3_STEPS);
+    if !(1..=50).contains(&steps) {
+        return Err("MiniMax-H3 steps must be an integer from 1 through 50".to_string());
+    }
+    let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    if seed > u32::MAX as u64 {
+        return Err("MiniMax-H3 seed must be an integer from 0 through 4294967295".to_string());
+    }
+    let quant = body.get("quant").and_then(Value::as_str).unwrap_or("int8");
+    if !matches!(quant, "int8-fast" | "int8" | "bf16") {
+        return Err(
+            "MiniMax-H3 quant must be 'int8-fast', 'int8', or 'bf16'".to_string(),
+        );
+    }
+    let attention = body
+        .get("attention_backend")
+        .and_then(Value::as_str)
+        .unwrap_or("cudnn");
+    if !matches!(attention, "cudnn" | "sage-int8") {
+        return Err(
+            "MiniMax-H3 attention_backend must be 'cudnn' or 'sage-int8'".to_string(),
+        );
+    }
+    if quant == "int8-fast" && attention != "cudnn" {
+        return Err(
+            "MiniMax-H3 int8-fast is quality-gated with cU-DNN attention only"
+                .to_string(),
+        );
+    }
+    if body.get("include_audio").and_then(Value::as_bool) == Some(false) {
+        return Err("MiniMax-H3 compiled profile always generates synchronized audio".to_string());
+    }
+    Ok(())
+}
+
+fn start_minimax_h3_request(
+    st: &AppState,
+    body: &Value,
+    gpu: crate::gpu_lock::GpuGuard,
+) -> Response {
+    let profile = minimax_h3_profile_from_request(body)
+        .expect("validated MiniMax-H3 request must resolve to a registered profile");
+    let profile_id = profile.id.clone();
+    let quant = body
+        .get("quant")
+        .and_then(Value::as_str)
+        .unwrap_or("int8")
+        .to_string();
+    let attention = body
+        .get("attention_backend")
+        .and_then(Value::as_str)
+        .unwrap_or("cudnn")
+        .to_string();
+    let steps = body
+        .get("steps")
+        .and_then(Value::as_i64)
+        .unwrap_or(MINIMAX_H3_STEPS);
+    let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    let runner = minimax_h3_profile_runner(profile, &quant)
+        .expect("validated MiniMax-H3 profile must declare the selected quant runner")
+        .to_string();
+    let n = st
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let video_id = format!("video-{n:04}");
+    let out_dir = st.out_dir.join(&video_id);
+    if let Err(error) = std::fs::create_dir_all(&out_dir) {
+        return err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot create MiniMax-H3 output directory: {error}"),
+        );
+    }
+    let request_path = out_dir.join("request.json");
+    let mut request = body.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.insert("runner".to_string(), json!("minimax_h3_mojo_request"));
+        object.insert("profile".to_string(), json!(profile_id.clone()));
+        object.insert("defer_decode".to_string(), json!(true));
+        object.insert("encoder_storage".to_string(), json!("int8"));
+    }
+    let request_bytes = match serde_json::to_vec_pretty(&request) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return err_detail(
+                StatusCode::BAD_REQUEST,
+                &format!("cannot serialize MiniMax-H3 request: {error}"),
+            );
+        }
+    };
+    if let Err(error) = std::fs::write(&request_path, request_bytes) {
+        return err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot write MiniMax-H3 request: {error}"),
+        );
+    }
+    let _ = write_minimax_h3_job_status(
+        &out_dir,
+        "queued",
+        "queued",
+        0,
+        steps,
+        "MiniMax-H3 request queued",
+    );
+
+    let bus = st.comfy_ws.clone();
+    let thread_video_id = video_id.clone();
+    let thread_out_dir = out_dir.clone();
+    let thread_quant = quant.clone();
+    let thread_attention = attention.clone();
+    let thread_runner = runner.clone();
+    let thread_profile_id = profile_id.clone();
+    std::thread::spawn(move || {
+        let _gpu = gpu;
+        let publish = |event: WorkerEvent| {
+            let _ = bus.send((thread_video_id.clone(), event));
+        };
+        let fail = |phase: &str, error: String| {
+            let _ = write_minimax_h3_job_status(
+                &thread_out_dir,
+                "failed",
+                phase,
+                0,
+                steps,
+                &error,
+            );
+            publish(WorkerEvent::Failed { error });
+        };
+        let message = format!(
+            "Starting MiniMax-H3 {} DiT with {} attention",
+            thread_quant.to_uppercase(),
+            thread_attention,
+        );
+        let _ = write_minimax_h3_job_status(
+            &thread_out_dir,
+            "running",
+            "conditioning_and_denoising",
+            0,
+            steps,
+            &message,
+        );
+        publish(WorkerEvent::Progress {
+            step: 0,
+            total: steps,
+            phase: message,
+            preview: String::new(),
+        });
+        let log_path = thread_out_dir.join("runner.log");
+        let log = match std::fs::File::create(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                fail("runner_start", format!("cannot create MiniMax-H3 runner log: {error}"));
+                return;
+            }
+        };
+        let stderr = match log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                fail("runner_start", format!("cannot clone MiniMax-H3 log handle: {error}"));
+                return;
+            }
+        };
+        let mut command = std::process::Command::new(repo_path(&thread_runner));
+        command
+            .current_dir(repo_root())
+            .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .arg(MINIMAX_H3_TEST_PROMPT)
+            .arg(&thread_out_dir)
+            .arg(steps.to_string())
+            .arg(seed.to_string())
+            .arg("50")
+            .arg("--encoder-storage=int8")
+            .arg("--runtime-cache-exact-product-prompt")
+            .arg(format!("--attention-backend={}", thread_attention))
+            .arg("--defer-video-decode");
+        if thread_quant == "int8-fast" {
+            command.arg("--resident-backend=w8a8");
+        }
+        command
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(stderr));
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                fail("runner_start", format!("cannot start MiniMax-H3 runner: {error}"));
+                return;
+            }
+        };
+        let mut last_progress: Option<(String, i64, i64, String)> = None;
+        let status = loop {
+            if let Ok(text) = std::fs::read_to_string(&log_path) {
+                if let Some(progress) = minimax_h3_progress_from_log(&text, steps) {
+                    if last_progress.as_ref() != Some(&progress) {
+                        let (phase, step, total, message) = &progress;
+                        let _ = write_minimax_h3_job_status(
+                            &thread_out_dir,
+                            "running",
+                            phase,
+                            *step,
+                            *total,
+                            message,
+                        );
+                        publish(WorkerEvent::Progress {
+                            step: *step,
+                            total: *total,
+                            phase: message.clone(),
+                            preview: String::new(),
+                        });
+                        last_progress = Some(progress);
+                    }
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                Err(error) => break Err(error),
+            }
+        };
+        match status {
+            Ok(status)
+                if status.success()
+                    && thread_out_dir.join("latents.safetensors").is_file() => {}
+            Ok(status) => {
+                fail(
+                    "denoise",
+                    format!(
+                        "MiniMax-H3 denoiser failed with {status}; inspect {}",
+                        log_path.to_string_lossy()
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                fail("runner", format!("cannot monitor MiniMax-H3 runner: {error}"));
+                return;
+            }
+        }
+
+        let decode_message = "Denoiser released; starting fresh GPU video decode and NVENC mux";
+        let _ = write_minimax_h3_job_status(
+            &thread_out_dir,
+            "running",
+            "decode",
+            steps,
+            steps,
+            decode_message,
+        );
+        publish(WorkerEvent::Progress {
+            step: steps,
+            total: steps,
+            phase: decode_message.to_string(),
+            preview: String::new(),
+        });
+        let decode_log_path = thread_out_dir.join("decode.log");
+        let decode_log = match std::fs::File::create(&decode_log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                fail("decode_start", format!("cannot create MiniMax-H3 decode log: {error}"));
+                return;
+            }
+        };
+        let decode_stderr = match decode_log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                fail("decode_start", format!("cannot clone MiniMax-H3 decode log: {error}"));
+                return;
+            }
+        };
+        let decode_status = std::process::Command::new(repo_path(&thread_runner))
+            .current_dir(repo_root())
+            .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .arg("decode")
+            .arg(&thread_out_dir)
+            .arg(steps.to_string())
+            .arg(seed.to_string())
+            .arg("50")
+            .arg("decode_only")
+            .stdout(std::process::Stdio::from(decode_log))
+            .stderr(std::process::Stdio::from(decode_stderr))
+            .status();
+        if !decode_status.as_ref().is_ok_and(std::process::ExitStatus::success) {
+            fail(
+                "decode",
+                format!(
+                    "MiniMax-H3 fresh decode failed with {:?}; inspect {}",
+                    decode_status,
+                    decode_log_path.to_string_lossy()
+                ),
+            );
+            return;
+        }
+        let result_path = thread_out_dir.join("result.json");
+        let mut result = std::fs::read_to_string(&result_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let authored = result
+            .as_ref()
+            .filter(|doc| doc.get("state").and_then(Value::as_str) == Some("done"))
+            .and_then(|doc| doc.get("artifact_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let artifact = if std::path::Path::new(authored).is_absolute() {
+            std::path::PathBuf::from(authored)
+        } else {
+            repo_root().join(authored)
+        };
+        if !artifact.is_file() {
+            fail(
+                "result",
+                format!(
+                    "MiniMax-H3 decode did not publish a valid artifact; inspect {}",
+                    result_path.to_string_lossy()
+                ),
+            );
+            return;
+        }
+        if let Some(document) = result.as_mut().and_then(Value::as_object_mut) {
+            document.insert("model".to_string(), json!("minimax_h3"));
+            document.insert("runner".to_string(), json!("minimax_h3_mojo_request"));
+            document.insert("quant".to_string(), json!(thread_quant));
+            document.insert("attention_backend".to_string(), json!(thread_attention));
+            document.insert("profile".to_string(), json!(thread_profile_id));
+            document.insert(
+                "mp4_url".to_string(),
+                json!(format!("/out/{}/video.mp4", thread_video_id)),
+            );
+        }
+        if let Some(document) = result.as_ref() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(document) {
+                let _ = std::fs::write(&result_path, bytes);
+            }
+        }
+        let _ = write_minimax_h3_job_status(
+            &thread_out_dir,
+            "done",
+            "done",
+            steps,
+            steps,
+            "MiniMax-H3 synchronized video and audio ready",
+        );
+        publish(WorkerEvent::Done {
+            output_path: artifact.to_string_lossy().into_owned(),
+        });
+    });
+
+    json_resp(
+        StatusCode::ACCEPTED,
+        &json!({
+            "schema": "serenity.video_job.v1",
+            "video_id": video_id,
+            "prompt_id": video_id,
+            "model": "minimax_h3",
+            "runner": "minimax_h3_mojo_request",
+            "profile_runner": runner,
+            "profile": profile_id,
+            "backend": "mojo",
+            "quant": quant,
+            "attention_backend": attention,
+            "state": "queued",
+            "status_url": format!("/out/{video_id}/status.json"),
+            "result_url": format!("/out/{video_id}/result.json"),
+            "request_url": format!("/out/{video_id}/request.json"),
+        }),
+    )
 }
 
 fn start_ltx2_mojo_request(
@@ -8056,6 +9183,85 @@ mod tests {
     }
 
     #[test]
+    fn minimax_h3_request_is_exact_and_switchable() {
+        let mut request = json!({
+            "model": "minimax_h3",
+            "runner": "minimax_h3_mojo_request",
+            "prompt": MINIMAX_H3_TEST_PROMPT,
+            "width": MINIMAX_H3_WIDTH,
+            "height": MINIMAX_H3_HEIGHT,
+            "frames": MINIMAX_H3_FRAMES,
+            "fps": MINIMAX_H3_FPS,
+            "steps": MINIMAX_H3_STEPS,
+            "seed": 0,
+            "quant": "int8",
+            "attention_backend": "cudnn",
+            "include_audio": true,
+        });
+        validate_minimax_h3_request(&request).unwrap();
+        request["quant"] = json!("int8-fast");
+        validate_minimax_h3_request(&request).unwrap();
+        request["attention_backend"] = json!("sage-int8");
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("quality-gated with cU-DNN"));
+        request["quant"] = json!("bf16");
+        request["attention_backend"] = json!("sage-int8");
+        validate_minimax_h3_request(&request).unwrap();
+        for profile in &minimax_h3_request_profile_registry().profiles {
+            request["width"] = json!(profile.width);
+            request["height"] = json!(profile.height);
+            request["frames"] = json!(profile.frames);
+            request["fps"] = json!(profile.fps);
+            validate_minimax_h3_request(&request).unwrap();
+            assert_eq!(
+                minimax_h3_profile_from_request(&request).map(|entry| entry.id.as_str()),
+                Some(profile.id.as_str())
+            );
+        }
+        request["width"] = json!(1024);
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("unsupported MiniMax-H3 compiled profile"));
+        request["width"] = json!(MINIMAX_H3_WIDTH);
+        request["height"] = json!(MINIMAX_H3_HEIGHT);
+        request["frames"] = json!(MINIMAX_H3_FRAMES);
+        request["prompt"] = json!("a different prompt");
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("exact compiled 241-token test prompt"));
+        request["prompt"] = json!(MINIMAX_H3_TEST_PROMPT);
+        request["quant"] = json!("fp8");
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("'int8-fast', 'int8', or 'bf16'"));
+    }
+
+    #[test]
+    fn minimax_h3_runner_log_reports_cache_and_real_denoise_progress() {
+        let cache = minimax_h3_progress_from_log(
+            "  conditioning cache: HIT /tmp/cond.bin\n\
+             resident cache: loaded block 15 / 40\n",
+            20,
+        )
+        .unwrap();
+        assert_eq!(cache.0, "resident_cache");
+        assert_eq!(cache.1, 0);
+        assert_eq!(cache.2, 20);
+        assert!(cache.3.contains("15 of 40"));
+
+        let denoise = minimax_h3_progress_from_log(
+            "phase=denoise step= 7 total= 19 video_t= 0.5\n",
+            20,
+        )
+        .unwrap();
+        assert_eq!(denoise.0, "denoise");
+        assert_eq!(denoise.1, 7);
+        assert_eq!(denoise.2, 20);
+        assert!(denoise.3.contains("7 of 19"));
+    }
+
+    #[test]
     fn readiness_shape() {
         let d = readiness_doc();
         assert_eq!(d.get("schema").unwrap(), "serenity.video_status.v1");
@@ -8078,7 +9284,7 @@ mod tests {
         assert_eq!(d.get("backend").unwrap(), "mojo");
         assert_eq!(d.get("control_plane").unwrap(), "serenity-server");
         let runners = d.get("candidate_runners").unwrap().as_array().unwrap();
-        assert_eq!(runners.len(), 5);
+        assert_eq!(runners.len(), 6);
         assert_eq!(runners[1].get("model").unwrap(), "ltx2_t2v_av");
         assert_eq!(runners[1].get("target_frame_count").unwrap(), 121);
         let refhq = &runners[1]["modes"]["ltx2_refhq"];
@@ -8185,11 +9391,41 @@ mod tests {
             request_runner["automatic_conditioning"]["available"],
             ltx2_mojo_conditioning_missing().is_empty()
         );
-        assert_eq!(runners[2].get("model").unwrap(), "wan22_t2v");
+        let h3 = runners
+            .iter()
+            .find(|entry| entry.get("model").and_then(Value::as_str) == Some("minimax_h3_t2va"))
+            .unwrap();
+        assert_eq!(h3["supported_profiles"][0]["width"], MINIMAX_H3_WIDTH);
+        assert_eq!(h3["supported_profiles"][0]["height"], MINIMAX_H3_HEIGHT);
+        assert_eq!(h3["supported_profiles"][0]["frames"], MINIMAX_H3_FRAMES);
+        assert_eq!(h3["supported_profiles"].as_array().unwrap().len(), 3);
+        assert_eq!(h3["supported_profiles"][1]["width"], 832);
+        assert_eq!(h3["supported_profiles"][2]["width"], 960);
+        assert_eq!(h3["quant_modes"][0]["id"], "int8-fast");
+        assert_eq!(h3["quant_modes"][1]["id"], "int8");
+        assert_eq!(h3["quant_modes"][2]["id"], "bf16");
+        assert_eq!(h3["attention_backends"][0]["id"], "cudnn");
+        assert_eq!(h3["attention_backends"][1]["id"], "sage-int8");
+        assert_eq!(h3["attention_backends"][0]["accepted_quality_default"], true);
+        assert_eq!(h3["attention_backends"][1]["accepted_quality_default"], false);
+        let h3_ready = minimax_h3_request_profile_registry()
+            .profiles
+            .iter()
+            .any(|profile| {
+                ["int8-fast", "int8", "bf16"]
+                    .iter()
+                    .any(|quant| minimax_h3_profile_mode_ready(profile, quant))
+            });
+        assert_eq!(h3["available"], h3_ready);
+        let wan = runners
+            .iter()
+            .find(|entry| entry.get("model").and_then(Value::as_str) == Some("wan22_t2v"))
+            .unwrap();
+        assert_eq!(wan.get("model").unwrap(), "wan22_t2v");
         if !wan22_built {
-            assert_eq!(runners[2].get("status").unwrap(), "prerequisites_missing");
+            assert_eq!(wan.get("status").unwrap(), "prerequisites_missing");
             assert!(
-                !runners[2]
+                !wan
                     .get("missing")
                     .unwrap()
                     .as_array()
@@ -8197,70 +9433,79 @@ mod tests {
                     .is_empty()
             );
         }
-        assert_eq!(runners[2].get("target_frame_count").unwrap(), 121);
-        assert_eq!(runners[2].get("target_width").unwrap(), WAN22_WIDTH);
-        assert_eq!(runners[2].get("target_height").unwrap(), WAN22_HEIGHT);
+        assert_eq!(wan.get("target_frame_count").unwrap(), 121);
+        assert_eq!(wan.get("target_width").unwrap(), WAN22_WIDTH);
+        assert_eq!(wan.get("target_height").unwrap(), WAN22_HEIGHT);
         assert_eq!(
-            runners[2].pointer("/native_profiles/1/width").unwrap(),
+            wan.pointer("/native_profiles/1/width").unwrap(),
             WAN22_PORTRAIT_WIDTH
         );
         assert_eq!(
-            runners[2].pointer("/native_profiles/1/height").unwrap(),
+            wan.pointer("/native_profiles/1/height").unwrap(),
             WAN22_PORTRAIT_HEIGHT
         );
         assert_eq!(
-            runners[2].pointer("/native_profiles/2/width").unwrap(),
+            wan.pointer("/native_profiles/2/width").unwrap(),
             WAN22_I2V_LANDSCAPE_WIDTH
         );
         assert_eq!(
-            runners[2].pointer("/native_profiles/3/height").unwrap(),
+            wan.pointer("/native_profiles/3/height").unwrap(),
             WAN22_I2V_PORTRAIT_HEIGHT
         );
-        assert_eq!(runners[2].get("i2v_steps").unwrap(), WAN22_I2V_STEPS);
-        assert_eq!(runners[2].get("default_steps").unwrap(), 50);
-        assert_eq!(runners[2].get("default_guidance").unwrap(), 5.0);
+        assert_eq!(wan.get("i2v_steps").unwrap(), WAN22_I2V_STEPS);
+        assert_eq!(wan.get("default_steps").unwrap(), 50);
+        assert_eq!(wan.get("default_guidance").unwrap(), 5.0);
         assert_eq!(
-            runners[2].get("quant_modes").unwrap(),
+            wan.get("quant_modes").unwrap(),
             &json!(["bf16", "fp8"])
         );
-        assert_eq!(runners[2].pointer("/modes/lora/max_count").unwrap(), 1);
+        assert_eq!(wan.pointer("/modes/lora/max_count").unwrap(), 1);
         assert_eq!(
-            runners[2].pointer("/modes/lora/base_model").unwrap(),
+            wan.pointer("/modes/lora/base_model").unwrap(),
             "Wan-AI/Wan2.2-TI2V-5B"
         );
         assert_eq!(
-            runners[2].get("accepted_video_parity").unwrap(),
+            wan.get("accepted_video_parity").unwrap(),
             &(wan22_built && wan22_product_gate_passed())
         );
         // both arms report readiness under arms_ready, matching disk state
         let arms = d.get("arms_ready").unwrap();
         assert_eq!(arms.get("ltx2_t2v_av").unwrap(), ltx2_ready);
+        assert_eq!(arms.get("minimax_h3_t2va").unwrap(), h3_ready);
         assert_eq!(arms.get("wan22_t2v").unwrap(), wan22_built);
-        assert_eq!(runners[3].get("model").unwrap(), "bernini_r_t2v");
-        assert_eq!(runners[3].get("target_width").unwrap(), BERNINI_WIDTH);
-        assert_eq!(runners[3].get("target_height").unwrap(), BERNINI_HEIGHT);
+        let bernini = runners
+            .iter()
+            .find(|entry| entry.get("model").and_then(Value::as_str) == Some("bernini_r_t2v"))
+            .unwrap();
+        assert_eq!(bernini.get("model").unwrap(), "bernini_r_t2v");
+        assert_eq!(bernini.get("target_width").unwrap(), BERNINI_WIDTH);
+        assert_eq!(bernini.get("target_height").unwrap(), BERNINI_HEIGHT);
         assert_eq!(
-            runners[3].get("target_frame_count").unwrap(),
+            bernini.get("target_frame_count").unwrap(),
             BERNINI_FRAMES
         );
-        assert_eq!(runners[3].get("target_fps").unwrap(), BERNINI_FPS);
+        assert_eq!(bernini.get("target_fps").unwrap(), BERNINI_FPS);
         assert_eq!(
-            runners[3].get("default_steps").unwrap(),
+            bernini.get("default_steps").unwrap(),
             BERNINI_DEFAULT_STEPS
         );
-        assert_eq!(runners[3].get("quant_modes").unwrap(), &json!(["fp8"]));
+        assert_eq!(bernini.get("quant_modes").unwrap(), &json!(["fp8"]));
         assert_eq!(
             arms.get("bernini_r_t2v").unwrap(),
             &(bernini_built && bernini_product_gate_passed())
         );
-        assert_eq!(runners[4].get("model").unwrap(), "scail2_animation");
-        assert_eq!(runners[4].get("target_width").unwrap(), SCAIL2_WIDTH);
-        assert_eq!(runners[4].get("target_height").unwrap(), SCAIL2_HEIGHT);
-        assert_eq!(runners[4].get("target_frame_count").unwrap(), SCAIL2_FRAMES);
-        assert_eq!(runners[4].get("target_fps").unwrap(), SCAIL2_FPS);
-        assert_eq!(runners[4].get("default_steps").unwrap(), SCAIL2_STEPS);
-        assert_eq!(runners[4].get("default_guidance").unwrap(), SCAIL2_GUIDANCE);
-        assert_eq!(runners[4].get("quant_modes").unwrap(), &json!(["fp8"]));
+        let scail2 = runners
+            .iter()
+            .find(|entry| entry.get("model").and_then(Value::as_str) == Some("scail2_animation"))
+            .unwrap();
+        assert_eq!(scail2.get("model").unwrap(), "scail2_animation");
+        assert_eq!(scail2.get("target_width").unwrap(), SCAIL2_WIDTH);
+        assert_eq!(scail2.get("target_height").unwrap(), SCAIL2_HEIGHT);
+        assert_eq!(scail2.get("target_frame_count").unwrap(), SCAIL2_FRAMES);
+        assert_eq!(scail2.get("target_fps").unwrap(), SCAIL2_FPS);
+        assert_eq!(scail2.get("default_steps").unwrap(), SCAIL2_STEPS);
+        assert_eq!(scail2.get("default_guidance").unwrap(), SCAIL2_GUIDANCE);
+        assert_eq!(scail2.get("quant_modes").unwrap(), &json!(["fp8"]));
         assert_eq!(
             arms.get("scail2_animation").unwrap(),
             &(scail2_built && scail2_product_gate_passed())

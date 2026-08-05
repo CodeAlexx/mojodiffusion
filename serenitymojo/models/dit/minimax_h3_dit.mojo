@@ -66,19 +66,28 @@ from std.memory import ArcPointer
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.vec_rms_norm import vec_rms_norm
-from serenitymojo.ops.vec_swiglu import vec_swiglu
+from serenitymojo.ops.activations import swiglu_packed_value_gate
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.elementwise import modulate, residual_gate
-from serenitymojo.ops.rope import rope_halfsplit_full
+from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
 from serenitymojo.ops.attention_flash import sdpa_flash_infer_fwd
+from serenitymojo.ops.sage_attention_int8 import sage_attention_int8_fwd
+from serenitymojo.models.dit.minimax_h3_int8_linear import (
+    minimax_h3_int8_linear,
+)
 from serenitymojo.ops.tensor_algebra import (
     gather_rows,
     slice,
     reshape,
+    reshape_owned,
     concat,
     add,
     full_device,
 )
+
+
+comptime MINIMAX_H3_ATTN_CUDNN = 0
+comptime MINIMAX_H3_ATTN_SAGE_INT8 = 1
 
 
 @fieldwise_init
@@ -426,7 +435,8 @@ def _minimax_h3_expand_rope_per_head(
 
 
 def _minimax_h3_apply_partial_rope(
-    x: Tensor, cos_exp: Tensor, sin_exp: Tensor, rotary_dim: Int, ctx: DeviceContext
+    x: Tensor, cos: Tensor, sin: Tensor, heads: Int,
+    rotary_dim: Int, ctx: DeviceContext
 ) raises -> Tensor:
     """Rotate only the first `rotary_dim` channels of a `[1,S,heads,head_dim]`
     head tensor, pass the rest through untouched — the PARTIAL rope this
@@ -441,8 +451,39 @@ def _minimax_h3_apply_partial_rope(
     var head_dim = sh[len(sh) - 1]
     var x_rot = slice(x, 3, 0, rotary_dim, ctx)
     var x_pass = slice(x, 3, rotary_dim, head_dim - rotary_dim, ctx)
-    var rotated = rope_halfsplit_full(x_rot, cos_exp, sin_exp, ctx)
+    var rotated = rope_halfsplit_full_head_broadcast(
+        x_rot, cos, sin, heads, ctx
+    )
     return concat(3, ctx, rotated, x_pass)
+
+
+def _minimax_h3_block_linear(
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    name: String,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Dispatch a block projection from its explicit stored dtype.
+
+    Ordinary streamed/groupwise-resident weights are BF16. The opt-in fast
+    resident store supplies an I8 tensor at the canonical key plus a sibling
+    F32 `<key>.scale` tensor; no dtype inference silently changes behavior.
+    """
+    ref weight = weights[name][]
+    if weight.dtype() == STDtype.BF16:
+        return linear(x, weight, None, ctx)
+    if weight.dtype() == STDtype.I8:
+        var scale_name = name + String(".scale")
+        if scale_name not in weights:
+            raise Error(
+                String("MiniMax-H3 INT8 block weight is missing scale: ")
+                + scale_name
+            )
+        return minimax_h3_int8_linear(x, weight, weights[scale_name][], ctx)
+    raise Error(
+        String("MiniMax-H3 block projection has unsupported dtype for ")
+        + name + String(": ") + weight.dtype().name()
+    )
 
 
 def minimax_h3_block_forward[
@@ -458,6 +499,7 @@ def minimax_h3_block_forward[
     sin: Tensor,
     rotary_dim: Int,
     ctx: DeviceContext,
+    attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
 ) raises -> Tensor:
     """One `MiniMaxH3TransformerBlock`. Mirrors `models/minimax_h3/
     block_forward.mojo::_transformer_block` op-for-op (see that file for the
@@ -516,6 +558,9 @@ def minimax_h3_block_forward[
                    build_minimax_h3_rope_tables`), shared by every block.
     rotary_dim:    rotated channel count (96 at the released geometry);
                    `head_dim - rotary_dim` channels pass through untouched.
+    attention_backend: runtime selector: cuDNN (default) or the opt-in local
+                   Sage INT8-QK backend. Unknown values and unsupported Sage
+                   geometry fail loudly; there is no silent fallback.
     """
     minimax_h3_require_transformed_weights(weights, layer)
 
@@ -551,24 +596,26 @@ def minimax_h3_block_forward[
     # qkv_proj is already de-interleaved into [q_all;k_all;v_all] thirds by
     # `minimax_h3_load_block_device` — no gather here (see this function's
     # weight-contract note above).
-    var qkv_out = linear(
-        attn_in, weights[prefix + "attn.qkv_proj.weight"][], None, ctx
+    var qkv_out = _minimax_h3_block_linear(
+        attn_in, weights, prefix + "attn.qkv_proj.weight", ctx
     )                                                                # [1, S, 3*inner]
 
     var q = slice(qkv_out, 2, 0 * inner, inner, ctx)
     var k = slice(qkv_out, 2, 1 * inner, inner, ctx)
     var v = slice(qkv_out, 2, 2 * inner, inner, ctx)
-    var q4 = reshape(q, [1, S, heads, head_dim], ctx)
-    var k4 = reshape(k, [1, S, heads, head_dim], ctx)
-    var v4 = reshape(v, [1, S, heads, head_dim], ctx)
+    var q4 = reshape_owned(q^, [1, S, heads, head_dim])
+    var k4 = reshape_owned(k^, [1, S, heads, head_dim])
+    var v4 = reshape_owned(v^, [1, S, heads, head_dim])
 
     q4 = vec_rms_norm(q4, weights[prefix + "attn.q_norm.weight"][], config.qk_norm_eps, ctx)
     k4 = vec_rms_norm(k4, weights[prefix + "attn.k_norm.weight"][], config.qk_norm_eps, ctx)
 
-    var cos_exp = _minimax_h3_expand_rope_per_head(cos, S, heads, rotary_dim, ctx)
-    var sin_exp = _minimax_h3_expand_rope_per_head(sin, S, heads, rotary_dim, ctx)
-    q4 = _minimax_h3_apply_partial_rope(q4, cos_exp, sin_exp, rotary_dim, ctx)
-    k4 = _minimax_h3_apply_partial_rope(k4, cos_exp, sin_exp, rotary_dim, ctx)
+    q4 = _minimax_h3_apply_partial_rope(
+        q4, cos, sin, heads, rotary_dim, ctx
+    )
+    k4 = _minimax_h3_apply_partial_rope(
+        k4, cos, sin, heads, rotary_dim, ctx
+    )
 
     var scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
     # Dh=128 on sm_86 fails to instantiate the SDK's `flash_attention` MMA
@@ -582,11 +629,30 @@ def minimax_h3_block_forward[
     # different geometry (e.g. a small test fixture) gets a matching SDPA
     # kernel instead of an unconditional guard raise. The check above
     # ensures `config` was built for exactly this instantiation.
-    var attn = sdpa_flash_infer_fwd[1, S, Heads, HeadDim](
-        q4, k4, v4, scale, ctx
-    )                                                                # [1, S, heads, head_dim] bf16
-    var merged = reshape(attn, [1, S, inner], ctx)
-    var attn_out = linear(merged, weights[prefix + "attn.out_proj.weight"][], None, ctx)
+    var attn: Tensor
+    if attention_backend == MINIMAX_H3_ATTN_CUDNN:
+        attn = sdpa_flash_infer_fwd[1, S, Heads, HeadDim](
+            q4, k4, v4, scale, ctx
+        )
+    elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+        comptime if HeadDim == 128:
+            attn = sage_attention_int8_fwd[1, S, Heads, HeadDim](
+                q4, k4, v4, scale, ctx
+            )
+        else:
+            raise Error(
+                "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+            )
+    else:
+        raise Error(
+            String("minimax_h3_block_forward: unknown attention backend ")
+            + String(attention_backend)
+        )
+                                                                        # [1, S, heads, head_dim] bf16
+    var merged = reshape_owned(attn^, [1, S, inner])
+    var attn_out = _minimax_h3_block_linear(
+        merged, weights, prefix + "attn.out_proj.weight", ctx
+    )
     var x1 = residual_gate(x, gate_msa, attn_out, ctx)
 
     # ── MLP branch ──
@@ -594,10 +660,12 @@ def minimax_h3_block_forward[
     var mlp_in = modulate(n2, scale_mlp, shift_mlp, ctx)
     # fc1 is already swapped to [value;gate] by `minimax_h3_load_block_device`
     # (matches the oracle's own swiglu_ff convention: value first, gate second).
-    var fc1_out = linear(mlp_in, weights[prefix + "mlp.fc1.weight"][], None, ctx)  # [1,S,2*ffn], [value;gate]
-    var value_act = slice(fc1_out, 2, 0, ffn, ctx)
-    var gate_act = slice(fc1_out, 2, ffn, ffn, ctx)
-    var act = vec_swiglu(gate_act, value_act, ctx)                   # silu(gate)*value
-    var ff_out = linear(act, weights[prefix + "mlp.fc2.weight"][], None, ctx)
+    var fc1_out = _minimax_h3_block_linear(
+        mlp_in, weights, prefix + "mlp.fc1.weight", ctx
+    )  # [1,S,2*ffn], [value;gate]
+    var act = swiglu_packed_value_gate(fc1_out, ctx)                # silu(gate)*value
+    var ff_out = _minimax_h3_block_linear(
+        act, weights, prefix + "mlp.fc2.weight", ctx
+    )
     var x2 = residual_gate(x1, gate_mlp, ff_out, ctx)
     return x2^

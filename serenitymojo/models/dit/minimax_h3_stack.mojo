@@ -65,12 +65,15 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     MINIMAX_H3_HEADS,
     MINIMAX_H3_HEAD_DIM,
+    MINIMAX_H3_ATTN_CUDNN,
     minimax_h3_block_forward,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import minimax_h3_load_block_device
 from serenitymojo.models.dit.minimax_h3_fp8_resident import (
+    MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3ResidentFp8,
     minimax_h3_resident_block_weights,
+    minimax_h3_resident_block_weights_w8a8,
 )
 from serenitymojo.models.dit.minimax_h3_modcache import MiniMaxH3ModCache
 
@@ -90,6 +93,7 @@ def minimax_h3_run_stack[
     num_layers: Int = -1,
     start_layer: Int = 0,
     resident: Optional[MiniMaxH3ResidentFp8] = Optional[MiniMaxH3ResidentFp8](None),
+    attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
 ) raises -> Tensor:
     """Stream and run `num_layers` denoiser blocks starting at `start_layer`
     (defaults: `start_layer=0`, `num_layers=config.num_layers`, i.e. all 50
@@ -123,14 +127,14 @@ def minimax_h3_run_stack[
                    given sequence position reads is a property of the packed
                    sequence, not the layer).
     cos/sin/rotary_dim: rope table, shared by every block unchanged.
-    resident:      OPTIONAL fp8-resident store (models/dit/
+    resident:      OPTIONAL one-byte quantized-resident store (models/dit/
                    minimax_h3_fp8_resident.mojo). When present, each block's
-                   weights come from an on-device E4M3 dequant instead of a
-                   per-step disk stream — same Dict contract, same
-                   block_forward, ~0.99+ cos vs the streamed base (the
-                   documented krea2-precedent tradeoff). When absent
-                   (default), this function is byte-for-byte the streaming
-                   loop it always was.
+                   weights come from an on-device INT8 or E4M3 dequant instead
+                   of a per-step disk stream — same Dict contract and same
+                   block_forward. When absent (default), weights stream as
+                   BF16 exactly as before.
+    attention_backend: runtime attention selector forwarded unchanged to
+                   every block; cuDNN by default, local Sage INT8-QK opt-in.
     """
     var n = num_layers
     if n < 0:
@@ -158,9 +162,14 @@ def minimax_h3_run_stack[
         var weights: Dict[String, ArcPointer[Tensor]]
         try:
             if resident:
-                weights = minimax_h3_resident_block_weights(
-                    resident.value(), layer, config, ctx
-                )
+                if resident.value().scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+                    weights = minimax_h3_resident_block_weights_w8a8(
+                        resident.value(), layer, config, ctx
+                    )
+                else:
+                    weights = minimax_h3_resident_block_weights(
+                        resident.value(), layer, config, ctx
+                    )
             else:
                 weights = minimax_h3_load_block_device(st, layer, config, ctx)
         except e:
@@ -170,7 +179,7 @@ def minimax_h3_run_stack[
             )
         h = minimax_h3_block_forward[S, Heads, HeadDim](
             h, weights, layer, config, modcache.block_mod[i][],
-            adaln_indices, cos, sin, rotary_dim, ctx,
+            adaln_indices, cos, sin, rotary_dim, ctx, attention_backend,
         )
         # `weights` (this block's ~1.2-1.3 GiB) drops HERE, at loop-scope
         # exit, before the next iteration's load — the entire memory point

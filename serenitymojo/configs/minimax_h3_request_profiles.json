@@ -1,0 +1,66 @@
+{
+  "schema": "serenity.minimax_h3.request_profiles.v1",
+  "default_profile": "minimax-h3-512x320x175-24fps",
+  "profiles": [
+    {
+      "id": "minimax-h3-512x320x175-24fps",
+      "label": "512x320 - 175 frames - 7.29s",
+      "width": 512,
+      "height": 320,
+      "frames": 175,
+      "fps": 24,
+      "steps": 20,
+      "text_tokens": 241,
+      "sequence_tokens": 9145,
+      "duration": 7.291667,
+      "fast_resident_blocks": 48,
+      "quality_resident_blocks": 43,
+      "gate": "base",
+      "runners": {
+        "int8-fast": "output/bin/minimax_h3_t2va_512x320x175_int8_fast",
+        "int8": "output/bin/minimax_h3_t2va_512x320x175_int8",
+        "bf16": "output/bin/minimax_h3_t2va_512x320x175_bf16"
+      }
+    },
+    {
+      "id": "minimax-h3-832x480x73-24fps",
+      "label": "832x480 - 73 frames - 3.04s",
+      "width": 832,
+      "height": 480,
+      "frames": 73,
+      "fps": 24,
+      "steps": 20,
+      "text_tokens": 241,
+      "sequence_tokens": 9065,
+      "duration": 3.041667,
+      "fast_resident_blocks": 46,
+      "quality_resident_blocks": 41,
+      "gate": "resolution",
+      "runners": {
+        "int8-fast": "output/bin/minimax_h3_t2va_832x480x73_int8_fast",
+        "int8": "output/bin/minimax_h3_t2va_832x480x73_int8",
+        "bf16": "output/bin/minimax_h3_t2va_832x480x73_bf16"
+      }
+    },
+    {
+      "id": "minimax-h3-960x544x56-24fps",
+      "label": "960x544 - 56 frames - 2.33s",
+      "width": 960,
+      "height": 544,
+      "frames": 56,
+      "fps": 24,
+      "steps": 20,
+      "text_tokens": 241,
+      "sequence_tokens": 9097,
+      "duration": 2.333333,
+      "fast_resident_blocks": 46,
+      "quality_resident_blocks": 41,
+      "gate": "resolution",
+      "runners": {
+        "int8-fast": "output/bin/minimax_h3_t2va_960x544x56_int8_fast",
+        "int8": "output/bin/minimax_h3_t2va_960x544x56_int8",
+        "bf16": "output/bin/minimax_h3_t2va_960x544x56_bf16"
+      }
+    }
+  ]
+}

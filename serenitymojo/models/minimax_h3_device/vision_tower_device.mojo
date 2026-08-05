@@ -70,11 +70,11 @@
 # behind), so segment lengths are dispatched through `_vis_sdpa_segment`
 # below. The i2va keyframe path — one still image, one segment — is
 # instantiated at S=2304 (the 768x768 canvas, the smallest canvas
-# `resolve_canvas_size` can emit and the gated geometry). Other lengths raise
-# a NAMED error listing the exact instantiation to add; a multi-segment
-# (video / multi-reference) request likewise raises rather than silently
-# attending across frame boundaries. The host tower remains the fallback for
-# those shapes until their lengths are added and gated.
+# `resolve_canvas_size` can emit and the gated geometry). Ref2VA's released
+# 768x1344 reference canvas is one temporal block at S=4032 and has its own
+# explicit instantiation. Other lengths raise a NAMED error listing the exact
+# instantiation to add; a request with more than the released FL2VA pair
+# likewise raises rather than silently attending across frame boundaries.
 #
 # Gate: models/minimax_h3_device/parity/minimax_h3_vision_tower_device_parity.mojo
 # against scripts/minimax_h3_vision_tower_device_oracle.py (torch bf16, GPU,
@@ -96,7 +96,7 @@ from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.activations import gelu, gelu_exact
 from serenitymojo.ops.rope import rope_halfsplit
-from serenitymojo.ops.tensor_algebra import add, reshape, reshape_owned
+from serenitymojo.ops.tensor_algebra import add, concat, reshape, reshape_owned, slice
 
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
     H3_VIS_DEPTH,
@@ -126,6 +126,7 @@ from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
 # The one attention length instantiated so far: 48x48 patches, the 768x768
 # canvas (the smallest `resolve_canvas_size` can emit; square keyframes).
 comptime H3_VIS_SDPA_S_2304 = 2304
+comptime H3_VIS_SDPA_S_4032 = 4032
 
 comptime _ROT_FREQS = H3_VIS_ROTARY_DIM // 2   # 18 inv_freq entries
 
@@ -358,13 +359,16 @@ def _vis_sdpa_segment(
         return sdpa_nomask[1, H3_VIS_SDPA_S_2304, H3_VIS_HEADS, H3_VIS_HEAD_DIM](
             q, k, v, scale, ctx
         )
+    if seg == H3_VIS_SDPA_S_4032:
+        return sdpa_nomask[1, H3_VIS_SDPA_S_4032, H3_VIS_HEADS, H3_VIS_HEAD_DIM](
+            q, k, v, scale, ctx
+        )
     raise Error(
         String("minimax_h3 vision device: attention segment length ")
         + String(seg)
         + " has no comptime sdpa instantiation — add it to _vis_sdpa_segment"
         " (vision_tower_device.mojo) and re-run the device parity gate at that"
-        " geometry. The host tower (minimax_h3_qwen3vl_vision.mojo) handles"
-        " any segment length and remains the fallback."
+        " geometry. Product inference never falls back to the host tower."
     )
 
 
@@ -447,19 +451,44 @@ def _vis_device_block(
     k = rope_halfsplit(k, cos_apply, sin_apply, ctx)
 
     # BSHD for full non-causal MHA, ONE SEGMENT PER FRAME (host header trap 2).
+    # Released I2VA/Ref2VA profiles have one segment; FL2VA has two square
+    # keyframe segments. Slice each segment before SDPA and concatenate in the
+    # original row order, exactly matching the host tower's cu_seqlens loop.
     q = reshape(q, [1, seq, H3_VIS_HEADS, H3_VIS_HEAD_DIM], ctx)
     k = reshape(k, [1, seq, H3_VIS_HEADS, H3_VIS_HEAD_DIM], ctx)
     v = reshape(v, [1, seq, H3_VIS_HEADS, H3_VIS_HEAD_DIM], ctx)
-    if len(cu_seqlens) != 2:
+    var attn: Tensor
+    if len(cu_seqlens) == 2:
+        var seg = cu_seqlens[1] - cu_seqlens[0]
+        if cu_seqlens[0] != 0 or cu_seqlens[1] != seq:
+            raise Error("minimax_h3 vision device: invalid single-segment boundaries")
+        attn = _vis_sdpa_segment(q, k, v, seg, scale, ctx)
+    elif len(cu_seqlens) == 3:
+        var start0 = cu_seqlens[0]
+        var start1 = cu_seqlens[1]
+        var end1 = cu_seqlens[2]
+        if start0 != 0 or start1 <= 0 or end1 != seq or start1 >= end1:
+            raise Error("minimax_h3 vision device: invalid two-segment boundaries")
+        var seg0 = start1
+        var seg1 = end1 - start1
+        var q0 = slice(q, 1, 0, seg0, ctx)
+        var k0 = slice(k, 1, 0, seg0, ctx)
+        var v0 = slice(v, 1, 0, seg0, ctx)
+        var q1 = slice(q, 1, start1, seg1, ctx)
+        var k1 = slice(k, 1, start1, seg1, ctx)
+        var v1 = slice(v, 1, start1, seg1, ctx)
+        var attn0 = _vis_sdpa_segment(q0, k0, v0, seg0, scale, ctx)
+        var attn1 = _vis_sdpa_segment(q1, k1, v1, seg1, scale, ctx)
+        attn = concat(1, ctx, attn0, attn1)
+    else:
         raise Error(
             String("minimax_h3 vision device: ")
             + String(len(cu_seqlens) - 1)
             + " attention segments (a multi-frame / multi-reference request)."
-            " Per-frame segmented attention is not on device yet — the host"
-            " tower handles it; wire that request through"
-            " minimax_h3_vision_forward instead."
+            " The GPU-only product path currently accepts one segment or the"
+            " released two-keyframe FL2VA pair; it never falls back to host"
+            " inference."
         )
-    var attn = _vis_sdpa_segment(q, k, v, seq, scale, ctx)
     attn = reshape(attn, [seq, H3_VIS_HIDDEN], ctx)
 
     var attn_out = linear_bias(

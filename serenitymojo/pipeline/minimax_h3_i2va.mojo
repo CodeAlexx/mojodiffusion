@@ -133,9 +133,23 @@ from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_qkv_device,
     minimax_h3_load_fc1_device,
 )
+from serenitymojo.models.dit.minimax_h3_fp8_resident import (
+    MINIMAX_H3_RESIDENT_INT8,
+    MINIMAX_H3_RESIDENT_INT8_W8A8,
+    MiniMaxH3ResidentFp8,
+    minimax_h3_resident_block_weights,
+    minimax_h3_resident_block_weights_w8a8,
+)
 from serenitymojo.models.dit.minimax_h3_modcache import (
+    MiniMaxH3ModCache,
     minimax_h3_check_modcache_weights,
     minimax_h3_build_modulation_cache,
+)
+from serenitymojo.models.dit.minimax_h3_runtime_cache import (
+    load_minimax_h3_modcache,
+    load_minimax_h3_resident_cache,
+    reload_minimax_h3_resident_w8a8_block,
+    save_minimax_h3_modcache,
 )
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 from serenitymojo.models.dit.minimax_h3_frontend import (
@@ -147,8 +161,8 @@ from serenitymojo.models.dit.minimax_h3_sampling import (
     MiniMaxH3DualSchedule,
     minimax_h3_build_sampling_geometry,
 )
-from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
-    minimax_h3_encode_conditioning_streamed,
+from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_int8 import (
+    minimax_h3_encode_conditioning_int8_streamed,
 )
 from serenitymojo.models.text_encoder.minimax_h3_conditioning import (
     MiniMaxH3ConditioningOutput,
@@ -195,8 +209,6 @@ from serenitymojo.pipeline.minimax_h3_media_in import (
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
     MiniMaxH3VisionGrid,
     MiniMaxH3VisionOutput,
-    minimax_h3_vision_forward,
-    minimax_h3_vision_load_weights,
 )
 from serenitymojo.models.minimax_h3_device.vision_tower_device import (
     minimax_h3_vision_device_weights,
@@ -236,11 +248,20 @@ from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
 # ── Checkpoint paths (same layout every H3 module defaults to) ──────────────
 comptime H3_ROOT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA"
 comptime TRANSFORMER_DIR = H3_ROOT + "/transformer"
+comptime TRANSFORMER_INDEX = TRANSFORMER_DIR + "/model.safetensors.index.json"
 comptime TEXT_ENCODER_DIR = H3_ROOT + "/text_encoder"
 comptime PROCESSOR_DIR = H3_ROOT + "/processor"
 comptime AUDIO_VAE_PATH = H3_ROOT + "/audio_vae/model.safetensors"
 comptime VIDEO_VAE_DIR = H3_ROOT + "/video_vae/source"
 comptime AUDIO_SAMPLE_RATE = 32000
+comptime RUNTIME_CACHE_DIR = H3_ROOT + "/serenity_runtime_cache_v1"
+comptime GROUPWISE_RUNTIME_CACHE = (
+    RUNTIME_CACHE_DIR
+    + "/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors"
+)
+comptime W8A8_RUNTIME_CACHE = (
+    RUNTIME_CACHE_DIR + "/resident_w8a8_row_blocks_50.safetensors"
+)
 
 # ── Geometry, comptime (rebuild to change) ──────────────────────────────────
 # Unlike t2va these are CHECKED against what the keyframe implies, not merely
@@ -285,6 +306,12 @@ comptime DEFAULT_SEED = 0
 
 # See this file's header, "SEAM: THE CONDITIONER CANNOT SEE THE PICTURE YET".
 comptime NO_VISION = get_defined_int["H3_KF_NO_VISION", 0]()
+
+# Reuse the FL2VA transformer's existing resident INT8 caches; never build or
+# write another weight cache. Product binaries select a conservative prefix
+# and stream the tail (BF16 for quality, one W8A8 block at a time for fast).
+comptime DIT_INT8_RESIDENT = get_defined_int["H3_FP8_RESIDENT", 0]()
+comptime DIT_RESIDENT_BLOCKS = get_defined_int["H3_RESIDENT_BLOCKS", 30]()
 
 comptime AUDIO_LATENT_DIM = 2048
 comptime AUDIO_DECODER_DIM = 1024
@@ -493,6 +520,46 @@ def _kf_global_timestep_row(
     for i in range(num_condition_rows):
         out[video_indices[i]] = 3 * step + 2
     return out^
+
+
+def _kf_get_modcache_cached(
+    shards: ShardedSafeTensors,
+    temb: Tensor,
+    config: MiniMaxH3DiTConfig,
+    steps: Int,
+    distinct_timesteps: Int,
+    cache_path: String,
+    ctx: DeviceContext,
+) raises -> MiniMaxH3ModCache:
+    """Load or build the geometry-independent three-timestep schedule cache.
+
+    I2VA, L2VA, and FL2VA share the same video/audio/condition timestep
+    schedule.  The cache is about 527 MiB for the 20-step product profile and
+    replaces a measured two-minute streamed AdaLN pass on every generation.
+    It contains no prompt, image, latent, or encoder state.
+    """
+    try:
+        var cached = load_minimax_h3_modcache(
+            cache_path,
+            String(TRANSFORMER_INDEX),
+            config,
+            steps,
+            distinct_timesteps,
+            ctx,
+        )
+        print("  modcache: HIT", cache_path)
+        return cached^
+    except e:
+        print("  modcache: MISS", String(e))
+    var built = minimax_h3_build_modulation_cache(shards, temb, config, ctx)
+    try:
+        save_minimax_h3_modcache(
+            built, String(TRANSFORMER_INDEX), cache_path, steps, ctx
+        )
+        print("  modcache: SAVED", cache_path)
+    except e:
+        print("  modcache: SAVE FAILED", String(e))
+    return built^
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -776,6 +843,8 @@ def _usage():
     )
     print("  <prompt> is the BODY text; the §2.1 alignment instruction is prepended for you")
     print("  optional flag: --attention-backend=cudnn|sage-int8 (default cudnn)")
+    print("  optional flag: --resident-backend=groupwise|w8a8 (INT8 builds)")
+    print("  optional flag: --defer-video-decode (fresh-process GPU decode)")
 
 
 def main() raises:
@@ -783,6 +852,9 @@ def main() raises:
     var args = List[String]()
     var attention_backend = MINIMAX_H3_ATTN_CUDNN
     var attention_backend_name = String("cudnn")
+    var resident_scheme = MINIMAX_H3_RESIDENT_INT8
+    var resident_backend_name = String("groupwise")
+    var defer_video_decode = False
     for i in range(len(raw_args)):
         var arg = String(raw_args[i])
         if arg == String("--attention-backend=sage-int8"):
@@ -798,6 +870,22 @@ def main() raises:
                 String("unknown attention backend flag: ") + arg
                 + String(" (expected cudnn or sage-int8)")
             )
+        if arg == String("--resident-backend=w8a8"):
+            resident_scheme = MINIMAX_H3_RESIDENT_INT8_W8A8
+            resident_backend_name = String("w8a8")
+            continue
+        if arg == String("--resident-backend=groupwise"):
+            resident_scheme = MINIMAX_H3_RESIDENT_INT8
+            resident_backend_name = String("groupwise")
+            continue
+        if arg.startswith("--resident-backend="):
+            raise Error(
+                String("unknown resident backend flag: ") + arg
+                + String(" (expected groupwise or w8a8)")
+            )
+        if arg == String("--defer-video-decode"):
+            defer_video_decode = True
+            continue
         args.append(arg)
     if len(args) < 5:
         _usage()
@@ -865,6 +953,13 @@ def main() raises:
     )
     print("  steps=", steps, " seed=", seed, " max_blocks=", max_blocks)
     print("  attention_backend=", attention_backend_name)
+    comptime if DIT_INT8_RESIDENT != 0:
+        print(
+            "  weight_storage=resident-int8-", resident_backend_name,
+            " prefix_blocks=", DIT_RESIDENT_BLOCKS,
+        )
+    else:
+        print("  weight_storage=streamed-bf16")
 
     # ── PREFLIGHT, all before DeviceContext ────────────────────────────────
     var t_pre0 = perf_counter_ns()
@@ -1000,30 +1095,33 @@ def main() raises:
         print("  preprocessed", len(keyframes), "keyframe(s) ->",
               len(patch_rows) // 1536, "patch rows")
 
-        # DEVICE tower when the geometry matches its gated comptime
-        # instantiation (ONE grid, 48x48 = 2304 patches — the square-768
-        # canvas every current i2va run uses; gate: models/minimax_h3_device/
-        # parity/, 12/12 vs GPU torch, 0.22 s vs 1290 s host). Any other
-        # geometry falls back to the gated HOST tower rather than raising —
-        # slow is better than dead, and the device module raises loudly for
-        # uninstantiated segment lengths by design.
-        var use_device_tower = (
-            len(vision_grids) == 1
-            and vision_grids[0].t == 1
-            and vision_grids[0].h == 48
-            and vision_grids[0].w == 48
-        )
-        var vision: MiniMaxH3VisionOutput
-        if use_device_tower:
-            var vis_dev = minimax_h3_vision_device_weights(String(TEXT_ENCODER_DIR), ctx)
-            vision = minimax_h3_vision_forward_device(vis_dev, patch_rows, vision_grids, ctx)
-            print("  vision tower: DEVICE path (2304-patch gated geometry)")
-        else:
-            var vision_weights = minimax_h3_vision_load_weights(String(TEXT_ENCODER_DIR))
-            vision = minimax_h3_vision_forward(
-                vision_weights, patch_rows, vision_grids
+        # DEVICE tower only at the accepted 768-square keyframe geometry:
+        # one 48x48 segment for I2VA/L2VA or two independently-attended 48x48
+        # segments for FL2VA. Product inference is GPU-only: a different
+        # geometry fails here instead of silently taking the host tower.
+        var use_device_tower = len(vision_grids) == KEYFRAMES
+        for gi in range(len(vision_grids)):
+            if (
+                vision_grids[gi].t != 1
+                or vision_grids[gi].h != 48
+                or vision_grids[gi].w != 48
+            ):
+                use_device_tower = False
+        if not use_device_tower:
+            raise Error(
+                String("minimax_h3_i2va: GPU-only product path requires ")
+                + String(KEYFRAMES)
+                + " 768x768 keyframe canvas(es), each vision grid 1x48x48;"
+                " this binary will not fall back to CPU/host vision inference"
             )
-            print("  vision tower: HOST path (geometry outside the device gate)")
+        var vis_dev = minimax_h3_vision_device_weights(String(TEXT_ENCODER_DIR), ctx)
+        var vision = minimax_h3_vision_forward_device(
+            vis_dev, patch_rows, vision_grids, ctx
+        )
+        print(
+            "  vision tower: DEVICE path (", len(vision_grids),
+            " independently attended 2304-patch segment(s))",
+        )
         if vision.num_tokens != len(presentation.pad_positions):
             raise Error(
                 String("minimax_h3_i2va: the tower returned ")
@@ -1100,13 +1198,19 @@ def main() raises:
             + String(len(condition_rows)) + " values, expected "
             + String(NUM_CONDITION_ROWS * patch_dim)
         )
-    var all_video = List[Float32](capacity=len(condition_rows) + len(video_noise_rows))
-    for i in range(len(condition_rows)):
-        all_video.append(condition_rows[i])
-    for i in range(len(video_noise_rows)):
-        all_video.append(video_noise_rows[i])
-    var video_shape: List[Int] = [NUM_VIDEO_ROWS, patch_dim]
-    var video_state = Tensor.from_host(all_video, video_shape^, STDtype.F32, ctx)
+    # Keep the pinned condition prefix and the evolving target in independent
+    # tensors. Ref2VA already uses this ownership law: concatenate only for
+    # frontend input, then Euler-step only the target. It also removed about
+    # 0.9 GiB from the measured conditioned peak by avoiding full-state slice
+    # and concat temporaries at the schedule boundary.
+    var condition_shape: List[Int] = [NUM_CONDITION_ROWS, patch_dim]
+    var condition_state = Tensor.from_host(
+        condition_rows, condition_shape^, STDtype.F32, ctx
+    )
+    var video_shape: List[Int] = [NUM_TARGET_VIDEO_ROWS, patch_dim]
+    var video_state = Tensor.from_host(
+        video_noise_rows, video_shape^, STDtype.F32, ctx
+    )
     var audio_shape: List[Int] = [NUM_AUDIO_ROWS, config.audio_latents_dim]
     var audio_state = Tensor.from_host(audio_noise_rows, audio_shape^, STDtype.F32, ctx)
     var t_kf1 = perf_counter_ns()
@@ -1136,7 +1240,11 @@ def main() raises:
             raise Error("minimax_h3_i2va: presentation exceeds the sdpa dispatch table (2048)")
         for _ in range(vpad - vreal):
             vids.append(151643)
-        var vemb_p = minimax_h3_encode_conditioning_streamed(
+        # The same installed row-scaled INT8 encoder cache used by T2VA now
+        # consumes the real vision splice/deepstack path as well. This keeps
+        # BF16 and INT8 DiT profiles from paying the ~220 s streamed-BF16
+        # language-weight tax; activations and vision features remain BF16.
+        var vemb_p = minimax_h3_encode_conditioning_int8_streamed(
             String(TEXT_ENCODER_DIR), vids, ctx, vision_out^,
             Optional(presentation.pad_positions.copy()),
         )
@@ -1156,7 +1264,11 @@ def main() raises:
         )
     var text_rows = reshape(cond.embeds, [TEXT_TOKENS, config.text_dim], ctx)
     var t_cond1 = perf_counter_ns()
-    print("  conditioning:", TEXT_TOKENS, "tokens (", Float64(t_cond1 - t_cond0) / 1.0e9, "s)")
+    print(
+        "  conditioning:", TEXT_TOKENS,
+        "tokens (row-scaled INT8 weights, BF16 outputs) (",
+        Float64(t_cond1 - t_cond0) / 1.0e9, "s)",
+    )
 
     # ── 3. Packed layout, WITH anchors ─────────────────────────────────────
     var geometry = minimax_h3_build_sampling_geometry(
@@ -1201,13 +1313,80 @@ def main() raises:
 
     var frontend_w = _load_frontend_weights(transformer_shards, config, ctx)
     var temb = minimax_h3_timestep_embedding(temb_ts_tensor, frontend_w, config, ctx)
-    var modcache = minimax_h3_build_modulation_cache(transformer_shards, temb, run_config, ctx)
+    var modcache_path = (
+        String(RUNTIME_CACHE_DIR) + String("/modcache_keyframe_steps_")
+        + String(steps) + String("_blocks_")
+        + String(run_config.num_layers) + String(".safetensors")
+    )
+    var modcache = _kf_get_modcache_cached(
+        transformer_shards,
+        temb,
+        run_config,
+        steps,
+        distinct_timesteps,
+        modcache_path,
+        ctx,
+    )
     ctx.synchronize()
     var t_mod1 = perf_counter_ns()
     print(
         "  modcache:", distinct_timesteps, "rows (3 per step: video, audio,"
         " condition) (", Float64(t_mod1 - t_mod0) / 1.0e9, "s)",
     )
+
+    # Optional resident INT8 prefix. This is a read-only view of the canonical
+    # FL2VA cache, so geometry-specialized I2VA binaries consume no extra model
+    # storage. The W8A8 tail is streamed one quantized block at a time.
+    var resident_cache_path = String("")
+    var resident = Optional[MiniMaxH3ResidentFp8](None)
+    var reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](None)
+    comptime if DIT_INT8_RESIDENT != 0:
+        if DIT_RESIDENT_BLOCKS < 1 or DIT_RESIDENT_BLOCKS > run_config.num_layers:
+            raise Error(
+                String("minimax_h3_i2va: H3_RESIDENT_BLOCKS must be in 1..")
+                + String(run_config.num_layers)
+            )
+        resident_cache_path = (
+            String(W8A8_RUNTIME_CACHE)
+            if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+            else String(GROUPWISE_RUNTIME_CACHE)
+        )
+        var t_res0 = perf_counter_ns()
+        resident = Optional[MiniMaxH3ResidentFp8](
+            load_minimax_h3_resident_cache(
+                resident_cache_path,
+                String(TRANSFORMER_INDEX),
+                config,
+                ctx,
+                DIT_RESIDENT_BLOCKS,
+                0,
+                resident_scheme,
+            )
+        )
+        var t_res1 = perf_counter_ns()
+        print(
+            "  resident cache: HIT", resident_cache_path,
+            " blocks=", DIT_RESIDENT_BLOCKS,
+            " GiB=", Float64(resident.value().resident_bytes())
+                / (1024.0 * 1024.0 * 1024.0),
+            " load_s=", Float64(t_res1 - t_res0) / 1.0e9,
+        )
+        if (
+            resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+            and DIT_RESIDENT_BLOCKS < run_config.num_layers
+        ):
+            reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](
+                load_minimax_h3_resident_cache(
+                    resident_cache_path,
+                    String(TRANSFORMER_INDEX),
+                    config,
+                    ctx,
+                    1,
+                    DIT_RESIDENT_BLOCKS,
+                    resident_scheme,
+                )
+            )
+            print("  resident cache: reusable one-block W8A8 tail ready")
 
     # ── 6. Denoise — the condition rows are never written ──────────────────
     var t_den0 = perf_counter_ns()
@@ -1225,14 +1404,47 @@ def main() raises:
         var placeholder_ts = Tensor.from_host(
             [video_ts], placeholder_shape^, STDtype.F32, ctx
         )
+        var video_rows_combined = concat(
+            0, ctx, condition_state, video_state
+        )
         var embed = minimax_h3_frontend_embed[TEXT_TOKENS, H3_HEADS, H3_HEAD_DIM](
-            video_state, audio_state, text_rows, placeholder_ts,
+            video_rows_combined, audio_state, text_rows, placeholder_ts,
             geometry.video_indices, geometry.audio_indices, geometry.text_indices,
             SEQ_LEN, frontend_w, config, ctx,
         )
         var hidden3 = reshape(embed.hidden, [1, SEQ_LEN, config.hidden_size], ctx)
         for layer in range(run_config.num_layers):
-            var block_w = minimax_h3_load_block_device(transformer_shards, layer, config, ctx)
+            var block_w: Dict[String, ArcPointer[Tensor]]
+            comptime if DIT_INT8_RESIDENT != 0:
+                if layer < len(resident.value().blocks):
+                    if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+                        block_w = minimax_h3_resident_block_weights_w8a8(
+                            resident.value(), layer, config, ctx
+                        )
+                    else:
+                        block_w = minimax_h3_resident_block_weights(
+                            resident.value(), layer, config, ctx
+                        )
+                elif resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+                    reload_minimax_h3_resident_w8a8_block(
+                        reusable_w8a8_tail.value(),
+                        resident_cache_path,
+                        String(TRANSFORMER_INDEX),
+                        config,
+                        layer,
+                        ctx,
+                    )
+                    block_w = minimax_h3_resident_block_weights_w8a8(
+                        reusable_w8a8_tail.value(), layer, config, ctx
+                    )
+                else:
+                    block_w = minimax_h3_load_block_device(
+                        transformer_shards, layer, config, ctx
+                    )
+            else:
+                block_w = minimax_h3_load_block_device(
+                    transformer_shards, layer, config, ctx
+                )
             hidden3 = minimax_h3_block_forward[SEQ_LEN, H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
@@ -1248,15 +1460,12 @@ def main() raises:
         # ONLY the target rows are stepped. The conditioning rows are re-imposed
         # by construction — "the loop only ever writes the generated rows, so
         # they are never updated again" (encoders.py:222-225, denoise.py:186).
-        var cond_part = slice(video_state, 0, 0, NUM_CONDITION_ROWS, ctx)
-        var tgt_state = slice(
-            video_state, 0, NUM_CONDITION_ROWS, NUM_TARGET_VIDEO_ROWS, ctx
-        )
         var tgt_vel = slice(
             frontend_out.video_out, 0, NUM_CONDITION_ROWS, NUM_TARGET_VIDEO_ROWS, ctx
         )
-        var stepped = schedule.step_video_device(tgt_vel, video_ts, tgt_state, ctx)
-        video_state = concat(0, ctx, cond_part, stepped)
+        video_state = schedule.step_video_device(
+            tgt_vel, video_ts, video_state, ctx
+        )
         audio_state = schedule.step_audio_device(
             frontend_out.audio_out, audio_ts, audio_state, ctx
         )
@@ -1273,26 +1482,44 @@ def main() raises:
     lat_names.append(String("video_state_rows"))
     lat_names.append(String("audio_state_rows"))
     var lat_tensors = List[ArcPointer[Tensor]]()
-    lat_tensors.append(ArcPointer[Tensor](slice(video_state, 0, 0, NUM_VIDEO_ROWS, ctx)))
+    # Persist TARGET video rows only. The condition prefix is an anchor, not
+    # decoder input; this makes the latent artifact directly compatible with
+    # the geometry-matched T2VA decode-only runner in a fresh GPU process.
+    lat_tensors.append(ArcPointer[Tensor](slice(
+        video_state, 0, 0, NUM_TARGET_VIDEO_ROWS, ctx
+    )))
     lat_tensors.append(ArcPointer[Tensor](slice(audio_state, 0, 0, NUM_AUDIO_ROWS, ctx)))
     save_safetensors(lat_names, lat_tensors, out_dir + "/latents.safetensors", ctx)
     var t_den1 = perf_counter_ns()
     print("  denoise done (", Float64(t_den1 - t_den0) / 1.0e9, "s)")
 
+    if defer_video_decode:
+        print(
+            "  deferred decode: target-only video/audio rows saved; release"
+            " this process and run the geometry-matched T2VA decode_only mode"
+        )
+        return
+
     # ── 7. Decode ──────────────────────────────────────────────────────────
     var audio_samples = _decode_audio(
         audio_state, NUM_AUDIO_LATENTS, config.audio_latents_dim, out_dir, ctx
     )
-    var frames_written = _decode_video(video_state, config.latents_dim, out_dir, ctx)
+    var final_video_rows = concat(0, ctx, condition_state, video_state)
+    var frames_written = _decode_video(
+        final_video_rows, config.latents_dim, out_dir, ctx
+    )
 
     var body = String("{\n")
     body += String("  \"task\":\"") + mode + String("\",\n")
-    body += String("  \"vision_conditioning\":\"DEGRADED_NO_VISION_TOWER\",\n")
-    body += String(
-        "  \"WARNING\":\"The conditioner did NOT see the keyframe. Only the VAE"
-        " condition rows anchor this render. NOT the released model's"
-        " conditioning.\",\n"
-    )
+    comptime if NO_VISION == 0:
+        body += String("  \"vision_conditioning\":\"device-qwen3vl-real\",\n")
+    else:
+        body += String("  \"vision_conditioning\":\"DEGRADED_NO_VISION_TOWER\",\n")
+        body += String(
+            "  \"WARNING\":\"The conditioner did NOT see the keyframe. Only the VAE"
+            " condition rows anchor this render. NOT the released model's"
+            " conditioning.\",\n"
+        )
     body += String("  \"partial_mode\":") + json_bool(partial_mode) + String(",\n")
     body += String("  \"max_blocks\":") + String(max_blocks) + String(",\n")
     body += String("  \"prompt\":\"") + json_escape(prompt) + String("\",\n")
@@ -1306,7 +1533,13 @@ def main() raises:
     body += String("  \"sequence_length\":") + String(SEQ_LEN) + String(",\n")
     body += String("  \"attention_backend\":\"") \
         + attention_backend_name + String("\",\n")
-    body += String("  \"weight_storage\":\"streamed-bf16\",\n")
+    comptime if DIT_INT8_RESIDENT != 0:
+        body += String("  \"weight_storage\":\"resident-int8-") \
+            + resident_backend_name + String("\",\n")
+        body += String("  \"resident_blocks\":") \
+            + String(DIT_RESIDENT_BLOCKS) + String(",\n")
+    else:
+        body += String("  \"weight_storage\":\"streamed-bf16\",\n")
     body += String("  \"frames_written\":") + String(frames_written) + String(",\n")
     body += String("  \"audio_samples_per_channel\":") + String(audio_samples) + String("\n")
     body += String("}\n")

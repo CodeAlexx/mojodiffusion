@@ -1017,6 +1017,7 @@ var WorkflowBuilder = (function () {
                     precision: p.quantization === 'bf16'
                         ? 'bf16'
                         : (p.quantization === 'int8' ? 'int8' : 'int8-fast'),
+                    task: p.h3Task || 't2va',
                     attention_backend: p.h3AttentionBackend === 'sage-int8'
                         ? 'sage-int8' : 'cudnn'
                 }
@@ -1025,7 +1026,10 @@ var WorkflowBuilder = (function () {
                 class_type: 'MiniMaxH3Sampler',
                 inputs: {
                     model: ['1', 0],
+                    task: p.h3Task || 't2va',
                     prompt: p.prompt || '',
+                    source_image: p.initImageName || '',
+                    last_frame: p.lastImageName || '',
                     width: Number(p.width) || 512,
                     height: Number(p.height) || 320,
                     num_frames: Number(p.frames) || 175,

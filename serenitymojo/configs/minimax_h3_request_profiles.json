@@ -1,6 +1,8 @@
 {
-  "schema": "serenity.minimax_h3.request_profiles.v1",
+  "schema": "serenity.minimax_h3.request_profiles.v2",
   "default_profile": "minimax-h3-512x320x175-24fps",
+  "runner": "output/bin/minimax_h3_serenity_runtime",
+  "quant_modes": ["int8-fast", "int8", "bf16"],
   "profiles": [
     {
       "id": "minimax-h3-512x320x175-24fps",
@@ -14,13 +16,8 @@
       "sequence_tokens": 9145,
       "duration": 7.291667,
       "fast_resident_blocks": 48,
-      "quality_resident_blocks": 43,
-      "gate": "base",
-      "runners": {
-        "int8-fast": "output/bin/minimax_h3_t2va_512x320x175_int8_fast",
-        "int8": "output/bin/minimax_h3_t2va_512x320x175_int8",
-        "bf16": "output/bin/minimax_h3_t2va_512x320x175_bf16"
-      }
+      "quality_resident_blocks": 41,
+      "gate": "base"
     },
     {
       "id": "minimax-h3-832x480x73-24fps",
@@ -35,12 +32,7 @@
       "duration": 3.041667,
       "fast_resident_blocks": 46,
       "quality_resident_blocks": 41,
-      "gate": "resolution",
-      "runners": {
-        "int8-fast": "output/bin/minimax_h3_t2va_832x480x73_int8_fast",
-        "int8": "output/bin/minimax_h3_t2va_832x480x73_int8",
-        "bf16": "output/bin/minimax_h3_t2va_832x480x73_bf16"
-      }
+      "gate": "resolution"
     },
     {
       "id": "minimax-h3-960x544x56-24fps",
@@ -55,12 +47,7 @@
       "duration": 2.333333,
       "fast_resident_blocks": 46,
       "quality_resident_blocks": 41,
-      "gate": "resolution",
-      "runners": {
-        "int8-fast": "output/bin/minimax_h3_t2va_960x544x56_int8_fast",
-        "int8": "output/bin/minimax_h3_t2va_960x544x56_int8",
-        "bf16": "output/bin/minimax_h3_t2va_960x544x56_bf16"
-      }
+      "gate": "resolution"
     }
   ]
 }

@@ -3144,7 +3144,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - `ops/sage_attention_int8.mojo` — OPT-IN Mojo-native Sage-style backend at
   the block self-attention seam: BF16 Q/K/V -> Q128/K64 signed-INT8 QK tensor
   cores -> online-softmax/BF16-PV with F32 accumulation -> BF16 output. Runtime flag on t2va, i2va,
-  and ref2va: `--attention-backend=cudnn|sage-int8` (default cuDNN; invalid
+  l2va, fl2va, and ref2va: `--attention-backend=cudnn|sage-int8` (default cuDNN; invalid
   values/geometry fail loud, no fallback). It serves both streamed-BF16 and
   resident one-byte weight modes because weight dequant precedes QKV and both
   paths enter attention as BF16. This is INT8-QK, not native FP8 attention:
@@ -3197,8 +3197,8 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   cache (`serenity_int8_rowscale_v1`, 702 nonempty files) and direct W8A8 GEMM;
   the full 241-token cat prompt completed all 50 layers with GPU finite
   `l2=14242.48, nonfinite=0`. A full 50-block resident store remains rejected
-  after measured OOM at 48, 46, and 45 resident blocks. The admitted quality
-  layout is **43 group-wise INT8 resident blocks + 7 streamed BF16 tail
+  after measured OOM at 48, 46, and 45 resident blocks. The historical quality
+  gate used **43 group-wise INT8 resident blocks + 7 streamed BF16 tail
   blocks**, 17.259968 GiB resident. It loads the contained prefix from one
   canonical 48-block cache rather than duplicating a 19.83-GB sidecar. Its
   optimized 20-step cU-DNN render completed 19 evaluations in 377.2288 s
@@ -3206,7 +3206,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   nonfinite=0/0, and zero swap. A fresh GPU streaming VAE process decoded 175
   frames and NVENC-muxed stereo audio in 78.81 s (10.39-GB process RSS, zero
   swap). Five-frame visual inspection (0/48/96/144/174) passed, including the
-  close-up, camera push, and action-shot progression.
+  close-up, camera push, and action-shot progression. The unified request
+  runner does not register that 43-block layout: it OOMed before its first
+  evaluation with the larger all-profile executable. Product requests use
+  **41 resident + 9 streamed BF16 tail blocks** instead; two base-profile
+  evaluations were finite and the hot evaluation measured 22.2680 s.
   The companion **streamed BF16 DiT + INT8 text encoder** render also passed
   all 19 evaluations and both finite gates; denoise=1412.227 s, fresh decode +
   NVENC=79.62 s, and the same five-frame visual gate passed. Full-schedule
@@ -3250,13 +3254,15 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   product bar. On the direct-W8A8 fast block path Sage also measured slower
   than cU-DNN (12.12 vs 10.24 s/eval). Therefore `sage-int8` is switchable but explicitly
   **experimental and OFF by default**; cU-DNN remains the quality default.
-- **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with a
-  registry of exact compiled profiles: 512x320x175 (7.29 s), 832x480x73
+- **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with one
+  `minimax_h3_serenity_runtime` T2VA executable. Requests select an admitted
+  runtime profile: 512x320x175 (7.29 s), 832x480x73
   (3.04 s), and 960x544x56 (2.33 s), all at 24 FPS/20 steps. The higher
   resolutions deliberately reduce frame count so DiT sequence length and
   decoded pixel-frames remain near the proven 24-GB workload. `/v1/video`
-  validates the exact 241-token test prompt and resolves all geometry fields to
-  a profile-specific runner before the cross-product GPU lease, launches
+  validates the exact 241-token test prompt and resolves resolution, frames,
+  FPS, and precision before the cross-product GPU lease. The one executable
+  carries the three sequence-length-specific AOT kernels internally and launches
   `int8-fast`, `int8`, or `bf16` asynchronously, exits after denoise, invokes
   the same runner in fresh `decode_only` mode, requires
   `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
@@ -3274,8 +3280,61 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   layout is 46 W8A8 resident + 4 compact W8A8 tail, with sampled peaks 22,560
   and 22,672 MiB. Higher-profile Quality uses 41 groupwise resident + 9 BF16
   tail; BF16 stays fully streamed. A live HTTP smoke (`video-0009`) selected
-  the exact 960x544 runner, completed one real eval in 7.948 s, decoded 56
+  the 960x544 request profile, completed one real eval in 7.948 s, decoded 56
   frames, and published the synchronized MP4.
+- **Conditioned Canvas closure (2026-08-05):** Canvas now follows the LTX2
+  capability-driven pattern and exposes T2VA, I2VA, L2VA, and FL2VA as explicit
+  tasks. It also exposes a bounded **image-only Ref2VA** task: one selected
+  Source image guides identity/style through separate GPU-vision + GPU-VAE
+  reference rows and is never inserted as frame zero. The vendor's native
+  2048-short-edge reference would exceed the current 24-GB conditioner
+  attention product limits; Canvas explicitly center-crops and compiles the
+  reference at 768x768 instead, reusing the gated 48x48 device geometry without
+  a CPU-model fallback. Conditioned requests are locked to the measured
+  768x768x124 at 24
+  FPS/20-step profile, exact compiled prompt, synchronized audio, required
+  first/last image contracts, and fresh-process GPU decode. Arbitrary step
+  counts are rejected before model allocation so they cannot create unbounded
+  modulation sidecars. The UI exposes W8A8 `int8-fast`, groupwise `int8`, and
+  BF16-DiT + INT8-encoder runners. cU-DNN remains the default; Sage is
+  switchable only on Quality/BF16 and labeled experimental, while Fast rejects
+  it.
+  The conditioned runner consumes the installed 702-file row-scaled INT8
+  Qwen3-VL cache with BF16 outputs, executes one/two independent device vision
+  segments, reuses the canonical FL2VA groupwise/W8A8 stores, and shares one
+  552,808,373-byte 20-step AdaLN cache across I2/L2/FL. It never builds duplicate
+  weight caches. A reusable one-block W8A8 tail store removed per-layer device
+  allocation churn; measured 24-GB-safe resident prefixes are I2/L2=4 and
+  FL2=2 after 30/22/16-block attempts exhausted allocator headroom.
+  Ref2VA does **not** reuse FL2VA DiT weights: it owns a separate canonical
+  48-block groupwise cache, 50-block W8A8 cache, and four-timestep 20-step
+  AdaLN cache under `Ref2VA/serenity_runtime_cache_v1`. Only the identical
+  Qwen3-VL encoder manifest/cache is shared, avoiding a duplicate ~23-GiB
+  row-scaled store. Its product shape is 937 conditioning tokens and S=23,239
+  (576 separate image-reference latent rows + 414 target-audio + 21,312
+  target-video rows). A real one-evaluation Fast/cU-DNN smoke passed with
+  finite target latents; observed process VRAM was 11,746 MiB for denoise and
+  15,592 MiB in the fresh 124-frame decoder. The decoded first frame was
+  visually distinct from the supplied portrait, directly checking that the
+  reference was not prepended to the result.
+  The full I2VA Fast/cU-DNN gate completed 19 evaluations in 543.4556 s
+  (~28.0-28.88 s/eval), peaked at 17,339 MiB, decoded in a fresh process, and
+  produced 124 finite 768-square frames plus non-silent stereo AAC. Start,
+  middle, and end inspection preserved the subject/camera/mirror transition and
+  red-dress ending; one middle mirror morphology artifact is recorded rather
+  than hidden. L2VA and two-segment FL2VA full-stack one-evaluation smokes passed
+  in 27.8382 s and 30.5527 s with finite `[21312,96]` video and `[414,32]`
+  audio states. BF16-DiT + INT8-encoder one-block parity passes vs the old full
+  BF16 encoder at video/audio cosine 0.99999699/0.99999475. Ref2VA Fast also
+  has a decoded 19-evaluation acceptance: denoise 561.0253 s (40.39 s cold,
+  then 28.40-30.02 s/eval), zero non-finites/swap, 124-frame NVENC H.264 plus
+  non-silent stereo AAC (mean -15.9 dB), and first/middle/end visual inspection
+  passed identity, motion, and the reference-only/not-frame-zero contract.
+  Ref2VA Groupwise and BF16 one-evaluation gates are finite; Groupwise vs BF16
+  cosine is video 0.99984670 / audio 0.99952229, both above the 0.999 bar.
+  L2/FL remain smoke-gated and Sage remains explicitly experimental.
+  Machine-local evidence is
+  `output/checks/minimax_h3_conditioned_canvas_gate.json`.
 - **Runtime cold-start closure (2026-08-04):** the exact product prompt now uses
   three versioned, source-stat-validated sidecars under
   `FL2VA/serenity_runtime_cache_v1`: BF16 conditioner output, BF16 AdaLN
@@ -3325,6 +3384,9 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   canvas law = 768 short edge, SQUARE keyframe -> 768x768 (16:9 canvas at
   S≈74k does not fit 24GB), preprocessor normalize (u8-127.5)/127.5
   bit-exact, condition rows pinned at cond_t=0.999 (video tracking-max law).
+  Product builds use device-only vision, the row-scaled INT8 multimodal
+  conditioner, target/condition row separation, reusable resident INT8 tails,
+  and deferred decode so the denoiser releases the GPU before the VAE loads.
 - `pipeline/minimax_h3_t2va.mojo` — THE product CLI. Comptime geometry
   (-D H3_TEXT_TOKENS/H3_FRAMES/H3_HEIGHT/H3_WIDTH; frames must be 17k+5),
   saves latents every run, `decode_only` argv[6] re-decodes in ~2 min,

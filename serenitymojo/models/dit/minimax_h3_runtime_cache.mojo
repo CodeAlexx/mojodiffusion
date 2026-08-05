@@ -182,6 +182,30 @@ def _load_raw_h2d(
     return Tensor(dev^, view.shape.copy(), view.dtype)
 
 
+def _load_raw_h2d_into(
+    st: SafeTensors, name: String, mut dst: Tensor, ctx: DeviceContext
+) raises:
+    """Reload one cached tensor into an existing GPU allocation."""
+    var info = st.tensor_info(name)
+    if info.dtype != dst.dtype() or info.shape != dst.shape():
+        raise Error(
+            String("MiniMax-H3 reusable resident tensor mismatch: ") + name
+        )
+    var bytes = st.tensor_bytes(name)
+    var view = from_parts(info.dtype, info.shape.copy(), bytes)
+    var nbytes = view.nbytes()
+    if nbytes != dst.nbytes():
+        raise Error(
+            String("MiniMax-H3 reusable resident byte mismatch: ") + name
+        )
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+    var host_dst = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
+    var src = BytePtr(unsafe_from_address=Int(view.data.unsafe_ptr()))
+    _ = sys_memcpy(host_dst, src, nbytes)
+    ctx.enqueue_copy(dst_buf=dst.buf, src_buf=host)
+    ctx.synchronize()
+
+
 def _block_prefix(layer: Int) -> String:
     return String("block.") + String(layer) + String(".")
 
@@ -341,6 +365,73 @@ def load_minimax_h3_resident_cache(
     return MiniMaxH3ResidentFp8(
         blocks^, start_layer, scratch^, scheme
     )
+
+
+def reload_minimax_h3_resident_w8a8_block(
+    mut resident: MiniMaxH3ResidentFp8,
+    cache_path: String,
+    source_index: String,
+    config: MiniMaxH3DiTConfig,
+    layer: Int,
+    ctx: DeviceContext,
+) raises:
+    """Refill one W8A8 block store without allocating any device tensors.
+
+    A fresh one-block store for every streamed tail layer eventually
+    fragments MAX's CUDA pool even when nvidia-smi reports several GiB free.
+    The four quantized weights, scales, and small BF16 keeps have identical
+    shapes in every H3 block, so one store can be filled in place and reused.
+    """
+    if resident.scheme != MINIMAX_H3_RESIDENT_INT8_W8A8:
+        raise Error("MiniMax-H3 reusable tail requires the W8A8 scheme")
+    if len(resident.blocks) != 1:
+        raise Error("MiniMax-H3 reusable tail requires exactly one block")
+    var st = SafeTensors.open(cache_path)
+    _check_common_metadata(st, String("resident-int8-w8a8-row"), source_index)
+    var cached_start = _meta_i64(st, String("__meta__.start_layer"), -1)
+    var cached_blocks = _meta_i64(st, String("__meta__.nblocks"), -1)
+    if layer < cached_start or layer >= cached_start + cached_blocks:
+        raise Error("MiniMax-H3 reusable tail layer outside cache range")
+
+    ref block = resident.blocks[0]
+    var expected = minimax_h3_block_tensor_names(layer)
+    var qslot = 0
+    var kslot = 0
+    var prefix = _block_prefix(layer)
+    for k in range(len(expected)):
+        ref name = expected[k]
+        var shape = minimax_h3_expected_shape(name, config)
+        var rows = shape[0]
+        var cols = shape[1] if len(shape) == 2 else 0
+        var cls = minimax_h3_fp8_class(name, rows, cols)
+        if cls == H3_FP8_ROW:
+            if qslot >= len(block.fp8):
+                raise Error("MiniMax-H3 reusable tail quantized-slot mismatch")
+            _load_raw_h2d_into(
+                st, prefix + String("weight.") + String(qslot),
+                block.fp8[qslot][], ctx,
+            )
+            _load_raw_h2d_into(
+                st, prefix + String("scale.") + String(qslot),
+                block.scale[qslot][], ctx,
+            )
+            block.fp8_names[qslot] = name.copy()
+            qslot += 1
+        elif cls == H3_FP8_BF16_KEEP:
+            if kslot >= len(block.bf16):
+                raise Error("MiniMax-H3 reusable tail keep-slot mismatch")
+            _load_raw_h2d_into(
+                st, prefix + String("keep.") + String(kslot),
+                block.bf16[kslot][], ctx,
+            )
+            block.bf16_names[kslot] = name.copy()
+            kslot += 1
+        else:
+            raise Error("MiniMax-H3 reusable tail cache class mismatch")
+    if qslot != len(block.fp8) or kslot != len(block.bf16):
+        raise Error("MiniMax-H3 reusable tail slot-count mismatch")
+    resident.start_layer = layer
+    st.release_to_os()
 
 
 def save_minimax_h3_modcache(

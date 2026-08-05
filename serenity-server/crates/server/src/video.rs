@@ -59,14 +59,13 @@ const LTX2_CUDA_CACHE: &str = "/dev/shm/serenity-ltx2-cuda-cache";
 const LTX2_SAMPLER_PARITY_REPORT: &str = "output/checks/ltx2_sampler_parity.json";
 const LTX2_VAE_PARITY_REPORT: &str = "output/checks/ltx2_vae_frame_parity.json";
 const LTX2_AUDIO_PARITY_REPORT: &str = "output/checks/ltx2_audio_parity.json";
-const MINIMAX_H3_INT8_RUNNER: &str = "output/bin/minimax_h3_t2va_512x320x175_int8";
-const MINIMAX_H3_INT8_FAST_RUNNER: &str =
-    "output/bin/minimax_h3_t2va_512x320x175_int8_fast";
-const MINIMAX_H3_BF16_RUNNER: &str = "output/bin/minimax_h3_t2va_512x320x175_bf16";
+const MINIMAX_H3_REQUEST_RUNNER: &str = "output/bin/minimax_h3_serenity_runtime";
 const MINIMAX_H3_INT8_FAST_SHIM: &str = "output/lib/libserenity_minimax_h3_int8.so";
 const MINIMAX_H3_PRODUCT_GATE: &str = "output/checks/minimax_h3_product_gate.json";
 const MINIMAX_H3_RESOLUTION_PROFILES_GATE: &str =
     "output/checks/minimax_h3_resolution_profiles_gate.json";
+const MINIMAX_H3_UNIFIED_RUNNER_GATE: &str =
+    "output/checks/minimax_h3_unified_runner_gate.json";
 const MINIMAX_H3_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/FL2VA";
 const MINIMAX_H3_ENCODER_CACHE: &str =
     "checkpoints/MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1";
@@ -90,6 +89,25 @@ overall_soundscape: Soft ambient wind whistling outside the window, the rhythmic
 
 non_diegetic_music: A light, plucking pizzicato string melody with a medium tempo and a playful, bouncing rhythm.
  -"#;
+const MINIMAX_H3_CONDITIONED_PROMPT_FILE: &str =
+    include_str!("../../../../serenitymojo/configs/minimax_h3_conditioned_prompt.txt");
+const MINIMAX_H3_CONDITIONED_WIDTH: i64 = 768;
+const MINIMAX_H3_CONDITIONED_HEIGHT: i64 = 768;
+const MINIMAX_H3_CONDITIONED_FRAMES: i64 = 124;
+const MINIMAX_H3_CONDITIONED_FPS: i64 = 24;
+const MINIMAX_H3_CONDITIONED_DECODE_RUNNER: &str =
+    "output/bin/minimax_h3_decode_768x768x124";
+const MINIMAX_H3_CONDITIONED_MODULATION_CACHE: &str =
+    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/modcache_keyframe_steps_20_blocks_50.safetensors";
+const MINIMAX_H3_REF2VA_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/Ref2VA";
+const MINIMAX_H3_REF2VA_MODULATION_CACHE: &str =
+    "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/modcache_ref_image_steps_20_blocks_50.safetensors";
+const MINIMAX_H3_REF2VA_INT8_RESIDENT_CACHE: &str =
+    "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors";
+const MINIMAX_H3_REF2VA_INT8_FAST_RESIDENT_CACHE: &str =
+    "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors";
+const MINIMAX_H3_REF2VA_PRODUCT_GATE: &str =
+    "output/checks/minimax_h3_ref2va_canvas_gate.json";
 const LTX2_CREATOR_CUDNN_LIB_CANDIDATES: [&str; 2] = [
     "LTX-Desktop/backend/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
     ".local/share/LTXDesktop/python/lib/python3.13/site-packages/nvidia/cudnn/lib",
@@ -385,6 +403,8 @@ struct Ltx2CheckpointProfile {
 struct MiniMaxH3RequestProfileRegistry {
     schema: String,
     default_profile: String,
+    runner: String,
+    quant_modes: Vec<String>,
     profiles: Vec<MiniMaxH3RequestProfile>,
 }
 
@@ -403,7 +423,6 @@ struct MiniMaxH3RequestProfile {
     fast_resident_blocks: i64,
     quality_resident_blocks: i64,
     gate: String,
-    runners: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -572,8 +591,18 @@ fn minimax_h3_request_profile_registry() -> &'static MiniMaxH3RequestProfileRegi
             serde_json::from_str(MINIMAX_H3_REQUEST_PROFILES_JSON)
                 .expect("embedded MiniMax-H3 request profile registry must be valid JSON");
         assert_eq!(
-            registry.schema, "serenity.minimax_h3.request_profiles.v1",
+            registry.schema, "serenity.minimax_h3.request_profiles.v2",
             "embedded MiniMax-H3 request profile registry schema mismatch"
+        );
+        assert_eq!(
+            registry.runner, MINIMAX_H3_REQUEST_RUNNER,
+            "embedded MiniMax-H3 registry must select the unified request runner"
+        );
+        assert!(
+            ["int8-fast", "int8", "bf16"]
+                .iter()
+                .all(|mode| registry.quant_modes.iter().any(|value| value == mode)),
+            "embedded MiniMax-H3 registry must declare all runtime quant modes"
         );
         assert!(
             registry.profiles.iter().any(|profile| profile.id == registry.default_profile),
@@ -592,11 +621,8 @@ fn minimax_h3_request_profile_registry() -> &'static MiniMaxH3RequestProfileRegi
                     && profile.fast_resident_blocks > 0
                     && profile.quality_resident_blocks > 0
                     && matches!(profile.gate.as_str(), "base" | "resolution")
-                    && ["int8-fast", "int8", "bf16"]
-                        .iter()
-                        .all(|mode| profile.runners.get(*mode).is_some_and(|path| !path.is_empty()))
             }),
-            "embedded MiniMax-H3 profiles must declare complete geometry and runners"
+            "embedded MiniMax-H3 profiles must declare complete runtime geometry"
         );
         registry
     })
@@ -637,11 +663,16 @@ fn minimax_h3_profile_from_request(body: &Value) -> Option<&'static MiniMaxH3Req
     )
 }
 
-fn minimax_h3_profile_runner<'a>(
-    profile: &'a MiniMaxH3RequestProfile,
+fn minimax_h3_request_runner<'a>(
+    _profile: &'a MiniMaxH3RequestProfile,
     quant: &str,
 ) -> Option<&'a str> {
-    profile.runners.get(quant).map(String::as_str)
+    let registry = minimax_h3_request_profile_registry();
+    registry
+        .quant_modes
+        .iter()
+        .any(|mode| mode == quant)
+        .then_some(registry.runner.as_str())
 }
 
 const LTX2_REQUEST_RUNNER_BUILD_INPUTS: &[&str] = &[
@@ -2199,9 +2230,180 @@ fn minimax_h3_encoder_cache_complete() -> bool {
         })
 }
 
+fn minimax_h3_conditioned_prompt() -> &'static str {
+    MINIMAX_H3_CONDITIONED_PROMPT_FILE.trim_end_matches(['\r', '\n'])
+}
+
+fn minimax_h3_ref2va_product_gate_passed(quant: &str) -> bool {
+    let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_REF2VA_PRODUCT_GATE)) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let pin = match quant {
+        "bf16" => "bf16_runner_sha256",
+        "int8" => "int8_runner_sha256",
+        "int8-fast" => "int8_fast_runner_sha256",
+        _ => return false,
+    };
+    let Some(runner) = minimax_h3_conditioned_runner("ref2va", quant) else {
+        return false;
+    };
+    let Some(runner_sha) = sha256sum(&repo_path(&runner)) else {
+        return false;
+    };
+    let Some(artifact) = doc
+        .pointer("/fast_full20/artifact")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(artifact_sha) = sha256sum(&repo_path(artifact)) else {
+        return false;
+    };
+    doc.get("passed").and_then(Value::as_bool) == Some(true)
+        && doc.pointer("/profile/reference_policy").and_then(Value::as_str)
+            == Some("identity_style_not_frame_zero")
+        && doc.pointer("/profile/sequence_tokens").and_then(Value::as_i64) == Some(23239)
+        && doc.pointer("/fast_full20/video_nonfinite").and_then(Value::as_i64) == Some(0)
+        && doc.pointer("/fast_full20/audio_nonfinite").and_then(Value::as_i64) == Some(0)
+        && doc.pointer("/fast_full20/visual_inspection_passed").and_then(Value::as_bool)
+            == Some(true)
+        && doc.pointer("/fast_full20/reference_was_not_frame_zero").and_then(Value::as_bool)
+            == Some(true)
+        && doc.pointer("/one_eval_quality_vs_bf16/passed").and_then(Value::as_bool)
+            == Some(true)
+        && doc.pointer(&format!("/pins/{pin}")).and_then(Value::as_str)
+            == Some(runner_sha.as_str())
+        && doc.pointer("/fast_full20/artifact_sha256").and_then(Value::as_str)
+            == Some(artifact_sha.as_str())
+}
+
+fn minimax_h3_task(body: &Value) -> &str {
+    body.get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("t2va")
+}
+
+fn minimax_h3_conditioned_runner(task: &str, quant: &str) -> Option<String> {
+    if !matches!(task, "i2va" | "l2va" | "fl2va" | "ref2va")
+        || !matches!(quant, "bf16" | "int8" | "int8-fast")
+    {
+        return None;
+    }
+    let suffix = if quant == "int8-fast" {
+        "int8_fast"
+    } else {
+        quant
+    };
+    Some(if task == "ref2va" {
+        format!("output/bin/minimax_h3_ref2va_768x768x124_{suffix}")
+    } else {
+        format!("output/bin/minimax_h3_{task}_768x768x124_{suffix}")
+    })
+}
+
+fn minimax_h3_request_media_path(body: &Value, key: &str) -> Result<std::path::PathBuf, String> {
+    let raw = body
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("MiniMax-H3 {key} is required for this task"))?;
+    if raw.contains(['\r', '\n']) {
+        return Err(format!("MiniMax-H3 {key} must be one filesystem path"));
+    }
+    let path = if std::path::Path::new(raw).is_absolute() {
+        std::path::PathBuf::from(raw)
+    } else {
+        repo_path(raw)
+    };
+    if !nonempty_file(&path) {
+        return Err(format!(
+            "MiniMax-H3 {key} is not a readable non-empty file: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn minimax_h3_conditioned_missing(task: &str, quant: &str) -> Vec<String> {
+    let mut missing = Vec::new();
+    match minimax_h3_conditioned_runner(task, quant) {
+        Some(runner) if bin_x(&runner) => {}
+        Some(runner) => missing.push(runner),
+        None => missing.push(format!("unsupported MiniMax-H3 task={task} quant={quant}")),
+    }
+    if task == "ref2va" && !minimax_h3_ref2va_product_gate_passed(quant) {
+        missing.push(MINIMAX_H3_REF2VA_PRODUCT_GATE.to_string());
+    }
+    if !bin_x(MINIMAX_H3_CONDITIONED_DECODE_RUNNER) {
+        missing.push(MINIMAX_H3_CONDITIONED_DECODE_RUNNER.to_string());
+    }
+    let root = model_path(if task == "ref2va" {
+        MINIMAX_H3_REF2VA_MODEL_ROOT
+    } else {
+        MINIMAX_H3_MODEL_ROOT
+    });
+    for relative in [
+        "transformer/model.safetensors.index.json",
+        "text_encoder/model.safetensors.index.json",
+        "text_encoder/config.json",
+        "processor/preprocessor_config.json",
+        "audio_vae/model.safetensors",
+        "video_vae/source/model.safetensors",
+    ] {
+        let path = root.join(relative);
+        if !nonempty_file(&path) {
+            missing.push(path.to_string_lossy().into_owned());
+        }
+    }
+    if !minimax_h3_encoder_cache_complete() {
+        missing.push(model_path(MINIMAX_H3_ENCODER_CACHE).to_string_lossy().into_owned());
+    }
+    let conditioned_modcache = model_path(if task == "ref2va" {
+        MINIMAX_H3_REF2VA_MODULATION_CACHE
+    } else {
+        MINIMAX_H3_CONDITIONED_MODULATION_CACHE
+    });
+    if !nonempty_file(&conditioned_modcache) {
+        missing.push(conditioned_modcache.to_string_lossy().into_owned());
+    }
+    if quant == "int8" {
+        let path = model_path(if task == "ref2va" {
+            MINIMAX_H3_REF2VA_INT8_RESIDENT_CACHE
+        } else {
+            MINIMAX_H3_INT8_RESIDENT_CACHE
+        });
+        if !nonempty_file(&path) {
+            missing.push(path.to_string_lossy().into_owned());
+        }
+    }
+    if quant == "int8-fast" {
+        let cache = if task == "ref2va" {
+            MINIMAX_H3_REF2VA_INT8_FAST_RESIDENT_CACHE
+        } else {
+            MINIMAX_H3_INT8_FAST_RESIDENT_CACHE
+        };
+        for path in [model_path(cache)] {
+            if !nonempty_file(&path) {
+                missing.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for runtime in [MINIMAX_H3_INT8_FAST_SHIM, LTX2_CSHIM] {
+        let path = repo_path(runtime);
+        if !nonempty_file(&path) {
+            missing.push(path.to_string_lossy().into_owned());
+        }
+    }
+    missing
+}
+
 fn minimax_h3_missing(profile: &MiniMaxH3RequestProfile, quant: &str) -> Vec<String> {
     let mut missing = Vec::new();
-    let runner = minimax_h3_profile_runner(profile, quant);
+    let runner = minimax_h3_request_runner(profile, quant);
     if let Some(runner) = runner {
         if !bin_x(runner) {
             missing.push(runner.to_string());
@@ -2250,6 +2452,9 @@ fn minimax_h3_missing(profile: &MiniMaxH3RequestProfile, quant: &str) -> Vec<Str
     if !nonempty_file(&cshim) {
         missing.push(cshim.to_string_lossy().into_owned());
     }
+    if !minimax_h3_unified_runner_gate_passed() {
+        missing.push(MINIMAX_H3_UNIFIED_RUNNER_GATE.to_string());
+    }
     missing
 }
 
@@ -2260,9 +2465,25 @@ pub(crate) fn minimax_h3_product_gate_passed() -> bool {
     let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    let binaries = [
-        ("int8_runner_sha256", MINIMAX_H3_INT8_RUNNER),
-        ("bf16_runner_sha256", MINIMAX_H3_BF16_RUNNER),
+    // Preserve the provenance of the retired per-mode binaries that produced
+    // the accepted visual artifacts. The current executable is independently
+    // pinned by the unified-runner gate, whose trajectories are byte-identical
+    // to those accepted legacy latents.
+    for (key, expected) in [
+        (
+            "int8_runner_sha256",
+            "ab281c7c075558cf0ab2935d942be441ff061b4c06e80da1958bbd68d8129b8d",
+        ),
+        (
+            "bf16_runner_sha256",
+            "10e469081ab743b2c921fb11cd12e29f96592416cfa1e238443698001e8e34b0",
+        ),
+    ] {
+        if doc.pointer(&format!("/pins/{key}")).and_then(Value::as_str) != Some(expected) {
+            return false;
+        }
+    }
+    let current_evidence = [
         ("cudnn_shim_sha256", LTX2_CSHIM),
         (
             "int8_full20_artifact_sha256",
@@ -2273,7 +2494,7 @@ pub(crate) fn minimax_h3_product_gate_passed() -> bool {
             "output/h3_cat_bf16dit_int8enc_cudnn_full20_20260804/video.mp4",
         ),
     ];
-    if binaries.iter().any(|(key, path)| {
+    if current_evidence.iter().any(|(key, path)| {
         let Some(actual) = sha256sum(&repo_path(path)) else {
             return true;
         };
@@ -2341,8 +2562,14 @@ fn minimax_h3_fast_product_gate_passed() -> bool {
     let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
+    if doc
+        .pointer("/pins/int8_fast_runner_sha256")
+        .and_then(Value::as_str)
+        != Some("87701f21e9a8f201192e8d2251af946d15bd65d918f98be08d4617b5a7073eee")
+    {
+        return false;
+    }
     for (key, path) in [
-        ("int8_fast_runner_sha256", MINIMAX_H3_INT8_FAST_RUNNER),
         ("int8_fast_shim_sha256", MINIMAX_H3_INT8_FAST_SHIM),
         (
             "int8_fast_full20_artifact_sha256",
@@ -2386,6 +2613,142 @@ fn minimax_h3_fast_product_gate_passed() -> bool {
         && repo_path(artifact).is_file()
 }
 
+fn minimax_h3_unified_runner_gate_passed() -> bool {
+    let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_UNIFIED_RUNNER_GATE)) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    if doc.get("schema").and_then(Value::as_str)
+        != Some("serenity.minimax_h3.unified_runner_gate.v1")
+        || doc.get("passed").and_then(Value::as_bool) != Some(true)
+        || doc.pointer("/topology/executable_count").and_then(Value::as_i64) != Some(1)
+        || doc.pointer("/topology/selector_checks_passed").and_then(Value::as_i64) != Some(9)
+        || doc.pointer("/topology/subprocess_profile_dispatch").and_then(Value::as_bool)
+            != Some(false)
+        || doc.pointer("/precision_switch/int8_quality_resident_blocks")
+            .and_then(Value::as_i64)
+            != Some(41)
+        || doc.pointer("/memory/int8_quality_43_blocks_registered")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || doc.pointer("/memory/int8_quality_41_blocks_passed")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || doc.pointer("/precision_switch/int8_quality_video_nonfinite")
+            .and_then(Value::as_i64)
+            != Some(0)
+        || doc.pointer("/precision_switch/int8_quality_audio_nonfinite")
+            .and_then(Value::as_i64)
+            != Some(0)
+        || doc.pointer("/precision_switch/bf16_video_nonfinite")
+            .and_then(Value::as_i64)
+            != Some(0)
+        || doc.pointer("/precision_switch/bf16_audio_nonfinite")
+            .and_then(Value::as_i64)
+            != Some(0)
+        || doc.pointer("/decode/passed").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    for (pin, path) in [
+        ("runner_sha256", MINIMAX_H3_REQUEST_RUNNER),
+        ("pipeline_source_sha256", "serenitymojo/pipeline/minimax_h3_t2va.mojo"),
+        (
+            "profile_registry_sha256",
+            "serenitymojo/configs/minimax_h3_request_profiles.json",
+        ),
+        (
+            "build_script_sha256",
+            "scripts/build_minimax_h3_video_profiles.sh",
+        ),
+    ] {
+        let Some(actual) = sha256sum(&repo_path(path)) else {
+            return false;
+        };
+        if doc.pointer(&format!("/pins/{pin}")).and_then(Value::as_str)
+            != Some(actual.as_str())
+        {
+            return false;
+        }
+    }
+    let Some(profiles) = doc.get("profiles").and_then(Value::as_array) else {
+        return false;
+    };
+    if profiles.len() != minimax_h3_request_profile_registry().profiles.len() {
+        return false;
+    }
+    for profile in &minimax_h3_request_profile_registry().profiles {
+        let Some(evidence) = profiles.iter().find(|entry| {
+            entry.get("width").and_then(Value::as_i64) == Some(profile.width)
+                && entry.get("height").and_then(Value::as_i64) == Some(profile.height)
+                && entry.get("frames").and_then(Value::as_i64) == Some(profile.frames)
+                && entry.get("fps").and_then(Value::as_i64) == Some(profile.fps)
+        }) else {
+            return false;
+        };
+        let Some(path) = evidence
+            .get("full20_unified_latents")
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let Some(actual) = sha256sum(&repo_path(path)) else {
+            return false;
+        };
+        if evidence.get("byte_identical").and_then(Value::as_bool) != Some(true)
+            || evidence
+                .get("sequence_tokens")
+                .and_then(Value::as_i64)
+                != Some(profile.sequence_tokens)
+            || evidence
+                .get("full20_unified_latents_sha256")
+                .and_then(Value::as_str)
+                != Some(actual.as_str())
+            || evidence
+                .get("accepted_latents_sha256")
+                .and_then(Value::as_str)
+                != Some(actual.as_str())
+        {
+            return false;
+        }
+    }
+    for (path_key, hash_key) in [
+        (
+            "int8_quality_resume_latents",
+            "int8_quality_resume_latents_sha256",
+        ),
+        ("bf16_resume_latents", "bf16_resume_latents_sha256"),
+    ] {
+        let Some(path) = doc
+            .pointer(&format!("/precision_switch/{path_key}"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let Some(actual) = sha256sum(&repo_path(path)) else {
+            return false;
+        };
+        if doc
+            .pointer(&format!("/precision_switch/{hash_key}"))
+            .and_then(Value::as_str)
+            != Some(actual.as_str())
+        {
+            return false;
+        }
+    }
+    let Some(decode_artifact) = doc.pointer("/decode/artifact").and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(decode_sha) = sha256sum(&repo_path(decode_artifact)) else {
+        return false;
+    };
+    doc.pointer("/decode/artifact_sha256").and_then(Value::as_str)
+        == Some(decode_sha.as_str())
+}
+
 fn minimax_h3_resolution_profile_gate_passed(profile: &MiniMaxH3RequestProfile) -> bool {
     let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_RESOLUTION_PROFILES_GATE)) else {
         return false;
@@ -2410,22 +2773,23 @@ fn minimax_h3_resolution_profile_gate_passed(profile: &MiniMaxH3RequestProfile) 
     else {
         return false;
     };
-    for (quant, pin) in [
-        ("int8-fast", "int8_fast_runner_sha256"),
-        ("int8", "int8_runner_sha256"),
-        ("bf16", "bf16_runner_sha256"),
-    ] {
-        let Some(runner) = minimax_h3_profile_runner(profile, quant) else {
-            return false;
-        };
-        let Some(actual) = sha256sum(&repo_path(runner)) else {
-            return false;
-        };
-        if gate.pointer(&format!("/pins/{pin}")).and_then(Value::as_str)
-            != Some(actual.as_str())
-        {
-            return false;
-        }
+    let historical_runner_pins = match profile.id.as_str() {
+        "minimax-h3-832x480x73-24fps" => [
+            ("int8_fast_runner_sha256", "82406aa4d7ff85e9fb33f16980e61ceca78973f6a04ac8a6caab91ac5ab3539b"),
+            ("int8_runner_sha256", "dadf8e548585a41a7bfa35ff5a53633965f063b27695372a46e3791ae70674f5"),
+            ("bf16_runner_sha256", "a12e9f5e34c63c7f72554da01e641749c407b3609dc9ae48c03fbbfe7e6983a9"),
+        ],
+        "minimax-h3-960x544x56-24fps" => [
+            ("int8_fast_runner_sha256", "91d2dcf14d4b53fabef3aadc21300e784aeb11b9bb294245a11ccbe237f1b3fd"),
+            ("int8_runner_sha256", "878c5bd181cfd9ee20ae6a93f0f89870e3988b5943fe7fef0814578a89a0c8ae"),
+            ("bf16_runner_sha256", "14d47273903e9f663e1f5e011d499527c8aaa0a727ebd4af9ceebdb26c008b07"),
+        ],
+        _ => return false,
+    };
+    if historical_runner_pins.iter().any(|(pin, expected)| {
+        gate.pointer(&format!("/pins/{pin}")).and_then(Value::as_str) != Some(*expected)
+    }) {
+        return false;
     }
     let Some(artifact) = gate
         .pointer("/evidence/int8_fast_full20_artifact")
@@ -2478,7 +2842,7 @@ fn minimax_h3_profile_mode_product_gate_passed(
     profile: &MiniMaxH3RequestProfile,
     quant: &str,
 ) -> bool {
-    if !minimax_h3_product_gate_passed() {
+    if !minimax_h3_product_gate_passed() || !minimax_h3_unified_runner_gate_passed() {
         return false;
     }
     match profile.gate.as_str() {
@@ -2518,8 +2882,51 @@ fn minimax_h3_profile_document(profile: &MiniMaxH3RequestProfile) -> Value {
             "int8-fast": profile.fast_resident_blocks,
             "int8": profile.quality_resident_blocks,
         },
-        "runners": profile.runners,
+        "runner": minimax_h3_request_profile_registry().runner,
+        "quant_modes": minimax_h3_request_profile_registry().quant_modes,
         "memory_policy": "constant_budget_higher_resolution_shorter_duration",
+    })
+}
+
+fn minimax_h3_conditioned_task_document(task: &str, label: &str) -> Value {
+    let fast_missing = minimax_h3_conditioned_missing(task, "int8-fast");
+    let quality_missing = minimax_h3_conditioned_missing(task, "int8");
+    let bf16_missing = minimax_h3_conditioned_missing(task, "bf16");
+    let fast_ready = fast_missing.is_empty();
+    let quality_ready = quality_missing.is_empty();
+    let bf16_ready = bf16_missing.is_empty();
+    json!({
+        "id": task,
+        "label": label,
+        "available": fast_ready || quality_ready || bf16_ready,
+        "available_modes": {
+            "int8-fast": fast_ready,
+            "int8": quality_ready,
+            "bf16": bf16_ready,
+        },
+        "missing": {
+            "int8-fast": fast_missing,
+            "int8": quality_missing,
+            "bf16": bf16_missing,
+        },
+        "runners": {
+            "int8-fast": minimax_h3_conditioned_runner(task, "int8-fast"),
+            "int8": minimax_h3_conditioned_runner(task, "int8"),
+            "bf16": minimax_h3_conditioned_runner(task, "bf16"),
+        },
+        "width": MINIMAX_H3_CONDITIONED_WIDTH,
+        "height": MINIMAX_H3_CONDITIONED_HEIGHT,
+        "frames": MINIMAX_H3_CONDITIONED_FRAMES,
+        "fps": MINIMAX_H3_CONDITIONED_FPS,
+        "steps": 20,
+        "include_audio": true,
+        "gpu_vision_only": true,
+        "reference_only": task == "ref2va",
+        "source_becomes_first_frame": matches!(task, "i2va" | "fl2va"),
+        "reference_image_short_edge": if task == "ref2va" { Some(768) } else { None },
+        "cache_policy": if task == "ref2va" { "ref2va_dit_cache_and_shared_identical_encoder_cache" } else { "reuse_existing_fl2va_resident_cache" },
+        "modulation_cache": if task == "ref2va" { MINIMAX_H3_REF2VA_MODULATION_CACHE } else { MINIMAX_H3_CONDITIONED_MODULATION_CACHE },
+        "encoder_storage": "row_scaled_int8_weights_bf16_outputs",
     })
 }
 
@@ -2582,7 +2989,9 @@ fn minimax_h3_progress_from_log(
                 requested_steps,
                 "Loaded cached GPU text conditioning".to_string(),
             ));
-        } else if line.contains("conditioning [real]") {
+        } else if line.contains("conditioning [real]")
+            || line.contains("REAL conditioning:")
+        {
             progress = Some((
                 "conditioning".to_string(),
                 0,
@@ -2717,9 +3126,19 @@ fn readiness_doc() -> Value {
         .any(|profile| minimax_h3_profile_mode_ready(profile, "bf16"));
     let minimax_h3_ready =
         minimax_h3_int8_fast_ready || minimax_h3_int8_ready || minimax_h3_bf16_ready;
+    let minimax_h3_conditioned_modes = vec![
+        minimax_h3_conditioned_task_document("i2va", "First frame to video"),
+        minimax_h3_conditioned_task_document("l2va", "Last frame to video"),
+        minimax_h3_conditioned_task_document("fl2va", "First + last frame to video"),
+        minimax_h3_conditioned_task_document("ref2va", "Reference image (identity/style)"),
+    ];
+    let minimax_h3_conditioned_ready = minimax_h3_conditioned_modes
+        .iter()
+        .any(|mode| mode.get("available").and_then(Value::as_bool) == Some(true));
     // top-level state reflects whether ANY arm is runnable.
-    let any_ready = ltx2_ready || wan22_ready || bernini_ready || scail2_ready || minimax_h3_ready;
-    let state = if ltx2_request_ready || minimax_h3_ready {
+    let any_ready = ltx2_ready || wan22_ready || bernini_ready || scail2_ready
+        || minimax_h3_ready || minimax_h3_conditioned_ready;
+    let state = if ltx2_request_ready || minimax_h3_ready || minimax_h3_conditioned_ready {
         "request_runner_ready"
     } else if any_ready {
         "bounded_smoke_ready"
@@ -2851,17 +3270,9 @@ fn readiness_doc() -> Value {
         },
         {
             "model": "minimax_h3_t2va",
-            "status": if minimax_h3_ready { "quality_profile_ready" } else { "gate_required" },
-            "runner": if minimax_h3_int8_fast_ready {
-                minimax_h3_profile_runner(minimax_h3_default, "int8-fast").unwrap_or("")
-            } else {
-                minimax_h3_profile_runner(minimax_h3_default, "int8").unwrap_or("")
-            },
-            "runners": {
-                "int8-fast": minimax_h3_profile_runner(minimax_h3_default, "int8-fast"),
-                "int8": minimax_h3_profile_runner(minimax_h3_default, "int8"),
-                "bf16": minimax_h3_profile_runner(minimax_h3_default, "bf16"),
-            },
+            "status": if minimax_h3_ready { "quality_profile_ready" } else if minimax_h3_conditioned_ready { "conditioned_test_ready" } else { "gate_required" },
+            "runner": MINIMAX_H3_REQUEST_RUNNER,
+            "runner_topology": "one_request_runner_runtime_geometry_length_fps_and_quant",
             "mode": "phase-isolated: GPU text encode + denoise -> fresh GPU VAE decode -> NVENC mux",
             "request_schema": "serenity.genparams.v1",
             "status_schema": "serenity.minimax_h3.status.v1",
@@ -2884,7 +3295,7 @@ fn readiness_doc() -> Value {
                     "available": minimax_h3_int8_fast_ready,
                     "missing": minimax_h3_int8_fast_missing,
                     "dtype_contract": "direct_w8a8_profile_resident_prefix_w8a8_cached_tail_int8_text_encoder_bf16_outputs_f32_reductions",
-                    "full20_denoise_seconds": 174.577378981_f64,
+                    "accepted_base_full20_denoise_seconds": 174.577378981_f64,
                     "visual_inspection_passed": true,
                 },
                 {
@@ -2893,7 +3304,9 @@ fn readiness_doc() -> Value {
                     "available": minimax_h3_int8_ready,
                     "missing": minimax_h3_int8_missing,
                     "dtype_contract": "groupwise_int8_profile_resident_prefix_bf16_tail_int8_text_encoder_bf16_activations_f32_reductions",
-                    "full20_denoise_seconds": 377.228794159_f64,
+                    "registered_resident_blocks": 41,
+                    "hot_one_eval_seconds": 22.268046142_f64,
+                    "historical_43_block_full20_seconds_not_registered": 377.228794159_f64,
                 },
                 {
                     "id": "bf16",
@@ -2922,8 +3335,22 @@ fn readiness_doc() -> Value {
             ],
             "test_prompt": MINIMAX_H3_TEST_PROMPT,
             "prompt_contract": "exact_241_token_compiled_test_prompt",
+            "conditioned_prompt": minimax_h3_conditioned_prompt(),
+            "conditioned_prompt_contract": "exact_compiled_prompt_per_conditioned_task",
+            "conditioned_profile": {
+                "id": "h3_conditioned_768_square_124",
+                "width": MINIMAX_H3_CONDITIONED_WIDTH,
+                "height": MINIMAX_H3_CONDITIONED_HEIGHT,
+                "frames": MINIMAX_H3_CONDITIONED_FRAMES,
+                "fps": MINIMAX_H3_CONDITIONED_FPS,
+                "steps": 20,
+                "decode_runner": MINIMAX_H3_CONDITIONED_DECODE_RUNNER,
+                "process_separated_decode": true,
+                "modulation_cache": MINIMAX_H3_CONDITIONED_MODULATION_CACHE,
+            },
+            "conditioned_modes": minimax_h3_conditioned_modes,
             "include_audio": true,
-            "available": minimax_h3_ready,
+            "available": minimax_h3_ready || minimax_h3_conditioned_ready,
             "product_gate": MINIMAX_H3_PRODUCT_GATE,
         },
         {
@@ -3461,24 +3888,33 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
         if let Err(error) = validate_minimax_h3_request(&b) {
             return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
         }
-        let profile = minimax_h3_profile_from_request(&b)
-            .expect("validated MiniMax-H3 request must resolve to a registered profile");
         let quant = b.get("quant").and_then(Value::as_str).unwrap_or("int8");
-        let missing = minimax_h3_missing(profile, quant);
+        let task = minimax_h3_task(&b);
+        let missing = if task == "t2va" {
+            let profile = minimax_h3_profile_from_request(&b)
+                .expect("validated MiniMax-H3 T2VA request must resolve to a registered profile");
+            minimax_h3_missing(profile, quant)
+        } else {
+            minimax_h3_conditioned_missing(task, quant)
+        };
         if !missing.is_empty() {
             return err_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!("MiniMax-H3 runtime prerequisites missing: {}", missing.join(", ")),
             );
         }
-        if !minimax_h3_profile_mode_product_gate_passed(profile, quant) {
-            return err_detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                &format!(
-                    "MiniMax-H3 profile {} is installed but its machine-local full-trajectory quality gate is not current for quant={quant}",
-                    profile.id,
-                ),
-            );
+        if task == "t2va" {
+            let profile = minimax_h3_profile_from_request(&b)
+                .expect("validated MiniMax-H3 T2VA request must resolve to a registered profile");
+            if !minimax_h3_profile_mode_product_gate_passed(profile, quant) {
+                return err_detail(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!(
+                        "MiniMax-H3 profile {} is installed but its machine-local full-trajectory quality gate is not current for quant={quant}",
+                        profile.id,
+                    ),
+                );
+            }
         }
     }
     if model == "wan22" {
@@ -5157,6 +5593,10 @@ fn remux_ltx2_generated_audio(
 }
 
 fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
+    let task = minimax_h3_task(body);
+    if task != "t2va" {
+        return validate_minimax_h3_conditioned_request(body, task);
+    }
     let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
     if prompt != MINIMAX_H3_TEST_PROMPT {
         return Err(
@@ -5177,15 +5617,15 @@ fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join("; ");
         return Err(format!(
-            "unsupported MiniMax-H3 compiled profile; admitted profiles: {supported}"
+            "unsupported MiniMax-H3 runtime profile; admitted profiles: {supported}"
         ));
     }
     let steps = body
         .get("steps")
         .and_then(Value::as_i64)
         .unwrap_or(MINIMAX_H3_STEPS);
-    if !(1..=50).contains(&steps) {
-        return Err("MiniMax-H3 steps must be an integer from 1 through 50".to_string());
+    if !(2..=50).contains(&steps) {
+        return Err("MiniMax-H3 steps must be an integer from 2 through 50".to_string());
     }
     let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
     if seed > u32::MAX as u64 {
@@ -5218,14 +5658,87 @@ fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_minimax_h3_conditioned_request(body: &Value, task: &str) -> Result<(), String> {
+    if !matches!(task, "i2va" | "l2va" | "fl2va" | "ref2va") {
+        return Err(
+            "MiniMax-H3 task must be 't2va', 'i2va', 'l2va', 'fl2va', or 'ref2va'"
+                .to_string(),
+        );
+    }
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
+    if prompt != minimax_h3_conditioned_prompt() {
+        return Err(format!(
+            "MiniMax-H3 {task} currently accepts only the exact compiled conditioned prompt published by GET /v1/video"
+        ));
+    }
+    for (key, expected) in [
+        ("width", MINIMAX_H3_CONDITIONED_WIDTH),
+        ("height", MINIMAX_H3_CONDITIONED_HEIGHT),
+        ("frames", MINIMAX_H3_CONDITIONED_FRAMES),
+        ("fps", MINIMAX_H3_CONDITIONED_FPS),
+    ] {
+        if body.get(key).and_then(Value::as_i64) != Some(expected) {
+            return Err(format!(
+                "MiniMax-H3 {task} is compiled only for 768x768, 124 frames at 24 FPS"
+            ));
+        }
+    }
+    let steps = body.get("steps").and_then(Value::as_i64).unwrap_or(20);
+    if steps != 20 {
+        return Err(
+            "MiniMax-H3 conditioned profiles are admitted only at 20 steps so requests reuse the installed modulation cache"
+                .to_string(),
+        );
+    }
+    let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    if seed > u32::MAX as u64 {
+        return Err("MiniMax-H3 seed must be an integer from 0 through 4294967295".to_string());
+    }
+    let quant = body.get("quant").and_then(Value::as_str).unwrap_or("int8");
+    if !matches!(quant, "int8-fast" | "int8" | "bf16") {
+        return Err("MiniMax-H3 quant must be 'int8-fast', 'int8', or 'bf16'".to_string());
+    }
+    let attention = body
+        .get("attention_backend")
+        .and_then(Value::as_str)
+        .unwrap_or("cudnn");
+    if !matches!(attention, "cudnn" | "sage-int8") {
+        return Err(
+            "MiniMax-H3 attention_backend must be 'cudnn' or 'sage-int8'".to_string(),
+        );
+    }
+    if quant == "int8-fast" && attention != "cudnn" {
+        return Err(
+            "MiniMax-H3 int8-fast is quality-gated with cU-DNN attention only".to_string(),
+        );
+    }
+    if body.get("include_audio").and_then(Value::as_bool) == Some(false) {
+        return Err("MiniMax-H3 conditioned profiles always generate synchronized audio".to_string());
+    }
+    if matches!(task, "i2va" | "fl2va" | "ref2va") {
+        minimax_h3_request_media_path(body, "source_image")?;
+    }
+    if matches!(task, "l2va" | "fl2va") {
+        minimax_h3_request_media_path(body, "last_frame")?;
+    }
+    Ok(())
+}
+
 fn start_minimax_h3_request(
     st: &AppState,
     body: &Value,
     gpu: crate::gpu_lock::GpuGuard,
 ) -> Response {
+    if minimax_h3_task(body) != "t2va" {
+        return start_minimax_h3_conditioned_request(st, body, gpu);
+    }
     let profile = minimax_h3_profile_from_request(body)
         .expect("validated MiniMax-H3 request must resolve to a registered profile");
     let profile_id = profile.id.clone();
+    let profile_width = profile.width;
+    let profile_height = profile.height;
+    let profile_frames = profile.frames;
+    let profile_fps = profile.fps;
     let quant = body
         .get("quant")
         .and_then(Value::as_str)
@@ -5241,9 +5754,14 @@ fn start_minimax_h3_request(
         .and_then(Value::as_i64)
         .unwrap_or(MINIMAX_H3_STEPS);
     let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
-    let runner = minimax_h3_profile_runner(profile, &quant)
+    let runner = minimax_h3_request_runner(profile, &quant)
         .expect("validated MiniMax-H3 profile must declare the selected quant runner")
         .to_string();
+    let resident_blocks = if quant == "int8-fast" {
+        profile.fast_resident_blocks
+    } else {
+        profile.quality_resident_blocks
+    };
     let n = st
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -5355,13 +5873,16 @@ fn start_minimax_h3_request(
             .arg(steps.to_string())
             .arg(seed.to_string())
             .arg("50")
+            .arg(format!("--width={profile_width}"))
+            .arg(format!("--height={profile_height}"))
+            .arg(format!("--frames={profile_frames}"))
+            .arg(format!("--fps={profile_fps}"))
+            .arg(format!("--quant={}", thread_quant))
+            .arg(format!("--resident-blocks={resident_blocks}"))
             .arg("--encoder-storage=int8")
             .arg("--runtime-cache-exact-product-prompt")
             .arg(format!("--attention-backend={}", thread_attention))
             .arg("--defer-video-decode");
-        if thread_quant == "int8-fast" {
-            command.arg("--resident-backend=w8a8");
-        }
         command
             .stdout(std::process::Stdio::from(log))
             .stderr(std::process::Stdio::from(stderr));
@@ -5407,10 +5928,426 @@ fn start_minimax_h3_request(
                 if status.success()
                     && thread_out_dir.join("latents.safetensors").is_file() => {}
             Ok(status) => {
+                cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
                 fail(
                     "denoise",
                     format!(
                         "MiniMax-H3 denoiser failed with {status}; inspect {}",
+                        log_path.to_string_lossy()
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+                fail("runner", format!("cannot monitor MiniMax-H3 runner: {error}"));
+                return;
+            }
+        }
+
+        let decode_message = "Denoiser released; starting fresh GPU video decode and NVENC mux";
+        let _ = write_minimax_h3_job_status(
+            &thread_out_dir,
+            "running",
+            "decode",
+            steps,
+            steps,
+            decode_message,
+        );
+        publish(WorkerEvent::Progress {
+            step: steps,
+            total: steps,
+            phase: decode_message.to_string(),
+            preview: String::new(),
+        });
+        let decode_log_path = thread_out_dir.join("decode.log");
+        let decode_log = match std::fs::File::create(&decode_log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+                fail("decode_start", format!("cannot create MiniMax-H3 decode log: {error}"));
+                return;
+            }
+        };
+        let decode_stderr = match decode_log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+                fail("decode_start", format!("cannot clone MiniMax-H3 decode log: {error}"));
+                return;
+            }
+        };
+        let decode_status = std::process::Command::new(repo_path(&thread_runner))
+            .current_dir(repo_root())
+            .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .arg("decode")
+            .arg(&thread_out_dir)
+            .arg(steps.to_string())
+            .arg(seed.to_string())
+            .arg("50")
+            .arg("decode_only")
+            .arg(format!("--width={profile_width}"))
+            .arg(format!("--height={profile_height}"))
+            .arg(format!("--frames={profile_frames}"))
+            .arg(format!("--fps={profile_fps}"))
+            .arg(format!("--quant={}", thread_quant))
+            .arg(format!("--resident-blocks={resident_blocks}"))
+            .stdout(std::process::Stdio::from(decode_log))
+            .stderr(std::process::Stdio::from(decode_stderr))
+            .status();
+        if !decode_status.as_ref().is_ok_and(std::process::ExitStatus::success) {
+            cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+            fail(
+                "decode",
+                format!(
+                    "MiniMax-H3 fresh decode failed with {:?}; inspect {}",
+                    decode_status,
+                    decode_log_path.to_string_lossy()
+                ),
+            );
+            return;
+        }
+        let result_path = thread_out_dir.join("result.json");
+        let mut result = std::fs::read_to_string(&result_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let authored = result
+            .as_ref()
+            .filter(|doc| doc.get("state").and_then(Value::as_str) == Some("done"))
+            .and_then(|doc| doc.get("artifact_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let artifact = if std::path::Path::new(authored).is_absolute() {
+            std::path::PathBuf::from(authored)
+        } else {
+            repo_root().join(authored)
+        };
+        if !artifact.is_file() {
+            cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+            fail(
+                "result",
+                format!(
+                    "MiniMax-H3 decode did not publish a valid artifact; inspect {}",
+                    result_path.to_string_lossy()
+                ),
+            );
+            return;
+        }
+        if let Some(document) = result.as_mut().and_then(Value::as_object_mut) {
+            document.insert("model".to_string(), json!("minimax_h3"));
+            document.insert("runner".to_string(), json!("minimax_h3_mojo_request"));
+            document.insert("quant".to_string(), json!(thread_quant));
+            document.insert("attention_backend".to_string(), json!(thread_attention));
+            document.insert("profile".to_string(), json!(thread_profile_id));
+            document.insert(
+                "mp4_url".to_string(),
+                json!(format!("/out/{}/video.mp4", thread_video_id)),
+            );
+        }
+        if let Some(document) = result.as_ref() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(document) {
+                let _ = std::fs::write(&result_path, bytes);
+            }
+        }
+        let _ = write_minimax_h3_job_status(
+            &thread_out_dir,
+            "done",
+            "done",
+            steps,
+            steps,
+            "MiniMax-H3 synchronized video and audio ready",
+        );
+        publish(WorkerEvent::Done {
+            output_path: artifact.to_string_lossy().into_owned(),
+        });
+    });
+
+    json_resp(
+        StatusCode::ACCEPTED,
+        &json!({
+            "schema": "serenity.video_job.v1",
+            "video_id": video_id,
+            "prompt_id": video_id,
+            "model": "minimax_h3",
+            "runner": "minimax_h3_mojo_request",
+            "request_runner": runner,
+            "profile": profile_id,
+            "backend": "mojo",
+            "quant": quant,
+            "attention_backend": attention,
+            "state": "queued",
+            "status_url": format!("/out/{video_id}/status.json"),
+            "result_url": format!("/out/{video_id}/result.json"),
+            "request_url": format!("/out/{video_id}/request.json"),
+        }),
+    )
+}
+
+fn cleanup_minimax_h3_conditioned_intermediates(out_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let generated_frame = name.starts_with("frame_") && name.ends_with(".png");
+        let transient = generated_frame
+            || name == "audio.wav"
+            || name == "latents.safetensors"
+            || name == "latents_ckpt.safetensors"
+            || name == ".gpu_guard"
+            || name == "ref_prompt.txt"
+            || name.starts_with("keyframe_first.")
+            || name.starts_with("keyframe_last.")
+            || name.starts_with("ref_image_")
+            || name.starts_with("ref_probe_")
+            || name.starts_with("ref_soundtrack_");
+        if transient && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn start_minimax_h3_conditioned_request(
+    st: &AppState,
+    body: &Value,
+    gpu: crate::gpu_lock::GpuGuard,
+) -> Response {
+    let task = minimax_h3_task(body).to_string();
+    let quant = body
+        .get("quant")
+        .and_then(Value::as_str)
+        .unwrap_or("int8")
+        .to_string();
+    let attention = body
+        .get("attention_backend")
+        .and_then(Value::as_str)
+        .unwrap_or("cudnn")
+        .to_string();
+    let steps = body.get("steps").and_then(Value::as_i64).unwrap_or(20);
+    let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    let runner = minimax_h3_conditioned_runner(&task, &quant)
+        .expect("validated conditioned MiniMax-H3 request must resolve a runner");
+    let mut media = Vec::new();
+    if matches!(task.as_str(), "i2va" | "fl2va" | "ref2va") {
+        media.push(
+            minimax_h3_request_media_path(body, "source_image")
+                .expect("validated MiniMax-H3 source_image must resolve"),
+        );
+    }
+    if matches!(task.as_str(), "l2va" | "fl2va") {
+        media.push(
+            minimax_h3_request_media_path(body, "last_frame")
+                .expect("validated MiniMax-H3 last_frame must resolve"),
+        );
+    }
+    let n = st
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let video_id = format!("video-{n:04}");
+    let out_dir = st.out_dir.join(&video_id);
+    if let Err(error) = std::fs::create_dir_all(&out_dir) {
+        return err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot create MiniMax-H3 output directory: {error}"),
+        );
+    }
+    let request_path = out_dir.join("request.json");
+    let mut request = body.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.insert("runner".to_string(), json!("minimax_h3_mojo_request"));
+        object.insert("profile".to_string(), json!("h3_conditioned_768_square_124"));
+        object.insert("defer_decode".to_string(), json!(true));
+        object.insert("gpu_model_execution_only".to_string(), json!(true));
+        object.insert(
+            "cache_policy".to_string(),
+            json!(if task == "ref2va" {
+                "ref2va_dit_cache_and_shared_identical_encoder_cache"
+            } else {
+                "reuse_existing_fl2va_resident_cache"
+            }),
+        );
+        object.insert("reference_only".to_string(), json!(task == "ref2va"));
+        object.insert("encoder_storage".to_string(), json!("int8"));
+    }
+    let request_bytes = match serde_json::to_vec_pretty(&request) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return err_detail(
+                StatusCode::BAD_REQUEST,
+                &format!("cannot serialize MiniMax-H3 request: {error}"),
+            );
+        }
+    };
+    if let Err(error) = std::fs::write(&request_path, request_bytes) {
+        return err_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot write MiniMax-H3 request: {error}"),
+        );
+    }
+    let _ = write_minimax_h3_job_status(
+        &out_dir,
+        "queued",
+        "queued",
+        0,
+        steps,
+        &format!("MiniMax-H3 {task} request queued"),
+    );
+
+    let bus = st.comfy_ws.clone();
+    let thread_video_id = video_id.clone();
+    let thread_out_dir = out_dir.clone();
+    let thread_task = task.clone();
+    let thread_quant = quant.clone();
+    let thread_attention = attention.clone();
+    let thread_runner = runner.clone();
+    let thread_media = media.clone();
+    std::thread::spawn(move || {
+        let _gpu = gpu;
+        let publish = |event: WorkerEvent| {
+            let _ = bus.send((thread_video_id.clone(), event));
+        };
+        let fail = |phase: &str, error: String| {
+            let _ = write_minimax_h3_job_status(
+                &thread_out_dir,
+                "failed",
+                phase,
+                0,
+                steps,
+                &error,
+            );
+            publish(WorkerEvent::Failed { error });
+        };
+        let message = format!(
+            "Starting MiniMax-H3 {} {} with GPU vision and {} attention",
+            thread_task.to_uppercase(),
+            thread_quant.to_uppercase(),
+            thread_attention,
+        );
+        let _ = write_minimax_h3_job_status(
+            &thread_out_dir,
+            "running",
+            "keyframe_conditioning_and_denoising",
+            0,
+            steps,
+            &message,
+        );
+        publish(WorkerEvent::Progress {
+            step: 0,
+            total: steps,
+            phase: message,
+            preview: String::new(),
+        });
+        let log_path = thread_out_dir.join("runner.log");
+        let log = match std::fs::File::create(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                fail("runner_start", format!("cannot create MiniMax-H3 runner log: {error}"));
+                return;
+            }
+        };
+        let stderr = match log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                fail("runner_start", format!("cannot clone MiniMax-H3 log handle: {error}"));
+                return;
+            }
+        };
+        let mut command = std::process::Command::new(repo_path(&thread_runner));
+        command
+            .current_dir(repo_root())
+            .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE);
+        if thread_task == "ref2va" {
+            let prompt_path = thread_out_dir.join("ref_prompt.txt");
+            if let Err(error) = std::fs::write(
+                &prompt_path,
+                format!("{}\n", minimax_h3_conditioned_prompt()),
+            ) {
+                fail("runner_start", format!("cannot write MiniMax-H3 Ref2VA prompt: {error}"));
+                return;
+            }
+            command
+                .arg(prompt_path)
+                .arg(&thread_out_dir)
+                .arg(steps.to_string())
+                .arg(seed.to_string());
+            for path in &thread_media {
+                command.arg(format!("image:{}", path.to_string_lossy()));
+            }
+            command.arg(format!("--attention-backend={}", thread_attention));
+        } else {
+            command
+                .arg(&thread_task)
+                .arg(minimax_h3_conditioned_prompt());
+            for path in &thread_media {
+                command.arg(path);
+            }
+            command
+                .arg(&thread_out_dir)
+                .arg(steps.to_string())
+                .arg(seed.to_string())
+                .arg("50")
+                .arg(format!("--attention-backend={}", thread_attention))
+                .arg("--defer-video-decode");
+        }
+        if thread_quant == "int8-fast" {
+            command.arg("--resident-backend=w8a8");
+        } else if thread_quant == "int8" {
+            command.arg("--resident-backend=groupwise");
+        }
+        command
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(stderr));
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                fail("runner_start", format!("cannot start MiniMax-H3 runner: {error}"));
+                return;
+            }
+        };
+        let mut last_progress: Option<(String, i64, i64, String)> = None;
+        let status = loop {
+            if let Ok(text) = std::fs::read_to_string(&log_path) {
+                if let Some(progress) = minimax_h3_progress_from_log(&text, steps) {
+                    if last_progress.as_ref() != Some(&progress) {
+                        let (phase, step, total, progress_message) = &progress;
+                        let _ = write_minimax_h3_job_status(
+                            &thread_out_dir,
+                            "running",
+                            phase,
+                            *step,
+                            *total,
+                            progress_message,
+                        );
+                        publish(WorkerEvent::Progress {
+                            step: *step,
+                            total: *total,
+                            phase: progress_message.clone(),
+                            preview: String::new(),
+                        });
+                        last_progress = Some(progress);
+                    }
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                Err(error) => break Err(error),
+            }
+        };
+        match status {
+            Ok(status)
+                if status.success()
+                    && thread_out_dir.join("latents.safetensors").is_file() => {}
+            Ok(status) => {
+                fail(
+                    "denoise",
+                    format!(
+                        "MiniMax-H3 {} denoiser failed with {status}; inspect {}",
+                        thread_task,
                         log_path.to_string_lossy()
                     ),
                 );
@@ -5452,7 +6389,7 @@ fn start_minimax_h3_request(
                 return;
             }
         };
-        let decode_status = std::process::Command::new(repo_path(&thread_runner))
+        let decode_status = std::process::Command::new(repo_path(MINIMAX_H3_CONDITIONED_DECODE_RUNNER))
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
             .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
@@ -5504,26 +6441,30 @@ fn start_minimax_h3_request(
         if let Some(document) = result.as_mut().and_then(Value::as_object_mut) {
             document.insert("model".to_string(), json!("minimax_h3"));
             document.insert("runner".to_string(), json!("minimax_h3_mojo_request"));
-            document.insert("quant".to_string(), json!(thread_quant));
-            document.insert("attention_backend".to_string(), json!(thread_attention));
-            document.insert("profile".to_string(), json!(thread_profile_id));
+            document.insert("task".to_string(), json!(thread_task.clone()));
+            document.insert("quant".to_string(), json!(thread_quant.clone()));
+            document.insert("attention_backend".to_string(), json!(thread_attention.clone()));
+            document.insert("encoder_storage".to_string(), json!("int8"));
+            document.insert("profile".to_string(), json!("h3_conditioned_768_square_124"));
             document.insert(
                 "mp4_url".to_string(),
                 json!(format!("/out/{}/video.mp4", thread_video_id)),
             );
+            document.insert("intermediates_cleaned".to_string(), json!(true));
         }
         if let Some(document) = result.as_ref() {
             if let Ok(bytes) = serde_json::to_vec_pretty(document) {
                 let _ = std::fs::write(&result_path, bytes);
             }
         }
+        cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
         let _ = write_minimax_h3_job_status(
             &thread_out_dir,
             "done",
             "done",
             steps,
             steps,
-            "MiniMax-H3 synchronized video and audio ready",
+            &format!("MiniMax-H3 {} synchronized video and audio ready", thread_task),
         );
         publish(WorkerEvent::Done {
             output_path: artifact.to_string_lossy().into_owned(),
@@ -5539,7 +6480,8 @@ fn start_minimax_h3_request(
             "model": "minimax_h3",
             "runner": "minimax_h3_mojo_request",
             "profile_runner": runner,
-            "profile": profile_id,
+            "profile": "h3_conditioned_768_square_124",
+            "task": task,
             "backend": "mojo",
             "quant": quant,
             "attention_backend": attention,
@@ -9184,6 +10126,16 @@ mod tests {
 
     #[test]
     fn minimax_h3_request_is_exact_and_switchable() {
+        let registry = minimax_h3_request_profile_registry();
+        assert_eq!(registry.runner, MINIMAX_H3_REQUEST_RUNNER);
+        for profile in &registry.profiles {
+            for quant in ["int8-fast", "int8", "bf16"] {
+                assert_eq!(
+                    minimax_h3_request_runner(profile, quant),
+                    Some(MINIMAX_H3_REQUEST_RUNNER),
+                );
+            }
+        }
         let mut request = json!({
             "model": "minimax_h3",
             "runner": "minimax_h3_mojo_request",
@@ -9222,7 +10174,7 @@ mod tests {
         request["width"] = json!(1024);
         assert!(validate_minimax_h3_request(&request)
             .unwrap_err()
-            .contains("unsupported MiniMax-H3 compiled profile"));
+            .contains("unsupported MiniMax-H3 runtime profile"));
         request["width"] = json!(MINIMAX_H3_WIDTH);
         request["height"] = json!(MINIMAX_H3_HEIGHT);
         request["frames"] = json!(MINIMAX_H3_FRAMES);
@@ -9235,6 +10187,48 @@ mod tests {
         assert!(validate_minimax_h3_request(&request)
             .unwrap_err()
             .contains("'int8-fast', 'int8', or 'bf16'"));
+    }
+
+    #[test]
+    fn minimax_h3_conditioned_requests_preserve_exact_media_contracts() {
+        let media = repo_path("pixi.toml");
+        assert!(nonempty_file(&media));
+        let mut request = json!({
+            "model": "minimax_h3",
+            "runner": "minimax_h3_mojo_request",
+            "task": "i2va",
+            "prompt": minimax_h3_conditioned_prompt(),
+            "source_image": media,
+            "width": MINIMAX_H3_CONDITIONED_WIDTH,
+            "height": MINIMAX_H3_CONDITIONED_HEIGHT,
+            "frames": MINIMAX_H3_CONDITIONED_FRAMES,
+            "fps": MINIMAX_H3_CONDITIONED_FPS,
+            "steps": 20,
+            "seed": 7,
+            "quant": "int8",
+            "attention_backend": "cudnn",
+            "include_audio": true,
+        });
+        validate_minimax_h3_request(&request).unwrap();
+        request["steps"] = json!(19);
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("installed modulation cache"));
+        request["steps"] = json!(20);
+        request["task"] = json!("fl2va");
+        request["last_frame"] = request["source_image"].clone();
+        validate_minimax_h3_request(&request).unwrap();
+        request["task"] = json!("l2va");
+        request.as_object_mut().unwrap().remove("source_image");
+        validate_minimax_h3_request(&request).unwrap();
+        request["task"] = json!("ref2va");
+        request["source_image"] = json!(media);
+        validate_minimax_h3_request(&request).unwrap();
+        request["task"] = json!("fl2va");
+        request.as_object_mut().unwrap().remove("last_frame");
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("last_frame is required"));
     }
 
     #[test]
@@ -9276,7 +10270,19 @@ mod tests {
         let wan22_built = wan22_missing().is_empty();
         let bernini_built = bernini_missing().is_empty();
         let scail2_built = scail2_missing().is_empty();
-        if !ltx2_ready && !wan22_built && !bernini_built && !scail2_built {
+        let h3_any_ready = minimax_h3_request_profile_registry()
+            .profiles
+            .iter()
+            .any(|profile| {
+                ["int8-fast", "int8", "bf16"]
+                    .iter()
+                    .any(|quant| minimax_h3_profile_mode_ready(profile, quant))
+            }) || ["i2va", "l2va", "fl2va"].iter().any(|task| {
+                ["int8-fast", "int8", "bf16"]
+                    .iter()
+                    .any(|quant| minimax_h3_conditioned_missing(task, quant).is_empty())
+            });
+        if !ltx2_ready && !wan22_built && !bernini_built && !scail2_built && !h3_any_ready {
             assert_eq!(d.get("state").unwrap(), "runner_missing");
             assert_eq!(d.get("readiness_label").unwrap(), "build_required");
         }
@@ -9395,6 +10401,11 @@ mod tests {
             .iter()
             .find(|entry| entry.get("model").and_then(Value::as_str) == Some("minimax_h3_t2va"))
             .unwrap();
+        assert_eq!(h3["runner"], MINIMAX_H3_REQUEST_RUNNER);
+        assert_eq!(
+            h3["runner_topology"],
+            "one_request_runner_runtime_geometry_length_fps_and_quant"
+        );
         assert_eq!(h3["supported_profiles"][0]["width"], MINIMAX_H3_WIDTH);
         assert_eq!(h3["supported_profiles"][0]["height"], MINIMAX_H3_HEIGHT);
         assert_eq!(h3["supported_profiles"][0]["frames"], MINIMAX_H3_FRAMES);
@@ -9408,6 +10419,18 @@ mod tests {
         assert_eq!(h3["attention_backends"][1]["id"], "sage-int8");
         assert_eq!(h3["attention_backends"][0]["accepted_quality_default"], true);
         assert_eq!(h3["attention_backends"][1]["accepted_quality_default"], false);
+        assert_eq!(h3["conditioned_profile"]["width"], 768);
+        assert_eq!(h3["conditioned_profile"]["frames"], 124);
+        assert_eq!(h3["conditioned_modes"][0]["id"], "i2va");
+        assert_eq!(h3["conditioned_modes"][1]["id"], "l2va");
+        assert_eq!(h3["conditioned_modes"][2]["id"], "fl2va");
+        assert_eq!(h3["conditioned_modes"][3]["id"], "ref2va");
+        assert_eq!(
+            h3["conditioned_modes"][3]["available"],
+            ["int8-fast", "int8", "bf16"]
+                .iter()
+                .any(|quant| minimax_h3_conditioned_missing("ref2va", quant).is_empty())
+        );
         let h3_ready = minimax_h3_request_profile_registry()
             .profiles
             .iter()
@@ -9416,7 +10439,12 @@ mod tests {
                     .iter()
                     .any(|quant| minimax_h3_profile_mode_ready(profile, quant))
             });
-        assert_eq!(h3["available"], h3_ready);
+        let h3_conditioned_ready = ["i2va", "l2va", "fl2va"].iter().any(|task| {
+            ["int8-fast", "int8", "bf16"]
+                .iter()
+                .any(|quant| minimax_h3_conditioned_missing(task, quant).is_empty())
+        });
+        assert_eq!(h3["available"], h3_ready || h3_conditioned_ready);
         let wan = runners
             .iter()
             .find(|entry| entry.get("model").and_then(Value::as_str) == Some("wan22_t2v"))

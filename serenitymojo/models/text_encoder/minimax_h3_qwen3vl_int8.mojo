@@ -20,6 +20,7 @@
 from std.gpu.host import DeviceContext, HostBuffer
 from std.memory import ArcPointer
 from std.math import sqrt
+from std.sys.defines import get_defined_int
 
 from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.io.dtype import STDtype
@@ -59,6 +60,12 @@ from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
     _detect_layer_prefix,
     _h3_embed_prefix,
     _h3_open_available_shards,
+    minimax_h3_deepstack_add,
+    minimax_h3_splice_vision_embeds,
+)
+from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_vision import (
+    MiniMaxH3VisionOutput,
+    minimax_h3_vision_deepstack_lm_layers,
 )
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.int8_linear import int8_linear_fwd_rowscale
@@ -74,6 +81,9 @@ from serenitymojo.ops.rope import rope_halfsplit
 comptime H3_ENCODER_INT8_CACHE_VERSION = 1
 comptime H3_ENCODER_INT8_STAGE_BYTES = 64 * 1024 * 1024
 comptime H3_ENCODER_INT8_SMALL_STAGE_BYTES = 1024 * 1024
+comptime H3_ENCODER_INT8_ALLOW_CACHE_BUILD = get_defined_int[
+    "H3_ENCODER_INT8_ALLOW_CACHE_BUILD", 1
+]()
 comptime _TArc = ArcPointer[Tensor]
 
 
@@ -561,14 +571,34 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
     ids: List[Int],
     num_layers: Int,
     ctx: DeviceContext,
+    vision: Optional[MiniMaxH3VisionOutput] = None,
+    visual_positions: Optional[List[Int]] = None,
 ) raises -> Tensor:
-    """Direct W8A8 GPU conditioner. No BF16 matrix enters the runtime path."""
+    """Direct W8A8 GPU conditioner. No BF16 matrix enters the runtime path.
+
+    When `vision` and `visual_positions` are both supplied, applies the same
+    one-time embedding replacement and post-layer 0/1/2 deepstack additions
+    as the gated BF16 multimodal conditioner. Supplying only one fails loud.
+    """
     if len(ids) == 0:
         raise Error("MiniMax-H3 INT8 conditioner received an empty prompt")
     if num_layers <= 0 or num_layers > H3_EXTRACT_LAYER:
         raise Error("MiniMax-H3 INT8 conditioner layer count must be in 1..50")
+    var has_vision = vision.__bool__()
+    if has_vision != visual_positions.__bool__():
+        raise Error(
+            "MiniMax-H3 INT8 conditioner requires vision and"
+            " visual_positions together"
+        )
 
-    _ = minimax_h3_build_int8_encoder_cache(text_encoder_dir, num_layers, ctx)
+    comptime if H3_ENCODER_INT8_ALLOW_CACHE_BUILD != 0:
+        _ = minimax_h3_build_int8_encoder_cache(
+            text_encoder_dir, num_layers, ctx
+        )
+    else:
+        print(
+            "  H3 encoder INT8 cache: consume-only (no cache writes allowed)"
+        )
     var st = _h3_open_available_shards(text_encoder_dir)
     var layer_prefix = _detect_layer_prefix(st)
     var embed_prefix = _h3_embed_prefix(layer_prefix)
@@ -580,6 +610,15 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
     var hidden = _h3_i8_embed(
         st, cache_dir, embed_prefix + "embed_tokens.weight", ids, io, ctx
     )
+    if has_vision:
+        var vpos = visual_positions.value().copy()
+        var host_embeds = hidden.to_host(ctx)
+        minimax_h3_splice_vision_embeds(
+            host_embeds, vision.value().embeds, vpos, H3_HIDDEN
+        )
+        hidden = Tensor.from_host(
+            host_embeds, hidden.shape(), hidden.dtype(), ctx
+        )
 
     var seq = len(ids)
     var q_tables = _build_rope_tables(
@@ -606,6 +645,7 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
         mask_data, [1, H3_HEADS, seq, seq], STDtype.BF16, ctx
     )
 
+    var deepstack_lm_layers = minimax_h3_vision_deepstack_lm_layers()
     for li in range(num_layers):
         var layer = _h3_i8_load_layer(
             st, cache_dir, layer_prefix, li, io, small_uploader, ctx
@@ -613,6 +653,18 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
         hidden = _h3_i8_layer_forward(
             layer, li, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx
         )
+        if has_vision:
+            for k in range(len(deepstack_lm_layers)):
+                if deepstack_lm_layers[k] == li:
+                    var vpos2 = visual_positions.value().copy()
+                    var tap = vision.value().deepstack_block(k)
+                    var host_hidden = hidden.to_host(ctx)
+                    minimax_h3_deepstack_add(
+                        host_hidden, tap, vpos2, H3_HIDDEN
+                    )
+                    hidden = Tensor.from_host(
+                        host_hidden, hidden.shape(), hidden.dtype(), ctx
+                    )
         ctx.synchronize()
         st.release_to_os()
         if (li + 1) % 5 == 0 or li + 1 == num_layers:
@@ -628,7 +680,10 @@ def minimax_h3_encode_conditioning_int8_streamed(
     text_encoder_dir: String,
     ids: List[Int],
     ctx: DeviceContext,
+    vision: Optional[MiniMaxH3VisionOutput] = None,
+    visual_positions: Optional[List[Int]] = None,
 ) raises -> Tensor:
     return minimax_h3_encode_conditioning_int8_streamed_depth(
-        text_encoder_dir, ids, H3_EXTRACT_LAYER, ctx
+        text_encoder_dir, ids, H3_EXTRACT_LAYER, ctx,
+        vision, visual_positions,
     )

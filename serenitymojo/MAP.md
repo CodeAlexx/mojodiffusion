@@ -3296,6 +3296,12 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   passed at 20,190 MiB and is backed by the earlier complete 362-frame
   15.08-second BF16 artifact. Canvas exposes 15.08 seconds for every precision
   at 512x320 and only for BF16 at 832x480; it never silently substitutes dtype.
+  Duration is also protected from resolution fallback: entering T2VA selects
+  the longest admitted profile, resolution labels show their exact duration
+  choices, and short-only 960x544 is disabled while 15.08 seconds is selected.
+  A deliberate 2.33-second selection re-enables and selects 960x544; returning
+  to 15.08 seconds resolves the closest admitted long resolution instead of
+  silently rewriting the request to 56 frames.
 - **Conditioned Canvas closure (2026-08-05):** Canvas now follows the LTX2
   capability-driven pattern and exposes T2VA, I2VA, L2VA, and FL2VA as explicit
   tasks. It also exposes a bounded **image-only Ref2VA** task: one selected

@@ -4442,24 +4442,54 @@ var CanvasTab = (function () {
                 : 'Generate H3 ' + genState.h3Mode.toUpperCase() + ' + Audio';
         });
         els.h3Resolution.addEventListener('change', function () {
-            applyCanvasH3ResolutionDuration(
-                this.value, Number(els.h3Duration.value), true
+            var requestedResolution = this.value;
+            var requestedDuration = Number(els.h3Duration.value);
+            if (applyCanvasH3ResolutionDuration(
+                requestedResolution, requestedDuration
+            ))
+                return;
+            var supported = canvasH3ProfilesForResolution(requestedResolution)
+                .map(function (profile) {
+                    return Number(canvasH3ProfileDuration(profile).toFixed(2));
+                });
+            showError(
+                'That H3 resolution cannot preserve ' + requestedDuration +
+                ' seconds. It supports ' + supported.join(', ') +
+                ' seconds; the current duration was kept.'
             );
+            applyCanvasH3Profile(preferredCanvasH3Profile());
         });
         els.h3Duration.addEventListener('change', function () {
             if (genState.h3Mode !== 't2va')
                 return;
+            var requestedDuration = Number(this.value);
             if (applyCanvasH3ResolutionDuration(
-                els.h3Resolution.value, Number(this.value), false
+                els.h3Resolution.value, requestedDuration
             ))
                 return;
-            var supported = canvasH3ProfilesForResolution(
-                els.h3Resolution.value
-            ).map(function (profile) {
+            var durationProfiles = canvasH3ProfilesForDuration(requestedDuration);
+            if (durationProfiles.length) {
+                var current = preferredCanvasH3Profile();
+                durationProfiles.sort(function (left, right) {
+                    if (!current)
+                        return Number(right.width) * Number(right.height) -
+                            Number(left.width) * Number(left.height);
+                    var leftDelta = Math.abs(Number(left.width) - Number(current.width)) +
+                        Math.abs(Number(left.height) - Number(current.height));
+                    var rightDelta = Math.abs(Number(right.width) - Number(current.width)) +
+                        Math.abs(Number(right.height) - Number(current.height));
+                    return leftDelta - rightDelta;
+                });
+                applyCanvasH3Profile(durationProfiles[0]);
+                return;
+            }
+            var supported = activeCanvasH3Profiles().map(function (profile) {
                 return Number(canvasH3ProfileDuration(profile).toFixed(2));
+            }).filter(function (duration, index, values) {
+                return values.indexOf(duration) === index;
             });
             showError(
-                'This H3 resolution supports ' +
+                'H3 supports ' +
                 supported.join(', ') + ' seconds.'
             );
             applyCanvasH3Profile(preferredCanvasH3Profile());
@@ -5581,17 +5611,47 @@ var CanvasTab = (function () {
         var selected = profiles.find(function (profile) {
             return canvasH3ProfileKey(profile) === genState.h3ProfileKey;
         });
-        return selected || exactCanvasH3Profile() || profiles[0];
+        if (selected)
+            return selected;
+        // Enter H3 on its longest admitted profile. A stale canvas bounding box
+        // must not silently select one of the short high-resolution probes.
+        return profiles.slice().sort(function (left, right) {
+            var durationDelta = canvasH3ProfileDuration(right) -
+                canvasH3ProfileDuration(left);
+            if (Math.abs(durationDelta) > 0.011)
+                return durationDelta;
+            return Number(right.width) * Number(right.height) -
+                Number(left.width) * Number(left.height);
+        })[0];
     }
-    function refreshCanvasH3DurationControl(resolutionKey, selectedDuration) {
+    function canvasH3ProfilesForDuration(selectedDuration) {
+        var duration = Number(selectedDuration);
+        return activeCanvasH3Profiles().filter(function (profile) {
+            return Math.abs(canvasH3ProfileDuration(profile) - duration) < 0.011;
+        });
+    }
+    function refreshCanvasH3ResolutionAvailability(selectedDuration) {
+        if (!els.h3Resolution)
+            return;
+        Array.from(els.h3Resolution.options).forEach(function (option) {
+            option.disabled = !canvasH3ProfilesForDuration(selectedDuration).some(
+                function (profile) {
+                    return canvasH3ResolutionKey(profile) === option.value;
+                }
+            );
+        });
+    }
+    function refreshCanvasH3DurationControl(selectedDuration) {
         if (!els.h3Duration)
             return;
-        var profiles = canvasH3ProfilesForResolution(resolutionKey);
+        var profiles = activeCanvasH3Profiles();
         if (els.h3DurationList)
             els.h3DurationList.innerHTML = '';
         var durations = [];
         profiles.forEach(function (profile) {
             var duration = Number(canvasH3ProfileDuration(profile).toFixed(2));
+            if (durations.indexOf(duration) >= 0)
+                return;
             durations.push(duration);
             var option = document.createElement('option');
             option.value = String(duration);
@@ -5607,8 +5667,10 @@ var CanvasTab = (function () {
         }
         els.h3Duration.min = String(Math.min.apply(Math, durations));
         els.h3Duration.max = String(Math.max.apply(Math, durations));
-        els.h3Duration.title = 'Supported seconds: ' + durations.join(', ');
+        els.h3Duration.title = 'Supported H3 seconds: ' + durations.join(', ') +
+            '. Resolution choices that cannot preserve the selected duration are disabled.';
         els.h3Duration.value = String(Number(Number(selectedDuration).toFixed(2)));
+        refreshCanvasH3ResolutionAvailability(selectedDuration);
     }
     function applyCanvasH3Geometry(profile) {
         if (!profile)
@@ -5650,7 +5712,7 @@ var CanvasTab = (function () {
         var duration = canvasH3ProfileDuration(profile);
         if (els.h3Resolution)
             els.h3Resolution.value = resolutionKey;
-        refreshCanvasH3DurationControl(resolutionKey, duration);
+        refreshCanvasH3DurationControl(duration);
         if (els.h3ProfileNote) {
             els.h3ProfileNote.textContent =
                 profile.width + '\u00d7' + profile.height + ' \u00b7 ' +
@@ -5660,9 +5722,7 @@ var CanvasTab = (function () {
         }
         return true;
     }
-    function applyCanvasH3ResolutionDuration(
-        resolutionKey, requestedDuration, allowNearest
-    ) {
+    function applyCanvasH3ResolutionDuration(resolutionKey, requestedDuration) {
         var profiles = canvasH3ProfilesForResolution(resolutionKey);
         if (!profiles.length)
             return false;
@@ -5670,12 +5730,6 @@ var CanvasTab = (function () {
         var profile = profiles.find(function (candidate) {
             return Math.abs(canvasH3ProfileDuration(candidate) - duration) < 0.011;
         });
-        if (!profile && allowNearest) {
-            profile = profiles.slice().sort(function (left, right) {
-                return Math.abs(canvasH3ProfileDuration(left) - duration) -
-                    Math.abs(canvasH3ProfileDuration(right) - duration);
-            })[0];
-        }
         return profile ? applyCanvasH3Profile(profile) : false;
     }
     function refreshCanvasH3ProfileControls(conditioned, mode) {
@@ -5739,10 +5793,14 @@ var CanvasTab = (function () {
             if (seen[key])
                 return;
             seen[key] = true;
+            var durations = canvasH3ProfilesForResolution(key).map(function (candidate) {
+                return Number(canvasH3ProfileDuration(candidate).toFixed(2));
+            });
             var option = document.createElement('option');
             option.value = key;
             option.textContent = profile.width + '\u00d7' + profile.height +
-                ' \u00b7 ' + profile.fps + ' FPS';
+                ' \u00b7 ' + profile.fps + ' FPS \u00b7 ' +
+                durations.join('/') + 's';
             els.h3Resolution.appendChild(option);
         });
         els.h3Resolution.disabled = false;

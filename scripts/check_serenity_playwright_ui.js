@@ -598,6 +598,7 @@ async function run() {
           const isLtx = video.model === "ltx2";
           const isWan = video.model === "wan22";
           const isBernini = video.model === "bernini";
+          const isH3 = video.model === "minimax_h3";
           const ltxRunner = isLtx
             ? (GenerateTab.state.videoStatus.candidate_runners || [])
               .find((entry) => entry && entry.model === "ltx2_t2v_av")
@@ -609,6 +610,19 @@ async function run() {
           const exactAvailableLtxProfile = !isLtx || ltxProfiles.some((profile) =>
             profile.available === true
               && Array.isArray(profile.modes) && profile.modes.includes("standard")
+              && Number(profile.width) === Number(video.width)
+              && Number(profile.height) === Number(video.height)
+              && Number(profile.frames) === Number(video.frames)
+              && Number(profile.fps) === Number(video.fps));
+          const h3Runner = isH3
+            ? (GenerateTab.state.videoStatus.candidate_runners || [])
+              .find((entry) => entry && entry.model === "minimax_h3_t2va")
+            : null;
+          const h3Profiles = h3Runner && Array.isArray(h3Runner.supported_profiles)
+            ? h3Runner.supported_profiles : [];
+          const exactAvailableH3Profile = !isH3 || h3Profiles.some((profile) =>
+            profile.available === true
+              && profile.available_modes && profile.available_modes[video.quant] === true
               && Number(profile.width) === Number(video.width)
               && Number(profile.height) === Number(video.height)
               && Number(profile.frames) === Number(video.frames)
@@ -633,6 +647,9 @@ async function run() {
                 && (admittedLtxDev || admittedLtxDistilled))
               || (isWan && video.steps === 50 && video.guidance === 5
                 && ["bf16", "fp8"].includes(video.quant))
+              || (isH3 && video.runner === "minimax_h3_mojo_request"
+                && ["int8-fast", "int8", "bf16"].includes(video.quant)
+                && exactAvailableH3Profile)
               || (isBernini && video.width === 848 && video.height === 480
                 && video.frames === 81 && video.fps === 16 && video.steps === 40
                 && video.guidance === 4 && video.quant === "fp8"),
@@ -650,6 +667,7 @@ async function run() {
             guidance: video.guidance,
             quant: video.quant,
             exactAvailableLtxProfile,
+            exactAvailableH3Profile,
           };
         }
         const response = await fetch("/v1/preflight", {
@@ -682,6 +700,86 @@ async function run() {
       } else {
         assert(result.admitted, `${result.name}: route was not admitted ${JSON.stringify(result)}`);
       }
+    }
+    const h3Model = modelResults.find((result) => result.backend === "minimax_h3");
+    if (h3Model) {
+      await page.locator('.nav-btn[data-tab="canvas"]').click();
+      await page.waitForFunction(() => document.querySelectorAll("#cv-model option").length > 1);
+      await page.locator("#cv-model").selectOption(h3Model.name);
+      await page.waitForFunction(() => {
+        const duration = document.querySelector("#cv-h3-duration");
+        return duration && duration.value !== "";
+      });
+      const readH3Controls = () => page.evaluate(() => ({
+        quant: document.querySelector("#cv-h3-quant").value,
+        resolution: document.querySelector("#cv-h3-resolution").value,
+        duration: Number(document.querySelector("#cv-h3-duration").value),
+        frames: Number(document.querySelector("#cv-frames").value),
+        fps: Number(document.querySelector("#cv-fps").value),
+        resolutions: Array.from(document.querySelector("#cv-h3-resolution").options)
+          .map((option) => ({
+            value: option.value,
+            label: option.textContent,
+            disabled: option.disabled,
+          })),
+      }));
+      const h3Default = await readH3Controls();
+      assert(
+        h3Default.resolution === "512x320_24fps"
+          && h3Default.duration === 15.08 && h3Default.frames === 362,
+        `H3 did not default to the admitted long profile: ${JSON.stringify(h3Default)}`,
+      );
+      await page.locator("#cv-h3-quant").selectOption("bf16");
+      await page.locator("#cv-h3-resolution").selectOption("832x480_24fps");
+      const h3LongBf16 = await readH3Controls();
+      assert(
+        h3LongBf16.duration === 15.08 && h3LongBf16.frames === 362
+          && h3LongBf16.resolution === "832x480_24fps",
+        `H3 BF16 high-resolution selection lost 15 seconds: ${JSON.stringify(h3LongBf16)}`,
+      );
+      const h3HighShortOption = h3LongBf16.resolutions.find(
+        (option) => option.value === "960x544_24fps",
+      );
+      assert(
+        h3HighShortOption && h3HighShortOption.disabled
+          && h3HighShortOption.label.includes("2.33s"),
+        `H3 did not mark the 960 short-only profile: ${JSON.stringify(h3HighShortOption)}`,
+      );
+      await page.evaluate(() => {
+        const resolution = document.querySelector("#cv-h3-resolution");
+        resolution.value = "960x544_24fps";
+        resolution.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      const h3RejectedShortFallback = await readH3Controls();
+      assert(
+        h3RejectedShortFallback.duration === 15.08
+          && h3RejectedShortFallback.frames === 362
+          && h3RejectedShortFallback.resolution === "832x480_24fps",
+        `H3 silently fell back to 2.33 seconds: ${JSON.stringify(h3RejectedShortFallback)}`,
+      );
+      await page.evaluate(() => {
+        const duration = document.querySelector("#cv-h3-duration");
+        duration.value = "2.33";
+        duration.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      const h3ExplicitShort = await readH3Controls();
+      assert(
+        h3ExplicitShort.duration === 2.33 && h3ExplicitShort.frames === 56
+          && h3ExplicitShort.resolution === "960x544_24fps",
+        `H3 could not explicitly select the 2.33-second profile: ${JSON.stringify(h3ExplicitShort)}`,
+      );
+      await page.evaluate(() => {
+        const duration = document.querySelector("#cv-h3-duration");
+        duration.value = "15.08";
+        duration.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      const h3RestoredLong = await readH3Controls();
+      assert(
+        h3RestoredLong.duration === 15.08 && h3RestoredLong.frames === 362
+          && h3RestoredLong.resolution === "832x480_24fps",
+        `H3 could not restore the 15-second BF16 profile: ${JSON.stringify(h3RestoredLong)}`,
+      );
+      await page.locator('.nav-btn[data-tab="generate"]').click();
     }
     const ltxModels = modelResults.filter((result) => result.backend === "ltx2");
     const ltxNames = ltxModels.map((result) => result.name);

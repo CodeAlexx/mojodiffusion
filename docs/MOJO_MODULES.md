@@ -851,7 +851,12 @@ edits: see sections C and D of the parity-ported doc.
 - `serenity-server/crates/server/src/video.rs` and the Canvas Generate/Workflow
   modules resolve exact profile geometry and precision before acquiring the GPU
   lease. Unsupported geometry, missing runners/caches, stale machine gates, and
-  invalid attention combinations fail queue admission closed.
+  invalid attention combinations fail queue admission closed. Canvas treats
+  duration as the protected selector: it opens T2VA on the longest admitted
+  profile, labels each resolution with its available seconds, and disables a
+  resolution that would silently shorten the selected duration. Choosing a
+  different supported duration explicitly re-resolves the compatible
+  resolution and exact frame count.
 
 **Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
 separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and

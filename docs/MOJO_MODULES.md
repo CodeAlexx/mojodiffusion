@@ -839,12 +839,15 @@ edits: see sections C and D of the parity-ported doc.
   rejects Sage because the measured end-to-end path was slower and below the
   audio parity bar.
 - `pipeline/minimax_h3_t2va.mojo` is the AOT-specialized product CLI. The
-  tracked profile registry builds three geometries at 24 FPS/20 steps
-  (512x320x175, 832x480x73, and 960x544x56), each with BF16, INT8 Quality, and
-  INT8 Fast runners. All nine small executables share external weight caches;
-  higher spatial resolutions shorten duration to keep the 24-GB attention and
-  decode workload bounded. Denoise and fresh-process GPU VAE decode/NVENC mux
-  remain phase isolated.
+  tracked registry selects five geometries at 24 FPS/20 steps inside one
+  `minimax_h3_serenity_runtime` executable: 512x320x175, 832x480x73,
+  960x544x56, plus 15.08-second/362-frame profiles at 512x320 and 832x480.
+  The 512x320 long profile admits BF16, INT8 Quality, and INT8 Fast; both INT8
+  modes keep zero blocks resident and stream their quantized cache one block at
+  a time so the longer attention activation retains VRAM headroom. The
+  832x480 long profile is BF16-only. Shorter profiles retain their measured
+  resident prefixes. Denoise and fresh-process GPU VAE decode/NVENC mux remain
+  phase isolated.
 - `serenity-server/crates/server/src/video.rs` and the Canvas Generate/Workflow
   modules resolve exact profile geometry and precision before acquiring the GPU
   lease. Unsupported geometry, missing runners/caches, stale machine gates, and
@@ -853,7 +856,12 @@ edits: see sections C and D of the parity-ported doc.
 **Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
 separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and
 streamed BF16 preserve the quality choices, and no claim is made that their
-full denoise trajectories are numerically identical.
+full denoise trajectories are numerically identical. The 512x320x362 Fast gate
+completed all 19 evaluations with finite video/audio latents, decoded 362
+frames plus 15.075 seconds of stereo audio, and peaked at 13,884 MiB during
+denoise and 11,398 MiB during decode. The long Quality/BF16 arms passed finite
+one-evaluation gates; 832x480x362 BF16 also has a prior complete 15.08-second
+artifact and a current-run finite gate.
 
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 

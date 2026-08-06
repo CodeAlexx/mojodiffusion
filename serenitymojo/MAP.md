@@ -3257,12 +3257,14 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with one
   `minimax_h3_serenity_runtime` T2VA executable. Requests select an admitted
   runtime profile: 512x320x175 (7.29 s), 832x480x73
-  (3.04 s), and 960x544x56 (2.33 s), all at 24 FPS/20 steps. The higher
-  resolutions deliberately reduce frame count so DiT sequence length and
-  decoded pixel-frames remain near the proven 24-GB workload. `/v1/video`
+  (3.04 s), 960x544x56 (2.33 s), 512x320x362 (15.08 s), or BF16-only
+  832x480x362 (15.08 s), all at 24 FPS/20 steps. The long 512 profile keeps
+  zero DiT blocks resident and streams W8A8 or groupwise-INT8 cache blocks on
+  GPU so attention retains 24-GB activation headroom; the short profiles keep
+  their measured resident prefixes. `/v1/video`
   validates the exact 241-token test prompt and resolves resolution, frames,
   FPS, and precision before the cross-product GPU lease. The one executable
-  carries the three sequence-length-specific AOT kernels internally and launches
+  carries the five sequence-length-specific AOT kernels internally and launches
   `int8-fast`, `int8`, or `bf16` asynchronously, exits after denoise, invokes
   the same runner in fresh `decode_only` mode, requires
   `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
@@ -3282,6 +3284,18 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   tail; BF16 stays fully streamed. A live HTTP smoke (`video-0009`) selected
   the 960x544 request profile, completed one real eval in 7.948 s, decoded 56
   frames, and published the synchronized MP4.
+- **15-second runtime restoration (2026-08-05):** Canvas Resolution and Seconds
+  resolve independently through the profile registry instead of tying every
+  resolution to one benchmark duration. The 512x320x362 INT8-Fast acceptance
+  trajectory completed all 19 evaluations with finite video/audio latents;
+  denoise peaked at 13,884 MiB and fresh decode at 11,398 MiB. The artifact is
+  362 H.264/NVENC frames at 24 FPS (15.083333 s) with stereo 32-kHz AAC; sampled
+  start/mid/late/end frames passed visual inspection and decoded PCM had no
+  NaNs/Infs/denormals. Long groupwise INT8 and BF16 passed finite one-eval
+  gates at 12,686 and 11,880 MiB. The current 832x480x362 BF16 specialization
+  passed at 20,190 MiB and is backed by the earlier complete 362-frame
+  15.08-second BF16 artifact. Canvas exposes 15.08 seconds for every precision
+  at 512x320 and only for BF16 at 832x480; it never silently substitutes dtype.
 - **Conditioned Canvas closure (2026-08-05):** Canvas now follows the LTX2
   capability-driven pattern and exposes T2VA, I2VA, L2VA, and FL2VA as explicit
   tasks. It also exposes a bounded **image-only Ref2VA** task: one selected
@@ -3389,6 +3403,9 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   and deferred decode so the denoiser releases the GPU before the VAE loads.
 - `pipeline/minimax_h3_t2va.mojo` — THE product CLI. Comptime geometry
   (-D H3_TEXT_TOKENS/H3_FRAMES/H3_HEIGHT/H3_WIDTH; frames must be 17k+5),
+  with runtime dispatch across the five product AOT sequence lengths (S=9145,
+  9065, 9097, 18567, 43177) in one executable. Long INT8 paths use a
+  zero-resident prefix and stream accepted quantized cache blocks on GPU;
   saves latents every run, `decode_only` argv[6] re-decodes in ~2 min,
   H3_VAE_TEMPORAL routes decode through the temporal chunk layer (the vendor
   does this at EVERY size — the direct path emits 4*latent_T frames, 21-27%

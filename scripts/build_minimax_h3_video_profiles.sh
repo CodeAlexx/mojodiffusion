@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-# One executable owns every admitted T2VA geometry and precision. The three
+# One executable owns every admitted T2VA geometry and precision. The five
 # sequence-length-specific attention kernels remain AOT specializations inside
 # that executable; the request selects width/height/frames/FPS/quant at runtime.
 output="output/bin/minimax_h3_serenity_runtime"

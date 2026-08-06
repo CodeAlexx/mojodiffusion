@@ -1537,6 +1537,28 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
                     block_w = minimax_h3_resident_block_weights_w8a8(
                         tail, layer, config, ctx
                     )
+                elif (
+                    resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                    and resident_cache_path != String("")
+                    and layer < GROUPWISE_RUNTIME_CACHE_BLOCKS
+                    and (SEQUENCE_S == 18567 or SEQUENCE_S == 43177)
+                ):
+                    # Long sequences need the activation headroom of a
+                    # zero-resident prefix. Stream one already-quantized
+                    # groupwise block at a time from the accepted 48-block
+                    # cache; only the final two uncached blocks remain BF16.
+                    var tail = load_minimax_h3_resident_cache(
+                        resident_cache_path,
+                        String(TRANSFORMER_INDEX),
+                        config,
+                        ctx,
+                        1,
+                        layer,
+                        resident_scheme,
+                    )
+                    block_w = minimax_h3_resident_block_weights(
+                        tail, layer, config, ctx
+                    )
                 else:
                     block_w = minimax_h3_load_block_device(
                         transformer_shards, layer, config, ctx
@@ -1779,6 +1801,14 @@ def main() raises:
             runtime_width == 960 and runtime_height == 544
             and runtime_frames == 56 and sequence_length == 9097
         )
+        or (
+            runtime_width == 512 and runtime_height == 320
+            and runtime_frames == 362 and sequence_length == 18567
+        )
+        or (
+            runtime_width == 832 and runtime_height == 480
+            and runtime_frames == 362 and sequence_length == 43177
+        )
     )
     if not admitted_profile:
         raise Error(
@@ -1786,7 +1816,8 @@ def main() raises:
             + String(runtime_width) + String("x") + String(runtime_height)
             + String(", ") + String(runtime_frames) + String(" frames at ")
             + String(runtime_fps) + String(" FPS; admitted profiles are ")
-            + String("512x320x175, 832x480x73, and 960x544x56 at 24 FPS")
+            + String("512x320x175, 512x320x362, 832x480x73, ")
+            + String("832x480x362, and 960x544x56 at 24 FPS")
         )
     if validate_request:
         print(
@@ -2178,6 +2209,22 @@ def main() raises:
             )
         elif sequence_length == 9097:
             frontend_out = _minimax_h3_model_eval_p[241, 9097](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 18567:
+            frontend_out = _minimax_h3_model_eval_p[241, 18567](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 43177:
+            frontend_out = _minimax_h3_model_eval_p[241, 43177](
                 video_state, audio_state, text_rows, placeholder_ts, geometry,
                 frontend_w, config, run_config, modcache, global_row,
                 block_adaln_indices, transformer_shards, fp8_resident,

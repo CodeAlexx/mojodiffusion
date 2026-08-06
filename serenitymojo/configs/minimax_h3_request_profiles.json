@@ -1,5 +1,5 @@
 {
-  "schema": "serenity.minimax_h3.request_profiles.v2",
+  "schema": "serenity.minimax_h3.request_profiles.v3",
   "default_profile": "minimax-h3-512x320x175-24fps",
   "runner": "output/bin/minimax_h3_serenity_runtime",
   "quant_modes": ["int8-fast", "int8", "bf16"],
@@ -15,6 +15,7 @@
       "text_tokens": 241,
       "sequence_tokens": 9145,
       "duration": 7.291667,
+      "quant_modes": ["int8-fast", "int8", "bf16"],
       "fast_resident_blocks": 48,
       "quality_resident_blocks": 41,
       "gate": "base"
@@ -30,6 +31,7 @@
       "text_tokens": 241,
       "sequence_tokens": 9065,
       "duration": 3.041667,
+      "quant_modes": ["int8-fast", "int8", "bf16"],
       "fast_resident_blocks": 46,
       "quality_resident_blocks": 41,
       "gate": "resolution"
@@ -45,9 +47,42 @@
       "text_tokens": 241,
       "sequence_tokens": 9097,
       "duration": 2.333333,
+      "quant_modes": ["int8-fast", "int8", "bf16"],
       "fast_resident_blocks": 46,
       "quality_resident_blocks": 41,
       "gate": "resolution"
+    },
+    {
+      "id": "minimax-h3-512x320x362-24fps",
+      "label": "512x320 - 362 frames - 15.08s",
+      "width": 512,
+      "height": 320,
+      "frames": 362,
+      "fps": 24,
+      "steps": 20,
+      "text_tokens": 241,
+      "sequence_tokens": 18567,
+      "duration": 15.083333,
+      "quant_modes": ["int8-fast", "int8", "bf16"],
+      "fast_resident_blocks": 0,
+      "quality_resident_blocks": 0,
+      "gate": "duration"
+    },
+    {
+      "id": "minimax-h3-832x480x362-24fps",
+      "label": "832x480 - 362 frames - 15.08s - BF16",
+      "width": 832,
+      "height": 480,
+      "frames": 362,
+      "fps": 24,
+      "steps": 20,
+      "text_tokens": 241,
+      "sequence_tokens": 43177,
+      "duration": 15.083333,
+      "quant_modes": ["bf16"],
+      "fast_resident_blocks": 0,
+      "quality_resident_blocks": 0,
+      "gate": "duration"
     }
   ]
 }

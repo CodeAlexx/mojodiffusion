@@ -66,6 +66,8 @@ const MINIMAX_H3_RESOLUTION_PROFILES_GATE: &str =
     "output/checks/minimax_h3_resolution_profiles_gate.json";
 const MINIMAX_H3_UNIFIED_RUNNER_GATE: &str =
     "output/checks/minimax_h3_unified_runner_gate.json";
+const MINIMAX_H3_DURATION_PROFILES_GATE: &str =
+    "output/checks/minimax_h3_duration_profiles_gate.json";
 const MINIMAX_H3_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/FL2VA";
 const MINIMAX_H3_ENCODER_CACHE: &str =
     "checkpoints/MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1";
@@ -420,6 +422,7 @@ struct MiniMaxH3RequestProfile {
     text_tokens: i64,
     sequence_tokens: i64,
     duration: f64,
+    quant_modes: Vec<String>,
     fast_resident_blocks: i64,
     quality_resident_blocks: i64,
     gate: String,
@@ -591,7 +594,7 @@ fn minimax_h3_request_profile_registry() -> &'static MiniMaxH3RequestProfileRegi
             serde_json::from_str(MINIMAX_H3_REQUEST_PROFILES_JSON)
                 .expect("embedded MiniMax-H3 request profile registry must be valid JSON");
         assert_eq!(
-            registry.schema, "serenity.minimax_h3.request_profiles.v2",
+            registry.schema, "serenity.minimax_h3.request_profiles.v3",
             "embedded MiniMax-H3 request profile registry schema mismatch"
         );
         assert_eq!(
@@ -618,9 +621,13 @@ fn minimax_h3_request_profile_registry() -> &'static MiniMaxH3RequestProfileRegi
                     && profile.text_tokens == MINIMAX_H3_TEXT_TOKENS
                     && profile.sequence_tokens > 0
                     && profile.duration > 0.0
-                    && profile.fast_resident_blocks > 0
-                    && profile.quality_resident_blocks > 0
-                    && matches!(profile.gate.as_str(), "base" | "resolution")
+                    && !profile.quant_modes.is_empty()
+                    && profile.quant_modes.iter().all(|mode| {
+                        registry.quant_modes.iter().any(|known| known == mode)
+                    })
+                    && profile.fast_resident_blocks >= 0
+                    && profile.quality_resident_blocks >= 0
+                    && matches!(profile.gate.as_str(), "base" | "resolution" | "duration")
             }),
             "embedded MiniMax-H3 profiles must declare complete runtime geometry"
         );
@@ -664,7 +671,7 @@ fn minimax_h3_profile_from_request(body: &Value) -> Option<&'static MiniMaxH3Req
 }
 
 fn minimax_h3_request_runner<'a>(
-    _profile: &'a MiniMaxH3RequestProfile,
+    profile: &'a MiniMaxH3RequestProfile,
     quant: &str,
 ) -> Option<&'a str> {
     let registry = minimax_h3_request_profile_registry();
@@ -672,6 +679,8 @@ fn minimax_h3_request_runner<'a>(
         .quant_modes
         .iter()
         .any(|mode| mode == quant)
+        .then(|| profile.quant_modes.iter().any(|mode| mode == quant))
+        .unwrap_or(false)
         .then_some(registry.runner.as_str())
 }
 
@@ -2624,7 +2633,7 @@ fn minimax_h3_unified_runner_gate_passed() -> bool {
         != Some("serenity.minimax_h3.unified_runner_gate.v1")
         || doc.get("passed").and_then(Value::as_bool) != Some(true)
         || doc.pointer("/topology/executable_count").and_then(Value::as_i64) != Some(1)
-        || doc.pointer("/topology/selector_checks_passed").and_then(Value::as_i64) != Some(9)
+        || doc.pointer("/topology/selector_checks_passed").and_then(Value::as_i64) != Some(15)
         || doc.pointer("/topology/subprocess_profile_dispatch").and_then(Value::as_bool)
             != Some(false)
         || doc.pointer("/precision_switch/int8_quality_resident_blocks")
@@ -2676,10 +2685,15 @@ fn minimax_h3_unified_runner_gate_passed() -> bool {
     let Some(profiles) = doc.get("profiles").and_then(Value::as_array) else {
         return false;
     };
-    if profiles.len() != minimax_h3_request_profile_registry().profiles.len() {
+    let accepted_profiles = minimax_h3_request_profile_registry()
+        .profiles
+        .iter()
+        .filter(|profile| profile.gate != "duration")
+        .collect::<Vec<_>>();
+    if profiles.len() != accepted_profiles.len() {
         return false;
     }
-    for profile in &minimax_h3_request_profile_registry().profiles {
+    for profile in accepted_profiles {
         let Some(evidence) = profiles.iter().find(|entry| {
             entry.get("width").and_then(Value::as_i64) == Some(profile.width)
                 && entry.get("height").and_then(Value::as_i64) == Some(profile.height)
@@ -2747,6 +2761,82 @@ fn minimax_h3_unified_runner_gate_passed() -> bool {
     };
     doc.pointer("/decode/artifact_sha256").and_then(Value::as_str)
         == Some(decode_sha.as_str())
+}
+
+fn minimax_h3_duration_profile_gate_passed(
+    profile: &MiniMaxH3RequestProfile,
+    quant: &str,
+) -> bool {
+    if !profile.quant_modes.iter().any(|mode| mode == quant) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(repo_path(MINIMAX_H3_DURATION_PROFILES_GATE)) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    if doc.get("schema").and_then(Value::as_str)
+        != Some("serenity.minimax_h3.duration_profiles_gate.v1")
+        || doc.get("passed").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    for (pin, path) in [
+        ("runner_sha256", MINIMAX_H3_REQUEST_RUNNER),
+        ("pipeline_source_sha256", "serenitymojo/pipeline/minimax_h3_t2va.mojo"),
+        (
+            "profile_registry_sha256",
+            "serenitymojo/configs/minimax_h3_request_profiles.json",
+        ),
+    ] {
+        let Some(actual) = sha256sum(&repo_path(path)) else {
+            return false;
+        };
+        if doc.pointer(&format!("/pins/{pin}")).and_then(Value::as_str)
+            != Some(actual.as_str())
+        {
+            return false;
+        }
+    }
+    let Some(candidate) = doc
+        .get("profiles")
+        .and_then(Value::as_array)
+        .and_then(|profiles| {
+            profiles
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(&profile.id))
+        })
+    else {
+        return false;
+    };
+    if candidate.pointer("/profile/width").and_then(Value::as_i64) != Some(profile.width)
+        || candidate.pointer("/profile/height").and_then(Value::as_i64) != Some(profile.height)
+        || candidate.pointer("/profile/frames").and_then(Value::as_i64) != Some(profile.frames)
+        || candidate.pointer("/profile/fps").and_then(Value::as_i64) != Some(profile.fps)
+        || candidate.pointer("/profile/text_tokens").and_then(Value::as_i64)
+            != Some(profile.text_tokens)
+        || candidate.pointer("/profile/sequence_tokens").and_then(Value::as_i64)
+            != Some(profile.sequence_tokens)
+    {
+        return false;
+    }
+    let Some(gate) = candidate.pointer(&format!("/modes/{quant}")) else {
+        return false;
+    };
+    let Some(evidence_path) = gate.get("evidence_path").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(evidence_sha) = sha256sum(&repo_path(evidence_path)) else {
+        return false;
+    };
+    gate.get("passed").and_then(Value::as_bool) == Some(true)
+        && gate.get("gpu_compute_only").and_then(Value::as_bool) == Some(true)
+        && gate.get("cpu_inference").and_then(Value::as_bool) == Some(false)
+        && gate.get("video_nonfinite").and_then(Value::as_i64) == Some(0)
+        && gate.get("audio_nonfinite").and_then(Value::as_i64) == Some(0)
+        && gate.get("evidence_sha256").and_then(Value::as_str)
+            == Some(evidence_sha.as_str())
 }
 
 fn minimax_h3_resolution_profile_gate_passed(profile: &MiniMaxH3RequestProfile) -> bool {
@@ -2845,9 +2935,13 @@ fn minimax_h3_profile_mode_product_gate_passed(
     if !minimax_h3_product_gate_passed() || !minimax_h3_unified_runner_gate_passed() {
         return false;
     }
+    if !profile.quant_modes.iter().any(|mode| mode == quant) {
+        return false;
+    }
     match profile.gate.as_str() {
         "base" => quant != "int8-fast" || minimax_h3_fast_product_gate_passed(),
         "resolution" => minimax_h3_resolution_profile_gate_passed(profile),
+        "duration" => minimax_h3_duration_profile_gate_passed(profile, quant),
         _ => false,
     }
 }
@@ -2872,6 +2966,7 @@ fn minimax_h3_profile_document(profile: &MiniMaxH3RequestProfile) -> Value {
         "text_tokens": profile.text_tokens,
         "sequence_tokens": profile.sequence_tokens,
         "duration": profile.duration,
+        "quant_modes": profile.quant_modes,
         "available": fast_ready || quality_ready || bf16_ready,
         "available_modes": {
             "int8-fast": fast_ready,
@@ -2883,7 +2978,6 @@ fn minimax_h3_profile_document(profile: &MiniMaxH3RequestProfile) -> Value {
             "int8": profile.quality_resident_blocks,
         },
         "runner": minimax_h3_request_profile_registry().runner,
-        "quant_modes": minimax_h3_request_profile_registry().quant_modes,
         "memory_policy": "constant_budget_higher_resolution_shorter_duration",
     })
 }
@@ -5636,6 +5730,15 @@ fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
         return Err(
             "MiniMax-H3 quant must be 'int8-fast', 'int8', or 'bf16'".to_string(),
         );
+    }
+    let profile = minimax_h3_profile_from_request(body)
+        .expect("MiniMax-H3 geometry was resolved earlier in request validation");
+    if !profile.quant_modes.iter().any(|mode| mode == quant) {
+        return Err(format!(
+            "MiniMax-H3 profile {} supports quant modes: {}",
+            profile.id,
+            profile.quant_modes.join(", "),
+        ));
     }
     let attention = body
         .get("attention_backend")
@@ -10129,11 +10232,16 @@ mod tests {
         let registry = minimax_h3_request_profile_registry();
         assert_eq!(registry.runner, MINIMAX_H3_REQUEST_RUNNER);
         for profile in &registry.profiles {
-            for quant in ["int8-fast", "int8", "bf16"] {
+            for quant in &profile.quant_modes {
                 assert_eq!(
-                    minimax_h3_request_runner(profile, quant),
+                    minimax_h3_request_runner(profile, quant.as_str()),
                     Some(MINIMAX_H3_REQUEST_RUNNER),
                 );
+            }
+            for quant in ["int8-fast", "int8", "bf16"] {
+                if !profile.quant_modes.iter().any(|mode| mode == quant) {
+                    assert_eq!(minimax_h3_request_runner(profile, quant), None);
+                }
             }
         }
         let mut request = json!({
@@ -10183,6 +10291,17 @@ mod tests {
             .unwrap_err()
             .contains("exact compiled 241-token test prompt"));
         request["prompt"] = json!(MINIMAX_H3_TEST_PROMPT);
+        request["width"] = json!(832);
+        request["height"] = json!(480);
+        request["frames"] = json!(362);
+        request["fps"] = json!(24);
+        request["quant"] = json!("int8");
+        assert!(validate_minimax_h3_request(&request)
+            .unwrap_err()
+            .contains("supports quant modes: bf16"));
+        request["width"] = json!(MINIMAX_H3_WIDTH);
+        request["height"] = json!(MINIMAX_H3_HEIGHT);
+        request["frames"] = json!(MINIMAX_H3_FRAMES);
         request["quant"] = json!("fp8");
         assert!(validate_minimax_h3_request(&request)
             .unwrap_err()
@@ -10409,9 +10528,13 @@ mod tests {
         assert_eq!(h3["supported_profiles"][0]["width"], MINIMAX_H3_WIDTH);
         assert_eq!(h3["supported_profiles"][0]["height"], MINIMAX_H3_HEIGHT);
         assert_eq!(h3["supported_profiles"][0]["frames"], MINIMAX_H3_FRAMES);
-        assert_eq!(h3["supported_profiles"].as_array().unwrap().len(), 3);
+        assert_eq!(h3["supported_profiles"].as_array().unwrap().len(), 5);
         assert_eq!(h3["supported_profiles"][1]["width"], 832);
         assert_eq!(h3["supported_profiles"][2]["width"], 960);
+        assert_eq!(h3["supported_profiles"][3]["frames"], 362);
+        assert_eq!(h3["supported_profiles"][3]["duration"], 15.083333);
+        assert_eq!(h3["supported_profiles"][4]["width"], 832);
+        assert_eq!(h3["supported_profiles"][4]["quant_modes"], json!(["bf16"]));
         assert_eq!(h3["quant_modes"][0]["id"], "int8-fast");
         assert_eq!(h3["quant_modes"][1]["id"], "int8");
         assert_eq!(h3["quant_modes"][2]["id"], "bf16");

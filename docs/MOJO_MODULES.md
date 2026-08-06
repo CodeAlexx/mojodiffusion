@@ -838,35 +838,36 @@ edits: see sections C and D of the parity-ported doc.
   and off by default: cU-DNN remains the accepted product backend, and Fast
   rejects Sage because the measured end-to-end path was slower and below the
   audio parity bar.
-- `pipeline/minimax_h3_t2va.mojo` is the AOT-specialized product CLI. The
-  tracked registry selects five geometries at 24 FPS/20 steps inside one
-  `minimax_h3_serenity_runtime` executable: 512x320x175, 832x480x73,
-  960x544x56, plus 15.08-second/362-frame profiles at 512x320 and 832x480.
-  The 512x320 long profile admits BF16, INT8 Quality, and INT8 Fast; both INT8
-  modes keep zero blocks resident and stream their quantized cache one block at
-  a time so the longer attention activation retains VRAM headroom. The
-  832x480 long profile is BF16-only. Shorter profiles retain their measured
-  resident prefixes. Denoise and fresh-process GPU VAE decode/NVENC mux remain
-  phase isolated.
+- `pipeline/minimax_h3_t2va.mojo` is the AOT-specialized product CLI. One
+  `minimax_h3_serenity_runtime` executable carries the complete 3x4 matrix at
+  24 FPS/20 steps: 512x320, 832x480, or 960x544 crossed with 56, 73, 175, or
+  362 frames (2.33, 3.04, 7.29, or 15.08 seconds). Every geometry admits BF16,
+  INT8 Quality, and INT8 Fast. Profiles with safe measured headroom retain
+  resident prefixes; larger products use zero-resident streaming. W8A8 GEMM
+  and BF16/group-wise linear accumulation are row chunked, and each streamed
+  block is released before the next load, bounding temporary allocation at the
+  960x544x362 maximum. Denoise and fresh-process GPU VAE decode/NVENC mux
+  remain phase isolated.
 - `serenity-server/crates/server/src/video.rs` and the Canvas Generate/Workflow
   modules resolve exact profile geometry and precision before acquiring the GPU
   lease. Unsupported geometry, missing runners/caches, stale machine gates, and
-  invalid attention combinations fail queue admission closed. Canvas treats
-  duration as the protected selector: it opens T2VA on the longest admitted
-  profile, labels each resolution with its available seconds, and disables a
-  resolution that would silently shorten the selected duration. Choosing a
-  different supported duration explicitly re-resolves the compatible
-  resolution and exact frame count.
+  invalid attention combinations fail queue admission closed. Canvas exposes
+  Resolution and Seconds as independent selectors: changing one preserves the
+  other and resolves the exact registry row, with no disabled resolution,
+  duration rewrite, or cross-profile fallback.
 
 **Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
 separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and
 streamed BF16 preserve the quality choices, and no claim is made that their
-full denoise trajectories are numerically identical. The 512x320x362 Fast gate
-completed all 19 evaluations with finite video/audio latents, decoded 362
-frames plus 15.075 seconds of stereo audio, and peaked at 13,884 MiB during
-denoise and 11,398 MiB during decode. The long Quality/BF16 arms passed finite
-one-evaluation gates; 832x480x362 BF16 also has a prior complete 15.08-second
-artifact and a current-run finite gate.
+full denoise trajectories are numerically identical. The maximum
+960x544x362 request passed real GPU one-evaluation finite gates in all three
+modes without CPU inference. The final-run measurements were approximately
+140 seconds / 18,678 MiB for INT8 Fast, 198 seconds / 18,292 MiB for INT8
+Quality, and 284 seconds / 18,282 MiB for BF16. The admission record combines
+those maximum-product memory/finite gates with exact request validation for all
+36 geometry/precision combinations. A 512x320x56 INT8 Quality smoke also
+exercised its 41-block resident prefix: 14.908 seconds/evaluation, finite
+video/audio, and a 20,766 MiB process peak.
 
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 

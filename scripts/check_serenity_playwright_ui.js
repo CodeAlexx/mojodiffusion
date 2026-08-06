@@ -725,9 +725,9 @@ async function run() {
       }));
       const h3Default = await readH3Controls();
       assert(
-        h3Default.resolution === "512x320_24fps"
+        h3Default.resolution === "960x544_24fps"
           && h3Default.duration === 15.08 && h3Default.frames === 362,
-        `H3 did not default to the admitted long profile: ${JSON.stringify(h3Default)}`,
+        `H3 did not default to the highest-resolution long profile: ${JSON.stringify(h3Default)}`,
       );
       await page.locator("#cv-h3-quant").selectOption("bf16");
       await page.locator("#cv-h3-resolution").selectOption("832x480_24fps");
@@ -737,25 +737,19 @@ async function run() {
           && h3LongBf16.resolution === "832x480_24fps",
         `H3 BF16 high-resolution selection lost 15 seconds: ${JSON.stringify(h3LongBf16)}`,
       );
-      const h3HighShortOption = h3LongBf16.resolutions.find(
+      const h3HighResolutionOption = h3LongBf16.resolutions.find(
         (option) => option.value === "960x544_24fps",
       );
       assert(
-        h3HighShortOption && h3HighShortOption.disabled
-          && h3HighShortOption.label.includes("2.33s"),
-        `H3 did not mark the 960 short-only profile: ${JSON.stringify(h3HighShortOption)}`,
+        h3HighResolutionOption && !h3HighResolutionOption.disabled,
+        `H3 resolution is still coupled to Seconds: ${JSON.stringify(h3HighResolutionOption)}`,
       );
-      await page.evaluate(() => {
-        const resolution = document.querySelector("#cv-h3-resolution");
-        resolution.value = "960x544_24fps";
-        resolution.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-      const h3RejectedShortFallback = await readH3Controls();
+      await page.locator("#cv-h3-resolution").selectOption("960x544_24fps");
+      const h3HighLong = await readH3Controls();
       assert(
-        h3RejectedShortFallback.duration === 15.08
-          && h3RejectedShortFallback.frames === 362
-          && h3RejectedShortFallback.resolution === "832x480_24fps",
-        `H3 silently fell back to 2.33 seconds: ${JSON.stringify(h3RejectedShortFallback)}`,
+        h3HighLong.duration === 15.08 && h3HighLong.frames === 362
+          && h3HighLong.resolution === "960x544_24fps",
+        `H3 Resolution change altered Seconds: ${JSON.stringify(h3HighLong)}`,
       );
       await page.evaluate(() => {
         const duration = document.querySelector("#cv-h3-duration");
@@ -766,19 +760,70 @@ async function run() {
       assert(
         h3ExplicitShort.duration === 2.33 && h3ExplicitShort.frames === 56
           && h3ExplicitShort.resolution === "960x544_24fps",
-        `H3 could not explicitly select the 2.33-second profile: ${JSON.stringify(h3ExplicitShort)}`,
+        `H3 Seconds change altered Resolution: ${JSON.stringify(h3ExplicitShort)}`,
       );
+      await page.locator("#cv-h3-resolution").selectOption("512x320_24fps");
+      const h3LowShort = await readH3Controls();
+      assert(
+        h3LowShort.duration === 2.33 && h3LowShort.frames === 56
+          && h3LowShort.resolution === "512x320_24fps",
+        `H3 Resolution change altered the selected short duration: ${JSON.stringify(h3LowShort)}`,
+      );
+      await page.evaluate(() => {
+        const duration = document.querySelector("#cv-h3-duration");
+        duration.value = "7.29";
+        duration.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      const h3LowMedium = await readH3Controls();
+      assert(
+        h3LowMedium.duration === 7.29 && h3LowMedium.frames === 175
+          && h3LowMedium.resolution === "512x320_24fps",
+        `H3 Seconds change altered the selected resolution: ${JSON.stringify(h3LowMedium)}`,
+      );
+      await page.locator("#cv-h3-resolution").selectOption("960x544_24fps");
       await page.evaluate(() => {
         const duration = document.querySelector("#cv-h3-duration");
         duration.value = "15.08";
         duration.dispatchEvent(new Event("change", { bubbles: true }));
       });
-      const h3RestoredLong = await readH3Controls();
+      const h3MaximumQuality = await readH3Controls();
       assert(
-        h3RestoredLong.duration === 15.08 && h3RestoredLong.frames === 362
-          && h3RestoredLong.resolution === "832x480_24fps",
-        `H3 could not restore the 15-second BF16 profile: ${JSON.stringify(h3RestoredLong)}`,
+        h3MaximumQuality.quant === "bf16"
+          && h3MaximumQuality.resolution === "960x544_24fps"
+          && h3MaximumQuality.duration === 15.08
+          && h3MaximumQuality.frames === 362 && h3MaximumQuality.fps === 24,
+        `H3 maximum BF16 controls did not resolve exactly: ${JSON.stringify(h3MaximumQuality)}`,
       );
+      const h3VideoBefore = videoRequests.length;
+      await page.locator("#cv-generate-btn").click();
+      for (let attempt = 0; attempt < 100 && videoRequests.length === h3VideoBefore; attempt += 1) {
+        await page.waitForTimeout(20);
+      }
+      assert(videoRequests.length === h3VideoBefore + 1,
+        "H3 Canvas Generate did not POST /v1/video");
+      const h3Request = videoRequests[videoRequests.length - 1];
+      assert(
+        h3Request.model === "minimax_h3"
+          && h3Request.runner === "minimax_h3_mojo_request"
+          && h3Request.quant === "bf16"
+          && h3Request.width === 960 && h3Request.height === 544
+          && h3Request.frames === 362 && h3Request.fps === 24,
+        `H3 Canvas submitted the wrong independent geometry: ${JSON.stringify(h3Request)}`,
+      );
+      if (process.env.SERENITY_H3_ONLY === "1") {
+        assert(pageErrors.length === 0, `page errors: ${pageErrors.join(" | ")}`);
+        assert(requestFailures.length === 0,
+          `same-origin request failures: ${requestFailures.join(" | ")}`);
+        console.log("serenity playwright H3 matrix: PASS");
+        console.log(JSON.stringify({
+          schema: "serenity.playwright.h3_independent_matrix.v1",
+          base_url: baseUrl,
+          default_controls: h3Default,
+          maximum_bf16_controls: h3MaximumQuality,
+          submitted_request: h3Request,
+        }, null, 2));
+        return;
+      }
       await page.locator('.nav-btn[data-tab="generate"]').click();
     }
     const ltxModels = modelResults.filter((result) => result.backend === "ltx2");

@@ -262,6 +262,7 @@ def load_minimax_h3_resident_cache(
     nblocks: Int,
     start_layer: Int = 0,
     scheme: Int = MINIMAX_H3_RESIDENT_INT8,
+    direct_groupwise: Bool = False,
 ) raises -> MiniMaxH3ResidentFp8:
     var st = SafeTensors.open(cache_path)
     var kind = String("resident-int8-groupwise")
@@ -295,7 +296,11 @@ def load_minimax_h3_resident_cache(
     # Scratch must be allocated before the 16 GiB store, exactly like the
     # fresh-build path, to preserve the measured fragmentation headroom.
     var scratch = List[ArcPointer[Tensor]]()
-    if scheme != MINIMAX_H3_RESIDENT_INT8_W8A8:
+    if (
+        nblocks > 0
+        and scheme != MINIMAX_H3_RESIDENT_INT8_W8A8
+        and not direct_groupwise
+    ):
         scratch = minimax_h3_allocate_resident_scratch(
             config, start_layer, ctx
         )

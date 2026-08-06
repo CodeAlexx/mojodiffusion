@@ -4448,14 +4448,9 @@ var CanvasTab = (function () {
                 requestedResolution, requestedDuration
             ))
                 return;
-            var supported = canvasH3ProfilesForResolution(requestedResolution)
-                .map(function (profile) {
-                    return Number(canvasH3ProfileDuration(profile).toFixed(2));
-                });
             showError(
-                'That H3 resolution cannot preserve ' + requestedDuration +
-                ' seconds. It supports ' + supported.join(', ') +
-                ' seconds; the current duration was kept.'
+                'The H3 runner did not report ' + requestedResolution +
+                ' at ' + requestedDuration + ' seconds.'
             );
             applyCanvasH3Profile(preferredCanvasH3Profile());
         });
@@ -4467,30 +4462,9 @@ var CanvasTab = (function () {
                 els.h3Resolution.value, requestedDuration
             ))
                 return;
-            var durationProfiles = canvasH3ProfilesForDuration(requestedDuration);
-            if (durationProfiles.length) {
-                var current = preferredCanvasH3Profile();
-                durationProfiles.sort(function (left, right) {
-                    if (!current)
-                        return Number(right.width) * Number(right.height) -
-                            Number(left.width) * Number(left.height);
-                    var leftDelta = Math.abs(Number(left.width) - Number(current.width)) +
-                        Math.abs(Number(left.height) - Number(current.height));
-                    var rightDelta = Math.abs(Number(right.width) - Number(current.width)) +
-                        Math.abs(Number(right.height) - Number(current.height));
-                    return leftDelta - rightDelta;
-                });
-                applyCanvasH3Profile(durationProfiles[0]);
-                return;
-            }
-            var supported = activeCanvasH3Profiles().map(function (profile) {
-                return Number(canvasH3ProfileDuration(profile).toFixed(2));
-            }).filter(function (duration, index, values) {
-                return values.indexOf(duration) === index;
-            });
             showError(
-                'H3 supports ' +
-                supported.join(', ') + ' seconds.'
+                'The H3 runner did not report ' + els.h3Resolution.value +
+                ' at ' + requestedDuration + ' seconds.'
             );
             applyCanvasH3Profile(preferredCanvasH3Profile());
         });
@@ -5624,23 +5598,6 @@ var CanvasTab = (function () {
                 Number(left.width) * Number(left.height);
         })[0];
     }
-    function canvasH3ProfilesForDuration(selectedDuration) {
-        var duration = Number(selectedDuration);
-        return activeCanvasH3Profiles().filter(function (profile) {
-            return Math.abs(canvasH3ProfileDuration(profile) - duration) < 0.011;
-        });
-    }
-    function refreshCanvasH3ResolutionAvailability(selectedDuration) {
-        if (!els.h3Resolution)
-            return;
-        Array.from(els.h3Resolution.options).forEach(function (option) {
-            option.disabled = !canvasH3ProfilesForDuration(selectedDuration).some(
-                function (profile) {
-                    return canvasH3ResolutionKey(profile) === option.value;
-                }
-            );
-        });
-    }
     function refreshCanvasH3DurationControl(selectedDuration) {
         if (!els.h3Duration)
             return;
@@ -5653,6 +5610,9 @@ var CanvasTab = (function () {
             if (durations.indexOf(duration) >= 0)
                 return;
             durations.push(duration);
+        });
+        durations.sort(function (left, right) { return left - right; });
+        durations.forEach(function (duration) {
             var option = document.createElement('option');
             option.value = String(duration);
             option.label = duration + ' seconds';
@@ -5667,10 +5627,9 @@ var CanvasTab = (function () {
         }
         els.h3Duration.min = String(Math.min.apply(Math, durations));
         els.h3Duration.max = String(Math.max.apply(Math, durations));
-        els.h3Duration.title = 'Supported H3 seconds: ' + durations.join(', ') +
-            '. Resolution choices that cannot preserve the selected duration are disabled.';
+        els.h3Duration.title = 'Supported H3 seconds at every resolution: ' +
+            durations.join(', ') + '.';
         els.h3Duration.value = String(Number(Number(selectedDuration).toFixed(2)));
-        refreshCanvasH3ResolutionAvailability(selectedDuration);
     }
     function applyCanvasH3Geometry(profile) {
         if (!profile)
@@ -5739,7 +5698,7 @@ var CanvasTab = (function () {
         els.h3Duration.value = '';
         if (els.h3DurationList)
             els.h3DurationList.innerHTML = '';
-        var lockReason = 'MiniMax-H3 Resolution and Seconds select width, height, frames, and FPS on one runtime request runner.';
+        var lockReason = 'MiniMax-H3 Resolution and Seconds are independent controls on one runtime request runner.';
         if (conditioned) {
             var definition = mode || (activeCanvasH3Runner() || {}).conditioned_profile;
             if (!definition)
@@ -5793,14 +5752,10 @@ var CanvasTab = (function () {
             if (seen[key])
                 return;
             seen[key] = true;
-            var durations = canvasH3ProfilesForResolution(key).map(function (candidate) {
-                return Number(canvasH3ProfileDuration(candidate).toFixed(2));
-            });
             var option = document.createElement('option');
             option.value = key;
             option.textContent = profile.width + '\u00d7' + profile.height +
-                ' \u00b7 ' + profile.fps + ' FPS \u00b7 ' +
-                durations.join('/') + 's';
+                ' \u00b7 ' + profile.fps + ' FPS';
             els.h3Resolution.appendChild(option);
         });
         els.h3Resolution.disabled = false;

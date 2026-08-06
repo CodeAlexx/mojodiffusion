@@ -3255,16 +3255,16 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   than cU-DNN (12.12 vs 10.24 s/eval). Therefore `sage-int8` is switchable but explicitly
   **experimental and OFF by default**; cU-DNN remains the quality default.
 - **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with one
-  `minimax_h3_serenity_runtime` T2VA executable. Requests select an admitted
-  runtime profile: 512x320x175 (7.29 s), 832x480x73
-  (3.04 s), 960x544x56 (2.33 s), 512x320x362 (15.08 s), or BF16-only
-  832x480x362 (15.08 s), all at 24 FPS/20 steps. The long 512 profile keeps
-  zero DiT blocks resident and streams W8A8 or groupwise-INT8 cache blocks on
-  GPU so attention retains 24-GB activation headroom; the short profiles keep
-  their measured resident prefixes. `/v1/video`
+  `minimax_h3_serenity_runtime` T2VA executable. Requests select the full
+  3-resolution by 4-duration matrix: 512x320, 832x480, or 960x544 crossed with
+  56, 73, 175, or 362 frames (2.33, 3.04, 7.29, or 15.08 seconds), all at
+  24 FPS/20 steps and all switchable among INT8 Fast, INT8 Quality, and BF16.
+  Large products keep zero DiT blocks resident and stream W8A8, groupwise INT8,
+  or BF16 blocks on GPU; smaller profiles retain their measured resident
+  prefixes. `/v1/video`
   validates the exact 241-token test prompt and resolves resolution, frames,
   FPS, and precision before the cross-product GPU lease. The one executable
-  carries the five sequence-length-specific AOT kernels internally and launches
+  carries the twelve sequence-length-specific AOT kernels internally and launches
   `int8-fast`, `int8`, or `bf16` asynchronously, exits after denoise, invokes
   the same runner in fresh `decode_only` mode, requires
   `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
@@ -3284,24 +3284,23 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   tail; BF16 stays fully streamed. A live HTTP smoke (`video-0009`) selected
   the 960x544 request profile, completed one real eval in 7.948 s, decoded 56
   frames, and published the synchronized MP4.
-- **15-second runtime restoration (2026-08-05):** Canvas Resolution and Seconds
-  resolve independently through the profile registry instead of tying every
-  resolution to one benchmark duration. The 512x320x362 INT8-Fast acceptance
-  trajectory completed all 19 evaluations with finite video/audio latents;
-  denoise peaked at 13,884 MiB and fresh decode at 11,398 MiB. The artifact is
-  362 H.264/NVENC frames at 24 FPS (15.083333 s) with stereo 32-kHz AAC; sampled
-  start/mid/late/end frames passed visual inspection and decoded PCM had no
-  NaNs/Infs/denormals. Long groupwise INT8 and BF16 passed finite one-eval
-  gates at 12,686 and 11,880 MiB. The current 832x480x362 BF16 specialization
-  passed at 20,190 MiB and is backed by the earlier complete 362-frame
-  15.08-second BF16 artifact. Canvas exposes 15.08 seconds for every precision
-  at 512x320 and only for BF16 at 832x480; it never silently substitutes dtype.
-  Duration is also protected from resolution fallback: entering T2VA selects
-  the longest admitted profile, resolution labels show their exact duration
-  choices, and short-only 960x544 is disabled while 15.08 seconds is selected.
-  A deliberate 2.33-second selection re-enables and selects 960x544; returning
-  to 15.08 seconds resolves the closest admitted long resolution instead of
-  silently rewriting the request to 56 frames.
+- **Independent geometry matrix closure (2026-08-05):** Canvas Resolution and
+  Seconds resolve independently through twelve exact registry rows. Changing
+  resolution preserves seconds; changing seconds preserves resolution. No
+  option is disabled and no fallback silently rewrites either selection. To
+  fit the maximum 960x544x362 product on a 24-GB GPU, W8A8 I32 accumulation and
+  BF16/group-wise F32 accumulation are row chunked, streamed block ownership is
+  released before the next load, and zero-resident profiles avoid unused BF16
+  scratch. A 17,001-row chunked-linear parity gate matched the ordinary path
+  exactly across 8,704,512 BF16 values. The maximum request passed real GPU
+  one-evaluation finite gates without CPU inference in all three modes:
+  approximately 140 seconds / 18,678 MiB INT8 Fast, 198 seconds / 18,292 MiB
+  INT8 Quality, and 284 seconds / 18,282 MiB BF16. Admission also validates all
+  36 geometry/precision requests against the one executable and pins those
+  checks plus the maximum-product evidence to the current runner/source hashes.
+  A separate 512x320x56 INT8 Quality gate exercised the 41-block groupwise
+  resident prefix at 14.908 seconds/evaluation, finite video/audio, and a
+  20,766 MiB process peak.
 - **Conditioned Canvas closure (2026-08-05):** Canvas now follows the LTX2
   capability-driven pattern and exposes T2VA, I2VA, L2VA, and FL2VA as explicit
   tasks. It also exposes a bounded **image-only Ref2VA** task: one selected

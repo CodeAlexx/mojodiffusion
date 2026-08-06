@@ -68,11 +68,13 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.ops.vec_rms_norm import vec_rms_norm
 from serenitymojo.ops.activations import swiglu_packed_value_gate
 from serenitymojo.ops.linear import linear
+from serenitymojo.ops.int8_quant import int8_dequant_groupwise_to_bf16
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
 from serenitymojo.ops.attention_flash import sdpa_flash_infer_fwd
 from serenitymojo.ops.sage_attention_int8 import sage_attention_int8_fwd
 from serenitymojo.models.dit.minimax_h3_int8_linear import (
+    minimax_h3_bf16_linear_chunked,
     minimax_h3_int8_linear,
 )
 from serenitymojo.ops.tensor_algebra import (
@@ -465,12 +467,18 @@ def _minimax_h3_block_linear(
 ) raises -> Tensor:
     """Dispatch a block projection from its explicit stored dtype.
 
-    Ordinary streamed/groupwise-resident weights are BF16. The opt-in fast
-    resident store supplies an I8 tensor at the canonical key plus a sibling
-    F32 `<key>.scale` tensor; no dtype inference silently changes behavior.
+    Ordinary streamed weights are BF16. Quantized resident stores supply an
+    I8 tensor at the canonical key plus a sibling scale tensor: F32 per-row
+    scales select direct W8A8, while F16 groupwise scales are dequantized only
+    for the projection currently executing. This avoids keeping all four BF16
+    block matrices live beside long-sequence activations.
     """
     ref weight = weights[name][]
     if weight.dtype() == STDtype.BF16:
+        var k = weight.shape()[1]
+        var rows = x.numel() // k
+        if rows > 16384:
+            return minimax_h3_bf16_linear_chunked(x, weight, ctx)
         return linear(x, weight, None, ctx)
     if weight.dtype() == STDtype.I8:
         var scale_name = name + String(".scale")
@@ -479,7 +487,31 @@ def _minimax_h3_block_linear(
                 String("MiniMax-H3 INT8 block weight is missing scale: ")
                 + scale_name
             )
-        return minimax_h3_int8_linear(x, weight, weights[scale_name][], ctx)
+        ref weight_scale = weights[scale_name][]
+        if weight_scale.dtype() == STDtype.F32:
+            return minimax_h3_int8_linear(x, weight, weight_scale, ctx)
+        if weight_scale.dtype() == STDtype.F16:
+            var wshape = weight.shape()
+            var sshape = weight_scale.shape()
+            if len(wshape) != 2 or len(sshape) != 2 \
+                    or sshape[0] != wshape[0] or sshape[1] <= 0 \
+                    or wshape[1] % sshape[1] != 0:
+                raise Error(
+                    String("MiniMax-H3 groupwise INT8 scale shape mismatch: ")
+                    + name
+                )
+            var group_size = wshape[1] // sshape[1]
+            var dequant = int8_dequant_groupwise_to_bf16(
+                weight, weight_scale, group_size, ctx
+            )
+            var rows = x.numel() // wshape[1]
+            if rows > 16384:
+                return minimax_h3_bf16_linear_chunked(x, dequant, ctx)
+            return linear(x, dequant, None, ctx)
+        raise Error(
+            String("MiniMax-H3 INT8 block scale has unsupported dtype for ")
+            + name + String(": ") + weight_scale.dtype().name()
+        )
     raise Error(
         String("MiniMax-H3 block projection has unsupported dtype for ")
         + name + String(": ") + weight.dtype().name()

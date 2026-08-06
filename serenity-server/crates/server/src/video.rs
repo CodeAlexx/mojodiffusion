@@ -2633,7 +2633,7 @@ fn minimax_h3_unified_runner_gate_passed() -> bool {
         != Some("serenity.minimax_h3.unified_runner_gate.v1")
         || doc.get("passed").and_then(Value::as_bool) != Some(true)
         || doc.pointer("/topology/executable_count").and_then(Value::as_i64) != Some(1)
-        || doc.pointer("/topology/selector_checks_passed").and_then(Value::as_i64) != Some(15)
+        || doc.pointer("/topology/selector_checks_passed").and_then(Value::as_i64) != Some(36)
         || doc.pointer("/topology/subprocess_profile_dispatch").and_then(Value::as_bool)
             != Some(false)
         || doc.pointer("/precision_switch/int8_quality_resident_blocks")
@@ -2777,7 +2777,7 @@ fn minimax_h3_duration_profile_gate_passed(
         return false;
     };
     if doc.get("schema").and_then(Value::as_str)
-        != Some("serenity.minimax_h3.duration_profiles_gate.v1")
+        != Some("serenity.minimax_h3.duration_profiles_gate.v2")
         || doc.get("passed").and_then(Value::as_bool) != Some(true)
     {
         return false;
@@ -2798,6 +2798,45 @@ fn minimax_h3_duration_profile_gate_passed(
         {
             return false;
         }
+    }
+    let Some(validation_path) = doc.pointer("/validation/path").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(validation_sha) = sha256sum(&repo_path(validation_path)) else {
+        return false;
+    };
+    let Ok(validation_text) = std::fs::read_to_string(repo_path(validation_path)) else {
+        return false;
+    };
+    let resident_blocks = match quant {
+        "int8-fast" => profile.fast_resident_blocks,
+        "int8" => profile.quality_resident_blocks,
+        "bf16" => 0,
+        _ => return false,
+    };
+    let expected_validation = format!(
+        "MiniMax-H3 request valid: {} x {} {} frames at {} FPS, S= {} quant= {} resident_blocks= {}",
+        profile.width,
+        profile.height,
+        profile.frames,
+        profile.fps,
+        profile.sequence_tokens,
+        quant,
+        resident_blocks,
+    );
+    if doc.pointer("/validation/passed").and_then(Value::as_bool) != Some(true)
+        || doc
+            .pointer("/validation/validated_requests")
+            .and_then(Value::as_i64)
+            != Some(36)
+        || doc.pointer("/validation/sha256").and_then(Value::as_str)
+            != Some(validation_sha.as_str())
+        || validation_text.lines().count() != 36
+        || !validation_text
+            .lines()
+            .any(|line| line == expected_validation)
+    {
+        return false;
     }
     let Some(candidate) = doc
         .get("profiles")
@@ -2821,21 +2860,58 @@ fn minimax_h3_duration_profile_gate_passed(
     {
         return false;
     }
-    let Some(gate) = candidate.pointer(&format!("/modes/{quant}")) else {
+    let Some(mode_gate) = candidate.pointer(&format!("/modes/{quant}")) else {
         return false;
     };
-    let Some(evidence_path) = gate.get("evidence_path").and_then(Value::as_str) else {
+    if mode_gate.get("passed").and_then(Value::as_bool) != Some(true)
+        || mode_gate.get("request_validated").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(coverage_id) = mode_gate.get("coverage_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(coverage) = doc
+        .get("coverage")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(coverage_id))
+        })
+    else {
+        return false;
+    };
+    if coverage.pointer("/profile/width").and_then(Value::as_i64) != Some(960)
+        || coverage.pointer("/profile/height").and_then(Value::as_i64) != Some(544)
+        || coverage.pointer("/profile/frames").and_then(Value::as_i64) != Some(362)
+        || coverage.pointer("/profile/fps").and_then(Value::as_i64) != Some(24)
+        || coverage
+            .pointer("/profile/text_tokens")
+            .and_then(Value::as_i64)
+            != Some(241)
+        || coverage
+            .pointer("/profile/sequence_tokens")
+            .and_then(Value::as_i64)
+            != Some(56017)
+    {
+        return false;
+    }
+    let Some(evidence) = coverage.pointer(&format!("/modes/{quant}")) else {
+        return false;
+    };
+    let Some(evidence_path) = evidence.get("evidence_path").and_then(Value::as_str) else {
         return false;
     };
     let Some(evidence_sha) = sha256sum(&repo_path(evidence_path)) else {
         return false;
     };
-    gate.get("passed").and_then(Value::as_bool) == Some(true)
-        && gate.get("gpu_compute_only").and_then(Value::as_bool) == Some(true)
-        && gate.get("cpu_inference").and_then(Value::as_bool) == Some(false)
-        && gate.get("video_nonfinite").and_then(Value::as_i64) == Some(0)
-        && gate.get("audio_nonfinite").and_then(Value::as_i64) == Some(0)
-        && gate.get("evidence_sha256").and_then(Value::as_str)
+    evidence.get("passed").and_then(Value::as_bool) == Some(true)
+        && evidence.get("gpu_compute_only").and_then(Value::as_bool) == Some(true)
+        && evidence.get("cpu_inference").and_then(Value::as_bool) == Some(false)
+        && evidence.get("video_nonfinite").and_then(Value::as_i64) == Some(0)
+        && evidence.get("audio_nonfinite").and_then(Value::as_i64) == Some(0)
+        && evidence.get("evidence_sha256").and_then(Value::as_str)
             == Some(evidence_sha.as_str())
 }
 
@@ -2978,7 +3054,7 @@ fn minimax_h3_profile_document(profile: &MiniMaxH3RequestProfile) -> Value {
             "int8": profile.quality_resident_blocks,
         },
         "runner": minimax_h3_request_profile_registry().runner,
-        "memory_policy": "constant_budget_higher_resolution_shorter_duration",
+        "memory_policy": "independent_resolution_duration_matrix",
     })
 }
 
@@ -5860,10 +5936,11 @@ fn start_minimax_h3_request(
     let runner = minimax_h3_request_runner(profile, &quant)
         .expect("validated MiniMax-H3 profile must declare the selected quant runner")
         .to_string();
-    let resident_blocks = if quant == "int8-fast" {
-        profile.fast_resident_blocks
-    } else {
-        profile.quality_resident_blocks
+    let resident_blocks = match quant.as_str() {
+        "int8-fast" => profile.fast_resident_blocks,
+        "int8" => profile.quality_resident_blocks,
+        "bf16" => 0,
+        _ => unreachable!("MiniMax-H3 quant was validated before request start"),
     };
     let n = st
         .next_id
@@ -10269,6 +10346,10 @@ mod tests {
         request["attention_backend"] = json!("sage-int8");
         validate_minimax_h3_request(&request).unwrap();
         for profile in &minimax_h3_request_profile_registry().profiles {
+            assert_eq!(profile.quant_modes.len(), 3);
+            assert!(["int8-fast", "int8", "bf16"]
+                .iter()
+                .all(|quant| profile.quant_modes.iter().any(|mode| mode == quant)));
             request["width"] = json!(profile.width);
             request["height"] = json!(profile.height);
             request["frames"] = json!(profile.frames);
@@ -10278,6 +10359,12 @@ mod tests {
                 minimax_h3_profile_from_request(&request).map(|entry| entry.id.as_str()),
                 Some(profile.id.as_str())
             );
+        }
+        assert_eq!(minimax_h3_request_profile_registry().profiles.len(), 12);
+        for (width, height) in [(512, 320), (832, 480), (960, 544)] {
+            for frames in [56, 73, 175, 362] {
+                assert!(minimax_h3_profile_for_geometry(width, height, frames, 24).is_some());
+            }
         }
         request["width"] = json!(1024);
         assert!(validate_minimax_h3_request(&request)
@@ -10291,14 +10378,6 @@ mod tests {
             .unwrap_err()
             .contains("exact compiled 241-token test prompt"));
         request["prompt"] = json!(MINIMAX_H3_TEST_PROMPT);
-        request["width"] = json!(832);
-        request["height"] = json!(480);
-        request["frames"] = json!(362);
-        request["fps"] = json!(24);
-        request["quant"] = json!("int8");
-        assert!(validate_minimax_h3_request(&request)
-            .unwrap_err()
-            .contains("supports quant modes: bf16"));
         request["width"] = json!(MINIMAX_H3_WIDTH);
         request["height"] = json!(MINIMAX_H3_HEIGHT);
         request["frames"] = json!(MINIMAX_H3_FRAMES);
@@ -10528,13 +10607,16 @@ mod tests {
         assert_eq!(h3["supported_profiles"][0]["width"], MINIMAX_H3_WIDTH);
         assert_eq!(h3["supported_profiles"][0]["height"], MINIMAX_H3_HEIGHT);
         assert_eq!(h3["supported_profiles"][0]["frames"], MINIMAX_H3_FRAMES);
-        assert_eq!(h3["supported_profiles"].as_array().unwrap().len(), 5);
-        assert_eq!(h3["supported_profiles"][1]["width"], 832);
-        assert_eq!(h3["supported_profiles"][2]["width"], 960);
+        assert_eq!(h3["supported_profiles"].as_array().unwrap().len(), 12);
+        assert_eq!(h3["supported_profiles"][1]["width"], 512);
+        assert_eq!(h3["supported_profiles"][2]["width"], 512);
         assert_eq!(h3["supported_profiles"][3]["frames"], 362);
         assert_eq!(h3["supported_profiles"][3]["duration"], 15.083333);
         assert_eq!(h3["supported_profiles"][4]["width"], 832);
-        assert_eq!(h3["supported_profiles"][4]["quant_modes"], json!(["bf16"]));
+        assert_eq!(
+            h3["supported_profiles"][11]["quant_modes"],
+            json!(["int8-fast", "int8", "bf16"])
+        );
         assert_eq!(h3["quant_modes"][0]["id"], "int8-fast");
         assert_eq!(h3["quant_modes"][1]["id"], "int8");
         assert_eq!(h3["quant_modes"][2]["id"], "bf16");

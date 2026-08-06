@@ -367,9 +367,11 @@ def minimax_h3_build_resident_fp8(
     # no large contiguous block. Law (measured across runs 3+4): every
     # large persistent allocation happens BEFORE the store build; after it,
     # only small activations.
-    var scratch = minimax_h3_allocate_resident_scratch(
-        config, start_layer, ctx
-    )
+    var scratch = List[ArcPointer[Tensor]]()
+    if n > 0:
+        scratch = minimax_h3_allocate_resident_scratch(
+            config, start_layer, ctx
+        )
 
     var heads = config.num_attention_heads
     var head_dim = config.attention_head_dim
@@ -593,6 +595,44 @@ def minimax_h3_resident_block_weights_w8a8(
             raise Error("MiniMax-H3 direct W8A8 cache dtype mismatch")
         if scale.numel() != weight.shape()[0]:
             raise Error("MiniMax-H3 direct W8A8 cache scale mismatch")
+        weights[block.fp8_names[k]] = block.fp8[k].copy()
+        weights[block.fp8_names[k] + String(".scale")] = block.scale[k].copy()
+    for k in range(len(block.bf16)):
+        weights[block.bf16_names[k]] = block.bf16[k].copy()
+    weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    weights[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(
+        _minimax_h3_marker_tensor(ctx)
+    )
+    return weights^
+
+
+def minimax_h3_resident_block_weights_groupwise(
+    resident: MiniMaxH3ResidentFp8,
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """Expose groupwise INT8 weights for projection-local BF16 dequant."""
+    if resident.scheme != MINIMAX_H3_RESIDENT_INT8:
+        raise Error("MiniMax-H3 groupwise block requested from wrong store")
+    var i = layer - resident.start_layer
+    if i < 0 or i >= len(resident.blocks):
+        raise Error("MiniMax-H3 groupwise layer outside resident range")
+    ref block = resident.blocks[i]
+    var weights = Dict[String, ArcPointer[Tensor]]()
+    for k in range(len(block.fp8)):
+        ref weight = block.fp8[k][]
+        ref scale = block.scale[k][]
+        if weight.dtype() != STDtype.I8 or scale.dtype() != STDtype.F16:
+            raise Error("MiniMax-H3 groupwise cache dtype mismatch")
+        var wshape = weight.shape()
+        var sshape = scale.shape()
+        if len(wshape) != 2 or len(sshape) != 2 \
+                or sshape[0] != wshape[0] or sshape[1] <= 0 \
+                or wshape[1] % sshape[1] != 0:
+            raise Error("MiniMax-H3 groupwise cache scale mismatch")
         weights[block.fp8_names[k]] = block.fp8[k].copy()
         weights[block.fp8_names[k] + String(".scale")] = block.scale[k].copy()
     for k in range(len(block.bf16)):

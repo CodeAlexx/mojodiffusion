@@ -291,6 +291,7 @@ from serenitymojo.models.dit.minimax_h3_fp8_resident import (
     MiniMaxH3ResidentFp8,
     minimax_h3_build_resident_fp8,
     minimax_h3_resident_block_weights,
+    minimax_h3_resident_block_weights_groupwise,
     minimax_h3_resident_block_weights_w8a8,
 )
 from serenitymojo.models.dit.minimax_h3_modcache import (
@@ -1429,6 +1430,7 @@ def _minimax_h3_get_resident_cached(
     cache_path: String,
     ctx: DeviceContext,
     cache_save_allowed: Bool = True,
+    direct_groupwise: Bool = False,
 ) raises -> MiniMaxH3ResidentFp8:
     if cache_path != String(""):
         try:
@@ -1440,6 +1442,7 @@ def _minimax_h3_get_resident_cached(
                 resident_blocks,
                 0,
                 resident_scheme,
+                direct_groupwise,
             )
             print("  resident cache: HIT", cache_path)
             return cached^
@@ -1516,6 +1519,10 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
                     block_w = minimax_h3_resident_block_weights_w8a8(
                         resident.value(), layer, config, ctx
                     )
+                elif resident_scheme == MINIMAX_H3_RESIDENT_INT8:
+                    block_w = minimax_h3_resident_block_weights_groupwise(
+                        resident.value(), layer, config, ctx
+                    )
                 else:
                     block_w = minimax_h3_resident_block_weights(
                         resident.value(), layer, config, ctx
@@ -1541,10 +1548,10 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
                     resident_scheme == MINIMAX_H3_RESIDENT_INT8
                     and resident_cache_path != String("")
                     and layer < GROUPWISE_RUNTIME_CACHE_BLOCKS
-                    and (SEQUENCE_S == 18567 or SEQUENCE_S == 43177)
+                    and len(resident.value().blocks) == 0
                 ):
-                    # Long sequences need the activation headroom of a
-                    # zero-resident prefix. Stream one already-quantized
+                    # Any zero-resident request needs the activation headroom
+                    # of a streamed prefix. Load one already-quantized
                     # groupwise block at a time from the accepted 48-block
                     # cache; only the final two uncached blocks remain BF16.
                     var tail = load_minimax_h3_resident_cache(
@@ -1555,8 +1562,9 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
                         1,
                         layer,
                         resident_scheme,
+                        True,
                     )
-                    block_w = minimax_h3_resident_block_weights(
+                    block_w = minimax_h3_resident_block_weights_groupwise(
                         tail, layer, config, ctx
                     )
                 else:
@@ -1582,6 +1590,10 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
             ctx,
             attention_backend,
         )
+        # A streamed cache block is owned by this per-layer Dict. Drop its
+        # ArcPointers before loading the next block; otherwise long sequences
+        # can overlap two weight blocks and lose several GiB of VRAM headroom.
+        block_w.clear()
     var hidden2 = reshape(
         hidden3, [SEQUENCE_S, config.hidden_size], ctx
     )
@@ -1790,24 +1802,28 @@ def main() raises:
     )
     var admitted_profile = runtime_fps == 24 and runtime_text_tokens == 241 and (
         (
-            runtime_width == 512 and runtime_height == 320
-            and runtime_frames == 175 and sequence_length == 9145
+            runtime_width == 512 and runtime_height == 320 and (
+                (runtime_frames == 56 and sequence_length == 3147)
+                or (runtime_frames == 73 and sequence_length == 4005)
+                or (runtime_frames == 175 and sequence_length == 9145)
+                or (runtime_frames == 362 and sequence_length == 18567)
+            )
         )
         or (
-            runtime_width == 832 and runtime_height == 480
-            and runtime_frames == 73 and sequence_length == 9065
+            runtime_width == 832 and runtime_height == 480 and (
+                (runtime_frames == 56 and sequence_length == 7057)
+                or (runtime_frames == 73 and sequence_length == 9065)
+                or (runtime_frames == 175 and sequence_length == 21105)
+                or (runtime_frames == 362 and sequence_length == 43177)
+            )
         )
         or (
-            runtime_width == 960 and runtime_height == 544
-            and runtime_frames == 56 and sequence_length == 9097
-        )
-        or (
-            runtime_width == 512 and runtime_height == 320
-            and runtime_frames == 362 and sequence_length == 18567
-        )
-        or (
-            runtime_width == 832 and runtime_height == 480
-            and runtime_frames == 362 and sequence_length == 43177
+            runtime_width == 960 and runtime_height == 544 and (
+                (runtime_frames == 56 and sequence_length == 9097)
+                or (runtime_frames == 73 and sequence_length == 11705)
+                or (runtime_frames == 175 and sequence_length == 27345)
+                or (runtime_frames == 362 and sequence_length == 56017)
+            )
         )
     )
     if not admitted_profile:
@@ -1816,8 +1832,8 @@ def main() raises:
             + String(runtime_width) + String("x") + String(runtime_height)
             + String(", ") + String(runtime_frames) + String(" frames at ")
             + String(runtime_fps) + String(" FPS; admitted profiles are ")
-            + String("512x320x175, 512x320x362, 832x480x73, ")
-            + String("832x480x362, and 960x544x56 at 24 FPS")
+            + String("the 3x4 matrix of 512x320, 832x480, or 960x544 ")
+            + String("at 56, 73, 175, or 362 frames and 24 FPS")
         )
     if validate_request:
         print(
@@ -2126,6 +2142,7 @@ def main() raises:
                 resident_cache_path,
                 ctx,
                 resident_cache_save_allowed,
+                resident_scheme == MINIMAX_H3_RESIDENT_INT8,
             )
         )
         var t_q1 = perf_counter_ns()
@@ -2191,8 +2208,24 @@ def main() raises:
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
         var frontend_out: MiniMaxH3FrontendOutput
-        if sequence_length == 9145:
-            frontend_out = _minimax_h3_model_eval_p[241, 9145](
+        if sequence_length == 3147:
+            frontend_out = _minimax_h3_model_eval_p[241, 3147](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 4005:
+            frontend_out = _minimax_h3_model_eval_p[241, 4005](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 7057:
+            frontend_out = _minimax_h3_model_eval_p[241, 7057](
                 video_state, audio_state, text_rows, placeholder_ts, geometry,
                 frontend_w, config, run_config, modcache, global_row,
                 block_adaln_indices, transformer_shards, fp8_resident,
@@ -2215,6 +2248,22 @@ def main() raises:
                 use_resident, resident_scheme, resident_cache_path, rope[0],
                 rope[1], rotary_dim, attention_backend, ctx,
             )
+        elif sequence_length == 9145:
+            frontend_out = _minimax_h3_model_eval_p[241, 9145](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 11705:
+            frontend_out = _minimax_h3_model_eval_p[241, 11705](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
         elif sequence_length == 18567:
             frontend_out = _minimax_h3_model_eval_p[241, 18567](
                 video_state, audio_state, text_rows, placeholder_ts, geometry,
@@ -2223,8 +2272,32 @@ def main() raises:
                 use_resident, resident_scheme, resident_cache_path, rope[0],
                 rope[1], rotary_dim, attention_backend, ctx,
             )
+        elif sequence_length == 21105:
+            frontend_out = _minimax_h3_model_eval_p[241, 21105](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 27345:
+            frontend_out = _minimax_h3_model_eval_p[241, 27345](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
         elif sequence_length == 43177:
             frontend_out = _minimax_h3_model_eval_p[241, 43177](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, ctx,
+            )
+        elif sequence_length == 56017:
+            frontend_out = _minimax_h3_model_eval_p[241, 56017](
                 video_state, audio_state, text_rows, placeholder_ts, geometry,
                 frontend_w, config, run_config, modcache, global_row,
                 block_adaln_indices, transformer_shards, fp8_resident,

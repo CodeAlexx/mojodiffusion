@@ -565,6 +565,42 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
 
 ## models/
 
+### MiniMax-H3 runtime geometry, precision, and omni-reference pipeline ✅ product gates
+
+- `models/dit/minimax_h3_{dit,frontend,int8_linear,runtime_cache}.mojo` is the
+  shared BF16/group-wise-INT8/W8A8 DiT runtime. Long-sequence QKV, SwiGLU,
+  residual projection, AdaLN gathering, and final projection are lifetime-
+  isolated or row chunked to bound the 24-GiB product peak.
+- `models/dit/minimax_h3_qk_inplace.mojo` performs exact-boundary BF16 Q/K RMS
+  normalization and partial RoPE in owned buffers. The GPU gate in
+  `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` covers this and the
+  fused/chunked BF16, group-wise, and W8A8 paths.
+- `models/dit/minimax_h3_step_cache.mojo` supplies the opt-in `high` denoise
+  policy: first/last eight blocks are recomputed and one group-32 INT8 middle
+  residual may be reused. `exact` is the quality default; High is experimental
+  because its decoded A/B showed visible video drift. It never changes request
+  geometry, duration, FPS, scheduler steps, or audio.
+- `ops/sage_attention_int8.mojo` is the switchable experimental INT8-QK
+  attention backend. cU-DNN remains the accepted default. Dynamic sequence
+  entry points in `ops/attention.mojo` and `ops/attention_flash.mojo` let one
+  runner serve runtime geometry and variable reference-token counts.
+- `models/minimax_h3_device/audio_encoder_device.mojo` implements the learned
+  Ref2VA AudioVAE encoder on GPU after media staging. Its real-weight trunk,
+  pre-block, and posterior mean all exceed 0.999999999 cosine.
+- `pipeline/minimax_h3_{t2va,i2va,ref2va}.mojo` accepts runtime width, height,
+  internal frames, FPS, precision, attention, and step-cache flags. The product
+  boundary exposes 1–15 authored seconds and 32–2048 dimensions in 32-pixel
+  steps inside the 1,032,192-pixel envelope, with six tested native presets.
+  BF16, INT8 Quality, and INT8 Fast remain independently switchable.
+- Ref2VA accepts ordered image/video/audio conditioning: at most 9 images, 3
+  videos, 3 audio clips, and 12 combined. Video audio is preserved as a
+  conditioning source and each audio-bearing reference selects ordinary,
+  soundtrack-reuse, or voice/timbre intent. Reference media is not prepended to
+  the generated video. Count/admission bounds are tested; all 12 were not
+  quality-run simultaneously on a 24-GiB GPU. The bounded INT8 Quality audio
+  comparison measured 0.997751 versus BF16, below the strict 0.999 bar, while
+  video measured 0.999227.
+
 ### `models/dit/zimage_dit.mojo` — `NextDiT`, `NextDiTConfig` ✅ (cos 0.99985)
 Z-Image NextDiT transformer (basic/non-omni). Reference = diffusers `transformer_z_image.py` (read line-by-line; flame-core Rust differs in t-embed inversion / concat order / final negate — diffusers is the oracle).
 - `@fieldwise_init struct NextDiTConfig(Copyable, Movable, ImplicitlyCopyable)` — `dim,n_heads,head_dim,n_layers,n_refiner,cap_feat_dim,norm_eps,rope_theta,t_scale,patch_size,in_channels,adaln_embed_dim,axis0,axis1,axis2`. `@staticmethod zimage()` = (3840, 30, 128, 30, 2, 2560, 1e-5, 256.0, 1000.0, 2, 16, 256, 32, 48, 48).

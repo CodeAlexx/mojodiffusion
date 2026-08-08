@@ -94,22 +94,13 @@
 # per step, no negative prompt, no cond/uncond blend — unlike wan22's CFG
 # loop, which this file's structure otherwise mirrors closely.
 #
-# ── FIXED PROMPT LENGTH (comptime, no attention mask — a real, currently
-# UNFILLED gap, not silently papered over) ──────────────────────────────
-# `minimax_h3_block_forward`'s self-attention (its own block-math header)
-# and the token refiner's `sdpa_nomask` both run with NO mask over the FULL
-# packed sequence — every row attends to every other row unconditionally.
-# Unlike wan22's cross-attention-only text padding (padded KV rows no OTHER
-# row's Q needs to ignore), H3 has ONE packed self-attention document: a
-# padded/truncated text region would pollute EVERY row's attention, not
-# just its own. Neither `sdpa_flash_infer_fwd` nor `sdpa_nomask` currently
-# accept a mask in how this port calls them. So `TEXT_TOKENS` below is a
-# COMPTIME budget the tokenized prompt's length must match EXACTLY (checked
-# at runtime, rebuild-hint error otherwise) — mirroring wan22's own
-# rebuild-on-geometry-change discipline, extended to prompt length. Wiring
-# variable-length prompts without a rebuild needs masked attention added to
-# both call sites first; that is out of this pass's scope and is reported,
-# not silently assumed away.
+# ── VARIABLE PROMPT LENGTH (exact rows, no DiT padding) ────────────────────────────
+# The prompt is tokenized before GPU allocation and its exact row count is
+# included in the runtime packed-sequence geometry. The language encoder may
+# temporarily pad to a power-of-two causal-attention dispatch size, but slices
+# those rows away before returning. The DiT therefore receives no synthetic
+# text rows and needs no padding mask. This is the same runtime-length contract
+# already used by the conditioned H3 pipelines.
 #
 # ── POSSIBLE PRECISION-BOUNDARY FINDING (flagged, NOT fixed — not this
 # file's code) ───────────────────────────────────────────────────────────
@@ -189,10 +180,8 @@
 #     stands in — see `_minimax_h3_stub_conditioning` below. THE REAL PROMPT
 #     TO WIRE ONCE THE TEXT ENCODER IS COMPLETE:
 #     `output/minimax_h3_prompts/rain_ring_box_shot1.txt` (245 tokens,
-#     tokenizes clean under H3's own processor) — not used tonight because
-#     it does not match this binary's compiled TEXT_TOKENS budget (see file
-#     header FIXED PROMPT LENGTH); wiring it needs H3_TEXT_TOKENS=245 and a
-#     rebuild, same as any other prompt-length change.
+#     tokenizes clean under H3's own processor). Product requests now resolve
+#     this exact count at runtime; no prompt-specific rebuild is required.
 #   * an UNMISSABLE banner prints (stdout, every phase, and result.json):
 #     this is an N-of-50-layer run with STUBBED conditioning. IT IS NOT A
 #     VALID MINIMAX-H3 GENERATION. It is a plumbing test — proving the
@@ -279,6 +268,7 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_tensor_names,
     minimax_h3_expected_shape,
     minimax_h3_block_forward,
+    minimax_h3_block_forward_dynamic,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
@@ -302,13 +292,27 @@ from serenitymojo.models.dit.minimax_h3_modcache import (
 from serenitymojo.models.dit.minimax_h3_runtime_cache import (
     load_minimax_h3_modcache,
     load_minimax_h3_resident_cache,
+    reload_minimax_h3_resident_w8a8_block,
     save_minimax_h3_modcache,
     save_minimax_h3_resident_cache,
 )
+from serenitymojo.models.dit.minimax_h3_step_cache import (
+    MINIMAX_H3_CACHE_BACK_BLOCKS,
+    MINIMAX_H3_CACHE_FRONT_BLOCKS,
+    MiniMaxH3QuantizedActivation,
+    MiniMaxH3StepCache,
+    minimax_h3_cache_apply_residual_inplace,
+    minimax_h3_cache_probe_rows,
+    minimax_h3_cache_quantize_activation,
+    minimax_h3_cache_should_reuse,
+    minimax_h3_cache_store_middle_residual,
+)
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 from serenitymojo.models.dit.minimax_h3_frontend import (
+    MiniMaxH3FrontendEmbed,
     MiniMaxH3FrontendOutput,
     minimax_h3_frontend_embed,
+    minimax_h3_frontend_embed_dynamic,
     minimax_h3_final_layer,
     minimax_h3_timestep_embedding,
 )
@@ -317,6 +321,7 @@ from serenitymojo.models.text_encoder.minimax_h3_conditioning import (
     MINIMAX_H3_ENCODER_INT8,
     MiniMaxH3ConditioningOutput,
     minimax_h3_encode_conditioning,
+    minimax_h3_tokenize_prompt,
 )
 from serenitymojo.models.dit.minimax_h3_sampling import (
     MiniMaxH3DualSchedule,
@@ -444,8 +449,8 @@ def _minimax_h3_open_transformer_shards(dir: String, partial_mode: Bool) raises 
     return ShardedSafeTensors.open(dir)
 
 
-# ── Legacy direct-CLI defaults. Product requests override video geometry
-# at runtime; TEXT_TOKENS remains the AOT token-refiner contract.
+# ── Legacy direct-CLI defaults. Product requests override video geometry,
+# and the real prompt overrides TEXT_TOKENS with its exact runtime token count.
 comptime HEIGHT = get_defined_int["H3_HEIGHT", 480]()
 comptime WIDTH = get_defined_int["H3_WIDTH", 832]()
 # FRAMES must already be of the form 17n+5 (video VAE chunking, packing.mojo
@@ -1016,14 +1021,16 @@ def _minimax_h3_decode_video(
 
 
 def _minimax_h3_mux_av(
-    out_dir: String, frames: Int, fps: Int
+    out_dir: String, frames: Int, input_fps: Int, output_fps: Int
 ) raises -> String:
     """Mux decoded PNG/WAV artifacts with NVIDIA NVENC, never CPU video encode."""
     var mp4 = out_dir + String("/video.mp4")
-    var cmd = String("ffmpeg -v error -y -framerate ") + String(fps)
+    var cmd = String("ffmpeg -v error -y -framerate ") + String(input_fps)
     cmd += String(" -start_number 0 -i ")
     cmd += shell_quote(out_dir + String("/frame_%05d.png"))
     cmd += String(" -i ") + shell_quote(out_dir + String("/audio.wav"))
+    if output_fps != input_fps:
+        cmd += String(" -vf fps=") + String(output_fps)
     cmd += String(" -frames:v ") + String(frames)
     cmd += String(" -c:v h264_nvenc -preset p7 -tune hq -rc vbr -cq 18")
     cmd += String(" -b:v 0 -pix_fmt yuv420p -af apad -c:a aac -shortest")
@@ -1462,10 +1469,11 @@ def _minimax_h3_get_resident_cached(
     return built^
 
 
-# One executable carries the small set of product-gated AOT attention kernels.
-# Geometry is selected from the request at runtime; only the cuDNN/Sage launch
-# shape remains a compile-time specialization, as required by those kernels.
-def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
+# One executable accepts every aligned product geometry and prompt length.
+# Keep the accepted 241-row static refiner byte-identical; all other exact
+# prompt lengths use the runtime refiner already shared with conditioned H3.
+# Packed A/V/T sequence length remains runtime data through attention.
+def _minimax_h3_model_eval_p[TEXT_S: Int](
     video_state: Tensor,
     audio_state: Tensor,
     text_rows: Tensor,
@@ -1479,6 +1487,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
     block_adaln_indices: List[Int],
     ref transformer_shards: ShardedSafeTensors,
     ref resident: Optional[MiniMaxH3ResidentFp8],
+    mut reusable_w8a8_tail: Optional[MiniMaxH3ResidentFp8],
     use_resident: Bool,
     resident_scheme: Int,
     resident_cache_path: String,
@@ -1486,32 +1495,69 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
     sin: Tensor,
     rotary_dim: Int,
     attention_backend: Int,
+    step_index: Int,
+    mut step_cache: MiniMaxH3StepCache,
     ctx: DeviceContext,
 ) raises -> MiniMaxH3FrontendOutput:
-    if geometry.sequence_length != SEQUENCE_S:
-        raise Error(
-            String("MiniMax-H3 runtime profile sequence length ")
-            + String(geometry.sequence_length)
-            + String(" does not match selected AOT kernel ")
-            + String(SEQUENCE_S)
+    var sequence_length = geometry.sequence_length
+    var embed: MiniMaxH3FrontendEmbed
+    if text_rows.shape()[0] == TEXT_S:
+        embed = minimax_h3_frontend_embed[TEXT_S, H3_HEADS, H3_HEAD_DIM](
+            video_state,
+            audio_state,
+            text_rows,
+            placeholder_ts,
+            geometry.video_indices,
+            geometry.audio_indices,
+            geometry.text_indices,
+            sequence_length,
+            frontend_w,
+            config,
+            ctx,
         )
-    var embed = minimax_h3_frontend_embed[TEXT_S, H3_HEADS, H3_HEAD_DIM](
-        video_state,
-        audio_state,
-        text_rows,
-        placeholder_ts,
-        geometry.video_indices,
-        geometry.audio_indices,
-        geometry.text_indices,
-        SEQUENCE_S,
-        frontend_w,
-        config,
-        ctx,
-    )
+    else:
+        embed = minimax_h3_frontend_embed_dynamic[H3_HEADS, H3_HEAD_DIM](
+            video_state,
+            audio_state,
+            text_rows,
+            placeholder_ts,
+            geometry.video_indices,
+            geometry.audio_indices,
+            geometry.text_indices,
+            sequence_length,
+            frontend_w,
+            config,
+            ctx,
+            True,
+        )
     var hidden3 = reshape(
-        embed.hidden, [1, SEQUENCE_S, config.hidden_size], ctx
+        embed.hidden, [1, sequence_length, config.hidden_size], ctx
     )
+    # At H3 Base's full-area long-video shapes, the frontend leaves several
+    # GiB of completed projection/packing buffers pending behind the stream.
+    # Fence once before block 0 so the allocator can reclaim those buffers;
+    # the denoiser consumes `hidden3` only after all frontend work anyway.
+    var low_headroom_bf16 = (
+        not use_resident and sequence_length >= 60000
+    )
+    if low_headroom_bf16:
+        ctx.synchronize()
+    var cache_probe_before = List[Float32]()
+    if step_cache.enabled:
+        cache_probe_before = minimax_h3_cache_probe_rows(
+            hidden3, sequence_length, config.hidden_size, ctx
+        )
+    var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
+    var reused_middle = False
     for layer in range(run_config.num_layers):
+        if (
+            step_cache.enabled
+            and reused_middle
+            and layer >= MINIMAX_H3_CACHE_FRONT_BLOCKS
+            and layer
+            < run_config.num_layers - MINIMAX_H3_CACHE_BACK_BLOCKS
+        ):
+            continue
         var block_w: Dict[String, ArcPointer[Tensor]]
         if use_resident:
             if layer < len(resident.value().blocks):
@@ -1532,17 +1578,16 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
                     resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
                     and resident_cache_path != String("")
                 ):
-                    var tail = load_minimax_h3_resident_cache(
+                    reload_minimax_h3_resident_w8a8_block(
+                        reusable_w8a8_tail.value(),
                         resident_cache_path,
                         String(TRANSFORMER_INDEX),
                         config,
-                        ctx,
-                        1,
                         layer,
-                        resident_scheme,
+                        ctx,
                     )
                     block_w = minimax_h3_resident_block_weights_w8a8(
-                        tail, layer, config, ctx
+                        reusable_w8a8_tail.value(), layer, config, ctx
                     )
                 elif (
                     resident_scheme == MINIMAX_H3_RESIDENT_INT8
@@ -1575,8 +1620,8 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
             block_w = minimax_h3_load_block_device(
                 transformer_shards, layer, config, ctx
             )
-        hidden3 = minimax_h3_block_forward[
-            SEQUENCE_S, H3_HEADS, H3_HEAD_DIM
+        hidden3 = minimax_h3_block_forward_dynamic[
+            H3_HEADS, H3_HEAD_DIM
         ](
             hidden3,
             block_w,
@@ -1590,14 +1635,59 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
             ctx,
             attention_backend,
         )
+        # The block's last-use temporaries are stream-ordered but large enough
+        # at S>=60k that carrying them into the next streamed weight load can
+        # exceed a 24 GiB card.  Synchronize only this BF16 low-headroom lane;
+        # measured resident INT8 paths and ordinary BF16 shapes stay async.
+        if low_headroom_bf16:
+            ctx.synchronize()
         # A streamed cache block is owned by this per-layer Dict. Drop its
         # ArcPointers before loading the next block; otherwise long sequences
         # can overlap two weight blocks and lose several GiB of VRAM headroom.
         block_w.clear()
+        if (
+            step_cache.enabled
+            and layer == MINIMAX_H3_CACHE_FRONT_BLOCKS - 1
+        ):
+            var cache_probe_after = minimax_h3_cache_probe_rows(
+                hidden3, sequence_length, config.hidden_size, ctx
+            )
+            reused_middle = minimax_h3_cache_should_reuse(
+                step_index, cache_probe_before, cache_probe_after, step_cache
+            )
+            if reused_middle:
+                minimax_h3_cache_apply_residual_inplace(
+                    hidden3, step_cache, ctx
+                )
+                print(
+                    "  cache-dit: step=", step_index + 1,
+                    " action=reuse-middle residual_diff=",
+                    step_cache.last_residual_diff,
+                )
+            elif step_cache.enabled:
+                first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](
+                    minimax_h3_cache_quantize_activation(hidden3, ctx)
+                )
+                print(
+                    "  cache-dit: step=", step_index + 1,
+                    " action=full-refresh residual_diff=",
+                    step_cache.last_residual_diff,
+                )
+        if (
+            step_cache.enabled
+            and not reused_middle
+            and layer
+            == run_config.num_layers - MINIMAX_H3_CACHE_BACK_BLOCKS - 1
+        ):
+            if not first_block_snapshot:
+                raise Error("MiniMax-H3 Cache-DiT refresh has no front snapshot")
+            minimax_h3_cache_store_middle_residual(
+                hidden3, first_block_snapshot.value(), step_cache, ctx
+            )
     var hidden2 = reshape(
-        hidden3, [SEQUENCE_S, config.hidden_size], ctx
+        hidden3, [sequence_length, config.hidden_size], ctx
     )
-    return minimax_h3_final_layer(
+    var frontend_out = minimax_h3_final_layer(
         hidden2,
         modcache.final_mod[],
         global_row,
@@ -1607,6 +1697,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int, SEQUENCE_S: Int](
         config,
         ctx,
     )
+    return frontend_out^
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1618,13 +1709,17 @@ def main() raises:
     var runtime_width = WIDTH
     var runtime_height = HEIGHT
     var runtime_frames = FRAMES
+    var output_frames = FRAMES
     var runtime_fps = FPS
+    var output_fps = FPS
     var runtime_text_tokens = TEXT_TOKENS
     var use_resident = DIT_FP8_RESIDENT != 0
     var resident_blocks_requested = DIT_RESIDENT_BLOCKS
     var quant = String("int8") if use_resident else String("bf16")
     var attention_backend = MINIMAX_H3_ATTN_CUDNN
     var attention_backend_name = String("cudnn")
+    var step_cache_enabled = False
+    var step_cache_name = String("exact")
     var resident_scheme = MINIMAX_H3_RESIDENT_INT8
     var resident_backend_name = String("groupwise")
     var encoder_storage = MINIMAX_H3_ENCODER_BF16
@@ -1655,11 +1750,19 @@ def main() raises:
                 raise Error("invalid --frames flag")
             runtime_frames = atol(String(fields[1]))
             continue
+        if arg.startswith("--output-frames="):
+            var fields = arg.split("=")
+            output_frames = atol(String(fields[1]))
+            continue
         if arg.startswith("--fps="):
             var fields = arg.split("=")
             if len(fields) != 2:
                 raise Error("invalid --fps flag")
             runtime_fps = atol(String(fields[1]))
+            continue
+        if arg.startswith("--output-fps="):
+            var fields = arg.split("=")
+            output_fps = atol(String(fields[1]))
             continue
         if arg.startswith("--resident-blocks="):
             var fields = arg.split("=")
@@ -1685,6 +1788,19 @@ def main() raises:
             raise Error(
                 String("unknown attention backend flag: ") + arg
                 + String(" (expected cudnn or sage-int8)")
+            )
+        if arg == String("--step-cache=high"):
+            step_cache_enabled = True
+            step_cache_name = String("high")
+            continue
+        if arg == String("--step-cache=exact"):
+            step_cache_enabled = False
+            step_cache_name = String("exact")
+            continue
+        if arg.startswith("--step-cache="):
+            raise Error(
+                String("unknown step cache flag: ") + arg
+                + String(" (expected exact or high)")
             )
         if arg == String("--resident-backend=w8a8"):
             resident_scheme = MINIMAX_H3_RESIDENT_INT8_W8A8
@@ -1756,9 +1872,11 @@ def main() raises:
         print(
             "usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0]"
             " [max_blocks=50] [--attention-backend=cudnn|sage-int8]"
+            " [--step-cache=exact|high]"
             " [--resident-backend=groupwise|w8a8]"
             " [--quant=bf16|int8|int8-fast]"
-            " [--width=N] [--height=N] [--frames=N] [--fps=N]"
+            " [--width=N] [--height=N] [--frames=N] [--output-frames=N]"
+            " [--fps=N] [--output-fps=N]"
             " [--resident-blocks=N]"
             " [--encoder-storage=bf16|int8]"
             " [--runtime-cache-exact-product-prompt]"
@@ -1786,8 +1904,29 @@ def main() raises:
     if len(args) >= 6:
         max_blocks = atol(String(args[5]))
 
-    if runtime_fps <= 0:
-        raise Error("MiniMax-H3 FPS must be positive")
+    # Resolve exact text geometry before creating a DeviceContext or running
+    # the 50-layer encoder. Unlike padding to a fixed DiT budget, using the
+    # real token count adds no synthetic rows to packed self-attention.
+    var prompt_token_ids = minimax_h3_tokenize_prompt(
+        String(PROCESSOR_DIR), prompt
+    )
+    runtime_text_tokens = len(prompt_token_ids)
+    if runtime_text_tokens == 0:
+        raise Error("MiniMax-H3 prompt tokenized to zero ids")
+    if runtime_text_tokens > 2048:
+        raise Error(
+            String("MiniMax-H3 prompt is ") + String(runtime_text_tokens)
+            + " tokens; the text-encoder attention dispatch tops out at 2048"
+        )
+
+    if runtime_fps < 1 or runtime_fps > 120:
+        raise Error("MiniMax-H3 internal FPS must be in [1,120]")
+    if output_frames == FRAMES and runtime_frames != FRAMES:
+        output_frames = runtime_frames
+    if output_frames < 1:
+        raise Error("MiniMax-H3 output frames must be positive")
+    if output_fps < 1 or output_fps > 120:
+        raise Error("MiniMax-H3 output FPS must be in [1,120]")
     var latent_h = runtime_height // 16
     var latent_w = runtime_width // 16
     var num_latent_frames = (runtime_frames - 5) // 17 * 5 + 2
@@ -1800,40 +1939,17 @@ def main() raises:
     var sequence_length = (
         runtime_text_tokens + num_audio_rows + num_video_rows
     )
-    var admitted_profile = runtime_fps == 24 and runtime_text_tokens == 241 and (
-        (
-            runtime_width == 512 and runtime_height == 320 and (
-                (runtime_frames == 56 and sequence_length == 3147)
-                or (runtime_frames == 73 and sequence_length == 4005)
-                or (runtime_frames == 175 and sequence_length == 9145)
-                or (runtime_frames == 362 and sequence_length == 18567)
-            )
-        )
-        or (
-            runtime_width == 832 and runtime_height == 480 and (
-                (runtime_frames == 56 and sequence_length == 7057)
-                or (runtime_frames == 73 and sequence_length == 9065)
-                or (runtime_frames == 175 and sequence_length == 21105)
-                or (runtime_frames == 362 and sequence_length == 43177)
-            )
-        )
-        or (
-            runtime_width == 960 and runtime_height == 544 and (
-                (runtime_frames == 56 and sequence_length == 9097)
-                or (runtime_frames == 73 and sequence_length == 11705)
-                or (runtime_frames == 175 and sequence_length == 27345)
-                or (runtime_frames == 362 and sequence_length == 56017)
-            )
-        )
-    )
-    if not admitted_profile:
+    if runtime_width < 32 or runtime_width > 2048 \
+            or runtime_height < 32 or runtime_height > 2048 \
+            or runtime_width % 32 != 0 or runtime_height % 32 != 0:
         raise Error(
-            String("unsupported MiniMax-H3 runtime profile: ")
-            + String(runtime_width) + String("x") + String(runtime_height)
-            + String(", ") + String(runtime_frames) + String(" frames at ")
-            + String(runtime_fps) + String(" FPS; admitted profiles are ")
-            + String("the 3x4 matrix of 512x320, 832x480, or 960x544 ")
-            + String("at 56, 73, 175, or 362 frames and 24 FPS")
+            "MiniMax-H3 width and height must each be in [32, 2048]"
+            " and divisible by 32"
+        )
+    if runtime_frames < 5 or runtime_frames > 362 or runtime_frames % 17 != 5:
+        raise Error(
+            "MiniMax-H3 internal frames must be in [5, 362] and satisfy"
+            " frames % 17 == 5"
         )
     if validate_request:
         print(
@@ -1854,7 +1970,12 @@ def main() raises:
             "--prepare-runtime-cache requires"
             " --runtime-cache-exact-product-prompt"
         )
-    if runtime_cache:
+    if step_cache_enabled and eval_start != 0:
+        raise Error(
+            "MiniMax-H3 High step cache cannot resume mid-denoise;"
+            " start at evaluation 0"
+        )
+    if runtime_cache or use_resident:
         var mkdir_rc = sys_system(
             String("mkdir -p ") + shell_quote(String(RUNTIME_CACHE_DIR))
         )
@@ -1887,10 +2008,12 @@ def main() raises:
             video_rows, num_latent_frames, latent_h, latent_w,
             config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
         )
-        var artifact = _minimax_h3_mux_av(out_dir, nframes, runtime_fps)
+        var artifact = _minimax_h3_mux_av(
+            out_dir, output_frames, runtime_fps, output_fps
+        )
         _minimax_h3_write_decode_result(
-            out_dir, artifact, nframes, runtime_width, runtime_height,
-            runtime_fps,
+            out_dir, artifact, output_frames, runtime_width, runtime_height,
+            output_fps,
         )
         print(
             "  DECODE-ONLY done:", nframes, "frames +",
@@ -1913,6 +2036,7 @@ def main() raises:
     )
     print("  steps=", steps, " seed=", seed, " max_blocks=", max_blocks)
     print("  attention_backend=", attention_backend_name)
+    print("  step_cache=", step_cache_name)
     print("  resident_backend=", resident_backend_name)
     print("  quant=", quant)
     print("  encoder_storage=", encoder_storage_name)
@@ -1993,8 +2117,8 @@ def main() raises:
     if len(cond.token_tags) != runtime_text_tokens:
         raise Error(
             String("minimax_h3_t2va: prompt tokenized to ")
-            + String(len(cond.token_tags)) + " tokens, but this binary is"
-            " admitted for text_tokens=" + String(runtime_text_tokens)
+            + String(len(cond.token_tags)) + " tokens after preflight resolved "
+            + String(runtime_text_tokens) + "; tokenizer result drifted"
         )
     var text_rows = reshape(
         cond.embeds, [runtime_text_tokens, config.text_dim], ctx
@@ -2067,13 +2191,11 @@ def main() raises:
 
     var frontend_w = _minimax_h3_load_frontend_weights(transformer_shards, config, ctx)
     var temb = minimax_h3_timestep_embedding(temb_timesteps_tensor, frontend_w, config, ctx)
-    var modcache_path = String("")
-    if runtime_cache:
-        modcache_path = (
-            String(RUNTIME_CACHE_DIR) + String("/modcache_steps_")
-            + String(steps) + String("_blocks_")
-            + String(run_config.num_layers) + String(".safetensors")
-        )
+    var modcache_path = (
+        String(RUNTIME_CACHE_DIR) + String("/modcache_steps_")
+        + String(steps) + String("_blocks_")
+        + String(run_config.num_layers) + String(".safetensors")
+    )
     var modcache = _minimax_h3_get_modcache_cached(
         transformer_shards,
         temb,
@@ -2098,6 +2220,7 @@ def main() raises:
     # unconditionally (an empty Optional costs nothing); populated only under
     # the comptime flag, so a default build's denoise loop is untouched.
     var fp8_resident = Optional[MiniMaxH3ResidentFp8](None)
+    var reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](None)
     var resident_cache_path = String("")
 
     if use_resident:
@@ -2108,31 +2231,27 @@ def main() raises:
             resident_blocks = run_config.num_layers
         var t_q0 = perf_counter_ns()
         var resident_cache_save_allowed = True
-        if runtime_cache:
-            if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
-                # The direct store can load a strict prefix from the full
-                # 50-block cache.  Production uses 48 resident blocks so the
-                # 20-step modulation cache and activations retain VRAM
-                # headroom; do not overwrite the full cache if that prefix
-                # load ever misses validation.
-                resident_cache_path = (
-                    String(RUNTIME_CACHE_DIR)
-                    + String("/resident_w8a8_row_blocks_")
-                    + String(run_config.num_layers) + String(".safetensors")
-                )
-                resident_cache_save_allowed = (
-                    resident_blocks == run_config.num_layers
-                )
-            else:
-                resident_cache_path = (
-                    String(RUNTIME_CACHE_DIR)
-                    + String("/resident_groupwise_q16_o64_fc132_fc264_blocks_")
-                    + String(GROUPWISE_RUNTIME_CACHE_BLOCKS)
-                    + String(".safetensors")
-                )
-                resident_cache_save_allowed = (
-                    resident_blocks == GROUPWISE_RUNTIME_CACHE_BLOCKS
-                )
+        if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
+            # The direct store can load a strict prefix from the full
+            # 50-block cache. Production normally uses a measured prefix.
+            resident_cache_path = (
+                String(RUNTIME_CACHE_DIR)
+                + String("/resident_w8a8_row_blocks_")
+                + String(run_config.num_layers) + String(".safetensors")
+            )
+            resident_cache_save_allowed = (
+                resident_blocks == run_config.num_layers
+            )
+        else:
+            resident_cache_path = (
+                String(RUNTIME_CACHE_DIR)
+                + String("/resident_groupwise_q16_o64_fc132_fc264_blocks_")
+                + String(GROUPWISE_RUNTIME_CACHE_BLOCKS)
+                + String(".safetensors")
+            )
+            resident_cache_save_allowed = (
+                resident_blocks == GROUPWISE_RUNTIME_CACHE_BLOCKS
+            )
         fp8_resident = Optional[MiniMaxH3ResidentFp8](
             _minimax_h3_get_resident_cached(
                 transformer_shards,
@@ -2145,6 +2264,25 @@ def main() raises:
                 resident_scheme == MINIMAX_H3_RESIDENT_INT8,
             )
         )
+        if (
+            resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+            and resident_blocks < run_config.num_layers
+        ):
+            # Keep one fixed-shape W8A8 allocation and refill it in place for
+            # the streamed tail. I2VA and Ref2VA already use this path; T2VA
+            # must not allocate a fresh block store for every layer/step.
+            reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](
+                load_minimax_h3_resident_cache(
+                    resident_cache_path,
+                    String(TRANSFORMER_INDEX),
+                    config,
+                    ctx,
+                    1,
+                    resident_blocks,
+                    resident_scheme,
+                )
+            )
+            print("  resident cache: reusable one-block W8A8 tail ready")
         var t_q1 = perf_counter_ns()
         print(
             "  fp8-resident: ", resident_blocks, " blocks + ",
@@ -2198,6 +2336,7 @@ def main() raises:
             "from", resume_path,
         )
 
+    var step_cache = MiniMaxH3StepCache(step_cache_enabled)
     for i in range(eval_start, eval_stop):
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
@@ -2207,112 +2346,14 @@ def main() raises:
 
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
-        var frontend_out: MiniMaxH3FrontendOutput
-        if sequence_length == 3147:
-            frontend_out = _minimax_h3_model_eval_p[241, 3147](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 4005:
-            frontend_out = _minimax_h3_model_eval_p[241, 4005](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 7057:
-            frontend_out = _minimax_h3_model_eval_p[241, 7057](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 9065:
-            frontend_out = _minimax_h3_model_eval_p[241, 9065](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 9097:
-            frontend_out = _minimax_h3_model_eval_p[241, 9097](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 9145:
-            frontend_out = _minimax_h3_model_eval_p[241, 9145](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 11705:
-            frontend_out = _minimax_h3_model_eval_p[241, 11705](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 18567:
-            frontend_out = _minimax_h3_model_eval_p[241, 18567](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 21105:
-            frontend_out = _minimax_h3_model_eval_p[241, 21105](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 27345:
-            frontend_out = _minimax_h3_model_eval_p[241, 27345](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 43177:
-            frontend_out = _minimax_h3_model_eval_p[241, 43177](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        elif sequence_length == 56017:
-            frontend_out = _minimax_h3_model_eval_p[241, 56017](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
-                frontend_w, config, run_config, modcache, global_row,
-                block_adaln_indices, transformer_shards, fp8_resident,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, ctx,
-            )
-        else:
-            raise Error(
-                String("unsupported MiniMax-H3 runtime profile: ")
-                + String(runtime_width) + String("x")
-                + String(runtime_height) + String("x")
-                + String(runtime_frames) + String(" at ")
-                + String(runtime_fps) + String(" FPS, S=")
-                + String(sequence_length)
-            )
+        var frontend_out = _minimax_h3_model_eval_p[241](
+            video_state, audio_state, text_rows, placeholder_ts, geometry,
+            frontend_w, config, run_config, modcache, global_row,
+            block_adaln_indices, transformer_shards, fp8_resident,
+            reusable_w8a8_tail,
+            use_resident, resident_scheme, resident_cache_path, rope[0],
+            rope[1], rotary_dim, attention_backend, i, step_cache, ctx,
+        )
 
         video_state = schedule.step_video_device(frontend_out.video_out, video_ts, video_state, ctx)
         audio_state = schedule.step_audio_device(frontend_out.audio_out, audio_ts, audio_state, ctx)
@@ -2364,6 +2405,12 @@ def main() raises:
 
     var t_denoise1 = perf_counter_ns()
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")
+    if step_cache.enabled:
+        print(
+            "  cache-dit summary: full=", step_cache.full_evaluations,
+            " cached=", step_cache.cached_evaluations,
+            " residual_bytes=", step_cache.residual_bytes(),
+        )
 
     # ── 7. Audio decode (WIRED, real waveform) ─────────────────────────────
     var t_vae0 = perf_counter_ns()
@@ -2389,11 +2436,19 @@ def main() raises:
     result_body += String("  \"seed\":") + String(seed) + String(",\n")
     result_body += String("  \"width\":") + String(runtime_width) + String(",\n")
     result_body += String("  \"height\":") + String(runtime_height) + String(",\n")
-    result_body += String("  \"frames\":") + String(runtime_frames) + String(",\n")
-    result_body += String("  \"fps\":") + String(runtime_fps) + String(",\n")
+    result_body += String("  \"frames\":") + String(output_frames) + String(",\n")
+    result_body += String("  \"internal_frames\":") + String(runtime_frames) + String(",\n")
+    result_body += String("  \"fps\":") + String(output_fps) + String(",\n")
+    result_body += String("  \"internal_fps\":") + String(runtime_fps) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(sequence_length) + String(",\n")
     result_body += String("  \"attention_backend\":\"") \
         + attention_backend_name + String("\",\n")
+    result_body += String("  \"step_cache\":\"") \
+        + step_cache_name + String("\",\n")
+    result_body += String("  \"step_cache_full_evaluations\":") \
+        + String(step_cache.full_evaluations) + String(",\n")
+    result_body += String("  \"step_cache_cached_evaluations\":") \
+        + String(step_cache.cached_evaluations) + String(",\n")
     result_body += String("  \"weight_storage\":\"") + (
         (
             String("resident-int8-") + resident_backend_name + String("-")
@@ -2435,7 +2490,9 @@ def main() raises:
             String("--width=") + String(runtime_width),
             String("--height=") + String(runtime_height),
             String("--frames=") + String(runtime_frames),
+            String("--output-frames=") + String(output_frames),
             String("--fps=") + String(runtime_fps),
+            String("--output-fps=") + String(output_fps),
             String("--quant=") + quant,
             String("--resident-blocks=") + String(resident_blocks_requested),
         )
@@ -2448,8 +2505,10 @@ def main() raises:
     )
     var t_vid1 = perf_counter_ns()
     print("  video decode done (", Float64(t_vid1 - t_vid0) / 1.0e9, "s)")
-    var artifact = _minimax_h3_mux_av(out_dir, frames_written, runtime_fps)
+    var artifact = _minimax_h3_mux_av(
+        out_dir, output_frames, runtime_fps, output_fps
+    )
     _minimax_h3_write_decode_result(
-        out_dir, artifact, frames_written, runtime_width, runtime_height,
-        runtime_fps,
+        out_dir, artifact, output_frames, runtime_width, runtime_height,
+        output_fps,
     )

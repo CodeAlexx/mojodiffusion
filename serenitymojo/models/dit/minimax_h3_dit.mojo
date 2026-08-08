@@ -59,7 +59,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.collections import Dict, List
+from std.collections import Dict, List, Optional
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
@@ -71,16 +71,37 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.int8_quant import int8_dequant_groupwise_to_bf16
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
-from serenitymojo.ops.attention_flash import sdpa_flash_infer_fwd
-from serenitymojo.ops.sage_attention_int8 import sage_attention_int8_fwd
-from serenitymojo.models.dit.minimax_h3_int8_linear import (
-    minimax_h3_bf16_linear_chunked,
-    minimax_h3_int8_linear,
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_infer_fwd,
+    sdpa_flash_infer_fwd_dynamic,
 )
+from serenitymojo.ops.sage_attention_int8 import (
+    sage_attention_int8_fwd,
+    sage_attention_int8_fwd_dynamic,
+)
+from serenitymojo.models.dit.minimax_h3_int8_linear import (
+    MiniMaxH3Int8QKV,
+    minimax_h3_bf16_linear_chunked,
+    minimax_h3_bf16_mlp_residual_inplace,
+    minimax_h3_bf16_qkv_linear,
+    minimax_h3_groupwise_mlp_residual_inplace,
+    minimax_h3_groupwise_qkv_linear,
+    minimax_h3_int8_linear,
+    minimax_h3_int8_mlp_residual_inplace,
+    minimax_h3_int8_qkv_linear,
+    minimax_h3_int8_residual_linear,
+    minimax_h3_int8_residual_linear_inplace,
+    minimax_h3_int8_swiglu_linear,
+)
+from serenitymojo.models.dit.minimax_h3_qk_inplace import (
+    minimax_h3_qk_norm_partial_rope_inplace,
+)
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 from serenitymojo.ops.tensor_algebra import (
     gather_rows,
     slice,
     reshape,
+    reshape_in_place,
     reshape_owned,
     concat,
     add,
@@ -518,8 +539,395 @@ def _minimax_h3_block_linear(
     )
 
 
-def minimax_h3_block_forward[
-    S: Int, Heads: Int = MINIMAX_H3_HEADS, HeadDim: Int = MINIMAX_H3_HEAD_DIM
+def _minimax_h3_block_swiglu_linear(
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    name: String,
+    low_headroom: Bool,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """FC1 plus SwiGLU, fusing the W8A8 long-sequence path.
+
+    The ordinary path remains the accepted projection followed by the
+    accepted activation. At S>=60k, direct W8A8 can preserve those exact BF16
+    boundaries while avoiding the otherwise full `[S, 2*ffn]` allocation.
+    """
+    ref weight = weights[name][]
+    if low_headroom and weight.dtype() == STDtype.I8:
+        var scale_name = name + String(".scale")
+        if scale_name in weights:
+            ref weight_scale = weights[scale_name][]
+            if weight_scale.dtype() == STDtype.F32:
+                return minimax_h3_int8_swiglu_linear(
+                    x, weight, weight_scale, ctx
+                )
+    var packed = _minimax_h3_block_linear(x, weights, name, ctx)
+    return swiglu_packed_value_gate(packed, ctx)
+
+
+def _minimax_h3_block_residual_linear(
+    x: Tensor,
+    residual: Tensor,
+    gate: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    name: String,
+    low_headroom: Bool,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """FC2 plus residual gate, fusing the W8A8 long-sequence path."""
+    ref weight = weights[name][]
+    if low_headroom and weight.dtype() == STDtype.I8:
+        var scale_name = name + String(".scale")
+        if scale_name in weights:
+            ref weight_scale = weights[scale_name][]
+            if weight_scale.dtype() == STDtype.F32:
+                return minimax_h3_int8_residual_linear(
+                    x, weight, weight_scale, residual, gate, ctx
+                )
+    var projected = _minimax_h3_block_linear(x, weights, name, ctx)
+    return residual_gate(residual, gate, projected, ctx)
+
+
+def _minimax_h3_gather_mod_chunk(
+    mod: Tensor,
+    adaln_indices: List[Int],
+    chunk: Int,
+    hidden: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Gather one `[hidden]` AdaLN chunk without first expanding all six.
+
+    This is mathematically identical to slicing `gather_rows(mod, ids)`, but
+    its largest output is `[S, hidden]` rather than `[S, 6 * hidden]`.
+    """
+    var table_chunk = slice(mod, 1, chunk * hidden, hidden, ctx)
+    return gather_rows(table_chunk, adaln_indices, ctx)
+
+
+struct _MiniMaxH3MlpPrepared(Movable):
+    """Only the tensors that must survive from FC1 into fused FC2."""
+
+    var act: Tensor
+    var gate: Tensor
+
+    def __init__(out self, var act: Tensor, var gate: Tensor):
+        self.act = act^
+        self.gate = gate^
+
+    def __del__(deinit self):
+        pass
+
+
+def _minimax_h3_prepare_low_headroom_mlp(
+    x1: Tensor,
+    mod: Tensor,
+    adaln_indices: List[Int],
+    hidden: Int,
+    weights: Dict[String, ArcPointer[Tensor]],
+    prefix: String,
+    norm_eps: Float32,
+    ctx: DeviceContext,
+) raises -> _MiniMaxH3MlpPrepared:
+    """Prepare fused FC1 in a scope that dies before FC2 allocation.
+
+    At long sequences each gathered shift/scale and each normalized input is
+    close to a GiB. Returning only FC1's activation and the residual gate
+    makes those preparation buffers unreachable before fused FC2 begins.
+    """
+    var shift = _minimax_h3_gather_mod_chunk(
+        mod, adaln_indices, 3, hidden, ctx
+    )
+    var scale = _minimax_h3_gather_mod_chunk(
+        mod, adaln_indices, 4, hidden, ctx
+    )
+    var gate = _minimax_h3_gather_mod_chunk(
+        mod, adaln_indices, 5, hidden, ctx
+    )
+    var n2 = vec_rms_norm(
+        x1, weights[prefix + "norm2.weight"][], norm_eps, ctx
+    )
+    var mlp_in = modulate(n2, scale, shift, ctx)
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    var act = _minimax_h3_block_swiglu_linear(
+        mlp_in, weights, prefix + "mlp.fc1.weight", True, ctx
+    )
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    return _MiniMaxH3MlpPrepared(act^, gate^)
+
+
+def _minimax_h3_low_headroom_attention[
+    Heads: Int, HeadDim: Int
+](
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    prefix: String,
+    mod: Tensor,
+    adaln_indices: List[Int],
+    hidden: Int,
+    inner: Int,
+    heads: Int,
+    head_dim: Int,
+    norm_eps: Float32,
+    qk_norm_eps: Float32,
+    cos: Tensor,
+    sin: Tensor,
+    rotary_dim: Int,
+    ctx: DeviceContext,
+    attention_backend: Int,
+) raises -> Tensor:
+    """Long-sequence attention in a lifetime isolated from the MLP.
+
+    Returning only `x + gate_msa * attention` guarantees the multi-GiB QKV,
+    RoPE, SDPA, modulation, and projection temporaries are destroyed before
+    FC1 begins.
+    """
+    var S = x.shape()[1]
+    var shift = _minimax_h3_gather_mod_chunk(
+        mod, adaln_indices, 0, hidden, ctx
+    )
+    var scale_msa = _minimax_h3_gather_mod_chunk(
+        mod, adaln_indices, 1, hidden, ctx
+    )
+    var gate = _minimax_h3_gather_mod_chunk(
+        mod, adaln_indices, 2, hidden, ctx
+    )
+    var n1 = vec_rms_norm(x, weights[prefix + "norm1.weight"][], norm_eps, ctx)
+    var attn_in = modulate(n1, scale_msa, shift, ctx)
+    ctx.synchronize()
+
+    var attn: Tensor
+    var attn_scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
+    var qkv_name = prefix + "attn.qkv_proj.weight"
+    ref qkv_weight = weights[qkv_name][]
+    if qkv_weight.dtype() == STDtype.BF16 or (
+        qkv_weight.dtype() == STDtype.I8
+        and (qkv_name + String(".scale")) in weights
+    ):
+        var split_qkv: MiniMaxH3Int8QKV
+        if qkv_weight.dtype() == STDtype.BF16:
+            split_qkv = minimax_h3_bf16_qkv_linear(
+                attn_in, qkv_weight, ctx
+            )
+        elif weights[qkv_name + String(".scale")][].dtype() == STDtype.F32:
+            ref qkv_scale = weights[qkv_name + String(".scale")][]
+            split_qkv = minimax_h3_int8_qkv_linear(
+                attn_in, qkv_weight, qkv_scale, ctx
+            )
+        elif weights[qkv_name + String(".scale")][].dtype() == STDtype.F16:
+            ref qkv_scale = weights[qkv_name + String(".scale")][]
+            split_qkv = minimax_h3_groupwise_qkv_linear(
+                attn_in, qkv_weight, qkv_scale, ctx
+            )
+        else:
+            raise Error("MiniMax-H3 low-headroom QKV scale dtype unsupported")
+        reshape_in_place(split_qkv.q, [1, S, heads, head_dim])
+        reshape_in_place(split_qkv.k, [1, S, heads, head_dim])
+        reshape_in_place(split_qkv.v, [1, S, heads, head_dim])
+        ctx.synchronize()
+        minimax_h3_qk_norm_partial_rope_inplace(
+            split_qkv.q, weights[prefix + "attn.q_norm.weight"][],
+            cos, sin, heads, rotary_dim, qk_norm_eps, ctx,
+        )
+        minimax_h3_qk_norm_partial_rope_inplace(
+            split_qkv.k, weights[prefix + "attn.k_norm.weight"][],
+            cos, sin, heads, rotary_dim, qk_norm_eps, ctx,
+        )
+        ctx.synchronize()
+        cu_mempool_trim_current(0)
+        if attention_backend == MINIMAX_H3_ATTN_CUDNN:
+            attn = sdpa_flash_infer_fwd_dynamic(
+                split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx
+            )
+        elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+            comptime if HeadDim == 128:
+                attn = sage_attention_int8_fwd_dynamic(
+                    split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx
+                )
+            else:
+                raise Error(
+                    "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+                )
+        else:
+            raise Error(
+                String("minimax_h3_block_forward: unknown attention backend ")
+                + String(attention_backend)
+            )
+        # Consume Q/K/V before the branch-local owner is destroyed.
+        ctx.synchronize()
+    else:
+        var qkv_out = _minimax_h3_block_linear(
+            attn_in, weights, qkv_name, ctx
+        )
+        var q = slice(qkv_out, 2, 0 * inner, inner, ctx)
+        var k = slice(qkv_out, 2, 1 * inner, inner, ctx)
+        var v = slice(qkv_out, 2, 2 * inner, inner, ctx)
+        var q4 = reshape_owned(q^, [1, S, heads, head_dim])
+        var k4 = reshape_owned(k^, [1, S, heads, head_dim])
+        var v4 = reshape_owned(v^, [1, S, heads, head_dim])
+        ctx.synchronize()
+        q4 = vec_rms_norm(
+            q4, weights[prefix + "attn.q_norm.weight"][], qk_norm_eps, ctx
+        )
+        k4 = vec_rms_norm(
+            k4, weights[prefix + "attn.k_norm.weight"][], qk_norm_eps, ctx
+        )
+        q4 = _minimax_h3_apply_partial_rope(
+            q4, cos, sin, heads, rotary_dim, ctx
+        )
+        k4 = _minimax_h3_apply_partial_rope(
+            k4, cos, sin, heads, rotary_dim, ctx
+        )
+        ctx.synchronize()
+        cu_mempool_trim_current(0)
+        if attention_backend == MINIMAX_H3_ATTN_CUDNN:
+            attn = sdpa_flash_infer_fwd_dynamic(
+                q4, k4, v4, attn_scale, ctx
+            )
+        elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+            comptime if HeadDim == 128:
+                attn = sage_attention_int8_fwd_dynamic(
+                    q4, k4, v4, attn_scale, ctx
+                )
+            else:
+                raise Error(
+                    "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+                )
+        else:
+            raise Error(
+                String("minimax_h3_block_forward: unknown attention backend ")
+                + String(attention_backend)
+            )
+        ctx.synchronize()
+    var merged = reshape_owned(attn^, [1, S, inner])
+    var attn_out = _minimax_h3_block_linear(
+        merged, weights, prefix + "attn.out_proj.weight", ctx
+    )
+    var x1 = residual_gate(x, gate, attn_out, ctx)
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    return x1^
+
+
+def _minimax_h3_block_forward_low_headroom[
+    Heads: Int, HeadDim: Int
+](
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    mod: Tensor,
+    adaln_indices: List[Int],
+    cos: Tensor,
+    sin: Tensor,
+    rotary_dim: Int,
+    ctx: DeviceContext,
+    attention_backend: Int,
+) raises -> Tensor:
+    var prefix = minimax_h3_block_prefix(layer)
+    var x1 = _minimax_h3_low_headroom_attention[Heads, HeadDim](
+        x, weights, prefix, mod, adaln_indices, config.hidden_size,
+        config.inner_dim(), config.num_attention_heads,
+        config.attention_head_dim, config.norm_eps, config.qk_norm_eps,
+        cos, sin, rotary_dim, ctx, attention_backend,
+    )
+    # The attention helper's local QKV/rope/SDPA tensors are destroyed only
+    # after it returns. Trim here—not inside that helper—so their pool pages
+    # are genuinely releasable.
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    var fc1_name = prefix + "mlp.fc1.weight"
+    var fc2_name = prefix + "mlp.fc2.weight"
+    ref fc1_weight = weights[fc1_name][]
+    ref fc2_weight = weights[fc2_name][]
+    var fc1_scale_name = fc1_name + String(".scale")
+    var fc2_scale_name = fc2_name + String(".scale")
+    if fc1_weight.dtype() == STDtype.I8 and fc2_weight.dtype() == STDtype.I8 \
+            and fc1_scale_name in weights and fc2_scale_name in weights \
+            and weights[fc1_scale_name][].dtype() == STDtype.F32 \
+            and weights[fc2_scale_name][].dtype() == STDtype.F32:
+        ref fc1_scale = weights[fc1_scale_name][]
+        ref fc2_scale = weights[fc2_scale_name][]
+        var shift = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 3, config.hidden_size, ctx
+        )
+        var scale_mlp = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 4, config.hidden_size, ctx
+        )
+        var gate = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 5, config.hidden_size, ctx
+        )
+        var n2 = vec_rms_norm(
+            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        )
+        var mlp_in = modulate(n2, scale_mlp, shift, ctx)
+        ctx.synchronize()
+        cu_mempool_trim_current(0)
+        return minimax_h3_int8_mlp_residual_inplace(
+            mlp_in, fc1_weight, fc1_scale, fc2_weight, fc2_scale,
+            x1^, gate, ctx,
+        )
+    if fc1_weight.dtype() == STDtype.I8 and fc2_weight.dtype() == STDtype.I8 \
+            and fc1_scale_name in weights and fc2_scale_name in weights \
+            and weights[fc1_scale_name][].dtype() == STDtype.F16 \
+            and weights[fc2_scale_name][].dtype() == STDtype.F16:
+        ref fc1_scale = weights[fc1_scale_name][]
+        ref fc2_scale = weights[fc2_scale_name][]
+        var shift = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 3, config.hidden_size, ctx
+        )
+        var scale_mlp = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 4, config.hidden_size, ctx
+        )
+        var gate = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 5, config.hidden_size, ctx
+        )
+        var n2 = vec_rms_norm(
+            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        )
+        var mlp_in = modulate(n2, scale_mlp, shift, ctx)
+        ctx.synchronize()
+        cu_mempool_trim_current(0)
+        return minimax_h3_groupwise_mlp_residual_inplace(
+            mlp_in, fc1_weight, fc1_scale, fc2_weight, fc2_scale,
+            x1^, gate, ctx,
+        )
+
+    if fc1_weight.dtype() == STDtype.BF16 \
+            and fc2_weight.dtype() == STDtype.BF16:
+        var shift = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 3, config.hidden_size, ctx
+        )
+        var scale_mlp = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 4, config.hidden_size, ctx
+        )
+        var gate = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 5, config.hidden_size, ctx
+        )
+        var n2 = vec_rms_norm(
+            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        )
+        var mlp_in = modulate(n2, scale_mlp, shift, ctx)
+        ctx.synchronize()
+        cu_mempool_trim_current(0)
+        return minimax_h3_bf16_mlp_residual_inplace(
+            mlp_in, fc1_weight, fc2_weight, x1^, gate, ctx
+        )
+
+    var prepared = _minimax_h3_prepare_low_headroom_mlp(
+        x1, mod, adaln_indices, config.hidden_size, weights, prefix,
+        config.norm_eps, ctx,
+    )
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    return _minimax_h3_block_residual_linear(
+        prepared.act, x1, prepared.gate, weights, fc2_name, True, ctx
+    )
+
+
+def _minimax_h3_block_forward_impl[
+    Heads: Int = MINIMAX_H3_HEADS, HeadDim: Int = MINIMAX_H3_HEAD_DIM
 ](
     x: Tensor,
     weights: Dict[String, ArcPointer[Tensor]],
@@ -597,6 +1005,10 @@ def minimax_h3_block_forward[
     minimax_h3_require_transformed_weights(weights, layer)
 
     var prefix = minimax_h3_block_prefix(layer)
+    var x_shape = x.shape()
+    if len(x_shape) != 3 or x_shape[0] != 1:
+        raise Error("minimax_h3_block_forward: x must be [1,S,hidden]")
+    var S = x_shape[1]
     var hidden = config.hidden_size
     var heads = config.num_attention_heads
     var head_dim = config.attention_head_dim
@@ -612,18 +1024,52 @@ def minimax_h3_block_forward[
             " than silently reinterpreting a mismatched config"
         )
 
-    # ── AdaLN row gather: one [hidden]-wide chunk per (shift/scale/gate) x (msa/mlp) ──
-    var gathered = gather_rows(mod, adaln_indices, ctx)              # [S, 6*hidden] f32
-    var shift_msa = slice(gathered, 1, 0 * hidden, hidden, ctx)
-    var scale_msa = slice(gathered, 1, 1 * hidden, hidden, ctx)
-    var gate_msa = slice(gathered, 1, 2 * hidden, hidden, ctx)
-    var shift_mlp = slice(gathered, 1, 3 * hidden, hidden, ctx)
-    var scale_mlp = slice(gathered, 1, 4 * hidden, hidden, ctx)
-    var gate_mlp = slice(gathered, 1, 5 * hidden, hidden, ctx)
+    # ── AdaLN row gather: one [hidden]-wide chunk per parameter ────────────
+    # The ordinary path remains byte-for-byte unchanged.  At S>=48k, the old
+    # full gather alone is >4.4 GiB, then its six materialized slices add the
+    # same amount again.  Gather only the attention branch here; the MLP
+    # branch is gathered after attention has completed.
+    var low_headroom = S >= 48000
+    if low_headroom:
+        return _minimax_h3_block_forward_low_headroom[Heads, HeadDim](
+            x, weights, layer, config, mod, adaln_indices, cos, sin,
+            rotary_dim, ctx, attention_backend,
+        )
+    var shift_msa: Tensor
+    var scale_msa: Tensor
+    var gate_msa: Tensor
+    var shift_mlp = Optional[Tensor](None)
+    var scale_mlp = Optional[Tensor](None)
+    var gate_mlp = Optional[Tensor](None)
+    if low_headroom:
+        shift_msa = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 0, hidden, ctx
+        )
+        scale_msa = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 1, hidden, ctx
+        )
+        gate_msa = _minimax_h3_gather_mod_chunk(
+            mod, adaln_indices, 2, hidden, ctx
+        )
+    else:
+        var gathered = gather_rows(mod, adaln_indices, ctx)
+        shift_msa = slice(gathered, 1, 0 * hidden, hidden, ctx)
+        scale_msa = slice(gathered, 1, 1 * hidden, hidden, ctx)
+        gate_msa = slice(gathered, 1, 2 * hidden, hidden, ctx)
+        var shift_mlp_t = slice(gathered, 1, 3 * hidden, hidden, ctx)
+        var scale_mlp_t = slice(gathered, 1, 4 * hidden, hidden, ctx)
+        var gate_mlp_t = slice(gathered, 1, 5 * hidden, hidden, ctx)
+        shift_mlp = Optional[Tensor](shift_mlp_t^)
+        scale_mlp = Optional[Tensor](scale_mlp_t^)
+        gate_mlp = Optional[Tensor](gate_mlp_t^)
 
     # ── Self-attention branch ──
     var n1 = vec_rms_norm(x, weights[prefix + "norm1.weight"][], config.norm_eps, ctx)
     var attn_in = modulate(n1, scale_msa, shift_msa, ctx)
+    if low_headroom:
+        # `attn_in` is now complete; release n1 plus shift/scale before the
+        # 3*inner QKV output is allocated.
+        ctx.synchronize()
 
     # qkv_proj is already de-interleaved into [q_all;k_all;v_all] thirds by
     # `minimax_h3_load_block_device` — no gather here (see this function's
@@ -638,6 +1084,10 @@ def minimax_h3_block_forward[
     var q4 = reshape_owned(q^, [1, S, heads, head_dim])
     var k4 = reshape_owned(k^, [1, S, heads, head_dim])
     var v4 = reshape_owned(v^, [1, S, heads, head_dim])
+    if low_headroom:
+        # All three slices have completed, so the `[S, 3*inner]` packed QKV
+        # allocation can be returned before per-head normalization/rope.
+        ctx.synchronize()
 
     q4 = vec_rms_norm(q4, weights[prefix + "attn.q_norm.weight"][], config.qk_norm_eps, ctx)
     k4 = vec_rms_norm(k4, weights[prefix + "attn.k_norm.weight"][], config.qk_norm_eps, ctx)
@@ -648,6 +1098,12 @@ def minimax_h3_block_forward[
     k4 = _minimax_h3_apply_partial_rope(
         k4, cos, sin, heads, rotary_dim, ctx
     )
+    if low_headroom:
+        ctx.synchronize()
+        # cuDNN owns a separate attention workspace allocation. Return any
+        # completed QKV/rope staging pages from the default CUDA pool before
+        # it asks the driver for the long-sequence workspace.
+        cu_mempool_trim_current(0)
 
     var scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
     # Dh=128 on sm_86 fails to instantiate the SDK's `flash_attention` MMA
@@ -663,12 +1119,12 @@ def minimax_h3_block_forward[
     # ensures `config` was built for exactly this instantiation.
     var attn: Tensor
     if attention_backend == MINIMAX_H3_ATTN_CUDNN:
-        attn = sdpa_flash_infer_fwd[1, S, Heads, HeadDim](
+        attn = sdpa_flash_infer_fwd_dynamic(
             q4, k4, v4, scale, ctx
         )
     elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
         comptime if HeadDim == 128:
-            attn = sage_attention_int8_fwd[1, S, Heads, HeadDim](
+            attn = sage_attention_int8_fwd_dynamic(
                 q4, k4, v4, scale, ctx
             )
         else:
@@ -680,6 +1136,9 @@ def minimax_h3_block_forward[
             String("minimax_h3_block_forward: unknown attention backend ")
             + String(attention_backend)
         )
+    if low_headroom:
+        # SDPA has consumed Q/K/V; reclaim them before out_proj.
+        ctx.synchronize()
                                                                         # [1, S, heads, head_dim] bf16
     var merged = reshape_owned(attn^, [1, S, inner])
     var attn_out = _minimax_h3_block_linear(
@@ -688,16 +1147,81 @@ def minimax_h3_block_forward[
     var x1 = residual_gate(x, gate_msa, attn_out, ctx)
 
     # ── MLP branch ──
-    var n2 = vec_rms_norm(x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx)
-    var mlp_in = modulate(n2, scale_mlp, shift_mlp, ctx)
-    # fc1 is already swapped to [value;gate] by `minimax_h3_load_block_device`
-    # (matches the oracle's own swiglu_ff convention: value first, gate second).
-    var fc1_out = _minimax_h3_block_linear(
-        mlp_in, weights, prefix + "mlp.fc1.weight", ctx
-    )  # [1,S,2*ffn], [value;gate]
-    var act = swiglu_packed_value_gate(fc1_out, ctx)                # silu(gate)*value
-    var ff_out = _minimax_h3_block_linear(
-        act, weights, prefix + "mlp.fc2.weight", ctx
-    )
-    var x2 = residual_gate(x1, gate_mlp, ff_out, ctx)
+    var x2: Tensor
+    if low_headroom:
+        # Complete and release the attention branch, then prepare FC1 inside a
+        # nested lifetime. Only its activation and residual gate survive into
+        # fused FC2; shift/scale/norm/input buffers die at helper return.
+        ctx.synchronize()
+        cu_mempool_trim_current(0)
+        var prepared = _minimax_h3_prepare_low_headroom_mlp(
+            x1, mod, adaln_indices, hidden, weights, prefix,
+            config.norm_eps, ctx,
+        )
+        x2 = _minimax_h3_block_residual_linear(
+            prepared.act, x1, prepared.gate, weights,
+            prefix + "mlp.fc2.weight", True, ctx,
+        )
+    else:
+        var n2 = vec_rms_norm(
+            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        )
+        var mlp_in = modulate(
+            n2, scale_mlp.value(), shift_mlp.value(), ctx
+        )
+        # fc1 is swapped to [value;gate] by the transformed loader.
+        var act = _minimax_h3_block_swiglu_linear(
+            mlp_in, weights, prefix + "mlp.fc1.weight", False, ctx
+        )
+        x2 = _minimax_h3_block_residual_linear(
+            act, x1, gate_mlp.value(), weights, prefix + "mlp.fc2.weight",
+            False, ctx,
+        )
     return x2^
+
+
+def minimax_h3_block_forward[
+    S: Int, Heads: Int = MINIMAX_H3_HEADS, HeadDim: Int = MINIMAX_H3_HEAD_DIM
+](
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    mod: Tensor,
+    adaln_indices: List[Int],
+    cos: Tensor,
+    sin: Tensor,
+    rotary_dim: Int,
+    ctx: DeviceContext,
+    attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
+) raises -> Tensor:
+    """Static-S compatibility surface for parity gates and existing callers."""
+    var x_shape = x.shape()
+    if len(x_shape) != 3 or x_shape[1] != S:
+        raise Error("minimax_h3_block_forward: runtime S != static S")
+    return _minimax_h3_block_forward_impl[Heads, HeadDim](
+        x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
+        ctx, attention_backend,
+    )
+
+
+def minimax_h3_block_forward_dynamic[
+    Heads: Int = MINIMAX_H3_HEADS, HeadDim: Int = MINIMAX_H3_HEAD_DIM
+](
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    mod: Tensor,
+    adaln_indices: List[Int],
+    cos: Tensor,
+    sin: Tensor,
+    rotary_dim: Int,
+    ctx: DeviceContext,
+    attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
+) raises -> Tensor:
+    """Runtime-S product surface used by arbitrary H3 canvas geometry."""
+    return _minimax_h3_block_forward_impl[Heads, HeadDim](
+        x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
+        ctx, attention_backend,
+    )

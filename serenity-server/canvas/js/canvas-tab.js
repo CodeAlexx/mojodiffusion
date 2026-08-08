@@ -89,9 +89,11 @@ var CanvasTab = (function () {
         ltx2ExtendDirection: 'end',
         ltx2ExtendSeconds: 3,
         h3Mode: 't2va',
-        h3ProfileKey: '',
+        h3ProfileKey: '1344x768',
+        h3Duration: 5,
         h3Quant: 'int8-fast',
         h3AttentionBackend: 'cudnn',
+        h3StepCache: 'exact',
         editMode: 'create',
         editEngine: 'krea2_turbo_1024',
         editModelEngine: 'klein9b',
@@ -129,6 +131,7 @@ var CanvasTab = (function () {
     var h3LastFrameFile = null;
     var h3LastFrameUploadedPath = '';
     var h3LastFrameUploadPromise = null;
+    var h3References = [];
     var editSourceVideoProbe = null;
     var styleReferenceDataUrl = '';
     var styleReferenceId = '';
@@ -631,13 +634,15 @@ var CanvasTab = (function () {
     };
     // ── Helpers ──
     function snapTo64(val) { return Math.max(64, Math.round(val / 64) * 64); }
-    function snapTo32(val) { return Math.max(64, Math.round(val / 32) * 32); }
+    function snapTo32(val) { return Math.max(32, Math.round(val / 32) * 32); }
     function clampDim(val) { return Math.max(256, Math.min(4096, val)); }
     function isVideoArch() { return genState.arch === 'ltxv' || genState.arch === 'minimax_h3' || genState.arch === 'wan' || genState.arch === 'bernini'; }
     function snapDimForArch(val) {
         return isVideoArch() ? snapTo32(val) : snapTo64(val);
     }
     function clampDimForArch(val) {
+        if (genState.arch === 'minimax_h3')
+            return Math.max(32, Math.min(2048, snapTo32(val)));
         if (isVideoArch())
             return Math.max(64, Math.min(1280, snapTo32(val)));
         return clampDim(snapTo64(val));
@@ -1491,14 +1496,17 @@ var CanvasTab = (function () {
             '<option value="i2va">First frame to video + audio</option>' +
             '<option value="l2va">Last frame to video + audio</option>' +
             '<option value="fl2va">First + last frame to video + audio</option>' +
-            '<option value="ref2va">Reference image to video + audio</option>' +
+            '<option value="ref2va">Omni-reference to video + audio</option>' +
             '</select>' +
-            '<label class="cv-setting-label" for="cv-h3-resolution">Resolution</label>' +
-            '<select id="cv-h3-resolution" class="cv-select"><option value="">Loading supported H3 resolutions...</option></select>' +
+            '<label class="cv-setting-label" for="cv-h3-resolution">Tested resolution preset</label>' +
+            '<select id="cv-h3-resolution" class="cv-select"><option value="">Loading H3 resolutions...</option></select>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Width</span>' +
+            '<input type="number" id="cv-h3-width" class="cv-number-input" min="32" max="2048" step="32" value="1344"></div>' +
+            '<div class="cv-setting-row"><span class="cv-setting-label">Height</span>' +
+            '<input type="number" id="cv-h3-height" class="cv-number-input" min="32" max="2048" step="32" value="768"></div>' +
             '<label class="cv-setting-label" for="cv-h3-duration">Seconds</label>' +
-            '<input type="number" id="cv-h3-duration" class="cv-select" min="0.01" step="0.01" list="cv-h3-duration-options" placeholder="Enter supported seconds">' +
-            '<datalist id="cv-h3-duration-options"></datalist>' +
-            '<div id="cv-h3-profile-note" class="cv-helper-text">One H3 runner applies resolution, seconds, frames, FPS, and precision at request time.</div>' +
+            '<input type="number" id="cv-h3-duration" class="cv-select" min="1" max="15" step="0.01" value="5">' +
+            '<div id="cv-h3-profile-note" class="cv-helper-text">Width and height are independently adjustable in 32-pixel steps within the 24-GB envelope. Duration: 1–15 seconds.</div>' +
             '<label class="cv-setting-label" for="cv-h3-quant">Quality / speed</label>' +
             '<select id="cv-h3-quant" class="cv-select">' +
             '<option value="int8-fast">INT8 Fast DiT · W8A8</option>' +
@@ -1510,6 +1518,21 @@ var CanvasTab = (function () {
             '<option value="cudnn">cU-DNN · quality default</option>' +
             '<option value="sage-int8">Sage INT8 · experimental</option>' +
             '</select>' +
+            '<label class="cv-setting-label" for="cv-h3-step-cache">Denoise acceleration</label>' +
+            '<select id="cv-h3-step-cache" class="cv-select">' +
+            '<option value="exact">Exact · every block, every step</option>' +
+            '<option value="high">Experimental cached · faster, quality loss</option>' +
+            '</select>' +
+            '<div class="cv-helper-text">Exact is the quality default. Experimental cached keeps size, seconds, FPS, steps, and audio, but measured A/B testing found visible video drift.</div>' +
+            '<div id="cv-h3-references-row" style="display:none">' +
+            '<details open><summary class="cv-section-title">H3 references</summary>' +
+            '<input id="cv-h3-references-file" type="file" accept="image/*,video/*,audio/*" multiple hidden>' +
+            '<label for="cv-h3-references-file" class="cv-import-btn">Add image, video, or audio</label>' +
+            '<button id="cv-h3-references-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
+            '<div id="cv-h3-references-note" class="cv-helper-text">0/12 · up to 9 images, 3 videos, and 3 audio clips.</div>' +
+            '<div id="cv-h3-references-list" class="cv-lora-list"></div>' +
+            '<div class="cv-helper-text">Order defines &lt;Image n&gt;, &lt;Video n&gt;, and &lt;Audio n&gt;. Audio may be a general reference, reused soundtrack, or voice-timbre reference.</div>' +
+            '</details></div>' +
             '<div id="cv-h3-last-frame-row" style="display:none">' +
             '<div class="cv-section-title">Last-frame keyframe</div>' +
             '<input id="cv-h3-last-frame-file" type="file" accept="image/*" hidden>' +
@@ -1517,8 +1540,8 @@ var CanvasTab = (function () {
             '<button id="cv-h3-last-frame-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
             '<div id="cv-h3-last-frame-note" class="cv-helper-text">Required for L2V and first+last-frame video.</div>' +
             '</div>' +
-            '<div id="cv-h3-mode-note" class="cv-helper-text">T2V uses the compiled profile. I2V uses the Source as frame zero. Ref2VA uses it only for identity and style—the image is not inserted into the output.</div>' +
-            '<div class="cv-helper-text">Conditioned modes are fixed at 768 × 768, 124 frames, 24 FPS and generate synchronized audio. GPU model execution only. Ref2VA has separate DiT caches and shares only the identical row-scaled encoder cache.</div>' +
+            '<div id="cv-h3-mode-note" class="cv-helper-text">Choose any supported output size and duration. I2V uses the Source as frame zero. Ref2VA accepts ordered image, video, and audio references without inserting a reference as frame zero.</div>' +
+            '<div class="cv-helper-text">Every H3 feature uses the same resolution, duration, frame-rate, and precision controls. GPU model execution only.</div>' +
             '</div>' +
             '</div>' +
             '</div>' +
@@ -1628,11 +1651,18 @@ var CanvasTab = (function () {
         els.h3Section = document.getElementById('cv-h3-section');
         els.h3Mode = document.getElementById('cv-h3-mode');
         els.h3Resolution = document.getElementById('cv-h3-resolution');
+        els.h3Width = document.getElementById('cv-h3-width');
+        els.h3Height = document.getElementById('cv-h3-height');
         els.h3Duration = document.getElementById('cv-h3-duration');
-        els.h3DurationList = document.getElementById('cv-h3-duration-options');
         els.h3ProfileNote = document.getElementById('cv-h3-profile-note');
         els.h3Quant = document.getElementById('cv-h3-quant');
         els.h3Attention = document.getElementById('cv-h3-attention');
+        els.h3StepCache = document.getElementById('cv-h3-step-cache');
+        els.h3ReferencesRow = document.getElementById('cv-h3-references-row');
+        els.h3ReferencesFile = document.getElementById('cv-h3-references-file');
+        els.h3ReferencesClear = document.getElementById('cv-h3-references-clear');
+        els.h3ReferencesNote = document.getElementById('cv-h3-references-note');
+        els.h3ReferencesList = document.getElementById('cv-h3-references-list');
         els.h3LastFrameRow = document.getElementById('cv-h3-last-frame-row');
         els.h3LastFrameFile = document.getElementById('cv-h3-last-frame-file');
         els.h3LastFrameClear = document.getElementById('cv-h3-last-frame-clear');
@@ -2281,6 +2311,135 @@ var CanvasTab = (function () {
             els.h3LastFrameNote.textContent =
                 'Required for L2V and first+last-frame video.';
     }
+    function h3ReferenceKind(file) {
+        var type = String(file && file.type || '').toLowerCase();
+        var name = String(file && file.name || '').toLowerCase();
+        if (type.indexOf('image/') === 0 || /\.(png|jpe?g|webp|bmp|gif)$/.test(name))
+            return 'image';
+        if (type.indexOf('video/') === 0 || /\.(mp4|mov|mkv|webm|avi|m4v)$/.test(name))
+            return 'video';
+        if (type.indexOf('audio/') === 0 || /\.(wav|mp3|m4a|aac|flac|ogg|opus)$/.test(name))
+            return 'audio';
+        return '';
+    }
+    function h3ReferenceCounts(rows) {
+        var counts = { image: 0, video: 0, audio: 0 };
+        (rows || []).forEach(function (row) {
+            if (Object.prototype.hasOwnProperty.call(counts, row.kind))
+                counts[row.kind] += 1;
+        });
+        return counts;
+    }
+    function renderH3References() {
+        if (!els.h3ReferencesList)
+            return;
+        els.h3ReferencesList.innerHTML = '';
+        h3References.forEach(function (reference, index) {
+            var row = document.createElement('div');
+            row.className = 'cv-lora-item';
+            var label = document.createElement('span');
+            label.className = 'cv-lora-name';
+            label.textContent = (index + 1) + '. ' + reference.kind.toUpperCase() +
+                ' · ' + reference.name + (reference.error ? ' · upload failed' :
+                    (reference.path ? ' · ready' : ' · uploading'));
+            row.appendChild(label);
+            if (reference.kind === 'audio' || reference.kind === 'video') {
+                var role = document.createElement('select');
+                role.className = 'cv-select';
+                [
+                    ['reference', 'Audio reference'],
+                    ['reuse', 'Reuse soundtrack'],
+                    ['voice_timbre', 'Voice timbre']
+                ].forEach(function (definition) {
+                    var option = document.createElement('option');
+                    option.value = definition[0];
+                    option.textContent = definition[1];
+                    role.appendChild(option);
+                });
+                role.value = reference.audioUse || 'reference';
+                role.addEventListener('change', function () {
+                    reference.audioUse = this.value;
+                });
+                row.appendChild(role);
+            }
+            var remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'cv-lora-clear';
+            remove.textContent = 'Remove';
+            remove.addEventListener('click', function () {
+                h3References.splice(index, 1);
+                renderH3References();
+            });
+            row.appendChild(remove);
+            els.h3ReferencesList.appendChild(row);
+        });
+        var counts = h3ReferenceCounts(h3References);
+        if (els.h3ReferencesNote)
+            els.h3ReferencesNote.textContent = h3References.length + '/12 · ' +
+                counts.image + '/9 images · ' + counts.video + '/3 videos · ' +
+                counts.audio + '/3 audio';
+        if (els.h3ReferencesClear)
+            els.h3ReferencesClear.disabled = h3References.length === 0;
+    }
+    function addH3ReferenceFiles(files) {
+        Array.from(files || []).forEach(function (file) {
+            var kind = h3ReferenceKind(file);
+            if (!kind) {
+                showError('Unsupported H3 reference file: ' + file.name);
+                return;
+            }
+            var counts = h3ReferenceCounts(h3References);
+            var limit = kind === 'image' ? 9 : 3;
+            if (h3References.length >= 12 || counts[kind] >= limit) {
+                showError('H3 Ref2VA limit reached: 12 combined, 9 images, 3 videos, 3 audio');
+                return;
+            }
+            var reference = {
+                kind: kind,
+                name: file.name || (kind + '-reference'),
+                path: '',
+                audioUse: 'reference',
+                file: file,
+                uploadPromise: null,
+                error: ''
+            };
+            h3References.push(reference);
+            reference.uploadPromise = SerenityAPI.uploadMedia(file).then(function (path) {
+                reference.path = String(path || '');
+                if (!reference.path)
+                    throw new Error('Media upload did not return a worker-readable path');
+                reference.error = '';
+                renderH3References();
+                return reference.path;
+            }).catch(function (error) {
+                reference.error = error.message || String(error);
+                renderH3References();
+                throw error;
+            });
+            reference.uploadPromise.catch(function () {
+                /* shown in the compact reference list and again on Generate */
+            });
+        });
+        renderH3References();
+    }
+    function resolvedH3References() {
+        return Promise.all(h3References.map(function (reference) {
+            var ready = reference.path
+                ? Promise.resolve(reference.path)
+                : reference.uploadPromise;
+            if (!ready)
+                return Promise.reject(new Error(
+                    'Reference "' + reference.name + '" must be selected again'
+                ));
+            return ready.then(function (path) {
+                return {
+                    kind: reference.kind,
+                    path: path,
+                    audio_use: reference.audioUse || 'reference'
+                };
+            });
+        }));
+    }
     function updateLtx2SourceStrengthHelp() {
         if (!els.ltx2SourceStrengthHelp)
             return;
@@ -2927,8 +3086,7 @@ var CanvasTab = (function () {
         var ltx2SourceMode = i2vLtx23Mode || temporalLtx23Mode ||
             (mode === 'create' && genState.arch === 'ltxv');
         var h3SourceMode = mode === 'create' && genState.arch === 'minimax_h3' &&
-            (genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va' ||
-                genState.h3Mode === 'ref2va');
+            (genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va');
         var maskedEditEngine = maskedEditEngineDefinition(genState.lanpaintEngine);
         var sourceStrengthRow = document.getElementById('cv-ltx2-source-strength-row');
         if (els.ltx2LastFrameRow)
@@ -2979,8 +3137,7 @@ var CanvasTab = (function () {
         els.importBtn.textContent = i2vLtx23Mode ? 'Load source image' :
             (temporalLtx23Mode ? 'Load source video' :
             (ltx2SourceMode ? 'Load source image / video' :
-            (h3SourceMode ? (genState.h3Mode === 'ref2va'
-                ? 'Load reference image' : 'Load source image') :
+            (h3SourceMode ? 'Load source image' :
                 (editing ? (mode === 'dynaedit' ? 'Load source video' : 'Load source image') : 'Import Image'))));
         els.importFile.accept = i2vLtx23Mode ? 'image/*' :
             (temporalLtx23Mode ? 'video/*' :
@@ -2992,8 +3149,6 @@ var CanvasTab = (function () {
             els.sourceEmpty.innerHTML = 'Drop the source video here<br><small>LTX 2.3 will preserve the unedited source region</small>';
         else if (els.sourceEmpty && ltx2SourceMode)
             els.sourceEmpty.innerHTML = 'Drop an image or video here<br><small>or choose it from the file manager</small>';
-        else if (els.sourceEmpty && h3SourceMode && genState.h3Mode === 'ref2va')
-            els.sourceEmpty.innerHTML = 'Drop the identity / style reference here<br><small>it will not become frame zero</small>';
         else if (els.sourceEmpty && h3SourceMode)
             els.sourceEmpty.innerHTML = 'Drop the first-frame image here<br><small>MiniMax-H3 will animate it</small>';
         else if (els.sourceEmpty)
@@ -4442,31 +4597,26 @@ var CanvasTab = (function () {
                 : 'Generate H3 ' + genState.h3Mode.toUpperCase() + ' + Audio';
         });
         els.h3Resolution.addEventListener('change', function () {
-            var requestedResolution = this.value;
-            var requestedDuration = Number(els.h3Duration.value);
-            if (applyCanvasH3ResolutionDuration(
-                requestedResolution, requestedDuration
-            ))
-                return;
-            showError(
-                'The H3 runner did not report ' + requestedResolution +
-                ' at ' + requestedDuration + ' seconds.'
-            );
-            applyCanvasH3Profile(preferredCanvasH3Profile());
+            genState.h3ProfileKey = this.value;
+            var preset = canvasH3Resolution(this.value);
+            if (preset) {
+                els.h3Width.value = String(preset.width);
+                els.h3Height.value = String(preset.height);
+            }
+            applyCanvasH3AuthoredGeometry();
+            History.push();
+        });
+        [els.h3Width, els.h3Height].forEach(function (control) {
+            control.addEventListener('change', function () {
+                var key = String(els.h3Width.value) + 'x' + String(els.h3Height.value);
+                genState.h3ProfileKey = canvasH3Resolution(key) ? key : 'custom';
+                els.h3Resolution.value = genState.h3ProfileKey;
+                applyCanvasH3AuthoredGeometry();
+                History.push();
+            });
         });
         els.h3Duration.addEventListener('change', function () {
-            if (genState.h3Mode !== 't2va')
-                return;
-            var requestedDuration = Number(this.value);
-            if (applyCanvasH3ResolutionDuration(
-                els.h3Resolution.value, requestedDuration
-            ))
-                return;
-            showError(
-                'The H3 runner did not report ' + els.h3Resolution.value +
-                ' at ' + requestedDuration + ' seconds.'
-            );
-            applyCanvasH3Profile(preferredCanvasH3Profile());
+            applyCanvasH3AuthoredGeometry();
         });
         els.h3Quant.addEventListener('change', function () {
             genState.h3Quant = this.value;
@@ -4477,6 +4627,17 @@ var CanvasTab = (function () {
         els.h3Attention.addEventListener('change', function () {
             genState.h3AttentionBackend = this.value === 'sage-int8'
                 ? 'sage-int8' : 'cudnn';
+        });
+        els.h3StepCache.addEventListener('change', function () {
+            genState.h3StepCache = this.value === 'high' ? 'high' : 'exact';
+        });
+        els.h3ReferencesFile.addEventListener('change', function () {
+            addH3ReferenceFiles(this.files);
+            this.value = '';
+        });
+        els.h3ReferencesClear.addEventListener('click', function () {
+            h3References = [];
+            renderH3References();
         });
         els.h3LastFrameFile.addEventListener('change', function () {
             var file = this.files && this.files[0];
@@ -4491,7 +4652,7 @@ var CanvasTab = (function () {
             els.h3LastFrameClear.disabled = false;
             els.h3LastFrameNote.textContent = 'Uploading H3 final keyframe · ' + file.name;
             h3LastFrameUploadPromise = imageFileAsDataUrl(file)
-                .then(h3SquareKeyframePngBase64)
+                .then(imageDataUrlAsPngBase64)
                 .then(uploadInitImage)
                 .then(function (path) {
                 if (file !== h3LastFrameFile)
@@ -4500,7 +4661,7 @@ var CanvasTab = (function () {
                 if (!h3LastFrameUploadedPath)
                     throw new Error('Media upload did not return a worker-readable path');
                 els.h3LastFrameNote.textContent =
-                    'H3 final keyframe ready · 768 × 768 center crop · ' + file.name;
+                    'H3 final keyframe ready · source aspect preserved · ' + file.name;
                 return h3LastFrameUploadedPath;
             }).catch(function (error) {
                 if (file === h3LastFrameFile)
@@ -4600,25 +4761,45 @@ var CanvasTab = (function () {
         // Frames sync
         els.framesInput.addEventListener('input', function () {
             genState.frames = parseInt(this.value) || 97;
-            els.framesRange.value = this.value;
+            if (genState.arch === 'minimax_h3' && els.h3Duration) {
+                genState.h3Duration = Math.max(1, Math.min(15, genState.frames / genState.fps));
+                genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
+                els.h3Duration.value = String(Number(genState.h3Duration.toFixed(3)));
+            }
+            els.framesInput.value = String(genState.frames);
+            els.framesRange.value = String(genState.frames);
             updateCanvasDurationHint();
             updateSizeLabel();
         });
         els.framesRange.addEventListener('input', function () {
             genState.frames = parseInt(this.value);
-            els.framesInput.value = this.value;
+            if (genState.arch === 'minimax_h3' && els.h3Duration) {
+                genState.h3Duration = Math.max(1, Math.min(15, genState.frames / genState.fps));
+                genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
+                els.h3Duration.value = String(Number(genState.h3Duration.toFixed(3)));
+            }
+            els.framesInput.value = String(genState.frames);
+            els.framesRange.value = String(genState.frames);
             updateCanvasDurationHint();
             updateSizeLabel();
         });
         // FPS sync
         els.fpsInput.addEventListener('input', function () {
             genState.fps = parseInt(this.value) || 24;
+            if (genState.arch === 'minimax_h3')
+                genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
             els.fpsRange.value = this.value;
+            els.framesInput.value = String(genState.frames);
+            els.framesRange.value = String(genState.frames);
             updateCanvasDurationHint();
         });
         els.fpsRange.addEventListener('input', function () {
             genState.fps = parseInt(this.value);
+            if (genState.arch === 'minimax_h3')
+                genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
             els.fpsInput.value = this.value;
+            els.framesInput.value = String(genState.frames);
+            els.framesRange.value = String(genState.frames);
             updateCanvasDurationHint();
         });
         els.importBtn.addEventListener('click', function () { els.importFile.click(); });
@@ -4896,6 +5077,11 @@ var CanvasTab = (function () {
                     History.push();
                     return;
                 }
+                if (genState.arch === 'minimax_h3') {
+                    applyCanvasH3AuthoredGeometry();
+                    History.push();
+                    return;
+                }
                 var container = document.getElementById('canvas-stage-container');
                 if (!container)
                     return;
@@ -4923,6 +5109,10 @@ var CanvasTab = (function () {
         var bboxFit = document.getElementById('cv-bbox-fit');
         if (bboxFit) {
             bboxFit.addEventListener('click', function () {
+                if (genState.arch === 'minimax_h3') {
+                    applyCanvasH3AuthoredGeometry();
+                    return;
+                }
                 var layer = getActiveKonvaLayer();
                 if (!layer)
                     return;
@@ -5198,8 +5388,18 @@ var CanvasTab = (function () {
             ltx2ExtendSeconds: genState.ltx2ExtendSeconds,
             h3Mode: genState.h3Mode,
             h3ProfileKey: genState.h3ProfileKey,
+            h3Duration: genState.h3Duration,
             h3Quant: genState.h3Quant,
             h3AttentionBackend: genState.h3AttentionBackend,
+            h3StepCache: genState.h3StepCache,
+            h3References: h3References.map(function (reference) {
+                return {
+                    kind: reference.kind,
+                    name: reference.name,
+                    path: reference.path,
+                    audioUse: reference.audioUse || 'reference'
+                };
+            }),
             editMode: genState.editMode, editEngine: genState.editEngine,
             editModelEngine: genState.editModelEngine,
             styleEntireImage: genState.styleEntireImage,
@@ -5341,12 +5541,33 @@ var CanvasTab = (function () {
                     .indexOf(state.genSettings.h3Mode) >= 0
                     ? state.genSettings.h3Mode : 't2va';
                 genState.h3ProfileKey = state.genSettings.h3ProfileKey || '';
+                genState.h3Duration = Number.isFinite(Number(state.genSettings.h3Duration))
+                    ? Math.max(1, Math.min(15, Number(state.genSettings.h3Duration))) : 5;
                 genState.h3Quant = ['int8-fast', 'int8', 'bf16']
                     .indexOf(state.genSettings.h3Quant) >= 0
                     ? state.genSettings.h3Quant : 'int8-fast';
                 genState.h3AttentionBackend =
                     state.genSettings.h3AttentionBackend === 'sage-int8'
                         ? 'sage-int8' : 'cudnn';
+                genState.h3StepCache = state.genSettings.h3StepCache === 'high'
+                    ? 'high' : 'exact';
+                h3References = Array.isArray(state.genSettings.h3References)
+                    ? state.genSettings.h3References.filter(function (reference) {
+                        return reference && ['image', 'video', 'audio']
+                            .indexOf(reference.kind) >= 0;
+                    }).slice(0, 12).map(function (reference) {
+                        return {
+                            kind: reference.kind,
+                            name: String(reference.name || reference.path || reference.kind),
+                            path: String(reference.path || ''),
+                            audioUse: ['reference', 'reuse', 'voice_timbre']
+                                .indexOf(reference.audioUse) >= 0
+                                ? reference.audioUse : 'reference',
+                            file: null,
+                            uploadPromise: null,
+                            error: ''
+                        };
+                    }) : [];
                 genState.editMode = state.genSettings.editMode || genState.editMode;
                 genState.editEngine = state.genSettings.editEngine || genState.editEngine;
                 genState.editModelEngine = state.genSettings.editModelEngine || genState.editModelEngine;
@@ -5527,120 +5748,115 @@ var CanvasTab = (function () {
             return mode && mode.id === genState.h3Mode;
         }) || null;
     }
-    function activeCanvasH3Profiles() {
+    function canvasH3ResolutionKey(resolution) {
+        if (!resolution)
+            return '';
+        return Number(resolution.width) + 'x' + Number(resolution.height);
+    }
+    function activeCanvasH3Resolutions() {
         var runner = activeCanvasH3Runner();
-        var profiles = runner && Array.isArray(runner.supported_profiles)
-            ? runner.supported_profiles : [];
-        return profiles.filter(function (profile) {
-            return profile && profile.available === true &&
-                (!profile.available_modes ||
-                    profile.available_modes[genState.h3Quant] === true);
+        var constraints = runner && runner.geometry_constraints;
+        var resolutions = constraints && Array.isArray(constraints.resolutions)
+            ? constraints.resolutions : [];
+        return resolutions.filter(function (resolution) {
+            return resolution && Number.isInteger(Number(resolution.width)) &&
+                Number.isInteger(Number(resolution.height)) &&
+                Number(resolution.width) > 0 && Number(resolution.height) > 0;
         });
     }
-    function canvasH3ProfileKey(profile) {
-        if (!profile)
-            return '';
-        return String(profile.id || [
-            Number(profile.width) + 'x' + Number(profile.height),
-            Number(profile.frames) + 'f',
-            Number(profile.fps) + 'fps'
-        ].join('_'));
-    }
-    function canvasH3ResolutionKey(profile) {
-        if (!profile)
-            return '';
-        return [
-            Number(profile.width) + 'x' + Number(profile.height),
-            Number(profile.fps) + 'fps'
-        ].join('_');
-    }
-    function canvasH3ProfileDuration(profile) {
-        var duration = Number(profile && profile.duration);
-        if (!Number.isFinite(duration) || duration <= 0)
-            duration = Number(profile && profile.frames) /
-                Number(profile && profile.fps);
-        return duration;
-    }
-    function canvasH3ProfilesForResolution(resolutionKey) {
-        return activeCanvasH3Profiles().filter(function (profile) {
-            return canvasH3ResolutionKey(profile) === resolutionKey;
-        });
-    }
-    function exactCanvasH3Profile() {
-        if (!boundingBox)
-            return null;
-        var width = Math.round(boundingBox.width());
-        var height = Math.round(boundingBox.height());
-        return activeCanvasH3Profiles().find(function (profile) {
-            return Number(profile.width) === width &&
-                Number(profile.height) === height &&
-                Number(profile.frames) === Number(genState.frames) &&
-                Number(profile.fps) === Number(genState.fps);
+    function canvasH3Resolution(key) {
+        return activeCanvasH3Resolutions().find(function (resolution) {
+            return canvasH3ResolutionKey(resolution) === String(key || '');
         }) || null;
     }
-    function preferredCanvasH3Profile() {
-        var profiles = activeCanvasH3Profiles();
-        if (!profiles.length)
-            return null;
-        var selected = profiles.find(function (profile) {
-            return canvasH3ProfileKey(profile) === genState.h3ProfileKey;
-        });
-        if (selected)
-            return selected;
-        // Enter H3 on its longest admitted profile. A stale canvas bounding box
-        // must not silently select one of the short high-resolution probes.
-        return profiles.slice().sort(function (left, right) {
-            var durationDelta = canvasH3ProfileDuration(right) -
-                canvasH3ProfileDuration(left);
-            if (Math.abs(durationDelta) > 0.011)
-                return durationDelta;
-            return Number(right.width) * Number(right.height) -
-                Number(left.width) * Number(left.height);
-        })[0];
+    function preferredCanvasH3Resolution() {
+        var resolutions = activeCanvasH3Resolutions();
+        return canvasH3Resolution(genState.h3ProfileKey) ||
+            resolutions.find(function (resolution) {
+                return Number(resolution.width) === Number(genState.width) &&
+                    Number(resolution.height) === Number(genState.height);
+            }) || canvasH3Resolution('1344x768') || resolutions[0] || null;
     }
-    function refreshCanvasH3DurationControl(selectedDuration) {
-        if (!els.h3Duration)
-            return;
-        var profiles = activeCanvasH3Profiles();
-        if (els.h3DurationList)
-            els.h3DurationList.innerHTML = '';
-        var durations = [];
-        profiles.forEach(function (profile) {
-            var duration = Number(canvasH3ProfileDuration(profile).toFixed(2));
-            if (durations.indexOf(duration) >= 0)
-                return;
-            durations.push(duration);
-        });
-        durations.sort(function (left, right) { return left - right; });
-        durations.forEach(function (duration) {
+    function refreshCanvasH3ResolutionOptions() {
+        var resolutions = activeCanvasH3Resolutions();
+        els.h3Resolution.innerHTML = '';
+        resolutions.forEach(function (resolution) {
             var option = document.createElement('option');
-            option.value = String(duration);
-            option.label = duration + ' seconds';
-            if (els.h3DurationList)
-                els.h3DurationList.appendChild(option);
+            option.value = canvasH3ResolutionKey(resolution);
+            option.textContent = String(resolution.aspect_ratio || 'H3') + ' \u00b7 ' +
+                resolution.width + '\u00d7' + resolution.height + ' \u00b7 H3-Base 768p';
+            els.h3Resolution.appendChild(option);
         });
-        els.h3Duration.disabled = !profiles.length;
-        if (!profiles.length) {
-            els.h3Duration.value = '';
-            els.h3Duration.title = '';
-            return;
-        }
-        els.h3Duration.min = String(Math.min.apply(Math, durations));
-        els.h3Duration.max = String(Math.max.apply(Math, durations));
-        els.h3Duration.title = 'Supported H3 seconds at every resolution: ' +
-            durations.join(', ') + '.';
-        els.h3Duration.value = String(Number(Number(selectedDuration).toFixed(2)));
+        var custom = document.createElement('option');
+        custom.value = 'custom';
+        custom.textContent = 'Custom · enter width and height below';
+        els.h3Resolution.appendChild(custom);
     }
-    function applyCanvasH3Geometry(profile) {
-        if (!profile)
+    function canvasH3RuntimeGeometry() {
+        var runner = activeCanvasH3Runner();
+        var constraints = runner && runner.geometry_constraints || {};
+        var width = Number(els.h3Width && els.h3Width.value);
+        var height = Number(els.h3Height && els.h3Height.value);
+        var duration = Number(els.h3Duration && els.h3Duration.value);
+        var fps = Number(genState.fps);
+        var step = Number(constraints.dimension_step) || 32;
+        var widthMin = Number(constraints.width_min) || 32;
+        var widthMax = Number(constraints.width_max) || 2048;
+        var heightMin = Number(constraints.height_min) || 32;
+        var heightMax = Number(constraints.height_max) || 2048;
+        var maxPixels = Number(constraints.max_pixels) || 768 * 1344;
+        if (!Number.isInteger(width) || !Number.isInteger(height) ||
+            width < widthMin || width > widthMax ||
+            height < heightMin || height > heightMax ||
+            width % step !== 0 || height % step !== 0 ||
+            width * height > maxPixels ||
+            !Number.isFinite(duration) || duration < 1 || duration > 15 ||
+            !Number.isInteger(fps) || fps < 1 || fps > 120)
+            return null;
+        return {
+            id: 'runtime-' + width + 'x' + height + '-' + duration + 's-' + fps + 'fps',
+            width: width,
+            height: height,
+            duration: duration,
+            frames: Math.max(1, Math.round(duration * fps)),
+            fps: fps,
+            steps: Number(genState.steps) || 20
+        };
+    }
+
+    function exactCanvasH3Profile() {
+        var geometry = canvasH3RuntimeGeometry();
+        if (!geometry || !boundingBox)
+            return null;
+        return Math.round(boundingBox.width()) === geometry.width &&
+            Math.round(boundingBox.height()) === geometry.height &&
+            Number(genState.frames) === geometry.frames &&
+            Number(genState.fps) === geometry.fps ? geometry : null;
+    }
+
+    function applyCanvasH3AuthoredGeometry() {
+        var geometry = canvasH3RuntimeGeometry();
+        if (!geometry) {
+            if (els.h3ProfileNote)
+                els.h3ProfileNote.textContent =
+                    'Invalid H3 size: use 32–2048 in 32-pixel steps and stay at or below 1,032,192 pixels.';
             return false;
-        var width = Number(profile.width);
-        var height = Number(profile.height);
+        }
+        var width = geometry.width;
+        var height = geometry.height;
+        var duration = geometry.duration;
+        var fps = geometry.fps;
+        var preset = canvasH3Resolution(width + 'x' + height);
+        els.h3Resolution.value = preset ? canvasH3ResolutionKey(preset) : 'custom';
+        els.h3Width.value = String(width);
+        els.h3Height.value = String(height);
+        els.h3Duration.value = String(Number(duration.toFixed(3)));
         genState.width = width;
         genState.height = height;
-        genState.frames = Number(profile.frames);
-        genState.fps = Number(profile.fps);
-        genState.steps = Number(profile.steps) || 20;
+        genState.h3Duration = duration;
+        genState.fps = fps;
+        genState.frames = Math.max(1, Math.round(duration * fps));
+        genState.h3ProfileKey = preset ? canvasH3ResolutionKey(preset) : 'custom';
         if (boundingBox) {
             var centerX = boundingBox.x() + boundingBox.width() / 2;
             var centerY = boundingBox.y() + boundingBox.height() / 2;
@@ -5654,113 +5870,61 @@ var CanvasTab = (function () {
             if (stage)
                 stage.batchDraw();
         }
-        els.steps.value = String(genState.steps);
-        els.stepsRange.value = String(genState.steps);
         els.framesInput.value = String(genState.frames);
         els.framesRange.value = String(genState.frames);
         els.fpsInput.value = String(genState.fps);
         els.fpsRange.value = String(genState.fps);
+        if (els.h3ProfileNote) {
+            els.h3ProfileNote.textContent = String(preset && preset.aspect_ratio || 'Custom') + ' \u00b7 ' +
+                width + '\u00d7' + height + ' \u00b7 ' +
+                duration.toFixed(2) + ' seconds exactly \u00b7 ' +
+                genState.frames + ' output frames at ' + fps + ' FPS';
+        }
         updateCanvasDurationHint();
         return true;
     }
-    function applyCanvasH3Profile(profile) {
-        if (!applyCanvasH3Geometry(profile))
-            return false;
-        genState.h3ProfileKey = canvasH3ProfileKey(profile);
-        var resolutionKey = canvasH3ResolutionKey(profile);
-        var duration = canvasH3ProfileDuration(profile);
-        if (els.h3Resolution)
-            els.h3Resolution.value = resolutionKey;
-        refreshCanvasH3DurationControl(duration);
-        if (els.h3ProfileNote) {
-            els.h3ProfileNote.textContent =
-                profile.width + '\u00d7' + profile.height + ' \u00b7 ' +
-                profile.frames + ' frames \u00b7 ' + profile.fps +
-                ' FPS \u00b7 ' + Number(duration.toFixed(2)) +
-                's \u00b7 one runtime-selectable Mojo runner';
-        }
-        return true;
-    }
-    function applyCanvasH3ResolutionDuration(resolutionKey, requestedDuration) {
-        var profiles = canvasH3ProfilesForResolution(resolutionKey);
-        if (!profiles.length)
-            return false;
-        var duration = Number(requestedDuration);
-        var profile = profiles.find(function (candidate) {
-            return Math.abs(canvasH3ProfileDuration(candidate) - duration) < 0.011;
+
+    function refreshCanvasH3ProfileControls() {
+        var runner = activeCanvasH3Runner();
+        var ready = !!(runner && runner.available === true);
+        refreshCanvasH3ResolutionOptions();
+        [els.h3Resolution, els.h3Width, els.h3Height, els.h3Duration].forEach(function (control) {
+            if (control)
+                control.disabled = !ready;
         });
-        return profile ? applyCanvasH3Profile(profile) : false;
-    }
-    function refreshCanvasH3ProfileControls(conditioned, mode) {
-        if (!els.h3Resolution || !els.h3Duration)
-            return;
-        els.h3Resolution.innerHTML = '';
-        els.h3Duration.value = '';
-        if (els.h3DurationList)
-            els.h3DurationList.innerHTML = '';
-        var lockReason = 'MiniMax-H3 Resolution and Seconds are independent controls on one runtime request runner.';
-        if (conditioned) {
-            var definition = mode || (activeCanvasH3Runner() || {}).conditioned_profile;
-            if (!definition)
-                return;
-            var option = document.createElement('option');
-            option.value = 'conditioned';
-            option.textContent = Number(definition.width) + '\u00d7' +
-                Number(definition.height) + ' \u00b7 conditioned';
-            els.h3Resolution.appendChild(option);
-            els.h3Resolution.value = 'conditioned';
-            els.h3Resolution.disabled = true;
-            var duration = Number(definition.frames) / Number(definition.fps);
-            var durationOption = document.createElement('option');
-            durationOption.value = String(Number(duration.toFixed(2)));
-            durationOption.label = Number(duration.toFixed(2)) + ' seconds';
-            if (els.h3DurationList)
-                els.h3DurationList.appendChild(durationOption);
-            els.h3Duration.value = String(Number(duration.toFixed(2)));
-            els.h3Duration.min = els.h3Duration.value;
-            els.h3Duration.max = els.h3Duration.value;
-            els.h3Duration.disabled = true;
-            els.h3Duration.title = 'This conditioned runner has exact fixed geometry.';
-            applyCanvasH3Geometry(definition);
-            if (els.h3ProfileNote) {
-                els.h3ProfileNote.textContent =
-                    definition.width + '\u00d7' + definition.height + ' \u00b7 ' +
-                    definition.frames + ' frames \u00b7 ' + definition.fps +
-                    ' FPS \u00b7 ' + Number(duration.toFixed(2)) +
-                    's \u00b7 exact conditioned runner';
-            }
-            setCanvasLtx2GeometryLocked(true, lockReason);
-            return;
-        }
-        var profiles = activeCanvasH3Profiles();
-        if (!profiles.length) {
-            var unavailable = document.createElement('option');
-            unavailable.value = '';
-            unavailable.textContent = 'No admitted H3 resolutions available';
-            els.h3Resolution.appendChild(unavailable);
-            els.h3Resolution.disabled = true;
-            els.h3Duration.disabled = true;
-            els.h3Duration.placeholder = 'No admitted H3 seconds available';
+        if (!ready) {
             if (els.h3ProfileNote)
                 els.h3ProfileNote.textContent = 'No executable H3 request runner was reported by the server.';
-            setCanvasLtx2GeometryLocked(false);
             return;
         }
-        var seen = {};
-        profiles.forEach(function (profile) {
-            var key = canvasH3ResolutionKey(profile);
-            if (seen[key])
-                return;
-            seen[key] = true;
-            var option = document.createElement('option');
-            option.value = key;
-            option.textContent = profile.width + '\u00d7' + profile.height +
-                ' \u00b7 ' + profile.fps + ' FPS';
-            els.h3Resolution.appendChild(option);
+        if (!Number(genState.h3Duration))
+            genState.h3Duration = 5;
+        var selectedResolution = preferredCanvasH3Resolution();
+        var customSelected = genState.h3ProfileKey === 'custom';
+        var selectedWidth = customSelected ? Number(genState.width) : Number(selectedResolution && selectedResolution.width);
+        var selectedHeight = customSelected ? Number(genState.height) : Number(selectedResolution && selectedResolution.height);
+        els.h3Resolution.value = customSelected ? 'custom' : canvasH3ResolutionKey(selectedResolution);
+        els.h3Width.value = String(selectedWidth || 1344);
+        els.h3Height.value = String(selectedHeight || 768);
+        els.h3Duration.value = String(genState.h3Duration);
+        setCanvasLtx2GeometryLocked(true,
+            'Adjust H3 width and height in the MiniMax-H3 controls.');
+        var constraints = runner.geometry_constraints || {};
+        [els.h3Width, els.h3Height].forEach(function (control) {
+            control.min = String(Number(constraints.width_min) || 32);
+            control.max = String(Number(constraints.width_max) || 2048);
+            control.step = String(Number(constraints.dimension_step) || 32);
         });
-        els.h3Resolution.disabled = false;
-        applyCanvasH3Profile(preferredCanvasH3Profile());
-        setCanvasLtx2GeometryLocked(true, lockReason);
+        var bboxW = document.getElementById('cv-bbox-w');
+        var bboxH = document.getElementById('cv-bbox-h');
+        [bboxW, bboxH].forEach(function (control) {
+            if (!control)
+                return;
+            control.min = '32';
+            control.max = '2048';
+            control.step = '32';
+        });
+        applyCanvasH3AuthoredGeometry();
     }
     function refreshCanvasH3Controls() {
         if (!els.h3Mode)
@@ -5770,10 +5934,7 @@ var CanvasTab = (function () {
             ? runner.conditioned_modes : [];
         Array.from(els.h3Mode.options).forEach(function (option) {
             if (option.value === 't2va') {
-                option.disabled = !(runner && Array.isArray(runner.supported_profiles) &&
-                    runner.supported_profiles.some(function (profile) {
-                        return profile && profile.available === true;
-                    }));
+                option.disabled = !(runner && runner.available === true);
                 return;
             }
             var definition = modes.find(function (mode) {
@@ -5815,20 +5976,13 @@ var CanvasTab = (function () {
             genState.h3AttentionBackend = 'cudnn';
         els.h3Attention.value = genState.h3AttentionBackend;
         els.h3Attention.disabled = genState.h3Quant === 'int8-fast';
+        genState.h3StepCache = genState.h3StepCache === 'high' ? 'high' : 'exact';
+        els.h3StepCache.value = genState.h3StepCache;
         var conditioned = genState.h3Mode !== 't2va';
         var needsLast = genState.h3Mode === 'l2va' || genState.h3Mode === 'fl2va';
+        var omniReference = genState.h3Mode === 'ref2va';
+        els.h3ReferencesRow.style.display = omniReference ? 'block' : 'none';
         els.h3LastFrameRow.style.display = needsLast ? 'block' : 'none';
-        if (conditioned) {
-            if (runner && typeof runner.conditioned_prompt === 'string') {
-                genState.prompt = runner.conditioned_prompt;
-                els.prompt.value = runner.conditioned_prompt;
-            }
-        } else {
-            if (runner && typeof runner.test_prompt === 'string') {
-                genState.prompt = runner.test_prompt;
-                els.prompt.value = runner.test_prompt;
-            }
-        }
         refreshCanvasH3ProfileControls(conditioned, mode);
         els.steps.value = String(genState.steps);
         els.stepsRange.value = String(genState.steps);
@@ -5837,16 +5991,22 @@ var CanvasTab = (function () {
         els.fpsInput.value = String(genState.fps);
         els.fpsRange.value = String(genState.fps);
         [els.framesInput, els.framesRange, els.fpsInput, els.fpsRange].forEach(function (control) {
-            control.disabled = true;
-            control.title = conditioned
-                ? 'This conditioned MiniMax-H3 runner has exact fixed geometry.'
-                : 'Choose H3 Resolution and Seconds; Canvas resolves the exact frame count and FPS.';
+            control.disabled = false;
+            control.title = 'MiniMax-H3 output frame count and FPS are adjustable; Seconds stays authoritative.';
+        });
+        [els.framesInput, els.framesRange].forEach(function (control) {
+            control.min = '1';
+            control.max = '1800';
+            control.step = '1';
+        });
+        [els.fpsInput, els.fpsRange].forEach(function (control) {
+            control.min = '1';
+            control.max = '120';
+            control.step = '1';
         });
         [els.steps, els.stepsRange].forEach(function (control) {
-            control.disabled = conditioned;
-            control.title = conditioned
-                ? 'Conditioned MiniMax-H3 uses the installed 20-step modulation cache.'
-                : '';
+            control.disabled = false;
+            control.title = '';
         });
         if (boundingBox) {
             boundingBox.width(genState.width);
@@ -5858,15 +6018,16 @@ var CanvasTab = (function () {
         }
         if (els.h3ModeNote) {
             els.h3ModeNote.textContent = genState.h3Mode === 't2va'
-                ? 'Choose Resolution and Seconds from the admitted T2V profiles. One H3 runner applies resolution, frames, FPS, and precision at request time.'
+                ? 'Choose an H3-Base native 768p video resolution, 1–15 seconds, FPS, and precision.'
                 : (genState.h3Mode === 'ref2va'
-                    ? 'Choose one Source image as an identity/style reference. It is center-cropped to 768 × 768 for conditioning and is not inserted as frame zero.'
+                    ? 'Add ordered image, video, and audio references below. They condition identity, motion, soundtrack reuse, or voice timbre and are not inserted as frame zero.'
                 : (genState.h3Mode === 'l2va'
                     ? 'Choose a required final keyframe below. The generated clip evolves toward it.'
                     : (genState.h3Mode === 'fl2va'
-                        ? 'Choose a Source image for frame zero, then choose the required final keyframe. The Source is center-cropped to square.'
-                        : 'The selected Source image is center-cropped to square and becomes frame zero. It is not a reference-only image.')));
+                        ? 'Choose a Source image for frame zero, then choose the required final keyframe. Both are prepared to the authored output canvas by the GPU runner.'
+                        : 'The selected Source image keeps its aspect on upload and is prepared to the authored output canvas as frame zero. It is not a reference-only image.')));
         }
+        renderH3References();
         genState.includeAudio = true;
         updateCanvasDurationHint();
     }
@@ -6857,6 +7018,18 @@ var CanvasTab = (function () {
         var isVideo = arch === 'ltxv' || arch === 'minimax_h3' || arch === 'wan' || arch === 'bernini';
         var isLtx2 = arch === 'ltxv';
         var isH3 = arch === 'minimax_h3';
+        if (!isH3) {
+            [els.framesInput, els.framesRange].forEach(function (control) {
+                control.min = '9';
+                control.max = '481';
+                control.step = '8';
+            });
+            [els.fpsInput, els.fpsRange].forEach(function (control) {
+                control.min = '8';
+                control.max = '60';
+                control.step = '1';
+            });
+        }
         els.cfgRow.style.display = (isFlux || isVideo) ? 'none' : 'flex';
         els.guidanceRow.style.display = isFlux ? 'flex' : 'none';
         els.videoSection.style.display = isVideo ? 'block' : 'none';
@@ -7212,22 +7385,10 @@ var CanvasTab = (function () {
             }
         }
         if (genState.arch === 'minimax_h3') {
-            if (genState.h3Mode === 't2va') {
-                if (!exactCanvasH3Profile()) {
-                    showError('Choose an admitted H3 Resolution and Seconds profile before generating.');
-                    return;
-                }
-            }
-            else {
-                var h3ModeProfile = activeCanvasH3Mode();
-                if (!h3ModeProfile || !boundingBox ||
-                    Math.round(boundingBox.width()) !== Number(h3ModeProfile.width) ||
-                    Math.round(boundingBox.height()) !== Number(h3ModeProfile.height) ||
-                    Number(genState.frames) !== Number(h3ModeProfile.frames) ||
-                    Number(genState.fps) !== Number(h3ModeProfile.fps)) {
-                    showError('The selected H3 conditioned feature requires its exact admitted geometry.');
-                    return;
-                }
+            applyCanvasH3AuthoredGeometry();
+            if (!exactCanvasH3Profile()) {
+                showError('Choose H3 width and height from 32–2048 in 32-pixel steps, at most 1,032,192 total pixels, and a duration from 1–15 seconds.');
+                return;
             }
         }
         setCanvasGenerating(true);
@@ -7277,19 +7438,28 @@ var CanvasTab = (function () {
             var hasExactH3ImageSource = genState.arch === 'minimax_h3' &&
                 !!editSourceDataUrl && !editSourceIsVideo;
             var h3NeedsFirst = genState.arch === 'minimax_h3' &&
-                (genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va' ||
-                    genState.h3Mode === 'ref2va');
+                (genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va');
             var h3NeedsLast = genState.arch === 'minimax_h3' &&
                 (genState.h3Mode === 'l2va' || genState.h3Mode === 'fl2va');
-            if (h3NeedsFirst && (genState.h3Mode === 'ref2va'
-                ? !hasExactH3ImageSource
-                : (!hasContent && !hasExactH3ImageSource))) {
+            if (h3NeedsFirst && !hasContent && !hasExactH3ImageSource) {
                 showError('MiniMax-H3 ' + genState.h3Mode.toUpperCase() +
-                    (genState.h3Mode === 'ref2va'
-                        ? ' requires a loaded Source image reference'
-                        : ' requires a loaded image or composed Canvas first frame'));
+                    ' requires a loaded image or composed Canvas first frame');
                 setCanvasGenerating(false);
                 return;
+            }
+            if (genState.arch === 'minimax_h3' &&
+                genState.h3Mode === 'ref2va' && h3References.length === 0) {
+                showError('MiniMax-H3 Ref2VA requires at least one image or video reference');
+                setCanvasGenerating(false);
+                return;
+            }
+            if (genState.arch === 'minimax_h3' && genState.h3Mode === 'ref2va') {
+                var h3RefCounts = h3ReferenceCounts(h3References);
+                if (h3RefCounts.image + h3RefCounts.video === 0) {
+                    showError('H3 audio references must accompany at least one image or video reference');
+                    setCanvasGenerating(false);
+                    return;
+                }
             }
             if (h3NeedsLast && !h3LastFrameFile) {
                 showError('MiniMax-H3 ' + genState.h3Mode.toUpperCase() +
@@ -7376,8 +7546,12 @@ var CanvasTab = (function () {
                 return;
             }
             var seed = genState.seed === -1 ? Math.floor(Math.random() * 4294967296) : genState.seed;
-            var bw = isVideo ? ModelUtils.clampVideoDimension(boundingBox.width()) : ModelUtils.clampDimension(boundingBox.width());
-            var bh = isVideo ? ModelUtils.clampVideoDimension(boundingBox.height()) : ModelUtils.clampDimension(boundingBox.height());
+            var bw = genState.arch === 'minimax_h3'
+                ? clampDimForArch(boundingBox.width())
+                : (isVideo ? ModelUtils.clampVideoDimension(boundingBox.width()) : ModelUtils.clampDimension(boundingBox.width()));
+            var bh = genState.arch === 'minimax_h3'
+                ? clampDimForArch(boundingBox.height())
+                : (isVideo ? ModelUtils.clampVideoDimension(boundingBox.height()) : ModelUtils.clampDimension(boundingBox.height()));
             if (genState.arch === 'wan') {
                 var wanI2v = hasContent;
                 if (wanI2v) {
@@ -7433,8 +7607,10 @@ var CanvasTab = (function () {
                 ltx2LastFrame: ltx2LastFrameFile
                     ? ltx2LastFrameFile.name : '',
                 h3Mode: genState.h3Mode,
+                h3Duration: genState.h3Duration,
                 h3Quant: genState.h3Quant,
                 h3AttentionBackend: genState.h3AttentionBackend,
+                h3StepCache: genState.h3StepCache,
                 h3LastFrame: h3LastFrameFile ? h3LastFrameFile.name : '',
                 ltx2RetakeStart: genState.ltx2RetakeStart,
                 ltx2RetakeDuration: genState.ltx2RetakeDuration,
@@ -7473,19 +7649,19 @@ var CanvasTab = (function () {
             if (genState.arch === 'minimax_h3') {
                 var h3SourceUpload = h3NeedsFirst
                     ? (hasExactH3ImageSource
-                        ? h3SquareKeyframePngBase64(editSourceDataUrl).then(uploadInitImage)
-                        : (genState.h3Mode === 'ref2va'
-                            ? Promise.reject(new Error('Ref2VA requires one selected Source image'))
-                            : exportBoundingBoxRegion().then(uploadInitImage)))
+                        ? imageDataUrlAsPngBase64(editSourceDataUrl).then(uploadInitImage)
+                        : exportBoundingBoxRegion().then(uploadInitImage))
                     : Promise.resolve('');
                 var h3LastUpload = h3NeedsLast
                     ? (h3LastFrameUploadedPath
                         ? Promise.resolve(h3LastFrameUploadedPath)
                         : (h3LastFrameUploadPromise || imageFileAsDataUrl(h3LastFrameFile)
-                            .then(h3SquareKeyframePngBase64)
+                            .then(imageDataUrlAsPngBase64)
                             .then(uploadInitImage)))
                     : Promise.resolve('');
-                Promise.all([h3SourceUpload, h3LastUpload]).then(function (images) {
+                var h3ReferenceUploads = genState.h3Mode === 'ref2va'
+                    ? resolvedH3References() : Promise.resolve([]);
+                Promise.all([h3SourceUpload, h3LastUpload, h3ReferenceUploads]).then(function (images) {
                     queueWorkflow(WorkflowBuilder.build({
                         model: genState.model || '',
                         prompt: genState.prompt,
@@ -7495,15 +7671,18 @@ var CanvasTab = (function () {
                         seed: seed,
                         frames: genState.frames,
                         fps: genState.fps,
+                        durationSeconds: genState.h3Duration,
                         includeAudio: true,
                         quantization: genState.h3Quant,
                         h3AttentionBackend: genState.h3AttentionBackend,
+                        h3StepCache: genState.h3StepCache,
                         h3Task: genState.h3Mode,
                         initImageName: images[0],
-                        lastImageName: images[1]
+                        lastImageName: images[1],
+                        h3References: images[2]
                     }));
                 }).catch(function (error) {
-                    showError('MiniMax-H3 keyframe upload failed: ' + error.message);
+                    showError('MiniMax-H3 media upload failed: ' + error.message);
                     setCanvasGenerating(false);
                 });
             }
@@ -7879,29 +8058,6 @@ var CanvasTab = (function () {
                 reject(new Error('Could not read the selected image'));
             };
             reader.readAsDataURL(file);
-        });
-    }
-    function h3SquareKeyframePngBase64(dataUrl) {
-        return new Promise(function (resolve, reject) {
-            var image = new Image();
-            image.onload = function () {
-                var size = 768;
-                var iw = image.naturalWidth || image.width;
-                var ih = image.naturalHeight || image.height;
-                var scale = Math.max(size / iw, size / ih);
-                var dw = iw * scale;
-                var dh = ih * scale;
-                var canvas = document.createElement('canvas');
-                canvas.width = size;
-                canvas.height = size;
-                var context = canvas.getContext('2d');
-                context.drawImage(image, (size - dw) / 2, (size - dh) / 2, dw, dh);
-                resolve(canvas.toDataURL('image/png').split(',')[1]);
-            };
-            image.onerror = function () {
-                reject(new Error('Could not decode the selected H3 keyframe'));
-            };
-            image.src = dataUrl;
         });
     }
     function loadDataUrlImage(dataUrl) {

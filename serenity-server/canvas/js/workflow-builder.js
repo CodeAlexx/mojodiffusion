@@ -1008,8 +1008,17 @@ var WorkflowBuilder = (function () {
         };
     }
     // ─── MiniMax-H3 (native synchronized audio/video) ───────────────────
+    function miniMaxH3RuntimeResolution(width, height) {
+        var requestedWidth = Number(width);
+        var requestedHeight = Number(height);
+        return [
+            Number.isInteger(requestedWidth) && requestedWidth > 0 ? requestedWidth : 1344,
+            Number.isInteger(requestedHeight) && requestedHeight > 0 ? requestedHeight : 768
+        ];
+    }
     function buildMiniMaxH3(p) {
         var seed = resolveSeed(p.seed);
+        var resolution = miniMaxH3RuntimeResolution(p.width, p.height);
         return {
             '1': {
                 class_type: 'MiniMaxH3Loader',
@@ -1019,7 +1028,8 @@ var WorkflowBuilder = (function () {
                         : (p.quantization === 'int8' ? 'int8' : 'int8-fast'),
                     task: p.h3Task || 't2va',
                     attention_backend: p.h3AttentionBackend === 'sage-int8'
-                        ? 'sage-int8' : 'cudnn'
+                        ? 'sage-int8' : 'cudnn',
+                    step_cache: p.h3StepCache === 'high' ? 'high' : 'exact'
                 }
             },
             '2': {
@@ -1030,10 +1040,20 @@ var WorkflowBuilder = (function () {
                     prompt: p.prompt || '',
                     source_image: p.initImageName || '',
                     last_frame: p.lastImageName || '',
-                    width: Number(p.width) || 512,
-                    height: Number(p.height) || 320,
+                    references: Array.isArray(p.h3References)
+                        ? p.h3References.map(function (reference) {
+                            return {
+                                kind: reference.kind,
+                                path: reference.path,
+                                audio_use: reference.audio_use || 'reference'
+                            };
+                        }) : [],
+                    width: resolution[0],
+                    height: resolution[1],
                     num_frames: Number(p.frames) || 175,
                     frame_rate: Number(p.fps) || 24,
+                    duration_seconds: Number(p.durationSeconds) ||
+                        (Number(p.frames) || 175) / (Number(p.fps) || 24),
                     steps: Number(p.steps) || 20,
                     seed: seed,
                     include_audio: true

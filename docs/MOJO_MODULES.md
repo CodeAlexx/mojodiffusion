@@ -818,7 +818,7 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
-## MiniMax-H3 audio-video inference runtime (2026-08-05)
+## MiniMax-H3 audio-video inference runtime (updated 2026-08-07)
 
 - `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
   modulation, and resident-weight sidecars used by the product runners. Cache
@@ -828,7 +828,23 @@ edits: see sections C and D of the parity-ported doc.
   scheme-selectable resident store. The admitted product schemes are group-wise
   INT8 weights for the Quality arm and direct W8A8 weights for the Fast arm.
   `models/dit/minimax_h3_int8_linear.mojo` plus the model-scoped cshim implement
-  GPU activation quantization, INT8 GEMM, and BF16 output scaling.
+  GPU activation quantization, INT8 GEMM, and BF16 output scaling. Packed-QKV,
+  SwiGLU, residual-gate, and final-layer work is row chunked so the same runner
+  can serve the maximum admitted runtime canvas without materializing the
+  previous multi-GiB intermediates.
+- `models/dit/minimax_h3_qk_inplace.mojo` normalizes and partially rotates Q/K
+  in their owned BF16 buffers at long sequence lengths. It preserves the F32
+  reduction and RoPE arithmetic boundaries while removing extra full-tensor
+  copies. `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` gates the
+  chunked/fused BF16, group-wise, W8A8, QKV, Q/K, and final-layer paths.
+- `models/dit/minimax_h3_step_cache.mojo` is an opt-in, model-scoped
+  Cache-DiT-style denoise accelerator. `exact` is the product quality default
+  and evaluates every block. `high` may reuse one group-32 INT8 middle-stack
+  residual after recomputing the first and last eight blocks; it does not
+  change authored size, seconds, FPS, steps, or synchronized audio. High stays
+  explicitly experimental because decoded A/B testing found visible video
+  drift. `parity/minimax_h3_step_cache_parity.mojo` gates reconstruction and
+  warm-up/reuse policy mechanics, not perceptual equivalence.
 - `models/text_encoder/minimax_h3_qwen3vl_int8.mojo` and
   `minimax_h3_qwen3vl_int8_cache_cli.mojo` provide the shared per-row INT8
   Qwen3-VL text-encoder cache and GPU forward. The BF16 conditioning output is
@@ -838,23 +854,37 @@ edits: see sections C and D of the parity-ported doc.
   and off by default: cU-DNN remains the accepted product backend, and Fast
   rejects Sage because the measured end-to-end path was slower and below the
   audio parity bar.
-- `pipeline/minimax_h3_t2va.mojo` is the AOT-specialized product CLI. One
-  `minimax_h3_serenity_runtime` executable carries the complete 3x4 matrix at
-  24 FPS/20 steps: 512x320, 832x480, or 960x544 crossed with 56, 73, 175, or
-  362 frames (2.33, 3.04, 7.29, or 15.08 seconds). Every geometry admits BF16,
-  INT8 Quality, and INT8 Fast. Profiles with safe measured headroom retain
-  resident prefixes; larger products use zero-resident streaming. W8A8 GEMM
-  and BF16/group-wise linear accumulation are row chunked, and each streamed
-  block is released before the next load, bounding temporary allocation at the
-  960x544x362 maximum. Denoise and fresh-process GPU VAE decode/NVENC mux
-  remain phase isolated.
+- `models/minimax_h3_device/audio_encoder_device.mojo` is the GPU reference
+  AudioVAE encoder for Ref2VA audio tracks and standalone audio clips. Media
+  decode/staging is host I/O; every learned DAC/Snake/attention/MLP/posterior
+  operation after upload remains on GPU. Its real-weight trunk, pre-block, and
+  posterior-mean cosines are 0.9999999999991, 0.9999999997322, and
+  0.9999999996329 against the accepted oracle.
+- `pipeline/minimax_h3_t2va.mojo`, `minimax_h3_i2va.mojo`, and
+  `minimax_h3_ref2va.mojo` now accept runtime width, height, aligned internal
+  frames, and FPS in the unified product binaries. The Serenity boundary
+  exposes six tested H3-Base presets plus custom width/height from 32 through
+  2048 in 32-pixel steps, capped at 1,032,192 pixels, and authored duration
+  from 1 through 15 seconds. The model timeline stays at native 24 FPS and
+  17n+5 internal frames; delivery frames/FPS are trimmed or resampled to the
+  exact authored duration. All admitted tasks retain BF16, INT8 Quality, and
+  INT8 Fast choices. Small shapes use measured resident prefixes and larger
+  sequences stream on GPU with zero resident blocks. Denoise and fresh-process
+  GPU VAE decode/NVENC mux remain phase isolated.
+- Ref2VA consumes an ordered list of at most 9 images, 3 videos, and 3 audio
+  clips, with at most 12 references combined. Video soundtracks and standalone
+  audio are encoded on GPU; audio intent is explicit as ordinary reference,
+  soundtrack reuse, or voice/timbre reference. Audio-only Ref2VA is rejected:
+  at least one image or video must anchor the visual generation. Reference
+  media is conditioning only and is never inserted as output frame zero.
 - `serenity-server/crates/server/src/video.rs` and the Canvas Generate/Workflow
-  modules resolve exact profile geometry and precision before acquiring the GPU
-  lease. Unsupported geometry, missing runners/caches, stale machine gates, and
-  invalid attention combinations fail queue admission closed. Canvas exposes
-  Resolution and Seconds as independent selectors: changing one preserves the
-  other and resolves the exact registry row, with no disabled resolution,
-  duration rewrite, or cross-profile fallback.
+  modules resolve runtime geometry, precision, attention, exact/high cache
+  policy, and ordered reference roles before acquiring the GPU lease.
+  Unsupported geometry, over-limit references, missing runners/caches, stale
+  machine gates, and invalid backend combinations fail queue admission closed.
+  Resolution and Seconds are independent selectors: changing one preserves the
+  other, and tested presets are conveniences rather than an exhaustive
+  resolution allowlist.
 
 **Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
 separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and
@@ -864,10 +894,17 @@ full denoise trajectories are numerically identical. The maximum
 modes without CPU inference. The final-run measurements were approximately
 140 seconds / 18,678 MiB for INT8 Fast, 198 seconds / 18,292 MiB for INT8
 Quality, and 284 seconds / 18,282 MiB for BF16. The admission record combines
-those maximum-product memory/finite gates with exact request validation for all
-36 geometry/precision combinations. A 512x320x56 INT8 Quality smoke also
+those maximum-product memory/finite gates with exact validation for the 36
+legacy anchor combinations plus runtime presets, custom aligned geometry,
+authored duration, and precision/cache controls. A 512x320x56 INT8 Quality smoke also
 exercised its 41-block resident prefix: 14.908 seconds/evaluation, finite
-video/audio, and a 20,766 MiB process peak.
+video/audio, and a 20,766 MiB process peak. Ref2VA multi-reference GPU smokes
+cover BF16, INT8 Quality, INT8 Fast, mixed images/video/audio, and embedded
+video audio. The bounded INT8 Quality multi-image/audio comparison passed
+video at 0.999227 cosine but measured audio at 0.997751 versus BF16, so that
+audio result is recorded as below the strict 0.999 numerical bar rather than
+being relabeled as parity. The maximum 12-reference combination is admission-
+tested but has not been quality-run simultaneously on the 24-GiB GPU.
 
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 

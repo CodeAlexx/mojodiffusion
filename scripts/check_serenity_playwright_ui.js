@@ -618,15 +618,23 @@ async function run() {
             ? (GenerateTab.state.videoStatus.candidate_runners || [])
               .find((entry) => entry && entry.model === "minimax_h3_t2va")
             : null;
-          const h3Profiles = h3Runner && Array.isArray(h3Runner.supported_profiles)
-            ? h3Runner.supported_profiles : [];
-          const exactAvailableH3Profile = !isH3 || h3Profiles.some((profile) =>
-            profile.available === true
-              && profile.available_modes && profile.available_modes[video.quant] === true
-              && Number(profile.width) === Number(video.width)
-              && Number(profile.height) === Number(video.height)
-              && Number(profile.frames) === Number(video.frames)
-              && Number(profile.fps) === Number(video.fps));
+          const h3Geometry = h3Runner && h3Runner.geometry_constraints || {};
+          const h3Quant = h3Runner && Array.isArray(h3Runner.quant_modes)
+            ? h3Runner.quant_modes.find((mode) => mode.id === video.quant) : null;
+          const h3Step = Number(h3Geometry.dimension_step) || 32;
+          const h3Width = Number(video.width);
+          const h3Height = Number(video.height);
+          const exactAvailableH3Profile = !isH3 || !!(h3Runner
+            && h3Runner.available === true && h3Quant && h3Quant.available === true
+            && h3Width >= Number(h3Geometry.width_min)
+            && h3Width <= Number(h3Geometry.width_max)
+            && h3Height >= Number(h3Geometry.height_min)
+            && h3Height <= Number(h3Geometry.height_max)
+            && h3Width % h3Step === 0 && h3Height % h3Step === 0
+            && h3Width * h3Height <= Number(h3Geometry.max_pixels)
+            && Number(video.fps) >= Number(h3Geometry.fps_min)
+            && Number(video.fps) <= Number(h3Geometry.fps_max)
+            && Number(video.frames) >= 1);
           const admittedLtxDev = video.guidance_mode === "dev"
             && video.steps === 15 && video.sampler === "res2s" && video.scheduler === "ltx2";
           const admittedLtxDistilled = video.guidance_mode === "distilled"
@@ -703,129 +711,351 @@ async function run() {
     }
     const h3Model = modelResults.find((result) => result.backend === "minimax_h3");
     if (h3Model) {
+      await page.locator('.nav-btn[data-tab="generate"]').click();
+      await page.evaluate((name) => {
+        const search = document.querySelector("#gen-model-search");
+        search.value = "";
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+        search.click();
+        const item = Array.from(document.querySelectorAll(".gen-model-dropdown-item"))
+          .find((candidate) => candidate.dataset.model === name);
+        if (!item) throw new Error(`H3 model ${name} is absent from Generate`);
+        item.click();
+      }, h3Model.name);
+      await page.waitForFunction((name) => GenerateTab.state.model === name, h3Model.name);
+      const readGenerateH3Controls = () => page.evaluate(() => ({
+        aspect: document.querySelector("#gen-aspect-dropdown").value,
+        aspects: Array.from(document.querySelector("#gen-aspect-dropdown").options)
+          .map((option) => option.value),
+        width: Number(document.querySelector("#gen-custom-width").value),
+        widthMin: Number(document.querySelector("#gen-custom-width").min),
+        widthMax: Number(document.querySelector("#gen-custom-width").max),
+        widthStep: Number(document.querySelector("#gen-custom-width").step),
+        widthDisabled: document.querySelector("#gen-custom-width").disabled,
+        height: Number(document.querySelector("#gen-custom-height").value),
+        heightMin: Number(document.querySelector("#gen-custom-height").min),
+        heightMax: Number(document.querySelector("#gen-custom-height").max),
+        heightStep: Number(document.querySelector("#gen-custom-height").step),
+        heightDisabled: document.querySelector("#gen-custom-height").disabled,
+        duration: Number(document.querySelector("#gen-seconds").value),
+        durationMin: Number(document.querySelector("#gen-seconds").min),
+        durationMax: Number(document.querySelector("#gen-seconds").max),
+        stepCache: document.querySelector("#gen-h3-step-cache").value,
+        frames: Number(document.querySelector("#gen-frames").value),
+        framesMin: Number(document.querySelector("#gen-frames").min),
+        framesMax: Number(document.querySelector("#gen-frames").max),
+        fps: Number(document.querySelector("#gen-fps").value),
+        fpsMin: Number(document.querySelector("#gen-fps").min),
+        fpsMax: Number(document.querySelector("#gen-fps").max),
+        quant: document.querySelector("#gen-video-quant").value,
+        quants: Array.from(document.querySelector("#gen-video-quant").options)
+          .map((option) => ({ id: option.value, disabled: option.disabled })),
+      }));
+      const setGenerateH3Geometry = (aspect, width, height, seconds, fps) => page.evaluate(
+        ({ aspect, width, height, seconds, fps }) => {
+          const fpsControl = document.querySelector("#gen-fps");
+          fpsControl.value = String(fps);
+          fpsControl.dispatchEvent(new Event("input", { bubbles: true }));
+          const aspectControl = document.querySelector("#gen-aspect-dropdown");
+          aspectControl.value = aspect;
+          aspectControl.dispatchEvent(new Event("change", { bubbles: true }));
+          if (aspect === "Free") {
+            const widthControl = document.querySelector("#gen-custom-width");
+            const heightControl = document.querySelector("#gen-custom-height");
+            widthControl.value = String(width);
+            widthControl.dispatchEvent(new Event("blur"));
+            heightControl.value = String(height);
+            heightControl.dispatchEvent(new Event("blur"));
+          }
+          const durationControl = document.querySelector("#gen-seconds");
+          durationControl.value = String(seconds);
+          durationControl.dispatchEvent(new Event("input", { bubbles: true }));
+        },
+        { aspect, width, height, seconds, fps },
+      );
+
+      const generateH3Default = await readGenerateH3Controls();
+      assert(
+        JSON.stringify(generateH3Default.aspects) === JSON.stringify([
+          "1536×672", "1344×768", "1024×768",
+          "768×768", "768×1024", "768×1344", "Free",
+        ])
+          && generateH3Default.widthMin === 32 && generateH3Default.widthMax === 2048
+          && generateH3Default.heightMin === 32 && generateH3Default.heightMax === 2048
+          && generateH3Default.widthStep === 32 && generateH3Default.heightStep === 32
+          && !generateH3Default.widthDisabled && !generateH3Default.heightDisabled
+          && generateH3Default.durationMin === 1 && generateH3Default.durationMax === 15
+          && generateH3Default.stepCache === "exact"
+          && generateH3Default.framesMin === 1 && generateH3Default.framesMax === 1800
+          && generateH3Default.fpsMin === 1 && generateH3Default.fpsMax === 120
+          && JSON.stringify(generateH3Default.quants.map((mode) => mode.id))
+            === JSON.stringify(["int8-fast", "int8", "bf16"])
+          && generateH3Default.quants.every((mode) => !mode.disabled),
+        `H3 Generate controls are locked or incomplete: ${JSON.stringify(generateH3Default)}`,
+      );
+
+      const testedGenerateH3Presets = [
+        ["1536×672", 1536, 672], ["1344×768", 1344, 768],
+        ["1024×768", 1024, 768], ["768×768", 768, 768],
+        ["768×1024", 768, 1024], ["768×1344", 768, 1344],
+      ];
+      for (const [aspect, width, height] of testedGenerateH3Presets) {
+        await setGenerateH3Geometry(aspect, width, height, 2, 24);
+        const controls = await readGenerateH3Controls();
+        assert(controls.aspect === aspect
+          && controls.width === width && controls.height === height
+          && controls.duration === 2 && controls.frames === 48 && controls.fps === 24,
+        `Generate H3 preset ${aspect} drifted: ${JSON.stringify(controls)}`);
+      }
+      await setGenerateH3Geometry("Free", 32, 2048, 1, 24);
+      const generateH3Boundary = await readGenerateH3Controls();
+      assert(generateH3Boundary.aspect === "Free"
+        && generateH3Boundary.width === 32 && generateH3Boundary.height === 2048
+        && generateH3Boundary.duration === 1 && generateH3Boundary.frames === 24,
+      `Generate H3 32-to-2048 boundary was clamped: ${JSON.stringify(generateH3Boundary)}`);
+      await setGenerateH3Geometry("Free", 992, 576, 4, 24);
+      for (const quant of ["int8-fast", "int8", "bf16"]) {
+        await page.evaluate((value) => {
+          const control = document.querySelector("#gen-video-quant");
+          control.value = value;
+          control.dispatchEvent(new Event("change", { bubbles: true }));
+        }, quant);
+        const controls = await readGenerateH3Controls();
+        assert(controls.quant === quant
+          && controls.width === 992 && controls.height === 576
+          && controls.duration === 4 && controls.frames === 96,
+        `Generate H3 ${quant} changed authored geometry: ${JSON.stringify(controls)}`);
+      }
+      await page.locator("#gen-prompt").fill("Playwright H3 Generate runtime geometry request");
+      const generateH3VideoBefore = videoRequests.length;
+      await page.locator("#gen-btn").click();
+      for (let attempt = 0; attempt < 100 && videoRequests.length === generateH3VideoBefore; attempt += 1) {
+        await page.waitForTimeout(20);
+      }
+      assert(videoRequests.length === generateH3VideoBefore + 1,
+        "H3 Generate did not POST /v1/video");
+      const generateH3Request = videoRequests[videoRequests.length - 1];
+      assert(generateH3Request.model === "minimax_h3"
+        && generateH3Request.runner === "minimax_h3_mojo_request"
+        && generateH3Request.quant === "bf16"
+        && generateH3Request.width === 992 && generateH3Request.height === 576
+        && generateH3Request.duration_seconds === 4
+        && generateH3Request.frames === 96 && generateH3Request.fps === 24
+        && generateH3Request.step_cache === "exact",
+      `H3 Generate submitted the wrong runtime geometry: ${JSON.stringify(generateH3Request)}`);
+
       await page.locator('.nav-btn[data-tab="canvas"]').click();
       await page.waitForFunction(() => document.querySelectorAll("#cv-model option").length > 1);
       await page.locator("#cv-model").selectOption(h3Model.name);
       await page.waitForFunction(() => {
         const duration = document.querySelector("#cv-h3-duration");
-        return duration && duration.value !== "";
+        const resolution = document.querySelector("#cv-h3-resolution");
+        return duration && duration.value !== "" && resolution &&
+          resolution.options.length === 7 && resolution.value !== "";
       });
       const readH3Controls = () => page.evaluate(() => ({
+        mode: document.querySelector("#cv-h3-mode").value,
         quant: document.querySelector("#cv-h3-quant").value,
         resolution: document.querySelector("#cv-h3-resolution").value,
-        duration: Number(document.querySelector("#cv-h3-duration").value),
-        frames: Number(document.querySelector("#cv-frames").value),
-        fps: Number(document.querySelector("#cv-fps").value),
         resolutions: Array.from(document.querySelector("#cv-h3-resolution").options)
-          .map((option) => ({
-            value: option.value,
-            label: option.textContent,
-            disabled: option.disabled,
-          })),
+          .map((option) => option.value),
+        width: Number(document.querySelector("#cv-h3-width").value),
+        height: Number(document.querySelector("#cv-h3-height").value),
+        bboxWidth: Number(document.querySelector("#cv-bbox-w").value),
+        bboxHeight: Number(document.querySelector("#cv-bbox-h").value),
+        duration: Number(document.querySelector("#cv-h3-duration").value),
+        durationMin: Number(document.querySelector("#cv-h3-duration").min),
+        durationMax: Number(document.querySelector("#cv-h3-duration").max),
+        stepCache: document.querySelector("#cv-h3-step-cache").value,
+        frames: Number(document.querySelector("#cv-frames").value),
+        framesMin: Number(document.querySelector("#cv-frames").min),
+        framesMax: Number(document.querySelector("#cv-frames").max),
+        fps: Number(document.querySelector("#cv-fps").value),
+        fpsMin: Number(document.querySelector("#cv-fps").min),
+        fpsMax: Number(document.querySelector("#cv-fps").max),
+        geometryDisabled: [
+          "#cv-h3-resolution", "#cv-h3-width", "#cv-h3-height",
+          "#cv-h3-duration", "#cv-frames", "#cv-fps",
+        ].some((selector) => document.querySelector(selector).disabled),
+        bboxGeometryLocked: ["#cv-bbox-w", "#cv-bbox-h"]
+          .every((selector) => document.querySelector(selector).disabled),
+        modes: Array.from(document.querySelector("#cv-h3-mode").options)
+          .map((option) => ({ id: option.value, disabled: option.disabled })),
       }));
+      const setH3Geometry = (resolution, seconds, fps, width, height) => page.evaluate(
+        ({ resolution, seconds, fps, width, height }) => {
+          const fpsControl = document.querySelector("#cv-fps");
+          fpsControl.value = String(fps);
+          fpsControl.dispatchEvent(new Event("input", { bubbles: true }));
+          const resolutionControl = document.querySelector("#cv-h3-resolution");
+          resolutionControl.value = resolution;
+          resolutionControl.dispatchEvent(new Event("change", { bubbles: true }));
+          if (resolution === "custom") {
+            const widthControl = document.querySelector("#cv-h3-width");
+            const heightControl = document.querySelector("#cv-h3-height");
+            widthControl.value = String(width);
+            heightControl.value = String(height);
+            widthControl.dispatchEvent(new Event("change", { bubbles: true }));
+            heightControl.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          const duration = document.querySelector("#cv-h3-duration");
+          duration.value = String(seconds);
+          duration.dispatchEvent(new Event("change", { bubbles: true }));
+        },
+        { resolution, seconds, fps, width, height },
+      );
+
       const h3Default = await readH3Controls();
       assert(
-        h3Default.resolution === "960x544_24fps"
-          && h3Default.duration === 15.08 && h3Default.frames === 362,
-        `H3 did not default to the highest-resolution long profile: ${JSON.stringify(h3Default)}`,
+        JSON.stringify(h3Default.resolutions) === JSON.stringify([
+          "1536x672", "1344x768", "1024x768",
+          "768x768", "768x1024", "768x1344", "custom",
+        ])
+          && h3Default.resolution === "1344x768"
+          && h3Default.width === 1344 && h3Default.height === 768
+          && h3Default.bboxWidth === 1344 && h3Default.bboxHeight === 768
+          && h3Default.durationMin === 1 && h3Default.durationMax === 15
+          && h3Default.stepCache === "exact"
+          && h3Default.framesMin === 1 && h3Default.framesMax === 1800
+          && h3Default.fpsMin === 1 && h3Default.fpsMax === 120
+          && !h3Default.geometryDisabled && h3Default.bboxGeometryLocked,
+        `H3 native resolution controls are wrong: ${JSON.stringify(h3Default)}`,
       );
+
+      const testedH3Presets = [
+        ["1536x672", 1536, 672], ["1344x768", 1344, 768],
+        ["1024x768", 1024, 768], ["768x768", 768, 768],
+        ["768x1024", 768, 1024], ["768x1344", 768, 1344],
+      ];
+      for (const [preset, width, height] of testedH3Presets) {
+        await setH3Geometry(preset, 2, 24);
+        const controls = await readH3Controls();
+        assert(controls.resolution === preset
+          && controls.width === width && controls.height === height
+          && controls.bboxWidth === width && controls.bboxHeight === height
+          && controls.duration === 2 && controls.frames === 48,
+        `H3 preset ${preset} did not resolve exactly: ${JSON.stringify(controls)}`);
+      }
+      await setH3Geometry("custom", 3, 24, 992, 576);
+      const h3Custom = await readH3Controls();
+      assert(h3Custom.resolution === "custom"
+        && h3Custom.width === 992 && h3Custom.height === 576
+        && h3Custom.bboxWidth === 992 && h3Custom.bboxHeight === 576
+        && h3Custom.duration === 3 && h3Custom.frames === 72,
+      `H3 custom runtime geometry did not resolve: ${JSON.stringify(h3Custom)}`);
+
       await page.locator("#cv-h3-quant").selectOption("bf16");
-      await page.locator("#cv-h3-resolution").selectOption("832x480_24fps");
-      const h3LongBf16 = await readH3Controls();
+      await setH3Geometry("1344x768", 2, 24);
+      const h3TwoSeconds = await readH3Controls();
       assert(
-        h3LongBf16.duration === 15.08 && h3LongBf16.frames === 362
-          && h3LongBf16.resolution === "832x480_24fps",
-        `H3 BF16 high-resolution selection lost 15 seconds: ${JSON.stringify(h3LongBf16)}`,
+        h3TwoSeconds.quant === "bf16"
+          && h3TwoSeconds.width === 1344 && h3TwoSeconds.height === 768
+          && h3TwoSeconds.duration === 2 && h3TwoSeconds.frames === 48
+          && h3TwoSeconds.fps === 24,
+        `H3 2-second authored geometry did not remain exact: ${JSON.stringify(h3TwoSeconds)}`,
       );
-      const h3HighResolutionOption = h3LongBf16.resolutions.find(
-        (option) => option.value === "960x544_24fps",
-      );
+
+      await setH3Geometry("1344x768", 4, 24);
+      const h3FourSeconds = await readH3Controls();
       assert(
-        h3HighResolutionOption && !h3HighResolutionOption.disabled,
-        `H3 resolution is still coupled to Seconds: ${JSON.stringify(h3HighResolutionOption)}`,
+        h3FourSeconds.width === 1344 && h3FourSeconds.height === 768
+          && h3FourSeconds.duration === 4 && h3FourSeconds.frames === 96,
+        `H3 4-second control changed resolution or duration: ${JSON.stringify(h3FourSeconds)}`,
       );
-      await page.locator("#cv-h3-resolution").selectOption("960x544_24fps");
-      const h3HighLong = await readH3Controls();
+
+      await setH3Geometry("1536x672", 15, 120);
+      const h3Maximum = await readH3Controls();
       assert(
-        h3HighLong.duration === 15.08 && h3HighLong.frames === 362
-          && h3HighLong.resolution === "960x544_24fps",
-        `H3 Resolution change altered Seconds: ${JSON.stringify(h3HighLong)}`,
+        h3Maximum.resolution === "1536x672"
+          && h3Maximum.width === 1536 && h3Maximum.height === 672
+          && h3Maximum.duration === 15 && h3Maximum.frames === 1800
+          && h3Maximum.fps === 120,
+        `H3 maximum runtime controls did not resolve: ${JSON.stringify(h3Maximum)}`,
       );
-      await page.evaluate(() => {
-        const duration = document.querySelector("#cv-h3-duration");
-        duration.value = "2.33";
-        duration.dispatchEvent(new Event("change", { bubbles: true }));
+
+      for (const mode of ["t2va", "i2va", "l2va", "fl2va", "ref2va"]) {
+        const option = h3Maximum.modes.find((candidate) => candidate.id === mode);
+        assert(option && !option.disabled,
+          `H3 feature ${mode} is not available: ${JSON.stringify(h3Maximum.modes)}`);
+        await page.locator("#cv-h3-mode").selectOption(mode);
+        const controls = await readH3Controls();
+        assert(!controls.geometryDisabled && controls.bboxGeometryLocked
+          && controls.width === 1536 && controls.height === 672
+          && controls.duration === 15,
+        `H3 ${mode} does not share the native resolution controls: ${JSON.stringify(controls)}`);
+      }
+
+      await page.locator("#cv-h3-mode").selectOption("ref2va");
+
+      const h3ReferenceSurface = await page.evaluate(() => ({
+        visible: document.querySelector("#cv-h3-references-row").style.display !== "none",
+        multiple: document.querySelector("#cv-h3-references-file").multiple,
+        accept: document.querySelector("#cv-h3-references-file").accept,
+      }));
+      assert(h3ReferenceSurface.visible && h3ReferenceSurface.multiple
+        && h3ReferenceSurface.accept.includes("image/*")
+        && h3ReferenceSurface.accept.includes("video/*")
+        && h3ReferenceSurface.accept.includes("audio/*"),
+      `H3 omni-reference picker is incomplete: ${JSON.stringify(h3ReferenceSurface)}`);
+      await page.locator("#cv-h3-references-file").setInputFiles([
+        { name: "identity.png", mimeType: "image/png", buffer: Buffer.from("h3-image") },
+        { name: "motion.mp4", mimeType: "video/mp4", buffer: Buffer.from("h3-video") },
+        { name: "voice.wav", mimeType: "audio/wav", buffer: Buffer.from("h3-audio") },
+      ]);
+      await page.waitForFunction(() => {
+        const labels = Array.from(document.querySelectorAll("#cv-h3-references-list .cv-lora-name"));
+        return labels.length === 3 && labels.every((label) => label.textContent.includes("ready"));
       });
-      const h3ExplicitShort = await readH3Controls();
-      assert(
-        h3ExplicitShort.duration === 2.33 && h3ExplicitShort.frames === 56
-          && h3ExplicitShort.resolution === "960x544_24fps",
-        `H3 Seconds change altered Resolution: ${JSON.stringify(h3ExplicitShort)}`,
+      const h3AudioRoles = page.locator("#cv-h3-references-list select");
+      await h3AudioRoles.nth(0).selectOption("reuse");
+      await h3AudioRoles.nth(1).selectOption("voice_timbre");
+      await setH3Geometry("1344x768", 4, 24);
+      await page.locator("#cv-prompt").fill(
+        "Use <Image 1> for identity, <Video 1> for motion, reuse <Audio 1>, and use <Audio 2> for voice timbre.",
       );
-      await page.locator("#cv-h3-resolution").selectOption("512x320_24fps");
-      const h3LowShort = await readH3Controls();
-      assert(
-        h3LowShort.duration === 2.33 && h3LowShort.frames === 56
-          && h3LowShort.resolution === "512x320_24fps",
-        `H3 Resolution change altered the selected short duration: ${JSON.stringify(h3LowShort)}`,
-      );
-      await page.evaluate(() => {
-        const duration = document.querySelector("#cv-h3-duration");
-        duration.value = "7.29";
-        duration.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-      const h3LowMedium = await readH3Controls();
-      assert(
-        h3LowMedium.duration === 7.29 && h3LowMedium.frames === 175
-          && h3LowMedium.resolution === "512x320_24fps",
-        `H3 Seconds change altered the selected resolution: ${JSON.stringify(h3LowMedium)}`,
-      );
-      await page.locator("#cv-h3-resolution").selectOption("960x544_24fps");
-      await page.evaluate(() => {
-        const duration = document.querySelector("#cv-h3-duration");
-        duration.value = "15.08";
-        duration.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-      const h3MaximumQuality = await readH3Controls();
-      assert(
-        h3MaximumQuality.quant === "bf16"
-          && h3MaximumQuality.resolution === "960x544_24fps"
-          && h3MaximumQuality.duration === 15.08
-          && h3MaximumQuality.frames === 362 && h3MaximumQuality.fps === 24,
-        `H3 maximum BF16 controls did not resolve exactly: ${JSON.stringify(h3MaximumQuality)}`,
-      );
-      const h3VideoBefore = videoRequests.length;
+      const h3RefVideoBefore = videoRequests.length;
       await page.locator("#cv-generate-btn").click();
-      for (let attempt = 0; attempt < 100 && videoRequests.length === h3VideoBefore; attempt += 1) {
+      for (let attempt = 0; attempt < 100 && videoRequests.length === h3RefVideoBefore; attempt += 1) {
         await page.waitForTimeout(20);
       }
-      assert(videoRequests.length === h3VideoBefore + 1,
-        "H3 Canvas Generate did not POST /v1/video");
-      const h3Request = videoRequests[videoRequests.length - 1];
-      assert(
-        h3Request.model === "minimax_h3"
-          && h3Request.runner === "minimax_h3_mojo_request"
-          && h3Request.quant === "bf16"
-          && h3Request.width === 960 && h3Request.height === 544
-          && h3Request.frames === 362 && h3Request.fps === 24,
-        `H3 Canvas submitted the wrong independent geometry: ${JSON.stringify(h3Request)}`,
-      );
+      assert(videoRequests.length === h3RefVideoBefore + 1,
+        "H3 Ref2VA Canvas did not POST /v1/video");
+      const h3RefRequest = videoRequests[videoRequests.length - 1];
+      assert(h3RefRequest.task === "ref2va"
+        && Array.isArray(h3RefRequest.references)
+        && h3RefRequest.references.length === 3
+        && h3RefRequest.references[0].kind === "image"
+        && h3RefRequest.references[0].path.endsWith(".png")
+        && h3RefRequest.references[1].kind === "video"
+        && h3RefRequest.references[1].path.endsWith(".mp4")
+        && h3RefRequest.references[1].audio_use === "reuse"
+        && h3RefRequest.references[2].kind === "audio"
+        && h3RefRequest.references[2].path.endsWith(".wav")
+        && h3RefRequest.references[2].audio_use === "voice_timbre",
+      `H3 ordered omni-references drifted: ${JSON.stringify(h3RefRequest)}`);
       if (process.env.SERENITY_H3_ONLY === "1") {
         assert(pageErrors.length === 0, `page errors: ${pageErrors.join(" | ")}`);
         assert(requestFailures.length === 0,
           `same-origin request failures: ${requestFailures.join(" | ")}`);
-        console.log("serenity playwright H3 matrix: PASS");
+        console.log("serenity playwright H3 runtime controls: PASS");
         console.log(JSON.stringify({
-          schema: "serenity.playwright.h3_independent_matrix.v1",
+          schema: "serenity.playwright.h3_runtime_controls.v1",
           base_url: baseUrl,
+          generate_default_controls: generateH3Default,
+          generate_boundary_controls: generateH3Boundary,
+          generate_submitted_request: generateH3Request,
           default_controls: h3Default,
-          maximum_bf16_controls: h3MaximumQuality,
-          submitted_request: h3Request,
+          two_second_controls: h3TwoSeconds,
+          four_second_controls: h3FourSeconds,
+          maximum_controls: h3Maximum,
+          custom_controls: h3Custom,
+          ref2va_submitted_request: h3RefRequest,
         }, null, 2));
         return;
       }
       await page.locator('.nav-btn[data-tab="generate"]').click();
     }
+
     const ltxModels = modelResults.filter((result) => result.backend === "ltx2");
     const ltxNames = ltxModels.map((result) => result.name);
     for (const required of [

@@ -93,7 +93,7 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.ffi import BytePtr, sys_memcpy
 from serenitymojo.ops.linear import linear_bias
 from serenitymojo.ops.norm import layer_norm
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_dynamic
 from serenitymojo.ops.activations import gelu, gelu_exact
 from serenitymojo.ops.rope import rope_halfsplit
 from serenitymojo.ops.tensor_algebra import add, concat, reshape, reshape_owned, slice
@@ -352,24 +352,12 @@ def _vis_sdpa_segment(
 ) raises -> Tensor:
     """Full non-causal MHA over ONE cu_seqlens segment, `[1,seg,16,72]` BSHD.
 
-    `sdpa_nomask` takes S at compile time (the same foundation-op wall
-    `qwen3_encoder._sdpa_dispatch` dispatches around); each production segment
-    length gets an explicit instantiation here, gated before use."""
-    if seg == H3_VIS_SDPA_S_2304:
-        return sdpa_nomask[1, H3_VIS_SDPA_S_2304, H3_VIS_HEADS, H3_VIS_HEAD_DIM](
-            q, k, v, scale, ctx
-        )
-    if seg == H3_VIS_SDPA_S_4032:
-        return sdpa_nomask[1, H3_VIS_SDPA_S_4032, H3_VIS_HEADS, H3_VIS_HEAD_DIM](
-            q, k, v, scale, ctx
-        )
-    raise Error(
-        String("minimax_h3 vision device: attention segment length ")
-        + String(seg)
-        + " has no comptime sdpa instantiation — add it to _vis_sdpa_segment"
-        " (vision_tower_device.mojo) and re-run the device parity gate at that"
-        " geometry. Product inference never falls back to the host tower."
-    )
+    Runtime math dispatch keeps inference on GPU for every processor grid while
+    preserving the accepted static vision-tower attention arithmetic; `seg` is
+    checked against the actual sliced tensor before launch."""
+    if q.shape()[1] != seg or k.shape()[1] != seg or v.shape()[1] != seg:
+        raise Error("minimax_h3 vision device: segment tensor length mismatch")
+    return sdpa_nomask_dynamic(q, k, v, scale, ctx)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -457,38 +445,29 @@ def _vis_device_block(
     q = reshape(q, [1, seq, H3_VIS_HEADS, H3_VIS_HEAD_DIM], ctx)
     k = reshape(k, [1, seq, H3_VIS_HEADS, H3_VIS_HEAD_DIM], ctx)
     v = reshape(v, [1, seq, H3_VIS_HEADS, H3_VIS_HEAD_DIM], ctx)
-    var attn: Tensor
-    if len(cu_seqlens) == 2:
-        var seg = cu_seqlens[1] - cu_seqlens[0]
-        if cu_seqlens[0] != 0 or cu_seqlens[1] != seq:
-            raise Error("minimax_h3 vision device: invalid single-segment boundaries")
-        attn = _vis_sdpa_segment(q, k, v, seg, scale, ctx)
-    elif len(cu_seqlens) == 3:
-        var start0 = cu_seqlens[0]
-        var start1 = cu_seqlens[1]
-        var end1 = cu_seqlens[2]
-        if start0 != 0 or start1 <= 0 or end1 != seq or start1 >= end1:
-            raise Error("minimax_h3 vision device: invalid two-segment boundaries")
-        var seg0 = start1
-        var seg1 = end1 - start1
-        var q0 = slice(q, 1, 0, seg0, ctx)
-        var k0 = slice(k, 1, 0, seg0, ctx)
-        var v0 = slice(v, 1, 0, seg0, ctx)
-        var q1 = slice(q, 1, start1, seg1, ctx)
-        var k1 = slice(k, 1, start1, seg1, ctx)
-        var v1 = slice(v, 1, start1, seg1, ctx)
-        var attn0 = _vis_sdpa_segment(q0, k0, v0, seg0, scale, ctx)
-        var attn1 = _vis_sdpa_segment(q1, k1, v1, seg1, scale, ctx)
-        attn = concat(1, ctx, attn0, attn1)
-    else:
+    if len(cu_seqlens) < 2 or cu_seqlens[0] != 0 \
+            or cu_seqlens[len(cu_seqlens) - 1] != seq:
         raise Error(
-            String("minimax_h3 vision device: ")
-            + String(len(cu_seqlens) - 1)
-            + " attention segments (a multi-frame / multi-reference request)."
-            " The GPU-only product path currently accepts one segment or the"
-            " released two-keyframe FL2VA pair; it never falls back to host"
-            " inference."
+            "minimax_h3 vision device: invalid attention segment boundaries"
         )
+    var first_len = cu_seqlens[1] - cu_seqlens[0]
+    if first_len <= 0:
+        raise Error("minimax_h3 vision device: empty attention segment")
+    var q0 = slice(q, 1, 0, first_len, ctx)
+    var k0 = slice(k, 1, 0, first_len, ctx)
+    var v0 = slice(v, 1, 0, first_len, ctx)
+    var attn = _vis_sdpa_segment(q0, k0, v0, first_len, scale, ctx)
+    for segment in range(1, len(cu_seqlens) - 1):
+        var start = cu_seqlens[segment]
+        var stop = cu_seqlens[segment + 1]
+        var seg = stop - start
+        if seg <= 0:
+            raise Error("minimax_h3 vision device: empty attention segment")
+        var qs = slice(q, 1, start, seg, ctx)
+        var ks = slice(k, 1, start, seg, ctx)
+        var vs = slice(v, 1, start, seg, ctx)
+        var next = _vis_sdpa_segment(qs, ks, vs, seg, scale, ctx)
+        attn = concat(1, ctx, attn, next)
     attn = reshape(attn, [seq, H3_VIS_HIDDEN], ctx)
 
     var attn_out = linear_bias(

@@ -115,6 +115,53 @@ def _unpad_seq[
     return Tensor(out_buf^, shape^, STDtype.BF16)
 
 
+def _pad_seq_dynamic(
+    t: Tensor, padded_s: Int, h: Int, dh: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Runtime `[B,S,H,Dh]` BF16 right-padding for causal inference."""
+    var shape = t.shape()
+    var b = shape[0]
+    var s = shape[1]
+    if padded_s == s:
+        return Tensor(t.buf.copy(), shape^, t.dtype())
+    var row_bytes = h * dh * 2
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        b * padded_s * row_bytes
+    )
+    ctx.enqueue_memset[DType.uint8](out_buf, 0)
+    for batch in range(b):
+        var src = t.buf.create_sub_buffer[DType.uint8](
+            batch * s * row_bytes, s * row_bytes
+        )
+        var dst = out_buf.create_sub_buffer[DType.uint8](
+            batch * padded_s * row_bytes, s * row_bytes
+        )
+        ctx.enqueue_copy(dst_buf=dst, src_buf=src)
+    return Tensor(out_buf^, [b, padded_s, h, dh], STDtype.BF16)
+
+
+def _unpad_seq_dynamic(
+    t: Tensor, real_s: Int, h: Int, dh: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Runtime inverse of `_pad_seq_dynamic`."""
+    var shape = t.shape()
+    var b = shape[0]
+    var padded_s = shape[1]
+    if real_s == padded_s:
+        return Tensor(t.buf.copy(), shape^, t.dtype())
+    var row_bytes = h * dh * 2
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](b * real_s * row_bytes)
+    for batch in range(b):
+        var src = t.buf.create_sub_buffer[DType.uint8](
+            batch * padded_s * row_bytes, real_s * row_bytes
+        )
+        var dst = out_buf.create_sub_buffer[DType.uint8](
+            batch * real_s * row_bytes, real_s * row_bytes
+        )
+        ctx.enqueue_copy(dst_buf=dst, src_buf=src)
+    return Tensor(out_buf^, [b, real_s, h, dh], STDtype.BF16)
+
+
 struct SdpaFlashFwd(Movable):
     """Train-forward result. `o` is the consumer-facing [B,S,H,Dh] output
     (a zero-copy view into `o_pad` when padding was needed at B=1 — keep this
@@ -163,9 +210,34 @@ def sdpa_flash_infer_fwd[
     scale: Float32,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    """Dedicated cuDNN inference SDPA: exact-size O, no saved backward set."""
+    """Static-shape compatibility wrapper around runtime-shape inference."""
+    return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
+
+
+def sdpa_flash_infer_fwd_dynamic(
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Dedicated cuDNN inference SDPA with runtime B/S/H/Dh geometry.
+
+    The cuDNN shim has always accepted these dimensions as runtime Int32
+    values.  Keeping them out of the Mojo type parameter list lets one H3
+    runner serve every aligned canvas size and duration.
+    """
     if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
         raise Error("sdpa_flash_infer_fwd: q/k/v must be BF16")
+    var qsh = q.shape()
+    var ksh = k.shape()
+    var vsh = v.shape()
+    if len(qsh) != 4 or ksh != qsh or vsh != qsh:
+        raise Error("sdpa_flash_infer_fwd_dynamic: q/k/v shape mismatch")
+    var B = qsh[0]
+    var S = qsh[1]
+    var H = qsh[2]
+    var Dh = qsh[3]
+    if B <= 0 or S <= 0 or H <= 0 or Dh <= 0:
+        raise Error("sdpa_flash_infer_fwd_dynamic: dimensions must be positive")
     var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
     ctx.enqueue_memset[DType.uint8](o_buf, 0)
     var o_shape: List[Int] = [B, S, H, Dh]
@@ -208,30 +280,69 @@ def sdpa_flash_infer_fwd_causal_padmask[
     stats tensor is scratch and is discarded before return.  No backward graph
     or materialized SxS attention mask is created.
     """
-    comptime if (S % 128) != 0:
-        raise Error("sdpa_flash_infer_fwd_causal_padmask: S must be 128-aligned")
+    return sdpa_flash_infer_fwd_causal_padmask_dynamic(
+        q, k, v, real_len, scale, ctx
+    )
+
+
+def sdpa_flash_infer_fwd_causal_padmask_dynamic(
+    q: Tensor, k: Tensor, v: Tensor,
+    real_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Runtime-shape causal BF16 SDPA with a valid-prefix length.
+
+    This is the dynamic sibling of the static compatibility wrapper above.
+    It is used by H3 Ref2VA when several visual references expand the Qwen3-VL
+    presentation beyond the old 2,048-token dispatch table. The cuDNN ABI has
+    always taken B/S/H/Dh at runtime; keeping them out of Mojo type parameters
+    avoids compiling one binary per reference count and aspect ratio.
+    """
     if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
         raise Error("sdpa_flash_infer_fwd_causal_padmask: q/k/v must be BF16")
+    var qsh = q.shape()
+    if len(qsh) != 4 or k.shape() != qsh or v.shape() != qsh:
+        raise Error(
+            "sdpa_flash_infer_fwd_causal_padmask_dynamic: q/k/v shape mismatch"
+        )
+    var B = qsh[0]
+    var S = qsh[1]
+    var H = qsh[2]
+    var Dh = qsh[3]
+    if B <= 0 or S <= 0 or H <= 0 or Dh <= 0:
+        raise Error(
+            "sdpa_flash_infer_fwd_causal_padmask_dynamic: dimensions must be positive"
+        )
     if real_len < 1 or real_len > S:
         raise Error("sdpa_flash_infer_fwd_causal_padmask: real_len out of [1, S]")
 
-    var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
+    var padded_s = ((S + 127) // 128) * 128
+    var q_pad = _pad_seq_dynamic(q, padded_s, H, Dh, ctx)
+    var k_pad = _pad_seq_dynamic(k, padded_s, H, Dh, ctx)
+    var v_pad = _pad_seq_dynamic(v, padded_s, H, Dh, ctx)
+    var o_buf = ctx.enqueue_create_buffer[DType.uint8](
+        B * padded_s * H * Dh * 2
+    )
     ctx.enqueue_memset[DType.uint8](o_buf, 0)
-    var o_shape: List[Int] = [B, S, H, Dh]
+    var o_shape: List[Int] = [B, padded_s, H, Dh]
     var o = Tensor(o_buf^, o_shape^, STDtype.BF16)
-    var stats_buf = ctx.enqueue_create_buffer[DType.uint8](B * H * S * 4)
+    var stats_buf = ctx.enqueue_create_buffer[DType.uint8](
+        B * H * padded_s * 4
+    )
     ctx.enqueue_memset[DType.uint8](stats_buf, 0)
-    var stats_shape: List[Int] = [B, H, S, 1]
+    var stats_shape: List[Int] = [B, H, padded_s, 1]
     var stats = Tensor(stats_buf^, stats_shape^, STDtype.F32)
 
-    var qs = _strides_bhnd(S, H, Dh)
-    var ks = _strides_bhnd(S, H, Dh)
-    var vs = _strides_bhnd(S, H, Dh)
-    var os_ = _strides_bhnd(S, H, Dh)
+    var qs = _strides_bhnd(padded_s, H, Dh)
+    var ks = _strides_bhnd(padded_s, H, Dh)
+    var vs = _strides_bhnd(padded_s, H, Dh)
+    var os_ = _strides_bhnd(padded_s, H, Dh)
     var stream = CUDA(ctx.stream())
     var rc = Int(external_call["flame_cudnn_sdpa_bf16_train_fwd", Int32](
-        _dev_ptr(q), _dev_ptr(k), _dev_ptr(v), _dev_ptr(o), _dev_ptr(stats),
-        Int32(B), Int32(H), Int32(S), Int32(S), Int32(Dh), scale,
+        _dev_ptr(q_pad), _dev_ptr(k_pad), _dev_ptr(v_pad),
+        _dev_ptr(o), _dev_ptr(stats),
+        Int32(B), Int32(H), Int32(padded_s), Int32(padded_s), Int32(Dh), scale,
         qs, ks, vs, os_,
         Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
         Int32(1),  # causal
@@ -246,7 +357,7 @@ def sdpa_flash_infer_fwd_causal_padmask[
             + String(" real_len=") + String(real_len)
             + String(" H=") + String(H) + String(" Dh=") + String(Dh) + String(")")
         )
-    return o^
+    return _unpad_seq_dynamic(o, S, H, Dh, ctx)
 
 
 def sdpa_flash_infer_fwd_rect[

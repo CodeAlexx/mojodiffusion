@@ -365,7 +365,11 @@ def load_minimax_h3_resident_cache(
             )
         )
         st.release_to_os()
-        if (i + 1) % 5 == 0 or i + 1 == nblocks:
+        # One-block loads are the streamed tail, not resident-cache setup.
+        # Logging every tail visit emits 50 identical "1 / 1" lines per
+        # evaluation and makes the product progress parser look stuck in
+        # cache setup. Multi-block prefix loads retain their useful progress.
+        if nblocks > 1 and ((i + 1) % 5 == 0 or i + 1 == nblocks):
             print("  resident cache: loaded block", i + 1, "/", nblocks)
     return MiniMaxH3ResidentFp8(
         blocks^, start_layer, scratch^, scheme
@@ -435,6 +439,67 @@ def reload_minimax_h3_resident_w8a8_block(
             raise Error("MiniMax-H3 reusable tail cache class mismatch")
     if qslot != len(block.fp8) or kslot != len(block.bf16):
         raise Error("MiniMax-H3 reusable tail slot-count mismatch")
+    resident.start_layer = layer
+    st.release_to_os()
+
+
+def reload_minimax_h3_resident_groupwise_block(
+    mut resident: MiniMaxH3ResidentFp8,
+    cache_path: String,
+    source_index: String,
+    config: MiniMaxH3DiTConfig,
+    layer: Int,
+    ctx: DeviceContext,
+) raises:
+    """Refill one direct-groupwise block store without device allocation."""
+    if resident.scheme != MINIMAX_H3_RESIDENT_INT8:
+        raise Error("MiniMax-H3 reusable groupwise tail requires INT8 groupwise")
+    if len(resident.blocks) != 1:
+        raise Error("MiniMax-H3 reusable groupwise tail requires one block")
+    var st = SafeTensors.open(cache_path)
+    _check_common_metadata(st, String("resident-int8-groupwise"), source_index)
+    var cached_start = _meta_i64(st, String("__meta__.start_layer"), -1)
+    var cached_blocks = _meta_i64(st, String("__meta__.nblocks"), -1)
+    if layer < cached_start or layer >= cached_start + cached_blocks:
+        raise Error("MiniMax-H3 reusable groupwise layer outside cache range")
+
+    ref block = resident.blocks[0]
+    var expected = minimax_h3_block_tensor_names(layer)
+    var qslot = 0
+    var kslot = 0
+    var prefix = _block_prefix(layer)
+    for k in range(len(expected)):
+        ref name = expected[k]
+        var shape = minimax_h3_expected_shape(name, config)
+        var rows = shape[0]
+        var cols = shape[1] if len(shape) == 2 else 0
+        var cls = minimax_h3_fp8_class(name, rows, cols)
+        if cls == H3_FP8_ROW:
+            if qslot >= len(block.fp8):
+                raise Error("MiniMax-H3 reusable groupwise quantized-slot mismatch")
+            _load_raw_h2d_into(
+                st, prefix + String("weight.") + String(qslot),
+                block.fp8[qslot][], ctx,
+            )
+            _load_raw_h2d_into(
+                st, prefix + String("scale.") + String(qslot),
+                block.scale[qslot][], ctx,
+            )
+            block.fp8_names[qslot] = name.copy()
+            qslot += 1
+        elif cls == H3_FP8_BF16_KEEP:
+            if kslot >= len(block.bf16):
+                raise Error("MiniMax-H3 reusable groupwise keep-slot mismatch")
+            _load_raw_h2d_into(
+                st, prefix + String("keep.") + String(kslot),
+                block.bf16[kslot][], ctx,
+            )
+            block.bf16_names[kslot] = name.copy()
+            kslot += 1
+        else:
+            raise Error("MiniMax-H3 reusable groupwise cache class mismatch")
+    if qslot != len(block.fp8) or kslot != len(block.bf16):
+        raise Error("MiniMax-H3 reusable groupwise slot-count mismatch")
     resident.start_layer = layer
     st.release_to_os()
 

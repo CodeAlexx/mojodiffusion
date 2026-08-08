@@ -3118,7 +3118,7 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   timing, VRAM, prompt-extension provenance, and visual acceptance. The Rust
   server refuses Wan readiness if any pinned check drifts.
 
-## §5 MiniMax-H3 (t2va + i2va + ref2va SHIPPED 2026-08-04)
+## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-07)
 
 The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
 layout (NOT the diffusers conversion). First valid video 2026-08-03
@@ -3141,6 +3141,19 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   timestep alone); inner 7168 != hidden 5376; qkv de-interleave + fc1
   [gate;value] swap owned by the LOADER; final-layer modulate runs in BF16
   with the F32 cast AFTER (transformer_minimax_h3.py:638).
+- `models/dit/minimax_h3_qk_inplace.mojo` plus the chunked/fused paths in
+  `minimax_h3_{dit,frontend,int8_linear}.mojo` bound long-sequence temporary
+  storage: Q/K normalize+partial-RoPE in their owned BF16 buffers; QKV, SwiGLU,
+  residual-gate, AdaLN, and final projections do not require the previous full
+  intermediates. `parity/minimax_h3_chunked_linear_parity.mojo` gates BF16,
+  group-wise INT8, W8A8, Q/K, and final-layer equivalence.
+- `models/dit/minimax_h3_step_cache.mojo` — opt-in `high` Cache-DiT-style
+  denoise acceleration. It recomputes front/back 8-block bands and may reuse
+  one group-32 INT8 middle residual after a 4-evaluation warmup; `exact` is the
+  no-reuse quality default. High preserves geometry, seconds, FPS, step count,
+  and audio, but decoded A/B showed visible video drift, so it remains
+  experimental. The model-scoped GPU gate proves reconstruction and decision
+  policy mechanics, not perceptual equivalence.
 - `ops/sage_attention_int8.mojo` — OPT-IN Mojo-native Sage-style backend at
   the block self-attention seam: BF16 Q/K/V -> Q128/K64 signed-INT8 QK tensor
   cores -> online-softmax/BF16-PV with F32 accumulation -> BF16 output. Runtime flag on t2va, i2va,
@@ -3255,16 +3268,18 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   than cU-DNN (12.12 vs 10.24 s/eval). Therefore `sage-int8` is switchable but explicitly
   **experimental and OFF by default**; cU-DNN remains the quality default.
 - **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with one
-  `minimax_h3_serenity_runtime` T2VA executable. Requests select the full
-  3-resolution by 4-duration matrix: 512x320, 832x480, or 960x544 crossed with
-  56, 73, 175, or 362 frames (2.33, 3.04, 7.29, or 15.08 seconds), all at
-  24 FPS/20 steps and all switchable among INT8 Fast, INT8 Quality, and BF16.
-  Large products keep zero DiT blocks resident and stream W8A8, groupwise INT8,
-  or BF16 blocks on GPU; smaller profiles retain their measured resident
-  prefixes. `/v1/video`
-  validates the exact 241-token test prompt and resolves resolution, frames,
-  FPS, and precision before the cross-product GPU lease. The one executable
-  carries the twelve sequence-length-specific AOT kernels internally and launches
+  `minimax_h3_serenity_runtime` T2VA executable. Requests independently select
+  authored duration from 1 through 15 seconds, delivery FPS from 1 through
+  120, and either one of six tested H3-Base canvases or a custom width/height
+  from 32 through 2048 in 32-pixel steps inside the 1,032,192-pixel product
+  envelope. The denoiser retains H3's native 24-FPS timeline and 17n+5 frame
+  alignment; decode trims/resamples to the exact authored seconds and delivery
+  FPS. All admitted geometry remains switchable among INT8 Fast, INT8 Quality,
+  and BF16. Large products keep zero DiT blocks resident and stream W8A8,
+  groupwise INT8, or BF16 blocks on GPU; smaller profiles retain their measured
+  resident prefixes. `/v1/video` resolves and validates geometry, precision,
+  attention, and exact/high step-cache policy before the GPU lease. The one
+  executable dispatches runtime sequence geometry and launches
   `int8-fast`, `int8`, or `bf16` asynchronously, exits after denoise, invokes
   the same runner in fresh `decode_only` mode, requires
   `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
@@ -3273,6 +3288,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   cU-DNN-vs-Sage. H3 owns a separate precision state so BF16 selected on a
   different video model cannot leak into H3; first entry defaults to
   `int8-fast`, while an explicit H3 Quality/BF16 choice remains switchable.
+  `exact` evaluates every block and is the quality default. The opt-in `high`
+  Cache-DiT-style policy recomputes the first/last eight blocks and may reuse
+  one group-32 INT8 middle-stack residual; it preserves size, seconds, FPS,
+  steps, and audio but remains experimental because decoded A/B testing found
+  visible video drift.
   cU-DNN is the default and Sage is labeled experimental. On 2026-08-05 both
   added profiles passed 19-evaluation Fast trajectories, zero finite-gate
   failures, fresh streaming GPU VAE decode, NVENC H.264 + stereo AAC probe, and
@@ -3284,10 +3304,12 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   tail; BF16 stays fully streamed. A live HTTP smoke (`video-0009`) selected
   the 960x544 request profile, completed one real eval in 7.948 s, decoded 56
   frames, and published the synchronized MP4.
-- **Independent geometry matrix closure (2026-08-05):** Canvas Resolution and
-  Seconds resolve independently through twelve exact registry rows. Changing
-  resolution preserves seconds; changing seconds preserves resolution. No
-  option is disabled and no fallback silently rewrites either selection. To
+- **Runtime geometry closure (2026-08-07):** Canvas Resolution and Seconds
+  resolve independently at runtime. Changing resolution preserves seconds;
+  changing seconds preserves resolution. Six native 768p aspect presets are
+  conveniences, not an exhaustive allowlist; custom aligned canvases inside
+  the product pixel envelope are admitted. No option is disabled and no
+  fallback silently rewrites either selection. To
   fit the maximum 960x544x362 product on a 24-GB GPU, W8A8 I32 accumulation and
   BF16/group-wise F32 accumulation are row chunked, streamed block ownership is
   released before the next load, and zero-resident profiles avoid unused BF16
@@ -3295,26 +3317,27 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   exactly across 8,704,512 BF16 values. The maximum request passed real GPU
   one-evaluation finite gates without CPU inference in all three modes:
   approximately 140 seconds / 18,678 MiB INT8 Fast, 198 seconds / 18,292 MiB
-  INT8 Quality, and 284 seconds / 18,282 MiB BF16. Admission also validates all
-  36 geometry/precision requests against the one executable and pins those
-  checks plus the maximum-product evidence to the current runner/source hashes.
+  INT8 Quality, and 284 seconds / 18,282 MiB BF16. Admission validates the 36
+  legacy benchmark-anchor combinations plus the runtime bounds, presets,
+  custom aligned geometry, authored-seconds mapping, precision choices, and
+  exact/high cache policy against the one executable. The machine-local gate
+  pins those checks and the maximum-product evidence to runner/source hashes.
   A separate 512x320x56 INT8 Quality gate exercised the 41-block groupwise
   resident prefix at 14.908 seconds/evaluation, finite video/audio, and a
   20,766 MiB process peak.
-- **Conditioned Canvas closure (2026-08-05):** Canvas now follows the LTX2
+- **Conditioned Canvas closure (updated 2026-08-07):** Canvas follows the LTX2
   capability-driven pattern and exposes T2VA, I2VA, L2VA, and FL2VA as explicit
-  tasks. It also exposes a bounded **image-only Ref2VA** task: one selected
-  Source image guides identity/style through separate GPU-vision + GPU-VAE
-  reference rows and is never inserted as frame zero. The vendor's native
-  2048-short-edge reference would exceed the current 24-GB conditioner
-  attention product limits; Canvas explicitly center-crops and compiles the
-  reference at 768x768 instead, reusing the gated 48x48 device geometry without
-  a CPU-model fallback. Conditioned requests are locked to the measured
-  768x768x124 at 24
-  FPS/20-step profile, exact compiled prompt, synchronized audio, required
-  first/last image contracts, and fresh-process GPU decode. Arbitrary step
-  counts are rejected before model allocation so they cannot create unbounded
-  modulation sidecars. The UI exposes W8A8 `int8-fast`, groupwise `int8`, and
+  tasks. It also exposes ordered omni-reference Ref2VA: at most 9 images, 3
+  videos, and 3 audio clips, capped at 12 combined. Video soundtracks and
+  standalone audio are GPU-encoded; each audio-bearing reference selects
+  ordinary conditioning, soundtrack reuse, or voice/timbre intent. At least
+  one image/video is required, and no reference is inserted as frame zero.
+  Browser images are staged on the gated 768x768 reference canvas instead of
+  the vendor's 2048-short-edge reference, which exceeds this 24-GiB product's
+  conditioner envelope. All conditioned tasks share the runtime resolution,
+  1-15 second duration, native-timeline/delivery-FPS, precision, attention, and
+  exact/high cache controls with T2VA; synchronized audio and fresh-process
+  GPU decode remain mandatory. The UI exposes W8A8 `int8-fast`, groupwise `int8`, and
   BF16-DiT + INT8-encoder runners. cU-DNN remains the default; Sage is
   switchable only on Quality/BF16 and labeled experimental, while Fast rejects
   it.
@@ -3349,11 +3372,20 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   then 28.40-30.02 s/eval), zero non-finites/swap, 124-frame NVENC H.264 plus
   non-silent stereo AAC (mean -15.9 dB), and first/middle/end visual inspection
   passed identity, motion, and the reference-only/not-frame-zero contract.
-  Ref2VA Groupwise and BF16 one-evaluation gates are finite; Groupwise vs BF16
-  cosine is video 0.99984670 / audio 0.99952229, both above the 0.999 bar.
+  Ref2VA Groupwise and BF16 one-evaluation gates are finite; the original
+  single-image Groupwise-vs-BF16 cosine is video 0.99984670 / audio 0.99952229,
+  both above the 0.999 bar. The 2026-08-07 multi-reference runtime gates cover
+  BF16 two-image+audio, INT8 Quality two-image+audio, INT8 Fast mixed
+  image/video/audio, and embedded video audio, all finite and GPU-only. The
+  bounded INT8 Quality comparison measured video 0.99922734 PASS and audio
+  0.99775070 FAIL against the strict 0.999 BF16 bar; this is recorded as
+  compounded small-audio-latent noise, not mislabeled as parity. Count and
+  admission contracts cover all 12 slots, but all 12 references have not been
+  quality-run simultaneously on the 24-GiB GPU.
   L2/FL remain smoke-gated and Sage remains explicitly experimental.
   Machine-local evidence is
-  `output/checks/minimax_h3_conditioned_canvas_gate.json`.
+  `output/checks/minimax_h3_conditioned_canvas_gate.json` and the superseding
+  omni-reference record `output/checks/minimax_h3_ref2va_canvas_gate.json`.
 - **Runtime cold-start closure (2026-08-04):** the exact product prompt now uses
   three versioned, source-stat-validated sidecars under
   `FL2VA/serenity_runtime_cache_v1`: BF16 conditioner output, BF16 AdaLN
@@ -3390,6 +3422,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   readback at the end. Gate 11/11 vs host oracle (e2e waveform cos
   0.999999999994677); production A/B on hero10s latents: 3.16s vs 932.7s
   host (295x), wav within 1 int16 LSB. BOTH pipelines call this now.
+- `models/minimax_h3_device/audio_encoder_device.mojo` — GPU reference
+  AudioVAE encoder used by Ref2VA video soundtracks and audio clips. Media
+  decode/staging remains host I/O; all learned DAC/Snake/attention/MLP/mean
+  operations after upload stay on GPU. Real-weight trunk/pre-block/mean
+  cosines are 0.9999999999991/0.9999999997322/0.9999999996329.
 - `models/text_encoder/minimax_h3_qwen3vl_vision.mojo` — the ONE Qwen3-VL
   vision tower (arbitration 3069b71): geometry + weighted forward, f64
   accumulation in LayerNorm+linears (sequential-f32 was a MEASURED defect vs
@@ -3400,16 +3437,17 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   (modeling_qwen3_vl.py:849-883). Composed GPU gate on real weights:
   parity/minimax_h3_deepstack_gpu_gate.mojo (depths 1/2/3 vs torch oracle).
 - `pipeline/minimax_h3_i2va.mojo` — keyframe (I2VA/FL2VA/L2VA) product CLI:
-  canvas law = 768 short edge, SQUARE keyframe -> 768x768 (16:9 canvas at
-  S≈74k does not fit 24GB), preprocessor normalize (u8-127.5)/127.5
-  bit-exact, condition rows pinned at cond_t=0.999 (video tracking-max law).
+  runtime target geometry shares the T2VA 24-GiB envelope; keyframes are
+  prepared onto that canvas, preprocessor normalize (u8-127.5)/127.5 remains
+  bit-exact, and condition rows stay pinned at cond_t=0.999 (video
+  tracking-max law).
   Product builds use device-only vision, the row-scaled INT8 multimodal
   conditioner, target/condition row separation, reusable resident INT8 tails,
   and deferred decode so the denoiser releases the GPU before the VAE loads.
 - `pipeline/minimax_h3_t2va.mojo` — THE product CLI. Comptime geometry
-  (-D H3_TEXT_TOKENS/H3_FRAMES/H3_HEIGHT/H3_WIDTH; frames must be 17k+5),
-  with runtime dispatch across the five product AOT sequence lengths (S=9145,
-  9065, 9097, 18567, 43177) in one executable. Long INT8 paths use a
+  supplies the maximum AOT envelope while `--width`, `--height`, `--frames`,
+  `--output-frames`, and `--fps` select the runtime request (internal frames
+  must be 17k+5). Long INT8 paths use a
   zero-resident prefix and stream accepted quantized cache blocks on GPU;
   saves latents every run, `decode_only` argv[6] re-decodes in ~2 min,
   H3_VAE_TEMPORAL routes decode through the temporal chunk layer (the vendor
@@ -3433,6 +3471,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   step to latents_ckpt.safetensors (two external SIGKILLs taught this).
   Audio-ref rows use the vendor truncation int(num_frames/24*sr)
   (before_encoder.py:374-378) — NOT the ref's full duration.
+  The product route accepts an ordered list of up to 9 image, 3 video, and 3
+  audio references (12 combined), carries embedded video audio, and encodes
+  audio references with the device AudioVAE. Audio roles are ordinary
+  reference, soundtrack reuse, or voice/timbre reference; audio-only requests
+  fail closed and references are never emitted as frame zero.
   Discovery loop: run w/ default comptime; each raise prints the exact
   -D value (H3_TEXT_TOKENS, H3_REF_SEQ_LEN).
 - `pipeline/parity/`, `models/*/parity/` — every gate above; oracle scripts

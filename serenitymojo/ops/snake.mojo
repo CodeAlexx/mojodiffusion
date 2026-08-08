@@ -74,3 +74,26 @@ def snake_beta(
     var scaled = mul(sin_sq, inv_beta_eps, ctx)  # inv_beta_eps · sin²  (broadcast)
     var y = add(x, scaled, ctx)  # x + …
     return y^
+
+
+def snake_alpha_precompute(
+    alpha: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    """Precompute `1 / (alpha + 1e-9)` for the DAC encoder's Snake1d.
+
+    Unlike BigVGAN SnakeBeta, the encoder stores alpha in linear space and has
+    no beta parameter. The returned tensor keeps alpha's broadcast shape.
+    """
+    var alpha_eps = add_scalar(alpha, _SNAKE_EPS, ctx)
+    return reciprocal_op(alpha_eps, ctx)
+
+
+def snake_alpha(
+    x: Tensor, alpha: Tensor, inv_alpha_eps: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    """DAC Snake1d: `x + sin(alpha*x)^2 / (alpha + 1e-9)`."""
+    var ax = mul(x, alpha, ctx)
+    var sin_ax = sin_op(ax, ctx)
+    var sin_sq = mul(sin_ax, sin_ax, ctx)
+    var scaled = mul(sin_sq, inv_alpha_eps, ctx)
+    return add(x, scaled, ctx)

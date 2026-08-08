@@ -178,10 +178,12 @@ def sage_int8_mma_tile(
     return Tensor(out_buf^, [16, 8], STDtype.I32)
 
 
-def _sage_quant_block_bf16[S: Int, H: Int, BLK: Int](
+def _sage_quant_block_bf16[BLK: Int](
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     scales: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    S: Int,
+    H: Int,
 ):
     """One symmetric scale per BLK sequence rows, BSHD BF16 -> BHSD INT8."""
     var tid = Int(thread_idx.x)
@@ -245,13 +247,15 @@ def _sage_quant_block_bf16[S: Int, H: Int, BLK: Int](
         idx += _WARPS * 32
 
 
-def _sage_gather_v_bf16[S: Int, H: Int](
+def _sage_gather_v_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    S: Int,
+    H: Int,
 ):
     """Gather pipeline BSHD V into the BHSD layout used by cp.async."""
     var idx = Int(block_idx.x) * (_WARPS * 32) + Int(thread_idx.x)
-    comptime total = S * H * _HEAD_DIM
+    var total = S * H * _HEAD_DIM
     if idx < total:
         var d = idx % _HEAD_DIM
         var sh = idx // _HEAD_DIM
@@ -262,29 +266,15 @@ def _sage_gather_v_bf16[S: Int, H: Int](
         )
 
 
-def _sage_attention_int8_token_kernel[S: Int, H: Int](
-    q8: LayoutTensor[
-        DType.int8, Layout.row_major(S * H * _HEAD_DIM), MutAnyOrigin
-    ],
-    k8: LayoutTensor[
-        DType.int8, Layout.row_major(S * H * _HEAD_DIM), MutAnyOrigin
-    ],
-    qs: LayoutTensor[
-        DType.float32,
-        Layout.row_major(H * ceildiv(S, _Q_QUANT_BLOCK)),
-        MutAnyOrigin,
-    ],
-    ks: LayoutTensor[
-        DType.float32,
-        Layout.row_major(H * ceildiv(S, _K_QUANT_BLOCK)),
-        MutAnyOrigin,
-    ],
-    v: LayoutTensor[
-        DType.bfloat16, Layout.row_major(S * H * _HEAD_DIM), MutAnyOrigin
-    ],
-    o: LayoutTensor[
-        DType.bfloat16, Layout.row_major(S * H * _HEAD_DIM), MutAnyOrigin
-    ],
+def _sage_attention_int8_token_kernel(
+    q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
+    k8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
+    qs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    ks: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    v: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    S: Int,
+    H: Int,
     scale: Float32,
 ):
     """INT8 QK + online softmax + BF16 PV, tiled M128 x N64.
@@ -663,9 +653,7 @@ def _sage_attention_int8_token_kernel[S: Int, H: Int](
                 )
 
 
-def sage_attention_int8_fwd[
-    B: Int, S: Int, H: Int, Dh: Int
-](
+def sage_attention_int8_fwd_dynamic(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -679,26 +667,29 @@ def sage_attention_int8_fwd[
     in F32 and PV uses FP16 tensor cores. This surface fails loudly outside
     B=1,Dh=128 and never falls back to cuDNN.
     """
-    comptime if B != 1 or Dh != _HEAD_DIM:
-        raise Error("sage_attention_int8_fwd requires B=1, Dh=128")
     if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 \
             or v.dtype() != STDtype.BF16:
         raise Error("sage_attention_int8_fwd requires BF16 Q/K/V")
+    var qsh = q.shape()
+    var ksh = k.shape()
+    var vsh = v.shape()
+    if len(qsh) != 4 or ksh != qsh or vsh != qsh:
+        raise Error("sage_attention_int8_fwd shape mismatch")
+    var B = qsh[0]
+    var S = qsh[1]
+    var H = qsh[2]
+    var Dh = qsh[3]
+    if B != 1 or Dh != _HEAD_DIM:
+        raise Error("sage_attention_int8_fwd requires B=1, Dh=128")
     var want = List[Int]()
     want.append(B)
     want.append(S)
     want.append(H)
     want.append(Dh)
-    var qsh = q.shape()
-    var ksh = k.shape()
-    var vsh = v.shape()
-    if qsh != want or ksh != want or vsh != want:
-        raise Error("sage_attention_int8_fwd shape mismatch")
-
-    comptime rows = H * S
-    comptime elems = rows * Dh
-    comptime qscale_elems = H * ceildiv(S, _Q_QUANT_BLOCK)
-    comptime kscale_elems = H * ceildiv(S, _K_QUANT_BLOCK)
+    var rows = H * S
+    var elems = rows * Dh
+    var qscale_elems = H * ceildiv(S, _Q_QUANT_BLOCK)
+    var kscale_elems = H * ceildiv(S, _K_QUANT_BLOCK)
     var q8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
     var k8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
     var qs_buf = ctx.enqueue_create_buffer[DType.uint8](qscale_elems * 4)
@@ -742,53 +733,50 @@ def sage_attention_int8_fwd[
         out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl
     )
     ctx.enqueue_function[
-        _sage_quant_block_bf16[S, H, _Q_QUANT_BLOCK],
-        _sage_quant_block_bf16[S, H, _Q_QUANT_BLOCK],
+        _sage_quant_block_bf16[_Q_QUANT_BLOCK],
+        _sage_quant_block_bf16[_Q_QUANT_BLOCK],
     ](
-        Q, Q8u, QS,
+        Q, Q8u, QS, S, H,
         grid_dim=(ceildiv(S, _Q_QUANT_BLOCK), H),
         block_dim=_WARPS * 32,
     )
     ctx.enqueue_function[
-        _sage_quant_block_bf16[S, H, _K_QUANT_BLOCK],
-        _sage_quant_block_bf16[S, H, _K_QUANT_BLOCK],
+        _sage_quant_block_bf16[_K_QUANT_BLOCK],
+        _sage_quant_block_bf16[_K_QUANT_BLOCK],
     ](
-        K, K8u, KS,
+        K, K8u, KS, S, H,
         grid_dim=(ceildiv(S, _K_QUANT_BLOCK), H),
         block_dim=_WARPS * 32,
     )
     ctx.enqueue_function[
-        _sage_gather_v_bf16[S, H],
-        _sage_gather_v_bf16[S, H],
+        _sage_gather_v_bf16,
+        _sage_gather_v_bf16,
     ](
-        V, VBHSD,
+        V, VBHSD, S, H,
         grid_dim=ceildiv(elems, _WARPS * 32),
         block_dim=_WARPS * 32,
     )
-    var Q8s = LayoutTensor[
-        DType.int8, Layout.row_major(elems), MutAnyOrigin
-    ](q8_buf.unsafe_ptr().bitcast[Int8]())
-    var K8s = LayoutTensor[
-        DType.int8, Layout.row_major(elems), MutAnyOrigin
-    ](k8_buf.unsafe_ptr().bitcast[Int8]())
-    var QSs = LayoutTensor[
-        DType.float32, Layout.row_major(qscale_elems), MutAnyOrigin
-    ](qs_buf.unsafe_ptr().bitcast[Float32]())
-    var KSs = LayoutTensor[
-        DType.float32, Layout.row_major(kscale_elems), MutAnyOrigin
-    ](ks_buf.unsafe_ptr().bitcast[Float32]())
-    var Vs = LayoutTensor[
-        DType.bfloat16, Layout.row_major(elems), MutAnyOrigin
-    ](v_bhsd_buf.unsafe_ptr().bitcast[BFloat16]())
-    var Os = LayoutTensor[
-        DType.bfloat16, Layout.row_major(elems), MutAnyOrigin
-    ](out_buf.unsafe_ptr().bitcast[BFloat16]())
     ctx.enqueue_function[
-        _sage_attention_int8_token_kernel[S, H],
-        _sage_attention_int8_token_kernel[S, H],
+        _sage_attention_int8_token_kernel,
+        _sage_attention_int8_token_kernel,
     ](
-        Q8s, K8s, QSs, KSs, Vs, Os, scale,
+        Q8, K8, QS, KS, VBHSD, O, S, H, scale,
         grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
         block_dim=_WARPS * 32,
     )
     return Tensor(out_buf^, want^, STDtype.BF16)
+
+
+def sage_attention_int8_fwd[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Static-shape compatibility wrapper around runtime-shape Sage."""
+    comptime if B != 1 or Dh != _HEAD_DIM:
+        raise Error("sage_attention_int8_fwd requires B=1, Dh=128")
+    return sage_attention_int8_fwd_dynamic(q, k, v, scale, ctx)

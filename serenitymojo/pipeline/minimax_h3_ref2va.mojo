@@ -144,7 +144,7 @@ from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.io.ffi import sys_system
+from serenitymojo.io.system_command import sys_system
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts
@@ -154,6 +154,7 @@ from serenitymojo.io.safetensors_writer import (
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
 from serenitymojo.models.minimax_h3.packing import (
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -172,6 +173,7 @@ from serenitymojo.models.minimax_h3.packing_ref2va import (
     MINIMAX_H3_REF_VIDEO,
     MiniMaxH3PreparedReference,
     minimax_h3_resolve_reference_image_size,
+    minimax_h3_resample_reference_repeats,
     minimax_h3_sample_reference_video_frames,
     minimax_h3_trim_reference_num_frames,
 )
@@ -186,7 +188,11 @@ from serenitymojo.models.minimax_h3.rearrange import minimax_h3_patchify_video
 from serenitymojo.models.minimax_h3.audio_encoder import (
     MiniMaxH3AudioEncoderConfig,
     MiniMaxH3AudioEncoderWeights,
-    minimax_h3_audio_encode,
+)
+from serenitymojo.models.minimax_h3_device.audio_encoder_device import (
+    MiniMaxH3AudioEncoderDeviceWeights,
+    minimax_h3_audio_encode_device,
+    minimax_h3_audio_encoder_device_weights,
 )
 from serenitymojo.models.dit.minimax_h3_ref_geometry import (
     MiniMaxH3ReferenceMedia,
@@ -207,9 +213,9 @@ from serenitymojo.pipeline.minimax_h3_media_in import (
     minimax_h3_ffmpeg_extract_rgb,
     minimax_h3_ffmpeg_read_image,
     minimax_h3_ffprobe_image_geometry,
-    minimax_h3_ffprobe_video_geometry,
     minimax_h3_has_audio_stream,
     minimax_h3_jpeg_exif_orientation,
+    minimax_h3_read_rgb_frames,
     minimax_h3_read_wav,
 )
 from serenitymojo.models.vae.minimax_h3_ref_encode import (
@@ -268,6 +274,7 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_tensor_names,
     minimax_h3_expected_shape,
     minimax_h3_block_forward,
+    minimax_h3_block_forward_dynamic,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
@@ -279,6 +286,7 @@ from serenitymojo.models.dit.minimax_h3_fp8_resident import (
     MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3ResidentFp8,
     minimax_h3_resident_block_weights,
+    minimax_h3_resident_block_weights_groupwise,
     minimax_h3_resident_block_weights_w8a8,
 )
 from serenitymojo.models.dit.minimax_h3_modcache import (
@@ -289,12 +297,25 @@ from serenitymojo.models.dit.minimax_h3_modcache import (
 from serenitymojo.models.dit.minimax_h3_runtime_cache import (
     load_minimax_h3_modcache,
     load_minimax_h3_resident_cache,
+    reload_minimax_h3_resident_groupwise_block,
     reload_minimax_h3_resident_w8a8_block,
     save_minimax_h3_modcache,
+)
+from serenitymojo.models.dit.minimax_h3_step_cache import (
+    MINIMAX_H3_CACHE_BACK_BLOCKS,
+    MINIMAX_H3_CACHE_FRONT_BLOCKS,
+    MiniMaxH3QuantizedActivation,
+    MiniMaxH3StepCache,
+    minimax_h3_cache_apply_residual_inplace,
+    minimax_h3_cache_probe_rows,
+    minimax_h3_cache_quantize_activation,
+    minimax_h3_cache_should_reuse,
+    minimax_h3_cache_store_middle_residual,
 )
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_frontend_embed,
+    minimax_h3_frontend_embed_dynamic,
     minimax_h3_final_layer,
     minimax_h3_timestep_embedding,
 )
@@ -331,6 +352,7 @@ comptime GROUPWISE_RUNTIME_CACHE = (
     RUNTIME_CACHE_DIR
     + "/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors"
 )
+comptime GROUPWISE_RUNTIME_CACHE_BLOCKS = 48
 comptime W8A8_RUNTIME_CACHE = (
     RUNTIME_CACHE_DIR + "/resident_w8a8_row_blocks_50.safetensors"
 )
@@ -498,17 +520,19 @@ def _validate_reference_counts(
         )
 
 
-def _preflight_geometry() raises:
-    if (FRAMES - 5) % 17 != 0:
+def _preflight_geometry(width: Int, height: Int, frames: Int) raises:
+    if (frames - 5) % 17 != 0:
         raise Error(
-            String("minimax_h3_ref2va: FRAMES=") + String(FRAMES)
+            String("minimax_h3_ref2va: frames=") + String(frames)
             + " is not of the form 17n+5 (the video VAE's chunk size); edit"
             " H3_FRAMES and rebuild — e.g. 5, 22, 39, 56, ..."
         )
-    if HEIGHT <= 0 or WIDTH <= 0 or HEIGHT % 32 != 0 or WIDTH % 32 != 0:
+    if height < 32 or width < 32 or height > 2048 or width > 2048 \
+            or height % 32 != 0 or width % 32 != 0:
         raise Error(
             String("minimax_h3_ref2va: H3_HEIGHT/H3_WIDTH must be positive")
-            + " multiples of 32; got " + String(WIDTH) + "x" + String(HEIGHT)
+            + " multiples of 32 in [32,2048]; got "
+            + String(width) + "x" + String(height)
         )
     if TEXT_TOKENS <= 0:
         raise Error("minimax_h3_ref2va: H3_TEXT_TOKENS must be positive")
@@ -517,7 +541,7 @@ def _preflight_geometry() raises:
             "minimax_h3_ref2va: H3_REF_IMAGE_SHORT_EDGE must be a positive"
             " multiple of 32"
         )
-    if NUM_LATENT_FRAMES <= 0:
+    if frames < 5 or frames > 362:
         raise Error(
             "minimax_h3_ref2va: derived NUM_LATENT_FRAMES is non-positive —"
             " rebuild with a larger H3_FRAMES"
@@ -564,13 +588,13 @@ def _preflight_checkpoint() raises:
     print("  preflight: tokenizer", String(TOKENIZER_DIR))
 
 
-def _h3_ref_audio_sample_cap() -> Int:
+def _h3_ref_audio_sample_cap(target_frames: Int) -> Int:
     """`int(max_duration * sample_rate)` with `max_duration = num_frames / 24`
     — the vendor's own truncation of EVERY reference waveform to the generated
     duration (`prepare_reference_waveform` call, before_encoder.py:374-378;
     the truncation itself is packing_ref2va.py:740). Applies to a standalone
     audio reference and to a video's soundtrack alike."""
-    return Int(Float64(FRAMES) / 24.0 * Float64(AUDIO_SAMPLE_RATE))
+    return Int(Float64(target_frames) / 24.0 * Float64(AUDIO_SAMPLE_RATE))
 
 
 def _h3_ref2va_image_size(width: Int, height: Int) raises -> List[Int]:
@@ -599,7 +623,7 @@ def _h3_ref2va_image_size(width: Int, height: Int) raises -> List[Int]:
 
 
 def _probe_reference_media(
-    spec: MiniMaxH3ReferenceSpec, scratch_path: String
+    spec: MiniMaxH3ReferenceSpec, scratch_path: String, target_frames: Int
 ) raises -> MiniMaxH3ReferenceMedia:
     """Read one reference's media geometry without running a model."""
     if spec.kind == MINIMAX_H3_REF_AUDIO:
@@ -618,7 +642,7 @@ def _probe_reference_media(
         # this file did exactly that (full 8.5 s -> 682 rows where the vendor
         # law gives 74).
         var planned = wave.num_samples
-        var cap = _h3_ref_audio_sample_cap()
+        var cap = _h3_ref_audio_sample_cap(target_frames)
         if planned > cap:
             planned = cap
         return MiniMaxH3ReferenceMedia(
@@ -645,29 +669,49 @@ def _probe_reference_media(
             MINIMAX_H3_REF_IMAGE, height, width, 1, 0
         )
 
-    var geometry = minimax_h3_ffprobe_video_geometry(
-        spec.path, spec.path + String(".h3probe")
+    # Decode once before the packed plan is built. Reference length is part of
+    # both the prompt presentation (2 fps vision timestamps) and the rotary
+    # layout, so substituting the target length here rejects shorter references
+    # later and changes the request semantics. The cached rgb24 pair is reused
+    # by `_h3_ref2va_prepare_video_reference` for the actual encode.
+    var frames = minimax_h3_ffmpeg_extract_rgb(
+        spec.path,
+        scratch_path + String(".rgb"),
+        scratch_path + String(".rgb.json"),
+        scratch_path + String(".h3probe"),
     )
-    var width = Int(geometry[0])
-    var height = Int(geometry[1])
-    var fps = geometry[2]
-    # The frame count is not read here: the exact count only follows from the
-    # rawvideo dump (see minimax_h3_ffmpeg_extract_rgb), and this stage is a
-    # plan, not a decode. The 24 fps grid bound is what the layout needs.
-    var approx_frames = FRAMES
+    var grid_frames = frames.num_frames
+    if frames.fps != Float64(24.0):
+        var repeats = minimax_h3_resample_reference_repeats(
+            frames.num_frames, frames.fps
+        )
+        grid_frames = 0
+        for i in range(len(repeats)):
+            grid_frames += repeats[i]
+    if grid_frames > target_frames:
+        grid_frames = target_frames
+
     var num_audio_samples = 0
     if minimax_h3_has_audio_stream(spec.path):
-        # A video reference conditions on its own soundtrack, whose sample count
-        # is resolved at decode. Planned at the target duration, which is the
-        # cap the vendor applies anyway (same law as the standalone audio
-        # reference — before_encoder.py:374-378).
-        num_audio_samples = _h3_ref_audio_sample_cap()
+        # The vendor truncates a soundtrack to the target duration but never
+        # pads a shorter one. Decode now so the plan reserves the real latent
+        # count; the cached WAV is reused by the GPU AudioVAE stage.
+        var wave = minimax_h3_ffmpeg_decode_audio(
+            spec.path, scratch_path + String(".wav"),
+            AUDIO_SAMPLE_RATE, 2,
+        )
+        num_audio_samples = wave.num_samples
+        var cap = _h3_ref_audio_sample_cap(target_frames)
+        if num_audio_samples > cap:
+            num_audio_samples = cap
     print(
-        "    ", spec.path, ":", width, "x", height, "@", fps, "fps, audio:",
+        "    ", spec.path, ":", frames.width, "x", frames.height, "@",
+        frames.fps, "fps ->", grid_frames, "frame(s) on 24 fps grid, audio:",
         "yes" if num_audio_samples > 0 else "no",
     )
     return MiniMaxH3ReferenceMedia(
-        MINIMAX_H3_REF_VIDEO, height, width, approx_frames, num_audio_samples
+        MINIMAX_H3_REF_VIDEO, frames.height, frames.width, grid_frames,
+        num_audio_samples,
     )
 
 
@@ -700,7 +744,7 @@ def _h3_ref2va_prepare_image_reference(
 
 
 def _h3_ref2va_prepare_video_reference(
-    spec: MiniMaxH3ReferenceSpec
+    spec: MiniMaxH3ReferenceSpec, target_frames: Int, scratch_path: String
 ) raises -> MiniMaxH3RgbFrames:
     """Decode one video reference and put it through the vendor's prep chain:
     ffmpeg -> rgb24 (unit A), 24 fps resample (before_encoder.py:371 runs it
@@ -712,21 +756,18 @@ def _h3_ref2va_prepare_video_reference(
     PREPARED frames feed BOTH the video VAE (condition rows) and the Qwen3-VL
     conditioner (2 fps sampled vision blocks), so preparing them twice would
     invite the two consumers to drift."""
-    var rgb_path = spec.path + String(".rgb")
-    var sidecar_path = spec.path + String(".rgb.json")
-    var scratch_path = spec.path + String(".h3probe")
-    print("    decoding", spec.path, "-> rgb24")
-    var frames = minimax_h3_ffmpeg_extract_rgb(
-        spec.path, rgb_path, sidecar_path, scratch_path
+    print("    reading cached rgb24 for", spec.path)
+    var frames = minimax_h3_read_rgb_frames(
+        scratch_path + String(".rgb"), scratch_path + String(".rgb.json")
     )
     print(
         "      ", frames.num_frames, "frames", frames.width, "x",
         frames.height, "@", frames.fps, "fps",
     )
-    var on_grid = minimax_h3_resample_reference_frames(frames, FRAMES)
+    var on_grid = minimax_h3_resample_reference_frames(frames, target_frames)
     if frames.fps != Float64(24.0):
         print("      24 fps resample ->", on_grid.num_frames, "frames kept")
-    var prepared = minimax_h3_prepare_reference_frames(on_grid, FRAMES)
+    var prepared = minimax_h3_prepare_reference_frames(on_grid, target_frames)
     print(
         "      canvas resize ->", prepared.num_frames, "frames",
         prepared.width, "x", prepared.height,
@@ -737,6 +778,8 @@ def _h3_ref2va_prepare_video_reference(
 def _minimax_h3_encode_references(
     specs: List[MiniMaxH3ReferenceSpec],
     references: List[MiniMaxH3PreparedReference],
+    target_frames: Int,
+    scratch_dir: String,
 ) raises:
     """Reference encode, stage 2 — the CPU prep chain, then THE GATED SEAM.
 
@@ -775,7 +818,10 @@ def _minimax_h3_encode_references(
     for i in range(len(specs)):
         if specs[i].kind != MINIMAX_H3_REF_VIDEO:
             continue
-        var prepared = _h3_ref2va_prepare_video_reference(specs[i])
+        var prepared = _h3_ref2va_prepare_video_reference(
+            specs[i], target_frames,
+            scratch_dir + String("/ref_probe_") + String(i),
+        )
 
         # `frames[: trim_reference_num_frames(...)]` (encoders.py:574): snap
         # DOWN to a 17n+5 the VAE encodes without padding. The plan
@@ -791,9 +837,8 @@ def _minimax_h3_encode_references(
                 + " decodes to " + String(prepared.num_frames)
                 + " frames on the 24 fps grid but the VAE's 17n+5 chunking"
                 " needs " + String(encode_frames)
-                + " — shorter than the plan assumed. The plan probes geometry"
-                " only (no frame count); supply a reference of at least 22"
-                " frames at 24 fps."
+                + " — the cached decode no longer matches the exact frame"
+                " count used to build the plan"
             )
         var frame_bytes = prepared.height * prepared.width * 3
         var kept = List[UInt8]()
@@ -892,6 +937,7 @@ def _minimax_h3_ref2va_real_presentation(
     specs: List[MiniMaxH3ReferenceSpec],
     medias: List[MiniMaxH3ReferenceMedia],
     prompt: String,
+    target_frames: Int,
 ) raises -> MiniMaxH3Ref2VARealPresentation:
     """Host-only: tokenizer + geometry, no pixels, no weights, no GPU.
 
@@ -936,8 +982,8 @@ def _minimax_h3_ref2va_real_presentation(
                 Float64(medias[i].pixel_width), Float64(medias[i].pixel_height)
             )
             var conditioner_frames = medias[i].num_frames
-            if conditioner_frames > FRAMES:
-                conditioner_frames = FRAMES
+            if conditioner_frames > target_frames:
+                conditioner_frames = target_frames
             var sampled = minimax_h3_sample_reference_video_frames(
                 conditioner_frames
             )
@@ -1035,7 +1081,8 @@ def _h3_ref2va_audio_latents_std() -> List[Float32]:
 def _h3_ref2va_load_audio_encoder_weights() raises -> MiniMaxH3AudioEncoderWeights:
     """The audio VAE's ENCODER-side tensors as host F32 lists — `encoder.*`,
     `pre_block.*`, `mean_proj.*` (~86M params), the exact set
-    `minimax_h3_audio_encode` reads. The decoder's 65M params and the frozen
+    uploaded by `minimax_h3_audio_encoder_device_weights`. The decoder's 65M
+    params and the frozen
     `zero_k_bias` buffer are deliberately not loaded (the port never reads
     them — models/minimax_h3/parity/minimax_h3_audio_real_weights_parity.mojo
     measured zero_k_bias at max|.| = 0.0)."""
@@ -1081,11 +1128,13 @@ def _h3_ref2va_audio_encoder_config() raises -> MiniMaxH3AudioEncoderConfig:
 
 
 def _h3_ref2va_reference_audio_rows(
-    weights: MiniMaxH3AudioEncoderWeights,
+    weights: MiniMaxH3AudioEncoderDeviceWeights,
     enc_config: MiniMaxH3AudioEncoderConfig,
     wave: MiniMaxH3Waveform,
     want_latents: Int,
     label: String,
+    target_frames: Int,
+    ctx: DeviceContext,
 ) raises -> List[Float32]:
     """One audio-bearing reference's CLEAN condition rows.
 
@@ -1095,15 +1144,16 @@ def _h3_ref2va_reference_audio_rows(
     audio VAE" — take the posterior MODE (the mean head; never sampled, never
     fp16-rounded, never noise-mixed), transpose, normalize per channel, pack
     channel-major. The transpose+normalize+pack is the GATED
-    `minimax_h3_audio_condition_rows`; the encode itself is the GATED host
-    `minimax_h3_audio_encode` (real-weights gate: max_abs <= 2e-4)."""
+    `minimax_h3_audio_condition_rows`; every learned encoder operation is the
+    gated GPU-only `minimax_h3_audio_encode_device` path (real-weight final
+    mean cosine 0.9999999996)."""
     if wave.sample_rate != AUDIO_SAMPLE_RATE:
         raise Error(
             String("minimax_h3_ref2va: ") + label + " is at "
             + String(wave.sample_rate) + " Hz, the audio VAE needs "
             + String(AUDIO_SAMPLE_RATE)
         )
-    var cap = _h3_ref_audio_sample_cap()
+    var cap = _h3_ref_audio_sample_cap(target_frames)
     var kept = wave.num_samples
     if kept > cap:
         kept = cap
@@ -1119,7 +1169,9 @@ def _h3_ref2va_reference_audio_rows(
         var samples = List[Float32](capacity=kept)
         for i in range(kept):
             samples.append(wave.samples[src_ch * wave.num_samples + i])
-        var latents = minimax_h3_audio_encode(weights, enc_config, samples)
+        var latents = minimax_h3_audio_encode_device(
+            weights, enc_config, samples, ctx
+        )
         if latents_t < 0:
             latents_t = latents.frames
         if latents.frames != latents_t:
@@ -1659,8 +1711,15 @@ def _minimax_h3_ref2va_generate(
     out_dir: String,
     attention_backend: Int,
     attention_backend_name: String,
+    step_cache_enabled: Bool,
+    step_cache_name: String,
     resident_scheme: Int,
     resident_backend_name: String,
+    resident_blocks_requested: Int,
+    target_frames: Int,
+    num_latent_frames: Int,
+    latent_h: Int,
+    latent_w: Int,
 ) raises:
     """The generation tail. Two shapes:
 
@@ -1690,27 +1749,18 @@ def _minimax_h3_ref2va_generate(
             _minimax_h3_ref2va_generate_real(
                 plan, specs, references, real_pres.value(), steps, seed,
                 out_dir, attention_backend, attention_backend_name,
+                step_cache_enabled, step_cache_name,
                 resident_scheme, resident_backend_name,
+                resident_blocks_requested,
+                target_frames, num_latent_frames, latent_h, latent_w,
             )
             return
         else:
-            _minimax_h3_encode_references(specs, references)
+            _minimax_h3_encode_references(
+                specs, references, target_frames, out_dir
+            )
             return
 
-    if H3_REF_SEQ_LEN != plan.sequence_length():
-        raise Error(
-            String("minimax_h3_ref2va: this request's plan.sequence_length()")
-            + " is " + String(plan.sequence_length()) + " but this binary is"
-            " compiled for H3_REF_SEQ_LEN=" + String(H3_REF_SEQ_LEN)
-            + " (default 1, i.e. never set) — minimax_h3_block_forward's"
-            " self-attention instantiates its row count S at COMPTIME"
-            " (models/dit/minimax_h3_dit.mojo — the same reason"
-            " H3_TEXT_TOKENS is comptime in this file already), and a ref2va"
-            " request's sequence_length depends on the references, so it"
-            " cannot be read off the request at runtime the way t2va's fixed"
-            " SEQ_LEN can. Rebuild with -D H3_REF_SEQ_LEN="
-            + String(plan.sequence_length())
-        )
     if plan.num_text_tokens != TEXT_TOKENS:
         raise Error(
             "minimax_h3_ref2va: plan.num_text_tokens != H3_TEXT_TOKENS"
@@ -1794,7 +1844,8 @@ def _minimax_h3_ref2va_generate(
         plan, config, transformer_shards, cond[0], cond[1], video_target^,
         audio_target^, text_rows, steps, seed, out_dir, True, injected,
         condition_rows_path, attention_backend, attention_backend_name, ctx,
-        resident_scheme, resident_backend_name,
+        step_cache_enabled, step_cache_name, resident_scheme,
+        resident_backend_name, resident_blocks_requested,
     )
 
 
@@ -1816,8 +1867,11 @@ def _minimax_h3_ref2va_denoise_and_save(
     attention_backend: Int,
     attention_backend_name: String,
     ctx: DeviceContext,
+    step_cache_enabled: Bool,
+    step_cache_name: String,
     resident_scheme: Int,
     resident_backend_name: String,
+    resident_blocks_requested: Int,
 ) raises:
     """The SHARED generation tail: RoPE, dual schedule, the 4-row-per-step
     modulation cache, the real `config.num_layers`-block streamed denoise
@@ -1900,17 +1954,19 @@ def _minimax_h3_ref2va_denoise_and_save(
         Float64(t_mod1 - t_mod0) / 1.0e9, "s)",
     )
 
-    # INT8 product builds keep a conservative four-block prefix resident and
-    # either stream BF16 (quality) or reload one direct-W8A8 tail block into a
-    # reusable allocation (fast). The cache belongs to Ref2VA's transformer;
-    # no FL2VA DiT weights are reused across this model boundary.
+    # INT8 product builds select a bounded resident prefix at runtime. Long
+    # sequences may select zero prefix blocks and reload one direct-W8A8 tail
+    # block into a reusable allocation, preserving activation/workspace
+    # headroom without falling back to CPU model execution. The cache belongs
+    # to Ref2VA's transformer; no FL2VA DiT weights are reused here.
     var resident_cache_path = String("")
     var resident = Optional[MiniMaxH3ResidentFp8](None)
     var reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](None)
+    var reusable_groupwise_tail = Optional[MiniMaxH3ResidentFp8](None)
     comptime if DIT_INT8_RESIDENT != 0:
-        if DIT_RESIDENT_BLOCKS < 1 or DIT_RESIDENT_BLOCKS > config.num_layers:
+        if resident_blocks_requested < 0 or resident_blocks_requested > config.num_layers:
             raise Error(
-                String("minimax_h3_ref2va: H3_RESIDENT_BLOCKS must be in 1..")
+                String("minimax_h3_ref2va: --resident-blocks must be in 0..")
                 + String(config.num_layers)
             )
         resident_cache_path = (
@@ -1922,32 +1978,45 @@ def _minimax_h3_ref2va_denoise_and_save(
         resident = Optional[MiniMaxH3ResidentFp8](
             load_minimax_h3_resident_cache(
                 resident_cache_path, String(TRANSFORMER_INDEX), config, ctx,
-                DIT_RESIDENT_BLOCKS, 0, resident_scheme,
+                resident_blocks_requested, 0, resident_scheme,
+                resident_scheme == MINIMAX_H3_RESIDENT_INT8,
             )
         )
         print(
             "  resident cache: HIT", resident_cache_path,
-            " blocks=", DIT_RESIDENT_BLOCKS,
+            " blocks=", resident_blocks_requested,
             " GiB=", Float64(resident.value().resident_bytes())
                 / (1024.0 * 1024.0 * 1024.0),
             " load_s=", Float64(perf_counter_ns() - t_res0) / 1.0e9,
         )
         if (
             resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
-            and DIT_RESIDENT_BLOCKS < config.num_layers
+            and resident_blocks_requested < config.num_layers
         ):
             reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](
                 load_minimax_h3_resident_cache(
                     resident_cache_path, String(TRANSFORMER_INDEX), config,
-                    ctx, 1, DIT_RESIDENT_BLOCKS, resident_scheme,
+                    ctx, 1, resident_blocks_requested, resident_scheme,
                 )
             )
             print("  resident cache: reusable one-block W8A8 tail ready")
+        elif (
+            resident_scheme == MINIMAX_H3_RESIDENT_INT8
+            and resident_blocks_requested < GROUPWISE_RUNTIME_CACHE_BLOCKS
+        ):
+            reusable_groupwise_tail = Optional[MiniMaxH3ResidentFp8](
+                load_minimax_h3_resident_cache(
+                    resident_cache_path, String(TRANSFORMER_INDEX), config,
+                    ctx, 1, resident_blocks_requested, resident_scheme, True,
+                )
+            )
+            print("  resident cache: reusable one-block groupwise tail ready")
 
     # ── Denoise loop. Condition rows (`cond_video`/`cond_audio`) are PINNED
     # — never re-mixed, never stepped. Target rows are the F32 accumulating
     # Euler state, exactly like t2va's video_state/audio_state. ───────────
     var t_denoise0 = perf_counter_ns()
+    var step_cache = MiniMaxH3StepCache(step_cache_enabled)
 
     for i in range(num_steps):
         var t_step0 = perf_counter_ns()
@@ -1965,7 +2034,9 @@ def _minimax_h3_ref2va_denoise_and_save(
 
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
-        var embed = minimax_h3_frontend_embed[TEXT_TOKENS, MINIMAX_H3_HEADS, MINIMAX_H3_HEAD_DIM](
+        var embed = minimax_h3_frontend_embed_dynamic[
+            MINIMAX_H3_HEADS, MINIMAX_H3_HEAD_DIM
+        ](
             video_rows_combined, audio_rows_combined, text_rows, placeholder_ts,
             plan.layout.video_indices, plan.layout.audio_indices, plan.layout.text_indices,
             plan.sequence_length(), frontend_w, config, ctx,
@@ -1976,7 +2047,16 @@ def _minimax_h3_ref2va_denoise_and_save(
         # ([S,hidden]) but `minimax_h3_block_forward` needs RANK 3
         # ([1,S,hidden]). Reshape in immediately before the block loop,
         # back out immediately after.
-        var hidden3 = reshape(embed.hidden, [1, H3_REF_SEQ_LEN, config.hidden_size], ctx)
+        var hidden3 = reshape(
+            embed.hidden, [1, plan.sequence_length(), config.hidden_size], ctx
+        )
+        var cache_probe_before = List[Float32]()
+        if step_cache.enabled:
+            cache_probe_before = minimax_h3_cache_probe_rows(
+                hidden3, plan.sequence_length(), config.hidden_size, ctx
+            )
+        var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
+        var reused_middle = False
 
         # The real streamed-block stack is gated behind `H3_REF2VA_REAL_
         # BLOCKS` (see that comptime's own header note): `minimax_h3_block_
@@ -1991,11 +2071,42 @@ def _minimax_h3_ref2va_denoise_and_save(
         # `sdpa_nomask`, which needs no shim) — already ran for real.
         comptime if H3_REF2VA_REAL_BLOCKS != 0:
             for layer in range(config.num_layers):
+                if (
+                    step_cache.enabled
+                    and reused_middle
+                    and layer >= MINIMAX_H3_CACHE_FRONT_BLOCKS
+                    and layer
+                    < config.num_layers - MINIMAX_H3_CACHE_BACK_BLOCKS
+                ):
+                    continue
+                # The final two layers intentionally remain BF16 for quality.
+                # Drop the reusable groupwise cache before loading them so
+                # its packed block does not overlap the larger BF16 block.
+                comptime if DIT_INT8_RESIDENT != 0:
+                    if (
+                        resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                        and layer == GROUPWISE_RUNTIME_CACHE_BLOCKS
+                        and reusable_groupwise_tail
+                    ):
+                        reusable_groupwise_tail = Optional[
+                            MiniMaxH3ResidentFp8
+                        ](None)
+                        ctx.synchronize()
+                        cu_mempool_trim_current(0)
+                        ctx.synchronize()
+                        print(
+                            "  resident cache: released groupwise tail before"
+                            " BF16 quality blocks"
+                        )
                 var block_w: Dict[String, ArcPointer[Tensor]]
                 comptime if DIT_INT8_RESIDENT != 0:
                     if layer < len(resident.value().blocks):
                         if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
                             block_w = minimax_h3_resident_block_weights_w8a8(
+                                resident.value(), layer, config, ctx
+                            )
+                        elif resident_scheme == MINIMAX_H3_RESIDENT_INT8:
+                            block_w = minimax_h3_resident_block_weights_groupwise(
                                 resident.value(), layer, config, ctx
                             )
                         else:
@@ -2010,6 +2121,17 @@ def _minimax_h3_ref2va_denoise_and_save(
                         block_w = minimax_h3_resident_block_weights_w8a8(
                             reusable_w8a8_tail.value(), layer, config, ctx
                         )
+                    elif (
+                        resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                        and layer < GROUPWISE_RUNTIME_CACHE_BLOCKS
+                    ):
+                        reload_minimax_h3_resident_groupwise_block(
+                            reusable_groupwise_tail.value(), resident_cache_path,
+                            String(TRANSFORMER_INDEX), config, layer, ctx,
+                        )
+                        block_w = minimax_h3_resident_block_weights_groupwise(
+                            reusable_groupwise_tail.value(), layer, config, ctx
+                        )
                     else:
                         block_w = minimax_h3_load_block_device(
                             transformer_shards, layer, config, ctx
@@ -2018,21 +2140,75 @@ def _minimax_h3_ref2va_denoise_and_save(
                     block_w = minimax_h3_load_block_device(
                         transformer_shards, layer, config, ctx
                     )
-                hidden3 = minimax_h3_block_forward[H3_REF_SEQ_LEN, MINIMAX_H3_HEADS, MINIMAX_H3_HEAD_DIM](
+                hidden3 = minimax_h3_block_forward_dynamic[
+                    MINIMAX_H3_HEADS, MINIMAX_H3_HEAD_DIM
+                ](
                     hidden3, block_w, layer, config, modcache.block_mod[layer][],
                     block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
                     attention_backend,
                 )
+                block_w.clear()
+                if (
+                    step_cache.enabled
+                    and layer == MINIMAX_H3_CACHE_FRONT_BLOCKS - 1
+                ):
+                    var cache_probe_after = minimax_h3_cache_probe_rows(
+                        hidden3, plan.sequence_length(), config.hidden_size, ctx
+                    )
+                    reused_middle = minimax_h3_cache_should_reuse(
+                        i, cache_probe_before, cache_probe_after, step_cache
+                    )
+                    if reused_middle:
+                        minimax_h3_cache_apply_residual_inplace(
+                            hidden3, step_cache, ctx
+                        )
+                        print(
+                            "  cache-dit: step=", i + 1,
+                            " action=reuse-middle residual_diff=",
+                            step_cache.last_residual_diff,
+                        )
+                    elif step_cache.enabled:
+                        first_block_snapshot = Optional[
+                            MiniMaxH3QuantizedActivation
+                        ](minimax_h3_cache_quantize_activation(hidden3, ctx))
+                        print(
+                            "  cache-dit: step=", i + 1,
+                            " action=full-refresh residual_diff=",
+                            step_cache.last_residual_diff,
+                        )
+                if (
+                    step_cache.enabled
+                    and not reused_middle
+                    and layer
+                    == config.num_layers - MINIMAX_H3_CACHE_BACK_BLOCKS - 1
+                ):
+                    if not first_block_snapshot:
+                        raise Error(
+                            "MiniMax-H3 Cache-DiT refresh has no front snapshot"
+                        )
+                    minimax_h3_cache_store_middle_residual(
+                        hidden3, first_block_snapshot.value(), step_cache, ctx
+                    )
+                # Long Ref2VA sequences can leave several blocks' completed
+                # async temporaries resident in MAX's CUDA pool.  Bound that
+                # high-water mark at the natural transformer-block boundary;
+                # operations *within* each block remain asynchronous.  The
+                # 48k threshold covers the released 15-second square canvas
+                # while leaving short generations on the faster async path.
+                if plan.sequence_length() >= 48000:
+                    ctx.synchronize()
+                    cu_mempool_trim_current(0)
                 # `block_w` drops here: one block's ~0.77 GiB bf16 is freed
                 # before the next layer's load, exactly like t2va.
 
-            var hidden2 = reshape(hidden3, [H3_REF_SEQ_LEN, config.hidden_size], ctx)
+            var hidden2 = reshape(
+                hidden3, [plan.sequence_length(), config.hidden_size], ctx
+            )
             var frontend_out = minimax_h3_final_layer(
                 hidden2, modcache.final_mod[], global_row,
                 plan.layout.video_indices, plan.layout.audio_indices,
                 frontend_w, config, ctx,
             )
-
             # EULER ON TARGET ROWS ONLY. `frontend_out.video_out`/`.audio_out`
             # cover ALL video/audio rows (condition + target, condition rows
             # FIRST — this file's own MiniMaxH3Ref2VAPlan header). Slice off
@@ -2109,6 +2285,12 @@ def _minimax_h3_ref2va_denoise_and_save(
     var t_denoise1 = perf_counter_ns()
     print("  saved final latents ->", out_dir + "/latents.safetensors")
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")
+    if step_cache.enabled:
+        print(
+            "  cache-dit summary: full=", step_cache.full_evaluations,
+            " cached=", step_cache.cached_evaluations,
+            " residual_bytes=", step_cache.residual_bytes(),
+        )
 
     # ── Result JSON — Stage D banner (partial) / REAL record, persisted. ───
     var result_body = String("{\n")
@@ -2143,11 +2325,17 @@ def _minimax_h3_ref2va_denoise_and_save(
     result_body += String("  \"sequence_length\":") + String(plan.sequence_length()) + String(",\n")
     result_body += String("  \"attention_backend\":\"") \
         + attention_backend_name + String("\",\n")
+    result_body += String("  \"step_cache\":\"") \
+        + step_cache_name + String("\",\n")
+    result_body += String("  \"step_cache_full_evaluations\":") \
+        + String(step_cache.full_evaluations) + String(",\n")
+    result_body += String("  \"step_cache_cached_evaluations\":") \
+        + String(step_cache.cached_evaluations) + String(",\n")
     comptime if DIT_INT8_RESIDENT != 0:
         result_body += String("  \"weight_storage\":\"resident-int8-") \
             + resident_backend_name + String("\",\n")
         result_body += String("  \"resident_blocks\":") \
-            + String(DIT_RESIDENT_BLOCKS) + String(",\n")
+            + String(resident_blocks_requested) + String(",\n")
     else:
         result_body += String("  \"weight_storage\":\"streamed-bf16\",\n")
     result_body += String("  \"reference_image_short_edge\":") \
@@ -2198,8 +2386,15 @@ def _minimax_h3_ref2va_generate_real(
     out_dir: String,
     attention_backend: Int,
     attention_backend_name: String,
+    step_cache_enabled: Bool,
+    step_cache_name: String,
     resident_scheme: Int,
     resident_backend_name: String,
+    resident_blocks_requested: Int,
+    target_frames: Int,
+    num_latent_frames: Int,
+    latent_h: Int,
+    latent_w: Int,
 ) raises:
     """THE REAL ref2va generation — every stage the partial mode stubbed,
     wired to its gated implementation:
@@ -2221,20 +2416,6 @@ def _minimax_h3_ref2va_generate_real(
                      (packing.py:511-515)
       denoise        the SAME shared tail the gated partial run used at
                      S=17916."""
-    # ── [0] discovery: both comptime numbers in ONE message ──────────────
-    if plan.num_text_tokens != TEXT_TOKENS or H3_REF_SEQ_LEN != plan.sequence_length():
-        raise Error(
-            String("minimax_h3_ref2va: REAL run discovery — this request's")
-            + " presentation is " + String(plan.num_text_tokens)
-            + " text tokens and its packed sequence_length is "
-            + String(plan.sequence_length()) + ", but this binary is compiled"
-            " for H3_TEXT_TOKENS=" + String(TEXT_TOKENS) + " / H3_REF_SEQ_LEN="
-            + String(H3_REF_SEQ_LEN) + " (both COMPTIME: S instantiates the"
-            " self-attention row count). Rebuild with -D H3_TEXT_TOKENS="
-            + String(plan.num_text_tokens) + " -D H3_REF_SEQ_LEN="
-            + String(plan.sequence_length())
-        )
-
     var config = minimax_h3_released_config()
     config.validate()
 
@@ -2271,17 +2452,10 @@ def _minimax_h3_ref2va_generate_real(
                 _h3_ref2va_prepare_image_reference(specs[i], out_dir, i)
             )
         elif specs[i].kind == MINIMAX_H3_REF_VIDEO:
-            var prepared = _h3_ref2va_prepare_video_reference(specs[i])
-            # The presentation's block timestamps were computed from the
-            # TARGET frame count; a shorter reference shifts every label.
-            if prepared.num_frames != FRAMES:
-                raise Error(
-                    String("minimax_h3_ref2va: reference ") + specs[i].path
-                    + " prepared to " + String(prepared.num_frames)
-                    + " frames but the presentation and the plan assumed "
-                    + String(FRAMES) + " — supply a reference of at least "
-                    + String(FRAMES) + " frames at 24 fps"
-                )
+            var prepared = _h3_ref2va_prepare_video_reference(
+                specs[i], target_frames,
+                out_dir + String("/ref_probe_") + String(i),
+            )
             prepared_videos.append(prepared^)
     print(
         "  prepared", len(prepared_images), "image +", len(prepared_videos),
@@ -2332,22 +2506,10 @@ def _minimax_h3_ref2va_generate_real(
         len(pres.vision_grids), "visual reference(s)",
     )
 
-    var product_image = (
-        len(specs) == 1 and specs[0].kind == MINIMAX_H3_REF_IMAGE
-        and len(pres.vision_grids) == 1 and pres.vision_grids[0].t == 1
-        and pres.vision_grids[0].h == 48 and pres.vision_grids[0].w == 48
-    )
-    var product_video = (
-        len(specs) == 1 and specs[0].kind == MINIMAX_H3_REF_VIDEO
-        and len(pres.vision_grids) == 1 and pres.vision_grids[0].t == 1
-        and pres.vision_grids[0].h == 48 and pres.vision_grids[0].w == 84
-    )
-    if not product_image and not product_video:
+    if len(pres.vision_grids) == 0:
         raise Error(
-            "minimax_h3_ref2va: GPU-only product path accepts exactly one"
-            " bounded 768x768 image reference (vision grid 1x48x48) or one"
-            " accepted 768x1344 video reference (vision grid 1x48x84); this"
-            " binary will not fall back to CPU/host vision inference"
+            "minimax_h3_ref2va: at least one image or video reference is"
+            " required; audio-only Ref2VA is not supported"
         )
     var vision_weights = minimax_h3_vision_device_weights(
         String(TEXT_ENCODER_DIR), ctx
@@ -2368,31 +2530,34 @@ def _minimax_h3_ref2va_generate_real(
             " reserved " + String(len(pres.pad_positions)) + " pad rows"
         )
 
-    # ── [3] audio condition rows — HOST, the audio VAE's posterior mode ──
+    # ── [3] audio condition rows — GPU AudioVAE posterior mode ───────────
     var t_aud0 = perf_counter_ns()
     var audio_rows = List[Float32]()
     if plan.num_condition_audio_rows > 0:
-        var enc_w = _h3_ref2va_load_audio_encoder_weights()
+        var enc_w_host = _h3_ref2va_load_audio_encoder_weights()
         var enc_cfg = _h3_ref2va_audio_encoder_config()
+        var enc_w = minimax_h3_audio_encoder_device_weights(
+            enc_w_host, enc_cfg, ctx
+        )
         for i in range(len(specs)):
             if references[i].num_audio_latents == 0:
                 continue
             if specs[i].kind == MINIMAX_H3_REF_VIDEO:
                 # The soundtrack of the reference's own container
                 # (MiniMaxH3Reference.__post_init__, packing_ref2va.py:
-                # 293-295). ffmpeg resamples to the VAE's 32 kHz here — a
+                # 293-295). The planning pass decoded and cached it at the
+                # VAE's 32 kHz so its exact latent count could be part of the
+                # packed layout. ffmpeg's resample is a
                 # DIFFERENT resampler than the vendor's torchaudio pass
                 # (minimax_h3_ffmpeg_decode_audio's own parity note), stated
                 # rather than hidden: the latent COUNT is unaffected, the
                 # sample values differ at resampler level.
-                var wave = minimax_h3_ffmpeg_decode_audio(
-                    specs[i].path,
-                    out_dir + "/ref_soundtrack_" + String(i) + ".wav",
-                    AUDIO_SAMPLE_RATE, 2,
+                var wave = minimax_h3_read_wav(
+                    out_dir + "/ref_probe_" + String(i) + ".wav"
                 )
                 var rows = _h3_ref2va_reference_audio_rows(
                     enc_w, enc_cfg, wave, references[i].num_audio_latents,
-                    specs[i].path + String(" (soundtrack)"),
+                    specs[i].path + String(" (soundtrack)"), target_frames, ctx,
                 )
                 for r in range(len(rows)):
                     audio_rows.append(rows[r])
@@ -2400,7 +2565,7 @@ def _minimax_h3_ref2va_generate_real(
                 var wave = minimax_h3_read_wav(specs[i].path)
                 var rows = _h3_ref2va_reference_audio_rows(
                     enc_w, enc_cfg, wave, references[i].num_audio_latents,
-                    specs[i].path,
+                    specs[i].path, target_frames, ctx,
                 )
                 for r in range(len(rows)):
                     audio_rows.append(rows[r])
@@ -2413,7 +2578,7 @@ def _minimax_h3_ref2va_generate_real(
     var t_aud1 = perf_counter_ns()
     print(
         "  audio condition rows:", plan.num_condition_audio_rows, "rows (",
-        Float64(t_aud1 - t_aud0) / 1.0e9, "s, host)",
+        Float64(t_aud1 - t_aud0) / 1.0e9, "s, GPU encoder)",
     )
 
     # ── [4] the REQUEST generator, vendor draw order (packing.py:511-515):
@@ -2421,7 +2586,7 @@ def _minimax_h3_ref2va_generate_real(
     var gen = MiniMaxH3TorchCpuGenerator(seed)
     var cond_noise = _h3_ref2va_condition_noise_rows(gen, references)
     var video_noise = minimax_h3_target_latent_rows(
-        gen, NUM_LATENT_FRAMES, LATENT_H, LATENT_W, PATCH_H, PATCH_W
+        gen, num_latent_frames, latent_h, latent_w, PATCH_H, PATCH_W
     )
     var audio_noise = minimax_h3_target_audio_rows(
         gen, plan.num_target_audio_rows // 2, config.audio_latents_dim
@@ -2477,13 +2642,17 @@ def _minimax_h3_ref2va_generate_real(
         var encode_frames = minimax_h3_trim_reference_num_frames(
             prepared.num_frames
         )
-        if encode_frames != prepared.num_frames:
+        if encode_frames > prepared.num_frames:
             raise Error(
-                "minimax_h3_ref2va: prepared frame count is not 17n+5"
-                " (internal — FRAMES is preflighted to be)"
+                "minimax_h3_ref2va: prepared video is shorter than the"
+                " VAE's minimum 17n+5 reference chunk"
             )
+        var frame_bytes = prepared.height * prepared.width * 3
+        var kept = List[UInt8](capacity=encode_frames * frame_bytes)
+        for b in range(encode_frames * frame_bytes):
+            kept.append(prepared.pixels[b])
         var pixels = minimax_h3_pixel_normalize_frames(
-            prepared.pixels, encode_frames, prepared.height, prepared.width
+            kept, encode_frames, prepared.height, prepared.width
         )
         var sampled_latents = minimax_h3_encode_reference_visual_seam(
             encoder, pixels, 3, encode_frames, prepared.height,
@@ -2546,10 +2715,10 @@ def _minimax_h3_ref2va_generate_real(
     var vpad = 8
     while vpad < vreal:
         vpad *= 2
-    if vpad > 2048:
+    if vpad > 16384:
         raise Error(
-            "minimax_h3_ref2va: presentation exceeds the sdpa dispatch table"
-            " (2048)"
+            "minimax_h3_ref2va: presentation exceeds the GPU conditioner"
+            " window (16384)"
         )
     for _ in range(vpad - vreal):
         vids.append(151643)
@@ -2559,10 +2728,10 @@ def _minimax_h3_ref2va_generate_real(
         Optional(pres.pad_positions.copy()),
     )
     var vemb = slice(vemb_p, 1, 0, vreal, ctx)
-    var text_rows = reshape(vemb, [TEXT_TOKENS, config.text_dim], ctx)
+    var text_rows = reshape(vemb, [vreal, config.text_dim], ctx)
     var t_cond1 = perf_counter_ns()
     print(
-        "  REAL conditioning:", TEXT_TOKENS, "tokens (row-scaled INT8",
+        "  REAL conditioning:", vreal, "tokens (row-scaled INT8",
         "weights, BF16 outputs; padded to", vpad, "for dispatch) (",
         Float64(t_cond1 - t_cond0) / 1.0e9, "s)",
     )
@@ -2586,23 +2755,53 @@ def _minimax_h3_ref2va_generate_real(
         plan, config, transformer_shards, cond_video, cond_audio,
         video_target^, audio_target^, text_rows, steps, seed, out_dir,
         False, False, String(""), attention_backend,
-        attention_backend_name, ctx, resident_scheme,
-        resident_backend_name,
+        attention_backend_name, ctx, step_cache_enabled, step_cache_name,
+        resident_scheme,
+        resident_backend_name, resident_blocks_requested,
     )
 
 
 def main() raises:
     var raw_args = argv()
+    var runtime_width = WIDTH
+    var runtime_height = HEIGHT
+    var runtime_frames = FRAMES
+    var runtime_fps = 24
     var partial_mode = False
     var attention_backend = MINIMAX_H3_ATTN_CUDNN
     var attention_backend_name = String("cudnn")
+    var step_cache_enabled = False
+    var step_cache_name = String("exact")
     var resident_scheme = MINIMAX_H3_RESIDENT_INT8
     var resident_backend_name = String("groupwise")
+    var resident_blocks_requested = DIT_RESIDENT_BLOCKS
     var condition_rows_path = String("")
     var condition_rows_prefix = String("--condition-rows=")
     var args = List[String]()
     for i in range(len(raw_args)):
         var a = String(raw_args[i])
+        if a.startswith("--width="):
+            var fields = a.split("=")
+            runtime_width = atol(String(fields[1]))
+            continue
+        if a.startswith("--height="):
+            var fields = a.split("=")
+            runtime_height = atol(String(fields[1]))
+            continue
+        if a.startswith("--frames="):
+            var fields = a.split("=")
+            runtime_frames = atol(String(fields[1]))
+            continue
+        if a.startswith("--fps="):
+            var fields = a.split("=")
+            runtime_fps = atol(String(fields[1]))
+            continue
+        if a.startswith("--resident-blocks="):
+            var fields = a.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --resident-blocks flag")
+            resident_blocks_requested = atol(String(fields[1]))
+            continue
         if a == String("--partial"):
             partial_mode = True
             continue
@@ -2618,6 +2817,19 @@ def main() raises:
             raise Error(
                 String("unknown attention backend flag: ") + a
                 + String(" (expected cudnn or sage-int8)")
+            )
+        if a == String("--step-cache=high"):
+            step_cache_enabled = True
+            step_cache_name = String("high")
+            continue
+        if a == String("--step-cache=exact"):
+            step_cache_enabled = False
+            step_cache_name = String("exact")
+            continue
+        if a.startswith("--step-cache="):
+            raise Error(
+                String("unknown step cache flag: ") + a
+                + String(" (expected exact or high)")
             )
         if a == String("--resident-backend=w8a8"):
             resident_scheme = MINIMAX_H3_RESIDENT_INT8_W8A8
@@ -2641,7 +2853,9 @@ def main() raises:
         print(
             "usage: minimax_h3_ref2va <prompt_file> <out_dir> [steps=30]"
             " [seed=0] [--partial] [--condition-rows=PATH]"
-            " [--attention-backend=cudnn|sage-int8] [kind:path ...]"
+            " [--attention-backend=cudnn|sage-int8] [--resident-blocks=N]"
+            " [--step-cache=exact|high]"
+            " [kind:path ...]"
         )
         print(
             "  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES,
@@ -2681,24 +2895,33 @@ def main() raises:
     print("  out_dir:", out_dir)
     print("  steps=", steps, " seed=", seed)
     print("  attention_backend=", attention_backend_name)
+    print("  step_cache=", step_cache_name)
     comptime if DIT_INT8_RESIDENT != 0:
         print(
             "  weight_storage=resident-int8-", resident_backend_name,
-            " prefix_blocks=", DIT_RESIDENT_BLOCKS,
+            " prefix_blocks=", resident_blocks_requested,
         )
     else:
         print("  weight_storage=streamed-bf16")
 
     var t0 = perf_counter_ns()
-    _preflight_geometry()
+    _preflight_geometry(runtime_width, runtime_height, runtime_frames)
+    if runtime_fps != 24:
+        raise Error("minimax_h3_ref2va: model sampling FPS must be 24")
+    var latent_h = runtime_height // 16
+    var latent_w = runtime_width // 16
+    var num_latent_frames = (runtime_frames - 5) // 17 * 5 + 2
+    var num_video_rows = (
+        num_latent_frames * (latent_h // PATCH_H) * (latent_w // PATCH_W)
+    )
 
-    var num_audio_latents = minimax_h3_target_audio_latents(FRAMES)
+    var num_audio_latents = minimax_h3_target_audio_latents(runtime_frames)
     print("")
     print("  ── target geometry ──")
     print(
-        "  ", WIDTH, "x", HEIGHT, ",", FRAMES, "frames -> latent [",
-        NUM_LATENT_FRAMES, ",", LATENT_H, ",", LATENT_W, "],",
-        NUM_VIDEO_ROWS, "video rows",
+        "  ", runtime_width, "x", runtime_height, ",", runtime_frames,
+        "frames -> latent [", num_latent_frames, ",", latent_h, ",",
+        latent_w, "],", num_video_rows, "video rows",
     )
     print(
         "   audio latents:", num_audio_latents, "->",
@@ -2730,7 +2953,8 @@ def main() raises:
     for i in range(len(specs)):
         print("   [", i, "]", specs[i].kind_name(), specs[i].path)
         medias.append(_probe_reference_media(
-            specs[i], out_dir + String("/ref_probe_") + String(i)
+            specs[i], out_dir + String("/ref_probe_") + String(i),
+            runtime_frames,
         ))
 
     # The vendor resolver owns every video/audio law. Only the bounded product
@@ -2746,7 +2970,9 @@ def main() raises:
                 MINIMAX_H3_REF_IMAGE, 1, size[0] // 16, size[1] // 16, 0
             ))
         else:
-            references.append(minimax_h3_resolve_reference(medias[i], FRAMES))
+            references.append(minimax_h3_resolve_reference(
+                medias[i], runtime_frames
+            ))
     print("")
     print("  ── resolved reference latent geometry ──")
     for i in range(len(references)):
@@ -2769,7 +2995,9 @@ def main() raises:
     if partial_mode:
         text_tags = _minimax_h3_ref2va_stub_conditioning_tags(references, TEXT_TOKENS)
     else:
-        var rp = _minimax_h3_ref2va_real_presentation(specs, medias, prompt)
+        var rp = _minimax_h3_ref2va_real_presentation(
+            specs, medias, prompt, runtime_frames
+        )
         print(
             "  REAL presentation:", len(rp.token_ids), "token ids,",
             len(rp.pad_positions), "vision pad rows,",
@@ -2781,9 +3009,9 @@ def main() raises:
     var plan = minimax_h3_build_ref2va_plan(
         text_tags,
         references,
-        NUM_LATENT_FRAMES,
-        LATENT_H,
-        LATENT_W,
+        num_latent_frames,
+        latent_h,
+        latent_w,
         num_audio_latents,
         PATCH_H,
         PATCH_W,
@@ -2836,5 +3064,8 @@ def main() raises:
         plan, specs, references, real_pres, partial_mode,
         condition_rows_path, steps, seed, out_dir,
         attention_backend, attention_backend_name,
+        step_cache_enabled, step_cache_name,
         resident_scheme, resident_backend_name,
+        resident_blocks_requested,
+        runtime_frames, num_latent_frames, latent_h, latent_w,
     )

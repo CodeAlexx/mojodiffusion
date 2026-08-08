@@ -145,7 +145,7 @@
 
 from std.collections import Dict, List
 from std.gpu.host import DeviceContext
-from std.math import sqrt
+from std.math import min, sqrt
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -155,8 +155,14 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.vec_rms_norm import vec_rms_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.embeddings import t_embedder
-from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_tiled
-from serenitymojo.ops.tensor_algebra import reshape, add, mul, add_scalar, slice, gather_rows
+from serenitymojo.ops.attention import (
+    sdpa_nomask,
+    sdpa_nomask_dynamic,
+    sdpa_nomask_tiled,
+)
+from serenitymojo.ops.tensor_algebra import (
+    reshape, add, mul, add_scalar, slice, gather_rows, concat,
+)
 from serenitymojo.ops.shape_backward import index_select_backward
 from serenitymojo.ops.patchify3d import patchify3d
 from serenitymojo.ops.cast import cast_tensor
@@ -255,6 +261,26 @@ def minimax_h3_condition_embed(
     """condition_proj: [Nt,5120] -> [Nt,5376]. bf16 throughout (NOT a
     dtype-trap prefix)."""
     return _lin(text_rows, w, "condition_proj.weight", "condition_proj.bias", ctx)
+
+
+def _minimax_h3_video_patch_embed_bf16(
+    video_rows: Tensor,
+    w: Dict[String, ArcPointer[Tensor]],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Project in checkpoint FP32, cast on device, and release the large FP32
+    result before the rest of the frontend is materialized."""
+    var projected = minimax_h3_video_patch_embed(video_rows, w, ctx)
+    return torch_f32_to_bf16_rne(projected, ctx)
+
+
+def _minimax_h3_audio_patch_embed_bf16(
+    audio_rows: Tensor,
+    w: Dict[String, ArcPointer[Tensor]],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var projected = minimax_h3_audio_patch_embed(audio_rows, w, ctx)
+    return torch_f32_to_bf16_rne(projected, ctx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +388,75 @@ def minimax_h3_token_refiner[
     return vec_rms_norm(state, w["token_refiner.final_norm.weight"][], config.final_norm_eps, ctx)
 
 
+def _minimax_h3_token_refiner_block_dynamic[
+    H: Int, Dh: Int
+](
+    hidden_in: Tensor,
+    w: Dict[String, ArcPointer[Tensor]],
+    prefix: String,
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Runtime-token-count refiner block for request-driven H3 inference."""
+    var S = hidden_in.shape()[0]
+    var inner = config.inner_dim()
+    var ffn = config.ffn_hidden_size
+    var eps = config.norm_eps
+    var qk_eps = config.qk_norm_eps
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var state = hidden_in.clone(ctx)
+
+    var normed = vec_rms_norm(state, w[prefix + ".norm1.weight"][], eps, ctx)
+    ref qkv_w = w[prefix + ".attn.qkv_proj.weight"][]
+    var to_q_w = slice(qkv_w, 0, 0, inner, ctx)
+    var to_k_w = slice(qkv_w, 0, inner, inner, ctx)
+    var to_v_w = slice(qkv_w, 0, 2 * inner, inner, ctx)
+    var q = linear(normed, to_q_w, None, ctx)
+    var k = linear(normed, to_k_w, None, ctx)
+    var v = linear(normed, to_v_w, None, ctx)
+    var q4 = reshape(q, [1, S, H, Dh], ctx)
+    var k4 = reshape(k, [1, S, H, Dh], ctx)
+    var v4 = reshape(v, [1, S, H, Dh], ctx)
+    q4 = vec_rms_norm(q4, w[prefix + ".attn.q_norm.weight"][], qk_eps, ctx)
+    k4 = vec_rms_norm(k4, w[prefix + ".attn.k_norm.weight"][], qk_eps, ctx)
+    var attn4 = sdpa_nomask_dynamic(q4, k4, v4, scale, ctx)
+    var attn = reshape(attn4, [S, inner], ctx)
+    var attn_out = linear(attn, w[prefix + ".attn.out_proj.weight"][], None, ctx)
+    state = add(state, attn_out, ctx)
+
+    var normed2 = vec_rms_norm(state, w[prefix + ".norm2.weight"][], eps, ctx)
+    ref fc1_w = w[prefix + ".mlp.fc1.weight"][]
+    var value_w = slice(fc1_w, 0, 0, ffn, ctx)
+    var gate_w = slice(fc1_w, 0, ffn, ffn, ctx)
+    var value = linear(normed2, value_w, None, ctx)
+    var gate = linear(normed2, gate_w, None, ctx)
+    var ff_act = swiglu(gate, value, ctx)
+    var ff_out = linear(ff_act, w[prefix + ".mlp.fc2.weight"][], None, ctx)
+    state = add(state, ff_out, ctx)
+    return state^
+
+
+def minimax_h3_token_refiner_dynamic[
+    H: Int, Dh: Int
+](
+    text_embeds: Tensor,
+    w: Dict[String, ArcPointer[Tensor]],
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Two token-refiner blocks with runtime text length and exact math SDPA."""
+    var state = text_embeds.clone(ctx)
+    for layer in range(config.token_refiner_num_layers):
+        var prefix = String("token_refiner.blocks.") + String(layer)
+        state = _minimax_h3_token_refiner_block_dynamic[H, Dh](
+            state, w, prefix, config, ctx
+        )
+    return vec_rms_norm(
+        state, w["token_refiner.final_norm.weight"][],
+        config.final_norm_eps, ctx,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Scatter the three projected/refined streams into one packed sequence buffer
 # (block_forward.mojo minimax_h3_forward step 3, lines 509-521).
@@ -389,6 +484,29 @@ def minimax_h3_scatter_streams(
     var v = index_select_backward(video_embeds, video_indices, 0, in_shape, ctx)
     var a = index_select_backward(audio_embeds, audio_indices, 0, in_shape, ctx)
     return add(add(t, v, ctx), a, ctx)
+
+
+def minimax_h3_concat_t2va_streams(
+    video_embeds: Tensor,
+    audio_embeds: Tensor,
+    text_embeds: Tensor,
+    sequence_length: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Low-peak packer for pure T2VA's guaranteed text | audio | video rows."""
+    if (
+        text_embeds.shape()[0]
+        + audio_embeds.shape()[0]
+        + video_embeds.shape()[0]
+        != sequence_length
+    ):
+        raise Error("minimax_h3_concat_t2va_streams: row count mismatch")
+    # Keep this pairwise.  The Mojo 0.26 variadic ABI has a host-side fault for
+    # this three-Tensor call shape before the concat kernel launches.  The
+    # text+audio prefix is tiny relative to the video stream, so this retains
+    # the one-full-sequence-buffer peak that this T2VA path is designed for.
+    var text_audio = concat(0, ctx, text_embeds, audio_embeds)
+    return concat(0, ctx, text_audio, video_embeds)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,7 +540,6 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     # video/audio patch-proj is fp32; the packed sequence the block stack
     # consumes is bf16-only (every blocks.* tensor is bf16) — cast down at
     # this boundary. See file header, "IMPLIED CAST BOUNDARY".
-    var video_embeds_f32 = minimax_h3_video_patch_embed(video_rows, w, ctx)
     # torch_f32_to_bf16_rne, NOT cast_tensor. This F32->BF16 boundary runs ONCE
     # PER DENOISING STEP, and Mojo's native cast differs from PyTorch's
     # round-to-nearest-even by ~1 bf16 quantum on some values. One cast is
@@ -430,6 +547,7 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     # and decorrelates from torch while every single-forward gate still reads
     # cos 0.9998 and the global std still matches. That is the NAVA failure —
     # a visibly distorted decode with every component green.
+    var video_embeds_f32 = minimax_h3_video_patch_embed(video_rows, w, ctx)
     var video_embeds = torch_f32_to_bf16_rne(video_embeds_f32, ctx)
     var audio_embeds_f32 = minimax_h3_audio_patch_embed(audio_rows, w, ctx)
     var audio_embeds = torch_f32_to_bf16_rne(audio_embeds_f32, ctx)
@@ -452,6 +570,44 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     return MiniMaxH3FrontendEmbed(hidden^, temb^)
 
 
+def minimax_h3_frontend_embed_dynamic[
+    TR_H: Int, TR_DH: Int
+](
+    video_rows: Tensor,
+    audio_rows: Tensor,
+    text_rows: Tensor,
+    timesteps: Tensor,
+    video_indices: List[Int],
+    audio_indices: List[Int],
+    text_indices: List[Int],
+    sequence_length: Int,
+    w: Dict[String, ArcPointer[Tensor]],
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+    t2va_contiguous: Bool = False,
+) raises -> MiniMaxH3FrontendEmbed:
+    """Runtime text/packed sequence frontend for request-driven H3 modes."""
+    var video_embeds = _minimax_h3_video_patch_embed_bf16(video_rows, w, ctx)
+    var audio_embeds = _minimax_h3_audio_patch_embed_bf16(audio_rows, w, ctx)
+    var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
+    var text_embeds = minimax_h3_token_refiner_dynamic[TR_H, TR_DH](
+        text_embeds0, w, config, ctx
+    )
+    var hidden: Tensor
+    if t2va_contiguous:
+        hidden = minimax_h3_concat_t2va_streams(
+            video_embeds, audio_embeds, text_embeds, sequence_length, ctx,
+        )
+    else:
+        hidden = minimax_h3_scatter_streams(
+            video_embeds, audio_embeds, text_embeds, video_indices,
+            audio_indices, text_indices, sequence_length, config.hidden_size,
+            ctx,
+        )
+    var temb = minimax_h3_timestep_embedding(timesteps, w, config, ctx)
+    return MiniMaxH3FrontendEmbed(hidden^, temb^)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Final layer: RMSNorm modulated per-row by timestep, then the two heads.
 #    (block_forward.mojo minimax_h3_forward step 7, lines 570-626.)
@@ -468,6 +624,124 @@ struct MiniMaxH3FrontendOutput(Movable):
     def __init__(out self, var video_out: Tensor, var audio_out: Tensor):
         self.video_out = video_out^
         self.audio_out = audio_out^
+
+
+comptime _MINIMAX_H3_FINAL_CHUNK_ROWS = 1024
+
+
+def _minimax_h3_final_layer_chunk(
+    hidden_chunk: Tensor,
+    final_modulation: Tensor,
+    timestep_indices: List[Int],
+    w: Dict[String, ArcPointer[Tensor]],
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> MiniMaxH3FrontendOutput:
+    """One exact row chunk of the final norm, modulation, and both heads."""
+    var hidden_size = config.hidden_size
+    var final_normed = vec_rms_norm(
+        hidden_chunk, w["final_layer.norm.weight"][],
+        config.final_norm_eps, ctx,
+    )
+    var final_normed_matched = cast_tensor(
+        final_normed, final_modulation.dtype(), ctx
+    )
+    var row_mod = gather_rows(final_modulation, timestep_indices, ctx)
+    var shift = slice(row_mod, 1, 0, hidden_size, ctx)
+    var scale = slice(row_mod, 1, hidden_size, hidden_size, ctx)
+    var scale_p1 = add_scalar(scale, Float32(1.0), ctx)
+    var modulated = add(
+        mul(final_normed_matched, scale_p1, ctx), shift, ctx
+    )
+    var modulated_f32 = cast_tensor(modulated, STDtype.F32, ctx)
+    var video_out = _lin(
+        modulated_f32, w, "final_layer.video_out.weight",
+        "final_layer.video_out.bias", ctx,
+    )
+    var audio_out = _lin(
+        modulated_f32, w, "final_layer.audio_out.weight",
+        "final_layer.audio_out.bias", ctx,
+    )
+    # The helper boundary is also the allocation-lifetime boundary: finish
+    # this chunk before its norm/modulation intermediates are destroyed.
+    ctx.synchronize()
+    return MiniMaxH3FrontendOutput(video_out^, audio_out^)
+
+
+def minimax_h3_final_layer_chunked(
+    hidden: Tensor,
+    final_modulation: Tensor,
+    timestep_indices: List[Int],
+    video_indices: List[Int],
+    audio_indices: List[Int],
+    w: Dict[String, ArcPointer[Tensor]],
+    config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> MiniMaxH3FrontendOutput:
+    """Low-headroom final layer with the same per-row arithmetic and heads.
+
+    The ordinary composition materializes `[S,2*hidden]` modulation and
+    `[S,hidden]` F32 tensors.  At H3's 15-second sequence lengths those alone
+    exceed the post-transformer headroom on a 24-GiB GPU.  Rows are independent,
+    so execute the identical operations in bounded chunks and copy only the two
+    small head outputs into their complete row-major destinations.
+    """
+    var shape = hidden.shape()
+    if len(shape) != 2 or shape[1] != config.hidden_size:
+        raise Error("minimax_h3_final_layer_chunked: hidden shape mismatch")
+    var sequence_length = shape[0]
+    if len(timestep_indices) != sequence_length:
+        raise Error(
+            "minimax_h3_final_layer_chunked: timestep index length mismatch"
+        )
+    var video_width = config.video_patch_dim()
+    var audio_width = config.audio_latents_dim
+    var video_all_buf = ctx.enqueue_create_buffer[DType.uint8](
+        sequence_length * video_width * 4
+    )
+    var audio_all_buf = ctx.enqueue_create_buffer[DType.uint8](
+        sequence_length * audio_width * 4
+    )
+
+    for row_start in range(
+        0, sequence_length, _MINIMAX_H3_FINAL_CHUNK_ROWS
+    ):
+        var chunk_rows = min(
+            _MINIMAX_H3_FINAL_CHUNK_ROWS, sequence_length - row_start
+        )
+        var hidden_chunk = slice(
+            hidden, 0, row_start, chunk_rows, ctx
+        )
+        var chunk_timestep_indices = List[Int](capacity=chunk_rows)
+        for row in range(chunk_rows):
+            chunk_timestep_indices.append(
+                timestep_indices[row_start + row]
+            )
+        var chunk = _minimax_h3_final_layer_chunk(
+            hidden_chunk, final_modulation, chunk_timestep_indices,
+            w, config, ctx,
+        )
+        var video_bytes = chunk_rows * video_width * 4
+        var video_dst = video_all_buf.create_sub_buffer[DType.uint8](
+            row_start * video_width * 4, video_bytes
+        )
+        ctx.enqueue_copy(dst_buf=video_dst, src_buf=chunk.video_out.buf)
+        var audio_bytes = chunk_rows * audio_width * 4
+        var audio_dst = audio_all_buf.create_sub_buffer[DType.uint8](
+            row_start * audio_width * 4, audio_bytes
+        )
+        ctx.enqueue_copy(dst_buf=audio_dst, src_buf=chunk.audio_out.buf)
+        ctx.synchronize()
+
+    var video_all = Tensor(
+        video_all_buf^, [sequence_length, video_width], STDtype.F32
+    )
+    var audio_all = Tensor(
+        audio_all_buf^, [sequence_length, audio_width], STDtype.F32
+    )
+    var video_out = gather_rows(video_all, video_indices, ctx)
+    var audio_out = gather_rows(audio_all, audio_indices, ctx)
+    return MiniMaxH3FrontendOutput(video_out^, audio_out^)
 
 
 def minimax_h3_final_layer(
@@ -500,6 +774,11 @@ def minimax_h3_final_layer(
     if len(timestep_indices) != sequence_length:
         raise Error(
             "minimax_h3_final_layer: timestep_indices length != sequence_length"
+        )
+    if sequence_length >= 48000:
+        return minimax_h3_final_layer_chunked(
+            hidden, final_modulation, timestep_indices,
+            video_indices, audio_indices, w, config, ctx,
         )
 
     var final_normed = vec_rms_norm(hidden, w["final_layer.norm.weight"][], config.final_norm_eps, ctx)

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build the exact GPU-only MiniMax-H3 keyframe product profiles. All INT8
-# runners reuse the existing FL2VA resident caches; this script writes only
-# small executables.
+# Build the GPU-only MiniMax-H3 keyframe task/precision runners. Geometry and
+# duration are runtime values. Separate task binaries remain because the
+# number and semantic position of keyframes changes the conditioning layout.
+# INT8 runners reuse the existing resident caches.
 set -euo pipefail
 
 repo=/home/alex/mojodiffusion

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build the exact GPU-only MiniMax-H3 reference-image product profiles.
+# Build the GPU-only MiniMax-H3 reference-image precision runners. Target
+# width, height, and duration are selected at runtime; reference conditioning
+# retains its own fixed presentation budget.
 set -euo pipefail
 
 repo=/home/alex/mojodiffusion

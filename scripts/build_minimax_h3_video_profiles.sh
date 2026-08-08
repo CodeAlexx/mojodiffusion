@@ -4,10 +4,10 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-# One executable owns every admitted T2VA geometry and precision. The twelve
-# sequence-length-specific attention kernels form the 3-resolution by
-# 4-duration AOT matrix inside that executable; the request selects
-# width/height/frames/FPS/quant at runtime.
+# One executable owns the full H3 runtime geometry envelope and every
+# precision mode. Width, height, internal/output frames, FPS, quantization,
+# and attention backend are runtime values; registered profiles are retained
+# only as measured quality/performance anchors.
 output="output/bin/minimax_h3_serenity_runtime"
 if [[ -x "$output" && "${H3_REBUILD_PROFILES:-0}" != 1 ]]; then
   echo "already built: $output"

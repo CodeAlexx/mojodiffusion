@@ -73,6 +73,7 @@ var GenerateTab = (function () {
         videoQuant: 'fp8',
         h3Quant: 'int8-fast',
         h3AttentionBackend: 'cudnn',
+        h3StepCache: 'exact',
         cameraMotion: 'none',
         videoCheckpoint: 'ltx-2.3-22b-distilled',
         capsPositive: '',
@@ -191,7 +192,11 @@ var GenerateTab = (function () {
     function getActiveAspects() {
         var arch = ModelUtils.archForModel(state.model);
         if (arch === 'minimax_h3') {
-            return activeMinimaxH3Profiles().map(function (profile) {
+            var h3Runner = activeMinimaxH3Runner();
+            var h3Constraints = h3Runner && h3Runner.geometry_constraints || {};
+            var h3Presets = Array.isArray(h3Constraints.resolutions)
+                ? h3Constraints.resolutions : [];
+            return h3Presets.map(function (profile) {
                 return {
                     label: profile.width + '×' + profile.height,
                     w: Number(profile.width),
@@ -794,6 +799,8 @@ var GenerateTab = (function () {
             '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int8">INT8</option><option value="int4">INT4</option></select></div>' +
             '<div id="gen-h3-attention-row" class="gen-param-row" data-param-search="attention cudnn sage int8"><label class="gen-label" for="gen-h3-attention">Attention</label>' +
             '<select id="gen-h3-attention" class="gen-select"><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option></select></div>' +
+            '<div id="gen-h3-step-cache-row" class="gen-param-row" data-param-search="denoise acceleration cache exact high speed"><label class="gen-label" for="gen-h3-step-cache">Denoise acceleration</label>' +
+            '<select id="gen-h3-step-cache" class="gen-select"><option value="exact">Exact · quality default</option><option value="high">Experimental cached · quality loss</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
             '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>' +
             '<div class="gen-param-row" data-param-search="camera motion dolly jib focus static"><label class="gen-label" for="gen-camera-motion">Camera Motion</label>' +
@@ -1108,6 +1115,8 @@ var GenerateTab = (function () {
         els.videoQuant = document.getElementById('gen-video-quant');
         els.h3Attention = document.getElementById('gen-h3-attention');
         els.h3AttentionRow = document.getElementById('gen-h3-attention-row');
+        els.h3StepCache = document.getElementById('gen-h3-step-cache');
+        els.h3StepCacheRow = document.getElementById('gen-h3-step-cache-row');
         els.cameraMotion = document.getElementById('gen-camera-motion');
         els.videoCheckpoint = document.getElementById('gen-video-checkpoint');
         els.videoPromptEnhancer = document.getElementById('gen-video-prompt-enhancer');
@@ -1651,11 +1660,8 @@ var GenerateTab = (function () {
                         state.width = aspects[i].w;
                         state.height = aspects[i].h;
                         if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
-                            var h3Profile = activeMinimaxH3Profiles().find(function (profile) {
-                                return Number(profile.width) === state.width &&
-                                    Number(profile.height) === state.height;
-                            });
-                            applyMinimaxH3RequestProfile(h3Profile);
+                            syncDimensionInputs();
+                            updateAspectPreview();
                         }
                         else if (ModelUtils.archForModel(state.model) === 'ltxv') {
                             var sizeProfiles = activeLtx2ProfilesForSize(
@@ -1724,18 +1730,18 @@ var GenerateTab = (function () {
         // Custom resolution inputs
         els.customWidth.addEventListener('blur', function () {
             var isVideo = ModelUtils.isVideoModel(state.model);
-            var v = isVideo
-                ? ModelUtils.clampVideoDimension(parseInt(this.value) || 512)
-                : ModelUtils.clampDimension(parseInt(this.value) || 1024);
+            var v = clampAuthoredDimension(
+                parseInt(this.value), 'width', isVideo ? 512 : 1024
+            );
             this.value = String(v);
             state.width = v;
             var wsl = document.getElementById('gen-width-slider');
             if (wsl)
                 wsl.value = String(v);
             if (state.aspectLocked && state.lockedRatio) {
-                var newH = isVideo
-                    ? ModelUtils.clampVideoDimension(Math.round(v / state.lockedRatio))
-                    : ModelUtils.clampDimension(Math.round(v / state.lockedRatio));
+                var newH = clampAuthoredDimension(
+                    Math.round(v / state.lockedRatio), 'height', isVideo ? 512 : 1024
+                );
                 state.height = newH;
                 if (els.customHeight)
                     els.customHeight.value = String(newH);
@@ -1748,18 +1754,18 @@ var GenerateTab = (function () {
         });
         els.customHeight.addEventListener('blur', function () {
             var isVideo = ModelUtils.isVideoModel(state.model);
-            var v = isVideo
-                ? ModelUtils.clampVideoDimension(parseInt(this.value) || 512)
-                : ModelUtils.clampDimension(parseInt(this.value) || 1024);
+            var v = clampAuthoredDimension(
+                parseInt(this.value), 'height', isVideo ? 512 : 1024
+            );
             this.value = String(v);
             state.height = v;
             var hsl = document.getElementById('gen-height-slider');
             if (hsl)
                 hsl.value = String(v);
             if (state.aspectLocked && state.lockedRatio) {
-                var newW = isVideo
-                    ? ModelUtils.clampVideoDimension(Math.round(v * state.lockedRatio))
-                    : ModelUtils.clampDimension(Math.round(v * state.lockedRatio));
+                var newW = clampAuthoredDimension(
+                    Math.round(v * state.lockedRatio), 'width', isVideo ? 512 : 1024
+                );
                 state.width = newW;
                 if (els.customWidth)
                     els.customWidth.value = String(newW);
@@ -1780,9 +1786,9 @@ var GenerateTab = (function () {
                     els.customWidth.value = String(v);
                 if (state.aspectLocked && state.lockedRatio) {
                     var isVideo = ModelUtils.isVideoModel(state.model);
-                    var newH = isVideo
-                        ? ModelUtils.clampVideoDimension(Math.round(v / state.lockedRatio))
-                        : ModelUtils.clampDimension(Math.round(v / state.lockedRatio));
+                    var newH = clampAuthoredDimension(
+                        Math.round(v / state.lockedRatio), 'height', isVideo ? 512 : 1024
+                    );
                     state.height = newH;
                     if (els.customHeight)
                         els.customHeight.value = String(newH);
@@ -1803,9 +1809,9 @@ var GenerateTab = (function () {
                     els.customHeight.value = String(v);
                 if (state.aspectLocked && state.lockedRatio) {
                     var isVideo = ModelUtils.isVideoModel(state.model);
-                    var newW = isVideo
-                        ? ModelUtils.clampVideoDimension(Math.round(v * state.lockedRatio))
-                        : ModelUtils.clampDimension(Math.round(v * state.lockedRatio));
+                    var newW = clampAuthoredDimension(
+                        Math.round(v * state.lockedRatio), 'width', isVideo ? 512 : 1024
+                    );
                     state.width = newW;
                     if (els.customWidth)
                         els.customWidth.value = String(newW);
@@ -1916,6 +1922,17 @@ var GenerateTab = (function () {
                     updateDurationHint();
                     return;
                 }
+                if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
+                    state.frames = Math.max(1, Math.min(1800, parseInt(this.value) || 1));
+                    state.seconds = Math.max(1, Math.min(15,
+                        state.frames / Math.max(1, state.fps)));
+                    state.frames = Math.max(1, Math.round(state.seconds * state.fps));
+                    this.value = String(state.frames);
+                    if (els.secondsInput)
+                        els.secondsInput.value = String(Number(state.seconds.toFixed(3)));
+                    updateDurationHint();
+                    return;
+                }
                 state.frames = Math.max(1, parseInt(this.value) || 1);
                 state.seconds = state.frames / Math.max(1, state.fps);
                 if (els.secondsInput)
@@ -1935,6 +1952,14 @@ var GenerateTab = (function () {
                 updateDurationHint();
                 return;
             }
+            if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
+                state.seconds = Math.max(1, Math.min(15, parseFloat(this.value) || 1));
+                state.frames = Math.max(1, Math.round(state.seconds * state.fps));
+                if (els.framesInput)
+                    els.framesInput.value = String(state.frames);
+                updateDurationHint();
+                return;
+            }
             state.seconds = Math.max(0.1, Math.min(120, parseFloat(this.value) || 1));
             state.frames = secondsToFrames(state.seconds, state.fps);
             if (els.framesInput)
@@ -1943,9 +1968,13 @@ var GenerateTab = (function () {
         });
         // FPS sync — recompute frames from seconds
         els.fpsInput.addEventListener('input', function () {
-            state.fps = Math.max(1, Math.min(60, parseInt(this.value) || 1));
+            var activeArch = ModelUtils.archForModel(state.model);
+            var fpsMax = activeArch === 'minimax_h3' ? 120 : 60;
+            state.fps = Math.max(1, Math.min(fpsMax, parseInt(this.value) || 1));
             els.fpsRange.value = String(state.fps);
-            state.frames = ModelUtils.archForModel(state.model) === 'ltxv'
+            state.frames = activeArch === 'minimax_h3'
+                ? Math.max(1, Math.round(state.seconds * state.fps))
+                : activeArch === 'ltxv'
                 ? ltx2SecondsToFrames(state.seconds, state.fps)
                 : secondsToFrames(state.seconds, state.fps);
             if (els.framesInput)
@@ -1955,7 +1984,10 @@ var GenerateTab = (function () {
         els.fpsRange.addEventListener('input', function () {
             state.fps = parseInt(this.value);
             els.fpsInput.value = this.value;
-            state.frames = ModelUtils.archForModel(state.model) === 'ltxv'
+            var activeArch = ModelUtils.archForModel(state.model);
+            state.frames = activeArch === 'minimax_h3'
+                ? Math.max(1, Math.round(state.seconds * state.fps))
+                : activeArch === 'ltxv'
                 ? ltx2SecondsToFrames(state.seconds, state.fps)
                 : secondsToFrames(state.seconds, state.fps);
             if (els.framesInput)
@@ -2009,6 +2041,10 @@ var GenerateTab = (function () {
                 }
                 state.h3AttentionBackend = this.value === 'sage-int8'
                     ? 'sage-int8' : 'cudnn';
+            });
+        if (els.h3StepCache)
+            els.h3StepCache.addEventListener('change', function () {
+                state.h3StepCache = this.value === 'high' ? 'high' : 'exact';
             });
         if (els.videoCheckpoint)
             els.videoCheckpoint.addEventListener('change', function () {
@@ -2881,7 +2917,7 @@ var GenerateTab = (function () {
             krea2: { w: 1024, h: 1024 },
             qwen: { w: 1024, h: 1024 },
             ltxv: { w: 1920, h: 1088 },
-            minimax_h3: { w: 512, h: 320 },
+            minimax_h3: { w: 1344, h: 768 },
             wan: { w: 1280, h: 704 },
             bernini: { w: 848, h: 480 },
             scail2: { w: 896, h: 512 }
@@ -2961,6 +2997,8 @@ var GenerateTab = (function () {
         });
         if (els.h3AttentionRow)
             els.h3AttentionRow.style.display = state.arch === 'minimax_h3' ? '' : 'none';
+        if (els.h3StepCacheRow)
+            els.h3StepCacheRow.style.display = state.arch === 'minimax_h3' ? '' : 'none';
         if (state.arch !== 'minimax_h3') {
             if (els.videoGuidanceMode && els.videoGuidanceMode.closest('.gen-param-row'))
                 els.videoGuidanceMode.closest('.gen-param-row').style.display = '';
@@ -3322,62 +3360,66 @@ var GenerateTab = (function () {
         }) || null;
     }
 
-    function activeMinimaxH3Profiles() {
+    function clampMinimaxH3Dimension(value, axis) {
         var runner = activeMinimaxH3Runner();
-        return runner && Array.isArray(runner.supported_profiles)
-            ? runner.supported_profiles : [];
+        var constraints = runner && runner.geometry_constraints || {};
+        var step = Number(constraints.dimension_step) || 32;
+        var minimum = Number(axis === 'height'
+            ? constraints.height_min : constraints.width_min) || 32;
+        var maximum = Number(axis === 'height'
+            ? constraints.height_max : constraints.width_max) || 2048;
+        var numeric = Number(value);
+        if (!Number.isFinite(numeric))
+            numeric = axis === 'height' ? 768 : 1344;
+        return Math.min(maximum, Math.max(minimum,
+            Math.round(numeric / step) * step));
     }
 
-    function applyMinimaxH3RequestProfile(profile) {
-        if (!profile)
-            return;
-        state.width = Number(profile.width);
-        state.height = Number(profile.height);
-        state.frames = Number(profile.frames);
-        state.fps = Number(profile.fps);
-        state.steps = Number(profile.steps) || 20;
-        state.seconds = Number(profile.duration) || state.frames / state.fps;
-        syncDimensionInputs();
-        if (els.framesInput)
-            els.framesInput.value = String(state.frames);
-        if (els.secondsInput)
-            els.secondsInput.value = state.seconds.toFixed(3);
-        if (els.fpsInput)
-            els.fpsInput.value = String(state.fps);
-        if (els.fpsRange)
-            els.fpsRange.value = String(state.fps);
-        if (els.steps)
-            els.steps.value = String(state.steps);
-        if (els.stepsRange)
-            els.stepsRange.value = String(state.steps);
-        updateAspectPreview();
-        updateDurationHint();
+    function clampAuthoredDimension(value, axis, fallback) {
+        if (ModelUtils.archForModel(state.model) === 'minimax_h3')
+            return clampMinimaxH3Dimension(value, axis);
+        if (ModelUtils.isVideoModel(state.model))
+            return ModelUtils.clampVideoDimension(Number(value) || fallback);
+        return ModelUtils.clampDimension(Number(value) || fallback);
     }
 
     function updateMinimaxH3VideoUI(arch) {
         state.arch = arch;
         var runner = activeMinimaxH3Runner();
         var runnerReady = !!(runner && runner.available === true);
-        var profiles = activeMinimaxH3Profiles();
-        var profile = profiles.find(function (candidate) {
-            return Number(candidate.width) === state.width &&
-                Number(candidate.height) === state.height &&
-                Number(candidate.frames) === state.frames &&
-                Number(candidate.fps) === state.fps;
-        }) || profiles[0] || {
-            width: 512, height: 320, frames: 175, fps: 24, steps: 20,
-            duration: 175 / 24
-        };
-        applyMinimaxH3RequestProfile(profile);
+        var constraints = runner && runner.geometry_constraints || {};
+        var profiles = Array.isArray(constraints.resolutions)
+            ? constraints.resolutions : [];
+        var dimensionStep = Number(constraints.dimension_step) || 32;
+        var widthMin = Number(constraints.width_min) || 32;
+        var widthMax = Number(constraints.width_max) || 2048;
+        var heightMin = Number(constraints.height_min) || 32;
+        var heightMax = Number(constraints.height_max) || 2048;
+        var maxPixels = Number(constraints.max_pixels) || 768 * 1344;
+        var validDimensions = Number.isInteger(Number(state.width)) &&
+            Number.isInteger(Number(state.height)) &&
+            state.width >= widthMin && state.width <= widthMax &&
+            state.height >= heightMin && state.height <= heightMax &&
+            state.width % dimensionStep === 0 && state.height % dimensionStep === 0 &&
+            state.width * state.height <= maxPixels;
+        if (!validDimensions) {
+            state.width = 1344;
+            state.height = 768;
+        }
+        state.seconds = Math.max(1, Math.min(15, Number(state.seconds) || 5));
+        state.fps = Math.max(1, Math.min(120, Math.round(Number(state.fps) || 24)));
+        state.frames = Math.max(1, Math.round(state.seconds * state.fps));
+        state.steps = Math.max(2, Math.min(50, Math.round(Number(state.steps) || 20)));
         state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.h3Quant) >= 0
             ? state.h3Quant : 'int8-fast';
         state.videoQuant = state.h3Quant;
         state.h3AttentionBackend = state.h3AttentionBackend === 'sage-int8'
             ? 'sage-int8' : 'cudnn';
+        state.h3StepCache = state.h3StepCache === 'high' ? 'high' : 'exact';
         state.includeAudio = true;
         state.audioPolicy = 'generate';
         state.batchCount = 1;
-        if (runner && typeof runner.test_prompt === 'string') {
+        if (!String(state.prompt || '').trim() && runner && typeof runner.test_prompt === 'string') {
             state.prompt = runner.test_prompt;
             if (els.prompt)
                 els.prompt.value = runner.test_prompt;
@@ -3432,6 +3474,8 @@ var GenerateTab = (function () {
             els.h3Attention.value = state.h3AttentionBackend;
             els.h3Attention.disabled = state.videoQuant === 'int8-fast';
         }
+        if (els.h3StepCache)
+            els.h3StepCache.value = state.h3StepCache;
         if (els.audioPolicy) {
             els.audioPolicy.innerHTML = '<option value="generate">Generate synchronized audio</option>';
             els.audioPolicy.value = 'generate';
@@ -3439,23 +3483,37 @@ var GenerateTab = (function () {
         }
         [els.framesInput, els.secondsInput, els.fpsInput, els.fpsRange].forEach(function (control) {
             if (control)
-                control.disabled = true;
+                control.disabled = false;
         });
-        if (els.framesInput)
+        if (els.framesInput) {
+            els.framesInput.min = '1';
+            els.framesInput.max = '1800';
+            els.framesInput.step = '1';
             els.framesInput.value = String(state.frames);
-        if (els.secondsInput)
+        }
+        if (els.secondsInput) {
+            els.secondsInput.min = '1';
+            els.secondsInput.max = '15';
+            els.secondsInput.step = '0.01';
             els.secondsInput.value = state.seconds.toFixed(3);
-        if (els.fpsInput)
+        }
+        if (els.fpsInput) {
+            els.fpsInput.min = '1';
+            els.fpsInput.max = '120';
             els.fpsInput.value = String(state.fps);
-        if (els.fpsRange)
+        }
+        if (els.fpsRange) {
+            els.fpsRange.min = '1';
+            els.fpsRange.max = '120';
             els.fpsRange.value = String(state.fps);
+        }
         if (els.steps) {
-            els.steps.min = '1';
+            els.steps.min = '2';
             els.steps.max = '50';
             els.steps.value = String(state.steps);
         }
         if (els.stepsRange) {
-            els.stepsRange.min = '1';
+            els.stepsRange.min = '2';
             els.stepsRange.max = '50';
             els.stepsRange.value = String(state.steps);
         }
@@ -3463,19 +3521,28 @@ var GenerateTab = (function () {
         [els.customWidth, els.customHeight,
             document.getElementById('gen-width-slider'),
             document.getElementById('gen-height-slider')].forEach(function (control) {
-            if (control)
-                control.disabled = true;
+            if (!control)
+                return;
+            control.disabled = false;
+            control.min = control === els.customHeight || control.id === 'gen-height-slider'
+                ? String(heightMin) : String(widthMin);
+            control.max = control === els.customHeight || control.id === 'gen-height-slider'
+                ? String(heightMax) : String(widthMax);
+            control.step = String(dimensionStep);
         });
         if (els.aspectDropdown) {
             els.aspectDropdown.innerHTML = profiles.map(function (candidate) {
                 var value = candidate.width + '×' + candidate.height;
-                var duration = Number(candidate.duration || candidate.frames / candidate.fps);
-                return '<option value="' + value + '">' + value + ' · ' +
-                    candidate.frames + ' frames · ' + duration.toFixed(2) + 's' +
-                    (candidate.available === true ? '' : ' · unavailable') + '</option>';
-            }).join('') || '<option value="512×320">512×320 · 175 frames · 7.29s</option>';
-            els.aspectDropdown.value = state.width + '×' + state.height;
-            els.aspectDropdown.disabled = profiles.length <= 1;
+                return '<option value="' + value + '">' +
+                    String(candidate.aspect_ratio || 'Preset') + ' · ' + value + '</option>';
+            }).join('') + '<option value="Free">Custom width × height</option>';
+            var currentPreset = profiles.some(function (candidate) {
+                return Number(candidate.width) === state.width &&
+                    Number(candidate.height) === state.height;
+            });
+            els.aspectDropdown.value = currentPreset
+                ? state.width + '×' + state.height : 'Free';
+            els.aspectDropdown.disabled = false;
         }
         if (els.videoGuidanceMode && els.videoGuidanceMode.closest('.gen-param-row'))
             els.videoGuidanceMode.closest('.gen-param-row').style.display = 'none';
@@ -3484,8 +3551,8 @@ var GenerateTab = (function () {
         var profileNote = document.getElementById('gen-video-profile-note');
         if (profileNote)
             profileNote.textContent = runnerReady
-                ? 'Compiled H3 profiles: exact 241-token prompt · synchronized audio · fixed 24 GB workload. Higher resolution uses fewer frames to preserve speed and VRAM safety. INT8 Fast is full-render visually gated with cU-DNN; INT8 Quality and BF16 remain switchable.'
-                : 'MiniMax-H3 profiles remain visible, but the selected local binaries, INT8 encoder cache, or quality gate are unavailable.';
+                ? 'H3 width and height are adjustable from 32–2048 in 32-pixel steps, up to 1,032,192 pixels. The listed sizes are tested presets, not a lock. Seconds are adjustable from 1–15; INT8 Fast, INT8 Quality, and BF16 remain switchable.'
+                : 'MiniMax-H3 controls remain visible, but the selected local binaries, INT8 encoder cache, or quality gate are unavailable.';
         var advancedNote = document.getElementById('gen-video-advanced-note');
         if (advancedNote)
             advancedNote.textContent = 'H3 runs entirely on GPU, exits after denoising, decodes in a fresh GPU process, and muxes with NVENC.';
@@ -4088,6 +4155,7 @@ var GenerateTab = (function () {
             ltx2Mode: state.videoGuidanceMode,
             quantization: state.videoQuant,
             h3AttentionBackend: state.h3AttentionBackend,
+            h3StepCache: state.h3StepCache,
             ltx2WorkflowProfile: state.videoWorkflowProfile,
             ltx2PromptEnhancer: state.videoPromptEnhancer,
             ltx2AudioPolicy: state.audioPolicy,
@@ -4177,6 +4245,8 @@ var GenerateTab = (function () {
                 height: state.height,
                 frames: state.frames,
                 fps: state.fps,
+                duration_seconds: Math.max(1, Math.min(15,
+                    Number(state.seconds) || state.frames / Math.max(1, state.fps))),
                 steps: Number(state.steps) || 20,
                 seed: seed,
                 quant: state.videoQuant === 'bf16'
@@ -4184,6 +4254,7 @@ var GenerateTab = (function () {
                     : (state.videoQuant === 'int8' ? 'int8' : 'int8-fast'),
                 attention_backend: state.h3AttentionBackend === 'sage-int8'
                     ? 'sage-int8' : 'cudnn',
+                step_cache: state.h3StepCache === 'high' ? 'high' : 'exact',
                 include_audio: true
             };
         }
@@ -6400,6 +6471,7 @@ var GenerateTab = (function () {
             videoQuant: state.videoQuant,
             quantization: state.videoQuant,
             h3AttentionBackend: state.h3AttentionBackend,
+            h3StepCache: state.h3StepCache,
             videoCheckpoint: state.videoCheckpoint,
             capsPositive: state.capsPositive,
             capsNegative: state.capsNegative,
@@ -6518,6 +6590,10 @@ var GenerateTab = (function () {
         else if (typeof params.attention_backend === 'string')
             state.h3AttentionBackend = params.attention_backend === 'sage-int8'
                 ? 'sage-int8' : 'cudnn';
+        if (typeof params.h3StepCache === 'string')
+            state.h3StepCache = params.h3StepCache === 'high' ? 'high' : 'exact';
+        else if (typeof params.step_cache === 'string')
+            state.h3StepCache = params.step_cache === 'high' ? 'high' : 'exact';
         if (typeof params.videoCheckpoint === 'string')
             state.videoCheckpoint = params.videoCheckpoint;
         else if (typeof params.checkpoint === 'string')
@@ -6632,6 +6708,8 @@ var GenerateTab = (function () {
             els.videoQuant.value = state.videoQuant;
         if (els.h3Attention)
             els.h3Attention.value = state.h3AttentionBackend;
+        if (els.h3StepCache)
+            els.h3StepCache.value = state.h3StepCache;
         if (els.videoCheckpoint)
             els.videoCheckpoint.value = state.videoCheckpoint;
         if (els.capsPositive)

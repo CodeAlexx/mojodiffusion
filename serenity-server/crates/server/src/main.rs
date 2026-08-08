@@ -3858,8 +3858,14 @@ fn asset_media_type(name: &str) -> Option<&'static str> {
         .map(|extension| extension.to_ascii_lowercase())
         .as_deref()
     {
-        Some("png") | Some("jpg") | Some("jpeg") | Some("webp") | Some("gif") => Some("image"),
-        Some("mp4") | Some("mov") | Some("webm") | Some("mkv") => Some("video"),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("webp") | Some("bmp") | Some("gif") => {
+            Some("image")
+        }
+        Some("mp4") | Some("mov") | Some("webm") | Some("mkv") | Some("avi") | Some("m4v") => {
+            Some("video")
+        }
+        Some("wav") | Some("mp3") | Some("m4a") | Some("aac") | Some("flac") | Some("ogg")
+        | Some("opus") => Some("audio"),
         _ => None,
     }
 }
@@ -4128,11 +4134,21 @@ fn upload_ext_from_filename(fname: &str) -> &'static str {
         Some("png") => "png",
         Some("jpg") | Some("jpeg") => "jpg",
         Some("webp") => "webp",
+        Some("bmp") => "bmp",
         Some("gif") => "gif",
         Some("mp4") => "mp4",
         Some("mov") => "mov",
         Some("webm") => "webm",
         Some("mkv") => "mkv",
+        Some("avi") => "avi",
+        Some("m4v") => "m4v",
+        Some("wav") => "wav",
+        Some("mp3") => "mp3",
+        Some("m4a") => "m4a",
+        Some("aac") => "aac",
+        Some("flac") => "flac",
+        Some("ogg") => "ogg",
+        Some("opus") => "opus",
         _ => "png",
     }
 }
@@ -4170,8 +4186,8 @@ async fn post_upload_image(State(st): State<AppState>, req: axum::extract::Reque
     handle_upload(&st, &body, "init")
 }
 
-/// POST /upload/media — land a browser-selected image, mask, or short driving
-/// video for path-based video-model requests. The response is the same
+/// POST /upload/media — land a browser-selected image, short driving video,
+/// or audio reference for path-based video-model requests. The response is the same
 /// `{name,path,url}` contract as /upload/image.
 async fn post_upload_media(State(st): State<AppState>, req: axum::extract::Request) -> Response {
     let is_multipart = req
@@ -5455,12 +5471,12 @@ mod endpoint_tests {
 
     #[test]
     fn asset_inventory_is_media_only_persistent_and_safe() {
-        let root =
-            std::env::temp_dir().join(format!("serenity-assets-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("serenity-assets-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("uploads/nested")).unwrap();
         std::fs::write(root.join("uploads/source-0002.png"), b"not-an-image").unwrap();
         std::fs::write(root.join("uploads/clip-0003.mp4"), b"not-a-video").unwrap();
+        std::fs::write(root.join("uploads/voice-0004.wav"), b"not-audio").unwrap();
         std::fs::write(root.join("uploads/ignore-0004.txt"), b"not-media").unwrap();
         std::fs::write(root.join("uploads/nested/hidden.png"), b"nested").unwrap();
 
@@ -5469,9 +5485,10 @@ mod endpoint_tests {
             .iter()
             .filter_map(|item| item["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
         assert!(names.contains(&"source-0002.png"));
         assert!(names.contains(&"clip-0003.mp4"));
+        assert!(names.contains(&"voice-0004.wav"));
         assert_eq!(
             assets
                 .iter()
@@ -5479,7 +5496,15 @@ mod endpoint_tests {
                 .unwrap()["media_type"],
             "image"
         );
+        assert_eq!(
+            assets
+                .iter()
+                .find(|item| item["name"] == "voice-0004.wav")
+                .unwrap()["media_type"],
+            "audio"
+        );
         assert!(safe_asset_path(&root, "source-0002.png").is_some());
+        assert!(safe_asset_path(&root, "voice-0004.wav").is_some());
         assert!(safe_asset_path(&root, "../source-0002.png").is_none());
         assert!(safe_asset_path(&root, "nested/hidden.png").is_none());
         assert!(safe_asset_path(&root, "ignore-0004.txt").is_none());

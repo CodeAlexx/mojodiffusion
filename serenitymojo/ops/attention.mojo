@@ -515,6 +515,149 @@ def _sdpa_math[
             qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype())
 
 
+# Runtime-shape sibling of `_sdpa_math_storage` for inference surfaces whose
+# token count is authored per request.  Keep the operation order identical to
+# the accepted static math path: gather BSHD->BHSD, F32 QK, scale, the same
+# row-softmax kernel, F32 P@V, then one cast/scatter back to the storage dtype.
+# In particular, do not substitute cuDNN here: H3's two token-refiner blocks
+# compound that otherwise-small backend difference before the 50-block DiT.
+def _sdpa_nomask_math_storage_dynamic[dtype: DType](
+    qs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    ks: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    vs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    B: Int,
+    S: Int,
+    H: Int,
+    Dh: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+    out_dt: STDtype,
+) raises -> Tensor:
+    var BH = B * H
+    var src_rows = B * S * H
+    var bhsd_rows = B * H * S
+    var q_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var k_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var v_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var bhsd_rl = RuntimeLayout[_DYN2].row_major(
+        IndexList[2](bhsd_rows, Dh)
+    )
+    var qd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+        q_buf.unsafe_ptr(), bhsd_rl
+    )
+    var kd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+        k_buf.unsafe_ptr(), bhsd_rl
+    )
+    var vd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+        v_buf.unsafe_ptr(), bhsd_rl
+    )
+    var ngather = B * H * S * Dh
+    var ggrid = (ngather + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](qs, qd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](ks, kd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](vs, vd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+
+    var scores = ctx.enqueue_create_buffer[DType.float32](BH * S * S)
+    var head_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, Dh))
+    var sc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, S))
+    var qptr = q_buf.unsafe_ptr()
+    var kptr = k_buf.unsafe_ptr()
+    var scptr = scores.unsafe_ptr()
+    for bh in range(BH):
+        var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+            qptr + bh * S * Dh, head_rl
+        )
+        var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+            kptr + bh * S * Dh, head_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            scptr + bh * S * S, sc_rl
+        )
+        matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
+
+    var sm_rows = BH * S
+    var sc_full_rl = RuntimeLayout[_DYN2].row_major(
+        IndexList[2](sm_rows, S)
+    )
+    var sc_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        scptr, sc_full_rl
+    )
+    var nsm = sm_rows * S
+    var smgrid = (nsm + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        sc_full, scale, sm_rows, S,
+        grid_dim=smgrid, block_dim=_BLOCK,
+    )
+    ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
+        sc_full, S, grid_dim=sm_rows, block_dim=_TPB
+    )
+
+    var out_f32 = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var optr = out_f32.unsafe_ptr()
+    comptime if dtype == DType.float32:
+        var vptr = v_buf.unsafe_ptr().bitcast[Float32]()
+        for bh in range(BH):
+            var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                scptr + bh * S * S, sc_rl
+            )
+            var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                vptr + bh * S * Dh, head_rl
+            )
+            var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                optr + bh * S * Dh, head_rl
+            )
+            matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
+    else:
+        _attn_pv_matmul[dtype](
+            scptr, v_buf.unsafe_ptr(), optr, BH, S, S, Dh, ctx
+        )
+
+    var bsz = out_dt.byte_size()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        B * S * H * Dh * bsz
+    )
+    var out_src = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        optr, bhsd_rl
+    )
+    var nsc = B * H * S * Dh
+    var scgrid = (nsc + _BLOCK - 1) // _BLOCK
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    comptime if dtype == DType.float32:
+        var Od = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        ctx.enqueue_function[
+            _scatter_bhsd_to_bshd_f32, _scatter_bhsd_to_bshd_f32
+        ](out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    elif dtype == DType.bfloat16:
+        var Od = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        ctx.enqueue_function[
+            _scatter_bhsd_to_bshd_bf16, _scatter_bhsd_to_bshd_bf16
+        ](out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    else:
+        var Od = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        ctx.enqueue_function[
+            _scatter_bhsd_to_bshd_f16, _scatter_bhsd_to_bshd_f16
+        ](out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+
+    var out_shape = List[Int]()
+    out_shape.append(B)
+    out_shape.append(S)
+    out_shape.append(H)
+    out_shape.append(Dh)
+    return Tensor(out_buf^, out_shape^, out_dt)
+
+
 # ── head-chunked math SDPA (bit-identical to _sdpa_math, smaller peak) ───────
 # WHY: _sdpa_math_storage materializes the F32 scores for ALL heads at once:
 # [B*H, S, S] F32 = B*H*S*S*4 bytes. At B=1,H=24,S=4297 that is ~1.77 GB — the
@@ -1878,6 +2021,71 @@ def sdpa_nomask[
         raise Error("sdpa_nomask: q shape does not match compile-time B/S/H/Dh")
 
     return _sdpa_math[B, S, H, Dh](q, k, v, q, scale, ctx, False)
+
+
+def sdpa_nomask_dynamic(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Exact math-mode SDPA with runtime B/S/H/Dh dimensions."""
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_nomask_dynamic: q/k/v dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4 or k.shape() != qshape or v.shape() != qshape:
+        raise Error("sdpa_nomask_dynamic: q/k/v must share [B,S,H,Dh]")
+    var B = qshape[0]
+    var S = qshape[1]
+    var H = qshape[2]
+    var Dh = qshape[3]
+    if B <= 0 or S <= 0 or H <= 0 or Dh <= 0:
+        raise Error("sdpa_nomask_dynamic: dimensions must be positive")
+    var src_rows = B * S * H
+    var src_rl = RuntimeLayout[_DYN2].row_major(
+        IndexList[2](src_rows, Dh)
+    )
+    var dt = q.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var qs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var ks = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var vs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        return _sdpa_nomask_math_storage_dynamic[DType.float32](
+            qs, ks, vs, B, S, H, Dh, scale, ctx, q.dtype()
+        )
+    elif dt == DType.bfloat16:
+        var qs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var ks = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var vs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        return _sdpa_nomask_math_storage_dynamic[DType.bfloat16](
+            qs, ks, vs, B, S, H, Dh, scale, ctx, q.dtype()
+        )
+    else:
+        var qs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var ks = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var vs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        return _sdpa_nomask_math_storage_dynamic[DType.float16](
+            qs, ks, vs, B, S, H, Dh, scale, ctx, q.dtype()
+        )
 
 
 def sdpa_tiled[

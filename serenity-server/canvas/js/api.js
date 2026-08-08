@@ -53,10 +53,20 @@ var SerenityAPI = (function () {
                     prompt: h3.prompt || '',
                     source_image: h3.source_image || '',
                     last_frame: h3.last_frame || '',
-                    width: Number(h3.width) || 512,
-                    height: Number(h3.height) || 320,
+                    references: Array.isArray(h3.references)
+                        ? h3.references.map(function (reference) {
+                            return {
+                                kind: reference.kind,
+                                path: reference.path,
+                                audio_use: reference.audio_use || 'reference'
+                            };
+                        }) : [],
+                    width: Number(h3.width) || 1344,
+                    height: Number(h3.height) || 768,
                     frames: Number(h3.num_frames) || 175,
                     fps: Number(h3.frame_rate) || 24,
+                    duration_seconds: Number(h3.duration_seconds) ||
+                        (Number(h3.num_frames) || 175) / (Number(h3.frame_rate) || 24),
                     steps: Number(h3.steps) || 20,
                     seed: Number(h3.seed) || 0,
                     quant: h3Loader && h3Loader.precision === 'bf16'
@@ -65,6 +75,8 @@ var SerenityAPI = (function () {
                             ? 'int8' : 'int8-fast'),
                     attention_backend: h3Loader && h3Loader.attention_backend === 'sage-int8'
                         ? 'sage-int8' : 'cudnn',
+                    step_cache: h3Loader && h3Loader.step_cache === 'high'
+                        ? 'high' : 'exact',
                     include_audio: true
                 };
             }

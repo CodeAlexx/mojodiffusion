@@ -18,9 +18,14 @@
 # Interrupted builds simply resume at the first missing pair.
 
 from std.gpu.host import DeviceContext, HostBuffer
+from std.gpu import global_idx
 from std.memory import ArcPointer
 from std.math import sqrt
 from std.sys.defines import get_defined_int
+from std.utils.index import IndexList
+
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.io.dtype import STDtype
@@ -74,6 +79,9 @@ from serenitymojo.ops.int8_quant import (
     int8_encode_perrow,
     int8_rowscale,
 )
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_infer_fwd_causal_padmask_dynamic,
+)
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.rope import rope_halfsplit
 
@@ -85,6 +93,133 @@ comptime H3_ENCODER_INT8_ALLOW_CACHE_BUILD = get_defined_int[
     "H3_ENCODER_INT8_ALLOW_CACHE_BUILD", 1
 ]()
 comptime _TArc = ArcPointer[Tensor]
+comptime _H3_VISUAL_DYN1 = Layout.row_major(-1)
+comptime _H3_VISUAL_BLOCK = 256
+
+
+def _h3_visual_rows_bf16[add_mode: Bool](
+    hidden: LayoutTensor[DType.bfloat16, _H3_VISUAL_DYN1, MutAnyOrigin],
+    values: LayoutTensor[DType.float32, _H3_VISUAL_DYN1, MutAnyOrigin],
+    positions: LayoutTensor[DType.int32, _H3_VISUAL_DYN1, MutAnyOrigin],
+    seq: Int,
+    rows: Int,
+    width: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < rows * width:
+        var source_row = idx // width
+        var column = idx % width
+        var target_row = Int(
+            rebind[Scalar[DType.int32]](positions[source_row])
+        )
+        if target_row >= 0 and target_row < seq:
+            var dst = target_row * width + column
+            var value = rebind[Scalar[DType.float32]](values[idx])
+            comptime if add_mode:
+                value += rebind[Scalar[DType.bfloat16]](
+                    hidden[dst]
+                ).cast[DType.float32]()
+            hidden[dst] = rebind[hidden.element_type](
+                value.cast[DType.bfloat16]()
+            )
+
+
+def _h3_i8_visual_rows_device(
+    mut hidden: Tensor,
+    values: List[Float32],
+    positions: List[Int],
+    add_mode: Bool,
+    ctx: DeviceContext,
+) raises:
+    """Replace or add visual rows without running conditioner math on CPU."""
+    var shape = hidden.shape()
+    if len(shape) != 3 or shape[0] != 1 or shape[2] != H3_HIDDEN:
+        raise Error("MiniMax-H3 visual injection: hidden shape mismatch")
+    var rows = len(positions)
+    if len(values) != rows * H3_HIDDEN:
+        raise Error("MiniMax-H3 visual injection: value count mismatch")
+    for i in range(rows):
+        if positions[i] < 0 or positions[i] >= shape[1]:
+            raise Error("MiniMax-H3 visual injection: position out of range")
+    if hidden.dtype() != STDtype.BF16:
+        raise Error("MiniMax-H3 visual injection: hidden must be BF16")
+
+    var source = Tensor.from_host(
+        values, [rows * H3_HIDDEN], STDtype.F32, ctx
+    )
+    var pos_host = ctx.enqueue_create_host_buffer[DType.int32](rows)
+    var pos_ptr = pos_host.unsafe_ptr()
+    for i in range(rows):
+        pos_ptr[i] = Int32(positions[i])
+    var pos_device = ctx.enqueue_create_buffer[DType.int32](rows)
+    ctx.enqueue_copy(dst_buf=pos_device, src_buf=pos_host)
+
+    var hidden_layout = RuntimeLayout[_H3_VISUAL_DYN1].row_major(
+        IndexList[1](hidden.numel())
+    )
+    var source_layout = RuntimeLayout[_H3_VISUAL_DYN1].row_major(
+        IndexList[1](len(values))
+    )
+    var positions_layout = RuntimeLayout[_H3_VISUAL_DYN1].row_major(
+        IndexList[1](rows)
+    )
+    var hidden_tensor = LayoutTensor[
+        DType.bfloat16, _H3_VISUAL_DYN1, MutAnyOrigin
+    ](hidden.buf.unsafe_ptr().bitcast[BFloat16](), hidden_layout)
+    var source_tensor = LayoutTensor[
+        DType.float32, _H3_VISUAL_DYN1, MutAnyOrigin
+    ](source.buf.unsafe_ptr().bitcast[Float32](), source_layout)
+    var positions_tensor = LayoutTensor[
+        DType.int32, _H3_VISUAL_DYN1, MutAnyOrigin
+    ](pos_device.unsafe_ptr(), positions_layout)
+    var total = rows * H3_HIDDEN
+    var grid = (total + _H3_VISUAL_BLOCK - 1) // _H3_VISUAL_BLOCK
+    if add_mode:
+        ctx.enqueue_function[
+            _h3_visual_rows_bf16[True], _h3_visual_rows_bf16[True]
+        ](
+            hidden_tensor, source_tensor, positions_tensor,
+            shape[1], rows, H3_HIDDEN,
+            grid_dim=grid, block_dim=_H3_VISUAL_BLOCK,
+        )
+    else:
+        ctx.enqueue_function[
+            _h3_visual_rows_bf16[False], _h3_visual_rows_bf16[False]
+        ](
+            hidden_tensor, source_tensor, positions_tensor,
+            shape[1], rows, H3_HIDDEN,
+            grid_dim=grid, block_dim=_H3_VISUAL_BLOCK,
+        )
+
+
+def _h3_i8_sdpa_dispatch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Tensor,
+    scale: Float32,
+    seq: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """H3 conditioner attention with a long-reference GPU extension.
+
+    The accepted <=2,048-token path retains the existing foundation-op
+    arithmetic. Multi-reference Ref2VA presentations use larger power-of-two
+    buckets and route only those buckets through runtime-shape causal cuDNN
+    SDPA. No host model fallback is permitted.
+    """
+    if seq <= 2048:
+        return _sdpa_dispatch(
+            q, k, v, mask, scale, seq, H3_HEADS, H3_HEAD_DIM, ctx
+        )
+    if seq <= 16384 and seq % 128 == 0:
+        return sdpa_flash_infer_fwd_causal_padmask_dynamic(
+            q, k, v, seq, scale, ctx
+        )
+    raise Error(
+        String("MiniMax-H3 conditioner sequence ") + String(seq)
+        + String(" is outside the GPU causal-attention window [8,16384]")
+    )
 
 
 def minimax_h3_int8_cache_dir(text_encoder_dir: String) -> String:
@@ -535,10 +670,9 @@ def _h3_i8_layer_forward(
     k = rope_halfsplit(k, cos_k, sin_k, ctx)
     var k_rep = _repeat_kv(k^, H3_HEADS, H3_KV_HEADS, ctx)
     var v_rep = _repeat_kv(v^, H3_HEADS, H3_KV_HEADS, ctx)
-    var attn = _sdpa_dispatch(
+    var attn = _h3_i8_sdpa_dispatch(
         q, k_rep, v_rep, mask,
-        Float32(1.0) / sqrt(Float32(H3_HEAD_DIM)),
-        seq, H3_HEADS, H3_HEAD_DIM, ctx,
+        Float32(1.0) / sqrt(Float32(H3_HEAD_DIM)), seq, ctx,
     )
     if li == 0:
         print("  H3 encoder INT8 layer 0 attention:", attn.shape())
@@ -612,12 +746,8 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
     )
     if has_vision:
         var vpos = visual_positions.value().copy()
-        var host_embeds = hidden.to_host(ctx)
-        minimax_h3_splice_vision_embeds(
-            host_embeds, vision.value().embeds, vpos, H3_HIDDEN
-        )
-        hidden = Tensor.from_host(
-            host_embeds, hidden.shape(), hidden.dtype(), ctx
+        _h3_i8_visual_rows_device(
+            hidden, vision.value().embeds, vpos, False, ctx
         )
 
     var seq = len(ids)
@@ -640,9 +770,18 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
     var sin_k = Tensor.from_host(
         k_tables[1], [seq * H3_KV_HEADS * half], STDtype.BF16, ctx
     )
-    var mask_data = _build_causal_mask(seq, H3_HEADS, seq)
+    var mask_data = List[Float32]()
+    var mask_shape = List[Int]()
+    if seq <= 2048:
+        mask_data = _build_causal_mask(seq, H3_HEADS, seq)
+        mask_shape = [1, H3_HEADS, seq, seq]
+    else:
+        # Long-reference cuDNN attention applies the causal mask internally.
+        # Keep only a one-value placeholder instead of allocating O(S^2).
+        mask_data.append(Float32(0.0))
+        mask_shape = [1, 1, 1, 1]
     var mask = Tensor.from_host(
-        mask_data, [1, H3_HEADS, seq, seq], STDtype.BF16, ctx
+        mask_data, mask_shape.copy(), STDtype.BF16, ctx
     )
 
     var deepstack_lm_layers = minimax_h3_vision_deepstack_lm_layers()
@@ -658,12 +797,8 @@ def minimax_h3_encode_conditioning_int8_streamed_depth(
                 if deepstack_lm_layers[k] == li:
                     var vpos2 = visual_positions.value().copy()
                     var tap = vision.value().deepstack_block(k)
-                    var host_hidden = hidden.to_host(ctx)
-                    minimax_h3_deepstack_add(
-                        host_hidden, tap, vpos2, H3_HIDDEN
-                    )
-                    hidden = Tensor.from_host(
-                        host_hidden, hidden.shape(), hidden.dtype(), ctx
+                    _h3_i8_visual_rows_device(
+                        hidden, tap, vpos2, True, ctx
                     )
         ctx.synchronize()
         st.release_to_os()

@@ -364,7 +364,10 @@ def load_minimax_h3_resident_cache(
                 quant_names^, quant^, scales^, keep_names^, keeps^
             )
         )
-        st.release_to_os()
+        # Keep the packed cache pages eligible for Linux's normal page cache.
+        # release_to_os() is a whole-mapping MADV_DONTNEED, not a per-block
+        # release: calling it here discarded every previously touched block
+        # and forced the streamed tail to reread the cache from storage.
         # One-block loads are the streamed tail, not resident-cache setup.
         # Logging every tail visit emits 50 identical "1 / 1" lines per
         # evaluation and makes the product progress parser look stuck in
@@ -440,7 +443,11 @@ def reload_minimax_h3_resident_w8a8_block(
     if qslot != len(block.fp8) or kslot != len(block.bf16):
         raise Error("MiniMax-H3 reusable tail slot-count mismatch")
     resident.start_layer = layer
-    st.release_to_os()
+    # Do not call release_to_os() here.  It applies MADV_DONTNEED to the whole
+    # packed cache mapping, so a one-block refill would evict all other blocks
+    # and turn every denoising evaluation into another full storage read.  The
+    # mapping is still unmapped on scope exit; clean file-backed pages remain
+    # reclaimable by Linux under host-memory pressure.
 
 
 def reload_minimax_h3_resident_groupwise_block(
@@ -501,7 +508,8 @@ def reload_minimax_h3_resident_groupwise_block(
     if qslot != len(block.fp8) or kslot != len(block.bf16):
         raise Error("MiniMax-H3 reusable groupwise slot-count mismatch")
     resident.start_layer = layer
-    st.release_to_os()
+    # Match the W8A8 refill path: this is a whole-cache mapping, so evicting it
+    # here would force the next groupwise block/evaluation back to storage.
 
 
 def save_minimax_h3_modcache(

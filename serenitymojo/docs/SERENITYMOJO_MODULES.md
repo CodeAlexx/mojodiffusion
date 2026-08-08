@@ -570,18 +570,31 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
 - `models/dit/minimax_h3_{dit,frontend,int8_linear,runtime_cache}.mojo` is the
   shared BF16/group-wise-INT8/W8A8 DiT runtime. Long-sequence QKV, SwiGLU,
   residual projection, AdaLN gathering, and final projection are lifetime-
-  isolated or row chunked to bound the 24-GiB product peak.
+  isolated or row chunked to bound the 24-GiB product peak. Streamed packed
+  cache refills unmap each short-lived view without whole-mapping
+  `MADV_DONTNEED`; clean pages remain in Linux's reclaimable file cache instead
+  of forcing another roughly 18-GiB storage read on every evaluation. The
+  768x768x362 Fast/Sage old/corrected-cold/corrected-hot gate measured
+  140.57/111.82/106.43 seconds, 97.3% fewer hot filesystem input blocks, and
+  one byte-identical latent SHA across all three runners. The groupwise
+  256x256x56 Quality/cU-DNN cold/hot gate measured 107.85/7.83 seconds and one
+  byte-identical latent SHA.
 - `models/dit/minimax_h3_qk_inplace.mojo` performs exact-boundary BF16 Q/K RMS
   normalization and partial RoPE in owned buffers. The GPU gate in
   `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` covers this and the
   fused/chunked BF16, group-wise, and W8A8 paths.
+- `models/dit/minimax_h3_frontend.mojo` packs disjoint video/audio/text rows
+  with a forward-only O(rows*hidden) GPU scatter rather than the autograd
+  index-select backward kernel. `parity/minimax_h3_scatter_forward_gate.mojo`
+  proves the interleaved mapping is bit-exact.
 - `models/dit/minimax_h3_step_cache.mojo` supplies the opt-in `high` denoise
   policy: first/last eight blocks are recomputed and one group-32 INT8 middle
   residual may be reused. `exact` is the quality default; High is experimental
   because its decoded A/B showed visible video drift. It never changes request
   geometry, duration, FPS, scheduler steps, or audio.
 - `ops/sage_attention_int8.mojo` is the switchable experimental INT8-QK
-  attention backend. cU-DNN remains the accepted default. Dynamic sequence
+  attention backend on BF16, INT8 Quality, and INT8 Fast. cU-DNN remains the
+  exact-quality choice. Dynamic sequence
   entry points in `ops/attention.mojo` and `ops/attention_flash.mojo` let one
   runner serve runtime geometry and variable reference-token counts.
 - `models/minimax_h3_device/audio_encoder_device.mojo` implements the learned
@@ -591,7 +604,9 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
   internal frames, FPS, precision, attention, and step-cache flags. The product
   boundary exposes 1–15 authored seconds and 32–2048 dimensions in 32-pixel
   steps inside the 1,032,192-pixel envelope, with six tested native presets.
-  BF16, INT8 Quality, and INT8 Fast remain independently switchable.
+  BF16, INT8 Quality, and INT8 Fast remain independently switchable. At long
+  sequence length the conditioned pipelines fence/trim once per streamed block
+  to bound deferred CUDA-pool temporaries; within-block work stays async.
 - Ref2VA accepts ordered image/video/audio conditioning: at most 9 images, 3
   videos, 3 audio clips, and 12 combined. Video audio is preserved as a
   conditioning source and each audio-bearing reference selects ordinary,

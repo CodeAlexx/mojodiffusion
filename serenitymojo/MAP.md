@@ -3118,7 +3118,7 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   timing, VRAM, prompt-extension provenance, and visual acceptance. The Rust
   server refuses Wan readiness if any pinned check drifts.
 
-## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-07)
+## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-08)
 
 The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
 layout (NOT the diffusers conversion). First valid video 2026-08-03
@@ -3250,8 +3250,9 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   latent cosine against the current groupwise-quality arm is video 0.93862942 /
   audio 0.98805401. It is therefore exposed as the separate `int8-fast` perceptually
   accepted choice, not mislabeled as numerical parity; `int8` quality and
-  streamed `bf16` remain available. The fast arm is gated only with cU-DNN;
-  stacking experimental Sage attention is rejected by request validation. A
+  streamed `bf16` remain available. Weight precision and attention are
+  independent runtime choices: Fast can use either exact-quality cU-DNN or
+  experimental Sage INT8. A
   real HTTP queue smoke (`video-0005`, two requested steps/one evaluation)
   selected the fast runner, denoised in 10.2355 s with finite latents, completed
   the fresh GPU decode, and published 175 H.264/NVENC frames plus stereo AAC as
@@ -3264,9 +3265,13 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   nonfinite=0/0, cosine 0.999907662, max_abs 0.00341797, attention-only 1.276x
   faster. A real resident-model step is finite and 22.98 s vs cU-DNN 23.72 s,
   but final latent cosine is video 0.998918 / audio 0.996266, below the 0.999
-  product bar. On the direct-W8A8 fast block path Sage also measured slower
-  than cU-DNN (12.12 vs 10.24 s/eval). Therefore `sage-int8` is switchable but explicitly
-  **experimental and OFF by default**; cU-DNN remains the quality default.
+  product bar. On the short direct-W8A8 fast block gate Sage also measured
+  slower than cU-DNN (12.12 vs 10.24 s/eval); that historical short-sequence
+  result is not a sparse-attention claim and does not predict the 61k-token
+  path. Therefore `sage-int8` is switchable on every precision profile but
+  explicitly **experimental/approximate**; cU-DNN remains the exact-quality
+  choice. The bare CLI defaults to cU-DNN, while Canvas defaults to Sage as the
+  user-visible speed choice and never silently relabels it as exact.
 - **Serenity integration:** `MiniMax-H3-Mojo` is a gated video model with one
   `minimax_h3_serenity_runtime` T2VA executable. Requests independently select
   authored duration from 1 through 15 seconds, delivery FPS from 1 through
@@ -3292,8 +3297,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   Cache-DiT-style policy recomputes the first/last eight blocks and may reuse
   one group-32 INT8 middle-stack residual; it preserves size, seconds, FPS,
   steps, and audio but remains experimental because decoded A/B testing found
-  visible video drift.
-  cU-DNN is the default and Sage is labeled experimental. On 2026-08-05 both
+  visible video drift. Completed Canvas videos expose a one-click `Continue
+  H3` staging action: the browser decodes the final displayed frame to a
+  lossless PNG, switches to I2VA, carries valid geometry/FPS/duration forward,
+  and leaves BF16, INT8 Quality, INT8 Fast, Sage, and cU-DNN selectable.
+  cU-DNN is the exact-quality choice and Sage is labeled experimental. On 2026-08-05 both
   added profiles passed 19-evaluation Fast trajectories, zero finite-gate
   failures, fresh streaming GPU VAE decode, NVENC H.264 + stereo AAC probe, and
   three-frame visual inspection. Their denoise times were 147.089 s at
@@ -3338,9 +3346,9 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   1-15 second duration, native-timeline/delivery-FPS, precision, attention, and
   exact/high cache controls with T2VA; synchronized audio and fresh-process
   GPU decode remain mandatory. The UI exposes W8A8 `int8-fast`, groupwise `int8`, and
-  BF16-DiT + INT8-encoder runners. cU-DNN remains the default; Sage is
-  switchable only on Quality/BF16 and labeled experimental, while Fast rejects
-  it.
+  BF16-DiT + INT8-encoder runners. Sage and cU-DNN remain independently
+  switchable on all three weight profiles; Sage is labeled approximate and
+  cU-DNN is labeled exact quality.
   The conditioned runner consumes the installed 702-file row-scaled INT8
   Qwen3-VL cache with BF16 outputs, executes one/two independent device vision
   segments, reuses the canonical FL2VA groupwise/W8A8 stores, and shares one
@@ -3386,6 +3394,47 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   Machine-local evidence is
   `output/checks/minimax_h3_conditioned_canvas_gate.json` and the superseding
   omni-reference record `output/checks/minimax_h3_ref2va_canvas_gate.json`.
+- **Long-sequence speed/lifecycle closure (2026-08-08):**
+  `minimax_h3_scatter_streams` no longer reuses the autograd
+  `index_select_backward` kernel for forward packing. Its disjoint GPU scatter
+  is O(rows*hidden), bit-exact under
+  `models/dit/parity/minimax_h3_scatter_forward_gate.mojo`, and a rebuilt
+  512x320x175 full-20 Fast trajectory stayed byte-identical
+  (`sha256=10b044d0...ff6a9`) while denoise fell from 176.10 to 160.95 s. At
+  768x768x362, fencing and trimming the CUDA pool at each streamed long-sequence
+  block boundary bounded deferred temporaries: the exact same Fast/Sage latent
+  changed from 188.48 to **103.38 s/evaluation**, a 45.2% reduction, with
+  byte-identical `sha256=97debb16...9a3c1`. The fence is only active from 60k
+  tokens; resident prefixes and within-block operations stay asynchronous.
+  Streamed BF16/Sage remains weight-I/O bound at 392.70 s/evaluation
+  (273.39 s weight load + 119.09 s forward), so it is the highest-precision
+  option rather than the practical 24-GB speed path. Corrected INT8 Quality
+  now consumes groupwise cache blocks 0-47 directly, recreates one reusable
+  packed block on every later evaluation, and leaves only blocks 48-49 BF16;
+  its real 15-second two-evaluation gate was finite at 283.78 s cold and
+  129.75 s hot. Ref2VA uses the same recreate-after-release lifecycle and a
+  direct two-evaluation real-image gate passed at 65.15 s cold / 9.42 s hot,
+  zero video/audio non-finites, with
+  `sha256=034bc189...c8949`. A subsequent live 20-step 768-square render
+  exposed a cache-I/O defect that the isolated one-evaluation A/B did not:
+  `runtime_cache` called whole-mapping `MADV_DONTNEED` after every streamed
+  block, causing roughly 18 GiB of real storage reads per evaluation and a
+  3,578.67-second / 59.64-minute denoise on the live 20-step alien render.
+  The refill paths no longer issue that whole-file eviction; clean packed
+  pages stay in Linux's reclaimable file cache after each short-lived mapping.
+  This is host weight staging only, not CPU model inference. An exact
+  768x768x362 Fast/Sage old/corrected-cold/corrected-hot A/B measured
+  140.57/111.82/106.43 seconds per evaluation, cut filesystem input blocks
+  from 86,622,960 to 2,327,960 hot (97.3%), and produced the identical latent
+  SHA `97debb16...9a3c1` in all three runs. The measured first-plus-18-hot
+  projection is 2,027.59 seconds / 33.79 minutes of denoise. The normalized
+  RTX 3090 target from a 13.5-minute RTX 5080 reference (5080 reported 2-3x
+  faster) is roughly 27-40.5 minutes; the measured 7.47-minute 768-square
+  decode puts the warm projected full generation near 41.5 minutes, close to
+  but not below the strict upper rung. The matching real 256x256x56 INT8
+  Quality/cU-DNN cold/hot gate measured 107.85/7.83 seconds per evaluation
+  (13.8x), stayed finite, and produced the identical latent SHA
+  `b9ecd5cf...ab19` in both runs.
 - **Runtime cold-start closure (2026-08-04):** the exact product prompt now uses
   three versioned, source-stat-validated sidecars under
   `FL2VA/serenity_runtime_cache_v1`: BF16 conditioner output, BF16 AdaLN

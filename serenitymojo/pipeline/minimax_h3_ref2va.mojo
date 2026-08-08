@@ -2058,6 +2058,29 @@ def _minimax_h3_ref2va_denoise_and_save(
         var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
         var reused_middle = False
 
+        comptime if DIT_INT8_RESIDENT != 0:
+            # The reusable groupwise tail is released before the two BF16
+            # quality blocks for VRAM headroom. Recreate its single packed
+            # block at the start of every later denoise evaluation so INT8
+            # Quality remains valid beyond the one-evaluation gate.
+            if (
+                resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                and resident_blocks_requested < GROUPWISE_RUNTIME_CACHE_BLOCKS
+                and not reusable_groupwise_tail
+            ):
+                reusable_groupwise_tail = Optional[MiniMaxH3ResidentFp8](
+                    load_minimax_h3_resident_cache(
+                        resident_cache_path,
+                        String(TRANSFORMER_INDEX),
+                        config,
+                        ctx,
+                        1,
+                        resident_blocks_requested,
+                        resident_scheme,
+                        True,
+                    )
+                )
+
         # The real streamed-block stack is gated behind `H3_REF2VA_REAL_
         # BLOCKS` (see that comptime's own header note): `minimax_h3_block_
         # forward` calls `sdpa_flash_infer_fwd`, which needs the cuDNN SDPA

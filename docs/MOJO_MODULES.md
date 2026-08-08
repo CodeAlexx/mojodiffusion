@@ -818,7 +818,7 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
-## MiniMax-H3 audio-video inference runtime (updated 2026-08-07)
+## MiniMax-H3 audio-video inference runtime (updated 2026-08-08)
 
 - `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
   modulation, and resident-weight sidecars used by the product runners. Cache
@@ -837,6 +837,11 @@ edits: see sections C and D of the parity-ported doc.
   reduction and RoPE arithmetic boundaries while removing extra full-tensor
   copies. `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` gates the
   chunked/fused BF16, group-wise, W8A8, QKV, Q/K, and final-layer paths.
+- `models/dit/minimax_h3_frontend.mojo` uses an inference-only disjoint scatter
+  for forward video/audio/text packing. It replaces the O(V*D*N) autograd
+  index-select backward reuse with O(rows*hidden) GPU copies;
+  `models/dit/parity/minimax_h3_scatter_forward_gate.mojo` gates the exact
+  interleaved row mapping.
 - `models/dit/minimax_h3_step_cache.mojo` is an opt-in, model-scoped
   Cache-DiT-style denoise accelerator. `exact` is the product quality default
   and evaluates every block. `high` may reuse one group-32 INT8 middle-stack
@@ -851,9 +856,10 @@ edits: see sections C and D of the parity-ported doc.
   shared by BF16, INT8 Quality, and INT8 Fast DiT runners.
 - `ops/sage_attention_int8.mojo` is an opt-in Sage-style INT8-QK attention
   backend with F32 accumulation and explicit tail masking. It is experimental
-  and off by default: cU-DNN remains the accepted product backend, and Fast
-  rejects Sage because the measured end-to-end path was slower and below the
-  audio parity bar.
+  and approximate, while cU-DNN remains the exact-quality choice. Attention and
+  weight precision are independent: both backends are admitted for BF16, INT8
+  Quality, and INT8 Fast. Canvas defaults to Sage for speed but keeps the label
+  and switch explicit; the bare runners default to cU-DNN when no flag is given.
 - `models/minimax_h3_device/audio_encoder_device.mojo` is the GPU reference
   AudioVAE encoder for Ref2VA audio tracks and standalone audio clips. Media
   decode/staging is host I/O; every learned DAC/Snake/attention/MLP/posterior
@@ -869,7 +875,12 @@ edits: see sections C and D of the parity-ported doc.
   17n+5 internal frames; delivery frames/FPS are trimmed or resampled to the
   exact authored duration. All admitted tasks retain BF16, INT8 Quality, and
   INT8 Fast choices. Small shapes use measured resident prefixes and larger
-  sequences stream on GPU with zero resident blocks. Denoise and fresh-process
+  sequences stream on GPU with zero resident blocks. Long conditioned
+  sequences fence and trim the CUDA pool at transformer-block boundaries to
+  prevent deferred streamed temporaries from accumulating; operations inside
+  each block remain asynchronous. Groupwise Quality streams cached INT8 through
+  block 47, recreates its reusable packed block on later denoise evaluations,
+  and keeps only blocks 48-49 BF16. Denoise and fresh-process
   GPU VAE decode/NVENC mux remain phase isolated.
 - Ref2VA consumes an ordered list of at most 9 images, 3 videos, and 3 audio
   clips, with at most 12 references combined. Video soundtracks and standalone
@@ -884,7 +895,10 @@ edits: see sections C and D of the parity-ported doc.
   machine gates, and invalid backend combinations fail queue admission closed.
   Resolution and Seconds are independent selectors: changing one preserves the
   other, and tested presets are conveniences rather than an exhaustive
-  resolution allowlist.
+  resolution allowlist. Video staging also exposes `Continue H3`, which decodes
+  the final displayed frame to PNG, switches Canvas to I2VA, carries valid
+  geometry/FPS/duration forward, and leaves all precision/attention choices
+  switchable.
 
 **Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
 separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and
@@ -905,6 +919,25 @@ video at 0.999227 cosine but measured audio at 0.997751 versus BF16, so that
 audio result is recorded as below the strict 0.999 numerical bar rather than
 being relabeled as parity. The maximum 12-reference combination is admission-
 tested but has not been quality-run simultaneously on the 24-GiB GPU.
+At 768x768x362 on the RTX 3090 Ti, the long-sequence streamed-block fence cut
+an exact Fast/Sage one-evaluation A/B from 188.48 to 103.38 seconds with an
+identical latent SHA. A later live 20-step render exposed whole-cache
+`MADV_DONTNEED` after every packed block: it reread about 18 GiB from storage
+per evaluation and the live 20-step render spent 3,578.67 seconds / 59.64
+minutes in denoise. The W8A8 and groupwise refill paths now leave those clean
+file pages in Linux's reclaimable page cache. An exact old/corrected-cold/
+corrected-hot A/B measured 140.57/111.82/106.43 seconds per evaluation,
+reduced filesystem input blocks 97.3% hot, and kept the latent byte-identical
+at `97debb16...9a3c1`. First-plus-18-hot projects to 33.79 minutes of denoise;
+the measured 7.47-minute decode makes the warm full-generation projection
+about 41.5 minutes. A separate real 256x256x56 INT8 Quality/cU-DNN cold/hot
+gate fell from 107.85 to 7.83 seconds/evaluation (13.8x), remained finite, and
+kept the latent byte-identical at `b9ecd5cf...ab19`. Streamed BF16/Sage
+measured 392.70 seconds/evaluation,
+including 273.39 seconds of weight loading. INT8 Quality passed two real
+evaluations at 283.78 seconds cold and 129.75 seconds hot with no non-finites;
+Ref2VA's matching recreate-after-release lifecycle passed two real image-
+conditioned evaluations at 65.15 and 9.42 seconds.
 
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 

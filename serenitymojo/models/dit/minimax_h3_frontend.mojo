@@ -135,18 +135,23 @@
 #   ops/tensor_algebra.mojo          reshape (1080), add (548), mul (565),
 #                                     add_scalar (766), slice (1910),
 #                                     gather_rows (2091), full_device (991)
-#   ops/shape_backward.mojo          index_select_backward (1015) — reused as a
-#                                     plain scatter (disjoint index sets, so
-#                                     scatter-ADD == scatter here)
+#   local disjoint stream scatter    forward-only O(S*hidden) row packing; the
+#                                     autograd index-select backward is O(V*D*N)
+#                                     and is not an inference scatter primitive
 #   ops/patchify3d.mojo              patchify3d (159)            — video unfold
 #   ops/cast.mojo                    cast_tensor (65)             — dtype boundary
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List
+from std.gpu import global_idx
 from std.gpu.host import DeviceContext
 from std.math import min, sqrt
 from std.memory import ArcPointer
+from std.utils.index import IndexList
+
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -163,7 +168,6 @@ from serenitymojo.ops.attention import (
 from serenitymojo.ops.tensor_algebra import (
     reshape, add, mul, add_scalar, slice, gather_rows, concat,
 )
-from serenitymojo.ops.shape_backward import index_select_backward
 from serenitymojo.ops.patchify3d import patchify3d
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
@@ -173,6 +177,9 @@ from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 # max_period=10000) — dit_frontend.mojo:44 MINIMAX_H3_TIME_MAX_PERIOD, matched
 # here as Float32 for ops/embeddings.t_embedder's parameter type.
 comptime MINIMAX_H3_TIME_MAX_PERIOD = Float32(10000.0)
+comptime _MINIMAX_H3_SCATTER_DYN1 = Layout.row_major(-1)
+comptime _MINIMAX_H3_SCATTER_BLOCK = 256
+comptime _MINIMAX_H3_SCATTER_WORDS_PER_THREAD = 4
 
 
 def _lin(
@@ -461,6 +468,37 @@ def minimax_h3_token_refiner_dynamic[
 # Scatter the three projected/refined streams into one packed sequence buffer
 # (block_forward.mojo minimax_h3_forward step 3, lines 509-521).
 # ─────────────────────────────────────────────────────────────────────────────
+def _minimax_h3_scatter_disjoint_u64x4(
+    src: LayoutTensor[
+        DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
+    ],
+    indices: LayoutTensor[
+        DType.int32, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
+    ],
+    dst: LayoutTensor[
+        DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
+    ],
+    rows: Int,
+    words_per_row: Int,
+    chunks_per_row: Int,
+):
+    """Copy four u64 words from source row r to disjoint destination row idx[r]."""
+    var thread = Int(global_idx.x)
+    if thread >= rows * chunks_per_row:
+        return
+    var source_row = thread // chunks_per_row
+    var word = (thread % chunks_per_row) * _MINIMAX_H3_SCATTER_WORDS_PER_THREAD
+    var destination_row = Int(
+        rebind[Scalar[DType.int32]](indices[source_row])
+    )
+    var source_offset = source_row * words_per_row + word
+    var destination_offset = destination_row * words_per_row + word
+    for lane in range(_MINIMAX_H3_SCATTER_WORDS_PER_THREAD):
+        dst[destination_offset + lane] = rebind[dst.element_type](
+            src[source_offset + lane]
+        )
+
+
 def minimax_h3_scatter_streams(
     video_embeds: Tensor,  # [Nv, hidden] bf16
     audio_embeds: Tensor,  # [Na, hidden] bf16
@@ -473,17 +511,93 @@ def minimax_h3_scatter_streams(
     ctx: DeviceContext,
 ) raises -> Tensor:
     """[S, hidden] with each row filled from exactly one of the three streams.
-    Reuses index_select_backward (scatter-ADD) as a plain scatter: the three
-    index sets are assumed DISJOINT and to cover [0, S) exactly once, so
-    summing the three zero-elsewhere scatters is a disjoint union, not an
-    accumulation."""
-    var in_shape = List[Int]()
-    in_shape.append(sequence_length)
-    in_shape.append(hidden_size)
-    var t = index_select_backward(text_embeds, text_indices, 0, in_shape, ctx)
-    var v = index_select_backward(video_embeds, video_indices, 0, in_shape, ctx)
-    var a = index_select_backward(audio_embeds, audio_indices, 0, in_shape, ctx)
-    return add(add(t, v, ctx), a, ctx)
+    The index sets are disjoint and cover [0,S) exactly once. Pack the streams
+    in the same order as their concatenated index vector, then perform one
+    forward scatter. The previous inference path called index_select_backward
+    three times; that autograd primitive makes every output element scan every
+    source index (O(V*D*N)) and cost 35.1 seconds at the 15-second 768-square
+    product geometry. This kernel is a byte-exact O(S*hidden) copy."""
+    if (
+        video_embeds.dtype() != STDtype.BF16
+        or audio_embeds.dtype() != STDtype.BF16
+        or text_embeds.dtype() != STDtype.BF16
+    ):
+        raise Error("minimax_h3_scatter_streams: streams must be BF16")
+    var stream_rows = (
+        text_embeds.shape()[0]
+        + audio_embeds.shape()[0]
+        + video_embeds.shape()[0]
+    )
+    if (
+        stream_rows != sequence_length
+        or len(text_indices) != text_embeds.shape()[0]
+        or len(audio_indices) != audio_embeds.shape()[0]
+        or len(video_indices) != video_embeds.shape()[0]
+    ):
+        raise Error("minimax_h3_scatter_streams: row/index count mismatch")
+    # Four u64 words per thread: released hidden=7168 BF16 values means 448
+    # coalesced threads per row, rather than 7168 scalar threads per row.
+    var row_bytes = hidden_size * 2
+    var chunk_bytes = 8 * _MINIMAX_H3_SCATTER_WORDS_PER_THREAD
+    if row_bytes % chunk_bytes != 0:
+        raise Error("minimax_h3_scatter_streams: hidden row is not u64x4 aligned")
+
+    var text_audio = concat(0, ctx, text_embeds, audio_embeds)
+    var streams = concat(0, ctx, text_audio, video_embeds)
+    var packed_indices = List[Int](capacity=sequence_length)
+    for index in text_indices:
+        packed_indices.append(index)
+    for index in audio_indices:
+        packed_indices.append(index)
+    for index in video_indices:
+        packed_indices.append(index)
+
+    var index_host = ctx.enqueue_create_host_buffer[DType.int32](sequence_length)
+    var index_ptr = index_host.unsafe_ptr()
+    for row in range(sequence_length):
+        var destination = packed_indices[row]
+        if destination < 0 or destination >= sequence_length:
+            raise Error("minimax_h3_scatter_streams: index out of range")
+        index_ptr[row] = Int32(destination)
+    var index_device = ctx.enqueue_create_buffer[DType.int32](sequence_length)
+    ctx.enqueue_copy(dst_buf=index_device, src_buf=index_host)
+
+    var output_buffer = ctx.enqueue_create_buffer[DType.uint8](
+        sequence_length * row_bytes
+    )
+    var words_per_row = row_bytes // 8
+    var chunks_per_row = (
+        words_per_row // _MINIMAX_H3_SCATTER_WORDS_PER_THREAD
+    )
+    var source_layout = RuntimeLayout[_MINIMAX_H3_SCATTER_DYN1].row_major(
+        IndexList[1](sequence_length * words_per_row)
+    )
+    var index_layout = RuntimeLayout[_MINIMAX_H3_SCATTER_DYN1].row_major(
+        IndexList[1](sequence_length)
+    )
+    var source = LayoutTensor[
+        DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
+    ](streams.buf.unsafe_ptr().bitcast[UInt64](), source_layout)
+    var indices = LayoutTensor[
+        DType.int32, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
+    ](index_device.unsafe_ptr(), index_layout)
+    var output = LayoutTensor[
+        DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
+    ](output_buffer.unsafe_ptr().bitcast[UInt64](), source_layout)
+    var threads = sequence_length * chunks_per_row
+    var grid = (
+        threads + _MINIMAX_H3_SCATTER_BLOCK - 1
+    ) // _MINIMAX_H3_SCATTER_BLOCK
+    ctx.enqueue_function[
+        _minimax_h3_scatter_disjoint_u64x4,
+        _minimax_h3_scatter_disjoint_u64x4,
+    ](
+        source, indices, output, sequence_length, words_per_row,
+        chunks_per_row, grid_dim=grid, block_dim=_MINIMAX_H3_SCATTER_BLOCK,
+    )
+    return Tensor(
+        output_buffer^, [sequence_length, hidden_size], STDtype.BF16
+    )
 
 
 def minimax_h3_concat_t2va_streams(

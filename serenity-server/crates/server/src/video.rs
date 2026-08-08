@@ -6372,12 +6372,10 @@ fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
             "MiniMax-H3 attention_backend must be 'cudnn' or 'sage-int8'".to_string(),
         );
     }
-    if quant == "int8-fast" && attention != "cudnn" {
-        return Err(
-            "MiniMax-H3 int8-fast is quality-gated with cU-DNN attention only"
-                .to_string(),
-        );
-    }
+    // Weight storage and attention are independent runtime choices. Sage is
+    // intentionally available with INT8 Fast as the experimental speed path;
+    // the capabilities document keeps cuDNN identified as the exact-quality
+    // backend.
     let step_cache = body
         .get("step_cache")
         .and_then(Value::as_str)
@@ -6426,11 +6424,8 @@ fn validate_minimax_h3_conditioned_request(body: &Value, task: &str) -> Result<(
             "MiniMax-H3 attention_backend must be 'cudnn' or 'sage-int8'".to_string(),
         );
     }
-    if quant == "int8-fast" && attention != "cudnn" {
-        return Err(
-            "MiniMax-H3 int8-fast is quality-gated with cU-DNN attention only".to_string(),
-        );
-    }
+    // Keep Sage switchable for every precision profile, including INT8 Fast.
+    // Its experimental quality label is advertised separately from admission.
     let step_cache = body
         .get("step_cache")
         .and_then(Value::as_str)
@@ -11093,9 +11088,7 @@ mod tests {
         request["quant"] = json!("int8-fast");
         validate_minimax_h3_request(&request).unwrap();
         request["attention_backend"] = json!("sage-int8");
-        assert!(validate_minimax_h3_request(&request)
-            .unwrap_err()
-            .contains("quality-gated with cU-DNN"));
+        validate_minimax_h3_request(&request).unwrap();
         request["quant"] = json!("bf16");
         validate_minimax_h3_request(&request).unwrap();
         request["step_cache"] = json!("invalid");
@@ -11165,6 +11158,9 @@ mod tests {
             "step_cache": "high",
             "include_audio": true,
         });
+        validate_minimax_h3_request(&request).unwrap();
+        request["quant"] = json!("int8-fast");
+        request["attention_backend"] = json!("sage-int8");
         validate_minimax_h3_request(&request).unwrap();
         let geometry = minimax_h3_runtime_geometry(&request).unwrap();
         assert_eq!((geometry.width, geometry.height), (1024, 768));

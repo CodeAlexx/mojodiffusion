@@ -322,6 +322,23 @@ var CanvasStaging = (function () {
         var event = new CustomEvent('sf-staging-regenerate');
         document.dispatchEvent(event);
     }
+    function continueWithH3() {
+        if (!_state.active)
+            return;
+        var result = _state.results[_state.currentIndex];
+        if (!result || !result.isVideo)
+            return;
+        var continuation = {
+            src: result.src,
+            isVideo: true,
+            filename: result.filename || '',
+            metadata: JSON.parse(JSON.stringify(result.metadata || {}))
+        };
+        deactivate();
+        document.dispatchEvent(new CustomEvent('sf-staging-continue-h3', {
+            detail: { result: continuation }
+        }));
+    }
     function bindKeyboard() {
         if (_keyboardBound)
             return;
@@ -508,6 +525,9 @@ var CanvasStaging = (function () {
             '<button class="staging-btn" id="stg-new-layer" title="Accept onto a new raster layer">New Layer</button>' +
             '<button class="staging-btn staging-reject" id="stg-reject">Reject</button>' +
             '<button class="staging-btn" id="stg-regen" title="Regenerate with new seed">Regenerate</button>' +
+            (result && result.isVideo
+                ? '<button class="staging-btn staging-continue-h3" id="stg-continue-h3" title="Use the exact final video frame as MiniMax-H3 I2VA frame zero">Continue H3</button>'
+                : '') +
             '</div>';
         // Mode toggles
         html += '<div class="staging-modes">' +
@@ -522,6 +542,7 @@ var CanvasStaging = (function () {
         var newLayerBtn = document.getElementById('stg-new-layer');
         var rejectBtn = document.getElementById('stg-reject');
         var regenBtn = document.getElementById('stg-regen');
+        var continueH3Btn = document.getElementById('stg-continue-h3');
         var compareBtn = document.getElementById('stg-compare');
         var partialBtn = document.getElementById('stg-partial');
         if (prevBtn)
@@ -536,6 +557,8 @@ var CanvasStaging = (function () {
             rejectBtn.addEventListener('click', reject);
         if (regenBtn)
             regenBtn.addEventListener('click', regenerate);
+        if (continueH3Btn)
+            continueH3Btn.addEventListener('click', continueWithH3);
         if (compareBtn)
             compareBtn.addEventListener('click', toggleCompare);
         if (partialBtn)
@@ -559,6 +582,7 @@ var CanvasStaging = (function () {
         acceptToNewLayer: acceptToNewLayer,
         reject: reject,
         regenerate: regenerate,
+        continueWithH3: continueWithH3,
         nextResult: nextResult,
         prevResult: prevResult,
         toggleCompare: toggleCompare,

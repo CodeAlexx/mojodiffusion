@@ -139,6 +139,7 @@ from serenitymojo.models.dit.minimax_h3_fp8_resident import (
     MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3ResidentFp8,
     minimax_h3_resident_block_weights,
+    minimax_h3_resident_block_weights_groupwise,
     minimax_h3_resident_block_weights_w8a8,
 )
 from serenitymojo.models.dit.minimax_h3_modcache import (
@@ -149,9 +150,11 @@ from serenitymojo.models.dit.minimax_h3_modcache import (
 from serenitymojo.models.dit.minimax_h3_runtime_cache import (
     load_minimax_h3_modcache,
     load_minimax_h3_resident_cache,
+    reload_minimax_h3_resident_groupwise_block,
     reload_minimax_h3_resident_w8a8_block,
     save_minimax_h3_modcache,
 )
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 from serenitymojo.models.dit.minimax_h3_step_cache import (
     MINIMAX_H3_CACHE_BACK_BLOCKS,
     MINIMAX_H3_CACHE_FRONT_BLOCKS,
@@ -275,6 +278,7 @@ comptime GROUPWISE_RUNTIME_CACHE = (
 comptime W8A8_RUNTIME_CACHE = (
     RUNTIME_CACHE_DIR + "/resident_w8a8_row_blocks_50.safetensors"
 )
+comptime GROUPWISE_RUNTIME_CACHE_BLOCKS = 48
 
 # ── Geometry, comptime (rebuild to change) ──────────────────────────────────
 # Unlike t2va these are CHECKED against what the keyframe implies, not merely
@@ -325,6 +329,7 @@ comptime NO_VISION = get_defined_int["H3_KF_NO_VISION", 0]()
 # and stream the tail (BF16 for quality, one W8A8 block at a time for fast).
 comptime DIT_INT8_RESIDENT = get_defined_int["H3_FP8_RESIDENT", 0]()
 comptime DIT_RESIDENT_BLOCKS = get_defined_int["H3_RESIDENT_BLOCKS", 30]()
+comptime PROFILE_BLOCKS = get_defined_int["H3_PROFILE_BLOCKS", 0]()
 
 comptime AUDIO_LATENT_DIM = 2048
 comptime AUDIO_DECODER_DIM = 1024
@@ -1383,6 +1388,7 @@ def main() raises:
     var resident_cache_path = String("")
     var resident = Optional[MiniMaxH3ResidentFp8](None)
     var reusable_w8a8_tail = Optional[MiniMaxH3ResidentFp8](None)
+    var reusable_groupwise_tail = Optional[MiniMaxH3ResidentFp8](None)
     comptime if DIT_INT8_RESIDENT != 0:
         if DIT_RESIDENT_BLOCKS < 1 or DIT_RESIDENT_BLOCKS > run_config.num_layers:
             raise Error(
@@ -1404,6 +1410,7 @@ def main() raises:
                 DIT_RESIDENT_BLOCKS,
                 0,
                 resident_scheme,
+                resident_scheme == MINIMAX_H3_RESIDENT_INT8,
             )
         )
         var t_res1 = perf_counter_ns()
@@ -1430,6 +1437,23 @@ def main() raises:
                 )
             )
             print("  resident cache: reusable one-block W8A8 tail ready")
+        elif (
+            resident_scheme == MINIMAX_H3_RESIDENT_INT8
+            and DIT_RESIDENT_BLOCKS < GROUPWISE_RUNTIME_CACHE_BLOCKS
+        ):
+            reusable_groupwise_tail = Optional[MiniMaxH3ResidentFp8](
+                load_minimax_h3_resident_cache(
+                    resident_cache_path,
+                    String(TRANSFORMER_INDEX),
+                    config,
+                    ctx,
+                    1,
+                    DIT_RESIDENT_BLOCKS,
+                    resident_scheme,
+                    True,
+                )
+            )
+            print("  resident cache: reusable one-block groupwise tail ready")
 
     # ── 6. Denoise — the condition rows are never written ──────────────────
     var t_den0 = perf_counter_ns()
@@ -1466,6 +1490,29 @@ def main() raises:
             )
         var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
         var reused_middle = False
+        comptime if DIT_INT8_RESIDENT != 0:
+            # The two exact-BF16 quality-tail blocks require the reusable
+            # groupwise store to be released for headroom. Recreate that one
+            # packed block at the start of each later evaluation.
+            if (
+                resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                and DIT_RESIDENT_BLOCKS < GROUPWISE_RUNTIME_CACHE_BLOCKS
+                and not reusable_groupwise_tail
+            ):
+                reusable_groupwise_tail = Optional[MiniMaxH3ResidentFp8](
+                    load_minimax_h3_resident_cache(
+                        resident_cache_path,
+                        String(TRANSFORMER_INDEX),
+                        config,
+                        ctx,
+                        1,
+                        DIT_RESIDENT_BLOCKS,
+                        resident_scheme,
+                        True,
+                    )
+                )
+        var block_weight_ns = UInt(0)
+        var block_forward_ns = UInt(0)
         for layer in range(run_config.num_layers):
             if (
                 step_cache.enabled
@@ -1475,11 +1522,34 @@ def main() raises:
                 < run_config.num_layers - MINIMAX_H3_CACHE_BACK_BLOCKS
             ):
                 continue
+            comptime if DIT_INT8_RESIDENT != 0:
+                if (
+                    resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                    and layer == GROUPWISE_RUNTIME_CACHE_BLOCKS
+                    and reusable_groupwise_tail
+                ):
+                    reusable_groupwise_tail = Optional[
+                        MiniMaxH3ResidentFp8
+                    ](None)
+                    ctx.synchronize()
+                    cu_mempool_trim_current(0)
+                    ctx.synchronize()
+                    print(
+                        "  resident cache: released groupwise tail before"
+                        " BF16 quality blocks"
+                    )
+            var block_weight_t0 = UInt(0)
+            comptime if PROFILE_BLOCKS != 0:
+                block_weight_t0 = perf_counter_ns()
             var block_w: Dict[String, ArcPointer[Tensor]]
             comptime if DIT_INT8_RESIDENT != 0:
                 if layer < len(resident.value().blocks):
                     if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8:
                         block_w = minimax_h3_resident_block_weights_w8a8(
+                            resident.value(), layer, config, ctx
+                        )
+                    elif resident_scheme == MINIMAX_H3_RESIDENT_INT8:
+                        block_w = minimax_h3_resident_block_weights_groupwise(
                             resident.value(), layer, config, ctx
                         )
                     else:
@@ -1498,6 +1568,21 @@ def main() raises:
                     block_w = minimax_h3_resident_block_weights_w8a8(
                         reusable_w8a8_tail.value(), layer, config, ctx
                     )
+                elif (
+                    resident_scheme == MINIMAX_H3_RESIDENT_INT8
+                    and layer < GROUPWISE_RUNTIME_CACHE_BLOCKS
+                ):
+                    reload_minimax_h3_resident_groupwise_block(
+                        reusable_groupwise_tail.value(),
+                        resident_cache_path,
+                        String(TRANSFORMER_INDEX),
+                        config,
+                        layer,
+                        ctx,
+                    )
+                    block_w = minimax_h3_resident_block_weights_groupwise(
+                        reusable_groupwise_tail.value(), layer, config, ctx
+                    )
                 else:
                     block_w = minimax_h3_load_block_device(
                         transformer_shards, layer, config, ctx
@@ -1506,11 +1591,38 @@ def main() raises:
                 block_w = minimax_h3_load_block_device(
                     transformer_shards, layer, config, ctx
                 )
+            comptime if PROFILE_BLOCKS != 0:
+                ctx.synchronize()
+                block_weight_ns += perf_counter_ns() - block_weight_t0
+            var block_forward_t0 = UInt(0)
+            comptime if PROFILE_BLOCKS != 0:
+                block_forward_t0 = perf_counter_ns()
             hidden3 = minimax_h3_block_forward_dynamic[H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
                 attention_backend,
             )
+            # At the 15-second base-area product geometry the reusable tail
+            # store and the long-sequence attention temporaries otherwise
+            # accumulate asynchronously across block boundaries.  The
+            # block-profiler's fence exposed a large throughput win here; the
+            # production A/B then measured 103.4 s versus 188.5 s for the same
+            # INT8/Sage evaluation, with byte-identical final latents. Fence
+            # only streamed long-sequence
+            # layers; resident prefix layers and ordinary geometries retain
+            # their asynchronous path.
+            comptime if DIT_INT8_RESIDENT != 0:
+                if (
+                    sequence_length >= 60000
+                    and layer >= len(resident.value().blocks)
+                ):
+                    ctx.synchronize()
+            else:
+                if sequence_length >= 60000:
+                    ctx.synchronize()
+            comptime if PROFILE_BLOCKS != 0:
+                ctx.synchronize()
+                block_forward_ns += perf_counter_ns() - block_forward_t0
             block_w.clear()
             if (
                 step_cache.enabled
@@ -1553,6 +1665,12 @@ def main() raises:
                 minimax_h3_cache_store_middle_residual(
                     hidden3, first_block_snapshot.value(), step_cache, ctx
                 )
+        comptime if PROFILE_BLOCKS != 0:
+            print(
+                "  profile-blocks: step=", i + 1,
+                " weights_s=", Float64(block_weight_ns) / 1.0e9,
+                " forward_s=", Float64(block_forward_ns) / 1.0e9,
+            )
         var hidden2 = reshape(hidden3, [sequence_length, config.hidden_size], ctx)
         var frontend_out = minimax_h3_final_layer(
             hidden2, modcache.final_mod[], global_row,

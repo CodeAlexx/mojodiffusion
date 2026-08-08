@@ -1894,6 +1894,8 @@
 .staging-btn:hover { background: var(--shell-accent); color: #fff; border-color: var(--shell-accent); }
 .staging-accept { background: #22c55e; color: #fff; border-color: #22c55e; }
 .staging-accept:hover { background: #16a34a; border-color: #16a34a; }
+.staging-continue-h3 { background: #7c3aed; color: #fff; border-color: #7c3aed; }
+.staging-continue-h3:hover { background: #6d28d9; border-color: #6d28d9; }
 .staging-reject { background: #ef4444; color: #fff; border-color: #ef4444; }
 .staging-reject:hover { background: #dc2626; border-color: #dc2626; }
 .staging-toggle.active { background: var(--shell-accent); color: #fff; border-color: var(--shell-accent); }

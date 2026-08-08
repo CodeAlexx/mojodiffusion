@@ -92,7 +92,7 @@ var CanvasTab = (function () {
         h3ProfileKey: '1344x768',
         h3Duration: 5,
         h3Quant: 'int8-fast',
-        h3AttentionBackend: 'cudnn',
+        h3AttentionBackend: 'sage-int8',
         h3StepCache: 'exact',
         editMode: 'create',
         editEngine: 'krea2_turbo_1024',
@@ -1498,6 +1498,27 @@ var CanvasTab = (function () {
             '<option value="fl2va">First + last frame to video + audio</option>' +
             '<option value="ref2va">Omni-reference to video + audio</option>' +
             '</select>' +
+            '<div id="cv-h3-source-row" style="display:none">' +
+            '<div class="cv-section-title">First-frame image</div>' +
+            '<button id="cv-h3-source-button" class="cv-import-btn" type="button">Choose first-frame image</button>' +
+            '<div id="cv-h3-source-note" class="cv-helper-text">Required for I2VA and FL2VA. You can also drag the image into the Source panel.</div>' +
+            '</div>' +
+            '<div id="cv-h3-references-row" style="display:none">' +
+            '<details open><summary class="cv-section-title">H3 references</summary>' +
+            '<input id="cv-h3-references-file" type="file" accept="image/*,video/*,audio/*" multiple hidden>' +
+            '<label for="cv-h3-references-file" class="cv-import-btn">Add image, video, or audio</label>' +
+            '<button id="cv-h3-references-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
+            '<div id="cv-h3-references-note" class="cv-helper-text">0/12 · up to 9 images, 3 videos, and 3 audio clips.</div>' +
+            '<div id="cv-h3-references-list" class="cv-lora-list"></div>' +
+            '<div class="cv-helper-text">Order defines &lt;Image n&gt;, &lt;Video n&gt;, and &lt;Audio n&gt;. Audio may be a general reference, reused soundtrack, or voice-timbre reference.</div>' +
+            '</details></div>' +
+            '<div id="cv-h3-last-frame-row" style="display:none">' +
+            '<div class="cv-section-title">Last-frame keyframe</div>' +
+            '<input id="cv-h3-last-frame-file" type="file" accept="image/*" hidden>' +
+            '<label for="cv-h3-last-frame-file" class="cv-import-btn">Choose last frame</label>' +
+            '<button id="cv-h3-last-frame-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
+            '<div id="cv-h3-last-frame-note" class="cv-helper-text">Required for L2V and first+last-frame video.</div>' +
+            '</div>' +
             '<label class="cv-setting-label" for="cv-h3-resolution">Tested resolution preset</label>' +
             '<select id="cv-h3-resolution" class="cv-select"><option value="">Loading H3 resolutions...</option></select>' +
             '<div class="cv-setting-row"><span class="cv-setting-label">Width</span>' +
@@ -1515,8 +1536,8 @@ var CanvasTab = (function () {
             '</select>' +
             '<label class="cv-setting-label" for="cv-h3-attention">Attention</label>' +
             '<select id="cv-h3-attention" class="cv-select">' +
-            '<option value="cudnn">cU-DNN · quality default</option>' +
-            '<option value="sage-int8">Sage INT8 · experimental</option>' +
+            '<option value="sage-int8">Sage INT8 · faster, approximate</option>' +
+            '<option value="cudnn">cuDNN · exact quality</option>' +
             '</select>' +
             '<label class="cv-setting-label" for="cv-h3-step-cache">Denoise acceleration</label>' +
             '<select id="cv-h3-step-cache" class="cv-select">' +
@@ -1524,22 +1545,6 @@ var CanvasTab = (function () {
             '<option value="high">Experimental cached · faster, quality loss</option>' +
             '</select>' +
             '<div class="cv-helper-text">Exact is the quality default. Experimental cached keeps size, seconds, FPS, steps, and audio, but measured A/B testing found visible video drift.</div>' +
-            '<div id="cv-h3-references-row" style="display:none">' +
-            '<details open><summary class="cv-section-title">H3 references</summary>' +
-            '<input id="cv-h3-references-file" type="file" accept="image/*,video/*,audio/*" multiple hidden>' +
-            '<label for="cv-h3-references-file" class="cv-import-btn">Add image, video, or audio</label>' +
-            '<button id="cv-h3-references-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
-            '<div id="cv-h3-references-note" class="cv-helper-text">0/12 · up to 9 images, 3 videos, and 3 audio clips.</div>' +
-            '<div id="cv-h3-references-list" class="cv-lora-list"></div>' +
-            '<div class="cv-helper-text">Order defines &lt;Image n&gt;, &lt;Video n&gt;, and &lt;Audio n&gt;. Audio may be a general reference, reused soundtrack, or voice-timbre reference.</div>' +
-            '</details></div>' +
-            '<div id="cv-h3-last-frame-row" style="display:none">' +
-            '<div class="cv-section-title">Last-frame keyframe</div>' +
-            '<input id="cv-h3-last-frame-file" type="file" accept="image/*" hidden>' +
-            '<label for="cv-h3-last-frame-file" class="cv-import-btn">Choose last frame</label>' +
-            '<button id="cv-h3-last-frame-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
-            '<div id="cv-h3-last-frame-note" class="cv-helper-text">Required for L2V and first+last-frame video.</div>' +
-            '</div>' +
             '<div id="cv-h3-mode-note" class="cv-helper-text">Choose any supported output size and duration. I2V uses the Source as frame zero. Ref2VA accepts ordered image, video, and audio references without inserting a reference as frame zero.</div>' +
             '<div class="cv-helper-text">Every H3 feature uses the same resolution, duration, frame-rate, and precision controls. GPU model execution only.</div>' +
             '</div>' +
@@ -1658,6 +1663,9 @@ var CanvasTab = (function () {
         els.h3Quant = document.getElementById('cv-h3-quant');
         els.h3Attention = document.getElementById('cv-h3-attention');
         els.h3StepCache = document.getElementById('cv-h3-step-cache');
+        els.h3SourceRow = document.getElementById('cv-h3-source-row');
+        els.h3SourceButton = document.getElementById('cv-h3-source-button');
+        els.h3SourceNote = document.getElementById('cv-h3-source-note');
         els.h3ReferencesRow = document.getElementById('cv-h3-references-row');
         els.h3ReferencesFile = document.getElementById('cv-h3-references-file');
         els.h3ReferencesClear = document.getElementById('cv-h3-references-clear');
@@ -2510,6 +2518,7 @@ var CanvasTab = (function () {
         }
         if (els.sourceEmpty)
             els.sourceEmpty.style.display = '';
+        refreshCanvasH3SourceInput();
         updateLtx2SourceStrengthHelp();
         updateLtx2VideoEditControls();
     }
@@ -2682,6 +2691,7 @@ var CanvasTab = (function () {
             }
             if (genState.arch === 'ltxv')
                 setLtx2SourceStrength(1.0);
+            refreshCanvasH3SourceInput();
             addImageDataUrlToCanvas(editSourceDataUrl);
         };
         reader.readAsDataURL(file);
@@ -3139,6 +3149,7 @@ var CanvasTab = (function () {
             (ltx2SourceMode ? 'Load source image / video' :
             (h3SourceMode ? 'Load source image' :
                 (editing ? (mode === 'dynaedit' ? 'Load source video' : 'Load source image') : 'Import Image'))));
+        els.importBtn.style.display = genState.arch === 'minimax_h3' ? 'none' : '';
         els.importFile.accept = i2vLtx23Mode ? 'image/*' :
             (temporalLtx23Mode ? 'video/*' :
             (ltx2SourceMode ? 'image/*,video/*' :
@@ -4620,8 +4631,6 @@ var CanvasTab = (function () {
         });
         els.h3Quant.addEventListener('change', function () {
             genState.h3Quant = this.value;
-            if (this.value === 'int8-fast')
-                genState.h3AttentionBackend = 'cudnn';
             refreshCanvasH3Controls();
         });
         els.h3Attention.addEventListener('change', function () {
@@ -4803,6 +4812,12 @@ var CanvasTab = (function () {
             updateCanvasDurationHint();
         });
         els.importBtn.addEventListener('click', function () { els.importFile.click(); });
+        if (els.h3SourceButton) {
+            els.h3SourceButton.addEventListener('click', function () {
+                els.importFile.accept = 'image/*';
+                els.importFile.click();
+            });
+        }
         els.sourceBrowse.addEventListener('click', function (event) {
             event.stopPropagation();
             els.importFile.click();
@@ -5547,8 +5562,8 @@ var CanvasTab = (function () {
                     .indexOf(state.genSettings.h3Quant) >= 0
                     ? state.genSettings.h3Quant : 'int8-fast';
                 genState.h3AttentionBackend =
-                    state.genSettings.h3AttentionBackend === 'sage-int8'
-                        ? 'sage-int8' : 'cudnn';
+                    state.genSettings.h3AttentionBackend === 'cudnn'
+                        ? 'cudnn' : 'sage-int8';
                 genState.h3StepCache = state.genSettings.h3StepCache === 'high'
                     ? 'high' : 'exact';
                 h3References = Array.isArray(state.genSettings.h3References)
@@ -5926,6 +5941,17 @@ var CanvasTab = (function () {
         });
         applyCanvasH3AuthoredGeometry();
     }
+    function refreshCanvasH3SourceInput() {
+        if (!els.h3SourceButton || !els.h3SourceNote)
+            return;
+        var loaded = !!editSourceDataUrl && !editSourceIsVideo;
+        els.h3SourceButton.textContent = loaded
+            ? 'Replace first-frame image' : 'Choose first-frame image';
+        els.h3SourceNote.textContent = loaded
+            ? 'First frame loaded' + (editSourceFile && editSourceFile.name
+                ? ': ' + editSourceFile.name : '') + '. MiniMax-H3 will use it as frame zero.'
+            : 'Required for I2VA and FL2VA. Choose it here or drag it into the Source panel.';
+    }
     function refreshCanvasH3Controls() {
         if (!els.h3Mode)
             return;
@@ -5972,17 +5998,18 @@ var CanvasTab = (function () {
             genState.h3Quant = firstQuant ? firstQuant.value : 'int8-fast';
         }
         els.h3Quant.value = genState.h3Quant;
-        if (genState.h3Quant === 'int8-fast')
-            genState.h3AttentionBackend = 'cudnn';
         els.h3Attention.value = genState.h3AttentionBackend;
-        els.h3Attention.disabled = genState.h3Quant === 'int8-fast';
+        els.h3Attention.disabled = false;
         genState.h3StepCache = genState.h3StepCache === 'high' ? 'high' : 'exact';
         els.h3StepCache.value = genState.h3StepCache;
         var conditioned = genState.h3Mode !== 't2va';
+        var needsFirst = genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va';
         var needsLast = genState.h3Mode === 'l2va' || genState.h3Mode === 'fl2va';
         var omniReference = genState.h3Mode === 'ref2va';
+        els.h3SourceRow.style.display = needsFirst ? 'block' : 'none';
         els.h3ReferencesRow.style.display = omniReference ? 'block' : 'none';
         els.h3LastFrameRow.style.display = needsLast ? 'block' : 'none';
+        refreshCanvasH3SourceInput();
         refreshCanvasH3ProfileControls(conditioned, mode);
         els.steps.value = String(genState.steps);
         els.stepsRange.value = String(genState.steps);
@@ -8689,6 +8716,120 @@ var CanvasTab = (function () {
         }
         stage.batchDraw();
     }
+    function extractVideoLastFrameDataUrl(src, fps) {
+        return new Promise(function (resolve, reject) {
+            var video = document.createElement('video');
+            var settled = false;
+            var timer = setTimeout(function () {
+                finish(new Error('Timed out while decoding the final video frame'));
+            }, 20000);
+            function finish(error, dataUrl) {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                video.removeAttribute('src');
+                video.load();
+                if (error)
+                    reject(error);
+                else
+                    resolve(dataUrl);
+            }
+            function capture() {
+                try {
+                    if (!video.videoWidth || !video.videoHeight)
+                        throw new Error('The video has no decodable picture');
+                    var canvas = document.createElement('canvas');
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    var context = canvas.getContext('2d');
+                    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    finish(null, canvas.toDataURL('image/png'));
+                }
+                catch (error) {
+                    finish(error);
+                }
+            }
+            video.muted = true;
+            video.playsInline = true;
+            video.preload = 'auto';
+            video.crossOrigin = 'anonymous';
+            video.addEventListener('error', function () {
+                finish(new Error('Could not load the completed video'));
+            }, { once: true });
+            video.addEventListener('loadedmetadata', function () {
+                var duration = Number(video.duration);
+                if (!Number.isFinite(duration) || duration <= 0) {
+                    finish(new Error('The completed video has no valid duration'));
+                    return;
+                }
+                var sourceFps = Math.max(1, Number(fps) || 24);
+                // Seek into the final frame's display interval instead of to
+                // duration, which is one timestamp beyond the last frame.
+                video.currentTime = Math.max(0, duration - 0.5 / sourceFps);
+            }, { once: true });
+            video.addEventListener('seeked', function () {
+                // `seeked` means the target frame is decoded and ready for
+                // drawImage. A paused video is not required to issue another
+                // requestVideoFrameCallback after this point.
+                capture();
+            }, { once: true });
+            video.src = String(src || '');
+            video.load();
+        });
+    }
+    function prepareH3Continuation(result) {
+        if (!result || !result.isVideo || !result.src) {
+            showError('Continue H3 requires a completed video result');
+            return;
+        }
+        var metadata = result.metadata && typeof result.metadata === 'object'
+            ? result.metadata : {};
+        var params = metadata.params && typeof metadata.params === 'object'
+            ? metadata.params : metadata;
+        if (!selectFirstCanvasModelForArch('minimax_h3')) {
+            showError('MiniMax-H3 is not available in the Canvas model list');
+            return;
+        }
+        genState.editMode = 'create';
+        if (els.editMode)
+            els.editMode.value = 'create';
+        genState.h3Mode = 'i2va';
+        var width = Number(params.width);
+        var height = Number(params.height);
+        if (width >= 32 && width <= 2048 && width % 32 === 0 &&
+            height >= 32 && height <= 2048 && height % 32 === 0) {
+            genState.width = width;
+            genState.height = height;
+            var resolutionKey = String(width) + 'x' + String(height);
+            genState.h3ProfileKey = canvasH3Resolution(resolutionKey)
+                ? resolutionKey : 'custom';
+        }
+        var fps = Math.max(1, Math.min(120, Number(params.fps) || genState.fps || 24));
+        var duration = Number(params.duration_seconds || params.duration);
+        genState.fps = fps;
+        if (Number.isFinite(duration) && duration > 0)
+            genState.h3Duration = Math.max(1, Math.min(15, duration));
+        genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
+        refreshCanvasH3Controls();
+        updateEditWorkspace();
+        if (els.h3SourceNote)
+            els.h3SourceNote.textContent = 'Extracting the exact final frame for H3 continuation…';
+        extractVideoLastFrameDataUrl(result.src, fps).then(function (dataUrl) {
+            selectGalleryImageAsCanvasSource(dataUrl, metadata);
+            refreshCanvasH3Controls();
+            updateEditWorkspace();
+            if (els.h3SourceNote)
+                els.h3SourceNote.textContent =
+                    'Continuation frame ready from ' + (result.filename || 'the completed video') +
+                    '. Choose BF16, INT8 Quality, or INT8 Fast, then author the next segment.';
+            if (els.h3Section)
+                els.h3Section.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            History.push();
+        }).catch(function (error) {
+            showError('Could not prepare H3 continuation: ' + error.message);
+        });
+    }
     function loadCanvasGallery() {
         var grid = document.getElementById('cv-gallery-grid');
         if (!grid)
@@ -9087,6 +9228,9 @@ var CanvasTab = (function () {
         connectWS();
         setupPreviewPanel();
         document.addEventListener('sf-staging-regenerate', startGeneration);
+        document.addEventListener('sf-staging-continue-h3', function (event) {
+            prepareH3Continuation(event.detail && event.detail.result);
+        });
         document.addEventListener('sf-style-reference-selected', function (event) {
             var ref = event.detail && event.detail.ref;
             enterStyleMode(ref);

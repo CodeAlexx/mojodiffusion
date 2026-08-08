@@ -46,6 +46,7 @@ const WORKER_BIN = process.env.SERENITY_WORKER_BIN ||
   path.join(ROOT, "output/bin/serenity_worker_stub");
 const CHROME_BIN = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ||
   firstExisting(["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]);
+const H3_CONTINUE_MP4_BASE64 = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMybW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAlx0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAACAAAAAgAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAHUbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABf21pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAT9zdGJsAAAAv3N0c2QAAAAAAAAAAQAAAK9hdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAACAAIABIAAAASAAAAAAAAAABFUxhdmM2MC4zMS4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAANWF2Y0MBZAAK/+EAGGdkAAqs2UlsBEAAAAMAQAAAAwEDxIllgAEABmjr48siwP34+AAAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAAAW6AAAFugAAAAYc3R0cwAAAAAAAAABAAAAAgAAIAAAAAAUc3RzcwAAAAAAAAABAAAAAQAAABxzdHNjAAAAAAAAAAEAAAABAAAAAgAAAAEAAAAcc3RzegAAAAAAAAAAAAAAAgAAAtAAAAANAAAAFHN0Y28AAAAAAAAAAQAAA2IAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYwLjE2LjEwMAAAAAhmcmVlAAAC5W1kYXQAAAKtBgX//6ncRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MSByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgzOjB4MTEzIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0xIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MSBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTMgYl9weXJhbWlkPTIgYl9hZGFwdD0xIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9MSBvcGVuX2dvcD0wIHdlaWdodHA9MiBrZXlpbnQ9MjUwIGtleWludF9taW49MiBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmNfbG9va2FoZWFkPTQwIHJjPWNyZiBtYnRyZWU9MSBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABtliIQAFP/+7Np+BTcMVvn10yG94AC3K4+Aln0AAAAJQZohbEEv/rXA";
 
 function firstExisting(candidates) {
   return candidates.find((candidate) => candidate && fs.existsSync(candidate)) || "";
@@ -219,6 +220,13 @@ async function run() {
         steps: request.steps,
         guidance: request.guidance,
       }),
+    });
+  });
+  await page.route("**/playwright-h3-continue.mp4", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "video/mp4",
+      body: Buffer.from(H3_CONTINUE_MP4_BASE64, "base64"),
     });
   });
   const restoredGalleryJob = {
@@ -856,6 +864,10 @@ async function run() {
       const readH3Controls = () => page.evaluate(() => ({
         mode: document.querySelector("#cv-h3-mode").value,
         quant: document.querySelector("#cv-h3-quant").value,
+        attention: document.querySelector("#cv-h3-attention").value,
+        attentionDisabled: document.querySelector("#cv-h3-attention").disabled,
+        attentionOptions: Array.from(document.querySelector("#cv-h3-attention").options)
+          .map((option) => option.value),
         resolution: document.querySelector("#cv-h3-resolution").value,
         resolutions: Array.from(document.querySelector("#cv-h3-resolution").options)
           .map((option) => option.value),
@@ -915,12 +927,23 @@ async function run() {
           && h3Default.width === 1344 && h3Default.height === 768
           && h3Default.bboxWidth === 1344 && h3Default.bboxHeight === 768
           && h3Default.durationMin === 1 && h3Default.durationMax === 15
+          && h3Default.attention === "sage-int8" && !h3Default.attentionDisabled
+          && JSON.stringify(h3Default.attentionOptions)
+            === JSON.stringify(["sage-int8", "cudnn"])
           && h3Default.stepCache === "exact"
           && h3Default.framesMin === 1 && h3Default.framesMax === 1800
           && h3Default.fpsMin === 1 && h3Default.fpsMax === 120
           && !h3Default.geometryDisabled && h3Default.bboxGeometryLocked,
         `H3 native resolution controls are wrong: ${JSON.stringify(h3Default)}`,
       );
+
+      await page.locator("#cv-h3-attention").selectOption("cudnn");
+      await page.locator("#cv-h3-quant").selectOption("int8-fast");
+      const h3CudnnSwitch = await readH3Controls();
+      assert(h3CudnnSwitch.attention === "cudnn"
+        && !h3CudnnSwitch.attentionDisabled,
+      `H3 cuDNN/Sage switch was overridden by INT8 Fast: ${JSON.stringify(h3CudnnSwitch)}`);
+      await page.locator("#cv-h3-attention").selectOption("sage-int8");
 
       const testedH3Presets = [
         ["1536x672", 1536, 672], ["1344x768", 1344, 768],
@@ -983,7 +1006,35 @@ async function run() {
           && controls.width === 1536 && controls.height === 672
           && controls.duration === 15,
         `H3 ${mode} does not share the native resolution controls: ${JSON.stringify(controls)}`);
+        const mediaInputs = await page.evaluate(() => ({
+          source: getComputedStyle(document.querySelector("#cv-h3-source-row")).display !== "none",
+          references: getComputedStyle(document.querySelector("#cv-h3-references-row")).display !== "none",
+          lastFrame: getComputedStyle(document.querySelector("#cv-h3-last-frame-row")).display !== "none",
+        }));
+        assert(mediaInputs.source === (mode === "i2va" || mode === "fl2va")
+          && mediaInputs.references === (mode === "ref2va")
+          && mediaInputs.lastFrame === (mode === "l2va" || mode === "fl2va"),
+        `H3 ${mode} media pickers are wrong: ${JSON.stringify(mediaInputs)}`);
       }
+
+      await page.locator("#cv-h3-mode").selectOption("i2va");
+      const h3SourceChooserPromise = page.waitForEvent("filechooser");
+      await page.locator("#cv-h3-source-button").click();
+      const h3SourceChooser = await h3SourceChooserPromise;
+      await h3SourceChooser.setFiles({
+        name: "alien-baby.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      });
+      await page.waitForFunction(() => {
+        const note = document.querySelector("#cv-h3-source-note");
+        const preview = document.querySelector("#cv-source-preview");
+        return note && note.textContent.includes("alien-baby.png")
+          && preview && preview.style.display === "block";
+      });
 
       await page.locator("#cv-h3-mode").selectOption("ref2va");
 
@@ -991,11 +1042,16 @@ async function run() {
         visible: document.querySelector("#cv-h3-references-row").style.display !== "none",
         multiple: document.querySelector("#cv-h3-references-file").multiple,
         accept: document.querySelector("#cv-h3-references-file").accept,
+        buttonTop: document.querySelector('label[for="cv-h3-references-file"]')
+          .getBoundingClientRect().top,
+        panelBottom: document.querySelector("#panel-canvas .cv-right")
+          .getBoundingClientRect().bottom,
       }));
       assert(h3ReferenceSurface.visible && h3ReferenceSurface.multiple
         && h3ReferenceSurface.accept.includes("image/*")
         && h3ReferenceSurface.accept.includes("video/*")
-        && h3ReferenceSurface.accept.includes("audio/*"),
+        && h3ReferenceSurface.accept.includes("audio/*")
+        && h3ReferenceSurface.buttonTop < h3ReferenceSurface.panelBottom,
       `H3 omni-reference picker is incomplete: ${JSON.stringify(h3ReferenceSurface)}`);
       await page.locator("#cv-h3-references-file").setInputFiles([
         { name: "identity.png", mimeType: "image/png", buffer: Buffer.from("h3-image") },
@@ -1022,6 +1078,7 @@ async function run() {
         "H3 Ref2VA Canvas did not POST /v1/video");
       const h3RefRequest = videoRequests[videoRequests.length - 1];
       assert(h3RefRequest.task === "ref2va"
+        && h3RefRequest.attention_backend === "sage-int8"
         && Array.isArray(h3RefRequest.references)
         && h3RefRequest.references.length === 3
         && h3RefRequest.references[0].kind === "image"
@@ -1033,6 +1090,65 @@ async function run() {
         && h3RefRequest.references[2].path.endsWith(".wav")
         && h3RefRequest.references[2].audio_use === "voice_timbre",
       `H3 ordered omni-references drifted: ${JSON.stringify(h3RefRequest)}`);
+      const h3ContinueContract = await page.evaluate(() => new Promise((resolve, reject) => {
+        document.addEventListener("sf-staging-continue-h3", (event) => {
+          resolve({
+            detail: event.detail && event.detail.result,
+            mode: document.querySelector("#cv-h3-mode").value,
+          });
+        }, { once: true });
+        CanvasStaging.activate([{
+          src: "/playwright-h3-continue.mp4",
+          isVideo: true,
+          filename: "completed-h3.mp4",
+          metadata: {
+            model: "minimax_h3",
+            width: 768,
+            height: 768,
+            fps: 24,
+            duration_seconds: 15,
+          },
+        }], CanvasTab.getToolContext());
+        const button = document.querySelector("#stg-continue-h3");
+        if (!button) {
+          reject(new Error("video staging has no Continue H3 action"));
+          return;
+        }
+        button.click();
+      }));
+      assert(h3ContinueContract.detail
+        && h3ContinueContract.detail.isVideo === true
+        && h3ContinueContract.detail.filename === "completed-h3.mp4"
+        && h3ContinueContract.mode === "i2va",
+      `H3 continuation action did not switch to I2VA: ${JSON.stringify(h3ContinueContract)}`);
+      try {
+        await page.waitForFunction(() => {
+          const note = document.querySelector("#cv-h3-source-note");
+          return note && note.textContent.includes("Continuation frame ready");
+        }, null, { timeout: 5000 });
+      } catch (error) {
+        const state = await page.evaluate(() => ({
+          note: document.querySelector("#cv-h3-source-note")?.textContent || "",
+          error: document.querySelector("#cv-error-banner")?.textContent || "",
+          preview: document.querySelector("#cv-source-preview")?.src || "",
+        }));
+        throw new Error(`H3 continuation extraction stalled: ${JSON.stringify(state)}; ${error.message}`);
+      }
+      const h3ContinuationReady = await page.evaluate(() => ({
+        mode: document.querySelector("#cv-h3-mode").value,
+        quant: document.querySelector("#cv-h3-quant").value,
+        width: Number(document.querySelector("#cv-h3-width").value),
+        height: Number(document.querySelector("#cv-h3-height").value),
+        duration: Number(document.querySelector("#cv-h3-duration").value),
+        fps: Number(document.querySelector("#cv-fps").value),
+        source: document.querySelector("#cv-source-preview").src,
+      }));
+      assert(h3ContinuationReady.mode === "i2va"
+        && h3ContinuationReady.quant === "bf16"
+        && h3ContinuationReady.width === 768 && h3ContinuationReady.height === 768
+        && h3ContinuationReady.duration === 15 && h3ContinuationReady.fps === 24
+        && h3ContinuationReady.source.startsWith("data:image/png;base64,"),
+      `H3 final-frame continuation was not ready: ${JSON.stringify(h3ContinuationReady)}`);
       if (process.env.SERENITY_H3_ONLY === "1") {
         assert(pageErrors.length === 0, `page errors: ${pageErrors.join(" | ")}`);
         assert(requestFailures.length === 0,
@@ -1050,6 +1166,8 @@ async function run() {
           maximum_controls: h3Maximum,
           custom_controls: h3Custom,
           ref2va_submitted_request: h3RefRequest,
+          continuation_action: h3ContinueContract,
+          continuation_ready: h3ContinuationReady,
         }, null, 2));
         return;
       }

@@ -980,7 +980,10 @@ edits: see sections C and D of the parity-ported doc.
   I2VA/L2VA/FL2VA, and ordered image/video/audio references select Ref2VA.
   Users keep one shared Resolution, Seconds, FPS, and Quality surface; attention
   and cache policy live under collapsed Advanced performance rather than as
-  primary generation choices. Video staging exposes `Continue H3`: native results
+  primary generation choices. Generate's shared source picker sends the exact
+  upload path as `source_image` with `task=i2va`; no source sends explicit
+  `task=t2va`. Its selected-result metadata is rendered in the right Current
+  Batch rail instead of covering the preview. Video staging exposes `Continue H3`: native results
   use their compact video/audio latent tail, while legacy results decode the
   final displayed frame to PNG and fall back to I2VA. Both paths carry valid
   geometry/FPS/duration forward, with Sage switchable on INT8 and BF16 fixed to

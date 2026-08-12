@@ -3335,6 +3335,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   Canvas presents this as one H3 generator rather than six backend task modes:
   no media infers text-to-video, a start image infers I2VA, an end image infers
   L2VA, both keyframes infer FL2VA, and an ordered media list infers Ref2VA.
+  Generate uses the same source picker and now serializes a selected upload as
+  both `task=i2va` and the exact `source_image` server path; an empty picker
+  emits explicit T2VA and no source field. The focused browser gate proves both
+  request bodies. Result metadata lives in the right-side Current Batch panel,
+  never as an overlay over the generated image or video.
   Resolution, Seconds, FPS, and Quality remain common controls; attention and
   cache policy are collapsed under Advanced performance. `Continue H3` is an
   action on a completed clip and clears unrelated Canvas media before carrying

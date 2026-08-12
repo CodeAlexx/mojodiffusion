@@ -368,6 +368,17 @@ async function run() {
     );
     assert(mainVideoAudioState.controls, "Generate video preview has no playback controls");
 
+    const generateMetadataPlacement = await page.evaluate(() => ({
+      inBatchPanel: !!document.querySelector(
+        ".gen-workspace-batch-panel > #gen-metadata-panel",
+      ),
+      overPreview: !!document.querySelector(
+        ".gen-workspace-stage #gen-metadata-panel",
+      ),
+    }));
+    assert(generateMetadataPlacement.inBatchPanel && !generateMetadataPlacement.overPreview,
+      `Generate result metadata still covers the preview: ${JSON.stringify(generateMetadataPlacement)}`);
+
     await page.waitForFunction(() => {
       const item = GenerateTab.state.gallery && GenerateTab.state.gallery[0];
       return item && item.model === "sd_xl_base_1.0" && item.width === 1024 && item.height === 1024;
@@ -896,6 +907,8 @@ async function run() {
       const generateH3Request = videoRequests[videoRequests.length - 1];
       assert(generateH3Request.model === "minimax_h3"
         && generateH3Request.runner === "minimax_h3_mojo_request"
+        && generateH3Request.task === "t2va"
+        && !Object.prototype.hasOwnProperty.call(generateH3Request, "source_image")
         && generateH3Request.quant === "bf16"
         && generateH3Request.attention_backend === "cudnn"
         && generateH3Request.width === 512 && generateH3Request.height === 320
@@ -904,6 +917,78 @@ async function run() {
         && generateH3Request.steps === 31
         && generateH3Request.step_cache === "exact",
       `H3 Generate submitted the wrong runtime geometry: ${JSON.stringify(generateH3Request)}`);
+
+      const h3GenerateSource = "/tmp/serenity-h3-generate-i2va-source.png";
+      await page.evaluate((source) => {
+        GenerateTab.state.initImagePath = source;
+        GenerateTab.state.initImageName = "serenity-h3-generate-i2va-source.png";
+      }, h3GenerateSource);
+      await page.locator("#gen-prompt").fill("Playwright H3 Generate I2VA request");
+      const generateH3I2vaBefore = videoRequests.length;
+      await page.locator("#gen-btn").click();
+      for (let attempt = 0;
+        attempt < 100 && videoRequests.length === generateH3I2vaBefore;
+        attempt += 1) {
+        await page.waitForTimeout(20);
+      }
+      assert(videoRequests.length === generateH3I2vaBefore + 1,
+        "H3 Generate I2VA did not POST /v1/video");
+      const generateH3I2vaRequest = videoRequests[videoRequests.length - 1];
+      assert(generateH3I2vaRequest.model === "minimax_h3"
+        && generateH3I2vaRequest.runner === "minimax_h3_mojo_request"
+        && generateH3I2vaRequest.task === "i2va"
+        && generateH3I2vaRequest.source_image === h3GenerateSource
+        && generateH3I2vaRequest.prompt === "Playwright H3 Generate I2VA request",
+      `H3 Generate dropped its selected I2VA source: ${JSON.stringify(generateH3I2vaRequest)}`);
+      await page.waitForFunction(() => {
+        const panel = document.querySelector("#gen-metadata-panel");
+        return panel && panel.classList.contains("visible");
+      });
+      const visibleMetadataPlacement = await page.evaluate(() => {
+        const panel = document.querySelector("#gen-metadata-panel");
+        const stage = document.querySelector(".gen-workspace-stage");
+        const right = document.querySelector(".gen-workspace-batch-panel");
+        const panelRect = panel.getBoundingClientRect();
+        const stageRect = stage.getBoundingClientRect();
+        return {
+          visible: panel.offsetParent !== null,
+          parentIsBatch: panel.parentElement === right,
+          panelLeft: panelRect.left,
+          stageRight: stageRect.right,
+          overlapsStage: panelRect.left < stageRect.right
+            && panelRect.right > stageRect.left
+            && panelRect.top < stageRect.bottom
+            && panelRect.bottom > stageRect.top,
+        };
+      });
+      assert(visibleMetadataPlacement.visible
+        && visibleMetadataPlacement.parentIsBatch
+        && !visibleMetadataPlacement.overlapsStage
+        && visibleMetadataPlacement.panelLeft >= visibleMetadataPlacement.stageRight,
+      `visible result metadata still covers the preview: ${JSON.stringify(visibleMetadataPlacement)}`);
+      await page.evaluate(() => {
+        GenerateTab.state.initImagePath = "";
+        GenerateTab.state.initImageName = "";
+      });
+      if (process.env.SERENITY_H3_GENERATE_ONLY === "1") {
+        console.log("serenity H3 Generate source and metadata placement: PASS");
+        console.log(JSON.stringify({
+          schema: "serenity.playwright.h3_generate_source.v1",
+          metadata_placement: generateMetadataPlacement,
+          visible_metadata_placement: visibleMetadataPlacement,
+          t2va_request: {
+            task: generateH3Request.task,
+            has_source_image: Object.prototype.hasOwnProperty.call(
+              generateH3Request, "source_image",
+            ),
+          },
+          i2va_request: {
+            task: generateH3I2vaRequest.task,
+            source_image: generateH3I2vaRequest.source_image,
+          },
+        }));
+        return;
+      }
 
       await page.locator('.nav-btn[data-tab="canvas"]').click();
       await page.waitForFunction(() => document.querySelectorAll("#cv-model option").length > 1);

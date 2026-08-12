@@ -1039,7 +1039,12 @@ var GenerateTab = (function () {
 
     function buildGenerateBatchHTML() {
         return '<div class="gen-workspace-batch-head"><strong>Current Batch</strong><span id="gen-batch-status">Idle</span></div>' +
-            '<div id="gen-batch-strip" class="gen-workspace-batch-strip"><div class="gen-workspace-batch-empty">New results appear here</div></div>';
+            '<div id="gen-batch-strip" class="gen-workspace-batch-strip"><div class="gen-workspace-batch-empty">New results appear here</div></div>' +
+            '<div id="gen-metadata-panel" class="gen-metadata-panel">' +
+            '<div class="gen-metadata-title">Selected result</div>' +
+            '<div id="gen-metadata-summary" class="gen-metadata-summary"></div>' +
+            '<div id="gen-metadata-full" class="gen-metadata-full"></div>' +
+            '</div>';
     }
 
     function buildGenerateLibraryHTML() {
@@ -1098,11 +1103,6 @@ var GenerateTab = (function () {
             '<button class="gen-action-btn" id="gen-to-timeline" title="Send to Timeline"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg></button>' +
             '<button class="gen-action-btn gen-action-btn-wide" id="gen-reuse-params" title="Restore every parameter used for this result"><i data-lucide="rotate-ccw"></i><span>Reuse parameters</span></button>' +
             '<button class="gen-action-btn" id="gen-clear-preview" title="Clear"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>' +
-            '</div>' +
-            // Metadata panel (below action bar)
-            '<div id="gen-metadata-panel" class="gen-metadata-panel">' +
-            '<div id="gen-metadata-summary" class="gen-metadata-summary"></div>' +
-            '<div id="gen-metadata-full" class="gen-metadata-full"></div>' +
             '</div>' +
             '</div>' +
             '<div id="gen-progress-label" class="gen-progress-label"></div>' +
@@ -4359,10 +4359,12 @@ var GenerateTab = (function () {
             }
         }
         if (state.arch === 'minimax_h3') {
-            return {
+            var h3SourceImage = String(state.initImagePath || '').trim();
+            var h3Request = {
                 schema: 'serenity.genparams.v1',
                 model: 'minimax_h3',
                 runner: 'minimax_h3_mojo_request',
+                task: h3SourceImage ? 'i2va' : 't2va',
                 prompt: finalPrompt.trim(),
                 width: state.width,
                 height: state.height,
@@ -4382,6 +4384,13 @@ var GenerateTab = (function () {
                 step_cache: state.h3StepCache === 'high' ? 'high' : 'exact',
                 include_audio: true
             };
+            // Generate's source-image picker is shared by the image/video
+            // surfaces. H3 requires the exact server upload path plus an I2VA
+            // task label; leaving either out silently runs T2VA even though the
+            // preview still shows a selected source image.
+            if (h3SourceImage)
+                h3Request.source_image = h3SourceImage;
+            return h3Request;
         }
         if (state.arch === 'wan') {
             var wanI2v = !!state.initImagePath;

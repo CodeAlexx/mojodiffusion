@@ -117,7 +117,7 @@ comptime TRAIN_ADAPTER_START = (NUM_NR + NUM_CR) * ZIMAGE_SLOTS
 comptime N_ADAPTERS_TOTAL = (NUM_NR + NUM_CR + MAIN_DEPTH) * ZIMAGE_SLOTS
 
 comptime CHECKPOINT_PATH = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
-comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_l2p_512"
+comptime CACHE_DIR = "/home/alex/.serenity/parity/cache/boxjana_l2p_512"
 comptime COS_BAR = Float64(0.999)
 comptime LOSS_REL_BAR = Float64(1.0e-3)
 

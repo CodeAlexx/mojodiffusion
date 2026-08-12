@@ -41,14 +41,21 @@ struct MmapRegion(Movable):
     var _len: Int  # length of the requested region
     var mmap_base: BytePtr  # page-aligned actual mmap base
     var mmap_len: Int  # page-aligned actual mmap length
+    var file_offset: Int  # requested region's byte offset in the source file
 
     def __init__(
-        out self, ptr: BytePtr, _len: Int, mmap_base: BytePtr, mmap_len: Int
+        out self,
+        ptr: BytePtr,
+        _len: Int,
+        mmap_base: BytePtr,
+        mmap_len: Int,
+        file_offset: Int,
     ):
         self.ptr = ptr
         self._len = _len
         self.mmap_base = mmap_base
         self.mmap_len = mmap_len
+        self.file_offset = file_offset
 
     @staticmethod
     def new(
@@ -103,6 +110,7 @@ struct MmapRegion(Movable):
             _len=length,
             mmap_base=base,
             mmap_len=aligned_len,
+            file_offset=offset,
         )
 
     def as_ptr(self) -> BytePtr:
@@ -129,6 +137,25 @@ struct MmapRegion(Movable):
         var aligned_ptr = BytePtr(unsafe_from_address=aligned_addr)
         # mmap.rs:128-130 — madvise WILLNEED.
         _ = sys_madvise(aligned_ptr, aligned_len, MADV_WILLNEED)
+
+    def release_range(self, region_offset: Int, region_len: Int):
+        """Drop clean PTEs for one completed tensor upload without evicting
+        unrelated tensors in the same multi-gigabyte shard."""
+        if (
+            region_offset < 0
+            or region_len <= 0
+            or region_offset + region_len > self._len
+        ):
+            return
+        var page_size = sys_sysconf(_SC_PAGESIZE)
+        var abs_addr = Int(self.ptr) + region_offset
+        var aligned_addr = abs_addr & ~(page_size - 1)
+        var aligned_len = region_len + (abs_addr - aligned_addr)
+        var aligned_ptr = BytePtr(unsafe_from_address=aligned_addr)
+        _ = sys_madvise(aligned_ptr, aligned_len, MADV_DONTNEED)
+
+    def source_offset(self, region_offset: Int) -> Int:
+        return self.file_offset + region_offset
 
     def release_to_os(self):
         """Advise the OS that pages may be reclaimed (MADV_DONTNEED). Data is

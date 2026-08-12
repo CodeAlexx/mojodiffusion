@@ -44,6 +44,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.cap_cache import save_tensor_bin, load_tensor_bin
 from serenitymojo.models.vae.ldm_decoder import load_flux1_ldm_decoder
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode
 from serenitymojo.pipeline.chroma_pipeline_1024_multistep import (
     _unpack_latent_shape, VAE_PATH,
 )
@@ -63,13 +64,13 @@ from net.syscalls import sys_fork, errno_str
 # a pure hang backstop, after which we SIGKILL + fall back in-process.
 comptime _DECODE_CHILD_TIMEOUT_S = 120.0
 comptime _DECODE_POLL_S = 0.05
-# Pre-flight guard: the child is a SEPARATE process whose peak (fresh CUDA
-# context ~1 GB + FLUX VAE weights + the ~11.7 GB whole-decode conv activations
-# MEASURED in-process on job-0078) must fit in the CURRENT device-global free
-# memory — which is exactly what the child's own CUDA context will see. The
-# parent has already released the DiT + trimmed, so free ≈ 13.3 GB on a clean
-# 16 GB run. Below threshold → raise (caller falls back in-process, loudly).
-comptime _DECODE_CHILD_MIN_FREE_BYTES = Int(12800) * 1024 * 1024  # ~12.5 GiB
+# Pre-flight guard for the WHOLE decoder. Host-verified on the 24 GB product GPU:
+# the child still OOMs with 20.7 GiB device-global free after VMM denoiser
+# eviction. Require 22 GiB so 24 GB cards skip the doomed ~2.6 s attempt and go
+# directly to the bounded tiled child; larger cards retain the quality-first
+# whole path. This is measured admission, not a model or UI quality gate.
+comptime _DECODE_CHILD_MIN_FREE_BYTES = Int(22528) * 1024 * 1024  # 22 GiB
+comptime _TILED_CHILD_MIN_FREE_BYTES = Int(9216) * 1024 * 1024
 comptime _CHROMA_PRODUCT_EDGE_UNITS = 16
 
 
@@ -89,6 +90,17 @@ def _decode_child_shape[LH_: Int, LW_: Int](
     var latent_f32 = cast_tensor(latent, STDtype.F32, ctx)
     var dec = load_flux1_ldm_decoder[LH_, LW_](String(VAE_PATH), ctx)
     var rgb = dec.decode(latent_f32, ctx)
+    save_tensor_bin(rgb, rgb_out_path, ctx)
+
+
+def _decode_tiled_child_shape[LH_: Int, LW_: Int](
+    packed: Tensor, rgb_out_path: String, ctx: DeviceContext
+) raises:
+    var latent = _unpack_latent_shape[LH_, LW_](packed, ctx)
+    var latent_f32 = cast_tensor(latent, STDtype.F32, ctx)
+    var rgb = flux_tiled_decode[LH_, LW_](
+        latent_f32, String(VAE_PATH), ctx
+    )
     save_tensor_bin(rgb, rgb_out_path, ctx)
 
 
@@ -114,6 +126,31 @@ def decode_child_run(
             return
     raise Error(
         String("chroma decode-child: unsupported latent grid ")
+        + String(lh) + String("x") + String(lw)
+    )
+
+
+def decode_tiled_child_run(
+    latent_path: String, rgb_out_path: String, lh: Int, lw: Int
+) raises:
+    """Fresh-process bounded fallback used when whole decode cannot coexist
+    with the resident parent. Process exit reclaims every tiled-VAE allocation
+    while the parent's denoiser residency remains intact."""
+    var ctx = DeviceContext()
+    var packed = load_tensor_bin(latent_path, ctx)
+    comptime for bi in range(DEFAULT_ASPECT_LADDER_LEN):
+        comptime X100_BI = DEFAULT_ASPECT_LADDER_X100[bi]
+        comptime LH_BI = aspect_lat_h_units(X100_BI, _CHROMA_PRODUCT_EDGE_UNITS)
+        comptime LW_BI = aspect_lat_w_units(X100_BI, _CHROMA_PRODUCT_EDGE_UNITS)
+        if lh == LH_BI and lw == LW_BI:
+            _decode_tiled_child_shape[LH_BI, LW_BI](
+                packed, rgb_out_path, ctx
+            )
+            print("[chroma-decode-tiled-child] wrote rgb", rgb_out_path,
+                  "grid=", lh, "x", lw)
+            return
+    raise Error(
+        String("chroma decode-tiled-child: unsupported latent grid ")
         + String(lh) + String("x") + String(lw)
     )
 
@@ -209,4 +246,87 @@ def decode_whole_subprocess(
     _unlink_file(latent_path)
     _unlink_file(rgb_path)
     print("[chroma] decode child reaped → whole-image rgb loaded (decode VRAM reclaimed)")
+    return rgb^
+
+
+def decode_tiled_subprocess(
+    packed_latent: Tensor, lh: Int, lw: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Run the existing gated 3x3 fallback in a fresh child process.
+
+    This path is selected only after the preferred whole child cannot fit next
+    to the resident parent. Unlike the old in-process fallback, child exit
+    cannot strand VAE allocations in the parent's CUDA pool."""
+    var prefix = String("/tmp/serenity_chroma_decode_tiled_") + String(_getpid())
+    var latent_path = prefix + String(".latent.bin")
+    var rgb_path = prefix + String(".rgb.bin")
+
+    try:
+        cu_mempool_trim_current(0)
+    except e:
+        print("[chroma] pre-tiled-decode pool trim failed (continuing):", e)
+    var free_bytes = cu_mem_get_info().free_bytes
+    if free_bytes < _TILED_CHILD_MIN_FREE_BYTES:
+        raise Error(
+            String("chroma tiled decode child preflight failed: free VRAM ")
+            + String(free_bytes // (1024 * 1024))
+            + String(" MiB < required ")
+            + String(_TILED_CHILD_MIN_FREE_BYTES // (1024 * 1024))
+            + String(" MiB")
+        )
+
+    save_tensor_bin(packed_latent, latent_path, ctx)
+    var args = List[String]()
+    args.append(SELF_EXE)
+    args.append(String("decode-tiled-child"))
+    args.append(latent_path)
+    args.append(rgb_path)
+    args.append(String(lh))
+    args.append(String(lw))
+    var argv = build_argv(args)
+    var path = cstr(SELF_EXE)
+
+    print("[chroma] tiled decode → fork VAE child; resident denoiser retained (parent pid",
+          _getpid(), ")")
+    var pid = sys_fork()
+    if pid == 0:
+        _ = sys_execv(path, argv)
+        sys__exit(127)
+    if pid < 0:
+        _unlink_file(latent_path)
+        raise Error(String("chroma tiled decode child fork failed: ") + errno_str())
+
+    var st = alloc[Int32](1)
+    var stp = rebind[UnsafePointer[Int32, MutExternalOrigin]](st)
+    var waited = 0.0
+    var reaped = Int32(0)
+    while waited < _DECODE_CHILD_TIMEOUT_S:
+        reaped = sys_waitpid(pid, stp, WNOHANG)
+        if reaped == pid:
+            break
+        if reaped < 0:
+            break
+        sleep(_DECODE_POLL_S)
+        waited += _DECODE_POLL_S
+    var status = Int(st[0])
+    st.free()
+
+    if reaped != pid:
+        proc_kill_wait(pid, SIGKILL)
+        _unlink_file(latent_path)
+        _unlink_file(rgb_path)
+        raise Error("chroma tiled decode child timed out or waitpid failed")
+    var exited_ok = (status & 0x7F) == 0 and ((status >> 8) & 0xFF) == 0
+    if not exited_ok:
+        _unlink_file(latent_path)
+        _unlink_file(rgb_path)
+        raise Error(
+            String("chroma tiled decode child abnormal exit status ")
+            + String(status)
+        )
+
+    var rgb = load_tensor_bin(rgb_path, ctx)
+    _unlink_file(latent_path)
+    _unlink_file(rgb_path)
+    print("[chroma] tiled decode child reaped → rgb loaded; denoiser still resident")
     return rgb^

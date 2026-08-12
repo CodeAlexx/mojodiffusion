@@ -28,7 +28,9 @@ from std.time import sleep
 from json.parser import loads
 
 from serenitymojo.serve.backend import StepResult
-from serenitymojo.serve.klein_runtime_backend import KleinRuntimeBackend
+from serenitymojo.serve.klein_runtime_backend import (
+    KleinRuntimeBackend, klein_encode_child_run,
+)
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import decode_start, encode_ev, encode_ready
 from serenitymojo.serve.klein_decode_subprocess import (
@@ -93,8 +95,17 @@ def _klein_worker_loop(mut backend: KleinRuntimeBackend, fd: Int32) raises:
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: serenity_worker_klein <fd> | serenity_worker_klein decode-child <latent> <rgb_out> <vae> <lh> <lw>")
+        print("usage: serenity_worker_klein <fd> | serenity_worker_klein encode-child <prefix> <variant> <prompt> <negative> <joint> | serenity_worker_klein decode-child <latent> <rgb_out> <vae> <lh> <lw>")
         return
+    if String(args[1]) == "encode-child":
+        if len(args) < 7:
+            print("usage: serenity_worker_klein encode-child <prefix> <variant> <prompt> <negative> <joint>")
+            return
+        klein_encode_child_run(
+            String(args[2]), String(args[3]), String(args[4]), String(args[5]),
+            Int(String(args[6])),
+        )
+        return                            # process exits -> encoder VRAM reclaimed
     # WHOLE-image VAE decode-in-a-child-process. klein_sample (allow_child_decode)
     # fork+execv's THIS same binary as `decode-child` so the whole-image decode runs
     # in a fresh CUDA context with its own pool (tiled decode degrades output —

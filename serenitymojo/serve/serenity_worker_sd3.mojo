@@ -30,6 +30,7 @@ from json.parser import loads
 
 from serenitymojo.serve.backend import StepResult
 from serenitymojo.serve.sd3_backend import Sd3Backend
+from serenitymojo.serve.sd3_decode_subprocess import decode_child_run
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import decode_start, encode_ev, encode_ready
 
@@ -91,7 +92,18 @@ def _sd3_worker_loop(mut backend: Sd3Backend, fd: Int32) raises:
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: serenity_worker_sd3 <fd>")
+        print("usage: serenity_worker_sd3 <fd> | serenity_worker_sd3 decode-whole-child|decode-tiled-child <latent> <rgb_out> <checkpoint> <lh> <lw>")
+        return
+    var mode = String(args[1])
+    if mode == "decode-whole-child" or mode == "decode-tiled-child":
+        if len(args) < 7:
+            print("usage: serenity_worker_sd3 decode-whole-child|decode-tiled-child <latent> <rgb_out> <checkpoint> <lh> <lw>")
+            return
+        decode_child_run(
+            String(args[2]), String(args[3]), String(args[4]),
+            Int(String(args[5])), Int(String(args[6])),
+            mode == "decode-tiled-child",
+        )
         return
     var fd = Int32(Int(String(args[1])))
     var b = Sd3Backend()

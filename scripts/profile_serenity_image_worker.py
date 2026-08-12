@@ -16,7 +16,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 NSYS = Path("/opt/nvidia/nsight-compute/2024.1.1/host/target-linux-x64/nsys")
-SYSTEM_SCOPE_PREFIX = "/system.slice/serenity-memory-"
+ROOTLESS_SCOPE_MARKER = "/app.slice/serenity-runtime-memory-"
+ROOTLESS_MAX_BYTES = 24 * 1024 * 1024 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +39,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "fail if /proc/<worker>/io read_bytes increases after sampling "
             "starts and before its final denoise progress event"
+        ),
+    )
+    parser.add_argument(
+        "--disk-read-warmup-jobs",
+        type=int,
+        default=0,
+        help=(
+            "number of leading jobs excluded from the read_bytes assertion; "
+            "use only to warm lazy driver/library code before gated jobs"
         ),
     )
     parser.add_argument("--timeout", type=float, default=1800.0)
@@ -69,15 +79,37 @@ def start_message(
     return request
 
 
-def require_system_scope() -> None:
+def require_isolated_scope() -> None:
     cgroup_lines = Path("/proc/self/cgroup").read_text().splitlines()
     unified = next((line.split(":", 2)[2] for line in cgroup_lines if line.startswith("0::")), "")
-    if not unified.startswith(SYSTEM_SCOPE_PREFIX) or not unified.endswith(".service"):
-        raise SystemExit(
-            "refusing to launch an image worker outside a dedicated system scope; "
-            f"current cgroup is {unified or '<unknown>'}. Run this command through "
-            "scripts/mem_safe_system.sh, not scripts/mem_safe.sh."
-        )
+    is_rootless_scope = ROOTLESS_SCOPE_MARKER in unified and unified.endswith(".service")
+    if is_rootless_scope:
+        cgroup_dir = Path("/sys/fs/cgroup") / unified.removeprefix("/")
+        memory_max_raw = (cgroup_dir / "memory.max").read_text().strip()
+        oom_group_raw = (cgroup_dir / "memory.oom.group").read_text().strip()
+        memory_high_raw = (cgroup_dir / "memory.high").read_text().strip()
+        try:
+            memory_max = int(memory_max_raw)
+        except ValueError as exc:
+            raise SystemExit(
+                f"refusing rootless runtime with non-finite memory.max={memory_max_raw}"
+            ) from exc
+        if memory_max > ROOTLESS_MAX_BYTES or oom_group_raw != "1":
+            raise SystemExit(
+                "refusing rootless runtime without the 24 GiB hard ceiling and "
+                f"OOM group: memory.max={memory_max_raw}, memory.oom.group={oom_group_raw}"
+            )
+        if memory_high_raw not in {"max", memory_max_raw}:
+            raise SystemExit(
+                "refusing rootless runtime with a reclaim-pressure threshold below "
+                f"the hard ceiling: memory.high={memory_high_raw}, memory.max={memory_max_raw}"
+            )
+        return
+    raise SystemExit(
+        "refusing to launch an image worker outside the passwordless rootless "
+        f"runtime cgroup; current cgroup is {unified or '<unknown>'}. Run this "
+        "command through scripts/mem_safe_runtime.sh."
+    )
 
 
 def process_io(pid: int) -> dict[str, int]:
@@ -91,7 +123,7 @@ def process_io(pid: int) -> dict[str, int]:
 
 def main() -> int:
     args = parse_args()
-    require_system_scope()
+    require_isolated_scope()
     if args.repeat < 1:
         raise SystemExit("--repeat must be >= 1")
     steps_sequence = [args.steps] * args.repeat
@@ -105,6 +137,12 @@ def main() -> int:
         if not steps_sequence or any(steps < 1 for steps in steps_sequence):
             raise SystemExit("--steps-sequence values must all be >= 1")
     repeat_count = len(steps_sequence)
+    if args.disk_read_warmup_jobs < 0:
+        raise SystemExit("--disk-read-warmup-jobs must be >= 0")
+    if args.disk_read_warmup_jobs >= repeat_count:
+        raise SystemExit(
+            "--disk-read-warmup-jobs must leave at least one measured job"
+        )
     if repeat_count > 1 and not args.no_nsys:
         raise SystemExit("--repeat > 1 is supported only with --no-nsys")
     if args.assert_no_read_during_sampling and not args.no_nsys:
@@ -192,6 +230,7 @@ def main() -> int:
                     print(json.dumps(event, separators=(",", ":")), flush=True)
                     if (
                         args.assert_no_read_during_sampling
+                        and completed >= args.disk_read_warmup_jobs
                         and event.get("ev") == "progress"
                         and event.get("phase") == "sampling"
                     ):
@@ -260,10 +299,29 @@ def main() -> int:
                                 f"worker terminal event: {event.get('ev')}: "
                                 f"{event.get('error', '')}"
                             )
-                        if args.assert_no_read_during_sampling and not sampling_io_passed:
+                        if (
+                            args.assert_no_read_during_sampling
+                            and completed >= args.disk_read_warmup_jobs
+                            and not sampling_io_passed
+                        ):
                             raise RuntimeError(
                                 "denoise disk-read gate did not observe a complete "
                                 "step-0-to-final-step sampling interval"
+                            )
+                        if (
+                            args.assert_no_read_during_sampling
+                            and completed < args.disk_read_warmup_jobs
+                        ):
+                            print(
+                                json.dumps(
+                                    {
+                                        "gate": "denoise_disk_read",
+                                        "job": completed + 1,
+                                        "state": "warmup_skipped",
+                                    },
+                                    separators=(",", ":"),
+                                ),
+                                flush=True,
                             )
                         completed += 1
                         sampling_io_start = None

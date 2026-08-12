@@ -798,7 +798,7 @@ edits: see sections C and D of the parity-ported doc.
   yet registered as Serenity server workers or Canvas engines; the UI must not
   route to them until capability, request, and worker lifecycle wiring exists.
 
-## Serenity Canvas editing runtime (2026-07-23)
+## Serenity Canvas editing runtime (updated 2026-08-11)
 
 - `serve/klein_runtime_backend.mojo` is the resident pure-Mojo product runtime
   for FLUX.2 Klein 9B and 4B. In addition to text-to-image it now accepts one
@@ -806,6 +806,17 @@ edits: see sections C and D of the parity-ported doc.
   source in the worker, and dispatches the matching compiled 4B/9B edit shape.
   Ordinary img2img remains rejected, and the older two-reference path remains
   bounded to 512x512.
+  Qwen3 text encoding now executes in a fresh GPU child and returns exact BF16
+  cap-cache tensors to the persistent worker. Child exit is the CUDA ownership
+  boundary: denoise no longer inherits the encoder's roughly 22-GiB pool high
+  water. `sampling/klein_sampler.mojo` also lets the worker skip its redundant
+  pre-step-0 DiT warm forward after the same shape/CFG/LoRA branch has compiled.
+  The final 1024px one-step two-job gate measured 101.556 s cold and 13.060 s
+  warm at a 16,821.9-MiB worker peak, with decoded pixels exact against the
+  earlier child-encoder gate and zero cgroup OOM events. The inline baseline was
+  134.161 s at 22,175.1 MiB. Whole-image child VAE decode still lacks enough
+  free VRAM beside the retained denoiser pool and falls back to the existing GPU
+  tiled decoder; no CPU model fallback was added.
 - `serve/image_io.mojo` keeps LanPaint's authored final-blend mask distinct from
   its optional expanded sampler-context mask. This lets structural edits expose
   surrounding geometry during denoising without committing generated pixels
@@ -818,7 +829,7 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
-## MiniMax-H3 audio-video inference runtime (updated 2026-08-08)
+## MiniMax-H3 audio-video inference runtime (updated 2026-08-11)
 
 - `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
   modulation, and resident-weight sidecars used by the product runners. Cache
@@ -833,10 +844,25 @@ edits: see sections C and D of the parity-ported doc.
   can serve the maximum admitted runtime canvas without materializing the
   previous multi-GiB intermediates.
 - `models/dit/minimax_h3_qk_inplace.mojo` normalizes and partially rotates Q/K
-  in their owned BF16 buffers at long sequence lengths. It preserves the F32
-  reduction and RoPE arithmetic boundaries while removing extra full-tensor
-  copies. `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` gates the
+  in their owned BF16 buffers with one kernel per tensor. It preserves the F32
+  reduction, explicit BF16 boundary, and partial-RoPE arithmetic while removing
+  extra full-tensor copies. The ordinary W8A8 QKV path also writes its three
+  BF16 outputs directly from one packed accumulator. BF16 and group-wise QKV
+  keep one packed GEMM at ordinary lengths because their split writers require
+  three GEMMs; those split writers remain available for the >=48k low-headroom
+  path. `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` gates the
   chunked/fused BF16, group-wise, W8A8, QKV, Q/K, and final-layer paths.
+- `models/dit/minimax_h3_loader_device.mojo` keeps BF16 checkpoint layout work
+  on GPU: QKV de-interleave and FC1 half-swap use exact device kernels after a
+  bounded batched pinned upload. `io/mmap.mojo`, `io/safetensors.mojo`, and
+  `io/sharded.mojo` expose tensor-range release so consumed source pages do not
+  accumulate across the 50 streamed blocks. Real checkpoint layers 0 and 1
+  match the former loader at max-abs 0.0 for QKV and FC1. At S=37,951 the same
+  final latent fell from 195.6406 to 119.0718 seconds/evaluation cold, a
+  76.5688-second saving. The final rebuilt executable measured 90.6757 seconds
+  with partially warm kernel cache, saving 104.9649 seconds, and reproduced
+  SHA `83be62c6...5d0bee`; sampled denoise VRAM was 14,790 MiB, host RSS stayed
+  near 3.3 GiB, and the cgroup recorded zero max/OOM events.
 - `models/dit/minimax_h3_frontend.mojo` uses an inference-only disjoint scatter
   for forward video/audio/text packing. It replaces the O(V*D*N) autograd
   index-select backward reuse with O(rows*hidden) GPU copies;
@@ -855,11 +881,21 @@ edits: see sections C and D of the parity-ported doc.
   Qwen3-VL text-encoder cache and GPU forward. The BF16 conditioning output is
   shared by BF16, INT8 Quality, and INT8 Fast DiT runners.
 - `ops/sage_attention_int8.mojo` is an opt-in Sage-style INT8-QK attention
-  backend with F32 accumulation and explicit tail masking. It is experimental
-  and approximate, while cU-DNN remains the exact-quality choice. Attention and
-  weight precision are independent: both backends are admitted for BF16, INT8
-  Quality, and INT8 Fast. Canvas defaults to Sage for speed but keeps the label
-  and switch explicit; the bare runners default to cU-DNN when no flag is given.
+  backend with upstream-style per-thread Q/K scale geometry, K-mean smoothing,
+  BF16 PV, F32 accumulation, and explicit tail masking. Its S=9,145 primitive
+  gate measured cosine 0.99993509 and 1.2035x versus cU-DNN. At the real
+  S=37,951 product shape, a full 50-block evaluation fell from 50.6334 to
+  41.9195 seconds, saving 8.7139 seconds; final video/audio cosine was
+  0.998955/0.992443. Keeping fixed A/V prefix attention exact measured 42.3831
+  seconds and 0.999048/0.994064. It is experimental and approximate, while
+  cU-DNN remains the exact-quality choice. Both backends are admitted for INT8
+  Quality and INT8 Fast; streamed BF16 is cU-DNN-only and rejects Sage at the
+  UI, server, and Mojo runner. Canvas defaults to Sage with INT8 Fast but keeps
+  the label and switch explicit; bare runners default to cU-DNN without a flag.
+  On INT8 Quality, a hot A-B-A measured 64.2411 seconds exact versus 58.7937
+  seconds Sage, saving 5.4474 seconds/evaluation. Sage versus INT8-exact cosine
+  was 0.999636 video / 0.999399 audio; combined INT8+Sage versus BF16 was
+  0.999585 video PASS / 0.998413 audio FAIL under the strict 0.999 bar.
 - `models/minimax_h3_device/audio_encoder_device.mojo` is the GPU reference
   AudioVAE encoder for Ref2VA audio tracks and standalone audio clips. Media
   decode/staging is host I/O; every learned DAC/Snake/attention/MLP/posterior
@@ -870,11 +906,17 @@ edits: see sections C and D of the parity-ported doc.
   `minimax_h3_ref2va.mojo` now accept runtime width, height, aligned internal
   frames, and FPS in the unified product binaries. The Serenity boundary
   exposes six tested H3-Base presets plus custom width/height from 32 through
-  2048 in 32-pixel steps, capped at 1,032,192 pixels, and authored duration
-  from 1 through 15 seconds. The model timeline stays at native 24 FPS and
-  17n+5 internal frames; delivery frames/FPS are trimmed or resampled to the
-  exact authored duration. All admitted tasks retain BF16, INT8 Quality, and
-  INT8 Fast choices. Small shapes use measured resident prefixes and larger
+  2048 in 32-pixel steps, capped at 1,032,192 pixels. The trained authored
+  duration is 1 through 15 seconds. T2VA, I2VA, L2VA, and FL2VA additionally
+  expose experimental single-pass long context up to 60 seconds when the
+  resolution/task combination fits the 107,000-token 24-GiB envelope; the UI
+  computes the exact duration ceiling as size or task changes. Ref2VA remains
+  capped at 15 seconds because its reference pack has variable length. The
+  model timeline stays at native 24 FPS and 17n+5 internal frames; delivery
+  frames/FPS are trimmed or resampled to the exact authored duration. This is
+  one denoise trajectory, not stitched continuation. All admitted tasks retain
+  BF16, INT8 Quality, and INT8 Fast choices. Small shapes use measured resident
+  prefixes and larger
   sequences stream on GPU with zero resident blocks. Long conditioned
   sequences fence and trim the CUDA pool at transformer-block boundaries to
   prevent deferred streamed temporaries from accumulating; operations inside
@@ -882,23 +924,74 @@ edits: see sections C and D of the parity-ported doc.
   block 47, recreates its reusable packed block on later denoise evaluations,
   and keeps only blocks 48-49 BF16. Denoise and fresh-process
   GPU VAE decode/NVENC mux remain phase isolated.
+  W8A8 Fast may retain eight blocks through S=37,951, where exact cU-DNN fell
+  from 50.6334 to 49.8125 seconds/evaluation with a byte-identical latent. The
+  server and runner force zero residency above 38k exact tokens; 12/16-block
+  attempts crossed the 24-GiB attention-workspace boundary. Groupwise INT8
+  Quality remains zero-resident at this long shape because measured resident
+  alternatives were slower.
 - Ref2VA consumes an ordered list of at most 9 images, 3 videos, and 3 audio
   clips, with at most 12 references combined. Video soundtracks and standalone
   audio are encoded on GPU; audio intent is explicit as ordinary reference,
   soundtrack reuse, or voice/timbre reference. Audio-only Ref2VA is rejected:
   at least one image or video must anchor the visual generation. Reference
   media is conditioning only and is never inserted as output frame zero.
-- `serenity-server/crates/server/src/video.rs` and the Canvas Generate/Workflow
-  modules resolve runtime geometry, precision, attention, exact/high cache
-  policy, and ordered reference roles before acquiring the GPU lease.
-  Unsupported geometry, over-limit references, missing runners/caches, stale
-  machine gates, and invalid backend combinations fail queue admission closed.
+- `models/minimax_h3/motion_context.mojo` implements native H3 continuation
+  without decoding/re-encoding the source MP4. Every completed H3 task saves a
+  compact generated video/audio latent tail. `Continue` pins a selectable 5,
+  22, or 39-frame window in the physical order `[text | fixed video | fixed
+  audio | target audio | target video]`, samples the new target, and trims the
+  matching A/V overlap from delivery. Resolution and the native 24-FPS model
+  timeline remain exact; BF16, groupwise INT8, W8A8 INT8 Fast, and exact/high
+  cache stay independently switchable. cU-DNN/Sage is switchable on INT8;
+  BF16 stays on cU-DNN. For an authored cut
+  that falls between H3's `5+17n` endpoints, the tail ends at the nearest
+  native endpoint instead of silently continuing from padded frames. Both
+  positive and negative audio-grid rounding residuals are retained. Legacy
+  H3 jobs without the compact artifact keep the decoded-last-frame I2VA
+  fallback.
+- `Continue` can also retain the ordered Ref2VA image/video/audio list. That
+  route uses the Ref2VA checkpoint and packs `[text | fixed motion video |
+  ordered reference blocks | fixed motion audio | target audio | target
+  video]`. Ordinary reference coordinates stay unchanged while the direct
+  video/audio tail is pinned to the new target head, so motion continuity and
+  identity/style/soundtrack/voice conditioning coexist in one denoise pass.
+  Reference-conditioned legs remain inside the trained 15-second window;
+  pressing Continue again is the long-form mechanism.
+- `serenity-server/crates/server/src/video.rs` is the shared video HTTP,
+  readiness, hashing, process, and GPU-lease shell. Model-specific admission
+  and orchestration live under `serenity-server/crates/server/src/video/`:
+  `minimax_h3.rs`, `ltx2.rs`, `wan22.rs`, `scail2.rs`, and `bernini.rs`, with
+  shared media probing in `probe.rs` and route coverage in `tests.rs`. The H3
+  module and the Canvas Generate/Workflow modules resolve runtime geometry,
+  precision, attention, exact/high cache policy, and ordered reference roles
+  before acquiring the GPU lease.
+  Unsupported geometry, over-limit references, missing installed model files,
+  missing runners or linked GPU runtime libraries, and invalid backend
+  combinations fail queue admission closed. Generated conditioning,
+  modulation, and INT8 resident caches are rebuildable implementation details,
+  not product admission gates; selected INT8 caches build on first use in a
+  separate GPU-only phase. Historical machine quality reports remain evidence
+  and never hide an installed model. BF16 requires no resident cache.
   Resolution and Seconds are independent selectors: changing one preserves the
   other, and tested presets are conveniences rather than an exhaustive
-  resolution allowlist. Video staging also exposes `Continue H3`, which decodes
-  the final displayed frame to PNG, switches Canvas to I2VA, carries valid
-  geometry/FPS/duration forward, and leaves all precision/attention choices
-  switchable.
+  resolution allowlist. Canvas exposes one H3 generator and infers the backend
+  task from optional media: blank is T2VA, start/end keyframes select
+  I2VA/L2VA/FL2VA, and ordered image/video/audio references select Ref2VA.
+  Users keep one shared Resolution, Seconds, FPS, and Quality surface; attention
+  and cache policy live under collapsed Advanced performance rather than as
+  primary generation choices. Video staging exposes `Continue H3`: native results
+  use their compact video/audio latent tail, while legacy results decode the
+  final displayed frame to PNG and fall back to I2VA. Both paths carry valid
+  geometry/FPS/duration forward, with Sage switchable on INT8 and BF16 fixed to
+  cU-DNN. Starting Continue clears unrelated media left by a prior Canvas
+  request, preventing stale Ref2VA inputs from silently leaking into the new
+  segment.
+  The runner now advertises `default_steps=20`. Generate and Canvas apply that
+  model default only when entering H3, so Wan's fixed 50-step value cannot leak
+  into H3; the H3 control itself remains enabled for authored values from 2
+  through 50. The browser gate proves 20 on entry and exact submission of
+  non-default 31/37-step requests across both surfaces.
 
 **Status: INFERENCE / PRODUCT-GATED.** The three modes are deliberately
 separate product choices: INT8 Fast is perceptually accepted, INT8 Quality and
@@ -919,6 +1012,20 @@ video at 0.999227 cosine but measured audio at 0.997751 versus BF16, so that
 audio result is recorded as below the strict 0.999 numerical bar rather than
 being relabeled as parity. The maximum 12-reference combination is admission-
 tested but has not been quality-run simultaneously on the 24-GiB GPU.
+Native continuation has a full three-clip INT8 Fast/cU-DNN acceptance at
+512x320: three 15-second legs denoised in 306.972, 383.195, and 385.392 seconds
+with zero non-finite A/V values and a sampled 21,030-MiB process peak. The
+concatenated delivery is exactly 45.000 seconds/1,080 frames with stereo audio;
+both joins passed visual review, the freeze scan found no event at least 0.5
+seconds long, and an 8-ms delivery-boundary fade reduced single-sample audio
+jumps to 0.001221 and 0.003235.
+A full 20-step combined Motion Context + image-Ref2VA acceptance at 512x320
+packed S=7,156 with 2,032 fixed/reference video rows and 74 fixed audio rows.
+It completed 19 W8A8/cU-DNN exact evaluations in 126.493 seconds after 123.417
+seconds of GPU conditioning, produced zero non-finite A/V values, and delivered
+exactly 48 frames/2.000 seconds plus stereo audio. Frame 21-to-22 seam PSNR was
+19.898 dB, inside the neighboring-motion range of 19.464-20.168 dB; visual
+inspection retained the woman, suit, space-bar layout, and cyborg crowd.
 At 768x768x362 on the RTX 3090 Ti, the long-sequence streamed-block fence cut
 an exact Fast/Sage one-evaluation A/B from 188.48 to 103.38 seconds with an
 identical latent SHA. A later live 20-step render exposed whole-cache
@@ -938,6 +1045,81 @@ including 273.39 seconds of weight loading. INT8 Quality passed two real
 evaluations at 283.78 seconds cold and 129.75 seconds hot with no non-finites;
 Ref2VA's matching recreate-after-release lifecycle passed two real image-
 conditioned evaluations at 65.15 and 9.42 seconds.
+At S=37,711 (1344x768x124), the 2026-08-11 internal stage probe measured dense
+cU-DNN attention at 0.649 s of a 1.082-s block and the four W8A8 projection
+GEMMs at about 0.170 s total. Hot streamed cU-DNN/Sage blocks measured
+1.192/0.978 s; Sage's 17.9% block gain remains subject to the approximate
+quality decision above. A resident prefix saved only about 0.097 s per block.
+All timing hooks were removed before the final build; its clean cU-DNN probe
+measured 1.09065 s and reproduced the accepted latent and audio byte-for-byte
+with zero cgroup OOM events.
+At S=37,951, Nsight Systems 2026.4.1 measured the controlled one-evaluation
+W8A8 resident-8 paths at 48.5900 seconds cU-DNN versus 43.9953 seconds
+exact-prefix Sage, saving 4.5947 seconds under profiling. The 50 main kernels
+consumed 30.3747 seconds for cU-DNN versus 24.8031 seconds for Sage. Launch
+overhead was about 0.023 seconds; the Sage main kernel itself consumed 58.8%
+of GPU-kernel time at 224 registers/thread and 64 KiB executed shared memory.
+An attempted base-2 softmax rewrite preserved cosine 0.99993509 but slowed the
+S=9,145 gate from 28.7319 to 30.2883 ms and was reverted.
+The accepted exact block fusion combines Q/K RMSNorm, its BF16 boundary, and
+partial RoPE in one kernel per tensor, and removes three packed-QKV slice-copy
+launches from ordinary W8A8. Nsight measured the replaced RMSNorm, RoPE, and
+Q/K/V-copy families at 1.1477, 0.1707, and 0.9562 seconds respectively; the
+final fused Q/K family took 0.8534 seconds and the copy family disappeared. A
+controlled final-dispatch run fell from 42.3730 to 40.8347 seconds/evaluation,
+saving 1.5383 seconds with byte-identical latent and audio artifacts. A prior
+repeat measured 40.4591 seconds. Direct QKV is deliberately W8A8-only at this
+shape; BF16 and INT8 Quality retain their single packed GEMM and still receive
+the Q/K fusion.
+
+## LTX-2.5 Gemma-4 conditioning and experimental inference (2026-08-12)
+
+- `models/text_encoder/gemma4_ltx_streamed.mojo` implements the Gemma-4-12B
+  tower used by LTX-2.5, including distinct sliding/global attention geometry,
+  scale-less V normalization, proportional partial RoPE, per-layer scalars,
+  and both checkpoint prefixes. The gate uses Lightricks' fine-tuned encoder,
+  not stock Google weights: all 49 captured states pass cosine 0.999, with
+  worst state 0.99990787.
+- `tokenizer/tokenizer.mojo::Qwen3Tokenizer.from_json_bytes` consumes the
+  checkpoint's embedded `tokenizer_json` through an origin-bound byte span.
+  `models/text_encoder/parity/ltx25_embedded_tokenizer_probe.mojo` compares its
+  positive and negative IDs with the standalone tokenizer. Large oracle tensor
+  dumps under the Gemma parity directories are reproducible local artifacts
+  and are gitignored.
+- `pipeline/ltx25_encode_prompt.mojo` preserves LTX's 49-state
+  FeatureExtractorV2 packing and uses the video/audio aggregate projections
+  stored inside the same LTX-2.5 text-encoder file. `ltx2_dit.mojo` accepts the
+  released transformer's absent feed-forward biases, and
+  `ltx2_vae_decoder.mojo` detects standalone versus bundled VAE prefixes.
+- Artifact evidence is real but remains experimental: 512x768/121-frame and
+  960x512/241-frame audio-video renders completed, plus a 960x512 render using
+  the existing LTX-2.3 Eri LoRA. The latter proves the loader/execution path,
+  not general LoRA compatibility. Every result manifest still records
+  `accepted_sampler_parity=false` and `accepted_speed_parity=false`; do not
+  promote the route from visual artifacts alone.
+
+## Process-isolated image-worker memory and speed paths (2026-08-12)
+
+- `serve/{sd3,sdxl,flux,chroma}_backend.mojo` and their
+  `*_decode_subprocess.mojo` helpers move VAE decoding into a self-exec GPU
+  child. Process exit reliably returns the child's CUDA pool while the parent
+  can retain the measured denoiser subset. Each family keeps its prior
+  release-and-decode or tiled route as an explicit fallback; no CPU model
+  execution was added.
+- SD3, Flux, and Chroma derive GPU-resident block promotion from current free
+  VRAM while reserving their measured denoise/decode headroom. Unchanged prompt
+  conditioning can be reused across warm jobs. These paths are architectural
+  and build evidence until each family has a paired artifact/timing gate.
+- Klein's paired gate is measured: process-separated Qwen3 encoding and removal
+  of the redundant warm forward reduced a 1024px one-step run from 134.161 to
+  101.556 seconds cold, while the second job completed in 13.060 seconds. Peak
+  worker VRAM fell from 22,175.1 to 16,821.9 MiB and decoded pixels stayed
+  exact against the prior gate.
+- `scripts/mem_safe_runtime.sh` launches the full runtime process tree in a
+  rootless transient user service with a hard host-memory/swap ceiling, desktop
+  reserve admission, OOM grouping, and final `memory.peak`/`memory.events`
+  evidence. It is the runtime counterpart to `scripts/mem_safe.sh`, not a
+  model offload mechanism.
 
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 

@@ -471,7 +471,7 @@ def _rewrite_kohya_diffusers_to_ldm(prefix: String) -> String:
     """Rewrite an SDXL kohya Diffusers prefix to Serenity's LDM prefix.
 
     This is a direct table port of the creator/reference implementation in
-    `/home/alex/EriDiffusion/inference-flame/src/lora_merge.rs`. Returning ""
+    `/home/alex/.serenity/parity/src/lora_merge.rs`. Returning ""
     means the prefix is not a supported SDXL UNet module.
     """
     if prefix == "lora_unet_conv_in":

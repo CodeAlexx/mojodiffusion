@@ -6,6 +6,27 @@ browser application in this repository. The browser source is
 HTTP, WebSocket, queues, graph lowering, GPU leases, and Mojo worker lifecycle.
 Model execution remains in the Mojo workers under `output/bin/`.
 
+The live job driver never terminates a generation because `/proc/<pid>/io`
+reports physical reads during sampling. Disk-read assertions are profiling and
+performance evidence, not a user-facing completion gate; worker failures,
+invalid requests, IPC errors, and missing output artifacts still fail loudly.
+
+Video routing is organized as a thin shared shell in
+`crates/server/src/video.rs` plus backend modules in
+`crates/server/src/video/`. MiniMax H3, LTX2, Wan 2.2, Scail2, and Bernini own
+their admission and orchestration in separate modules; `probe.rs` contains
+shared media inspection and `tests.rs` contains route-level coverage. Keep
+model inference in Mojo: this Rust layer owns capability publication, request
+validation, queues, process lifecycle, and artifact delivery.
+
+MiniMax H3 follows an installed-software contract. Its canonical model appears
+and remains selectable when the checkpoint directory, compiled runner, model
+files, and linked GPU runtime libraries are present. Deleted generated videos,
+benchmark reports, product-gate JSON, conditioning caches, modulation caches,
+and INT8 resident caches do not hide or disable the model. BF16 starts directly;
+the first INT8 or INT8 Fast request builds its selected acceleration cache in a
+separate GPU-only phase, then reuses that cache on later requests.
+
 The browser Video Edit tab is the one deliberate exception to that execution
 architecture: it uses the vendored Genesis Rust/C/FFmpeg/OpenCL compositor as a
 separate `gcompose` sidecar. It does not use Mojo and it never launches
@@ -17,6 +38,9 @@ evidence are documented in
 
 Serenity Studio recursively discovers `.safetensors` beneath
 `~/.serenity/models/checkpoints/`, `diffusion_models/`, `unet/`, and `dits/`.
+Browser registry and capability reads are deduplicated and retry boundedly
+across a transient local-server rebuild, so an already-open tab does not strand
+its model picker empty. Persistent failures still surface as unavailable.
 It also recursively discovers complete Diffusers bundles anywhere below the
 model root by their `model_index.json`; a folder such as `microsoft_lens/` or a
 future nested user folder does not require a source-code allowlist. The Models

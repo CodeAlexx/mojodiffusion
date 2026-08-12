@@ -74,6 +74,7 @@ from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
 from serenitymojo.ops.attention_flash import (
     sdpa_flash_infer_fwd,
     sdpa_flash_infer_fwd_dynamic,
+    sdpa_flash_infer_fwd_cross_dynamic,
 )
 from serenitymojo.ops.sage_attention_int8 import (
     sage_attention_int8_fwd,
@@ -111,6 +112,56 @@ from serenitymojo.ops.tensor_algebra import (
 
 comptime MINIMAX_H3_ATTN_CUDNN = 0
 comptime MINIMAX_H3_ATTN_SAGE_INT8 = 1
+comptime MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE = 100000
+
+
+def minimax_h3_sage_exact_prefix_backend(prefix_rows: Int) raises -> Int:
+    if prefix_rows <= 0 or prefix_rows >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
+        raise Error("MiniMax-H3 exact Sage prefix must be in [1,100000)")
+    return MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE + prefix_rows
+
+
+def _minimax_h3_attention_dispatch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+    attention_backend: Int,
+) raises -> Tensor:
+    """Exact cuDNN, raw Sage, or Sage with an exact query prefix."""
+    if attention_backend == MINIMAX_H3_ATTN_CUDNN:
+        return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
+    if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+        return sage_attention_int8_fwd_dynamic(q, k, v, scale, ctx)
+    if attention_backend >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
+        var prefix_rows = (
+            attention_backend - MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE
+        )
+        var shape = q.shape()
+        var sequence_length = shape[1]
+        if prefix_rows >= sequence_length:
+            raise Error("MiniMax-H3 exact Sage prefix must be smaller than S")
+        # Compute the dominant video-query slab once with Sage, then replace
+        # the small text+audio prefix with exact cross-SDPA against the same
+        # complete K/V document.  T2VA packs rows as text|audio|video.
+        var approximate = sage_attention_int8_fwd_dynamic(
+            q, k, v, scale, ctx
+        )
+        var q_prefix = slice(q, 1, 0, prefix_rows, ctx)
+        var exact_prefix = sdpa_flash_infer_fwd_cross_dynamic(
+            q_prefix, k, v, scale, ctx
+        )
+        var video_tail = slice(
+            approximate, 1, prefix_rows, sequence_length - prefix_rows, ctx
+        )
+        return concat(1, ctx, exact_prefix, video_tail)
+    raise Error(
+        String("minimax_h3_block_forward: unknown attention backend ")
+        + String(attention_backend)
+    )
+
+
 
 
 @fieldwise_init
@@ -697,6 +748,11 @@ def _minimax_h3_low_headroom_attention[
     var attn_in = modulate(n1, scale_msa, shift, ctx)
     ctx.synchronize()
 
+    comptime if HeadDim != 128:
+        if attention_backend != MINIMAX_H3_ATTN_CUDNN:
+            raise Error(
+                "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+            )
     var attn: Tensor
     var attn_scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
     var qkv_name = prefix + "attn.qkv_proj.weight"
@@ -736,24 +792,15 @@ def _minimax_h3_low_headroom_attention[
         )
         ctx.synchronize()
         cu_mempool_trim_current(0)
-        if attention_backend == MINIMAX_H3_ATTN_CUDNN:
-            attn = sdpa_flash_infer_fwd_dynamic(
-                split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx
-            )
-        elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
-            comptime if HeadDim == 128:
-                attn = sage_attention_int8_fwd_dynamic(
-                    split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx
-                )
-            else:
+        comptime if HeadDim != 128:
+            if attention_backend != MINIMAX_H3_ATTN_CUDNN:
                 raise Error(
                     "minimax_h3_block_forward: sage-int8 requires head_dim=128"
                 )
-        else:
-            raise Error(
-                String("minimax_h3_block_forward: unknown attention backend ")
-                + String(attention_backend)
-            )
+        attn = _minimax_h3_attention_dispatch(
+            split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx,
+            attention_backend,
+        )
         # Consume Q/K/V before the branch-local owner is destroyed.
         ctx.synchronize()
     else:
@@ -781,24 +828,14 @@ def _minimax_h3_low_headroom_attention[
         )
         ctx.synchronize()
         cu_mempool_trim_current(0)
-        if attention_backend == MINIMAX_H3_ATTN_CUDNN:
-            attn = sdpa_flash_infer_fwd_dynamic(
-                q4, k4, v4, attn_scale, ctx
-            )
-        elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
-            comptime if HeadDim == 128:
-                attn = sage_attention_int8_fwd_dynamic(
-                    q4, k4, v4, attn_scale, ctx
-                )
-            else:
+        comptime if HeadDim != 128:
+            if attention_backend != MINIMAX_H3_ATTN_CUDNN:
                 raise Error(
                     "minimax_h3_block_forward: sage-int8 requires head_dim=128"
                 )
-        else:
-            raise Error(
-                String("minimax_h3_block_forward: unknown attention backend ")
-                + String(attention_backend)
-            )
+        attn = _minimax_h3_attention_dispatch(
+            q4, k4, v4, attn_scale, ctx, attention_backend,
+        )
         ctx.synchronize()
     var merged = reshape_owned(attn^, [1, S, inner])
     var attn_out = _minimax_h3_block_linear(
@@ -1071,40 +1108,6 @@ def _minimax_h3_block_forward_impl[
         # 3*inner QKV output is allocated.
         ctx.synchronize()
 
-    # qkv_proj is already de-interleaved into [q_all;k_all;v_all] thirds by
-    # `minimax_h3_load_block_device` — no gather here (see this function's
-    # weight-contract note above).
-    var qkv_out = _minimax_h3_block_linear(
-        attn_in, weights, prefix + "attn.qkv_proj.weight", ctx
-    )                                                                # [1, S, 3*inner]
-
-    var q = slice(qkv_out, 2, 0 * inner, inner, ctx)
-    var k = slice(qkv_out, 2, 1 * inner, inner, ctx)
-    var v = slice(qkv_out, 2, 2 * inner, inner, ctx)
-    var q4 = reshape_owned(q^, [1, S, heads, head_dim])
-    var k4 = reshape_owned(k^, [1, S, heads, head_dim])
-    var v4 = reshape_owned(v^, [1, S, heads, head_dim])
-    if low_headroom:
-        # All three slices have completed, so the `[S, 3*inner]` packed QKV
-        # allocation can be returned before per-head normalization/rope.
-        ctx.synchronize()
-
-    q4 = vec_rms_norm(q4, weights[prefix + "attn.q_norm.weight"][], config.qk_norm_eps, ctx)
-    k4 = vec_rms_norm(k4, weights[prefix + "attn.k_norm.weight"][], config.qk_norm_eps, ctx)
-
-    q4 = _minimax_h3_apply_partial_rope(
-        q4, cos, sin, heads, rotary_dim, ctx
-    )
-    k4 = _minimax_h3_apply_partial_rope(
-        k4, cos, sin, heads, rotary_dim, ctx
-    )
-    if low_headroom:
-        ctx.synchronize()
-        # cuDNN owns a separate attention workspace allocation. Return any
-        # completed QKV/rope staging pages from the default CUDA pool before
-        # it asks the driver for the long-sequence workspace.
-        cu_mempool_trim_current(0)
-
     var scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
     # Dh=128 on sm_86 fails to instantiate the SDK's `flash_attention` MMA
     # tiling (serenitymojo/MAP.md gotcha 4); this is the cuDNN v9 shim
@@ -1118,26 +1121,65 @@ def _minimax_h3_block_forward_impl[
     # kernel instead of an unconditional guard raise. The check above
     # ensures `config` was built for exactly this instantiation.
     var attn: Tensor
-    if attention_backend == MINIMAX_H3_ATTN_CUDNN:
-        attn = sdpa_flash_infer_fwd_dynamic(
-            q4, k4, v4, scale, ctx
+    var qkv_name = prefix + "attn.qkv_proj.weight"
+    ref qkv_weight = weights[qkv_name][]
+    var qkv_scale_name = qkv_name + String(".scale")
+    var direct_w8a8_qkv = (
+        qkv_weight.dtype() == STDtype.I8
+        and qkv_scale_name in weights
+        and weights[qkv_scale_name][].dtype() == STDtype.F32
+    )
+    if direct_w8a8_qkv:
+        # Write Q/K/V directly from the single packed W8A8 accumulator. The
+        # old ordinary path materialized `[S,3*inner]` and then launched three
+        # full-tensor slice copies per block. Do not select the BF16/groupwise
+        # split writers here: they require three separate GEMMs and are kept
+        # only for the >=48k low-headroom path where peak memory is decisive.
+        var split_qkv: MiniMaxH3Int8QKV
+        ref qkv_scale = weights[qkv_scale_name][]
+        split_qkv = minimax_h3_int8_qkv_linear(
+            attn_in, qkv_weight, qkv_scale, ctx
         )
-    elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
-        comptime if HeadDim == 128:
-            attn = sage_attention_int8_fwd_dynamic(
-                q4, k4, v4, scale, ctx
-            )
-        else:
-            raise Error(
-                "minimax_h3_block_forward: sage-int8 requires head_dim=128"
-            )
+        reshape_in_place(split_qkv.q, [1, S, heads, head_dim])
+        reshape_in_place(split_qkv.k, [1, S, heads, head_dim])
+        reshape_in_place(split_qkv.v, [1, S, heads, head_dim])
+        minimax_h3_qk_norm_partial_rope_inplace(
+            split_qkv.q, weights[prefix + "attn.q_norm.weight"][],
+            cos, sin, heads, rotary_dim, config.qk_norm_eps, ctx,
+        )
+        minimax_h3_qk_norm_partial_rope_inplace(
+            split_qkv.k, weights[prefix + "attn.k_norm.weight"][],
+            cos, sin, heads, rotary_dim, config.qk_norm_eps, ctx,
+        )
+        attn = _minimax_h3_attention_dispatch(
+            split_qkv.q, split_qkv.k, split_qkv.v,
+            scale, ctx, attention_backend,
+        )
+        # The split owner is branch-local.  Finish its final consumer before
+        # its three buffers are returned to the stream-ordered allocator.
+        ctx.synchronize()
     else:
-        raise Error(
-            String("minimax_h3_block_forward: unknown attention backend ")
-            + String(attention_backend)
+        # Compatibility fallback for non-production test weights.
+        var qkv_out = _minimax_h3_block_linear(
+            attn_in, weights, qkv_name, ctx
         )
-    if low_headroom:
-        # SDPA has consumed Q/K/V; reclaim them before out_proj.
+        var q = slice(qkv_out, 2, 0 * inner, inner, ctx)
+        var k = slice(qkv_out, 2, 1 * inner, inner, ctx)
+        var v = slice(qkv_out, 2, 2 * inner, inner, ctx)
+        var q4 = reshape_owned(q^, [1, S, heads, head_dim])
+        var k4 = reshape_owned(k^, [1, S, heads, head_dim])
+        var v4 = reshape_owned(v^, [1, S, heads, head_dim])
+        minimax_h3_qk_norm_partial_rope_inplace(
+            q4, weights[prefix + "attn.q_norm.weight"][],
+            cos, sin, heads, rotary_dim, config.qk_norm_eps, ctx,
+        )
+        minimax_h3_qk_norm_partial_rope_inplace(
+            k4, weights[prefix + "attn.k_norm.weight"][],
+            cos, sin, heads, rotary_dim, config.qk_norm_eps, ctx,
+        )
+        attn = _minimax_h3_attention_dispatch(
+            q4, k4, v4, scale, ctx, attention_backend,
+        )
         ctx.synchronize()
                                                                         # [1, S, heads, head_dim] bf16
     var merged = reshape_owned(attn^, [1, S, inner])

@@ -30,6 +30,7 @@ from serenitymojo.serve.backend import StepResult
 from serenitymojo.serve.sdxl_backend import SdxlBackend
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import decode_start, encode_ev, encode_ready
+from serenitymojo.serve.sdxl_decode_subprocess import decode_child_run
 
 comptime WORKER_IDLE_SLEEP_S = 0.02  # poll cadence while waiting for a command
 
@@ -89,7 +90,19 @@ def _sdxl_worker_loop(mut backend: SdxlBackend, fd: Int32) raises:
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: serenity_worker_sdxl <fd>")
+        print("usage: serenity_worker_sdxl <fd> | serenity_worker_sdxl decode-child <latent> <rgb_out> <vae> <lh> <lw>")
+        return
+    # VAE-in-a-child-process. The resident parent keeps the UNet alive while a
+    # fresh GPU process performs the parity-preserving tiled decode, then exits
+    # and returns every decoder allocation to CUDA. Route before parsing <fd>.
+    if String(args[1]) == "decode-child":
+        if len(args) < 7:
+            print("usage: serenity_worker_sdxl decode-child <latent> <rgb_out> <vae> <lh> <lw>")
+            return
+        decode_child_run(
+            String(args[2]), String(args[3]), String(args[4]),
+            Int(String(args[5])), Int(String(args[6])),
+        )
         return
     var fd = Int32(Int(String(args[1])))
     var b = SdxlBackend()

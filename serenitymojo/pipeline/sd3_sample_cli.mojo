@@ -137,7 +137,7 @@ from serenitymojo.training.sample_prompt_config import (
 # ── Model paths (comptime; override by editing this file or adding config support) ──
 comptime MODEL_PATH = "/home/alex/.serenity/models/checkpoints/sd3.5_large.safetensors"
 # Default sidecar (used when caps_pos is empty in the sample_prompts JSON).
-comptime EMBEDDINGS_PATH = "/home/alex/EriDiffusion/inference-flame/output/sd3_large_embeddings.safetensors"
+comptime EMBEDDINGS_PATH = "/home/alex/.serenity/parity/output/sd3_large_embeddings.safetensors"
 
 # ── Latent / DiT shape constants (comptime-fixed; see header for rationale) ──
 comptime LH = SD3_LARGE_LATENT_H         # 128

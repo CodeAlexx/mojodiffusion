@@ -50,7 +50,7 @@ from serenitymojo.vae.flux_vae_encoder import FluxVaeEncoder
 comptime VAE_PATH = "/home/alex/.serenity/models/vaes/ae.safetensors"
 comptime STAGE_DIR = "/home/alex/mojodiffusion/output/alina_stage"
 # REAL Rust-encoded flux cache to source the (un-ported) T5/CLIP text path from.
-comptime TEXT_SRC_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_flux_512_smoke"
+comptime TEXT_SRC_DIR = "/home/alex/.serenity/parity/cache/eri2_flux_512_smoke"
 comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_flux_cache"
 comptime IH = 512
 comptime IW = 512

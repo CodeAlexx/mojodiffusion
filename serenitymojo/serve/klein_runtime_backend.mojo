@@ -56,8 +56,10 @@
 # Mojo 1.0.0b1: `def` not `fn`.
 
 from std.gpu.host import DeviceContext
-from std.memory import ArcPointer
-from std.time import perf_counter_ns
+from std.memory import ArcPointer, UnsafePointer, alloc
+from std.builtin.type_aliases import MutExternalOrigin
+from std.ffi import external_call
+from std.time import perf_counter_ns, sleep
 
 from image.png import encode_png_with_text
 
@@ -86,6 +88,12 @@ from serenitymojo.serve.image_io import decode_image_any
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.serve.model_scan import LORAS_DIR
 from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
+from serenitymojo.io.cap_cache import save_tensor_bin, load_tensor_bin
+from serenitymojo.serve.proc_ipc import (
+    build_argv, cstr, sys_execv, sys__exit, sys_waitpid, proc_kill_wait,
+    SELF_EXE, SIGKILL, WNOHANG,
+)
+from net.syscalls import sys_fork, errno_str
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
     reject_unsupported_mask_image_params,
@@ -139,6 +147,25 @@ comptime S_EDIT_1024 = N_EDIT_IMG_1024 + N_TXT
 comptime KRPHASE_IDLE = 0
 comptime KRPHASE_ENCODE = 1
 comptime KRPHASE_SAMPLE = 2
+
+# Qwen3-8B layer-26 encoding peaks near 22 GiB on the validated 24 GiB host.
+# It must run in a fresh process: the long-lived Mojo CUDA pool retained that
+# entire high-water mark after object destruction and cuMemPoolTrimTo(0).
+comptime _KLEIN_ENCODE_CHILD_TIMEOUT_S = 600.0
+comptime _KLEIN_ENCODE_POLL_S = 0.05
+# Direct-host inline baseline peaked at 22,175 MiB for the entire worker,
+# including its parent context and cap tensors. A 22,000 MiB device-global free
+# floor therefore preserves measured headroom while admitting the validated
+# card with the desktop compositor resident (22,488 MiB free).
+comptime _KLEIN_ENCODE_CHILD_MIN_FREE_BYTES = Int(22000) * 1024 * 1024
+
+
+def _getpid() -> Int:
+    return Int(external_call["getpid", Int32]())
+
+
+def _unlink_file(path: String):
+    _ = external_call["unlink", Int32](cstr(path))
 
 
 def _lower(s: String) -> String:
@@ -311,6 +338,112 @@ def _encode_text_pair(
     neg_out.append(ArcPointer(neg2^))
 
 
+def klein_encode_child_run(
+    prefix: String, variant: String, prompt: String, negative: String, joint: Int,
+) raises:
+    """Fresh-process Qwen3 encode used by the persistent Serenity worker.
+
+    The tensors are serialized as raw BF16 cap-cache bytes. Process exit is the
+    ownership boundary that releases every encoder allocation before the parent
+    starts Klein denoising.
+    """
+    var ctx = DeviceContext()
+    var pos = List[ArcPointer[Tensor]]()
+    var neg = List[ArcPointer[Tensor]]()
+    _encode_text_pair(variant, prompt, negative, joint, ctx, pos, neg)
+    save_tensor_bin(pos[0][], prefix + String(".pos.bin"), ctx)
+    save_tensor_bin(neg[0][], prefix + String(".neg.bin"), ctx)
+    print("[klein-encode-child] wrote caps", prefix)
+
+
+def _encode_text_pair_subprocess(
+    variant: String, prompt: String, negative: String, joint: Int,
+    ctx: DeviceContext,
+    mut pos_out: List[ArcPointer[Tensor]],
+    mut neg_out: List[ArcPointer[Tensor]],
+) raises:
+    """Encode on the GPU in a fork+exec child and load exact BF16 caps.
+
+    Unlike the old in-process fallback, this fails clearly when another process
+    has consumed the encoder's required VRAM. Retrying inline would recreate the
+    measured 22 GiB retained-pool failure and make the later decode OOM.
+    """
+    var free_bytes = cu_mem_get_info().free_bytes
+    if free_bytes < _KLEIN_ENCODE_CHILD_MIN_FREE_BYTES:
+        raise Error(
+            String("klein_runtime: Qwen3 GPU encode needs ")
+            + String(_KLEIN_ENCODE_CHILD_MIN_FREE_BYTES // (1024 * 1024))
+            + String(" MiB free, found ")
+            + String(free_bytes // (1024 * 1024))
+            + String(" MiB")
+        )
+
+    var prefix = String("/tmp/serenity_klein_caps_") + String(_getpid())
+    var pos_path = prefix + String(".pos.bin")
+    var neg_path = prefix + String(".neg.bin")
+    _unlink_file(pos_path)
+    _unlink_file(neg_path)
+
+    var args = List[String]()
+    args.append(SELF_EXE)
+    args.append(String("encode-child"))
+    args.append(prefix)
+    args.append(variant)
+    args.append(prompt)
+    args.append(negative)
+    args.append(String(joint))
+    var argv = build_argv(args)
+    var path = cstr(SELF_EXE)
+
+    print("[klein_runtime] fork Qwen3 encoder child (parent pid", _getpid(), ")")
+    var pid = sys_fork()
+    if pid == 0:
+        _ = sys_execv(path, argv)
+        sys__exit(127)
+    if pid < 0:
+        raise Error(String("klein_runtime: Qwen3 encoder fork failed: ") + errno_str())
+
+    var st = alloc[Int32](1)
+    var stp = rebind[UnsafePointer[Int32, MutExternalOrigin]](st)
+    var waited = 0.0
+    var reaped = Int32(0)
+    while waited < _KLEIN_ENCODE_CHILD_TIMEOUT_S:
+        reaped = sys_waitpid(pid, stp, WNOHANG)
+        if reaped == pid or reaped < 0:
+            break
+        sleep(_KLEIN_ENCODE_POLL_S)
+        waited += _KLEIN_ENCODE_POLL_S
+    var status = Int(st[0])
+    st.free()
+
+    if reaped != pid:
+        proc_kill_wait(pid, SIGKILL)
+        _unlink_file(pos_path)
+        _unlink_file(neg_path)
+        raise Error("klein_runtime: Qwen3 encoder child timed out")
+    var exited_ok = (status & 0x7F) == 0 and ((status >> 8) & 0xFF) == 0
+    if not exited_ok:
+        _unlink_file(pos_path)
+        _unlink_file(neg_path)
+        raise Error(
+            String("klein_runtime: Qwen3 encoder child failed, status ")
+            + String(status)
+        )
+
+    try:
+        var pos = load_tensor_bin(pos_path, ctx)
+        var neg = load_tensor_bin(neg_path, ctx)
+        _unlink_file(pos_path)
+        _unlink_file(neg_path)
+        pos_out.append(ArcPointer(pos^))
+        neg_out.append(ArcPointer(neg^))
+        print("[klein_runtime] encoder child reaped; exact BF16 caps loaded")
+    except e:
+        _unlink_file(pos_path)
+        _unlink_file(neg_path)
+        raise Error(String("klein_runtime: encoder cap read-back failed: ") + String(e))
+
+
 def _embed_genparams_in_png(path: String, params_json: String) raises:
     """Re-open the PNG klein_sample saved (plain RGB) and rewrite it WITH a
     serenity.genparams.v1 tEXt chunk. Same approach as klein_backend.mojo (the
@@ -360,6 +493,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     # discarded before each decode; only pinned host bytes remain resident.
     var loader: List[ArcPointer[TurboPlannedLoader]]
     var loader_checkpoint: String
+    var warmed_denoisers: List[String]
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
@@ -389,6 +523,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.cap_cache_neg = List[ArcPointer[Tensor]]()
         self.loader = List[ArcPointer[TurboPlannedLoader]]()
         self.loader_checkpoint = String("")
+        self.warmed_denoisers = List[String]()
 
     def backend_name(self) -> String:
         return String("klein")
@@ -603,6 +738,28 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.loader.append(ArcPointer(built^))
         self.loader_checkpoint = self.cfg[0][].checkpoint.copy()
 
+    def _denoiser_warm_key(self) -> String:
+        return (
+            self.variant + String(":") + String(self.params.width)
+            + String("x") + String(self.params.height)
+            + (String(":single") if self.params.cfg == 1.0 else String(":cfg"))
+            + (String(":lora") if self.lora_path != String("") else String(":base"))
+        )
+
+    def _denoiser_needs_warm(self) -> Bool:
+        var key = self._denoiser_warm_key()
+        for warmed in self.warmed_denoisers:
+            if warmed == key:
+                return False
+        return True
+
+    def _mark_denoiser_warm(mut self):
+        var key = self._denoiser_warm_key()
+        for warmed in self.warmed_denoisers:
+            if warmed == key:
+                return
+        self.warmed_denoisers.append(key^)
+
     def _clear_job(mut self):
         self.active = False
         self.phase = KRPHASE_IDLE
@@ -650,7 +807,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         # rebuilding.
         self.pos_txt = List[ArcPointer[Tensor]]()
         self.neg_txt = List[ArcPointer[Tensor]]()
-        _encode_text_pair(
+        _encode_text_pair_subprocess(
             self.variant, self.params.prompt, self.params.negative, joint, self.ctx,
             self.pos_txt, self.neg_txt,
         )
@@ -669,7 +826,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         var after = cu_mem_get_info()
         self.encode_seconds = Float64(perf_counter_ns() - t0) / 1.0e9
         self._record_vram()
-        print("[klein_runtime] Qwen3 encode done; encoder freed before DiT load; used",
+        print("[klein_runtime] Qwen3 child encode done; encoder process exited; used",
               before.used_bytes() // (1024 * 1024), "->",
               after.used_bytes() // (1024 * 1024), "MiB after trim")
 
@@ -770,6 +927,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         steps: Int, seed: UInt64,
     ) raises:
         self._ensure_loader()
+        var needs_warm = self._denoiser_needs_warm()
         if self.variant == String("9b"):
             var _img = klein_sample_with_loader[
                 N_IMG_, N_TXT, S_, LH_, LW_, H_9B, Dh
@@ -779,6 +937,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 progress_fd=self.progress_fd,
                 allow_child_decode=True,
                 lora_multiplier=self.lora_multiplier,
+                warm_denoiser=needs_warm,
             )
         else:
             var _img = klein_sample_with_loader[
@@ -789,7 +948,9 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 progress_fd=self.progress_fd,
                 allow_child_decode=True,
                 lora_multiplier=self.lora_multiplier,
+                warm_denoiser=needs_warm,
             )
+        self._mark_denoiser_warm()
 
     def _sample_product(
         mut self, pos: Tensor, neg: Tensor, cfg_scale: Float32,
@@ -882,6 +1043,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                 )
         elif self.params.width == 512 and self.params.height == 512:
             self._ensure_loader()
+            var needs_warm = self._denoiser_needs_warm()
             if self.variant == String("9b"):
                 var _img = klein_sample_with_loader[
                     N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_9B, Dh
@@ -891,6 +1053,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     progress_fd=self.progress_fd,
                     allow_child_decode=True,
                     lora_multiplier=self.lora_multiplier,
+                    warm_denoiser=needs_warm,
                 )
             else:
                 var _img = klein_sample_with_loader[
@@ -901,7 +1064,9 @@ struct KleinRuntimeBackend(GenBackend, Movable):
                     progress_fd=self.progress_fd,
                     allow_child_decode=True,
                     lora_multiplier=self.lora_multiplier,
+                    warm_denoiser=needs_warm,
                 )
+            self._mark_denoiser_warm()
         else:
             self._sample_product(pos, neg, cfg_scale, steps, seed)
 

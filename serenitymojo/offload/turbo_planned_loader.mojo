@@ -61,7 +61,8 @@
 # memory pressure. Phase 4 can tighten the budget and enable eviction.
 
 from std.gpu.host import DeviceBuffer, DeviceContext, DeviceEvent, HostBuffer
-from std.memory import ArcPointer
+from std.memory import ArcPointer, alloc
+from std.ffi import external_call
 
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.plan import BlockPlan, DTypePolicy, OffloadConfig
@@ -71,6 +72,11 @@ from serenitymojo.io.ffi import BytePtr, sys_memcpy
 from serenitymojo.offload.turbo_loader import (
     TurboBlockLoader, _TensorRecord, _h2d_dma_copy,
 )
+from serenitymojo.offload.vmm_cuda import (
+    cu_mem_get_allocation_granularity,
+    cu_mem_get_info,
+)
+from serenitymojo.offload.vmm_manager import VmmModelHandle
 from serenitymojo.offload.residency import (
     ResidencyManager,
     BudgetTracker,
@@ -82,6 +88,7 @@ from serenitymojo.ops.fp8_quant import (
 )
 from serenitymojo.ops.fp8 import (
     fp8_e4m3_dequant_perrow_to_bf16,
+    fp8_e4m3_dequant_perrow_to_bf16_into,
     fp8_e4m3_dequant_to_bf16,
 )
 # int8-resident weight quant (Klein int8-W8A8 slice 4). Same tensorwise weight
@@ -100,8 +107,62 @@ from serenitymojo.ops.squareq import squareq_reconstruct_weight, squareq_w8_reco
 from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_reconstruct_weight
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors import read_f32_scalar_bytes
+from serenitymojo.io.safetensors_writer import (
+    HostBufferTensorDesc, save_safetensors_host_buffers,
+)
 
 comptime TArc = ArcPointer[Tensor]
+comptime _FP8_HOST_CACHE_VERSION = 2
+comptime _FP8_CACHE_SCALE_SUFFIX = ".__fp8_scale"
+
+
+def _stat_size_mtime(path: String) -> List[Int]:
+    """Follow symlinks and return [size, mtime_sec], or [-1, -1]."""
+    var n = path.byte_length()
+    var cbuf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        cbuf[i] = src[i]
+    cbuf[n] = 0
+    var statbuf = alloc[UInt8](160)
+    var rc = Int(external_call["stat", Int32](
+        BytePtr(unsafe_from_address=Int(cbuf)),
+        BytePtr(unsafe_from_address=Int(statbuf)),
+    ))
+    var size = -1
+    var mtime = -1
+    if rc == 0:
+        var q = statbuf.bitcast[Int64]()
+        size = Int(q[6])
+        mtime = Int(q[11])
+    cbuf.free()
+    statbuf.free()
+    var out: List[Int] = [size, mtime]
+    return out^
+
+
+def _shape_equal(a: List[Int], b: List[Int]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+def _cache_i64(
+    cache: ShardedSafeTensors, name: String, default: Int
+) raises -> Int:
+    if not cache.has_tensor(name):
+        return default
+    var info = cache.tensor_info(name)
+    if info.dtype != STDtype.I64 or info.size < 8:
+        return default
+    var b = cache.tensor_bytes(name)
+    var value = 0
+    for i in range(8):
+        value = value | (Int(b[i]) << (8 * i))
+    return value
 
 
 # int8-resident Block carries each big weight as an I8 [N,K] tensor plus a
@@ -394,6 +455,7 @@ struct TurboPlannedLoader(Movable):
     var _plan: BlockPlan
     var _config: OffloadConfig
     var _residency: ResidencyManager
+    var _source_path: String
     var _step: Int          # monotonic block-visit counter for mark_visit
     var _pending_idx: Int   # block index queued by prefetch() awaiting GPU dispatch
     var _has_ctx: Bool      # whether _stored_ctx is valid
@@ -409,6 +471,11 @@ struct TurboPlannedLoader(Movable):
     # (dequant on await). Opt in via pin_residents_fp8(); default empty = no-op.
     var _fp8_prefixes: List[String]
     var _fp8_blocks: List[List[_ResidentFp8Tensor]]
+    # Adaptive host->device promotions use explicit CUDA VMM physical mappings,
+    # not DeviceContext's process-lifetime caching allocator. Tensor records
+    # hold NON-OWNING DeviceBuffer views into this handle; explicit discard can
+    # therefore unmap/release the physical bytes immediately.
+    var _fp8_vmm: List[ArcPointer[VmmModelHandle]]
 
     # ── squareq_w4-resident set: parallel to _fp8_blocks. Pinned VERBATIM from
     # the prebuilt sidecar (scripts/squareq_build_slab.py output dir — never
@@ -533,7 +600,7 @@ struct TurboPlannedLoader(Movable):
         # BlockPlan is Movable-only; copy it via the record-level Copyable impl.
         var plan_for_residency = _copy_block_plan(plan)
         var residency = ResidencyManager(plan_for_residency^, config, budget^)
-        return TurboPlannedLoader(turbo^, plan^, config, residency^)
+        return TurboPlannedLoader(turbo^, plan^, config, residency^, dir.copy())
 
     def __init__(
         out self,
@@ -541,11 +608,13 @@ struct TurboPlannedLoader(Movable):
         var plan: BlockPlan,
         config: OffloadConfig,
         var residency: ResidencyManager,
+        var source_path: String,
     ):
         self._turbo = turbo^
         self._plan = plan^
         self._config = config
         self._residency = residency^
+        self._source_path = source_path^
         self._step = 0
         self._pending_idx = -1
         self._has_ctx = False
@@ -554,6 +623,7 @@ struct TurboPlannedLoader(Movable):
         self._res_recs = List[List[_TensorRecord]]()
         self._fp8_prefixes = List[String]()
         self._fp8_blocks = List[List[_ResidentFp8Tensor]]()
+        self._fp8_vmm = List[ArcPointer[VmmModelHandle]]()
         self._squareq_prefixes = List[String]()
         self._squareq_blocks = List[List[_ResidentSquareqTensor]]()
         self._nvfp4_prefixes = List[String]()
@@ -722,7 +792,7 @@ struct TurboPlannedLoader(Movable):
 
     def pin_residents_fp8(mut self, budget_bytes: Int, ctx: DeviceContext) raises -> Int:
         """Pin plan blocks (in plan order) permanently on device as fp8-resident:
-        each sizeable 2-D BF16 matmul weight is quantized ONCE to E4M3 bytes + a
+        each sizeable 2-D BF16/FP16 matmul weight is quantized ONCE to E4M3 bytes + a
         per-output-row F32 scale (fp8_quant.mojo); 1-D biases / norm scales / tiny
         2-D tensors stay resident BF16 (exact). ~half the raw-BF16 footprint, so
         the whole DiT fits resident with LoRA training state. await_block dequants
@@ -756,7 +826,7 @@ struct TurboPlannedLoader(Movable):
                 var tv = self._turbo.sharded.tensor_view(nm)
                 var sh = tv.shape.copy()
                 var big_2d = (
-                    tv.dtype == STDtype.BF16
+                    (tv.dtype == STDtype.BF16 or tv.dtype == STDtype.F16)
                     and len(sh) == 2
                     and sh[0] * sh[1] >= _FP8_MIN_ELEMS
                 )
@@ -1048,7 +1118,7 @@ struct TurboPlannedLoader(Movable):
         `<key>.__fp8_scale` `F32 [out]`, with small tensors BF16.
 
         WHY THIS EXISTS (do not use `pin_residents_fp8` on such a checkpoint):
-        that sibling QUANTIZES from BF16 and gates on `tv.dtype == STDtype.BF16`.
+        that sibling QUANTIZES from BF16/FP16 source tensors.
         Against an already-fp8 cache every big weight FAILS that test and falls to
         the small-tensor branch, which calls `from_view_as_bf16` on E4M3 bytes —
         reinterpreting 1-byte fp8 as 2-byte bf16. That is silent corruption, not
@@ -1127,7 +1197,16 @@ struct TurboPlannedLoader(Movable):
         next to training state (qwenimage: fp8 ~20GB, card 24GB, measured OOM
         2026-07-04). await_block H2Ds the fp8 bytes + scale and dequants — HALF
         the per-step PCIe of bf16 streaming, ZERO disk (MJ-1065). `budget_bytes`
-        caps HOST pinned bytes; caller must require pinned==block_count."""
+        caps HOST pinned bytes; caller must require pinned==block_count.
+
+        BF16 and FP16 checkpoint weights take the same explicit BF16
+        quantization-input path. Checkpoint mmap pages are clean, replaceable
+        source data after a block's
+        FP8/BF16 host buffers have been fenced.  Drop those pages at every block
+        boundary instead of retaining the whole BF16 checkpoint beside its FP8
+        copy until this function returns.  This keeps one-time model admission
+        near destination-store size rather than source + destination size; it
+        does not alter the pinned bytes or the zero-disk denoise contract."""
         var used = 0
         var pinned = 0
         for i in range(self._plan.count()):
@@ -1156,7 +1235,7 @@ struct TurboPlannedLoader(Movable):
                 var tv = self._turbo.sharded.tensor_view(nm)
                 var sh = tv.shape.copy()
                 var big_2d = (
-                    tv.dtype == STDtype.BF16
+                    (tv.dtype == STDtype.BF16 or tv.dtype == STDtype.F16)
                     and len(sh) == 2
                     and sh[0] * sh[1] >= _FP8_MIN_ELEMS
                 )
@@ -1194,12 +1273,561 @@ struct TurboPlannedLoader(Movable):
                         HArc(dummy^), 1, List[Int](),
                     ))
             if used + block_bytes > budget_bytes:
+                self._turbo.sharded.release_to_os()
                 break  # plan-order contiguous; caller enforces pinned==count
             self._fp8h_prefixes.append(p)
             self._fp8h_blocks.append(tensors^)
             used += block_bytes
             pinned += 1
+            # Every D2H above is synchronized. No live tensor view still needs
+            # this block's checkpoint pages; future blocks fault only their own
+            # immutable ranges back in as needed.
+            self._turbo.sharded.release_to_os()
         return pinned
+
+    def fp8_host_cache_valid(self, cache_path: String) raises -> Bool:
+        """Validate a generic E4M3-row-scale sidecar against this source/plan."""
+        var source_meta = _stat_size_mtime(self._source_path)
+        if source_meta[0] < 0:
+            return False
+        var cache: ShardedSafeTensors
+        try:
+            cache = ShardedSafeTensors.open(cache_path)
+        except:
+            return False
+        if _cache_i64(
+            cache, String("__serenity_fp8_host.version"), -1
+        ) != _FP8_HOST_CACHE_VERSION:
+            return False
+        if _cache_i64(
+            cache, String("__serenity_fp8_host.source_size"), -1
+        ) != source_meta[0]:
+            return False
+        if _cache_i64(
+            cache, String("__serenity_fp8_host.source_mtime"), -1
+        ) != source_meta[1]:
+            return False
+        if _cache_i64(
+            cache, String("__serenity_fp8_host.blocks"), -1
+        ) != self._plan.count():
+            return False
+
+        for i in range(self._plan.count()):
+            var p = self._plan.normalized_prefix(i)
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                return False
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                if not cache.has_tensor(nm):
+                    return False
+                var source_info = self._turbo.sharded.tensor_info(nm)
+                var cache_info = cache.tensor_info(nm)
+                var big_2d = (
+                    (
+                        source_info.dtype == STDtype.BF16
+                        or source_info.dtype == STDtype.F16
+                    )
+                    and len(source_info.shape) == 2
+                    and source_info.shape[0] * source_info.shape[1] >= _FP8_MIN_ELEMS
+                )
+                if big_2d:
+                    if cache_info.dtype != STDtype.F8_E4M3:
+                        return False
+                    if not _shape_equal(cache_info.shape, source_info.shape):
+                        return False
+                    var scale_name = nm + String(_FP8_CACHE_SCALE_SUFFIX)
+                    if not cache.has_tensor(scale_name):
+                        return False
+                    var scale_info = cache.tensor_info(scale_name)
+                    if (
+                        scale_info.dtype != STDtype.F32
+                        or len(scale_info.shape) != 1
+                        or scale_info.shape[0] != source_info.shape[0]
+                    ):
+                        return False
+                else:
+                    if cache_info.dtype != STDtype.BF16:
+                        return False
+                    if not _shape_equal(cache_info.shape, source_info.shape):
+                        return False
+        return True
+
+    def save_fp8_host_cache(
+        self, cache_path: String, ctx: DeviceContext
+    ) raises:
+        """Atomically persist the exact pinned FP8 host store without VRAM."""
+        self.require_all_blocks_memory_resident()
+        if len(self._fp8h_prefixes) != self._plan.count():
+            raise Error(
+                "save_fp8_host_cache requires every plan block in fp8-host storage"
+            )
+        var source_meta = _stat_size_mtime(self._source_path)
+        if source_meta[0] < 0:
+            raise Error("save_fp8_host_cache cannot stat source checkpoint")
+
+        var names = List[String]()
+        var descs = List[HostBufferTensorDesc]()
+
+        # Cache identity tensors. HostBuffer ownership rides in each descriptor.
+        var meta_values: List[Int] = [
+            _FP8_HOST_CACHE_VERSION,
+            source_meta[0],
+            source_meta[1],
+            self._plan.count(),
+        ]
+        var meta_names: List[String] = [
+            String("__serenity_fp8_host.version"),
+            String("__serenity_fp8_host.source_size"),
+            String("__serenity_fp8_host.source_mtime"),
+            String("__serenity_fp8_host.blocks"),
+        ]
+        for mi in range(len(meta_values)):
+            var h = ctx.enqueue_create_host_buffer[DType.uint8](8)
+            h.unsafe_ptr().bitcast[Int64]()[0] = Int64(meta_values[mi])
+            names.append(meta_names[mi].copy())
+            descs.append(HostBufferTensorDesc(
+                STDtype.I64, [1], HArc(h^), 8
+            ))
+
+        for hslot in range(len(self._fp8h_blocks)):
+            for ti in range(len(self._fp8h_blocks[hslot])):
+                ref rt = self._fp8h_blocks[hslot][ti]
+                names.append(rt.name.copy())
+                descs.append(HostBufferTensorDesc(
+                    rt.bytes_dtype,
+                    rt.bytes_shape.copy(),
+                    rt.bytes_h.copy(),
+                    rt.bytes_nbytes,
+                ))
+                if rt.is_fp8:
+                    if not rt.per_row_scale:
+                        raise Error(
+                            "save_fp8_host_cache requires per-row FP8 scales"
+                        )
+                    names.append(rt.name + String(_FP8_CACHE_SCALE_SUFFIX))
+                    descs.append(HostBufferTensorDesc(
+                        STDtype.F32,
+                        rt.scale_shape.copy(),
+                        rt.scale_h.copy(),
+                        rt.scale_nbytes,
+                    ))
+        save_safetensors_host_buffers(names, descs, cache_path)
+
+
+    def promote_fp8_host_to_device(
+        mut self,
+        budget_bytes: Int,
+        ctx: DeviceContext,
+        phase_evictable: Bool = False,
+        min_free_bytes: Int = 0,
+        dequantize_on_promotion: Bool = False,
+    ) raises -> Int:
+        """Promote host FP8 blocks using the ownership policy the backend needs.
+
+        Persistent workers such as Flux use DeviceContext residency, which is
+        already measured and never needs same-process eviction. Phase-separated
+        workers such as Chroma opt into explicit VMM so decode can physically
+        unmap the prefix and later restore it from pinned host memory.
+
+        `min_free_bytes` is a fail-closed live-VRAM floor. The loader clamps the
+        caller's snapshot budget on entry and rechecks the floor before every
+        physical block allocation, so concurrent VRAM use cannot make a stale
+        budget consume the backend's denoise/decode headroom."""
+        # Persistent backends may call this again after the resident prefix has
+        # already consumed the caller's nominal free-memory budget. Preserve
+        # that proven prefix; admission governs NEW physical allocations only.
+        if len(self._fp8_prefixes) > 0:
+            return len(self._fp8_prefixes)
+        if budget_bytes <= 0:
+            return 0
+        var live_free = cu_mem_get_info().free_bytes
+        var safe_budget = budget_bytes
+        if min_free_bytes > 0:
+            if live_free <= min_free_bytes:
+                return 0
+            var live_budget = live_free - min_free_bytes
+            if safe_budget > live_budget:
+                safe_budget = live_budget
+        if phase_evictable:
+            if dequantize_on_promotion:
+                return self._promote_fp8_host_to_bf16_device_vmm(
+                    safe_budget, ctx, min_free_bytes
+                )
+            return self._promote_fp8_host_to_device_vmm(
+                safe_budget, ctx, min_free_bytes
+            )
+        return self._promote_fp8_host_to_device_cached(
+            safe_budget, ctx, min_free_bytes
+        )
+
+    def _promote_fp8_host_to_device_cached(
+        mut self, budget_bytes: Int, ctx: DeviceContext, min_free_bytes: Int
+    ) raises -> Int:
+        """Proven persistent DeviceContext path for backends that never evict."""
+        if len(self._fp8_prefixes) > 0:
+            return len(self._fp8_prefixes)
+        var used = 0
+        var promoted = 0
+        for hslot in range(len(self._fp8h_prefixes)):
+            var block_bytes = 0
+            for t in range(len(self._fp8h_blocks[hslot])):
+                ref rt = self._fp8h_blocks[hslot][t]
+                block_bytes += rt.bytes_nbytes
+                if rt.is_fp8:
+                    if not rt.per_row_scale:
+                        raise Error(
+                            "promote_fp8_host_to_device requires per-row FP8 scales"
+                        )
+                    block_bytes += rt.scale_nbytes
+            if used + block_bytes > budget_bytes:
+                break
+            # The caller's budget is only a snapshot. Recheck immediately
+            # before this block's real DeviceContext allocations.
+            var live_free = cu_mem_get_info().free_bytes
+            if live_free < block_bytes + min_free_bytes:
+                break
+
+            var tensors = List[_ResidentFp8Tensor]()
+            for t in range(len(self._fp8h_blocks[hslot])):
+                ref rt = self._fp8h_blocks[hslot][t]
+                var dbuf = ctx.enqueue_create_buffer[DType.uint8](rt.bytes_nbytes)
+                ctx.enqueue_copy(dbuf, rt.bytes_h[])
+                var a = Tensor(
+                    dbuf^, rt.bytes_shape.copy(), rt.bytes_dtype
+                )
+                var a_arc = TArc(a^)
+                if rt.is_fp8:
+                    var sbuf = ctx.enqueue_create_buffer[DType.uint8](
+                        rt.scale_nbytes
+                    )
+                    ctx.enqueue_copy(sbuf, rt.scale_h[])
+                    var scale = Tensor(
+                        sbuf^, rt.scale_shape.copy(), STDtype.F32
+                    )
+                    tensors.append(_ResidentFp8Tensor(
+                        rt.name.copy(), True, a_arc, TArc(scale^)
+                    ))
+                else:
+                    tensors.append(_ResidentFp8Tensor(
+                        rt.name.copy(), False, a_arc.copy(), a_arc
+                    ))
+            self._fp8_prefixes.append(self._fp8h_prefixes[hslot].copy())
+            self._fp8_blocks.append(tensors^)
+            used += block_bytes
+            promoted += 1
+            ctx.synchronize()
+        return promoted
+
+    def _promote_fp8_host_to_bf16_device_vmm(
+        mut self, budget_bytes: Int, ctx: DeviceContext, min_free_bytes: Int
+    ) raises -> Int:
+        """Decode host E4M3 weights once into evictable BF16 VMM blocks.
+
+        This is the compute path for pre-FP8 GPUs: it preserves the exact
+        E4M3-decode trajectory while removing every per-step dequantization.
+        The host FP8 store remains authoritative, and phase teardown unmaps
+        these larger BF16 blocks before VAE decode."""
+        if len(self._fp8_prefixes) > 0:
+            return len(self._fp8_prefixes)
+
+        # Two reusable FP8 source slabs bound promotion scratch. They are
+        # discarded with the other phase-local staging before decode.
+        self._f8h_ensure(ctx)
+        var granularity = cu_mem_get_allocation_granularity(0)
+        var block_sizes = List[Int]()
+        var used = 0
+        for hslot in range(len(self._fp8h_prefixes)):
+            var block_bytes = 0
+            for t in range(len(self._fp8h_blocks[hslot])):
+                ref rt = self._fp8h_blocks[hslot][t]
+                if rt.is_fp8:
+                    if not rt.per_row_scale:
+                        raise Error(
+                            "BF16 VMM promotion requires per-row FP8 scales"
+                        )
+                    block_bytes += rt.bytes_nbytes * STDtype.BF16.byte_size()
+                else:
+                    if rt.bytes_dtype != STDtype.BF16:
+                        raise Error(
+                            "BF16 VMM promotion requires BF16 passthrough tensors"
+                        )
+                    block_bytes += rt.bytes_nbytes
+            var rounded = (
+                (block_bytes + granularity - 1) // granularity
+            ) * granularity
+            if used + rounded > budget_bytes:
+                break
+            block_sizes.append(block_bytes)
+            used += rounded
+
+        if len(block_sizes) == 0:
+            return 0
+
+        var vmm = VmmModelHandle.create(
+            String("turbo-fp8-host-bf16-promotions"),
+            block_sizes.copy(),
+            STDtype.U8,
+            0,
+        )
+        self._fp8_vmm.append(ArcPointer(vmm^))
+
+        var promoted = 0
+        try:
+            for hslot in range(len(block_sizes)):
+                var physical_bytes = self._fp8_vmm[0][].block_reserved_bytes(
+                    hslot
+                )
+                var live_free = cu_mem_get_info().free_bytes
+                if live_free < physical_bytes + min_free_bytes:
+                    break
+                var block_ptr = self._fp8_vmm[0][].ensure_block_resident(hslot)
+
+                # Reuse one bounded FP8 slab as the decode source for this
+                # block; the destination lives directly in VMM.
+                self._f8h_prefetch(hslot, ctx)
+                var okey = self._f8h_key(self._fp8h_prefixes[hslot])
+                var oslot = -1
+                if self._f8h[].slot_key[0] == okey:
+                    oslot = 0
+                elif self._f8h[].slot_key[1] == okey:
+                    oslot = 1
+                if oslot < 0:
+                    raise Error(
+                        "BF16 VMM promotion could not stage FP8 host block"
+                    )
+                ctx.stream().enqueue_wait_for(self._f8h[].evs[oslot])
+                self._f8h[].active = oslot
+                var src_offsets = self._f8h_layout(hslot)
+                var offset = 0
+                var tensors = List[_ResidentFp8Tensor]()
+                for t in range(len(self._fp8h_blocks[hslot])):
+                    ref rt = self._fp8h_blocks[hslot][t]
+                    var dst_nbytes = (
+                        rt.bytes_nbytes * STDtype.BF16.byte_size()
+                        if rt.is_fp8 else rt.bytes_nbytes
+                    )
+                    var dst_raw = BytePtr(
+                        unsafe_from_address=Int(block_ptr) + offset
+                    )
+                    var dst_buf = DeviceBuffer[DType.uint8](
+                        ctx, dst_raw, dst_nbytes, owning=False
+                    )
+                    var dst = Tensor(
+                        dst_buf^, rt.bytes_shape.copy(), STDtype.BF16
+                    )
+                    if rt.is_fp8:
+                        var wsub = self._f8h[].devs[oslot].create_sub_buffer[
+                            DType.uint8
+                        ](src_offsets[2 * t], rt.bytes_nbytes)
+                        var wt = Tensor(
+                            wsub^, rt.bytes_shape.copy(), rt.bytes_dtype
+                        )
+                        var ssub = self._f8h[].devs[oslot].create_sub_buffer[
+                            DType.uint8
+                        ](src_offsets[2 * t + 1], rt.scale_nbytes)
+                        var st = Tensor(
+                            ssub^, rt.scale_shape.copy(), STDtype.F32
+                        )
+                        fp8_e4m3_dequant_perrow_to_bf16_into(
+                            wt, st, dst, ctx
+                        )
+                    else:
+                        ctx.enqueue_copy(dst.buf, rt.bytes_h[])
+                    var dst_arc = TArc(dst^)
+                    tensors.append(_ResidentFp8Tensor(
+                        rt.name.copy(), False, dst_arc.copy(), dst_arc
+                    ))
+                    offset += dst_nbytes
+                if offset != block_sizes[hslot]:
+                    raise Error(
+                        String("BF16 VMM promotion packed ") + String(offset)
+                        + String(" bytes != selected ")
+                        + String(block_sizes[hslot])
+                    )
+                ctx.synchronize()
+                self._fp8_prefixes.append(
+                    self._fp8h_prefixes[hslot].copy()
+                )
+                self._fp8_blocks.append(tensors^)
+                self._fp8_vmm[0][].mark_block_populated(hslot)
+                promoted += 1
+            if promoted == 0:
+                self._discard_fp8_vmm_promotions()
+        except e:
+            self._turbo.copy_stream.synchronize()
+            ctx.synchronize()
+            self._discard_fp8_vmm_promotions()
+            raise e^
+        return promoted
+
+    def _promote_fp8_host_to_device_vmm(
+        mut self, budget_bytes: Int, ctx: DeviceContext, min_free_bytes: Int
+    ) raises -> Int:
+        """Promote a plan-order prefix of the existing per-row FP8 host store
+        to device residency without rereading or requantizing the checkpoint.
+
+        The host copy remains authoritative, so callers may discard these
+        promotions before a high-headroom phase (for example VAE decode) and
+        recreate them for the next denoise with only pinned-RAM H2D traffic.
+        `await_block` already checks `_fp8_slot` before `_fp8h_slot`, making a
+        promoted block a no-copy device hit while the unpromoted tail continues
+        through the overlapped host path.  This method deliberately refuses to
+        mix with checkpoint-created FP8 residents: all entries in
+        `_fp8_prefixes` must be promotions from this host store."""
+        if len(self._fp8_prefixes) > 0:
+            return len(self._fp8_prefixes)
+        # Select the prefix using PHYSICAL VMM bytes, including allocation-
+        # granularity rounding. This keeps the caller's reserve honest.
+        var granularity = cu_mem_get_allocation_granularity(0)
+        var block_sizes = List[Int]()
+        var used = 0
+        for hslot in range(len(self._fp8h_prefixes)):
+            var block_bytes = 0
+            for t in range(len(self._fp8h_blocks[hslot])):
+                ref rt = self._fp8h_blocks[hslot][t]
+                block_bytes += rt.bytes_nbytes
+                if rt.is_fp8:
+                    if not rt.per_row_scale:
+                        raise Error(
+                            "promote_fp8_host_to_device requires per-row FP8 scales"
+                        )
+                    block_bytes += rt.scale_nbytes
+            var rounded = (
+                (block_bytes + granularity - 1) // granularity
+            ) * granularity
+            if used + rounded > budget_bytes:
+                break
+            block_sizes.append(block_bytes)
+            used += rounded
+
+        if len(block_sizes) == 0:
+            return 0
+
+        var vmm = VmmModelHandle.create(
+            String("turbo-fp8-host-promotions"),
+            block_sizes.copy(),
+            STDtype.U8,
+            0,
+        )
+        self._fp8_vmm.append(ArcPointer(vmm^))
+
+        var promoted = 0
+        try:
+            for hslot in range(len(block_sizes)):
+                var physical_bytes = self._fp8_vmm[0][].block_reserved_bytes(
+                    hslot
+                )
+                # cuMemCreate is the physical allocation boundary. Recheck the
+                # live floor immediately before it, not merely at selection.
+                var live_free = cu_mem_get_info().free_bytes
+                if live_free < physical_bytes + min_free_bytes:
+                    break
+                var block_ptr = self._fp8_vmm[0][].ensure_block_resident(hslot)
+                var offset = 0
+                var tensors = List[_ResidentFp8Tensor]()
+                for t in range(len(self._fp8h_blocks[hslot])):
+                    ref rt = self._fp8h_blocks[hslot][t]
+                    _h2d_dma_copy(
+                        block_ptr + UInt64(offset),
+                        rt.bytes_h[].unsafe_ptr(),
+                        rt.bytes_nbytes,
+                        self._turbo.copy_stream,
+                    )
+                    var raw = BytePtr(
+                        unsafe_from_address=Int(block_ptr) + offset
+                    )
+                    var dbuf = DeviceBuffer[DType.uint8](
+                        ctx, raw, rt.bytes_nbytes, owning=False
+                    )
+                    var a = Tensor(
+                        dbuf^, rt.bytes_shape.copy(), rt.bytes_dtype
+                    )
+                    var a_arc = TArc(a^)
+                    offset += rt.bytes_nbytes
+                    if rt.is_fp8:
+                        var scale_raw = BytePtr(
+                            unsafe_from_address=Int(block_ptr) + offset
+                        )
+                        _h2d_dma_copy(
+                            block_ptr + UInt64(offset),
+                            rt.scale_h[].unsafe_ptr(),
+                            rt.scale_nbytes,
+                            self._turbo.copy_stream,
+                        )
+                        var sbuf = DeviceBuffer[DType.uint8](
+                            ctx, scale_raw, rt.scale_nbytes, owning=False
+                        )
+                        var scale = Tensor(
+                            sbuf^, rt.scale_shape.copy(), STDtype.F32
+                        )
+                        tensors.append(_ResidentFp8Tensor(
+                            rt.name.copy(), True, a_arc, TArc(scale^)
+                        ))
+                        offset += rt.scale_nbytes
+                    else:
+                        tensors.append(_ResidentFp8Tensor(
+                            rt.name.copy(), False, a_arc.copy(), a_arc
+                        ))
+                if offset != block_sizes[hslot]:
+                    raise Error(
+                        String("promote_fp8_host_to_device: packed ")
+                        + String(offset) + String(" bytes != selected ")
+                        + String(block_sizes[hslot]) + String(" for block ")
+                        + String(hslot)
+                    )
+                self._turbo.copy_stream.synchronize()
+                ctx.synchronize()
+                self._fp8_prefixes.append(
+                    self._fp8h_prefixes[hslot].copy()
+                )
+                self._fp8_blocks.append(tensors^)
+                self._fp8_vmm[0][].mark_block_populated(hslot)
+                promoted += 1
+            if promoted == 0:
+                # The VA reservation is cheap but must not survive a failed
+                # live-headroom check, otherwise a later retry would append a
+                # second handle while `_fp8_prefixes` is still empty.
+                self._discard_fp8_vmm_promotions()
+        except e:
+            # The caller synchronized before promotion. Any copy already issued
+            # above is fenced per completed block; explicitly tear down partial
+            # VMM state so a failed promotion never strands physical VRAM.
+            self._turbo.copy_stream.synchronize()
+            ctx.synchronize()
+            self._discard_fp8_vmm_promotions()
+            raise e^
+        return promoted
+
+    def fp8_device_block_count(self) -> Int:
+        return len(self._fp8_prefixes)
+
+    def _discard_fp8_vmm_promotions(mut self) raises:
+        """Drop non-owning tensor views, then explicitly unmap/release VMM."""
+        self._fp8_blocks = List[List[_ResidentFp8Tensor]]()
+        self._fp8_prefixes = List[String]()
+        if len(self._fp8_vmm) == 1:
+            for i in range(self._fp8_vmm[0][].block_count()):
+                if self._fp8_vmm[0][].block_refcount(i) > 0:
+                    self._fp8_vmm[0][].release_block(i)
+                if self._fp8_vmm[0][].is_block_resident(i):
+                    self._fp8_vmm[0][].evict_block(i)
+            self._fp8_vmm[0][].destroy()
+        self._fp8_vmm = List[ArcPointer[VmmModelHandle]]()
+
+    def discard_fp8_host_promotions(mut self) raises:
+        """Drop device FP8 promotions while preserving the complete host store.
+
+        The caller must synchronize first.  This is phase residency, not model
+        eviction: the next denoise can call `promote_fp8_host_to_device` and
+        restore the fast path without checkpoint I/O or quantization."""
+        self._discard_fp8_vmm_promotions()
 
     def pin_residents_fp8_host_prequantized(
         mut self, budget_bytes: Int, ctx: DeviceContext
@@ -1290,6 +1918,7 @@ struct TurboPlannedLoader(Movable):
             self._fp8h_blocks.append(tensors^)
             used += block_bytes
             pinned += 1
+            self._turbo.sharded.release_to_os()
         return pinned
 
     def pin_residents_fp8_host_raw(

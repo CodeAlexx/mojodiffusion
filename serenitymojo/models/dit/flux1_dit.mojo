@@ -55,7 +55,7 @@ from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import silu, gelu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask_infer
 from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat, add
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
@@ -220,7 +220,7 @@ struct Flux1DiT(Movable):
     ) raises -> Tensor:
         var q_roped = rope_interleaved(q, cos, sin, ctx)
         var k_roped = rope_interleaved(k, cos, sin, ctx)
-        return sdpa_nomask[1, S, 24, 128](
+        return sdpa_nomask_infer[1, S, 24, 128](
             q_roped, k_roped, v, Float32(1.0) / sqrt(Float32(128)), ctx
         )
 

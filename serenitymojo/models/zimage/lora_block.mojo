@@ -76,8 +76,9 @@ from serenitymojo.ops.elementwise import (
 )
 from serenitymojo.ops.vec_modulate import vec_modulate
 from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
-from serenitymojo.ops.attention import sdpa, sdpa_nomask, sdpa_nomask_slab
-from serenitymojo.ops.attention_flash import sdpa_flash_train_fwd
+from serenitymojo.ops.attention import (
+    sdpa, sdpa_nomask, sdpa_nomask_slab, sdpa_nomask_infer,
+)
 # cuDNN flash SDPA for no-saved Z-Image inference forwards and graph backward
 # recompute. BF16-native; unaligned S is padded inside the flash wrapper.
 # CAPTURE MUST BE OFF with this on for slab/capture paths because the flash
@@ -117,21 +118,8 @@ def _zimage_sdpa_product_fwd[
     ctx: DeviceContext,
 ) raises -> Tensor:
     comptime if ZIMAGE_SDPA_FLASH:
-        # Z-Image product forwards may arrive from F32 norm/projection math;
-        # the cuDNN flash shim is BF16-native, so cast inside the op boundary.
-        if q.dtype() == STDtype.BF16 and k.dtype() == STDtype.BF16 and v.dtype() == STDtype.BF16:
-            var ff = sdpa_flash_train_fwd[B, S, H, Dh](q, k, v, scale, ctx)
-            # `ff.o` can be an unpadded view into `ff.o_pad`; clone so inference
-            # callers receive an owning tensor after the saved flash set is dropped.
-            return ff.o.clone(ctx)
-        var q_bf16 = cast_tensor(q, STDtype.BF16, ctx, False)
-        var k_bf16 = cast_tensor(k, STDtype.BF16, ctx, False)
-        var v_bf16 = cast_tensor(v, STDtype.BF16, ctx, False)
-        var ff = sdpa_flash_train_fwd[B, S, H, Dh](q_bf16, k_bf16, v_bf16, scale, ctx)
-        # `ff.o` can be an unpadded view into `ff.o_pad`; clone so inference
-        # callers receive an owning tensor after the saved flash set is dropped.
-        var out = ff.o.clone(ctx)
-        return cast_tensor(out, q.dtype(), ctx, False)
+        # Inference needs only O, not the training-forward LSE/stats tape.
+        return sdpa_nomask_infer[B, S, H, Dh](q, k, v, scale, ctx)
     else:
         return sdpa_nomask[B, S, H, Dh](q, k, v, scale, ctx)
 

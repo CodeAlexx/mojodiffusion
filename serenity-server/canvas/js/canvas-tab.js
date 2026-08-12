@@ -94,6 +94,8 @@ var CanvasTab = (function () {
         h3Quant: 'int8-fast',
         h3AttentionBackend: 'sage-int8',
         h3StepCache: 'exact',
+        h3ContinueFrom: '',
+        h3ContextFrames: 22,
         editMode: 'create',
         editEngine: 'krea2_turbo_1024',
         editModelEngine: 'klein9b',
@@ -1385,12 +1387,12 @@ var CanvasTab = (function () {
             '<span id="cv-batch-label" class="cv-setting-label">Batch</span><input type="number" id="cv-batch" class="cv-number-input" min="1" max="8" value="1"></div>' +
             '<div id="cv-video-section" style="display:none">' +
             '<div class="cv-section-title" style="margin-top:8px">Video</div>' +
-            '<div class="cv-setting-row">' +
+            '<div id="cv-video-frames-row" class="cv-setting-row">' +
             '<span class="cv-setting-label">Frames</span>' +
             '<input type="number" id="cv-frames" class="cv-number-input" min="9" max="481" step="8" value="97">' +
             '<input type="range" id="cv-frames-range" class="cv-range" min="9" max="481" step="8" value="97">' +
             '</div>' +
-            '<div class="cv-setting-row">' +
+            '<div id="cv-video-fps-row" class="cv-setting-row">' +
             '<span class="cv-setting-label">FPS</span>' +
             '<input type="number" id="cv-fps" class="cv-number-input" min="8" max="60" value="24">' +
             '<input type="range" id="cv-fps-range" class="cv-range" min="8" max="60" value="24">' +
@@ -1489,51 +1491,61 @@ var CanvasTab = (function () {
             '<div class="cv-helper-text">The Mojo runner validates these exact values and rejects unsupported compiled profiles before model loading.</div>' +
             '</div>' +
             '<div id="cv-h3-section" class="cv-ltx2-section" style="display:none">' +
-            '<div class="cv-section-title" style="margin-top:8px">MiniMax-H3 Mojo request</div>' +
-            '<label class="cv-setting-label" for="cv-h3-mode">Feature</label>' +
-            '<select id="cv-h3-mode" class="cv-select">' +
-            '<option value="t2va">Text to video + audio</option>' +
-            '<option value="i2va">First frame to video + audio</option>' +
-            '<option value="l2va">Last frame to video + audio</option>' +
-            '<option value="fl2va">First + last frame to video + audio</option>' +
-            '<option value="ref2va">Omni-reference to video + audio</option>' +
+            '<div class="cv-section-title" style="margin-top:8px">MiniMax-H3 video + audio</div>' +
+            '<input id="cv-h3-mode" type="hidden" value="t2va">' +
+            '<div id="cv-h3-mode-note" class="cv-h3-route-pill">Text only · add media below when you want conditioning</div>' +
+            '<div id="cv-h3-continue-row" style="display:none">' +
+            '<div class="cv-section-title">Continue clip</div>' +
+            '<div id="cv-h3-continue-source" class="cv-helper-text">Choose Continue H3 on a completed H3 result.</div>' +
+            '<label class="cv-setting-label" for="cv-h3-context-frames">Continuity strength</label>' +
+            '<select id="cv-h3-context-frames" class="cv-select">' +
+            '<option value="5">Light</option>' +
+            '<option value="22" selected>Balanced</option>' +
+            '<option value="39">Strong</option>' +
             '</select>' +
-            '<div id="cv-h3-source-row" style="display:none">' +
-            '<div class="cv-section-title">First-frame image</div>' +
-            '<button id="cv-h3-source-button" class="cv-import-btn" type="button">Choose first-frame image</button>' +
-            '<div id="cv-h3-source-note" class="cv-helper-text">Required for I2VA and FL2VA. You can also drag the image into the Source panel.</div>' +
+            '<button id="cv-h3-new-video" class="cv-import-btn" type="button">Start a new video</button>' +
             '</div>' +
-            '<div id="cv-h3-references-row" style="display:none">' +
-            '<details open><summary class="cv-section-title">H3 references</summary>' +
-            '<input id="cv-h3-references-file" type="file" accept="image/*,video/*,audio/*" multiple hidden>' +
-            '<label for="cv-h3-references-file" class="cv-import-btn">Add image, video, or audio</label>' +
-            '<button id="cv-h3-references-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
-            '<div id="cv-h3-references-note" class="cv-helper-text">0/12 · up to 9 images, 3 videos, and 3 audio clips.</div>' +
-            '<div id="cv-h3-references-list" class="cv-lora-list"></div>' +
-            '<div class="cv-helper-text">Order defines &lt;Image n&gt;, &lt;Video n&gt;, and &lt;Audio n&gt;. Audio may be a general reference, reused soundtrack, or voice-timbre reference.</div>' +
-            '</details></div>' +
-            '<div id="cv-h3-last-frame-row" style="display:none">' +
-            '<div class="cv-section-title">Last-frame keyframe</div>' +
+            '<div id="cv-h3-media-row" class="cv-h3-media-card">' +
+            '<div class="cv-section-title">Optional media</div>' +
+            '<div id="cv-h3-source-row">' +
+            '<button id="cv-h3-source-button" class="cv-import-btn" type="button">Add start image</button>' +
+            '<button id="cv-h3-source-clear" class="cv-lora-clear" type="button" disabled>Remove</button>' +
+            '<div id="cv-h3-source-note" class="cv-helper-text">Leave blank for text-to-video. Drop an image on Canvas to use it as the first frame.</div>' +
+            '</div>' +
+            '<div id="cv-h3-last-frame-row">' +
             '<input id="cv-h3-last-frame-file" type="file" accept="image/*" hidden>' +
-            '<label for="cv-h3-last-frame-file" class="cv-import-btn">Choose last frame</label>' +
-            '<button id="cv-h3-last-frame-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
-            '<div id="cv-h3-last-frame-note" class="cv-helper-text">Required for L2V and first+last-frame video.</div>' +
+            '<label for="cv-h3-last-frame-file" class="cv-import-btn">Add end image</label>' +
+            '<button id="cv-h3-last-frame-clear" class="cv-lora-clear" type="button" disabled>Remove</button>' +
+            '<div id="cv-h3-last-frame-note" class="cv-helper-text">Optional. The video will finish on this image.</div>' +
             '</div>' +
-            '<label class="cv-setting-label" for="cv-h3-resolution">Tested resolution preset</label>' +
+            '<div id="cv-h3-references-row">' +
+            '<details><summary class="cv-section-title">Add identity, style, video, or voice references</summary>' +
+            '<input id="cv-h3-references-file" type="file" accept="image/*,video/*,audio/*" multiple hidden>' +
+            '<label for="cv-h3-references-file" class="cv-import-btn">Add references</label>' +
+            '<button id="cv-h3-references-clear" class="cv-lora-clear" type="button" disabled>Clear</button>' +
+            '<div id="cv-h3-references-note" class="cv-helper-text">None added</div>' +
+            '<div id="cv-h3-references-list" class="cv-lora-list"></div>' +
+            '<div class="cv-helper-text">Up to 9 images, 3 videos, and 3 audio clips; 12 combined. References cannot be mixed with start/end keyframes in one request.</div>' +
+            '</details></div>' +
+            '</div>' +
+            '<label class="cv-setting-label" for="cv-h3-resolution">Resolution</label>' +
             '<select id="cv-h3-resolution" class="cv-select"><option value="">Loading H3 resolutions...</option></select>' +
             '<div class="cv-setting-row"><span class="cv-setting-label">Width</span>' +
             '<input type="number" id="cv-h3-width" class="cv-number-input" min="32" max="2048" step="32" value="1344"></div>' +
             '<div class="cv-setting-row"><span class="cv-setting-label">Height</span>' +
             '<input type="number" id="cv-h3-height" class="cv-number-input" min="32" max="2048" step="32" value="768"></div>' +
             '<label class="cv-setting-label" for="cv-h3-duration">Seconds</label>' +
-            '<input type="number" id="cv-h3-duration" class="cv-select" min="1" max="15" step="0.01" value="5">' +
-            '<div id="cv-h3-profile-note" class="cv-helper-text">Width and height are independently adjustable in 32-pixel steps within the 24-GB envelope. Duration: 1–15 seconds.</div>' +
-            '<label class="cv-setting-label" for="cv-h3-quant">Quality / speed</label>' +
+            '<input type="number" id="cv-h3-duration" class="cv-number-input cv-h3-number" min="1" max="60" step="0.01" value="5">' +
+            '<label class="cv-setting-label" for="cv-h3-fps">FPS</label>' +
+            '<input type="number" id="cv-h3-fps" class="cv-number-input cv-h3-number" min="1" max="120" step="1" value="24">' +
+            '<div id="cv-h3-profile-note" class="cv-helper-text">Choose resolution, seconds, and FPS directly.</div>' +
+            '<label class="cv-setting-label" for="cv-h3-quant">Quality</label>' +
             '<select id="cv-h3-quant" class="cv-select">' +
-            '<option value="int8-fast">INT8 Fast DiT · W8A8</option>' +
-            '<option value="int8">INT8 Quality DiT · groupwise</option>' +
-            '<option value="bf16">BF16 DiT · INT8 encoder</option>' +
+            '<option value="int8-fast">Fast · INT8</option>' +
+            '<option value="int8">High quality · INT8</option>' +
+            '<option value="bf16">Highest quality · BF16</option>' +
             '</select>' +
+            '<details class="cv-h3-advanced"><summary class="cv-section-title">Advanced performance</summary>' +
             '<label class="cv-setting-label" for="cv-h3-attention">Attention</label>' +
             '<select id="cv-h3-attention" class="cv-select">' +
             '<option value="sage-int8">Sage INT8 · faster, approximate</option>' +
@@ -1544,9 +1556,8 @@ var CanvasTab = (function () {
             '<option value="exact">Exact · every block, every step</option>' +
             '<option value="high">Experimental cached · faster, quality loss</option>' +
             '</select>' +
-            '<div class="cv-helper-text">Exact is the quality default. Experimental cached keeps size, seconds, FPS, steps, and audio, but measured A/B testing found visible video drift.</div>' +
-            '<div id="cv-h3-mode-note" class="cv-helper-text">Choose any supported output size and duration. I2V uses the Source as frame zero. Ref2VA accepts ordered image, video, and audio references without inserting a reference as frame zero.</div>' +
-            '<div class="cv-helper-text">Every H3 feature uses the same resolution, duration, frame-rate, and precision controls. GPU model execution only.</div>' +
+            '<div class="cv-helper-text">Exact is the quality default. Cached mode may visibly change the result.</div>' +
+            '</details>' +
             '</div>' +
             '</div>' +
             '</div>' +
@@ -1647,6 +1658,8 @@ var CanvasTab = (function () {
         els.batch = document.getElementById('cv-batch');
         els.batchLabel = document.getElementById('cv-batch-label');
         els.videoSection = document.getElementById('cv-video-section');
+        els.videoFramesRow = document.getElementById('cv-video-frames-row');
+        els.videoFpsRow = document.getElementById('cv-video-fps-row');
         els.framesInput = document.getElementById('cv-frames');
         els.framesRange = document.getElementById('cv-frames-range');
         els.fpsInput = document.getElementById('cv-fps');
@@ -1655,16 +1668,21 @@ var CanvasTab = (function () {
         els.ltx2Section = document.getElementById('cv-ltx2-section');
         els.h3Section = document.getElementById('cv-h3-section');
         els.h3Mode = document.getElementById('cv-h3-mode');
+        els.h3ContinueRow = document.getElementById('cv-h3-continue-row');
+        els.h3ContinueSource = document.getElementById('cv-h3-continue-source');
+        els.h3ContextFrames = document.getElementById('cv-h3-context-frames');
         els.h3Resolution = document.getElementById('cv-h3-resolution');
         els.h3Width = document.getElementById('cv-h3-width');
         els.h3Height = document.getElementById('cv-h3-height');
         els.h3Duration = document.getElementById('cv-h3-duration');
+        els.h3Fps = document.getElementById('cv-h3-fps');
         els.h3ProfileNote = document.getElementById('cv-h3-profile-note');
         els.h3Quant = document.getElementById('cv-h3-quant');
         els.h3Attention = document.getElementById('cv-h3-attention');
         els.h3StepCache = document.getElementById('cv-h3-step-cache');
         els.h3SourceRow = document.getElementById('cv-h3-source-row');
         els.h3SourceButton = document.getElementById('cv-h3-source-button');
+        els.h3SourceClear = document.getElementById('cv-h3-source-clear');
         els.h3SourceNote = document.getElementById('cv-h3-source-note');
         els.h3ReferencesRow = document.getElementById('cv-h3-references-row');
         els.h3ReferencesFile = document.getElementById('cv-h3-references-file');
@@ -1676,6 +1694,7 @@ var CanvasTab = (function () {
         els.h3LastFrameClear = document.getElementById('cv-h3-last-frame-clear');
         els.h3LastFrameNote = document.getElementById('cv-h3-last-frame-note');
         els.h3ModeNote = document.getElementById('cv-h3-mode-note');
+        els.h3NewVideo = document.getElementById('cv-h3-new-video');
         els.ltx2Resolution = document.getElementById('cv-ltx2-resolution');
         els.ltx2Duration = document.getElementById('cv-ltx2-duration');
         els.ltx2DurationList = document.getElementById('cv-ltx2-duration-options');
@@ -2317,7 +2336,11 @@ var CanvasTab = (function () {
             els.h3LastFrameClear.disabled = true;
         if (els.h3LastFrameNote)
             els.h3LastFrameNote.textContent =
-                'Required for L2V and first+last-frame video.';
+                'Optional. The video will finish on this image.';
+        if (genState.arch === 'minimax_h3') {
+            syncCanvasH3Mode();
+            refreshCanvasH3Controls();
+        }
     }
     function h3ReferenceKind(file) {
         var type = String(file && file.type || '').toLowerCase();
@@ -2376,16 +2399,19 @@ var CanvasTab = (function () {
             remove.textContent = 'Remove';
             remove.addEventListener('click', function () {
                 h3References.splice(index, 1);
-                renderH3References();
+                syncCanvasH3Mode();
+                refreshCanvasH3Controls();
+                applyCanvasH3AuthoredGeometry();
             });
             row.appendChild(remove);
             els.h3ReferencesList.appendChild(row);
         });
         var counts = h3ReferenceCounts(h3References);
         if (els.h3ReferencesNote)
-            els.h3ReferencesNote.textContent = h3References.length + '/12 · ' +
-                counts.image + '/9 images · ' + counts.video + '/3 videos · ' +
-                counts.audio + '/3 audio';
+            els.h3ReferencesNote.textContent = h3References.length === 0
+                ? 'None added'
+                : h3References.length + '/12 · ' + counts.image + '/9 images · ' +
+                    counts.video + '/3 videos · ' + counts.audio + '/3 audio';
         if (els.h3ReferencesClear)
             els.h3ReferencesClear.disabled = h3References.length === 0;
     }
@@ -2428,7 +2454,9 @@ var CanvasTab = (function () {
                 /* shown in the compact reference list and again on Generate */
             });
         });
-        renderH3References();
+        syncCanvasH3Mode();
+        refreshCanvasH3Controls();
+        applyCanvasH3AuthoredGeometry();
     }
     function resolvedH3References() {
         return Promise.all(h3References.map(function (reference) {
@@ -2518,7 +2546,14 @@ var CanvasTab = (function () {
         }
         if (els.sourceEmpty)
             els.sourceEmpty.style.display = '';
-        refreshCanvasH3SourceInput();
+        if (genState.arch === 'minimax_h3') {
+            syncCanvasH3Mode();
+            refreshCanvasH3Controls();
+            updateEditWorkspace();
+        }
+        else {
+            refreshCanvasH3SourceInput();
+        }
         updateLtx2SourceStrengthHelp();
         updateLtx2VideoEditControls();
     }
@@ -2693,6 +2728,11 @@ var CanvasTab = (function () {
                 setLtx2SourceStrength(1.0);
             refreshCanvasH3SourceInput();
             addImageDataUrlToCanvas(editSourceDataUrl);
+            if (genState.arch === 'minimax_h3') {
+                syncCanvasH3Mode();
+                refreshCanvasH3Controls();
+                updateEditWorkspace();
+            }
         };
         reader.readAsDataURL(file);
     }
@@ -4599,13 +4639,13 @@ var CanvasTab = (function () {
             });
         });
         els.ltx2LastFrameClear.addEventListener('click', clearLtx2LastFrame);
-        els.h3Mode.addEventListener('change', function () {
-            genState.h3Mode = this.value;
-            refreshCanvasH3Controls();
-            updateEditWorkspace();
-            els.generateBtn.textContent = genState.h3Mode === 't2va'
-                ? 'Generate H3 Video + Audio'
-                : 'Generate H3 ' + genState.h3Mode.toUpperCase() + ' + Audio';
+        els.h3ContextFrames.addEventListener('change', function () {
+            var frames = Number(this.value);
+            genState.h3ContextFrames = [5, 22, 39].indexOf(frames) >= 0
+                ? frames : 22;
+            refreshCanvasH3DurationLimit();
+            applyCanvasH3AuthoredGeometry();
+            History.push();
         });
         els.h3Resolution.addEventListener('change', function () {
             genState.h3ProfileKey = this.value;
@@ -4614,6 +4654,7 @@ var CanvasTab = (function () {
                 els.h3Width.value = String(preset.width);
                 els.h3Height.value = String(preset.height);
             }
+            refreshCanvasH3DurationLimit();
             applyCanvasH3AuthoredGeometry();
             History.push();
         });
@@ -4622,12 +4663,20 @@ var CanvasTab = (function () {
                 var key = String(els.h3Width.value) + 'x' + String(els.h3Height.value);
                 genState.h3ProfileKey = canvasH3Resolution(key) ? key : 'custom';
                 els.h3Resolution.value = genState.h3ProfileKey;
+                refreshCanvasH3DurationLimit();
                 applyCanvasH3AuthoredGeometry();
                 History.push();
             });
         });
         els.h3Duration.addEventListener('change', function () {
+            refreshCanvasH3DurationLimit();
             applyCanvasH3AuthoredGeometry();
+        });
+        els.h3Fps.addEventListener('change', function () {
+            genState.fps = Math.max(1, Math.min(120, Math.round(Number(this.value) || 24)));
+            this.value = String(genState.fps);
+            applyCanvasH3AuthoredGeometry();
+            History.push();
         });
         els.h3Quant.addEventListener('change', function () {
             genState.h3Quant = this.value;
@@ -4643,10 +4692,15 @@ var CanvasTab = (function () {
         els.h3ReferencesFile.addEventListener('change', function () {
             addH3ReferenceFiles(this.files);
             this.value = '';
+            syncCanvasH3Mode();
+            refreshCanvasH3Controls();
         });
         els.h3ReferencesClear.addEventListener('click', function () {
             h3References = [];
             renderH3References();
+            syncCanvasH3Mode();
+            refreshCanvasH3Controls();
+            applyCanvasH3AuthoredGeometry();
         });
         els.h3LastFrameFile.addEventListener('change', function () {
             var file = this.files && this.files[0];
@@ -4670,7 +4724,9 @@ var CanvasTab = (function () {
                 if (!h3LastFrameUploadedPath)
                     throw new Error('Media upload did not return a worker-readable path');
                 els.h3LastFrameNote.textContent =
-                    'H3 final keyframe ready · source aspect preserved · ' + file.name;
+                    'End image ready · ' + file.name;
+                syncCanvasH3Mode();
+                refreshCanvasH3Controls();
                 return h3LastFrameUploadedPath;
             }).catch(function (error) {
                 if (file === h3LastFrameFile)
@@ -4683,6 +4739,18 @@ var CanvasTab = (function () {
             });
         });
         els.h3LastFrameClear.addEventListener('click', clearH3LastFrame);
+        els.h3SourceClear.addEventListener('click', clearCanvasEditSource);
+        els.h3NewVideo.addEventListener('click', function () {
+            genState.h3ContinueFrom = '';
+            genState.h3Mode = 't2va';
+            h3References = [];
+            clearH3LastFrame();
+            clearCanvasEditSource();
+            renderH3References();
+            refreshCanvasH3Controls();
+            updateEditWorkspace();
+            History.push();
+        });
         els.ltx2SourceStrength.addEventListener('input', function () {
             genState.ltx2SourceStrength = Math.max(0, Math.min(1, Number(this.value)));
             els.ltx2SourceStrengthVal.textContent = genState.ltx2SourceStrength.toFixed(2);
@@ -4771,7 +4839,10 @@ var CanvasTab = (function () {
         els.framesInput.addEventListener('input', function () {
             genState.frames = parseInt(this.value) || 97;
             if (genState.arch === 'minimax_h3' && els.h3Duration) {
-                genState.h3Duration = Math.max(1, Math.min(15, genState.frames / genState.fps));
+                var durationMax = canvasH3MaxDurationForSize(
+                    Number(els.h3Width.value), Number(els.h3Height.value));
+                genState.h3Duration = Math.max(1, Math.min(
+                    durationMax, genState.frames / genState.fps));
                 genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
                 els.h3Duration.value = String(Number(genState.h3Duration.toFixed(3)));
             }
@@ -4783,7 +4854,10 @@ var CanvasTab = (function () {
         els.framesRange.addEventListener('input', function () {
             genState.frames = parseInt(this.value);
             if (genState.arch === 'minimax_h3' && els.h3Duration) {
-                genState.h3Duration = Math.max(1, Math.min(15, genState.frames / genState.fps));
+                var durationMax = canvasH3MaxDurationForSize(
+                    Number(els.h3Width.value), Number(els.h3Height.value));
+                genState.h3Duration = Math.max(1, Math.min(
+                    durationMax, genState.frames / genState.fps));
                 genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
                 els.h3Duration.value = String(Number(genState.h3Duration.toFixed(3)));
             }
@@ -5407,6 +5481,8 @@ var CanvasTab = (function () {
             h3Quant: genState.h3Quant,
             h3AttentionBackend: genState.h3AttentionBackend,
             h3StepCache: genState.h3StepCache,
+            h3ContinueFrom: genState.h3ContinueFrom,
+            h3ContextFrames: genState.h3ContextFrames,
             h3References: h3References.map(function (reference) {
                 return {
                     kind: reference.kind,
@@ -5552,12 +5628,12 @@ var CanvasTab = (function () {
                     state.genSettings.ltx2ExtendDirection === 'start' ? 'start' : 'end';
                 genState.ltx2ExtendSeconds = Number.isFinite(Number(state.genSettings.ltx2ExtendSeconds))
                     ? Math.max(2, Math.min(20, Number(state.genSettings.ltx2ExtendSeconds))) : 3;
-                genState.h3Mode = ['t2va', 'i2va', 'l2va', 'fl2va', 'ref2va']
+                genState.h3Mode = ['t2va', 'i2va', 'l2va', 'fl2va', 'ref2va', 'continue']
                     .indexOf(state.genSettings.h3Mode) >= 0
                     ? state.genSettings.h3Mode : 't2va';
                 genState.h3ProfileKey = state.genSettings.h3ProfileKey || '';
                 genState.h3Duration = Number.isFinite(Number(state.genSettings.h3Duration))
-                    ? Math.max(1, Math.min(15, Number(state.genSettings.h3Duration))) : 5;
+                    ? Math.max(1, Math.min(60, Number(state.genSettings.h3Duration))) : 5;
                 genState.h3Quant = ['int8-fast', 'int8', 'bf16']
                     .indexOf(state.genSettings.h3Quant) >= 0
                     ? state.genSettings.h3Quant : 'int8-fast';
@@ -5566,6 +5642,12 @@ var CanvasTab = (function () {
                         ? 'cudnn' : 'sage-int8';
                 genState.h3StepCache = state.genSettings.h3StepCache === 'high'
                     ? 'high' : 'exact';
+                genState.h3ContinueFrom = /^video-\d+$/.test(
+                    String(state.genSettings.h3ContinueFrom || ''))
+                    ? String(state.genSettings.h3ContinueFrom) : '';
+                genState.h3ContextFrames = [5, 22, 39].indexOf(
+                    Number(state.genSettings.h3ContextFrames)) >= 0
+                    ? Number(state.genSettings.h3ContextFrames) : 22;
                 h3References = Array.isArray(state.genSettings.h3References)
                     ? state.genSettings.h3References.filter(function (reference) {
                         return reference && ['image', 'video', 'audio']
@@ -5763,6 +5845,111 @@ var CanvasTab = (function () {
             return mode && mode.id === genState.h3Mode;
         }) || null;
     }
+    function inferredCanvasH3Mode() {
+        if (genState.h3Mode === 'continue' && genState.h3ContinueFrom)
+            return 'continue';
+        if (h3References.length > 0)
+            return 'ref2va';
+        var hasFirst = !!editSourceDataUrl && !editSourceIsVideo;
+        var hasLast = !!h3LastFrameFile || !!h3LastFrameUploadedPath;
+        if (hasFirst && hasLast)
+            return 'fl2va';
+        if (hasFirst)
+            return 'i2va';
+        if (hasLast)
+            return 'l2va';
+        return 't2va';
+    }
+    function syncCanvasH3Mode() {
+        genState.h3Mode = inferredCanvasH3Mode();
+        if (els.h3Mode)
+            els.h3Mode.value = genState.h3Mode;
+        return genState.h3Mode;
+    }
+    function canvasH3DefaultSteps() {
+        var runner = activeCanvasH3Runner();
+        var advertised = Number(runner && runner.default_steps);
+        if (Number.isInteger(advertised) && advertised >= 2 && advertised <= 50)
+            return advertised;
+        var profiles = runner && Array.isArray(runner.supported_profiles)
+            ? runner.supported_profiles : [];
+        var profileSteps = Number(profiles[0] && profiles[0].steps);
+        return Number.isInteger(profileSteps) && profileSteps >= 2 && profileSteps <= 50
+            ? profileSteps : 20;
+    }
+    function canvasH3InternalFrames(seconds) {
+        var frames = Math.max(5, Math.round(Number(seconds) * 24));
+        while (frames % 17 !== 5)
+            frames += 1;
+        return frames;
+    }
+    function canvasH3SequenceTokens(width, height, seconds, task) {
+        var contextFrames = task === 'continue'
+            ? Number(genState.h3ContextFrames) || 22 : 0;
+        var authoredFrames = Math.max(5, Math.round(Number(seconds) * 24));
+        var internalFrames = authoredFrames + contextFrames;
+        while (internalFrames % 17 !== 5)
+            internalFrames += 1;
+        var latentFrames = Math.floor((internalFrames - 5) / 17) * 5 + 2;
+        var rowsPerFrame = Math.floor(Number(width) / 32) *
+            Math.floor(Number(height) / 32);
+        var audioLatents = Math.round(internalFrames / 24 * 40);
+        var conditionFrames = task === 'fl2va' ? 2 :
+            (task === 'i2va' || task === 'l2va' ? 1 : 0);
+        var presentationTokens = task === 'i2va' ? 970 :
+            (task === 'l2va' ? 975 : (task === 'fl2va' ? 1581 : 241));
+        var motionVideoSteps = task === 'continue'
+            ? (contextFrames === 5 ? 2 : (contextFrames === 39 ? 12 : 7)) : 0;
+        var motionAudioLatents = task === 'continue'
+            ? Math.round(contextFrames / 24 * 40) : 0;
+        return presentationTokens +
+            (latentFrames + conditionFrames + motionVideoSteps) * rowsPerFrame +
+            (audioLatents + motionAudioLatents) * 2;
+    }
+    function canvasH3MaxDurationForSize(width, height) {
+        var runner = activeCanvasH3Runner();
+        var mode = activeCanvasH3Mode();
+        var constraints = genState.h3Mode === 't2va'
+            ? runner && runner.geometry_constraints || {}
+            : mode && mode.geometry || {};
+        var trainedMax = Number(constraints.trained_seconds_max) || 15;
+        var absoluteMax = Number(constraints.seconds_max) || trainedMax;
+        var tokenMax = Number(constraints.long_context_max_sequence_tokens) || 0;
+        if (genState.h3Mode === 'ref2va' ||
+            (genState.h3Mode === 'continue' && h3References.length > 0) ||
+            absoluteMax <= trainedMax || tokenMax <= 0)
+            return trainedMax;
+        for (var centiseconds = Math.round(absoluteMax * 100);
+            centiseconds > Math.round(trainedMax * 100); centiseconds -= 1) {
+            var seconds = centiseconds / 100;
+            if (canvasH3SequenceTokens(
+                width, height, seconds, genState.h3Mode) <= tokenMax)
+                return seconds;
+        }
+        return trainedMax;
+    }
+    function refreshCanvasH3DurationLimit() {
+        if (!els.h3Duration)
+            return 15;
+        var maximum = canvasH3MaxDurationForSize(
+            Number(els.h3Width.value), Number(els.h3Height.value));
+        els.h3Duration.max = String(maximum);
+        els.h3Duration.title = maximum > 15
+            ? 'Experimental single-pass H3 long context · trained range ends at 15 seconds · this mode and resolution fit up to ' + maximum.toFixed(2) + ' seconds on the 24-GB token envelope'
+            : (genState.h3Mode === 'ref2va' ||
+                (genState.h3Mode === 'continue' && h3References.length > 0)
+                ? 'Reference-conditioned H3 remains within the trained 15-second window; chain Continue segments for longer video'
+                : 'This resolution uses the full 24-GB token envelope at the trained 15-second limit');
+        var duration = Math.max(1, Math.min(
+            maximum, Number(els.h3Duration.value) || Number(genState.h3Duration) || 5));
+        genState.h3Duration = duration;
+        els.h3Duration.value = String(Number(duration.toFixed(3)));
+        [els.framesInput, els.framesRange].forEach(function (control) {
+            if (control)
+                control.max = String(Math.max(1, Math.round(maximum * 120)));
+        });
+        return maximum;
+    }
     function canvasH3ResolutionKey(resolution) {
         if (!resolution)
             return '';
@@ -5799,7 +5986,7 @@ var CanvasTab = (function () {
             var option = document.createElement('option');
             option.value = canvasH3ResolutionKey(resolution);
             option.textContent = String(resolution.aspect_ratio || 'H3') + ' \u00b7 ' +
-                resolution.width + '\u00d7' + resolution.height + ' \u00b7 H3-Base 768p';
+                resolution.width + '\u00d7' + resolution.height;
             els.h3Resolution.appendChild(option);
         });
         var custom = document.createElement('option');
@@ -5813,19 +6000,20 @@ var CanvasTab = (function () {
         var width = Number(els.h3Width && els.h3Width.value);
         var height = Number(els.h3Height && els.h3Height.value);
         var duration = Number(els.h3Duration && els.h3Duration.value);
-        var fps = Number(genState.fps);
+        var fps = Number(els.h3Fps && els.h3Fps.value || genState.fps);
         var step = Number(constraints.dimension_step) || 32;
         var widthMin = Number(constraints.width_min) || 32;
         var widthMax = Number(constraints.width_max) || 2048;
         var heightMin = Number(constraints.height_min) || 32;
         var heightMax = Number(constraints.height_max) || 2048;
         var maxPixels = Number(constraints.max_pixels) || 768 * 1344;
+        var durationMax = canvasH3MaxDurationForSize(width, height);
         if (!Number.isInteger(width) || !Number.isInteger(height) ||
             width < widthMin || width > widthMax ||
             height < heightMin || height > heightMax ||
             width % step !== 0 || height % step !== 0 ||
             width * height > maxPixels ||
-            !Number.isFinite(duration) || duration < 1 || duration > 15 ||
+            !Number.isFinite(duration) || duration < 1 || duration > durationMax ||
             !Number.isInteger(fps) || fps < 1 || fps > 120)
             return null;
         return {
@@ -5850,11 +6038,12 @@ var CanvasTab = (function () {
     }
 
     function applyCanvasH3AuthoredGeometry() {
+        var durationMax = refreshCanvasH3DurationLimit();
         var geometry = canvasH3RuntimeGeometry();
         if (!geometry) {
             if (els.h3ProfileNote)
                 els.h3ProfileNote.textContent =
-                    'Invalid H3 size: use 32–2048 in 32-pixel steps and stay at or below 1,032,192 pixels.';
+                    'Invalid H3 geometry: use 32–2048 in 32-pixel steps, stay at or below 1,032,192 pixels, and keep duration at or below the ' + durationMax.toFixed(2) + '-second single-pass limit for this mode and resolution.';
             return false;
         }
         var width = geometry.width;
@@ -5893,7 +6082,9 @@ var CanvasTab = (function () {
             els.h3ProfileNote.textContent = String(preset && preset.aspect_ratio || 'Custom') + ' \u00b7 ' +
                 width + '\u00d7' + height + ' \u00b7 ' +
                 duration.toFixed(2) + ' seconds exactly \u00b7 ' +
-                genState.frames + ' output frames at ' + fps + ' FPS';
+                genState.frames + ' output frames at ' + fps + ' FPS \u00b7 single-pass max ' +
+                durationMax.toFixed(2) + ' seconds' +
+                (duration > 15 ? ' \u00b7 experimental beyond trained 15 seconds' : '');
         }
         updateCanvasDurationHint();
         return true;
@@ -5903,7 +6094,7 @@ var CanvasTab = (function () {
         var runner = activeCanvasH3Runner();
         var ready = !!(runner && runner.available === true);
         refreshCanvasH3ResolutionOptions();
-        [els.h3Resolution, els.h3Width, els.h3Height, els.h3Duration].forEach(function (control) {
+        [els.h3Resolution, els.h3Width, els.h3Height, els.h3Duration, els.h3Fps].forEach(function (control) {
             if (control)
                 control.disabled = !ready;
         });
@@ -5922,6 +6113,8 @@ var CanvasTab = (function () {
         els.h3Width.value = String(selectedWidth || 1344);
         els.h3Height.value = String(selectedHeight || 768);
         els.h3Duration.value = String(genState.h3Duration);
+        els.h3Fps.value = String(genState.fps || 24);
+        refreshCanvasH3DurationLimit();
         setCanvasLtx2GeometryLocked(true,
             'Adjust H3 width and height in the MiniMax-H3 controls.');
         var constraints = runner.geometry_constraints || {};
@@ -5946,39 +6139,19 @@ var CanvasTab = (function () {
             return;
         var loaded = !!editSourceDataUrl && !editSourceIsVideo;
         els.h3SourceButton.textContent = loaded
-            ? 'Replace first-frame image' : 'Choose first-frame image';
+            ? 'Replace start image' : 'Add start image';
+        if (els.h3SourceClear)
+            els.h3SourceClear.disabled = !loaded;
         els.h3SourceNote.textContent = loaded
-            ? 'First frame loaded' + (editSourceFile && editSourceFile.name
-                ? ': ' + editSourceFile.name : '') + '. MiniMax-H3 will use it as frame zero.'
-            : 'Required for I2VA and FL2VA. Choose it here or drag it into the Source panel.';
+            ? 'Start image ready' + (editSourceFile && editSourceFile.name
+                ? ' · ' + editSourceFile.name : '')
+            : 'Leave blank for text-to-video. Drop an image on Canvas to use it as the first frame.';
     }
     function refreshCanvasH3Controls() {
         if (!els.h3Mode)
             return;
         var runner = activeCanvasH3Runner();
-        var modes = runner && Array.isArray(runner.conditioned_modes)
-            ? runner.conditioned_modes : [];
-        Array.from(els.h3Mode.options).forEach(function (option) {
-            if (option.value === 't2va') {
-                option.disabled = !(runner && runner.available === true);
-                return;
-            }
-            var definition = modes.find(function (mode) {
-                return mode && mode.id === option.value;
-            });
-            option.disabled = !definition || definition.available !== true;
-            if (definition && definition.available !== true && definition.reason)
-                option.title = definition.reason;
-        });
-        if (!Array.from(els.h3Mode.options).some(function (option) {
-            return option.value === genState.h3Mode && !option.disabled;
-        })) {
-            var firstReady = Array.from(els.h3Mode.options).find(function (option) {
-                return !option.disabled;
-            });
-            genState.h3Mode = firstReady ? firstReady.value : 't2va';
-        }
-        els.h3Mode.value = genState.h3Mode;
+        syncCanvasH3Mode();
         var mode = activeCanvasH3Mode();
         Array.from(els.h3Quant.options).forEach(function (option) {
             var ready = genState.h3Mode === 't2va'
@@ -5998,32 +6171,37 @@ var CanvasTab = (function () {
             genState.h3Quant = firstQuant ? firstQuant.value : 'int8-fast';
         }
         els.h3Quant.value = genState.h3Quant;
+        if (genState.h3Quant === 'bf16')
+            genState.h3AttentionBackend = 'cudnn';
         els.h3Attention.value = genState.h3AttentionBackend;
-        els.h3Attention.disabled = false;
+        els.h3Attention.disabled = genState.h3Quant === 'bf16';
         genState.h3StepCache = genState.h3StepCache === 'high' ? 'high' : 'exact';
         els.h3StepCache.value = genState.h3StepCache;
-        var conditioned = genState.h3Mode !== 't2va';
-        var needsFirst = genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va';
-        var needsLast = genState.h3Mode === 'l2va' || genState.h3Mode === 'fl2va';
-        var omniReference = genState.h3Mode === 'ref2va';
-        els.h3SourceRow.style.display = needsFirst ? 'block' : 'none';
-        els.h3ReferencesRow.style.display = omniReference ? 'block' : 'none';
-        els.h3LastFrameRow.style.display = needsLast ? 'block' : 'none';
+        var nativeContinuation = genState.h3Mode === 'continue';
+        var mediaRow = document.getElementById('cv-h3-media-row');
+        if (mediaRow)
+            mediaRow.style.display = nativeContinuation ? 'none' : 'block';
+        els.h3SourceRow.style.display = 'block';
+        els.h3ReferencesRow.style.display = 'block';
+        els.h3LastFrameRow.style.display = 'block';
+        els.h3ContinueRow.style.display = nativeContinuation ? 'block' : 'none';
+        els.h3ContextFrames.value = String(genState.h3ContextFrames);
+        els.h3ContinueSource.textContent = genState.h3ContinueFrom
+            ? 'Source job: ' + genState.h3ContinueFrom + ' · video and audio latent tail retained'
+            : 'Choose Continue H3 on a completed native H3 result.';
         refreshCanvasH3SourceInput();
-        refreshCanvasH3ProfileControls(conditioned, mode);
+        refreshCanvasH3ProfileControls();
         els.steps.value = String(genState.steps);
         els.stepsRange.value = String(genState.steps);
         els.framesInput.value = String(genState.frames);
         els.framesRange.value = String(genState.frames);
         els.fpsInput.value = String(genState.fps);
         els.fpsRange.value = String(genState.fps);
-        [els.framesInput, els.framesRange, els.fpsInput, els.fpsRange].forEach(function (control) {
-            control.disabled = false;
-            control.title = 'MiniMax-H3 output frame count and FPS are adjustable; Seconds stays authoritative.';
-        });
+        els.h3Fps.value = String(genState.fps);
         [els.framesInput, els.framesRange].forEach(function (control) {
             control.min = '1';
-            control.max = '1800';
+            control.max = String(Math.max(1, Math.round(
+                canvasH3MaxDurationForSize(genState.width, genState.height) * 120)));
             control.step = '1';
         });
         [els.fpsInput, els.fpsRange].forEach(function (control) {
@@ -6044,18 +6222,27 @@ var CanvasTab = (function () {
             stage.batchDraw();
         }
         if (els.h3ModeNote) {
-            els.h3ModeNote.textContent = genState.h3Mode === 't2va'
-                ? 'Choose an H3-Base native 768p video resolution, 1–15 seconds, FPS, and precision.'
-                : (genState.h3Mode === 'ref2va'
-                    ? 'Add ordered image, video, and audio references below. They condition identity, motion, soundtrack reuse, or voice timbre and are not inserted as frame zero.'
-                : (genState.h3Mode === 'l2va'
-                    ? 'Choose a required final keyframe below. The generated clip evolves toward it.'
-                    : (genState.h3Mode === 'fl2va'
-                        ? 'Choose a Source image for frame zero, then choose the required final keyframe. Both are prepared to the authored output canvas by the GPU runner.'
-                        : 'The selected Source image keeps its aspect on upload and is prepared to the authored output canvas as frame zero. It is not a reference-only image.')));
+            var hasKeyframes = (!!editSourceDataUrl && !editSourceIsVideo) ||
+                !!h3LastFrameFile || !!h3LastFrameUploadedPath;
+            els.h3ModeNote.textContent = h3References.length > 0 && hasKeyframes
+                ? 'Choose keyframes or references · remove one set before generating'
+                : (genState.h3Mode === 'continue'
+                    ? 'Continue clip · native video and audio context'
+                    : (genState.h3Mode === 'ref2va'
+                        ? 'Reference guided · start and end frames stay free'
+                        : (genState.h3Mode === 'fl2va'
+                            ? 'Start + end images · H3 fills the motion between them'
+                            : (genState.h3Mode === 'i2va'
+                                ? 'Start image · H3 animates it'
+                                : (genState.h3Mode === 'l2va'
+                                    ? 'End image · H3 builds toward it'
+                                    : 'Text only · add media below when you want conditioning')))));
         }
         renderH3References();
         genState.includeAudio = true;
+        if (els.generateBtn)
+            els.generateBtn.textContent = genState.h3Mode === 'continue'
+                ? 'Continue H3 Video + Audio' : 'Generate H3 Video + Audio';
         updateCanvasDurationHint();
     }
     function activeCanvasWanRunner() {
@@ -6098,9 +6285,10 @@ var CanvasTab = (function () {
             if (name === 'image_to_image' || name === 'image_conditioning') {
                 return {
                     supported: genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va' ||
-                        genState.h3Mode === 'ref2va',
-                    policy: genState.h3Mode === 'ref2va' ? 'reference_only' : 'keyframe',
-                    note: genState.h3Mode === 'ref2va'
+                        genState.h3Mode === 'ref2va' || genState.h3Mode === 'continue',
+                    policy: (genState.h3Mode === 'ref2va' || genState.h3Mode === 'continue')
+                        ? 'reference_only' : 'keyframe',
+                    note: (genState.h3Mode === 'ref2va' || genState.h3Mode === 'continue')
                         ? 'The Source guides identity/style without becoming frame zero'
                         : 'The Canvas image becomes the H3 first-frame keyframe'
                 };
@@ -7060,6 +7248,9 @@ var CanvasTab = (function () {
         els.cfgRow.style.display = (isFlux || isVideo) ? 'none' : 'flex';
         els.guidanceRow.style.display = isFlux ? 'flex' : 'none';
         els.videoSection.style.display = isVideo ? 'block' : 'none';
+        els.videoFramesRow.style.display = isH3 ? 'none' : 'flex';
+        els.videoFpsRow.style.display = isH3 ? 'none' : 'flex';
+        els.durationHint.style.display = isH3 ? 'none' : '';
         els.denoiseRow.style.display = isVideo ? 'none' : 'flex';
         els.denoiseHelp.style.display = isVideo ? 'none' : 'block';
         els.ltx2Section.style.display = isLtx2 ? 'flex' : 'none';
@@ -7111,6 +7302,11 @@ var CanvasTab = (function () {
             applyCanvasLtx2GuidanceMode();
         }
         else if (isH3) {
+            // A model switch must adopt H3's own inference default instead of
+            // inheriting another model's global value (notably Wan's 50).
+            // Refreshes within H3 preserve whatever the user entered.
+            if (previousArch !== arch)
+                genState.steps = canvasH3DefaultSteps();
             setCanvasSelectOptions(els.sampler, [
                 { value: 'flowmatch_euler', label: 'H3 flow scheduler' }
             ], 'flowmatch_euler', false);
@@ -7412,9 +7608,12 @@ var CanvasTab = (function () {
             }
         }
         if (genState.arch === 'minimax_h3') {
+            syncCanvasH3Mode();
             applyCanvasH3AuthoredGeometry();
             if (!exactCanvasH3Profile()) {
-                showError('Choose H3 width and height from 32–2048 in 32-pixel steps, at most 1,032,192 total pixels, and a duration from 1–15 seconds.');
+                var h3DurationMax = canvasH3MaxDurationForSize(
+                    Number(els.h3Width.value), Number(els.h3Height.value));
+                showError('Choose H3 width and height from 32–2048 in 32-pixel steps, at most 1,032,192 total pixels, and a duration from 1 to ' + h3DurationMax.toFixed(2) + ' seconds for this mode and resolution.');
                 return;
             }
         }
@@ -7468,9 +7667,16 @@ var CanvasTab = (function () {
                 (genState.h3Mode === 'i2va' || genState.h3Mode === 'fl2va');
             var h3NeedsLast = genState.arch === 'minimax_h3' &&
                 (genState.h3Mode === 'l2va' || genState.h3Mode === 'fl2va');
-            if (h3NeedsFirst && !hasContent && !hasExactH3ImageSource) {
-                showError('MiniMax-H3 ' + genState.h3Mode.toUpperCase() +
-                    ' requires a loaded image or composed Canvas first frame');
+            var h3HasKeyframes = hasExactH3ImageSource || !!h3LastFrameFile ||
+                !!h3LastFrameUploadedPath;
+            if (genState.arch === 'minimax_h3' && h3References.length > 0 &&
+                h3HasKeyframes && genState.h3Mode !== 'continue') {
+                showError('Use H3 keyframes or references in one request, not both. Remove the start/end images or clear the references.');
+                setCanvasGenerating(false);
+                return;
+            }
+            if (h3NeedsFirst && !hasExactH3ImageSource) {
+                showError('Add a start image for this H3 request');
                 setCanvasGenerating(false);
                 return;
             }
@@ -7480,13 +7686,21 @@ var CanvasTab = (function () {
                 setCanvasGenerating(false);
                 return;
             }
-            if (genState.arch === 'minimax_h3' && genState.h3Mode === 'ref2va') {
+            if (genState.arch === 'minimax_h3' &&
+                (genState.h3Mode === 'ref2va' ||
+                    (genState.h3Mode === 'continue' && h3References.length > 0))) {
                 var h3RefCounts = h3ReferenceCounts(h3References);
                 if (h3RefCounts.image + h3RefCounts.video === 0) {
                     showError('H3 audio references must accompany at least one image or video reference');
                     setCanvasGenerating(false);
                     return;
                 }
+            }
+            if (genState.arch === 'minimax_h3' &&
+                genState.h3Mode === 'continue' && !genState.h3ContinueFrom) {
+                showError('Choose Continue H3 on a completed native H3 video first');
+                setCanvasGenerating(false);
+                return;
             }
             if (h3NeedsLast && !h3LastFrameFile) {
                 showError('MiniMax-H3 ' + genState.h3Mode.toUpperCase() +
@@ -7561,7 +7775,7 @@ var CanvasTab = (function () {
                 (genState.arch === 'ltxv' &&
                     (hasContent || hasExactLtx2ImageSource || hasLtx2VideoSource)) ||
                 (genState.arch === 'minimax_h3' && h3NeedsFirst &&
-                    (hasContent || hasExactH3ImageSource)) ||
+                    hasExactH3ImageSource) ||
                 (genState.arch === 'wan' && hasContent);
             var featureError = validateCanvasGenerationFeatures(
                 consumesCanvasSource && (hasContent || hasExactLtx2ImageSource || hasExactH3ImageSource),
@@ -7638,6 +7852,8 @@ var CanvasTab = (function () {
                 h3Quant: genState.h3Quant,
                 h3AttentionBackend: genState.h3AttentionBackend,
                 h3StepCache: genState.h3StepCache,
+                h3ContinueFrom: genState.h3ContinueFrom,
+                h3ContextFrames: genState.h3ContextFrames,
                 h3LastFrame: h3LastFrameFile ? h3LastFrameFile.name : '',
                 ltx2RetakeStart: genState.ltx2RetakeStart,
                 ltx2RetakeDuration: genState.ltx2RetakeDuration,
@@ -7675,9 +7891,7 @@ var CanvasTab = (function () {
                 ? String(ltx2CheckpointWorkflow.id || '') : '';
             if (genState.arch === 'minimax_h3') {
                 var h3SourceUpload = h3NeedsFirst
-                    ? (hasExactH3ImageSource
-                        ? imageDataUrlAsPngBase64(editSourceDataUrl).then(uploadInitImage)
-                        : exportBoundingBoxRegion().then(uploadInitImage))
+                    ? imageDataUrlAsPngBase64(editSourceDataUrl).then(uploadInitImage)
                     : Promise.resolve('');
                 var h3LastUpload = h3NeedsLast
                     ? (h3LastFrameUploadedPath
@@ -7686,7 +7900,8 @@ var CanvasTab = (function () {
                             .then(imageDataUrlAsPngBase64)
                             .then(uploadInitImage)))
                     : Promise.resolve('');
-                var h3ReferenceUploads = genState.h3Mode === 'ref2va'
+                var h3ReferenceUploads = (genState.h3Mode === 'ref2va' ||
+                    genState.h3Mode === 'continue')
                     ? resolvedH3References() : Promise.resolve([]);
                 Promise.all([h3SourceUpload, h3LastUpload, h3ReferenceUploads]).then(function (images) {
                     queueWorkflow(WorkflowBuilder.build({
@@ -7704,6 +7919,8 @@ var CanvasTab = (function () {
                         h3AttentionBackend: genState.h3AttentionBackend,
                         h3StepCache: genState.h3StepCache,
                         h3Task: genState.h3Mode,
+                        h3ContinueFrom: genState.h3ContinueFrom,
+                        h3ContextFrames: genState.h3ContextFrames,
                         initImageName: images[0],
                         lastImageName: images[1],
                         h3References: images[2]
@@ -8524,8 +8741,18 @@ var CanvasTab = (function () {
                 pendingCanvasMetadata.promptId = pendingCanvasPromptId;
             if (typeof CanvasStatusBar !== 'undefined')
                 CanvasStatusBar.updateGenStatus('queued');
-            if (result && result.video_pending && result.video_result)
+            if (result && result.video_pending && result.video_result) {
                 pollVideoJob(result.video_result);
+            }
+            else if (result && result.video_result &&
+                result.video_result.state === 'done') {
+                // A fast backend or an intercepted product test may return a
+                // terminal video result directly. Do not leave Canvas in the
+                // cancel-only state; the normal asynchronous route is handled
+                // by pollVideoJob above.
+                pendingCanvasPromptId = '';
+                setCanvasGenerating(false);
+            }
         })
             .catch(function (err) {
             showError('Failed to queue: ' + err.message);
@@ -8785,18 +9012,96 @@ var CanvasTab = (function () {
         }
         var metadata = result.metadata && typeof result.metadata === 'object'
             ? result.metadata : {};
+        var promptId = String(metadata.promptId || '');
+        // Gallery rows intentionally stay lightweight. Resolve the worker
+        // result only when Continue is chosen so native-tail eligibility is
+        // based on the authoritative per-job manifest, not stale UI metadata.
+        if (/^video-\d+$/.test(promptId) && !metadata.serverResult &&
+            metadata.h3ContinuationPreflight !== true) {
+            metadata.h3ContinuationPreflight = true;
+            Promise.all([
+                fetch('/out/' + encodeURIComponent(promptId) + '/result.json')
+                    .then(function (response) {
+                        if (!response.ok)
+                            throw new Error('HTTP ' + response.status);
+                        return response.json();
+                    }),
+                fetch('/out/' + encodeURIComponent(promptId) + '/request.json')
+                    .then(function (response) {
+                        return response.ok ? response.json() : {};
+                    }).catch(function () { return {}; })
+            ]).then(function (documents) {
+                    metadata.serverResult = documents[0];
+                    metadata.serverRequest = documents[1];
+                    result.metadata = metadata;
+                    prepareH3Continuation(result);
+                }).catch(function () {
+                    // Older jobs legitimately have no native tail. Preserve
+                    // the exact-final-frame I2VA fallback in that case.
+                    result.metadata = metadata;
+                    prepareH3Continuation(result);
+                });
+            return;
+        }
         var params = metadata.params && typeof metadata.params === 'object'
             ? metadata.params : metadata;
+        var serverResult = metadata.serverResult &&
+            typeof metadata.serverResult === 'object'
+            ? metadata.serverResult : {};
+        var manifest = serverResult.server_result ||
+            serverResult.worker_result || serverResult;
+        var nativeContinuation = /^video-\d+$/.test(promptId) &&
+            manifest.model === 'minimax_h3' &&
+            manifest.motion_context_available === true;
         if (!selectFirstCanvasModelForArch('minimax_h3')) {
             showError('MiniMax-H3 is not available in the Canvas model list');
             return;
         }
+        // Continue is a new authored request. Do not let media left over from
+        // another Canvas request silently change its inferred H3 route.
+        h3References = [];
+        clearH3LastFrame();
+        clearCanvasEditSource();
         genState.editMode = 'create';
         if (els.editMode)
             els.editMode.value = 'create';
-        genState.h3Mode = 'i2va';
-        var width = Number(params.width);
-        var height = Number(params.height);
+        genState.h3Mode = nativeContinuation ? 'continue' : 'i2va';
+        genState.h3ContinueFrom = nativeContinuation ? promptId : '';
+        if (!nativeContinuation) {
+            // The decoded-final-frame fallback is the quality-preserving
+            // recovery path for older jobs. Use BF16 explicitly, which also
+            // makes its cU-DNN-only attention contract unambiguous.
+            genState.h3Quant = 'bf16';
+            genState.h3AttentionBackend = 'cudnn';
+        }
+        if (nativeContinuation) {
+            genState.h3ContextFrames = 22;
+            genState.h3StepCache = 'exact';
+            var sourceRequest = metadata.serverRequest &&
+                typeof metadata.serverRequest === 'object'
+                ? metadata.serverRequest : {};
+            var sourceReferences = Array.isArray(sourceRequest.references)
+                ? sourceRequest.references
+                : (Array.isArray(manifest.references) ? manifest.references : []);
+            h3References = sourceReferences.filter(function (reference) {
+                    return reference && ['image', 'video', 'audio']
+                        .indexOf(reference.kind) >= 0 && reference.path;
+                }).slice(0, 12).map(function (reference) {
+                    return {
+                        kind: reference.kind,
+                        name: String(reference.name || reference.path || reference.kind),
+                        path: String(reference.path || ''),
+                        audioUse: ['reference', 'reuse', 'voice_timbre']
+                            .indexOf(reference.audio_use || reference.audioUse) >= 0
+                            ? (reference.audio_use || reference.audioUse) : 'reference',
+                        file: null,
+                        uploadPromise: null,
+                        error: ''
+                    };
+                });
+        }
+        var width = Number(manifest.width || params.width);
+        var height = Number(manifest.height || params.height);
         if (width >= 32 && width <= 2048 && width % 32 === 0 &&
             height >= 32 && height <= 2048 && height % 32 === 0) {
             genState.width = width;
@@ -8805,24 +9110,40 @@ var CanvasTab = (function () {
             genState.h3ProfileKey = canvasH3Resolution(resolutionKey)
                 ? resolutionKey : 'custom';
         }
-        var fps = Math.max(1, Math.min(120, Number(params.fps) || genState.fps || 24));
-        var duration = Number(params.duration_seconds || params.duration);
+        var fps = Math.max(1, Math.min(120,
+            Number(manifest.fps || params.fps) || genState.fps || 24));
+        var duration = Number(params.duration_seconds || params.duration ||
+            (Number(manifest.frames) > 0 ? Number(manifest.frames) / fps : 0));
         genState.fps = fps;
-        if (Number.isFinite(duration) && duration > 0)
-            genState.h3Duration = Math.max(1, Math.min(15, duration));
+        if (Number.isFinite(duration) && duration > 0) {
+            var durationMax = canvasH3MaxDurationForSize(
+                genState.width, genState.height);
+            genState.h3Duration = Math.max(1, Math.min(durationMax, duration));
+        }
         genState.frames = Math.max(1, Math.round(genState.h3Duration * genState.fps));
         refreshCanvasH3Controls();
         updateEditWorkspace();
+        if (nativeContinuation) {
+            if (els.h3ContinueSource)
+                els.h3ContinueSource.textContent =
+                    'Source job: ' + promptId + ' · native video + audio latent tail ready';
+            if (els.h3Section)
+                els.h3Section.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            History.push();
+            return;
+        }
         if (els.h3SourceNote)
-            els.h3SourceNote.textContent = 'Extracting the exact final frame for H3 continuation…';
+            els.h3SourceNote.textContent =
+                'This older or non-H3 result has no native A/V tail. Extracting the exact final frame for I2VA fallback…';
         extractVideoLastFrameDataUrl(result.src, fps).then(function (dataUrl) {
             selectGalleryImageAsCanvasSource(dataUrl, metadata);
             refreshCanvasH3Controls();
             updateEditWorkspace();
             if (els.h3SourceNote)
                 els.h3SourceNote.textContent =
-                    'Continuation frame ready from ' + (result.filename || 'the completed video') +
-                    '. Choose BF16, INT8 Quality, or INT8 Fast, then author the next segment.';
+                    'I2VA fallback frame ready from ' +
+                    (result.filename || 'the completed video') +
+                    '. Native audio continuation is unavailable for this source.';
             if (els.h3Section)
                 els.h3Section.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
             History.push();

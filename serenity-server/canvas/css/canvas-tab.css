@@ -969,6 +969,72 @@
     border-radius: 7px;
     background: color-mix(in srgb, var(--shell-bg-panel) 82%, transparent);
 }
+
+.cv-h3-route-pill {
+    padding: 8px 10px;
+    border-left: 3px solid var(--shell-accent);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--shell-accent) 12%, var(--shell-bg-panel));
+    color: var(--shell-text);
+    font-size: 11px;
+    line-height: 1.35;
+}
+
+.cv-h3-media-card {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    padding: 9px;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--shell-bg-surface) 70%, transparent);
+}
+
+#cv-h3-width,
+#cv-h3-height {
+    width: 100%;
+    flex: 1;
+    text-align: left;
+}
+
+.cv-h3-number {
+    width: 100%;
+    box-sizing: border-box;
+    text-align: left;
+}
+
+#cv-h3-source-row,
+#cv-h3-last-frame-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+#cv-h3-source-row .cv-import-btn,
+#cv-h3-last-frame-row .cv-import-btn {
+    width: auto;
+    flex: 1;
+    border-color: color-mix(in srgb, var(--shell-accent) 42%, var(--shell-border));
+    color: var(--shell-text);
+}
+
+#cv-h3-source-row .cv-helper-text,
+#cv-h3-last-frame-row .cv-helper-text {
+    flex-basis: 100%;
+}
+
+.cv-h3-advanced > summary,
+#cv-h3-references-row > details > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.cv-h3-advanced[open],
+#cv-h3-references-row > details[open] {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
 .cv-path-label { min-width: 0; margin-top: 2px; }
 .cv-path-input {
     width: 100%;

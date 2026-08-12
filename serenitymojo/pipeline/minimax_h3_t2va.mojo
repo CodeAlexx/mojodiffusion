@@ -255,7 +255,9 @@ from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.io.cap_cache import save_tensor_bin, load_tensor_bin
 from serenitymojo.components.artifacts import shell_quote
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import reshape, permute, slice, add, mul
+from serenitymojo.ops.tensor_algebra import (
+    reshape, permute, slice, add, mul, mul_scalar, concat,
+)
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
 from serenitymojo.audio.wav import save_wav
 
@@ -269,6 +271,7 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_expected_shape,
     minimax_h3_block_forward,
     minimax_h3_block_forward_dynamic,
+    minimax_h3_sage_exact_prefix_backend,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
@@ -327,6 +330,15 @@ from serenitymojo.models.dit.minimax_h3_sampling import (
     MiniMaxH3DualSchedule,
     MiniMaxH3SamplingGeometry,
     minimax_h3_build_sampling_geometry,
+)
+from serenitymojo.models.minimax_h3.motion_context import (
+    MINIMAX_H3_MOTION_CONTEXT_FPS,
+    minimax_h3_build_motion_context_geometry,
+    minimax_h3_load_motion_context,
+    minimax_h3_motion_context_audio_latents,
+    minimax_h3_motion_context_steps,
+    minimax_h3_preflight_motion_context,
+    minimax_h3_save_motion_context_tail_at_pixel_frame,
 )
 from serenitymojo.models.minimax_h3.rearrange import minimax_h3_unpack_audio
 from serenitymojo.models.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
@@ -459,6 +471,15 @@ comptime WIDTH = get_defined_int["H3_WIDTH", 832]()
 comptime FRAMES = get_defined_int["H3_FRAMES", 22]()
 comptime TEXT_TOKENS = get_defined_int["H3_TEXT_TOKENS", 32]()
 comptime FPS = 24
+comptime MINIMAX_H3_TRAINED_MAX_FRAMES = 362
+comptime MINIMAX_H3_SINGLE_PASS_MAX_FRAMES = 1450
+# Direct-CLI guard. The server uses a slightly lower 107k estimate so real
+# prompt rows retain headroom beneath this measured maximum-shape envelope.
+comptime MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE = 109303
+# The product path may request eight W8A8 blocks through the largest directly
+# gated exact-attention sequence (S=37,951). The runner knows the real prompt
+# length and owns the final safety cap.
+comptime MINIMAX_H3_FAST_RESIDENT_EXACT_SEQUENCE_LIMIT = 38000
 
 comptime LATENT_H = HEIGHT // 16
 comptime LATENT_W = WIDTH // 16
@@ -750,6 +771,24 @@ def _minimax_h3_global_timestep_row(
     return out^
 
 
+def _minimax_h3_motion_context_global_timestep_row(
+    geometry: MiniMaxH3SamplingGeometry, step: Int
+) raises -> List[Int]:
+    """Global 4-row modulation-cache addressing for latent continuation."""
+    var out = List[Int](capacity=geometry.sequence_length)
+    for _ in range(geometry.sequence_length):
+        out.append(4 * step)
+    for i in range(geometry.num_condition_video_rows):
+        out[geometry.video_indices[i]] = 4 * step + 2
+    for i in range(geometry.num_condition_audio_rows):
+        out[geometry.audio_indices[i]] = 4 * step + 3
+    for i in range(
+        geometry.num_condition_audio_rows, len(geometry.audio_indices)
+    ):
+        out[geometry.audio_indices[i]] = 4 * step + 1
+    return out^
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Video decode seam — STUBBED. See file header "VIDEO DECODE".
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1021,13 +1060,24 @@ def _minimax_h3_decode_video(
 
 
 def _minimax_h3_mux_av(
-    out_dir: String, frames: Int, input_fps: Int, output_fps: Int
+    out_dir: String,
+    frames: Int,
+    input_fps: Int,
+    output_fps: Int,
+    trim_start_frames: Int = 0,
 ) raises -> String:
-    """Mux decoded PNG/WAV artifacts with NVIDIA NVENC, never CPU video encode."""
+    """Mux with NVENC, trimming a continuation overlap in picture and sound."""
+    if trim_start_frames < 0:
+        raise Error("MiniMax-H3 trim-start frames cannot be negative")
     var mp4 = out_dir + String("/video.mp4")
     var cmd = String("ffmpeg -v error -y -framerate ") + String(input_fps)
-    cmd += String(" -start_number 0 -i ")
+    cmd += String(" -start_number ") + String(trim_start_frames) + String(" -i ")
     cmd += shell_quote(out_dir + String("/frame_%05d.png"))
+    if trim_start_frames > 0:
+        var trim_seconds = (
+            Float64(trim_start_frames) / Float64(input_fps)
+        )
+        cmd += String(" -ss ") + String(trim_seconds)
     cmd += String(" -i ") + shell_quote(out_dir + String("/audio.wav"))
     if output_fps != input_fps:
         cmd += String(" -vf fps=") + String(output_fps)
@@ -1497,6 +1547,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     attention_backend: Int,
     step_index: Int,
     mut step_cache: MiniMaxH3StepCache,
+    t2va_contiguous: Bool,
     ctx: DeviceContext,
 ) raises -> MiniMaxH3FrontendOutput:
     var sequence_length = geometry.sequence_length
@@ -1528,7 +1579,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             frontend_w,
             config,
             ctx,
-            True,
+            t2va_contiguous,
         )
     var hidden3 = reshape(
         embed.hidden, [1, sequence_length, config.hidden_size], ctx
@@ -1718,6 +1769,7 @@ def main() raises:
     var quant = String("int8") if use_resident else String("bf16")
     var attention_backend = MINIMAX_H3_ATTN_CUDNN
     var attention_backend_name = String("cudnn")
+    var sage_exact_av_prefix = False
     var step_cache_enabled = False
     var step_cache_name = String("exact")
     var resident_scheme = MINIMAX_H3_RESIDENT_INT8
@@ -1730,6 +1782,9 @@ def main() raises:
     var validate_request = False
     var eval_start = 0
     var eval_stop = -1
+    var motion_context_path = String("")
+    var motion_context_frames = 22
+    var trim_start_frames = 0
     for i in range(len(raw_args)):
         var arg = String(raw_args[i])
         if arg.startswith("--width="):
@@ -1779,10 +1834,12 @@ def main() raises:
         if arg == String("--attention-backend=sage-int8"):
             attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
             attention_backend_name = String("sage-int8")
+            sage_exact_av_prefix = True
             continue
         if arg == String("--attention-backend=cudnn"):
             attention_backend = MINIMAX_H3_ATTN_CUDNN
             attention_backend_name = String("cudnn")
+            sage_exact_av_prefix = False
             continue
         if arg.startswith("--attention-backend="):
             raise Error(
@@ -1852,7 +1909,32 @@ def main() raises:
                 raise Error("invalid --eval-stop flag")
             eval_stop = atol(String(fields[1]))
             continue
+        if arg.startswith("--motion-context="):
+            var fields = arg.split("=")
+            if len(fields) != 2 or String(fields[1]).byte_length() == 0:
+                raise Error("invalid --motion-context flag")
+            motion_context_path = String(fields[1])
+            continue
+        if arg.startswith("--motion-context-frames="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --motion-context-frames flag")
+            motion_context_frames = atol(String(fields[1]))
+            continue
+        if arg.startswith("--trim-start-frames="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --trim-start-frames flag")
+            trim_start_frames = atol(String(fields[1]))
+            continue
         args.append(arg)
+    var motion_context_enabled = motion_context_path != String("")
+    if motion_context_enabled:
+        _ = minimax_h3_motion_context_steps(motion_context_frames)
+        if trim_start_frames == 0:
+            trim_start_frames = motion_context_frames
+    elif trim_start_frames != 0:
+        raise Error("--trim-start-frames requires --motion-context")
     if quant == String("bf16"):
         use_resident = False
     elif quant == String("int8"):
@@ -1867,6 +1949,11 @@ def main() raises:
         raise Error(
             String("unknown --quant value: ") + quant
             + String(" (expected bf16, int8, or int8-fast)")
+        )
+    if quant == String("bf16") and attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+        raise Error(
+            "MiniMax-H3 Sage attention is INT8-only; use --attention-backend=cudnn"
+            " with --quant=bf16"
         )
     if len(args) < 3:
         print(
@@ -1883,6 +1970,9 @@ def main() raises:
             " [--prepare-runtime-cache]"
             " [--validate-request]"
             " [--eval-start=N] [--eval-stop=N]"
+            " [--motion-context=PATH]"
+            " [--motion-context-frames=5|22|39]"
+            " [--trim-start-frames=N]"
             " [--defer-video-decode]"
         )
         print(
@@ -1927,6 +2017,13 @@ def main() raises:
         raise Error("MiniMax-H3 output frames must be positive")
     if output_fps < 1 or output_fps > 120:
         raise Error("MiniMax-H3 output FPS must be in [1,120]")
+    if motion_context_enabled:
+        if runtime_fps != MINIMAX_H3_MOTION_CONTEXT_FPS:
+            raise Error("MiniMax-H3 motion context requires native 24 FPS")
+        if trim_start_frames != motion_context_frames:
+            raise Error(
+                "MiniMax-H3 motion context must trim exactly its overlap"
+            )
     var latent_h = runtime_height // 16
     var latent_w = runtime_width // 16
     var num_latent_frames = (runtime_frames - 5) // 17 * 5 + 2
@@ -1936,9 +2033,34 @@ def main() raises:
     var rows_per_frame = (latent_h // PATCH_H) * (latent_w // PATCH_W)
     var num_video_rows = num_latent_frames * rows_per_frame
     var num_audio_rows = num_audio_latents * 2
+    var num_condition_video_rows = 0
+    var num_condition_audio_rows = 0
+    if motion_context_enabled:
+        num_condition_video_rows = (
+            minimax_h3_motion_context_steps(motion_context_frames)
+            * rows_per_frame
+        )
+        num_condition_audio_rows = (
+            minimax_h3_motion_context_audio_latents(motion_context_frames) * 2
+        )
     var sequence_length = (
-        runtime_text_tokens + num_audio_rows + num_video_rows
+        runtime_text_tokens + num_condition_video_rows
+        + num_condition_audio_rows + num_audio_rows + num_video_rows
     )
+    if (
+        sequence_length > MINIMAX_H3_FAST_RESIDENT_EXACT_SEQUENCE_LIMIT
+        and resident_blocks_requested > 0
+    ):
+        print(
+            "  resident policy: exact S=", sequence_length,
+            "exceeds", MINIMAX_H3_FAST_RESIDENT_EXACT_SEQUENCE_LIMIT,
+            "; using streamed weights",
+        )
+        resident_blocks_requested = 0
+    if sage_exact_av_prefix and not motion_context_enabled:
+        attention_backend = minimax_h3_sage_exact_prefix_backend(
+            runtime_text_tokens + num_audio_rows
+        )
     if runtime_width < 32 or runtime_width > 2048 \
             or runtime_height < 32 or runtime_height > 2048 \
             or runtime_width % 32 != 0 or runtime_height % 32 != 0:
@@ -1946,10 +2068,27 @@ def main() raises:
             "MiniMax-H3 width and height must each be in [32, 2048]"
             " and divisible by 32"
         )
-    if runtime_frames < 5 or runtime_frames > 362 or runtime_frames % 17 != 5:
+    if runtime_frames < 5 or runtime_frames > MINIMAX_H3_SINGLE_PASS_MAX_FRAMES \
+            or runtime_frames % 17 != 5:
         raise Error(
-            "MiniMax-H3 internal frames must be in [5, 362] and satisfy"
+            "MiniMax-H3 internal frames must be in [5, 1450] and satisfy"
             " frames % 17 == 5"
+        )
+    if (
+        trim_start_frames >= runtime_frames
+        or Float64(runtime_frames - trim_start_frames) / Float64(runtime_fps)
+            < Float64(output_frames) / Float64(output_fps)
+    ):
+        raise Error(
+            "MiniMax-H3 internal frames do not cover the requested output"
+            " after motion-context trimming"
+        )
+    if runtime_frames > MINIMAX_H3_TRAINED_MAX_FRAMES \
+            and sequence_length > MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE:
+        raise Error(
+            String("MiniMax-H3 experimental single-pass long context S=")
+            + String(sequence_length) + " exceeds the 109303-token 24-GB"
+            " envelope; lower resolution or duration"
         )
     if validate_request:
         print(
@@ -2009,7 +2148,8 @@ def main() raises:
             config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
         )
         var artifact = _minimax_h3_mux_av(
-            out_dir, output_frames, runtime_fps, output_fps
+            out_dir, output_frames, runtime_fps, output_fps,
+            trim_start_frames,
         )
         _minimax_h3_write_decode_result(
             out_dir, artifact, output_frames, runtime_width, runtime_height,
@@ -2049,6 +2189,18 @@ def main() raises:
     )
     var config = minimax_h3_released_config()
     config.validate()
+    if motion_context_enabled:
+        minimax_h3_preflight_motion_context(
+            motion_context_path,
+            rows_per_frame,
+            config.video_patch_dim(),
+            config.audio_latents_dim,
+            motion_context_frames,
+        )
+        print(
+            "  preflight: native motion context", motion_context_frames,
+            "frames from", motion_context_path,
+        )
     if max_blocks > config.num_layers:
         max_blocks = config.num_layers
     var partial_mode = max_blocks < config.num_layers
@@ -2130,12 +2282,61 @@ def main() raises:
         Float64(t_cond1 - t_cond0) / 1.0e9, "s)",
     )
 
+    # Load the previous clip's compact latent tail directly onto the GPU.
+    # Video condition noise is mixed once, then remains pinned for every
+    # denoise step; audio remains bit-identical to the generated source tail.
+    var condition_video_rows = Optional[Tensor](None)
+    var condition_audio_rows = Optional[Tensor](None)
+    var source_audio_overhang = Float64(0.0)
+    if motion_context_enabled:
+        var loaded_context = minimax_h3_load_motion_context(
+            motion_context_path,
+            rows_per_frame,
+            config.video_patch_dim(),
+            config.audio_latents_dim,
+            motion_context_frames,
+            runtime_width,
+            runtime_height,
+            ctx,
+        )
+        source_audio_overhang = loaded_context.source_audio_overhang
+        var condition_noise = randn(
+            loaded_context.video_rows.shape().copy(), seed + 102,
+            STDtype.F32, ctx,
+        )
+        var scaled_video = mul_scalar(
+            loaded_context.video_rows, Float32(0.999), ctx
+        )
+        var scaled_noise = mul_scalar(
+            condition_noise, Float32(0.001), ctx
+        )
+        var noisy_video = add(scaled_video, scaled_noise, ctx)
+        condition_video_rows = Optional[Tensor](noisy_video^)
+        condition_audio_rows = Optional[Tensor](slice(
+            loaded_context.audio_rows, 0, 0,
+            loaded_context.audio_rows.shape()[0], ctx,
+        ))
+        print(
+            "  motion context: pinned video rows=",
+            condition_video_rows.value().shape()[0],
+            " audio rows=", condition_audio_rows.value().shape()[0],
+            " source_audio_overhang=", source_audio_overhang,
+        )
+
     # ── 2. Packed-sequence geometry (host scalar, this port's own reproduction) ──
     var no_anchors = List[Int]()
-    var geometry = minimax_h3_build_sampling_geometry(
-        cond.token_tags, num_latent_frames, latent_h, latent_w,
-        num_audio_latents, PATCH_H, PATCH_W, no_anchors,
-    )
+    var geometry: MiniMaxH3SamplingGeometry
+    if motion_context_enabled:
+        geometry = minimax_h3_build_motion_context_geometry(
+            cond.token_tags, num_latent_frames, latent_h, latent_w,
+            num_audio_latents, PATCH_H, PATCH_W, motion_context_frames,
+            source_audio_overhang,
+        )
+    else:
+        geometry = minimax_h3_build_sampling_geometry(
+            cond.token_tags, num_latent_frames, latent_h, latent_w,
+            num_audio_latents, PATCH_H, PATCH_W, no_anchors,
+        )
     if geometry.sequence_length != sequence_length:
         raise Error(
             String("minimax_h3_t2va: geometry.sequence_length ")
@@ -2143,9 +2344,11 @@ def main() raises:
             + String(sequence_length) + " — runtime geometry derivation"
             " drifted from the shared packing implementation"
         )
-    if len(geometry.video_indices) != num_video_rows:
+    if len(geometry.video_indices) \
+            != num_condition_video_rows + num_video_rows:
         raise Error("minimax_h3_t2va: video row count mismatch")
-    if len(geometry.audio_indices) != num_audio_rows:
+    if len(geometry.audio_indices) \
+            != num_condition_audio_rows + num_audio_rows:
         raise Error("minimax_h3_t2va: audio row count mismatch")
 
     # ── 3. MM-RoPE tables (device) ─────────────────────────────────────────
@@ -2181,18 +2384,29 @@ def main() raises:
 
     # ── 5. AdaLN modulation cache — ONE streamed pass, built ONCE ──────────
     var t_mod0 = perf_counter_ns()
-    var distinct_timesteps = 2 * num_steps
+    var distinct_timesteps = (
+        4 * num_steps if motion_context_enabled else 2 * num_steps
+    )
     var temb_timesteps = List[Float32](capacity=distinct_timesteps)
     for i in range(num_steps):
-        temb_timesteps.append(schedule.video_timestep(i))
+        var video_t = schedule.video_timestep(i)
+        temb_timesteps.append(video_t)
         temb_timesteps.append(schedule.audio_timestep(i))
+        if motion_context_enabled:
+            temb_timesteps.append(
+                video_t if video_t > Float32(0.999) else Float32(0.999)
+            )
+            temb_timesteps.append(Float32(1.0))
     var temb_shape: List[Int] = [distinct_timesteps]
     var temb_timesteps_tensor = Tensor.from_host(temb_timesteps, temb_shape^, STDtype.F32, ctx)
 
     var frontend_w = _minimax_h3_load_frontend_weights(transformer_shards, config, ctx)
     var temb = minimax_h3_timestep_embedding(temb_timesteps_tensor, frontend_w, config, ctx)
     var modcache_path = (
-        String(RUNTIME_CACHE_DIR) + String("/modcache_steps_")
+        String(RUNTIME_CACHE_DIR) + (
+            String("/modcache_motion_context_steps_")
+            if motion_context_enabled else String("/modcache_steps_")
+        )
         + String(steps) + String("_blocks_")
         + String(run_config.num_layers) + String(".safetensors")
     )
@@ -2341,22 +2555,63 @@ def main() raises:
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
         var audio_ts = schedule.audio_timestep(i)
-        var global_row = _minimax_h3_global_timestep_row(geometry.token_tags, i)
+        var global_row = _minimax_h3_global_timestep_row(
+            geometry.token_tags, i
+        )
+        if motion_context_enabled:
+            global_row = _minimax_h3_motion_context_global_timestep_row(
+                geometry, i
+            )
         var block_adaln_indices = minimax_h3_adaln_rows(global_row, geometry.token_tags)
 
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
-        var frontend_out = _minimax_h3_model_eval_p[241](
-            video_state, audio_state, text_rows, placeholder_ts, geometry,
-            frontend_w, config, run_config, modcache, global_row,
-            block_adaln_indices, transformer_shards, fp8_resident,
-            reusable_w8a8_tail,
-            use_resident, resident_scheme, resident_cache_path, rope[0],
-            rope[1], rotary_dim, attention_backend, i, step_cache, ctx,
-        )
-
-        video_state = schedule.step_video_device(frontend_out.video_out, video_ts, video_state, ctx)
-        audio_state = schedule.step_audio_device(frontend_out.audio_out, audio_ts, audio_state, ctx)
+        if motion_context_enabled:
+            var video_rows_combined = concat(
+                0, ctx, condition_video_rows.value(), video_state
+            )
+            var audio_rows_combined = concat(
+                0, ctx, condition_audio_rows.value(), audio_state
+            )
+            var frontend_out = _minimax_h3_model_eval_p[241](
+                video_rows_combined, audio_rows_combined, text_rows,
+                placeholder_ts, geometry, frontend_w, config, run_config,
+                modcache, global_row, block_adaln_indices,
+                transformer_shards, fp8_resident, reusable_w8a8_tail,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, i, step_cache, False,
+                ctx,
+            )
+            var target_video_out = slice(
+                frontend_out.video_out, 0, num_condition_video_rows,
+                num_video_rows, ctx,
+            )
+            var target_audio_out = slice(
+                frontend_out.audio_out, 0, num_condition_audio_rows,
+                num_audio_rows, ctx,
+            )
+            video_state = schedule.step_video_device(
+                target_video_out, video_ts, video_state, ctx
+            )
+            audio_state = schedule.step_audio_device(
+                target_audio_out, audio_ts, audio_state, ctx
+            )
+        else:
+            var frontend_out = _minimax_h3_model_eval_p[241](
+                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                frontend_w, config, run_config, modcache, global_row,
+                block_adaln_indices, transformer_shards, fp8_resident,
+                reusable_w8a8_tail,
+                use_resident, resident_scheme, resident_cache_path, rope[0],
+                rope[1], rotary_dim, attention_backend, i, step_cache, True,
+                ctx,
+            )
+            video_state = schedule.step_video_device(
+                frontend_out.video_out, video_ts, video_state, ctx
+            )
+            audio_state = schedule.step_audio_device(
+                frontend_out.audio_out, audio_ts, audio_state, ctx
+            )
         ctx.synchronize()
         var t_step1 = perf_counter_ns()
         print(
@@ -2402,6 +2657,25 @@ def main() raises:
     lat_tensors.append(ArcPointer[Tensor](slice(audio_state, 0, 0, audio_state.shape()[0], ctx)))
     save_safetensors(lat_names, lat_tensors, out_dir + "/latents.safetensors", ctx)
     print("  saved final latents ->", out_dir + "/latents.safetensors")
+    var continuation_end_pixel_frames = trim_start_frames + Int(round(
+        Float64(output_frames) * Float64(runtime_fps)
+        / Float64(output_fps)
+    ))
+    var saved_motion_frames = minimax_h3_save_motion_context_tail_at_pixel_frame(
+        video_state,
+        audio_state,
+        num_latent_frames,
+        num_audio_latents,
+        continuation_end_pixel_frames,
+        runtime_width,
+        runtime_height,
+        out_dir + String("/motion_context.safetensors"),
+        ctx,
+    )
+    print(
+        "  saved native A/V continuation tail (", saved_motion_frames,
+        " frames) ->", out_dir + "/motion_context.safetensors",
+    )
 
     var t_denoise1 = perf_counter_ns()
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")
@@ -2441,6 +2715,16 @@ def main() raises:
     result_body += String("  \"fps\":") + String(output_fps) + String(",\n")
     result_body += String("  \"internal_fps\":") + String(runtime_fps) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(sequence_length) + String(",\n")
+    result_body += String("  \"motion_context\":") \
+        + json_bool(motion_context_enabled) + String(",\n")
+    result_body += String("  \"motion_context_frames\":") \
+        + String(motion_context_frames if motion_context_enabled else 0) \
+        + String(",\n")
+    result_body += String("  \"trim_start_frames\":") \
+        + String(trim_start_frames) + String(",\n")
+    result_body += String("  \"motion_context_artifact\":\"") \
+        + json_escape(out_dir + String("/motion_context.safetensors")) \
+        + String("\",\n")
     result_body += String("  \"attention_backend\":\"") \
         + attention_backend_name + String("\",\n")
     result_body += String("  \"step_cache\":\"") \
@@ -2493,6 +2777,12 @@ def main() raises:
             String("--output-frames=") + String(output_frames),
             String("--fps=") + String(runtime_fps),
             String("--output-fps=") + String(output_fps),
+            String("--trim-start-frames=") + String(trim_start_frames),
+            (
+                String("--motion-context=") + motion_context_path
+                if motion_context_enabled else String("")
+            ),
+            String("--motion-context-frames=") + String(motion_context_frames),
             String("--quant=") + quant,
             String("--resident-blocks=") + String(resident_blocks_requested),
         )
@@ -2506,7 +2796,8 @@ def main() raises:
     var t_vid1 = perf_counter_ns()
     print("  video decode done (", Float64(t_vid1 - t_vid0) / 1.0e9, "s)")
     var artifact = _minimax_h3_mux_av(
-        out_dir, output_frames, runtime_fps, output_fps
+        out_dir, output_frames, runtime_fps, output_fps,
+        trim_start_frames,
     )
     _minimax_h3_write_decode_result(
         out_dir, artifact, output_frames, runtime_width, runtime_height,

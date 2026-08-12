@@ -71,7 +71,7 @@ from serenitymojo.models.dit.anima_contract import (
 from serenitymojo.training.train_step import LoraAdapter
 
 
-comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_synth_smoke"
+comptime CACHE_DIR = "/home/alex/.serenity/parity/cache/anima_synth_smoke"
 
 comptime H = ANIMA_NUM_HEADS        # 16
 comptime Dh = ANIMA_HEAD_DIM        # 128

@@ -31,6 +31,7 @@ comptime MAP_PRIVATE: Int32 = 0x2
 comptime MAP_NORESERVE: Int32 = 0x4000
 comptime MADV_WILLNEED: Int32 = 3
 comptime MADV_DONTNEED: Int32 = 4
+comptime POSIX_FADV_DONTNEED: Int32 = 4
 comptime _SC_PAGESIZE: Int32 = 30
 comptime O_RDONLY: Int32 = 0
 comptime O_WRONLY: Int32 = 1
@@ -213,6 +214,18 @@ def sys_pwrite(fd: Int, buf: BytePtr, count: Int, offset: Int) -> Int:
 def sys_close(fd: Int) -> Int:
     """close(2). Returns 0 on success, -1 on error."""
     return Int(external_call["close", Int32](Int32(fd)))
+
+
+def sys_posix_fadvise(fd: Int, offset: Int, length: Int, advice: Int32) -> Int:
+    """posix_fadvise(2). Returns an errno value (zero on success).
+
+    `length == 0` means through end-of-file.  Unlike MADV_DONTNEED, the
+    POSIX_FADV_DONTNEED advice targets the file's clean page cache, allowing a
+    completed checkpoint-to-RAM copy to leave its cgroup charge before the GPU
+    denoiser begins."""
+    return Int(external_call["posix_fadvise", Int32](
+        Int32(fd), offset, length, advice
+    ))
 
 
 def sys_pread(fd: Int, buf: BytePtr, count: Int, offset: Int) -> Int:

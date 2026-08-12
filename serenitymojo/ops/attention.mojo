@@ -51,8 +51,13 @@ from linalg.matmul.vendor.blas import matmul
 from nn.attention.gpu.mha import flash_attention
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.autograd_v2.step_slab import StepSlab
-from serenitymojo.ops.attention_flash import sdpa_flash_fwd_padmask
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_fwd_padmask,
+    sdpa_flash_infer_fwd,
+    sdpa_flash_infer_fwd_rect,
+)
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -2023,6 +2028,36 @@ def sdpa_nomask[
     return _sdpa_math[B, S, H, Dh](q, k, v, q, scale, ctx, False)
 
 
+def sdpa_nomask_infer[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Fast production-inference SDPA; training/reference math is untouched.
+
+    cuDNN consumes BF16. F32 product paths narrow only at the attention
+    boundary and widen the result back to F32, matching the already accepted
+    flash-vs-math numerical class. F16 retains the incumbent math path.
+    """
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_nomask_infer: q/k/v dtype mismatch")
+    if q.dtype() == STDtype.BF16:
+        return sdpa_flash_infer_fwd[B, S, H, Dh](q, k, v, scale, ctx)
+    if q.dtype() == STDtype.F32:
+        var q_bf16 = cast_tensor(q, STDtype.BF16, ctx, False)
+        var k_bf16 = cast_tensor(k, STDtype.BF16, ctx, False)
+        var v_bf16 = cast_tensor(v, STDtype.BF16, ctx, False)
+        var out_bf16 = sdpa_flash_infer_fwd[B, S, H, Dh](
+            q_bf16, k_bf16, v_bf16, scale, ctx
+        )
+        return cast_tensor(out_bf16, STDtype.F32, ctx, False)
+    return sdpa_nomask[B, S, H, Dh](q, k, v, scale, ctx)
+
+
 def sdpa_nomask_dynamic(
     q: Tensor,
     k: Tensor,
@@ -2302,6 +2337,33 @@ def sdpa_cross_nomask[
         return _sdpa_cross_math[B, Sq, Skv, H, Dh](q, k, v, scale, ctx)
     else:
         return _sdpa_cross_tiled[B, Sq, Skv, H, Dh](q, k, v, q, scale, ctx, False)
+
+
+def sdpa_cross_nomask_infer[
+    B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Rectangular sibling of `sdpa_nomask_infer` for product inference."""
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_cross_nomask_infer: q/k/v dtype mismatch")
+    if q.dtype() == STDtype.BF16:
+        return sdpa_flash_infer_fwd_rect[B, Sq, Skv, H, Dh](
+            q, k, v, scale, ctx
+        )
+    if q.dtype() == STDtype.F32:
+        var q_bf16 = cast_tensor(q, STDtype.BF16, ctx, False)
+        var k_bf16 = cast_tensor(k, STDtype.BF16, ctx, False)
+        var v_bf16 = cast_tensor(v, STDtype.BF16, ctx, False)
+        var out_bf16 = sdpa_flash_infer_fwd_rect[B, Sq, Skv, H, Dh](
+            q_bf16, k_bf16, v_bf16, scale, ctx
+        )
+        return cast_tensor(out_bf16, STDtype.F32, ctx, False)
+    return sdpa_cross_nomask[B, Sq, Skv, H, Dh](q, k, v, scale, ctx)
 
 
 def sdpa_cross_masked[

@@ -41,7 +41,7 @@ from serenitymojo.training.adamw8bit import (
     adam8bit_step_bnb,
 )
 
-comptime DATA_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/tests/parity/adam8bit_data"
+comptime DATA_DIR = "/home/alex/.serenity/parity/tests/parity/adam8bit_data"
 
 # hyperparams.json of every scenario (bnb 0.49.2 dump generation)
 comptime LR = Float32(1.0e-3)

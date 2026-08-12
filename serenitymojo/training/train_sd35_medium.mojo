@@ -78,7 +78,7 @@ comptime LAT_STD_MAX = Float32(20.0)
 comptime DEFAULT_STEPS = 6
 comptime CLIP = Float32(1.0)
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/sd3.5_medium.safetensors"
-comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sd35_512_smoke"
+comptime CACHE_DIR = "/home/alex/.serenity/parity/cache/eri2_sd35_512_smoke"
 comptime OUT_LORA = "/home/alex/mojodiffusion/output/sd35_lora/sd35_medium_lora.safetensors"
 
 

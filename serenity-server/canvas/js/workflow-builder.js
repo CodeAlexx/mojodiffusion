@@ -1027,7 +1027,8 @@ var WorkflowBuilder = (function () {
                         ? 'bf16'
                         : (p.quantization === 'int8' ? 'int8' : 'int8-fast'),
                     task: p.h3Task || 't2va',
-                    attention_backend: p.h3AttentionBackend === 'sage-int8'
+                    attention_backend: p.quantization !== 'bf16'
+                        && p.h3AttentionBackend === 'sage-int8'
                         ? 'sage-int8' : 'cudnn',
                     step_cache: p.h3StepCache === 'high' ? 'high' : 'exact'
                 }
@@ -1038,6 +1039,11 @@ var WorkflowBuilder = (function () {
                     model: ['1', 0],
                     task: p.h3Task || 't2va',
                     prompt: p.prompt || '',
+                    continue_from: /^video-\d+$/.test(String(p.h3ContinueFrom || ''))
+                        ? String(p.h3ContinueFrom) : '',
+                    motion_context_frames: [5, 22, 39].indexOf(
+                        Number(p.h3ContextFrames)) >= 0
+                        ? Number(p.h3ContextFrames) : 22,
                     source_image: p.initImageName || '',
                     last_frame: p.lastImageName || '',
                     references: Array.isArray(p.h3References)

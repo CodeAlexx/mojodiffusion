@@ -508,6 +508,14 @@ struct Qwen3Encoder:
             weights.append(ArcPointer(t^))
             name_to_idx[nm] = idx
         uploader.finish(ctx)
+        # Every selected weight is now owned by a device Tensor and the final
+        # batched H2D has been fenced.  Do not leave the clean checkpoint pages
+        # charged to the product cgroup while a large denoiser host store is
+        # built next (Klein 9B otherwise overlaps ~16 GB of Qwen page cache with
+        # its resident block store and can drive systemd-oomd to kill GNOME).
+        # The mappings remain valid until `sharded` drops, but no later encoder
+        # work reads them.
+        sharded.release_to_os()
         print(
             "[qwen3] batched H2D tensors", uploader.tensors_uploaded,
             "bytes", uploader.bytes_uploaded, "fences", uploader.fence_count,

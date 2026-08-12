@@ -152,7 +152,7 @@ from serenitymojo.io.safetensors_writer import (
     save_safetensors,
 )
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import reshape, slice, concat
+from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, slice, concat
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
@@ -185,6 +185,14 @@ from serenitymojo.models.minimax_h3.presentation import (
     minimax_h3_special_id,
 )
 from serenitymojo.models.minimax_h3.rearrange import minimax_h3_patchify_video
+from serenitymojo.models.minimax_h3.motion_context import (
+    minimax_h3_load_motion_context,
+    minimax_h3_motion_context_audio_latents,
+    minimax_h3_motion_context_source_audio_overhang,
+    minimax_h3_motion_context_steps,
+    minimax_h3_preflight_motion_context,
+    minimax_h3_save_motion_context_tail_at_pixel_frame,
+)
 from serenitymojo.models.minimax_h3.audio_encoder import (
     MiniMaxH3AudioEncoderConfig,
     MiniMaxH3AudioEncoderWeights,
@@ -198,6 +206,7 @@ from serenitymojo.models.dit.minimax_h3_ref_geometry import (
     MiniMaxH3ReferenceMedia,
     MiniMaxH3Ref2VAPlan,
     MINIMAX_H3_KEYFRAME_NOISE_AUG,
+    minimax_h3_build_ref2va_motion_context_plan,
     minimax_h3_build_ref2va_plan,
     minimax_h3_ref2va_row_timesteps,
     minimax_h3_reference_audio_latents,
@@ -541,10 +550,14 @@ def _preflight_geometry(width: Int, height: Int, frames: Int) raises:
             "minimax_h3_ref2va: H3_REF_IMAGE_SHORT_EDGE must be a positive"
             " multiple of 32"
         )
-    if frames < 5 or frames > 362:
+    # Authored Ref2VA output remains capped at 15 seconds by the Rust product
+    # boundary. Native continuation prepends as many as 39 fixed context
+    # frames, so the runner's internal aligned timeline must use the same
+    # bounded envelope as the unified H3 runtime instead of rejecting every
+    # full-length continuation leg above the 362-frame target-only limit.
+    if frames < 5 or frames > 1450:
         raise Error(
-            "minimax_h3_ref2va: derived NUM_LATENT_FRAMES is non-positive —"
-            " rebuild with a larger H3_FRAMES"
+            "minimax_h3_ref2va: internal frames must be within [5,1450]"
         )
 
 
@@ -1720,6 +1733,9 @@ def _minimax_h3_ref2va_generate(
     num_latent_frames: Int,
     latent_h: Int,
     latent_w: Int,
+    motion_context_path: String,
+    motion_context_frames: Int,
+    continuation_end_frames: Int,
 ) raises:
     """The generation tail. Two shapes:
 
@@ -1753,6 +1769,8 @@ def _minimax_h3_ref2va_generate(
                 resident_scheme, resident_backend_name,
                 resident_blocks_requested,
                 target_frames, num_latent_frames, latent_h, latent_w,
+                motion_context_path, motion_context_frames,
+                continuation_end_frames,
             )
             return
         else:
@@ -1846,6 +1864,8 @@ def _minimax_h3_ref2va_generate(
         condition_rows_path, attention_backend, attention_backend_name, ctx,
         step_cache_enabled, step_cache_name, resident_scheme,
         resident_backend_name, resident_blocks_requested,
+        num_latent_frames, latent_h, latent_w, continuation_end_frames,
+        False,
     )
 
 
@@ -1872,6 +1892,11 @@ def _minimax_h3_ref2va_denoise_and_save(
     resident_scheme: Int,
     resident_backend_name: String,
     resident_blocks_requested: Int,
+    num_latent_frames: Int,
+    latent_h: Int,
+    latent_w: Int,
+    continuation_end_frames: Int,
+    motion_context_enabled: Bool,
 ) raises:
     """The SHARED generation tail: RoPE, dual schedule, the 4-row-per-step
     modulation cache, the real `config.num_layers`-block streamed denoise
@@ -2300,13 +2325,32 @@ def _minimax_h3_ref2va_denoise_and_save(
     lat_names.append(String("condition_video_rows"))
     lat_names.append(String("condition_audio_rows"))
     var lat_tensors = List[ArcPointer[Tensor]]()
-    lat_tensors.append(ArcPointer[Tensor](video_target^))
-    lat_tensors.append(ArcPointer[Tensor](audio_target^))
+    lat_tensors.append(ArcPointer[Tensor](slice(
+        video_target, 0, 0, video_target.shape()[0], ctx
+    )))
+    lat_tensors.append(ArcPointer[Tensor](slice(
+        audio_target, 0, 0, audio_target.shape()[0], ctx
+    )))
     lat_tensors.append(ArcPointer[Tensor](slice(cond_video, 0, 0, cond_video.shape()[0], ctx)))
     lat_tensors.append(ArcPointer[Tensor](slice(cond_audio, 0, 0, cond_audio.shape()[0], ctx)))
     save_safetensors(lat_names, lat_tensors, out_dir + "/latents.safetensors", ctx)
+    var saved_motion_frames = minimax_h3_save_motion_context_tail_at_pixel_frame(
+        video_target,
+        audio_target,
+        num_latent_frames,
+        plan.num_target_audio_rows // 2,
+        continuation_end_frames,
+        latent_w * 16,
+        latent_h * 16,
+        out_dir + String("/motion_context.safetensors"),
+        ctx,
+    )
     var t_denoise1 = perf_counter_ns()
     print("  saved final latents ->", out_dir + "/latents.safetensors")
+    print(
+        "  saved native A/V continuation tail (", saved_motion_frames,
+        " frames) ->", out_dir + "/motion_context.safetensors",
+    )
     print("  denoise done (", Float64(t_denoise1 - t_denoise0) / 1.0e9, "s)")
     if step_cache.enabled:
         print(
@@ -2346,6 +2390,8 @@ def _minimax_h3_ref2va_denoise_and_save(
     result_body += String("  \"steps\":") + String(num_steps) + String(",\n")
     result_body += String("  \"seed\":") + String(seed) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(plan.sequence_length()) + String(",\n")
+    result_body += String("  \"motion_context\":") \
+        + json_bool(motion_context_enabled) + String(",\n")
     result_body += String("  \"attention_backend\":\"") \
         + attention_backend_name + String("\",\n")
     result_body += String("  \"step_cache\":\"") \
@@ -2418,6 +2464,9 @@ def _minimax_h3_ref2va_generate_real(
     num_latent_frames: Int,
     latent_h: Int,
     latent_w: Int,
+    motion_context_path: String,
+    motion_context_frames: Int,
+    continuation_end_frames: Int,
 ) raises:
     """THE REAL ref2va generation — every stage the partial mode stubbed,
     wired to its gated implementation:
@@ -2441,6 +2490,26 @@ def _minimax_h3_ref2va_generate_real(
                      S=17916."""
     var config = minimax_h3_released_config()
     config.validate()
+    var motion_context_enabled = motion_context_path != String("")
+    var rows_per_frame = (latent_h // PATCH_H) * (latent_w // PATCH_W)
+    var motion_video_rows_n = 0
+    var motion_audio_rows_n = 0
+    if motion_context_enabled:
+        motion_video_rows_n = (
+            minimax_h3_motion_context_steps(motion_context_frames)
+            * rows_per_frame
+        )
+        motion_audio_rows_n = (
+            minimax_h3_motion_context_audio_latents(motion_context_frames) * 2
+        )
+    var reference_video_rows_n = (
+        plan.num_condition_video_rows - motion_video_rows_n
+    )
+    var reference_audio_rows_n = (
+        plan.num_condition_audio_rows - motion_audio_rows_n
+    )
+    if reference_video_rows_n <= 0 or reference_audio_rows_n < 0:
+        raise Error("minimax_h3_ref2va: combined condition row accounting drift")
 
     print("")
     print("  ################################################################")
@@ -2491,6 +2560,40 @@ def _minimax_h3_ref2va_generate_real(
         String("minimax_h3_ref2va (real)"),
     )
     var ctx = DeviceContext()
+
+    # Direct previous-clip latent tails remain on GPU. Video receives H3's
+    # single 0.999 augmentation; audio stays bit-identical to the source tail.
+    var motion_video = Optional[Tensor](None)
+    var motion_audio = Optional[Tensor](None)
+    if motion_context_enabled:
+        var loaded_context = minimax_h3_load_motion_context(
+            motion_context_path,
+            rows_per_frame,
+            config.video_patch_dim(),
+            config.audio_latents_dim,
+            motion_context_frames,
+            latent_w * 16,
+            latent_h * 16,
+            ctx,
+        )
+        var motion_noise = randn(
+            loaded_context.video_rows.shape().copy(), seed + 102,
+            STDtype.F32, ctx,
+        )
+        var motion_scaled = mul_scalar(
+            loaded_context.video_rows, Float32(0.999), ctx
+        )
+        var noise_scaled = mul_scalar(motion_noise, Float32(0.001), ctx)
+        motion_video = Optional[Tensor](add(motion_scaled, noise_scaled, ctx))
+        motion_audio = Optional[Tensor](slice(
+            loaded_context.audio_rows, 0, 0,
+            loaded_context.audio_rows.shape()[0], ctx,
+        ))
+        print(
+            "  motion context: fixed video rows=", motion_video_rows_n,
+            " fixed audio rows=", motion_audio_rows_n,
+            " source_audio_overhang=", loaded_context.source_audio_overhang,
+        )
 
     # ── [2] the vision tower — DEVICE, GPU-only product path ─────────────
     var t_vis0 = perf_counter_ns()
@@ -2556,7 +2659,7 @@ def _minimax_h3_ref2va_generate_real(
     # ── [3] audio condition rows — GPU AudioVAE posterior mode ───────────
     var t_aud0 = perf_counter_ns()
     var audio_rows = List[Float32]()
-    if plan.num_condition_audio_rows > 0:
+    if reference_audio_rows_n > 0:
         var enc_w_host = _h3_ref2va_load_audio_encoder_weights()
         var enc_cfg = _h3_ref2va_audio_encoder_config()
         var enc_w = minimax_h3_audio_encoder_device_weights(
@@ -2592,15 +2695,15 @@ def _minimax_h3_ref2va_generate_real(
                 )
                 for r in range(len(rows)):
                     audio_rows.append(rows[r])
-    if len(audio_rows) != plan.num_condition_audio_rows * config.audio_latents_dim:
+    if len(audio_rows) != reference_audio_rows_n * config.audio_latents_dim:
         raise Error(
             String("minimax_h3_ref2va: audio condition rows hold ")
             + String(len(audio_rows)) + " values but the plan reserved "
-            + String(plan.num_condition_audio_rows * config.audio_latents_dim)
+            + String(reference_audio_rows_n * config.audio_latents_dim)
         )
     var t_aud1 = perf_counter_ns()
     print(
-        "  audio condition rows:", plan.num_condition_audio_rows, "rows (",
+        "  reference audio condition rows:", reference_audio_rows_n, "rows (",
         Float64(t_aud1 - t_aud0) / 1.0e9, "s, GPU encoder)",
     )
 
@@ -2701,19 +2804,23 @@ def _minimax_h3_ref2va_generate_real(
         )
         for r in range(len(rows)):
             video_rows.append(rows[r])
-    if len(video_rows) != plan.num_condition_video_rows * config.video_patch_dim():
+    if len(video_rows) != reference_video_rows_n * config.video_patch_dim():
         raise Error(
             String("minimax_h3_ref2va: video condition rows hold ")
             + String(len(video_rows)) + " values but the plan reserved "
-            + String(plan.num_condition_video_rows * config.video_patch_dim())
+            + String(reference_video_rows_n * config.video_patch_dim())
         )
     # The 0.999 noise mix, ONCE, at encode time (gated scale_noise).
     var mixed = minimax_h3_mix_condition_rows(video_rows, cond_noise)
     var cond_video_shape: List[Int] = [
-        plan.num_condition_video_rows, config.video_patch_dim(),
+        reference_video_rows_n, config.video_patch_dim(),
     ]
     var cond_video = Tensor.from_host(mixed, cond_video_shape^, STDtype.F32, ctx)
-    var cond_audio_rows_n = plan.num_condition_audio_rows
+    if motion_context_enabled:
+        cond_video = _h3_ref2va_concat_rows(
+            motion_video.value(), cond_video, ctx
+        )
+    var cond_audio_rows_n = reference_audio_rows_n
     if cond_audio_rows_n == 0:
         cond_audio_rows_n = 1  # placeholder, never read (see partial sibling)
         audio_rows.resize(config.audio_latents_dim, Float32(0.0))
@@ -2721,6 +2828,10 @@ def _minimax_h3_ref2va_generate_real(
         cond_audio_rows_n, config.audio_latents_dim,
     ]
     var cond_audio = Tensor.from_host(audio_rows, cond_audio_shape^, STDtype.F32, ctx)
+    if motion_context_enabled:
+        cond_audio = _h3_ref2va_scatter_rows(
+            cond_audio, motion_audio.value(), reference_audio_rows_n, ctx
+        )
     var t_enc1 = perf_counter_ns()
     print(
         "  REAL condition rows:", plan.num_condition_video_rows, "video +",
@@ -2781,6 +2892,8 @@ def _minimax_h3_ref2va_generate_real(
         attention_backend_name, ctx, step_cache_enabled, step_cache_name,
         resident_scheme,
         resident_backend_name, resident_blocks_requested,
+        num_latent_frames, latent_h, latent_w, continuation_end_frames,
+        motion_context_path != String(""),
     )
 
 
@@ -2800,6 +2913,9 @@ def main() raises:
     var resident_blocks_requested = DIT_RESIDENT_BLOCKS
     var condition_rows_path = String("")
     var condition_rows_prefix = String("--condition-rows=")
+    var motion_context_path = String("")
+    var motion_context_frames = 22
+    var continuation_end_frames = 0
     var args = List[String]()
     for i in range(len(raw_args)):
         var a = String(raw_args[i])
@@ -2870,7 +2986,31 @@ def main() raises:
         if a.startswith(condition_rows_prefix):
             condition_rows_path = String(a[byte = condition_rows_prefix.byte_length() :])
             continue
+        if a.startswith("--motion-context="):
+            var fields = a.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --motion-context flag")
+            motion_context_path = String(fields[1])
+            continue
+        if a.startswith("--motion-context-frames="):
+            var fields = a.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --motion-context-frames flag")
+            motion_context_frames = atol(String(fields[1]))
+            continue
+        if a.startswith("--continuation-end-frames="):
+            var fields = a.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --continuation-end-frames flag")
+            continuation_end_frames = atol(String(fields[1]))
+            continue
         args.append(a)
+
+    comptime if DIT_INT8_RESIDENT == 0:
+        if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+            raise Error(
+                "MiniMax-H3 Sage attention is INT8-only; BF16 Ref2VA uses cU-DNN"
+            )
 
     if len(args) < 3:
         print(
@@ -2878,6 +3018,8 @@ def main() raises:
             " [seed=0] [--partial] [--condition-rows=PATH]"
             " [--attention-backend=cudnn|sage-int8] [--resident-blocks=N]"
             " [--step-cache=exact|high]"
+            " [--motion-context=PATH] [--motion-context-frames=5|22|39]"
+            " [--continuation-end-frames=N]"
             " [kind:path ...]"
         )
         print(
@@ -2905,6 +3047,19 @@ def main() raises:
     var seed = UInt64(DEFAULT_SEED)
     if len(args) >= 5:
         seed = UInt64(atol(String(args[4])))
+    var motion_context_enabled = motion_context_path != String("")
+    if motion_context_enabled:
+        _ = minimax_h3_motion_context_steps(motion_context_frames)
+        if partial_mode:
+            raise Error(
+                "minimax_h3_ref2va: motion context requires real Ref2VA mode"
+            )
+    if continuation_end_frames == 0:
+        continuation_end_frames = runtime_frames
+    if continuation_end_frames < 1 or continuation_end_frames > runtime_frames:
+        raise Error(
+            "minimax_h3_ref2va: continuation endpoint must be within target frames"
+        )
 
     var specs = List[MiniMaxH3ReferenceSpec]()
     for i in range(5, len(args)):
@@ -3029,18 +3184,60 @@ def main() raises:
         text_tags = rp.token_tags.copy()
         real_pres = Optional(rp^)
 
-    var plan = minimax_h3_build_ref2va_plan(
-        text_tags,
-        references,
-        num_latent_frames,
-        latent_h,
-        latent_w,
-        num_audio_latents,
-        PATCH_H,
-        PATCH_W,
-    )
+    var source_audio_overhang = Float64(0.0)
+    if motion_context_enabled:
+        var preflight_config = minimax_h3_released_config()
+        minimax_h3_preflight_motion_context(
+            motion_context_path,
+            (latent_h // PATCH_H) * (latent_w // PATCH_W),
+            preflight_config.video_patch_dim(),
+            preflight_config.audio_latents_dim,
+            motion_context_frames,
+        )
+        source_audio_overhang = minimax_h3_motion_context_source_audio_overhang(
+            motion_context_path,
+            (latent_h // PATCH_H) * (latent_w // PATCH_W),
+            runtime_width,
+            runtime_height,
+        )
+        print(
+            "  preflight: native motion context", motion_context_frames,
+            "frames from", motion_context_path,
+        )
+
+    var plan: MiniMaxH3Ref2VAPlan
+    if motion_context_enabled:
+        plan = minimax_h3_build_ref2va_motion_context_plan(
+            text_tags,
+            references,
+            num_latent_frames,
+            latent_h,
+            latent_w,
+            num_audio_latents,
+            motion_context_frames,
+            source_audio_overhang,
+            PATCH_H,
+            PATCH_W,
+        )
+    else:
+        plan = minimax_h3_build_ref2va_plan(
+            text_tags,
+            references,
+            num_latent_frames,
+            latent_h,
+            latent_w,
+            num_audio_latents,
+            PATCH_H,
+            PATCH_W,
+        )
     print("")
-    print("  ── packed layout [text | references | target audio | target video] ──")
+    print(
+        "  ── packed layout",
+        "[text | motion video | references | motion audio | target audio | target video]"
+        if motion_context_enabled else
+        "[text | references | target audio | target video]",
+        "──",
+    )
     print("    sequence_length      ", plan.sequence_length())
     print("    text rows            [0,", plan.num_text_tokens, ")")
     print(
@@ -3091,4 +3288,6 @@ def main() raises:
         resident_scheme, resident_backend_name,
         resident_blocks_requested,
         runtime_frames, num_latent_frames, latent_h, latent_w,
+        motion_context_path, motion_context_frames,
+        continuation_end_frames,
     )

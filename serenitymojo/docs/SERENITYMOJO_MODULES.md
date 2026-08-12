@@ -90,6 +90,34 @@ activity for the centered Generate status line. Exact-tokenizer parity passed;
 real-context cosine is 0.99923-0.99973 against the cached Creator oracle, and
 the optimized oracle prompt ran in 17.19 seconds.
 
+### `models/text_encoder/gemma4_ltx_streamed.mojo` and `pipeline/ltx25_encode_prompt.mojo` — LTX-2.5 conditioning 🟠
+
+Pure-Mojo Gemma-4-12B conditioning for the Lightricks LTX-2.5 checkpoint. The
+encoder handles sliding and global attention geometry, scale-less V norm,
+proportional partial RoPE, layer scalars, and both `model.language_model.` and
+fine-tuned `model.` prefixes. `Qwen3Tokenizer.from_json_bytes` reads the
+checkpoint-embedded tokenizer without a Python extraction step. The conditioner
+packs all 49 states in the existing FeatureExtractorV2 order and applies the
+video/audio projections stored inside the same text-encoder file.
+
+All 49 real fine-tuned encoder states pass cosine 0.999 (worst 0.99990787), and
+real LTX-2.5 MP4s completed at 512x768 and 960x512, including one loader/runtime
+exercise with an LTX-2.3 LoRA. The result manifests remain experimental with
+sampler and speed parity false; the LoRA artifact is not a general compatibility
+claim.
+
+### Process-isolated worker encode/decode helpers 🟠
+
+`serve/{sd3,sdxl,flux,chroma}_backend.mojo` and their
+`*_decode_subprocess.mojo` helpers use self-exec GPU children so child exit
+returns decoder CUDA allocations while the parent retains an admitted denoiser
+subset. Existing release/tiled paths remain explicit fallbacks, and no CPU
+model execution is introduced. Klein applies the same ownership boundary to
+Qwen3 text encoding and skips redundant warm forwards: the measured 1024px
+one-step sequence fell from 134.161 seconds inline to 101.556 seconds cold and
+13.060 seconds warm, with peak worker VRAM reduced from 22,175.1 to 16,821.9
+MiB and exact decoded pixels.
+
 ### `sampling/ltx2_request_cli.mojo` — exact canonical LTX2 request route 🟠
 
 Pure-Mojo `serenity.genparams.v1` adapter used by SerenityUI's Video tab. Unlike
@@ -593,8 +621,8 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
   because its decoded A/B showed visible video drift. It never changes request
   geometry, duration, FPS, scheduler steps, or audio.
 - `ops/sage_attention_int8.mojo` is the switchable experimental INT8-QK
-  attention backend on BF16, INT8 Quality, and INT8 Fast. cU-DNN remains the
-  exact-quality choice. Dynamic sequence
+  attention backend on INT8 Quality and INT8 Fast. BF16 is cU-DNN-only and
+  rejects Sage at the UI, server, and runner boundaries. Dynamic sequence
   entry points in `ops/attention.mojo` and `ops/attention_flash.mojo` let one
   runner serve runtime geometry and variable reference-token counts.
 - `models/minimax_h3_device/audio_encoder_device.mojo` implements the learned

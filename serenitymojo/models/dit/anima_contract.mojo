@@ -24,10 +24,10 @@ comptime ANIMA_VAE_PATH = (
     "qwen_image_vae.safetensors"
 )
 comptime ANIMA_DEFAULT_CONDITIONING_PATH = (
-    "/home/alex/EriDiffusion/inference-flame/output/anima_embeddings.safetensors"
+    "/home/alex/.serenity/parity/output/anima_embeddings.safetensors"
 )
 comptime ANIMA_DEFAULT_RUST_LATENT_PATH = (
-    "/home/alex/EriDiffusion/inference-flame/output/anima_rust_latent.safetensors"
+    "/home/alex/.serenity/parity/output/anima_rust_latent.safetensors"
 )
 
 comptime ANIMA_DEFAULT_WIDTH = 1024

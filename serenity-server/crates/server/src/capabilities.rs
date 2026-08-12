@@ -1,4 +1,4 @@
-use serde_json::{Value as JsonValue, json};
+use serde_json::{json, Value as JsonValue};
 use serenity_wire::JobParams;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1601,7 +1601,8 @@ mod tests {
         let generate = include_str!("../../../canvas/js/generate.js");
         let simple = include_str!("../../../canvas/js/simple.js");
 
-        assert!(model_utils.contains("fetch('/v1/capabilities'"));
+        assert!(model_utils.contains("fetchJsonWithRetry("));
+        assert!(model_utils.contains("'/v1/capabilities'"));
         assert!(model_utils.contains("function aspectsForArch(capabilities, arch)"));
         assert!(generate.contains("ModelUtils.aspectsForArch(state.capabilities, arch)"));
         assert!(simple.contains("ModelUtils.aspectsForArch(state.capabilities, state.arch)"));
@@ -1810,11 +1811,9 @@ mod tests {
             "prompt": "replace the sky",
             "mask_image": "/tmp/mask.png"
         });
-        assert!(
-            reject_disabled_raw_surfaces(&missing_init)
-                .unwrap_err()
-                .contains("requires init_image")
-        );
+        assert!(reject_disabled_raw_surfaces(&missing_init)
+            .unwrap_err()
+            .contains("requires init_image"));
 
         let full_lanpaint = json!({
             "model": "zimage",
@@ -1823,11 +1822,9 @@ mod tests {
             "mask_image": "/tmp/mask.png",
             "lanpaint_num_steps": 16
         });
-        assert!(
-            reject_disabled_raw_surfaces(&full_lanpaint)
-                .unwrap_err()
-                .contains("LanPaint")
-        );
+        assert!(reject_disabled_raw_surfaces(&full_lanpaint)
+            .unwrap_err()
+            .contains("LanPaint"));
     }
 
     #[test]

@@ -273,6 +273,17 @@ struct LTX2BlockWeights(Movable):
         for ref kv in keys:
             var canon = kv[0]
             var src = prefix + kv[1]
+            # LTX-2.5 sets ff_bias=False and ships NO `ff.net.0.proj.bias` /
+            # `ff.net.2.bias`. Measured against the real checkpoints: 2.5 drops
+            # exactly those 96 tensors (48 blocks x 2) versus 2.3 and changes
+            # nothing else — 4348 common tensors, zero shape differences. Only
+            # the MAIN blocks' video FF is affected; audio_ff and the connector
+            # FFs keep their biases. Every other key stays mandatory, so a
+            # genuinely missing weight still fails loud.
+            if not _st_has(st, src) and (
+                canon == "ff.net.0.proj.bias" or canon == "ff.net.2.bias"
+            ):
+                continue
             var tv = st.tensor_view(src)
             var t = Tensor.from_view_as_bf16(tv, ctx)
             name_to_idx[canon] = len(weights)
@@ -372,6 +383,16 @@ struct LTX2BlockWeights(Movable):
             var canon = kv[0]
             var src = kv[1]
             if src not in block:
+                # LTX-2.5 sets ff_bias=False: it ships NO
+                # `ff.net.0.proj.bias` / `ff.net.2.bias` (measured: exactly
+                # those 96 tensors dropped vs 2.3, nothing else changed). Skip
+                # them; every other key stays mandatory so a genuinely missing
+                # weight still fails loud.
+                if (
+                    canon == "ff.net.0.proj.bias"
+                    or canon == "ff.net.2.bias"
+                ):
+                    continue
                 raise Error(
                     String("from_fp8_block: streamed block missing ") + src
                 )
@@ -410,6 +431,13 @@ struct LTX2BlockWeights(Movable):
         self, x: Tensor, w_key: String, b_key: String, ctx: DeviceContext
     ) raises -> Tensor:
         ref w = self._w(w_key)
+        if b_key not in self.name_to_idx:
+            # ff_bias=False (LTX-2.5): the tensor genuinely does not exist.
+            # Restricted to the two video-FF biases so any OTHER missing bias
+            # still raises instead of silently degrading.
+            if b_key == "ff.net.0.proj.bias" or b_key == "ff.net.2.bias":
+                return linear(x, w, None, ctx)
+            raise Error(String("LTX2: missing weight ") + b_key)
         ref b = self._w(b_key)
         return linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
 
@@ -833,6 +861,17 @@ struct LTX2AVBlockWeights(Movable):
         for ref kv in keys:
             var canon = kv[0]
             var src = prefix + kv[1]
+            # LTX-2.5 sets ff_bias=False and ships NO `ff.net.0.proj.bias` /
+            # `ff.net.2.bias`. Measured against the real checkpoints: 2.5 drops
+            # exactly those 96 tensors (48 blocks x 2) versus 2.3 and changes
+            # nothing else — 4348 common tensors, zero shape differences. Only
+            # the MAIN blocks' video FF is affected; audio_ff and the connector
+            # FFs keep their biases. Every other key stays mandatory, so a
+            # genuinely missing weight still fails loud.
+            if not _st_has(st, src) and (
+                canon == "ff.net.0.proj.bias" or canon == "ff.net.2.bias"
+            ):
+                continue
             var tv = st.tensor_view(src)
             name_to_idx[canon] = len(weights)
             weights.append(ArcPointer(_av_view_to_bf16(tv, ctx)))
@@ -933,6 +972,16 @@ struct LTX2AVBlockWeights(Movable):
             var canon = kv[0]
             var src = kv[1]
             if src not in block:
+                # LTX-2.5 sets ff_bias=False: it ships NO
+                # `ff.net.0.proj.bias` / `ff.net.2.bias` (measured: exactly
+                # those 96 tensors dropped vs 2.3, nothing else changed). Skip
+                # them; every other key stays mandatory so a genuinely missing
+                # weight still fails loud.
+                if (
+                    canon == "ff.net.0.proj.bias"
+                    or canon == "ff.net.2.bias"
+                ):
+                    continue
                 raise Error(
                     String("from_fp8_block(AV): streamed block missing ") + src
                 )
@@ -1169,6 +1218,15 @@ struct LTX2AVBlockWeights(Movable):
         self, x: Tensor, w_key: String, b_key: String, ctx: DeviceContext
     ) raises -> Tensor:
         ref w = self._w(w_key)
+        if b_key not in self.name_to_idx:
+            # ff_bias=False (LTX-2.5): the tensor genuinely does not exist.
+            # Restricted to the two video-FF biases so any OTHER missing bias
+            # still raises instead of silently degrading.
+            if not (b_key == "ff.net.0.proj.bias" or b_key == "ff.net.2.bias"):
+                raise Error(String("LTX2AV: missing weight ") + b_key)
+            if w.dtype() == STDtype.F8_E4M3:
+                return linear_fp8(x, w, self._scale_t(w_key), None, ctx)
+            return linear(x, w, None, ctx)
         ref b = self._w(b_key)
         var out: Tensor
         if w.dtype() == STDtype.F8_E4M3:

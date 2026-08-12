@@ -189,6 +189,9 @@ from serenitymojo.models.minimax_h3.packing import (
     minimax_h3_resolve_canvas_size,
 )
 from serenitymojo.models.minimax_h3.rearrange import minimax_h3_unpack_audio
+from serenitymojo.models.minimax_h3.motion_context import (
+    minimax_h3_save_motion_context_tail,
+)
 from serenitymojo.models.minimax_h3.audio_decoder import (
     MiniMaxH3AudioDecoderConfig,
     MiniMaxH3AudioWeights,
@@ -287,6 +290,9 @@ comptime HEIGHT = get_defined_int["H3_HEIGHT", 480]()
 comptime WIDTH = get_defined_int["H3_WIDTH", 832]()
 comptime FRAMES = get_defined_int["H3_FRAMES", 22]()
 comptime TEXT_TOKENS = get_defined_int["H3_TEXT_TOKENS", 32]()
+comptime MINIMAX_H3_TRAINED_MAX_FRAMES = 362
+comptime MINIMAX_H3_SINGLE_PASS_MAX_FRAMES = 1450
+comptime MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE = 109303
 
 comptime LATENT_H = HEIGHT // 16
 comptime LATENT_W = WIDTH // 16
@@ -395,8 +401,24 @@ def _preflight_geometry(width: Int, height: Int, frames: Int) raises:
         raise Error(
             "minimax_h3_i2va: width/height must be multiples of 32 in [32,2048]"
         )
-    if frames < 5 or frames > 362:
-        raise Error("minimax_h3_i2va: internal frames must be in [5,362]")
+    if frames < 5 or frames > MINIMAX_H3_SINGLE_PASS_MAX_FRAMES:
+        raise Error("minimax_h3_i2va: internal frames must be in [5,1450]")
+    if frames > MINIMAX_H3_TRAINED_MAX_FRAMES:
+        var latent_h = height // 16
+        var latent_w = width // 16
+        var rows_per_frame = (latent_h // PATCH_H) * (latent_w // PATCH_W)
+        var latent_frames = (frames - 5) // 17 * 5 + 2
+        var audio_latents = Int(round(Float64(frames) / 24.0 * 40.0))
+        var sequence_length = (
+            TEXT_TOKENS + KEYFRAMES * rows_per_frame
+            + latent_frames * rows_per_frame + audio_latents * 2
+        )
+        if sequence_length > MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE:
+            raise Error(
+                String("minimax_h3_i2va: experimental single-pass long context S=")
+                + String(sequence_length) + " exceeds the 109303-token 24-GB"
+                " envelope; lower resolution or duration"
+            )
     if KEYFRAMES < 1 or KEYFRAMES > 2:
         raise Error(
             String("minimax_h3_i2va: H3_KEYFRAMES must be 1 (I2VA/L2VA) or 2"
@@ -950,6 +972,11 @@ def main() raises:
             defer_video_decode = True
             continue
         args.append(arg)
+    comptime if DIT_INT8_RESIDENT == 0:
+        if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+            raise Error(
+                "MiniMax-H3 Sage attention is INT8-only; BF16 conditioned runners use cU-DNN"
+            )
     if len(args) < 5:
         _usage()
         return
@@ -1720,6 +1747,20 @@ def main() raises:
         slice(audio_state, 0, 0, num_audio_rows, ctx)
     ))
     save_safetensors(lat_names, lat_tensors, out_dir + "/latents.safetensors", ctx)
+    var saved_motion_frames = minimax_h3_save_motion_context_tail(
+        video_state,
+        audio_state,
+        num_latent_frames,
+        num_audio_latents,
+        runtime_width,
+        runtime_height,
+        out_dir + String("/motion_context.safetensors"),
+        ctx,
+    )
+    print(
+        "  saved native A/V continuation tail (", saved_motion_frames,
+        " frames) ->", out_dir + "/motion_context.safetensors",
+    )
     var t_den1 = perf_counter_ns()
     print("  denoise done (", Float64(t_den1 - t_den0) / 1.0e9, "s)")
 

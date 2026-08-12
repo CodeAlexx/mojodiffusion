@@ -6,7 +6,7 @@
 # and BF16 rounding boundaries, but write the normalized and rotated values back
 # into the already-owned split-QKV buffers.
 
-from std.gpu import barrier, block_idx, global_idx, thread_idx
+from std.gpu import barrier, block_idx, thread_idx
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
 from std.math import sqrt
@@ -21,17 +21,23 @@ from serenitymojo.tensor import Tensor
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _DYN2 = Layout.row_major(-1, -1)
-comptime _TPB = 256
-comptime _ROPE_BLOCK = 256
+# MiniMax-H3's released head width is 128.  One lane owns one BF16 head value;
+# a 256-thread block leaves half its lanes empty and adds an all-zero reduction
+# level.  The 128-thread tree preserves the same non-zero addition order.
+comptime _TPB = 128
 
 
-def _h3_rms_norm_bf16_inplace_kernel(
+def _h3_rms_norm_partial_rope_bf16_inplace_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     weight: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    cols: Int,
+    cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    head_dim: Int,
+    rotary_dim: Int,
+    heads: Int,
     eps: Float32,
 ):
-    """Bit-identical in-place form of ops.norm._rms_norm_kernel_bf16."""
+    """Exact RMSNorm + BF16 boundary + partial RoPE in one row kernel."""
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -39,7 +45,7 @@ def _h3_rms_norm_bf16_inplace_kernel(
     ]()
     var local: Float32 = 0.0
     var col = tid
-    while col < cols:
+    while col < head_dim:
         var value = rebind[Scalar[DType.bfloat16]](x[row, col]).cast[
             DType.float32
         ]()
@@ -53,37 +59,11 @@ def _h3_rms_norm_bf16_inplace_kernel(
             shared[tid] = shared[tid] + shared[tid + active]
         barrier()
         active //= 2
-    var inv = 1.0 / sqrt(shared[0] / Float32(cols) + eps)
-    col = tid
-    while col < cols:
-        var value = rebind[Scalar[DType.bfloat16]](x[row, col]).cast[
-            DType.float32
-        ]()
-        var scale = rebind[Scalar[DType.bfloat16]](weight[col]).cast[
-            DType.float32
-        ]()
-        x[row, col] = rebind[x.element_type](
-            (value * inv * scale).cast[DType.bfloat16]()
-        )
-        col += _TPB
 
-
-def _h3_partial_rope_bf16_f32_inplace_kernel(
-    x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    rows: Int,
-    head_dim: Int,
-    rotary_dim: Int,
-    heads: Int,
-):
-    """Exact half-split RoPE over the leading rotary channels, in place."""
-    var idx = Int(global_idx.x)
+    var inv = 1.0 / sqrt(shared[0] / Float32(head_dim) + eps)
     var half = rotary_dim // 2
-    var total = rows * half
-    if idx < total:
-        var row = idx // half
-        var lane = idx - row * half
+    if tid < half:
+        var lane = tid
         var token = row // heads
         var value0 = rebind[Scalar[DType.bfloat16]](x[row, lane]).cast[
             DType.float32
@@ -91,15 +71,39 @@ def _h3_partial_rope_bf16_f32_inplace_kernel(
         var value1 = rebind[Scalar[DType.bfloat16]](
             x[row, lane + half]
         ).cast[DType.float32]()
+        var scale0 = rebind[Scalar[DType.bfloat16]](weight[lane]).cast[
+            DType.float32
+        ]()
+        var scale1 = rebind[Scalar[DType.bfloat16]](
+            weight[lane + half]
+        ).cast[DType.float32]()
+        # Preserve the original two-kernel contract exactly: RMSNorm rounds
+        # to BF16 before the RoPE kernel reads the normalized values as F32.
+        var norm0 = (value0 * inv * scale0).cast[DType.bfloat16]().cast[
+            DType.float32
+        ]()
+        var norm1 = (value1 * inv * scale1).cast[DType.bfloat16]().cast[
+            DType.float32
+        ]()
         var cos0 = rebind[Scalar[DType.float32]](cos[token, lane])
         var sin0 = rebind[Scalar[DType.float32]](sin[token, lane])
         var cos1 = rebind[Scalar[DType.float32]](cos[token, lane + half])
         var sin1 = rebind[Scalar[DType.float32]](sin[token, lane + half])
         x[row, lane] = rebind[x.element_type](
-            (value0 * cos0 - value1 * sin0).cast[DType.bfloat16]()
+            (norm0 * cos0 - norm1 * sin0).cast[DType.bfloat16]()
         )
         x[row, lane + half] = rebind[x.element_type](
-            (value1 * cos1 + value0 * sin1).cast[DType.bfloat16]()
+            (norm1 * cos1 + norm0 * sin1).cast[DType.bfloat16]()
+        )
+    elif tid >= rotary_dim and tid < head_dim:
+        var value = rebind[Scalar[DType.bfloat16]](x[row, tid]).cast[
+            DType.float32
+        ]()
+        var scale = rebind[Scalar[DType.bfloat16]](weight[tid]).cast[
+            DType.float32
+        ]()
+        x[row, tid] = rebind[x.element_type](
+            (value * inv * scale).cast[DType.bfloat16]()
         )
 
 
@@ -156,15 +160,9 @@ def minimax_h3_qk_norm_partial_rope_inplace(
         sin.buf.unsafe_ptr().bitcast[Float32](), table_layout
     )
     ctx.enqueue_function[
-        _h3_rms_norm_bf16_inplace_kernel,
-        _h3_rms_norm_bf16_inplace_kernel,
-    ](X, Weight, head_dim, eps, grid_dim=rows, block_dim=_TPB)
-    var total_pairs = rows * (rotary_dim // 2)
-    var grid = (total_pairs + _ROPE_BLOCK - 1) // _ROPE_BLOCK
-    ctx.enqueue_function[
-        _h3_partial_rope_bf16_f32_inplace_kernel,
-        _h3_partial_rope_bf16_f32_inplace_kernel,
+        _h3_rms_norm_partial_rope_bf16_inplace_kernel,
+        _h3_rms_norm_partial_rope_bf16_inplace_kernel,
     ](
-        X, Cos, Sin, rows, head_dim, rotary_dim, heads,
-        grid_dim=grid, block_dim=_ROPE_BLOCK,
+        X, Weight, Cos, Sin, head_dim, rotary_dim, heads, eps,
+        grid_dim=rows, block_dim=_TPB,
     )

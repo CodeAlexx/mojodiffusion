@@ -103,7 +103,7 @@ comptime SHIFT = Float32(3.0)
 comptime SEED = UInt64(42)
 comptime EPS = Float32(1.0e-5)
 comptime CKPT_PATH = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
-comptime COND_PATH = "/home/alex/EriDiffusion/inference-flame/output/l2p_embeddings.safetensors"
+comptime COND_PATH = "/home/alex/.serenity/parity/output/l2p_embeddings.safetensors"
 comptime OUT_PATH = "/home/alex/mojodiffusion/output/zimage_l2p_512_30step.png"
 
 

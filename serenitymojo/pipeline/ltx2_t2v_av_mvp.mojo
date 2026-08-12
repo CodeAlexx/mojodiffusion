@@ -83,14 +83,14 @@ from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED
 # ── paths ─────────────────────────────────────────────────────────────────────
 comptime CKPT_FP8 = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8.safetensors"
 comptime CKPT_BF16 = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors"
-comptime CACHED = "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors"
+comptime CACHED = "/home/alex/.serenity/parity/cached_ltx2_embeddings.safetensors"
 # Real feature_extract_and_project dump (video_context [1,1024,4096] +
 # audio_context [1,1024,2048] + encoder_attention_mask [1,1,1,1024]) produced by
 # `ltx2_generate_av --dump-audio-context`. The audio_context here is the GENUINE
 # 2048-dim projection of the full 188160-dim Gemma feature stack (rescale
 # sqrt(2048/3840)=0.7303), proven orthogonal (cos≈-0.0004) to video[...,:2048] —
 # it is NOT a down-projected slice.
-comptime AUDIO_CTX_DUMP = "/home/alex/EriDiffusion/inference-flame/output/audio_context_dump/ltx2_audio_context.safetensors"
+comptime AUDIO_CTX_DUMP = "/home/alex/.serenity/parity/output/audio_context_dump/ltx2_audio_context.safetensors"
 comptime OUT_DIR = "/home/alex/mojodiffusion/output/ltx2_mvp"
 comptime MP4_OUT = OUT_DIR + "/ltx2_t2v_av_256_16f.mp4"
 comptime WAV_OUT = OUT_DIR + "/mvp_audio.wav"

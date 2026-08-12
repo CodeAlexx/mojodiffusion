@@ -361,6 +361,29 @@ var GenerateTab = (function () {
         var mode = activeLtx2RequestMode() || {};
         var checkpoints = activeLtx2Checkpoints();
         var selected = activeLtx2Checkpoint();
+        // Creator checkpoints discovered by the model registry are valid UI
+        // identities even when they are not one of the canonical runtime
+        // checkpoint rows. Keep their authored workflow selected and visible;
+        // runtime availability is a separate queue-admission concern.
+        if (!selected && ModelUtils.archForModel(state.model) === 'ltxv') {
+            var selectedId = String(state.videoCheckpoint || state.model || '')
+                .replace(/\.safetensors$/i, '');
+            var creatorWorkflow = ltx2CheckpointWorkflow(selectedId);
+            if (creatorWorkflow) {
+                selected = {
+                    id: selectedId,
+                    label: state.model,
+                    installed: true,
+                    guidance_modes: [String(
+                        creatorWorkflow.guidance_mode || 'distilled'
+                    )],
+                    quant_modes: [state.videoQuant || 'fp8'],
+                    readiness_label: 'registered_creator_workflow'
+                };
+                checkpoints = checkpoints.concat([selected]);
+                state.videoCheckpoint = selectedId;
+            }
+        }
         if (!selected) {
             selected = checkpoints.find(function (checkpoint) {
                 return checkpoint.id === mode.default_checkpoint;
@@ -1751,6 +1774,7 @@ var GenerateTab = (function () {
             }
             syncAspectDropdown();
             updateAspectPreview();
+            refreshMinimaxH3DurationLimit();
         });
         els.customHeight.addEventListener('blur', function () {
             var isVideo = ModelUtils.isVideoModel(state.model);
@@ -1775,6 +1799,7 @@ var GenerateTab = (function () {
             }
             syncAspectDropdown();
             updateAspectPreview();
+            refreshMinimaxH3DurationLimit();
         });
         // Width slider sync
         var widthSlider = document.getElementById('gen-width-slider');
@@ -1798,6 +1823,7 @@ var GenerateTab = (function () {
                 }
                 syncAspectDropdown();
                 updateAspectPreview();
+                refreshMinimaxH3DurationLimit();
             });
         }
         var heightSlider = document.getElementById('gen-height-slider');
@@ -1821,6 +1847,7 @@ var GenerateTab = (function () {
                 }
                 syncAspectDropdown();
                 updateAspectPreview();
+                refreshMinimaxH3DurationLimit();
             });
         }
         // Seed
@@ -1923,8 +1950,10 @@ var GenerateTab = (function () {
                     return;
                 }
                 if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
-                    state.frames = Math.max(1, Math.min(1800, parseInt(this.value) || 1));
-                    state.seconds = Math.max(1, Math.min(15,
+                    var durationMax = minimaxH3MaxDurationForSize(state.width, state.height);
+                    state.frames = Math.max(1, Math.min(
+                        Math.round(durationMax * 120), parseInt(this.value) || 1));
+                    state.seconds = Math.max(1, Math.min(durationMax,
                         state.frames / Math.max(1, state.fps)));
                     state.frames = Math.max(1, Math.round(state.seconds * state.fps));
                     this.value = String(state.frames);
@@ -1953,7 +1982,9 @@ var GenerateTab = (function () {
                 return;
             }
             if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
-                state.seconds = Math.max(1, Math.min(15, parseFloat(this.value) || 1));
+                var durationMax = minimaxH3MaxDurationForSize(state.width, state.height);
+                state.seconds = Math.max(1, Math.min(
+                    durationMax, parseFloat(this.value) || 1));
                 state.frames = Math.max(1, Math.round(state.seconds * state.fps));
                 if (els.framesInput)
                     els.framesInput.value = String(state.frames);
@@ -2009,13 +2040,13 @@ var GenerateTab = (function () {
                 state.videoQuant = this.value;
                 if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
                     state.h3Quant = state.videoQuant;
-                    if (state.videoQuant === 'int8-fast') {
+                    if (state.videoQuant === 'bf16') {
                         state.h3AttentionBackend = 'cudnn';
                         if (els.h3Attention)
                             els.h3Attention.value = 'cudnn';
                     }
                     if (els.h3Attention)
-                        els.h3Attention.disabled = state.videoQuant === 'int8-fast';
+                        els.h3Attention.disabled = state.videoQuant === 'bf16';
                     return;
                 }
                 var selectedIsLtx = ModelUtils.archForModel(state.model) === 'ltxv';
@@ -2034,7 +2065,7 @@ var GenerateTab = (function () {
             });
         if (els.h3Attention)
             els.h3Attention.addEventListener('change', function () {
-                if (state.videoQuant === 'int8-fast') {
+                if (state.videoQuant === 'bf16') {
                     state.h3AttentionBackend = 'cudnn';
                     this.value = 'cudnn';
                     return;
@@ -2906,6 +2937,7 @@ var GenerateTab = (function () {
             ws.value = String(state.width);
         if (hs)
             hs.value = String(state.height);
+        refreshMinimaxH3DurationLimit();
     }
     function getDefaultsForArch(arch) {
         var defaults = {
@@ -3360,6 +3392,68 @@ var GenerateTab = (function () {
         }) || null;
     }
 
+    function minimaxH3DefaultSteps() {
+        var runner = activeMinimaxH3Runner();
+        var advertised = Number(runner && runner.default_steps);
+        if (Number.isInteger(advertised) && advertised >= 2 && advertised <= 50)
+            return advertised;
+        var profiles = runner && Array.isArray(runner.supported_profiles)
+            ? runner.supported_profiles : [];
+        var profileSteps = Number(profiles[0] && profiles[0].steps);
+        return Number.isInteger(profileSteps) && profileSteps >= 2 && profileSteps <= 50
+            ? profileSteps : 20;
+    }
+
+    function minimaxH3InternalFrames(seconds) {
+        var frames = Math.max(5, Math.round(Number(seconds) * 24));
+        while (frames % 17 !== 5)
+            frames += 1;
+        return frames;
+    }
+
+    function minimaxH3SequenceTokens(width, height, seconds) {
+        var internalFrames = minimaxH3InternalFrames(seconds);
+        var latentFrames = Math.floor((internalFrames - 5) / 17) * 5 + 2;
+        var rowsPerFrame = Math.floor(Number(width) / 32) *
+            Math.floor(Number(height) / 32);
+        var audioLatents = Math.round(internalFrames / 24 * 40);
+        return 241 + latentFrames * rowsPerFrame + audioLatents * 2;
+    }
+
+    function minimaxH3MaxDurationForSize(width, height) {
+        var runner = activeMinimaxH3Runner();
+        var constraints = runner && runner.geometry_constraints || {};
+        var trainedMax = Number(constraints.trained_seconds_max) || 15;
+        var absoluteMax = Number(constraints.seconds_max) || trainedMax;
+        var tokenMax = Number(constraints.long_context_max_sequence_tokens) || 0;
+        if (absoluteMax <= trainedMax || tokenMax <= 0)
+            return trainedMax;
+        for (var centiseconds = Math.round(absoluteMax * 100);
+            centiseconds > Math.round(trainedMax * 100); centiseconds -= 1) {
+            var seconds = centiseconds / 100;
+            if (minimaxH3SequenceTokens(width, height, seconds) <= tokenMax)
+                return seconds;
+        }
+        return trainedMax;
+    }
+
+    function refreshMinimaxH3DurationLimit() {
+        if (!els.secondsInput || ModelUtils.archForModel(state.model) !== 'minimax_h3')
+            return;
+        var maximum = minimaxH3MaxDurationForSize(state.width, state.height);
+        els.secondsInput.max = String(maximum);
+        els.secondsInput.title = maximum > 15
+            ? 'Experimental single-pass H3 long context · trained range ends at 15 seconds · this resolution fits up to ' + maximum.toFixed(2) + ' seconds on the 24-GB token envelope'
+            : 'This resolution uses the full 24-GB token envelope at the trained 15-second limit';
+        state.seconds = Math.max(1, Math.min(maximum, Number(state.seconds) || 5));
+        state.frames = Math.max(1, Math.round(state.seconds * Math.max(1, state.fps)));
+        els.secondsInput.value = state.seconds.toFixed(3);
+        if (els.framesInput) {
+            els.framesInput.max = String(Math.max(1, Math.round(maximum * 120)));
+            els.framesInput.value = String(state.frames);
+        }
+    }
+
     function clampMinimaxH3Dimension(value, axis) {
         var runner = activeMinimaxH3Runner();
         var constraints = runner && runner.geometry_constraints || {};
@@ -3383,7 +3477,7 @@ var GenerateTab = (function () {
         return ModelUtils.clampDimension(Number(value) || fallback);
     }
 
-    function updateMinimaxH3VideoUI(arch) {
+    function updateMinimaxH3VideoUI(arch, enteringH3) {
         state.arch = arch;
         var runner = activeMinimaxH3Runner();
         var runnerReady = !!(runner && runner.available === true);
@@ -3406,10 +3500,13 @@ var GenerateTab = (function () {
             state.width = 1344;
             state.height = 768;
         }
-        state.seconds = Math.max(1, Math.min(15, Number(state.seconds) || 5));
+        var durationMax = minimaxH3MaxDurationForSize(state.width, state.height);
+        state.seconds = Math.max(1, Math.min(durationMax, Number(state.seconds) || 5));
         state.fps = Math.max(1, Math.min(120, Math.round(Number(state.fps) || 24)));
         state.frames = Math.max(1, Math.round(state.seconds * state.fps));
-        state.steps = Math.max(2, Math.min(50, Math.round(Number(state.steps) || 20)));
+        state.steps = enteringH3
+            ? minimaxH3DefaultSteps()
+            : Math.max(2, Math.min(50, Math.round(Number(state.steps) || 20)));
         state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.h3Quant) >= 0
             ? state.h3Quant : 'int8-fast';
         state.videoQuant = state.h3Quant;
@@ -3469,10 +3566,10 @@ var GenerateTab = (function () {
                     (backend.available === true ? '' : ' disabled') + '>' +
                     backend.label + '</option>';
             }).join('') || '<option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option>';
-            if (state.videoQuant === 'int8-fast')
+            if (state.videoQuant === 'bf16')
                 state.h3AttentionBackend = 'cudnn';
             els.h3Attention.value = state.h3AttentionBackend;
-            els.h3Attention.disabled = state.videoQuant === 'int8-fast';
+            els.h3Attention.disabled = state.videoQuant === 'bf16';
         }
         if (els.h3StepCache)
             els.h3StepCache.value = state.h3StepCache;
@@ -3487,15 +3584,18 @@ var GenerateTab = (function () {
         });
         if (els.framesInput) {
             els.framesInput.min = '1';
-            els.framesInput.max = '1800';
+            els.framesInput.max = String(Math.max(1, Math.round(durationMax * 120)));
             els.framesInput.step = '1';
             els.framesInput.value = String(state.frames);
         }
         if (els.secondsInput) {
             els.secondsInput.min = '1';
-            els.secondsInput.max = '15';
+            els.secondsInput.max = String(durationMax);
             els.secondsInput.step = '0.01';
             els.secondsInput.value = state.seconds.toFixed(3);
+            els.secondsInput.title = durationMax > 15
+                ? 'Experimental single-pass H3 long context · trained range ends at 15 seconds · this resolution fits up to ' + durationMax.toFixed(2) + ' seconds on the 24-GB token envelope'
+                : 'This resolution uses the full 24-GB token envelope at the trained 15-second limit';
         }
         if (els.fpsInput) {
             els.fpsInput.min = '1';
@@ -3511,11 +3611,13 @@ var GenerateTab = (function () {
             els.steps.min = '2';
             els.steps.max = '50';
             els.steps.value = String(state.steps);
+            els.steps.disabled = false;
         }
         if (els.stepsRange) {
             els.stepsRange.min = '2';
             els.stepsRange.max = '50';
             els.stepsRange.value = String(state.steps);
+            els.stepsRange.disabled = false;
         }
         syncDimensionInputs();
         [els.customWidth, els.customHeight,
@@ -3551,14 +3653,14 @@ var GenerateTab = (function () {
         var profileNote = document.getElementById('gen-video-profile-note');
         if (profileNote)
             profileNote.textContent = runnerReady
-                ? 'H3 width and height are adjustable from 32–2048 in 32-pixel steps, up to 1,032,192 pixels. The listed sizes are tested presets, not a lock. Seconds are adjustable from 1–15; INT8 Fast, INT8 Quality, and BF16 remain switchable.'
-                : 'MiniMax-H3 controls remain visible, but the selected local binaries, INT8 encoder cache, or quality gate are unavailable.';
+                ? 'H3 width and height are adjustable from 32–2048 in 32-pixel steps, up to 1,032,192 pixels. The listed sizes are tested presets, not a lock. H3 is trained through 15 seconds; lower resolutions expose experimental single-pass long context up to their token-budgeted limit. INT8 caches build automatically on first use; BF16 starts directly.'
+                : 'MiniMax-H3 controls remain visible, but a required model file, runner, or GPU runtime library is missing.';
         var advancedNote = document.getElementById('gen-video-advanced-note');
         if (advancedNote)
             advancedNote.textContent = 'H3 runs entirely on GPU, exits after denoising, decodes in a fresh GPU process, and muxes with NVENC.';
         if (els.modelWarn) {
             els.modelWarn.textContent = runnerReady
-                ? '' : 'MiniMax-H3 is not admitted by the current machine-local quality gate';
+                ? '' : 'MiniMax-H3 is installed but a required runtime file is missing';
             els.modelWarn.classList.toggle('visible', !runnerReady);
         }
         if (els.btn)
@@ -3797,12 +3899,13 @@ var GenerateTab = (function () {
             ? selected.generationDefaults : {};
     }
     function updateGenerateUIForArch(arch) {
+        var previousArch = state.arch;
         if (arch === 'ltxv') {
             updateVideoUIForArch(arch);
             return;
         }
         if (arch === 'minimax_h3') {
-            updateMinimaxH3VideoUI(arch);
+            updateMinimaxH3VideoUI(arch, previousArch !== arch);
             return;
         }
         if (arch === 'wan') {
@@ -3953,8 +4056,14 @@ var GenerateTab = (function () {
     function updateDurationHint() {
         if (!els.durationHint)
             return;
+        var h3 = ModelUtils.archForModel(state.model) === 'minimax_h3';
+        var h3Max = h3 ? minimaxH3MaxDurationForSize(state.width, state.height) : 0;
         els.durationHint.textContent = state.frames + ' frames \u00b7 ' +
-            Number(state.seconds.toFixed(3)) + 's at ' + state.fps + 'fps';
+            Number(state.seconds.toFixed(3)) + 's at ' + state.fps + 'fps' +
+            (h3 ? ' \u00b7 single-pass max ' + h3Max.toFixed(2) + 's at this resolution' +
+                (state.seconds > 15 ? ' \u00b7 experimental beyond trained 15s' : '') : '');
+        if (h3)
+            refreshMinimaxH3DurationLimit();
         if (ModelUtils.archForModel(state.model) === 'ltxv')
             updateLtx2ProfileStatus();
     }
@@ -4245,14 +4354,16 @@ var GenerateTab = (function () {
                 height: state.height,
                 frames: state.frames,
                 fps: state.fps,
-                duration_seconds: Math.max(1, Math.min(15,
+                duration_seconds: Math.max(1, Math.min(
+                    minimaxH3MaxDurationForSize(state.width, state.height),
                     Number(state.seconds) || state.frames / Math.max(1, state.fps))),
                 steps: Number(state.steps) || 20,
                 seed: seed,
                 quant: state.videoQuant === 'bf16'
                     ? 'bf16'
                     : (state.videoQuant === 'int8' ? 'int8' : 'int8-fast'),
-                attention_backend: state.h3AttentionBackend === 'sage-int8'
+                attention_backend: state.videoQuant !== 'bf16'
+                    && state.h3AttentionBackend === 'sage-int8'
                     ? 'sage-int8' : 'cudnn',
                 step_cache: state.h3StepCache === 'high' ? 'high' : 'exact',
                 include_audio: true

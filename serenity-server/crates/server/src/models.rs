@@ -20,11 +20,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Json, Path as AxPath, Query};
-use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const LTX2_FEATURE_ADAPTERS_JSON: &str =
     include_str!("../../../../serenitymojo/configs/ltx2_feature_adapters.json");
@@ -385,15 +385,7 @@ fn normalize_user_model_type(raw: &str) -> Option<String> {
 fn architecture_has_selected_checkpoint_loader(arch: &str) -> bool {
     matches!(
         arch,
-        "sdxl"
-            | "krea2"
-            | "zimage"
-            | "qwen-image"
-            | "sd3"
-            | "flux"
-            | "chroma"
-            | "anima"
-            | "ltx2"
+        "sdxl" | "krea2" | "zimage" | "qwen-image" | "sd3" | "flux" | "chroma" | "anima" | "ltx2"
     )
 }
 
@@ -408,9 +400,7 @@ fn selected_checkpoint_scope(
         ("sdxl", "diffusion_model" | "full_checkpoint") => Some("denoiser"),
         ("krea2", "diffusion_model") => Some("denoiser"),
         ("zimage", "diffusion_model") => Some("denoiser"),
-        ("qwen-image", "diffusion_model")
-            if !name.to_ascii_lowercase().contains("edit") =>
-        {
+        ("qwen-image", "diffusion_model") if !name.to_ascii_lowercase().contains("edit") => {
             Some("denoiser")
         }
         ("sd3", "sd3_large_full_checkpoint") => Some("full_checkpoint"),
@@ -426,9 +416,7 @@ fn selected_checkpoint_scope(
                     | "ltx-2.3-22b-distilled-fp8"
                     | "ltx-2.3-22b-distilled-fp8-dequant-bf16"
             );
-            (arch_source != "filename"
-                || !arch_override.is_empty()
-                || known_ltx23_single_file)
+            (arch_source != "filename" || !arch_override.is_empty() || known_ltx23_single_file)
                 .then_some("video_denoiser")
         }
         _ => None,
@@ -1687,7 +1675,7 @@ fn scan_checkpoints_uncached() -> Vec<ScanEntry> {
     // pinned creator-parity, cache-provenance, full-render, visual, mux, and
     // VRAM product gate passes. The directory may be partially downloaded for
     // hours; directory presence alone is not model readiness.
-    if crate::video::bernini_product_gate_passed() {
+    if crate::video::bernini::bernini_product_gate_passed() {
         let name = "Bernini-R-Diffusers";
         let dir = format!("{checkpoints}/{name}");
         if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
@@ -1708,7 +1696,7 @@ fn scan_checkpoints_uncached() -> Vec<ScanEntry> {
     // SCAIL-2 is a directory-backed multi-artifact model. Expose one product
     // identity only after the local full-animation gate binds the current
     // seven repo-built runners and installed FP8 cache.
-    if crate::video::scail2_product_gate_passed() {
+    if crate::video::scail2::scail2_product_gate_passed() {
         let name = "SCAIL-2-Mojo";
         let dir = format!("{checkpoints}/{name}");
         if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
@@ -1726,27 +1714,24 @@ fn scan_checkpoints_uncached() -> Vec<ScanEntry> {
             });
         }
     }
-    // MiniMax-H3 is a multi-directory audio/video model. Its product identity
-    // is selectable only after the exact compiled profile has current binaries,
-    // a complete GPU INT8 encoder cache, finite full-render evidence, and a
-    // visually inspected NVENC artifact.
-    if crate::video::minimax_h3_product_gate_passed() {
-        let name = "MiniMax-H3-Mojo";
-        let dir = format!("{checkpoints}/MiniMax-H3");
-        if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
-            out.push(ScanEntry {
-                name: name.to_string(),
-                path: dir.clone(),
-                arch: "minimax-h3".to_string(),
-                detected_arch: "minimax-h3".to_string(),
-                arch_source: "bundled_identity".to_string(),
-                arch_override: String::new(),
-                format: "diffusers_directory".to_string(),
-                size: du_sb(&dir),
-                folder: folder_relative_to(&dir, &checkpoints),
-                sidecar: sidecar_for_dir(&dir),
-            });
-        }
+    // MiniMax-H3 is a multi-directory audio/video model. Installed model
+    // identity is a filesystem fact, not a benchmark verdict: validation
+    // reports may describe confidence, but never hide a user's model.
+    let name = "MiniMax-H3-Mojo";
+    let dir = format!("{checkpoints}/MiniMax-H3");
+    if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
+        out.push(ScanEntry {
+            name: name.to_string(),
+            path: dir.clone(),
+            arch: "minimax-h3".to_string(),
+            detected_arch: "minimax-h3".to_string(),
+            arch_source: "bundled_identity".to_string(),
+            arch_override: String::new(),
+            format: "diffusers_directory".to_string(),
+            size: du_sb(&dir),
+            folder: folder_relative_to(&dir, &checkpoints),
+            sidecar: sidecar_for_dir(&dir),
+        });
     }
     // known multi-shard checkpoint subdirs under checkpoints/.
     for (name, arch) in [
@@ -2849,8 +2834,10 @@ mod tests {
         assert_eq!(arbitrary_qwen["uses_selected_checkpoint"], true);
         assert_eq!(arbitrary_qwen["selected_checkpoint_scope"], "denoiser");
 
-        let qwen_edit =
-            model_entry_json(&entry("qwen-image-edit-2511", "qwen-image", "diffusion_model"), "");
+        let qwen_edit = model_entry_json(
+            &entry("qwen-image-edit-2511", "qwen-image", "diffusion_model"),
+            "",
+        );
         assert_eq!(qwen_edit["runtime_supported"], false);
         assert_eq!(qwen_edit["uses_selected_checkpoint"], false);
 
@@ -2860,18 +2847,16 @@ mod tests {
         assert_eq!(bundled_flux["selected_checkpoint_scope"], "denoiser");
 
         for arch in ["chroma", "anima"] {
-            let arbitrary =
-                model_entry_json(&entry("creator-name", arch, "diffusion_model"), "");
+            let arbitrary = model_entry_json(&entry("creator-name", arch, "diffusion_model"), "");
             assert_eq!(arbitrary["runtime_supported"], true, "{arch}");
             assert_eq!(arbitrary["uses_selected_checkpoint"], true, "{arch}");
             assert_eq!(arbitrary["selected_checkpoint_scope"], "denoiser", "{arch}");
         }
 
-        let arbitrary_sd3 =
-            model_entry_json(
-                &entry("creator-name", "sd3", "sd3_large_full_checkpoint"),
-                "",
-            );
+        let arbitrary_sd3 = model_entry_json(
+            &entry("creator-name", "sd3", "sd3_large_full_checkpoint"),
+            "",
+        );
         assert_eq!(arbitrary_sd3["runtime_supported"], true);
         assert_eq!(arbitrary_sd3["uses_selected_checkpoint"], true);
         assert_eq!(
@@ -2967,12 +2952,10 @@ mod tests {
         let nava = model_entry_json(&entry("NAVA/NAVA_fp8", "nava", "diffusion_model"), "");
         assert_eq!(nava["generation_route"], "video");
         assert_eq!(nava["runtime_supported"], false);
-        assert!(
-            nava["runtime_reason"]
-                .as_str()
-                .unwrap()
-                .contains("not one of the compiled video product profiles")
-        );
+        assert!(nava["runtime_reason"]
+            .as_str()
+            .unwrap()
+            .contains("not one of the compiled video product profiles"));
 
         let mut classified_video = entry("creator-video", "ltx2", "diffusion_model");
         classified_video.detected_arch = "unknown".to_string();

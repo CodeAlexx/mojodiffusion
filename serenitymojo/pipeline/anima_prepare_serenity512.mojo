@@ -86,9 +86,9 @@ def main() raises:
     var ctx = DeviceContext()
     var args = argv()
     var img_path = String(
-        "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_real_serenity/test_256.png"
+        "/home/alex/.serenity/parity/cache/anima_real_serenity/test_256.png"
     )
-    var out_dir = String("/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_real_serenity")
+    var out_dir = String("/home/alex/.serenity/parity/cache/anima_real_serenity")
     if len(args) > 1:
         img_path = String(args[1])
     if len(args) > 2:

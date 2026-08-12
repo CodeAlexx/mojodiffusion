@@ -15,19 +15,19 @@ comptime LENS_TEXT_ENCODER_DIR = LENS_ROOT + "/text_encoder"
 comptime LENS_TOKENIZER_DIR = LENS_ROOT + "/tokenizer"
 comptime LENS_VAE_FILE = LENS_ROOT + "/vae/diffusion_pytorch_model.safetensors"
 comptime LENS_CAPTURE_1024_METADATA = (
-    "/home/alex/EriDiffusion/inference-flame/lens/parity/captures/"
+    "/home/alex/.serenity/parity/lens/parity/captures/"
     "capture_metadata.json"
 )
 comptime LENS_CAPTURE_512_METADATA = (
-    "/home/alex/EriDiffusion/inference-flame/lens/parity/captures_512/"
+    "/home/alex/.serenity/parity/lens/parity/captures_512/"
     "capture_metadata.json"
 )
 comptime LENS_TEXT_SMOKE_METADATA = (
-    "/home/alex/EriDiffusion/inference-flame/lens/parity/captures_text_smoke/"
+    "/home/alex/.serenity/parity/lens/parity/captures_text_smoke/"
     "metadata.json"
 )
 comptime LENS_TEXT_SMOKE_DIR = (
-    "/home/alex/EriDiffusion/inference-flame/lens/parity/captures_text_smoke"
+    "/home/alex/.serenity/parity/lens/parity/captures_text_smoke"
 )
 comptime LENS_TEXT_SMOKE_INPUT_IDS = LENS_TEXT_SMOKE_DIR + "/input_ids.safetensors"
 comptime LENS_TEXT_SMOKE_ATTENTION_MASK = (

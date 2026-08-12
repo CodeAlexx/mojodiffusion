@@ -170,6 +170,7 @@ async function run() {
   const promptRequests = [];
   const generateRequests = [];
   const videoRequests = [];
+  let modelRegistryAttempts = 0;
   let releaseVideoIdentity;
   const videoIdentityGate = new Promise((resolve) => { releaseVideoIdentity = resolve; });
 
@@ -181,6 +182,18 @@ async function run() {
     if (request.url().startsWith(baseUrl)) {
       requestFailures.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText || "failed"}`);
     }
+  });
+  await page.route("**/v1/models?refresh=1", async (route) => {
+    modelRegistryAttempts += 1;
+    if (modelRegistryAttempts === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "simulated server restart" }),
+      });
+      return;
+    }
+    await route.continue();
   });
   await page.route("**/prompt", async (route) => {
     promptRequests.push(parseRequestJson(route.request()));
@@ -318,7 +331,24 @@ async function run() {
     ));
 
     const initialModel = await page.evaluate(() => GenerateTab.state.model);
+    assert(modelRegistryAttempts >= 2,
+      `model registry did not retry after a transient server restart (${modelRegistryAttempts} request)`);
     assert(/krea.*turbo/i.test(initialModel), `Generate defaulted to ${initialModel}, expected Krea-2 Turbo`);
+    if (process.env.SERENITY_REGISTRY_RETRY_ONLY === "1") {
+      const loadedModelCount = await page.evaluate(() => GenerateTab.state.allModels.length);
+      assert(loadedModelCount > 0, "model registry retry completed with an empty picker");
+      assert(pageErrors.length === 0, `page errors: ${pageErrors.join(" | ")}`);
+      assert(requestFailures.length === 0,
+        `same-origin request failures: ${requestFailures.join(" | ")}`);
+      console.log("serenity model registry restart retry: PASS");
+      console.log(JSON.stringify({
+        schema: "serenity.playwright.model_registry_retry.v1",
+        model_registry_attempts: modelRegistryAttempts,
+        loaded_model_count: loadedModelCount,
+        selected_model: initialModel,
+      }));
+      return;
+    }
 
     const mainVideoAudioState = await page.evaluate(() => {
       const video = document.querySelector("#gen-preview-video");
@@ -710,7 +740,8 @@ async function run() {
       assert(result.selected === result.name, `${result.name}: picker selected ${result.selected}`);
       assert(result.nodes > 0, `${result.name}: generated an empty workflow`);
       assert(result.sink, `${result.name}: workflow has no media sink`);
-      if (result.backend === "ltx2" && !result.exactAvailableLtxProfile) {
+      if ((result.backend === "ltx2" && !result.exactAvailableLtxProfile)
+          || (result.backend === "minimax_h3" && !result.exactAvailableH3Profile)) {
         assert(!result.admitted,
           `${result.name}: LTX route bypassed the unavailable runtime ${JSON.stringify(result)}`);
       } else {
@@ -748,6 +779,8 @@ async function run() {
         duration: Number(document.querySelector("#gen-seconds").value),
         durationMin: Number(document.querySelector("#gen-seconds").min),
         durationMax: Number(document.querySelector("#gen-seconds").max),
+        steps: Number(document.querySelector("#gen-steps").value),
+        stepsDisabled: document.querySelector("#gen-steps").disabled,
         stepCache: document.querySelector("#gen-h3-step-cache").value,
         frames: Number(document.querySelector("#gen-frames").value),
         framesMin: Number(document.querySelector("#gen-frames").min),
@@ -758,6 +791,8 @@ async function run() {
         quant: document.querySelector("#gen-video-quant").value,
         quants: Array.from(document.querySelector("#gen-video-quant").options)
           .map((option) => ({ id: option.value, disabled: option.disabled })),
+        attention: document.querySelector("#gen-h3-attention").value,
+        attentionDisabled: document.querySelector("#gen-h3-attention").disabled,
       }));
       const setGenerateH3Geometry = (aspect, width, height, seconds, fps) => page.evaluate(
         ({ aspect, width, height, seconds, fps }) => {
@@ -793,6 +828,7 @@ async function run() {
           && generateH3Default.widthStep === 32 && generateH3Default.heightStep === 32
           && !generateH3Default.widthDisabled && !generateH3Default.heightDisabled
           && generateH3Default.durationMin === 1 && generateH3Default.durationMax === 15
+          && generateH3Default.steps === 20 && !generateH3Default.stepsDisabled
           && generateH3Default.stepCache === "exact"
           && generateH3Default.framesMin === 1 && generateH3Default.framesMax === 1800
           && generateH3Default.fpsMin === 1 && generateH3Default.fpsMax === 120
@@ -801,6 +837,11 @@ async function run() {
           && generateH3Default.quants.every((mode) => !mode.disabled),
         `H3 Generate controls are locked or incomplete: ${JSON.stringify(generateH3Default)}`,
       );
+
+      await page.locator("#gen-steps").fill("31");
+      const generateH3AuthoredSteps = await readGenerateH3Controls();
+      assert(generateH3AuthoredSteps.steps === 31 && !generateH3AuthoredSteps.stepsDisabled,
+        `H3 Generate steps were not user-adjustable: ${JSON.stringify(generateH3AuthoredSteps)}`);
 
       const testedGenerateH3Presets = [
         ["1536×672", 1536, 672], ["1344×768", 1344, 768],
@@ -830,11 +871,21 @@ async function run() {
         }, quant);
         const controls = await readGenerateH3Controls();
         assert(controls.quant === quant
+          && controls.attention === "cudnn"
+          && controls.attentionDisabled === (quant === "bf16")
           && controls.width === 992 && controls.height === 576
           && controls.duration === 4 && controls.frames === 96,
         `Generate H3 ${quant} changed authored geometry: ${JSON.stringify(controls)}`);
       }
-      await page.locator("#gen-prompt").fill("Playwright H3 Generate runtime geometry request");
+      await setGenerateH3Geometry("Free", 512, 320, 60, 24);
+      const generateH3LongContext = await readGenerateH3Controls();
+      assert(generateH3LongContext.aspect === "Free"
+        && generateH3LongContext.width === 512 && generateH3LongContext.height === 320
+        && generateH3LongContext.durationMax === 60
+        && generateH3LongContext.duration === 60
+        && generateH3LongContext.frames === 1440,
+      `Generate H3 long-context controls did not expand: ${JSON.stringify(generateH3LongContext)}`);
+      await page.locator("#gen-prompt").fill("Playwright H3 single-pass 60-second request");
       const generateH3VideoBefore = videoRequests.length;
       await page.locator("#gen-btn").click();
       for (let attempt = 0; attempt < 100 && videoRequests.length === generateH3VideoBefore; attempt += 1) {
@@ -846,9 +897,11 @@ async function run() {
       assert(generateH3Request.model === "minimax_h3"
         && generateH3Request.runner === "minimax_h3_mojo_request"
         && generateH3Request.quant === "bf16"
-        && generateH3Request.width === 992 && generateH3Request.height === 576
-        && generateH3Request.duration_seconds === 4
-        && generateH3Request.frames === 96 && generateH3Request.fps === 24
+        && generateH3Request.attention_backend === "cudnn"
+        && generateH3Request.width === 512 && generateH3Request.height === 320
+        && generateH3Request.duration_seconds === 60
+        && generateH3Request.frames === 1440 && generateH3Request.fps === 24
+        && generateH3Request.steps === 31
         && generateH3Request.step_cache === "exact",
       `H3 Generate submitted the wrong runtime geometry: ${JSON.stringify(generateH3Request)}`);
 
@@ -879,26 +932,38 @@ async function run() {
         durationMin: Number(document.querySelector("#cv-h3-duration").min),
         durationMax: Number(document.querySelector("#cv-h3-duration").max),
         stepCache: document.querySelector("#cv-h3-step-cache").value,
+        steps: Number(document.querySelector("#cv-steps").value),
+        stepsDisabled: document.querySelector("#cv-steps").disabled,
         frames: Number(document.querySelector("#cv-frames").value),
         framesMin: Number(document.querySelector("#cv-frames").min),
         framesMax: Number(document.querySelector("#cv-frames").max),
-        fps: Number(document.querySelector("#cv-fps").value),
-        fpsMin: Number(document.querySelector("#cv-fps").min),
-        fpsMax: Number(document.querySelector("#cv-fps").max),
+        fps: Number(document.querySelector("#cv-h3-fps").value),
+        fpsMin: Number(document.querySelector("#cv-h3-fps").min),
+        fpsMax: Number(document.querySelector("#cv-h3-fps").max),
         geometryDisabled: [
           "#cv-h3-resolution", "#cv-h3-width", "#cv-h3-height",
-          "#cv-h3-duration", "#cv-frames", "#cv-fps",
+          "#cv-h3-duration", "#cv-h3-fps",
         ].some((selector) => document.querySelector(selector).disabled),
         bboxGeometryLocked: ["#cv-bbox-w", "#cv-bbox-h"]
           .every((selector) => document.querySelector(selector).disabled),
-        modes: Array.from(document.querySelector("#cv-h3-mode").options)
-          .map((option) => ({ id: option.value, disabled: option.disabled })),
+        modeControlHidden: document.querySelector("#cv-h3-mode").type === "hidden",
+        routeText: document.querySelector("#cv-h3-mode-note").textContent,
+        mediaVisible: getComputedStyle(
+          document.querySelector("#cv-h3-media-row")).display !== "none",
+        genericFramesVisible: getComputedStyle(
+          document.querySelector("#cv-video-frames-row")).display !== "none",
+        genericFpsVisible: getComputedStyle(
+          document.querySelector("#cv-video-fps-row")).display !== "none",
+        continuationVisible: getComputedStyle(
+          document.querySelector("#cv-h3-continue-row")).display !== "none",
+        continuationSource: document.querySelector("#cv-h3-continue-source").textContent,
+        contextFrames: Number(document.querySelector("#cv-h3-context-frames").value),
       }));
       const setH3Geometry = (resolution, seconds, fps, width, height) => page.evaluate(
         ({ resolution, seconds, fps, width, height }) => {
-          const fpsControl = document.querySelector("#cv-fps");
+          const fpsControl = document.querySelector("#cv-h3-fps");
           fpsControl.value = String(fps);
-          fpsControl.dispatchEvent(new Event("input", { bubbles: true }));
+          fpsControl.dispatchEvent(new Event("change", { bubbles: true }));
           const resolutionControl = document.querySelector("#cv-h3-resolution");
           resolutionControl.value = resolution;
           resolutionControl.dispatchEvent(new Event("change", { bubbles: true }));
@@ -931,12 +996,22 @@ async function run() {
           && JSON.stringify(h3Default.attentionOptions)
             === JSON.stringify(["sage-int8", "cudnn"])
           && h3Default.stepCache === "exact"
+          && h3Default.steps === 20 && !h3Default.stepsDisabled
           && h3Default.framesMin === 1 && h3Default.framesMax === 1800
           && h3Default.fpsMin === 1 && h3Default.fpsMax === 120
+          && h3Default.mode === "t2va" && h3Default.modeControlHidden
+          && h3Default.mediaVisible
+          && !h3Default.genericFramesVisible && !h3Default.genericFpsVisible
           && !h3Default.geometryDisabled && h3Default.bboxGeometryLocked,
         `H3 native resolution controls are wrong: ${JSON.stringify(h3Default)}`,
       );
 
+      await page.locator("#cv-steps").fill("37");
+      const h3AuthoredSteps = await readH3Controls();
+      assert(h3AuthoredSteps.steps === 37 && !h3AuthoredSteps.stepsDisabled,
+        `H3 steps were not user-adjustable: ${JSON.stringify(h3AuthoredSteps)}`);
+
+      await page.locator(".cv-h3-advanced summary").click();
       await page.locator("#cv-h3-attention").selectOption("cudnn");
       await page.locator("#cv-h3-quant").selectOption("int8-fast");
       const h3CudnnSwitch = await readH3Controls();
@@ -972,11 +1047,20 @@ async function run() {
       const h3TwoSeconds = await readH3Controls();
       assert(
         h3TwoSeconds.quant === "bf16"
+          && h3TwoSeconds.attention === "cudnn"
+          && h3TwoSeconds.attentionDisabled
           && h3TwoSeconds.width === 1344 && h3TwoSeconds.height === 768
           && h3TwoSeconds.duration === 2 && h3TwoSeconds.frames === 48
           && h3TwoSeconds.fps === 24,
         `H3 2-second authored geometry did not remain exact: ${JSON.stringify(h3TwoSeconds)}`,
       );
+
+      await page.locator("#cv-h3-quant").selectOption("int8");
+      const h3Int8Attention = await readH3Controls();
+      assert(h3Int8Attention.attention === "cudnn"
+          && !h3Int8Attention.attentionDisabled,
+        `H3 Sage switch did not return for INT8 Quality: ${JSON.stringify(h3Int8Attention)}`);
+      await page.locator("#cv-h3-attention").selectOption("sage-int8");
 
       await setH3Geometry("1344x768", 4, 24);
       const h3FourSeconds = await readH3Controls();
@@ -996,28 +1080,24 @@ async function run() {
         `H3 maximum runtime controls did not resolve: ${JSON.stringify(h3Maximum)}`,
       );
 
-      for (const mode of ["t2va", "i2va", "l2va", "fl2va", "ref2va"]) {
-        const option = h3Maximum.modes.find((candidate) => candidate.id === mode);
-        assert(option && !option.disabled,
-          `H3 feature ${mode} is not available: ${JSON.stringify(h3Maximum.modes)}`);
-        await page.locator("#cv-h3-mode").selectOption(mode);
-        const controls = await readH3Controls();
-        assert(!controls.geometryDisabled && controls.bboxGeometryLocked
-          && controls.width === 1536 && controls.height === 672
-          && controls.duration === 15,
-        `H3 ${mode} does not share the native resolution controls: ${JSON.stringify(controls)}`);
-        const mediaInputs = await page.evaluate(() => ({
-          source: getComputedStyle(document.querySelector("#cv-h3-source-row")).display !== "none",
-          references: getComputedStyle(document.querySelector("#cv-h3-references-row")).display !== "none",
-          lastFrame: getComputedStyle(document.querySelector("#cv-h3-last-frame-row")).display !== "none",
-        }));
-        assert(mediaInputs.source === (mode === "i2va" || mode === "fl2va")
-          && mediaInputs.references === (mode === "ref2va")
-          && mediaInputs.lastFrame === (mode === "l2va" || mode === "fl2va"),
-        `H3 ${mode} media pickers are wrong: ${JSON.stringify(mediaInputs)}`);
-      }
+      await page.locator(".cv-h3-advanced summary").click();
+      const h3UnifiedSurface = await page.evaluate(() => ({
+        modeControl: document.querySelector("#cv-h3-mode").type,
+        start: getComputedStyle(document.querySelector("#cv-h3-source-row")).display !== "none",
+        references: getComputedStyle(document.querySelector("#cv-h3-references-row")).display !== "none",
+        lastFrame: getComputedStyle(document.querySelector("#cv-h3-last-frame-row")).display !== "none",
+        advancedOpen: document.querySelector(".cv-h3-advanced").open,
+      }));
+      assert(h3UnifiedSurface.modeControl === "hidden"
+        && h3UnifiedSurface.start && h3UnifiedSurface.references
+        && h3UnifiedSurface.lastFrame && !h3UnifiedSurface.advancedOpen,
+      `H3 Canvas is not one progressive-disclosure surface: ${JSON.stringify(h3UnifiedSurface)}`);
 
-      await page.locator("#cv-h3-mode").selectOption("i2va");
+      await setH3Geometry("custom", 60, 24, 512, 320);
+      const h3LongT2va = await readH3Controls();
+      assert(h3LongT2va.durationMax === 60 && h3LongT2va.duration === 60
+        && h3LongT2va.frames === 1440,
+      `H3 Canvas T2VA long context did not expand: ${JSON.stringify(h3LongT2va)}`);
       const h3SourceChooserPromise = page.waitForEvent("filechooser");
       await page.locator("#cv-h3-source-button").click();
       const h3SourceChooser = await h3SourceChooserPromise;
@@ -1033,13 +1113,34 @@ async function run() {
         const note = document.querySelector("#cv-h3-source-note");
         const preview = document.querySelector("#cv-source-preview");
         return note && note.textContent.includes("alien-baby.png")
-          && preview && preview.style.display === "block";
+          && preview && preview.style.display === "block"
+          && document.querySelector("#cv-h3-mode").value === "i2va";
       });
+      const h3StartOnly = await readH3Controls();
+      assert(h3StartOnly.mode === "i2va" && h3StartOnly.routeText.includes("Start image"),
+        `H3 did not infer start-image generation: ${JSON.stringify(h3StartOnly)}`);
 
-      await page.locator("#cv-h3-mode").selectOption("ref2va");
+      await page.locator("#cv-h3-last-frame-file").setInputFiles({
+        name: "cockpit.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      });
+      await page.waitForFunction(() => document.querySelector("#cv-h3-mode").value === "fl2va");
+      const h3FirstLast = await readH3Controls();
+      assert(h3FirstLast.routeText.includes("Start + end images"),
+        `H3 did not infer first-plus-last generation: ${JSON.stringify(h3FirstLast)}`);
+      await page.locator("#cv-h3-source-clear").click();
+      await page.waitForFunction(() => document.querySelector("#cv-h3-mode").value === "l2va");
+      await page.locator("#cv-h3-last-frame-clear").click();
+      await page.waitForFunction(() => document.querySelector("#cv-h3-mode").value === "t2va");
 
+      await page.locator("#cv-h3-references-row summary").click();
       const h3ReferenceSurface = await page.evaluate(() => ({
         visible: document.querySelector("#cv-h3-references-row").style.display !== "none",
+        open: document.querySelector("#cv-h3-references-row details").open,
         multiple: document.querySelector("#cv-h3-references-file").multiple,
         accept: document.querySelector("#cv-h3-references-file").accept,
         buttonTop: document.querySelector('label[for="cv-h3-references-file"]')
@@ -1047,7 +1148,7 @@ async function run() {
         panelBottom: document.querySelector("#panel-canvas .cv-right")
           .getBoundingClientRect().bottom,
       }));
-      assert(h3ReferenceSurface.visible && h3ReferenceSurface.multiple
+      assert(h3ReferenceSurface.visible && h3ReferenceSurface.open && h3ReferenceSurface.multiple
         && h3ReferenceSurface.accept.includes("image/*")
         && h3ReferenceSurface.accept.includes("video/*")
         && h3ReferenceSurface.accept.includes("audio/*")
@@ -1060,8 +1161,13 @@ async function run() {
       ]);
       await page.waitForFunction(() => {
         const labels = Array.from(document.querySelectorAll("#cv-h3-references-list .cv-lora-name"));
-        return labels.length === 3 && labels.every((label) => label.textContent.includes("ready"));
+        return labels.length === 3 && labels.every((label) => label.textContent.includes("ready"))
+          && document.querySelector("#cv-h3-mode").value === "ref2va";
       });
+      const h3LongRef2va = await readH3Controls();
+      assert(h3LongRef2va.durationMax === 15 && h3LongRef2va.duration === 15
+        && h3LongRef2va.frames === 360,
+      `H3 references did not infer Ref2VA and retain its trained duration cap: ${JSON.stringify(h3LongRef2va)}`);
       const h3AudioRoles = page.locator("#cv-h3-references-list select");
       await h3AudioRoles.nth(0).selectOption("reuse");
       await h3AudioRoles.nth(1).selectOption("voice_timbre");
@@ -1118,13 +1224,12 @@ async function run() {
       }));
       assert(h3ContinueContract.detail
         && h3ContinueContract.detail.isVideo === true
-        && h3ContinueContract.detail.filename === "completed-h3.mp4"
-        && h3ContinueContract.mode === "i2va",
-      `H3 continuation action did not switch to I2VA: ${JSON.stringify(h3ContinueContract)}`);
+        && h3ContinueContract.detail.filename === "completed-h3.mp4",
+      `H3 continuation action lost its completed clip: ${JSON.stringify(h3ContinueContract)}`);
       try {
         await page.waitForFunction(() => {
           const note = document.querySelector("#cv-h3-source-note");
-          return note && note.textContent.includes("Continuation frame ready");
+          return note && note.textContent.includes("I2VA fallback frame ready");
         }, null, { timeout: 5000 });
       } catch (error) {
         const state = await page.evaluate(() => ({
@@ -1140,7 +1245,7 @@ async function run() {
         width: Number(document.querySelector("#cv-h3-width").value),
         height: Number(document.querySelector("#cv-h3-height").value),
         duration: Number(document.querySelector("#cv-h3-duration").value),
-        fps: Number(document.querySelector("#cv-fps").value),
+        fps: Number(document.querySelector("#cv-h3-fps").value),
         source: document.querySelector("#cv-source-preview").src,
       }));
       assert(h3ContinuationReady.mode === "i2va"
@@ -1149,6 +1254,77 @@ async function run() {
         && h3ContinuationReady.duration === 15 && h3ContinuationReady.fps === 24
         && h3ContinuationReady.source.startsWith("data:image/png;base64,"),
       `H3 final-frame continuation was not ready: ${JSON.stringify(h3ContinuationReady)}`);
+
+      const h3NativeContinueContract = await page.evaluate(() => new Promise((resolve, reject) => {
+        document.addEventListener("sf-staging-continue-h3", (event) => {
+          resolve({ detail: event.detail && event.detail.result });
+        }, { once: true });
+        CanvasStaging.activate([{
+          src: "/out/video-0420/video.mp4",
+          isVideo: true,
+          filename: "native-h3.mp4",
+          metadata: {
+            promptId: "video-0420",
+            width: 768,
+            height: 768,
+            fps: 24,
+            duration_seconds: 10,
+            serverResult: {
+              state: "done",
+              model: "minimax_h3",
+              width: 768,
+              height: 768,
+              fps: 24,
+              frames: 240,
+              motion_context_available: true,
+              motion_context_windows: [5, 22, 39],
+            },
+          },
+        }], CanvasTab.getToolContext());
+        const button = document.querySelector("#stg-continue-h3");
+        if (!button) {
+          reject(new Error("native video staging has no Continue H3 action"));
+          return;
+        }
+        button.click();
+      }));
+      assert(h3NativeContinueContract.detail
+        && h3NativeContinueContract.detail.metadata.promptId === "video-0420",
+      `H3 native continuation event lost its source: ${JSON.stringify(h3NativeContinueContract)}`);
+      await page.waitForFunction(() => document.querySelector("#cv-h3-mode").value === "continue");
+      await page.locator("#cv-h3-context-frames").selectOption("39");
+      const h3NativeContinuationReady = await readH3Controls();
+      assert(h3NativeContinuationReady.mode === "continue"
+        && h3NativeContinuationReady.continuationVisible
+        && h3NativeContinuationReady.continuationSource.includes("video-0420")
+        && h3NativeContinuationReady.contextFrames === 39
+        && h3NativeContinuationReady.durationMax >= 15
+        && h3NativeContinuationReady.width === 768
+        && h3NativeContinuationReady.height === 768
+        && h3NativeContinuationReady.duration === 10
+        && h3NativeContinuationReady.fps === 24
+        && h3NativeContinuationReady.stepCache === "exact",
+      `H3 native latent continuation was not ready: ${JSON.stringify(h3NativeContinuationReady)}`);
+      await page.locator("#cv-prompt").fill("Continue the same action and sound without a cut.");
+      const h3NativeVideoBefore = videoRequests.length;
+      await page.locator("#cv-generate-btn").click();
+      for (let attempt = 0; attempt < 100 && videoRequests.length === h3NativeVideoBefore; attempt += 1) {
+        await page.waitForTimeout(20);
+      }
+      assert(videoRequests.length === h3NativeVideoBefore + 1,
+        "H3 native continuation did not POST /v1/video");
+      const h3NativeRequest = videoRequests[videoRequests.length - 1];
+      assert(h3NativeRequest.task === "continue"
+        && h3NativeRequest.continue_from === "video-0420"
+        && h3NativeRequest.motion_context_frames === 39
+        && Array.isArray(h3NativeRequest.references)
+        && h3NativeRequest.references.length === 0
+        && h3NativeRequest.width === 768 && h3NativeRequest.height === 768
+        && h3NativeRequest.duration_seconds === 10
+        && h3NativeRequest.fps === 24
+        && h3NativeRequest.step_cache === "exact"
+        && h3NativeRequest.include_audio === true,
+      `H3 native continuation request drifted: ${JSON.stringify(h3NativeRequest)}`);
       if (process.env.SERENITY_H3_ONLY === "1") {
         assert(pageErrors.length === 0, `page errors: ${pageErrors.join(" | ")}`);
         assert(requestFailures.length === 0,
@@ -1159,15 +1335,20 @@ async function run() {
           base_url: baseUrl,
           generate_default_controls: generateH3Default,
           generate_boundary_controls: generateH3Boundary,
+          generate_long_context_controls: generateH3LongContext,
           generate_submitted_request: generateH3Request,
           default_controls: h3Default,
           two_second_controls: h3TwoSeconds,
           four_second_controls: h3FourSeconds,
           maximum_controls: h3Maximum,
+          long_context_t2va_controls: h3LongT2va,
+          long_context_ref2va_controls: h3LongRef2va,
           custom_controls: h3Custom,
           ref2va_submitted_request: h3RefRequest,
           continuation_action: h3ContinueContract,
           continuation_ready: h3ContinuationReady,
+          native_continuation_ready: h3NativeContinuationReady,
+          native_continuation_request: h3NativeRequest,
         }, null, 2));
         return;
       }

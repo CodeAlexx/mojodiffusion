@@ -33,5 +33,5 @@ def main() raises:
         print("[flux1-contract] cached inputs PASS:", inputs_path)
     else:
         print("[flux1-contract] cached inputs missing:", inputs_path)
-        print("Generate with: cd /home/alex/EriDiffusion/inference-flame && FLUX1_SAVE_INPUTS=1 cargo run --release --bin flux1_infer")
+        print("Generate with: cd /home/alex/.serenity/parity/inference-flame && FLUX1_SAVE_INPUTS=1 cargo run --release --bin flux1_infer")
     print("FLUX.1-dev pipeline contract PASS")

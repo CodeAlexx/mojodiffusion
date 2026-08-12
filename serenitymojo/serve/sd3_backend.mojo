@@ -93,6 +93,7 @@ from serenitymojo.offload.plan import (
     build_sd35_large_block_plan,
 )
 from serenitymojo.registry.checkpoints import path_exists
+from serenitymojo.io.env import env_int
 
 from serenitymojo.tokenizer.clip_tokenizer import ClipTokenizer
 from serenitymojo.tokenizer.t5_tokenizer import T5Tokenizer
@@ -111,8 +112,7 @@ from serenitymojo.models.dit.sd3_mmdit import (
 from serenitymojo.models.sd35.sd3_lokr_overlay import (
     Sd3LokrOverlay, load_sd3_large_lokr,
 )
-from serenitymojo.pipeline.sd3_tiled_decode import sd3_tiled_decode_5x5_lowmem
-from serenitymojo.models.vae.ldm_decoder import load_sd3_embedded_ldm_decoder
+from serenitymojo.serve.sd3_decode_subprocess import decode_subprocess
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm as _ops_layer_norm
@@ -175,6 +175,7 @@ comptime CONTEXT_DIM = 4096                 # joint_attention_dim (T5 hidden wid
 
 # ── verified model + tokenizer paths (match sd3_infer.rs constants exactly) ──
 comptime MODEL_PATH = "models/sd3.5/transformer.safetensors"
+comptime SD3_FP8_CACHE_PATH = "models/sd3.5/transformer.fp8cache.safetensors"
 comptime CLIP_L_PATH = "models/text-encoders/clip_l.safetensors"
 comptime CLIP_G_PATH = "models/text-encoders/clip_g.safetensors"
 comptime T5_PATH = "models/text-encoders/t5xxl_fp16.safetensors"
@@ -199,21 +200,22 @@ comptime T5_PAD_ID = 0
 comptime SD3_DEFAULT_STEPS = 28
 comptime SD3_DEFAULT_SEED = 42
 
+# The measured one-step host-store path peaks around 17 GiB on this 24 GiB card.
+# Keep at least 18 GiB free at the promotion boundary for the gate, two serial
+# CFG forwards, transient block reconstruction, and activations; use only the
+# excess for plan-order device FP8 hits. The shared loader rechecks this floor
+# before every physical VMM mapping, so a stale free-VRAM snapshot fails closed.
+# VAE decode runs only after phase-local VMM weights are physically unmapped.
+# Keep a 4 GiB live floor for denoise activations/concurrent GPU use while
+# allowing the 3090 to expand the complete E4M3 cache to BF16 once per job.
+comptime SD3_DENOISE_VRAM_RESERVE_MIB = 4096
+
 
 comptime S3PHASE_IDLE = 0
 comptime S3PHASE_ENCODE = 1
 comptime S3PHASE_LOAD = 2
 comptime S3PHASE_DENOISE = 3
 comptime S3PHASE_DECODE = 4
-
-# Whole-image VAE decode is preferred when it fits: tiled decode is MEASURED to
-# degrade output (MJ-1054). SD3 releases GPU staging and its resident gate
-# before decode, so free VRAM is usually ample. After that release + mempool trim
-# we query free VRAM and decode whole when it clears this bar, else fall back to
-# the (degrading) 5x5-lowmem tiled path. 14 GiB is a conservative estimate to be
-# tightened by measurement.
-comptime WHOLE_DECODE_MIN_FREE_BYTES = 14 * 1024 * 1024 * 1024  # 14 GiB
-
 
 def _shell(cmd: String) -> Int:
     var n = cmd.byte_length()
@@ -490,7 +492,7 @@ def _sd3_large_forward[LH_: Int, LW_: Int, N_IMG_: Int, S_JOINT_: Int](
         _sd3_joint_block[1, S_JOINT_, N_CTX, N_IMG_, H_HEADS, H_DIM](
             ctx_tokens, x_tokens, c, handle.block, i, is_last,
             DUAL_BLOCKS, HIDDEN, ctx,
-            lora,
+            lora, True,
         )
         loader.mark_active_block_done(ctx)
 
@@ -508,6 +510,12 @@ struct Sd3Backend(GenBackend, Movable):
     var loader_checkpoint: String
     var lora: List[ArcPointer[Sd3LokrOverlay]]         # 0/1 runtime LoKr
     var lora_target_count: Int
+    # Exact prompt-pair conditioning is about 7 MiB and independent of seed,
+    # steps, CFG, and image shape. Preserve one entry across jobs so variations
+    # do not reload CLIP-L, CLIP-G, and T5-XXL.
+    var cap_cache_prompt: String
+    var cap_cache_negative: String
+    var cap_cache: List[ArcPointer[Sd3Caps]]
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -527,6 +535,10 @@ struct Sd3Backend(GenBackend, Movable):
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
+    var text_conditioning_cache_hit: Bool
+    var fp8_cache_hit: Bool
+    var device_resident_blocks: Int
+    var device_resident_budget_bytes: Int
     var prepare_seconds: Float64
     var denoise_seconds: Float64
     var vae_decode_seconds: Float64
@@ -541,6 +553,9 @@ struct Sd3Backend(GenBackend, Movable):
         self.loader_checkpoint = String("")
         self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.lora_target_count = 0
+        self.cap_cache_prompt = String("")
+        self.cap_cache_negative = String("")
+        self.cap_cache = List[ArcPointer[Sd3Caps]]()
         self.active = False
         self.cancel_flag = False
         self.phase = S3PHASE_IDLE
@@ -558,6 +573,10 @@ struct Sd3Backend(GenBackend, Movable):
         self.job_t0_ns = UInt(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
+        self.text_conditioning_cache_hit = False
+        self.fp8_cache_hit = False
+        self.device_resident_blocks = 0
+        self.device_resident_budget_bytes = 0
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
@@ -638,6 +657,10 @@ struct Sd3Backend(GenBackend, Movable):
         # A cancelled/failed job can leave GPU gate/LoKr state resident. Drop
         # that per-job state, but retain a matching complete host store.
         if self.loaded:
+            self.ctx.synchronize()
+            if len(self.loader) == 1:
+                self.loader[0][].discard_fp8h_device_staging()
+                self.loader[0][].discard_fp8_host_promotions()
             self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
             self.lora = List[ArcPointer[Sd3LokrOverlay]]()
             self.lora_target_count = 0
@@ -671,6 +694,9 @@ struct Sd3Backend(GenBackend, Movable):
         self.job_t0_ns = perf_counter_ns()
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
+        self.text_conditioning_cache_hit = False
+        self.device_resident_blocks = 0
+        self.device_resident_budget_bytes = 0
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
@@ -712,6 +738,8 @@ struct Sd3Backend(GenBackend, Movable):
         self.ctx.synchronize()
         if len(self.loader) == 1:
             self.loader[0][].discard_fp8h_device_staging()
+            self.loader[0][].discard_fp8_host_promotions()
+            print("[sd3] released phase-local VMM denoiser promotions before VAE")
         self.gate = List[ArcPointer[SD3MMDiTPreBlockGate]]()
         self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.loaded = False
@@ -785,11 +813,25 @@ struct Sd3Backend(GenBackend, Movable):
         ) + String(self.dpmpp_update_steps) + String(
             ',"dpmpp_second_order_steps":'
         ) + String(self.dpmpp_second_order_steps) + String("},\n")
-        content += String('    "dtype":"bf16_mmdit_bf16_latent"\n')
+        content += String('    "text_conditioning_cache_hit":') + json_bool(
+            self.text_conditioning_cache_hit
+        ) + String(",\n")
+        content += String(
+            '    "dtype":"fp8_e4m3_cached_bf16_resident_mmdit_bf16_latent"\n'
+        )
         content += String("  },\n")
         content += String('  "mojo":{\n')
         content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
         content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
+        content += String('    "fp8_cache_hit":') + (
+            String("true") if self.fp8_cache_hit else String("false")
+        ) + String(",\n")
+        content += String('    "device_resident_blocks":') + String(
+            self.device_resident_blocks
+        ) + String(",\n")
+        content += String('    "device_resident_budget_mib":') + String(
+            self.device_resident_budget_bytes // (1024 * 1024)
+        ) + String(",\n")
         content += String('    "prepare_seconds":') + String(self.prepare_seconds) + String(",\n")
         content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
         content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
@@ -849,6 +891,25 @@ struct Sd3Backend(GenBackend, Movable):
         keeps the proven `_assemble_one` math while ensuring CLIP/T5 allocations
         are gone before the SD3.5 MMDiT worker loads its first block.
         """
+        if (
+            len(self.cap_cache) == 1
+            and self.cap_cache_prompt == self.params.prompt
+            and self.cap_cache_negative == self.params.negative
+        ):
+            print(
+                "[sd3] conditioning cache HIT (prompts unchanged) — skipping encoders"
+            )
+            ref cached = self.cap_cache[0][]
+            self.caps = List[ArcPointer[Sd3Caps]]()
+            self.caps.append(ArcPointer(Sd3Caps(
+                cached.context.clone(self.ctx),
+                cached.context_uncond.clone(self.ctx),
+                cached.pooled.clone(self.ctx),
+                cached.pooled_uncond.clone(self.ctx),
+            )))
+            self.text_conditioning_cache_hit = True
+            return
+
         var stem = self.params.out_dir + "/." + self.params.job_id
         var prompt_path = stem + ".sd3_prompt.txt"
         var negative_path = stem + ".sd3_negative.txt"
@@ -871,6 +932,15 @@ struct Sd3Backend(GenBackend, Movable):
         )
         self.caps = List[ArcPointer[Sd3Caps]]()
         self.caps.append(ArcPointer(caps^))
+        self.cap_cache = List[ArcPointer[Sd3Caps]]()
+        self.cap_cache.append(ArcPointer(Sd3Caps(
+            self.caps[0][].context.clone(self.ctx),
+            self.caps[0][].context_uncond.clone(self.ctx),
+            self.caps[0][].pooled.clone(self.ctx),
+            self.caps[0][].pooled_uncond.clone(self.ctx),
+        )))
+        self.cap_cache_prompt = self.params.prompt.copy()
+        self.cap_cache_negative = self.params.negative.copy()
         _print_vram("after process-isolated conditioning load")
 
     def _load_model_shape[LH_: Int, LW_: Int](mut self) raises:
@@ -892,21 +962,60 @@ struct Sd3Backend(GenBackend, Movable):
             )
         ))
         if len(self.loader) == 0:
-            var plan = build_sd35_large_block_plan()
-            var loader = TurboPlannedLoader.open(
+            var source_plan = build_sd35_large_block_plan()
+            var source_loader = TurboPlannedLoader.open(
                 checkpoint_path.copy(),
-                plan^,
+                source_plan^,
                 OffloadConfig.synchronous_single(),
                 self.ctx,
                 fill_block_store=False,
             )
-            var host_blocks = loader.pin_residents_fp8_host(1 << 60, self.ctx)
-            loader.require_all_blocks_memory_resident()
-            loader.release_checkpoint_pages()
-            loader.discard_unused_raw_streaming_slots(self.ctx)
-            loader.set_fp8h_overlap(True)
-            print("[sd3] host-resident FP8 denoiser blocks:", host_blocks, "/", DEPTH)
-            self.loader.append(ArcPointer(loader^))
+            if source_loader.fp8_host_cache_valid(
+                String(SD3_FP8_CACHE_PATH)
+            ):
+                print("[sd3] validated FP8 host-cache HIT:", SD3_FP8_CACHE_PATH)
+                var cache_plan = build_sd35_large_block_plan()
+                var cache_loader = TurboPlannedLoader.open(
+                    String(SD3_FP8_CACHE_PATH),
+                    cache_plan^,
+                    OffloadConfig.synchronous_single(),
+                    self.ctx,
+                    fill_block_store=False,
+                )
+                var host_blocks = cache_loader.pin_residents_fp8_host_prequantized(
+                    1 << 60, self.ctx
+                )
+                cache_loader.require_all_blocks_memory_resident()
+                cache_loader.release_checkpoint_pages()
+                cache_loader.discard_unused_raw_streaming_slots(self.ctx)
+                cache_loader.set_fp8h_overlap(True)
+                self.fp8_cache_hit = True
+                print(
+                    "[sd3] cache-loaded FP8 denoiser blocks:",
+                    host_blocks, "/", DEPTH,
+                )
+                self.loader.append(ArcPointer(cache_loader^))
+            else:
+                print("[sd3] FP8 host cache MISS; quantizing source once")
+                var host_blocks = source_loader.pin_residents_fp8_host(
+                    1 << 60, self.ctx
+                )
+                source_loader.require_all_blocks_memory_resident()
+                source_loader.release_checkpoint_pages()
+                source_loader.discard_unused_raw_streaming_slots(self.ctx)
+                source_loader.set_fp8h_overlap(True)
+                print(
+                    "[sd3] host-resident FP8 denoiser blocks:",
+                    host_blocks, "/", DEPTH,
+                )
+                try:
+                    source_loader.save_fp8_host_cache(
+                        String(SD3_FP8_CACHE_PATH), self.ctx
+                    )
+                    print("[sd3] wrote exact FP8 host cache:", SD3_FP8_CACHE_PATH)
+                except e:
+                    print("[sd3] FP8 host-cache write failed (continuing):", e)
+                self.loader.append(ArcPointer(source_loader^))
             self.loader_checkpoint = checkpoint_path.copy()
         else:
             self.loader[0][].require_all_blocks_memory_resident()
@@ -942,6 +1051,34 @@ struct Sd3Backend(GenBackend, Movable):
                 self._load_model_shape[LH_BI, LW_BI]()
                 return
         raise Error("sd3: admitted load shape was not compiled")
+
+    def _ensure_denoise_residency(mut self) raises:
+        """Promote only the host-store prefix that fits above live headroom.
+
+        SD3 drops these explicit VMM mappings before VAE decode, while the
+        pinned FP8 host store remains authoritative for the next job."""
+        if len(self.loader) != 1:
+            raise Error("sd3: denoise residency requested before loader init")
+        var reserve_mib = env_int(
+            String("SERENITY_SD3_DENOISE_RESERVE_MIB"),
+            SD3_DENOISE_VRAM_RESERVE_MIB,
+        )
+        var reserve_bytes = reserve_mib * 1024 * 1024
+        var free_bytes = cu_mem_get_info().free_bytes
+        var budget = 0
+        if free_bytes > reserve_bytes:
+            budget = free_bytes - reserve_bytes
+        var promoted = self.loader[0][].promote_fp8_host_to_device(
+            budget, self.ctx, True, reserve_bytes, True
+        )
+        self.device_resident_blocks = promoted
+        self.device_resident_budget_bytes = budget
+        print(
+            "[sd3] adaptive device residency:", promoted, "/", DEPTH,
+            "blocks;", budget // (1024 * 1024), "MiB budget;",
+            reserve_mib, "MiB live-free floor",
+        )
+        _print_vram("after adaptive SD3 device residency")
 
     def _prepare_job_shape[LH_: Int, LW_: Int](mut self) raises:
         """Flow-match scheduler (honors steps + large shift) + seeded BF16 latent."""
@@ -1063,22 +1200,21 @@ struct Sd3Backend(GenBackend, Movable):
         # Release GPU gate/staging before VAE while retaining the pinned-host
         # store. A later job reloads only the much smaller gate.
         self._release_resident_for_decode()
-        # Prefer whole-image decode when VRAM allows; tiled degrades output (MJ-1054).
-        var mem = cu_mem_get_info()
-        var free_gib = Float64(mem.free_bytes) / 1073741824.0
-        if mem.free_bytes > WHOLE_DECODE_MIN_FREE_BYTES:
-            print("[sd3] WHOLE-image decode (free=", free_gib,
-                  "GiB) — tiled measured to degrade output (MJ-1054)")
-            var dec = load_sd3_embedded_ldm_decoder[LH_, LW_](
-                self._checkpoint_path(), self.ctx
+        # Decode in a self-exec child. Child exit is the only reliable reclaim
+        # boundary for the decoder's allocator high-water; keeping it in this
+        # persistent worker poisons the next job's text-encoder admission.
+        try:
+            var wimg = decode_subprocess(
+                latent, self._checkpoint_path(), LH_, LW_, False, self.ctx
             )
-            var wimg = dec.decode(latent, self.ctx)
-            _save_rgb_png_with_text(wimg, png_path, self.params.params_json, self.ctx)
+            _save_rgb_png_with_text(
+                wimg, png_path, self.params.params_json, self.ctx
+            )
             return png_path
-        print("[sd3] tiled VAE decode FALLBACK (5x5 lowmem overlap+blend) — free=",
-              free_gib, "GiB below whole-image threshold; tiled degrades output (MJ-1054)")
-        var img = sd3_tiled_decode_5x5_lowmem[LH_, LW_](
-            latent, self._checkpoint_path(), self.ctx
+        except e:
+            print("[sd3] whole-image decode child unavailable; trying tiled child:", e)
+        var img = decode_subprocess(
+            latent, self._checkpoint_path(), LH_, LW_, True, self.ctx
         )
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
@@ -1148,6 +1284,7 @@ struct Sd3Backend(GenBackend, Movable):
                         r.phase = String("loading")
                         return r^
                     self._load_model()
+                self._ensure_denoise_residency()
                 self.load_seconds += Float64(perf_counter_ns() - load_t0) / 1.0e9
                 self.announced = False
                 var prep_t0 = perf_counter_ns()

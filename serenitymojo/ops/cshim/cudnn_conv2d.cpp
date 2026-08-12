@@ -57,13 +57,29 @@ extern "C" int serenity_cudnn_conv2d_bf16_nchw(
     int rc = ensure_conv2d_handle();
     if (rc != 0) return rc;
     const size_t runtime_version = cudnnGetVersion();
-    if (runtime_version != 91002) {
+    // cuDNN 9 keeps this classic descriptor API ABI-compatible across minor
+    // releases. Creator's accepted numeric oracle was recorded on 9.10.2, but
+    // refusing newer cuDNN 9 runtimes makes audio decode unusable as soon as
+    // the project environment advances. Keep the major-version boundary and
+    // the minimum tested API level strict; report (rather than reject) a newer
+    // minor because its output still needs the normal end-to-end parity gate.
+    if (runtime_version / 10000 != 9 || runtime_version < 91002) {
         std::fprintf(
             stderr,
-            "[serenity_cudnn_conv2d] Creator parity requires cuDNN 9.10.2 "
-            "(91002), loaded %zu\n",
+            "[serenity_cudnn_conv2d] requires cuDNN 9.10.2 or newer cuDNN 9 "
+            "runtime, loaded %zu\n",
             runtime_version);
         return -91002;
+    }
+    if (runtime_version != 91002) {
+        static std::once_flag version_warning;
+        std::call_once(version_warning, [runtime_version]() {
+            std::fprintf(
+                stderr,
+                "[serenity_cudnn_conv2d] using cuDNN %zu; Creator numeric "
+                "acceptance remains gated against the pinned 9.10.2 oracle\n",
+                runtime_version);
+        });
     }
     cudnnStatus_t status = cudnnSetStream(g_conv2d_handle, (cudaStream_t)stream);
     if (status != CUDNN_STATUS_SUCCESS) return (int)status;

@@ -438,6 +438,27 @@ struct Qwen3Tokenizer(Movable):
         self.id_to_token = Dict[Int, String]()
         self.pre_o200k = pre_o200k
 
+    @staticmethod
+    def from_json_bytes[
+        mut: Bool, //, origin: Origin[mut=mut]
+    ](json_bytes: Span[Byte, origin]) raises -> Qwen3Tokenizer:
+        """Parse tokenizer.json from an origin-bound, caller-owned byte span.
+
+        Parsing completes before this function returns; only the existing
+        owned vocab/merge/added-token tables escape the borrowed span.
+        """
+        var tokenizer = Qwen3Tokenizer(
+            Dict[String, Int](),
+            Dict[String, Int](),
+            List[String](),
+            List[Int](),
+            False,
+        )
+        tokenizer._parse_vocab(json_bytes)
+        tokenizer._parse_merges(json_bytes)
+        tokenizer._parse_added_tokens(json_bytes)
+        return tokenizer^
+
     def _parse_vocab_object(mut self, bytes: Span[Byte, _]) raises:
         var p = 0
         _skip_ws(bytes, p)

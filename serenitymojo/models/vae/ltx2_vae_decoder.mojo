@@ -157,12 +157,29 @@ struct LTX2VaeDecoderWeights(Movable):
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
 
+        # LTX-2.3 bundles the VAE INSIDE the DiT checkpoint under a `vae.`
+        # prefix; LTX-2.5 ships it as a STANDALONE file whose keys carry no
+        # prefix (`decoder.*`, `encoder.*`, `per_channel_statistics.*` —
+        # measured from ltx-2.5-video-vae-conv-bf16.safetensors: 170 tensors,
+        # 84 decoder / 84 encoder / 2 stats). `wanted` therefore holds TAILS;
+        # the file is read with the detected prefix while the in-memory
+        # canonical name keeps its `vae.` form so the forward path is unchanged.
+        var SP = String("vae.")
+        if not sharded.has_tensor(SP + "per_channel_statistics.std-of-means"):
+            if sharded.has_tensor(String("per_channel_statistics.std-of-means")):
+                SP = String("")
+            else:
+                raise Error(
+                    "LTX2 VAE: per_channel_statistics found under neither"
+                    " 'vae.' (2.3 bundled) nor '' (2.5 standalone)"
+                )
+
         var wanted = List[String]()
-        wanted.append(String("vae.decoder.conv_in.conv.weight"))
-        wanted.append(String("vae.decoder.conv_in.conv.bias"))
+        wanted.append(String("decoder.conv_in.conv.weight"))
+        wanted.append(String("decoder.conv_in.conv.bias"))
 
         comptime for i in range(N_UP_BLOCKS):
-            var bp = String("vae.decoder.up_blocks.") + String(i)
+            var bp = String("decoder.up_blocks.") + String(i)
             comptime if IS_MID[i]:
                 comptime for r in range(MID_NRES[i]):
                     var p = bp + ".res_blocks." + String(r)
@@ -174,26 +191,26 @@ struct LTX2VaeDecoderWeights(Movable):
                 wanted.append(bp + ".conv.conv.weight")
                 wanted.append(bp + ".conv.conv.bias")
 
-        wanted.append(String("vae.decoder.conv_out.conv.weight"))
-        wanted.append(String("vae.decoder.conv_out.conv.bias"))
+        wanted.append(String("decoder.conv_out.conv.weight"))
+        wanted.append(String("decoder.conv_out.conv.bias"))
 
         for ref nm in wanted:
-            var tv = sharded.tensor_view(nm)
+            var tv = sharded.tensor_view(SP + nm)
             var t = Tensor.from_view(tv, ctx)
             var idx = len(weights)
             weights.append(ArcPointer(t^))
-            name_to_idx[nm] = idx
+            name_to_idx[String("vae.") + nm] = idx
 
         # per_channel_statistics — [128] each, reshape to NDHWC broadcast.
         var dtype = sharded.tensor_info(
-            String("vae.decoder.conv_in.conv.weight")
+            SP + "decoder.conv_in.conv.weight"
         ).dtype
         var std_v = sharded.tensor_view(
-            String("vae.per_channel_statistics.std-of-means")
+            SP + "per_channel_statistics.std-of-means"
         )
         var std_t = Tensor.from_view(std_v, ctx)
         var mean_v = sharded.tensor_view(
-            String("vae.per_channel_statistics.mean-of-means")
+            SP + "per_channel_statistics.mean-of-means"
         )
         var mean_t = Tensor.from_view(mean_v, ctx)
         var bsh = List[Int]()

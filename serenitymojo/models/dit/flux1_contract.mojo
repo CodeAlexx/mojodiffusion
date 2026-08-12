@@ -12,7 +12,7 @@ from serenitymojo.sampling.flux1_dev import build_flux1_packed_latent_plan
 
 
 comptime FLUX1_DEFAULT_INPUTS_PATH = (
-    "/home/alex/EriDiffusion/inference-flame/output/flux1_inputs.safetensors"
+    "/home/alex/.serenity/parity/output/flux1_inputs.safetensors"
 )
 
 

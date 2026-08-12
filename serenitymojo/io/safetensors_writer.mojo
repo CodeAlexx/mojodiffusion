@@ -33,7 +33,7 @@
 # uint8 buffers throughout.
 
 from std.memory import alloc, UnsafePointer, ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .dtype import STDtype
 from .ffi import (
     BytePtr,
@@ -205,6 +205,18 @@ struct HostTensorDesc(Copyable, Movable):
     var bytes: List[UInt8]
 
 
+@fieldwise_init
+struct HostBufferTensorDesc(Copyable, Movable):
+    """Pinned-host sibling of HostTensorDesc for multi-gigabyte runtime caches.
+
+    Ownership stays in the ArcPointer for the complete write, so payload bytes
+    can be pwritten directly without materializing a second List[UInt8] copy."""
+    var dtype: STDtype
+    var shape: List[Int]
+    var buffer: ArcPointer[HostBuffer[DType.uint8]]
+    var nbytes: Int
+
+
 def _tensor_offsets_host(descs: List[HostTensorDesc]) -> List[Int]:
     """Host-desc twin of _tensor_offsets: contiguous data-segment offsets, with
     the total size as the final sentinel entry."""
@@ -344,6 +356,103 @@ def save_safetensors_host(
         raise Error(
             String("save_safetensors_host: atomic rename ") + tmp_path + " -> "
             + path + " failed (different filesystem? out of space?)"
+        )
+
+
+def save_safetensors_host_buffers(
+    names: List[String],
+    descs: List[HostBufferTensorDesc],
+    path: String,
+) raises:
+    """Atomic safetensors write directly from owned pinned-host buffers."""
+    if len(names) != len(descs):
+        raise Error(
+            String("save_safetensors_host_buffers: len(names)=")
+            + String(len(names)) + " != len(descs)=" + String(len(descs))
+        )
+    if len(names) == 0:
+        raise Error("save_safetensors_host_buffers: refusing to write an empty file")
+
+    var offsets = List[Int]()
+    var header_descs = List[HostTensorDesc]()
+    var running = 0
+    for i in range(len(descs)):
+        var numel = 1
+        for d in range(len(descs[i].shape)):
+            numel *= descs[i].shape[d]
+        var expect = numel * descs[i].dtype.byte_size()
+        if descs[i].nbytes != expect:
+            raise Error(
+                String("save_safetensors_host_buffers: '") + names[i]
+                + String("' byte size ") + String(descs[i].nbytes)
+                + String(" != numel*byte_size ") + String(expect)
+            )
+        offsets.append(running)
+        running += descs[i].nbytes
+        # Header construction reads only dtype/shape; keep the byte list empty.
+        header_descs.append(HostTensorDesc(
+            descs[i].dtype, descs[i].shape.copy(), List[UInt8]()
+        ))
+    offsets.append(running)
+    var hdr = _build_header_host(names, header_descs, offsets)
+    var header_len = len(hdr)
+
+    var tmp_path = path + String(".tmp")
+    var fd = sys_open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, Int32(0o644))
+    if fd < 0:
+        raise Error(
+            String("save_safetensors_host_buffers: failed to open for write: ")
+            + tmp_path
+        )
+
+    var lenbuf = alloc[UInt8](8)
+    var hl = header_len
+    for i in range(8):
+        lenbuf[i] = UInt8(hl & 0xFF)
+        hl = hl >> 8
+    try:
+        _write_all(fd, BytePtr(unsafe_from_address=Int(lenbuf)), 8, 0)
+    except e:
+        lenbuf.free()
+        _ = sys_close(fd)
+        _ = sys_remove(tmp_path)
+        raise e^
+    lenbuf.free()
+
+    var hbuf = alloc[UInt8](header_len)
+    for i in range(header_len):
+        hbuf[i] = hdr[i]
+    try:
+        _write_all(fd, BytePtr(unsafe_from_address=Int(hbuf)), header_len, 8)
+    except e:
+        hbuf.free()
+        _ = sys_close(fd)
+        _ = sys_remove(tmp_path)
+        raise e^
+    hbuf.free()
+
+    var data_offset = 8 + header_len
+    for i in range(len(descs)):
+        try:
+            _write_all(
+                fd,
+                BytePtr(unsafe_from_address=Int(descs[i].buffer[].unsafe_ptr())),
+                descs[i].nbytes,
+                data_offset + offsets[i],
+            )
+        except e:
+            _ = sys_close(fd)
+            _ = sys_remove(tmp_path)
+            raise Error(
+                String("save_safetensors_host_buffers: writing tensor '")
+                + names[i] + String("': ") + String(e)
+            )
+    _ = sys_close(fd)
+    if sys_rename(tmp_path, path) != 0:
+        _ = sys_remove(tmp_path)
+        raise Error(
+            String("save_safetensors_host_buffers: atomic rename ")
+            + tmp_path + String(" -> ") + path + String(" failed")
         )
 
 

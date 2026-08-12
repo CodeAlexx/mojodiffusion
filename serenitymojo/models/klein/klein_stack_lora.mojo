@@ -2052,7 +2052,10 @@ def klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
     denoise step. The naive path ran the whole offloaded stack twice. This path
     keeps each streamed block resident, runs positive and negative branches
     through it, records compute completion once both branches are queued, and
-    returns device-resident predictions so CFG stays on GPU.
+    returns device-resident predictions so CFG stays on GPU. Positive and
+    negative scratch reuse is ordered on the same compute stream; block staging
+    reuse is guarded by `mark_active_block_done` events, so per-branch or
+    per-block device-wide fences would only destroy copy/compute overlap.
     """
     var num_double = lora.num_double
     var num_single = lora.num_single
@@ -2079,7 +2082,6 @@ def klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
             img_pos, txt_pos, w, img_mod_dev, txt_mod_dev, bl,
             cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
         )
-        ctx.synchronize()
         var fwd_neg = double_block_lora_predict_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
             img_neg, txt_neg, w, img_mod_dev, txt_mod_dev, bl,
             cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
@@ -2089,7 +2091,6 @@ def klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
         img_neg = fwd_neg.img_out.copy()
         txt_neg = fwd_neg.txt_out.copy()
         loader.mark_active_block_done(ctx)
-        ctx.synchronize()
 
     var x_pos = TArc(concat(0, ctx, txt_pos[], img_pos[]))
     var x_neg = TArc(concat(0, ctx, txt_neg[], img_neg[]))
@@ -2104,7 +2105,6 @@ def klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
             x_pos, w, single_mod_dev, sl, cos_t, sin_t, D, F, eps,
             norm_ones[], norm_zeros[], ctx, scratch,
         )
-        ctx.synchronize()
         var fwd_neg = single_block_lora_predict_device_resident_scratch[H, Dh, S](
             x_neg, w, single_mod_dev, sl, cos_t, sin_t, D, F, eps,
             norm_ones[], norm_zeros[], ctx, scratch,
@@ -2112,7 +2112,6 @@ def klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
         x_pos = fwd_pos.out.copy()
         x_neg = fwd_neg.out.copy()
         loader.mark_active_block_done(ctx)
-        ctx.synchronize()
 
     var img_out_pos = TArc(slice(x_pos[], 0, N_TXT, N_IMG, ctx))
     var img_out_neg = TArc(slice(x_neg[], 0, N_TXT, N_IMG, ctx))

@@ -25,9 +25,11 @@ from .ffi import (
     BytePtr,
     sys_open,
     sys_close,
+    sys_posix_fadvise,
     sys_pread,
     file_size,
     O_RDONLY,
+    POSIX_FADV_DONTNEED,
 )
 
 
@@ -85,16 +87,19 @@ struct SafeTensors(Movable):
     var region: MmapRegion
     var tensors: Dict[String, TensorRef]
     var storage_names: List[String]
+    var path: String
 
     def __init__(
         out self,
         var region: MmapRegion,
         var tensors: Dict[String, TensorRef],
         var storage_names: List[String],
+        path: String,
     ):
         self.region = region^
         self.tensors = tensors^
         self.storage_names = storage_names^
+        self.path = path
 
     @staticmethod
     def open(path: String) raises -> SafeTensors:
@@ -228,7 +233,7 @@ struct SafeTensors(Movable):
                 sorted_offsets.insert(pos, storage_offsets[i])
             storage_names = sorted_names^
 
-        return SafeTensors(region^, tensors^, storage_names^)
+        return SafeTensors(region^, tensors^, storage_names^, path.copy())
 
     def tensor_bytes(
         self, name: String
@@ -305,9 +310,35 @@ struct SafeTensors(Movable):
         var t = self.tensors[name].copy()
         self.region.prefetch_range(t.offset, t.size)
 
+    def release_tensor(self, name: String) raises:
+        """Release one tensor's clean mmap/page-cache range after its pinned
+        staging copy is complete. The immutable mapping stays valid."""
+        if name not in self.tensors:
+            return
+        var t = self.tensors[name].copy()
+        self.region.release_range(t.offset, t.size)
+        var fd = sys_open(self.path, O_RDONLY)
+        if fd >= 0:
+            _ = sys_posix_fadvise(
+                fd,
+                self.region.source_offset(t.offset),
+                t.size,
+                POSIX_FADV_DONTNEED,
+            )
+            _ = sys_close(fd)
+
     def release_to_os(self):
-        """Release all pages (MADV_DONTNEED). Mirrors mmap.rs:300-302."""
+        """Release mappings and clean file cache after a completed copy.
+
+        MADV_DONTNEED drops this mapping's resident PTEs. Reopening the immutable
+        checkpoint for POSIX_FADV_DONTNEED also evicts its clean page-cache
+        charge, preventing source pages from crowding executable/kernel pages
+        out of a memory-capped inference worker."""
         self.region.release_to_os()
+        var fd = sys_open(self.path, O_RDONLY)
+        if fd >= 0:
+            _ = sys_posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+            _ = sys_close(fd)
 
     def data_size(self) -> Int:
         """Total data segment size in bytes. Mirrors mmap.rs:305-307."""

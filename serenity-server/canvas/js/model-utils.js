@@ -7,8 +7,41 @@ var ModelUtils = (function () {
     'use strict';
     var objectInfoCache = null;
     var modelRegistryCache = null;
+    var modelRegistryPending = null;
     var modelByIdentity = {};
     var capabilitiesCache = null;
+    var capabilitiesPending = null;
+
+    function fetchJsonWithRetry(url, label, validate) {
+        var attempt = 0;
+        var maximumAttempts = 6;
+        function run() {
+            attempt += 1;
+            return fetch(url, { cache: 'no-store' })
+                .then(function (resp) {
+                if (!resp.ok)
+                    throw new Error(label + ' HTTP ' + resp.status);
+                return resp.json();
+            })
+                .then(function (data) {
+                if (!validate(data))
+                    throw new Error('invalid Serenity ' + label);
+                return data;
+            })
+                .catch(function (error) {
+                if (attempt >= maximumAttempts)
+                    throw error;
+                // An already-open browser commonly races a sub-second server
+                // rebuild. Retry long enough to bridge that restart, while
+                // remaining bounded when the server is genuinely unavailable.
+                var delayMs = Math.min(1000, attempt * 250);
+                return new Promise(function (resolve) {
+                    setTimeout(resolve, delayMs);
+                }).then(run);
+            });
+        }
+        return run();
+    }
     function loadObjectInfo() {
         if (objectInfoCache)
             return Promise.resolve(objectInfoCache);
@@ -121,21 +154,26 @@ var ModelUtils = (function () {
     function loadModelRegistry() {
         if (modelRegistryCache)
             return Promise.resolve(modelRegistryCache);
-        return fetch('/v1/models?refresh=1', { cache: 'no-store' })
-            .then(function (resp) {
-            if (!resp.ok)
-                throw new Error('models HTTP ' + resp.status);
-            return resp.json();
-        })
+        if (modelRegistryPending)
+            return modelRegistryPending;
+        modelRegistryPending = fetchJsonWithRetry(
+            '/v1/models?refresh=1',
+            'model registry',
+            function (data) {
+                return !!data && data.schema === 'serenity.models.v1' &&
+                    Array.isArray(data.models);
+            })
             .then(function (data) {
-            if (!data || data.schema !== 'serenity.models.v1' || !Array.isArray(data.models))
-                throw new Error('invalid Serenity model registry');
             modelRegistryCache = data;
             modelByIdentity = {};
             data.models.forEach(rememberModel);
             (data.loras || []).forEach(rememberModel);
             return data;
+        })
+            .finally(function () {
+            modelRegistryPending = null;
         });
+        return modelRegistryPending;
     }
     // Check if a detected architecture is a video model
     function isVideoModel(filename) {
@@ -222,18 +260,23 @@ var ModelUtils = (function () {
     function loadCapabilities() {
         if (capabilitiesCache)
             return Promise.resolve(capabilitiesCache);
-        return fetch('/v1/capabilities', { cache: 'no-store' })
-            .then(function (resp) {
-            if (!resp.ok)
-                throw new Error('capabilities HTTP ' + resp.status);
-            return resp.json();
-        })
+        if (capabilitiesPending)
+            return capabilitiesPending;
+        capabilitiesPending = fetchJsonWithRetry(
+            '/v1/capabilities',
+            'capability document',
+            function (data) {
+                return !!data && data.schema === 'serenity.capabilities.v1' &&
+                    Array.isArray(data.backends);
+            })
             .then(function (data) {
-            if (!data || data.schema !== 'serenity.capabilities.v1' || !Array.isArray(data.backends))
-                throw new Error('invalid Serenity capability document');
             capabilitiesCache = data;
             return data;
+        })
+            .finally(function () {
+            capabilitiesPending = null;
         });
+        return capabilitiesPending;
     }
     function backendForArch(arch) {
         var byArch = {
@@ -279,8 +322,10 @@ var ModelUtils = (function () {
     function clearCache() {
         objectInfoCache = null;
         modelRegistryCache = null;
+        modelRegistryPending = null;
         modelByIdentity = {};
         capabilitiesCache = null;
+        capabilitiesPending = null;
         localStorage.removeItem('sf-object-info-etag');
         localStorage.removeItem('sf-object-info-data');
     }

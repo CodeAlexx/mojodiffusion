@@ -137,7 +137,7 @@ def _validate_dir(cache_dir: String, ctx: DeviceContext) raises:
     # Context note: the DiT cross-attn input is the LLM-adapter OUTPUT
     # [B,256,1024], NOT text_embedding [B,512,1024]. train_anima_real loads it
     # from the captured sidecar (context_cond). Report whether it's available.
-    var sidecar = "/home/alex/EriDiffusion/inference-flame/output/anima_embeddings.safetensors"
+    var sidecar = "/home/alex/.serenity/parity/output/anima_embeddings.safetensors"
     if _file_exists(sidecar):
         var sc = SafeTensors.open(sidecar)
         if _has_key(sc, String("context_cond")):
@@ -157,7 +157,7 @@ def _validate_dir(cache_dir: String, ctx: DeviceContext) raises:
 def main() raises:
     var ctx = DeviceContext()
     var args = argv()
-    var cache_dir = String("/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_synth_smoke")
+    var cache_dir = String("/home/alex/.serenity/parity/cache/anima_synth_smoke")
     if len(args) > 1:
         cache_dir = String(args[1])
     _validate_dir(cache_dir, ctx)

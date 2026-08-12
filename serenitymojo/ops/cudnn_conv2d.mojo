@@ -87,8 +87,8 @@ def cudnn_conv2d_bf16_nchw(
     if rc != 0:
         if rc == -91002:
             raise Error(
-                "cudnn_conv2d_bf16_nchw: Creator parity requires the pinned "
-                "cuDNN 9.10.2 decode runtime"
+                "cudnn_conv2d_bf16_nchw: requires cuDNN 9.10.2 or a newer "
+                "cuDNN 9 decode runtime"
             )
         raise Error(
             String("cudnn_conv2d_bf16_nchw: shim rc=") + String(rc)

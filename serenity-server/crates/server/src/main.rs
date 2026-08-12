@@ -1954,13 +1954,15 @@ fn kind_from_bin(bin: &std::path::Path) -> String {
 }
 
 /// Some Mojo runtimes keep a job's allocation pool pinned even after every
-/// backend tensor has been dropped. SD3 retains ~8.3 GiB and Lens retained
-/// ~14.0 GiB after completed 1024px jobs, so recycle those measured workers
-/// after a terminal event.
+/// backend tensor has been dropped. Lens retained ~14.0 GiB after completed
+/// 1024px jobs, so recycle that measured worker after a terminal event.
+/// SD3 no longer belongs here: its encoder and decoder are process-isolated and
+/// its evictable VMM denoise weights are unmapped before decode. Keeping the
+/// worker alive is required to reuse the host-weight and conditioning caches.
 /// Z-Image deliberately keeps its DiT and VAE resident between jobs; recycling
 /// it here turns every Canvas edit into a multi-minute cold model load.
 fn kind_requires_per_job_recycle(kind: &str) -> bool {
-    matches!(kind, "sd3" | "lens")
+    matches!(kind, "lens")
 }
 
 /// Keep the one measured-safe resident edit worker through the common
@@ -1986,6 +1988,24 @@ fn worker_for_model(cur_bin: &std::path::Path, model: &str) -> Result<(String, P
     ))
 }
 
+/// A worker kind can serve several weight variants, but those variants cannot
+/// safely share one long-lived Mojo process: the CUDA allocator and resident
+/// host/device stores are variant-specific. Force a process recycle when a
+/// Klein request switches between the 9B and 4B checkpoints even though both
+/// variants use the same `serenity_worker_klein` binary.
+fn worker_residency_key(kind: &str, model: &str) -> String {
+    if kind != "flux2" {
+        return kind.to_string();
+    }
+
+    let model = model.to_ascii_lowercase();
+    if model.contains("4b") {
+        "flux2:klein-4b".to_string()
+    } else {
+        "flux2:klein-9b".to_string()
+    }
+}
+
 fn run_worker_driver(
     worker_bin: PathBuf,
     worker_args: Vec<String>,
@@ -2001,6 +2021,7 @@ fn run_worker_driver(
     // when a job needs a different model (one GPU = one resident model at a time).
     let mut worker_bin = worker_bin;
     let mut current_kind = kind_from_bin(&worker_bin);
+    let mut current_residency_key = current_kind.clone();
     // `handle` is Option so we can drop a dead worker and respawn lazily on the next
     // job (mirrors process_isolated_backend: a peer-close fails the job, the next
     // start() respawns). It starts None and is brought up on first need / handshake.
@@ -2136,7 +2157,8 @@ fn run_worker_driver(
                 continue;
             }
         };
-        if want_kind != current_kind {
+        let want_residency_key = worker_residency_key(&want_kind, &params.model);
+        if want_kind != current_kind || want_residency_key != current_residency_key {
             if !want_bin.exists() {
                 let error = format!(
                     "worker binary unavailable for backend '{want_kind}': {}",
@@ -2149,7 +2171,12 @@ fn run_worker_driver(
                 schedule_evict(&registry, &job_id);
                 continue;
             }
-            tracing::info!(%job_id, from = %current_kind, to = %want_kind, "swapping worker for model");
+            tracing::info!(
+                %job_id,
+                from = %current_residency_key,
+                to = %want_residency_key,
+                "swapping worker for model residency"
+            );
             publish_driver_phase(
                 &jobs,
                 &channel,
@@ -2163,6 +2190,7 @@ fn run_worker_driver(
             std::thread::sleep(std::time::Duration::from_millis(800));
             worker_bin = want_bin;
             current_kind = want_kind;
+            current_residency_key = want_residency_key;
         }
 
         // Lazily (re)spawn if we have no live worker (first job, or after a prior
@@ -2351,70 +2379,6 @@ enum JobOutcome {
     ChannelClosed,
 }
 
-#[derive(Default)]
-struct DenoiseDiskReadGate {
-    read_bytes_at_step_zero: Option<u64>,
-}
-
-impl DenoiseDiskReadGate {
-    fn observe(&mut self, handle: &WorkerHandle, event: &WorkerEvent) -> Result<(), String> {
-        let WorkerEvent::Progress {
-            step, total, phase, ..
-        } = event
-        else {
-            return Ok(());
-        };
-        if phase != "sampling" {
-            return Ok(());
-        }
-
-        let read_bytes = worker_read_bytes(handle.pid())?;
-        self.observe_sampling_progress(*step, *total, read_bytes, handle.pid())
-    }
-
-    fn observe_sampling_progress(
-        &mut self,
-        step: i64,
-        total: i64,
-        read_bytes: u64,
-        worker_pid: u32,
-    ) -> Result<(), String> {
-        if step == 0 {
-            // A backend may publish an early UI sampling phase and then a second,
-            // exact model-ready boundary. The latest step-0 event is authoritative.
-            self.read_bytes_at_step_zero = Some(read_bytes);
-            tracing::info!(
-                worker_pid,
-                read_bytes,
-                total,
-                "denoise disk-read gate armed"
-            );
-            return Ok(());
-        }
-
-        let Some(start) = self.read_bytes_at_step_zero else {
-            return Err(format!(
-                "hardware safety gate: sampling step {step}/{total} arrived without an exact step-0 boundary"
-            ));
-        };
-        if read_bytes != start {
-            return Err(format!(
-                "hardware safety gate: worker read {} physical bytes during denoise by step {step}/{total}; worker terminated",
-                read_bytes.saturating_sub(start)
-            ));
-        }
-        if step == total {
-            tracing::info!(
-                worker_pid,
-                steps = total,
-                read_bytes_delta = 0_u64,
-                "denoise disk-read gate passed"
-            );
-        }
-        Ok(())
-    }
-}
-
 fn is_final_sampling_boundary(event: &WorkerEvent) -> bool {
     matches!(
         event,
@@ -2425,23 +2389,6 @@ fn is_final_sampling_boundary(event: &WorkerEvent) -> bool {
             ..
         } if phase == "sampling" && step == total
     )
-}
-
-fn worker_read_bytes(pid: u32) -> Result<u64, String> {
-    let path = format!("/proc/{pid}/io");
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|error| format!("hardware safety gate: cannot read {path}: {error}"))?;
-    parse_proc_read_bytes(&contents)
-}
-
-fn parse_proc_read_bytes(contents: &str) -> Result<u64, String> {
-    contents
-        .lines()
-        .find_map(|line| line.strip_prefix("read_bytes:"))
-        .ok_or_else(|| "hardware safety gate: /proc worker I/O has no read_bytes field".to_string())?
-        .trim()
-        .parse::<u64>()
-        .map_err(|error| format!("hardware safety gate: invalid read_bytes value: {error}"))
 }
 
 /// Poll one job to its terminal event, publishing every WorkerEvent to `channel`
@@ -2461,7 +2408,6 @@ fn drive_one_job(
     ctl: &std::sync::mpsc::Receiver<DriverCtl>,
     jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
 ) -> JobOutcome {
-    let mut denoise_io_gate = DenoiseDiskReadGate::default();
     loop {
         // 1. Service any pending control messages WITHOUT blocking.
         loop {
@@ -2497,13 +2443,6 @@ fn drive_one_job(
         // 2. Pump the worker.
         match handle.next_event_poll() {
             Ok(EventPoll::Event(ev)) => {
-                if let Err(error) = denoise_io_gate.observe(handle, &ev) {
-                    handle.kill();
-                    let failed = WorkerEvent::Failed { error };
-                    apply_event_to_record(jobs, job_id, &failed);
-                    channel.publish(failed);
-                    return JobOutcome::PeerClosed;
-                }
                 if is_final_sampling_boundary(&ev) {
                     if let Err(error) = handle.send_sampling_ack() {
                         let failed = WorkerEvent::Failed {
@@ -2576,7 +2515,6 @@ fn drive_one_pass(
     jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
     publish_done: bool,
 ) -> PassResult {
-    let mut denoise_io_gate = DenoiseDiskReadGate::default();
     loop {
         loop {
             match ctl.try_recv() {
@@ -2603,13 +2541,6 @@ fn drive_one_pass(
         }
         match handle.next_event_poll() {
             Ok(EventPoll::Event(ev)) => {
-                if let Err(error) = denoise_io_gate.observe(handle, &ev) {
-                    handle.kill();
-                    let failed = WorkerEvent::Failed { error };
-                    apply_event_to_record(jobs, job_id, &failed);
-                    channel.publish(failed);
-                    return PassResult::PeerClosed;
-                }
                 if is_final_sampling_boundary(&ev) {
                     if let Err(error) = handle.send_sampling_ack() {
                         let failed = WorkerEvent::Failed {
@@ -4577,27 +4508,6 @@ fn max_existing_output_id(out_dir: &FsPath) -> u64 {
 mod endpoint_tests {
     use super::*;
 
-    #[test]
-    fn denoise_disk_read_gate_fails_closed() {
-        let mut gate = DenoiseDiskReadGate::default();
-        assert!(gate.observe_sampling_progress(1, 8, 4096, 123).is_err());
-
-        gate.observe_sampling_progress(0, 8, 8192, 123).unwrap();
-        gate.observe_sampling_progress(1, 8, 8192, 123).unwrap();
-        gate.observe_sampling_progress(8, 8, 8192, 123).unwrap();
-        let error = gate
-            .observe_sampling_progress(8, 8, 12288, 123)
-            .unwrap_err();
-        assert!(error.contains("4096 physical bytes"));
-    }
-
-    #[test]
-    fn proc_io_read_bytes_parser_is_exact() {
-        let sample = "rchar: 99\nread_bytes: 4096\ncancelled_write_bytes: 0\n";
-        assert_eq!(parse_proc_read_bytes(sample).unwrap(), 4096);
-        assert!(parse_proc_read_bytes("rchar: 99\n").is_err());
-    }
-
     fn valid_t2i_params(model: &str) -> JobParams {
         let mut params = JobParams::default();
         params.model = model.to_string();
@@ -4689,6 +4599,23 @@ mod endpoint_tests {
     }
 
     #[test]
+    fn worker_residency_separates_klein_weight_variants() {
+        assert_eq!(
+            worker_residency_key("flux2", "klein-9b"),
+            "flux2:klein-9b"
+        );
+        assert_eq!(
+            worker_residency_key("flux2", "klein-4b"),
+            "flux2:klein-4b"
+        );
+        assert_ne!(
+            worker_residency_key("flux2", "klein-9b"),
+            worker_residency_key("flux2", "klein-4b")
+        );
+        assert_eq!(worker_residency_key("sdxl", "sdxl"), "sdxl");
+    }
+
+    #[test]
     fn worker_dispatch_rejects_blocked_model_families() {
         let current = PathBuf::from("/tmp/serenity-bin/serenity_worker_zimage");
         for model in ["qwen-image-edit", "flux2-dev"] {
@@ -4721,9 +4648,9 @@ mod endpoint_tests {
 
     #[test]
     fn only_measured_non_resident_workers_recycle_per_job() {
-        assert!(kind_requires_per_job_recycle("sd3"));
         assert!(kind_requires_per_job_recycle("lens"));
         for kind in [
+            "sd3",
             "zimage",
             "qwenimage",
             "sdxl",

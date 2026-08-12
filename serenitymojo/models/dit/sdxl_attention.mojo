@@ -30,6 +30,7 @@ from layout.runtime_layout import RuntimeLayout
 from linalg.matmul.vendor.blas import matmul
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.attention import sdpa_cross_nomask_infer
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -275,6 +276,16 @@ def sdxl_sdpa[
     if len(ks) != 4 or ks[0] != B or ks[1] != Skv or ks[2] != H or ks[3] != Dh:
         raise Error("sdxl_sdpa: k must be [B,Skv,H,Dh]")
 
+    # Product SDXL keeps its latent/activation stream in F32 even though the
+    # UNet weights are BF16.  The shared inference boundary handles that case
+    # by casting Q/K/V to BF16 for cuDNN SDPA and casting the result back to
+    # F32.  Keep only F16 on the local math implementation as a reference
+    # fallback.
+    if q.dtype() == STDtype.BF16 or q.dtype() == STDtype.F32:
+        return sdpa_cross_nomask_infer[B, Sq, Skv, H, Dh](
+            q, k, v, scale, ctx
+        )
+
     comptime BH = B * H
     var q_f32 = ctx.enqueue_create_buffer[DType.float32](B * H * Sq * Dh)
     var k_f32 = ctx.enqueue_create_buffer[DType.float32](B * H * Skv * Dh)
@@ -364,8 +375,6 @@ def sdxl_sdpa[
         )
         ctx.enqueue_function[_scatter_f16, _scatter_f16](
             out_src, Od, B, Sq, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
-    ctx.synchronize()
-
     var out_shape = List[Int]()
     out_shape.append(B)
     out_shape.append(Sq)

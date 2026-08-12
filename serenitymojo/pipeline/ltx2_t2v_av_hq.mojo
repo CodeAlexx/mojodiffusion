@@ -72,7 +72,7 @@ from serenitymojo.models.dit.ltx2_connector import (
     LTX2ConnectorConfig, LTX2ConnectorWeights, ltx2_connector_forward,
 )
 from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream
-from serenitymojo.offload.vmm_cuda import cu_mem_get_info
+from serenitymojo.offload.vmm_cuda import cu_mem_get_info, cu_mempool_trim_current
 from serenitymojo.sampling.ltx2_sampling import (
     LTX2Scheduler, res2s_coefficients, res2s_substep, res2s_combine, Res2sCoeffs,
     res2s_sde_step, res2s_bong_refine, res2s_bong_active,
@@ -697,8 +697,19 @@ struct _RequestHQLoraStack(Movable):
             trained.append(ArcPointer(LoraSet.load(path)))
             trained_mults.append(mult)
             trained_streams.append(streams)
-        var distilled: Optional[LoraSet] = None
-        if _refhq_uses_support_lora():
+        # `distilled` was already declared at the top of this function for the
+        # explicit `LTX2_REQUEST_DISTILLATION_LORA` path; re-declaring it here
+        # is what broke the parse ("invalid redefinition of 'distilled'"), and
+        # a plain assignment would be worse than the error: with
+        # LTX2_REFHQ_SUPPORT_LORA unset (i.e. "official", the DEFAULT) it would
+        # silently overwrite an adapter the request explicitly asked for.
+        #
+        # The struct contract above is explicit that "a directly distilled full
+        # checkpoint must never receive a second, unrelated distillation delta",
+        # so at most ONE adapter may ever be selected. Order: an explicit
+        # request adapter wins; otherwise fall back to the official support
+        # LoRA; 'baked' selects none.
+        if (not distilled) and _refhq_uses_support_lora():
             distilled = Optional[LoraSet](
                 LoraSet.load(_refhq_lora_distilled())
             )
@@ -1642,9 +1653,21 @@ def _ndhwc_to_ncdhw(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 
 # Load a VAE per-channel-stat [128] from the bf16 checkpoint as BF16 storage.
 def _load_vae_stat(name: String, ctx: DeviceContext) raises -> Tensor:
+    # LTX-2.3 bundles the VAE INSIDE the DiT checkpoint under a `vae.` prefix.
+    # LTX-2.5 ships the VAE as a STANDALONE file whose keys carry no prefix
+    # (measured: ltx-2.5-video-vae-conv-bf16.safetensors = 170 tensors,
+    # 84 decoder / 84 encoder / 2 `per_channel_statistics.*`). Try the bundled
+    # layout first, then fall back to the standalone file.
     var st = ShardedSafeTensors.open(_ckpt_bf16())
-    var tv = st.tensor_view(String("vae.per_channel_statistics.") + name)
-    return Tensor.from_view_as_bf16(tv, ctx)
+    var bundled = String("vae.per_channel_statistics.") + name
+    if st.has_tensor(bundled):
+        return Tensor.from_view_as_bf16(st.tensor_view(bundled), ctx)
+    var vst = ShardedSafeTensors.open(
+        _request_hq_video_vae_ckpt(_ckpt_bf16())
+    )
+    return Tensor.from_view_as_bf16(
+        vst.tensor_view(String("per_channel_statistics.") + name), ctx
+    )
 
 
 def _refhq_spatial_upscale_scoped(
@@ -1793,9 +1816,14 @@ def _write_ltx2_denoise_io(
 
 
 def _assert_ltx2_no_denoise_disk_reads(
-    out_dir: String, start_bytes: Int
+    out_dir: String, start_bytes: Int, allow_checkpoint_streaming: Bool = False
 ) raises:
     var current = _ltx2_proc_read_bytes()
+    if allow_checkpoint_streaming:
+        _write_ltx2_denoise_io(
+            out_dir, String("checkpoint_stream"), start_bytes, current
+        )
+        return
     if current != start_bytes:
         _write_ltx2_denoise_io(
             out_dir, String("failed"), start_bytes, current
@@ -2295,7 +2323,9 @@ def run_single_p[
     )
     var video_decode_t0 = perf_counter()
     print("  [decode] video VAE (latent -> frames)")
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var video_x_bf16 = cast_tensor(video_x, STDtype.BF16, ctx)
     var frames = decode_video[1, 128, NF_CT, NH_CT, NW_CT](vae, video_x_bf16, ctx)
     var fsh = frames.shape()
@@ -3097,7 +3127,9 @@ def run_staged(
         # ══════════ DECODE VIDEO (stage-1 res) ══════════
         ctx.synchronize()
         t0 = perf_counter()
-        var vae1 = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+        var vae1 = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
         var vx1_bf16 = cast_tensor(video_x, STDtype.BF16, ctx)
         var frames1 = decode_video[
             1, 128, NF_STAGED, NH_STAGED, NW_STAGED
@@ -3347,7 +3379,9 @@ def run_staged(
     # ══════════════ DECODE VIDEO (2x res) ══════════════
     ctx.synchronize()
     t0 = perf_counter()
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var vx2_bf16 = cast_tensor(vx2, STDtype.BF16, ctx)
     var frames = decode_video[
         1, 128, NF_STAGED, NH2_STAGED, NW2_STAGED
@@ -4865,14 +4899,19 @@ def _refhq_decode_audio_wav(
     """Existing refhq audio VAE -> vocoder -> WAV tail, shared by video decoders."""
     var wav_out = out_dir + "/refhq_audio.wav"
     print("  [decode] audio VAE (latent -> mel) -> vocoder (mel -> 48kHz wav)")
-    var avae = LTX2AudioVaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    # LTX 2.3 bundled decoder/vocoder tensors in the main checkpoint. LTX 2.5
+    # ships them in a dedicated audio artifact. Route both consumers through
+    # the request-aware checkpoint selector instead of accidentally reopening
+    # the transformer checkpoint during postprocess.
+    var audio_checkpoint = _request_hq_audio_vae_ckpt(_ckpt_bf16())
+    var avae = LTX2AudioVaeDecoderWeights.load(audio_checkpoint, ctx)
     var a_final_bf16 = cast_tensor(a_final, STDtype.BF16, ctx)
     var mel = cast_tensor(decode_audio(avae, a_final_bf16, ctx), STDtype.BF16, ctx)
     var msh = mel.shape()
     print("  mel NCHW: [", msh[0], ",", msh[1], ",", msh[2], ",", msh[3], "] BF16 storage")
     _ = _stats(String("mel"), mel, ctx)
 
-    var voc = LTX2VocoderWithBWE.from_file(_ckpt_bf16(), ctx)
+    var voc = LTX2VocoderWithBWE.from_file(audio_checkpoint, ctx)
     var wav = voc.forward(mel, ctx)
     var wsh = wav.shape()
     var L = wsh[2]
@@ -4970,7 +5009,9 @@ def _refhq_decode_mux[
     v_final: Tensor, a_final: Tensor, out_dir: String, ctx: DeviceContext
 ) raises:
     print("  [decode] video VAE (latent -> frames)")
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var v_final_bf16 = cast_tensor(v_final, STDtype.BF16, ctx)
     var frames = decode_video[1, 128, NF_CT, NH_CT, NW_CT](
         vae, v_final_bf16, ctx
@@ -5040,7 +5081,9 @@ def _refhq_decode_video_desktop_tiled(
 ) raises -> Int:
     """Decode 960x544x121 with the local LTX Desktop 15 GB tile contract."""
     print("  [decode] video VAE (Desktop 15GB tiled: 512/64 px, 64/24 frames)")
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var latent = cast_tensor(v_final, STDtype.BF16, ctx)
 
     # Desktop split_temporal_causal groups are [0:8], [4:13], [9:16].
@@ -5139,7 +5182,9 @@ def _refhq_decode_video_desktop_tiled_request[
         "  [decode] video VAE ", NUM_FRAMES_CT,
         " frames (Desktop tiled, streaming finalized chunks)",
     )
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var latent = cast_tensor(v_final, STDtype.BF16, ctx)
     var previous = ltx2_desktop_decode_temporal_group[8](
         vae, latent, 0, ctx
@@ -5202,7 +5247,9 @@ def _refhq_decode_video_desktop_tiled_request_portrait[
         "  [decode] video VAE portrait ", NUM_FRAMES_CT,
         " frames (Desktop tiled, streaming finalized chunks)",
     )
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var latent = cast_tensor(v_final, STDtype.BF16, ctx)
     var previous = ltx2_desktop_decode_temporal_group_portrait[8](
         vae, latent, 0, ctx
@@ -5254,7 +5301,9 @@ def _refhq_decode_video_desktop_tiled_full(
     """Decode full two-stage 1920x1088x121 with Desktop 15GB tiling."""
     print("  [decode] video VAE FULL 1920x1088 "
           "(Desktop 15GB tiled: 512/64 px, 64/24 frames)")
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var latent = cast_tensor(v_final, STDtype.BF16, ctx)
 
     var previous = ltx2_desktop_decode_temporal_group_full[8](
@@ -5285,7 +5334,9 @@ def _refhq_decode_video_desktop_tiled_full_portrait(
     """Decode 1088x1920x121 with the transposed Desktop 15GB tile grid."""
     print("  [decode] video VAE FULL 1088x1920 "
           "(Desktop 15GB tiled: 512/64 px, 64/24 frames)")
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var latent = cast_tensor(v_final, STDtype.BF16, ctx)
 
     var previous = ltx2_desktop_decode_temporal_group_full_portrait[8](
@@ -6693,17 +6744,46 @@ def run_request_hq(
         print("  [int4-resident] preloading all 48 dev-model blocks:", int4_slab)
         stream.enable_int4_resident_range(0, NUM_LAYERS - 1, ctx)
         print("  [int4-resident] resident storage bytes:", stream.resident_bytes())
-    _write_ltx2_status(
-        out_dir, String("running"), String("preloading_denoiser"), 0,
-        progress_total,
-        String("Copying every denoiser block into memory before step 0"),
+    var product_block_source = _env_str("LTX2_PRODUCT_BLOCK_SOURCE").lower()
+    if product_block_source.byte_length() == 0:
+        product_block_source = String("resident")
+    if (
+        product_block_source != String("resident")
+        and product_block_source != String("checkpoint_stream")
+    ):
+        raise Error(
+            String("LTX2_PRODUCT_BLOCK_SOURCE must be resident or ")
+            + String("checkpoint_stream; got '") + product_block_source
+            + String("'")
+        )
+    var memory_blocks = 0
+    var checkpoint_streaming = (
+        product_block_source == String("checkpoint_stream")
     )
-    var memory_blocks = stream.enable_product_memory_resident(ctx)
-    ck.release_to_os()
-    print(
-        "  [memory-resident] denoiser blocks:", memory_blocks, "/",
-        NUM_LAYERS, "host bytes:", stream.product_host_bytes(),
-    )
+    if checkpoint_streaming:
+        _write_ltx2_status(
+            out_dir, String("running"), String("streaming_denoiser"), 0,
+            progress_total,
+            String("Using bounded checkpoint streaming for denoiser blocks"),
+        )
+        stream.enable_product_checkpoint_streaming()
+        ck.release_to_os()
+        print(
+            "  [checkpoint-stream] denoiser blocks: bounded one-block GPU ",
+            "window; clean checkpoint pages released after every upload",
+        )
+    else:
+        _write_ltx2_status(
+            out_dir, String("running"), String("preloading_denoiser"), 0,
+            progress_total,
+            String("Copying every denoiser block into memory before step 0"),
+        )
+        memory_blocks = stream.enable_product_memory_resident(ctx)
+        ck.release_to_os()
+        print(
+            "  [memory-resident] denoiser blocks:", memory_blocks, "/",
+            NUM_LAYERS, "host bytes:", stream.product_host_bytes(),
+        )
     # The official spatial upscaler sits between the two denoise stages. Keep
     # its weights and VAE statistics resident for the whole request; reopening
     # its safetensors after stage 1 would perform physical I/O inside the
@@ -6956,6 +7036,67 @@ def run_request_hq(
     ctx.synchronize()
     prepare_seconds = perf_counter() - t0
     min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+    # Checkpoint streaming is the low-host-RAM fallback, but a one-block GPU
+    # window leaves most of a 24 GiB card idle. The exact stage-1/stage-2
+    # warmups above establish the request's real activation high-water mark.
+    # Fill the remaining device capacity with a persistent BF16 block prefix,
+    # retaining 4 GiB of driver-visible headroom for allocator variation. The
+    # cached prefix is reused by every denoise eval; only the uncached suffix
+    # performs checkpoint I/O. Reassigning `stream` before decode releases the
+    # cache, so the VAE still receives a clean denoiser lifetime boundary.
+    if checkpoint_streaming:
+        var cache_policy = _env_str(
+            "LTX2_CHECKPOINT_GPU_CACHE_BLOCKS"
+        ).lower()
+        if cache_policy.byte_length() == 0:
+            cache_policy = String("auto")
+        var cache_blocks = 0
+        var cache_block_bytes = stream.resident_storage_bytes_for_block(0)
+        if cache_policy == String("auto"):
+            # Exact-shape warmup leaves dead activation buffers in CUDA's
+            # caching pool. They are reusable, but the driver free counter does
+            # not include them and would under-size the persistent cache. Trim
+            # only freed pool pages after synchronization; live globals,
+            # latents, RoPE, and warm outputs remain allocated and visible.
+            ctx.synchronize()
+            cu_mempool_trim_current(0)
+            ctx.synchronize()
+            var cache_mem = cu_mem_get_info()
+            var cache_reserve_bytes = 4 * 1024 * 1024 * 1024
+            var cache_budget = cache_mem.free_bytes - cache_reserve_bytes
+            if cache_budget > 0 and cache_block_bytes > 0:
+                cache_blocks = cache_budget // cache_block_bytes
+                if cache_blocks > NUM_LAYERS:
+                    cache_blocks = NUM_LAYERS
+        elif cache_policy == String("off") or cache_policy == String("0"):
+            cache_blocks = 0
+        else:
+            cache_blocks = atol(cache_policy)
+            if cache_blocks < 0 or cache_blocks > NUM_LAYERS:
+                raise Error(
+                    String("LTX2_CHECKPOINT_GPU_CACHE_BLOCKS must be auto, off, ")
+                    + String("or an integer from 0 to ") + String(NUM_LAYERS)
+                    + String("; got '") + cache_policy + String("'")
+                )
+        if cache_blocks > 0:
+            _write_ltx2_status(
+                out_dir, String("running"), String("caching_denoiser_gpu"), 0,
+                progress_total,
+                String("Keeping ") + String(cache_blocks)
+                + String(" denoiser blocks resident in GPU memory"),
+            )
+            stream.enable_fp8_resident_range(0, cache_blocks - 1, ctx)
+            ctx.synchronize()
+            stream.release_checkpoint_pages()
+            var cache_after = cu_mem_get_info()
+            print(
+                "  [checkpoint-gpu-cache] blocks: 0..", cache_blocks - 1,
+                " resident bytes:", stream.resident_bytes(),
+                " free bytes after cache:", cache_after.free_bytes,
+            )
+            min_free_bytes = _record_ltx2_min_free(min_free_bytes)
+        else:
+            print("  [checkpoint-gpu-cache] disabled by policy or capacity")
     # The complete checkpoint-to-RAM pass is large enough to evict cold pages
     # from this runner image. Re-read the small executable once before arming
     # the zero-I/O boundary so first-use sampler/stat code cannot fault from
@@ -7088,7 +7229,7 @@ def run_request_hq(
             REFHQ_MOD_SCALE, ctx,
         )
         _assert_ltx2_no_denoise_disk_reads(
-            out_dir, denoise_read_bytes_start
+            out_dir, denoise_read_bytes_start, checkpoint_streaming
         )
         return (guided_v^, guided_a^)
 
@@ -7206,7 +7347,7 @@ def run_request_hq(
                     video_x, source_mask1.value(), source_clean1.value(), ctx
                 )
             _assert_ltx2_no_denoise_disk_reads(
-                out_dir, denoise_read_bytes_start
+                out_dir, denoise_read_bytes_start, checkpoint_streaming
             )
     else:
         var s1_names = List[String]()
@@ -7219,10 +7360,17 @@ def run_request_hq(
         )
         video_x = s1_out[0].clone(ctx)
         audio_x = s1_out[1].clone(ctx)
-    _assert_ltx2_no_denoise_disk_reads(out_dir, denoise_read_bytes_start)
+    _assert_ltx2_no_denoise_disk_reads(
+        out_dir, denoise_read_bytes_start, checkpoint_streaming
+    )
+    var stage1_read_bytes_end = _ltx2_proc_read_bytes()
     _write_ltx2_denoise_io(
-        out_dir, String("stage1_passed"), denoise_read_bytes_start,
-        denoise_read_bytes_start,
+        out_dir,
+        (
+            String("stage1_checkpoint_stream")
+            if checkpoint_streaming else String("stage1_passed")
+        ),
+        denoise_read_bytes_start, stage1_read_bytes_end,
     )
     print("  [Stage1] complete")
 
@@ -7437,7 +7585,7 @@ def run_request_hq(
         var denoised_v = _refhq_x0(vx, c[0], sigma, ctx)
         var denoised_a = _refhq_x0(ax, c[1], sigma, ctx)
         _assert_ltx2_no_denoise_disk_reads(
-            out_dir, denoise_read_bytes_start
+            out_dir, denoise_read_bytes_start, checkpoint_streaming
         )
         return (denoised_v^, denoised_a^)
 
@@ -7525,7 +7673,7 @@ def run_request_hq(
                     vx2, source_mask2.value(), source_clean2.value(), ctx
                 )
             _assert_ltx2_no_denoise_disk_reads(
-                out_dir, denoise_read_bytes_start
+                out_dir, denoise_read_bytes_start, checkpoint_streaming
             )
     else:
         var s2_names = List[String]()
@@ -7538,10 +7686,17 @@ def run_request_hq(
         vx2 = s2_out[0].clone(ctx)
         ax2 = s2_out[1].clone(ctx)
     ctx.synchronize()
-    _assert_ltx2_no_denoise_disk_reads(out_dir, denoise_read_bytes_start)
+    _assert_ltx2_no_denoise_disk_reads(
+        out_dir, denoise_read_bytes_start, checkpoint_streaming
+    )
+    var stage2_read_bytes_end = _ltx2_proc_read_bytes()
     _write_ltx2_denoise_io(
-        out_dir, String("passed"), denoise_read_bytes_start,
-        denoise_read_bytes_start,
+        out_dir,
+        (
+            String("checkpoint_stream_passed")
+            if checkpoint_streaming else String("passed")
+        ),
+        denoise_read_bytes_start, stage2_read_bytes_end,
     )
     unlock_all_mappings()
     print("  [hardware-safety] runtime mapping locks released after denoise")
@@ -7570,15 +7725,18 @@ def run_request_hq(
 
     # Drop the streamed transformer handle before loading the VAE.
     stream = LTX2BlockStream.open(request_ckpt_path)
+    # Persist recovery metadata for every run, not only an explicitly deferred
+    # decode. If postprocess fails after final latents are written, the decode
+    # command can resume in a fresh process without repeating denoising.
+    _write_ltx2_decode_handoff(
+        out_dir, steps, seed, include_audio, guidance_mode, quant,
+        contexts_path, negative_contexts_path, len(loras.trained),
+        load_seconds, conditioning_seconds, source_encode_seconds,
+        prepare_seconds,
+        denoise_seconds, perf_counter() - total_t0,
+        total_vram_bytes, min_free_bytes,
+    )
     if defer_decode:
-        _write_ltx2_decode_handoff(
-            out_dir, steps, seed, include_audio, guidance_mode, quant,
-            contexts_path, negative_contexts_path, len(loras.trained),
-            load_seconds, conditioning_seconds, source_encode_seconds,
-            prepare_seconds,
-            denoise_seconds, perf_counter() - total_t0,
-            total_vram_bytes, min_free_bytes,
-        )
         _write_ltx2_status(
             out_dir, String("running"), String("decode_handoff"),
             progress_total, progress_total,
@@ -7593,7 +7751,9 @@ def run_request_hq(
         + String(" video frames"),
     )
     t0 = perf_counter()
-    var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+    var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
     var frames = decode_video[
         1, 128, REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2
     ](vae, cast_tensor(v_final, STDtype.BF16, ctx), ctx)
@@ -7768,7 +7928,9 @@ def decode_request_profile(
             REQUEST_HQ_NF, REQUEST_HQ_NUM_FRAMES
         ](v_final, out_dir, ctx)
     else:
-        var vae = LTX2VaeDecoderWeights.load(_ckpt_bf16(), ctx)
+        var vae = LTX2VaeDecoderWeights.load(
+        _request_hq_video_vae_ckpt(_ckpt_bf16()), ctx
+    )
         var decoded = decode_video[
             1, 128, REQUEST_HQ_NF, REQUEST_HQ_NH2, REQUEST_HQ_NW2
         ](vae, cast_tensor(v_final, STDtype.BF16, ctx), ctx)

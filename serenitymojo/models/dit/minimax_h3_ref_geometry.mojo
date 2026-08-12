@@ -88,6 +88,7 @@ from serenitymojo.models.minimax_h3.packing_ref2va import (
     MINIMAX_H3_REF_IMAGE,
     MINIMAX_H3_REF_VIDEO,
     MiniMaxH3PreparedReference,
+    minimax_h3_build_ref2va_motion_context_packed_sequence,
     minimax_h3_build_ref2va_packed_sequence,
     minimax_h3_resolve_reference_image_size,
     minimax_h3_trim_reference_num_frames,
@@ -352,6 +353,53 @@ def minimax_h3_build_ref2va_plan(
         raise Error(
             "minimax_h3_ref_geometry: derived target row ranges overlap the"
             " text region — reference geometry and target geometry disagree"
+        )
+    return MiniMaxH3Ref2VAPlan(
+        layout^,
+        len(text_token_tags),
+        layout.num_condition_video_rows,
+        layout.num_condition_audio_rows,
+        num_target_audio_rows,
+        num_target_video_rows,
+        target_audio_start,
+        target_video_start,
+    )
+
+
+def minimax_h3_build_ref2va_motion_context_plan(
+    text_token_tags: List[Int],
+    references: List[MiniMaxH3PreparedReference],
+    num_latent_frames: Int,
+    latent_height: Int,
+    latent_width: Int,
+    num_audio_latents: Int,
+    context_frames: Int,
+    source_audio_overhang: Float64,
+    patch_h: Int = MINIMAX_H3_PATCH_H,
+    patch_w: Int = MINIMAX_H3_PATCH_W,
+) raises -> MiniMaxH3Ref2VAPlan:
+    """Build ordered Ref2VA blocks plus a pinned previous-clip A/V tail."""
+    var layout = minimax_h3_build_ref2va_motion_context_packed_sequence(
+        text_token_tags,
+        references,
+        num_latent_frames,
+        latent_height,
+        latent_width,
+        num_audio_latents,
+        patch_h,
+        patch_w,
+        context_frames,
+        source_audio_overhang,
+    )
+    var num_target_audio_rows = num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS
+    var num_target_video_rows = (
+        num_latent_frames * (latent_height // patch_h) * (latent_width // patch_w)
+    )
+    var target_video_start = layout.sequence_length - num_target_video_rows
+    var target_audio_start = target_video_start - num_target_audio_rows
+    if target_audio_start < len(text_token_tags):
+        raise Error(
+            "minimax_h3_ref_geometry: combined target rows overlap text"
         )
     return MiniMaxH3Ref2VAPlan(
         layout^,

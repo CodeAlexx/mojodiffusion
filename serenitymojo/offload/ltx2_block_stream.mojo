@@ -249,6 +249,12 @@ struct LTX2BlockStream(Movable):
     # orchestration path while making mmap fallback impossible after step 0.
     var product_host_loaders: List[ArcPointer[TurboPlannedLoader]]
     var product_host_active: Bool
+    # Explicit low-host-RAM product mode. The default remains the complete
+    # pinned host store; callers must opt in before denoise. In checkpoint
+    # streaming mode each synchronized block upload is followed by
+    # MADV_DONTNEED/POSIX_FADV_DONTNEED so clean 22B checkpoint pages do not
+    # accumulate in the product cgroup and trigger systemd-oomd.
+    var product_checkpoint_streaming: Bool
     var product_host_bytes_: Int
 
     @staticmethod
@@ -320,6 +326,7 @@ struct LTX2BlockStream(Movable):
         self.checkpoint_path = checkpoint_path
         self.product_host_loaders = List[ArcPointer[TurboPlannedLoader]]()
         self.product_host_active = False
+        self.product_checkpoint_streaming = False
         self.product_host_bytes_ = 0
 
     def block_count(self) -> Int:
@@ -339,6 +346,59 @@ struct LTX2BlockStream(Movable):
 
     def product_host_bytes(self) -> Int:
         return self.product_host_bytes_
+
+    def resident_storage_bytes_for_block(self, block_idx: Int) raises -> Int:
+        """Return the device bytes used by resident storage for one block.
+
+        FP8 tensors remain raw FP8 in the resident store. Every other storage
+        dtype is materialized as BF16, matching `enable_fp8_resident_range`.
+        This metadata-only query lets the product pipeline size a partial GPU
+        cache from the free VRAM measured after its exact-shape warmup.
+        """
+        if block_idx < 0 or block_idx >= self.n_blocks:
+            raise Error("resident_storage_bytes_for_block: invalid block index")
+        var total = 0
+        var bp = self.prefix + String(block_idx) + "."
+        for ref nm in self.sharded.names():
+            if not nm.startswith(bp):
+                continue
+            if (
+                nm.endswith("_scale")
+                or nm.endswith("input_scale")
+                or nm.endswith(".scale_weight")
+                or nm.endswith(".scale_input")
+            ):
+                continue
+            var tv = self.sharded.tensor_view(nm)
+            if tv.dtype == STDtype.F8_E4M3:
+                total += tv.nbytes()
+            else:
+                var numel = 1
+                for dim_idx in range(len(tv.shape)):
+                    numel *= tv.shape[dim_idx]
+                total += numel * STDtype.BF16.byte_size()
+        return total
+
+    def release_checkpoint_pages(mut self):
+        """Drop clean checkpoint pages after an explicit preload boundary."""
+        self.sharded.release_to_os()
+
+    def enable_product_checkpoint_streaming(mut self) raises:
+        """Use the existing byte-identical per-block checkpoint loader.
+
+        This is an explicit product choice for hosts that cannot pin the full
+        BF16 DiT in RAM. It changes only the block source: weights still land
+        as BF16 GPU tensors and the same LTX2 block forward executes.
+        """
+        if self.int4_slab:
+            raise Error(
+                "LTX2 checkpoint streaming is not valid for the int4 resident slab"
+            )
+        if len(self.product_host_loaders) != 0:
+            raise Error(
+                "LTX2 checkpoint streaming must be selected before resident preload"
+            )
+        self.product_checkpoint_streaming = True
 
     def enable_product_memory_resident(mut self, ctx: DeviceContext) raises -> Int:
         """Copy every FP8/BF16 block byte into pinned RAM before denoise.
@@ -402,13 +462,21 @@ struct LTX2BlockStream(Movable):
     def load_block_bf16_product(
         mut self, block_idx: Int, ctx: DeviceContext
     ) raises -> FP8Block:
-        """Product-only block load that cannot touch the checkpoint mapping."""
+        """Load one product block from the explicitly selected source."""
         if self.int4_slab:
             return self.load_block_bf16(block_idx, ctx)
+        if self.product_checkpoint_streaming:
+            var block = self.load_block_bf16(block_idx, ctx)
+            # load_block_bf16 synchronizes the H2D/dequant work before return,
+            # so the source pages are no longer needed by the active GPU work.
+            # Drop both mapping residency and clean page-cache charge now rather
+            # than letting 37+ GiB accumulate under the desktop user slice.
+            self.sharded.release_to_os()
+            return block^
         if len(self.product_host_loaders) != 1:
             raise Error(
                 "LTX2 product refuses sampling: complete host-resident block "
-                "store was not prepared before denoise"
+                "store was not prepared and checkpoint streaming is disabled"
             )
         if self.product_host_active:
             self.product_host_loaders[0][].mark_active_block_done(ctx)

@@ -12,9 +12,9 @@ from serenitymojo.runtime.model_manifest import ModelManifest, sdxl_default_mani
 
 
 comptime SDXL_CACHED_EMBEDDINGS_PATH = (
-    "/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors"
+    "/home/alex/.serenity/parity/output/sdxl_embeddings.safetensors"
 )
-comptime SDXL_ENCODER_WORKDIR = "/home/alex/EriDiffusion/inference-flame"
+comptime SDXL_ENCODER_WORKDIR = "/home/alex/.serenity/parity/inference-flame"
 
 
 def sdxl_default_cached_embeddings_path() -> String:

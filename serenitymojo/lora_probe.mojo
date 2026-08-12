@@ -105,7 +105,7 @@ def main() raises:
 
     # A real on-disk train_klein LoRA (verified header 2026-05-26). The load is
     # wrapped so a missing file at runtime is non-fatal (compile is the gate).
-    comptime LORA_PATH = "/home/alex/EriDiffusion/EriDiffusion-v2/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
+    comptime LORA_PATH = "/home/alex/.serenity/parity/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
     try:
         var lset = LoraSet.load(String(LORA_PATH))
         print(

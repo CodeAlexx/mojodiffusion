@@ -61,10 +61,10 @@ comptime QWEN8_DIR = (
 )
 comptime TOK_JSON = QWEN8_DIR + "/tokenizer.json"
 comptime BASE_PATH = (
-    "/home/alex/EriDiffusion/Models/checkpoints/flux-2-klein-base-9b.safetensors"
+    "/home/alex/.serenity/parity/checkpoints/flux-2-klein-base-9b.safetensors"
 )
 comptime ADAPTER_PATH = (
-    "/home/alex/EriDiffusion/Models/checkpoints/asymflux2-klein-9b.safetensors"
+    "/home/alex/.serenity/parity/checkpoints/asymflux2-klein-9b.safetensors"
 )
 comptime OUT = "/home/alex/mojodiffusion/output/asymflux2_512.png"
 

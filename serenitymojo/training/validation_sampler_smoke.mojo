@@ -33,7 +33,7 @@ comptime VAE_PATH = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
 comptime CAPS_POS = "/home/alex/mojodiffusion/output/klein9b_caps_pos.bin"
 comptime CAPS_NEG = "/home/alex/mojodiffusion/output/klein9b_caps_neg.bin"
 # A real trained LoRA (same file the lora wiring smoke uses).
-comptime LORA_PATH = "/home/alex/EriDiffusion/EriDiffusion-v2/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
+comptime LORA_PATH = "/home/alex/.serenity/parity/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
 comptime OUT_BASE = "/home/alex/mojodiffusion/output/klein_validation_baseline.png"
 comptime OUT_LORA = "/home/alex/mojodiffusion/output/klein_validation_with_lora.png"
 

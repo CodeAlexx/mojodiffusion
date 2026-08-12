@@ -32,6 +32,7 @@ from serenitymojo.serve.flux_backend import FluxBackend
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import decode_start, encode_ev, encode_ready
 from serenitymojo.serve.flux_encode_subprocess import encode_child_run
+from serenitymojo.serve.flux_decode_subprocess import decode_child_run as decode_flux_child_run
 
 comptime WORKER_IDLE_SLEEP_S = 0.02  # poll cadence while waiting for a command
 
@@ -91,7 +92,7 @@ def _flux_worker_loop(mut backend: FluxBackend, fd: Int32) raises:
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: serenity_worker_flux <fd> | serenity_worker_flux encode-child <prefix> <prompt>")
+        print("usage: serenity_worker_flux <fd> | serenity_worker_flux encode-child <prefix> <prompt> | serenity_worker_flux decode-child <packed> <rgb_out> <vae> <lh> <lw>")
         return
     # Text-encoders-in-a-child-process. The parent flux worker fork+execv's THIS
     # same binary as `encode-child` so the ~10 GB CLIP-L + T5-XXL encode runs in
@@ -105,6 +106,17 @@ def main() raises:
             return
         encode_child_run(String(args[2]), String(args[3]))
         return                            # process exits → encoder VRAM reclaimed
+    # VAE-in-a-child-process. Keep the parent's offloaded DiT handle and RoPE
+    # alive across jobs while a fresh GPU process decodes and exits.
+    if String(args[1]) == "decode-child":
+        if len(args) < 7:
+            print("usage: serenity_worker_flux decode-child <packed> <rgb_out> <vae> <lh> <lw>")
+            return
+        decode_flux_child_run(
+            String(args[2]), String(args[3]), String(args[4]),
+            Int(String(args[5])), Int(String(args[6])),
+        )
+        return
     var fd = Int32(Int(String(args[1])))
     var b = FluxBackend()
     _flux_worker_loop(b, fd)

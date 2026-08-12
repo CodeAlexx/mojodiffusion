@@ -90,7 +90,7 @@ from serenitymojo.models.dit.sd3_contract import (
 from serenitymojo.models.sd35.sd3_lokr_overlay import Sd3LokrOverlay
 from serenitymojo.offload.block_loader import BlockLoader, unload_block
 from serenitymojo.ops.activations import gelu, silu
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_infer
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.layout import patchify, unpatchify
@@ -855,6 +855,7 @@ def _sd3_joint_block[
     hidden: Int,
     ctx: DeviceContext,
     lora: Optional[ArcPointer[Sd3LokrOverlay]] = None,
+    inference_fast_attention: Bool = False,
 ) raises:
     # Block keys in the safetensors file include the "model.diffusion_model." prefix.
     var pfx = String("model.diffusion_model.")
@@ -1000,9 +1001,15 @@ def _sd3_joint_block[
 
     # SDPA (math-mode; S_JOINT, H=24, Dh=64)
     comptime SCALE = Float32(1.0) / Float32(8.0)  # 1/sqrt(64)
-    var attn_out = sdpa_nomask[B, S_JOINT, H, Dh](
-        joint_q, joint_k, joint_v, SCALE, ctx
-    )
+    var attn_out: Tensor
+    if inference_fast_attention:
+        attn_out = sdpa_nomask_infer[B, S_JOINT, H, Dh](
+            joint_q, joint_k, joint_v, SCALE, ctx
+        )
+    else:
+        attn_out = sdpa_nomask[B, S_JOINT, H, Dh](
+            joint_q, joint_k, joint_v, SCALE, ctx
+        )
 
     # Split back: context = attn_out[:, :N_CTX, :, :], x = attn_out[:, N_CTX:, :, :]
     var ctx_attn_bshd = slice(attn_out, 1, 0, N_CTX, ctx)       # [B, N_CTX, H, Dh]
@@ -1101,9 +1108,15 @@ def _sd3_joint_block[
         var x2_k = reshape(slice(x2_qkv5, 2, 1, 1, ctx), x2_head_sh.copy(), ctx)
         var x2_v = reshape(slice(x2_qkv5, 2, 2, 1, ctx), x2_head_sh^, ctx)
         # Self-attention on x only (no context concatenation)
-        var attn2_out_bshd = sdpa_nomask[B, N_IMG, H, Dh](
-            x2_q, x2_k, x2_v, SCALE, ctx
-        )
+        var attn2_out_bshd: Tensor
+        if inference_fast_attention:
+            attn2_out_bshd = sdpa_nomask_infer[B, N_IMG, H, Dh](
+                x2_q, x2_k, x2_v, SCALE, ctx
+            )
+        else:
+            attn2_out_bshd = sdpa_nomask[B, N_IMG, H, Dh](
+                x2_q, x2_k, x2_v, SCALE, ctx
+            )
         var attn2_sh = List[Int]()
         attn2_sh.append(B)
         attn2_sh.append(N_IMG)

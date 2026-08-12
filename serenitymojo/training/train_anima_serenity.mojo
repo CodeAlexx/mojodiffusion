@@ -145,7 +145,7 @@ comptime FIXED_TIMESTEP = 500           # fixed discrete index for the smoke
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 # Chunk D REAL cache (anima_prepare_serenity output): a real VAE-encoded latent.
-comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_real_serenity"
+comptime CACHE_DIR = "/home/alex/.serenity/parity/cache/anima_real_serenity"
 # Chunk C wired (GAP 1): context produced ENTIRELY by the Mojo pipeline
 # (pipeline/anima_text_context.mojo: real Qwen3-0.6B encoder -> zero-pad ->
 # net.llm_adapter) from the real caption tokenized at max_len 512. This REPLACES

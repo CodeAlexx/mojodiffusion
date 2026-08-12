@@ -45,8 +45,8 @@ from serenitymojo.image.png import ValueRange, save_png
 
 
 comptime OUT_PNG = "/home/alex/mojodiffusion/output/anima_1024_30step.png"
-comptime RUST_LATENT_PATH = "/home/alex/EriDiffusion/inference-flame/output/anima_rust_latent.safetensors"
-comptime EMBEDDINGS_PATH = "/home/alex/EriDiffusion/inference-flame/output/anima_embeddings.safetensors"
+comptime RUST_LATENT_PATH = "/home/alex/.serenity/parity/output/anima_rust_latent.safetensors"
+comptime EMBEDDINGS_PATH = "/home/alex/.serenity/parity/output/anima_embeddings.safetensors"
 
 comptime CFG_SCALE = Float32(4.5)
 comptime SEED = UInt64(42)

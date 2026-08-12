@@ -11,9 +11,9 @@ from serenitymojo.registry.checkpoints import path_exists
 
 comptime ZIMAGE_L2P_DEFAULT_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
 comptime ZIMAGE_L2P_DEFAULT_CONDITIONING = (
-    "/home/alex/EriDiffusion/inference-flame/output/l2p_embeddings.safetensors"
+    "/home/alex/.serenity/parity/output/l2p_embeddings.safetensors"
 )
-comptime ZIMAGE_L2P_INFER_WORKDIR = "/home/alex/EriDiffusion/inference-flame"
+comptime ZIMAGE_L2P_INFER_WORKDIR = "/home/alex/.serenity/parity/inference-flame"
 comptime ZIMAGE_L2P_WIDTH = 1024
 comptime ZIMAGE_L2P_HEIGHT = 1024
 comptime ZIMAGE_L2P_PIXEL_CHANNELS = 3

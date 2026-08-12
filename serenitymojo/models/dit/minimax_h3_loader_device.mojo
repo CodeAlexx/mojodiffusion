@@ -71,13 +71,17 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List
+from std.gpu import global_idx
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
+from std.utils.index import IndexList
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import TensorView
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import BatchedTensorUploader, Tensor
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     MINIMAX_H3_QKV_DEINTERLEAVED_MARKER,
@@ -96,6 +100,9 @@ from serenitymojo.models.minimax_h3.loader import (
 comptime MINIMAX_H3_TRANSFORMER_DIR = (
     "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transformer"
 )
+comptime _H3_WEIGHT_DYN1 = Layout.row_major(-1)
+comptime _H3_WEIGHT_REORDER_BLOCK = 256
+comptime _H3_BLOCK_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,6 +198,121 @@ def _tensor_view_bf16_host[
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _minimax_h3_qkv_deinterleave_bf16_kernel(
+    src: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
+    total: Int,
+    heads: Int,
+    head_dim: Int,
+    in_features: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < total:
+        var dest_row = idx // in_features
+        var col = idx % in_features
+        var inner = heads * head_dim
+        var part = dest_row // inner
+        var within = dest_row % inner
+        var head = within // head_dim
+        var dim = within % head_dim
+        var source_row = head * 3 * head_dim + part * head_dim + dim
+        dst[idx] = rebind[dst.element_type](
+            rebind[Scalar[DType.bfloat16]](
+                src[source_row * in_features + col]
+            )
+        )
+
+
+def _minimax_h3_fc1_swap_bf16_kernel(
+    src: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
+    total: Int,
+    ffn_dim: Int,
+    in_features: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < total:
+        var dest_row = idx // in_features
+        var col = idx % in_features
+        var source_row = (
+            dest_row + ffn_dim
+            if dest_row < ffn_dim
+            else dest_row - ffn_dim
+        )
+        dst[idx] = rebind[dst.element_type](
+            rebind[Scalar[DType.bfloat16]](
+                src[source_row * in_features + col]
+            )
+        )
+
+
+def _minimax_h3_qkv_deinterleave_bf16_device(
+    raw: Tensor,
+    heads: Int,
+    head_dim: Int,
+    in_features: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if raw.dtype() != STDtype.BF16:
+        raise Error("MiniMax-H3 QKV device reorder requires BF16")
+    var total = raw.numel()
+    if total != heads * 3 * head_dim * in_features:
+        raise Error("MiniMax-H3 QKV device reorder shape mismatch")
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        total * STDtype.BF16.byte_size()
+    )
+    var rl = RuntimeLayout[_H3_WEIGHT_DYN1].row_major(IndexList[1](total))
+    var src = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
+        raw.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var dst = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var grid = (total + _H3_WEIGHT_REORDER_BLOCK - 1) \
+        // _H3_WEIGHT_REORDER_BLOCK
+    ctx.enqueue_function[
+        _minimax_h3_qkv_deinterleave_bf16_kernel,
+        _minimax_h3_qkv_deinterleave_bf16_kernel,
+    ](
+        src, dst, total, heads, head_dim, in_features,
+        grid_dim=grid, block_dim=_H3_WEIGHT_REORDER_BLOCK,
+    )
+    return Tensor(out_buf^, raw.shape(), STDtype.BF16)
+
+
+def _minimax_h3_fc1_swap_bf16_device(
+    raw: Tensor,
+    ffn_dim: Int,
+    in_features: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if raw.dtype() != STDtype.BF16:
+        raise Error("MiniMax-H3 FC1 device reorder requires BF16")
+    var total = raw.numel()
+    if total != 2 * ffn_dim * in_features:
+        raise Error("MiniMax-H3 FC1 device reorder shape mismatch")
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        total * STDtype.BF16.byte_size()
+    )
+    var rl = RuntimeLayout[_H3_WEIGHT_DYN1].row_major(IndexList[1](total))
+    var src = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
+        raw.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var dst = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var grid = (total + _H3_WEIGHT_REORDER_BLOCK - 1) \
+        // _H3_WEIGHT_REORDER_BLOCK
+    ctx.enqueue_function[
+        _minimax_h3_fc1_swap_bf16_kernel,
+        _minimax_h3_fc1_swap_bf16_kernel,
+    ](
+        src, dst, total, ffn_dim, in_features,
+        grid_dim=grid, block_dim=_H3_WEIGHT_REORDER_BLOCK,
+    )
+    return Tensor(out_buf^, raw.shape(), STDtype.BF16)
+
+
 def minimax_h3_load_qkv_device(
     st: ShardedSafeTensors,
     name: String,
@@ -202,10 +324,10 @@ def minimax_h3_load_qkv_device(
     """Load one block's `attn.qkv_proj.weight` and de-interleave it in BF16.
     Shape is unchanged ([3*inner, hidden]); only row order changes."""
     var tv = st.tensor_view(name)
-    var shape = tv.shape.copy()
-    var raw = _tensor_view_bf16_host(tv)
-    var reordered = minimax_h3_deinterleave_qkv_bf16(raw, heads, head_dim, in_features)
-    return Tensor.from_host_bf16(reordered^, shape^, ctx)
+    var raw = Tensor.from_view(tv, ctx)
+    return _minimax_h3_qkv_deinterleave_bf16_device(
+        raw^, heads, head_dim, in_features, ctx
+    )
 
 
 def minimax_h3_load_fc1_device(
@@ -218,10 +340,10 @@ def minimax_h3_load_fc1_device(
     """Load one block's `mlp.fc1.weight` and swap [gate;value]->[value;gate] in
     BF16. Shape is unchanged ([2*ffn, hidden]); only row order changes."""
     var tv = st.tensor_view(name)
-    var shape = tv.shape.copy()
-    var raw = _tensor_view_bf16_host(tv)
-    var swapped = minimax_h3_swap_fc1_bf16(raw, ffn_dim, in_features)
-    return Tensor.from_host_bf16(swapped^, shape^, ctx)
+    var raw = Tensor.from_view(tv, ctx)
+    return _minimax_h3_fc1_swap_bf16_device(
+        raw^, ffn_dim, in_features, ctx
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,19 +384,33 @@ def minimax_h3_load_block_device(
     var ffn = config.ffn_hidden_size
 
     var weights = Dict[String, ArcPointer[Tensor]]()
+    var uploader = BatchedTensorUploader(_H3_BLOCK_UPLOAD_BYTES, ctx)
+    var transform_sources = List[ArcPointer[Tensor]]()
     var names = minimax_h3_block_tensor_names(layer)
     for i in range(len(names)):
         ref name = names[i]
+        var raw = uploader.from_view(st.tensor_view(name), ctx)
+        # `from_view` has already copied mmap bytes into the pinned slab. Drop
+        # only this tensor's clean source pages while the H2D consumes the slab.
+        st.release_tensor(name)
         if name == qkv_name:
-            weights[name] = ArcPointer(
-                minimax_h3_load_qkv_device(st, name, heads, head_dim, hidden, ctx)
+            var transformed = _minimax_h3_qkv_deinterleave_bf16_device(
+                raw, heads, head_dim, hidden, ctx
             )
+            transform_sources.append(ArcPointer(raw^))
+            weights[name] = ArcPointer(transformed^)
         elif name == fc1_name:
-            weights[name] = ArcPointer(
-                minimax_h3_load_fc1_device(st, name, ffn, hidden, ctx)
+            var transformed = _minimax_h3_fc1_swap_bf16_device(
+                raw, ffn, hidden, ctx
             )
+            transform_sources.append(ArcPointer(raw^))
+            weights[name] = ArcPointer(transformed^)
         else:
-            weights[name] = ArcPointer(Tensor.from_view(st.tensor_view(name), ctx))
+            weights[name] = ArcPointer(raw^)
+
+    # One fence covers the block's H2D copies and both exact GPU relocations.
+    uploader.finish(ctx)
+    transform_sources.clear()
 
     minimax_h3_check_block_weights(weights, layer, config)
     weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(_minimax_h3_marker_tensor(ctx))

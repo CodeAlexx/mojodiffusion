@@ -36,7 +36,9 @@ from serenitymojo.models.text_encoder.qwen3_encoder import (
     _reshape,
 )
 from serenitymojo.ops.activations import gelu
-from serenitymojo.ops.attention_flash import sdpa_flash_infer_fwd_causal_padmask
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_infer_fwd_causal_padmask_dynamic,
+)
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.rope import rope_halfsplit
@@ -256,39 +258,20 @@ def _attention_dispatch(
     real_len: Int, seq: Int, ctx: DeviceContext,
 ) raises -> Tensor:
     var scale = Float32(1.0 / 16.0)  # query_pre_attn_scalar(256)^-0.5
-    if seq == 128:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 128, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 256:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 256, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 384:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 384, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 512:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 512, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 640:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 640, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 768:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 768, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 896:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 896, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    if seq == 1024:
-        return sdpa_flash_infer_fwd_causal_padmask[1, 1024, 16, 256](
-            q, k, v, real_len, scale, ctx
-        )
-    raise Error("Gemma attention bucket must be 128..1024 in 128-token steps")
+    # This used to enumerate the eight 128-step buckets against
+    # `sdpa_flash_infer_fwd_causal_padmask[B,S,H,Dh]`, which reads as compile-time
+    # specialization but is not: that wrapper's entire body forwards to
+    # `..._dynamic`, which takes B/S/H/Dh off the tensor shapes
+    # (ops/attention_flash.mojo:283). All eight branches were the same call.
+    # Equivalence was MEASURED, not argued — parity/gemma3_dispatch_refactor_probe.mojo
+    # drives all eight buckets and its digests are bit-identical across the change.
+    # The 128-step bucketing itself still happens in `_bucket_for`; it bounds how
+    # many distinct shapes the cuDNN plan cache sees. Only the fake dispatch went.
+    if seq < 128 or seq > GEMMA_MAX_TOKENS or (seq % 128) != 0:
+        raise Error("Gemma attention bucket must be 128..1024 in 128-token steps")
+    return sdpa_flash_infer_fwd_causal_padmask_dynamic(
+        q, k, v, real_len, scale, ctx
+    )
 
 
 def _layer_forward(

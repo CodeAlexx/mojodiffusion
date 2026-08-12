@@ -264,6 +264,64 @@ def sdpa_flash_infer_fwd_dynamic(
     return o^
 
 
+def sdpa_flash_infer_fwd_cross_dynamic(
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Runtime BF16 SDPA with distinct query and key/value lengths.
+
+    The cuDNN shim and its graph cache already model `N_q` and `N_kv`
+    independently.  This surface exposes that existing capability to Mojo so
+    H3 can recompute a small modality prefix exactly without paying for exact
+    attention on every video query row.
+    """
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 \
+            or v.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_infer_fwd_cross_dynamic: q/k/v must be BF16")
+    var qsh = q.shape()
+    var ksh = k.shape()
+    var vsh = v.shape()
+    if len(qsh) != 4 or len(ksh) != 4 or vsh != ksh:
+        raise Error("sdpa_flash_infer_fwd_cross_dynamic: q/k/v rank mismatch")
+    var B = qsh[0]
+    var Nq = qsh[1]
+    var H = qsh[2]
+    var Dh = qsh[3]
+    var Nkv = ksh[1]
+    if (
+        B <= 0 or Nq <= 0 or Nkv <= 0 or H <= 0 or Dh <= 0
+        or ksh[0] != B or ksh[2] != H or ksh[3] != Dh
+    ):
+        raise Error("sdpa_flash_infer_fwd_cross_dynamic: shape mismatch")
+    var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * Nq * H * Dh * 2)
+    ctx.enqueue_memset[DType.uint8](o_buf, 0)
+    var o_shape: List[Int] = [B, Nq, H, Dh]
+    var o = Tensor(o_buf^, o_shape^, STDtype.BF16)
+    var qs = _strides_bhnd(Nq, H, Dh)
+    var ks = _strides_bhnd(Nkv, H, Dh)
+    var vs = _strides_bhnd(Nkv, H, Dh)
+    var os_ = _strides_bhnd(Nq, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bf16", Int32](
+        _dev_ptr(q), _dev_ptr(k), _dev_ptr(v), _dev_ptr(o),
+        Int32(B), Int32(H), Int32(Nq), Int32(Nkv), Int32(Dh), scale,
+        qs, ks, vs, os_,
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0), stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_infer_fwd_cross_dynamic: shim rc=")
+            + String(rc) + String(" (B=") + String(B)
+            + String(" Nq=") + String(Nq) + String(" Nkv=")
+            + String(Nkv) + String(" H=") + String(H)
+            + String(" Dh=") + String(Dh) + String(")")
+        )
+    return o^
+
+
 def sdpa_flash_infer_fwd_causal_padmask[
     B: Int, S: Int, H: Int, Dh: Int
 ](

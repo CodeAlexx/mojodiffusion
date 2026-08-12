@@ -16,7 +16,7 @@
 # The public product surface is `sage_attention_int8_fwd`; the exported
 # `sage_int8_mma_tile` exists only for the host-exact primitive gate.
 
-from std.gpu import barrier, block_idx, lane_id, syncwarp, thread_idx
+from std.gpu import barrier, block_idx, global_idx, lane_id, syncwarp, thread_idx
 from std.gpu.host import DeviceContext
 from std.memory import bitcast, stack_allocation
 from std.gpu.memory import AddressSpace
@@ -36,8 +36,13 @@ comptime _DYN1 = Layout.row_major(-1)
 comptime _WARPS = 8
 comptime _Q_TILE = 16
 comptime _QK_N = 8
-comptime _Q_QUANT_BLOCK = 128
+# One attention warp owns sixteen query rows.  The official Ampere
+# per-thread quantizer splits that tile into eight (row, row+8) pairs and
+# each 64-row K tile into four interleaved column-pair groups.
+comptime _Q_QUANT_BLOCK = 16
 comptime _K_QUANT_BLOCK = 64
+comptime _Q_SCALES_PER_BLOCK = 8
+comptime _K_SCALES_PER_BLOCK = 4
 comptime _KV_TILE = 64
 comptime _HEAD_DIM = 128
 comptime _NEG_BIG = Float32(-1.0e30)
@@ -178,30 +183,53 @@ def sage_int8_mma_tile(
     return Tensor(out_buf^, [16, 8], STDtype.I32)
 
 
-def _sage_quant_block_bf16[BLK: Int](
+def _sage_k_mean_bf16(
+    src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    mean: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    S: Int,
+    H: Int,
+):
+    """Mean K over sequence for exact softmax-invariant key smoothing."""
+    var hd = Int(global_idx.x)
+    if hd >= H * _HEAD_DIM:
+        return
+    var head = hd // _HEAD_DIM
+    var d = hd - head * _HEAD_DIM
+    var total = Float32(0.0)
+    for s in range(S):
+        total += Float32(rebind[Scalar[DType.bfloat16]](
+            src[(s * H + head) * _HEAD_DIM + d]
+        ))
+    mean[hd] = rebind[mean.element_type](
+        (total / Float32(S)).cast[DType.bfloat16]()
+    )
+
+
+def _sage_quant_q_per_thread_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     scales: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     S: Int,
     H: Int,
 ):
-    """One symmetric scale per BLK sequence rows, BSHD BF16 -> BHSD INT8."""
+    """Official per-thread Q geometry: one scale for rows (r, r+8)."""
     var tid = Int(thread_idx.x)
     var warp = tid >> 5
     var lane = tid & 31
     var seq_block = Int(block_idx.x)
     var head = Int(block_idx.y)
-    var seq_start = seq_block * BLK
-    var warp_max_sh = stack_allocation[
-        _WARPS, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    var seq_start = seq_block * _Q_QUANT_BLOCK
+    var scale_sh = stack_allocation[
+        _Q_SCALES_PER_BLOCK, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
     ]()
 
     var local_max = Float32(0.0)
-    var idx = tid
-    while idx < BLK * _HEAD_DIM:
-        var s_local = idx // _HEAD_DIM
-        var d = idx - s_local * _HEAD_DIM
-        var s = seq_start + s_local
+    var idx = lane
+    while idx < 2 * _HEAD_DIM:
+        var row_pair = idx // _HEAD_DIM
+        var d = idx - row_pair * _HEAD_DIM
+        var s = seq_start + warp + row_pair * 8
         if s < S:
             var x = Float32(rebind[Scalar[DType.bfloat16]](
                 src[(s * H + head) * _HEAD_DIM + d]
@@ -209,34 +237,30 @@ def _sage_quant_block_bf16[BLK: Int](
             var ax = x if x >= 0.0 else -x
             if ax > local_max:
                 local_max = ax
-        idx += _WARPS * 32
+        idx += 32
     var wmax = Float32(warp_max(SIMD[DType.float32, 1](local_max)))
     if lane == 0:
-        warp_max_sh[warp] = wmax
+        var warp_scale = wmax / 127.0
+        if warp_scale < 1.0e-30:
+            warp_scale = 1.0e-30
+        scale_sh[warp] = warp_scale
+        scales[
+            (head * ceildiv(S, _Q_QUANT_BLOCK) + seq_block)
+            * _Q_SCALES_PER_BLOCK + warp
+        ] = rebind[scales.element_type](warp_scale)
     barrier()
-    if warp == 0:
-        var block_max = warp_max_sh[lane] if lane < _WARPS else Float32(0.0)
-        block_max = Float32(warp_max(SIMD[DType.float32, 1](block_max)))
-        if lane == 0:
-            var scale = block_max / 127.0
-            if scale < 1.0e-30:
-                scale = 1.0e-30
-            warp_max_sh[0] = scale
-            scales[head * ceildiv(S, BLK) + seq_block] = \
-                rebind[scales.element_type](scale)
-    barrier()
-    var scale = warp_max_sh[0]
+    var quant_scale = scale_sh[warp]
 
-    idx = tid
-    while idx < BLK * _HEAD_DIM:
-        var s_local = idx // _HEAD_DIM
-        var d = idx - s_local * _HEAD_DIM
-        var s = seq_start + s_local
+    idx = lane
+    while idx < 2 * _HEAD_DIM:
+        var row_pair = idx // _HEAD_DIM
+        var d = idx - row_pair * _HEAD_DIM
+        var s = seq_start + warp + row_pair * 8
         if s < S:
             var x = Float32(rebind[Scalar[DType.bfloat16]](
                 src[(s * H + head) * _HEAD_DIM + d]
             ))
-            var xi = Int(round(x / scale))
+            var xi = Int(round(x / quant_scale))
             if xi > 127:
                 xi = 127
             elif xi < -127:
@@ -244,7 +268,82 @@ def _sage_quant_block_bf16[BLK: Int](
             dst[(head * S + s) * _HEAD_DIM + d] = rebind[dst.element_type](
                 Scalar[DType.uint8](xi & 255)
             )
-        idx += _WARPS * 32
+        idx += 32
+
+
+def _sage_quant_k_per_thread_bf16(
+    src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    scales: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    mean: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    S: Int,
+    H: Int,
+):
+    """Official per-thread K geometry: four interleaved row-pair groups."""
+    var tid = Int(thread_idx.x)
+    var warp = tid >> 5
+    var lane = tid & 31
+    var seq_block = Int(block_idx.x)
+    var head = Int(block_idx.y)
+    var seq_start = seq_block * _K_QUANT_BLOCK
+    var scale_sh = stack_allocation[
+        _K_SCALES_PER_BLOCK, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+
+    var local_max = Float32(0.0)
+    var idx = lane
+    while idx < 16 * _HEAD_DIM:
+        var owned_row = idx // _HEAD_DIM
+        var d = idx - owned_row * _HEAD_DIM
+        var row_chunk = owned_row >> 1
+        var row_in_pair = owned_row & 1
+        var s = seq_start + row_chunk * 8 + warp * 2 + row_in_pair
+        if s < S:
+            var x = Float32(rebind[Scalar[DType.bfloat16]](
+                src[(s * H + head) * _HEAD_DIM + d]
+            )) - Float32(rebind[Scalar[DType.bfloat16]](
+                mean[head * _HEAD_DIM + d]
+            ))
+            var ax = x if x >= 0.0 else -x
+            if ax > local_max:
+                local_max = ax
+        idx += 32
+    var wmax = Float32(warp_max(SIMD[DType.float32, 1](local_max)))
+    if lane == 0:
+        var warp_scale = wmax / 127.0
+        if warp_scale < 1.0e-30:
+            warp_scale = 1.0e-30
+        scale_sh[warp] = warp_scale
+        scales[
+            (head * ceildiv(S, _K_QUANT_BLOCK) + seq_block)
+            * _K_SCALES_PER_BLOCK + warp
+        ] = rebind[scales.element_type](warp_scale)
+    barrier()
+    var quant_scale = scale_sh[warp]
+
+    idx = lane
+    while idx < 16 * _HEAD_DIM:
+        var owned_row = idx // _HEAD_DIM
+        var d = idx - owned_row * _HEAD_DIM
+        var row_chunk = owned_row >> 1
+        var row_in_pair = owned_row & 1
+        var s = seq_start + row_chunk * 8 + warp * 2 + row_in_pair
+        if s < S:
+            var x = Float32(rebind[Scalar[DType.bfloat16]](
+                src[(s * H + head) * _HEAD_DIM + d]
+            )) - Float32(rebind[Scalar[DType.bfloat16]](
+                mean[head * _HEAD_DIM + d]
+            ))
+            var xi = Int(round(x / quant_scale))
+            if xi > 127:
+                xi = 127
+            elif xi < -127:
+                xi = -127
+            dst[(head * S + s) * _HEAD_DIM + d] = rebind[dst.element_type](
+                Scalar[DType.uint8](xi & 255)
+            )
+        idx += 32
 
 
 def _sage_gather_v_bf16(
@@ -328,7 +427,11 @@ def _sage_attention_int8_token_kernel(
                     q8[(head * S + qr) * _HEAD_DIM + d]
                 )
     var qscale = rebind[Scalar[DType.float32]](
-        qs[head * ceildiv(S, _Q_QUANT_BLOCK) + Int(block_idx.x)]
+        qs[
+            (head * ceildiv(S, _Q_QUANT_BLOCK)
+                + q_start // _Q_QUANT_BLOCK)
+            * _Q_SCALES_PER_BLOCK + group
+        ]
     )
 
     # Prime stage zero. Each lane contributes 16-byte cp.async transfers; the
@@ -449,8 +552,11 @@ def _sage_attention_int8_token_kernel(
         var v_stage_base = stage * _KV_TILE * _HEAD_DIM
 
         var kscale = rebind[Scalar[DType.float32]](
-            ks[head * ceildiv(S, _K_QUANT_BLOCK) \
-                + key_start // _K_QUANT_BLOCK]
+            ks[
+                (head * ceildiv(S, _K_QUANT_BLOCK)
+                    + key_start // _K_QUANT_BLOCK)
+                * _K_SCALES_PER_BLOCK + thread
+            ]
         )
         var score_factor = qscale * kscale * scale
 
@@ -662,9 +768,15 @@ def sage_attention_int8_fwd_dynamic(
 ) raises -> Tensor:
     """Opt-in no-mask, non-causal BF16 attention for H3 geometry.
 
-    Q and K use Sage-style Q128/K64 block quantization to signed INT8; QK uses
-    the host-exact tensor-core primitive above. Softmax statistics accumulate
-    in F32 and PV uses FP16 tensor cores. This surface fails loudly outside
+    Q and K use the official Ampere per-thread scale geometry: eight query
+    row-pair scales per 16-row warp tile and four interleaved key-pair scales
+    per 64-row streamed tile.  Those groups align exactly with the row/column
+    fragments owned by each INT8 MMA lane, so rescaling remains fused.
+    K is mean-centered along sequence before quantization; that subtracts one
+    query-dependent constant from every score and is therefore exactly
+    softmax-invariant before quantization. QK uses the host-exact tensor-core
+    primitive above. Softmax statistics accumulate in F32 and PV uses BF16
+    tensor cores. This fails loudly outside
     B=1,Dh=128 and never falls back to cuDNN.
     """
     if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 \
@@ -688,12 +800,15 @@ def sage_attention_int8_fwd_dynamic(
     want.append(Dh)
     var rows = H * S
     var elems = rows * Dh
-    var qscale_elems = H * ceildiv(S, _Q_QUANT_BLOCK)
-    var kscale_elems = H * ceildiv(S, _K_QUANT_BLOCK)
+    var qscale_elems = H * ceildiv(S, _Q_QUANT_BLOCK) \
+        * _Q_SCALES_PER_BLOCK
+    var kscale_elems = H * ceildiv(S, _K_QUANT_BLOCK) \
+        * _K_SCALES_PER_BLOCK
     var q8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
     var k8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
     var qs_buf = ctx.enqueue_create_buffer[DType.uint8](qscale_elems * 4)
     var ks_buf = ctx.enqueue_create_buffer[DType.uint8](kscale_elems * 4)
+    var km_buf = ctx.enqueue_create_buffer[DType.uint8](H * Dh * 2)
     var v_bhsd_buf = ctx.enqueue_create_buffer[DType.uint8](elems * 2)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](elems * 2)
     var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](elems))
@@ -729,24 +844,33 @@ def sage_attention_int8_fwd_dynamic(
     var KS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         ks_buf.unsafe_ptr().bitcast[Float32](), kscale_rl
     )
+    var KM = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        km_buf.unsafe_ptr().bitcast[BFloat16](),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](H * Dh)),
+    )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
         out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl
     )
+    ctx.enqueue_function[_sage_k_mean_bf16, _sage_k_mean_bf16](
+        K, KM, S, H,
+        grid_dim=ceildiv(H * Dh, _WARPS * 32),
+        block_dim=_WARPS * 32,
+    )
     ctx.enqueue_function[
-        _sage_quant_block_bf16[_Q_QUANT_BLOCK],
-        _sage_quant_block_bf16[_Q_QUANT_BLOCK],
+        _sage_quant_q_per_thread_bf16,
+        _sage_quant_q_per_thread_bf16,
     ](
         Q, Q8u, QS, S, H,
         grid_dim=(ceildiv(S, _Q_QUANT_BLOCK), H),
         block_dim=_WARPS * 32,
     )
     ctx.enqueue_function[
-        _sage_quant_block_bf16[_K_QUANT_BLOCK],
-        _sage_quant_block_bf16[_K_QUANT_BLOCK],
+        _sage_quant_k_per_thread_bf16,
+        _sage_quant_k_per_thread_bf16,
     ](
-        K, K8u, KS, S, H,
+        K, K8u, KS, KM, S, H,
         grid_dim=(ceildiv(S, _K_QUANT_BLOCK), H),
-        block_dim=_WARPS * 32,
+        block_dim=_K_SCALES_PER_BLOCK * 32,
     )
     ctx.enqueue_function[
         _sage_gather_v_bf16,

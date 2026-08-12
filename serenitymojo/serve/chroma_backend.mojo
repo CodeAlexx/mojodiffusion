@@ -85,7 +85,9 @@ from serenitymojo.models.chroma.chroma_lora_overlay import (
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.serve.chroma_encode_subprocess import encode_captions_subprocess
-from serenitymojo.serve.chroma_decode_subprocess import decode_whole_subprocess
+from serenitymojo.serve.chroma_decode_subprocess import (
+    decode_whole_subprocess, decode_tiled_subprocess,
+)
 from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
@@ -131,6 +133,7 @@ from serenitymojo.serve.backend import (
 from serenitymojo.serve.product_manifest import (
     json_bool, json_escape, peak_vram_mib, write_text_file,
 )
+from serenitymojo.io.env import env_int
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
@@ -145,6 +148,10 @@ comptime CPHASE_LOAD = 2
 comptime CPHASE_DENOISE = 3
 comptime CPHASE_DECODE = 4
 comptime CHROMA_PRODUCT_EDGE_UNITS = 16
+# Chroma's whole-image decoder requires 12.5 GiB device-global free.  Reserve
+# another 2.5 GiB for CFG denoise allocator growth and use the remainder for
+# persistent device FP8 blocks. Runtime-sweepable for measured hardware gates.
+comptime CHROMA_DENOISE_VRAM_RESERVE_MIB = 15360
 
 
 def _chroma_shape_supported(width: Int, height: Int) -> Bool:
@@ -311,6 +318,14 @@ struct ChromaBackend(GenBackend, Movable):
     var rope_sin: List[ArcPointer[Tensor]]       # 0/1
     var lora: List[ArcPointer[ChromaLoraOverlay]]  # 0/1 additive runtime overlay
     var lora_factor_count: Int
+    # Exact prompt-pair T5 conditioning is only ~8 MiB.  Preserve it across jobs
+    # so seed/step/CFG variations do not reload T5-XXL.
+    var cap_cache_prompt: String
+    var cap_cache_negative: String
+    var cap_cache_cond: List[ArcPointer[Tensor]]
+    var cap_cache_uncond: List[ArcPointer[Tensor]]
+    var cap_cache_cond_real_len: Int
+    var cap_cache_uncond_real_len: Int
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -337,6 +352,9 @@ struct ChromaBackend(GenBackend, Movable):
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
+    var text_conditioning_cache_hit: Bool
+    var device_resident_blocks: Int
+    var device_resident_budget_bytes: Int
     var prepare_seconds: Float64
     var denoise_seconds: Float64
     var vae_decode_seconds: Float64
@@ -352,6 +370,12 @@ struct ChromaBackend(GenBackend, Movable):
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.lora = List[ArcPointer[ChromaLoraOverlay]]()
         self.lora_factor_count = 0
+        self.cap_cache_prompt = String("")
+        self.cap_cache_negative = String("")
+        self.cap_cache_cond = List[ArcPointer[Tensor]]()
+        self.cap_cache_uncond = List[ArcPointer[Tensor]]()
+        self.cap_cache_cond_real_len = N_TXT
+        self.cap_cache_uncond_real_len = N_TXT
         self.active = False
         self.cancel_flag = False
         self.phase = CPHASE_IDLE
@@ -376,6 +400,9 @@ struct ChromaBackend(GenBackend, Movable):
         self.job_t0_ns = UInt(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
+        self.text_conditioning_cache_hit = False
+        self.device_resident_blocks = 0
+        self.device_resident_budget_bytes = 0
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
@@ -396,6 +423,11 @@ struct ChromaBackend(GenBackend, Movable):
     def start(mut self, params: JobParams) raises:
         if self.active:
             raise Error("ChromaBackend.start: a job is already running")
+        # Base shared weights are retained across jobs. A LoRA request needs a
+        # freshly overlaid shared state; evict the base before admission so the
+        # LOAD phase cannot accidentally reuse it.
+        if self.loaded and len(params.loras) > 0:
+            self._free_dit()
         reject_unsupported_common_runtime_params(params, String("chroma"))
         reject_unsupported_reference_image_params(params, String("chroma"))
         reject_unsupported_inpaint_conditioning_params(params, String("chroma"))
@@ -487,6 +519,9 @@ struct ChromaBackend(GenBackend, Movable):
         self.job_t0_ns = perf_counter_ns()
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
+        self.text_conditioning_cache_hit = False
+        self.device_resident_blocks = 0
+        self.device_resident_budget_bytes = 0
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
@@ -575,12 +610,21 @@ struct ChromaBackend(GenBackend, Movable):
         content += String(self.dpmpp_second_order_steps) + String("},\n")
         content += String('    "cond_real_len":') + String(self.cond_real_len) + String(",\n")
         content += String('    "uncond_real_len":') + String(self.uncond_real_len) + String(",\n")
+        content += String('    "text_conditioning_cache_hit":') + json_bool(
+            self.text_conditioning_cache_hit
+        ) + String(",\n")
         content += String('    "vae_decode_tile_grid":"') + json_escape(self.vae_decode_grid) + String('",\n')
         content += String('    "dtype":"bf16_dit_bf16_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
         content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
         content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
+        content += String('    "device_resident_blocks":') + String(
+            self.device_resident_blocks
+        ) + String(",\n")
+        content += String('    "device_resident_budget_mib":') + String(
+            self.device_resident_budget_bytes // (1024 * 1024)
+        ) + String(",\n")
         content += String('    "prepare_seconds":') + String(self.prepare_seconds) + String(",\n")
         content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
         content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
@@ -609,6 +653,26 @@ struct ChromaBackend(GenBackend, Movable):
         Falls back to the in-process encode on any subprocess failure. The
         encode math is byte-identical either way; the real lengths feed the DiT
         T5 pad-row attention mask (MJ-1048)."""
+        if (
+            len(self.cap_cache_cond) == 1
+            and len(self.cap_cache_uncond) == 1
+            and self.cap_cache_prompt == self.params.prompt
+            and self.cap_cache_negative == self.params.negative
+        ):
+            print("[chroma] conditioning cache HIT (prompts unchanged) — skipping T5")
+            self.text_conditioning_cache_hit = True
+            self.t5_cond = List[ArcPointer[Tensor]]()
+            self.t5_cond.append(ArcPointer(
+                self.cap_cache_cond[0][].clone(self.ctx)
+            ))
+            self.t5_uncond = List[ArcPointer[Tensor]]()
+            self.t5_uncond.append(ArcPointer(
+                self.cap_cache_uncond[0][].clone(self.ctx)
+            ))
+            self.cond_real_len = self.cap_cache_cond_real_len
+            self.uncond_real_len = self.cap_cache_uncond_real_len
+            return
+
         _print_vram("before T5-XXL encode (subprocess)")
         var caps = encode_captions_subprocess(
             self.params.prompt, self.params.negative, self.ctx
@@ -622,6 +686,14 @@ struct ChromaBackend(GenBackend, Movable):
         self.t5_cond.append(ArcPointer(_clone(caps.cond, self.ctx)))
         self.t5_uncond = List[ArcPointer[Tensor]]()
         self.t5_uncond.append(ArcPointer(_clone(caps.uncond, self.ctx)))
+        self.cap_cache_cond = List[ArcPointer[Tensor]]()
+        self.cap_cache_cond.append(ArcPointer(self.t5_cond[0][].clone(self.ctx)))
+        self.cap_cache_uncond = List[ArcPointer[Tensor]]()
+        self.cap_cache_uncond.append(ArcPointer(self.t5_uncond[0][].clone(self.ctx)))
+        self.cap_cache_prompt = self.params.prompt.copy()
+        self.cap_cache_negative = self.params.negative.copy()
+        self.cap_cache_cond_real_len = self.cond_real_len
+        self.cap_cache_uncond_real_len = self.uncond_real_len
 
     def _free_dit(mut self):
         """Drop GPU shared weights and RoPE while preserving the host store."""
@@ -702,6 +774,30 @@ struct ChromaBackend(GenBackend, Movable):
                 self._load_model_shape[LH_BI, LW_BI, N_IMG_BI]()
                 return
         raise Error("chroma: admitted load shape was not compiled")
+
+    def _ensure_denoise_residency(mut self) raises:
+        if len(self.loader) != 1:
+            raise Error("chroma: denoise residency requested before loader init")
+        var reserve_mib = env_int(
+            String("SERENITY_CHROMA_DENOISE_RESERVE_MIB"),
+            CHROMA_DENOISE_VRAM_RESERVE_MIB,
+        )
+        var free_bytes = cu_mem_get_info().free_bytes
+        var reserve_bytes = reserve_mib * 1024 * 1024
+        var budget = 0
+        if free_bytes > reserve_bytes:
+            budget = free_bytes - reserve_bytes
+        var promoted = self.loader[0][].promote_fp8_host_to_device(
+            budget, self.ctx, True, reserve_bytes
+        )
+        self.device_resident_blocks = promoted
+        self.device_resident_budget_bytes = budget
+        print(
+            "[chroma] adaptive device residency:", promoted, "/57 blocks;",
+            budget // (1024 * 1024), "MiB budget;", reserve_mib,
+            "MiB denoise/decode reserve",
+        )
+        _print_vram("after adaptive Chroma device residency")
 
     def _prepare_job_shape[LH_: Int, LW_: Int, N_IMG_: Int](mut self) raises:
         """Selected creator-compatible sigma table + seeded initial packed latent."""
@@ -825,9 +921,11 @@ struct ChromaBackend(GenBackend, Movable):
     # ── final decode + PNG(tEXt) ──────────────────────────────────────────────
     def _decode_and_save_shape[LH_: Int, LW_: Int](mut self) raises -> String:
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
-        # Keep only a tiny packed-latent clone, then release the shared weights
-        # + block loader before unpack + VAE decode (the pipeline's Stage 8 drop;
-        # mandatory on a 16 GB card).
+        # Keep only a tiny packed-latent clone. The complete pinned-host FP8
+        # store stays warm across jobs. Adaptive device promotions are backed
+        # by explicit CUDA VMM, so this phase boundary can unmap/release their
+        # physical bytes before the quality-first whole-image decoder and map
+        # them again from pinned host memory for the next denoise.
         var packed = self.latent[0][].clone(self.ctx)
         self.t5_cond = List[ArcPointer[Tensor]]()
         self.t5_uncond = List[ArcPointer[Tensor]]()
@@ -838,10 +936,11 @@ struct ChromaBackend(GenBackend, Movable):
         self.ctx.synchronize()
         if len(self.loader) == 1:
             self.loader[0][].discard_fp8h_device_staging()
-        self._free_dit()
+            self.loader[0][].discard_fp8_host_promotions()
+            print("[chroma] released phase-local VMM denoiser promotions before VAE")
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
-        _print_vram("after DiT release before VAE")
+        _print_vram("after transient Chroma staging release before VAE")
         # Pipeline Stage 8 (unpack BF16 → F32 cast → FLUX VAE decode), tried in
         # this order:
         #   1) WHOLE-image decode in a CHILD PROCESS (chroma_decode_subprocess,
@@ -850,11 +949,10 @@ struct ChromaBackend(GenBackend, Movable):
         #      job-0079: the child itself lost a coin-flip margin (status 256,
         #      fresh-context overhead + decode peak vs ~13.28 GB free). The
         #      attempt stays first — it wins whenever the parent floor is lower.
-        #   2) IN-PROCESS 3x3 TILED decode (flux_tiled_decode — authored for
-        #      exactly this post-offloaded-DiT high-water state, same flux
-        #      ae.safetensors VAE). Klein ships tiled VAE decode in production
-        #      on this 16 GB card, so tiled here is consistent with shipped
-        #      quality (MJ-1054 was a different arm). Printed LOUD.
+        #   2) CHILD-PROCESS 3x3 TILED decode (same gated flux_tiled_decode math
+        #      as the former fallback). Process exit guarantees its VAE memory
+        #      is reclaimed while the resident denoiser survives for job N+1.
+        #   3) IN-PROCESS tiled decode only as the final resilience fallback.
         var rgb: Tensor
         try:
             rgb = decode_whole_subprocess(packed, LH_, LW_, self.ctx)
@@ -862,12 +960,21 @@ struct ChromaBackend(GenBackend, Movable):
             _print_vram("after decode child reaped (rgb loaded)")
         except e:
             print("[chroma] decode child unavailable (", e,
-                  ") → tiled VAE decode (flux_tiled_decode)")
-            var latent = _unpack_latent_shape[LH_, LW_](packed, self.ctx)
-            var latent_f32 = cast_tensor(latent, STDtype.F32, self.ctx)
-            rgb = flux_tiled_decode[LH_, LW_](latent_f32, String(VAE_PATH), self.ctx)
-            self.vae_decode_grid = String("3x3_tiled_fallback")
-            _print_vram("after tiled VAE decode (3x3 flux_tiled_decode)")
+                  ") → tiled VAE child")
+            try:
+                rgb = decode_tiled_subprocess(packed, LH_, LW_, self.ctx)
+                self.vae_decode_grid = String("3x3_tiled_child_process")
+                _print_vram("after tiled decode child reaped (rgb loaded)")
+            except tiled_e:
+                print("[chroma] tiled decode child unavailable (", tiled_e,
+                      ") → emergency in-process flux_tiled_decode")
+                var latent = _unpack_latent_shape[LH_, LW_](packed, self.ctx)
+                var latent_f32 = cast_tensor(latent, STDtype.F32, self.ctx)
+                rgb = flux_tiled_decode[LH_, LW_](
+                    latent_f32, String(VAE_PATH), self.ctx
+                )
+                self.vae_decode_grid = String("3x3_tiled_inprocess_emergency")
+                _print_vram("after emergency in-process tiled VAE decode")
         _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         return png_path
 
@@ -881,7 +988,10 @@ struct ChromaBackend(GenBackend, Movable):
         raise Error("chroma: admitted decode shape was not compiled")
 
     def _clear_job(mut self):
-        self._free_dit()
+        # A LoRA overlay is request-specific; discard it after the job. The base
+        # model remains warm for the normal repeated-generation path.
+        if len(self.params.loras) > 0:
+            self._free_dit()
         self.active = False
         self.phase = CPHASE_IDLE
         self.cur = 0
@@ -945,6 +1055,7 @@ struct ChromaBackend(GenBackend, Movable):
                         r.phase = String("loading")
                         return r^
                     self._load_model()
+                self._ensure_denoise_residency()
                 self.load_seconds += Float64(perf_counter_ns() - load_t0) / 1.0e9
                 self.announced = False
                 var prep_t0 = perf_counter_ns()

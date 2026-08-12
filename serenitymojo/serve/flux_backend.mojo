@@ -94,6 +94,7 @@ from serenitymojo.pipeline.flux_sample_cli import (
     AE_IN_CHANNELS, N_TXT,
 )
 from serenitymojo.serve.flux_encode_subprocess import encode_text_subprocess
+from serenitymojo.serve.flux_decode_subprocess import decode_tiled_subprocess
 from serenitymojo.serve.proc_ipc import (
     prefault_self_executable, prefault_mapped_shared_libraries,
 )
@@ -109,6 +110,7 @@ from serenitymojo.serve.backend import (
 from serenitymojo.serve.product_manifest import (
     json_bool, json_escape, peak_vram_mib, write_text_file,
 )
+from serenitymojo.io.env import env_int
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
@@ -119,6 +121,13 @@ comptime FPHASE_LOAD = 2
 comptime FPHASE_DENOISE = 3
 comptime FPHASE_DECODE = 4
 comptime FLUX_PRODUCT_EDGE_UNITS = 16
+# Reserve enough for both the decoder's measured 9 GiB child-process bar and
+# the denoise allocator's measured ~3.4 GiB high-water growth.  A live sweep on
+# this 24 GiB product card rejected 9 GiB (57/57 blocks, decode OOM) and passed
+# 13 GiB (31/57 blocks, exact pixels, decoder success).  Keep those promotions
+# live across jobs: freeing their ArcPointers did not return allocator segments
+# to CUDA, so dropping them gained no decode headroom and only lost reuse.
+comptime FLUX_DENOISE_VRAM_RESERVE_MIB = 13312
 
 # Whole-image VAE decode is preferred when it fits: tiled decode is MEASURED to
 # degrade output; the ungated 5x5-lowmem variant is the WORST (84.8% px differ
@@ -266,6 +275,10 @@ def _flux_forward_turbo[
 
     # vec = time + guidance + vector.
     var vec = model.shared._embed_vec(timestep, guidance, vector, ctx)
+    # `vec` is immutable for the whole forward. SiLU was previously recomputed
+    # once per 19 double blocks, once per 38 single blocks, and once again for
+    # the final layer (58 identical kernel launches per denoise step).
+    var vec_silu = silu(vec, ctx)
 
     # double blocks — await this block's slot, immediately stage the NEXT block
     # into the idle slot, then queue this block's compute.
@@ -274,7 +287,6 @@ def _flux_forward_turbo[
         var handle = tloader.await_block(bi, ctx)
         tloader.prefetch_next_with_ctx(bi, ctx)
         var bm = model._block_model(handle.block) if model.lora.count() == 0 else model._block_model_lora(handle.block, ctx)
-        var vec_silu = silu(vec, ctx)
         var img_mod = linear(
             vec_silu,
             bm._w(prefix + ".img_mod.lin.weight"),
@@ -302,7 +314,6 @@ def _flux_forward_turbo[
         var handle = tloader.await_block(plan_idx, ctx)
         tloader.prefetch_next_with_ctx(plan_idx, ctx)
         var bm = model._block_model(handle.block) if model.lora.count() == 0 else model._block_model_lora(handle.block, ctx)
-        var vec_silu = silu(vec, ctx)
         var single_mod = linear(
             vec_silu,
             bm._w(prefix + ".modulation.lin.weight"),
@@ -314,8 +325,7 @@ def _flux_forward_turbo[
 
     # extract image tokens (txt first in the merged seq) and run final layer.
     var img_out = slice(x, 1, FN_TXT, FN_IMG, ctx)
-    var vec_silu_final = silu(vec, ctx)
-    return model.shared._final_layer(img_out, vec_silu_final, ctx)
+    return model.shared._final_layer(img_out, vec_silu, ctx)
 
 
 struct FluxBackend(GenBackend, Movable):
@@ -335,6 +345,13 @@ struct FluxBackend(GenBackend, Movable):
     var rope_cos: List[ArcPointer[Tensor]]       # 0/1 (resident rope cos)
     var rope_sin: List[ArcPointer[Tensor]]       # 0/1 (resident rope sin)
     var warmed_shapes: List[String]              # CUDA kernels activated per WxH
+    # Exact-prompt conditioning is only ~8 MiB and is independent of seed,
+    # steps, guidance, and image shape.  Keep the most recent result on-device
+    # across jobs so a variation does not cold-load the ~10 GiB CLIP-L/T5-XXL
+    # checkpoint again.  FLUX Dev discards the negative prompt (no CFG), so the
+    # positive prompt is the complete cache identity.
+    var cap_cache_prompt: String
+    var cap_cache: List[ArcPointer[FluxCaps]]     # 0/1
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -358,6 +375,9 @@ struct FluxBackend(GenBackend, Movable):
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
+    var conditioning_cache_hit: Bool
+    var device_resident_blocks: Int
+    var device_resident_budget_bytes: Int
     var prepare_seconds: Float64
     var denoise_seconds: Float64
     var vae_decode_seconds: Float64
@@ -375,6 +395,8 @@ struct FluxBackend(GenBackend, Movable):
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.warmed_shapes = List[String]()
+        self.cap_cache_prompt = String("")
+        self.cap_cache = List[ArcPointer[FluxCaps]]()
         self.active = False
         self.cancel_flag = False
         self.phase = FPHASE_IDLE
@@ -396,6 +418,9 @@ struct FluxBackend(GenBackend, Movable):
         self.job_t0_ns = UInt(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
+        self.conditioning_cache_hit = False
+        self.device_resident_blocks = 0
+        self.device_resident_budget_bytes = 0
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
@@ -477,6 +502,9 @@ struct FluxBackend(GenBackend, Movable):
         self.job_t0_ns = perf_counter_ns()
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
+        self.conditioning_cache_hit = False
+        self.device_resident_blocks = 0
+        self.device_resident_budget_bytes = 0
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
@@ -548,7 +576,7 @@ struct FluxBackend(GenBackend, Movable):
         content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
         content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
         content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
-        content += String('    "released_resident_dit_before_unpack":true,\n')
+        content += String('    "released_resident_dit_before_unpack":') + json_bool(not self.loaded) + String(",\n")
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
         content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
@@ -571,6 +599,15 @@ struct FluxBackend(GenBackend, Movable):
         content += String('  "mojo":{\n')
         content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
         content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
+        content += String('    "conditioning_cache_hit":') + (
+            String("true") if self.conditioning_cache_hit else String("false")
+        ) + String(",\n")
+        content += String('    "device_resident_blocks":') + String(
+            self.device_resident_blocks
+        ) + String(",\n")
+        content += String('    "device_resident_budget_mib":') + String(
+            self.device_resident_budget_bytes // (1024 * 1024)
+        ) + String(",\n")
         content += String('    "prepare_seconds":') + String(self.prepare_seconds) + String(",\n")
         content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
         content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
@@ -597,9 +634,23 @@ struct FluxBackend(GenBackend, Movable):
         in-process encode_text on any subprocess failure. FLUX is
         guidance-distilled — only the positive prompt is encoded; the negative
         is discarded (no CFG path)."""
+        if len(self.cap_cache) == 1 and self.cap_cache_prompt == self.params.prompt:
+            print("[flux] conditioning cache HIT (prompt unchanged) — skipping text encode")
+            self.conditioning_cache_hit = True
+            var cached_vector = self.cap_cache[0][].vector.clone(self.ctx)
+            var cached_txt = self.cap_cache[0][].txt.clone(self.ctx)
+            self.caps = List[ArcPointer[FluxCaps]]()
+            self.caps.append(ArcPointer(FluxCaps(cached_vector^, cached_txt^)))
+            return
+
         _print_vram("before CLIP-L + T5-XXL load")
         var caps = encode_text_subprocess(self.params.prompt, self.ctx)
         _print_vram("after text encode (encoders freed)")
+        self.cap_cache = List[ArcPointer[FluxCaps]]()
+        self.cap_cache.append(ArcPointer(FluxCaps(
+            caps.vector.clone(self.ctx), caps.txt.clone(self.ctx)
+        )))
+        self.cap_cache_prompt = self.params.prompt.copy()
         self.caps = List[ArcPointer[FluxCaps]]()
         self.caps.append(ArcPointer(caps^))
 
@@ -701,6 +752,33 @@ struct FluxBackend(GenBackend, Movable):
                 self._load_model_shape[N_IMG_BI, IMG_H2_BI, IMG_W2_BI]()
                 return
         raise Error("flux: admitted load shape was not compiled")
+
+    def _ensure_denoise_residency(mut self) raises:
+        """Use the card's actual free VRAM for denoise, leaving only measured
+        compute headroom.  The complete host FP8 store always remains available,
+        so this is a fast H2D promotion on warm jobs rather than a model reload."""
+        if len(self.tloader) != 1:
+            raise Error("flux: denoise residency requested before loader init")
+        var free_bytes = cu_mem_get_info().free_bytes
+        var reserve_mib = env_int(
+            String("SERENITY_FLUX_DENOISE_RESERVE_MIB"),
+            FLUX_DENOISE_VRAM_RESERVE_MIB,
+        )
+        var reserve_bytes = reserve_mib * 1024 * 1024
+        var budget = 0
+        if free_bytes > reserve_bytes:
+            budget = free_bytes - reserve_bytes
+        var promoted = self.tloader[0][].promote_fp8_host_to_device(
+            budget, self.ctx, False, reserve_bytes
+        )
+        self.device_resident_blocks = promoted
+        self.device_resident_budget_bytes = budget
+        print(
+            "[flux] adaptive device residency:", promoted, "/57 blocks;",
+            budget // (1024 * 1024), "MiB budget;",
+            reserve_mib, "MiB denoise/decode reserve",
+        )
+        _print_vram("after adaptive FLUX device residency")
 
     def _prepare_job_shape[
         LATENT_H_: Int, LATENT_W_: Int, N_IMG_: Int
@@ -858,6 +936,26 @@ struct FluxBackend(GenBackend, Movable):
         self.ctx.synchronize()
         if len(self.tloader) == 1:
             self.tloader[0][].discard_fp8h_device_staging()
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
+        _print_vram("after transient staging release for VAE")
+        # Decode the exact packed latent in a fresh GPU process first. Its exit
+        # reclaims the VAE allocator high-water while this worker keeps the DiT
+        # handle, host block store, and RoPE ready for the next image.
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
+        try:
+            var img = decode_tiled_subprocess(
+                packed, String(VAE_PATH), LATENT_H_, LATENT_W_, self.ctx
+            )
+            self.vae_decode_grid = String("3x3_tiled_child")
+            _save_rgb_png_with_text(
+                img, png_path, self.params.params_json, self.ctx
+            )
+            return png_path
+        except e:
+            print("[flux] resident child decode unavailable; using release fallback:", e)
+        # Preserve the old completion path when child admission fails.
         self._free_dit()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
@@ -954,6 +1052,7 @@ struct FluxBackend(GenBackend, Movable):
                         r.phase = String("loading")
                         return r^
                     self._load_model()
+                self._ensure_denoise_residency()
                 self.load_seconds += Float64(perf_counter_ns() - load_t0) / 1.0e9
                 self.announced = False
                 var prep_t0 = perf_counter_ns()

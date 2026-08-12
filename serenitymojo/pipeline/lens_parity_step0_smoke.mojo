@@ -32,8 +32,8 @@ from serenitymojo.sampling.lens_flowmatch import LensFlowMatchScheduler
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 comptime TRANSFORMER_DIR = "/home/alex/.serenity/models/microsoft_lens/transformer"
-comptime TEXT_SMOKE_DIR  = "/home/alex/EriDiffusion/inference-flame/lens/parity/captures_text_smoke"
-comptime CAPTURES_DIR    = "/home/alex/EriDiffusion/inference-flame/lens/parity/captures"
+comptime TEXT_SMOKE_DIR  = "/home/alex/.serenity/parity/lens/parity/captures_text_smoke"
+comptime CAPTURES_DIR    = "/home/alex/.serenity/parity/lens/parity/captures"
 comptime HIDDEN_05 = TEXT_SMOKE_DIR + "/hidden_layer_05.safetensors"
 comptime HIDDEN_11 = TEXT_SMOKE_DIR + "/hidden_layer_11.safetensors"
 comptime HIDDEN_17 = TEXT_SMOKE_DIR + "/hidden_layer_17.safetensors"

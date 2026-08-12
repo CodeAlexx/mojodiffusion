@@ -63,7 +63,7 @@ from serenitymojo.image.png import save_png, ValueRange
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-comptime EMBEDDINGS_PATH = "/home/alex/EriDiffusion/inference-flame/output/sd3_medium_embeddings.safetensors"
+comptime EMBEDDINGS_PATH = "/home/alex/.serenity/parity/output/sd3_medium_embeddings.safetensors"
 comptime MODEL_PATH = "/home/alex/.serenity/models/checkpoints/stablediffusion35_medium.safetensors"
 comptime OUT_PNG = "/home/alex/mojodiffusion/output/sd3_medium_1024_28step.png"
 

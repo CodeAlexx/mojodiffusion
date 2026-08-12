@@ -33,7 +33,7 @@ from serenitymojo.lora import LoraSet
 comptime KLEIN9B_PATH = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 # A real train_klein LoRA (verified header 2026-05-26). NOTE the split-vs-fused
 # gap above: with this file, img_attn merges no-op against the fused base.
-comptime LORA_PATH = "/home/alex/EriDiffusion/EriDiffusion-v2/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
+comptime LORA_PATH = "/home/alex/.serenity/parity/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
 comptime MULTIPLIER: Float32 = 1.0
 # No file-level alpha/rank: scale is PER-MODULE (alpha/module_rank, alpha
 # defaulting to module_rank when absent → scale = multiplier). See lora.mojo

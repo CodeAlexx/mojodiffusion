@@ -90,6 +90,7 @@ from serenitymojo.serve.backend import (
 from serenitymojo.serve.product_manifest import (
     json_bool, json_escape, peak_vram_mib, write_text_file,
 )
+from serenitymojo.serve.sdxl_decode_subprocess import decode_tiled_subprocess
 
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
@@ -322,6 +323,15 @@ struct SdxlBackend(GenBackend, Movable):
     var model_1280x832: List[ArcPointer[SDXLUNet[LH_1280X832, LW_1280X832]]]
     var model_832x1280: List[ArcPointer[SDXLUNet[LH_832X1280, LW_832X1280]]]
 
+    # One exact conditioning entry survives repeat jobs. SDXL ADM conditioning
+    # depends on prompt text and target geometry, so both dimensions are part of
+    # the key. The four BF16 tensors are well under 1 MiB combined.
+    var cap_cache_prompt: String
+    var cap_cache_negative: String
+    var cap_cache_width: Int
+    var cap_cache_height: Int
+    var cap_cache: List[ArcPointer[SdxlCaps]]
+
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
     var cancel_flag: Bool
@@ -341,6 +351,7 @@ struct SdxlBackend(GenBackend, Movable):
     var prepare_seconds: Float64
     var denoise_seconds: Float64
     var vae_decode_seconds: Float64
+    var text_conditioning_cache_hit: Bool
     var total_vram_bytes: Int
     var min_free_bytes: Int
 
@@ -358,6 +369,11 @@ struct SdxlBackend(GenBackend, Movable):
         self.model_portrait = List[ArcPointer[SDXLUNet[LH_PORTRAIT, LW_PORTRAIT]]]()
         self.model_1280x832 = List[ArcPointer[SDXLUNet[LH_1280X832, LW_1280X832]]]()
         self.model_832x1280 = List[ArcPointer[SDXLUNet[LH_832X1280, LW_832X1280]]]()
+        self.cap_cache_prompt = String("")
+        self.cap_cache_negative = String("")
+        self.cap_cache_width = 0
+        self.cap_cache_height = 0
+        self.cap_cache = List[ArcPointer[SdxlCaps]]()
         self.active = False
         self.cancel_flag = False
         self.phase = SPHASE_IDLE
@@ -376,6 +392,7 @@ struct SdxlBackend(GenBackend, Movable):
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
+        self.text_conditioning_cache_hit = False
         self.total_vram_bytes = 0
         self.min_free_bytes = 0
 
@@ -450,6 +467,7 @@ struct SdxlBackend(GenBackend, Movable):
         self.prepare_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
+        self.text_conditioning_cache_hit = False
         var mem = cu_mem_get_info()
         self.total_vram_bytes = mem.total_bytes
         self.min_free_bytes = mem.free_bytes
@@ -524,6 +542,9 @@ struct SdxlBackend(GenBackend, Movable):
         content += String('    "lora_signature":"') + json_escape(
             self._requested_lora_signature()
         ) + String('",\n')
+        content += String('    "text_conditioning_cache_hit":') + json_bool(
+            self.text_conditioning_cache_hit
+        ) + String(",\n")
         content += String('    "dtype":"bf16_unet_f32_latent"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
@@ -547,6 +568,26 @@ struct SdxlBackend(GenBackend, Movable):
     def _encode(mut self) raises:
         """Runtime CLIP-L+G encode of params.prompt AND params.negative into the
         SDXL context/y conditioning (encoders + text_projection loaded then freed)."""
+        if (
+            len(self.cap_cache) == 1
+            and self.cap_cache_prompt == self.params.prompt
+            and self.cap_cache_negative == self.params.negative
+            and self.cap_cache_width == self.params.width
+            and self.cap_cache_height == self.params.height
+        ):
+            ref cached_caps = self.cap_cache[0][]
+            var caps = SdxlCaps(
+                cached_caps.context.clone(self.ctx),
+                cached_caps.context_uncond.clone(self.ctx),
+                cached_caps.y.clone(self.ctx),
+                cached_caps.y_uncond.clone(self.ctx),
+            )
+            self.caps = List[ArcPointer[SdxlCaps]]()
+            self.caps.append(ArcPointer(caps^))
+            self.ctx.synchronize()
+            self.text_conditioning_cache_hit = True
+            print("[sdxl] conditioning cache HIT (prompts and geometry unchanged)")
+            return
         _print_vram("before CLIP-L+G load")
         var clip_l = ClipEncoder.load(String(CLIP_L_PATH), ClipConfig.clip_l(), self.ctx)
         var clip_g = ClipEncoder.load(String(CLIP_G_PATH), ClipConfig.clip_g(), self.ctx)
@@ -580,6 +621,19 @@ struct SdxlBackend(GenBackend, Movable):
         _print_vram("after CLIP encode (encoders freed)")
         self.caps = List[ArcPointer[SdxlCaps]]()
         self.caps.append(ArcPointer(caps^))
+        ref encoded_caps = self.caps[0][]
+        var cached = SdxlCaps(
+            encoded_caps.context.clone(self.ctx),
+            encoded_caps.context_uncond.clone(self.ctx),
+            encoded_caps.y.clone(self.ctx),
+            encoded_caps.y_uncond.clone(self.ctx),
+        )
+        self.cap_cache = List[ArcPointer[SdxlCaps]]()
+        self.cap_cache.append(ArcPointer(cached^))
+        self.cap_cache_prompt = self.params.prompt.copy()
+        self.cap_cache_negative = self.params.negative.copy()
+        self.cap_cache_width = self.params.width
+        self.cap_cache_height = self.params.height
 
     def _load_model(mut self) raises:
         """Load the selected compatible SDXL checkpoint (once; stays resident)."""
@@ -845,6 +899,45 @@ struct SdxlBackend(GenBackend, Movable):
         var img = sdxl_tiled_decode[LH_, LW_](latent, manifest.vae_path, self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
 
+    def _decode_child_shape[LH_: Int, LW_: Int](
+        mut self, latent: Tensor, png_path: String
+    ) raises -> Bool:
+        """Decode in a separate GPU process without dropping the resident UNet.
+
+        The child executes the same 3x3 tiled decoder used by the existing 24 GB
+        fallback. If CUDA cannot admit both processes, return False so the proven
+        release-and-decode path below still completes the job.
+        """
+        var manifest = default_manifest_by_id(String("sdxl"))
+        try:
+            var img = decode_tiled_subprocess(
+                latent, manifest.vae_path, LH_, LW_, self.ctx
+            )
+            _save_rgb_png_with_text(
+                img, png_path, self.params.params_json, self.ctx
+            )
+            return True
+        except e:
+            print("[sdxl] resident child decode unavailable; using release fallback:", e)
+            return False
+
+    def _try_resident_decode(
+        mut self, latent: Tensor, png_path: String
+    ) raises -> Bool:
+        if self.params.width == 1024:
+            return self._decode_child_shape[LH_SQUARE, LW_SQUARE](latent, png_path)
+        elif self.params.width == 1152:
+            return self._decode_child_shape[LH_1152X896, LW_1152X896](latent, png_path)
+        elif self.params.width == 896:
+            return self._decode_child_shape[LH_896X1152, LW_896X1152](latent, png_path)
+        elif self.params.width == 1344:
+            return self._decode_child_shape[LH_LANDSCAPE, LW_LANDSCAPE](latent, png_path)
+        elif self.params.width == 768:
+            return self._decode_child_shape[LH_PORTRAIT, LW_PORTRAIT](latent, png_path)
+        elif self.params.width == 1280:
+            return self._decode_child_shape[LH_1280X832, LW_1280X832](latent, png_path)
+        return self._decode_child_shape[LH_832X1280, LW_832X1280](latent, png_path)
+
     def _decode_and_save(mut self) raises -> String:
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
         var latent = self.latent[0][].clone(self.ctx)
@@ -854,10 +947,16 @@ struct SdxlBackend(GenBackend, Movable):
         self.latent = List[ArcPointer[Tensor]]()
         self.previous_denoised = List[ArcPointer[Tensor]]()
         self.previous_sigma = 0.0
-        # The 1024^2 SDXL VAE decode activations OOM on a 24 GB card if the ~6 GB
-        # resident UNet stays put (MEASURED: CUDA_ERROR_OUT_OF_MEMORY at decode with
-        # ~15 GB already used). Free the UNet + trim the mempool before decoding; the
-        # next job reloads it in SPHASE_LOAD (self.loaded=False).
+        # First try the process-separated decoder. It uses the same tiled decode
+        # math as the existing 24 GB path while preserving the resident UNet for
+        # the next image. Trim only dead transient allocations in the parent.
+        self.ctx.synchronize()
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
+        if self._try_resident_decode(latent, png_path):
+            return png_path
+        # Admission can fail when device-global headroom is insufficient. Preserve
+        # the old completion path: release UNet, trim, and decode in this process.
         self.model_square = List[ArcPointer[SDXLUNet[LH_SQUARE, LW_SQUARE]]]()
         self.model_1152x896 = List[ArcPointer[SDXLUNet[LH_1152X896, LW_1152X896]]]()
         self.model_896x1152 = List[ArcPointer[SDXLUNet[LH_896X1152, LW_896X1152]]]()

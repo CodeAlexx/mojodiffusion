@@ -1,9 +1,10 @@
 # vmm_slab_smoke.mojo - physical VMM slab primitive smoke.
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, DeviceBuffer
 
 from serenitymojo.offload.vmm_cuda import vmm_supported
 from serenitymojo.offload.vmm_slab import VmmSlabAllocator
+from serenitymojo.io.ffi import BytePtr
 
 
 def _check(name: String, got: Int, expected: Int) raises:
@@ -16,6 +17,17 @@ def _check_bool(name: String, got: Bool, expected: Bool) raises:
     print("[vmm-slab]", name, "got=", got, "expected=", expected)
     if got != expected:
         raise Error(String("vmm slab mismatch: ") + name)
+
+
+def _check_nonowning_buffer(
+    ptr: UInt64, nbytes: Int, ctx: DeviceContext
+) raises:
+    """Prove Mojo kernels can view Rust/Flame-style VMM memory without giving
+    DeviceContext ownership of the physical allocation."""
+    var raw = BytePtr(unsafe_from_address=Int(ptr))
+    var buf = DeviceBuffer[DType.uint8](ctx, raw, nbytes, owning=False)
+    if UInt64(Int(buf.unsafe_ptr())) != ptr:
+        raise Error("vmm slab: non-owning DeviceBuffer pointer mismatch")
 
 
 def main() raises:
@@ -40,6 +52,7 @@ def main() raises:
     if p0_again != p0:
         raise Error("vmm slab: resident pointer changed")
     _check(String("region0 refcount x2"), slab.regions[r0].refcount, 2)
+    _check_nonowning_buffer(p0, slab.regions[r0].size, ctx)
     slab.release(r0)
     slab.release(r0)
     slab.evict(r0)

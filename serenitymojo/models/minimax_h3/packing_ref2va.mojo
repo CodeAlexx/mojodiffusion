@@ -43,7 +43,7 @@
 # it is pure integer/float arithmetic and is gateable now.
 
 from std.collections import List
-from std.math import sqrt, floor
+from std.math import sqrt, floor, round
 
 from serenitymojo.models.minimax_h3.packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -58,6 +58,11 @@ from serenitymojo.models.minimax_h3.packing import (
     _round_half_even,
     minimax_h3_spatial_position_grid,
     minimax_h3_temporal_position_grid,
+)
+from serenitymojo.models.minimax_h3.motion_context import (
+    minimax_h3_motion_context_audio_latents,
+    minimax_h3_motion_context_step_offsets,
+    minimax_h3_motion_context_steps,
 )
 
 # Reference images are resized to a 2048 pixel short edge — upscaling included —
@@ -470,4 +475,177 @@ def minimax_h3_build_ref2va_packed_sequence(
         text_indices^,
         num_reference_video_rows,
         num_reference_audio_rows,
+    )
+
+
+def minimax_h3_build_ref2va_motion_context_packed_sequence(
+    text_token_tags: List[Int],
+    references: List[MiniMaxH3PreparedReference],
+    num_latent_frames: Int,
+    latent_height: Int,
+    latent_width: Int,
+    num_audio_latents: Int,
+    patch_h: Int,
+    patch_w: Int,
+    context_frames: Int,
+    source_audio_overhang: Float64,
+) raises -> MiniMaxH3PackedSequence:
+    """Build Ref2VA references and native A/V continuation in one document.
+
+    Physical rows follow the coexistence order H3 consumes:
+
+      [text | fixed motion video | references | fixed motion audio |
+       target audio | target video]
+
+    Ordinary references retain their stock coordinates.  The motion-audio
+    block still advances the reference cursor, but its rows are translated
+    onto the target head; fixed motion-video rows land on that same shifted
+    target timeline.  This preserves both identity/style reference distance
+    from text and the previous clip's synchronized A/V join.
+    """
+    if source_audio_overhang < -0.5 or source_audio_overhang > 0.5:
+        raise Error(
+            "MiniMax-H3 source audio rounding residual must be in [-0.5,0.5]"
+        )
+    var base = minimax_h3_build_ref2va_packed_sequence(
+        text_token_tags,
+        references,
+        num_latent_frames,
+        latent_height,
+        latent_width,
+        num_audio_latents,
+        patch_h,
+        patch_w,
+    )
+    var rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
+    var context_steps = minimax_h3_motion_context_steps(context_frames)
+    var context_audio_latents = minimax_h3_motion_context_audio_latents(
+        context_frames
+    )
+    var motion_video_rows = context_steps * rows_per_frame
+    var motion_audio_rows = context_audio_latents * MINIMAX_H3_AUDIO_CHANNELS
+    var target_audio_rows = num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS
+    var target_video_rows = num_latent_frames * rows_per_frame
+    var base_target_video_start = base.sequence_length - target_video_rows
+    var base_target_audio_start = base_target_video_start - target_audio_rows
+    var text_rows = len(text_token_tags)
+    if base_target_audio_start < text_rows or target_audio_rows <= 0:
+        raise Error("MiniMax-H3 Ref2VA motion-context target geometry mismatch")
+
+    var reference_rows = base_target_audio_start - text_rows
+    var motion_video_start = text_rows
+    var reference_start = motion_video_start + motion_video_rows
+    var motion_audio_start = reference_start + reference_rows
+    var target_audio_start = motion_audio_start + motion_audio_rows
+    var target_video_start = target_audio_start + target_audio_rows
+    var sequence_length = target_video_start + target_video_rows
+
+    var position_ids = List[Float64]()
+    var token_tags = List[Int]()
+    for _ in range(sequence_length * 3):
+        position_ids.append(Float64(0.0))
+    for _ in range(sequence_length):
+        token_tags.append(MINIMAX_H3_VIDEO_TAG)
+
+    # Text stays byte-for-byte equivalent to stock Ref2VA.
+    for row in range(text_rows):
+        for axis in range(3):
+            position_ids[3 * row + axis] = base.position_ids[3 * row + axis]
+        token_tags[row] = base.token_tags[row]
+
+    # The appended motion-audio reference advances the target origin by its
+    # latent span even though its own rows are relocated onto the target head.
+    var base_target_origin = base.position_ids[3 * base_target_video_start]
+    var target_origin = base_target_origin + Float64(context_audio_latents)
+    var offsets = minimax_h3_motion_context_step_offsets(context_steps)
+    for frame in range(context_steps):
+        var frame_time = (
+            target_origin + ROPE_FRAME_RESCALE * Float64(offsets[frame])
+        )
+        for spatial in range(rows_per_frame):
+            var dst = motion_video_start + frame * rows_per_frame + spatial
+            var src = base_target_video_start + spatial
+            position_ids[3 * dst] = frame_time
+            position_ids[3 * dst + 1] = base.position_ids[3 * src + 1]
+            position_ids[3 * dst + 2] = base.position_ids[3 * src + 2]
+            token_tags[dst] = MINIMAX_H3_VIDEO_TAG
+
+    # Ordered identity/style/video/audio references keep the stock clock.
+    for row in range(reference_rows):
+        var src = text_rows + row
+        var dst = reference_start + row
+        for axis in range(3):
+            position_ids[3 * dst + axis] = base.position_ids[3 * src + axis]
+        token_tags[dst] = base.token_tags[src]
+
+    # End-align fixed audio with the pinned video window on the shifted target
+    # timeline, preserving the source clip's signed audio-grid residual.
+    var raw_end = (
+        ROPE_FRAME_RESCALE * Float64(context_frames) + source_audio_overhang
+    )
+    var end_coord = Float64(round(raw_end))
+    var motion_audio_time = (
+        target_origin + end_coord - Float64(context_audio_latents)
+    )
+    var width_low = base.position_ids[3 * base_target_audio_start + 2]
+    var width_high = base.position_ids[
+        3 * (base_target_audio_start + num_audio_latents) + 2
+    ]
+    for row in range(motion_audio_rows):
+        var dst = motion_audio_start + row
+        position_ids[3 * dst] = (
+            motion_audio_time + Float64(row % context_audio_latents)
+        )
+        position_ids[3 * dst + 2] = (
+            width_low if row < context_audio_latents else width_high
+        )
+        token_tags[dst] = MINIMAX_H3_AUDIO_TAG
+
+    # Target rows retain stock spatial coordinates while the appended motion
+    # audio span translates only their time coordinate.
+    for row in range(base_target_audio_start, base.sequence_length):
+        var dst = row + motion_video_rows + motion_audio_rows
+        position_ids[3 * dst] = (
+            base.position_ids[3 * row] + Float64(context_audio_latents)
+        )
+        position_ids[3 * dst + 1] = base.position_ids[3 * row + 1]
+        position_ids[3 * dst + 2] = base.position_ids[3 * row + 2]
+        token_tags[dst] = base.token_tags[row]
+
+    # Modality index order is the payload contract: motion video first,
+    # ordinary reference media next, motion audio last among condition rows,
+    # then each target suffix.
+    var video_indices = List[Int]()
+    for row in range(motion_video_rows):
+        video_indices.append(motion_video_start + row)
+    for i in range(base.num_condition_video_rows):
+        video_indices.append(base.video_indices[i] + motion_video_rows)
+    for i in range(base.num_condition_video_rows, len(base.video_indices)):
+        video_indices.append(
+            base.video_indices[i] + motion_video_rows + motion_audio_rows
+        )
+
+    var audio_indices = List[Int]()
+    for i in range(base.num_condition_audio_rows):
+        audio_indices.append(base.audio_indices[i] + motion_video_rows)
+    for row in range(motion_audio_rows):
+        audio_indices.append(motion_audio_start + row)
+    for i in range(base.num_condition_audio_rows, len(base.audio_indices)):
+        audio_indices.append(
+            base.audio_indices[i] + motion_video_rows + motion_audio_rows
+        )
+
+    var text_indices = List[Int]()
+    for row in range(text_rows):
+        text_indices.append(row)
+
+    return MiniMaxH3PackedSequence(
+        sequence_length,
+        position_ids^,
+        token_tags^,
+        video_indices^,
+        audio_indices^,
+        text_indices^,
+        base.num_condition_video_rows + motion_video_rows,
+        base.num_condition_audio_rows + motion_audio_rows,
     )

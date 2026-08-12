@@ -367,6 +367,7 @@ def _denoise_lora_from_initial_with_loader[
     lora_multiplier: Float32 = Float32(1.0),
     progress_fd: Int32 = Int32(-1),
     feed_bf16: Bool = True,
+    warm_denoiser: Bool = True,
 ) raises -> Tensor:
     # MJ-1059: the default product/worker path carries the latent in F32 and casts
     # it to BF16 only to feed the DiT (feed_bf16=True). The reference trainer-parity replay entry
@@ -406,46 +407,51 @@ def _denoise_lora_from_initial_with_loader[
     print_sample_setup(String("Klein-sample"), cfg.name, num_steps, cfg_scale, N_IMG, cfg.n_layers())
 
     # The first DiT forward activates lazy CUDA/cuDNN kernels and ComputeCache
-    # entries. Run it without advancing `x` or the schedule, before step 0.
-    scratch.reset()
-    var warm_sigma = sigmas[0]
-    var warm_mods = build_klein_step_mods_device_cached(
-        mod_weights, warm_sigma, cfg.timestep_dim, cfg.d_model, ctx
-    )
-    base.final_shift = warm_mods[3].copy()
-    base.final_scale = warm_mods[4].copy()
-    var warm_x = cast_tensor(x, STDtype.BF16, ctx) if feed_bf16 else x.clone(ctx)
-    if cfg_scale == Float32(1.0):
-        var warm_v = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
-            H, Dh, N_IMG, N_TXT, S
-        ](
-            TArc(warm_x^), txt_tokens_t, base,
-            loader, lora_dev, warm_mods[0].copy(), warm_mods[1].copy(),
-            warm_mods[2].copy(), cos_dev, sin_dev,
-            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
-            cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx, scratch,
+    # entries. A persistent product worker records the compiled shape/CFG branch
+    # and passes warm_denoiser=False on later jobs; repeating this full forward
+    # once per image adds one entire denoise step without changing numerics.
+    if warm_denoiser:
+        scratch.reset()
+        var warm_sigma = sigmas[0]
+        var warm_mods = build_klein_step_mods_device_cached(
+            mod_weights, warm_sigma, cfg.timestep_dim, cfg.d_model, ctx
         )
-        _ = warm_v^
+        base.final_shift = warm_mods[3].copy()
+        base.final_scale = warm_mods[4].copy()
+        var warm_x = cast_tensor(x, STDtype.BF16, ctx) if feed_bf16 else x.clone(ctx)
+        if cfg_scale == Float32(1.0):
+            var warm_v = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+                H, Dh, N_IMG, N_TXT, S
+            ](
+                TArc(warm_x^), txt_tokens_t, base,
+                loader, lora_dev, warm_mods[0].copy(), warm_mods[1].copy(),
+                warm_mods[2].copy(), cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+                cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx, scratch,
+            )
+            _ = warm_v^
+        else:
+            var warm_preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
+                H, Dh, N_IMG, N_TXT, S
+            ](
+                TArc(warm_x^), txt_tokens_t, neg_tokens_t, base,
+                loader, lora_dev, warm_mods[0].copy(), warm_mods[1].copy(),
+                warm_mods[2].copy(), cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+                cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx, scratch,
+            )
+            var warm_cfg = flux2_cfg(warm_preds.pos, warm_preds.neg, cfg_scale, ctx)
+            _ = warm_cfg^
+        ctx.synchronize()
+        scratch.reset()
+        print("[Klein-sample] pre-step-0 denoiser kernel warm-up complete")
+        print("[Klein-sample] prefaulted worker image bytes=", prefault_self_executable())
+        print(
+            "[Klein-sample] prefaulted mapped shared-library bytes=",
+            prefault_mapped_shared_libraries(),
+        )
     else:
-        var warm_preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
-            H, Dh, N_IMG, N_TXT, S
-        ](
-            TArc(warm_x^), txt_tokens_t, neg_tokens_t, base,
-            loader, lora_dev, warm_mods[0].copy(), warm_mods[1].copy(),
-            warm_mods[2].copy(), cos_dev, sin_dev,
-            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
-            cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx, scratch,
-        )
-        var warm_cfg = flux2_cfg(warm_preds.pos, warm_preds.neg, cfg_scale, ctx)
-        _ = warm_cfg^
-    ctx.synchronize()
-    scratch.reset()
-    print("[Klein-sample] pre-step-0 denoiser kernel warm-up complete")
-    print("[Klein-sample] prefaulted worker image bytes=", prefault_self_executable())
-    print(
-        "[Klein-sample] prefaulted mapped shared-library bytes=",
-        prefault_mapped_shared_libraries(),
-    )
+        print("[Klein-sample] denoiser kernel warm-up HIT; skipped redundant forward")
     if progress_fd >= 0:
         _emit_server_progress(progress_fd, 0, num_steps)
 
@@ -563,13 +569,14 @@ def _denoise_lora_with_loader[
     mut loader: TurboPlannedLoader,
     lora_multiplier: Float32 = Float32(1.0),
     progress_fd: Int32 = Int32(-1),
+    warm_denoiser: Bool = True,
 ) raises -> Tensor:
     var x = _initial_noise_tokens[N_IMG, LH, LW](cfg.in_channels, seed, ctx)
     return _denoise_lora_from_initial_with_loader[
         H, Dh, N_IMG, N_TXT, S, LH, LW
     ](
         cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
-        loader, lora_multiplier, progress_fd,
+        loader, lora_multiplier, progress_fd, True, warm_denoiser,
     )
 
 
@@ -765,6 +772,7 @@ def klein_sample_with_loader[
     lora_multiplier: Float32 = Float32(1.0),
     progress_fd: Int32 = Int32(-1),
     allow_child_decode: Bool = False,
+    warm_denoiser: Bool = True,
 ) raises -> Tensor:
     """Product sampler using a backend-owned complete host block store."""
     if cfg.n_heads != H:
@@ -782,7 +790,7 @@ def klein_sample_with_loader[
         H, Dh, N_IMG, N_TXT, S, LH, LW
     ](
         cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, ctx,
-        loader, lora_multiplier, progress_fd,
+        loader, lora_multiplier, progress_fd, warm_denoiser,
     )
     # Retain every host-resident block for the next job, but release the two
     # transient GPU staging slabs before VAE decode.

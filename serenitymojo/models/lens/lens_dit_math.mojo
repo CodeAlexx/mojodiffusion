@@ -32,7 +32,7 @@ from serenitymojo.models.lens.lens_contract import (
 
 
 comptime LENS_CAPTURE_1024_DIR = (
-    "/home/alex/EriDiffusion/inference-flame/lens/parity/captures"
+    "/home/alex/.serenity/parity/lens/parity/captures"
 )
 comptime LENS_CAPTURE_HS_STEP0 = LENS_CAPTURE_1024_DIR + "/hidden_states_pre_step_00.safetensors"
 comptime LENS_CAPTURE_TEMB_STEP0 = LENS_CAPTURE_1024_DIR + "/temb_step0.safetensors"

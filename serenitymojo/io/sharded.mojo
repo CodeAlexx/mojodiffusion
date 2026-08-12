@@ -537,6 +537,11 @@ struct ShardedSafeTensors(Movable):
         var bytes = shard.tensor_bytes(name)
         return from_parts(info.dtype, info.shape.copy(), bytes)
 
+    def release_tensor(self, name: String) raises:
+        """Release only the source pages for one completed tensor upload."""
+        var idx = self.shard_index(name)
+        self.shards[idx][].release_tensor(name)
+
     def release_to_os(self):
         """Release clean mmap pages for every shard after device upload.
 

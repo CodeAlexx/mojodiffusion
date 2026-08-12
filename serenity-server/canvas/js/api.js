@@ -51,6 +51,10 @@ var SerenityAPI = (function () {
                     runner: 'minimax_h3_mojo_request',
                     task: h3.task || (h3Loader && h3Loader.task) || 't2va',
                     prompt: h3.prompt || '',
+                    continue_from: h3.continue_from || '',
+                    motion_context_frames: [5, 22, 39].indexOf(
+                        Number(h3.motion_context_frames)) >= 0
+                        ? Number(h3.motion_context_frames) : 22,
                     source_image: h3.source_image || '',
                     last_frame: h3.last_frame || '',
                     references: Array.isArray(h3.references)
@@ -73,7 +77,8 @@ var SerenityAPI = (function () {
                         ? 'bf16'
                         : (h3Loader && h3Loader.precision === 'int8'
                             ? 'int8' : 'int8-fast'),
-                    attention_backend: h3Loader && h3Loader.attention_backend === 'sage-int8'
+                    attention_backend: h3Loader && h3Loader.precision !== 'bf16'
+                        && h3Loader.attention_backend === 'sage-int8'
                         ? 'sage-int8' : 'cudnn',
                     step_cache: h3Loader && h3Loader.step_cache === 'high'
                         ? 'high' : 'exact',

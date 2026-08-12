@@ -34,6 +34,7 @@ from serenitymojo.serve.ipc_codec import decode_start, encode_ev, encode_ready
 from serenitymojo.serve.chroma_encode_subprocess import encode_child_run
 from serenitymojo.serve.chroma_decode_subprocess import (
     decode_child_run as chroma_decode_child_run,
+    decode_tiled_child_run as chroma_decode_tiled_child_run,
 )
 
 comptime WORKER_IDLE_SLEEP_S = 0.02  # poll cadence while waiting for a command
@@ -94,7 +95,7 @@ def _chroma_worker_loop(mut backend: ChromaBackend, fd: Int32) raises:
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: serenity_worker_chroma <fd> | serenity_worker_chroma encode-child <prefix> <prompt> <negative> | serenity_worker_chroma decode-child <latent_path> <rgb_out_path> <latent_h> <latent_w>")
+        print("usage: serenity_worker_chroma <fd> | serenity_worker_chroma encode-child <prefix> <prompt> <negative> | serenity_worker_chroma decode-child <latent_path> <rgb_out_path> <latent_h> <latent_w> | serenity_worker_chroma decode-tiled-child <latent_path> <rgb_out_path> <latent_h> <latent_w>")
         return
     # T5-encoder-in-a-child-process. The parent chroma worker fork+execv's THIS
     # same binary as `encode-child` so the ~9.5 GB T5-XXL encoder runs in a
@@ -123,6 +124,15 @@ def main() raises:
             Int(String(args[4])), Int(String(args[5])),
         )
         return                            # process exits → decode VRAM reclaimed
+    if String(args[1]) == "decode-tiled-child":
+        if len(args) < 6:
+            print("usage: serenity_worker_chroma decode-tiled-child <latent_path> <rgb_out_path> <latent_h> <latent_w>")
+            return
+        chroma_decode_tiled_child_run(
+            String(args[2]), String(args[3]),
+            Int(String(args[4])), Int(String(args[5])),
+        )
+        return                            # process exits → tiled VAE VRAM reclaimed
     var fd = Int32(Int(String(args[1])))
     var b = ChromaBackend()
     _chroma_worker_loop(b, fd)

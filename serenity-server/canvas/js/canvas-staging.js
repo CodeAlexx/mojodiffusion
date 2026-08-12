@@ -526,7 +526,7 @@ var CanvasStaging = (function () {
             '<button class="staging-btn staging-reject" id="stg-reject">Reject</button>' +
             '<button class="staging-btn" id="stg-regen" title="Regenerate with new seed">Regenerate</button>' +
             (result && result.isVideo
-                ? '<button class="staging-btn staging-continue-h3" id="stg-continue-h3" title="Use the exact final video frame as MiniMax-H3 I2VA frame zero">Continue H3</button>'
+                ? '<button class="staging-btn staging-continue-h3" id="stg-continue-h3" title="Continue native MiniMax-H3 video and audio from its retained latent tail; older results use final-frame I2VA fallback">Continue H3</button>'
                 : '') +
             '</div>';
         // Mode toggles

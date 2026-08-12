@@ -4588,6 +4588,10 @@ var CanvasTab = (function () {
         els.ltx2Quant.addEventListener('change', function () {
             genState.ltx2Quant = this.value;
             selectCanvasLtx23Model();
+            ModelUtils.warmModel(genState.model, {
+                checkpoint: String(genState.model || '').replace(/\.safetensors$/i, ''),
+                quant: genState.ltx2Quant
+            });
         });
         els.ltx2Profile.addEventListener('change', function () {
             var key = this.value;
@@ -4681,6 +4685,10 @@ var CanvasTab = (function () {
         els.h3Quant.addEventListener('change', function () {
             genState.h3Quant = this.value;
             refreshCanvasH3Controls();
+            ModelUtils.warmModel(genState.model, {
+                quant: genState.h3Quant,
+                task: genState.h3Mode || 't2va'
+            });
         });
         els.h3Attention.addEventListener('change', function () {
             genState.h3AttentionBackend = this.value === 'sage-int8'
@@ -4826,6 +4834,12 @@ var CanvasTab = (function () {
             updateCanvasUIForArch(ModelUtils.archForModel(this.value));
             if (genState.editMode === 'flowedit' || genState.editMode === 'style')
                 syncFlowEditEngineFromCanvasModel(this.value);
+            ModelUtils.warmModel(this.value, {
+                checkpoint: String(this.value || '').replace(/\.safetensors$/i, ''),
+                quant: ModelUtils.archForModel(this.value) === 'minimax_h3'
+                    ? genState.h3Quant : genState.ltx2Quant,
+                task: genState.h3Mode || 't2va'
+            });
         });
         els.guidance.addEventListener('input', function () {
             genState.guidance = parseFloat(this.value) || 3.5;
@@ -7197,6 +7211,11 @@ var CanvasTab = (function () {
             genState.model = pick.name;
             updateTopbarModel(pick.name);
             updateCanvasUIForArch(ModelUtils.archForModel(pick.name));
+            ModelUtils.warmModel(pick.name, {
+                checkpoint: String(pick.name || '').replace(/\.safetensors$/i, ''),
+                quant: genState.ltx2Quant,
+                task: genState.h3Mode || 't2va'
+            });
             populateEditModelEngineOptions();
             populateMaskedEditEngineOptions();
             if (genState.editMode === 'flowedit' || genState.editMode === 'style')

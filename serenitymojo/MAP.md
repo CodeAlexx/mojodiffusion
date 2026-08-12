@@ -95,6 +95,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/text_encoder/ideogram_qwen3vl.mojo` | `load_ideogram_qwen3vl` / `encode_ideogram_taps`: Ideogram-4 Qwen3-VL text path (reuses `Qwen3Encoder`; θ=5e6, fp8 load, 13-tap concat → [1,L,53248]). | ✅ 13-tap cos 0.99998625 |
 | `serve/serenity_daemon.mojo` | localhost SerenityUI HTTP/WebSocket daemon: `/v1/generate`, jobs/progress, gallery, model browser, sampler registry, workflow, presets/state, and route dispatch for `/v1/video`. | ✅ product gates |
 | `serve/klein_runtime_backend.mojo` | Resident pure-Mojo FLUX.2 Klein 9B/4B worker. Supports text-to-image plus one-source native `ReferenceLatent` editing at 512x512 or 1024x1024; two-source legacy edit remains 512x512 and ordinary img2img fails loudly. | ✅ real 1024 edit artifacts for 4B + 9B |
+| `serenity-server/crates/server/src/warm_load.rs` + browser `ModelUtils.warmModel` | Shared selection-driven host artifact warmer for image/video denoisers, VAEs, tokenizers, and text/vision/audio encoders. Encoder artifacts are read first by four bounded readers; a generation or newer selection cancels stale work before worker I/O. | ✅ 184 Rust tests; Klein 26.01 GB in 41.518 s at 597.5 MiB/s; H3 resolver/status smoke |
 | `lora.mojo` + `models/{flux,chroma}/**_lora_overlay.mojo` + `models/sd35/sd3_lokr_overlay.mojo` | Shared inference LoRA format detection/scaling plus creator-topology overlays for fused Flux/Chroma projections and SwarmUI/Comfy-compatible SD3/3.5 LoKr carriers. Product backends for SDXL, Ideogram 4, SD3/3.5, Qwen Image, Anima, Flux, Chroma, Klein, Krea 2, Z-Image, and LTX-2 receive exact registry paths and user multipliers. | ✅ current-build product proofs include SDXL `job-0062`, Flux `job-0063`, Chroma `job-0006`, SD3.5 `job-0067`, Anima `job-0070`, Qwen `job-0001`, and Ideogram `job-0003` |
 | `sampling/swarmui_schedules.mojo` + `sampling/sampler_registry.mojo` | SwarmUI/Comfy Flux shift-1.15 schedules (`normal`, `karras`, `exponential`, `simple`, `ddim_uniform`, `sgm_uniform`, `beta`, `linear_quadratic`, `kl_optimal`) plus genuine Euler and DPM++ 2M data-prediction routing for Flux/Chroma. The public 44-sampler/16-scheduler catalog remains distinct from each family's executable subset. | ✅ scalar creator-source smoke; live Flux `job-0005` and Chroma `job-0006` each executed 2 DPM updates / 1 second-order update over beta |
 | `serve/image_io.mojo` | Shared worker image/mask I/O, including alpha/luminance LanPaint masks, separately expanded sampler-context masks, crop helpers, and final source-preserving blend primitives. | ✅ CPU mask smoke + browser/real-job gates |
@@ -3121,6 +3122,31 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   conditioning, scheduler, transformer stream, both VAE directions, BF16 LoRA,
   timing, VRAM, prompt-extension provenance, and visual acceptance. The Rust
   server refuses Wan readiness if any pinned check drifts.
+
+## Shared model and encoder warm loading (2026-08-12)
+
+- `serenity-server/crates/server/src/warm_load.rs` gives every registered image
+  and video family one selection-driven Linux page-cache warm path. Browser
+  model, H3 quality/task, and LTX checkpoint/quality changes call
+  `POST /v1/warm-model`; `GET /v1/warm-model/status` publishes
+  `serenity.model_warm.v1` progress. Text, vision, and audio encoder shards plus
+  tokenizers/processors are prioritized before denoiser/runtime stores and
+  VAEs. The resolver covers the image manifest catalog and H3, LTX, Wan,
+  Bernini, and SCAIL video artifacts.
+- Four sequential shard readers are bounded to the least of the selected
+  artifact bytes and 32 GiB while preserving both 25% and a hard 16 GiB of
+  current `MemAvailable`. A newer selection cancels the previous generation
+  token, and both image and video submission cancel warming before worker/model
+  I/O. This is host disk/page-cache work only: it never provides CPU inference
+  or changes weights, math, or sampler output.
+- The corrected Klein-9B profile names all five Qwen encoder shards and the
+  actual FP8 runtime checkpoint rather than the BF16 training symlink. A cold
+  17-file, 26,013,626,802-byte profile completed in 41.518 seconds at 597.54
+  MiB/s with no read errors. A new-prompt 1024 one-step product run reduced
+  text-encode time from 43.7707 to 35.1216 seconds, saving 8.6491 seconds; the
+  later 50-step cache-hit artifact passed visual health. H3 INT8 resolver and
+  live status prioritized the text-encoder store; that smoke was cancelled
+  rather than claiming a complete 122-GB warm.
 
 ## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-11)
 

@@ -699,6 +699,7 @@ var SimpleMode = (function () {
                 var badge = document.querySelector('.model-badge');
                 if (badge)
                     badge.textContent = this.value;
+                ModelUtils.warmModel(this.value);
             });
         }
         // Generate
@@ -817,6 +818,7 @@ var SimpleMode = (function () {
             var badge = document.querySelector('.model-badge');
             if (badge)
                 badge.textContent = models[0].name;
+            ModelUtils.warmModel(models[0].name);
         })
             .catch(function () {
             if (els.model)

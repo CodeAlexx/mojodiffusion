@@ -2047,6 +2047,10 @@ var GenerateTab = (function () {
                     }
                     if (els.h3Attention)
                         els.h3Attention.disabled = state.videoQuant === 'bf16';
+                    ModelUtils.warmModel(state.model, {
+                        quant: state.h3Quant,
+                        task: state.h3Mode || 't2va'
+                    });
                     return;
                 }
                 var selectedIsLtx = ModelUtils.archForModel(state.model) === 'ltxv';
@@ -2062,6 +2066,11 @@ var GenerateTab = (function () {
                     return model.name.replace(/\.safetensors$/i, '') === checkpoint;
                 }))
                     selectModel(checkpoint);
+                else
+                    ModelUtils.warmModel(state.model, {
+                        checkpoint: state.videoCheckpoint,
+                        quant: state.videoQuant
+                    });
             });
         if (els.h3Attention)
             els.h3Attention.addEventListener('change', function () {
@@ -3126,6 +3135,11 @@ var GenerateTab = (function () {
                 els.modelSearch.placeholder = 'Search models...';
             }
             updateUIForArch(ModelUtils.archForModel(pick.name));
+            ModelUtils.warmModel(pick.name, {
+                checkpoint: state.videoCheckpoint,
+                quant: state.videoQuant,
+                task: state.h3Mode || 't2va'
+            });
             els.modelWarn.classList.remove('visible');
         })
             .catch(function () {
@@ -5432,6 +5446,12 @@ var GenerateTab = (function () {
             globalBadge.textContent = name;
             globalBadge.title = name;
         }
+        ModelUtils.warmModel(name, {
+            checkpoint: state.videoCheckpoint,
+            quant: ModelUtils.archForModel(name) === 'minimax_h3'
+                ? state.h3Quant : state.videoQuant,
+            task: state.h3Mode || 't2va'
+        });
     }
     function renderModelDropdown() {
         if (!els.modelDropdownList)

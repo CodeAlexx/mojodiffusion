@@ -35,6 +35,174 @@ pub(crate) use probe::{get_video_probe, probe_video_path};
 use scail2::*;
 use wan22::*;
 
+/// Resolve the learned artifacts touched by a selected video profile. The page
+/// warmer consumes these paths before a request starts; generation still
+/// validates and opens the exact same files in the model-specific arm.
+pub(crate) fn warm_artifacts(
+    model: &str,
+    resolved_checkpoint: Option<&std::path::Path>,
+    quant: &str,
+    task: &str,
+) -> (String, Vec<crate::warm_load::WarmArtifact>) {
+    use crate::warm_load::WarmArtifact;
+
+    let identity = model.trim().to_ascii_lowercase();
+    if identity.contains("minimax") || identity.contains("h3") {
+        let is_ref = task == "ref2va";
+        let root = model_path(if is_ref {
+            MINIMAX_H3_REF2VA_MODEL_ROOT
+        } else {
+            MINIMAX_H3_MODEL_ROOT
+        });
+        let mut artifacts = vec![
+            WarmArtifact::new(
+                "MiniMax-H3 text encoder INT8 store",
+                model_path(MINIMAX_H3_ENCODER_CACHE),
+            ),
+            WarmArtifact::new(
+                "MiniMax-H3 conditioning cache",
+                model_path(MINIMAX_H3_CONDITIONING_CACHE),
+            ),
+        ];
+        let modulation = if is_ref {
+            MINIMAX_H3_REF2VA_MODULATION_CACHE
+        } else if matches!(task, "i2va" | "l2va" | "fl2va" | "continue") {
+            MINIMAX_H3_CONDITIONED_MODULATION_CACHE
+        } else {
+            MINIMAX_H3_MODULATION_CACHE
+        };
+        artifacts.push(WarmArtifact::new(
+            "MiniMax-H3 modulation runtime cache",
+            model_path(modulation),
+        ));
+        if let Some(cache) = minimax_h3_resident_cache_path(quant, is_ref) {
+            artifacts.push(WarmArtifact::new(
+                "MiniMax-H3 resident denoiser runtime cache",
+                cache,
+            ));
+        }
+        // The quantized runtime stores own the blocks, while the source tree
+        // still owns shared tensors. BF16 streams all transformer shards.
+        artifacts.push(WarmArtifact::new(
+            "MiniMax-H3 transformer source",
+            root.join("transformer"),
+        ));
+        artifacts.extend([
+            WarmArtifact::new(
+                "MiniMax-H3 audio VAE",
+                root.join("audio_vae/model.safetensors"),
+            ),
+            WarmArtifact::new(
+                "MiniMax-H3 video VAE",
+                root.join("video_vae/source/model.safetensors"),
+            ),
+            WarmArtifact::new("MiniMax-H3 processor", root.join("processor")),
+        ]);
+        return (format!("minimax_h3:{task}:{quant}"), artifacts);
+    }
+
+    if identity.contains("ltx") {
+        let mut artifacts = vec![
+            WarmArtifact::new("LTX Gemma text encoder", model_path(LTX2_GEMMA_FP8)),
+            WarmArtifact::new("LTX Gemma tokenizer", model_path(LTX2_GEMMA_TOKENIZER)),
+        ];
+        if let Some(checkpoint) = resolved_checkpoint {
+            artifacts.push(WarmArtifact::new("selected LTX checkpoint", checkpoint));
+        } else {
+            let checkpoint = if quant == "bf16" {
+                LTX2_REFHQ_BF16
+            } else if quant == "int4" {
+                LTX2_REFHQ_INT4_SLAB
+            } else {
+                LTX2_CONDITIONING_CHECKPOINT
+            };
+            artifacts.push(WarmArtifact::new(
+                "LTX denoiser checkpoint",
+                model_path(checkpoint),
+            ));
+        }
+        if quant == "int4" {
+            artifacts.push(WarmArtifact::new(
+                "LTX INT4 resident denoiser slab",
+                model_path(LTX2_REFHQ_INT4_SLAB),
+            ));
+        }
+        artifacts.push(WarmArtifact::new(
+            "LTX distillation adapter",
+            model_path(LTX2_REFHQ_DISTILLATION_ADAPTER),
+        ));
+        return (format!("ltx2:{quant}"), artifacts);
+    }
+
+    if identity.contains("wan") {
+        let artifacts = if identity.contains("a14b") {
+            vec![
+                WarmArtifact::new("Wan A14B high denoiser", model_path(WAN22_A14B_HIGH)),
+                WarmArtifact::new("Wan A14B low denoiser", model_path(WAN22_A14B_LOW)),
+                WarmArtifact::new("Wan UMT5 encoder", model_path(WAN22_UMT5_FILE)),
+                WarmArtifact::new("Wan tokenizer", model_path(WAN22_TOKENIZER)),
+                WarmArtifact::new("Wan A14B VAE", model_path(WAN22_A14B_VAE)),
+            ]
+        } else {
+            vec![
+                WarmArtifact::new(
+                    "Wan transformer shard",
+                    model_path(WAN22_TRANSFORMER_SHARD_1),
+                ),
+                WarmArtifact::new(
+                    "Wan transformer shard",
+                    model_path(WAN22_TRANSFORMER_SHARD_2),
+                ),
+                WarmArtifact::new(
+                    "Wan transformer shard",
+                    model_path(WAN22_TRANSFORMER_SHARD_3),
+                ),
+                WarmArtifact::new("Wan UMT5 encoder", model_path(WAN22_UMT5_FILE)),
+                WarmArtifact::new("Wan tokenizer", model_path(WAN22_TOKENIZER)),
+                WarmArtifact::new("Wan sentencepiece tokenizer", model_path(WAN22_SPIECE)),
+                WarmArtifact::new("Wan VAE", model_path(WAN22_VAE)),
+            ]
+        };
+        return ("wan22".to_string(), artifacts);
+    }
+
+    if identity.contains("bernini") {
+        return (
+            "bernini".to_string(),
+            vec![
+                WarmArtifact::new("Bernini UMT5 encoder", model_path(WAN22_UMT5_FILE)),
+                WarmArtifact::new(
+                    "Bernini high denoiser cache",
+                    model_path(BERNINI_HIGH_CACHE),
+                ),
+                WarmArtifact::new(
+                    "Bernini low denoiser cache",
+                    model_path(BERNINI_LOW_CACHE),
+                ),
+                WarmArtifact::new("Bernini VAE", model_path(BERNINI_VAE)),
+            ],
+        );
+    }
+
+    if identity.contains("scail") {
+        return (
+            "scail2".to_string(),
+            vec![
+                WarmArtifact::new("SCAIL UMT5 encoder", model_path(SCAIL2_UMT5)),
+                WarmArtifact::new("SCAIL tokenizer", model_path(SCAIL2_TOKENIZER)),
+                WarmArtifact::new("SCAIL CLIP vision encoder", model_path(SCAIL2_CLIP)),
+                WarmArtifact::new(
+                    "SCAIL denoiser FP8 cache",
+                    model_path(SCAIL2_FP8_CACHE),
+                ),
+                WarmArtifact::new("SCAIL VAE", model_path(SCAIL2_VAE)),
+            ],
+        );
+    }
+
+    (String::new(), Vec::new())
+}
+
 const BACKEND_NAME: &str = "mojo";
 
 /// Resolve the checkout that built this server, with an explicit override for
@@ -918,6 +1086,9 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
             }
         }
     }
+    // Selection-time warming has done all useful work it can do. Stop its host
+    // reader before the video subprocess starts opening encoder/model files.
+    st.warm_load.cancel_for_generation();
     // Cross-path single-GPU lease (audit L3): a video render is minutes of GPU
     // work in a subprocess; it must not co-run with a generate/caption/magic
     // job on a 16GB card. Held (RAII) across the whole arm; 409 if busy.

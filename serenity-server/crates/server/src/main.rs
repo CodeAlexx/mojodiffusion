@@ -73,6 +73,7 @@ mod settings;
 mod trainer;
 mod video;
 mod video_edit;
+mod warm_load;
 
 use capabilities::{
     ModelFamily, capability_profile_for_model, generate_capabilities_v1, has_text,
@@ -249,6 +250,9 @@ pub(crate) struct AppState {
     /// Global ComfyUI event bus (see [`ComfyBus`]). `post_generate`/grid attach each
     /// new `JobChannel` to it; the canvas `/ws` socket subscribes to it.
     pub(crate) comfy_ws: ComfyBus,
+    /// Selection-driven shared page-cache warmer for model, encoder, tokenizer,
+    /// and VAE artifacts. A real generation cancels it before GPU work begins.
+    pub(crate) warm_load: warm_load::WarmLoadManager,
 }
 
 #[derive(Clone, Debug)]
@@ -1009,12 +1013,23 @@ fn local_artifact_manifest(
         } else {
             "models/qwen3-8b"
         });
-        let qwen_shard_count = if is_four_b { 2 } else { 4 };
+        let qwen_shard_count = if is_four_b { 2 } else { 5 };
+        let runtime_checkpoint = if is_four_b {
+            format!("{root}/transformer.safetensors")
+        } else {
+            // The 9B product worker deliberately redirects the creator/base
+            // selection to this Serenity FP8 artifact. Keep preflight and page
+            // warming on that exact runtime file instead of the 18.16 GB BF16
+            // training symlink.
+            models::resolve_checkpoint("flux-2-klein-base-9b_fp8_e4m3fn")
+                .map(|checkpoint| checkpoint.path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b_fp8_e4m3fn.safetensors"
+                        .to_string()
+                })
+        };
         let mut specs = vec![
-            artifact_file(
-                "Klein/Flux2 checkpoint",
-                format!("{root}/transformer.safetensors"),
-            ),
+            artifact_file("Klein/Flux2 checkpoint", runtime_checkpoint),
             artifact_file("Flux2 VAE", repository_path("models/klein/vae.safetensors")),
             artifact_dir(
                 if is_four_b {
@@ -1440,6 +1455,14 @@ struct ProgressQuery {
 #[derive(Debug, Deserialize)]
 struct CancelRequest {
     job: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WarmModelRequest {
+    model: String,
+    checkpoint: Option<String>,
+    quant: Option<String>,
+    task: Option<String>,
 }
 
 fn params_from_generate_request(
@@ -2810,6 +2833,101 @@ async fn post_preflight(
     (StatusCode::OK, Json(report)).into_response()
 }
 
+/// POST /v1/warm-model — begin a cancellable, RAM-bounded page-cache warm for
+/// every learned artifact used by the selected profile. Encoder/tokenizer files
+/// are ordered first because they are the first expensive stage of a cold job.
+async fn post_warm_model(
+    State(st): State<AppState>,
+    Json(req): Json<WarmModelRequest>,
+) -> Response {
+    let model = req.model.trim();
+    if model.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "schema": "serenity.model_warm.v1",
+                "state": "rejected",
+                "error": "model is required",
+            })),
+        )
+            .into_response();
+    }
+
+    // UI selections are resolved only through the registry. The warm route is
+    // deliberately not an arbitrary-file read endpoint.
+    let selected_identity = req
+        .checkpoint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(model);
+    let resolved = models::resolve_checkpoint(selected_identity)
+        .or_else(|| models::resolve_checkpoint(model));
+    let selected_checkpoint = resolved
+        .as_ref()
+        .filter(|checkpoint| {
+            models::selected_checkpoint_scope_for_resolved(checkpoint).is_some()
+        })
+        .map(|checkpoint| checkpoint.path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut profile = String::new();
+    let mut artifacts = Vec::<warm_load::WarmArtifact>::new();
+    if let Some(manifest) = local_artifact_manifest(model, &selected_checkpoint) {
+        profile = manifest.profile.to_string();
+        artifacts.extend(manifest.specs.into_iter().map(|spec| {
+            warm_load::WarmArtifact::new(spec.label, PathBuf::from(spec.path))
+        }));
+    }
+
+    let quant = req.quant.as_deref().unwrap_or("int8-fast");
+    let task = req.task.as_deref().unwrap_or("t2va");
+    let (video_profile, video_artifacts) = video::warm_artifacts(
+        model,
+        resolved.as_ref().map(|checkpoint| checkpoint.path.as_path()),
+        quant,
+        task,
+    );
+    if !video_artifacts.is_empty() {
+        profile = video_profile;
+        artifacts.extend(video_artifacts);
+    }
+
+    // A scanned standalone checkpoint may not yet have a richer family
+    // manifest. It is still safe and useful to warm that exact registry file.
+    if artifacts.is_empty() {
+        if let Some(checkpoint) = resolved.as_ref() {
+            profile = checkpoint.arch.clone();
+            artifacts.push(warm_load::WarmArtifact::new(
+                "selected model checkpoint",
+                &checkpoint.path,
+            ));
+        }
+    }
+    if artifacts.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "schema": "serenity.model_warm.v1",
+                "state": "rejected",
+                "model": model,
+                "error": "selected model has no installed warm-load artifact profile",
+            })),
+        )
+            .into_response();
+    }
+
+    let status = st
+        .warm_load
+        .start(model.to_string(), profile, artifacts);
+    (StatusCode::ACCEPTED, Json(status)).into_response()
+}
+
+/// GET /v1/warm-model/status — current/last warmer telemetry for the UI and
+/// product tests. This reports host-page warming only, never sampler readiness.
+async fn get_warm_model_status(State(st): State<AppState>) -> Response {
+    (StatusCode::OK, Json(st.warm_load.status())).into_response()
+}
+
 /// POST /v1/generate — accept the RAW request JSON so a Comfy `workflow`
 /// graph survives. If the body carries a `workflow` key, lower it through the
 /// serenity-graph executor FIRST (flattening the graph into the flat keys the rest
@@ -2930,6 +3048,11 @@ pub(crate) fn enqueue_generate(
         }
         return Err((StatusCode::BAD_REQUEST, Json(report)).into_response());
     }
+
+    // Stop selection-time disk warming before this job becomes runnable. Any
+    // pages already touched remain useful; no background reader competes with
+    // the worker's real encoder/model load.
+    st.warm_load.cancel_for_generation();
 
     // Build the genparams the worker embeds in the PNG tEXt: the lowered request +
     // schema + the server-assigned job_id (the UI's "reuse params" round-trips this,
@@ -4872,10 +4995,18 @@ mod endpoint_tests {
             .any(|spec| spec.path.contains("diffusion_pytorch_model-")));
 
         for (model, encoder, shards) in [
-            ("klein-9b", "/models/qwen3-8b", 4usize),
+            ("klein-9b", "/models/qwen3-8b", 5usize),
             ("klein-4b", "/models/qwen3-4b", 2usize),
         ] {
             let manifest = local_artifact_manifest(model, "").expect("Klein manifest");
+            if model == "klein-9b" {
+                assert!(manifest.specs.iter().any(|spec| {
+                    spec.label == "Klein/Flux2 checkpoint"
+                        && spec
+                            .path
+                            .ends_with("flux-2-klein-base-9b_fp8_e4m3fn.safetensors")
+                }));
+            }
             assert!(manifest
                 .specs
                 .iter()
@@ -5646,11 +5777,14 @@ async fn main() -> anyhow::Result<()> {
         jobs: job_book,
         backend_name,
         comfy_ws,
+        warm_load: warm_load::WarmLoadManager::default(),
     };
 
     // 3. Router.
     let app = Router::new()
         .route("/v1/preflight", post(post_preflight))
+        .route("/v1/warm-model", post(post_warm_model))
+        .route("/v1/warm-model/status", get(get_warm_model_status))
         .route("/v1/generate", post(post_generate))
         .route("/v1/grid", post(grid::post_grid))
         .route("/v1/cancel", post(post_cancel))

@@ -1121,6 +1121,27 @@ the Q/K fusion.
   evidence. It is the runtime counterpart to `scripts/mem_safe.sh`, not a
   model offload mechanism.
 
+## Shared model and encoder warm loading (2026-08-12)
+
+- `serenity-server/crates/server/src/warm_load.rs` is the Rust host-artifact
+  warming service used across Mojo worker process boundaries. It expands and
+  canonicalizes the selected image/video model paths, prioritizes tokenizers,
+  processors, and text/vision/audio encoder shards, and then reads denoiser,
+  runtime-store, and VAE artifacts with four sequential readers. Its RAM budget
+  preserves both 25% and 16 GiB of `MemAvailable` and is capped at 32 GiB.
+- The browser uses the debounced `ModelUtils.warmModel` helper on initial and
+  changed model selections, including H3 task/quant and LTX checkpoint/quant.
+  The server exposes `POST /v1/warm-model` and the
+  `serenity.model_warm.v1` status at `GET /v1/warm-model/status`. New selections
+  supersede old work; accepted image or video generation cancels the warmer
+  before worker I/O. No CPU inference path is introduced.
+- Image manifests and the H3/LTX/Wan/Bernini/SCAIL video resolvers share this
+  mechanism. The Klein manifest correction points at the exact FP8 denoiser and
+  all five Qwen encoder shards. The measured Klein profile warmed 26.01 GB in
+  41.518 seconds (597.54 MiB/s), and a forced new-prompt text encode fell from
+  43.7707 to 35.1216 seconds. This is load-path evidence, not sampler or quality
+  parity.
+
 ## serve/parity — worker runtime gates (Phase-5 worker-fix campaign)
 
 Gates for the process-isolated **worker** runtime (`serve/`): they exercise the

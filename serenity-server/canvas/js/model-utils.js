@@ -11,6 +11,42 @@ var ModelUtils = (function () {
     var modelByIdentity = {};
     var capabilitiesCache = null;
     var capabilitiesPending = null;
+    var warmModelTimer = null;
+    var warmModelController = null;
+
+    // Warm the exact selected model profile while the user edits settings or a
+    // prompt. Calls from multiple visible surfaces are debounced into one
+    // request; the server cancels the reader when generation starts.
+    function warmModel(model, options) {
+        var identity = String(model || '').trim();
+        if (!identity)
+            return;
+        options = options || {};
+        if (warmModelTimer)
+            clearTimeout(warmModelTimer);
+        warmModelTimer = setTimeout(function () {
+            if (warmModelController)
+                warmModelController.abort();
+            warmModelController = typeof AbortController !== 'undefined'
+                ? new AbortController() : null;
+            var body = { model: identity };
+            if (options.checkpoint)
+                body.checkpoint = String(options.checkpoint);
+            if (options.quant)
+                body.quant = String(options.quant);
+            if (options.task)
+                body.task = String(options.task);
+            fetch('/v1/warm-model', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: warmModelController ? warmModelController.signal : undefined
+            }).catch(function (error) {
+                if (!error || error.name !== 'AbortError')
+                    console.warn('model warm-load request failed', error);
+            });
+        }, 150);
+    }
 
     function fetchJsonWithRetry(url, label, validate) {
         var attempt = 0;
@@ -344,6 +380,7 @@ var ModelUtils = (function () {
         backendForArch: backendForArch,
         aspectsForArch: aspectsForArch,
         loadObjectInfo: loadObjectInfo,
+        warmModel: warmModel,
         clearCache: clearCache
     };
 })();

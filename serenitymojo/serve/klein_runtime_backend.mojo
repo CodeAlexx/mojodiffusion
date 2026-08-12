@@ -153,11 +153,11 @@ comptime KRPHASE_SAMPLE = 2
 # entire high-water mark after object destruction and cuMemPoolTrimTo(0).
 comptime _KLEIN_ENCODE_CHILD_TIMEOUT_S = 600.0
 comptime _KLEIN_ENCODE_POLL_S = 0.05
-# Direct-host inline baseline peaked at 22,175 MiB for the entire worker,
-# including its parent context and cap tensors. A 22,000 MiB device-global free
-# floor therefore preserves measured headroom while admitting the validated
-# card with the desktop compositor resident (22,488 MiB free).
-comptime _KLEIN_ENCODE_CHILD_MIN_FREE_BYTES = Int(22000) * 1024 * 1024
+# Do not pre-reject from a fixed device-global free-VRAM threshold. Desktop GPU
+# use varies by a few hundred MiB, and a static 22 GiB floor rejected a measured
+# 21,888 MiB-free card before the encoder attempted a single allocation. The
+# encoder runs in an exec'd child specifically so CUDA allocation failure is
+# contained and the parent worker remains recoverable.
 
 
 def _getpid() -> Int:
@@ -364,20 +364,10 @@ def _encode_text_pair_subprocess(
 ) raises:
     """Encode on the GPU in a fork+exec child and load exact BF16 caps.
 
-    Unlike the old in-process fallback, this fails clearly when another process
-    has consumed the encoder's required VRAM. Retrying inline would recreate the
-    measured 22 GiB retained-pool failure and make the later decode OOM.
+    Unlike the old in-process fallback, a CUDA allocation failure is contained
+    by child-process exit. Retrying inline would recreate the measured 22 GiB
+    retained-pool failure and make the later decode OOM.
     """
-    var free_bytes = cu_mem_get_info().free_bytes
-    if free_bytes < _KLEIN_ENCODE_CHILD_MIN_FREE_BYTES:
-        raise Error(
-            String("klein_runtime: Qwen3 GPU encode needs ")
-            + String(_KLEIN_ENCODE_CHILD_MIN_FREE_BYTES // (1024 * 1024))
-            + String(" MiB free, found ")
-            + String(free_bytes // (1024 * 1024))
-            + String(" MiB")
-        )
-
     var prefix = String("/tmp/serenity_klein_caps_") + String(_getpid())
     var pos_path = prefix + String(".pos.bin")
     var neg_path = prefix + String(".neg.bin")

@@ -112,6 +112,7 @@ from serenitymojo.serve.product_manifest import (
 )
 from serenitymojo.io.env import env_int
 
+comptime FLUX_CAP_CACHE_SLOTS = 4
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
 
@@ -350,8 +351,11 @@ struct FluxBackend(GenBackend, Movable):
     # across jobs so a variation does not cold-load the ~10 GiB CLIP-L/T5-XXL
     # checkpoint again.  FLUX Dev discards the negative prompt (no CFG), so the
     # positive prompt is the complete cache identity.
-    var cap_cache_prompt: String
-    var cap_cache: List[ArcPointer[FluxCaps]]     # 0/1
+    # Keyed by positive prompt (FLUX is guidance-distilled — no negative),
+    # capacity FLUX_CAP_CACHE_SLOTS drop-oldest: the old single slot missed
+    # 100% on prompt-alternating A/B and grid workloads.
+    var cap_cache_keys: List[String]
+    var cap_cache: List[ArcPointer[FluxCaps]]
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -395,7 +399,7 @@ struct FluxBackend(GenBackend, Movable):
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.warmed_shapes = List[String]()
-        self.cap_cache_prompt = String("")
+        self.cap_cache_keys = List[String]()
         self.cap_cache = List[ArcPointer[FluxCaps]]()
         self.active = False
         self.cancel_flag = False
@@ -634,11 +638,14 @@ struct FluxBackend(GenBackend, Movable):
         in-process encode_text on any subprocess failure. FLUX is
         guidance-distilled — only the positive prompt is encoded; the negative
         is discarded (no CFG path)."""
-        if len(self.cap_cache) == 1 and self.cap_cache_prompt == self.params.prompt:
-            print("[flux] conditioning cache HIT (prompt unchanged) — skipping text encode")
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] != self.params.prompt:
+                continue
+            print("[flux] conditioning cache HIT (slot", slot, "of",
+                  len(self.cap_cache_keys), ") — skipping text encode")
             self.conditioning_cache_hit = True
-            var cached_vector = self.cap_cache[0][].vector.clone(self.ctx)
-            var cached_txt = self.cap_cache[0][].txt.clone(self.ctx)
+            var cached_vector = self.cap_cache[slot][].vector.clone(self.ctx)
+            var cached_txt = self.cap_cache[slot][].txt.clone(self.ctx)
             self.caps = List[ArcPointer[FluxCaps]]()
             self.caps.append(ArcPointer(FluxCaps(cached_vector^, cached_txt^)))
             return
@@ -646,11 +653,13 @@ struct FluxBackend(GenBackend, Movable):
         _print_vram("before CLIP-L + T5-XXL load")
         var caps = encode_text_subprocess(self.params.prompt, self.ctx)
         _print_vram("after text encode (encoders freed)")
-        self.cap_cache = List[ArcPointer[FluxCaps]]()
+        if len(self.cap_cache_keys) >= FLUX_CAP_CACHE_SLOTS:
+            _ = self.cap_cache_keys.pop(0)
+            _ = self.cap_cache.pop(0)
+        self.cap_cache_keys.append(self.params.prompt.copy())
         self.cap_cache.append(ArcPointer(FluxCaps(
             caps.vector.clone(self.ctx), caps.txt.clone(self.ctx)
         )))
-        self.cap_cache_prompt = self.params.prompt.copy()
         self.caps = List[ArcPointer[FluxCaps]]()
         self.caps.append(ArcPointer(caps^))
 

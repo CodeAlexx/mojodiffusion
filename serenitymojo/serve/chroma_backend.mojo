@@ -135,6 +135,7 @@ from serenitymojo.serve.product_manifest import (
 )
 from serenitymojo.io.env import env_int
 
+comptime CHROMA_CAP_CACHE_SLOTS = 4
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
 # Chroma1-HD publisher inference profile.
@@ -320,12 +321,15 @@ struct ChromaBackend(GenBackend, Movable):
     var lora_factor_count: Int
     # Exact prompt-pair T5 conditioning is only ~8 MiB.  Preserve it across jobs
     # so seed/step/CFG variations do not reload T5-XXL.
-    var cap_cache_prompt: String
-    var cap_cache_negative: String
+    # Keyed (prompt \x1f negative) multi-slot cache, capacity
+    # CHROMA_CAP_CACHE_SLOTS drop-oldest — the old single slot missed 100%
+    # on prompt-alternating A/B and grid workloads. Parallel lists share the
+    # slot index.
+    var cap_cache_keys: List[String]
     var cap_cache_cond: List[ArcPointer[Tensor]]
     var cap_cache_uncond: List[ArcPointer[Tensor]]
-    var cap_cache_cond_real_len: Int
-    var cap_cache_uncond_real_len: Int
+    var cap_cache_cond_real_len: List[Int]
+    var cap_cache_uncond_real_len: List[Int]
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -370,12 +374,11 @@ struct ChromaBackend(GenBackend, Movable):
         self.rope_sin = List[ArcPointer[Tensor]]()
         self.lora = List[ArcPointer[ChromaLoraOverlay]]()
         self.lora_factor_count = 0
-        self.cap_cache_prompt = String("")
-        self.cap_cache_negative = String("")
+        self.cap_cache_keys = List[String]()
         self.cap_cache_cond = List[ArcPointer[Tensor]]()
         self.cap_cache_uncond = List[ArcPointer[Tensor]]()
-        self.cap_cache_cond_real_len = N_TXT
-        self.cap_cache_uncond_real_len = N_TXT
+        self.cap_cache_cond_real_len = List[Int]()
+        self.cap_cache_uncond_real_len = List[Int]()
         self.active = False
         self.cancel_flag = False
         self.phase = CPHASE_IDLE
@@ -653,24 +656,23 @@ struct ChromaBackend(GenBackend, Movable):
         Falls back to the in-process encode on any subprocess failure. The
         encode math is byte-identical either way; the real lengths feed the DiT
         T5 pad-row attention mask (MJ-1048)."""
-        if (
-            len(self.cap_cache_cond) == 1
-            and len(self.cap_cache_uncond) == 1
-            and self.cap_cache_prompt == self.params.prompt
-            and self.cap_cache_negative == self.params.negative
-        ):
-            print("[chroma] conditioning cache HIT (prompts unchanged) — skipping T5")
+        var want_key = self.params.prompt + String("\x1f") + self.params.negative
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] != want_key:
+                continue
+            print("[chroma] conditioning cache HIT (slot", slot, "of",
+                  len(self.cap_cache_keys), ") — skipping T5")
             self.text_conditioning_cache_hit = True
             self.t5_cond = List[ArcPointer[Tensor]]()
             self.t5_cond.append(ArcPointer(
-                self.cap_cache_cond[0][].clone(self.ctx)
+                self.cap_cache_cond[slot][].clone(self.ctx)
             ))
             self.t5_uncond = List[ArcPointer[Tensor]]()
             self.t5_uncond.append(ArcPointer(
-                self.cap_cache_uncond[0][].clone(self.ctx)
+                self.cap_cache_uncond[slot][].clone(self.ctx)
             ))
-            self.cond_real_len = self.cap_cache_cond_real_len
-            self.uncond_real_len = self.cap_cache_uncond_real_len
+            self.cond_real_len = self.cap_cache_cond_real_len[slot]
+            self.uncond_real_len = self.cap_cache_uncond_real_len[slot]
             return
 
         _print_vram("before T5-XXL encode (subprocess)")
@@ -686,14 +688,19 @@ struct ChromaBackend(GenBackend, Movable):
         self.t5_cond.append(ArcPointer(_clone(caps.cond, self.ctx)))
         self.t5_uncond = List[ArcPointer[Tensor]]()
         self.t5_uncond.append(ArcPointer(_clone(caps.uncond, self.ctx)))
-        self.cap_cache_cond = List[ArcPointer[Tensor]]()
+        if len(self.cap_cache_keys) >= CHROMA_CAP_CACHE_SLOTS:
+            _ = self.cap_cache_keys.pop(0)
+            _ = self.cap_cache_cond.pop(0)
+            _ = self.cap_cache_uncond.pop(0)
+            _ = self.cap_cache_cond_real_len.pop(0)
+            _ = self.cap_cache_uncond_real_len.pop(0)
+        self.cap_cache_keys.append(
+            self.params.prompt + String("\x1f") + self.params.negative
+        )
         self.cap_cache_cond.append(ArcPointer(self.t5_cond[0][].clone(self.ctx)))
-        self.cap_cache_uncond = List[ArcPointer[Tensor]]()
         self.cap_cache_uncond.append(ArcPointer(self.t5_uncond[0][].clone(self.ctx)))
-        self.cap_cache_prompt = self.params.prompt.copy()
-        self.cap_cache_negative = self.params.negative.copy()
-        self.cap_cache_cond_real_len = self.cond_real_len
-        self.cap_cache_uncond_real_len = self.uncond_real_len
+        self.cap_cache_cond_real_len.append(self.cond_real_len)
+        self.cap_cache_uncond_real_len.append(self.uncond_real_len)
 
     def _free_dit(mut self):
         """Drop GPU shared weights and RoPE while preserving the host store."""

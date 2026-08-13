@@ -212,6 +212,7 @@ comptime SD3_DEFAULT_SEED = 42
 comptime SD3_DENOISE_VRAM_RESERVE_MIB = 4096
 
 
+comptime SD3_CAP_CACHE_SLOTS = 4
 comptime S3PHASE_IDLE = 0
 comptime S3PHASE_ENCODE = 1
 comptime S3PHASE_LOAD = 2
@@ -514,8 +515,10 @@ struct Sd3Backend(GenBackend, Movable):
     # Exact prompt-pair conditioning is about 7 MiB and independent of seed,
     # steps, CFG, and image shape. Preserve one entry across jobs so variations
     # do not reload CLIP-L, CLIP-G, and T5-XXL.
-    var cap_cache_prompt: String
-    var cap_cache_negative: String
+    # Keyed conditioning cache (prompt \x1f negative -> caps), capacity
+    # SD3_CAP_CACHE_SLOTS with drop-oldest eviction: the old single slot
+    # missed 100% on any A/B or grid workload that alternates prompts.
+    var cap_cache_keys: List[String]
     var cap_cache: List[ArcPointer[Sd3Caps]]
 
     # ── per-job state (cleared on done/failed/cancelled) ──
@@ -558,8 +561,7 @@ struct Sd3Backend(GenBackend, Movable):
         self.loader_checkpoint = String("")
         self.lora = List[ArcPointer[Sd3LokrOverlay]]()
         self.lora_target_count = 0
-        self.cap_cache_prompt = String("")
-        self.cap_cache_negative = String("")
+        self.cap_cache_keys = List[String]()
         self.cap_cache = List[ArcPointer[Sd3Caps]]()
         self.active = False
         self.cancel_flag = False
@@ -906,15 +908,15 @@ struct Sd3Backend(GenBackend, Movable):
         pattern) — the old blocking `_shell` froze the worker event loop for
         the whole 15-30 s encode, so progress/cancel went unserviced.
         """
-        if (
-            len(self.cap_cache) == 1
-            and self.cap_cache_prompt == self.params.prompt
-            and self.cap_cache_negative == self.params.negative
-        ):
+        var want_key = self.params.prompt + String("\x1f") + self.params.negative
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] != want_key:
+                continue
             print(
-                "[sd3] conditioning cache HIT (prompts unchanged) — skipping encoders"
+                "[sd3] conditioning cache HIT (slot", slot,
+                "of", len(self.cap_cache_keys), ") — skipping encoders"
             )
-            ref cached = self.cap_cache[0][]
+            ref cached = self.cap_cache[slot][]
             self.caps = List[ArcPointer[Sd3Caps]]()
             self.caps.append(ArcPointer(Sd3Caps(
                 cached.context.clone(self.ctx),
@@ -950,15 +952,18 @@ struct Sd3Backend(GenBackend, Movable):
         )
         self.caps = List[ArcPointer[Sd3Caps]]()
         self.caps.append(ArcPointer(caps^))
-        self.cap_cache = List[ArcPointer[Sd3Caps]]()
+        if len(self.cap_cache_keys) >= SD3_CAP_CACHE_SLOTS:
+            _ = self.cap_cache_keys.pop(0)
+            _ = self.cap_cache.pop(0)
+        self.cap_cache_keys.append(
+            self.params.prompt + String("\x1f") + self.params.negative
+        )
         self.cap_cache.append(ArcPointer(Sd3Caps(
             self.caps[0][].context.clone(self.ctx),
             self.caps[0][].context_uncond.clone(self.ctx),
             self.caps[0][].pooled.clone(self.ctx),
             self.caps[0][].pooled_uncond.clone(self.ctx),
         )))
-        self.cap_cache_prompt = self.params.prompt.copy()
-        self.cap_cache_negative = self.params.negative.copy()
         _print_vram("after process-isolated conditioning load")
 
     def _load_model_shape[LH_: Int, LW_: Int](mut self) raises:

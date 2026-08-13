@@ -223,7 +223,9 @@ from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 from std.collections import Dict, List
 from max.gpu.host import DeviceContext
-from std.memory import ArcPointer
+from std.memory import alloc, ArcPointer
+from std.ffi import external_call
+from json.parser import loads as _json_loads
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.patchify3d import unpatchify3d
@@ -1780,8 +1782,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
 # ═════════════════════════════════════════════════════════════════════════════
 # main
 # ═════════════════════════════════════════════════════════════════════════════
-def main() raises:
-    var raw_args = argv()
+def _job_main(raw_args: List[String]) raises:
     var args = List[String]()
     var runtime_width = WIDTH
     var runtime_height = HEIGHT
@@ -2845,3 +2846,91 @@ def main() raises:
         out_dir, artifact, output_frames, runtime_width, runtime_height,
         output_fps,
     )
+
+
+def _serve_read_line() raises -> String:
+    """Blocking newline-delimited read from stdin (fd 0). Returns "" on EOF."""
+    var out = String("")
+    while True:
+        var buf = alloc[UInt8](1)
+        var got = external_call["read", Int](Int32(0), buf, 1)
+        if got <= 0:
+            buf.free()
+            return String("")  # EOF/parent closed -> shut down
+        var c = Int(buf[0])
+        buf.free()
+        if c == 10:
+            return out
+        out += chr(c)
+
+
+def _serve_redirect_stdout(path: String) raises:
+    """dup2 a fresh per-job log over stdout+stderr so the resident worker's
+    output lands where the per-job spawn used to point it."""
+    var n = path.byte_length()
+    var cbuf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        cbuf[i] = src[i]
+    cbuf[n] = 0
+    # O_WRONLY|O_CREAT|O_TRUNC = 0x241, mode 0644
+    var fd = Int(external_call["open", Int32](cbuf, Int32(0x241), Int32(0o644)))
+    cbuf.free()
+    if fd < 0:
+        raise Error(String("serve: cannot open job log: ") + path)
+    _ = external_call["dup2", Int32](Int32(fd), Int32(1))
+    _ = external_call["dup2", Int32](Int32(fd), Int32(2))
+    _ = external_call["close", Int32](Int32(fd))
+
+
+def main() raises:
+    var raw = argv()
+    var serve = False
+    var toks = List[String]()
+    for i in range(len(raw)):
+        var a = String(raw[i])
+        if a == "--serve":
+            serve = True
+        else:
+            toks.append(a^)
+    if not serve:
+        _job_main(toks)
+        return
+
+    # ── WARM WORKER (Phase A): one resident process serves many denoise
+    # jobs. Each job arrives as one stdin line: a JSON array of the exact
+    # argv tokens the per-job spawn used to pass (binary name excluded).
+    # stdout/stderr are re-pointed at <out_dir>/runner.log per job, so the
+    # Rust side's log-driven progress/status contract is unchanged; job
+    # completion is signaled by result.json (success, unchanged) or the
+    # "[serve] job FAILED" sentinel below. The process boot, CUDA context,
+    # JIT-cache checks, and warm page cache carry across jobs; the deferred
+    # video decode stays a fresh process (measured VRAM isolation).
+    print("[serve] MiniMax-H3 warm worker ready")
+    while True:
+        var line = _serve_read_line()
+        if line == String(""):
+            print("[serve] stdin closed — exiting")
+            return
+        if line.byte_length() < 3:
+            continue
+        var job_toks = List[String]()
+        job_toks.append(toks[0].copy() if len(toks) > 0 else String("minimax_h3_serenity_runtime"))
+        try:
+            var arr = _json_loads(line)
+            for i in range(arr.length()):
+                job_toks.append(arr[i].as_string())
+        except e:
+            print("[serve] bad job line (", e, ") — ignored")
+            continue
+        # argv layout: [bin, prompt, out_dir, ...] -> out_dir is token 2.
+        if len(job_toks) > 2:
+            try:
+                _serve_redirect_stdout(job_toks[2] + String("/runner.log"))
+            except e:
+                print("[serve] log redirect failed (", e, ") — continuing on current log")
+        try:
+            _job_main(job_toks)
+            print("[serve] job complete — worker staying warm")
+        except e:
+            print("[serve] job FAILED:", e)

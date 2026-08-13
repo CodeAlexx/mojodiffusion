@@ -40,5 +40,5 @@
     "beta1": 0.9,
     "beta2": 0.999
   },
-  "cache_dir": "/home/alex/EriDiffusion/EriDiffusion-v2/cache/alina_zimage_512"
+  "cache_dir": "/home/alex/mojodiffusion/output/alina_zimage_512"
 }

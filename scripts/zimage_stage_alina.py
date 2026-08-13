@@ -21,7 +21,7 @@ from PIL import Image
 from safetensors.torch import save_file
 
 SRC = "/home/alex/datasets/AlinaAignatova"
-DST = "/home/alex/mojodiffusion/output/alina_zimage_stage"
+DST = "/home/alex/mojodiffusion/output/alina_zimage_512_stage"
 BUCKETS = [(576, 448), (704, 384)]  # (H, W)
 
 

@@ -421,6 +421,10 @@ struct Ideogram4Backend(GenBackend, Movable):
     var cap_cache_keys: List[String]
     var cap_cache_feats: List[TArc]
     var cap_cache_tokens: List[Int]
+    # LoRA signature of the RESIDENT transformers (name\x1fweight, "" = none):
+    # cross-job residency is only valid when the next job's set matches,
+    # because load_lora applies factors into the loaded weights object.
+    var resident_lora_sig: String
     var llm: List[TArc]
     var neg_llm: List[TArc]
     var text_zpad: List[TArc]
@@ -472,6 +476,7 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.cap_cache_keys = List[String]()
         self.cap_cache_feats = List[TArc]()
         self.cap_cache_tokens = List[Int]()
+        self.resident_lora_sig = String("")
         self.llm = List[TArc]()
         self.neg_llm = List[TArc]()
         self.text_zpad = List[TArc]()
@@ -578,9 +583,24 @@ struct Ideogram4Backend(GenBackend, Movable):
             if params.cfg_override_start_percent > params.cfg_override_end_percent:
                 raise Error("ideogram4: cfg_override_start_percent must be <= cfg_override_end_percent")
 
-        # A previous job may have failed mid-denoise; never try to encode text
-        # while the cond/uncond transformers are still resident.
-        self._free_transformers()
+        # Free only when this job must run the streamed TE (conditioning-cache
+        # miss) or the resident LoRA set differs — a cache hit skips the
+        # encoder entirely, so fully-loaded transformers can stay resident
+        # across the job boundary (the unload existed to make TE room; see
+        # the manifest note). Partial load states (loaded=False) always free.
+        var will_hit = False
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] == params.prompt:
+                will_hit = True
+        var new_sig = String("")
+        if len(params.loras) == 1:
+            new_sig = params.loras[0].name + String("\x1f") \
+                + String(params.loras[0].weight)
+        if will_hit and self.loaded and new_sig == self.resident_lora_sig:
+            print("[ideogram4] keeping transformers RESIDENT across jobs"
+                  " (conditioning cache will hit; same LoRA set)")
+        else:
+            self._free_transformers()
         self.params = params.copy()
         self.bucket = bucket
         self.cfg = Float32(params.cfg)
@@ -788,6 +808,10 @@ struct Ideogram4Backend(GenBackend, Movable):
                 ))
             self.loaded = True
             self.load_stage = 2
+            self.resident_lora_sig = String("")
+            if len(self.params.loras) == 1:
+                self.resident_lora_sig = self.params.loras[0].name \
+                    + String("\x1f") + String(self.params.loras[0].weight)
             return True
         return True
 

@@ -931,6 +931,12 @@ def _sage_attention_int8_pv8_token_kernel(
         var valid = Int32(16) if v_copy * 16 < _HEAD_DIM * S_pad else Int32(0)
         var d_row = (v_copy * 16) // _KV_TILE
         var kv_off = (v_copy * 16) - d_row * _KV_TILE
+        # 16B-group swizzle ((kv>>4) ^ ((d>>1)&3)): spreads the 16-word rows
+        # so the PV B-fragment u32 loads are bank-conflict-free (rows d and
+        # d+4 land in the same 32-bank half; (d>>1)&3 bijects each half's
+        # four rows onto four distinct group offsets).
+        var v_phys = d_row * _KV_TILE \
+            + (((kv_off >> 4) ^ ((d_row >> 1) & 3)) << 4)
         _ = inlined_assembly[
             (
                 "cp.async.cg.shared.global [$1], [$2], 16, $3; "
@@ -940,7 +946,7 @@ def _sage_attention_int8_pv8_token_kernel(
             constraints="=r,r,l,r",
             has_side_effect=True,
         ](
-            v_sh + d_row * _KV_TILE + kv_off,
+            v_sh + v_phys,
             v8.ptr + (head * _HEAD_DIM + d_row) * S_pad + kv_off,
             valid,
         )
@@ -997,6 +1003,8 @@ def _sage_attention_int8_pv8_token_kernel(
                 # always inside the padded row; the pad itself is zeros.
                 var d_row = (v_copy * 16) // _KV_TILE
                 var kv_off = (v_copy * 16) - d_row * _KV_TILE
+                var v_phys = d_row * _KV_TILE \
+                    + (((kv_off >> 4) ^ ((d_row >> 1) & 3)) << 4)
                 _ = inlined_assembly[
                     (
                         "cp.async.cg.shared.global [$1], [$2], 16, $3; "
@@ -1006,8 +1014,7 @@ def _sage_attention_int8_pv8_token_kernel(
                     constraints="=r,r,l,r",
                     has_side_effect=True,
                 ](
-                    v_sh + next_stage * _KV_TILE * _HEAD_DIM
-                        + d_row * _KV_TILE + kv_off,
+                    v_sh + next_stage * _KV_TILE * _HEAD_DIM + v_phys,
                     v8.ptr + (head * _HEAD_DIM + d_row) * S_pad
                         + next_start + kv_off,
                     Int32(16),
@@ -1125,6 +1132,16 @@ def _sage_attention_int8_pv8_token_kernel(
         # pk[n_half]: this lane's four P values for one 8-column group,
         # quantized to [0,127] and packed row0-pair | row1-pair (low|high u16)
         # so ONE shuffled word serves both query rows of the A-fragment.
+        # PER-TILE P scale (SageBwd): quantize against exp(s - tile_m), so the
+        # tile's own max maps to 127 regardless of the global running max —
+        # with a global scale, tiles far below the row max quantize their
+        # whole range into tiny integers and long-S cosine decays (measured
+        # 0.9986 at S=37951). The compensating exp(tile_m - m_new) folds into
+        # the F32 accumulation per row below.
+        var pboost0 = exp(m_new0 - tile_m0)
+        var pboost1 = exp(m_new1 - tile_m1)
+        var pfold0 = exp(tile_m0 - m_new0)
+        var pfold1 = exp(tile_m1 - m_new1)
         var pk = SIMD[DType.uint32, 8](0)
         var tile_l0 = Float32(0.0)
         var tile_l1 = Float32(0.0)
@@ -1143,10 +1160,10 @@ def _sage_attention_int8_pv8_token_kernel(
             var p11 = exp(
                 Float32(scores[n_half * 4 + 3]) * score_factor - m_new1
             ) if q1 < S and key1 < S else Float32(0.0)
-            var i00 = (p00 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
-            var i01 = (p01 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
-            var i10 = (p10 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
-            var i11 = (p11 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i00 = (p00 * pboost0 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i01 = (p01 * pboost0 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i10 = (p10 * pboost1 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i11 = (p11 * pboost1 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
             pk[n_half] = i00 | (i01 << 8) | (i10 << 16) | (i11 << 24)
             tile_l0 += p00 + p01
             tile_l1 += p10 + p11
@@ -1206,18 +1223,22 @@ def _sage_attention_int8_pv8_token_kernel(
             var v_sh_u32 = v_sh.bitcast[Scalar[DType.uint32]]()
             comptime for nt in range(16):
                 var d_col = nt * 8 + (lane >> 2)
-                var b_word = (v_stage_base + d_col * _KV_TILE
-                    + c * 32 + 4 * thread) >> 2
+                var d_swz = (d_col >> 1) & 3
+                var row_word = (v_stage_base + d_col * _KV_TILE) >> 2
+                var b_lo_word = row_word \
+                    + ((((c * 2) ^ d_swz) << 2) | thread)
+                var b_hi_word = row_word \
+                    + ((((c * 2 + 1) ^ d_swz) << 2) | thread)
                 var bf = bitcast[DType.int8, 8](SIMD[DType.uint32, 2](
-                    rebind[Scalar[DType.uint32]](v_sh_u32[b_word]),
-                    rebind[Scalar[DType.uint32]](v_sh_u32[b_word + 4]),
+                    rebind[Scalar[DType.uint32]](v_sh_u32[b_lo_word]),
+                    rebind[Scalar[DType.uint32]](v_sh_u32[b_hi_word]),
                 ))
                 var df = _mma_m16n8k32_s8(af, bf, SIMD[DType.int32, 4](0))
                 comptime base = nt * 4
-                out_frag[base + 0] += Float32(df[0]) * vs_frag[nt * 2]
-                out_frag[base + 1] += Float32(df[1]) * vs_frag[nt * 2 + 1]
-                out_frag[base + 2] += Float32(df[2]) * vs_frag[nt * 2]
-                out_frag[base + 3] += Float32(df[3]) * vs_frag[nt * 2 + 1]
+                out_frag[base + 0] += Float32(df[0]) * vs_frag[nt * 2] * pfold0
+                out_frag[base + 1] += Float32(df[1]) * vs_frag[nt * 2 + 1] * pfold0
+                out_frag[base + 2] += Float32(df[2]) * vs_frag[nt * 2] * pfold1
+                out_frag[base + 3] += Float32(df[3]) * vs_frag[nt * 2 + 1] * pfold1
 
         if next_start < S:
             _ = inlined_assembly[

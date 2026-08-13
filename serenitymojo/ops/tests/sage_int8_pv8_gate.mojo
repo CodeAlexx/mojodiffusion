@@ -80,6 +80,9 @@ def main() raises:
     var ok = True
     ok = _run_one(1024, 32, 20, ctx) and ok
     ok = _run_one(9145, 32, 5, ctx) and ok
+    # The fast-resident boundary — the long-S product regime where streamed
+    # blocks dominate and the PV tile count per row is ~8x S=9145.
+    ok = _run_one(37951, 32, 3, ctx) and ok
     if ok:
         print("PASS: int8-pv within 0.999 of bf16-pv sage at both lengths")
     else:

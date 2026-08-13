@@ -79,6 +79,7 @@ from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16_into
 from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
@@ -196,6 +197,13 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
     var start_layer: Int
     var scratch: List[ArcPointer[Tensor]]
     var scheme: Int
+    # One open handle on the packed tail cache for the store's lifetime
+    # (0/1). The streamed tail previously re-opened the 19.8 GB cache
+    # (54 KB header parse + mmap/munmap) once per block per step — up to
+    # 1440x per job. Filled lazily by the reload wrappers; clean file-backed
+    # pages of a held mapping stay reclaimable under memory pressure.
+    var tail_st: List[ArcPointer[SafeTensors]]
+    var tail_st_path: String
 
     def __init__(
         out self,
@@ -208,6 +216,8 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
         self.start_layer = start_layer
         self.scratch = scratch^
         self.scheme = scheme
+        self.tail_st = List[ArcPointer[SafeTensors]]()
+        self.tail_st_path = String("")
 
     def resident_bytes(self) raises -> Int:
         """Actual device bytes held by this store (quantized 1B/param + the

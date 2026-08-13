@@ -383,10 +383,31 @@ def _minimax_h3_marker_tensor(ctx: DeviceContext) raises -> Tensor:
     return Tensor(buf^, shape^, STDtype.BF16)
 
 
+def minimax_h3_block_uploader(ctx: DeviceContext) raises -> BatchedTensorUploader:
+    """The block-sized pinned slab for `minimax_h3_load_block_device_up` —
+    hoist ONE of these around a streamed block loop."""
+    return BatchedTensorUploader(_H3_BLOCK_UPLOAD_BYTES, ctx)
+
+
 def minimax_h3_load_block_device(
     st: ShardedSafeTensors,
     layer: Int,
     config: MiniMaxH3DiTConfig,
+    ctx: DeviceContext,
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """One-shot wrapper (gates/probes): constructs its own pinned slab.
+    The streamed hot loop must use `minimax_h3_load_block_device_up` with a
+    hoisted uploader — constructing here page-locks and frees the
+    `_H3_BLOCK_UPLOAD_BYTES` slab once per block per step."""
+    var uploader = BatchedTensorUploader(_H3_BLOCK_UPLOAD_BYTES, ctx)
+    return minimax_h3_load_block_device_up(st, layer, config, uploader, ctx)
+
+
+def minimax_h3_load_block_device_up(
+    st: ShardedSafeTensors,
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    mut uploader: BatchedTensorUploader,
     ctx: DeviceContext,
 ) raises -> Dict[String, ArcPointer[Tensor]]:
     var qkv_name = minimax_h3_block_prefix(layer) + "attn.qkv_proj.weight"
@@ -397,7 +418,6 @@ def minimax_h3_load_block_device(
     var ffn = config.ffn_hidden_size
 
     var weights = Dict[String, ArcPointer[Tensor]]()
-    var uploader = BatchedTensorUploader(_H3_BLOCK_UPLOAD_BYTES, ctx)
     var transform_sources = List[ArcPointer[Tensor]]()
     var names = minimax_h3_block_tensor_names(layer)
     for i in range(len(names)):

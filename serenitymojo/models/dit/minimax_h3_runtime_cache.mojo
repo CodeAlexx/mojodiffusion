@@ -387,18 +387,42 @@ def reload_minimax_h3_resident_w8a8_block(
     layer: Int,
     ctx: DeviceContext,
 ) raises:
+    """Path-taking wrapper: opens the cache then delegates to the `_st`
+    variant. Hot loops should hold ONE open `SafeTensors` for the whole run
+    and call `reload_minimax_h3_resident_w8a8_block_st` — this wrapper
+    re-parses the 54 KB header and re-mmaps the 19.8 GB cache PER CALL,
+    which the streamed tail previously paid up to 1440x per job."""
+    if len(resident.tail_st) == 0 or resident.tail_st_path != cache_path:
+        resident.tail_st = List[ArcPointer[SafeTensors]]()
+        resident.tail_st.append(ArcPointer(SafeTensors.open(cache_path)))
+        resident.tail_st_path = cache_path.copy()
+    var st_arc = resident.tail_st[0]
+    reload_minimax_h3_resident_w8a8_block_st(
+        resident, st_arc[], source_index, config, layer, ctx
+    )
+
+
+def reload_minimax_h3_resident_w8a8_block_st(
+    mut resident: MiniMaxH3ResidentFp8,
+    st: SafeTensors,
+    source_index: String,
+    config: MiniMaxH3DiTConfig,
+    layer: Int,
+    ctx: DeviceContext,
+) raises:
     """Refill one W8A8 block store without allocating any device tensors.
 
     A fresh one-block store for every streamed tail layer eventually
     fragments MAX's CUDA pool even when nvidia-smi reports several GiB free.
     The four quantized weights, scales, and small BF16 keeps have identical
     shapes in every H3 block, so one store can be filled in place and reused.
+    Clean file-backed pages of the caller-held mapping remain reclaimable by
+    Linux under pressure, so holding it open across the run is safe.
     """
     if resident.scheme != MINIMAX_H3_RESIDENT_INT8_W8A8:
         raise Error("MiniMax-H3 reusable tail requires the W8A8 scheme")
     if len(resident.blocks) != 1:
         raise Error("MiniMax-H3 reusable tail requires exactly one block")
-    var st = SafeTensors.open(cache_path)
     _check_common_metadata(st, String("resident-int8-w8a8-row"), source_index)
     var cached_start = _meta_i64(st, String("__meta__.start_layer"), -1)
     var cached_blocks = _meta_i64(st, String("__meta__.nblocks"), -1)
@@ -458,12 +482,30 @@ def reload_minimax_h3_resident_groupwise_block(
     layer: Int,
     ctx: DeviceContext,
 ) raises:
+    """Path-taking wrapper — see the W8A8 twin; hot loops use `_st`."""
+    if len(resident.tail_st) == 0 or resident.tail_st_path != cache_path:
+        resident.tail_st = List[ArcPointer[SafeTensors]]()
+        resident.tail_st.append(ArcPointer(SafeTensors.open(cache_path)))
+        resident.tail_st_path = cache_path.copy()
+    var st_arc = resident.tail_st[0]
+    reload_minimax_h3_resident_groupwise_block_st(
+        resident, st_arc[], source_index, config, layer, ctx
+    )
+
+
+def reload_minimax_h3_resident_groupwise_block_st(
+    mut resident: MiniMaxH3ResidentFp8,
+    st: SafeTensors,
+    source_index: String,
+    config: MiniMaxH3DiTConfig,
+    layer: Int,
+    ctx: DeviceContext,
+) raises:
     """Refill one direct-groupwise block store without device allocation."""
     if resident.scheme != MINIMAX_H3_RESIDENT_INT8:
         raise Error("MiniMax-H3 reusable groupwise tail requires INT8 groupwise")
     if len(resident.blocks) != 1:
         raise Error("MiniMax-H3 reusable groupwise tail requires one block")
-    var st = SafeTensors.open(cache_path)
     _check_common_metadata(st, String("resident-int8-groupwise"), source_index)
     var cached_start = _meta_i64(st, String("__meta__.start_layer"), -1)
     var cached_blocks = _meta_i64(st, String("__meta__.nblocks"), -1)

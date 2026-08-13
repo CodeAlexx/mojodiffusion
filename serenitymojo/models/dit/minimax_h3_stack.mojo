@@ -68,7 +68,11 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     MINIMAX_H3_ATTN_CUDNN,
     minimax_h3_block_forward,
 )
-from serenitymojo.models.dit.minimax_h3_loader_device import minimax_h3_load_block_device
+from serenitymojo.models.dit.minimax_h3_loader_device import (
+    minimax_h3_block_uploader,
+    minimax_h3_load_block_device_up,
+)
+from serenitymojo.tensor import BatchedTensorUploader
 from serenitymojo.models.dit.minimax_h3_fp8_resident import (
     MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3ResidentFp8,
@@ -157,6 +161,11 @@ def minimax_h3_run_stack[
     var h3_shape: List[Int] = [1, S, config.hidden_size]
     var h = reshape_owned(hidden^, h3_shape^)
 
+    # ONE pinned slab for every streamed block this call touches — the
+    # per-call constructor page-locked and freed the slab per block per step.
+    var stream_up = List[BatchedTensorUploader]()
+    if not resident:
+        stream_up.append(minimax_h3_block_uploader(ctx))
     for i in range(n):
         var layer = start_layer + i
         var weights: Dict[String, ArcPointer[Tensor]]
@@ -171,7 +180,9 @@ def minimax_h3_run_stack[
                         resident.value(), layer, config, ctx
                     )
             else:
-                weights = minimax_h3_load_block_device(st, layer, config, ctx)
+                weights = minimax_h3_load_block_device_up(
+                    st, layer, config, stream_up[0], ctx
+                )
         except e:
             raise Error(
                 String("minimax_h3_run_stack: layer ") + String(layer)

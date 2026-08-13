@@ -2933,4 +2933,10 @@ def main() raises:
             _job_main(job_toks)
             print("[serve] job complete — worker staying warm")
         except e:
+            # A mid-job exception leaves device allocations stranded in this
+            # process's CUDA pool (measured: a failed job left 23.1 GiB
+            # resident and poisoned every later context on the card). Failed
+            # jobs are rare; exit and let the supervisor respawn clean.
             print("[serve] job FAILED:", e)
+            print("[serve] exiting after failure — supervisor respawns clean")
+            return

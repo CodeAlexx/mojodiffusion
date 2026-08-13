@@ -28,6 +28,90 @@ pub(super) const MINIMAX_H3_WIDTH: i64 = 512;
 pub(super) const MINIMAX_H3_HEIGHT: i64 = 320;
 pub(super) const MINIMAX_H3_FRAMES: i64 = 175;
 pub(super) const MINIMAX_H3_FPS: i64 = 24;
+
+// ── Warm denoise worker (Phase A; OPT-IN via SERENITY_H3_WARM=1) ─────────────
+// One resident `--serve` runtime holds process boot, preflight, JIT-cache
+// checks, and the CUDA context across denoise jobs. Per-job progress stays
+// log-driven: the worker dup2s its stdout onto each job's runner.log, so the
+// existing polling contract is untouched. Success is still latents +
+// motion_context on disk; failure is the "[serve] job FAILED" sentinel or a
+// dead worker. Deferred video decode keeps its fresh process.
+static H3_WARM_WORKER: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn minimax_h3_warm_enabled() -> bool {
+    std::env::var("SERENITY_H3_WARM").ok().as_deref() == Some("1")
+}
+
+fn minimax_h3_warm_alive() -> bool {
+    let mut guard = H3_WARM_WORKER.lock().unwrap();
+    match guard.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(None) => true,
+            _ => {
+                *guard = None;
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+pub(super) fn minimax_h3_warm_kill() {
+    let mut guard = H3_WARM_WORKER.lock().unwrap();
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn minimax_h3_warm_submit(runner: &str, args: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut guard = H3_WARM_WORKER.lock().unwrap();
+    if let Some(child) = guard.as_mut() {
+        if child.try_wait()?.is_some() {
+            *guard = None;
+        }
+    }
+    if guard.is_none() {
+        let serve_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(repo_path("output/logs/minimax_h3_warm_worker.log"))?;
+        let serve_err = serve_log.try_clone()?;
+        let mut cmd = minimax_h3_capped_command(&repo_path(runner));
+        cmd.current_dir(repo_root())
+            // Flat memory band (MemoryHigh == MemoryMax): the default 10G
+            // MemoryHigh reclaim band makes pinned host allocations fail
+            // under pressure and surface as CUDA_ERROR_OUT_OF_MEMORY
+            // (MJ-1140 signature; the identical job passes standalone with
+            // the flat band and fails under the server's 10G-high).
+            .env("MEM_MAX", "12G")
+            .env("MEM_HIGH", "12G")
+            .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .env("CUDA_MODULE_LOADING", "EAGER")
+            .env("LD_BIND_NOW", "1")
+            .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
+            .arg("--serve")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(serve_log))
+            .stderr(std::process::Stdio::from(serve_err));
+        tracing::info!("spawning warm MiniMax-H3 denoise worker");
+        *guard = Some(cmd.spawn()?);
+    }
+    let line = serde_json::to_string(args)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        + "\n";
+    let child = guard.as_mut().expect("warm worker present");
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "no stdin"))?;
+    stdin.write_all(line.as_bytes())?;
+    stdin.flush()?;
+    Ok(())
+}
 pub(super) const MINIMAX_H3_STEPS: i64 = 20;
 pub(super) const MINIMAX_H3_TEXT_TOKENS: i64 = 241;
 // The unified Mojo executable can evaluate a wider aligned tensor envelope,
@@ -1741,56 +1825,73 @@ pub(super) fn start_minimax_h3_request(
                 return;
             }
         };
-        let mut command = minimax_h3_capped_command(&repo_path(&thread_runner));
-        command
-            .current_dir(repo_root())
-            .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
-            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
-            .env("CUDA_MODULE_LOADING", "EAGER")
-            .env("LD_BIND_NOW", "1")
-            .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
-            .arg(&thread_prompt)
-            .arg(&thread_out_dir)
-            .arg(steps.to_string())
-            .arg(seed.to_string())
-            .arg("50")
-            .arg(format!("--width={profile_width}"))
-            .arg(format!("--height={profile_height}"))
-            .arg(format!("--frames={internal_frames}"))
-            .arg(format!("--output-frames={model_output_frames}"))
-            .arg(format!("--fps={MINIMAX_H3_FPS}"))
-            .arg(format!("--output-fps={output_fps}"))
-            .arg(format!("--quant={}", thread_quant))
-            .arg(format!("--resident-blocks={resident_blocks}"))
-            .arg("--encoder-storage=int8")
-            .arg(format!("--attention-backend={}", thread_attention))
-            .arg(format!("--step-cache={}", thread_step_cache))
-            .arg("--defer-video-decode");
+        let mut runner_args: Vec<String> = vec![
+            thread_prompt.clone(),
+            thread_out_dir.to_string_lossy().to_string(),
+            steps.to_string(),
+            seed.to_string(),
+            "50".to_string(),
+            format!("--width={profile_width}"),
+            format!("--height={profile_height}"),
+            format!("--frames={internal_frames}"),
+            format!("--output-frames={model_output_frames}"),
+            format!("--fps={MINIMAX_H3_FPS}"),
+            format!("--output-fps={output_fps}"),
+            format!("--quant={}", thread_quant),
+            format!("--resident-blocks={resident_blocks}"),
+            "--encoder-storage=int8".to_string(),
+            format!("--attention-backend={}", thread_attention),
+            format!("--step-cache={}", thread_step_cache),
+            "--defer-video-decode".to_string(),
+        ];
         if let Some(source) = thread_continuation_source.as_ref() {
-            command
-                .arg(format!(
-                    "--motion-context={}",
-                    source.latent_path.to_string_lossy()
-                ))
-                .arg(format!("--motion-context-frames={motion_context_frames}"))
-                .arg(format!("--trim-start-frames={trim_start_frames}"));
+            runner_args.push(format!(
+                "--motion-context={}",
+                source.latent_path.to_string_lossy()
+            ));
+            runner_args.push(format!("--motion-context-frames={motion_context_frames}"));
+            runner_args.push(format!("--trim-start-frames={trim_start_frames}"));
         }
         if thread_prompt == MINIMAX_H3_TEST_PROMPT {
-            command.arg("--runtime-cache-exact-product-prompt");
+            runner_args.push("--runtime-cache-exact-product-prompt".to_string());
         }
-        command
-            .stdout(std::process::Stdio::from(log))
-            .stderr(std::process::Stdio::from(stderr));
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
+        // Warm path: hand the job line to the resident --serve worker; the
+        // worker re-points its stdout at this job's runner.log itself.
+        let warm = minimax_h3_warm_enabled();
+        let mut child_opt: Option<std::process::Child> = None;
+        if warm {
+            drop(log);
+            drop(stderr);
+            if let Err(error) = minimax_h3_warm_submit(&thread_runner, &runner_args) {
                 fail(
                     "runner_start",
-                    format!("cannot start MiniMax-H3 runner: {error}"),
+                    format!("cannot submit to warm MiniMax-H3 worker: {error}"),
                 );
                 return;
             }
-        };
+        } else {
+            let mut command = minimax_h3_capped_command(&repo_path(&thread_runner));
+            command
+                .current_dir(repo_root())
+                .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
+                .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+                .env("CUDA_MODULE_LOADING", "EAGER")
+                .env("LD_BIND_NOW", "1")
+                .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
+                .args(&runner_args)
+                .stdout(std::process::Stdio::from(log))
+                .stderr(std::process::Stdio::from(stderr));
+            child_opt = Some(match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    fail(
+                        "runner_start",
+                        format!("cannot start MiniMax-H3 runner: {error}"),
+                    );
+                    return;
+                }
+            });
+        }
         let mut last_progress: Option<(String, i64, i64, String)> = None;
         let status = loop {
             if let Ok(text) = std::fs::read_to_string(&log_path) {
@@ -1815,23 +1916,38 @@ pub(super) fn start_minimax_h3_request(
                     }
                 }
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
-                Err(error) => break Err(error),
+            if let Some(child) = child_opt.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status.success()),
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                    Err(error) => break Err(error),
+                }
+            } else {
+                // Warm worker: completion is marker-driven — the process
+                // outlives the job by design.
+                let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if text.contains("[serve] job FAILED") {
+                    break Ok(false);
+                }
+                if text.contains("[serve] job complete") {
+                    break Ok(true);
+                }
+                if !minimax_h3_warm_alive() {
+                    break Ok(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         };
         match status {
-            Ok(status)
-                if status.success()
-                    && thread_out_dir.join("latents.safetensors").is_file()
+            Ok(true)
+                if thread_out_dir.join("latents.safetensors").is_file()
                     && thread_out_dir.join("motion_context.safetensors").is_file() => {}
-            Ok(status) => {
+            Ok(_) => {
                 cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
                 fail(
                     "denoise",
                     format!(
-                        "MiniMax-H3 denoiser failed with {status}; inspect {}",
+                        "MiniMax-H3 denoiser failed; inspect {}",
                         log_path.to_string_lossy()
                     ),
                 );

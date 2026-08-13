@@ -3,7 +3,7 @@
 #   /home/alex/serenityflow-v2/.venv/bin/python serenitymojo/sampling/boogu_sched_oracle.py 8
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/sampling/boogu_sched_parity.mojo
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

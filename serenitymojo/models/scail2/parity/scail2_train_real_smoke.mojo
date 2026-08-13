@@ -32,10 +32,9 @@
 #     pixi run mojo run -I . serenitymojo/models/scail2/parity/scail2_train_real_smoke.mojo; \
 #     kill $POLL; echo "peak VRAM MiB:"; sort -n /tmp/vram.log | tail -1 )
 
-from std.builtin.type_aliases import MutExternalOrigin
 from std.collections import List, Optional
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import UnsafePointer, alloc
 from std.time import perf_counter

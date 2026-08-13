@@ -29,7 +29,7 @@
 #
 # DTYPE: BF16 storage boundary; F32/F64 only in host reductions. No persistent F32.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import isfinite
 
 from serenitymojo.tensor import Tensor

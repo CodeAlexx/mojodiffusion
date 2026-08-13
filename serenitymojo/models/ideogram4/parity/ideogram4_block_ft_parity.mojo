@@ -37,7 +37,7 @@
 #       -o /tmp/ideogram4_block_ft_parity
 #   /tmp/ideogram4_block_ft_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

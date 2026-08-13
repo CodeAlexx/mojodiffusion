@@ -29,7 +29,7 @@
 
 from std.collections import List
 from std.time import sleep
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

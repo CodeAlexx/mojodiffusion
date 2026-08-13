@@ -35,7 +35,7 @@
 # Mojo current-beta: `def` not `fn`; `comptime` not `alias`; move-only Tensor
 # (Movable result structs, `^`, ArcPointer for List storage).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.math import sqrt, cos as fcos, sin as fsin, pow as fpow, log as flog, pi

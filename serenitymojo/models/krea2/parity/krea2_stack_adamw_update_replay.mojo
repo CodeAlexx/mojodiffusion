@@ -7,7 +7,7 @@
 # product parity, full 28-block parity, txtfusion parity, or convergence evidence.
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

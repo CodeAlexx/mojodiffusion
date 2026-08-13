@@ -18,7 +18,7 @@
 # checked against the BFS reachable count at the end (the design doc's
 # "dep-count exactness" toy gate).
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.collections import Dict
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import mul_scalar as _ta_mul_scalar

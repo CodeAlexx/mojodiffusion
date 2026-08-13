@@ -1,6 +1,6 @@
 # ideogram4_real_lora_key_dump.mojo — print a small summary of a real ai-toolkit
 # Ideogram-4 LoRA safetensors file. This is an audit helper, not a gate.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.tensor import Tensor

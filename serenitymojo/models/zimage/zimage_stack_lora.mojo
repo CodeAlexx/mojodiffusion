@@ -64,7 +64,7 @@
 # Mojo 1.0.0b1: def not fn; Tensor move-only; host List[Float32] carriers.
 
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.math import sqrt
 from std.utils.index import IndexList
 from std.collections import List, Optional
@@ -181,12 +181,17 @@ comptime _ZIMG_BLOCK = 256
 
 def _zimage_fill_key_tail_mask_f32(
     mask: LayoutTensor[DType.float32, _ZIMG_DYN2, MutAnyOrigin],
-    seq_len: Int,
-    heads: Int,
-    valid0: Int,
-    valid1: Int,
-    rows: Int,
+    seq_len_w: Int32,
+    heads_w: Int32,
+    valid0_w: Int32,
+    valid1_w: Int32,
+    rows_w: Int32,
 ):
+    var seq_len = Int(seq_len_w)
+    var heads = Int(heads_w)
+    var valid0 = Int(valid0_w)
+    var valid1 = Int(valid1_w)
+    var rows = Int(rows_w)
     var idx = Int(global_idx.x)
     if idx < rows * seq_len:
         var row = idx // seq_len
@@ -220,11 +225,14 @@ def zimage_key_tail_mask_f32[
     var buf = ctx.enqueue_create_buffer[DType.uint8](rows * S * 4)
     var rl = RuntimeLayout[_ZIMG_DYN2].row_major(IndexList[2](rows, S))
     var lt = LayoutTensor[DType.float32, _ZIMG_DYN2, MutAnyOrigin](
-        buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (rows * S + _ZIMG_BLOCK - 1) // _ZIMG_BLOCK
-    ctx.enqueue_function[_zimage_fill_key_tail_mask_f32, _zimage_fill_key_tail_mask_f32](
-        lt, S, H, valid0, valid1, rows, grid_dim=grid, block_dim=_ZIMG_BLOCK,
+    ctx.enqueue_function[_zimage_fill_key_tail_mask_f32](
+        lt, Int32(S), Int32(H), Int32(valid0), Int32(valid1), Int32(rows), grid_dim=grid, block_dim=_ZIMG_BLOCK,
     )
     var shape = List[Int]()
     shape.append(B)
@@ -237,11 +245,15 @@ def zimage_key_tail_mask_f32[
 def _zimage_patch_rows_to_nchw_f32(
     patches: LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin],
-    channels: Int,
-    height: Int,
-    width: Int,
-    patch: Int,
+    channels_w: Int32,
+    height_w: Int32,
+    width_w: Int32,
+    patch_w: Int32,
 ):
+    var channels = Int(channels_w)
+    var height = Int(height_w)
+    var width = Int(width_w)
+    var patch = Int(patch_w)
     var idx = Int(global_idx.x)
     var total = channels * height * width
     if idx < total:
@@ -294,16 +306,20 @@ def zimage_unpatchify_image_rows_channel_minor(
     var src_rl = RuntimeLayout[_ZIMG_DYN1].row_major(IndexList[1](patches.numel()))
     var out_rl = RuntimeLayout[_ZIMG_DYN1].row_major(IndexList[1](total))
     var P = LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin](
-        patches.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(patches.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=src_rl,
     )
     var O = LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     var grid = (total + _ZIMG_BLOCK - 1) // _ZIMG_BLOCK
-    ctx.enqueue_function[
-        _zimage_patch_rows_to_nchw_f32, _zimage_patch_rows_to_nchw_f32
-    ](
-        P, O, channels, height, width, patch,
+    ctx.enqueue_function[_zimage_patch_rows_to_nchw_f32](
+        P, O, Int32(channels), Int32(height), Int32(width), Int32(patch),
         grid_dim=grid, block_dim=_ZIMG_BLOCK,
     )
     return Tensor(out_buf^, [1, channels, height, width], STDtype.F32)

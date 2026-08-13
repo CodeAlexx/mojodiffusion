@@ -62,7 +62,7 @@
 #     normalization (global mean/std normalize, then channel-wise normalize
 #     over dims (-2,-1)); rng-contract: mojo-native-not-pytorch-parity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log
 
 from serenitymojo.tensor import Tensor

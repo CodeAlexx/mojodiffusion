@@ -21,7 +21,7 @@
 #     serenitymojo/models/dit/parity/ltx25_block_load_probe.mojo \
 #     -o output/checks/ltx25_block_load
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.dit.ltx2_dit import LTX2AVBlockWeights, LTX2Config

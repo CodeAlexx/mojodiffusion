@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/scratch_ring_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 
 from serenitymojo.io.dtype import STDtype

@@ -10,7 +10,6 @@
 # as_bytes(), and String built from a StringSlice over an alloc'd buffer.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -23,7 +22,7 @@ def _substr(s: String, start: Int, end: Int) raises -> String:
         return String("")
     var sp = s.as_bytes()
     var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 def _hexv(c: Int) -> Int:
@@ -85,7 +84,7 @@ def percent_encode(s: String, safe: String = "") raises -> String:
             out[w + 1] = hx[(c >> 4) & 0xF]
             out[w + 2] = hx[c & 0xF]
             w += 3
-    var res = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(out)), length=w))
+    var res = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(out)), length=w)))
     out.free()
     return res
 
@@ -117,7 +116,7 @@ def _pct_decode(s: String, plus_as_space: Bool) raises -> String:
         out[w] = UInt8(c)
         w += 1
         i += 1
-    var res = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(out)), length=w))
+    var res = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(out)), length=w)))
     out.free()
     return res
 

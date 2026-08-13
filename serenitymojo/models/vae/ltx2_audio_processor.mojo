@@ -7,7 +7,7 @@
 #   the encoder uses center=True REFLECT padding, n_fft=win_length=1024,
 #   hop=160, power=1, and Slaney-normalized 64-bin mel filters at 16 kHz.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos, sin, pi, log, exp
 from std.memory import alloc
 

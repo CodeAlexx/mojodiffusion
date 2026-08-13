@@ -2,7 +2,7 @@
 # Instantiates sdxl_sdpa at cross-attn (Sq=64, Skv=77) and self-attn (Sq=Skv=64)
 # comptime shapes. Guarded so no GPU work runs (GPU wedged; compile-only).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.sdxl_attention import sdxl_sdpa

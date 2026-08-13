@@ -43,7 +43,7 @@
 # biased linear = linear(x, w, Optional[Tensor](b), ctx). Block runs BF16 weights
 # + BF16 saved activations (matches flame-core bf16 contract).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

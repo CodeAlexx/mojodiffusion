@@ -63,7 +63,7 @@
 # inference forward (model/KleinModel.klein_inference_forward) returns the packed
 # flow; this driver runs the Euler update on the F32 latent.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor

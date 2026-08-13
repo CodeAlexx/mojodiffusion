@@ -22,7 +22,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.cap_cache import load_tensor_bin
 from serenitymojo.sampling.klein_sample_resident import klein_decode_latent_to_png

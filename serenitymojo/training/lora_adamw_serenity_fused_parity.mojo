@@ -17,7 +17,7 @@
 #     && /tmp/adamw_par
 # READ the printed counts; "ALL BIT-EQUAL" + exit 0 = PASS.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import fma, sqrt
 
 from serenitymojo.models.klein.lora_adapter import _lora_adamw_precomputed

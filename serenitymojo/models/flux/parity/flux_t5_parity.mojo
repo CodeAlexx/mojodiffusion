@@ -18,7 +18,7 @@
 
 from std.math import sqrt
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY
 from std.memory import alloc
 from serenitymojo.io.dtype import STDtype

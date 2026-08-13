@@ -61,7 +61,7 @@
 
 from std.collections import List, Optional
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
@@ -503,7 +503,7 @@ struct AnimaBackend(GenBackend, Movable):
     # DENOISE tick.
     var has_latent: Bool
     var latent: List[Float32]
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var load_seconds: Float64
     var text_encode_seconds: Float64
     var prepare_seconds: Float64
@@ -532,7 +532,7 @@ struct AnimaBackend(GenBackend, Movable):
         self.ctx_uncond = List[Float32]()
         self.has_latent = False
         self.latent = List[Float32]()
-        self.job_t0_ns = UInt(0)
+        self.job_t0_ns = Int(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
         self.prepare_seconds = 0.0

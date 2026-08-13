@@ -21,7 +21,7 @@
 # klein uses the same value-tolerance for dQ-derived grads). k/v/o (dK/dV/dOut-
 # derived) and cross-attn (its own attention) all land ≥0.988.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

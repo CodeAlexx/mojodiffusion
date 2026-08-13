@@ -46,7 +46,7 @@
 # EXPECT: "ALL GATES PASS — chroma_flux_lycoris_orchestration_smoke".
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.flux.lora_block import DBL_STREAM_SLOTS, SGL_SLOTS
 from serenitymojo.models.flux.flux_lycoris_stack import (

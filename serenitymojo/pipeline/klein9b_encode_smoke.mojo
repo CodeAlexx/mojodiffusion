@@ -10,7 +10,7 @@
 # The prompts / template / tokenization MUST match the denoise smoke so the
 # cached embeddings are the exact numbers the pre-split in-process run produced.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer

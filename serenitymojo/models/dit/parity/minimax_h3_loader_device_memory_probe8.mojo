@@ -4,7 +4,7 @@
 # iteration" (genuine leak: the previous block's Dict is not actually being
 # dropped).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import sleep
 
 from serenitymojo.io.sharded import ShardedSafeTensors

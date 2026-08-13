@@ -1,7 +1,7 @@
 # NAVA UniPC scheduler trajectory parity: Mojo UniPcMultistepScheduler(shift=5)
 # driven 25 steps with the torch oracle's seeded eps sequence, gated EVERY step
 # (accumulation test) + final vs the torch latent trajectory.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness, ParityResult

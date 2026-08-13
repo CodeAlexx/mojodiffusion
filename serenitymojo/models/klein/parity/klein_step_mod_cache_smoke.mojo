@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/models/klein/parity/klein_step_mod_cache_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

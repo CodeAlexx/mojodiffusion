@@ -24,7 +24,7 @@
 #
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA. GPU-only compute.
 
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.tensor_view import TensorView
 from serenitymojo.io.ffi import BytePtr, sys_memcpy

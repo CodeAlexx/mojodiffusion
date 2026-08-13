@@ -26,7 +26,7 @@
 # target) so the gate is a pure numerical parity check of the sampler math, not a
 # model forward. Both Mojo and host-ref call the SAME mock.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, log, sqrt
 
 from serenitymojo.io.dtype import STDtype

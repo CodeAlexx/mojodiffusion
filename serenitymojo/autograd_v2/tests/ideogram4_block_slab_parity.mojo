@@ -1,7 +1,7 @@
 # Stage-2 gate: the slab-routed block (ideogram4_block_lora_forward_slab/
 # _backward_slab) must be BYTE-identical to the non-slab block. Verifies the 5 new
 # atomic slab ops + the ~150-site threading in one shot (contract C8). NONZERO LoRA B.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

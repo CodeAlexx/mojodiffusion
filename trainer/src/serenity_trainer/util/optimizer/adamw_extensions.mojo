@@ -28,7 +28,7 @@
 # 16-bit source preserves the stochastic-rounding guarantee.
 
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.builtin.dtype import DType
 from std.math import sqrt, floor, log, pow
 from layout import Layout, LayoutTensor
@@ -52,7 +52,10 @@ comptime _U24 = Float32(1.0) / Float32(16777216.0)  # 1/2^24 → uniform [0,1)
 def _bf16_lt(t: Tensor, n: Int) -> LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin]:
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     return LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        t.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(t.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
 
 
@@ -61,7 +64,7 @@ def _adamw_sr_kernel(
     m: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
     lr: Float32,
     beta1: Float32,
     beta2: Float32,
@@ -70,8 +73,10 @@ def _adamw_sr_kernel(
     bc1: Float32,
     bc2_sqrt: Float32,
     seed: UInt32,
-    stochastic: Int,
+    stochastic_w: Int32,
 ):
+    var n = Int(n_w)
+    var stochastic = Int(stochastic_w)
     var i = Int(global_idx.x)
     if i >= n:
         return
@@ -158,12 +163,12 @@ def adamw_step(
 
     var sr = 1 if stochastic_rounding else 0
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_adamw_sr_kernel, _adamw_sr_kernel](
+    ctx.enqueue_function[_adamw_sr_kernel](
         _bf16_lt(p, n),
         _bf16_lt(m, n),
         _bf16_lt(v, n),
         _bf16_lt(g, n),
-        n,
+        Int64(n),
         lr,
         beta1,
         beta2,
@@ -172,7 +177,7 @@ def adamw_step(
         bc1,
         bc2_sqrt,
         seed,
-        sr,
+        Int32(sr),
         grid_dim=grid,
         block_dim=_BLOCK,
     )

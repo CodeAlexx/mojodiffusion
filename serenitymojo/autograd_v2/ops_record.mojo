@@ -29,7 +29,7 @@
 # Leaf edges: pass the param tensor id (>0 tracked; the wrapper get-or-creates
 # the OPK_LEAF accumulator); id 0 = frozen -> null edge (contract C7).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.linear import linear, linear_slab

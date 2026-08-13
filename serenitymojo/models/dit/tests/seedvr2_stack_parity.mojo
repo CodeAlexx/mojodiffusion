@@ -17,9 +17,9 @@
 #      pixi run mojo run -I . \
 #        serenitymojo/models/dit/tests/seedvr2_stack_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
-from math import sqrt
+from std.math import sqrt
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

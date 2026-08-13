@@ -4,7 +4,7 @@
 # OFT are identity substitutions for the frozen projection weights, so the block
 # should match the base WanAttentionBlock without dense full-delta carriers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc
 

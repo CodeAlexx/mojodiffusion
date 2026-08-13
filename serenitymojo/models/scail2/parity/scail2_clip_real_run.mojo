@@ -5,7 +5,7 @@
 # Input key: clip_pixel [1,3,224,224] F32, already creator-preprocessed.
 # Output key: clip_context [1,257,1280] F16.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys import argv
 

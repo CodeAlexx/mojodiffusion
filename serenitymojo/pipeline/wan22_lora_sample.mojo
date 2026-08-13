@@ -27,7 +27,7 @@
 # Mojo 1.0.0b1, NVIDIA.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys import argv
 from std.sys.defines import get_defined_int

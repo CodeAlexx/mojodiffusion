@@ -14,7 +14,7 @@
 #
 #   pixi run mojo run -I . serenitymojo/models/chroma/parity/chroma_padmask_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, sin, cos as fcos
 
 from serenitymojo.tensor import Tensor

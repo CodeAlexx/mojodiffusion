@@ -56,7 +56,7 @@
 # fused GPU kernel impractical, exactly as in adafactor.mojo. Stochastic rounding
 # mirrors add_stochastic_ (CAME.py:176,185 → bf16_stochastic_rounding.py:45-57).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.builtin.dtype import DType
 from std.math import sqrt, floor, log, pow
 from serenitymojo.tensor import Tensor

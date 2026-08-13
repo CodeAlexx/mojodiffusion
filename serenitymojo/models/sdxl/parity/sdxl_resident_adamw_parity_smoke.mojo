@@ -39,7 +39,7 @@
 #     output/bin/sdxl_resident_adamw_parity_smoke
 
 from std.sys import has_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 
 from serenitymojo.training.train_step import LoraAdapter

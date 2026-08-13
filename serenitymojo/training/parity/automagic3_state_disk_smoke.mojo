@@ -10,7 +10,7 @@
 #
 # Build+run: standard -O2 + cshim link line; needs GPU.
 
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.builtin.dtype import DType
 from std.collections import List
 from serenitymojo.io.ffi import sys_remove

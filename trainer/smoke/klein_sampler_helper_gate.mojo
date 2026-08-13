@@ -8,7 +8,7 @@
 # This gate intentionally covers only the Mojo helpers currently implemented in
 # modelSampler/Flux2Sampler.mojo. It is not an end-to-end sampler parity test.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

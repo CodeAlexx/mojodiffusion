@@ -27,8 +27,8 @@
 from std.ffi import external_call
 from std.time import perf_counter_ns
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
@@ -72,9 +72,9 @@ def _cu_memcpy_dtoh_async(
     )
 
 
-def _cu_memcpy_htod_async(
+def _cu_memcpy_htod_async[o: Origin, //](
     dst_device_ptr: UInt64,
-    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    src_host_ptr: UnsafePointer[UInt8, o],
     nbytes: Int,
     stream: CUstream,
 ) -> Int32:

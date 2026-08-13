@@ -27,7 +27,7 @@
 #   serenitymojo/models/vae/parity/ideogram4_vae_encode_probe.mojo). This file is
 #   the serenity-side seam the dataLoader's "EncodeIdeogram4VAE" step calls.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.vae.ldm_encoder import (

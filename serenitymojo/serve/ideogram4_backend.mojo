@@ -19,7 +19,7 @@
 # cond/uncond transformers for denoise, then frees them before VAE decode. The
 # DiT weights are resident across denoise steps, not across jobs.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
 
@@ -423,7 +423,7 @@ struct Ideogram4Backend(GenBackend, Movable):
     var executed_sampler: String
     var executed_scheduler: String
     var lora_target_count: Int
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var load_seconds: Float64
     var text_encode_seconds: Float64
     var prepare_seconds: Float64
@@ -629,7 +629,7 @@ struct Ideogram4Backend(GenBackend, Movable):
         var inp = _build_fixed_inputs[GH_, GW_](self.ctx)
         # mrope_section is the per-axis HEAD_DIM band split (24+20+20 over the
         # head_dim halving), independent of resolution — unchanged for all buckets.
-        var sec = [24, 20, 20]
+        var sec: List[Int] = [24, 20, 20]
         var cs = build_ideogram4_mrope(
             inp[0][], HEAD_DIM, sec, Float32(5000000.0), self.ctx, STDtype.BF16
         )

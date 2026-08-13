@@ -10,7 +10,7 @@
 #   /home/alex/serenityflow-v2/.venv/bin/python serenitymojo/training/parity/opt_adafactor_oracle.py
 #   pixi run mojo run -I . serenitymojo/training/parity/opt_adafactor_parity.mojo
 
-from sys import argv
+from std.sys import argv
 from serenitymojo.parity import ParityHarness
 from serenitymojo.training.opt_adafactor import (
     adafactor_step_factored, adafactor_step_factored_nd,

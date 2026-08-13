@@ -32,7 +32,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.autograd_v2.node import TArc

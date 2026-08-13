@@ -14,7 +14,7 @@
 #     serenitymojo/pipeline/anima_pipeline_1024_multistep.mojo \
 #     -o /tmp/anima_1024 && /tmp/anima_1024
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 from std.math import sqrt as fsqrt
 

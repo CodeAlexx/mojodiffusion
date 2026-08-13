@@ -5,7 +5,7 @@
 # runtime model rebind, or SerenityTrainer parity.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.chroma.full_finetune_inventory import (
     chroma_full_finetune_checkpoint_key_manifest,

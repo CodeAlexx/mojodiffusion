@@ -19,7 +19,7 @@
 #       serenitymojo/offload/ltx2_int4_stream_smoke.mojo -o /tmp/ltx2_int4_stream_smoke
 #   /tmp/ltx2_int4_stream_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.offload.ltx2_int4_block_stream import LTX2Int4BlockStream
 from serenitymojo.models.dit.ltx2_dit import LTX2Config, LTX2BlockWeights
 

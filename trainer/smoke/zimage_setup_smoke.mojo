@@ -1,5 +1,5 @@
 # Z-Image setup compile+run: predict path (synthetic weights) via ZImageLoRASetup.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenity_trainer.modelSetup.ZImageLoRASetup import zimage_lora_predict_smoke
 from serenity_trainer.modelSetup.BaseZImageSetup import sigma_from_timestep, model_t_from_timestep
 

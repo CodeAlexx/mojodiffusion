@@ -6,10 +6,10 @@
 # and approach cuDNN's 159.7us at [B,S,H,Dh]=[1,1024,16,128]?
 # Zero inputs: perf is value-independent (exp/fma still run every step).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import exp
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 
 
 def flash_kernel[Dh: Int](
@@ -17,11 +17,14 @@ def flash_kernel[Dh: Int](
     kp: UnsafePointer[BFloat16, MutAnyOrigin],
     vp: UnsafePointer[BFloat16, MutAnyOrigin],
     op: UnsafePointer[BFloat16, MutAnyOrigin],
-    B: Int,
-    S: Int,
-    H: Int,
+    B_w: Int32,
+    S_w: Int32,
+    H_w: Int32,
     scale: Float32,
 ):
+    var B = Int(B_w)
+    var S = Int(S_w)
+    var H = Int(H_w)
     var tid = Int(global_idx.x)
     if tid >= B * S * H:
         return
@@ -67,23 +70,23 @@ def bench[B: Int, S: Int, H: Int, Dh: Int](ctx: DeviceContext) raises:
     var vp = vb.unsafe_ptr().bitcast[BFloat16]()
     var op = ob.unsafe_ptr().bitcast[BFloat16]()
 
-    var scale = Float32(1.0) / (Float32(Dh) ** 0.5)
+    var scale = Float32(1.0) / (Float32(Dh) ** Float32(0.5))
     var threads = B * S * H
     var block = 128
     var grid = (threads + block - 1) // block
 
     comptime kern = flash_kernel[Dh]
     for _ in range(10):
-        ctx.enqueue_function[kern, kern](
-            qp, kp, vp, op, B, S, H, scale, grid_dim=grid, block_dim=block
+        ctx.enqueue_function[kern](
+            qp, kp, vp, op, Int32(B), Int32(S), Int32(H), scale, grid_dim=grid, block_dim=block
         )
     ctx.synchronize()
 
     var iters = 100
     var t0 = perf_counter_ns()
     for _ in range(iters):
-        ctx.enqueue_function[kern, kern](
-            qp, kp, vp, op, B, S, H, scale, grid_dim=grid, block_dim=block
+        ctx.enqueue_function[kern](
+            qp, kp, vp, op, Int32(B), Int32(S), Int32(H), scale, grid_dim=grid, block_dim=block
         )
     ctx.synchronize()
     var t1 = perf_counter_ns()

@@ -49,7 +49,7 @@
 
 from std.collections import List
 from std.math import exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

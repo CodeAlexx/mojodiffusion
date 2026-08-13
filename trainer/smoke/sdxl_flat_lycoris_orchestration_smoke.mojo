@@ -41,7 +41,7 @@
 # EXPECT: "ALL GATES PASS — sdxl_flat_lycoris_orchestration_smoke".
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.sdxl.real_weights import (
     sdxl_st_C, sdxl_st_Cff, sdxl_st_depth, sdxl_st_prefixes,

@@ -32,7 +32,7 @@
 # materialize on host (F32 registers) then re-upload BF16 — no persistent F32.
 
 from std.math import exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 

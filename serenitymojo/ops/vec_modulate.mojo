@@ -19,7 +19,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -44,9 +44,11 @@ def _vec_modulate_kernel(
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     sh: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    cols: Int,
-    nchunks: Int,
+    cols_w: Int32,
+    nchunks_w: Int32,
 ):
+    var cols = Int(cols_w)
+    var nchunks = Int(nchunks_w)
     var chunk = Int(global_idx.x)
     if chunk >= nchunks:
         return
@@ -88,21 +90,33 @@ def vec_modulate(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        shift.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(shift.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
     )
     var nchunks = n // _VW
     var grid = (nchunks + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_vec_modulate_kernel, _vec_modulate_kernel](
-        X, S, SH, O, d, nchunks, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_vec_modulate_kernel](
+        X, S, SH, O, Int32(d), Int32(nchunks), grid_dim=grid, block_dim=_BLOCK
     )
     return Tensor(out_buf^, xshape.copy(), STDtype.F32)
 
@@ -139,20 +153,32 @@ def vec_modulate_slab(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        shift.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(shift.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
     )
     var nchunks = n // _VW
     var grid = (nchunks + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_vec_modulate_kernel, _vec_modulate_kernel](
-        X, S, SH, O, d, nchunks, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_vec_modulate_kernel](
+        X, S, SH, O, Int32(d), Int32(nchunks), grid_dim=grid, block_dim=_BLOCK
     )
     return Tensor(out_buf^, xshape.copy(), STDtype.F32)

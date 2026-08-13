@@ -58,7 +58,7 @@
 # F32 accumulation in ops.
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -105,8 +105,10 @@ def _bcast_add_c_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    rows: Int, c: Int,
+    rows_w: Int32, c_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var c = Int(c_w)
     var idx = Int(global_idx.x)
     var total = rows * c
     if idx < total:
@@ -120,8 +122,10 @@ def _bcast_add_c_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int, c: Int,
+    rows_w: Int32, c_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var c = Int(c_w)
     var idx = Int(global_idx.x)
     var total = rows * c
     if idx < total:
@@ -141,29 +145,47 @@ def _bcast_add_channel(x: Tensor, b: Tensor, rows: Int, c: Int, ctx: DeviceConte
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            b.buf.unsafe_ptr().bitcast[Float32](), brl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=brl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_bcast_add_c_kernel_f32, _bcast_add_c_kernel_f32](
-            X, B, O, rows, c, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_bcast_add_c_kernel_f32](
+            X, B, O, Int32(rows), Int32(c), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            b.buf.unsafe_ptr().bitcast[BFloat16](), brl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=brl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_bcast_add_c_kernel_bf16, _bcast_add_c_kernel_bf16](
-            X, B, O, rows, c, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_bcast_add_c_kernel_bf16](
+            X, B, O, Int32(rows), Int32(c), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("_bcast_add_channel: only F32/BF16")
@@ -298,7 +320,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
                 weights[idx] = ArcPointer[Tensor](rscf^)
         return SDXLUNet[Self.LH, Self.LW](weights^, name_to_idx^)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing UNet weight: ") + name)
         var idx = self.name_to_idx[name]
@@ -636,8 +658,9 @@ from std.gpu import global_idx as _gidx
 def _cast_kernel_f32_to_bf16(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(_gidx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](x[i])
@@ -653,14 +676,20 @@ def _cast_to(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 2)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_cast_kernel_f32_to_bf16, _cast_kernel_f32_to_bf16](
-        X, O, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_cast_kernel_f32_to_bf16](
+        X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, x.shape(), dtype)

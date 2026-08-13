@@ -26,7 +26,7 @@ from http.router import Router
 from http.staticfiles import open_ro, file_size_fd, read_fd, close_fd
 from examples.app import build_router, dispatch, before_request, after_response, maybe_compress, keep_alive_wanted
 from std.memory import alloc
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 
 
 fn _hex(n: Int) -> String:
@@ -187,9 +187,9 @@ def pump_stream(
             return 1
         var piece: String
         if mode == 2:
-            piece = _hex(n) + "\r\n" + String(StringSlice(ptr=fp, length=n)) + "\r\n"
+            piece = _hex(n) + "\r\n" + String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=fp, length=n))) + "\r\n"
         else:
-            piece = String(StringSlice(ptr=fp, length=n))
+            piece = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=fp, length=n)))
             streamrem[fd] = streamrem[fd] - n
         fbuf.free()
         if fd in wbuf:
@@ -335,7 +335,7 @@ def handle_readable(
     while True:
         var k = sys_recv(Int32(fd), tp, READ_CHUNK, Int32(0))
         if k > 0:
-            acc += String(StringSlice(ptr=tmp, length=k))
+            acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=tmp, length=k)))
         elif k == 0:
             closed = True
             break

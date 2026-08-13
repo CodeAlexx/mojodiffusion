@@ -145,7 +145,7 @@
 
 from std.collections import Dict, List
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import min, sqrt
 from std.memory import ArcPointer
 from std.utils.index import IndexList
@@ -478,11 +478,14 @@ def _minimax_h3_scatter_disjoint_u64x4(
     dst: LayoutTensor[
         DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
     ],
-    rows: Int,
-    words_per_row: Int,
-    chunks_per_row: Int,
+    rows_w: Int32,
+    words_per_row_w: Int32,
+    chunks_per_row_w: Int32,
 ):
     """Copy four u64 words from source row r to disjoint destination row idx[r]."""
+    var rows = Int(rows_w)
+    var words_per_row = Int(words_per_row_w)
+    var chunks_per_row = Int(chunks_per_row_w)
     var thread = Int(global_idx.x)
     if thread >= rows * chunks_per_row:
         return
@@ -577,23 +580,35 @@ def minimax_h3_scatter_streams(
     )
     var source = LayoutTensor[
         DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
-    ](streams.buf.unsafe_ptr().bitcast[UInt64](), source_layout)
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(streams.buf.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=source_layout,
+    )
     var indices = LayoutTensor[
         DType.int32, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
-    ](index_device.unsafe_ptr(), index_layout)
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(index_device.unsafe_ptr())
+        ),
+        runtime_layout=index_layout,
+    )
     var output = LayoutTensor[
         DType.uint64, _MINIMAX_H3_SCATTER_DYN1, MutAnyOrigin
-    ](output_buffer.unsafe_ptr().bitcast[UInt64](), source_layout)
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(output_buffer.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=source_layout,
+    )
     var threads = sequence_length * chunks_per_row
     var grid = (
         threads + _MINIMAX_H3_SCATTER_BLOCK - 1
     ) // _MINIMAX_H3_SCATTER_BLOCK
-    ctx.enqueue_function[
-        _minimax_h3_scatter_disjoint_u64x4,
-        _minimax_h3_scatter_disjoint_u64x4,
-    ](
-        source, indices, output, sequence_length, words_per_row,
-        chunks_per_row, grid_dim=grid, block_dim=_MINIMAX_H3_SCATTER_BLOCK,
+    ctx.enqueue_function[_minimax_h3_scatter_disjoint_u64x4](
+        source, indices, output, Int32(sequence_length), Int32(words_per_row),
+        Int32(chunks_per_row), grid_dim=grid, block_dim=_MINIMAX_H3_SCATTER_BLOCK,
     )
     return Tensor(
         output_buffer^, [sequence_length, hidden_size], STDtype.BF16

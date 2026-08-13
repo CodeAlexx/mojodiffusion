@@ -22,9 +22,9 @@
 #   9B: num_double=8, num_single=24 -> 8*12 + 24*2 = 144 LoRA adapters
 #       (1:1 with Serenity SEPARATE nn.Linear wrapping, Flux2LoRASetup.py:57).
 
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
-from os import getenv
+from std.os import getenv
 from std.memory import ArcPointer
 from std.math import sqrt
 from serenitymojo.tensor import Tensor

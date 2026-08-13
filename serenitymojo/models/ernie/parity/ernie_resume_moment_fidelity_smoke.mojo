@@ -31,7 +31,7 @@
 #     -o /tmp/gate_ernie
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.training.lora_save import lora_train_state_has_moments
 from serenitymojo.models.ernie.ernie_stack_lora import (

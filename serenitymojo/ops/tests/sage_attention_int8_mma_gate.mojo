@@ -2,7 +2,7 @@
 #
 # Host-exact gate for the local m16n8k32.s8 tensor-core primitive.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.sage_attention_int8 import sage_int8_mma_tile

@@ -4,7 +4,7 @@
 # and exits before prefix forward / denoise. This is a cheap GPU-memory sanity
 # check after trimming unused lm_head + understanding-side vision weights.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.dit.sensenova_u1 import SenseNovaU1
 

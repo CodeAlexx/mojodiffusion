@@ -5,7 +5,7 @@
 # harness OOMs post-latent-save — the very pressure that motivated worker tiling).
 #
 # argv: 1 latent safetensors ("tensor" F32 [1,4096,128]) · 2 out prefix
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

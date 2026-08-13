@@ -5,7 +5,7 @@
 # to `expected`. Gate cos >= 0.999 at a SMALL grid (L=128, Dh=128) to dodge the
 # math-mode SDPA Dh=128 OOM at full sequence length.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

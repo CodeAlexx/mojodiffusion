@@ -3,7 +3,7 @@
 # SD 1.5 uses the same scaled-linear beta schedule and eps-prediction Euler
 # update as the SDXL Rust path, with 512x512 defaults and 30 inference steps.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.sampling.sdxl_euler import (

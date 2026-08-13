@@ -11,7 +11,7 @@
 #   -Xlinker -lcuda serenitymojo/models/ltx2/parity/ltx2_av_stack_smoke.mojo \
 #   -o /tmp/ltx2_av_stack_smoke && /tmp/ltx2_av_stack_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer
 

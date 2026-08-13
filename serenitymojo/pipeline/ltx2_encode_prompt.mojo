@@ -12,9 +12,10 @@
 #   right-sided after encoding; zero features become projection-bias rows.
 
 from std.sys import argv
-from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from std.gpu import block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.math import sqrt
 from std.memory import ArcPointer, stack_allocation
 from std.utils.index import IndexList
@@ -52,8 +53,9 @@ def _alias(x: Tensor) -> Tensor:
 def _pack_state_kernel(
     src: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    layer_idx: Int,
+    layer_idx_w: Int32,
 ):
+    var layer_idx = Int(layer_idx_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -97,17 +99,23 @@ def _pack_features(
     var out_shape: List[Int] = [1, bucket, _FEATURES]
     var dst_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](bucket, _FEATURES))
     var DST = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), dst_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=dst_rl,
     )
     var src_rl = RuntimeLayout[_DYN2].row_major(
         IndexList[2](bucket, GEMMA_HIDDEN)
     )
     for li in range(_N_STATES):
         var SRC = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            states[li][].buf.unsafe_ptr().bitcast[BFloat16](), src_rl
-        )
-        ctx.enqueue_function[_pack_state_kernel, _pack_state_kernel](
-            SRC, DST, li, grid_dim=real_len, block_dim=_TPB
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(states[li][].buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+        ctx.enqueue_function[_pack_state_kernel](
+            SRC, DST, Int32(li), grid_dim=real_len, block_dim=_TPB
         )
     ctx.synchronize()
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
@@ -116,10 +124,13 @@ def _pack_features(
 def _fill_bias_rows_kernel(
     dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    first_row: Int,
-    rows: Int,
-    cols: Int,
+    first_row_w: Int32,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
+    var first_row = Int(first_row_w)
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var idx = Int(block_idx.x) * _TPB + Int(thread_idx.x)
     var n = (rows - first_row) * cols
     if idx < n:
@@ -150,14 +161,20 @@ def _pad_projection_with_bias(
     )
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_dim))
     var DST = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), dst_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=dst_rl,
     )
     var BIAS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        bias.buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bias_rl,
     )
     var n = (GEMMA_MAX_TOKENS - bucket) * out_dim
-    ctx.enqueue_function[_fill_bias_rows_kernel, _fill_bias_rows_kernel](
-        DST, BIAS, bucket, GEMMA_MAX_TOKENS, out_dim,
+    ctx.enqueue_function[_fill_bias_rows_kernel](
+        DST, BIAS, Int32(bucket), Int32(GEMMA_MAX_TOKENS), Int32(out_dim),
         grid_dim=(n + _TPB - 1) // _TPB, block_dim=_TPB,
     )
     var shape: List[Int] = [1, GEMMA_MAX_TOKENS, out_dim]

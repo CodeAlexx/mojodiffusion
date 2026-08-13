@@ -4,7 +4,7 @@
 # worth of Chroma block LoRA adapters, save through save_chroma_lora, inspect
 # raw SerenityTrainer alpha/down/up keys, then reload with load_chroma_lora_resume.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

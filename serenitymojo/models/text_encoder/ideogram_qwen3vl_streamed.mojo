@@ -26,7 +26,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -177,7 +177,7 @@ def encode_ideogram_taps_streamed(
     for p in range(n):
         if len(taps[p]) != 13:
             raise Error("encode_ideogram_taps_streamed: tap count != 13")
-        var s4 = [1, seq, _HIDDEN, 1]
+        var s4: List[Int] = [1, seq, _HIDDEN, 1]
         var cat = reshape(taps[p][0][], s4.copy(), ctx)
         for t in range(1, 13):
             var r = reshape(taps[p][t][], s4.copy(), ctx)

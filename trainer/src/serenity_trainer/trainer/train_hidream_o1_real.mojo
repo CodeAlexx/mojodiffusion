@@ -95,7 +95,7 @@
 #     lr is written back into cfg.lr so argv precedence holds there too).
 # Template: serenitymojo/configs/hidream_o1.json (all levers default-off).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, exp, log as flog, cos as fcos, sin as fsin, pi, isfinite
 from std.memory import ArcPointer
 from std.collections import Optional

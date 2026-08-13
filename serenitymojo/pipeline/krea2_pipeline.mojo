@@ -64,7 +64,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Inference-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.collections import Optional
 from std.sys import argv

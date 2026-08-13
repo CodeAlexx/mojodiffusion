@@ -13,9 +13,8 @@
 #   cd /home/alex/mojodiffusion && \
 #     pixi run mojo run -I . serenitymojo/models/nldiffusion/parity/tiled_decode_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
 
 from serenitymojo.tensor import Tensor

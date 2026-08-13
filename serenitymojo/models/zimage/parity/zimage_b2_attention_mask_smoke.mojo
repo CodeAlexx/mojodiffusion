@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/models/zimage/parity/zimage_b2_attention_mask_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.zimage.zimage_stack_lora import zimage_key_tail_mask_f32
 

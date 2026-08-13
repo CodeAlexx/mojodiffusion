@@ -5,7 +5,7 @@
 # is intentionally tiny: 9 decoded frames at 16x16. It proves native Mojo T2V
 # wiring without requiring production-size block-sparse attention.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.components.artifacts import (
     mux_frame_sequence_mp4,

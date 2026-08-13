@@ -15,7 +15,7 @@
 # the audit needs when no cache is present. Loss-decreasing on ONE sample is the
 # weakest real-learning claim; it cannot prove generalization, only that the
 # backward + optimizer reduce the flow-match MSE on data it sees.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

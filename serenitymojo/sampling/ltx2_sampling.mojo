@@ -43,7 +43,7 @@ from serenitymojo.ops import (
     torch_bf16_eager_blend_with_f32_mask,
 )
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar, div_scalar
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, log, sqrt
 
 

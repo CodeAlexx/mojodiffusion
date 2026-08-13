@@ -9,7 +9,7 @@
 # synthetic set: 1 double block * 12 Linears + 1 single block * 2 Linears, each
 # with lora_down/lora_up/alpha.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 

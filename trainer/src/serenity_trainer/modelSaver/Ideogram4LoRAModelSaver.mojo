@@ -9,7 +9,7 @@ from serenity_trainer.modelSetup.ideogram4LoraTargets import (
     ideogram4_convert_lora_key_before_save,
     ideogram4_full_lora_save_prefixes,
 )
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenity_trainer.module.LoRAModule import LoraAdapter
 from serenity_trainer.model.Ideogram4LoRABlock import Ideogram4LoraSet
 from serenity_trainer.modelSaver.GenericLoRAModelSaver import save_lora, save_lora_one

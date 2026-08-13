@@ -7,7 +7,7 @@
 # (i+1)%2) use a NON-trivial |i-j|<=128 bidirectional mask, so this gate
 # exercises the sliding-mask fix (sdpa_tiled w/ full mask). Gate cos >= 0.99.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -25,7 +25,7 @@
 #   cd /home/alex/mojodiffusion && \
 #     pixi run mojo run -I . serenitymojo/models/nldiffusion/parity/generate_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
 

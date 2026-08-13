@@ -20,7 +20,7 @@
 #       serenitymojo/models/anima/parity/anima_text_context_parity.mojo -o /tmp/anima_txt_ctx
 #   /tmp/anima_txt_ctx
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Dict
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness, ParityResult

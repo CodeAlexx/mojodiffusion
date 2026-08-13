@@ -49,7 +49,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -285,7 +285,7 @@ def _self_attention[S: Int, H: Int, DH: Int, HEAD_AXIS: Bool](
     ctx: DeviceContext,
 ) raises -> Tensor:
     var dim = H * DH
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
     var q = _lin(x, w, prefix + "to_query.weight", prefix + "to_query.bias", ctx)
     var k = _lin(x, w, prefix + "to_key.weight", prefix + "to_key.bias", ctx)
     var v = _lin(x, w, prefix + "to_value.weight", prefix + "to_value.bias", ctx)
@@ -346,7 +346,7 @@ def _cross_attention[S: Int, TXT: Int, H: Int, DH: Int](
     ctx: DeviceContext,
 ) raises -> Tensor:
     var dim = H * DH
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
     var q = _lin(x, w, prefix + "to_query.weight", prefix + "to_query.bias", ctx)
     var k = _lin(cond, w, prefix + "to_key.weight", prefix + "to_key.bias", ctx)
     var v = _lin(cond, w, prefix + "to_value.weight", prefix + "to_value.bias", ctx)
@@ -528,7 +528,7 @@ struct Kandinsky5DiT(Movable):
             w[key] = ArcPointer(Tensor.from_view(tv, ctx))
         return Kandinsky5DiT(weights=w^, config=cfg)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         return self.weights[name][]
 
     # Block weight sub-dict with the "<kind>_transformer_blocks.i." prefix stripped.

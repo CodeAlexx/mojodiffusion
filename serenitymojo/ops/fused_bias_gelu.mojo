@@ -17,7 +17,7 @@
 # Convention: kernel-triple (f32 / bf16 / f16) + dtype dispatcher (ops/activations.mojo).
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -36,9 +36,11 @@ def _bias_gelu_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
-    h: Int,
+    n_w: Int64,
+    h_w: Int32,
 ):
+    var n = Int(n_w)
+    var h = Int(h_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](x[i])
@@ -50,9 +52,11 @@ def _bias_gelu_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
-    h: Int,
+    n_w: Int64,
+    h_w: Int32,
 ):
+    var n = Int(n_w)
+    var h = Int(h_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
@@ -64,9 +68,11 @@ def _bias_gelu_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    n: Int,
-    h: Int,
+    n_w: Int64,
+    h_w: Int32,
 ):
+    var n = Int(n_w)
+    var h = Int(h_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
@@ -100,42 +106,69 @@ def bias_gelu(x: Tensor, bias: Tensor, ctx: DeviceContext) raises -> Tensor:
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            bias.buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[_bias_gelu_kernel_f32, _bias_gelu_kernel_f32](
-            X, B, O, n, h, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_bias_gelu_kernel_f32](
+            X, B, O, Int64(n), Int32(h), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            bias.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[_bias_gelu_kernel_bf16, _bias_gelu_kernel_bf16](
-            X, B, O, n, h, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_bias_gelu_kernel_bf16](
+            X, B, O, Int64(n), Int32(h), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            bias.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[_bias_gelu_kernel_f16, _bias_gelu_kernel_f16](
-            X, B, O, n, h, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_bias_gelu_kernel_f16](
+            X, B, O, Int64(n), Int32(h), grid_dim=grid, block_dim=_BLOCK
         )
     # single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())

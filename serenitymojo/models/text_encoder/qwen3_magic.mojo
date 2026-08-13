@@ -3,7 +3,7 @@
 # Reuses Qwen3Encoder's forward + the checkpoint's lm_head via lm_logits_last.
 # No KV-cache yet: re-forwards the (padded) context each token, so it's correct
 # but O(steps*seq) — fine for a one-shot caption, KV-cache is the speed follow-up.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder
 from serenitymojo.llm.decoder import KVCache, decode_step

@@ -15,7 +15,7 @@
 #     serenitymojo/autograd_v2/tests/krea2_flash_sdpa_peak.mojo -o /tmp/krea2_flash_sdpa_peak
 # Run with an external nvidia-smi sampler (the orchestrator/this harness loops).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.math import sqrt
 from serenitymojo.tensor import Tensor

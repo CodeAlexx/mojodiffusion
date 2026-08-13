@@ -29,7 +29,7 @@
 #   hidden / heads / head_dim are FULL ERNIE production values (4096 / 32 / 128)
 # so attention/FFN matmuls hit the real 4096x4096 / 4096x12288 weight matrices.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

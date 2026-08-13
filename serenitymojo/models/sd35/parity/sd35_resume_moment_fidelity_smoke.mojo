@@ -33,7 +33,7 @@
 #     -o /tmp/gate_sd35
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.training.lora_save import (
     NamedLora,

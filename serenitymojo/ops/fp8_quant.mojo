@@ -19,7 +19,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx, grid_dim, block_dim
 from std.math import ldexp, floor
 from std.utils.index import IndexList
@@ -100,9 +100,11 @@ def _fp8_e4m3_encode(v: Float32) -> UInt32:
 def _rowscale_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [rows*cols]
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
-    cols: Int,
-    rows: Int,
+    cols_w: Int32,
+    rows_w: Int32,
 ):
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var r = idx
@@ -126,9 +128,11 @@ def _encode_perrow_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [n]
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
     o: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],      # [n]
-    cols: Int,
-    n: Int,
+    cols_w: Int32,
+    n_w: Int64,
 ):
+    var cols = Int(cols_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var i = idx
@@ -164,16 +168,22 @@ def fp8_e4m3_rowscale(w: Tensor, ctx: DeviceContext) raises -> Tensor:
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cols))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var grid = (rows + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_rowscale_kernel, _rowscale_kernel](
-        X, S, cols, rows, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_rowscale_kernel](
+        X, S, Int32(cols), Int32(rows), grid_dim=grid, block_dim=_BLOCK,
     )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     var s_shape: List[Int] = [rows]
@@ -222,19 +232,28 @@ def fp8_e4m3_encode_perrow(
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr(), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_encode_perrow_kernel, _encode_perrow_kernel](
-        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_encode_perrow_kernel](
+        X, S, O, Int32(cols), Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, w.shape(), STDtype.F8_E4M3)

@@ -63,7 +63,7 @@ from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
 from serenitymojo.ops.shape_backward import cat_backward
 from serenitymojo.ops.tensor_algebra import concat, slice, reshape, add, mul_scalar, zeros_device
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenity_trainer.module.LensLoRAModule import (
     LoraAdapter, LoraGrads, make_lora_adapter, _lora_adamw,
@@ -160,7 +160,7 @@ def build_lens_lora_set(rank: Int, alpha: Float32, seed: UInt64, ctx: DeviceCont
     return LensLoraSet(block^, rank)
 
 
-fn _bidx(b: Int, slot: Int) -> Int:
+def _bidx(b: Int, slot: Int) -> Int:
     return b * LORA_SLOTS_PER_BLOCK + slot
 
 

@@ -29,9 +29,10 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
-from std.gpu import global_idx, grid_dim, block_dim, block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu import global_idx, grid_dim, block_dim, block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation, ArcPointer
 from std.math import sqrt, min, max, floor, log
 
@@ -56,8 +57,10 @@ def _af_row_kernel(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows*cols]
     row_var: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [rows]
     row_psq: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [rows] scratch
-    cols: Int, rows: Int, w_lerp: Float32,
+    cols_w: Int32, rows_w: Int32, w_lerp: Float32,
 ):
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var r = Int(block_idx.x)
     if r >= rows:
         return
@@ -99,8 +102,10 @@ def _af_row_kernel(
 def _af_col_kernel(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows*cols]
     col_var: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [cols]
-    cols: Int, rows: Int, w_lerp: Float32,
+    cols_w: Int32, rows_w: Int32, w_lerp: Float32,
 ):
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var c = Int(block_idx.x)
     if c >= cols:
         return
@@ -132,8 +137,10 @@ def _af_col_kernel(
 def _af_reduce_kernel(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [n]
     scal: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [8]
-    n: Int, out_idx: Int,
+    n_w: Int64, out_idx_w: Int32,
 ):
+    var n = Int(n_w)
+    var out_idx = Int(out_idx_w)
     var tid = Int(thread_idx.x)
     var sh = stack_allocation[
         _BLOCK, Scalar[DType.float32], address_space=AddressSpace.SHARED
@@ -162,8 +169,11 @@ def _af_updsq_kernel(
     col_var: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     scal: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [8]: [1]=row_var_sum
     parts: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [_PARTS]
-    cols: Int, n: Int, rows: Int, eps1: Float32,
+    cols_w: Int32, n_w: Int64, rows_w: Int32, eps1: Float32,
 ):
+    var cols = Int(cols_w)
+    var n = Int(n_w)
+    var rows = Int(rows_w)
     var bid = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var sh = stack_allocation[
@@ -201,8 +211,9 @@ def _af_updsq_kernel(
 # ── K5: 1-thread scalar combine → scal[3] = -alpha/denom ─────────────────────
 def _af_scalars_kernel(
     scal: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [8]
-    n: Int, rho_t: Float32, eps2: Float32, d: Float32,
+    n_w: Int64, rho_t: Float32, eps2: Float32, d: Float32,
 ):
+    var n = Int(n_w)
     if Int(global_idx.x) == 0:
         var p_rms = sqrt(Float32(rebind[Scalar[DType.float32]](scal[0])) / Float32(n))
         var alpha = p_rms
@@ -225,9 +236,12 @@ def _af_apply_kernel(
     row_var: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     col_var: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     scal: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [3]=scale [1]=row_var_sum
-    cols: Int, n: Int, rows: Int,
+    cols_w: Int32, n_w: Int64, rows_w: Int32,
     eps1: Float32, wd_mul: Float32, sr_seed: UInt64,
 ):
+    var cols = Int(cols_w)
+    var n = Int(n_w)
+    var rows = Int(rows_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var row_mean = Float32(rebind[Scalar[DType.float32]](scal[1])) / Float32(rows)
@@ -316,7 +330,10 @@ struct AdafactorDeviceState(Copyable, Movable):
 def _lt_f32(t: Tensor, n: Int) raises -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        t.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(t.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
 
 
@@ -367,7 +384,10 @@ def adafactor_step_device(
 
     var nrl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        p_bf16.buf.unsafe_ptr().bitcast[BFloat16](), nrl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(p_bf16.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=nrl,
     )
     var G = _lt_f32(g_f32, n)
     var RV = _lt_f32(state.row_var[], rows)
@@ -377,40 +397,40 @@ def adafactor_step_device(
     var PT = _lt_f32(parts, _PARTS)
 
     # K1/K2: factored second-moment lerps (+ row p² partials, PRE-decay p).
-    ctx.enqueue_function[_af_row_kernel, _af_row_kernel](
-        P, G, RV, RP, cols, rows, Float32(one_minus_beta2_t),
+    ctx.enqueue_function[_af_row_kernel](
+        P, G, RV, RP, Int32(cols), Int32(rows), Float32(one_minus_beta2_t),
         grid_dim=rows, block_dim=_BLOCK,
     )
-    ctx.enqueue_function[_af_col_kernel, _af_col_kernel](
-        G, CV, cols, rows, Float32(one_minus_beta2_t),
+    ctx.enqueue_function[_af_col_kernel](
+        G, CV, Int32(cols), Int32(rows), Float32(one_minus_beta2_t),
         grid_dim=cols, block_dim=_BLOCK,
     )
     # K3: p² total -> scal[0]; row_var sum -> scal[1].
-    ctx.enqueue_function[_af_reduce_kernel, _af_reduce_kernel](
-        RP, SC, rows, 0, grid_dim=1, block_dim=_BLOCK,
+    ctx.enqueue_function[_af_reduce_kernel](
+        RP, SC, Int64(rows), Int32(0), grid_dim=1, block_dim=_BLOCK,
     )
-    ctx.enqueue_function[_af_reduce_kernel, _af_reduce_kernel](
-        RV, SC, rows, 1, grid_dim=1, block_dim=_BLOCK,
+    ctx.enqueue_function[_af_reduce_kernel](
+        RV, SC, Int64(rows), Int32(1), grid_dim=1, block_dim=_BLOCK,
     )
     # K4: update² partials -> parts; reduce -> scal[2].
-    ctx.enqueue_function[_af_updsq_kernel, _af_updsq_kernel](
-        G, RV, CV, SC, PT, cols, n, rows, Float32(eps1),
+    ctx.enqueue_function[_af_updsq_kernel](
+        G, RV, CV, SC, PT, Int32(cols), Int64(n), Int32(rows), Float32(eps1),
         grid_dim=_PARTS, block_dim=_BLOCK,
     )
-    ctx.enqueue_function[_af_reduce_kernel, _af_reduce_kernel](
-        PT, SC, _PARTS, 2, grid_dim=1, block_dim=_BLOCK,
+    ctx.enqueue_function[_af_reduce_kernel](
+        PT, SC, Int64(_PARTS), Int32(2), grid_dim=1, block_dim=_BLOCK,
     )
     # K5: -alpha/denom -> scal[3].
-    ctx.enqueue_function[_af_scalars_kernel, _af_scalars_kernel](
-        SC, n, Float32(rho_t), Float32(eps2), Float32(d),
+    ctx.enqueue_function[_af_scalars_kernel](
+        SC, Int64(n), Float32(rho_t), Float32(eps2), Float32(d),
         grid_dim=1, block_dim=1,
     )
     # K6: apply + SR/RNE bf16 write IN PLACE.
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_af_apply_kernel, _af_apply_kernel](
-        P, G, RV, CV, SC, cols, n, rows,
+    ctx.enqueue_function[_af_apply_kernel](
+        P, G, RV, CV, SC, Int32(cols), Int64(n), Int32(rows),
         Float32(eps1), Float32(wd_mul), sr_seed,
         grid_dim=grid, block_dim=_BLOCK,
     )
@@ -434,8 +454,9 @@ def _af1_fused_kernel(
     v: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [n] exp_avg_sq IN PLACE
     parts_p: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [_PARTS]
     parts_u: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [_PARTS]
-    n: Int, w_lerp: Float32, eps1: Float32,
+    n_w: Int64, w_lerp: Float32, eps1: Float32,
 ):
+    var n = Int(n_w)
     var bid = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var sh_p = stack_allocation[
@@ -485,8 +506,9 @@ def _af1_apply_kernel(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     scal: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [3]=scale
-    n: Int, eps1: Float32, wd_mul: Float32, sr_seed: UInt64,
+    n_w: Int64, eps1: Float32, wd_mul: Float32, sr_seed: UInt64,
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var scale = Float32(rebind[Scalar[DType.float32]](scal[3]))
@@ -580,7 +602,10 @@ def adafactor_step_device_1d(
 
     var nrl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        p_bf16.buf.unsafe_ptr().bitcast[BFloat16](), nrl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(p_bf16.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=nrl,
     )
     var G = _lt_f32(g_f32, n)
     var V = _lt_f32(state.row_var[], n)
@@ -589,27 +614,27 @@ def adafactor_step_device_1d(
     var PU = _lt_f32(parts_u, _PARTS)
 
     # K1d: p² partials + v lerp + u² partials in one pass.
-    ctx.enqueue_function[_af1_fused_kernel, _af1_fused_kernel](
-        P, G, V, PP, PU, n, Float32(one_minus_beta2_t), Float32(eps1),
+    ctx.enqueue_function[_af1_fused_kernel](
+        P, G, V, PP, PU, Int64(n), Float32(one_minus_beta2_t), Float32(eps1),
         grid_dim=_PARTS, block_dim=_BLOCK,
     )
     # K3: p² total -> scal[0]; update² total -> scal[2] (scal[1] unused here).
-    ctx.enqueue_function[_af_reduce_kernel, _af_reduce_kernel](
-        PP, SC, _PARTS, 0, grid_dim=1, block_dim=_BLOCK,
+    ctx.enqueue_function[_af_reduce_kernel](
+        PP, SC, Int64(_PARTS), Int32(0), grid_dim=1, block_dim=_BLOCK,
     )
-    ctx.enqueue_function[_af_reduce_kernel, _af_reduce_kernel](
-        PU, SC, _PARTS, 2, grid_dim=1, block_dim=_BLOCK,
+    ctx.enqueue_function[_af_reduce_kernel](
+        PU, SC, Int64(_PARTS), Int32(2), grid_dim=1, block_dim=_BLOCK,
     )
     # K5 (shared with 2D — it only reads scal[0]/scal[2]): scal[3]=-alpha/denom.
-    ctx.enqueue_function[_af_scalars_kernel, _af_scalars_kernel](
-        SC, n, Float32(rho_t), Float32(eps2), Float32(d),
+    ctx.enqueue_function[_af_scalars_kernel](
+        SC, Int64(n), Float32(rho_t), Float32(eps2), Float32(d),
         grid_dim=1, block_dim=1,
     )
     # K2d: apply + SR/RNE bf16 write IN PLACE.
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_af1_apply_kernel, _af1_apply_kernel](
-        P, G, V, SC, n, Float32(eps1), Float32(wd_mul), sr_seed,
+    ctx.enqueue_function[_af1_apply_kernel](
+        P, G, V, SC, Int64(n), Float32(eps1), Float32(wd_mul), sr_seed,
         grid_dim=grid, block_dim=_BLOCK,
     )

@@ -18,7 +18,7 @@
 #   /tmp/mojoh2tls cert.pem key.pem
 #   curl -k --http2 https://localhost:8444/health
 
-from sys import argv
+from std.sys import argv
 from net.tcp import TCPListener
 from net.poll import Epoll, EPOLLIN, EVENT_SIZE, rd_u64
 from net.syscalls import BytePtr, sys_accept, sys_close, sys_fcntl, F_GETFL, F_SETFL, O_NONBLOCK
@@ -88,7 +88,7 @@ def flush_h2(conn: Int, ssl_addr: Int, obuf: BytePtr):
         var m = h2_send(conn, obuf, OUT_CAP)
         if m <= 0:
             break
-        conn_write_all(ssl_addr, String(StringSlice(ptr=obuf, length=m)))
+        conn_write_all(ssl_addr, String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=obuf, length=m))))
 
 
 def accept_new(
@@ -210,7 +210,7 @@ def handle_h1(
     while True:
         var r = conn_read(ssl, tp, READ_CHUNK)
         if r > 0:
-            acc += String(StringSlice(ptr=tmp, length=r))
+            acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=tmp, length=r)))
         elif r == -1:
             break
         else:

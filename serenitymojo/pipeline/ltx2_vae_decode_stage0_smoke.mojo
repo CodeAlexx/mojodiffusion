@@ -16,7 +16,7 @@
 #     serenitymojo/pipeline/ltx2_vae_decode_stage0_smoke.mojo \
 #     -o /tmp/ltx2_vae_decode_stage0_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

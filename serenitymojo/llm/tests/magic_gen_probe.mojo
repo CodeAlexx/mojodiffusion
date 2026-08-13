@@ -1,7 +1,7 @@
 # magic_gen_probe.mojo — DIAGNOSE the captioner over-generation. Runs the exact
 # magic-prompt chat + generation, then reports: prompt len, generated len (==1700
 # ⇒ never hit EOS), and decoded head/tail (what does it emit after the JSON?).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.pipeline.ideogram4_magic import _system_prompt
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config

@@ -5,7 +5,7 @@
 # key spelling. It intentionally starts from deterministic latent noise; the
 # CLIP+UNet denoise path remains separate work.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.sd15_contract import validate_sd15_metadata_contract

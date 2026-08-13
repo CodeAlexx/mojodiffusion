@@ -14,7 +14,7 @@
 #     -o output/checks/fp4_gemm_bench
 # Run: LD_LIBRARY_PATH=.pixi/envs/default/lib output/checks/fp4_gemm_bench
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor

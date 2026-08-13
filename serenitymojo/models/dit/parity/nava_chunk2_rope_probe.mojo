@@ -1,7 +1,7 @@
 # NAVA chunk 2 (video 3D rope): build_multiaxis_rope_tables([44,42,42],θ1e4) +
 # rope_interleaved on q [1,320,24,128] vs torch rope_apply_3d (qv_rope).
 # grid (f,h,w)=(5,8,8)=320 tokens, 24 heads, head_dim 128. Token order f-major.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

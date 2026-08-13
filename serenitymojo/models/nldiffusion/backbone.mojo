@@ -20,7 +20,7 @@
 # CHUNK A scope: one decoder layer + its parity probe. The full 34-layer stack
 # and the image head are later chunks.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

@@ -18,7 +18,7 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #     serenitymojo/models/klein/parity/klein_lora_scale_band_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.parity import ParityHarness
 from serenitymojo.tensor import Tensor
@@ -30,7 +30,7 @@ from serenitymojo.ops.tensor_algebra import (
 from serenitymojo.ops.cast import cast_tensor
 
 
-fn _lcg(mut state: UInt64) -> Float32:
+def _lcg(mut state: UInt64) -> Float32:
     state = state * 6364136223846793005 + 1442695040888963407
     var u = (state >> 40) & 0xFFFFFF
     return (Float32(Int(u)) / Float32(1 << 23)) - 1.0

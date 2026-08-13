@@ -17,7 +17,7 @@
 #   conv decode internally), compare to sampler_tail_out.safetensors [1,3,128,128].
 #   PASS PSNR >= 25 dB (BF16 VAE vs F32 oracle). A double-unscale tanks PSNR.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import log10
 
 from serenitymojo.tensor import Tensor

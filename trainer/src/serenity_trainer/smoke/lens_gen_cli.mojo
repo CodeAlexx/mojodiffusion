@@ -19,7 +19,7 @@
 #                  norm-rescaled CFG (cfg=4.0).
 #   4. DECODE    — LensVAE.decode → [1,3,H,W] → save_png.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.image.png import save_png, ValueRange

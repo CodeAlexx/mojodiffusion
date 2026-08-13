@@ -5,7 +5,7 @@
 #
 # Run: cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #        serenitymojo/pipeline/parity/parity_final.mojo
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

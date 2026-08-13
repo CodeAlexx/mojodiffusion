@@ -1,7 +1,7 @@
 # Parity gate for SCAIL-2 sequence order, shifts, and pose complex-frequency
 # average pooling. Generate fixtures with scail2_rope_oracle.py first.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from std.sys import argv
 from serenitymojo.io.ffi import (

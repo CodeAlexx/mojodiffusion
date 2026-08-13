@@ -17,7 +17,7 @@
 #       serenitymojo/training/train_sd35_medium.mojo -o /tmp/train_sd35_medium
 #   /tmp/train_sd35_medium [steps]
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt, sin
 from std.time import perf_counter_ns
@@ -25,7 +25,6 @@ from std.os import listdir
 from std.sys import argv
 from std.ffi import external_call
 from std.memory import alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.io.dtype import STDtype

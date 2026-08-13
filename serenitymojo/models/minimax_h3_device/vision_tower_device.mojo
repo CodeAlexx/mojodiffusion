@@ -85,7 +85,7 @@
 from std.collections import List
 from std.math import cos as fcos, sin as fsin, sqrt as fsqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -223,7 +223,7 @@ def minimax_h3_vision_device_weights(
             continue
 
         var wstem = String(name.removesuffix("qkv.weight"))
-        if len(wstem) != len(name):
+        if wstem.byte_length() != name.byte_length():
             var stem = wstem
             var hbase = Int(tv.data.unsafe_ptr())
             var blk_bytes = H3_VIS_HIDDEN * H3_VIS_HIDDEN * tv.dtype.byte_size()
@@ -238,7 +238,7 @@ def minimax_h3_vision_device_weights(
                 [H3_VIS_HIDDEN, H3_VIS_HIDDEN], tv.dtype, ctx))
             continue
         var bstem = String(name.removesuffix("qkv.bias"))
-        if len(bstem) != len(name):
+        if bstem.byte_length() != name.byte_length():
             var stem = bstem
             var hbase = Int(tv.data.unsafe_ptr())
             var blk_bytes = H3_VIS_HIDDEN * tv.dtype.byte_size()

@@ -7,7 +7,7 @@
 # raise the product manifest's experimental readiness/parity labels.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.io.file import open
 
 from serenitymojo.io.dtype import STDtype

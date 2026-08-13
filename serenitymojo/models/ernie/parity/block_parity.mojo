@@ -18,7 +18,7 @@
 #       serenitymojo/models/ernie/parity/block_parity.mojo -o /tmp/ernie_block_parity
 #   /tmp/ernie_block_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness, ParityResult

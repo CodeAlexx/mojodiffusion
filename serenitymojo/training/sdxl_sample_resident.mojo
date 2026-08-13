@@ -75,7 +75,7 @@
 # is loaded PER CALL so it adds zero resident memory between samples; the UNet
 # weights + LoRA are BORROWED from the trainer (no new resident weights).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from std.math import sqrt
 

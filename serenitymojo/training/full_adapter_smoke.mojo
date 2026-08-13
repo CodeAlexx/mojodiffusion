@@ -15,7 +15,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/training/full_adapter_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.ffi import sys_system

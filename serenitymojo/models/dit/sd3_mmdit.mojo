@@ -32,7 +32,7 @@
 #   joint_blocks.{i}.context_block.mlp.fc1.weight/bias    (not pre_only)
 #   joint_blocks.{i}.context_block.mlp.fc2.weight/bias    (not pre_only)
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import sqrt
 from std.collections import Optional
@@ -565,9 +565,16 @@ comptime _BLOCK_SD3 = 256
 def _sd3_unpatchify_kernel_bf16(
     seq: LayoutTensor[DType.bfloat16, _DYN1_SD3, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1_SD3, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
     """f = (ph * p + pw) * C + c  (SD3 spatial-outer, channels-inner)."""
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var total = B * C * H * W
     if idx < total:
@@ -618,13 +625,19 @@ def _sd3_unpatchify(
     var grid = (total + _BLOCK_SD3 - 1) // _BLOCK_SD3
     if dt == DType.bfloat16:
         var S = LayoutTensor[DType.bfloat16, _DYN1_SD3, MutAnyOrigin](
-            seq.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(seq.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1_SD3, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_sd3_unpatchify_kernel_bf16, _sd3_unpatchify_kernel_bf16](
-            S, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK_SD3
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_sd3_unpatchify_kernel_bf16](
+            S, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK_SD3
         )
     else:
         raise Error("_sd3_unpatchify: only BF16 supported for SD3 output")

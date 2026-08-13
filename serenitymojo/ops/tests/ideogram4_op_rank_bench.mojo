@@ -1,7 +1,7 @@
 # Reliable per-op timing at the block's real dims (nsys broken) to rank the GPU
 # kill order. The trainer is GPU-bound; this finds which kernel dominates the
 # ~122ms/block.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

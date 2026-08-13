@@ -5,7 +5,7 @@
 # Raw JPEG/TXT datasets must first be cached into latent/text tensors.
 
 from std.collections import Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.os import makedirs
 from std.time import perf_counter, perf_counter_ns

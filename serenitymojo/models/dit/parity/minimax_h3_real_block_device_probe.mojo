@@ -25,7 +25,7 @@
 
 from std.collections import Dict, List
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.sharded import ShardedSafeTensors

@@ -12,7 +12,7 @@
 #     serenitymojo/training/parity/automagic3_device_parity.mojo -o /tmp/a3dev_gate
 
 from std.math import sqrt, exp, abs
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -32,7 +32,12 @@ def _lcg(mut s: UInt64) -> Float32:
 
 
 def _dyn(buf_ptr: UnsafePointer[Float32, MutAnyOrigin], n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
-    return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](buf_ptr, RuntimeLayout[_DYN1].row_major(IndexList[1](n)))
+    return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(buf_ptr)
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
+    )
 
 
 def main() raises:
@@ -129,13 +134,48 @@ def main() raises:
     var U = _dyn(upd_dev.unsafe_ptr(), NP)
     var RV = _dyn(rv_dev.unsafe_ptr(), NR)
     var CV = _dyn(cv_dev.unsafe_ptr(), NC)
-    var SR = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](sr_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](H * NP)))
-    var DSC = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](desc_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](12)))
-    var HIDX = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](hidx_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](2)))
-    var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](hfill_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](2)))
-    var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](gnum_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
-    var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](gden_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
-    var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](pb_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](NP)))
+    var SR = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(sr_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](H * NP)),
+    )
+    var DSC = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(desc_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](12)),
+    )
+    var HIDX = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(hidx_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](2)),
+    )
+    var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(hfill_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](2)),
+    )
+    var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float64], MutAnyOrigin](
+            unsafe_from_address=Int(gnum_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
+    )
+    var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float64], MutAnyOrigin](
+            unsafe_from_address=Int(gden_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
+    )
+    var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(pb_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](NP)),
+    )
 
     var dev_lr = start_lr
     var dev_lr_traj = List[Float64]()
@@ -149,11 +189,11 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=g_dev, src_buf=gh)
         gnum_dev.enqueue_fill(Float64(0.0))
         gden_dev.enqueue_fill(Float64(0.0))
-        ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
+        ctx.enqueue_function[automagic3_factored_kernel](
             P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
             Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
             Float32(dev_lr), Float32(wd), Float32(1.0),
-            s, UInt64(0x5EED_A3D0),
+            Int32(s), UInt64(0x5EED_A3D0),
             grid_dim=2, block_dim=256,
         )
         ctx.enqueue_copy(dst_buf=num_h, src_buf=gnum_dev)
@@ -184,7 +224,7 @@ def main() raises:
     ctx.synchronize()
 
     # ── compare ──
-    fn relmax(a: List[Float32], bp: UnsafePointer[Float32, MutAnyOrigin], off: Int, n: Int) -> Float64:
+    def relmax(a: List[Float32], bp: UnsafePointer[Float32, MutAnyOrigin], off: Int, n: Int) -> Float64:
         var m = Float64(0.0)
         for i in range(n):
             var d = abs(Float64(a[i]) - Float64(bp[off + i]))

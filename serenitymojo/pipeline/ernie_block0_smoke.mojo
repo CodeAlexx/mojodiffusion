@@ -4,7 +4,7 @@
 # latent patch projection + text projection + timestep AdaLN -> image-first/text
 # concat -> 3-axis ERNIE RoPE -> block0 attention + GELU-gated MLP.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

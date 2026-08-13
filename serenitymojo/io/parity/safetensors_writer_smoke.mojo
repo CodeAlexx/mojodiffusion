@@ -23,7 +23,7 @@
 #
 # Loud-fail: any mismatch raises and aborts with a descriptive message.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor

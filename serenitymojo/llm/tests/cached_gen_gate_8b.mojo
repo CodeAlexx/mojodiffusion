@@ -2,7 +2,7 @@
 # Qwen3-8B (klein_9b config) — the EXACT model + config ideogram4_magic loads.
 # Proves generate_greedy_cached == generate_greedy token-for-token AND times both
 # at the captioner's real seq width (maxseq=2048) vs 512, on the real model.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.models.text_encoder.qwen3_magic import (

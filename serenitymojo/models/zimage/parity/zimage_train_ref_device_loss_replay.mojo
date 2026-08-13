@@ -7,7 +7,7 @@
 # forward/backward, adapter gradients, optimizer, save/resume, or product loop.
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.pathlib import Path
 

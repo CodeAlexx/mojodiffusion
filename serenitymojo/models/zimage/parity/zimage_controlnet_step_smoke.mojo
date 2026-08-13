@@ -29,7 +29,7 @@
 #       -o /tmp/zimage_controlnet_step_smoke
 #   /tmp/zimage_controlnet_step_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sin, cos, sqrt
 from std.memory import ArcPointer

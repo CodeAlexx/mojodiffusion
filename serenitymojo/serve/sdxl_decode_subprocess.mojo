@@ -7,9 +7,8 @@
 # reclaims all VAE allocations without destroying/reloading the parent's UNet.
 
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import sleep
 
 from serenitymojo.tensor import Tensor

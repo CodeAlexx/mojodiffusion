@@ -8,7 +8,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 comptime SSL_FILETYPE_PEM: Int32 = 1
@@ -39,7 +38,7 @@ def tls_err() -> String:
     var n = 0
     while p[n] != 0:
         n += 1
-    return String(StringSlice(ptr=p, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p, length=n)))
 
 
 def make_ctx(cert_path: String, key_path: String) raises -> Int:

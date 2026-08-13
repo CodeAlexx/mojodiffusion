@@ -13,7 +13,7 @@
 # Run: LD_LIBRARY_PATH=serenitymojo/ops/cshim/lib:.pixi/envs/default/lib /tmp/w4a4_parity
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

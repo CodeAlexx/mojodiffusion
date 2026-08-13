@@ -19,7 +19,7 @@
 # GroupNorm, embedding-linear, and conv tensors preserve checkpoint dtype. Conv
 # weights are remapped OIHW -> RSCF on the host without widening BF16/F16 lists.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

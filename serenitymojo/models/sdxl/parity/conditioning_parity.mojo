@@ -1,7 +1,7 @@
 # SDXL ADM pooled+size conditioning parity against conditioning_oracle.py and
 # the frozen local Serenity sampler helper time-id contract it consumes.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

@@ -1,5 +1,5 @@
 # Real-weights Z-Image full forward (load zimage_base, LoRA B=0 → forward==base).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.random import randn

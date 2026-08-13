@@ -2,7 +2,7 @@
 # ltx-2.3-22b-dev_audio_vae.safetensors vs torch decoder mel. PRODUCTION = F32
 # (init_ltx_vae builds dtype=torch.float32), so we decode in F32 (f32=True).
 # Latent [1,8,34,16] -> mel [1,2,133,64].  Gate cos>=0.999.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness

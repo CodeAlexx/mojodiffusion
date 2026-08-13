@@ -9,10 +9,10 @@
 #
 # Each gates vs a real torch bf16 oracle at cos >= 0.999 (see tests/).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
-from math import exp, log, sin, cos, sqrt
+from std.math import exp, log, sin, cos, sqrt
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 
@@ -241,11 +241,15 @@ def _rope3d_kernel(
     q: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [L*H*D] flat
     fr: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [L*FREQW] flat
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [L*H*D] flat
-    total: Int,      # L*H*(D//2) threads (one per adjacent pair)
-    H: Int,          # head count
-    D: Int,          # head_dim (=128)
-    FREQW: Int,      # rotary width (=126)
+    total_w: Int64,      # L*H*(D//2) threads (one per adjacent pair)
+    H_w: Int32,          # head count
+    D_w: Int32,          # head_dim (=128)
+    FREQW_w: Int32,      # rotary width (=126)
 ):
+    var total = Int(total_w)
+    var H = Int(H_w)
+    var D = Int(D_w)
+    var FREQW = Int(FREQW_w)
     var i = Int(global_idx.x)
     if i < total:
         var pairs = D // 2
@@ -298,17 +302,26 @@ def apply_rope3d(q: Tensor, freqs: Tensor, ctx: DeviceContext) raises -> Tensor:
     var q_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](q.numel()))
     var f_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](freqs.numel()))
     var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        q.buf.unsafe_ptr().bitcast[BFloat16](), q_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=q_rl,
     )
     var F = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        freqs.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(freqs.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), q_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=q_rl,
     )
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_rope3d_kernel, _rope3d_kernel](
-        Q, F, O, total, H, D, FREQW, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_rope3d_kernel](
+        Q, F, O, Int64(total), Int32(H), Int32(D), Int32(FREQW), grid_dim=grid, block_dim=_BLOCK
     )
     return Tensor(out_buf^, q.shape(), q.dtype())
 

@@ -20,7 +20,6 @@
 #       math; days-since-epoch). See parse_http_date for supported formats.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -37,7 +36,7 @@ def _substr(s: String, start: Int, end: Int) raises -> String:
         return String("")
     var sp = s.as_bytes()
     var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 def _lower_b(c: Int) -> Int:
@@ -57,7 +56,7 @@ def _ascii_lower(s: String) raises -> String:
     var out = alloc[UInt8](n)
     for i in range(n):
         out[i] = UInt8(_lower_b(Int(sp[i])))
-    var res = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(out)), length=n))
+    var res = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(out)), length=n)))
     out.free()
     return res
 
@@ -271,7 +270,7 @@ def _hex16(v: UInt64) -> String:
         var nib = Int(x & 0xF)
         out[15 - i] = db[nib]
         x = x >> 4
-    var res = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(out)), length=16))
+    var res = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(out)), length=16)))
     out.free()
     return res
 

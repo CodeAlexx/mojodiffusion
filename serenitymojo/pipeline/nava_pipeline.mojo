@@ -26,7 +26,7 @@
 #
 # NOTE: 3 forwards/step × 25 steps = 75 forwards total. Expected ~10-30 min.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

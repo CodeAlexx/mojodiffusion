@@ -11,9 +11,10 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import exp
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -31,8 +32,9 @@ comptime _NEG_BIG = Float32(-3.0e38)
 def _softmax_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -86,8 +88,9 @@ def _softmax_kernel_f32(
 def _softmax_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -138,8 +141,9 @@ def _softmax_kernel_bf16(
 def _softmax_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -207,33 +211,51 @@ def softmax_lastdim(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[_softmax_kernel_f32, _softmax_kernel_f32](
-            X, O, d, grid_dim=rows, block_dim=_TPB
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_softmax_kernel_f32](
+            X, O, Int32(d), grid_dim=rows, block_dim=_TPB
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[_softmax_kernel_bf16, _softmax_kernel_bf16](
-            X, O, d, grid_dim=rows, block_dim=_TPB
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_softmax_kernel_bf16](
+            X, O, Int32(d), grid_dim=rows, block_dim=_TPB
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[_softmax_kernel_f16, _softmax_kernel_f16](
-            X, O, d, grid_dim=rows, block_dim=_TPB
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_softmax_kernel_f16](
+            X, O, Int32(d), grid_dim=rows, block_dim=_TPB
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, xshape.copy(), x.dtype())

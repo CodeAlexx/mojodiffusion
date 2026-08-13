@@ -1,5 +1,5 @@
 # dump my vc, vu for lat_step_27 @ t=0.82353 → guidance-term parity check
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

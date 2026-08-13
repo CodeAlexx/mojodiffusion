@@ -35,7 +35,7 @@
 #
 # Mojo 1.0.0b1.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -162,8 +162,11 @@ def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 def _broadcast_rope_kernel(
     cos: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*half]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # [N*H*half]
-    N: Int, H: Int, half: Int,
+    N_w: Int64, H_w: Int32, half_w: Int32,
 ):
+    var N = Int(N_w)
+    var H = Int(H_w)
+    var half = Int(half_w)
     # Tile the per-token RoPE table [N, half] across H heads, producing a
     # row-major [N, H, half] table whose flattened rows align with q/k laid out
     # as [N*H, head_dim] (token-major, then head, then pair).
@@ -186,14 +189,20 @@ def _broadcast_rope_to_heads(
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](N * half))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var C = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        tbl.buf.unsafe_ptr().bitcast[Float32](), rl_in
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(tbl.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_in,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_broadcast_rope_kernel, _broadcast_rope_kernel](
-        C, O, N, H, half, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_broadcast_rope_kernel](
+        C, O, Int64(N), Int32(H), Int32(half), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, [N * H, half], F32)

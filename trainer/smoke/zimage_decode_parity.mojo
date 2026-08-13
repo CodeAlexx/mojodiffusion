@@ -1,7 +1,7 @@
 # VAE decode parity: decode Serenity's EXACT latent_final, compare to zi_SERENITY_1024.png.
 # decode() _rescales internally → pass the RAW (scaled) latent, NOT pre-unscaled.
 from std.time import monotonic
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

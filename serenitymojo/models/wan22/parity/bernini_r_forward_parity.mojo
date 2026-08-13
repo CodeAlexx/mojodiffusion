@@ -2,7 +2,7 @@
 # argv: bernini_r_forward_parity <fp8_cache_dir> <transformer|transformer_2>
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from std.sys import argv
 

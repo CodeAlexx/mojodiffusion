@@ -13,7 +13,6 @@
 #   payload (XOR-unmasked with key[i%4])   server→client frames are NEVER masked
 
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 comptime B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -36,7 +35,7 @@ def _b2s(b: List[UInt8]) -> String:
     var buf = alloc[UInt8](n)
     for i in range(n):
         buf[i] = b[i]
-    var s = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(buf)), length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(buf)), length=n)))
     buf.free()
     return s
 

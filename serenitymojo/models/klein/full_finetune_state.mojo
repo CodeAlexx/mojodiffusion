@@ -6,7 +6,7 @@
 # It does not wire a product full-finetune loop or model-struct resume rebind.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.klein.full_finetune_inventory import (
     klein_full_finetune_checkpoint_key_manifest,

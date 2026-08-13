@@ -12,7 +12,7 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #       serenitymojo/models/lingbotvideo/parity/lingbot_ti2v_prep_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.sharded import ShardedSafeTensors

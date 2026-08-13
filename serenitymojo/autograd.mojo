@@ -21,7 +21,7 @@
 # Add/Sub don't need saved tensors for backward; a per-op "needs_saved" gate
 # will drop those clones. Inert for correctness; trivial for the T1 shapes.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.utils.index import IndexList
 from std.memory import ArcPointer
 from std.collections import Dict
@@ -132,25 +132,53 @@ def _raw_gemm(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](b_rows, b_cols))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rc, cc))
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        o.buf.unsafe_ptr().bitcast[Float32](), c_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(o.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
+    )
     var dt = a.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            a.buf.unsafe_ptr().bitcast[Float32](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            b.buf.unsafe_ptr().bitcast[Float32](), b_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
     elif dt == DType.bfloat16:
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            b.buf.unsafe_ptr().bitcast[BFloat16](), b_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
     else:
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            a.buf.unsafe_ptr().bitcast[Float16](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            b.buf.unsafe_ptr().bitcast[Float16](), b_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
     ctx.synchronize()
     return o^

@@ -14,7 +14,7 @@
 #   output/ltx2_musubi_ref/ltx2_musubi_ref.safetensors (1152 keys, rank 32)
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 
 from serenitymojo.io.safetensors import SafeTensors

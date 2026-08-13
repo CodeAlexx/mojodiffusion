@@ -7,7 +7,7 @@
 # This executable then compares 16 kHz waveform, log-mel, learned AudioVAE
 # latent, and the conformed 126-frame Retake latent.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

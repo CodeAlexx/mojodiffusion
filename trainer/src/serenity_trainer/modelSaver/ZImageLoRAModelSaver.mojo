@@ -20,7 +20,7 @@
 # Z-Image, so they are byte-identical); INTERNAL writes to
 # "<dest>/lora/lora.safetensors" (LoRASaverMixin.__save_internal :70-77).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 
 from serenity_trainer.model.ZImageModel import ZImageLoraSet

@@ -26,7 +26,7 @@
 # specializations inside this file. Do not create one CLI file per resolution.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.training.train_config import TrainConfig

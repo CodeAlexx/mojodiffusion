@@ -23,8 +23,8 @@
 #     serenitymojo/sampling/seedvr2_upscale_general_cli.mojo -o /tmp/seedvr2_gup && \
 #   env LD_LIBRARY_PATH=.pixi/envs/default/lib /tmp/seedvr2_gup
 
-from std.gpu.host import DeviceContext
-from math import sqrt, log, cos, sin
+from max.gpu.host import DeviceContext
+from std.math import sqrt, log, cos, sin
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

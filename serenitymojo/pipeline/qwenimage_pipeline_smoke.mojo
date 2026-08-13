@@ -23,7 +23,7 @@
 # full padded sequence as text conditioning (wiring/memory proof). Token
 # dropping + exact template are a parity-time refinement — flagged in report.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

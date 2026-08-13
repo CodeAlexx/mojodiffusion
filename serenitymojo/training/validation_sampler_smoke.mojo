@@ -17,7 +17,7 @@
 # pipeline/klein9b_encode_smoke.mojo) so the Qwen3 encoder and the 9B DiT never
 # co-reside on the 24 GB card.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.training.validation_sampler import (
     ValidationCaps,
     load_caps,

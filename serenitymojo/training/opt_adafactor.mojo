@@ -40,7 +40,7 @@
 # Mojo 0.26.x. Host-F32 path; no GPU kernel (shape-dependent reductions).
 
 from std.math import sqrt, exp, log
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 

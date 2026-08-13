@@ -8,7 +8,7 @@
 # current LoRA backward does not consume them.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

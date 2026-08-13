@@ -1,6 +1,6 @@
 # chunk1 parity probe: fp8 per-row dequant of layers.0.attention.qkv.weight
 # vs the Wave-0 oracle fixture. Gate: cos >= 0.999.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness

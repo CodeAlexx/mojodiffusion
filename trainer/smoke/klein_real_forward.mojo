@@ -77,7 +77,7 @@
 #     trainer/smoke/klein_real_forward.mojo -o /tmp/klein_rf && /tmp/klein_rf
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

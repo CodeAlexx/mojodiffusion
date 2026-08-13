@@ -34,7 +34,7 @@
 #       -o output/bin/l2p_batch2_parity
 #   output/bin/l2p_batch2_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.memory import ArcPointer

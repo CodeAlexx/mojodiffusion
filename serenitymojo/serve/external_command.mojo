@@ -5,7 +5,6 @@
 # while the daemon can keep polling IPC and cancellation state.
 
 from std.memory import alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from std.memory import UnsafePointer
 
 from net.syscalls import BytePtr, sys_fork, errno_str

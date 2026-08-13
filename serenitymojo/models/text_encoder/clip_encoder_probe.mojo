@@ -2,7 +2,7 @@
 # Constructs both configs + a DeviceContext, exercises the type. Does NOT load
 # weights or run the GPU forward (GPU wedged; compile-only verification).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.models.text_encoder.clip_encoder import ClipConfig, ClipEncoder
 
 

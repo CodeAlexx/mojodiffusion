@@ -1,7 +1,7 @@
 # NAVA audio vocoder parity: Mojo LTX2VocoderWithBWE.forward on NAVA's
 # ltx-2.3-22b-dev_audio_vae.safetensors vs torch (F32 production) raw 48 kHz wav.
 # mel [1,2,133,64] -> wav48 [1,2,63840].  Gate cos>=0.999 (forward F32-computes).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness

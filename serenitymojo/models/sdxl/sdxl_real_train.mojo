@@ -43,7 +43,7 @@
 # All NHWC, F32 interior (matches the gated units + the Rust FP32 residual stream).
 # Latent enters NCHW [1,4,L,L]; converted to NHWC once at entry, NCHW at exit.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import List, Optional
 from serenitymojo.tensor import Tensor

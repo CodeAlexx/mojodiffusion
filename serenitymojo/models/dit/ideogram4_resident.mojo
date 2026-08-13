@@ -4,7 +4,7 @@
 # per-step re-dequant, and both cond+uncond transformers fit GPU-resident
 # (~9.3GB each) so CFG runs without streaming. Math identical to ideogram4_dit's
 # ideogram4_forward (parity-gated); only the weight source + matmul differ.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -31,7 +31,7 @@ struct Ideogram4Weights(Movable):
     var lora_b: Dict[String, ArcPointer[Tensor]]   # base-weight-name -> B [out,rank]
     var lora_scale: Dict[String, Float32]
 
-    fn __init__(out self, var t: Dict[String, ArcPointer[Tensor]]):
+    def __init__(out self, var t: Dict[String, ArcPointer[Tensor]]):
         self.t = t^
         self.lora_a = Dict[String, ArcPointer[Tensor]]()
         self.lora_b = Dict[String, ArcPointer[Tensor]]()
@@ -52,7 +52,7 @@ struct Ideogram4Weights(Movable):
                 d[nm] = ArcPointer(Tensor.from_view(st.tensor_view(nm), ctx))
         return Ideogram4Weights(d^)
 
-    def w(self, name: String) raises -> ref [self.t] Tensor:
+    def w(self, name: String) raises -> ref [self.t[String("")]] Tensor:
         if name not in self.t:
             raise Error("Ideogram4Weights: missing " + name)
         return self.t[name][]
@@ -86,9 +86,11 @@ struct Ideogram4Weights(Movable):
             )
             var inner = prefix.copy()
             if inner.startswith("diffusion_model."):
-                inner = String(inner[byte=16 :])
+                var _tmp_inner = String(inner[byte=16 :])
+                inner = _tmp_inner^
             elif inner.startswith("transformer."):
-                inner = String(inner[byte=12 :])
+                var _tmp_inner = String(inner[byte=12 :])
+                inner = _tmp_inner^
             var bw = inner + ".weight"
             if bw not in self.t:
                 continue
@@ -142,10 +144,10 @@ def _lin(w: Ideogram4Weights, x: Tensor, name: String, bias: String, ctx: Device
         var down = linear(x, w.lora_a[name][].clone(ctx), None, ctx)   # x·Aᵀ -> [..,rank]
         var up = linear(down, w.lora_b[name][].clone(ctx), None, ctx)  # ·Bᵀ -> [..,out]
         up = mul_scalar(up, w.lora_scale[name], ctx)
-        if len(bias) == 0:
+        if bias.byte_length() == 0:
             return add(linear(x, wbf, None, ctx), up, ctx)
         return add(linear(x, wbf, Optional[Tensor](w.w(bias).clone(ctx)), ctx), up, ctx)
-    if len(bias) == 0:
+    if bias.byte_length() == 0:
         return linear(x, wbf, None, ctx)
     return linear(x, wbf, Optional[Tensor](w.w(bias).clone(ctx)), ctx)
 
@@ -173,7 +175,7 @@ def _attn_r_masked[S: Int, N_TXT: Int](
     k = rms_norm(k, w.w(p + "attention.norm_k.weight"), Float32(1.0e-5), ctx)
     q = apply_rope_ideogram(q, cosf, sinf, ctx)
     k = apply_rope_ideogram(k, cosf, sinf, ctx)
-    var scale = Float32(1.0 / (Float32(head_dim) ** 0.5))
+    var scale = Float32(1.0 / (Float32(head_dim) ** Float32(0.5)))
     var attn: Tensor
     comptime if N_TXT > 0:
         attn = sdpa_qwen_flash_padmask[1, S, 18, 256, N_TXT](
@@ -237,7 +239,7 @@ struct Ideogram4Masks(Movable):
     var img_mask: Tensor
     var img_ids: List[Int]
 
-    fn __init__(out self, var llm_mask: Tensor, var img_mask: Tensor, var img_ids: List[Int]):
+    def __init__(out self, var llm_mask: Tensor, var img_mask: Tensor, var img_ids: List[Int]):
         self.llm_mask = llm_mask^
         self.img_mask = img_mask^
         self.img_ids = img_ids^

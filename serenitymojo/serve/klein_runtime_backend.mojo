@@ -55,9 +55,8 @@
 #
 # Mojo 1.0.0b1: `def` not `fn`.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
 from std.time import perf_counter_ns, sleep
 
@@ -461,7 +460,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     var lora_path: String
     var lora_multiplier: Float32
     var out_png: String
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var encode_seconds: Float64
     var sample_decode_seconds: Float64
     var total_vram_bytes: Int
@@ -498,7 +497,7 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.lora_path = String("")
         self.lora_multiplier = Float32(1.0)
         self.out_png = String("")
-        self.job_t0_ns = UInt(0)
+        self.job_t0_ns = Int(0)
         self.encode_seconds = 0.0
         self.sample_decode_seconds = 0.0
         self.total_vram_bytes = 0

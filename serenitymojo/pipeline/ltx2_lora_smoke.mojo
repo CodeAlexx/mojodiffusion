@@ -25,7 +25,7 @@
 #
 # Run:  pixi run mojo run -I . serenitymojo/pipeline/ltx2_lora_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

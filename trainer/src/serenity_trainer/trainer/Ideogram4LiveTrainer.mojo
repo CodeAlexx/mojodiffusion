@@ -34,7 +34,7 @@
 # The UI launches this as a background process. Progress is written as
 # Serenity-shaped callback lines so TrainerRuntimeBridge can tail the file.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.os import makedirs
 from std.sys import argv
 

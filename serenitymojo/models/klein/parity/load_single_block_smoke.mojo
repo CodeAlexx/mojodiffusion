@@ -8,7 +8,7 @@
 #      pixi run mojo run -I . serenitymojo/models/klein/parity/load_single_block_smoke.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

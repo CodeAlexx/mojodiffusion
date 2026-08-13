@@ -56,7 +56,7 @@
 # drop-in replacement of `context_cond` only.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.time import perf_counter_ns
 

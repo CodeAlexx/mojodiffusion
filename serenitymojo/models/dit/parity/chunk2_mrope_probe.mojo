@@ -1,5 +1,5 @@
 # chunk2 parity: Ideogram-4 MRoPE cos/sin vs Wave-0 fixture. Gate cos>=0.999.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

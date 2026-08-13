@@ -72,7 +72,7 @@
 # Optional[Tensor](b), ctx). Host List[Float32] at the API boundary (matches the
 # parity gates + the Klein block boundary contract).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

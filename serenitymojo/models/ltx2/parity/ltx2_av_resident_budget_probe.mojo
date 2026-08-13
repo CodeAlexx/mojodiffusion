@@ -17,7 +17,7 @@
 #   -Xlinker -lcuda serenitymojo/models/ltx2/parity/ltx2_av_resident_budget_probe.mojo \
 #   -o /tmp/ltx2_av_resident_budget && /tmp/ltx2_av_resident_budget
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.time import perf_counter_ns
 

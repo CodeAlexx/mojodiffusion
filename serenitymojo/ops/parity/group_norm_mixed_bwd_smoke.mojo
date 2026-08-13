@@ -8,7 +8,7 @@
 #   timeout 180 prlimit --as=16000000000 pixi run mojo run -I . serenitymojo/ops/parity/group_norm_mixed_bwd_smoke.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

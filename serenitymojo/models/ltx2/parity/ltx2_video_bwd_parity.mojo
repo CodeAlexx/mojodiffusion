@@ -25,7 +25,7 @@
 #       serenitymojo/models/ltx2/parity/ltx2_video_bwd_parity.mojo \
 #       -o /tmp/ltx2_video_bwd_parity && /tmp/ltx2_video_bwd_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

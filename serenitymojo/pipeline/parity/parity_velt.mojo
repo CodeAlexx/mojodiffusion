@@ -1,7 +1,7 @@
 # parity_velt.mojo — my DiT velocity vs FRESH single-sample diffusers velocity
 # for the exact (latent,t) pairs parity_vel_vs_t flagged. If all ~0.9999, the
 # DiT is correct and the earlier 0.38 was a batched-hook reference artifact.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

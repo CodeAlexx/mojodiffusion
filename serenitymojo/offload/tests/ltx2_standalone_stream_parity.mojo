@@ -23,8 +23,8 @@
 #   # Optional >24 GB residency arm (not part of the 16 GB product gate):
 #   # /tmp/ltx2_standalone_stream_parity resident
 
-from std.gpu.host import DeviceContext
-from sys import argv
+from max.gpu.host import DeviceContext
+from std.sys import argv
 from serenitymojo.offload.ltx2_block_stream import (
     LTX2BlockStream, LTX2StandaloneStage, FP8Block,
 )

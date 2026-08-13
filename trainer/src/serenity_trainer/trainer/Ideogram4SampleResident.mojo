@@ -40,7 +40,7 @@
 # optimizer state are loaded. The denoise loop receives prompt llm_features plus
 # real text_len so pad rows are masked exactly like train/cache conditioning.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

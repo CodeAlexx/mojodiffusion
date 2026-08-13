@@ -16,7 +16,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Foreground gate — no artifacts written.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log
 from std.sys import argv
 from std.time import perf_counter_ns

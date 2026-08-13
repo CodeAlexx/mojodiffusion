@@ -5,7 +5,6 @@
 # characters below 0x20 become \u00XX. dumps() is compact; dumps_pretty() indents.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from json.value import (
     JSONValue, JSON_NULL, JSON_BOOL, JSON_INT, JSON_FLOAT, JSON_STR, JSON_ARR, JSON_OBJ,
 )
@@ -121,7 +120,7 @@ def _b2s(b: List[UInt8]) -> String:
     var buf = alloc[UInt8](n)
     for i in range(n):
         buf[i] = b[i]
-    var s = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(buf)), length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(buf)), length=n)))
     buf.free()
     return s
 

@@ -4,7 +4,7 @@
 # that runs before the block stack: latent patch projection, timestep MLP, and
 # Mistral hidden-state projection.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, exp as fexp, log as flog, sin as fsin, sqrt
 from std.memory import ArcPointer
 
@@ -109,7 +109,7 @@ struct ErnieImageResident(Movable):
     def load_default_block0_smoke(ctx: DeviceContext) raises -> ErnieImageResident:
         return ErnieImageResident.load_block0_smoke(String(ERNIE_TRANSFORMER_DIR), ctx)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing ERNIE resident weight: ") + name)
         var idx = self.name_to_idx[name]

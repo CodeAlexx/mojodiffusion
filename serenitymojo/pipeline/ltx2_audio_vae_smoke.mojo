@@ -18,7 +18,7 @@
 # Run (after scripts/ltx2_audio_vae_ref.py):
 #   /tmp/ltx2_audio_vae_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

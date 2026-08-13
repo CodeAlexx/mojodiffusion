@@ -17,9 +17,10 @@
 # bwd recompute — a numerics-mismatch STE like ai-toolkit's, disclosed.
 # Mojo 1.0.0b1, NVIDIA sm_120 (Blackwell).
 
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
-from std.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -53,9 +54,11 @@ def _rht_nvfp4_quant_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [M*K] flat
     xq: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],     # [M*K/2] packed
     xs: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],     # tiled scales
-    segs_per_row: Int,
-    kb_pad4: Int,   # padded scale-cols (K/16 rounded up to 4)
+    segs_per_row_w: Int32,
+    kb_pad4_w: Int32,   # padded scale-cols (K/16 rounded up to 4)
 ):
+    var segs_per_row = Int(segs_per_row_w)
+    var kb_pad4 = Int(kb_pad4_w)
     var seg = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var row = seg // segs_per_row
@@ -220,13 +223,26 @@ def rht_nvfp4_quant_flat(
     var rl_q = RuntimeLayout[_DYN1].row_major(IndexList[1](m * k // 2))
     var rl_s = RuntimeLayout[_DYN1].row_major(IndexList[1](_scale_tiles_bytes(m, kb)))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), rl_x
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl_x,
     )
-    var XQ = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](xq.unsafe_ptr(), rl_q)
-    var XS = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](xs.unsafe_ptr(), rl_s)
+    var XQ = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(xq.unsafe_ptr())
+        ),
+        runtime_layout=rl_q,
+    )
+    var XS = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(xs.unsafe_ptr())
+        ),
+        runtime_layout=rl_s,
+    )
     comptime kern = _rht_nvfp4_quant_kernel
-    ctx.enqueue_function[kern, kern](
-        X, XQ, XS, k // _SEG, kb_pad,
+    ctx.enqueue_function[kern](
+        X, XQ, XS, Int32(k // _SEG), Int32(kb_pad),
         grid_dim=m * (k // _SEG), block_dim=_SEG_TPB,
     )
     return SquareqNvfp4Out(xq^, xs^)
@@ -237,8 +253,9 @@ def _f32_to_bf16_add_kernel(
     d: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     lr: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    total: Int,
+    total_w: Int64,
 ):
+    var total = Int(total_w)
     var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
     if i < total:
         var v = rebind[Scalar[DType.float32]](d[i]) + rebind[
@@ -281,17 +298,26 @@ def squareq_nvfp4_linear(
     var total = m * out_f
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
     var D = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        d_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(d_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var LR = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        lr.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(lr.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     comptime kern = _f32_to_bf16_add_kernel
-    ctx.enqueue_function[kern, kern](
-        D, LR, O, total, grid_dim=(total + 255) // 256, block_dim=256
+    ctx.enqueue_function[kern](
+        D, LR, O, Int64(total), grid_dim=(total + 255) // 256, block_dim=256
     )
     var oshape = List[Int]()
     for i in range(len(xshape) - 1):
@@ -309,11 +335,14 @@ def _nvfp4_dequant_ih256_kernel(
     nvq: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],    # [out*in/2]
     nvs: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],    # tiled scales
     o_out: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [out*in]
-    out_f: Int,
-    in_f: Int,
-    kb_pad4: Int,
+    out_f_w: Int32,
+    in_f_w: Int32,
+    kb_pad4_w: Int32,
     nvg: Float32,
 ):
+    var out_f = Int(out_f_w)
+    var in_f = Int(in_f_w)
+    var kb_pad4 = Int(kb_pad4_w)
     var segs_per_row = in_f // _SEG
     var seg = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -413,14 +442,27 @@ def squareq_nvfp4_reconstruct_weight(
     var rl_q = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * (in_f // 2)))
     var rl_s = RuntimeLayout[_DYN1].row_major(IndexList[1](nvs.numel()))
     var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * in_f))
-    var Q = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](nvq.buf.unsafe_ptr(), rl_q)
-    var S = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](nvs.buf.unsafe_ptr(), rl_s)
+    var Q = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(nvq.buf.unsafe_ptr())
+        ),
+        runtime_layout=rl_q,
+    )
+    var S = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(nvs.buf.unsafe_ptr())
+        ),
+        runtime_layout=rl_s,
+    )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl_o
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl_o,
     )
     comptime kern = _nvfp4_dequant_ih256_kernel
-    ctx.enqueue_function[kern, kern](
-        Q, S, O, out_f, in_f, kb_pad, nvg,
+    ctx.enqueue_function[kern](
+        Q, S, O, Int32(out_f), Int32(in_f), Int32(kb_pad), nvg,
         grid_dim=out_f * (in_f // _SEG), block_dim=_SEG_TPB,
     )
     var w_res = Tensor(out_buf^, [out_f, in_f], STDtype.BF16)

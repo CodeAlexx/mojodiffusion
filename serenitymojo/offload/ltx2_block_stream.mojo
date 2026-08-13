@@ -25,7 +25,7 @@
 
 from std.memory import ArcPointer, bitcast
 from std.collections import Optional
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
@@ -280,7 +280,7 @@ struct LTX2BlockStream(Movable):
         var max_idx = -1
         for ref nm in st.names():
             if nm.startswith(prefix):
-                var rest = _substr(nm, len(prefix), len(nm))
+                var rest = _substr(nm, prefix.byte_length(), nm.byte_length())
                 # rest = "{idx}.{...}"
                 var dot = _first_dot(rest)
                 if dot > 0:
@@ -294,12 +294,12 @@ struct LTX2BlockStream(Movable):
         var scales = Dict[String, Float32]()
         for ref nm in st.names():
             if nm.endswith("_scale"):
-                var weight_key = _substr(nm, 0, len(nm) - len(String("_scale")))
+                var weight_key = _substr(nm, 0, nm.byte_length() - String("_scale").byte_length())
                 var tv = st.tensor_view(nm)
                 scales[weight_key] = _read_f32_scalar(tv.data)
             elif nm.endswith(".scale_weight"):
                 var base_key = _substr(
-                    nm, 0, len(nm) - len(String(".scale_weight"))
+                    nm, 0, nm.byte_length() - String(".scale_weight").byte_length()
                 )
                 var tv = st.tensor_view(nm)
                 scales[base_key + ".weight"] = _read_f32_scalar(tv.data)
@@ -491,7 +491,7 @@ struct LTX2BlockStream(Movable):
                     String("LTX2 product loader returned key outside block prefix: ")
                     + e.key
                 )
-            var canon = _substr(e.key, len(bp), len(e.key))
+            var canon = _substr(e.key, bp.byte_length(), e.key.byte_length())
             block[canon] = e.value
         self.product_host_active = True
         return block^
@@ -551,7 +551,7 @@ struct LTX2BlockStream(Movable):
                 or nm.endswith(".scale_input")
             ):
                 continue
-            var canon = _substr(nm, len(bp), len(nm))
+            var canon = _substr(nm, bp.byte_length(), nm.byte_length())
             var tv = self.sharded.tensor_view(nm)
             if tv.dtype == STDtype.F8_E4M3:
                 var scale = self._scale_for(nm)
@@ -926,11 +926,11 @@ struct LTX2BlockStream(Movable):
         for ref nm in st.names():
             if not nm.startswith(bp):
                 continue
-            var canon = _substr(nm, len(bp), len(nm))
+            var canon = _substr(nm, bp.byte_length(), nm.byte_length())
             if canon.endswith(".qweight"):
-                var qsuf = len(String(".qweight"))
-                var base = _substr(canon, 0, len(canon) - qsuf)
-                var full = _substr(nm, 0, len(nm) - qsuf)
+                var qsuf = String(".qweight").byte_length()
+                var base = _substr(canon, 0, canon.byte_length() - qsuf)
+                var full = _substr(nm, 0, nm.byte_length() - qsuf)
                 var qweight = Tensor.from_view_raw(st.tensor_view(full + ".qweight"), ctx)
                 var wscales = Tensor.from_view(st.tensor_view(full + ".wscales"), ctx)
                 var lora_down = Tensor.from_view(st.tensor_view(full + ".lora_down"), ctx)
@@ -952,8 +952,8 @@ struct LTX2BlockStream(Movable):
             ):
                 continue
             elif canon.endswith(".bias"):
-                var bsuf = len(String(".bias"))
-                var bbase = _substr(nm, 0, len(nm) - bsuf)
+                var bsuf = String(".bias").byte_length()
+                var bbase = _substr(nm, 0, nm.byte_length() - bsuf)
                 if (bbase + ".qweight") in st.name_to_shard:
                     continue
                 block[canon] = ArcPointer(Tensor.from_view_as_bf16(st.tensor_view(nm), ctx))
@@ -986,7 +986,7 @@ struct LTX2BlockStream(Movable):
                 for ref nm in st.names():
                     if not nm.startswith(bp):
                         continue
-                    var canon = _substr(nm, len(bp), len(nm))
+                    var canon = _substr(nm, bp.byte_length(), nm.byte_length())
                     var t: Tensor
                     if canon.endswith(".qweight"):
                         t = Tensor.from_view_raw(st.tensor_view(nm), ctx)   # I8 resident
@@ -1011,8 +1011,8 @@ struct LTX2BlockStream(Movable):
         for ref e in rb.items():
             var canon = e.key
             if canon.endswith(".qweight"):
-                var qsuf = len(String(".qweight"))
-                var base = _substr(canon, 0, len(canon) - qsuf)
+                var qsuf = String(".qweight").byte_length()
+                var base = _substr(canon, 0, canon.byte_length() - qsuf)
                 ref qweight = rb[base + ".qweight"][]
                 ref wscales = rb[base + ".wscales"][]
                 ref lora_down = rb[base + ".lora_down"][]
@@ -1029,8 +1029,8 @@ struct LTX2BlockStream(Movable):
             ):
                 continue
             elif canon.endswith(".bias"):
-                var bsuf = len(String(".bias"))
-                var bbase = _substr(canon, 0, len(canon) - bsuf)
+                var bsuf = String(".bias").byte_length()
+                var bbase = _substr(canon, 0, canon.byte_length() - bsuf)
                 if (bbase + ".qweight") in rb:
                     continue
                 block[canon] = e.value       # share Arc
@@ -1094,7 +1094,7 @@ struct LTX2BlockStream(Movable):
                         or nm.endswith(".scale_input")
                     ):
                         continue
-                    var canon = _substr(nm, len(bp), len(nm))
+                    var canon = _substr(nm, bp.byte_length(), nm.byte_length())
                     var tv = self.sharded.tensor_view(nm)
                     if tv.dtype == STDtype.F8_E4M3:
                         var raw = Tensor.from_view_raw(tv, ctx)

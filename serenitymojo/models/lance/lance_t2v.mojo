@@ -11,7 +11,7 @@
 # is practical; this module intentionally starts with a tiny dense-mask smoke so
 # real weights can execute on GPU while the streaming and MoE-gen path harden.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import sqrt, exp as fexp, log as flog, cos as fcos, sin as fsin
 from std.memory import ArcPointer
@@ -170,8 +170,13 @@ def _replace_span(
 def _repeat_kv_kernel[dtype: DType](
     src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    seq: Int, h: Int, h_kv: Int, dh: Int, n_rep: Int,
+    seq_w: Int32, h_w: Int32, h_kv_w: Int32, dh_w: Int32, n_rep_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var h = Int(h_w)
+    var h_kv = Int(h_kv_w)
+    var dh = Int(dh_w)
+    var n_rep = Int(n_rep_w)
     var idx = Int(global_idx.x)
     var total = seq * h * dh
     if idx < total:
@@ -199,33 +204,51 @@ def _repeat_kv(
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var SRC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=src_rl,
+    )
         var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[_repeat_kv_kernel[DType.float32], _repeat_kv_kernel[DType.float32]](
-            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_repeat_kv_kernel[DType.float32]](
+            SRC, DST, Int32(s), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var SRC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
         var DST = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[_repeat_kv_kernel[DType.bfloat16], _repeat_kv_kernel[DType.bfloat16]](
-            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_repeat_kv_kernel[DType.bfloat16]](
+            SRC, DST, Int32(s), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.float16:
         var SRC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=src_rl,
+    )
         var DST = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
-        )
-        ctx.enqueue_function[_repeat_kv_kernel[DType.float16], _repeat_kv_kernel[DType.float16]](
-            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_repeat_kv_kernel[DType.float16]](
+            SRC, DST, Int32(s), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("Lance _repeat_kv: unsupported storage dtype")
@@ -352,7 +375,7 @@ struct LanceWeights(Movable):
             weights.append(ArcPointer(t^))
         return LanceWeights(weights^, name_to_idx^, LanceT2VConfig.lance_3b_video())
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing Lance weight: ") + name)
         var idx = self.name_to_idx[name]

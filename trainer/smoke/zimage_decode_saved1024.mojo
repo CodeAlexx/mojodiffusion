@@ -1,6 +1,6 @@
 # Decode the saved Mojo 1024 latent in a fresh process/context.
 from std.time import monotonic
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

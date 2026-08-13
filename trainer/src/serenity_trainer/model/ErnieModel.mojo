@@ -16,7 +16,7 @@
 
 from std.math import exp, sqrt
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -326,10 +326,13 @@ def _ernie_bn_scale_kernel[dtype: DType](
     mean: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     std_values: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    inner: Int,
-    channels: Int,
-    n: Int,
+    inner_w: Int32,
+    channels_w: Int32,
+    n_w: Int64,
 ):
+    var inner = Int(inner_w)
+    var channels = Int(channels_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var c = (i // inner) % channels
@@ -344,10 +347,13 @@ def _ernie_bn_unscale_kernel[dtype: DType](
     mean: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     std_values: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    inner: Int,
-    channels: Int,
-    n: Int,
+    inner_w: Int32,
+    channels_w: Int32,
+    n_w: Int64,
 ):
+    var inner = Int(inner_w)
+    var channels = Int(channels_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var c = (i // inner) % channels
@@ -398,63 +404,69 @@ def _ernie_bn_apply[scale_mode: Bool](
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var crl = RuntimeLayout[_DYN1].row_major(IndexList[1](channels))
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        mean_t.buf.unsafe_ptr().bitcast[Float32](), crl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(mean_t.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=crl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        std_t.buf.unsafe_ptr().bitcast[Float32](), crl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(std_t.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=crl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            latents.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(latents.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         comptime if scale_mode:
-            ctx.enqueue_function[
-                _ernie_bn_scale_kernel[DType.float32],
-                _ernie_bn_scale_kernel[DType.float32],
-            ](X, M, S, O, inner, channels, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_ernie_bn_scale_kernel[DType.float32]](X, M, S, O, Int32(inner), Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _ernie_bn_unscale_kernel[DType.float32],
-                _ernie_bn_unscale_kernel[DType.float32],
-            ](X, M, S, O, inner, channels, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_ernie_bn_unscale_kernel[DType.float32]](X, M, S, O, Int32(inner), Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            latents.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(latents.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         comptime if scale_mode:
-            ctx.enqueue_function[
-                _ernie_bn_scale_kernel[DType.bfloat16],
-                _ernie_bn_scale_kernel[DType.bfloat16],
-            ](X, M, S, O, inner, channels, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_ernie_bn_scale_kernel[DType.bfloat16]](X, M, S, O, Int32(inner), Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _ernie_bn_unscale_kernel[DType.bfloat16],
-                _ernie_bn_unscale_kernel[DType.bfloat16],
-            ](X, M, S, O, inner, channels, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_ernie_bn_unscale_kernel[DType.bfloat16]](X, M, S, O, Int32(inner), Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            latents.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(latents.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         comptime if scale_mode:
-            ctx.enqueue_function[
-                _ernie_bn_scale_kernel[DType.float16],
-                _ernie_bn_scale_kernel[DType.float16],
-            ](X, M, S, O, inner, channels, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_ernie_bn_scale_kernel[DType.float16]](X, M, S, O, Int32(inner), Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _ernie_bn_unscale_kernel[DType.float16],
-                _ernie_bn_unscale_kernel[DType.float16],
-            ](X, M, S, O, inner, channels, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_ernie_bn_unscale_kernel[DType.float16]](X, M, S, O, Int32(inner), Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     return Tensor(out_buf^, sh^, storage)
 

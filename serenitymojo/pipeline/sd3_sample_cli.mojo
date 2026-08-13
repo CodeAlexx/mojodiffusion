@@ -97,7 +97,7 @@
 #   5. Keep _select_prompt / _load_prompt_json unchanged — they are shared infra.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

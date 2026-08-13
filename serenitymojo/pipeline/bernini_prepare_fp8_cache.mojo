@@ -1,7 +1,7 @@
 # One-shot Mojo cache preparation for one Bernini-R Wan A14B expert.
 # Usage: bernini_prepare_fp8_cache <source transformer dir> <cache dir>
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.models.wan22.wan22_fp8_stream import (

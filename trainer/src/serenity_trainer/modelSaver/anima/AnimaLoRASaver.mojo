@@ -9,7 +9,7 @@
 # SAFETENSORS, LEGACY_SAFETENSORS, and INTERNAL saves. Tensor storage dtype is
 # preserved unless the caller explicitly uses the dtype override helper.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

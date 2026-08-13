@@ -36,7 +36,7 @@
 # Mojo 0.26.x+ / 1.0.0b1: def not fn; no fn; Tensor move-only; host List[Float32].
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.math import exp as fexp, log as flog, cos as fcos, sin as fsin
 from serenitymojo.tensor import Tensor

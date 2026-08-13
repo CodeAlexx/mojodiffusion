@@ -21,7 +21,7 @@
 #       serenitymojo/models/zimage/parity/lora_stack_parity.mojo -o /tmp/zimage_lora_parity
 #   /tmp/zimage_lora_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness, ParityResult

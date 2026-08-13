@@ -10,7 +10,7 @@
 #
 # All tensors are BF16 storage (port dtype policy).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.autograd import Tape
 from serenity_trainer.util.config.TrainConfig import TrainConfig

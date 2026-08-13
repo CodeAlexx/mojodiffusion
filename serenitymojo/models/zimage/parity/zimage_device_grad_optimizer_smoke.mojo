@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/models/zimage/parity/zimage_device_grad_optimizer_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

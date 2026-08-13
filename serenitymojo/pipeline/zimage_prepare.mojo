@@ -25,7 +25,7 @@
 #       serenitymojo/configs/zimage_eri_2000.json
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from std.os import listdir
 from std.sys import argv

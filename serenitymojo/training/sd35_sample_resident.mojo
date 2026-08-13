@@ -70,7 +70,7 @@
 # NEW resident weights are held: the sampler borrows the trainer's already-
 # resident base + loader + lora.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

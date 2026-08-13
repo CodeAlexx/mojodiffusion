@@ -28,7 +28,7 @@
 #
 # All F32. The sinusoidal dim = model_channels (320); time_embed_dim = 1280.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from std.collections import Optional

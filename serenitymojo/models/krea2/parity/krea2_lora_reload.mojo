@@ -21,7 +21,7 @@
 
 from std.collections import List
 from std.math import sqrt, isnan, isinf
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.io.dtype import STDtype

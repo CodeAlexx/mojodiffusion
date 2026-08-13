@@ -6,7 +6,7 @@
 #   rm -f serenitymojo.mojopkg && pixi run mojo run -I . \
 #     serenitymojo/models/lingbotvideo/parity/video_resize_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

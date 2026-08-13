@@ -6,7 +6,7 @@
 #     pixi run mojo build -I . -I trainer/src \
 #       trainer/smoke/qwen_text_encoder_compile_check.mojo -o /tmp/qenc_check
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenity_trainer.model.QwenTextEncoder import (
     Qwen3Config,
     Qwen3Encoder,

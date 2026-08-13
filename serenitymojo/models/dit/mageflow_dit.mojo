@@ -31,7 +31,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in foundation ops.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, sin as fsin, pow as fpow, exp as fexp, log as flog
 
 from serenitymojo.tensor import Tensor

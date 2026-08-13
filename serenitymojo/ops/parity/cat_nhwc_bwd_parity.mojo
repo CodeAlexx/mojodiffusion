@@ -12,7 +12,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/ops/parity/cat_nhwc_bwd_parity.mojo -o /tmp/cat_nhwc
 #   /tmp/cat_nhwc
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness, ParityResult

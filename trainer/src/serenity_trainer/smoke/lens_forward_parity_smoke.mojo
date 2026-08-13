@@ -26,7 +26,7 @@
 #       hidden[1,S_img,128] BF16, txt0..3[1,S_txt,2880] BF16, mask[1,S_txt],
 #       timestep f32, weights, loras, ctx) -> Tensor[1,S_img,128] BF16  (flow).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, isfinite
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

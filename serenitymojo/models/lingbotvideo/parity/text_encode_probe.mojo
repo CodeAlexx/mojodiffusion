@@ -11,7 +11,7 @@
 #     pixi run mojo run -I . \
 #       serenitymojo/models/lingbotvideo/parity/text_encode_probe.mojo
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

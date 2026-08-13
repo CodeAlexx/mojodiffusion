@@ -17,7 +17,7 @@
 #       serenitymojo/pipeline/ltx2_decode_latent_gate.mojo -o /tmp/ltx2_decode_gate
 #   LD_LIBRARY_PATH=/home/alex/libtorch-cu124/libtorch/lib /tmp/ltx2_decode_gate
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

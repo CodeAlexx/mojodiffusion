@@ -11,7 +11,7 @@
 #   /home/alex/serenityflow-v2/.venv/bin/python serenitymojo/ops/parity/rope_halfsplit_full_oracle.py
 #   pixi run mojo run -I . serenitymojo/ops/parity/rope_halfsplit_full_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sin as msin, cos as mcos
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

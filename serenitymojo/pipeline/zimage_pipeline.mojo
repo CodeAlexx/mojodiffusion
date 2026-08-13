@@ -22,7 +22,7 @@
 # Run: cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #        serenitymojo/pipeline/zimage_pipeline.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log, cos
 
 from serenitymojo.tensor import Tensor

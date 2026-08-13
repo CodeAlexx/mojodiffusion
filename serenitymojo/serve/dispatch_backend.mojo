@@ -35,7 +35,7 @@
 # An unknown model name is REJECTED at start() (fail-loud — no silent fallback
 # to a model the user didn't ask for).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info

@@ -24,7 +24,7 @@
 # checkpoint dtype. Conv filters are remapped OIHW -> RSCF without widening
 # BF16/F16 host lists.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import List
 from serenitymojo.tensor import Tensor

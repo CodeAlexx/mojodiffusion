@@ -5,7 +5,7 @@
 # It is not a full model replay and does not accept CPU_OFFLOADED parity.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

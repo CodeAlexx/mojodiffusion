@@ -11,7 +11,7 @@
 # trainer wiring — open the cache, get an epoch order, pull a Sample, hand its
 # latent+cap to ModelSpec.predict.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenity_trainer.dataLoader.CacheReader import CacheReader, Sample, Batch
 

@@ -10,7 +10,7 @@ from std.sys import argv
 from std.math import sqrt
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.on_device_global_norm import on_device_global_norm, TArc

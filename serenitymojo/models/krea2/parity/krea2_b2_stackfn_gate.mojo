@@ -8,7 +8,7 @@
 # Uses random combined + synthetic d_velocity (backward is linear in d_velocity, so a
 # random dY exercises the whole chain); b2 gets 0.5*dY per sample so b2 == mean(B1).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, cos as mcos, sin as msin
 from std.memory import ArcPointer

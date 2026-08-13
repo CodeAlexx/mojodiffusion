@@ -3,7 +3,7 @@
 # scail2_rope_skeptic_oracle.py and are separately hash-gated by
 # FIXTURES.sha256.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from std.sys import argv
 from serenitymojo.io.ffi import (

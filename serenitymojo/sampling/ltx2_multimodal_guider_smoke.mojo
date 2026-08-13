@@ -12,7 +12,7 @@
 #       serenitymojo/sampling/ltx2_multimodal_guider_smoke.mojo -o /tmp/guider_smoke
 #   LD_LIBRARY_PATH=/home/alex/libtorch-cu124/libtorch/lib /tmp/guider_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

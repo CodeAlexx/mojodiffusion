@@ -5,7 +5,7 @@
 # CFG denoise (cond + uncond transformers, logit-normal schedule, Euler) ->
 # latent denorm -> Ideogram unpatch -> Flux2 VAE decode -> PNG, gating final_z /
 # final_latent / decoded vs the torch reference.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

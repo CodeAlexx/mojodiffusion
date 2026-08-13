@@ -17,7 +17,7 @@
 #       serenitymojo/models/ernie/parity/lora_step_smoke.mojo -o /tmp/ernie_lora_step
 #   /tmp/ernie_lora_step
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import alloc, ArcPointer

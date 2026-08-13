@@ -1,5 +1,5 @@
 # Validate _attn_pv_matmul (new cuBLAS P@V) against a host F32 reference.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import abs
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

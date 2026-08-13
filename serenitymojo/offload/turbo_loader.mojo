@@ -29,8 +29,8 @@
 
 from std.ffi import external_call
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 from std.gpu import global_idx
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype
@@ -81,9 +81,9 @@ def _h2d_copy_kernel(
             dst[b] = src[b]
 
 
-def _cu_memcpy_htod_async(
+def _cu_memcpy_htod_async[o: Origin, //](
     dst_device_ptr: UInt64,
-    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    src_host_ptr: UnsafePointer[UInt8, o],
     nbytes: Int,
     stream: CUstream,
 ) -> Int32:
@@ -92,9 +92,9 @@ def _cu_memcpy_htod_async(
     )
 
 
-def _h2d_dma_copy(
+def _h2d_dma_copy[o: Origin, //](
     dst_device_ptr: UInt64,
-    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    src_host_ptr: UnsafePointer[UInt8, o],
     nbytes: Int,
     stream: DeviceStream,
 ) raises:
@@ -109,9 +109,9 @@ def _h2d_dma_copy(
         )
 
 
-def _h2d_dma_copy_raw_stream(
+def _h2d_dma_copy_raw_stream[o: Origin, //](
     dst_device_ptr: UInt64,
-    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    src_host_ptr: UnsafePointer[UInt8, o],
     nbytes: Int,
     stream: CUstream,
 ) raises:
@@ -561,7 +561,7 @@ struct TurboBlockLoader(Movable):
                     )
                     self.copy_stream.record_event(self.ev0)
                 else:
-                    var compiled = ctx.compile_function[_h2d_copy_kernel, _h2d_copy_kernel]()
+                    var compiled = ctx.compile_function[_h2d_copy_kernel]()
                     comptime COPY_BLOCK = 256
                     var n64 = n_bytes // 8
                     var copy_items = n64 + (n_bytes - n64 * 8)
@@ -599,7 +599,7 @@ struct TurboBlockLoader(Movable):
                     )
                     self.copy_stream.record_event(self.ev1)
                 else:
-                    var compiled = ctx.compile_function[_h2d_copy_kernel, _h2d_copy_kernel]()
+                    var compiled = ctx.compile_function[_h2d_copy_kernel]()
                     comptime COPY_BLOCK = 256
                     var n64 = n_bytes // 8
                     var copy_items = n64 + (n_bytes - n64 * 8)

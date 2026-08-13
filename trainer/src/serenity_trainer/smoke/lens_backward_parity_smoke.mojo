@@ -42,7 +42,7 @@
 # so a small BF16↔f32 gap is expected — the 0.999 cosine bar accounts for it.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, isfinite
 
 from serenitymojo.tensor import Tensor

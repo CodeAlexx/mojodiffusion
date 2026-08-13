@@ -37,14 +37,13 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU (sm_120 / 16GB).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt, exp
 from std.time import perf_counter_ns
 from std.sys import argv
 from std.ffi import external_call
 from std.memory import alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.dtype import STDtype
@@ -380,7 +379,7 @@ struct CacheCond(Movable):
     var w: Int
     var src_id: Float32
 
-    fn __init__(out self, var tokens: List[Float32], f: Int, h: Int, w: Int,
+    def __init__(out self, var tokens: List[Float32], f: Int, h: Int, w: Int,
                 src_id: Float32):
         self.tokens = tokens^
         self.f = f
@@ -396,7 +395,7 @@ struct CacheGrid(Copyable, Movable):
     var w: Int
     var src_id: Float32
 
-    fn __init__(out self, f: Int, h: Int, w: Int, src_id: Float32):
+    def __init__(out self, f: Int, h: Int, w: Int, src_id: Float32):
         self.f = f
         self.h = h
         self.w = w

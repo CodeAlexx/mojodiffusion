@@ -3,7 +3,7 @@
 # inference runs in this gate.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

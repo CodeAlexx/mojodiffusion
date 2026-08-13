@@ -34,7 +34,7 @@
 #   <scratch>/dsgpu [ref.safetensors]
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

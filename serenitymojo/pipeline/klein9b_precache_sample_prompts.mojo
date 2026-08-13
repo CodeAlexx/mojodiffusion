@@ -5,7 +5,7 @@
 # GPU memory is released before the trainer/sampler process starts.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer

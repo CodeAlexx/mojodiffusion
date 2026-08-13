@@ -22,7 +22,7 @@
 #
 # Dtype policy: all tensors BF16; LR factor and grad norm are host F32 scalars.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenity_trainer.util.config.TrainConfig import TrainConfig
 from serenity_trainer.modelSetup.BaseModelSetup import ModelSpec
 from serenity_trainer.util.lr_scheduler_util import LrSchedule, resolve_schedule

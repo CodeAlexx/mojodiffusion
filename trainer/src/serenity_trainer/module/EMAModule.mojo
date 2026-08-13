@@ -21,7 +21,7 @@
 # `ema_step` once per (ema, param) pair, exactly as EMAModule.step zips the two
 # lists. The host owns the parameter↔ema correspondence (Serenity's zip).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.builtin.dtype import DType
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

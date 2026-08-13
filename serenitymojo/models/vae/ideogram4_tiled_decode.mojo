@@ -6,7 +6,7 @@
 # blend in image space. The only model-specific parts are LATENT_CH=32 and the
 # Ideogram-4 AutoencoderKLFlux2 decoder loader.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -22,7 +22,7 @@
 from std.collections import List
 from std.sys import argv
 from std.math import exp, sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

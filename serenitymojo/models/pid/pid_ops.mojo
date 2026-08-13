@@ -43,7 +43,7 @@
 #
 # Mojo 1.0.0b1.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from std.math import exp, cos, sin, log
@@ -85,8 +85,13 @@ struct RopeTables(Movable):
 def _patchify_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [B*C*H*W]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [B*L*TOK]
-    B: Int, C: Int, H: Int, W: Int, ps: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, ps_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var ps = Int(ps_w)
     # one thread per output element. out idx = ((b*L + l)*TOK + tok)
     var pH = H // ps
     var pW = W // ps
@@ -129,14 +134,20 @@ def patchify(x: Tensor, ps: Int, ctx: DeviceContext) raises -> Tensor:
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl_in
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_in,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_patchify_kernel, _patchify_kernel](
-        X, O, B, C, H, W, ps, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_patchify_kernel](
+        X, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(ps), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, [B, L, TOK], STDtype.F32)
@@ -145,8 +156,13 @@ def patchify(x: Tensor, ps: Int, ctx: DeviceContext) raises -> Tensor:
 def _unpatchify_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [B*L*TOK]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [B*C*H*W]
-    B: Int, C: Int, H: Int, W: Int, ps: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, ps_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var ps = Int(ps_w)
     # one thread per pixel output element. out idx = ((b*C+c)*H+h)*W+w
     var pH = H // ps
     var pW = W // ps
@@ -189,14 +205,20 @@ def unpatchify(
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](tokens.numel()))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        tokens.buf.unsafe_ptr().bitcast[Float32](), rl_in
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(tokens.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_in,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_unpatchify_kernel, _unpatchify_kernel](
-        X, O, B, C, H, W, ps, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_unpatchify_kernel](
+        X, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(ps), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, [B, C, H, W], STDtype.F32)
@@ -208,9 +230,13 @@ def unpatchify(
 def _ntk_rope_kernel(
     cos_o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [L*half]
     sin_o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [L*half]
-    H: Int, W: Int, dim: Int, half: Int,
+    H_w: Int32, W_w: Int32, dim_w: Int32, half_w: Int32,
     h_theta: Float32, w_theta: Float32, scale: Float32,
 ):
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var dim = Int(dim_w)
+    var half = Int(half_w)
     # one thread per (position, half-index j). half = dim//2. quarter = dim//4.
     # The packed freqs_cis at column 2k uses x-axis freq_k, column 2k+1 uses
     # y-axis freq_k, for k in [0, quarter). half == 2*quarter.
@@ -279,14 +305,20 @@ def ntk_rope_tables_2d(
     var sin_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var CO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        cos_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var SO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        sin_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_ntk_rope_kernel, _ntk_rope_kernel](
-        CO, SO, H, W, dim, half, h_theta, w_theta, scale,
+    ctx.enqueue_function[_ntk_rope_kernel](
+        CO, SO, Int32(H), Int32(W), Int32(dim), Int32(half), h_theta, w_theta, scale,
         grid_dim=grid, block_dim=_BLOCK,
     )
     ctx.synchronize()
@@ -301,8 +333,11 @@ def ntk_rope_tables_2d(
 def _ts_sinusoid_kernel(
     t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*dim]
-    N: Int, dim: Int, half: Int, neg_ln_mp: Float32,
+    N_w: Int64, dim_w: Int32, half_w: Int32, neg_ln_mp: Float32,
 ):
+    var N = Int(N_w)
+    var dim = Int(dim_w)
+    var half = Int(half_w)
     # one thread per output element. out idx = n*dim + d.
     # emb[n, j]        = cos(t[n] * freqs[j])    for j in [0, half)
     # emb[n, half + j] = sin(t[n] * freqs[j])
@@ -341,15 +376,21 @@ def timestep_embedding(
     var rl_t = RuntimeLayout[_DYN1].row_major(IndexList[1](N))
     var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        t.buf.unsafe_ptr().bitcast[Float32](), rl_t
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(t.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_t,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl_o
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_o,
     )
     var neg_ln_mp = -log(max_period)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_ts_sinusoid_kernel, _ts_sinusoid_kernel](
-        T, O, N, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_ts_sinusoid_kernel](
+        T, O, Int64(N), Int32(dim), Int32(half), neg_ln_mp, grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, [N, dim], STDtype.F32)
@@ -375,8 +416,10 @@ def _concat_last_kernel(
     a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [rows*D]
     b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [rows*D]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [rows*2D]
-    rows: Int, D: Int,
+    rows_w: Int32, D_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var D = Int(D_w)
     # out[r, 0:D] = a[r], out[r, D:2D] = b[r]   (cat([x,lq], dim=-1))
     var idx = Int(global_idx.x)
     var total = rows * 2 * D
@@ -395,8 +438,11 @@ def _gate_apply_kernel(
     logit: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], # [B*N*D]
     sigma: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], # [B]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # [B*N*D]
-    B: Int, N: Int, D: Int, neg_alpha: Float32,
+    B_w: Int32, N_w: Int64, D_w: Int32, neg_alpha: Float32,
 ):
+    var B = Int(B_w)
+    var N = Int(N_w)
+    var D = Int(D_w)
     # gate = sigmoid(logit + (-exp(log_alpha))*sigma_b)
     # out  = x + gate * lq.  neg_alpha = -exp(log_alpha).
     var idx = Int(global_idx.x)
@@ -433,17 +479,26 @@ def sigma_aware_gate(
     var rl_xy = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * D))
     var rl_cat = RuntimeLayout[_DYN1].row_major(IndexList[1](cat_n))
     var XA = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl_xy
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_xy,
     )
     var LB = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        lq.buf.unsafe_ptr().bitcast[Float32](), rl_xy
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(lq.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_xy,
     )
     var CO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        cat_buf.unsafe_ptr().bitcast[Float32](), rl_cat
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cat_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_cat,
     )
     var cgrid = (cat_n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_concat_last_kernel, _concat_last_kernel](
-        XA, LB, CO, rows, D, grid_dim=cgrid, block_dim=_BLOCK
+    ctx.enqueue_function[_concat_last_kernel](
+        XA, LB, CO, Int32(rows), Int32(D), grid_dim=cgrid, block_dim=_BLOCK
     )
     ctx.synchronize()
     var cat_t = Tensor(cat_buf^, [B, N, 2 * D], STDtype.F32)
@@ -455,24 +510,39 @@ def sigma_aware_gate(
     var rl_d = RuntimeLayout[_DYN1].row_major(IndexList[1](nn))
     var rl_s = RuntimeLayout[_DYN1].row_major(IndexList[1](B))
     var XX = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl_d
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_d,
     )
     var LL = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        lq.buf.unsafe_ptr().bitcast[Float32](), rl_d
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(lq.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_d,
     )
     var LG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        logit.buf.unsafe_ptr().bitcast[Float32](), rl_d
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(logit.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_d,
     )
     var SG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        sigma.buf.unsafe_ptr().bitcast[Float32](), rl_s
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sigma.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_s,
     )
     var OO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl_d
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_d,
     )
     var neg_alpha = -exp(log_alpha)
     var ggrid = (nn + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_gate_apply_kernel, _gate_apply_kernel](
-        XX, LL, LG, SG, OO, B, N, D, neg_alpha, grid_dim=ggrid, block_dim=_BLOCK
+    ctx.enqueue_function[_gate_apply_kernel](
+        XX, LL, LG, SG, OO, Int32(B), Int64(N), Int32(D), neg_alpha, grid_dim=ggrid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, [B, N, D], STDtype.F32)

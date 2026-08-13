@@ -58,8 +58,8 @@
 
 from std.math import sqrt, exp as fexp, cos as fcos, sin as fsin, pow as fpow
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
-from os import getenv
+from max.gpu.host import DeviceContext
+from std.os import getenv
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -217,14 +217,12 @@ def build_lens_rope_tables[
 ](ctx: DeviceContext) raises -> LensRopeTables:
     comptime N_IMG_ = LH_ * LW_
     comptime MAX_VID_IDX = max(LH_ // 2, LW_ // 2)  # transformer.py:157
-    constrained[
-        MAX_VID_IDX + N_TXT_ <= ROPE_TABLE_ROWS,
-        "Lens RoPE: max_vid_index + text_seq_len exceeds the 4096 freq table rows",
-    ]()
-    constrained[
-        LH_ <= ROPE_TABLE_ROWS and LW_ <= ROPE_TABLE_ROWS,
-        "Lens RoPE: latent grid dim exceeds the 4096 freq table rows",
-    ]()
+    comptime assert (
+        MAX_VID_IDX + N_TXT_ <= ROPE_TABLE_ROWS
+    ), "Lens RoPE: max_vid_index + text_seq_len exceeds the 4096 freq table rows"
+    comptime assert (
+        LH_ <= ROPE_TABLE_ROWS and LW_ <= ROPE_TABLE_ROWS
+    ), "Lens RoPE: latent grid dim exceeds the 4096 freq table rows"
 
     var pos_cos_host = List[Float32]()
     var pos_sin_host = List[Float32]()
@@ -895,7 +893,7 @@ def lens_forward_full_lora[N_IMG_: Int, N_TXT_: Int](
 
 # Integer sqrt (comptime): the square latent grid side from the image-token count
 # (S_IMG = LH*LW, square verified path → LH = LW = isqrt(S_IMG)).
-fn _isqrt(n: Int) -> Int:
+def _isqrt(n: Int) -> Int:
     var r = 1
     while (r + 1) * (r + 1) <= n:
         r += 1

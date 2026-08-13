@@ -49,7 +49,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.math import sqrt
 
@@ -158,7 +158,8 @@ struct LingBotWanVaeEncoder[H: Int, W: Int]:
         for ref raw in st.names():
             var nm = raw
             if nm.startswith("w::"):
-                nm = String(nm[byte=3 :])
+                var _tmp_nm = String(nm[byte=3 :])
+                nm = _tmp_nm^
             if not _is_encoder_tensor(nm):
                 continue
             var tv = st.tensor_view(raw)
@@ -189,7 +190,7 @@ struct LingBotWanVaeEncoder[H: Int, W: Int]:
             weights^, name_to_idx^, mean^, inv_std^
         )
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LingBot Wan VAE encoder missing weight: ") + name)
         return self.weights[self.name_to_idx[name]][]

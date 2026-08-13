@@ -30,7 +30,7 @@
 #     serenitymojo/models/text_encoder/parity/gemma4_states_parity.mojo \
 #     -o output/checks/gemma4_states_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

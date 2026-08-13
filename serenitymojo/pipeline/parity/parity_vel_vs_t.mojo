@@ -1,7 +1,7 @@
 # parity_vel_vs_t.mojo — velocity cos vs t (no dt amplification). For sampled
 # steps, feed my DiT the oracle's input latent at t=1-sigma[s], compare velocity
 # directly to diffusers' velc_NN.bin. Isolates the velocity error's t-dependence.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

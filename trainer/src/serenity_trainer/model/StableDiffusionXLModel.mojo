@@ -18,7 +18,7 @@
 # original storage dtype.
 
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -777,8 +777,9 @@ def _sdxl_vae_decode_kernel[dtype: DType](
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     output: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     scaling_factor: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
@@ -789,8 +790,9 @@ def _sdxl_vae_encode_kernel[dtype: DType](
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     output: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     scaling_factor: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
@@ -817,55 +819,55 @@ def _sdxl_vae_scale_apply[decode_mode: Bool](
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            latents.buf.unsafe_ptr().bitcast[Float32](), runtime_layout
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(latents.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=runtime_layout,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            output_buf.unsafe_ptr().bitcast[Float32](), runtime_layout
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(output_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=runtime_layout,
+    )
         comptime if decode_mode:
-            ctx.enqueue_function[
-                _sdxl_vae_decode_kernel[DType.float32],
-                _sdxl_vae_decode_kernel[DType.float32],
-            ](X, O, scaling_factor, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sdxl_vae_decode_kernel[DType.float32]](X, O, scaling_factor, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _sdxl_vae_encode_kernel[DType.float32],
-                _sdxl_vae_encode_kernel[DType.float32],
-            ](X, O, scaling_factor, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sdxl_vae_encode_kernel[DType.float32]](X, O, scaling_factor, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            latents.buf.unsafe_ptr().bitcast[BFloat16](), runtime_layout
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(latents.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=runtime_layout,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            output_buf.unsafe_ptr().bitcast[BFloat16](), runtime_layout
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(output_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=runtime_layout,
+    )
         comptime if decode_mode:
-            ctx.enqueue_function[
-                _sdxl_vae_decode_kernel[DType.bfloat16],
-                _sdxl_vae_decode_kernel[DType.bfloat16],
-            ](X, O, scaling_factor, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sdxl_vae_decode_kernel[DType.bfloat16]](X, O, scaling_factor, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _sdxl_vae_encode_kernel[DType.bfloat16],
-                _sdxl_vae_encode_kernel[DType.bfloat16],
-            ](X, O, scaling_factor, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sdxl_vae_encode_kernel[DType.bfloat16]](X, O, scaling_factor, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            latents.buf.unsafe_ptr().bitcast[Float16](), runtime_layout
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(latents.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=runtime_layout,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            output_buf.unsafe_ptr().bitcast[Float16](), runtime_layout
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(output_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=runtime_layout,
+    )
         comptime if decode_mode:
-            ctx.enqueue_function[
-                _sdxl_vae_decode_kernel[DType.float16],
-                _sdxl_vae_decode_kernel[DType.float16],
-            ](X, O, scaling_factor, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sdxl_vae_decode_kernel[DType.float16]](X, O, scaling_factor, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _sdxl_vae_encode_kernel[DType.float16],
-                _sdxl_vae_encode_kernel[DType.float16],
-            ](X, O, scaling_factor, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sdxl_vae_encode_kernel[DType.float16]](X, O, scaling_factor, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     return Tensor(output_buf^, sh^, storage)
 

@@ -11,7 +11,7 @@
 #   context [1,512,3072]    → text embed target
 #   e_vid [1,320,6,3072]    → time embed target (broadcast; compare token 0)
 #
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

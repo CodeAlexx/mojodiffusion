@@ -13,7 +13,7 @@
 #   pixi run mojo run -I . serenitymojo/ops/parity/norm_dx_equiv_smoke.mojo
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -28,7 +28,7 @@
 # on a tape and never receive gradients (only their LoRA d_A/d_B do).
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
@@ -64,7 +64,7 @@ struct ZImageWeights(Movable):
         return ZImageWeights(weights^, name_to_idx^)
 
     # Reference to a weight by full name (raises if missing).
-    def get(self, name: String) raises -> ref [self.weights] Tensor:
+    def get(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("ZImageWeights: missing weight: ") + name)
         var idx = self.name_to_idx[name]

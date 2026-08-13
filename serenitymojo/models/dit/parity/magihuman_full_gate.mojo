@@ -10,7 +10,7 @@
 # Self-attn uses sdpa_nomask_tiled (online softmax, no [S,S]) → no Dh=128 OOM.
 # Gate cos >= 0.99 (deep 40-layer chain).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

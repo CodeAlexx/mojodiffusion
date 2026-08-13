@@ -10,7 +10,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -46,7 +45,7 @@ def _bytes_to_string(data: List[UInt8]) -> String:
     var buf = alloc[UInt8](n)
     for i in range(n):
         buf[i] = data[i]
-    var out = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(buf)), length=n))
+    var out = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(buf)), length=n)))
     buf.free()
     return out^
 

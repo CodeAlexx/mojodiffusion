@@ -379,6 +379,90 @@ def dequant_int8_perrow(q8: torch.Tensor, s8: torch.Tensor) -> torch.Tensor:
     return q8.float() * s8.float().unsqueeze(1)
 
 
+# ── ConvRot int8 ("convrot_w8_v1") — rotate-then-int8, NO low-rank branch ────
+# W_rot = W @ H_bd (block-diagonal normalized Hadamard-256 along the INPUT dim);
+# int8 per-OUTPUT-channel absmax scaling of W_rot. The rotation spreads each
+# row's outliers across its 256-wide input blocks, so the per-row absmax stops
+# being set by one spike and the int8 grid is spent on the bulk of the mass.
+# int8 has the headroom that forced squareq's low-rank branch at 4 bits, so
+# there is none here; `lora_rank: 0` in the plan keeps the door open.
+FORMAT_TAG_CONVROT = "convrot_w8_v1"
+QMAX_I8 = 127.0
+
+
+def quant_int8_perchannel(w_rot: torch.Tensor) -> tuple:
+    """Rotated weight [out, in] -> (qweight i8 [out, in], wscale f32 [out]).
+
+    wscale[o] = absmax(W_rot[o, :]) / 127; qweight = clamp(round(W_rot/wscale),
+    -127, 127). Symmetric on purpose: -128 never appears, so an int8 GEMM can
+    negate/accumulate without an asymmetric-range special case."""
+    x = w_rot.float()
+    scale = x.abs().amax(1) / QMAX_I8
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    q = torch.clamp(torch.round(x / scale.unsqueeze(1)), -QMAX_I8, QMAX_I8)
+    return q.to(torch.int8).contiguous(), scale.float().contiguous()
+
+
+def dequant_int8_perchannel(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Inverse of quant_int8_perchannel -> f32 [out, in] (still rotated)."""
+    return q.float() * scale.float().unsqueeze(1)
+
+
+def reconstruct_weight_convrot(
+    qweight: torch.Tensor, wscale: torch.Tensor, hblock: int = HBLOCK
+) -> torch.Tensor:
+    """W_hat [out, in] f32 = dequant8(qweight, wscale) @ H_bd. H_bd is
+    self-inverse, so this is what the Mojo convrot reader must reproduce."""
+    return rht_grouped(
+        dequant_int8_perchannel(qweight, wscale).double(), block=hblock
+    ).float()
+
+
+# Rows are independent under both the rotation (block-diagonal along in) and
+# the per-out-channel scale, so the encode is chunked over output rows to keep
+# peak RSS bounded on H3-sized weights (fc1 is 28672x5376). Chunking is
+# bit-identical to the whole-tensor path; selftest_convrot gates that.
+_CHUNK_ELEMS = 32 << 20
+
+
+def quantize_layer_convrot(w: torch.Tensor, hblock: int = HBLOCK) -> tuple:
+    """Full convrot_w8_v1 encode of one linear weight w [out, in].
+    Returns (tensors {qweight, wscale}, stats)."""
+    out_f, in_f = w.shape
+    if in_f % hblock != 0:
+        raise ValueError(f"quantize_layer_convrot: in={in_f} not divisible by {hblock}")
+    rows = max(1, min(out_f, _CHUNK_ELEMS // in_f))
+    q = torch.empty(out_f, in_f, dtype=torch.int8)
+    s = torch.empty(out_f, dtype=torch.float32)
+    dot = nrm_hat = nrm_w = err2 = 0.0
+    for i in range(0, out_f, rows):
+        wc = w[i : i + rows].float()
+        rrot = rht_grouped(wc.double(), block=hblock).float()
+        qc, sc = quant_int8_perchannel(rrot)
+        q[i : i + rows] = qc
+        s[i : i + rows] = sc
+        hat = rht_grouped(
+            dequant_int8_perchannel(qc, sc).double(), block=hblock
+        ).float()
+        a, b = hat.flatten().double(), wc.flatten().double()
+        dot += float(a @ b)
+        nrm_hat += float(a @ a)
+        nrm_w += float(b @ b)
+        err2 += float(((a - b) ** 2).sum())
+        del wc, rrot, qc, sc, hat, a, b
+    cos_w = dot / ((nrm_hat**0.5) * (nrm_w**0.5) + 1e-30)
+    stats = {
+        "out": out_f,
+        "in": in_f,
+        "rank": 0,
+        "cos_w": cos_w,
+        "rel_l2": (err2**0.5) / (nrm_w**0.5 + 1e-30),
+        "bytes_q": q.numel() + s.numel() * 4,
+        "bytes_bf16": w.numel() * 2,
+    }
+    return {"qweight": q, "wscale": s}, stats
+
+
 def quantize_layer_w8(w: torch.Tensor, rank: int = 16, hblock: int = HBLOCK, seed: int = 0) -> tuple:
     """squareq_w8_v1 encode. Returns (tensors {q8weight,w8scale,lora_down,lora_up}, stats)."""
     out_f, in_f = w.shape

@@ -6,7 +6,7 @@
 # single block, final AdaLN, and final projection. The full 8+24 block pipeline
 # should extend these helpers rather than duplicating them.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, exp as fexp, log as flog
 from std.memory import ArcPointer
 
@@ -201,7 +201,7 @@ struct Klein9BDiT(Movable):
             weights.append(ArcPointer(t^))
         return Klein9BDiT(weights^, name_to_idx^, cfg)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing Klein weight: ") + name)
         var idx = self.name_to_idx[name]

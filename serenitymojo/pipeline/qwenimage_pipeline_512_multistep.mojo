@@ -16,7 +16,7 @@
 # behavior, just done via mask instead of physical narrowing (Mojo can't
 # narrow at runtime because tensor shapes are comptime-fixed).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

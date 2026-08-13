@@ -64,7 +64,7 @@
 # ops/tensor_algebra.*, ops/patchify3d.patchify3d, ShardedSafeTensors.
 
 from std.math import log
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -276,7 +276,7 @@ def cosmos_self_attention[N: Int, H: Int, DH: Int](
     x_seq: Tensor, cos: Tensor, sin: Tensor,
     w: Dict[String, ArcPointer[Tensor]], eps: Float32, ctx: DeviceContext,
 ) raises -> Tensor:
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
     var q = _lin_nobias(x_seq, w, "self_attn.q_proj.weight", ctx)
     var k = _lin_nobias(x_seq, w, "self_attn.k_proj.weight", ctx)
     var v = _lin_nobias(x_seq, w, "self_attn.v_proj.weight", ctx)
@@ -308,7 +308,7 @@ def cosmos_cross_attention[N: Int, TXT: Int, H: Int, DH: Int](
     x_seq: Tensor, text_ctx: Tensor,
     w: Dict[String, ArcPointer[Tensor]], eps: Float32, ctx: DeviceContext,
 ) raises -> Tensor:
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
     var q = _lin_nobias(x_seq, w, "cross_attn.q_proj.weight", ctx)       # [N,H*DH]
     var k = _lin_nobias(text_ctx, w, "cross_attn.k_proj.weight", ctx)    # [TXT,H*DH]
     var v = _lin_nobias(text_ctx, w, "cross_attn.v_proj.weight", ctx)    # [TXT,H*DH]
@@ -523,7 +523,7 @@ struct CosmosPredict25Dit(Movable):
             w[key] = ArcPointer(Tensor.from_view(tv, ctx))
         return CosmosPredict25Dit(weights=w^, config=cfg)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         return self.weights[name][]
 
     # Block weights sub-dict (keys stripped of "blocks.i." prefix).

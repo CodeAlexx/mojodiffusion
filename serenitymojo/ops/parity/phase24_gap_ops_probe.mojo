@@ -9,7 +9,7 @@
 #      pixi run mojo run -I . serenitymojo/ops/parity/phase24_gap_ops_probe.mojo
 
 from std.math import sqrt, erf
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

@@ -1,5 +1,5 @@
 # gate: resident fp8 forward (forward_r) vs chunk6 fixture (same as ideogram4_forward).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

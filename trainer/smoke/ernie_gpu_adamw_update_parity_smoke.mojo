@@ -21,7 +21,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.sys import has_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.ernie.ernie_stack_lora import (
     ErnieLoraSet, ErnieLoraGrads, build_ernie_lora_set, ernie_lora_adamw_step,

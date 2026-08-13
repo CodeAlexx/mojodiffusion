@@ -49,7 +49,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Inference-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from std.math import sqrt
 from std.sys import argv
@@ -340,7 +340,8 @@ def _save_mask_png_shape[HEIGHT_: Int, WIDTH_: Int, LH_: Int, LW_: Int](
     512x512, white = edit region."""
     var mask_path = out_png
     if mask_path.endswith(".png"):
-        mask_path = String(mask_path.removesuffix(".png"))
+        var _mask_trimmed = String(mask_path.removesuffix(".png"))
+        mask_path = _mask_trimmed^
     mask_path += "_mask.png"
     var host = List[Float32]()
     comptime TOK_GH_ = LH_ // 2

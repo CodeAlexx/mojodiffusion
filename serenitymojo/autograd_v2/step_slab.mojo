@@ -31,7 +31,7 @@
 # variants to hit the SAME GEMM kernels as MAX-pool allocations (which are
 # 256-aligned). Mojo 1.0.0b1, NVIDIA.
 
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 
 from serenitymojo.scratch_ring import ScratchRingAllocator, ScratchRingMark
 

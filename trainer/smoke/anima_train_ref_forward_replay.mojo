@@ -47,7 +47,7 @@
 # parity gate (64/64) is the backward math proof. Main loop owns the bar.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 
 from serenitymojo.io.dtype import STDtype

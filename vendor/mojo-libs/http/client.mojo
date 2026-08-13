@@ -20,7 +20,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from net.tcp import tcp_connect, _parse_ipv4
 from net.socket import Socket
 from net.syscalls import BytePtr, sys_socket, sys_connect, errno_str, AF_INET, SOCK_STREAM
@@ -166,7 +165,7 @@ def _byte_slice(s: String, start: Int, end: Int) -> String:
         return String("")
     var sp = s.as_bytes()
     var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 def _atoi(s: String) -> Int:
@@ -204,7 +203,7 @@ def _bytes_to_str(b: List[UInt8], start: Int, end: Int) -> String:
     var buf = alloc[UInt8](n)
     for i in range(n):
         buf[i] = b[start + i]
-    var s = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(buf)), length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(buf)), length=n)))
     buf.free()
     return s
 

@@ -17,7 +17,7 @@
 # bytes ARE read via pread (small, bounded by 100MB cap) — this is the only
 # eager I/O, matching the Rust reference which read_exact's the header.
 
-from std.memory import alloc, UnsafePointer, Span, bitcast
+from std.memory import alloc, UnsafePointer, bitcast
 from .dtype import STDtype
 from .mmap import MmapRegion
 from .json_header import parse_header, HeaderEntry
@@ -259,7 +259,7 @@ struct SafeTensors(Movable):
         # tracks this handle.
         var base = (self.region.as_ptr() + t.offset).as_immutable(
         ).unsafe_origin_cast[origin_of(self)]()
-        return Span[UInt8, origin_of(self)](ptr=base, length=t.size)
+        return Span(unsafe_ptr=base, length=t.size)
 
     def _tensor_ptr_unsafe(self, name: String) raises -> BytePtr:
         """UNSAFE: raw, lifetime-UNTRACKED pointer to a tensor's data =

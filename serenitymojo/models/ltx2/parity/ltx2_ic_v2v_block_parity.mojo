@@ -27,7 +27,7 @@
 #       serenitymojo/models/ltx2/parity/ltx2_ic_v2v_block_parity.mojo \
 #       -o /tmp/ltx2_ic_v2v_block_parity && /tmp/ltx2_ic_v2v_block_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.sys import argv
 

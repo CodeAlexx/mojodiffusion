@@ -7,7 +7,7 @@
 # is not integral (notably latent 168 and 104).
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.vae.ldm_decoder import load_sd3_embedded_ldm_decoder

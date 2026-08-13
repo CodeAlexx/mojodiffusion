@@ -22,9 +22,10 @@
 #
 # Build/gate: serenitymojo/training/parity/automagic3_device_parity.mojo
 
-from std.gpu import thread_idx, block_idx, block_dim, barrier
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.atomic import Atomic
 from std.math import sqrt, exp
 from std.memory import ArcPointer, stack_allocation
@@ -88,9 +89,10 @@ def automagic3_factored_kernel(
     lr: Float32,
     weight_decay: Float32,
     grad_scale: Float32,
-    step: Int,
+    step_w: Int32,
     seed: UInt64,
 ):
+    var step = Int(step_w)
     var m = Int(block_idx.x)
     var base = m * 6
     var rows = Int(descs[base + 0])
@@ -304,7 +306,7 @@ def automagic3_factored_kernel(
 # the forward consumes are produced by the VERIFIED host SR writeback
 # (automagic3_writeback_bf16_sr) from the downloaded F32 master each step.
 # ─────────────────────────────────────────────────────────────────────────────
-from std.gpu.host import DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceBuffer, HostBuffer
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.automagic3 import (
     Automagic3Rng, automagic3_writeback_bf16_sr,
@@ -380,7 +382,12 @@ struct Automagic3DeviceState(Movable):
 
 
 def _dynf(p: UnsafePointer[Float32, MutAnyOrigin], n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
-    return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](p, RuntimeLayout[_DYN1].row_major(IndexList[1](n)))
+    return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(p)
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
+    )
 
 
 def automagic3_device_state_init_from_adapters(
@@ -546,39 +553,53 @@ def _automagic3_device_step_preloaded(
     var RV = _dynf(state.rv_dev.unsafe_ptr(), state.nr)
     var CV = _dynf(state.cv_dev.unsafe_ptr(), state.ncv)
     var SR = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        state.sr_dev.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](_A3_H * state.np)),
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(state.sr_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](_A3_H * state.np)),
     )
     var DSC = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        state.dsc_dev.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat * 6)),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dsc_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat * 6)),
     )
     var HIDX = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        state.hidx_dev.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(state.hidx_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)),
     )
     var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        state.hfill_dev.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(state.hfill_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)),
     )
     var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](
-        state.gnum_dev.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
+        unsafe_ptr=Pointer[Scalar[DType.float64], MutAnyOrigin](
+            unsafe_from_address=Int(state.gnum_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
     )
     var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](
-        state.gden_dev.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
+        unsafe_ptr=Pointer[Scalar[DType.float64], MutAnyOrigin](
+            unsafe_from_address=Int(state.gden_dev.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
     )
     var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        state.pb_dev.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](state.np)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.pb_dev.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](state.np)),
     )
 
-    ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
+    ctx.enqueue_function[automagic3_factored_kernel](
         P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
         Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
         Float32(state.lr), Float32(weight_decay), grad_scale,
-        state.step, UInt64(0x5EED_A3D0),
+        Int32(state.step), UInt64(0x5EED_A3D0),
         grid_dim=state.nmat, block_dim=256,
     )
     state.step += 1

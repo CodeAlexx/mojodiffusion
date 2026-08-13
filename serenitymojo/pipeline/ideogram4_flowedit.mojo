@@ -56,7 +56,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Inference-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log
 from std.memory import ArcPointer, alloc
 from std.sys import argv
@@ -356,7 +356,8 @@ def _save_mask_png(
 ) raises -> String:
     var mask_path = out_png
     if mask_path.endswith(".png"):
-        mask_path = String(mask_path.removesuffix(".png"))
+        var _mask_trimmed = String(mask_path.removesuffix(".png"))
+        mask_path = _mask_trimmed^
     mask_path += "_mask.png"
     var host = List[Float32]()
     comptime scale_h = HEIGHT // TOK_GH   # 16
@@ -388,7 +389,7 @@ def _flowedit_denoise(
 ) raises -> Tensor:
     var inp = _build_inputs(ctx)
     var img_zeros = _zeros_bf16([1, NIMG, FEAT_DIM], NIMG * FEAT_DIM, ctx)
-    var sec = [24, 20, 20]
+    var sec: List[Int] = [24, 20, 20]
     var cs = build_ideogram4_mrope(inp[0][], HEAD_DIM, sec, Float32(5000000.0), ctx, STDtype.BF16)
     var ncs = build_ideogram4_mrope(inp[2][], HEAD_DIM, sec, Float32(5000000.0), ctx, STDtype.BF16)
 

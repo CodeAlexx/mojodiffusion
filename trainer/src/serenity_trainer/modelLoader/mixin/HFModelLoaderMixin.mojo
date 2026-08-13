@@ -15,7 +15,7 @@
 #   - a directory with a single *.safetensors fallback.
 # So this one entry point covers the Serenity base-model load surface.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

@@ -19,7 +19,7 @@
 #   serenitymojo/models/vae/parity/krea2_vae_parity_probe.mojo
 # DEV-ONLY: Python never runs here; the .bin files are static host references.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import log10
 from std.memory import alloc
 

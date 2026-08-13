@@ -55,7 +55,7 @@
 #
 # All NHWC, F32 interior (matches the gated units + the Rust FP32 residual stream).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import Optional
 from serenitymojo.tensor import Tensor

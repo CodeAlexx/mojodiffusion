@@ -11,7 +11,7 @@
 #      pixi run mojo run -I . serenitymojo/models/flux/parity/load_flux_weights_smoke.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.flux.config import flux_dev
 from serenitymojo.models.flux.weights import (

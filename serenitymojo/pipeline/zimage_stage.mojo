@@ -24,7 +24,7 @@
 # the resulting repository-local binary with the generated run configuration.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, alloc
 from std.os import listdir
 from std.sys import argv

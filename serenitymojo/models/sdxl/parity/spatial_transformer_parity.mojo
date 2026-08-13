@@ -14,7 +14,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/spatial_transformer_parity.mojo -o /tmp/sdxl_st_parity
 #   /tmp/sdxl_st_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

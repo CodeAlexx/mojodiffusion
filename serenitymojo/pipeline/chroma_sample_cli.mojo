@@ -83,7 +83,7 @@
 #     -o /tmp/chroma_sample_cli
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, exp as fexp, log as flog, sin as fsin, sqrt
 from std.memory import ArcPointer
 
@@ -208,14 +208,14 @@ struct ChromaShared(Movable):
             name_to_idx[nm] = idx
         return ChromaShared(weights^, name_to_idx^)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("ChromaShared missing weight: ") + name)
         var idx = self.name_to_idx[name]
         return self.weights[idx][]
 
 
-def _bw(ref block: Block, name: String) raises -> ref [block] Tensor:
+def _bw(ref block: Block, name: String) raises -> ref [block[String("")]] Tensor:
     if name not in block:
         raise Error(String("Block missing weight: ") + name)
     return block[name][]

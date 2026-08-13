@@ -20,7 +20,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import exp, tanh, erf
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -99,44 +99,51 @@ def _gelu_exact_deriv(x: Float32) -> Float32:
 # the right kernel and reads x at its storage dtype (cast up to F32 for math).
 
 # --- F32 kernels ---
-def _relu_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _relu_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _relu_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
-def _sigmoid_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _sigmoid_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _sigmoid_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
-def _sigmoid_out_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _sigmoid_out_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _sigmoid_deriv_from_output(rebind[Scalar[DType.float32]](y[i])))
 
 
-def _tanh_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _tanh_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _tanh_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
-def _silu_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _silu_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _silu_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
-def _gelu_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _gelu_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _gelu_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
 # --- BF16 kernels ---
-def _relu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _relu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -144,7 +151,8 @@ def _relu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: Layo
         o[i] = rebind[o.element_type]((gv * _relu_deriv(xv)).cast[DType.bfloat16]())
 
 
-def _sigmoid_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _sigmoid_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -152,7 +160,8 @@ def _sigmoid_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: L
         o[i] = rebind[o.element_type]((gv * _sigmoid_deriv(xv)).cast[DType.bfloat16]())
 
 
-def _sigmoid_out_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _sigmoid_out_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -160,7 +169,8 @@ def _sigmoid_out_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], 
         o[i] = rebind[o.element_type]((gv * _sigmoid_deriv_from_output(yv)).cast[DType.bfloat16]())
 
 
-def _tanh_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _tanh_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -168,7 +178,8 @@ def _tanh_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: Layo
         o[i] = rebind[o.element_type]((gv * _tanh_deriv(xv)).cast[DType.bfloat16]())
 
 
-def _silu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _silu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -176,7 +187,8 @@ def _silu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: Layo
         o[i] = rebind[o.element_type]((gv * _silu_deriv(xv)).cast[DType.bfloat16]())
 
 
-def _gelu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _gelu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -185,7 +197,8 @@ def _gelu_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: Layo
 
 
 # --- F16 kernels ---
-def _relu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _relu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -193,7 +206,8 @@ def _relu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Layout
         o[i] = rebind[o.element_type]((gv * _relu_deriv(xv)).cast[DType.float16]())
 
 
-def _sigmoid_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _sigmoid_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -201,7 +215,8 @@ def _sigmoid_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Lay
         o[i] = rebind[o.element_type]((gv * _sigmoid_deriv(xv)).cast[DType.float16]())
 
 
-def _sigmoid_out_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _sigmoid_out_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -209,7 +224,8 @@ def _sigmoid_out_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], y:
         o[i] = rebind[o.element_type]((gv * _sigmoid_deriv_from_output(yv)).cast[DType.float16]())
 
 
-def _tanh_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _tanh_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -217,7 +233,8 @@ def _tanh_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Layout
         o[i] = rebind[o.element_type]((gv * _tanh_deriv(xv)).cast[DType.float16]())
 
 
-def _silu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _silu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -225,7 +242,8 @@ def _silu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Layout
         o[i] = rebind[o.element_type]((gv * _silu_deriv(xv)).cast[DType.float16]())
 
 
-def _gelu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _gelu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -234,13 +252,15 @@ def _gelu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Layout
 
 
 # --- exact (erf) GELU backward kernels (arm 5) ---
-def _gelu_exact_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+def _gelu_exact_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _gelu_exact_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
-def _gelu_exact_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+def _gelu_exact_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
@@ -248,7 +268,8 @@ def _gelu_exact_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x
         o[i] = rebind[o.element_type]((gv * _gelu_exact_deriv(xv)).cast[DType.bfloat16]())
 
 
-def _gelu_exact_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+def _gelu_exact_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n_w: Int64):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
@@ -270,53 +291,98 @@ def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Te
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
-        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_f32, _relu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_f32, _sigmoid_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_f32, _tanh_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_f32, _silu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_f32, _gelu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_f32, _gelu_exact_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
-        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_bf16, _relu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_bf16, _sigmoid_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_bf16, _tanh_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_bf16, _silu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_bf16, _gelu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_bf16, _gelu_exact_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
-        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_f16, _relu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_f16, _sigmoid_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_f16, _tanh_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_f16, _silu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_f16, _gelu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_f16, _gelu_exact_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -335,53 +401,98 @@ def _run_slab(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext, mut sla
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
-        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_f32, _relu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_f32, _sigmoid_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_f32, _tanh_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_f32, _silu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_f32, _gelu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_f32, _gelu_exact_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
-        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_bf16, _relu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_bf16, _sigmoid_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_bf16, _tanh_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_bf16, _silu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_bf16, _gelu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_bf16, _gelu_exact_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
-        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_f16, _relu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_f16, _sigmoid_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_f16, _tanh_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_f16, _silu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_f16, _gelu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_f16, _gelu_exact_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -409,53 +520,98 @@ def _run_scratch(
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
-        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_f32, _relu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_f32, _sigmoid_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_f32, _tanh_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_f32, _silu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_f32, _gelu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_f32, _gelu_exact_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_f32](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
-        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_bf16, _relu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_bf16, _sigmoid_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_bf16, _tanh_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_bf16, _silu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_bf16, _gelu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_bf16, _gelu_exact_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_bf16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
-        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         if arm == 0:
-            ctx.enqueue_function[_relu_bwd_f16, _relu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_relu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 1:
-            ctx.enqueue_function[_sigmoid_bwd_f16, _sigmoid_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sigmoid_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 2:
-            ctx.enqueue_function[_tanh_bwd_f16, _tanh_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_tanh_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
-            ctx.enqueue_function[_silu_bwd_f16, _silu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_silu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif arm == 4:
-            ctx.enqueue_function[_gelu_bwd_f16, _gelu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[_gelu_exact_bwd_f16, _gelu_exact_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_gelu_exact_bwd_f16](G, X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     return out^
 
 
@@ -470,20 +626,65 @@ def _run_sigmoid_from_output(grad_out: Tensor, y: Tensor, ctx: DeviceContext) ra
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
-        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var Y = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](y.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[_sigmoid_out_bwd_f32, _sigmoid_out_bwd_f32](G, Y, O, n, grid_dim=grid, block_dim=_BLOCK)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var Y = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(y.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_sigmoid_out_bwd_f32](G, Y, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
-        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var Y = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](y.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[_sigmoid_out_bwd_bf16, _sigmoid_out_bwd_bf16](G, Y, O, n, grid_dim=grid, block_dim=_BLOCK)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var Y = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(y.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_sigmoid_out_bwd_bf16](G, Y, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
-        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var Y = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](y.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[_sigmoid_out_bwd_f16, _sigmoid_out_bwd_f16](G, Y, O, n, grid_dim=grid, block_dim=_BLOCK)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var Y = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(y.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_sigmoid_out_bwd_f16](G, Y, O, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, y.shape(), y.dtype())
 
 

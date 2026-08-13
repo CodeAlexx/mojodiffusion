@@ -14,7 +14,7 @@
 #   /home/alex/SerenityTrainer/venv/bin/python \
 #     serenitymojo/models/lingbotvideo/parity/oracle_image_preprocess.py
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

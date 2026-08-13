@@ -54,7 +54,7 @@
 # load_krea2_qwen3vl_4b streams every tensor through ONE reusable pinned host
 # staging buffer sized to the largest tensor (embed_tokens, ~778 MB), capping the
 # pinned-host peak at one tensor instead of all 398 -> measured peak ~9.6 GB.
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
@@ -234,7 +234,7 @@ def encode_krea2_stack(
     # Then slice the L axis (dim 1) to [DROP_IDX, L) -> drop the system prefix AND
     # the SDPA padding in one narrow.
     var keep = L - KREA2_DROP_IDX
-    var s4 = [1, len(padded), 1, H]
+    var s4: List[Int] = [1, len(padded), 1, H]
     var r0 = reshape(states[sel[0]][], s4.copy(), ctx)
     var r1 = reshape(states[sel[1]][], s4.copy(), ctx)
     var r2 = reshape(states[sel[2]][], s4.copy(), ctx)

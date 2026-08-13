@@ -68,7 +68,7 @@
 #   model.LensVAE:   LensDecoder[LH,LW] with .unscale_latents(latent_nchw) (VAE
 #                    batch-norm un-normalize) and .decode(latent_nchw) -> image.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

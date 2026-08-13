@@ -11,7 +11,7 @@
 #   /home/alex/SimpleTuner/.venv/bin/python serenitymojo/models/dit/parity/wan22_gen_oracle_large.py
 #   pixi run mojo run -I . serenitymojo/models/dit/parity/wan22_full_parity_large.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

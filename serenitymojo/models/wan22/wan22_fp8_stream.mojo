@@ -14,7 +14,7 @@
 # validate_wan22_a14b_fp8_cache.
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

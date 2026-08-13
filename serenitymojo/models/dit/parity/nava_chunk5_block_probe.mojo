@@ -3,7 +3,7 @@
 # loads and dequantises weights from NAVA_fp8.safetensors (prefix backbone.double_blocks.0.),
 # runs nava_double_block, then prints ParityHarness comparison vs double0_out.
 # Gate: cos >= 0.999.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

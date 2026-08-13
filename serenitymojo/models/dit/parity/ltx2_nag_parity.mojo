@@ -13,7 +13,7 @@
 #
 # F32 throughout (the kernel accumulates the L1 norms in F32; nag.py is float32).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.tensor import Tensor

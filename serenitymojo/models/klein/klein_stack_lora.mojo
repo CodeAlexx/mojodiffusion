@@ -46,7 +46,7 @@
 # store Tensor in a collection); `ArcPointer[Tensor]` is the Copyable device
 # carrier; no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
 
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.math import sqrt

@@ -14,7 +14,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/weights_remap_parity.mojo -o /tmp/sdxl_wr
 #   /tmp/sdxl_wr
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

@@ -32,7 +32,7 @@
 #     -Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda \
 #     serenitymojo/pipeline/parity/mageflow_edit_gate.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.tensor import Tensor

@@ -21,7 +21,7 @@
 # mscale 1.0, mscale_all_dim 1.0 -> attention_scaling = 1.0 (measured). truncate
 # defaults True. head_dim 128 -> half 64.
 
-from std.gpu.host import (
+from max.gpu.host import (
     DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent,
 )
 from std.math import cos as fcos, sin as fsin, log as flog

@@ -8,7 +8,7 @@
 # resident together on a 16 GB card. All model paths are explicit arguments.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.os import makedirs
 from std.sys import argv

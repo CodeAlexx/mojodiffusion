@@ -4,7 +4,7 @@
 # checkpoint weights for pixel patch embedding, timestep embedding, and caption
 # embedding. It does not claim transformer block or full denoise coverage.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.math import (
     cos as fcos,
@@ -283,8 +283,9 @@ comptime _ZL2P_BLOCK = 256
 def _zl2p_tanh_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _ZL2P_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _ZL2P_DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
@@ -300,13 +301,19 @@ def _zl2p_tanh(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var rl = RuntimeLayout[_ZL2P_DYN1].row_major(IndexList[1](n))
     var grid = (n + _ZL2P_BLOCK - 1) // _ZL2P_BLOCK
     var X = LayoutTensor[DType.bfloat16, _ZL2P_DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _ZL2P_DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
-    ctx.enqueue_function[_zl2p_tanh_kernel_bf16, _zl2p_tanh_kernel_bf16](
-        X, O, n, grid_dim=grid, block_dim=_ZL2P_BLOCK
+    ctx.enqueue_function[_zl2p_tanh_kernel_bf16](
+        X, O, Int64(n), grid_dim=grid, block_dim=_ZL2P_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, x.shape(), x.dtype())

@@ -4,7 +4,7 @@
 # set_timesteps(num_steps) schedule, model timestep scaling, negative Euler
 # deltas, textbook CFG, and `x + v * dt` update.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.sd3_contract import (

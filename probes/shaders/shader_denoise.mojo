@@ -32,7 +32,7 @@
 from std.math import ceildiv, sqrt, exp, pow, sin, cos, log
 from std.sys import has_accelerator
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 
 comptime dtype = DType.float32
@@ -544,7 +544,7 @@ def main() raises:
     # ====================== SmartDenoise ======================
     var sd_buf = ctx.enqueue_create_buffer[dtype](N)
     var sd_t = LayoutTensor[dtype, img_layout](sd_buf)
-    ctx.enqueue_function[smartdenoise_kernel, smartdenoise_kernel](
+    ctx.enqueue_function[smartdenoise_kernel](
         in_t, sd_t, Float32(1.2), Float32(2.0), Float32(0.2),
         grid_dim=gdim, block_dim=bdim,
     )
@@ -561,7 +561,7 @@ def main() raises:
     var lut_t = LayoutTensor[dtype, lut_layout](lut_buf)
     var hq_buf = ctx.enqueue_create_buffer[dtype](N)
     var hq_t = LayoutTensor[dtype, img_layout](hq_buf)
-    ctx.enqueue_function[hqdn3d_kernel, hqdn3d_kernel](
+    ctx.enqueue_function[hqdn3d_kernel](
         in_t, hq_t, lut_t, grid_dim=gdim, block_dim=bdim,
     )
     ctx.synchronize()
@@ -574,7 +574,7 @@ def main() raises:
     var mII_buf = ctx.enqueue_create_buffer[dtype](N)
     var mI_t = LayoutTensor[dtype, img_layout](mI_buf)
     var mII_t = LayoutTensor[dtype, img_layout](mII_buf)
-    ctx.enqueue_function[guided_moments_kernel, guided_moments_kernel](
+    ctx.enqueue_function[guided_moments_kernel](
         in_t, mI_t, mII_t, grid_dim=gdim, block_dim=bdim)
     # box-blur each moment field: H then V (separable)
     var tmp1_buf = ctx.enqueue_create_buffer[dtype](N)
@@ -585,13 +585,13 @@ def main() raises:
     var tmp2_t = LayoutTensor[dtype, img_layout](tmp2_buf)
     var bmII_buf = ctx.enqueue_create_buffer[dtype](N)
     var bmII_t = LayoutTensor[dtype, img_layout](bmII_buf)
-    ctx.enqueue_function[box_h_kernel, box_h_kernel](mI_t, tmp1_t, grid_dim=gdim, block_dim=bdim)
-    ctx.enqueue_function[box_v_kernel, box_v_kernel](tmp1_t, bmI_t, grid_dim=gdim, block_dim=bdim)
-    ctx.enqueue_function[box_h_kernel, box_h_kernel](mII_t, tmp2_t, grid_dim=gdim, block_dim=bdim)
-    ctx.enqueue_function[box_v_kernel, box_v_kernel](tmp2_t, bmII_t, grid_dim=gdim, block_dim=bdim)
+    ctx.enqueue_function[box_h_kernel](mI_t, tmp1_t, grid_dim=gdim, block_dim=bdim)
+    ctx.enqueue_function[box_v_kernel](tmp1_t, bmI_t, grid_dim=gdim, block_dim=bdim)
+    ctx.enqueue_function[box_h_kernel](mII_t, tmp2_t, grid_dim=gdim, block_dim=bdim)
+    ctx.enqueue_function[box_v_kernel](tmp2_t, bmII_t, grid_dim=gdim, block_dim=bdim)
     var gd_buf = ctx.enqueue_create_buffer[dtype](N)
     var gd_t = LayoutTensor[dtype, img_layout](gd_buf)
-    ctx.enqueue_function[guided_combine_kernel, guided_combine_kernel](
+    ctx.enqueue_function[guided_combine_kernel](
         in_t, bmI_t, bmII_t, gd_t, GEPS, grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with gd_buf.map_to_host() as h:
@@ -610,7 +610,7 @@ def main() raises:
     var ypos_t = LayoutTensor[dtype, pos_layout](ypos_buf)
     var db_buf = ctx.enqueue_create_buffer[dtype](N)
     var db_t = LayoutTensor[dtype, img_layout](db_buf)
-    ctx.enqueue_function[deband_kernel, deband_kernel](
+    ctx.enqueue_function[deband_kernel](
         in_t, db_t, xpos_t, ypos_t, Float32(0.01),
         grid_dim=gdim, block_dim=bdim,
     )

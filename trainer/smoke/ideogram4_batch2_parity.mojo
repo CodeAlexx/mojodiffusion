@@ -35,7 +35,7 @@
 #       smoke/ideogram4_batch2_parity.mojo -o target/ideogram4_batch2_parity'
 #   target/ideogram4_batch2_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt
 

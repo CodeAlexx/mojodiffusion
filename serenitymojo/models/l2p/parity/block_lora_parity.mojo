@@ -24,7 +24,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/l2p/parity/block_lora_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness

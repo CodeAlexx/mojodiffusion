@@ -16,7 +16,7 @@
 
 from std.math import sqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.ops.conv import conv2d

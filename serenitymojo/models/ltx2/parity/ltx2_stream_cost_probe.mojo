@@ -12,7 +12,7 @@
 #   -Xlinker -lm -Xlinker -lcuda \
 #   serenitymojo/models/ltx2/parity/ltx2_stream_cost_probe.mojo -o /tmp/ltx2_probe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.offload.ltx2_int4_block_stream import LTX2Int4BlockStream
 from std.memory import ArcPointer

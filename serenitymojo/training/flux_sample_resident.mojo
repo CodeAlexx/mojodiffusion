@@ -59,7 +59,7 @@
 # sampler borrows the trainer's already-resident base + loader + lora.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 
 from serenitymojo.tensor import Tensor

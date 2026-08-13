@@ -26,7 +26,7 @@
 # Run (SKIPPED branch only needs the plain form):
 #   pixi run mojo run -I . serenitymojo/models/text_encoder/minimax_h3_qwen3vl_streamed_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.ffi import sys_open, sys_close, O_RDONLY
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (
     minimax_h3_encode_conditioning_streamed,

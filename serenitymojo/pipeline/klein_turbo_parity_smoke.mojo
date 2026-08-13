@@ -29,7 +29,7 @@
 #     serenitymojo/pipeline/klein_turbo_parity_smoke.mojo \
 #     -o /tmp/klein_turbo_parity && /tmp/klein_turbo_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

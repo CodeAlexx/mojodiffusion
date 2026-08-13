@@ -8,7 +8,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, pi
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

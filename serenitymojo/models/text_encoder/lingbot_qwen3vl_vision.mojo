@@ -20,7 +20,7 @@
 
 from std.math import cos as fcos, sin as fsin, exp as fexp, log as flog, sqrt as fsqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -132,7 +132,7 @@ struct Qwen3VLVisionModel(Movable):
         self.weights = weights^
         self.name_to_idx = name_to_idx^
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing visual weight: ") + name)
         return self.weights[self.name_to_idx[name]][]

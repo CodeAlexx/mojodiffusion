@@ -42,7 +42,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, exp as fexp, log as flog
 from std.memory import ArcPointer
 
@@ -147,7 +147,7 @@ struct Flux1DiT(Movable):
             weights.append(ArcPointer(t^))
         return Flux1DiT(weights^, name_to_idx^, config)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing FLUX.1 weight: ") + name)
         var idx = self.name_to_idx[name]

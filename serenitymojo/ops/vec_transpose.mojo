@@ -22,9 +22,10 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -42,8 +43,10 @@ comptime _TILE_LAYOUT = Layout.row_major(_TILE, _PAD)
 def _vec_transpose_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    R: Int, C: Int,
+    R_w: Int32, C_w: Int32,
 ):
+    var R = Int(R_w)
+    var C = Int(C_w)
     var tile = LayoutTensor[
         DType.float32, _TILE_LAYOUT, MutAnyOrigin,
         address_space=AddressSpace.SHARED,
@@ -79,15 +82,21 @@ def vec_transpose(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var gx = (C + _TILE - 1) // _TILE
     var gy = (R + _TILE - 1) // _TILE
-    ctx.enqueue_function[_vec_transpose_kernel, _vec_transpose_kernel](
-        X, O, R, C, grid_dim=(gx, gy), block_dim=(_TILE, _TILE)
+    ctx.enqueue_function[_vec_transpose_kernel](
+        X, O, Int32(R), Int32(C), grid_dim=(gx, gy), block_dim=(_TILE, _TILE)
     )
     var oshape = List[Int]()
     oshape.append(C); oshape.append(R)

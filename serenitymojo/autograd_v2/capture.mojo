@@ -15,8 +15,8 @@
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA, MAX 26.3.
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 from std.memory import alloc
 from serenitymojo.io.ffi import BytePtr
 

@@ -37,11 +37,11 @@
 # Run (GPU; FP8 streaming keeps DiT ~12 GB):
 #   pixi run mojo run -I . serenitymojo/pipeline/ltx2_t2v_av_mvp.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, pow as fpow, log as flog, pi
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
-from sys import argv
+from std.sys import argv
 
 from serenitymojo.io.ffi import (
     sys_open, sys_pwrite, sys_close, sys_system,

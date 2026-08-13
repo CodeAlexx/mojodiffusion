@@ -12,7 +12,7 @@
 #
 # Run: pixi run mojo run -I . serenitymojo/models/text_encoder/minimax_h3_repeat_kv_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.text_encoder.qwen3_encoder import _repeat_kv

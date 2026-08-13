@@ -10,7 +10,7 @@
 #
 #   pixi run mojo run -I . pipeline/parity/minimax_h3_video_vae_pixel_norm_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (

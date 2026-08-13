@@ -1,7 +1,7 @@
 # GPU gate for MiniMax-H3's opt-in High step cache.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype
@@ -73,4 +73,85 @@ def main() raises:
         4, before, after, decision_cache
     ):
         raise Error("MiniMax-H3 step cache did not reuse a stable residual")
-    print("PASS: MiniMax-H3 High step cache GPU reconstruction + policy")
+
+    # ── Adaptive policy: accumulated drift budget ──────────────────────────
+    # A per-decision-acceptable diff (0.10 < 0.12) must be REFUSED once the
+    # accumulated drift would exceed the 0.24 budget, and the refusal is a
+    # full refresh that resets the accumulator.
+    decision_cache.middle_residual = Optional(
+        minimax_h3_cache_quantize_activation(first_for_snapshot, ctx)
+    )
+    decision_cache.accumulated_diff = Float32(0.20)
+    var after_drift = List[Float32](capacity=128)
+    for i in range(128):
+        # Stored previous residual is 0.25/row; 0.275 gives rel-L1 diff 0.10.
+        after_drift.append(before[i] + Float32(0.275))
+    if minimax_h3_cache_should_reuse(5, before, after_drift, decision_cache):
+        raise Error("MiniMax-H3 step cache reused past the drift budget")
+    if decision_cache.accumulated_diff != Float32(0.0):
+        raise Error("MiniMax-H3 step cache refresh did not reset the budget")
+    # After the refresh the same residual is stable again and reuses.
+    decision_cache.middle_residual = Optional(
+        minimax_h3_cache_quantize_activation(first_for_snapshot, ctx)
+    )
+    if not minimax_h3_cache_should_reuse(
+        6, before, after_drift, decision_cache
+    ):
+        raise Error("MiniMax-H3 step cache did not reuse after budget reset")
+
+    # ── Audio veto: tighter band blocks reuse even when video passes ──────
+    # Video diff 0 (stable) but audio diff 0.10 — above the 0.06 audio
+    # threshold, below the 0.12 video one. Reuse must be REFUSED.
+    decision_cache.middle_residual = Optional(
+        minimax_h3_cache_quantize_activation(first_for_snapshot, ctx)
+    )
+    var audio_before = List[Float32](capacity=16)
+    var audio_after_stable = List[Float32](capacity=16)
+    for i in range(16):
+        audio_before.append(Float32(i) * Float32(0.01))
+        audio_after_stable.append(audio_before[i] + Float32(0.25))
+    # Seed the previous audio probe via one refused refresh call.
+    _ = minimax_h3_cache_should_reuse(
+        7, before, after_drift, decision_cache,
+        audio_before, audio_after_stable,
+    )
+    decision_cache.middle_residual = Optional(
+        minimax_h3_cache_quantize_activation(first_for_snapshot, ctx)
+    )
+    var audio_after_moved = List[Float32](capacity=16)
+    for i in range(16):
+        # residual 0.275 vs previous 0.25 -> audio rel-L1 diff 0.10
+        audio_after_moved.append(audio_before[i] + Float32(0.275))
+    if minimax_h3_cache_should_reuse(
+        8, before, after_drift, decision_cache,
+        audio_before, audio_after_moved,
+    ):
+        raise Error("MiniMax-H3 step cache ignored the audio veto")
+    if decision_cache.last_audio_residual_diff < Float32(0.09) \
+            or decision_cache.last_audio_residual_diff > Float32(0.11):
+        raise Error("MiniMax-H3 audio diff not measured as expected")
+    # Stable audio (diff 0) with stable video must still reuse.
+    decision_cache.middle_residual = Optional(
+        minimax_h3_cache_quantize_activation(first_for_snapshot, ctx)
+    )
+    if not minimax_h3_cache_should_reuse(
+        9, before, after_drift, decision_cache,
+        audio_before, audio_after_moved,
+    ):
+        raise Error("MiniMax-H3 step cache refused with stable audio")
+
+    # ── Adaptive policy: exact tail ────────────────────────────────────────
+    # With a 10-evaluation schedule the final three evaluations never reuse,
+    # and entering the tail disables the cache (no further snapshot cost).
+    var tail_cache = MiniMaxH3StepCache(True, 10)
+    tail_cache.middle_residual = Optional(
+        minimax_h3_cache_quantize_activation(first_for_snapshot, ctx)
+    )
+    if minimax_h3_cache_should_reuse(7, before, after, tail_cache):
+        raise Error("MiniMax-H3 step cache reused inside the exact tail")
+    if tail_cache.enabled:
+        raise Error("MiniMax-H3 step cache stayed enabled inside the tail")
+    print(
+        "PASS: MiniMax-H3 step cache GPU reconstruction + adaptive policy"
+        " (budget + exact tail)"
+    )

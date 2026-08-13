@@ -32,7 +32,7 @@
 #       -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa \
 #       serenitymojo/models/krea2/parity/krea2_streamed_ref_seam_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor

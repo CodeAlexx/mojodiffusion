@@ -66,7 +66,7 @@ def _read_text_file(path: String) raises -> String:
             raise Error(String("serenity_lower: read failed on ") + path)
         done += k
     _ = sys_close(fd)
-    var s = String(StringSlice(ptr=buf, length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=buf, length=n)))
     buf.free()
     return s^
 

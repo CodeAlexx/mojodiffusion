@@ -12,7 +12,7 @@
 # asymflux2-specific wiring: adapter apply + the asymflow sample loop + the
 # Oklab pixel codec + the AsymFLUX.2 sqrt-shift sigma schedule.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt as fsqrt, cbrt as fcbrt, pow as fpow, log as flog
 from std.memory import ArcPointer
 

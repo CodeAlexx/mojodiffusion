@@ -23,7 +23,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU, inference-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.linear import linear

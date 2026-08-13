@@ -28,9 +28,9 @@
 #     pixi run mojo run -I . serenitymojo/sampling/parity/dpmpp_2m_parity.mojo
 #   (add a trailing `--bitrot` arg for the deliberate-wrong demo)
 
-from collections import List
+from std.collections import List
 from std.math import cos, log
-from sys import argv
+from std.sys import argv
 
 from serenitymojo.sampling.dpmpp_2m import (
     dpmpp_2m_coeffs,

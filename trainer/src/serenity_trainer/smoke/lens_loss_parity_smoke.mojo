@@ -25,7 +25,7 @@
 # DTYPE: BF16 forward boundary (trained storage); the loss is reduced in F64 on
 # host. The 2% bar accounts for the bf16<->f32 gap.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import isfinite
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -12,7 +12,7 @@
 #     serenitymojo/training/tests/klein_dora_orchestration_smoke.mojo \
 #     -o /tmp/klein_dora_orch && /tmp/klein_dora_orch
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.training.dora_stack import (
     KleinDoRASet, build_klein_dora_set, klein_dora_preflight,

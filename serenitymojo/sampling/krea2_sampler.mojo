@@ -32,7 +32,7 @@
 # The schedule is tiny host-side F32 work; only the CFG combine and Euler update
 # touch the GPU (through ops/tensor_algebra). Mojo 1.0.0b1. Inference-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, log
 
 from serenitymojo.tensor import Tensor

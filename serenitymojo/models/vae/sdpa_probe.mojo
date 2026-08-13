@@ -2,7 +2,7 @@
 # B=1, S=64 (8x8 latent), H=1 head, Dh=512. scale=1/sqrt(512).
 # Compare to a CPU single-head softmax-attention reference.
 from std.math import sqrt, exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.attention import sdpa

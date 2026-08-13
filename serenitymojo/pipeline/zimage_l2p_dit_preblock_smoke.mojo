@@ -4,7 +4,7 @@
 # pixel patchify16 -> all_x_embedder, sigma -> timestep MLP, and
 # cap_feats -> RMSNorm+Linear caption embedder.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.zimage_l2p_contract import (

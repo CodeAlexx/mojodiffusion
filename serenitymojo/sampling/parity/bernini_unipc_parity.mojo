@@ -2,7 +2,7 @@
 # Run scripts/bernini_r_scheduler_oracle.py first.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.io.dtype import STDtype

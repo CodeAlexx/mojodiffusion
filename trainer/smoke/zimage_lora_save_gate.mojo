@@ -1,5 +1,5 @@
 # Save a Z-Image LoRA set; gate verifies keys match a real Serenity LoRA.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenity_trainer.model.ZImageModel import build_zimage_lora_set
 from serenity_trainer.modelSaver.zImage.ZImageLoRASaver import save_zimage_lora
 

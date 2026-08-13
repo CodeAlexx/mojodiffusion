@@ -17,12 +17,12 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/unet_stack_real_smoke.mojo -o /tmp/sdxl_real_smoke
 #   /tmp/sdxl_real_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from math import isfinite
+from std.math import isfinite
 
 from serenitymojo.ops.conv import conv2d
 from serenitymojo.ops.conv2d_backward import conv2d_backward

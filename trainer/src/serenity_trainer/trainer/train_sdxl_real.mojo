@@ -43,7 +43,7 @@
 
 from std.sys import argv
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.os import listdir, makedirs
 from std.time import perf_counter_ns

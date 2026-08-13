@@ -6,10 +6,11 @@
 
 from std.collections import List
 from std.ffi import external_call
-from std.gpu import barrier, block_dim, block_idx, global_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA
-from std.gpu.memory import AddressSpace
+from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -29,10 +30,12 @@ def _quantize_activation_outer_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float8_e4m3fn, _DYN1, MutAnyOrigin],
-    cols: Int,
-    rows: Int,
+    cols_w: Int32,
+    rows_w: Int32,
 ):
     """One-block-per-row absmax reduction and E4M3 encoding."""
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var row = Int(block_idx.x)
     if row >= rows:
         return
@@ -85,9 +88,11 @@ def _quantize_activation_outer_kernel(
 def _pad_rows_bf16_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    actual_numel: Int,
-    padded_numel: Int,
+    actual_numel_w: Int32,
+    padded_numel_w: Int32,
 ):
+    var actual_numel = Int(actual_numel_w)
+    var padded_numel = Int(padded_numel_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     while i < padded_numel:
@@ -105,7 +110,10 @@ def _quantize_activation_outer(
     var padded_numel = padded_m * k
     var x_in_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](actual_numel))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_in_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_in_rl,
     )
     var x_grid = (padded_numel + _BLOCK - 1) // _BLOCK
     if x_grid > 65535:
@@ -114,36 +122,39 @@ def _quantize_activation_outer(
     var scale_buf = ctx.enqueue_create_buffer[DType.uint8](padded_m * 4)
     var scale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](padded_m))
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale_buf.unsafe_ptr().bitcast[Float32](), scale_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=scale_rl,
     )
     var fp8_buf = ctx.enqueue_create_buffer[DType.uint8](padded_numel)
     var fp8_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](padded_numel))
     var O = LayoutTensor[DType.float8_e4m3fn, _DYN1, MutAnyOrigin](
-        fp8_buf.unsafe_ptr().bitcast[Float8_e4m3fn](), fp8_rl
+        unsafe_ptr=Pointer[Scalar[DType.float8_e4m3fn], MutAnyOrigin](
+            unsafe_from_address=Int(fp8_buf.unsafe_ptr().bitcast[Float8_e4m3fn]())
+        ),
+        runtime_layout=fp8_rl,
     )
     if actual_numel == padded_numel:
-        ctx.enqueue_function[
-            _quantize_activation_outer_kernel,
-            _quantize_activation_outer_kernel,
-        ](
-            X, S, O, k, padded_m,
+        ctx.enqueue_function[_quantize_activation_outer_kernel](
+            X, S, O, Int32(k), Int32(padded_m),
             grid_dim=padded_m, block_dim=_BLOCK,
         )
     else:
         var x_buf = ctx.enqueue_create_buffer[DType.uint8](padded_numel * 2)
         var x_out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](padded_numel))
         var XP = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x_buf.unsafe_ptr().bitcast[BFloat16](), x_out_rl
-        )
-        ctx.enqueue_function[_pad_rows_bf16_kernel, _pad_rows_bf16_kernel](
-            X, XP, actual_numel, padded_numel,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_out_rl,
+    )
+        ctx.enqueue_function[_pad_rows_bf16_kernel](
+            X, XP, Int32(actual_numel), Int32(padded_numel),
             grid_dim=x_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _quantize_activation_outer_kernel,
-            _quantize_activation_outer_kernel,
-        ](
-            XP, S, O, k, padded_m,
+        ctx.enqueue_function[_quantize_activation_outer_kernel](
+            XP, S, O, Int32(k), Int32(padded_m),
             grid_dim=padded_m, block_dim=_BLOCK,
         )
     var fp8_shape: List[Int] = [padded_m, k]
@@ -160,9 +171,11 @@ def _scale_bias_bf16_kernel(
     ws: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    m: Int,
-    n: Int,
+    m_w: Int32,
+    n_w: Int64,
 ):
+    var m = Int(m_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = m * n
@@ -234,26 +247,41 @@ def fp8_cublas_linear_outer(
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](actual_m * n))
     var RAW = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        raw_buf.unsafe_ptr().bitcast[Float32](), raw_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(raw_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=raw_rl,
     )
     var XS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_scale.buf.unsafe_ptr().bitcast[Float32](), xs_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=xs_rl,
     )
     var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight_scale.buf.unsafe_ptr().bitcast[Float32](), ws_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=ws_rl,
     )
     var BIAS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        bias.buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bias_rl,
     )
     var OUT = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
     )
     var total = actual_m * n
     var grid = (total + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_scale_bias_bf16_kernel, _scale_bias_bf16_kernel](
-        RAW, XS, WS, BIAS, OUT, actual_m, n,
+    ctx.enqueue_function[_scale_bias_bf16_kernel](
+        RAW, XS, WS, BIAS, OUT, Int32(actual_m), Int64(n),
         grid_dim=grid, block_dim=_BLOCK,
     )
 

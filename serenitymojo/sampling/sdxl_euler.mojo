@@ -4,7 +4,7 @@
 # The schedule is CPU scalar setup. CFG and latent Euler updates stay on GPU
 # through tensor_algebra ops. This file does not encode CLIP or run the UNet.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, log, pow, sqrt
 
 from serenitymojo.tensor import Tensor

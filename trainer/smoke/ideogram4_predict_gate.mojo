@@ -7,7 +7,7 @@
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo run -I . -I trainer/src \
 #       trainer/smoke/ideogram4_predict_gate.mojo
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

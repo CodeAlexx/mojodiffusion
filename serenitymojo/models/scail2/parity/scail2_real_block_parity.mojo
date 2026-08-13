@@ -2,7 +2,7 @@
 # Fixture is produced only by scail2_real_block_oracle.py from the pinned source.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.io.dtype import STDtype

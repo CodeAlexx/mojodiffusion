@@ -1,7 +1,7 @@
 # Parity: Ideogram-4 VAE *encoder* (training path) vs torch oracle.
 # Oracle = ideogram4_vae_encode_oracle.py (ae.encoder -> mean[:,:32] -> patchify
 # -> (patched-shift)/scale). Gates moments / mean / final normalized latents.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

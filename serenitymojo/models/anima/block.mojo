@@ -48,7 +48,7 @@
 # gate's F32 path). BF16 storage is the trainer's concern (the backward ops all
 # cast up to F32 internally), not the parity unit's.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt as fsqrt
 from std.memory import ArcPointer

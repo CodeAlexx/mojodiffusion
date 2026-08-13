@@ -38,7 +38,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.gpu import global_idx
 from std.memory import ArcPointer
 from std.math import sqrt
@@ -171,8 +171,12 @@ def _is_enc_resample_conv2d_weight(name: String) -> Bool:
 def _patchify2_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    bsz: Int, d: Int, oh: Int, ow: Int,
+    bsz_w: Int32, d_w: Int32, oh_w: Int32, ow_w: Int32,
 ):
+    var bsz = Int(bsz_w)
+    var d = Int(d_w)
+    var oh = Int(oh_w)
+    var ow = Int(ow_w)
     var idx = Int(global_idx.x)
     var total = bsz * d * oh * ow * 12
     if idx < total:
@@ -197,8 +201,12 @@ def _patchify2_kernel_f32(
 def _patchify2_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    bsz: Int, d: Int, oh: Int, ow: Int,
+    bsz_w: Int32, d_w: Int32, oh_w: Int32, ow_w: Int32,
 ):
+    var bsz = Int(bsz_w)
+    var d = Int(d_w)
+    var oh = Int(oh_w)
+    var ow = Int(ow_w)
     var idx = Int(global_idx.x)
     var total = bsz * d * oh * ow * 12
     if idx < total:
@@ -240,23 +248,35 @@ def _patchify2_ndhwc(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[_patchify2_kernel_f32, _patchify2_kernel_f32](
-            X, O, b, d, oh, ow, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_patchify2_kernel_f32](
+            X, O, Int32(b), Int32(d), Int32(oh), Int32(ow), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[_patchify2_kernel_bf16, _patchify2_kernel_bf16](
-            X, O, b, d, oh, ow, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_patchify2_kernel_bf16](
+            X, O, Int32(b), Int32(d), Int32(oh), Int32(ow), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("Wan22 patchify supports F32/BF16 only")
@@ -282,10 +302,23 @@ def _patchify2_ndhwc(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 def _avgdown3d_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    bsz: Int, dpad: Int, h: Int, w: Int, cin: Int,
-    od: Int, oh: Int, ow: Int, cout: Int,
-    factor_t: Int, factor_s: Int, group_size: Int, pad_t: Int,
+    bsz_w: Int32, dpad_w: Int32, h_w: Int32, w_w: Int32, cin_w: Int32,
+    od_w: Int32, oh_w: Int32, ow_w: Int32, cout_w: Int32,
+    factor_t_w: Int32, factor_s_w: Int32, group_size_w: Int32, pad_t_w: Int32,
 ):
+    var bsz = Int(bsz_w)
+    var dpad = Int(dpad_w)
+    var h = Int(h_w)
+    var w = Int(w_w)
+    var cin = Int(cin_w)
+    var od = Int(od_w)
+    var oh = Int(oh_w)
+    var ow = Int(ow_w)
+    var cout = Int(cout_w)
+    var factor_t = Int(factor_t_w)
+    var factor_s = Int(factor_s_w)
+    var group_size = Int(group_size_w)
+    var pad_t = Int(pad_t_w)
     var idx = Int(global_idx.x)
     var total = bsz * od * oh * ow * cout
     if idx < total:
@@ -324,10 +357,23 @@ def _avgdown3d_kernel_f32(
 def _avgdown3d_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    bsz: Int, dpad: Int, h: Int, w: Int, cin: Int,
-    od: Int, oh: Int, ow: Int, cout: Int,
-    factor_t: Int, factor_s: Int, group_size: Int, pad_t: Int,
+    bsz_w: Int32, dpad_w: Int32, h_w: Int32, w_w: Int32, cin_w: Int32,
+    od_w: Int32, oh_w: Int32, ow_w: Int32, cout_w: Int32,
+    factor_t_w: Int32, factor_s_w: Int32, group_size_w: Int32, pad_t_w: Int32,
 ):
+    var bsz = Int(bsz_w)
+    var dpad = Int(dpad_w)
+    var h = Int(h_w)
+    var w = Int(w_w)
+    var cin = Int(cin_w)
+    var od = Int(od_w)
+    var oh = Int(oh_w)
+    var ow = Int(ow_w)
+    var cout = Int(cout_w)
+    var factor_t = Int(factor_t_w)
+    var factor_s = Int(factor_s_w)
+    var group_size = Int(group_size_w)
+    var pad_t = Int(pad_t_w)
     var idx = Int(global_idx.x)
     var total = bsz * od * oh * ow * cout
     if idx < total:
@@ -389,25 +435,37 @@ def _avg_down3d(
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[_avgdown3d_kernel_f32, _avgdown3d_kernel_f32](
-            X, O, b, dpad, h, w, cin, od, oh, ow, out_channels,
-            factor_t, factor_s, group_size, pad_t, grid_dim=grid, block_dim=_BLOCK,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_avgdown3d_kernel_f32](
+            X, O, Int32(b), Int32(dpad), Int32(h), Int32(w), Int32(cin), Int32(od), Int32(oh), Int32(ow), Int32(out_channels),
+            Int32(factor_t), Int32(factor_s), Int32(group_size), Int32(pad_t), grid_dim=grid, block_dim=_BLOCK,
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[_avgdown3d_kernel_bf16, _avgdown3d_kernel_bf16](
-            X, O, b, dpad, h, w, cin, od, oh, ow, out_channels,
-            factor_t, factor_s, group_size, pad_t, grid_dim=grid, block_dim=_BLOCK,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_avgdown3d_kernel_bf16](
+            X, O, Int32(b), Int32(dpad), Int32(h), Int32(w), Int32(cin), Int32(od), Int32(oh), Int32(ow), Int32(out_channels),
+            Int32(factor_t), Int32(factor_s), Int32(group_size), Int32(pad_t), grid_dim=grid, block_dim=_BLOCK,
         )
     else:
         raise Error("Wan22 AvgDown3D supports F32/BF16 only")
@@ -514,7 +572,7 @@ struct Wan22VaeImageEncoder[H: Int, W: Int]:
         var inv_std = Tensor.from_host(inv, msh^, STDtype.BF16, ctx)
         return Wan22VaeImageEncoder[Self.H, Self.W](weights^, name_to_idx^, mean^, inv_std^)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("Wan22 VAE encoder missing weight: ") + name)
         return self.weights[self.name_to_idx[name]][]

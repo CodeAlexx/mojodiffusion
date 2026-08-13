@@ -15,7 +15,7 @@
 #   pixi run mojo run -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/pipeline/ltx2_av_block_parity_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

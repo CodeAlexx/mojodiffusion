@@ -4,7 +4,7 @@
 # latent patch embedding + cropped pos_embed, timestep+pooled conditioning, and
 # context projection for both SD3.5 Large and the local "small" SD3.5 Medium.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.sd3_contract import (

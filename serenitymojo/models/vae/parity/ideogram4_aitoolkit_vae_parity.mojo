@@ -12,7 +12,7 @@
 #
 # Run: cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg &&
 #   pixi run mojo run -I . serenitymojo/models/vae/parity/ideogram4_aitoolkit_vae_parity.mojo
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

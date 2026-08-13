@@ -4,7 +4,7 @@
 # real Chroma distilled_guidance_layer and builds the per-step cache used by
 # the Rust Chroma DiT. It also exposes bounded real-weight block/proj slices.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, exp as fexp, log as flog, sin as fsin, sqrt
 from std.memory import ArcPointer
 
@@ -146,7 +146,7 @@ struct ChromaDitCache(Movable):
     def load_default_stage_smoke(ctx: DeviceContext) raises -> ChromaDitCache:
         return ChromaDitCache.load_stage_smoke(chroma_default_checkpoint_path(), ctx)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing Chroma weight: ") + name)
         var idx = self.name_to_idx[name]

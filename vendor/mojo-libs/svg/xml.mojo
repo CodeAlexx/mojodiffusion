@@ -53,7 +53,7 @@ def _is_name_char(c: Int) -> Bool:
 def _slice(b: List[UInt8], start: Int, end: Int) -> String:
     if end <= start:
         return String("")
-    return String(StringSlice(ptr=b.unsafe_ptr() + start, length=end - start))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + start, length=end - start)))
 
 
 def _decode_entities(s: String) raises -> String:

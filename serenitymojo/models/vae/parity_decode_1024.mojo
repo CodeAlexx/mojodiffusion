@@ -7,7 +7,7 @@
 #
 # Run: pixi run mojo run -I . serenitymojo/models/vae/parity_decode_1024.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

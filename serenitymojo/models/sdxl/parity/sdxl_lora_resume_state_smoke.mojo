@@ -5,7 +5,7 @@
 # trainer state sidecar round-trips. No UNet, model checkpoint, or sampler run.
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.sdxl.lora_block import (
     SLOT_A1_Q, SLOT_A2_K, SLOT_FF_PROJ, SLOT_FF_OUT,

@@ -7,7 +7,7 @@
 # and out when the cache/checkpoint path is BF16; F32 is limited to internals of
 # existing kernels, reductions, and optimizer-bound grad buffers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

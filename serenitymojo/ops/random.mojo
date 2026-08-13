@@ -8,7 +8,7 @@
 # SeedableRng::seed_from_u64 -> PCG32-expanded 32-byte seed -> ChaCha12Rng
 # -> Standard f32 -> Box-Muller.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import log, sqrt, cos, sin
 from std.utils.index import IndexList
@@ -207,9 +207,10 @@ def _std_rng_pair(seed: UInt64, pair: UInt64) -> _NormalPair:
 
 def _randn_kernel_f32(
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
     seed: UInt64,
 ):
+    var n = Int(n_w)
     var pair_i = Int(global_idx.x)
     var i = pair_i * 2
     if i < n:
@@ -221,9 +222,10 @@ def _randn_kernel_f32(
 
 def _randn_kernel_bf16(
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
     seed: UInt64,
 ):
+    var n = Int(n_w)
     var pair_i = Int(global_idx.x)
     var i = pair_i * 2
     if i < n:
@@ -235,9 +237,10 @@ def _randn_kernel_bf16(
 
 def _randn_kernel_f16(
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
     seed: UInt64,
 ):
+    var n = Int(n_w)
     var pair_i = Int(global_idx.x)
     var i = pair_i * 2
     if i < n:
@@ -268,24 +271,33 @@ def randn(var shape: List[Int], seed: UInt64, dtype: STDtype, ctx: DeviceContext
 
     if dt == DType.float32:
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_randn_kernel_f32, _randn_kernel_f32](
-            O, n, seed, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_randn_kernel_f32](
+            O, Int64(n), seed, grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_randn_kernel_bf16, _randn_kernel_bf16](
-            O, n, seed, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_randn_kernel_bf16](
+            O, Int64(n), seed, grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_randn_kernel_f16, _randn_kernel_f16](
-            O, n, seed, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_randn_kernel_f16](
+            O, Int64(n), seed, grid_dim=grid, block_dim=_BLOCK
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, shape^, dtype)
@@ -314,8 +326,9 @@ def _std_rng_uniform_pair(seed: UInt64, pair: UInt64) -> _NormalPair:
 
 def _rand_uniform_kernel_f32(
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int, seed: UInt64, lo: Float32, span: Float32,
+    n_w: Int64, seed: UInt64, lo: Float32, span: Float32,
 ):
+    var n = Int(n_w)
     var pair_i = Int(global_idx.x)
     var i = pair_i * 2
     if i < n:
@@ -327,8 +340,9 @@ def _rand_uniform_kernel_f32(
 
 def _rand_uniform_kernel_bf16(
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int, seed: UInt64, lo: Float32, span: Float32,
+    n_w: Int64, seed: UInt64, lo: Float32, span: Float32,
 ):
+    var n = Int(n_w)
     var pair_i = Int(global_idx.x)
     var i = pair_i * 2
     if i < n:
@@ -340,8 +354,9 @@ def _rand_uniform_kernel_bf16(
 
 def _rand_uniform_kernel_f16(
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    n: Int, seed: UInt64, lo: Float32, span: Float32,
+    n_w: Int64, seed: UInt64, lo: Float32, span: Float32,
 ):
+    var n = Int(n_w)
     var pair_i = Int(global_idx.x)
     var i = pair_i * 2
     if i < n:
@@ -372,17 +387,29 @@ def rand_uniform(
     var dt = dtype.to_mojo_dtype()
     if dt == DType.float32:
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[_rand_uniform_kernel_f32, _rand_uniform_kernel_f32](
-            O, n, seed, lo, span, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rand_uniform_kernel_f32](
+            O, Int64(n), seed, lo, span, grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[_rand_uniform_kernel_bf16, _rand_uniform_kernel_bf16](
-            O, n, seed, lo, span, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rand_uniform_kernel_bf16](
+            O, Int64(n), seed, lo, span, grid_dim=grid, block_dim=_BLOCK)
     else:
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[_rand_uniform_kernel_f16, _rand_uniform_kernel_f16](
-            O, n, seed, lo, span, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rand_uniform_kernel_f16](
+            O, Int64(n), seed, lo, span, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, shape^, dtype)

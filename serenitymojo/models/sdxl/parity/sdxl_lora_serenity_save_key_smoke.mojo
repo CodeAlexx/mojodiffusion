@@ -4,7 +4,7 @@
 # save through save_sdxl_lora, then inspect the safetensors header and raw reference trainer
 # alpha/down/up keys. No UNet, model checkpoint, or sampler run.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

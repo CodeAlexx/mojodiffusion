@@ -14,7 +14,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns, sleep
 
@@ -34,7 +33,7 @@ def byte_substr(s: String, start: Int, end: Int) -> String:
         return String("")
     var sp = s.as_bytes()
     var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 # ── constants (Linux x86-64 ABI) ─────────────────────────────────────────────
 comptime AF_UNIX: Int32 = 1
@@ -53,6 +52,14 @@ def sys_socketpair(domain: Int32, stype: Int32, proto: Int32,
                    sv: UnsafePointer[Int32, MutExternalOrigin]) -> Int32:
     """socketpair(2). Fills sv[0], sv[1] with two connected fds. 0 / -1."""
     return external_call["socketpair", Int32](domain, stype, proto, sv)
+
+
+# 1.0 rejects comptime-null Pointer construction; a @no_inline runtime zero
+# yields the same null pointer without tripping the comptime constraint.
+@no_inline
+def _proc_null_addr() -> Int:
+    var z = 0
+    return z
 
 
 def sys_execv(path: BytePtr, argv: UnsafePointer[BytePtr, MutExternalOrigin]) -> Int32:
@@ -109,7 +116,7 @@ def unlock_all_mappings() raises:
 def cstr(s: String) -> BytePtr:
     """Heap a NUL-terminated byte copy of `s`. Caller owns it (or leaks it in a
     child about to execv — harmless)."""
-    var n = len(s)
+    var n = s.byte_length()
     var p = alloc[UInt8](n + 1)
     var src = s.unsafe_ptr()
     for i in range(n):
@@ -125,7 +132,7 @@ def build_argv(args: List[String]) -> UnsafePointer[BytePtr, MutExternalOrigin]:
     var argv = alloc[BytePtr](n + 1)
     for i in range(n):
         argv[i] = cstr(args[i])
-    argv[n] = rebind[BytePtr](UnsafePointer[UInt8, MutExternalOrigin]())  # NULL
+    argv[n] = BytePtr(unsafe_from_address=_proc_null_addr())  # NULL for execv
     return rebind[UnsafePointer[BytePtr, MutExternalOrigin]](argv)
 
 
@@ -180,7 +187,7 @@ def write_msg(fd: Int32, line: String) raises:
     """Send one newline-framed message. Appends '\\n'. MSG_NOSIGNAL so a dead
     peer yields an error return, not a SIGPIPE."""
     var framed = line + "\n"
-    var n = len(framed)
+    var n = framed.byte_length()
     var buf = cstr(framed)  # NUL-terminated; we send the first n bytes
     var sent = 0
     while sent < n:
@@ -232,7 +239,7 @@ struct LineReader(Movable):
             if errno() == EAGAIN:
                 return String("")            # nonblocking: nothing ready
             raise Error("LineReader.recv failed: " + errno_str())
-        self.buf += String(StringSlice(ptr=rebind[BytePtr](tmp), length=r))
+        self.buf += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=rebind[BytePtr](tmp), length=r)))
         tmp.free()
         return self._drain_one()
 
@@ -323,7 +330,7 @@ def _read_self_maps() raises -> String:
             buf.free()
             _ = sys_close(Int32(fd))
             raise Error("prefault mapped libraries: read /proc/self/maps failed")
-        text += String(StringSlice(ptr=rebind[BytePtr](buf), length=n))
+        text += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=rebind[BytePtr](buf), length=n)))
         offset += n
     buf.free()
     _ = sys_close(Int32(fd))

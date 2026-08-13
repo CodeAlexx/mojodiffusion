@@ -36,7 +36,6 @@ fn destroy(h: AnyCoroutine):
 # ───────────────────────────────────────────────────────────────────────────
 
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from net.poll import Epoll, EPOLLIN, EVENT_SIZE, rd_u64
 from net.tcp import TCPListener
 from net.syscalls import (
@@ -148,7 +147,7 @@ async def serve_conn(parked: CoPtr, done: BytePtr, fd: Int):
         while True:
             var got = sys_recv(Int32(fd), bp, READ_CHUNK, Int32(0))
             if got > 0:
-                buf += String(StringSlice(ptr=bp, length=got))
+                buf += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=bp, length=got)))
             elif got == 0:
                 should_close = True              # peer closed
                 break

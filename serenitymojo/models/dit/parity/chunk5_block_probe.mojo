@@ -1,5 +1,5 @@
 # chunk5 parity: one Ideogram-4 transformer block (layer 0) vs Wave-0 fixture.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

@@ -23,7 +23,7 @@
 #
 # HEAVY GPU: requires >= 22 GB free. Run only after Chroma finishes.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import isfinite
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -45,7 +45,7 @@ def _has(block: FP8Block, key: String) -> Bool:
     return key in block
 
 
-def _w(block: FP8Block, key: String) raises -> ref [block] Tensor:
+def _w(block: FP8Block, key: String) raises -> ref [block[String("")]] Tensor:
     return block[key][]
 
 

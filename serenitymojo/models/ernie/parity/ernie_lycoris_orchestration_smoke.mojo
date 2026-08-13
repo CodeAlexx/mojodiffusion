@@ -10,7 +10,7 @@
 #     -o /tmp/ernie_lycoris_orch && /tmp/ernie_lycoris_orch
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.ernie.lora_block import ERNIE_SLOTS
 from serenitymojo.models.ernie.ernie_lycoris_stack import (

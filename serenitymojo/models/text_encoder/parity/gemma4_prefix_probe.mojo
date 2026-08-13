@@ -16,7 +16,7 @@
 #   pixi run mojo run -I . \
 #     serenitymojo/models/text_encoder/parity/gemma4_prefix_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.text_encoder.gemma4_ltx_streamed import (

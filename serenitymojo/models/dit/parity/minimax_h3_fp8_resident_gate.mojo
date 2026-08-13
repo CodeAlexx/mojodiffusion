@@ -79,7 +79,7 @@
 #   && output/checks/minimax_h3_fp8_resident_gate fp8-sage
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 from std.sys import argv

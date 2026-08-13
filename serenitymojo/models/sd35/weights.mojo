@@ -24,7 +24,7 @@
 # block/offload streaming still has a separate host-F32 blocker in
 # sd35_stack_lora.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.safetensors import SafeTensors

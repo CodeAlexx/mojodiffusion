@@ -1,7 +1,7 @@
 # Real-data loss parity vs Serenity (SERENITY_loss=0.469153 on real sample, t=499 σ=0.5).
 # Feed IDENTICAL scaled_noisy/target/cap (Serenity's own) → Mojo loss must match.
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

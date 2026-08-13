@@ -24,7 +24,7 @@
 #       serenitymojo/models/flux/parity/lora_stack_parity.mojo -o /tmp/flux_lora_parity
 #   /tmp/flux_lora_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.parity import ParityHarness
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

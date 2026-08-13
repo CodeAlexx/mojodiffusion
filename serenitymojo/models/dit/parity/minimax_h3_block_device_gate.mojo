@@ -79,7 +79,7 @@
 # any config that wasn't the release, before a single line of block math ran).
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

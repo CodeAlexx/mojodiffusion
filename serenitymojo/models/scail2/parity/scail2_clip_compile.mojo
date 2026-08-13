@@ -2,7 +2,7 @@
 # Running it requires a converted official visual safetensors file and executes
 # one zero-image forward; `mojo build` is sufficient for the bounded build gate.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.tensor import Tensor

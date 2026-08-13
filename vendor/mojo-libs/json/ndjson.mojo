@@ -11,7 +11,6 @@
 # current line's value at once (the input String itself is the only doc-sized
 # buffer — see the honest note in the test report).
 
-from std.builtin.type_aliases import MutExternalOrigin
 from std.memory import UnsafePointer
 from json.value import JSONValue
 from json.parser import loads
@@ -111,7 +110,7 @@ struct NdjsonReader(Movable):
         var le = self.pos
         while le < self.n and Int(p[le]) != 0x0A:
             le += 1
-        var line = String(StringSlice(ptr=p + ls, length=le - ls))
+        var line = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p + ls, length=le - ls)))
         self.pos = le + 1 if le < self.n else le
         return loads(line)
 

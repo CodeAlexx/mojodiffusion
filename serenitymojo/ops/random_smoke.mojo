@@ -1,6 +1,6 @@
 # random_smoke.mojo - GPU randn smoke test.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

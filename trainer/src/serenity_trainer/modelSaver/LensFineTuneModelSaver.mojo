@@ -14,7 +14,7 @@
 # wrapper is the thin, named entry the trainer/cadence calls for a full fine-tune
 # checkpoint — matching Serenity's LensFineTuneModelSaver factory product.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 
 from serenity_trainer.modelLoader.LensModelLoader import LensWeights

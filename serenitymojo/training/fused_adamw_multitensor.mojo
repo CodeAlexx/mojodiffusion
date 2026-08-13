@@ -32,7 +32,7 @@
 
 from std.math import sqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -62,8 +62,8 @@ def _fused_adamw_kernel[p_dtype: DType, g_dtype: DType](
     m_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     v_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
-    ntensors: Int,
-    total: Int,
+    ntensors_w: Int32,
+    total_w: Int64,
     lr: Float32,
     beta1: Float32,
     beta2: Float32,
@@ -73,6 +73,8 @@ def _fused_adamw_kernel[p_dtype: DType, g_dtype: DType](
     bc2: Float32,
     clip_scale: Float32,
 ):
+    var ntensors = Int(ntensors_w)
+    var total = Int(total_w)
     var gid = Int(global_idx.x)
     if gid >= total:
         return
@@ -128,11 +130,8 @@ def _launch_fused_adamw[p_dtype: DType, g_dtype: DType](
     clip_scale: Float32,
 ) raises:
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _fused_adamw_kernel[p_dtype, g_dtype],
-        _fused_adamw_kernel[p_dtype, g_dtype],
-    ](
-        PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps, weight_decay,
+    ctx.enqueue_function[_fused_adamw_kernel[p_dtype, g_dtype]](
+        PA, GA, MA, VA, OFF, Int32(nt), Int64(total), lr, beta1, beta2, eps, weight_decay,
         bc1, bc2, clip_scale, grid_dim=grid, block_dim=_BLOCK,
     )
 
@@ -231,15 +230,35 @@ def fused_adamw_step(
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
     var PA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        p_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(p_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var MA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        m_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(m_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var VA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        v_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(v_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(off_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
+    )
 
     if param_dtype == STDtype.F32:
         if grad_dtype == STDtype.F32:
@@ -387,15 +406,35 @@ def fused_adamw_step_with_arena(
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
     var PA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        p_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(p_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var MA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        m_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(m_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var VA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        v_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(v_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(off_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
+    )
 
     if param_dtype == STDtype.F32:
         if grad_dtype == STDtype.F32:

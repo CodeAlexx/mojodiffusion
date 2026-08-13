@@ -45,9 +45,10 @@
 
 from std.math import cos as fcos, sin as fsin, exp as fexp, log as flog, sqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import global_idx, block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import global_idx, block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -130,9 +131,11 @@ def _embed_kernel_bf16(
     table: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     ids: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    seq: Int,
-    hidden: Int,
+    seq_w: Int32,
+    hidden_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var hidden = Int(hidden_w)
     var idx = Int(global_idx.x)
     var total = seq * hidden
     if idx < total:
@@ -147,8 +150,9 @@ def _add_kernel_bf16(
     a: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var av = rebind[Scalar[DType.bfloat16]](a[i]).cast[DType.float32]()
@@ -161,12 +165,17 @@ def _add_kernel_bf16(
 def _repeat_kv_kernel_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    seq: Int,
-    h: Int,
-    h_kv: Int,
-    dh: Int,
-    n_rep: Int,
+    seq_w: Int32,
+    h_w: Int32,
+    h_kv_w: Int32,
+    dh_w: Int32,
+    n_rep_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var h = Int(h_w)
+    var h_kv = Int(h_kv_w)
+    var dh = Int(dh_w)
+    var n_rep = Int(n_rep_w)
     var idx = Int(global_idx.x)
     var total = h * seq * dh
     if idx < total:
@@ -190,9 +199,11 @@ def _repeat_kv_kernel_bf16(
 def _gather_hs_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    rows: Int,
-    dh: Int,
+    rows_w: Int32,
+    dh_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var dh = Int(dh_w)
     var idx = Int(global_idx.x)
     var total = rows * dh
     if idx < total:
@@ -208,9 +219,11 @@ def _scale_mask_ns_bf16(
     scores: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     mask: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     scale: Float32,
-    rows: Int,
-    cols: Int,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
@@ -225,9 +238,11 @@ def _scale_mask_ns_bf16(
 def _scale_only(
     scores: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     scale: Float32,
-    rows: Int,
-    cols: Int,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
@@ -241,8 +256,9 @@ def _scale_only(
 # ops/attention._softmax_rows_f32 verbatim.
 def _softmax_rows_ns(
     x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -294,9 +310,11 @@ def _softmax_rows_ns(
 def _scatter_hs_bf16(
     src: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    dh: Int,
+    rows_w: Int32,
+    dh_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var dh = Int(dh_w)
     var idx = Int(global_idx.x)
     var total = rows * dh
     if idx < total:
@@ -332,16 +350,25 @@ def _embed(
     var total = seq * hidden
     var grid = (total + _BLOCK - 1) // _BLOCK
     var IDS = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        id_dev.unsafe_ptr().bitcast[Int32](), id_rl
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(id_dev.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=id_rl,
     )
     var T = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        table.buf.unsafe_ptr().bitcast[BFloat16](), tab_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(table.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=tab_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
     )
-    ctx.enqueue_function[_embed_kernel_bf16, _embed_kernel_bf16](
-        T, IDS, O, seq, hidden, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_embed_kernel_bf16](
+        T, IDS, O, Int32(seq), Int32(hidden), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     var sh = List[Int]()
@@ -360,16 +387,25 @@ def _add(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        a.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        b.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
-    ctx.enqueue_function[_add_kernel_bf16, _add_kernel_bf16](
-        A, B, O, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_add_kernel_bf16](
+        A, B, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, a.shape(), a.dtype())
@@ -402,13 +438,19 @@ def _repeat_kv_bhsd(
     var dst_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
     var grid = (out_n + _BLOCK - 1) // _BLOCK
     var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
     )
     var D = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), dst_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=dst_rl,
     )
-    ctx.enqueue_function[_repeat_kv_kernel_bf16, _repeat_kv_kernel_bf16](
-        S, D, seq, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_repeat_kv_kernel_bf16](
+        S, D, Int32(seq), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     var osh = List[Int]()
@@ -459,33 +501,51 @@ def _attention_nonsquare(
     var q_src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](q_rows, dh))
     var kv_src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](kv_rows, dh))
     var qf_dst = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        q_f32.unsafe_ptr(), q_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(q_f32.unsafe_ptr())
+        ),
+        runtime_layout=q_src_rl,
     )
     var kf_dst = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        k_f32.unsafe_ptr(), kv_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(k_f32.unsafe_ptr())
+        ),
+        runtime_layout=kv_src_rl,
     )
     var vf_dst = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        v_f32.unsafe_ptr(), kv_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v_f32.unsafe_ptr())
+        ),
+        runtime_layout=kv_src_rl,
     )
     var qs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        q_hsd.buf.unsafe_ptr().bitcast[BFloat16](), q_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q_hsd.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=q_src_rl,
     )
     var ks = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        k_hsd.buf.unsafe_ptr().bitcast[BFloat16](), kv_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k_hsd.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=kv_src_rl,
     )
     var vs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        v_hsd.buf.unsafe_ptr().bitcast[BFloat16](), kv_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v_hsd.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=kv_src_rl,
     )
     var qgrid = (q_rows * dh + _BLOCK - 1) // _BLOCK
     var kvgrid = (kv_rows * dh + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_gather_hs_bf16, _gather_hs_bf16](
-        qs, qf_dst, q_rows, dh, grid_dim=qgrid, block_dim=_BLOCK
+    ctx.enqueue_function[_gather_hs_bf16](
+        qs, qf_dst, Int32(q_rows), Int32(dh), grid_dim=qgrid, block_dim=_BLOCK
     )
-    ctx.enqueue_function[_gather_hs_bf16, _gather_hs_bf16](
-        ks, kf_dst, kv_rows, dh, grid_dim=kvgrid, block_dim=_BLOCK
+    ctx.enqueue_function[_gather_hs_bf16](
+        ks, kf_dst, Int32(kv_rows), Int32(dh), grid_dim=kvgrid, block_dim=_BLOCK
     )
-    ctx.enqueue_function[_gather_hs_bf16, _gather_hs_bf16](
-        vs, vf_dst, kv_rows, dh, grid_dim=kvgrid, block_dim=_BLOCK
+    ctx.enqueue_function[_gather_hs_bf16](
+        vs, vf_dst, Int32(kv_rows), Int32(dh), grid_dim=kvgrid, block_dim=_BLOCK
     )
 
     # 2) QKᵀ per head -> scores F32 [H, Sq, Skv]
@@ -498,39 +558,54 @@ def _attention_nonsquare(
     var scptr = scores.unsafe_ptr()
     for head in range(h):
         var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            qptr + head * sq * dh, q_head_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(qptr + head * sq * dh)
+        ),
+        runtime_layout=q_head_rl,
+    )
         var Bt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            kptr + head * skv * dh, k_head_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(kptr + head * skv * dh)
+        ),
+        runtime_layout=k_head_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            scptr + head * sq * skv, sc_head_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scptr + head * sq * skv)
+        ),
+        runtime_layout=sc_head_rl,
+    )
         matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
 
     # 3) scale (+ optional mask) over [H*Sq, Skv]
     var sm_rows = h * sq
     var sc_full_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, skv))
     var sc_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        scptr, sc_full_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scptr)
+        ),
+        runtime_layout=sc_full_rl,
     )
     var nsm = sm_rows * skv
     var smgrid = (nsm + _BLOCK - 1) // _BLOCK
     if use_mask:
         var Mf = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            mask.buf.unsafe_ptr().bitcast[BFloat16](), sc_full_rl
-        )
-        ctx.enqueue_function[_scale_mask_ns_bf16, _scale_mask_ns_bf16](
-            sc_full, Mf, scale, sm_rows, skv, grid_dim=smgrid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(mask.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=sc_full_rl,
+    )
+        ctx.enqueue_function[_scale_mask_ns_bf16](
+            sc_full, Mf, scale, Int32(sm_rows), Int32(skv), grid_dim=smgrid, block_dim=_BLOCK
         )
     else:
-        ctx.enqueue_function[_scale_only, _scale_only](
-            sc_full, scale, sm_rows, skv, grid_dim=smgrid, block_dim=_BLOCK
+        ctx.enqueue_function[_scale_only](
+            sc_full, scale, Int32(sm_rows), Int32(skv), grid_dim=smgrid, block_dim=_BLOCK
         )
 
     # 4) softmax over last dim (Skv) in place, one block per row.
-    ctx.enqueue_function[_softmax_rows_ns, _softmax_rows_ns](
-        sc_full, skv, grid_dim=sm_rows, block_dim=_TPB
+    ctx.enqueue_function[_softmax_rows_ns](
+        sc_full, Int32(skv), grid_dim=sm_rows, block_dim=_TPB
     )
 
     # 5) P @ V per head -> F32 [H, Sq, Dh]
@@ -541,14 +616,23 @@ def _attention_nonsquare(
     var vptr = v_f32.unsafe_ptr()
     for head in range(h):
         var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            scptr + head * sq * skv, sc_head_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scptr + head * sq * skv)
+        ),
+        runtime_layout=sc_head_rl,
+    )
         var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            vptr + head * skv * dh, v_head_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(vptr + head * skv * dh)
+        ),
+        runtime_layout=v_head_rl,
+    )
         var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            optr + head * sq * dh, o_head_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(optr + head * sq * dh)
+        ),
+        runtime_layout=o_head_rl,
+    )
         matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
 
     # 6) downcast F32 [H*Sq, Dh] -> BF16 [H, Sq, Dh]
@@ -556,14 +640,20 @@ def _attention_nonsquare(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_rows * dh * 2)
     var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_rows, dh))
     var src_o = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_f32.unsafe_ptr(), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_f32.unsafe_ptr())
+        ),
+        runtime_layout=out_rl,
     )
     var dst_o = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
     )
     var ogrid = (out_rows * dh + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_scatter_hs_bf16, _scatter_hs_bf16](
-        src_o, dst_o, out_rows, dh, grid_dim=ogrid, block_dim=_BLOCK
+    ctx.enqueue_function[_scatter_hs_bf16](
+        src_o, dst_o, Int32(out_rows), Int32(dh), grid_dim=ogrid, block_dim=_BLOCK
     )
     ctx.synchronize()
     var osh = List[Int]()
@@ -745,7 +835,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
             SenseNovaU1Config.sensenova_u1_8b(), shared^, loader^
         )
 
-    def _shared(self, name: String) raises -> ref [self.shared] Tensor:
+    def _shared(self, name: String) raises -> ref [self.shared[String("")]] Tensor:
         if name not in self.shared:
             raise Error(String("sensenova_u1: missing shared weight: ") + name)
         return self.shared[name][]
@@ -1246,7 +1336,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 # reference to the Tensor (origin bound to `block`).
 def _bget[
     mut: Bool, //, origin: Origin[mut=mut]
-](ref [origin] block: Block, p: String, suffix: String) raises -> ref [block] Tensor:
+](ref [origin] block: Block, p: String, suffix: String) raises -> ref [block[String("")]] Tensor:
     var full = p + suffix
     if full not in block:
         raise Error(String("sensenova_u1: missing block weight: ") + full)

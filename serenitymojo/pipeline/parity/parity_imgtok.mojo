@@ -2,7 +2,7 @@
 # stack + final layer, to show the velocity-relevant (image-token) trajectory.
 # The full-seq cos was dragged down by cap tokens; this isolates the 256 image
 # rows that actually become the velocity.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import alloc
 from serenitymojo.tensor import Tensor

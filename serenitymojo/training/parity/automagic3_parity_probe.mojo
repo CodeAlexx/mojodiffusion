@@ -23,7 +23,7 @@
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/training/parity/automagic3_parity_probe.mojo
 
-from sys import argv
+from std.sys import argv
 from serenitymojo.parity import ParityHarness
 from serenitymojo.training.automagic3 import (
     Automagic3State, Automagic3Ctl,

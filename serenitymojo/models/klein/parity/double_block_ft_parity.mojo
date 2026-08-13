@@ -24,7 +24,7 @@
 #       -o /tmp/double_block_ft_parity
 #   /tmp/double_block_ft_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness, ParityResult

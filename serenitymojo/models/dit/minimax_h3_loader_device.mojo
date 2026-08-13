@@ -72,7 +72,7 @@
 
 from std.collections import Dict, List
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -201,11 +201,15 @@ def _tensor_view_bf16_host[
 def _minimax_h3_qkv_deinterleave_bf16_kernel(
     src: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
-    total: Int,
-    heads: Int,
-    head_dim: Int,
-    in_features: Int,
+    total_w: Int64,
+    heads_w: Int32,
+    head_dim_w: Int32,
+    in_features_w: Int32,
 ):
+    var total = Int(total_w)
+    var heads = Int(heads_w)
+    var head_dim = Int(head_dim_w)
+    var in_features = Int(in_features_w)
     var idx = Int(global_idx.x)
     if idx < total:
         var dest_row = idx // in_features
@@ -226,10 +230,13 @@ def _minimax_h3_qkv_deinterleave_bf16_kernel(
 def _minimax_h3_fc1_swap_bf16_kernel(
     src: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin],
-    total: Int,
-    ffn_dim: Int,
-    in_features: Int,
+    total_w: Int64,
+    ffn_dim_w: Int32,
+    in_features_w: Int32,
 ):
+    var total = Int(total_w)
+    var ffn_dim = Int(ffn_dim_w)
+    var in_features = Int(in_features_w)
     var idx = Int(global_idx.x)
     if idx < total:
         var dest_row = idx // in_features
@@ -263,18 +270,21 @@ def _minimax_h3_qkv_deinterleave_bf16_device(
     )
     var rl = RuntimeLayout[_H3_WEIGHT_DYN1].row_major(IndexList[1](total))
     var src = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
-        raw.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(raw.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var dst = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (total + _H3_WEIGHT_REORDER_BLOCK - 1) \
         // _H3_WEIGHT_REORDER_BLOCK
-    ctx.enqueue_function[
-        _minimax_h3_qkv_deinterleave_bf16_kernel,
-        _minimax_h3_qkv_deinterleave_bf16_kernel,
-    ](
-        src, dst, total, heads, head_dim, in_features,
+    ctx.enqueue_function[_minimax_h3_qkv_deinterleave_bf16_kernel](
+        src, dst, Int64(total), Int32(heads), Int32(head_dim), Int32(in_features),
         grid_dim=grid, block_dim=_H3_WEIGHT_REORDER_BLOCK,
     )
     return Tensor(out_buf^, raw.shape(), STDtype.BF16)
@@ -296,18 +306,21 @@ def _minimax_h3_fc1_swap_bf16_device(
     )
     var rl = RuntimeLayout[_H3_WEIGHT_DYN1].row_major(IndexList[1](total))
     var src = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
-        raw.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(raw.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var dst = LayoutTensor[DType.bfloat16, _H3_WEIGHT_DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (total + _H3_WEIGHT_REORDER_BLOCK - 1) \
         // _H3_WEIGHT_REORDER_BLOCK
-    ctx.enqueue_function[
-        _minimax_h3_fc1_swap_bf16_kernel,
-        _minimax_h3_fc1_swap_bf16_kernel,
-    ](
-        src, dst, total, ffn_dim, in_features,
+    ctx.enqueue_function[_minimax_h3_fc1_swap_bf16_kernel](
+        src, dst, Int64(total), Int32(ffn_dim), Int32(in_features),
         grid_dim=grid, block_dim=_H3_WEIGHT_REORDER_BLOCK,
     )
     return Tensor(out_buf^, raw.shape(), STDtype.BF16)

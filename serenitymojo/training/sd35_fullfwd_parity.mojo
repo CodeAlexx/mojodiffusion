@@ -10,7 +10,7 @@
 #       serenitymojo/training/sd35_fullfwd_parity.mojo -o /tmp/sd35_fullfwd
 #   /tmp/sd35_fullfwd
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc
 from serenitymojo.parity import ParityHarness

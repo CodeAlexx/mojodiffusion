@@ -32,9 +32,8 @@
 # applied exactly; missing projections remain absent and incompatible shapes
 # fail loud.
 
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer, UnsafePointer
 from std.time import sleep
 
@@ -517,7 +516,7 @@ struct QwenImageBackend(GenBackend, Movable):
         """Scheduler (honors steps) + seeded initial packed latent (honors seed)."""
         self.sched = List[ArcPointer[Scheduler]]()
         self.sched.append(ArcPointer(Scheduler.qwen(self.params.steps, Float32(N_IMG_))))
-        var nchw_shape = [1, 16, LH_, LW_]
+        var nchw_shape: List[Int] = [1, 16, LH_, LW_]
         var noise = randn(nchw_shape.copy(), UInt64(self.params.seed), STDtype.BF16, self.ctx)
         if self.params.variation_strength > 0.0:
             var vnoise = randn(

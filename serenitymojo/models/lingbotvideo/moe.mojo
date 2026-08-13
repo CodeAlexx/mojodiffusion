@@ -30,9 +30,10 @@
 # Mojo 1.0.0b1, NVIDIA GPU. Inference-only, GPU-only.
 
 from std.math import exp
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import thread_idx, block_idx, barrier, global_idx
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import thread_idx, block_idx, global_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -214,8 +215,9 @@ def _lingbot_router_kernel(
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # [E]
     out_ids: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],    # [S*TOP_K]
     out_gate: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], # [S*TOP_K]
-    s: Int,
+    s_w: Int32,
 ):
+    var s = Int(s_w)
     var tok = Int(block_idx.x)
     if tok >= s:
         return
@@ -370,20 +372,32 @@ def lingbot_grouped_sigmoid_router_gpu(
     var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](e))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_slots))
     var lg_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        logits.buf.unsafe_ptr().bitcast[Float32](), lg_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(logits.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=lg_rl,
     )
     var b_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias.buf.unsafe_ptr().bitcast[Float32](), b_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
     )
     var ids_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        ids_buf.unsafe_ptr().bitcast[Int32](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(ids_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=o_rl,
     )
     var gate_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        gate_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(gate_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
     )
 
-    ctx.enqueue_function[_lingbot_router_kernel, _lingbot_router_kernel](
-        lg_lt, b_lt, ids_lt, gate_lt, s,
+    ctx.enqueue_function[_lingbot_router_kernel](
+        lg_lt, b_lt, ids_lt, gate_lt, Int32(s),
         grid_dim=s, block_dim=E,
     )
     ctx.synchronize()
@@ -425,10 +439,13 @@ def _det_combine_kernel(
     eo: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],   # [S*TOP_K, H]
     gate: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [S*TOP_K]
     outp: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [S, H]
-    s: Int,
-    h: Int,
-    topk: Int,
+    s_w: Int32,
+    h_w: Int32,
+    topk_w: Int32,
 ):
+    var s = Int(s_w)
+    var h = Int(h_w)
+    var topk = Int(topk_w)
     var idx = Int(global_idx.x)
     var total = s * h
     if idx < total:
@@ -468,18 +485,27 @@ def _deterministic_gated_combine(
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_slots))
     var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](s, h))
     var eo_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        expert_out.buf.unsafe_ptr().bitcast[BFloat16](), eo_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(expert_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=eo_rl,
     )
     var g_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[Float32](), g_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=g_rl,
     )
     var out_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
     )
     var total = s * h
     var grid = (total + 255) // 256
-    ctx.enqueue_function[_det_combine_kernel, _det_combine_kernel](
-        eo_lt, g_lt, out_lt, s, h, topk,
+    ctx.enqueue_function[_det_combine_kernel](
+        eo_lt, g_lt, out_lt, Int32(s), Int32(h), Int32(topk),
         grid_dim=grid, block_dim=256,
     )
     ctx.synchronize()

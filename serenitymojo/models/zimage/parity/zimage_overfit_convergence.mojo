@@ -20,7 +20,7 @@
 #       -o /tmp/zimage_overfit
 #   /tmp/zimage_overfit
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, sin
 from std.memory import alloc, ArcPointer

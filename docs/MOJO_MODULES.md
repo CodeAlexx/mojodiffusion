@@ -829,7 +829,7 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
-## MiniMax-H3 audio-video inference runtime (updated 2026-08-11)
+## MiniMax-H3 audio-video inference runtime (updated 2026-08-12)
 
 - `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
   modulation, and resident-weight sidecars used by the product runners. Cache
@@ -852,6 +852,16 @@ edits: see sections C and D of the parity-ported doc.
   three GEMMs; those split writers remain available for the >=48k low-headroom
   path. `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` gates the
   chunked/fused BF16, group-wise, W8A8, QKV, Q/K, and final-layer paths.
+- `ops/norm.mojo::rms_norm_modulate_bf16` preserves the scalar RMSNorm F32
+  reduction and explicitly rounds/re-upcasts the intermediate BF16 value before
+  token-addressed AdaLN math, making it bit-identical to the former two-kernel
+  composition. `ops/parity/rms_norm_modulate_bf16_parity.mojo` gates both H3's
+  `[S,5376]` per-row modulation and shared-vector broadcasting at zero
+  mismatches. `models/dit/minimax_h3_dit.mojo` selects it only for an all-BF16
+  boundary and retains the former composition for every fallback dtype. The
+  same block dispatch now uses the existing exact direct-W8A8 SwiGLU and
+  projection/residual epilogues at ordinary sequence lengths; BF16 and
+  group-wise projection paths are unchanged.
 - `models/dit/minimax_h3_loader_device.mojo` keeps BF16 checkpoint layout work
   on GPU: QKV de-interleave and FC1 half-swap use exact device kernels after a
   bounded batched pinned upload. `io/mmap.mojo`, `io/safetensors.mojo`, and
@@ -870,19 +880,40 @@ edits: see sections C and D of the parity-ported doc.
   interleaved row mapping.
 - `models/dit/minimax_h3_step_cache.mojo` is an opt-in, model-scoped
   Cache-DiT-style denoise accelerator. `exact` is the product quality default
-  and evaluates every block. `high` may reuse one group-32 INT8 middle-stack
+  and evaluates every block. `high` reuses the group-32 INT8 middle-stack
   residual after recomputing the first and last eight blocks; it does not
-  change authored size, seconds, FPS, steps, or synchronized audio. High stays
-  explicitly experimental because decoded A/B testing found visible video
-  drift. `parity/minimax_h3_step_cache_parity.mojo` gates reconstruction and
-  warm-up/reuse policy mechanics, not perceptual equivalence.
+  change authored size, seconds, FPS, or steps. 2026-08-12 the policy became
+  ADAPTIVE: the old one-cached-evaluation cap is replaced by an accumulated
+  rel-L1 drift budget (0.24, reset on every full refresh) plus a
+  3-evaluation exact tail; `MiniMaxH3StepCache(enabled, total_steps)` now
+  takes the schedule length. The decoded exact-vs-high A/B at 512x320x175
+  ACCEPTED it (8 of 19 evaluations reused, 1.50x, frames visually
+  equivalent, audio corr 0.956), so `high` is labeled accepted-approximate.
+  Combining `high` with Sage attention degrades audio: the shipped
+  DECISION VETO (2026-08-13) probes audio rows separately against tighter
+  thresholds and refuses reuse when the audio band moves, halving the
+  attenuation to ~-2.5 dB (corr 0.8809) at the cost of 3 of 8 skips; the
+  Canvas helper text says so. An application-side mask that withheld the
+  cached residual from audio rows measured far WORSE (corr 0.2140) and is
+  retained unwired. `parity/minimax_h3_step_cache_parity.mojo` gates
+  reconstruction plus budget/exact-tail/audio-veto mechanics.
 - `models/text_encoder/minimax_h3_qwen3vl_int8.mojo` and
   `minimax_h3_qwen3vl_int8_cache_cli.mojo` provide the shared per-row INT8
   Qwen3-VL text-encoder cache and GPU forward. The BF16 conditioning output is
   shared by BF16, INT8 Quality, and INT8 Fast DiT runners.
 - `ops/sage_attention_int8.mojo` is an opt-in Sage-style INT8-QK attention
   backend with upstream-style per-thread Q/K scale geometry, K-mean smoothing,
-  BF16 PV, F32 accumulation, and explicit tail masking. Its S=9,145 primitive
+  BF16 PV, F32 accumulation, and explicit tail masking. 2026-08-12 it gained
+  `SageInt8Scratch` + `sage_attention_int8_fwd_scratch`: product runners
+  preallocate one run-lifetime scratch (2.02 GiB at S=75,468) instead of
+  ~1.6-3.2 GiB of per-call transient buffers 50x per evaluation, which
+  intermittently OOMed mid-denoise near the 24-GiB envelope; the token
+  kernel now also reads V directly in pipeline BSHD (the per-call V-copy and
+  its gather kernel are gone; speed-neutral). Scratch vs per-call is
+  BIT-IDENTICAL (`ops/tests/sage_attention_int8_scratch_gate.mojo`, incl.
+  smaller-S reuse and loud oversized-S rejection). The controlled i2va A/B
+  at 1344x768x243 (S=75,468, same seed/binary) measured cuDNN 234.6 s vs
+  Sage 155.7 s per hot evaluation — 1.51x — with nonfinite 0/0. Its S=9,145 primitive
   gate measured cosine 0.99993509 and 1.2035x versus cU-DNN. At the real
   S=37,951 product shape, a full 50-block evaluation fell from 50.6334 to
   41.9195 seconds, saving 8.7139 seconds; final video/audio cosine was
@@ -1074,6 +1105,23 @@ saving 1.5383 seconds with byte-identical latent and audio artifacts. A prior
 repeat measured 40.4591 seconds. Direct QKV is deliberately W8A8-only at this
 shape; BF16 and INT8 Quality retain their single packed GEMM and still receive
 the Q/K fusion.
+The 2026-08-12 exact-path follow-on fuses the two main-block BF16
+RMSNorm/AdaLN pairs and admits the already-gated direct W8A8 SwiGLU and
+projection/residual epilogues at S=37,951. The dedicated RMS/AdaLN gate reports
+zero mismatches/max-abs 0.0 at `[257,5376]` and `[513,1024]`; the existing
+`minimax_h3_chunked_linear_parity` gate reports max-abs 0.0 for W8A8 SwiGLU,
+FC2+residual, in-place FC2, and full MLP fusion. Across valid Nsight Systems
+2026.4.1 kernel tables, RMS/AdaLN saves 0.4830 seconds and the ordinary-length
+W8A8 dispatch saves another 0.8056 seconds of targeted GPU work per evaluation.
+The fresh task-start/final exact fixed-seed runs observed 46.8824 -> 44.1819
+seconds (2.7005 seconds, 5.76%, 1.061x) and the final profile removed the former
+50-launch standalone SwiGLU and 100-launch standalone residual families. Every
+full-stack latent retained SHA `5d089b34...6f3f7c`; final evidence is
+`output/checks/h3_speed_probe_20260812/nsys2026_exact_after_w8a8_fusions/`
+plus its sibling `_run` directory. Since cU-DNN attention itself varied between
+profiles, the 1.2886-second kernel-family reduction is the attribution result;
+the larger wall delta is an observed end-to-end result, not a stable attention
+speed claim.
 
 ## LTX-2.5 Gemma-4 conditioning and experimental inference (2026-08-12)
 

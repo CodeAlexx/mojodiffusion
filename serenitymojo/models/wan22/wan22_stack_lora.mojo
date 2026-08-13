@@ -34,11 +34,10 @@
 #
 # Mojo 0.26.x+: def not fn; Tensor move-only; TArc carriers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from std.ffi import external_call
 from std.memory import alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.math import sqrt, sin as _fsin, cos as _fcos

@@ -4,7 +4,7 @@
 # varlen cuDNN attention. Verify that the bounded full-buffer mask path matches
 # attention over the physically trimmed first VALID rows.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.attention_flash import (
@@ -30,7 +30,7 @@ def main() raises:
     var v = randn([B, SKV, H, DH], 20260603, STDtype.BF16, ctx)
     var k_short = slice(k, 1, 0, VALID, ctx)
     var v_short = slice(v, 1, 0, VALID, ctx)
-    var scale = Float32(1.0 / Float32(DH) ** 0.5)
+    var scale = Float32(1.0 / Float32(DH) ** Float32(0.5))
     var expected = sdpa_flash_infer_fwd_rect[B, SQ, VALID, H, DH](
         q, k_short, v_short, scale, ctx
     ).to_host(ctx)

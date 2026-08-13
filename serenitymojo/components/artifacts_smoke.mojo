@@ -1,6 +1,6 @@
 # artifacts_smoke.mojo - compile/run gate for shared artifact helpers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.components.artifacts import (
     build_ffmpeg_mux_command,

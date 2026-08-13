@@ -16,7 +16,7 @@
 # This does not claim full adapter inventory, external legacy/OMI conversion, or
 # numeric SD3 parity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

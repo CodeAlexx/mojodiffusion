@@ -2,7 +2,7 @@
 # loaded prefix K/V must be TOKEN-FOR-TOKEN identical to a fresh full prime over
 # prefix+tail (greedy ⇒ exact equality). Real Qwen3-8B + the real captioner chat.
 # Also times both paths (the measured win) and the save/load round-trip.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.pipeline.ideogram4_magic import _system_prompt
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer

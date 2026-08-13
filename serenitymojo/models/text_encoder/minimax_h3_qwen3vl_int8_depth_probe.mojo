@@ -2,7 +2,7 @@
 # It never invokes the BF16 streamed encoder. Cache creation, if needed, uses
 # the fixed-slab GPU converter from minimax_h3_qwen3vl_int8.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_int8 import (

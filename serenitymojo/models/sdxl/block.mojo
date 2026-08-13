@@ -37,7 +37,7 @@
 #     d_x_skip = d_r  (if no skip)  OR  conv2d_backward(x, skip_w, d_r).d_x (if skip)
 #     d_x = d_x_a + d_x_skip   (+ skip conv weight/bias grads when present)
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from std.collections import Optional

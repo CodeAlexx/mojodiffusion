@@ -25,7 +25,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU (16GB: ~8.2G resident blocks + activations,
 # proven by the in-train 1024^2 sampler).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.time import perf_counter_ns
 from std.sys import argv

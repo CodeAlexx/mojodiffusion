@@ -12,7 +12,7 @@
 # overlap the visual encoder, UMT5, or the 14B denoiser.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys import argv
 

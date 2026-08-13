@@ -1,7 +1,7 @@
 # vmm_manager_smoke.mojo - VMM model/block handle smoke.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.offload.vmm_cuda import vmm_supported

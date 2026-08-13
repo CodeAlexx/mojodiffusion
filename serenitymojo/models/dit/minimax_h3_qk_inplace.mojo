@@ -6,9 +6,10 @@
 # and BF16 rounding boundaries, but write the normalized and rotated values back
 # into the already-owned split-QKV buffers.
 
-from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from std.gpu import block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.math import sqrt
 from std.memory import stack_allocation
 from std.utils.index import IndexList
@@ -32,12 +33,15 @@ def _h3_rms_norm_partial_rope_bf16_inplace_kernel(
     weight: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    head_dim: Int,
-    rotary_dim: Int,
-    heads: Int,
+    head_dim_w: Int32,
+    rotary_dim_w: Int32,
+    heads_w: Int32,
     eps: Float32,
 ):
     """Exact RMSNorm + BF16 boundary + partial RoPE in one row kernel."""
+    var head_dim = Int(head_dim_w)
+    var rotary_dim = Int(rotary_dim_w)
+    var heads = Int(heads_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -148,21 +152,30 @@ def minimax_h3_qk_norm_partial_rope_inplace(
         IndexList[2](tokens, rotary_dim)
     )
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_layout
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_layout,
     )
     var Weight = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[BFloat16](), weight_layout
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=weight_layout,
     )
     var Cos = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        cos.buf.unsafe_ptr().bitcast[Float32](), table_layout
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=table_layout,
     )
     var Sin = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        sin.buf.unsafe_ptr().bitcast[Float32](), table_layout
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=table_layout,
     )
-    ctx.enqueue_function[
-        _h3_rms_norm_partial_rope_bf16_inplace_kernel,
-        _h3_rms_norm_partial_rope_bf16_inplace_kernel,
-    ](
-        X, Weight, Cos, Sin, head_dim, rotary_dim, heads, eps,
+    ctx.enqueue_function[_h3_rms_norm_partial_rope_bf16_inplace_kernel](
+        X, Weight, Cos, Sin, Int32(head_dim), Int32(rotary_dim), Int32(heads), eps,
         grid_dim=rows, block_dim=_TPB,
     )

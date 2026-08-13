@@ -4,7 +4,7 @@
 # block worth of LoRA adapters, save through save_klein_lora, then inspect the
 # safetensors header and alpha/down/up keys. No model weights or denoise run.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

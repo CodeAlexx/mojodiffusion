@@ -5,7 +5,7 @@
 # additive-mask SDPA on tiny F32 and BF16 cases, without loading Qwen weights.
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

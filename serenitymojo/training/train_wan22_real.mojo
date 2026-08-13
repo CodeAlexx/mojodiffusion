@@ -65,14 +65,13 @@
 # (video model = LoRA/LoCon only; network_algorithm=dora/oft/lokr/loha now FAIL-LOUD
 #  via require_lora_or_locon_linear rather than silently training plain LoRA).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt, exp
 from std.time import perf_counter_ns
 from std.sys import argv
 from std.ffi import external_call
 from std.memory import alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.dtype import STDtype

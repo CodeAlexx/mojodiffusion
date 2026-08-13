@@ -1,6 +1,6 @@
 # NAVA audio resample parity: Mojo resample_hann(wav48, 48000, 16000) vs torch
 # torchaudio.functional.resample (sinc_interp_hann). wav48 [1,2,63840] -> [1,2,21280].
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness

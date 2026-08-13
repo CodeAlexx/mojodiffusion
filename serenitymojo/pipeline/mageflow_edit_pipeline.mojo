@@ -40,7 +40,7 @@
 #     -Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda \
 #     serenitymojo/pipeline/mageflow_edit_pipeline.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log, cos as _cos, floor, ceil
 
 from serenitymojo.tensor import Tensor
@@ -173,7 +173,7 @@ struct VlPre(Movable):
     var grid_w: Int
     var seq: Int
 
-    fn __init__(out self, var pv: Tensor, grid_h: Int, grid_w: Int, seq: Int):
+    def __init__(out self, var pv: Tensor, grid_h: Int, grid_w: Int, seq: Int):
         self.pv = pv^
         self.grid_h = grid_h
         self.grid_w = grid_w

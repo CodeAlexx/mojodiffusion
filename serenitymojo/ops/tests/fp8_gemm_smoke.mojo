@@ -4,7 +4,7 @@
 #   pixi run mojo build -I . -Xlinker -lm \
 #     serenitymojo/ops/tests/fp8_gemm_smoke.mojo -o /tmp/fp8_gemm_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -9,7 +9,7 @@
 #
 # Compile-verify only. The build command must produce a binary; do NOT run.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

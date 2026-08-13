@@ -73,7 +73,7 @@
 # store Tensor in a collection); host List[Float32] are the Copyable carriers;
 # no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor

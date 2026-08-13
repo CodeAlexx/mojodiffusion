@@ -10,7 +10,7 @@
 # call boundary. Rotation math and OFT trainable gradients use F32 internally.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.atomic import Atomic
 from std.utils.index import IndexList
@@ -222,9 +222,11 @@ def _oft_b4_forward_kernel[dtype: DType](
     x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     vec: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    in_f: Int,
+    rows_w: Int32,
+    in_f_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var in_f = Int(in_f_w)
     var idx = Int(global_idx.x)
     var total = rows * in_f
     if idx < total:
@@ -250,9 +252,11 @@ def _oft_b4_dx_kernel[dtype: DType](
     d_x_rot: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     vec: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    in_f: Int,
+    rows_w: Int32,
+    in_f_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var in_f = Int(in_f_w)
     var idx = Int(global_idx.x)
     var total = rows * in_f
     if idx < total:
@@ -278,10 +282,13 @@ def _oft_b4_drg_kernel[dtype: DType](
     d_x_rot: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     d_rg: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    rows: Int,
-    in_f: Int,
-    r: Int,
+    rows_w: Int32,
+    in_f_w: Int32,
+    r_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var in_f = Int(in_f_w)
+    var r = Int(r_w)
     var idx = Int(global_idx.x)
     var total = rows * r * 16
     if idx < total:
@@ -302,8 +309,9 @@ def _oft_b4_dvec_kernel(
     d_rg: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     vec: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     d_vec: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    r: Int,
+    r_w: Int32,
 ):
+    var r = Int(r_w)
     var idx = Int(global_idx.x)
     var total = r * 6
     if idx < total:
@@ -391,38 +399,53 @@ def oft_serenity_rotate_b4(x: Tensor, vec: Tensor, ctx: DeviceContext) raises ->
     var grid = (total + _BLOCK - 1) // _BLOCK
 
     var V = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        vec_f32.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(vec_f32.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _oft_b4_forward_kernel[DType.float32], _oft_b4_forward_kernel[DType.float32]
-        ](X, V, O, rows, in_f, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_oft_b4_forward_kernel[DType.float32]](X, V, O, Int32(rows), Int32(in_f), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[
-            _oft_b4_forward_kernel[DType.bfloat16], _oft_b4_forward_kernel[DType.bfloat16]
-        ](X, V, O, rows, in_f, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_oft_b4_forward_kernel[DType.bfloat16]](X, V, O, Int32(rows), Int32(in_f), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[
-            _oft_b4_forward_kernel[DType.float16], _oft_b4_forward_kernel[DType.float16]
-        ](X, V, O, rows, in_f, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_oft_b4_forward_kernel[DType.float16]](X, V, O, Int32(rows), Int32(in_f), grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -455,10 +478,16 @@ def oft_serenity_rotate_backward_b4(
     var v_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](v2[0], v2[1]))
     var drg_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](r, 16))
     var V = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        vec_f32.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(vec_f32.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     var DRG = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        drg_buf.unsafe_ptr().bitcast[Float32](), drg_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(drg_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=drg_rl,
     )
 
     var rot_total = rows * in_f
@@ -468,59 +497,77 @@ def oft_serenity_rotate_backward_b4(
 
     if dt == DType.float32:
         var G = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            d_x_rot.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(d_x_rot.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _oft_b4_drg_kernel[DType.float32], _oft_b4_drg_kernel[DType.float32]
-        ](G, X, DRG, rows, in_f, r, grid_dim=drg_grid, block_dim=_BLOCK)
-        ctx.enqueue_function[
-            _oft_b4_dx_kernel[DType.float32], _oft_b4_dx_kernel[DType.float32]
-        ](G, V, DX, rows, in_f, grid_dim=rot_grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_oft_b4_drg_kernel[DType.float32]](G, X, DRG, Int32(rows), Int32(in_f), Int32(r), grid_dim=drg_grid, block_dim=_BLOCK)
+        ctx.enqueue_function[_oft_b4_dx_kernel[DType.float32]](G, V, DX, Int32(rows), Int32(in_f), grid_dim=rot_grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var G = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            d_x_rot.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(d_x_rot.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[
-            _oft_b4_drg_kernel[DType.bfloat16], _oft_b4_drg_kernel[DType.bfloat16]
-        ](G, X, DRG, rows, in_f, r, grid_dim=drg_grid, block_dim=_BLOCK)
-        ctx.enqueue_function[
-            _oft_b4_dx_kernel[DType.bfloat16], _oft_b4_dx_kernel[DType.bfloat16]
-        ](G, V, DX, rows, in_f, grid_dim=rot_grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_oft_b4_drg_kernel[DType.bfloat16]](G, X, DRG, Int32(rows), Int32(in_f), Int32(r), grid_dim=drg_grid, block_dim=_BLOCK)
+        ctx.enqueue_function[_oft_b4_dx_kernel[DType.bfloat16]](G, V, DX, Int32(rows), Int32(in_f), grid_dim=rot_grid, block_dim=_BLOCK)
     else:
         var G = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            d_x_rot.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(d_x_rot.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[
-            _oft_b4_drg_kernel[DType.float16], _oft_b4_drg_kernel[DType.float16]
-        ](G, X, DRG, rows, in_f, r, grid_dim=drg_grid, block_dim=_BLOCK)
-        ctx.enqueue_function[
-            _oft_b4_dx_kernel[DType.float16], _oft_b4_dx_kernel[DType.float16]
-        ](G, V, DX, rows, in_f, grid_dim=rot_grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_oft_b4_drg_kernel[DType.float16]](G, X, DRG, Int32(rows), Int32(in_f), Int32(r), grid_dim=drg_grid, block_dim=_BLOCK)
+        ctx.enqueue_function[_oft_b4_dx_kernel[DType.float16]](G, V, DX, Int32(rows), Int32(in_f), grid_dim=rot_grid, block_dim=_BLOCK)
 
     var DV = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dvec_buf.unsafe_ptr().bitcast[Float32](), v_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dvec_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=v_rl,
     )
     var dvec_grid = (r * _B4_NE + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_oft_b4_dvec_kernel, _oft_b4_dvec_kernel](
-        DRG, V, DV, r, grid_dim=dvec_grid, block_dim=_BLOCK
+    ctx.enqueue_function[_oft_b4_dvec_kernel](
+        DRG, V, DV, Int32(r), grid_dim=dvec_grid, block_dim=_BLOCK
     )
 
     return OFTOTDeviceGrads(

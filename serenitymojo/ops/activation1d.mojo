@@ -36,7 +36,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.conv1d import conv1d, zero_insert1d, replicate_pad1d
 from serenitymojo.ops.snake import snake_beta

@@ -1,6 +1,6 @@
 """Exact-byte smoke gate for GPU `[1,3,F,H,W]` to RGB24 conversion."""
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -5,7 +5,7 @@
 # safetensors convert CosmosTransformer3DModel keys back to `net.*` names and add
 # AnimaTextConditioner weights under `net.llm_adapter.*`.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

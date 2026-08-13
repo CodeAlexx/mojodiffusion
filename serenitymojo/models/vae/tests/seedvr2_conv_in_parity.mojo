@@ -15,8 +15,8 @@
 #      pixi run mojo run -I . \
 #        serenitymojo/models/vae/tests/seedvr2_conv_in_parity.mojo
 
-from std.gpu.host import DeviceContext
-from math import sqrt
+from max.gpu.host import DeviceContext
+from std.math import sqrt
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.safetensors import SafeTensors

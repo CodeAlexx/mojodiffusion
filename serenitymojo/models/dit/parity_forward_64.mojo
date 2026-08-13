@@ -12,7 +12,7 @@
 # unified=1056. Mirrors parity_forward.mojo (the 8x8 driver) exactly but reads
 # the 64x64 fixture set.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

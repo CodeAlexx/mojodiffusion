@@ -40,7 +40,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. Numeric gate: P2.5 smoke vs the Python connector
 # reference (scripts/ltx2_dit_forward_parity_ref.py), cos >= 0.999.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, pow as fpow, pi
 from std.memory import ArcPointer
 
@@ -199,7 +199,7 @@ struct LTX2ConnectorWeights(Movable):
     def _has(self, name: String) -> Bool:
         return name in self.name_to_idx
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LTX2 connector: missing weight ") + name)
         return self.weights[self.name_to_idx[name]][]

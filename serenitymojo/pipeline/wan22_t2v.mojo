@@ -64,7 +64,7 @@
 
 from std.sys import argv
 from std.sys.defines import get_defined_int
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import round
 from image.studio_ops import resize_lanczos
 from image.transform import crop

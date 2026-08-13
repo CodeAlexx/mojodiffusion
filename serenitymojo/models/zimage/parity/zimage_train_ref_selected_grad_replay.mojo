@@ -14,7 +14,7 @@
 
 from std.builtin.dtype import DType
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.pathlib import Path
 from std.sys.defines import get_defined_int
 

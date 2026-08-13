@@ -21,7 +21,7 @@
 #       serenitymojo/models/ernie/parity/stack_real_smoke.mojo -o /tmp/ernie_stack_real_smoke
 #   /tmp/ernie_stack_real_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sin as fsin, cos as fcos, isfinite
 from std.memory import ArcPointer

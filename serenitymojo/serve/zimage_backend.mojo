@@ -34,7 +34,7 @@
 # resolve against the scanner's loras dir (F4).
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
 
@@ -434,7 +434,7 @@ struct ZImageBackend(GenBackend, Movable):
     var inpaint_preserve_mean: Float32
     var lanpaint_mask_blend_applied: Bool
     var lanpaint_mask_blend_mean: Float32
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var load_seconds: Float64
     var text_encode_seconds: Float64
     var denoise_seconds: Float64
@@ -1130,7 +1130,7 @@ struct ZImageBackend(GenBackend, Movable):
                 "-> start step", run_start, "/", self.params.steps,
                 "( sigma0 =", sig0, ")",
             )
-        var nshape = [1, 16, self.hl, self.wl]
+        var nshape: List[Int] = [1, 16, self.hl, self.wl]
         self.latent = List[TArc]()
         self.latent.append(
             TArc(Tensor.from_host(lat_host, nshape^, STDtype.BF16, self.ctx))
@@ -1162,7 +1162,7 @@ struct ZImageBackend(GenBackend, Movable):
         var img = decode_image_any(self.params.init_image)
         var resized = resize_bilinear(img, self.params.width, self.params.height)
         var host = image_to_signed_nchw(resized)
-        var ishape = [1, 3, self.params.height, self.params.width]
+        var ishape: List[Int] = [1, 3, self.params.height, self.params.width]
         var image_t = Tensor.from_host(host, ishape^, STDtype.BF16, self.ctx)
         print("[zimage][img2img] init image", self.params.init_image,
               "(", img.width, "x", img.height, ") -> VAE encode_mean")
@@ -1201,7 +1201,7 @@ struct ZImageBackend(GenBackend, Movable):
                     var idx = c_off + p
                     var base = sigma_next * self.inpaint_noise[idx] + inv_sigma * self.inpaint_base_latent[idx]
                     host[idx] = m * base + (Float32(1.0) - m) * host[idx]
-        var shape = [1, 16, self.hl, self.wl]
+        var shape: List[Int] = [1, 16, self.hl, self.wl]
         return Tensor.from_host(host, shape^, STDtype.BF16, self.ctx)
 
     def _apply_lanpaint_mask_blend(mut self, var rgb: Tensor) raises -> Tensor:

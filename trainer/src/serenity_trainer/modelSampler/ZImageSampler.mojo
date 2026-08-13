@@ -48,7 +48,7 @@
 # to the velocity dtype at the end (:519). Per-step sigma deltas are host F32
 # scalars (allowed scalar schedule math), applied via the scheduler tensor op.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.random import randn

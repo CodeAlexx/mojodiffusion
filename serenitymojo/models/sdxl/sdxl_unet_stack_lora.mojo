@@ -36,7 +36,7 @@
 #
 # Mojo 0.26.x: def not fn; comptime not alias; Tensor move-only -> TArc carriers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import List, Optional
 from std.math import sqrt

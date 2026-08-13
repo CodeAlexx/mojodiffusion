@@ -20,7 +20,7 @@
 # `clamped_mask.mean(dim=(1,2,3), keepdim=True)` is the mean over the *mask*'s own
 # trailing dims (mask_inner elements), then broadcast across the loss channels.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -30,7 +30,7 @@ from serenitymojo.io.dtype import STDtype
 # For shape [N, d1, d2, ...] this divides each item i by mean over the trailing
 # dims. Mirrors `clamped_mask.mean(dim=(1, 2, 3), keepdim=True)`. Computed over
 # whatever tensor's shape is passed (the mask shape for clamped_mask).
-fn _inner_count(shape: List[Int]) -> Int:
+def _inner_count(shape: List[Int]) -> Int:
     var c = 1
     for i in range(1, len(shape)):
         c = c * shape[i]
@@ -41,7 +41,7 @@ fn _inner_count(shape: List[Int]) -> Int:
 # Returns one stride per dim: the mask's contiguous stride where the dims match,
 # or 0 where mask_shape[d]==1 and loss_shape[d]>1 (singleton broadcast). Mirrors
 # PyTorch numpy-style broadcasting (both tensors share rank here: [N,*,H,W]).
-fn _broadcast_strides(mask_shape: List[Int], loss_shape: List[Int]) -> List[Int]:
+def _broadcast_strides(mask_shape: List[Int], loss_shape: List[Int]) -> List[Int]:
     var rank = len(loss_shape)
     # contiguous row-major strides of the mask
     var mask_stride = List[Int]()
@@ -63,7 +63,7 @@ fn _broadcast_strides(mask_shape: List[Int], loss_shape: List[Int]) -> List[Int]
 
 # Map a row-major flat index `i` over `loss_shape` to the corresponding flat
 # index into the mask, using broadcast-aware strides.
-fn _mask_index(
+def _mask_index(
     i: Int, loss_shape: List[Int], strides: List[Int]
 ) -> Int:
     var rank = len(loss_shape)
@@ -78,7 +78,7 @@ fn _mask_index(
 
 
 # torch.clamp(mask, unmasked_weight, 1)  (masked_loss.py:11 / :29)
-fn _clamp(v: Float32, lo: Float32, hi: Float32) -> Float32:
+def _clamp(v: Float32, lo: Float32, hi: Float32) -> Float32:
     var x = v
     if x < lo:
         x = lo

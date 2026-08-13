@@ -35,7 +35,7 @@
 
 from std.memory import ArcPointer
 from std.collections import Optional
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.ltx2.ltx2_video_stack import (

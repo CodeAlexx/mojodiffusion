@@ -29,7 +29,7 @@
 # Mojo 1.0.0b1: def not fn; Tensor move-only crosses API as host List[Float32];
 # no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
 
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.utils.index import IndexList
@@ -179,13 +179,22 @@ def _lora_bf16_gemm_nt_f32(
     var b_rl = RuntimeLayout[_LORA_DYN2].row_major(IndexList[2](n_rows, k))
     var c_rl = RuntimeLayout[_LORA_DYN2].row_major(IndexList[2](m, n_rows))
     var A = LayoutTensor[DType.bfloat16, _LORA_DYN2, MutAnyOrigin](
-        x_bf.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_bf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
     )
     var B = LayoutTensor[DType.bfloat16, _LORA_DYN2, MutAnyOrigin](
-        w_bf.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w_bf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
     )
     var C = LayoutTensor[DType.float32, _LORA_DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
     matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     return Tensor(c_buf^, [m, n_rows], STDtype.F32)
@@ -206,13 +215,22 @@ def _lora_bf16_gemm_nn_f32(
     var oi_rl = RuntimeLayout[_LORA_DYN2].row_major(IndexList[2](out_f, in_f))
     var mi_rl = RuntimeLayout[_LORA_DYN2].row_major(IndexList[2](m, in_f))
     var GY = LayoutTensor[DType.bfloat16, _LORA_DYN2, MutAnyOrigin](
-        gy_bf.buf.unsafe_ptr().bitcast[BFloat16](), mo_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(gy_bf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=mo_rl,
     )
     var W = LayoutTensor[DType.bfloat16, _LORA_DYN2, MutAnyOrigin](
-        w_bf.buf.unsafe_ptr().bitcast[BFloat16](), oi_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w_bf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=oi_rl,
     )
     var DX = LayoutTensor[DType.float32, _LORA_DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), mi_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=mi_rl,
     )
     matmul(ctx, DX, GY, W, c_row_major=True)
     return Tensor(c_buf^, [m, in_f], STDtype.F32)
@@ -233,13 +251,22 @@ def _lora_bf16_gemm_tn_f32(
     var mi_rl = RuntimeLayout[_LORA_DYN2].row_major(IndexList[2](m, in_f))
     var oi_rl = RuntimeLayout[_LORA_DYN2].row_major(IndexList[2](out_f, in_f))
     var GY = LayoutTensor[DType.bfloat16, _LORA_DYN2, MutAnyOrigin](
-        gy_bf.buf.unsafe_ptr().bitcast[BFloat16](), mo_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(gy_bf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=mo_rl,
     )
     var X2 = LayoutTensor[DType.bfloat16, _LORA_DYN2, MutAnyOrigin](
-        x2_bf.buf.unsafe_ptr().bitcast[BFloat16](), mi_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x2_bf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=mi_rl,
     )
     var DW = LayoutTensor[DType.float32, _LORA_DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), oi_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=oi_rl,
     )
     matmul(ctx, DW, GY, X2, transpose_a=True, c_row_major=True)
     return Tensor(c_buf^, [out_f, in_f], STDtype.F32)

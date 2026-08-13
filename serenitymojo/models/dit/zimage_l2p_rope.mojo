@@ -22,7 +22,7 @@
 # block_forward path (small data at smoke sizes), keeping this builder true to
 # the Rust signature `[total_seq, head_dim/2]`.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, log as flog, exp as fexp, sin as fsin
 
 from serenitymojo.io.dtype import STDtype

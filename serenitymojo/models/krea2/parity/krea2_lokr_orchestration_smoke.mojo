@@ -10,7 +10,7 @@
 #     serenitymojo/models/krea2/parity/krea2_lokr_orchestration_smoke.mojo \
 #     -o /tmp/krea2_lokr_orch && /tmp/krea2_lokr_orch
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.krea2.krea2_lokr_stack import (
     Krea2LoKrSet, build_krea2_lokr_set, krea2_lokr_carrier_lists,

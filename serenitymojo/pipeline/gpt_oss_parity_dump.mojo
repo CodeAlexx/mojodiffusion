@@ -13,7 +13,7 @@
 # Output: serenitymojo/models/text_encoder/parity/mine_captures.safetensors
 #   keys "l5","l11","l17","l23" each [1, S, 2880] BF16 (byte-exact storage).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

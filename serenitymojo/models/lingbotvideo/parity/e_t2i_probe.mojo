@@ -18,7 +18,7 @@
 #     pixi run mojo run -I . serenitymojo/models/lingbotvideo/parity/e_t2i_probe.mojo
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

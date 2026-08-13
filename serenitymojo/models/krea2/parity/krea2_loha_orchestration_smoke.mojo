@@ -10,7 +10,7 @@
 #     -o /tmp/krea2_loha_orch && /tmp/krea2_loha_orch
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.krea2.krea2_lokr_stack import KREA2_SLOTS
 from serenitymojo.models.krea2.krea2_loha_stack import (

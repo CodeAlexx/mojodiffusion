@@ -24,7 +24,7 @@
 # exactly: LayoutTensor views built INLINE (a `def` helper can't return one).
 
 from std.math import copysign
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -48,8 +48,9 @@ def _lion_kernel(
     beta1: Float32,
     beta2: Float32,
     weight_decay: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var gv = rebind[Scalar[DType.float32]](g[idx])
@@ -108,14 +109,26 @@ def lion_step(
 
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var pt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        param.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(param.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var gt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var mt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        m.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(m.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_lion_kernel, _lion_kernel](
-        pt, gt, mt, lr, beta1, beta2, weight_decay, n,
+    ctx.enqueue_function[_lion_kernel](
+        pt, gt, mt, lr, beta1, beta2, weight_decay, Int64(n),
         grid_dim=grid, block_dim=_BLOCK,
     )
     ctx.synchronize()

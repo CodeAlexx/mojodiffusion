@@ -10,7 +10,7 @@
 # Run: cd /home/alex/mojodiffusion && pixi run mojo run -I . serenitymojo/offload/skeptic_probe.mojo
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 from serenitymojo.tensor import Tensor

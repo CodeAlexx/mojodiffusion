@@ -3,7 +3,7 @@
 # the trainer so the SAME code path (SafeTensors mmap + patchify3d) is exercised.
 # Prints each sample's latent std/mean (round-trip gate vs the torch builder).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.training.train_wan22_real import (
     _load_cache_sample, _count_cache_samples,
 )

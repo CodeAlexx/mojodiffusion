@@ -11,7 +11,7 @@
 # fallback_train_dtype only for the T5 encoder compute/load path; the component
 # storage dtype remains the requested text_encoder_3 dtype.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

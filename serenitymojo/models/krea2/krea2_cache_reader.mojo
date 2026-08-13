@@ -40,7 +40,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import log
 from std.memory import ArcPointer
@@ -227,8 +227,12 @@ def krea2_reorder_combined_edit[LTMAX: Int, LFULL_E: Int, CONDL: Int](
 # downstream) are 0. One thread per masked element: total = H*LFULL*(LTMAX-LT).
 def _krea2_pad_mask_kernel(
     mask: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [H*LFULL*LFULL] flat
-    H: Int, lfull: Int, lt: Int, ltmax: Int,
+    H_w: Int32, lfull_w: Int32, lt_w: Int32, ltmax_w: Int32,
 ):
+    var H = Int(H_w)
+    var lfull = Int(lfull_w)
+    var lt = Int(lt_w)
+    var ltmax = Int(ltmax_w)
     var idx = Int(global_idx.x)
     var padcols = ltmax - lt
     var total = H * lfull * padcols
@@ -259,12 +263,15 @@ def krea2_build_pad_mask(
     var nflat = KREA2_HEADS * lfull * lfull
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nflat))
     var m = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        mask.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(mask.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var npad = KREA2_HEADS * lfull * (ltmax - lt)
     var grid = (npad + _MASK_BLOCK - 1) // _MASK_BLOCK
-    ctx.enqueue_function[_krea2_pad_mask_kernel, _krea2_pad_mask_kernel](
-        m, KREA2_HEADS, lfull, lt, ltmax, grid_dim=grid, block_dim=_MASK_BLOCK
+    ctx.enqueue_function[_krea2_pad_mask_kernel](
+        m, Int32(KREA2_HEADS), Int32(lfull), Int32(lt), Int32(ltmax), grid_dim=grid, block_dim=_MASK_BLOCK
     )
     return mask^
 
@@ -329,8 +336,11 @@ def krea2_edit_real_len(lt: Int, imglen: Int, condlen: Int) -> Int:
 # plan; treat every number here as arithmetic on the shapes, not a measurement.
 def _krea2_edit_bias_kernel(
     mask: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [heads*L*L] flat
-    lfull: Int, cond_off: Int, cond_end: Int, bias: Float32,
+    lfull_w: Int32, cond_off_w: Int64, cond_end_w: Int32, bias: Float32,
 ):
+    var lfull = Int(lfull_w)
+    var cond_off = Int(cond_off_w)
+    var cond_end = Int(cond_end_w)
     var idx = Int(global_idx.x)
     var total = lfull * lfull
     if idx >= total:
@@ -399,11 +409,14 @@ def krea2_build_edit_attn_bias(
     var nflat = lfull * lfull
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nflat))
     var m = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        plane.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(plane.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (nflat + _MASK_BLOCK - 1) // _MASK_BLOCK
-    ctx.enqueue_function[_krea2_edit_bias_kernel, _krea2_edit_bias_kernel](
-        m, lfull, cond_off, cond_end, bias,
+    ctx.enqueue_function[_krea2_edit_bias_kernel](
+        m, Int32(lfull), Int64(cond_off), Int32(cond_end), bias,
         grid_dim=grid, block_dim=_MASK_BLOCK,
     )
     var plane_t: Tensor
@@ -446,12 +459,15 @@ def krea2_build_refiner_mask(
     var nflat = heads * ltmax * ltmax
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nflat))
     var m = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        mask.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(mask.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var npad = heads * ltmax * (ltmax - real_text_len)
     var grid = (npad + _MASK_BLOCK - 1) // _MASK_BLOCK
-    ctx.enqueue_function[_krea2_pad_mask_kernel, _krea2_pad_mask_kernel](
-        m, heads, ltmax, real_text_len, ltmax, grid_dim=grid, block_dim=_MASK_BLOCK
+    ctx.enqueue_function[_krea2_pad_mask_kernel](
+        m, Int32(heads), Int32(ltmax), Int32(real_text_len), Int32(ltmax), grid_dim=grid, block_dim=_MASK_BLOCK
     )
     return mask^
 

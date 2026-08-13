@@ -11,7 +11,7 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #     serenitymojo/models/klein/parity/klein_layer_norm_modulate_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from serenitymojo.parity import ParityHarness
 from serenitymojo.tensor import Tensor
@@ -22,7 +22,7 @@ from serenitymojo.ops.elementwise import modulate
 comptime EPS = Float32(1e-06)
 
 
-fn _lcg(mut state: UInt64) -> Float32:
+def _lcg(mut state: UInt64) -> Float32:
     # simple deterministic LCG in [-1, 1)
     state = state * 6364136223846793005 + 1442695040888963407
     var u = (state >> 40) & 0xFFFFFF  # 24 bits

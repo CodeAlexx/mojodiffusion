@@ -1,6 +1,6 @@
 # Phase 5 gate: save_train_state → load_train_state round-trips resume state.
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenity_trainer.trainer.train_step import ParamSlot

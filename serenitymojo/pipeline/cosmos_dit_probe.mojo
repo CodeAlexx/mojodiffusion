@@ -3,7 +3,7 @@
 # Tiny grid so it runs on any GPU without weights present (block/full-stack paths
 # are exercised symbolically by the type checker; the rope path runs for real).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

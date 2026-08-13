@@ -9,7 +9,7 @@
 # Run:
 #   /tmp/minimax_h3_qwen_int8_cache <text_encoder_dir> [layers=50]
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_int8 import (

@@ -15,7 +15,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.cap_cache import save_tensor_bin
 from serenitymojo.models.krea2.krea2_cache_reader import (

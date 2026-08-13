@@ -30,7 +30,7 @@
 #     -o /tmp/lycoris_family_parity && /tmp/lycoris_family_parity
 from std.collections import List
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.locon_conv_adapter import LoConConvAdapter, locon_forward

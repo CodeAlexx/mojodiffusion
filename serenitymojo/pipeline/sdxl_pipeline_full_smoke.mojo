@@ -6,7 +6,7 @@
 # Like the quick smoke, it host-stages only the final latent between denoise and
 # VAE so the UNet/embedding tensors drop before tiled 1024 decode.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

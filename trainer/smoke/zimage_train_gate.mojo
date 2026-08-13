@@ -1,7 +1,7 @@
 # Z-Image LoRA real-weights TRAIN gate (fixed-σ overfit probe).
 # Loads real zimage_base weights, runs N fixed-σ training steps with LoRA, and
 # proves: loss DECREASES, LoRA-B goes 0→nonzero on the adapters, 0 nonfinite.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -26,7 +26,7 @@
 #       serenitymojo/pipeline/anima_text_context.mojo -o /tmp/anima_text_context
 #   /tmp/anima_text_context <tokens_sidecar.safetensors> <out_context.safetensors>
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer
 from std.sys import argv

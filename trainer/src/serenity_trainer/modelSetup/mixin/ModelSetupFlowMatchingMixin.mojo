@@ -49,7 +49,7 @@
 # Sigma tensors are F32 (Py L24 promotion), so all multiplies stay in F32 and the
 # BF16 store-dtype-per-op rounding never fires inside the math.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.tensor_algebra import add, mul

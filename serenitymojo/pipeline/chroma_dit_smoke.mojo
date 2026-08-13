@@ -5,7 +5,7 @@
 # two double blocks, the first two single blocks, and final image projection on
 # a static token grid.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

@@ -17,7 +17,7 @@
 #     pixi run mojo run -I . serenitymojo/models/lingbotvideo/parity/a3_block_probe.mojo
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

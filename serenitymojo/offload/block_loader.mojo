@@ -46,7 +46,7 @@
 from std.memory import ArcPointer
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.tensor import Tensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 
 # A loaded block: tensor-name -> device Tensor (Arc-wrapped). Mirrors Rust

@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/training/lora_adamw_plain_device_grads_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

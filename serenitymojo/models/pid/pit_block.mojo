@@ -29,7 +29,7 @@
 #
 # All compute F32 (parity gate cos>=0.999). Mojo 1.0.0b1.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from std.math import erf, sqrt
@@ -65,8 +65,9 @@ def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 def _gelu_erf_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](x[i])
@@ -81,14 +82,20 @@ def gelu_erf(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_gelu_erf_kernel, _gelu_erf_kernel](
-        X, O, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_gelu_erf_kernel](
+        X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, x.shape(), STDtype.F32)
@@ -103,8 +110,12 @@ def gelu_erf(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 def _rope_expand_kernel(
     pos: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [L*half]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # [B*L*H*half]
-    B: Int, L: Int, H: Int, half: Int,
+    B_w: Int32, L_w: Int32, H_w: Int32, half_w: Int32,
 ):
+    var B = Int(B_w)
+    var L = Int(L_w)
+    var H = Int(H_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = B * L * H * half
     if idx < total:
@@ -127,14 +138,20 @@ def _expand_rope_table(
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](L * half))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        pos.buf.unsafe_ptr().bitcast[Float32](), rl_in
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(pos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_in,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_rope_expand_kernel, _rope_expand_kernel](
-        P, O, B, L, H, half, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_rope_expand_kernel](
+        P, O, Int32(B), Int32(L), Int32(H), Int32(half), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     return Tensor(out_buf^, [B * L * H, half], STDtype.F32)

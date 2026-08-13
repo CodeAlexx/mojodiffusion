@@ -28,10 +28,10 @@
 #       serenitymojo/models/zimage/parity/stack_finitediff.mojo -o /tmp/zimage_stack_fd
 #   /tmp/zimage_stack_fd
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc, ArcPointer
-from math import abs as fabs
+from std.math import abs as fabs
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -7,7 +7,7 @@
 #     pixi run mojo run -I . -I trainer/src \
 #       trainer/smoke/adamw_compile_check.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenity_trainer.util.optimizer.adamw_extensions import adamw_step

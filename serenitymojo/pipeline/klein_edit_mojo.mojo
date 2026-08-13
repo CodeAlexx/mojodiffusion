@@ -28,7 +28,7 @@
 # (Qwen3-8B layers 8/17/26 -> [1,512,12288]) so no text encoder co-resides.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer
 

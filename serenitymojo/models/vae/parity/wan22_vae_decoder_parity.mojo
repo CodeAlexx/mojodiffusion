@@ -9,7 +9,7 @@
 # The product path loads the converted BF16 high-compression VAE and decodes
 # five 16x16 latent frames into 17 256x256 RGB frames, exactly as T2V does.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.vae.wan22_decoder import Wan22VaeImageDecoder

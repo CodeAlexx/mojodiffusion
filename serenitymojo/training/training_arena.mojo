@@ -6,7 +6,7 @@
 # host-side cursor moves only; callers must not rewind past tensors still needed
 # by queued device work.
 
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator, ScratchRingMark

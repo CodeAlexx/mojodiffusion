@@ -14,7 +14,7 @@
 #   axis2 half=1: inv[0]=1
 # angle[t,col] = pos[t,axis(col)] * inv[local_i(col)]; cols = [a0i0,a0i1,a1i0,a1i1,a2i0]
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.rope_tables import build_multiaxis_rope_tables

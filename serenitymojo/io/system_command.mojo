@@ -6,7 +6,6 @@
 
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]

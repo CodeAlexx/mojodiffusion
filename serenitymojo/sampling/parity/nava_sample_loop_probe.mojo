@@ -2,7 +2,7 @@
 # (cond + zeros-uncond, vid_g=3 aud_g=2, NO slg/align/timbre) + 2 UniPC schedulers
 # (shift=5), 3 steps, gated per-step vs the torch oracle (nava_sample_oracle.py).
 # Latents stay F32-resident; cast to BF16 only to feed the DiT (h2d discipline).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

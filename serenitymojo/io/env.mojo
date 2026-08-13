@@ -10,7 +10,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 
 comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
@@ -34,7 +33,7 @@ def env_or(name: String, default: String) -> String:
     while ret[i] != 0:
         out += chr(Int(ret[i]))
         i += 1
-    if len(out) == 0:
+    if out.byte_length() == 0:
         return default
     return out
 
@@ -43,7 +42,7 @@ def env_int(name: String, default: Int) -> Int:
     """Return env var `name` parsed as a non-negative base-10 Int, or `default`
     if unset/empty/non-numeric. Used for LINGBOT_RESIDENT_BLOCKS."""
     var s = env_or(name, String(""))
-    if len(s) == 0:
+    if s.byte_length() == 0:
         return default
     var v = 0
     var bytes = s.as_bytes()

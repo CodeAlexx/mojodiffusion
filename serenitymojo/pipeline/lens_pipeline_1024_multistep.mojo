@@ -11,7 +11,7 @@
 #
 # Architecture: 48 dual-stream MMDiT blocks staged from a complete FP8 host store.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, exp as fexp, cos as fcos, sin as fsin, log as flog, pow as fpow
 from std.memory import ArcPointer
 

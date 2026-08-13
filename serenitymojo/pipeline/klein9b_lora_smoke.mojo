@@ -24,7 +24,7 @@
 #   overlay). All valid targets (proj/mlp/single + the 48 attention QKV modules)
 #   now merge.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.dit.klein_dit import Klein9BDiT
 from serenitymojo.lora import LoraSet

@@ -5,7 +5,7 @@
 # one decoder layer by default) so it validates loader/embedding/MoE-gen/mRoPE
 # wiring without requiring the still-missing block-sparse video attention.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.random import randn

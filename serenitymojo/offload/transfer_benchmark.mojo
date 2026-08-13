@@ -37,7 +37,7 @@
 from std.collections import List
 from std.time import perf_counter_ns
 from std.math import log, exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 
 comptime DIR_H2D = 0

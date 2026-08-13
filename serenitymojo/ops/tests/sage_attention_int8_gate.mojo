@@ -2,7 +2,7 @@
 #
 # Isolated correctness and timing gate for the opt-in Sage INT8-QK backend.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import isfinite, sqrt
 from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
@@ -23,7 +23,7 @@ comptime ITERS = 20
 
 def main() raises:
     var ctx = DeviceContext()
-    var shape = [B, S, H, D]
+    var shape: List[Int] = [B, S, H, D]
     var q = randn(shape.copy(), 101, STDtype.BF16, ctx)
     var k = randn(shape.copy(), 102, STDtype.BF16, ctx)
     var v = randn(shape.copy(), 103, STDtype.BF16, ctx)

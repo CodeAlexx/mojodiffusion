@@ -12,8 +12,8 @@
 #   /home/alex/serenityflow-v2/.venv/bin/python serenitymojo/training/parity/opt_lion_oracle.py
 #   pixi run mojo run -I . serenitymojo/training/parity/opt_lion_parity.mojo
 
-from sys import argv
-from std.gpu.host import DeviceContext
+from std.sys import argv
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

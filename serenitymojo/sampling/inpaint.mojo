@@ -42,7 +42,7 @@
 # ops broadcast.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp as _scalar_exp, expm1 as _scalar_expm1, sqrt as _scalar_sqrt
 from std.math import cos as _scalar_cos, sin as _scalar_sin, isfinite
 
@@ -82,7 +82,7 @@ def lanpaint_coef_c(
     x_t: Tensor, score: Tensor, a_drift: Float32, abt: Float32, ctx: DeviceContext
 ) raises -> Tensor:
     var x0 = add(x_t, score, ctx)
-    var sqrt_abt = abt ** 0.5
+    var sqrt_abt = abt ** Float32(0.5)
     var one_minus_abt = 1.0 - abt
     # num = sqrt_abt * x0 - x_t
     var num = sub(mul_scalar(x0, sqrt_abt, ctx), x_t, ctx)
@@ -146,7 +146,7 @@ def lanpaint_overdamped_advance(
     var variance = 2.0 * k2
     var sd: Float32 = 0.0
     if variance > 0.0:
-        sd = variance ** 0.5
+        sd = variance ** Float32(0.5)
     return add(mean, mul_scalar(noise, sd, ctx), ctx)
 
 

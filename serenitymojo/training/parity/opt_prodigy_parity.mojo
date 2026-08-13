@@ -11,7 +11,7 @@
 #   /home/alex/serenityflow-v2/.venv/bin/python serenitymojo/training/parity/opt_prodigy_oracle.py
 #   pixi run mojo run -I . serenitymojo/training/parity/opt_prodigy_parity.mojo
 
-from sys import argv
+from std.sys import argv
 from std.math import sqrt
 from serenitymojo.parity import ParityHarness
 from serenitymojo.training.opt_prodigy import Prodigy

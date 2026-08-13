@@ -19,7 +19,7 @@
 #       serenitymojo/training/sd35_medium_overfit_smoke.mojo -o /tmp/sd35_medium_overfit
 #   /tmp/sd35_medium_overfit
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt, sin
 from std.time import perf_counter_ns

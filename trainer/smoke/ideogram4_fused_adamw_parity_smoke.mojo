@@ -42,7 +42,7 @@
 #     -o target/ideogram4_fused_adamw_parity_smoke
 # WRITTEN, NOT BUILT/RUN in the MJ-1038 edit session (campaign rule).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import max
 from std.memory import ArcPointer
 

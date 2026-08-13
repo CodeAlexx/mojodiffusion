@@ -18,7 +18,7 @@
 # GATE: all three tests bit-exact (BF16 round-to-nearest is deterministic on
 # both the GPU kernel and the host cast). Mirrors mxfp4_dequant_smoke.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ldexp
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

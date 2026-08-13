@@ -3,7 +3,7 @@
 # This is intentionally one denoise step: it proves the real 1024 token shape
 # and image path before optimizing 50-step quality/performance.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

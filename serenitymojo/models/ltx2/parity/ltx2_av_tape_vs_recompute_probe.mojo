@@ -17,7 +17,7 @@
 #   -Xlinker -lcuda serenitymojo/models/ltx2/parity/ltx2_av_tape_vs_recompute_probe.mojo \
 #   -o /tmp/ltx2_av_tape_probe && /tmp/ltx2_av_tape_probe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer
 from std.time import perf_counter_ns

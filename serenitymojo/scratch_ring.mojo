@@ -1,6 +1,6 @@
 from std.builtin.dtype import DType
 from std.collections import List
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

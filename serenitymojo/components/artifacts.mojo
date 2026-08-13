@@ -3,7 +3,7 @@
 # This keeps frame extraction, PNG path behavior, and frame-sequence muxing out
 # of model smokes.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.image.png import save_png, ValueRange

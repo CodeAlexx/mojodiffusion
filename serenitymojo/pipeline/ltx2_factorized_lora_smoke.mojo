@@ -3,7 +3,7 @@
 # Verifies the production runtime shape: LoRA adapters attach as low-rank A/B
 # factors on LTX2AVBlockWeights instead of materializing full [out,in] deltas.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.dit.ltx2_dit import LTX2Config, LTX2AVBlockWeights

@@ -16,7 +16,7 @@
 # Run: pixi run mojo build -I . -Xlinker -lm \
 #        serenitymojo/ops/pixelshuffle_smoke.mojo -o /tmp/p_d2s_smoke && /tmp/p_d2s_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.pixelshuffle import (

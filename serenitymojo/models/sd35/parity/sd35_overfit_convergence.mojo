@@ -21,7 +21,7 @@
 #   /tmp/sd35_overfit
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, sin
 
 from serenitymojo.models.sd35.sd35_block import (

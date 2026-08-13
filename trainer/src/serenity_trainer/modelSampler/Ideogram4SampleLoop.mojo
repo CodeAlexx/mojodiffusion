@@ -32,7 +32,7 @@
 # (asymmetric CFG); the cond forward runs over text+image tokens, the uncond over
 # image tokens only (no text). This is NOT the Flux2 pos/neg-batch CFG.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

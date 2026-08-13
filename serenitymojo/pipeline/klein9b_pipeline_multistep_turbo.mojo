@@ -22,7 +22,7 @@
 # set OUT to the 64 path, N_IMG=16, LH=LW=4, and swap Klein9BOffloaded.load
 # back to Klein9BDiT.load_full.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

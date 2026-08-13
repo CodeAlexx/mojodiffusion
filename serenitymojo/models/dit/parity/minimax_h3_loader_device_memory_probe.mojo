@@ -9,7 +9,7 @@
 # not from inside Mojo. This file just prints markers before/after each block
 # and sleeps briefly so the external poller has time to sample.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import sleep
 
 from serenitymojo.io.sharded import ShardedSafeTensors

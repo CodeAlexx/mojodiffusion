@@ -16,10 +16,11 @@
 # The public product surface is `sage_attention_int8_fwd`; the exported
 # `sage_int8_mma_tile` exists only for the host-exact primitive gate.
 
-from std.gpu import barrier, block_idx, global_idx, lane_id, syncwarp, thread_idx
-from std.gpu.host import DeviceContext
-from std.memory import bitcast, stack_allocation
-from std.gpu.memory import AddressSpace
+from std.gpu import block_idx, global_idx, lane_id, thread_idx
+from max.gpu import barrier, syncwarp
+from max.gpu.host import DeviceBuffer, DeviceContext
+from std.memory import ArcPointer, bitcast, stack_allocation
+from max.gpu.memory import AddressSpace
 from std.gpu.primitives.warp import max as warp_max
 from std.math import ceildiv, exp, round
 from std.sys import _RegisterPackType, inlined_assembly
@@ -169,27 +170,36 @@ def sage_int8_mma_tile(
     var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](32 * 8))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](16 * 8))
     var A = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
-        a.buf.unsafe_ptr().bitcast[Int8](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=a_rl,
     )
     var B = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
-        b.buf.unsafe_ptr().bitcast[Int8](), b_rl
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=b_rl,
     )
     var O = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Int32](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=o_rl,
     )
-    ctx.enqueue_function[
-        _sage_int8_mma_tile_kernel, _sage_int8_mma_tile_kernel
-    ](A, B, O, grid_dim=1, block_dim=32)
+    ctx.enqueue_function[_sage_int8_mma_tile_kernel](A, B, O, grid_dim=1, block_dim=32)
     return Tensor(out_buf^, [16, 8], STDtype.I32)
 
 
 def _sage_k_mean_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     mean: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    S: Int,
-    H: Int,
+    S_w: Int32,
+    H_w: Int32,
 ):
     """Mean K over sequence for exact softmax-invariant key smoothing."""
+    var S = Int(S_w)
+    var H = Int(H_w)
     var hd = Int(global_idx.x)
     if hd >= H * _HEAD_DIM:
         return
@@ -209,10 +219,12 @@ def _sage_quant_q_per_thread_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     scales: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    S: Int,
-    H: Int,
+    S_w: Int32,
+    H_w: Int32,
 ):
     """Official per-thread Q geometry: one scale for rows (r, r+8)."""
+    var S = Int(S_w)
+    var H = Int(H_w)
     var tid = Int(thread_idx.x)
     var warp = tid >> 5
     var lane = tid & 31
@@ -276,10 +288,12 @@ def _sage_quant_k_per_thread_bf16(
     dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     scales: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     mean: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    S: Int,
-    H: Int,
+    S_w: Int32,
+    H_w: Int32,
 ):
     """Official per-thread K geometry: four interleaved row-pair groups."""
+    var S = Int(S_w)
+    var H = Int(H_w)
     var tid = Int(thread_idx.x)
     var warp = tid >> 5
     var lane = tid & 31
@@ -346,25 +360,6 @@ def _sage_quant_k_per_thread_bf16(
         idx += 32
 
 
-def _sage_gather_v_bf16(
-    src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    S: Int,
-    H: Int,
-):
-    """Gather pipeline BSHD V into the BHSD layout used by cp.async."""
-    var idx = Int(block_idx.x) * (_WARPS * 32) + Int(thread_idx.x)
-    var total = S * H * _HEAD_DIM
-    if idx < total:
-        var d = idx % _HEAD_DIM
-        var sh = idx // _HEAD_DIM
-        var h = sh % H
-        var s = sh // H
-        dst[(h * S + s) * _HEAD_DIM + d] = rebind[dst.element_type](
-            rebind[Scalar[DType.bfloat16]](src[idx])
-        )
-
-
 def _sage_attention_int8_token_kernel(
     q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
     k8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
@@ -372,8 +367,8 @@ def _sage_attention_int8_token_kernel(
     ks: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    S: Int,
-    H: Int,
+    S_w: Int32,
+    H_w: Int32,
     scale: Float32,
 ):
     """INT8 QK + online softmax + BF16 PV, tiled M128 x N64.
@@ -383,6 +378,8 @@ def _sage_attention_int8_token_kernel(
     probabilities stay in registers; this avoids both the old single-producer
     warp bottleneck and an H*S*S score slab.
     """
+    var S = Int(S_w)
+    var H = Int(H_w)
     var tid = Int(thread_idx.x)
     var warp = tid >> 5
     var lane = tid & 31
@@ -393,9 +390,9 @@ def _sage_attention_int8_token_kernel(
     var q0 = q_start + group
     var q1 = q0 + 8
 
-    # All eight query warps reuse the same K/V tile. In particular, staging V
-    # changes the input BSHD stride into contiguous shared-memory rows before
-    # the tensor-core fragment gather.
+    # All eight query warps reuse the same K/V tile. V is read directly from
+    # the pipeline's BSHD tensor: each 16-byte cp.async stays inside one
+    # 128-element head row, so only the row base address depends on layout.
     var k_sh = stack_allocation[
         2 * _KV_TILE * _HEAD_DIM, Scalar[DType.int8],
         address_space=AddressSpace.SHARED,
@@ -470,7 +467,11 @@ def _sage_attention_int8_token_kernel(
             UInt32,
             constraints="=r,r,l,r",
             has_side_effect=True,
-        ](v_sh + v_phys, v.ptr + head * S * _HEAD_DIM + v_elem, valid)
+        ](
+            v_sh + v_phys,
+            v.ptr + (v_row * H + head) * _HEAD_DIM + v_col,
+            valid,
+        )
         v_copy += _WARPS * 32
     _ = inlined_assembly[
         "cp.async.commit_group; mov.u32 $0, 0;",
@@ -537,7 +538,8 @@ def _sage_attention_int8_token_kernel(
                     has_side_effect=True,
                 ](
                     v_sh + next_stage * _KV_TILE * _HEAD_DIM + v_phys,
-                    v.ptr + (head * S + next_start) * _HEAD_DIM + v_elem,
+                    v.ptr + ((next_start + v_row) * H + head) * _HEAD_DIM
+                        + v_col,
                     valid,
                 )
                 v_copy += _WARPS * 32
@@ -759,6 +761,49 @@ def _sage_attention_int8_token_kernel(
                 )
 
 
+@always_inline
+def _sage_enqueue_forward(
+    Q: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    K: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    V: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    Q8u: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    K8u: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    Q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
+    K8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
+    QS: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    KS: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    KM: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    O: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    S: Int,
+    H: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises:
+    """The single kernel sequence both entry points share: K mean, per-thread
+    Q/K quantization, then the INT8-QK/BF16-PV attention kernel reading V
+    directly from the pipeline's BSHD tensor."""
+    ctx.enqueue_function[_sage_k_mean_bf16](
+        K, KM, Int32(S), Int32(H),
+        grid_dim=ceildiv(H * _HEAD_DIM, _WARPS * 32),
+        block_dim=_WARPS * 32,
+    )
+    ctx.enqueue_function[_sage_quant_q_per_thread_bf16](
+        Q, Q8u, QS, Int32(S), Int32(H),
+        grid_dim=(ceildiv(S, _Q_QUANT_BLOCK), H),
+        block_dim=_WARPS * 32,
+    )
+    ctx.enqueue_function[_sage_quant_k_per_thread_bf16](
+        K, K8u, KS, KM, Int32(S), Int32(H),
+        grid_dim=(ceildiv(S, _K_QUANT_BLOCK), H),
+        block_dim=_K_SCALES_PER_BLOCK * 32,
+    )
+    ctx.enqueue_function[_sage_attention_int8_token_kernel](
+        Q8, K8, QS, KS, V, O, Int32(S), Int32(H), scale,
+        grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
+        block_dim=_WARPS * 32,
+    )
+
+
 def sage_attention_int8_fwd_dynamic(
     q: Tensor,
     k: Tensor,
@@ -809,86 +854,272 @@ def sage_attention_int8_fwd_dynamic(
     var qs_buf = ctx.enqueue_create_buffer[DType.uint8](qscale_elems * 4)
     var ks_buf = ctx.enqueue_create_buffer[DType.uint8](kscale_elems * 4)
     var km_buf = ctx.enqueue_create_buffer[DType.uint8](H * Dh * 2)
-    var v_bhsd_buf = ctx.enqueue_create_buffer[DType.uint8](elems * 2)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](elems * 2)
     var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](elems))
     var qscale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](qscale_elems))
     var kscale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](kscale_elems))
     var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        q.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
     )
     var K = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        k.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
     )
     var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        v.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
-    )
-    var VBHSD = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        v_bhsd_buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
     )
     var Q8u = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        q8_buf.unsafe_ptr(), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(q8_buf.unsafe_ptr())
+        ),
+        runtime_layout=src_rl,
     )
     var K8u = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        k8_buf.unsafe_ptr(), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(k8_buf.unsafe_ptr())
+        ),
+        runtime_layout=src_rl,
     )
     var Q8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
-        q8_buf.unsafe_ptr().bitcast[Int8](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(q8_buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=src_rl,
     )
     var K8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
-        k8_buf.unsafe_ptr().bitcast[Int8](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(k8_buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=src_rl,
     )
     var QS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        qs_buf.unsafe_ptr().bitcast[Float32](), qscale_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(qs_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=qscale_rl,
     )
     var KS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        ks_buf.unsafe_ptr().bitcast[Float32](), kscale_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(ks_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=kscale_rl,
     )
     var KM = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        km_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](H * Dh)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(km_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](H * Dh)),
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
     )
-    ctx.enqueue_function[_sage_k_mean_bf16, _sage_k_mean_bf16](
-        K, KM, S, H,
-        grid_dim=ceildiv(H * Dh, _WARPS * 32),
-        block_dim=_WARPS * 32,
-    )
-    ctx.enqueue_function[
-        _sage_quant_q_per_thread_bf16,
-        _sage_quant_q_per_thread_bf16,
-    ](
-        Q, Q8u, QS, S, H,
-        grid_dim=(ceildiv(S, _Q_QUANT_BLOCK), H),
-        block_dim=_WARPS * 32,
-    )
-    ctx.enqueue_function[
-        _sage_quant_k_per_thread_bf16,
-        _sage_quant_k_per_thread_bf16,
-    ](
-        K, K8u, KS, KM, S, H,
-        grid_dim=(ceildiv(S, _K_QUANT_BLOCK), H),
-        block_dim=_K_SCALES_PER_BLOCK * 32,
-    )
-    ctx.enqueue_function[
-        _sage_gather_v_bf16,
-        _sage_gather_v_bf16,
-    ](
-        V, VBHSD, S, H,
-        grid_dim=ceildiv(elems, _WARPS * 32),
-        block_dim=_WARPS * 32,
-    )
-    ctx.enqueue_function[
-        _sage_attention_int8_token_kernel,
-        _sage_attention_int8_token_kernel,
-    ](
-        Q8, K8, QS, KS, VBHSD, O, S, H, scale,
-        grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
-        block_dim=_WARPS * 32,
+    _sage_enqueue_forward(
+        Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx
     )
     return Tensor(out_buf^, want^, STDtype.BF16)
+
+
+struct SageInt8Scratch(Copyable, Movable):
+    """Preallocated device scratch for the product Sage denoise path.
+
+    One Sage call at H3 geometry otherwise creates five fresh device buffers
+    (~1.1 GiB at S=38k, ~2.1 GiB at S=73k) fifty times per evaluation. Near
+    the 24 GiB envelope that transient churn intermittently OOMs mid-denoise
+    (video-0177 died at step 4 with CUDA_ERROR_OUT_OF_MEMORY). Sizing this
+    scratch once for the run's sequence ceiling and reusing it from every
+    block and step makes the steady-state Sage allocation count zero, and a
+    geometry that cannot fit fails at setup instead of minutes into denoise.
+    """
+
+    var q8: ArcPointer[Tensor]
+    var k8: ArcPointer[Tensor]
+    var qs: ArcPointer[Tensor]
+    var ks: ArcPointer[Tensor]
+    var km: ArcPointer[Tensor]
+    var out: ArcPointer[Tensor]
+    var max_s: Int
+    var heads: Int
+
+    def __init__(
+        out self, max_s: Int, heads: Int, ctx: DeviceContext
+    ) raises:
+        if max_s <= 0 or heads <= 0:
+            raise Error("SageInt8Scratch requires positive max_s and heads")
+        var elems = heads * max_s * _HEAD_DIM
+        var qscale_elems = heads * ceildiv(max_s, _Q_QUANT_BLOCK) \
+            * _Q_SCALES_PER_BLOCK
+        var kscale_elems = heads * ceildiv(max_s, _K_QUANT_BLOCK) \
+            * _K_SCALES_PER_BLOCK
+        var q8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
+        var k8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
+        var qs_buf = ctx.enqueue_create_buffer[DType.uint8](qscale_elems * 4)
+        var ks_buf = ctx.enqueue_create_buffer[DType.uint8](kscale_elems * 4)
+        var km_buf = ctx.enqueue_create_buffer[DType.uint8](
+            heads * _HEAD_DIM * 2
+        )
+        var out_buf = ctx.enqueue_create_buffer[DType.uint8](elems * 2)
+        self.q8 = ArcPointer(Tensor(q8_buf^, [elems], STDtype.I8))
+        self.k8 = ArcPointer(Tensor(k8_buf^, [elems], STDtype.I8))
+        self.qs = ArcPointer(Tensor(qs_buf^, [qscale_elems], STDtype.F32))
+        self.ks = ArcPointer(Tensor(ks_buf^, [kscale_elems], STDtype.F32))
+        self.km = ArcPointer(
+            Tensor(km_buf^, [heads * _HEAD_DIM], STDtype.BF16)
+        )
+        self.out = ArcPointer(Tensor(out_buf^, [elems], STDtype.BF16))
+        self.max_s = max_s
+        self.heads = heads
+
+    def resident_bytes(self) -> Int:
+        """Total device bytes held for VRAM accounting/logging."""
+        var total = 0
+        total += self.q8[].nbytes()
+        total += self.k8[].nbytes()
+        total += self.qs[].nbytes()
+        total += self.ks[].nbytes()
+        total += self.km[].nbytes()
+        total += self.out[].nbytes()
+        return total
+
+
+def sage_attention_int8_fwd_scratch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    scratch: SageInt8Scratch,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Sage forward through preallocated scratch: zero device allocations.
+
+    Numerics are identical to `sage_attention_int8_fwd_dynamic` — both run
+    `_sage_enqueue_forward`. The returned tensor is a NON-OWNING view of
+    `scratch.out`: the caller must fully consume it (same stream) before the
+    next `sage_attention_int8_fwd_scratch` call overwrites the buffer. The
+    H3 block loop satisfies this — attention output feeds out_proj within
+    the same block, ahead of the next block's Sage call.
+    """
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 \
+            or v.dtype() != STDtype.BF16:
+        raise Error("sage_attention_int8_fwd_scratch requires BF16 Q/K/V")
+    var qsh = q.shape()
+    var ksh = k.shape()
+    var vsh = v.shape()
+    if len(qsh) != 4 or ksh != qsh or vsh != qsh:
+        raise Error("sage_attention_int8_fwd_scratch shape mismatch")
+    var B = qsh[0]
+    var S = qsh[1]
+    var H = qsh[2]
+    var Dh = qsh[3]
+    if B != 1 or Dh != _HEAD_DIM:
+        raise Error("sage_attention_int8_fwd_scratch requires B=1, Dh=128")
+    if H != scratch.heads:
+        raise Error(
+            String("sage_attention_int8_fwd_scratch: H=") + String(H)
+            + String(" != scratch heads=") + String(scratch.heads)
+        )
+    if S > scratch.max_s:
+        raise Error(
+            String("sage_attention_int8_fwd_scratch: S=") + String(S)
+            + String(" exceeds scratch max_s=") + String(scratch.max_s)
+        )
+    var rows = H * S
+    var elems = rows * Dh
+    var qscale_elems = H * ceildiv(S, _Q_QUANT_BLOCK) \
+        * _Q_SCALES_PER_BLOCK
+    var kscale_elems = H * ceildiv(S, _K_QUANT_BLOCK) \
+        * _K_SCALES_PER_BLOCK
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](elems))
+    var qscale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](qscale_elems))
+    var kscale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](kscale_elems))
+    var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var K = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var Q8u = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.q8[].buf.unsafe_ptr())
+        ),
+        runtime_layout=src_rl,
+    )
+    var K8u = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.k8[].buf.unsafe_ptr())
+        ),
+        runtime_layout=src_rl,
+    )
+    var Q8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.q8[].buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var K8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.k8[].buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var QS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.qs[].buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=qscale_rl,
+    )
+    var KS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.ks[].buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=kscale_rl,
+    )
+    var KM = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.km[].buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](H * Dh)),
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(scratch.out[].buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    _sage_enqueue_forward(
+        Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx
+    )
+    var out_view = DeviceBuffer[DType.uint8](
+        ctx, scratch.out[].buf.unsafe_ptr(), elems * 2, owning=False
+    )
+    var want = List[Int]()
+    want.append(B)
+    want.append(S)
+    want.append(H)
+    want.append(Dh)
+    return Tensor(out_view^, want^, STDtype.BF16)
 
 
 def sage_attention_int8_fwd[

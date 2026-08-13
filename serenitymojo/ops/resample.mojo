@@ -4,7 +4,7 @@
 # Used by the LTX-2 / NAVA audio path to resample the 48 kHz vocoder output to the
 # 16 kHz target rate (wrapped_decode's torchaudio.functional.resample). F32.
 from std.math import cos, sin, pi, ceil
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.conv1d import conv1d

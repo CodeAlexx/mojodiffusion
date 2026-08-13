@@ -5,7 +5,7 @@
 # block forward should match the existing no-adapter LoRA block path without
 # allocating dense full-delta carrier tensors.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

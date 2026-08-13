@@ -7,7 +7,7 @@
 # This is a full wiring artifact, not a quality target. Real T2V still needs
 # bigger dense-safe grids, then block-sparse attention for production size.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

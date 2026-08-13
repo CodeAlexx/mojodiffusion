@@ -11,7 +11,7 @@
 #   pixi run mojo run -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/models/ltx2/parity/ltx2_av_mojo_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

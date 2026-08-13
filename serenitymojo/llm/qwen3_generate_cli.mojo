@@ -1,4 +1,4 @@
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.models.text_encoder.qwen3_magic import generate_greedy
 

@@ -2,7 +2,7 @@
 # Compare with scripts/scail2_seed_oracle.py using safetensors.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys import argv
 

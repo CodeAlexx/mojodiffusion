@@ -13,7 +13,7 @@
 #     -Xlinker -L.pixi/envs/default/lib -Xlinker -lsqlite3 \
 #     serenitymojo/ops/tests/fp8_quant_smoke.mojo -o /tmp/fp8_quant_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, pi
 
 from serenitymojo.tensor import Tensor

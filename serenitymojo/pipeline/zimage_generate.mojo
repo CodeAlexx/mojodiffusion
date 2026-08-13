@@ -39,7 +39,7 @@
 #   /tmp/zimage_generate_check [lora_path|base] [out_png] [sample_prompts.json] [prompt_id]
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log, cos
 from std.memory import alloc
 from std.time import perf_counter_ns
@@ -407,7 +407,7 @@ def _latent_velocity_overlay_from_refined[
     )
 
 
-def _trace_stage(label: String, t0: UInt, ctx: DeviceContext) raises -> UInt:
+def _trace_stage(label: String, t0: Int, ctx: DeviceContext) raises -> Int:
     # Trace mode deliberately synchronizes so the printed stage timings are real.
     ctx.synchronize()
     var now = perf_counter_ns()

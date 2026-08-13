@@ -35,7 +35,7 @@
 # Mojo current beta, NVIDIA GPU.
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

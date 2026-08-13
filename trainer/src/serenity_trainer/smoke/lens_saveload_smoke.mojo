@@ -29,7 +29,7 @@
 
 from std.memory import ArcPointer
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -76,7 +76,7 @@ def _slot_dims(slot: Int) raises -> Tuple[Int, Int]:
 
 
 # PCG-style nonzero-distinct draw in roughly [-amp, amp], never exactly 0.
-fn _draw(mut s: UInt64, amp: Float32) -> Float32:
+def _draw(mut s: UInt64, amp: Float32) -> Float32:
     s = s * UInt64(6364136223846793005) + UInt64(1442695040888963407)
     var u = Float32((s >> UInt64(40)) & UInt64(0xFFFF)) / Float32(65536.0)
     var v = (u - Float32(0.5)) * Float32(2.0) * amp

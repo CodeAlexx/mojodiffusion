@@ -3,7 +3,7 @@
 # This is split out of `sdxl_model_compile_check.mojo` because `DeviceContext`
 # requires GPU architecture detection and fails inside the current sandbox.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

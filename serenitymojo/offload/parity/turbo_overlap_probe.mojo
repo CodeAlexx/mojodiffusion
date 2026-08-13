@@ -62,7 +62,7 @@
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 from std.gpu import global_idx
-from std.gpu.host import (
+from max.gpu.host import (
     DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent,
 )
 
@@ -79,9 +79,11 @@ comptime _BLOCK = 256
 # strongest possible competitor to the copy engine for the overlap test.
 def _spin_kernel(
     buf: UnsafePointer[Float32, MutAnyOrigin],
-    n: Int,
-    iters: Int,
+    n_w: Int64,
+    iters_w: Int32,
 ):
+    var n = Int(n_w)
+    var iters = Int(iters_w)
     var i = Int(global_idx.x)
     if i < n:
         var x = buf[i]
@@ -154,8 +156,8 @@ def main() raises:
 
     # ── warmup (JIT compile kernel, fault pages, spin up copy engine) ─────────
     _h2d_dma_copy(u0, host.unsafe_ptr(), copy_bytes, copy_stream)
-    ctx.enqueue_function[_spin_kernel, _spin_kernel](
-        p1, n_elems, spin_iters, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_spin_kernel](
+        p1, Int64(n_elems), Int32(spin_iters), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
 
@@ -169,8 +171,8 @@ def main() raises:
     # ── ARM 2: compute_only ───────────────────────────────────────────────────
     t0 = perf_counter_ns()
     for _ in range(n_iters):
-        ctx.enqueue_function[_spin_kernel, _spin_kernel](
-            p1, n_elems, spin_iters, grid_dim=grid, block_dim=_BLOCK
+        ctx.enqueue_function[_spin_kernel](
+            p1, Int64(n_elems), Int32(spin_iters), grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
     var t_compute = Int(perf_counter_ns() - t0)
@@ -180,8 +182,8 @@ def main() raises:
     for _ in range(n_iters):
         _h2d_dma_copy(u0, host.unsafe_ptr(), copy_bytes, copy_stream)
         ctx.synchronize()
-        ctx.enqueue_function[_spin_kernel, _spin_kernel](
-            p0, n_elems, spin_iters, grid_dim=grid, block_dim=_BLOCK
+        ctx.enqueue_function[_spin_kernel](
+            p0, Int64(n_elems), Int32(spin_iters), grid_dim=grid, block_dim=_BLOCK
         )
         ctx.synchronize()
     var t_serial = Int(perf_counter_ns() - t0)
@@ -193,13 +195,13 @@ def main() raises:
     for i in range(n_iters):
         if i % 2 == 0:
             _h2d_dma_copy(u0, host.unsafe_ptr(), copy_bytes, copy_stream)
-            ctx.enqueue_function[_spin_kernel, _spin_kernel](
-                p1, n_elems, spin_iters, grid_dim=grid, block_dim=_BLOCK
+            ctx.enqueue_function[_spin_kernel](
+                p1, Int64(n_elems), Int32(spin_iters), grid_dim=grid, block_dim=_BLOCK
             )
         else:
             _h2d_dma_copy(u1, host.unsafe_ptr(), copy_bytes, copy_stream)
-            ctx.enqueue_function[_spin_kernel, _spin_kernel](
-                p0, n_elems, spin_iters, grid_dim=grid, block_dim=_BLOCK
+            ctx.enqueue_function[_spin_kernel](
+                p0, Int64(n_elems), Int32(spin_iters), grid_dim=grid, block_dim=_BLOCK
             )
     ctx.synchronize()
     var t_conc = Int(perf_counter_ns() - t0)
@@ -234,8 +236,8 @@ def main() raises:
                     cd_rec1 = False
                 _h2d_dma_copy(u1, host.unsafe_ptr(), copy_bytes, copy_stream)
                 copy_stream.record_event(ev1)
-        ctx.enqueue_function[_spin_kernel, _spin_kernel](
-            cur_p, n_elems, spin_iters, grid_dim=grid, block_dim=_BLOCK
+        ctx.enqueue_function[_spin_kernel](
+            cur_p, Int64(n_elems), Int32(spin_iters), grid_dim=grid, block_dim=_BLOCK
         )
         # mark this slot's compute done so the copy stream may later reuse it.
         if i % 2 == 0:

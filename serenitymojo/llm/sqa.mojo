@@ -9,9 +9,10 @@
 # Verified against a CPU reference (sqa_test.mojo) before it is wired into the
 # cached decoder.
 
-from std.gpu import global_idx, thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
-from std.gpu.host import DeviceContext
+from std.gpu import global_idx, thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer, stack_allocation
 from std.math import exp
 from serenitymojo.tensor import Tensor
@@ -40,11 +41,14 @@ def _k_sqa_dev[dh: Int](
     kc: BPtr,     # [L, H_kv, dh]   (cache k [1,L,H_kv,dh])
     vc: BPtr,     # [L, H_kv, dh]   (cache v [1,L,H_kv,dh])
     o: BPtr,      # [H, dh]         (output [1,1,H*dh])
-    H: Int,
-    H_kv: Int,
-    L: Int,
+    H_w: Int32,
+    H_kv_w: Int32,
+    L_w: Int32,
     scale: Float32,
 ):
+    var H = Int(H_w)
+    var H_kv = Int(H_kv_w)
+    var L = Int(L_w)
     var hq = Int(global_idx.x)
     if hq >= H:
         return
@@ -105,8 +109,8 @@ def sqa_device(
     var vp = vc.buf.unsafe_ptr().bitcast[BFloat16]()
     var op = o_buf.unsafe_ptr().bitcast[BFloat16]()
     if dh == 128:
-        ctx.enqueue_function[_k_sqa_dev[128], _k_sqa_dev[128]](
-            qp, kp, vp, op, H, H_kv, L, scale,
+        ctx.enqueue_function[_k_sqa_dev[128]](
+            qp, kp, vp, op, Int32(H), Int32(H_kv), Int32(L), scale,
             grid_dim=(H + 31) // 32, block_dim=32,
         )
     else:
@@ -130,11 +134,14 @@ def _k_sqa_par[dh: Int, MAXL: Int](
     kc: BPtr,     # [L, H_kv, dh]
     vc: BPtr,     # [L, H_kv, dh]
     o: BPtr,      # [H, dh]
-    H: Int,
-    H_kv: Int,
-    L: Int,
+    H_w: Int32,
+    H_kv_w: Int32,
+    L_w: Int32,
     scale: Float32,
 ):
+    var H = Int(H_w)
+    var H_kv = Int(H_kv_w)
+    var L = Int(L_w)
     var hq = Int(block_idx.x)
     if hq >= H:
         return
@@ -230,8 +237,8 @@ def sqa_device_par(
     var kp = kc.buf.unsafe_ptr().bitcast[BFloat16]()
     var vp = vc.buf.unsafe_ptr().bitcast[BFloat16]()
     var op = o_buf.unsafe_ptr().bitcast[BFloat16]()
-    ctx.enqueue_function[_k_sqa_par[128, _SQA_MAXL], _k_sqa_par[128, _SQA_MAXL]](
-        qp, kp, vp, op, H, H_kv, L, scale,
+    ctx.enqueue_function[_k_sqa_par[128, _SQA_MAXL]](
+        qp, kp, vp, op, Int32(H), Int32(H_kv), Int32(L), scale,
         grid_dim=H, block_dim=_SQA_TPB,
     )
     return Tensor(o_buf^, [1, 1, H * dh], STDtype.BF16)
@@ -242,12 +249,16 @@ def _k_sqa(
     kc: FPtr,     # [H_kv, L, dh]
     vc: FPtr,     # [H_kv, L, dh]
     o: FPtr,      # [H, dh]  (output)
-    H: Int,
-    H_kv: Int,
-    L: Int,
-    dh: Int,
+    H_w: Int32,
+    H_kv_w: Int32,
+    L_w: Int32,
+    dh_w: Int32,
     scale: Float32,
 ):
+    var H = Int(H_w)
+    var H_kv = Int(H_kv_w)
+    var L = Int(L_w)
+    var dh = Int(dh_w)
     var hq = Int(global_idx.x)
     if hq >= H:
         return
@@ -322,9 +333,9 @@ def sqa_gpu(
     ctx.enqueue_copy(dv, hv)
 
     var scale = Float32(1.0) / Float32(Float64(dh) ** 0.5)
-    ctx.enqueue_function[_k_sqa, _k_sqa](
+    ctx.enqueue_function[_k_sqa](
         dq.unsafe_ptr(), dk.unsafe_ptr(), dv.unsafe_ptr(), do.unsafe_ptr(),
-        H, H_kv, L, dh, scale,
+        Int32(H), Int32(H_kv), Int32(L), Int32(dh), scale,
         grid_dim=(H + 31) // 32, block_dim=32,
     )
     var ho = ctx.enqueue_create_host_buffer[DType.float32](nq)

@@ -3,7 +3,7 @@
 #      oracle out.bin (should agree — sanity that debug path == forward path).
 #  (b) compare after_final_layer restricted to IMAGE tokens (first 256 of 448)
 #      vs cap tokens, to show the velocity-relevant error is the image slice.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import alloc
 from serenitymojo.tensor import Tensor

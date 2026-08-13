@@ -10,7 +10,7 @@
 #
 # DEV-ONLY: Python never runs here. The .bin files are static host references.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

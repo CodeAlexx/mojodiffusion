@@ -2,7 +2,7 @@
 # Runs Qwen3-8B (lm_head present) autoregressively in Mojo with a magic-prompt
 # system prompt, emitting an Ideogram-4 structured JSON caption. The JSON is then
 # tokenized + fed to ideogram4_generate (separate step). No external LLM/API.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.models.text_encoder.qwen3_magic import (
@@ -328,7 +328,7 @@ def _byte_substr(s: String, start: Int, end: Int) -> String:
         return String("")
     var sp = s.as_bytes()
     var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 def _strip_trailing_commas(s: String) raises -> String:
@@ -511,7 +511,7 @@ def magic_expand(plain: String, aspect: String, ctx: DeviceContext) raises -> St
 
 def main() raises:
     # argv: [plain-prompt] [aspect]  (defaults keep the original smoke behavior)
-    from sys import argv
+    from std.sys import argv
     var a = argv()
     var ctx = DeviceContext()
     var plain = String("a red cube on a white table")

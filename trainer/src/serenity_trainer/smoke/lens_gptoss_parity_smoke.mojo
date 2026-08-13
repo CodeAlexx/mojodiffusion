@@ -24,7 +24,7 @@
 #
 # Reference policy: Serenity ONLY (LensGptOssEncoder via the oracle). No Rust.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import isfinite
 
 from serenitymojo.tensor import Tensor

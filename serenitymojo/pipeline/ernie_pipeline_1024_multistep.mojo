@@ -16,7 +16,7 @@
 #     context_cond   [1, 256, 3072] F32
 #     context_uncond [1, 256, 3072] F32
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

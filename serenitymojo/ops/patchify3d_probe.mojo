@@ -10,7 +10,7 @@
 #   pixi run mojo run -I . serenitymojo/ops/patchify3d_probe.mojo
 
 from std.math import abs as fabs
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.patchify3d import patchify3d, unpatchify3d

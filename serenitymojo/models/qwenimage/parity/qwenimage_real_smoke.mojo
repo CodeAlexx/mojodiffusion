@@ -15,7 +15,7 @@
 # Run: cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #      pixi run mojo run -I . serenitymojo/models/qwenimage/parity/qwenimage_real_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sin as fsin, isfinite
 from serenitymojo.tensor import Tensor

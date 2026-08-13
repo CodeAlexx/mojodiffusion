@@ -26,7 +26,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Pure Mojo + MAX. No autograd, no Python at runtime.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import (
@@ -40,7 +40,7 @@ from serenitymojo.ops.softmax import softmax_lastdim
 from serenitymojo.models.vae.conv3d import conv3d_fcqrs_cudnn
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.sdxl.real_weights import load_bias
-from math import sqrt
+from std.math import sqrt
 
 
 # ── causal_conv3d ─────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 # FAIL). IDEOGRAM4_SDPA_FLASH is off (math SDPA, deterministic) so bit equality is
 # achievable. Mirrors autograd_v2/tests/klein_block_parity.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

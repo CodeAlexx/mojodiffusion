@@ -6,7 +6,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 comptime O_RDONLY: Int32 = 0
@@ -28,7 +27,7 @@ def read_file(path: String) -> Optional[String]:
     var cp = _cstr(path)
     # 3-arg open (mode ignored without O_CREAT) — single signature avoids the
     # symbol-collision trap with any stdlib `open` declaration.
-    var fd = external_call["open", Int32](cp, O_RDONLY, Int32(0))
+    var fd = external_call["open64", Int32](cp, O_RDONLY, Int32(0))
     cp.free()
     if fd < 0:
         return None
@@ -39,7 +38,7 @@ def read_file(path: String) -> Optional[String]:
         var n = external_call["read", Int](fd, bp, READ_CHUNK)
         if n <= 0:
             break
-        acc += String(StringSlice(ptr=bp, length=n))
+        acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=bp, length=n)))
     buf.free()
     _ = external_call["close", Int32](fd)
     return acc^
@@ -53,7 +52,7 @@ comptime SEEK_END: Int32 = 2
 def open_ro(path: String) -> Int32:
     """open(path, O_RDONLY). Returns the fd, or -1 if it can't be opened."""
     var cp = _cstr(path)
-    var fd = external_call["open", Int32](cp, O_RDONLY, Int32(0))
+    var fd = external_call["open64", Int32](cp, O_RDONLY, Int32(0))
     cp.free()
     return fd
 

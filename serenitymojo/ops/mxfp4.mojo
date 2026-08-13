@@ -28,7 +28,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.math import ldexp
 from std.utils.index import IndexList
@@ -91,8 +91,9 @@ def _mxfp4_dequant_kernel(
     blocks: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     scales: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    rows_total: Int,
+    rows_total_w: Int32,
 ):
+    var rows_total = Int(rows_total_w)
     var bid = Int(global_idx.x)
     if bid < rows_total:
         # E8M0: scale = 2^(scale_byte - 127).
@@ -238,19 +239,28 @@ def mxfp4_dequant_to_bf16(
     var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_numel))
 
     var B = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        blocks.buf.unsafe_ptr(), blocks_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(blocks.buf.unsafe_ptr())
+        ),
+        runtime_layout=blocks_rl,
     )
     var S = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        scales.buf.unsafe_ptr(), scales_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(scales.buf.unsafe_ptr())
+        ),
+        runtime_layout=scales_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
     )
 
     # ── Launch: one thread per block, _BLOCK threads per CTA ────────────────
     var grid = (rows_total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_mxfp4_dequant_kernel, _mxfp4_dequant_kernel](
-        B, S, O, rows_total,
+    ctx.enqueue_function[_mxfp4_dequant_kernel](
+        B, S, O, Int32(rows_total),
         grid_dim=grid, block_dim=_BLOCK,
     )
     # sync removed (single-stream ordering; was kernel-trailing host stall)

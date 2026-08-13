@@ -1,7 +1,7 @@
 # Exact mapping gate for the inference-only MiniMax-H3 stream packer.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.minimax_h3_frontend import (

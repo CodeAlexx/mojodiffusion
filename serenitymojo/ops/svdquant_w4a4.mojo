@@ -17,9 +17,10 @@
 # Quality (SquareQ sim + gate): rank-128 per-out ⇒ cos ~0.99/layer, outlier-robust.
 # Speed foundation: int4 GEMM = 4.4–7.3× cuBLAS bf16 (MJ-1099 B.1).
 
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
-from std.gpu.host import DeviceContext
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import stack_allocation
 from std.utils.index import IndexList
@@ -187,9 +188,11 @@ def _rescale_kernel(
     wscale: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], # [N]
     addend: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], # [M*N] low-rank+bias
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],      # [M*N] out
-    M: Int, N: Int,
+    M_w: Int32, N_w: Int64,
 ):
     """out[m,n] = C[m,n]·xscale[m]·wscale[n] + addend[m,n]  (fused epilogue)."""
+    var M = Int(M_w)
+    var N = Int(N_w)
     var idx = Int(block_idx.x) * _TPB + Int(thread_idx.x)
     var total = M * N
     if idx < total:
@@ -217,14 +220,26 @@ def _fwht_quant_launch[K: Int](
     var xq_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M * half))
     var xs_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var XQ = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        xq_buf.unsafe_ptr(), xq_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(xq_buf.unsafe_ptr())
+        ),
+        runtime_layout=xq_rl,
+    )
     var XS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        xs_buf.unsafe_ptr().bitcast[BFloat16](), xs_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(xs_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=xs_rl,
+    )
 
     comptime kern = _fwht_quant_kernel[K]
-    ctx.enqueue_function[kern, kern](X, XQ, XS, grid_dim=M, block_dim=_TPB)
+    ctx.enqueue_function[kern](X, XQ, XS, grid_dim=M, block_dim=_TPB)
 
     var xq = Tensor(xq_buf^, [M, half], STDtype.U8)
     var xs = Tensor(xs_buf^, [M], STDtype.BF16)
@@ -285,18 +300,38 @@ def svdquant_linear_w4a4(x: Tensor, w: SvdquantW4A4, ctx: DeviceContext) raises 
     var ws_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f))
     var up_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M * out_f))
     var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Int32](), c_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=c_rl,
+    )
     var XS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        fq.xscale.buf.unsafe_ptr().bitcast[BFloat16](), xs_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(fq.xscale.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=xs_rl,
+    )
     var WS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.wscale.buf.unsafe_ptr().bitcast[BFloat16](), ws_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.wscale.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=ws_rl,
+    )
     var AD = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        up.buf.unsafe_ptr().bitcast[BFloat16](), up_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(up.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=up_rl,
+    )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        o_buf.unsafe_ptr().bitcast[BFloat16](), up_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(o_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=up_rl,
+    )
     var total = M * out_f
     var grid = (total + _TPB - 1) // _TPB
-    ctx.enqueue_function[_rescale_kernel, _rescale_kernel](
-        C, XS, WS, AD, O, M, out_f, grid_dim=grid, block_dim=_TPB)
+    ctx.enqueue_function[_rescale_kernel](
+        C, XS, WS, AD, O, Int32(M), Int64(out_f), grid_dim=grid, block_dim=_TPB)
 
     return Tensor(o_buf^, [M, out_f], STDtype.BF16)

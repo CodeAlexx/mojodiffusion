@@ -19,7 +19,7 @@
 #   it does not claim SDXL UNet forward/backward parity or text-encoder LoRA
 #   coverage for this file.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

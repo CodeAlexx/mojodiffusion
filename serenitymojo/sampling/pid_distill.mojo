@@ -19,7 +19,7 @@
 # provides the scalar schedule + the velocity->x0 and SDE-renoise GPU helpers.
 # B=1, pixel-space [B,3,H,W]. Mojo 1.0.0b1.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -50,8 +50,9 @@ def _vel_to_x0_kernel[dtype: DType](
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     v: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    n: Int, t: Float32,
+    n_w: Int64, t: Float32,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         # F32 is the sampler arithmetic workspace; storage remains `dtype`.
@@ -72,25 +73,70 @@ def velocity_to_x0(x: Tensor, v: Tensor, t: Float32, ctx: DeviceContext) raises 
     var grid = (n + _BLOCK - 1) // _BLOCK
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
-        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](v.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[_vel_to_x0_kernel[DType.float32], _vel_to_x0_kernel[DType.float32]](
-            X, V, O, n, t, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_vel_to_x0_kernel[DType.float32]](
+            X, V, O, Int64(n), t, grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
-        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](v.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[_vel_to_x0_kernel[DType.bfloat16], _vel_to_x0_kernel[DType.bfloat16]](
-            X, V, O, n, t, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_vel_to_x0_kernel[DType.bfloat16]](
+            X, V, O, Int64(n), t, grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.float16:
-        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var V = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](v.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[_vel_to_x0_kernel[DType.float16], _vel_to_x0_kernel[DType.float16]](
-            X, V, O, n, t, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var V = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_vel_to_x0_kernel[DType.float16]](
+            X, V, O, Int64(n), t, grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("velocity_to_x0: unsupported storage dtype")
@@ -103,8 +149,9 @@ def _renoise_kernel[dtype: DType](
     x0: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     eps: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    n: Int, t_next: Float32,
+    n_w: Int64, t_next: Float32,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         # F32 is the sampler arithmetic workspace; storage remains `dtype`.
@@ -125,25 +172,70 @@ def sde_renoise(x0: Tensor, eps: Tensor, t_next: Float32, ctx: DeviceContext) ra
     var grid = (n + _BLOCK - 1) // _BLOCK
     var dt = x0.dtype().to_mojo_dtype()
     if dt == DType.float32:
-        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x0.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var E = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](eps.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[_renoise_kernel[DType.float32], _renoise_kernel[DType.float32]](
-            X, E, O, n, t_next, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var E = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(eps.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_renoise_kernel[DType.float32]](
+            X, E, O, Int64(n), t_next, grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
-        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x0.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var E = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](eps.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[_renoise_kernel[DType.bfloat16], _renoise_kernel[DType.bfloat16]](
-            X, E, O, n, t_next, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var E = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(eps.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_renoise_kernel[DType.bfloat16]](
+            X, E, O, Int64(n), t_next, grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.float16:
-        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x0.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var E = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](eps.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[_renoise_kernel[DType.float16], _renoise_kernel[DType.float16]](
-            X, E, O, n, t_next, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var E = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(eps.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_renoise_kernel[DType.float16]](
+            X, E, O, Int64(n), t_next, grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("sde_renoise: unsupported storage dtype")
@@ -155,8 +247,9 @@ def sde_renoise(x0: Tensor, eps: Tensor, t_next: Float32, ctx: DeviceContext) ra
 def _clamp_kernel[dtype: DType](
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         # F32 compare workspace; final clamped sample stores in `dtype`.
@@ -176,22 +269,52 @@ def clamp_unit(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var grid = (n + _BLOCK - 1) // _BLOCK
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
-        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
-        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[_clamp_kernel[DType.float32], _clamp_kernel[DType.float32]](
-            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_clamp_kernel[DType.float32]](
+            X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
-        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[_clamp_kernel[DType.bfloat16], _clamp_kernel[DType.bfloat16]](
-            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_clamp_kernel[DType.bfloat16]](
+            X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.float16:
-        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
-        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[_clamp_kernel[DType.float16], _clamp_kernel[DType.float16]](
-            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_clamp_kernel[DType.float16]](
+            X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("clamp_unit: unsupported storage dtype")

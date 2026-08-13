@@ -25,7 +25,7 @@
 # stdlib builtin `open` or `external_call["write"]` (symbol-collision hazard
 # documented in io/ffi.mojo).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.tensor import Tensor

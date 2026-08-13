@@ -60,7 +60,7 @@
 # so can_prefetch() is always True in Phase 3 — we are exercising parity, not
 # memory pressure. Phase 4 can tighten the budget and enable eviction.
 
-from std.gpu.host import DeviceBuffer, DeviceContext, DeviceEvent, HostBuffer
+from max.gpu.host import DeviceBuffer, DeviceContext, DeviceEvent, HostBuffer
 from std.memory import ArcPointer, alloc
 from std.ffi import external_call
 

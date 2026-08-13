@@ -11,7 +11,7 @@
 # finalized chunks [32,40,49] instead of retaining the full 121-frame tensor.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

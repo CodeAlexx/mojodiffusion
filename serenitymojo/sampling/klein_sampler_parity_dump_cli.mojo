@@ -12,7 +12,7 @@
 # [1,128,LH,LW] or [N_IMG,128], in the raw tensor-bin format.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.io.cap_cache import load_tensor_bin, validate_klein_cap_cache_header

@@ -81,7 +81,7 @@ def _read_num(b: List[UInt8], n: Int, mut pos: Int) raises -> Float64:
             pos += 1
     if pos == start:
         raise Error("svg path: expected number at index " + String(pos))
-    return atof(String(StringSlice(ptr=b.unsafe_ptr() + start, length=pos - start)))
+    return atof(String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + start, length=pos - start))))
 
 
 def _read_flag(b: List[UInt8], n: Int, mut pos: Int) raises -> Int:

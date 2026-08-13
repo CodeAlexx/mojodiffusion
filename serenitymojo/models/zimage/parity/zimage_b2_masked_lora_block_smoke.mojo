@@ -6,7 +6,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/models/zimage/parity/zimage_b2_masked_lora_block_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos, sin
 from std.memory import ArcPointer
 

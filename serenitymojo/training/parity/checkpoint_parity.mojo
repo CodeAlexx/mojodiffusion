@@ -22,9 +22,9 @@
 #       serenitymojo/training/parity/checkpoint_oracle.py
 #   pixi run mojo run -I . serenitymojo/training/parity/checkpoint_parity.mojo
 
-from collections import List
-from math import sqrt
-from std.gpu.host import DeviceContext
+from std.collections import List
+from std.math import sqrt
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

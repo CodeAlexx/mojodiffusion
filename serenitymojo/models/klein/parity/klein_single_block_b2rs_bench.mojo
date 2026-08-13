@@ -10,7 +10,7 @@
 
 from std.collections import List, Optional
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
 

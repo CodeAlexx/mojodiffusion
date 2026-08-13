@@ -11,7 +11,7 @@
 #
 # pixi run mojo run -I . serenitymojo/ops/sdpa_tiled_probe.mojo
 from std.math import sqrt, exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.attention import (

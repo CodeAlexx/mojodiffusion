@@ -23,7 +23,7 @@
 #   is a SEPARATE concern handled by the dataLoader; this encoder takes token ids
 #   and returns the 13-tap conditioning, exactly as the gate does.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder
 from serenitymojo.models.text_encoder.ideogram_qwen3vl import (

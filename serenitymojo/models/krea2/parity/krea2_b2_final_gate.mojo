@@ -4,7 +4,7 @@
 # krea2_final_layer_backward run per sample. Checks b2's d_x[sample] == b1_s's d_x.
 # Small dims → seconds. Isolates the final-layer backward from the block chain.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

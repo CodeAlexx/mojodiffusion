@@ -20,7 +20,7 @@
 # Bicubic reuses the PIL-exact separable resampler from lingbot_image_preprocess
 # (torchvision Fast antialiased bicubic ~ PIL bicubic; gated by pixel cos).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, floor, ceil
 
 from serenitymojo.tensor import Tensor

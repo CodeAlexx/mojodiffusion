@@ -45,7 +45,7 @@
 # are exactly the "scalar reductions / host stats" the dtype policy permits in
 # F32). BF16 in, F32 compute, BF16 out — zero persistent F32 tensors.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.builtin.dtype import DType
 from std.math import sqrt, floor, log, pow
 from serenitymojo.tensor import Tensor

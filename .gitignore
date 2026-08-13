@@ -94,3 +94,4 @@ serenitymojo/models/krea2/parity/krea2_omini_*.safetensors
 serenitymojo/models/text_encoder/parity/gemma4_refs/
 serenitymojo/models/text_encoder/parity/gemma4_refs_ltx25/
 serenitymojo/models/text_encoder/parity/gemma4_prefix_fixtures/
+pixi.lock.pre-*

@@ -4,7 +4,7 @@
 # noise. This isolates decoder key/dtype/runtime issues from the slower
 # text-encoder + streamed-DiT path.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder

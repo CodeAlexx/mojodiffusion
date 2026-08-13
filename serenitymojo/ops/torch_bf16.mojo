@@ -9,7 +9,7 @@
 # This file intentionally lives under ops/ so LTX2 is not the only caller.
 
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import floor, log, pow
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -64,8 +64,9 @@ def torch_bf16_rne_value(v: Float32) -> BFloat16:
 def _torch_f32_to_bf16_rne_kernel(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](src[i])
@@ -80,14 +81,20 @@ def torch_f32_to_bf16_rne(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * STDtype.BF16.byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_torch_f32_to_bf16_rne_kernel, _torch_f32_to_bf16_rne_kernel](
-        X, O, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_torch_f32_to_bf16_rne_kernel](
+        X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
     return Tensor(out_buf^, x.shape(), STDtype.BF16)
 
@@ -96,9 +103,11 @@ def _bf16_f32_broadcast_mul_kernel(
     lhs: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     rhs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    channels: Int,
-    n: Int,
+    channels_w: Int32,
+    n_w: Int64,
 ):
+    var channels = Int(channels_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var a = rebind[Scalar[DType.bfloat16]](lhs[i]).cast[DType.float32]()
@@ -109,8 +118,9 @@ def _bf16_f32_broadcast_mul_kernel(
 def _f32_one_minus_kernel(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](src[i])
@@ -121,8 +131,9 @@ def _f32_add_to_bf16_rne_kernel(
     lhs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     rhs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var a = rebind[Scalar[DType.float32]](lhs[i])
@@ -134,8 +145,9 @@ def _bf16_f32_add_to_bf16_rne_kernel(
     lhs: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     rhs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var a = rebind[Scalar[DType.bfloat16]](lhs[i]).cast[DType.float32]()
@@ -147,8 +159,9 @@ def _bf16_sub_to_f32_kernel(
     lhs: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     rhs: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var a = rebind[Scalar[DType.bfloat16]](lhs[i]).cast[DType.float32]()
@@ -160,8 +173,9 @@ def _f32_div_to_bf16_rne_kernel(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     sigma: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](src[i])
@@ -172,8 +186,9 @@ def _bf16_scale_to_f32_kernel(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     scale: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.bfloat16]](src[i]).cast[DType.float32]()
@@ -214,40 +229,57 @@ def torch_bf16_eager_blend_with_f32_mask(
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var mask_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](mask_n))
     var N = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        noise.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(noise.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        clean.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(clean.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        mask.buf.unsafe_ptr().bitcast[Float32](), mask_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(mask.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=mask_rl,
     )
     var L = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        left_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(left_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var IM = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        inv_mask_buf.unsafe_ptr().bitcast[Float32](), mask_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(inv_mask_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=mask_rl,
     )
     var R = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        right_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(right_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
 
     var grid = (n + _BLOCK - 1) // _BLOCK
     var mask_grid = (mask_n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _bf16_f32_broadcast_mul_kernel, _bf16_f32_broadcast_mul_kernel
-    ](N, M, L, channels, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.enqueue_function[_f32_one_minus_kernel, _f32_one_minus_kernel](
-        M, IM, mask_n, grid_dim=mask_grid, block_dim=_BLOCK
+    ctx.enqueue_function[_bf16_f32_broadcast_mul_kernel](N, M, L, Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_f32_one_minus_kernel](
+        M, IM, Int64(mask_n), grid_dim=mask_grid, block_dim=_BLOCK
     )
-    ctx.enqueue_function[
-        _bf16_f32_broadcast_mul_kernel, _bf16_f32_broadcast_mul_kernel
-    ](C, IM, R, channels, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.enqueue_function[_f32_add_to_bf16_rne_kernel, _f32_add_to_bf16_rne_kernel](
-        L, R, O, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_bf16_f32_broadcast_mul_kernel](C, IM, R, Int32(channels), Int64(n), grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_f32_add_to_bf16_rne_kernel](
+        L, R, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
 
     return Tensor(out_buf^, clean.shape(), STDtype.BF16)
@@ -274,26 +306,36 @@ def torch_bf16_eager_add_scaled(
 
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        velocity.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(velocity.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        prod_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(prod_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
 
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_bf16_scale_to_f32_kernel, _bf16_scale_to_f32_kernel](
-        V, P, scale, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_bf16_scale_to_f32_kernel](
+        V, P, scale, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
-    ctx.enqueue_function[
-        _bf16_f32_add_to_bf16_rne_kernel, _bf16_f32_add_to_bf16_rne_kernel
-    ](
-        X, P, O, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_bf16_f32_add_to_bf16_rne_kernel](
+        X, P, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
 
     return Tensor(out_buf^, x.shape(), STDtype.BF16)
@@ -317,24 +359,36 @@ def torch_bf16_eager_velocity_from_x0(
 
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        sample.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sample.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var D = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        denoised.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(denoised.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var Diff = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        diff_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(diff_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
 
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_bf16_sub_to_f32_kernel, _bf16_sub_to_f32_kernel](
-        X, D, Diff, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_bf16_sub_to_f32_kernel](
+        X, D, Diff, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
-    ctx.enqueue_function[_f32_div_to_bf16_rne_kernel, _f32_div_to_bf16_rne_kernel](
-        Diff, O, sigma, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_f32_div_to_bf16_rne_kernel](
+        Diff, O, sigma, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
 
     return Tensor(out_buf^, sample.shape(), STDtype.BF16)

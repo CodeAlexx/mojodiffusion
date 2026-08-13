@@ -1,7 +1,7 @@
 # Anima seven-shape geometry/3-axis-RoPE/tile gate against SerenityTrainer Diffusers.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.io.file import open
 
 from serenitymojo.serve.anima_backend import _rope_tables

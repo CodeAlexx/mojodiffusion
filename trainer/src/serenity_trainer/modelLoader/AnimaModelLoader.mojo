@@ -14,7 +14,7 @@
 # plan without pretending to instantiate those runtime modules. Persistent tensor
 # state loaded through safetensors uses Tensor.from_view, preserving storage dtype.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.sharded import ShardedSafeTensors

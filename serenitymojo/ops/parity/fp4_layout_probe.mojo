@@ -20,7 +20,7 @@
 # Run: LD_LIBRARY_PATH=.pixi/envs/default/lib:serenitymojo/ops/cshim/lib \
 #     output/checks/fp4_layout_probe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.ops.fp4_gemm import fp4_gemm_nt_rc

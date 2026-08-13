@@ -12,7 +12,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.autograd_v2.node import TArc, arc_view

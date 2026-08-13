@@ -15,7 +15,7 @@
 # renormalized), we implement that exact algorithm here on the host in f64, then
 # upload the final tensor. This reproduces PIL's precompute_coeffs / ResampleHV.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceil
 
 from serenitymojo.tensor import Tensor

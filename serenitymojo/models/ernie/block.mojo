@@ -59,7 +59,7 @@
 # table (d_x cos collapsed to ~0.23 in ops/parity/rope_halfsplit_full_parity.mojo).
 # Fixed 2026-06-01. The block parity gate now builds the REAL 3-axis table.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

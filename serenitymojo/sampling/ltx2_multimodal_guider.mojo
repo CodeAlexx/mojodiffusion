@@ -28,7 +28,7 @@
 # reference accumulates bf16->f32 on GPU; F64 host accumulation is a strict
 # precision superset and is covered by the unit gate cos >= 0.99999).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

@@ -1,6 +1,6 @@
 # Real-prompt, full-depth MiniMax-H3 INT8 conditioning probe.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer, alloc
 from std.sys import argv
@@ -34,7 +34,7 @@ def _read_text(path: String) raises -> String:
             raise Error("failed reading prompt file")
         done += got
     _ = sys_close(fd)
-    var out = String(StringSlice(ptr=buf, length=n))
+    var out = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=buf, length=n)))
     buf.free()
     return out^
 

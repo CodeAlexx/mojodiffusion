@@ -3,7 +3,7 @@
 # native packed inputs -> native randn noise -> CFG denoise (cond+uncond,
 # logit-normal V4_DEFAULT_20 preset) -> latent denorm -> Ideogram unpatch ->
 # Flux2 VAE decode -> PNG. Reuses every parity-verified component.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

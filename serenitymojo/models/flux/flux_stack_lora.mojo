@@ -44,7 +44,7 @@
 #
 # Mojo 1.0.0b1: def not fn; Tensor move-only; host List[Float32] carriers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.math import sqrt

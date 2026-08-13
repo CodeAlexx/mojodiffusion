@@ -34,7 +34,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. F32 math in the combine kernel (matches the Python
 # torch.float32 reference); storage dtype preserved on output.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from std.math import sqrt
@@ -59,12 +59,14 @@ def _nag_combine_kernel_f32(
     pos: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     neg: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int,
-    dim: Int,
+    rows_w: Int32,
+    dim_w: Int32,
     scale: Float32,
     alpha: Float32,
     tau: Float32,
 ):
+    var rows = Int(rows_w)
+    var dim = Int(dim_w)
     var r = Int(global_idx.x)
     if r >= rows:
         return
@@ -97,12 +99,14 @@ def _nag_combine_kernel_bf16(
     pos: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     neg: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    rows: Int,
-    dim: Int,
+    rows_w: Int32,
+    dim_w: Int32,
     scale: Float32,
     alpha: Float32,
     tau: Float32,
 ):
+    var rows = Int(rows_w)
+    var dim = Int(dim_w)
     var r = Int(global_idx.x)
     if r >= rows:
         return
@@ -133,12 +137,14 @@ def _nag_combine_kernel_f16(
     pos: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     neg: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    rows: Int,
-    dim: Int,
+    rows_w: Int32,
+    dim_w: Int32,
     scale: Float32,
     alpha: Float32,
     tau: Float32,
 ):
+    var rows = Int(rows_w)
+    var dim = Int(dim_w)
     var r = Int(global_idx.x)
     if r >= rows:
         return
@@ -204,44 +210,71 @@ def nag_combine(
 
     if dt == DType.float32:
         var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            pos.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(pos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var N = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            neg.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(neg.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_nag_combine_kernel_f32, _nag_combine_kernel_f32](
-            P, N, O, rows, dim, scale, alpha, tau,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_nag_combine_kernel_f32](
+            P, N, O, Int32(rows), Int32(dim), scale, alpha, tau,
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif dt == DType.bfloat16:
         var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            pos.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(pos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var N = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            neg.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(neg.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_nag_combine_kernel_bf16, _nag_combine_kernel_bf16](
-            P, N, O, rows, dim, scale, alpha, tau,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_nag_combine_kernel_bf16](
+            P, N, O, Int32(rows), Int32(dim), scale, alpha, tau,
             grid_dim=grid, block_dim=_BLOCK,
         )
     else:
         var P = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            pos.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(pos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var N = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            neg.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(neg.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_nag_combine_kernel_f16, _nag_combine_kernel_f16](
-            P, N, O, rows, dim, scale, alpha, tau,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_nag_combine_kernel_f16](
+            P, N, O, Int32(rows), Int32(dim), scale, alpha, tau,
             grid_dim=grid, block_dim=_BLOCK,
         )
     ctx.synchronize()

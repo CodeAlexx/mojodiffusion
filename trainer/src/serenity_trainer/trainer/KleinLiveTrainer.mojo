@@ -13,7 +13,7 @@
 #   10 save_every_steps
 #   11 vae_safetensors
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.os import makedirs
 from std.sys import argv
 

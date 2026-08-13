@@ -13,7 +13,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/ops/parity/conv2d_bwd_s2_parity.mojo -o /tmp/conv_s2
 #   /tmp/conv_s2
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness, ParityResult

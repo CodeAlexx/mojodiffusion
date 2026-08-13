@@ -6,7 +6,7 @@
 # BF16 tensors are loaded from safetensors views without persistent F32 storage.
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
@@ -49,7 +49,7 @@ struct Flux2Weights(Movable):
             name_to_idx[nm] = idx
         return Flux2Weights(weights^, name_to_idx^)
 
-    def get(self, name: String) raises -> ref [self.weights] Tensor:
+    def get(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("Flux2Weights: missing weight: ") + name)
         var idx = self.name_to_idx[name]

@@ -39,7 +39,7 @@
 from std.collections import Optional
 from std.memory import alloc, UnsafePointer, ArcPointer
 from std.ffi import external_call
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

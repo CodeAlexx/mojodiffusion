@@ -25,7 +25,7 @@
 #   pixi run mojo run -I . serenitymojo/pipeline/klein_edit_prepare_smoke.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

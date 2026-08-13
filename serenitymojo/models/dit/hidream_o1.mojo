@@ -47,7 +47,7 @@
 
 from std.math import sqrt, exp, log, cos as fcos, sin as fsin
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -349,8 +349,13 @@ comptime _BLOCK = 256
 def _repeat_kv_kernel_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    seq: Int, h: Int, h_kv: Int, dh: Int, n_rep: Int,
+    seq_w: Int32, h_w: Int32, h_kv_w: Int32, dh_w: Int32, n_rep_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var h = Int(h_w)
+    var h_kv = Int(h_kv_w)
+    var dh = Int(dh_w)
+    var n_rep = Int(n_rep_w)
     var idx = Int(global_idx.x)
     var total = seq * h * dh
     if idx < total:
@@ -366,8 +371,13 @@ def _repeat_kv_kernel_bf16(
 def _repeat_kv_kernel_f32(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    seq: Int, h: Int, h_kv: Int, dh: Int, n_rep: Int,
+    seq_w: Int32, h_w: Int32, h_kv_w: Int32, dh_w: Int32, n_rep_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var h = Int(h_w)
+    var h_kv = Int(h_kv_w)
+    var dh = Int(dh_w)
+    var n_rep = Int(n_rep_w)
     var idx = Int(global_idx.x)
     var total = seq * h * dh
     if idx < total:
@@ -400,23 +410,35 @@ def _repeat_kv(
     var grid = (out_n + _BLOCK - 1) // _BLOCK
     if dt == DType.bfloat16:
         var SRC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
         var DST = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[_repeat_kv_kernel_bf16, _repeat_kv_kernel_bf16](
-            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_repeat_kv_kernel_bf16](
+            SRC, DST, Int32(s), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.float32:
         var SRC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=src_rl,
+    )
         var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[_repeat_kv_kernel_f32, _repeat_kv_kernel_f32](
-            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_repeat_kv_kernel_f32](
+            SRC, DST, Int32(s), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("_repeat_kv: unsupported dtype (BF16/F32 only)")
@@ -467,7 +489,7 @@ struct HiDreamO1DiT[S: Int]:
             name_to_idx[nm] = idx
         return HiDreamO1DiT[Self.S](weights^, name_to_idx^, config)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("HiDreamO1DiT: missing weight: ") + name)
         var idx = self.name_to_idx[name]
@@ -716,7 +738,7 @@ def _is_hidream_resident_key(name: String) -> Bool:
 
 def _bget_hidream[
     mut: Bool, //, origin: Origin[mut=mut]
-](ref [origin] block: Block, p: String, suffix: String) raises -> ref [block] Tensor:
+](ref [origin] block: Block, p: String, suffix: String) raises -> ref [block[String("")]] Tensor:
     var full = p + suffix
     if full not in block:
         raise Error(String("HiDreamO1Offloaded: missing block weight: ") + full)
@@ -759,7 +781,7 @@ struct HiDreamO1Offloaded[S: Int](Movable):
         )
         return HiDreamO1Offloaded[Self.S](shared^, loader^, config)
 
-    def _w(self, name: String) raises -> ref [self.shared] Tensor:
+    def _w(self, name: String) raises -> ref [self.shared[String("")]] Tensor:
         if name not in self.shared:
             raise Error(String("HiDreamO1Offloaded: missing shared weight: ") + name)
         return self.shared[name][]

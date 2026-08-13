@@ -7,7 +7,6 @@
 # set_pixel / fill_rect.
 
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from graphics.color import Color, rgb
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]

@@ -6,7 +6,7 @@
 #   freqs_t = freqs[0]; H at idx d%3==1 & d<section[1]*3; W at d%3==2 & d<section[2]*3
 #   emb = cat(freqs_t, freqs_t, -1); cos=emb.cos(), sin=emb.sin()  -> [1,L,head_dim]
 # head_dim=256, base=5e6, section=(24,20,20) -> sec_h=sec_w=60. axis order (t,h,w).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import cos as fcos, sin as fsin, exp, log, floor
 from std.utils.index import IndexList
@@ -23,13 +23,18 @@ def _ideogram4_mrope_kernel[out_dtype: DType](
     pos: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     cosx: LayoutTensor[out_dtype, _DYN1, MutAnyOrigin],
     sinx: LayoutTensor[out_dtype, _DYN1, MutAnyOrigin],
-    head_dim: Int,
-    half: Int,
-    sec_h: Int,
-    sec_w: Int,
+    head_dim_w: Int32,
+    half_w: Int32,
+    sec_h_w: Int32,
+    sec_w_w: Int32,
     log_theta: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var head_dim = Int(head_dim_w)
+    var half = Int(half_w)
+    var sec_h = Int(sec_h_w)
+    var sec_w = Int(sec_w_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx >= n:
         return
@@ -93,22 +98,45 @@ def build_ideogram4_mrope(
     var p_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        position_ids.buf.unsafe_ptr().bitcast[Float32](), p_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(position_ids.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=p_rl,
     )
     var lt = log(theta)
     var grid = (n + _BLOCK - 1) // _BLOCK
 
-    var out_shape = [1, L, head_dim]
+    var out_shape: List[Int] = [1, L, head_dim]
     if out_dtype == STDtype.F32:
-        var C = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](cos_buf.unsafe_ptr().bitcast[Float32](), o_rl)
-        var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](sin_buf.unsafe_ptr().bitcast[Float32](), o_rl)
-        ctx.enqueue_function[_ideogram4_mrope_kernel[DType.float32], _ideogram4_mrope_kernel[DType.float32]](
-            P, C, S, head_dim, half, sec_h, sec_w, lt, n, grid_dim=grid, block_dim=_BLOCK)
+        var C = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_ideogram4_mrope_kernel[DType.float32]](
+            P, C, S, Int32(head_dim), Int32(half), Int32(sec_h), Int32(sec_w), lt, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif out_dtype == STDtype.BF16:
-        var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](cos_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
-        var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](sin_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
-        ctx.enqueue_function[_ideogram4_mrope_kernel[DType.bfloat16], _ideogram4_mrope_kernel[DType.bfloat16]](
-            P, C, S, head_dim, half, sec_h, sec_w, lt, n, grid_dim=grid, block_dim=_BLOCK)
+        var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_ideogram4_mrope_kernel[DType.bfloat16]](
+            P, C, S, Int32(head_dim), Int32(half), Int32(sec_h), Int32(sec_w), lt, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         raise Error("build_ideogram4_mrope: out_dtype must be F32 or BF16")
     ctx.synchronize()

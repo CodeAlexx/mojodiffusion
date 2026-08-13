@@ -11,7 +11,7 @@
 # row so prior tiles free → retained-memory peak stays near the 2x2 working path.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.vae.ldm_decoder import load_flux1_ldm_decoder

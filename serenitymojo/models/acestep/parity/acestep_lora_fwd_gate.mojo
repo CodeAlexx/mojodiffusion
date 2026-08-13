@@ -11,7 +11,7 @@
 # remapped here to full key "decoder.layers.N.<attn>.<proj>_proj.lora_{A,B}"
 # (which _layer_bw slices to the per-layer relative "<attn>.<proj>_proj.lora_{A,B}").
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

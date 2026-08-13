@@ -17,7 +17,7 @@
 
 import sys
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.loss_weight import combined_loss_value, combined_loss_grad_elem

@@ -6,7 +6,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -37,7 +36,7 @@ def gzip_bytes(data: String) -> String:
     var used = Int(dl[0])
     var out = String("")
     if rc == 0 and used > 0:
-        out = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(outb)), length=used))
+        out = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(outb)), length=used)))
     inb.free()
     outb.free()
     dl.free()
@@ -76,7 +75,7 @@ def brotli_bytes(data: String) -> String:
     var used = ol[0]
     var out = String("")
     if ok == 1 and used > 0:
-        out = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(outb)), length=used))
+        out = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(outb)), length=used)))
     inb.free()
     outb.free()
     ol.free()

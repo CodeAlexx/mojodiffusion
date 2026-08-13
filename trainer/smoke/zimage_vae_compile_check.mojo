@@ -6,7 +6,7 @@
 #     pixi run mojo build -I . -I trainer/src \
 #       trainer/smoke/zimage_vae_compile_check.mojo -o /tmp/zvae_check
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenity_trainer.model.ZImageVAE import (

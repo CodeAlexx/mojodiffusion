@@ -1,7 +1,7 @@
 # 1:1 surface port of Serenity
 #   modules/modelSaver/StableDiffusion3LoRAModelSaver.py
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 

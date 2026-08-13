@@ -29,7 +29,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -60,12 +60,17 @@ def _reduce_kernel[in_dtype: DType, out_dtype: DType](
     kept_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     red_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     red_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    n_out: Int,
-    n_kept: Int,
-    n_red: Int,
-    n_reduce_elems: Int,
-    mode: Int,  # 0=sum, 1=mean, 2=var(unbiased), 3=std(unbiased)
+    n_out_w: Int32,
+    n_kept_w: Int32,
+    n_red_w: Int32,
+    n_reduce_elems_w: Int32,
+    mode_w: Int32,  # 0=sum, 1=mean, 2=var(unbiased), 3=std(unbiased)
 ):
+    var n_out = Int(n_out_w)
+    var n_kept = Int(n_kept_w)
+    var n_red = Int(n_red_w)
+    var n_reduce_elems = Int(n_reduce_elems_w)
+    var mode = Int(mode_w)
     var oid = Int(global_idx.x)
     if oid >= n_out:
         return
@@ -235,20 +240,28 @@ def _reduce_impl(
     var rst_buf = _upload_i32(rstride_u, ctx)
 
     var KS = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        ks_buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](len(kshape_u))),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(ks_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](len(kshape_u))),
     )
     var KST = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        kst_buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](len(kstride_u))),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(kst_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](len(kstride_u))),
     )
     var RS = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        rs_buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](len(rshape_u))),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(rs_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](len(rshape_u))),
     )
     var RST = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        rst_buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](len(rstride_u))),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(rst_buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](len(rstride_u))),
     )
 
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n_out * out_dtype.byte_size())
@@ -263,70 +276,79 @@ def _reduce_impl(
         if out_dt != DType.float32:
             raise Error("reduce: F32 input only supports F32 output")
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl_in
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_in,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl_out
-        )
-        ctx.enqueue_function[
-            _reduce_kernel[DType.float32, DType.float32],
-            _reduce_kernel[DType.float32, DType.float32],
-        ](
-            X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
+    )
+        ctx.enqueue_function[_reduce_kernel[DType.float32, DType.float32]](
+            X, O, KS, KST, RS, RST, Int32(n_out), Int32(n_kept), Int32(n_red), Int32(n_reduce_elems), Int32(mode),
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif in_dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl_in
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl_in,
+    )
         if out_dt == DType.float32:
             var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float32](), rl_out
-            )
-            ctx.enqueue_function[
-                _reduce_kernel[DType.bfloat16, DType.float32],
-                _reduce_kernel[DType.bfloat16, DType.float32],
-            ](
-                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
+    )
+            ctx.enqueue_function[_reduce_kernel[DType.bfloat16, DType.float32]](
+                X, O, KS, KST, RS, RST, Int32(n_out), Int32(n_kept), Int32(n_red), Int32(n_reduce_elems), Int32(mode),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         elif out_dt == DType.bfloat16:
             var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[BFloat16](), rl_out
-            )
-            ctx.enqueue_function[
-                _reduce_kernel[DType.bfloat16, DType.bfloat16],
-                _reduce_kernel[DType.bfloat16, DType.bfloat16],
-            ](
-                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl_out,
+    )
+            ctx.enqueue_function[_reduce_kernel[DType.bfloat16, DType.bfloat16]](
+                X, O, KS, KST, RS, RST, Int32(n_out), Int32(n_kept), Int32(n_red), Int32(n_reduce_elems), Int32(mode),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         else:
             raise Error("reduce: BF16 input supports only BF16 or F32 output")
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), rl_in
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl_in,
+    )
         if out_dt == DType.float32:
             var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float32](), rl_out
-            )
-            ctx.enqueue_function[
-                _reduce_kernel[DType.float16, DType.float32],
-                _reduce_kernel[DType.float16, DType.float32],
-            ](
-                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_out,
+    )
+            ctx.enqueue_function[_reduce_kernel[DType.float16, DType.float32]](
+                X, O, KS, KST, RS, RST, Int32(n_out), Int32(n_kept), Int32(n_red), Int32(n_reduce_elems), Int32(mode),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         elif out_dt == DType.float16:
             var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float16](), rl_out
-            )
-            ctx.enqueue_function[
-                _reduce_kernel[DType.float16, DType.float16],
-                _reduce_kernel[DType.float16, DType.float16],
-            ](
-                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl_out,
+    )
+            ctx.enqueue_function[_reduce_kernel[DType.float16, DType.float16]](
+                X, O, KS, KST, RS, RST, Int32(n_out), Int32(n_kept), Int32(n_red), Int32(n_reduce_elems), Int32(mode),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         else:

@@ -37,7 +37,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.memory import ArcPointer
 from std.utils.index import IndexList
@@ -118,13 +118,19 @@ def nldiff_downsample_gen[
 def _scatter_interleave_kernel_bf16(
     y: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    total: Int,
-    C: Int,
-    Ws: Int,
-    Wo: Int,
-    ki: Int,
-    kj: Int,
+    total_w: Int64,
+    C_w: Int32,
+    Ws_w: Int32,
+    Wo_w: Int32,
+    ki_w: Int32,
+    kj_w: Int32,
 ):
+    var total = Int(total_w)
+    var C = Int(C_w)
+    var Ws = Int(Ws_w)
+    var Wo = Int(Wo_w)
+    var ki = Int(ki_w)
+    var kj = Int(kj_w)
     var idx = Int(global_idx.x)
     if idx >= total:
         return
@@ -139,13 +145,19 @@ def _scatter_interleave_kernel_bf16(
 def _scatter_interleave_kernel_f32(
     y: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    total: Int,
-    C: Int,
-    Ws: Int,
-    Wo: Int,
-    ki: Int,
-    kj: Int,
+    total_w: Int64,
+    C_w: Int32,
+    Ws_w: Int32,
+    Wo_w: Int32,
+    ki_w: Int32,
+    kj_w: Int32,
 ):
+    var total = Int(total_w)
+    var C = Int(C_w)
+    var Ws = Int(Ws_w)
+    var Wo = Int(Wo_w)
+    var ki = Int(ki_w)
+    var kj = Int(kj_w)
     var idx = Int(global_idx.x)
     if idx >= total:
         return
@@ -176,24 +188,32 @@ def _scatter_into(
     var grid = (total + _BLOCK - 1) // _BLOCK
     if dt == DType.bfloat16:
         var Y = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            y.buf.unsafe_ptr().bitcast[BFloat16](), y_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(y.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=y_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            dst.buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-        )
-        ctx.enqueue_function[
-            _scatter_interleave_kernel_bf16, _scatter_interleave_kernel_bf16
-        ](Y, O, total, c, Ws, Wo, ki, kj, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dst.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_scatter_interleave_kernel_bf16](Y, O, Int64(total), Int32(c), Int32(Ws), Int32(Wo), Int32(ki), Int32(kj), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.float32:
         var Y = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            y.buf.unsafe_ptr().bitcast[Float32](), y_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(y.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=y_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            dst.buf.unsafe_ptr().bitcast[Float32](), o_rl
-        )
-        ctx.enqueue_function[
-            _scatter_interleave_kernel_f32, _scatter_interleave_kernel_f32
-        ](Y, O, total, c, Ws, Wo, ki, kj, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dst.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_scatter_interleave_kernel_f32](Y, O, Int64(total), Int32(c), Int32(Ws), Int32(Wo), Int32(ki), Int32(kj), grid_dim=grid, block_dim=_BLOCK)
     else:
         raise Error("_scatter_into: dtype must be bf16 or f32")
 

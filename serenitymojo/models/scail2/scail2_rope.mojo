@@ -17,7 +17,7 @@
 # directly and preserves that complex average exactly (up to F32 trig/storage).
 
 from std.math import exp, log, cos, sin
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -153,13 +153,19 @@ def build_scail2_position_descriptors(
 def _scail2_rope_kernel[out_dtype: DType](
     cos_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     sin_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
-    total_rows: Int,
-    video_t: Int,
-    grid_h: Int,
-    grid_w: Int,
-    additional_ref_count: Int,
-    replace_mode: Int,
+    total_rows_w: Int32,
+    video_t_w: Int32,
+    grid_h_w: Int32,
+    grid_w_w: Int32,
+    additional_ref_count_w: Int32,
+    replace_mode_w: Int32,
 ):
+    var total_rows = Int(total_rows_w)
+    var video_t = Int(video_t_w)
+    var grid_h = Int(grid_h_w)
+    var grid_w = Int(grid_w_w)
+    var additional_ref_count = Int(additional_ref_count_w)
+    var replace_mode = Int(replace_mode_w)
     var idx = Int(global_idx.x)
     var total = total_rows * SCAIL2_ROPE_HALF
     if idx >= total:
@@ -283,47 +289,56 @@ def build_scail2_rope_tables(
     var odt = out_dtype.to_mojo_dtype()
     if odt == DType.float32:
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[
-            _scail2_rope_kernel[DType.float32],
-            _scail2_rope_kernel[DType.float32],
-        ](
-            C, S, rows, plan.video_t, plan.grid_h, plan.grid_w,
-            plan.additional_ref_count, replace_mode,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_scail2_rope_kernel[DType.float32]](
+            C, S, Int32(rows), Int32(plan.video_t), Int32(plan.grid_h), Int32(plan.grid_w),
+            Int32(plan.additional_ref_count), Int32(replace_mode),
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif odt == DType.bfloat16:
         var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[
-            _scail2_rope_kernel[DType.bfloat16],
-            _scail2_rope_kernel[DType.bfloat16],
-        ](
-            C, S, rows, plan.video_t, plan.grid_h, plan.grid_w,
-            plan.additional_ref_count, replace_mode,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_scail2_rope_kernel[DType.bfloat16]](
+            C, S, Int32(rows), Int32(plan.video_t), Int32(plan.grid_h), Int32(plan.grid_w),
+            Int32(plan.additional_ref_count), Int32(replace_mode),
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif odt == DType.float16:
         var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[
-            _scail2_rope_kernel[DType.float16],
-            _scail2_rope_kernel[DType.float16],
-        ](
-            C, S, rows, plan.video_t, plan.grid_h, plan.grid_w,
-            plan.additional_ref_count, replace_mode,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_scail2_rope_kernel[DType.float16]](
+            C, S, Int32(rows), Int32(plan.video_t), Int32(plan.grid_h), Int32(plan.grid_w),
+            Int32(plan.additional_ref_count), Int32(replace_mode),
             grid_dim=grid, block_dim=_BLOCK,
         )
     else:

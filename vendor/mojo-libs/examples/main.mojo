@@ -174,7 +174,7 @@ def handle_ws(
     while True:
         var k = sys_recv(Int32(fd), tp, READ_CHUNK, Int32(0))
         if k > 0:
-            acc += String(StringSlice(ptr=tmp, length=k))
+            acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=tmp, length=k)))
         elif k == 0:
             closed = True
             break
@@ -235,7 +235,7 @@ def handle_readable(
     while True:
         var k = sys_recv(Int32(fd), tp, READ_CHUNK, Int32(0))
         if k > 0:
-            acc += String(StringSlice(ptr=tmp, length=k))
+            acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=tmp, length=k)))
         elif k == 0:
             closed = True
             break

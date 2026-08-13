@@ -13,7 +13,7 @@
 # Token ids are read by staging the I32 view bytes into a host buffer and
 # bitcasting to Int32, then collected into List[Int] for encode().
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

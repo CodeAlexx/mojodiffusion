@@ -32,7 +32,7 @@
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/autograd_v2/tests/ideogram4_block_aitoolkit_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

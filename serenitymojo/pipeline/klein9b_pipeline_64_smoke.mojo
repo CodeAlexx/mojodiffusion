@@ -1,6 +1,6 @@
 # klein9b_pipeline_64_smoke.mojo - end-to-end Klein 9B image smoke.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

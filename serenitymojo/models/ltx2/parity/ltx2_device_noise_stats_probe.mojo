@@ -15,7 +15,7 @@
 #   /tmp/ltx2_device_noise_probe          # GPU required (device randn)
 
 from std.math import sqrt, abs
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 
 from serenitymojo.io.dtype import STDtype

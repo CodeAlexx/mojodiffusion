@@ -9,7 +9,7 @@
 # Gates BOTH wrappers vs the torch oracles:
 #   - Ideogram4VaeEncoder.encode  vs ideogram4_fx_vae_encode.safetensors (latents)
 #   - Ideogram4TextEncoder.encode vs ideogram4_fx_qwen.safetensors (chunk7 13-tap)
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

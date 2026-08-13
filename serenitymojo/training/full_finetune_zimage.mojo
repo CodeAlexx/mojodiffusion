@@ -33,9 +33,9 @@
 #
 # Mojo 1.0.0b1.
 
-from std.algorithm import parallelize
+from max.algorithm import parallelize
 from std.collections import List, Dict
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.math import sqrt
 from std.memory import ArcPointer, alloc
 from std.time import perf_counter_ns
@@ -519,7 +519,7 @@ def zimage_full_ft_step(
     var qul = opt.qmap_unsigned.copy()
 
     @parameter
-    fn _slot_worker(w: Int):
+    def _slot_worker(w: Int):
         var s = w % ZIMAGE_SLOTS
         var n = slotn_p[s]
         var gp = UnsafePointer[BFloat16, MutAnyOrigin](
@@ -558,7 +558,7 @@ def zimage_full_ft_step(
             var mp = opt.masters[idx].unsafe_ptr()
 
             @parameter
-            fn _conv_worker(c: Int):
+            def _conv_worker(c: Int):
                 var s0 = c * 262144
                 var e0 = min(s0 + 262144, n)
                 for i in range(s0, e0):

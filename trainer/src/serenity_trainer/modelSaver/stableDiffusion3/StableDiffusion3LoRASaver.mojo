@@ -13,7 +13,7 @@
 # StableDiffusion3LoraSavePlan. Callers that write through the low-level helper
 # must provide names already in the target namespace from that plan.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

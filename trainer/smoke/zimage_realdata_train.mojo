@@ -1,7 +1,7 @@
 # REAL-DATA Z-Image LoRA train run via the faithful predict() on Serenity's own
 # cached CLEAN sample. Verifies loss lands in Serenity's real-data range (~0.2-0.8,
 # baseline mean ~0.47), NOT the synthetic ~1.7. LoRA-B imprints 0→nonzero, nonfinite=0.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

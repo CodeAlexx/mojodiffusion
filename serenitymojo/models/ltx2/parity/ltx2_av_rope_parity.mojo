@@ -21,7 +21,7 @@
 #   -Xlinker -lcuda serenitymojo/models/ltx2/parity/ltx2_av_rope_parity.mojo \
 #   -o /tmp/ltx2_av_rope_parity && /tmp/ltx2_av_rope_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt
 

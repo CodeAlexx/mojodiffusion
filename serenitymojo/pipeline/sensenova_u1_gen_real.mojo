@@ -15,7 +15,7 @@
 # Reference: inference-flame/src/bin/sensenova_u1_gen.rs::run_t2i.
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

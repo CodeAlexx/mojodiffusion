@@ -13,7 +13,7 @@
 # decoder instance differs (SDXL LdmVaeDecoder vs ZImageDecoder). SDXL latent is F32 with
 # 4 channels; the decode is called on F32 crops exactly as the monolithic path did.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

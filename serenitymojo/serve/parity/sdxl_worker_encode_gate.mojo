@@ -21,7 +21,7 @@
 #
 # RE-RUN (GPU + models + python ref): see docs/MOJO_MODULES.md serve/parity section.
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

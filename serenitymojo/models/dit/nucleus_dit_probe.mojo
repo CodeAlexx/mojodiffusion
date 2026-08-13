@@ -1,7 +1,7 @@
 # Compile probe for nucleus_dit.mojo — imports + constructs the type + config.
 # COMPILE ONLY (GPU wedged). EXIT=0 == pass.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.models.dit.nucleus_dit import (

@@ -16,7 +16,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.sys import has_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step

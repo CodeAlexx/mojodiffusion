@@ -7,7 +7,7 @@
 
 from std.collections import List, Optional
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.ops.linalg_backward import linear_backward

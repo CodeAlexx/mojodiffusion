@@ -4,7 +4,7 @@
 # Never transformer + VAE resident together → no OOM at 1024.
 from std.math import sqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

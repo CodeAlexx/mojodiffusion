@@ -21,8 +21,17 @@ from serenitymojo.io.ffi import (
 )
 
 
+# Mojo 1.0 rejects a COMPILE-TIME zero address ("Pointer is non-nullable; use
+# Optional[Pointer]"), but Optional cannot cross an FFI boundary -- the C ABI
+# here genuinely requires a NULL argument. Computing the address at runtime
+# yields the same null pointer without tripping the comptime constraint.
+@no_inline
+def _null_addr() -> Int:
+    var z = 0
+    return z
+
 def _null() -> BytePtr:
-    return BytePtr(unsafe_from_address=0)
+    return BytePtr(unsafe_from_address=_null_addr())
 
 
 def _cstring(s: String) -> BytePtr:

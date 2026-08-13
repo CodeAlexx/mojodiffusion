@@ -1,6 +1,6 @@
 # vmm_slab_smoke.mojo - physical VMM slab primitive smoke.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 
 from serenitymojo.offload.vmm_cuda import vmm_supported
 from serenitymojo.offload.vmm_slab import VmmSlabAllocator

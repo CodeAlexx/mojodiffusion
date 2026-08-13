@@ -13,7 +13,7 @@
 # (masters present -> True) from an OLD-era save_lora_train_state file (bf16 A/B +
 # moments, no masters -> False).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sin, cos
 

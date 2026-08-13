@@ -27,7 +27,7 @@
 #     serenitymojo/models/text_encoder/parity/gemma3_dispatch_refactor_probe.mojo \
 #     -o output/checks/gemma3_dispatch_probe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.text_encoder.gemma3_ltx_streamed import (

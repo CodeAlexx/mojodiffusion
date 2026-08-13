@@ -1,7 +1,7 @@
 # Sampler trajectory parity vs Serenity (parity/zi_sampler_ref.safetensors).
 # Verify (1) scheduler sigmas/timesteps, (2) denoise latent_final from identical latent0+cap.
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

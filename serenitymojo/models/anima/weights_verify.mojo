@@ -7,7 +7,7 @@
 #     serenitymojo/models/anima/weights_verify.mojo -o /tmp/anima_weights_verify && \
 #   /tmp/anima_weights_verify
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.anima.config import anima
 from serenitymojo.models.anima.weights import load_anima_block_weights

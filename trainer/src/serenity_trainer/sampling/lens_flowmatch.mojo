@@ -12,7 +12,7 @@
 # Includes the host schedule and the GPU tensor Euler step. Tensor ops may use
 # F32 arithmetic internally, but the latent carrier stays in its storage dtype.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp
 
 from serenitymojo.ops.cast import cast_tensor

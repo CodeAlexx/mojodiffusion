@@ -1,6 +1,6 @@
 # NAVA chunk 1: Mojo fp8 per-row dequant of a NAVA Linear vs torch reference.
 # Reuses the Ideogram fp8 path (ops/fp8) — confirms the same scheme on NAVA weights.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts

@@ -6,7 +6,7 @@
 # pair so the trainer can report a concrete sample-shift metric.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, sin as fsin, cos as fcos
 
 from serenitymojo.tensor import Tensor

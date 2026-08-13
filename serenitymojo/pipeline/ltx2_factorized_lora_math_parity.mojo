@@ -8,7 +8,7 @@
 # The synthetic shapes mirror LTX2 linear calls: x has leading token dimensions,
 # W is PyTorch row-major [out, in], A is [rank, in], and B is [out, rank].
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear

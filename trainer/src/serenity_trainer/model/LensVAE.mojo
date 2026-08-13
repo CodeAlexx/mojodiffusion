@@ -19,7 +19,7 @@
 # runs in the VAE weight dtype (F32 for flux2-vae.safetensors), F32 only in the
 # foundation conv/norm registers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

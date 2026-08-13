@@ -17,7 +17,7 @@
 #   pixi run mojo build -I . -Xlinker -lm \
 #     serenitymojo/pipeline/mxfp4_dequant_smoke.mojo -o /tmp/mxfp4_dequant_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ldexp
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -2,7 +2,7 @@
 # giger LoRA applied (additive overlay on the resident cond transformer) + a real
 # giger .json caption prompt. Proves whether the giger LoRA learned the style.
 # Same path as ideogram4_generate.mojo; only the prompt + LoRA apply differ.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

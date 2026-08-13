@@ -31,9 +31,10 @@
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul, div, mul_scalar
 from serenitymojo.io.dtype import STDtype
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from std.math import exp, sqrt
@@ -137,9 +138,10 @@ def _cfg_qwen_kernel_f32(
     cond: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     uncond: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    dim: Int,
+    dim_w: Int32,
     scale: Float32,
 ):
+    var dim = Int(dim_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var s_cond = stack_allocation[
@@ -181,9 +183,10 @@ def _cfg_qwen_kernel_bf16(
     cond: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     uncond: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    dim: Int,
+    dim_w: Int32,
     scale: Float32,
 ):
+    var dim = Int(dim_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var s_cond = stack_allocation[
@@ -226,9 +229,10 @@ def _cfg_qwen_kernel_f16(
     cond: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     uncond: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     dst: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    dim: Int,
+    dim_w: Int32,
     scale: Float32,
 ):
+    var dim = Int(dim_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var s_cond = stack_allocation[
@@ -383,42 +387,69 @@ def cfg_qwen_device(
     var rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, dim))
     if v_cond.dtype() == STDtype.F32:
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            v_cond.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v_cond.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var U = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            v_uncond.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v_uncond.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_cfg_qwen_kernel_f32, _cfg_qwen_kernel_f32](
-            C, U, O, dim, scale, grid_dim=rows, block_dim=_CFG_TPB
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_cfg_qwen_kernel_f32](
+            C, U, O, Int32(dim), scale, grid_dim=rows, block_dim=_CFG_TPB
         )
     elif v_cond.dtype() == STDtype.BF16:
         var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            v_cond.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v_cond.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var U = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            v_uncond.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v_uncond.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_cfg_qwen_kernel_bf16, _cfg_qwen_kernel_bf16](
-            C, U, O, dim, scale, grid_dim=rows, block_dim=_CFG_TPB
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_cfg_qwen_kernel_bf16](
+            C, U, O, Int32(dim), scale, grid_dim=rows, block_dim=_CFG_TPB
         )
     elif v_cond.dtype() == STDtype.F16:
         var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            v_cond.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(v_cond.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var U = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            v_uncond.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(v_uncond.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_cfg_qwen_kernel_f16, _cfg_qwen_kernel_f16](
-            C, U, O, dim, scale, grid_dim=rows, block_dim=_CFG_TPB
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_cfg_qwen_kernel_f16](
+            C, U, O, Int32(dim), scale, grid_dim=rows, block_dim=_CFG_TPB
         )
     else:
         raise Error("cfg_qwen_device: expected F32/BF16/F16 tensors")

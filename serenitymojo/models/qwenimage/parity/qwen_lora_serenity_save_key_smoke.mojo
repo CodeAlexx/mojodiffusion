@@ -4,7 +4,7 @@
 # through save_qwen_lora, and reopens only the safetensors header/one alpha value.
 # It does not run denoise, load model weights, or exercise image generation.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

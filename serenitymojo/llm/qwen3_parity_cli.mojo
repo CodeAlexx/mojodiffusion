@@ -2,7 +2,7 @@
 # Feeds the EXACT HF token ids for "The capital of France is" so the test
 # isolates the transformer forward from any tokenizer difference.
 # HF reference: argmax next-token = 12095 (" Paris"), logit ~17.375.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 
 comptime SNAP = "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"

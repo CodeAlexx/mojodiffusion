@@ -41,7 +41,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import alloc
 from std.os import listdir

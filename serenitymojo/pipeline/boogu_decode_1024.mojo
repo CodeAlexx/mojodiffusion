@@ -6,7 +6,7 @@
 # from ideogram4_tiled_decode (VAE-agnostic). Run in a fresh process:
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/pipeline/boogu_decode_1024.mojo
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

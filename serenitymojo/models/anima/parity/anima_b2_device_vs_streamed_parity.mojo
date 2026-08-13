@@ -24,7 +24,7 @@
 #       serenitymojo/models/anima/parity/anima_b2_device_vs_streamed_parity.mojo \
 #       -o output/bin/anima_b2_device_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import log as flog, cos as fcos, sin as fsin, exp as fexp
 

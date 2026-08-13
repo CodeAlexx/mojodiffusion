@@ -12,7 +12,7 @@
 #     serenitymojo/pipeline/ltx2_vae_decode_hq121_smoke.mojo \
 #     -o /tmp/ltx2_vae_decode_hq121_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter
 
 from serenitymojo.tensor import Tensor

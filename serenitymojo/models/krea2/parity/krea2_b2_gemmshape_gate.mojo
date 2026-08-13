@@ -6,7 +6,7 @@
 # difference == the bf16 GEMM tiles the M dimension differently for M=L vs M=2L =
 # SHAPE-DETERMINISTIC rounding, which is the whole story if the deltas are ~1 bf16 eps.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from serenitymojo.tensor import Tensor

@@ -8,7 +8,7 @@
 #     pixi run mojo run -I . serenitymojo/models/lingbotvideo/parity/dense_block_microbench.mojo
 
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

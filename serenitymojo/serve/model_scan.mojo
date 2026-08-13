@@ -48,7 +48,7 @@ def byte_substr(s: String, start: Int, end: Int) -> String:
         return String("")
     var sp = s.as_bytes()
     var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 comptime MODEL_ROOT = "models"
 comptime CHECKPOINTS_DIR = "models/checkpoints"
@@ -105,7 +105,7 @@ def _read_text_file(path: String) raises -> String:
             raise Error(String("model_scan: read failed on ") + path)
         done += k
     _ = sys_close(fd)
-    var s = String(StringSlice(ptr=buf, length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=buf, length=n)))
     buf.free()
     return s^
 
@@ -163,7 +163,7 @@ def _header_text(path: String) raises -> String:
             break
         done += r
     _ = sys_close(fd)
-    var s = String(StringSlice(ptr=buf, length=done))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=buf, length=done)))
     buf.free()
     return s^
 

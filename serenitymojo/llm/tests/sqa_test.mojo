@@ -1,4 +1,4 @@
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, sqrt
 from serenitymojo.llm.sqa import sqa_gpu
 

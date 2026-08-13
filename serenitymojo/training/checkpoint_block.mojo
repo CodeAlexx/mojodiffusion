@@ -43,10 +43,10 @@
 # Mojo 1.0.0b1: def not fn; Tensor move-only; CLONE struct grad fields out;
 # SdpaGrads consume-once; weights stay resident (weights are not checkpointed).
 
-from collections import List
-from collections.optional import Optional
-from math import sqrt
-from std.gpu.host import DeviceContext
+from std.collections import List
+from std.collections.optional import Optional
+from std.math import sqrt
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

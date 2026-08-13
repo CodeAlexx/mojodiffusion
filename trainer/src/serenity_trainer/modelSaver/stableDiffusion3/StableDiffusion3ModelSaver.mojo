@@ -7,7 +7,7 @@
 # plans and a raw safetensors helper. It does not implement the SD3 diffusers to
 # checkpoint key converter.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

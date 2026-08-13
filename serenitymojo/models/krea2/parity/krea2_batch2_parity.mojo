@@ -31,7 +31,7 @@
 #       -o output/bin/krea2_batch2_parity
 #   output/bin/krea2_batch2_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 

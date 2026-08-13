@@ -4,7 +4,7 @@
 # latent patch projection, timestep MLP, and Mistral-hidden text projection.
 # It intentionally bypasses Mistral3B and the 36 ERNIE DiT blocks.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

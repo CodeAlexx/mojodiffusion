@@ -25,7 +25,7 @@
 # SAME layout the committed stack gates feed the block forward (their _load_rope
 # transposes the oracle's [H,P,hrd] to [P*H,hrd]).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import cos as fcos, sin as fsin, pow as fpow, pi
 

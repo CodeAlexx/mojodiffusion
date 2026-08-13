@@ -6,7 +6,6 @@
 # carrying the byte offset.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from json.value import JSONValue
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
@@ -204,7 +203,7 @@ struct Parser:
                 self.pos += 1
             else:
                 break
-        var text = String(StringSlice(ptr=self.p + start, length=self.pos - start))
+        var text = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=self.p + start, length=self.pos - start)))
         if is_float:
             return JSONValue.from_float(Float64(text))
         # integer
@@ -286,7 +285,7 @@ def _bytes_to_string(b: List[UInt8]) -> String:
     var buf = alloc[UInt8](n)
     for i in range(n):
         buf[i] = b[i]
-    var s = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(buf)), length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(buf)), length=n)))
     buf.free()
     return s
 

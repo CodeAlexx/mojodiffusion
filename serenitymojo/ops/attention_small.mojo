@@ -17,9 +17,10 @@
 # Layout: q/k/v/o are [B, S, H, Dh] (the sdpa_nomask contract).
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
-from std.gpu import block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu import block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
 from std.utils.index import IndexList
@@ -37,9 +38,10 @@ def _sdpa_small_kernel[S: Int, Dh: Int](
     k: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    H: Int,
+    H_w: Int32,
     scale: Float32,
 ):
+    var H = Int(H_w)
     # One block per (b,h); Dh threads. Shared: q,k,v tiles [S,Dh] F32 + scores.
     var bh = Int(block_idx.x)
     var b = bh // H
@@ -130,15 +132,31 @@ def sdpa_nomask_small[
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 2)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        q.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
     var K = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        k.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
     var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        v.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-    ctx.enqueue_function[_sdpa_small_kernel[S, Dh], _sdpa_small_kernel[S, Dh]](
-        Q, K, V, O, H, scale, grid_dim=B * H, block_dim=Dh,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+    ctx.enqueue_function[_sdpa_small_kernel[S, Dh]](
+        Q, K, V, O, Int32(H), scale, grid_dim=B * H, block_dim=Dh,
     )
     var oshape: List[Int] = [B, S, H, Dh]
     return Tensor(out_buf^, oshape^, STDtype.BF16)

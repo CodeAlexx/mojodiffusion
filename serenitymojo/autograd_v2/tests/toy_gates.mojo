@@ -10,7 +10,7 @@
 #     serenitymojo/autograd_v2/tests/toy_gates.mojo -o /tmp/toy_gates
 # Run:   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib /tmp/toy_gates
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.autograd_v2.node import (

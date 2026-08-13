@@ -21,7 +21,7 @@
 #
 # GPU run required (HARD RULE: real numeric gate on GPU, not compile-only).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

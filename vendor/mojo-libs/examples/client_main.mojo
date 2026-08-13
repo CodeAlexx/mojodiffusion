@@ -4,7 +4,7 @@
 #   /tmp/mojoget /health          # GET 127.0.0.1:8080/health
 #   /tmp/mojoget /health 8080 127.0.0.1
 
-from sys import argv
+from std.sys import argv
 from http.client import get
 
 

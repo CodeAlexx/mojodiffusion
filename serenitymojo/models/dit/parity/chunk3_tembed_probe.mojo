@@ -1,5 +1,5 @@
 # chunk3 parity: Ideogram-4 t-embedding (EmbedScalar->MLP) vs Wave-0 fixture.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness

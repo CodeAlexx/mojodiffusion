@@ -17,7 +17,7 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #     serenitymojo/models/klein/parity/klein_int8_f32_fusion_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from serenitymojo.parity import ParityHarness
 from serenitymojo.tensor import Tensor
@@ -34,7 +34,7 @@ from serenitymojo.ops.int8_linear import (
 )
 
 
-fn _lcg(mut state: UInt64) -> Float32:
+def _lcg(mut state: UInt64) -> Float32:
     state = state * 6364136223846793005 + 1442695040888963407
     var u = (state >> 40) & 0xFFFFFF
     return (Float32(Int(u)) / Float32(1 << 23)) - 1.0

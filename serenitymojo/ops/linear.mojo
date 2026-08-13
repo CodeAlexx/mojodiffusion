@@ -19,7 +19,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -41,10 +41,13 @@ def _bias_cast_kernel_f32(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
-    has_bias: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
+    has_bias_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
+    var has_bias = Int(has_bias_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -60,10 +63,13 @@ def _bias_cast_kernel_bf16(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
-    has_bias: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
+    has_bias_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
+    var has_bias = Int(has_bias_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -79,10 +85,13 @@ def _bias_cast_kernel_f16(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
-    has_bias: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
+    has_bias_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
+    var has_bias = Int(has_bias_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -98,9 +107,11 @@ def _bias_cast_direct_kernel_f32(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -115,9 +126,11 @@ def _bias_cast_direct_kernel_f32_from_bf16(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -132,9 +145,11 @@ def _bias_cast_direct_kernel_f32_from_f16(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -149,9 +164,11 @@ def _bias_cast_direct_kernel_bf16(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -166,9 +183,11 @@ def _bias_cast_direct_kernel_f16(
     c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     out_buf: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    m: Int,
-    out_dim: Int,
+    m_w: Int32,
+    out_dim_w: Int32,
 ):
+    var m = Int(m_w)
+    var out_dim = Int(out_dim_w)
     var idx = Int(global_idx.x)
     var total = m * out_dim
     if idx < total:
@@ -233,50 +252,83 @@ def _linear_impl(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](wshape[0], wshape[1]))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
 
     if dt == DType.float32 and wdt == DType.float32:
         var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     elif dt == DType.float32 and wdt == DType.bfloat16:
         var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     elif dt == DType.float32 and wdt == DType.float16:
         var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     elif dt == DType.bfloat16:
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     else:  # float16
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
 
     var out_shape = List[Int]()
@@ -313,92 +365,110 @@ def _linear_impl(
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](bias_count))
     var c_out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias_f32_buf.unsafe_ptr().bitcast[Float32](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias_f32_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
     )
     var c_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_out_rl,
     )
 
     var total = m * out_dim
     var grid = (total + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var o_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), c_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_out_rl,
+    )
         if has_bias:
             if bias_tensor.dtype() == STDtype.F32:
                 var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                    bias_tensor.buf.unsafe_ptr().bitcast[Float32](), bias_rl
-                )
-                ctx.enqueue_function[
-                    _bias_cast_direct_kernel_f32, _bias_cast_direct_kernel_f32
-                ](
-                    c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias_tensor.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
+    )
+                ctx.enqueue_function[_bias_cast_direct_kernel_f32](
+                    c_lt, B, o_lt, Int32(m), Int32(out_dim),
                     grid_dim=grid, block_dim=_BLOCK,
                 )
             elif bias_tensor.dtype() == STDtype.BF16:
                 var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                    bias_tensor.buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
-                )
-                ctx.enqueue_function[
-                    _bias_cast_direct_kernel_f32_from_bf16,
-                    _bias_cast_direct_kernel_f32_from_bf16,
-                ](
-                    c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias_tensor.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+                ctx.enqueue_function[_bias_cast_direct_kernel_f32_from_bf16](
+                    c_lt, B, o_lt, Int32(m), Int32(out_dim),
                     grid_dim=grid, block_dim=_BLOCK,
                 )
             else:
                 var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                    bias_tensor.buf.unsafe_ptr().bitcast[Float16](), bias_rl
-                )
-                ctx.enqueue_function[
-                    _bias_cast_direct_kernel_f32_from_f16,
-                    _bias_cast_direct_kernel_f32_from_f16,
-                ](
-                    c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias_tensor.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+                ctx.enqueue_function[_bias_cast_direct_kernel_f32_from_f16](
+                    c_lt, B, o_lt, Int32(m), Int32(out_dim),
                     grid_dim=grid, block_dim=_BLOCK,
                 )
         else:
-            ctx.enqueue_function[_bias_cast_kernel_f32, _bias_cast_kernel_f32](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias_i,
+            ctx.enqueue_function[_bias_cast_kernel_f32](
+                c_lt, bias_lt, o_lt, Int32(m), Int32(out_dim), Int32(has_bias_i),
                 grid_dim=grid, block_dim=_BLOCK,
             )
     elif dt == DType.bfloat16:
         var o_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), c_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_out_rl,
+    )
         if has_bias:
             var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                bias_tensor.buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
-            )
-            ctx.enqueue_function[
-                _bias_cast_direct_kernel_bf16, _bias_cast_direct_kernel_bf16
-            ](
-                c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias_tensor.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+            ctx.enqueue_function[_bias_cast_direct_kernel_bf16](
+                c_lt, B, o_lt, Int32(m), Int32(out_dim),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         else:
-            ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias_i,
+            ctx.enqueue_function[_bias_cast_kernel_bf16](
+                c_lt, bias_lt, o_lt, Int32(m), Int32(out_dim), Int32(has_bias_i),
                 grid_dim=grid, block_dim=_BLOCK,
             )
     else:  # float16
         var o_lt = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), c_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=c_out_rl,
+    )
         if has_bias:
             var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                bias_tensor.buf.unsafe_ptr().bitcast[Float16](), bias_rl
-            )
-            ctx.enqueue_function[
-                _bias_cast_direct_kernel_f16, _bias_cast_direct_kernel_f16
-            ](
-                c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias_tensor.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+            ctx.enqueue_function[_bias_cast_direct_kernel_f16](
+                c_lt, B, o_lt, Int32(m), Int32(out_dim),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         else:
-            ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias_i,
+            ctx.enqueue_function[_bias_cast_kernel_f16](
+                c_lt, bias_lt, o_lt, Int32(m), Int32(out_dim), Int32(has_bias_i),
                 grid_dim=grid, block_dim=_BLOCK,
             )
     # TIER2-SYNC-REMOVED: single-stream enqueue serializes kernel order; the
@@ -490,50 +560,83 @@ def linear_slab(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
 
     if dt == DType.float32 and wdt == DType.float32:
         var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     elif dt == DType.float32 and wdt == DType.bfloat16:
         var x_cast = cast_tensor_slab(x, STDtype.BF16, ctx, slab, False)
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     elif dt == DType.float32 and wdt == DType.float16:
         var x_cast = cast_tensor_slab(x, STDtype.F16, ctx, slab, False)
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     elif dt == DType.bfloat16:
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     else:  # float16
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
 
     var out_shape = List[Int]()
@@ -570,92 +673,110 @@ def linear_slab(
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](bias_count))
     var c_out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias_f32_buf.unsafe_ptr().bitcast[Float32](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias_f32_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
     )
     var c_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_out_rl,
     )
 
     var total = m * out_dim
     var grid = (total + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var o_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), c_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_out_rl,
+    )
         if bias:
             if bias.value().dtype() == STDtype.F32:
                 var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                    bias.value().buf.unsafe_ptr().bitcast[Float32](), bias_rl
-                )
-                ctx.enqueue_function[
-                    _bias_cast_direct_kernel_f32, _bias_cast_direct_kernel_f32
-                ](
-                    c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
+    )
+                ctx.enqueue_function[_bias_cast_direct_kernel_f32](
+                    c_lt, B, o_lt, Int32(m), Int32(out_dim),
                     grid_dim=grid, block_dim=_BLOCK,
                 )
             elif bias.value().dtype() == STDtype.BF16:
                 var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                    bias.value().buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
-                )
-                ctx.enqueue_function[
-                    _bias_cast_direct_kernel_f32_from_bf16,
-                    _bias_cast_direct_kernel_f32_from_bf16,
-                ](
-                    c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+                ctx.enqueue_function[_bias_cast_direct_kernel_f32_from_bf16](
+                    c_lt, B, o_lt, Int32(m), Int32(out_dim),
                     grid_dim=grid, block_dim=_BLOCK,
                 )
             else:
                 var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                    bias.value().buf.unsafe_ptr().bitcast[Float16](), bias_rl
-                )
-                ctx.enqueue_function[
-                    _bias_cast_direct_kernel_f32_from_f16,
-                    _bias_cast_direct_kernel_f32_from_f16,
-                ](
-                    c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+                ctx.enqueue_function[_bias_cast_direct_kernel_f32_from_f16](
+                    c_lt, B, o_lt, Int32(m), Int32(out_dim),
                     grid_dim=grid, block_dim=_BLOCK,
                 )
         else:
-            ctx.enqueue_function[_bias_cast_kernel_f32, _bias_cast_kernel_f32](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+            ctx.enqueue_function[_bias_cast_kernel_f32](
+                c_lt, bias_lt, o_lt, Int32(m), Int32(out_dim), Int32(has_bias),
                 grid_dim=grid, block_dim=_BLOCK,
             )
     elif dt == DType.bfloat16:
         var o_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), c_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_out_rl,
+    )
         if bias:
             var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
-            )
-            ctx.enqueue_function[
-                _bias_cast_direct_kernel_bf16, _bias_cast_direct_kernel_bf16
-            ](
-                c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+            ctx.enqueue_function[_bias_cast_direct_kernel_bf16](
+                c_lt, B, o_lt, Int32(m), Int32(out_dim),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         else:
-            ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+            ctx.enqueue_function[_bias_cast_kernel_bf16](
+                c_lt, bias_lt, o_lt, Int32(m), Int32(out_dim), Int32(has_bias),
                 grid_dim=grid, block_dim=_BLOCK,
             )
     else:  # float16
         var o_lt = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), c_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=c_out_rl,
+    )
         if bias:
             var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[Float16](), bias_rl
-            )
-            ctx.enqueue_function[
-                _bias_cast_direct_kernel_f16, _bias_cast_direct_kernel_f16
-            ](
-                c_lt, B, o_lt, m, out_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=bias_rl,
+    )
+            ctx.enqueue_function[_bias_cast_direct_kernel_f16](
+                c_lt, B, o_lt, Int32(m), Int32(out_dim),
                 grid_dim=grid, block_dim=_BLOCK,
             )
         else:
-            ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+            ctx.enqueue_function[_bias_cast_kernel_f16](
+                c_lt, bias_lt, o_lt, Int32(m), Int32(out_dim), Int32(has_bias),
                 grid_dim=grid, block_dim=_BLOCK,
             )
     # TIER2-SYNC-REMOVED: single-stream enqueue serializes kernel order; the
@@ -724,33 +845,54 @@ def linear_scratch(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
     )
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
     if weight.dtype() == STDtype.F32:
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     elif weight.dtype() == STDtype.BF16:
         var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
         var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True)
     else:
         var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
         var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True)
     return out^
 
@@ -817,33 +959,54 @@ def linear_bias_scratch(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
     )
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
     if weight.dtype() == STDtype.F32:
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     elif weight.dtype() == STDtype.BF16:
         var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
         var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True)
     else:
         var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
         var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True)
 
     # Bias-add-and-store into the SAME F32 scratch buffer (elementwise, in place
@@ -855,13 +1018,14 @@ def linear_bias_scratch(
         bias_f32 = cast_tensor(bias.value(), STDtype.F32, ctx, False)
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_dim))
     var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias_f32.buf.unsafe_ptr().bitcast[Float32](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias_f32.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
     )
     var total = m * out_dim
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _bias_cast_direct_kernel_f32, _bias_cast_direct_kernel_f32
-    ](C, bias_lt, C, m, out_dim, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_bias_cast_direct_kernel_f32](C, bias_lt, C, Int32(m), Int32(out_dim), grid_dim=grid, block_dim=_BLOCK)
     return out^
 
 
@@ -914,47 +1078,74 @@ def linear_rows(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](row_count, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, row_count))
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
     if weight.dtype() == STDtype.F32:
         if x.dtype() != STDtype.F32:
             raise Error("linear_rows: F32 weight requires F32 x")
         var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32]() + row_start * k, b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]() + row_start * k)
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True, alpha=alpha)
     elif weight.dtype() == STDtype.BF16:
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k, b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k)
+        ),
+        runtime_layout=b_rl,
+    )
         if x.dtype() == STDtype.F32:
             var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
             var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
             matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
         else:
             var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                x.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
             matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
     else:
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16]() + row_start * k, b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]() + row_start * k)
+        ),
+        runtime_layout=b_rl,
+    )
         if x.dtype() == STDtype.F32:
             var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
             var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
             matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
         else:
             var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                x.buf.unsafe_ptr().bitcast[Float16](), a_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
             matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
     if x.dtype() == STDtype.F32:
         return Tensor(c_buf^, out_shape^, STDtype.F32)
@@ -965,23 +1156,32 @@ def linear_rows(
     var bias_buf = ctx.enqueue_create_buffer[DType.uint8](4)
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias_buf.unsafe_ptr().bitcast[Float32](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
     )
     var total = m * row_count
     var grid = (total + _BLOCK - 1) // _BLOCK
     if x.dtype() == STDtype.BF16:
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), c_rl
-        )
-        ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
-            C, bias_lt, O, m, row_count, 0, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
+        ctx.enqueue_function[_bias_cast_kernel_bf16](
+            C, bias_lt, O, Int32(m), Int32(row_count), Int32(0), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), c_rl
-        )
-        ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
-            C, bias_lt, O, m, row_count, 0, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=c_rl,
+    )
+        ctx.enqueue_function[_bias_cast_kernel_f16](
+            C, bias_lt, O, Int32(m), Int32(row_count), Int32(0), grid_dim=grid, block_dim=_BLOCK
         )
     return Tensor(out_buf^, out_shape^, x.dtype())
 
@@ -1042,33 +1242,54 @@ def linear_rows_scratch(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](row_count, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, row_count))
     var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
     )
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
     if weight.dtype() == STDtype.F32:
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32]() + row_start * k, b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]() + row_start * k)
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True, alpha=alpha)
     elif weight.dtype() == STDtype.BF16:
         var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
         var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k, b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k)
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
     else:
         var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
         var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=a_rl,
+    )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16]() + row_start * k, b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]() + row_start * k)
+        ),
+        runtime_layout=b_rl,
+    )
         matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
     return out^
 
@@ -1132,77 +1353,128 @@ def linear_two_inputs(
     var w1_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, in1))
     var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     if weight0.dtype() == STDtype.F32:
         if x0.dtype() != STDtype.F32:
             raise Error("linear_two_inputs: F32 weight requires F32 inputs")
         var X0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x0.buf.unsafe_ptr().bitcast[Float32](), x0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x0_rl,
+    )
         var X1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x1.buf.unsafe_ptr().bitcast[Float32](), x1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x1.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x1_rl,
+    )
         var W0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight0.buf.unsafe_ptr().bitcast[Float32](), w0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight0.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=w0_rl,
+    )
         var W1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight1.buf.unsafe_ptr().bitcast[Float32](), w1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight1.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=w1_rl,
+    )
         matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
         matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
     elif weight0.dtype() == STDtype.BF16:
         var W0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight0.buf.unsafe_ptr().bitcast[BFloat16](), w0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight0.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w0_rl,
+    )
         var W1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight1.buf.unsafe_ptr().bitcast[BFloat16](), w1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight1.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w1_rl,
+    )
         if x0.dtype() == STDtype.F32:
             var x0_cast = cast_tensor(x0, STDtype.BF16, ctx, False)
             var x1_cast = cast_tensor(x1, STDtype.BF16, ctx, False)
             var X0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                x0_cast.buf.unsafe_ptr().bitcast[BFloat16](), x0_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x0_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x0_rl,
+    )
             var X1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                x1_cast.buf.unsafe_ptr().bitcast[BFloat16](), x1_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x1_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x1_rl,
+    )
             matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
             matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
         else:
             var X0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                x0.buf.unsafe_ptr().bitcast[BFloat16](), x0_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x0_rl,
+    )
             var X1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                x1.buf.unsafe_ptr().bitcast[BFloat16](), x1_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x1.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x1_rl,
+    )
             matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
             matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
     else:
         var W0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight0.buf.unsafe_ptr().bitcast[Float16](), w0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight0.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=w0_rl,
+    )
         var W1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight1.buf.unsafe_ptr().bitcast[Float16](), w1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight1.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=w1_rl,
+    )
         if x0.dtype() == STDtype.F32:
             var x0_cast = cast_tensor(x0, STDtype.F16, ctx, False)
             var x1_cast = cast_tensor(x1, STDtype.F16, ctx, False)
             var X0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                x0_cast.buf.unsafe_ptr().bitcast[Float16](), x0_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x0_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x0_rl,
+    )
             var X1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                x1_cast.buf.unsafe_ptr().bitcast[Float16](), x1_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x1_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x1_rl,
+    )
             matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
             matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
         else:
             var X0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                x0.buf.unsafe_ptr().bitcast[Float16](), x0_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x0_rl,
+    )
             var X1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                x1.buf.unsafe_ptr().bitcast[Float16](), x1_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x1.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x1_rl,
+    )
             matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
             matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
 
@@ -1215,23 +1487,32 @@ def linear_two_inputs(
     var bias_buf = ctx.enqueue_create_buffer[DType.uint8](4)
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias_buf.unsafe_ptr().bitcast[Float32](), bias_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=bias_rl,
     )
     var total = m * out_dim
     var grid = (total + _BLOCK - 1) // _BLOCK
     if x0.dtype() == STDtype.BF16:
         var OUT = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
-            O, bias_lt, OUT, m, out_dim, 0, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_bias_cast_kernel_bf16](
+            O, bias_lt, OUT, Int32(m), Int32(out_dim), Int32(0), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var OUT = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
-        )
-        ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
-            O, bias_lt, OUT, m, out_dim, 0, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_bias_cast_kernel_f16](
+            O, bias_lt, OUT, Int32(m), Int32(out_dim), Int32(0), grid_dim=grid, block_dim=_BLOCK
         )
     return Tensor(out_buf^, out_shape^, x0.dtype())
 
@@ -1301,55 +1582,94 @@ def linear_two_inputs_scratch(
     var w1_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, in1))
     var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var X0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x0.buf.unsafe_ptr().bitcast[Float32](), x0_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x0.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x0_rl,
     )
     var X1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x1.buf.unsafe_ptr().bitcast[Float32](), x1_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x1.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x1_rl,
     )
     var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     if weight0.dtype() == STDtype.F32:
         var W0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight0.buf.unsafe_ptr().bitcast[Float32](), w0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight0.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=w0_rl,
+    )
         var W1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            weight1.buf.unsafe_ptr().bitcast[Float32](), w1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight1.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=w1_rl,
+    )
         matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
         matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
     elif weight0.dtype() == STDtype.BF16:
         var x0_cast = cast_tensor(x0, STDtype.BF16, ctx, False)
         var x1_cast = cast_tensor(x1, STDtype.BF16, ctx, False)
         var X0_16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x0_cast.buf.unsafe_ptr().bitcast[BFloat16](), x0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x0_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x0_rl,
+    )
         var X1_16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x1_cast.buf.unsafe_ptr().bitcast[BFloat16](), x1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x1_cast.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x1_rl,
+    )
         var W0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight0.buf.unsafe_ptr().bitcast[BFloat16](), w0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight0.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w0_rl,
+    )
         var W1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            weight1.buf.unsafe_ptr().bitcast[BFloat16](), w1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight1.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w1_rl,
+    )
         matmul(ctx, O, X0_16, W0, transpose_b=True, c_row_major=True)
         matmul(ctx, O, X1_16, W1, transpose_b=True, c_row_major=True, beta=1.0)
     else:
         var x0_cast = cast_tensor(x0, STDtype.F16, ctx, False)
         var x1_cast = cast_tensor(x1, STDtype.F16, ctx, False)
         var X0_16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x0_cast.buf.unsafe_ptr().bitcast[Float16](), x0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x0_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x0_rl,
+    )
         var X1_16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x1_cast.buf.unsafe_ptr().bitcast[Float16](), x1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x1_cast.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x1_rl,
+    )
         var W0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight0.buf.unsafe_ptr().bitcast[Float16](), w0_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight0.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=w0_rl,
+    )
         var W1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            weight1.buf.unsafe_ptr().bitcast[Float16](), w1_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight1.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=w1_rl,
+    )
         matmul(ctx, O, X0_16, W0, transpose_b=True, c_row_major=True)
         matmul(ctx, O, X1_16, W1, transpose_b=True, c_row_major=True, beta=1.0)
     return out^

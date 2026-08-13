@@ -102,7 +102,7 @@ from std.sys import argv
 from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -129,6 +129,7 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_forward,
     minimax_h3_block_forward_dynamic,
 )
+from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
     minimax_h3_load_qkv_device,
@@ -162,6 +163,7 @@ from serenitymojo.models.dit.minimax_h3_step_cache import (
     MiniMaxH3StepCache,
     minimax_h3_cache_apply_residual_inplace,
     minimax_h3_cache_probe_rows,
+    minimax_h3_cache_probe_given_rows,
     minimax_h3_cache_quantize_activation,
     minimax_h3_cache_should_reuse,
     minimax_h3_cache_store_middle_residual,
@@ -359,11 +361,13 @@ def _read_keyframe(path: String, scratch_dir: String, tag: String) raises -> Min
     var raw = MiniMaxH3RgbImage(frames.pixels.copy(), frames.height, frames.width)
     var orientation = minimax_h3_jpeg_exif_orientation(path)
     if orientation > 1:
+        var rw = raw.width
+        var rh = raw.height
+        var ow = rh if orientation >= 5 else rw
+        var oh = rw if orientation >= 5 else rh
         print(
             "  keyframe", tag, ": EXIF orientation", orientation,
-            "applied (", raw.width, "x", raw.height, "->",
-            (raw.height if orientation >= 5 else raw.width), "x",
-            (raw.width if orientation >= 5 else raw.height), ")",
+            "applied (", rw, "x", rh, "->", ow, "x", oh, ")",
         )
     return minimax_h3_exif_transpose(raw, orientation)
 
@@ -769,7 +773,7 @@ def _write_rgb_frames(
         var chw = permute(hwc, [2, 0, 1], ctx)
         var img = reshape(chw, [1, 3, height, width], ctx)
         var name = String(first_index + f)
-        while len(name) < 5:
+        while name.byte_length() < 5:
             name = String("0") + name
         save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
     return frames
@@ -842,7 +846,7 @@ def _decode_video(
     var grid_cfhw = unpatchify3d(
         rows_cf, latent_channels, num_latent_frames, latent_h, latent_w, 1, 2, 2, ctx
     )
-    var perm = [1, 2, 3, 0]
+    var perm: List[Int] = [1, 2, 3, 0]
     var grid_fhwc = permute(grid_cfhw, perm^, ctx)
     var latents = reshape(
         grid_fhwc, [1, num_latent_frames, latent_h, latent_w, latent_channels], ctx
@@ -1483,8 +1487,41 @@ def main() raises:
             print("  resident cache: reusable one-block groupwise tail ready")
 
     # ── 6. Denoise — the condition rows are never written ──────────────────
+    # Sage attention runs the whole denoise through one preallocated scratch:
+    # its per-call transient buffers otherwise churn ~1-2 GiB fifty times per
+    # evaluation and intermittently OOM near the 24-GiB envelope
+    # (video-0177). Allocated after the resident store so a geometry that
+    # cannot hold both fails here, not minutes into denoise.
+    var sage_scratch = Optional[SageInt8Scratch](None)
+    if attention_backend != MINIMAX_H3_ATTN_CUDNN:
+        sage_scratch = Optional[SageInt8Scratch](
+            SageInt8Scratch(sequence_length, H3_HEADS, ctx)
+        )
+        ctx.synchronize()
+        print(
+            "  sage scratch: preallocated",
+            Float64(sage_scratch.value().resident_bytes())
+                / (1024.0 * 1024.0 * 1024.0),
+            "GiB for S=", sequence_length,
+        )
     var t_den0 = perf_counter_ns()
-    var step_cache = MiniMaxH3StepCache(step_cache_enabled)
+    var step_cache = MiniMaxH3StepCache(step_cache_enabled, num_steps)
+    # Audio-protection probe rows: up to 16 evenly sampled AUDIO positions.
+    # The audio band degrades before video under approximation, so the cache
+    # holds these rows to a tighter drift budget (audio veto).
+    var cache_audio_probe_ids = List[Int]()
+    if step_cache_enabled and len(geometry.audio_indices) > 0:
+        var n_audio = len(geometry.audio_indices)
+        var want_rows = 16
+        if n_audio < want_rows:
+            want_rows = n_audio
+        if want_rows == 1:
+            cache_audio_probe_ids.append(geometry.audio_indices[0])
+        else:
+            for i in range(want_rows):
+                cache_audio_probe_ids.append(
+                    geometry.audio_indices[(i * (n_audio - 1)) // (want_rows - 1)]
+                )
     for i in range(num_steps):
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
@@ -1511,9 +1548,14 @@ def main() raises:
             embed.hidden, [1, sequence_length, config.hidden_size], ctx
         )
         var cache_probe_before = List[Float32]()
+        var cache_probe_audio_before = List[Float32]()
         if step_cache.enabled:
             cache_probe_before = minimax_h3_cache_probe_rows(
                 hidden3, sequence_length, config.hidden_size, ctx
+            )
+            cache_probe_audio_before = minimax_h3_cache_probe_given_rows(
+                hidden3, cache_audio_probe_ids, sequence_length,
+                config.hidden_size, ctx,
             )
         var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
         var reused_middle = False
@@ -1538,8 +1580,8 @@ def main() raises:
                         True,
                     )
                 )
-        var block_weight_ns = UInt(0)
-        var block_forward_ns = UInt(0)
+        var block_weight_ns = Int(0)
+        var block_forward_ns = Int(0)
         for layer in range(run_config.num_layers):
             if (
                 step_cache.enabled
@@ -1565,7 +1607,7 @@ def main() raises:
                         "  resident cache: released groupwise tail before"
                         " BF16 quality blocks"
                     )
-            var block_weight_t0 = UInt(0)
+            var block_weight_t0 = Int(0)
             comptime if PROFILE_BLOCKS != 0:
                 block_weight_t0 = perf_counter_ns()
             var block_w: Dict[String, ArcPointer[Tensor]]
@@ -1621,13 +1663,13 @@ def main() raises:
             comptime if PROFILE_BLOCKS != 0:
                 ctx.synchronize()
                 block_weight_ns += perf_counter_ns() - block_weight_t0
-            var block_forward_t0 = UInt(0)
+            var block_forward_t0 = Int(0)
             comptime if PROFILE_BLOCKS != 0:
                 block_forward_t0 = perf_counter_ns()
             hidden3 = minimax_h3_block_forward_dynamic[H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
-                attention_backend,
+                attention_backend, sage_scratch,
             )
             # At the 15-second base-area product geometry the reusable tail
             # store and the long-sequence attention temporaries otherwise
@@ -1658,8 +1700,13 @@ def main() raises:
                 var cache_probe_after = minimax_h3_cache_probe_rows(
                     hidden3, sequence_length, config.hidden_size, ctx
                 )
+                var cache_probe_audio_after = minimax_h3_cache_probe_given_rows(
+                    hidden3, cache_audio_probe_ids, sequence_length,
+                    config.hidden_size, ctx,
+                )
                 reused_middle = minimax_h3_cache_should_reuse(
-                    i, cache_probe_before, cache_probe_after, step_cache
+                    i, cache_probe_before, cache_probe_after, step_cache,
+                    cache_probe_audio_before, cache_probe_audio_after,
                 )
                 if reused_middle:
                     minimax_h3_cache_apply_residual_inplace(

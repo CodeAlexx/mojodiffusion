@@ -1,6 +1,6 @@
 # klein_vae_1024_smoke.mojo - FLUX.2/Klein VAE native-size decode smoke.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

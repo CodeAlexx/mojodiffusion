@@ -3,7 +3,7 @@
 # argv: scail2_decode <latent.safetensors> <vae.safetensors> <out_dir> [audio_source]
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.components.artifacts import (

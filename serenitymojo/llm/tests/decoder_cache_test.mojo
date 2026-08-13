@@ -1,6 +1,6 @@
 # Verify KV-cached decode == no-cache forward (token-for-token), and that the
 # final argmax matches HF (" Paris", 12095).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.llm.decoder import KVCache, decode_step
 

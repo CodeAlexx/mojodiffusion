@@ -12,7 +12,7 @@
 # final packed latent, lets the DiT/text tensors drop, then uses the shared 5x5
 # low-memory tiled FLUX decode before writing the PNG.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.image.png import ValueRange, save_png
 from serenitymojo.io.dtype import STDtype

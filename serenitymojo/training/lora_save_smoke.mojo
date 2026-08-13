@@ -9,7 +9,7 @@
 #     pixi run mojo run -I . serenitymojo/training/lora_save_smoke.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import (
     NamedLora,

@@ -11,7 +11,7 @@
 #     --target-accelerator sm_86 -I . \
 #     serenitymojo/training/full_finetune_save_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

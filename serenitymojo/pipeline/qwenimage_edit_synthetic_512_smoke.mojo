@@ -4,7 +4,7 @@
 # synthetic target noise + synthetic single-reference latents -> edit DiT CFG
 # with reference `t_ref=0` -> target slice -> Qwen image VAE decode.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

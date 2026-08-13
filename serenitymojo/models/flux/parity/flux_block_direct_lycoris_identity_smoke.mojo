@@ -5,7 +5,7 @@
 # weights, so the direct double and single blocks should match the base block
 # without dense full-delta carriers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 
 from serenitymojo.parity import ParityHarness

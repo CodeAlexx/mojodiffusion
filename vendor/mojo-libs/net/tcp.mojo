@@ -48,7 +48,7 @@ struct TCPStream(Movable):
         if n < 0:
             buf.free()
             raise Error("recv failed: " + errno_str())
-        var out = String(StringSlice(ptr=buf, length=n))
+        var out = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=buf, length=n)))
         buf.free()
         return out
 

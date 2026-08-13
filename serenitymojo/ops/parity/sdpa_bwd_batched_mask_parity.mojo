@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/ops/parity/sdpa_bwd_batched_mask_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos, isfinite, sin, sqrt
 
 from serenitymojo.io.dtype import STDtype

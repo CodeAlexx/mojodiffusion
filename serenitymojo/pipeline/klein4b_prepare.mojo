@@ -35,7 +35,7 @@
 #                      /home/alex/mojodiffusion/output/eri2_klein_cache 115
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.sys import argv
 

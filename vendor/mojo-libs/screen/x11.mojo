@@ -11,7 +11,6 @@
 
 from std.ffi import OwnedDLHandle as DLHandle
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from std.os import getenv
 
 from image.buffer import Image

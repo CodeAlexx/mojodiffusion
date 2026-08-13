@@ -1,6 +1,6 @@
 # lance_t2v_smoke.mojo - compile/run gate for shared Lance sampling helpers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

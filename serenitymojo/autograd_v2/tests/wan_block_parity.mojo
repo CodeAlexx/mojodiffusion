@@ -29,7 +29,7 @@
 # Run:   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib \
 #   /tmp/wan_block_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

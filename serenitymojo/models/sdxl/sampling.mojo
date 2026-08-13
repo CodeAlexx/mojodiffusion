@@ -16,7 +16,7 @@
 #
 # All NHWC, F32. Conv filters RSCF [Kh,Kw,Cin,Cout].
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from std.collections import Optional

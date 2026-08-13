@@ -40,10 +40,10 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import ceildiv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
-from layout import Layout, LayoutTensor
+from layout import Layout, LayoutTensor, TileTensor, row_major
 from layout.runtime_layout import RuntimeLayout
 from nn.conv.conv import conv3d_gpu_naive_ndhwc_qrscf, conv3d_cudnn
 from serenitymojo.tensor import Tensor
@@ -62,9 +62,11 @@ comptime _CONV_BS = 16  # 3D conv block tile (block_size x block_size)
 def _bias_add_kernel_f32(
     o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
@@ -77,9 +79,11 @@ def _bias_add_kernel_f32(
 def _bias_add_kernel_bf16(
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
@@ -94,9 +98,11 @@ def _bias_add_kernel_bf16(
 def _bias_add_kernel_f16(
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
@@ -206,27 +212,45 @@ def conv3d_fcqrs_cudnn(
     var padding = IndexList[3](pad_d, pad_h, pad_w)
 
     if dt == DType.float32:
-        var X = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
+        var X = TileTensor(
+            Pointer[Scalar[DType.float32], MutAnyOrigin](
+                unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+            ),
+            row_major(n, di, hi, wi, cin),
         )
-        var F = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), filt_rl
+        var F = TileTensor(
+            Pointer[Scalar[DType.float32], MutAnyOrigin](
+                unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+            ),
+            row_major(cout, cin, q, r, s),
         )
-        var O = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        var O = TileTensor(
+            Pointer[Scalar[DType.float32], MutAnyOrigin](
+                unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+            ),
+            row_major(n, do_, ho, wo, cout),
         )
         conv3d_cudnn[DType.float32, DType.float32, DType.float32](
             X, F, O, stride, dilation, padding, 1, ctx
         )
     else:
-        var X = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), in_rl
+        var X = TileTensor(
+            Pointer[Scalar[DType.float16], MutAnyOrigin](
+                unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+            ),
+            row_major(n, di, hi, wi, cin),
         )
-        var F = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), filt_rl
+        var F = TileTensor(
+            Pointer[Scalar[DType.float16], MutAnyOrigin](
+                unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+            ),
+            row_major(cout, cin, q, r, s),
         )
-        var O = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        var O = TileTensor(
+            Pointer[Scalar[DType.float16], MutAnyOrigin](
+                unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+            ),
+            row_major(n, do_, ho, wo, cout),
         )
         conv3d_cudnn[DType.float16, DType.float16, DType.float16](
             X, F, O, stride, dilation, padding, 1, ctx
@@ -245,33 +269,51 @@ def conv3d_fcqrs_cudnn(
         var grid = (rows * cout + _BLOCK - 1) // _BLOCK
         if dt == DType.float32:
             var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[Float32](), b_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
             var O2 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-            )
-            ctx.enqueue_function[_bias_add_kernel_f32, _bias_add_kernel_f32](
-                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+            ctx.enqueue_function[_bias_add_kernel_f32](
+                O2, bias_lt, Int32(rows), Int32(cout), grid_dim=grid, block_dim=_BLOCK
             )
         elif dt == DType.bfloat16:
             var bias_lt = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
             var O2 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-            )
-            ctx.enqueue_function[_bias_add_kernel_bf16, _bias_add_kernel_bf16](
-                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+            ctx.enqueue_function[_bias_add_kernel_bf16](
+                O2, bias_lt, Int32(rows), Int32(cout), grid_dim=grid, block_dim=_BLOCK
             )
         else:
             var bias_lt = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[Float16](), b_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
             var O2 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float16](), o_rl
-            )
-            ctx.enqueue_function[_bias_add_kernel_f16, _bias_add_kernel_f16](
-                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=o_rl,
+    )
+            ctx.enqueue_function[_bias_add_kernel_f16](
+                O2, bias_lt, Int32(rows), Int32(cout), grid_dim=grid, block_dim=_BLOCK
             )
         ctx.synchronize()
 
@@ -359,16 +401,25 @@ def conv3d(
             _CONV_BS, None,
         ]
         var X = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var F = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), filt_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=filt_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[knl, knl](
-            X, F, O, stride, dilation, padding, 1,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[knl](
+            X, F, O, stride, dilation, padding, Int32(1),
             grid_dim=(gx, gy, n), block_dim=(_CONV_BS, _CONV_BS),
         )
     elif dt == DType.bfloat16:
@@ -378,16 +429,25 @@ def conv3d(
             _CONV_BS, None,
         ]
         var X = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var F = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), filt_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=filt_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[knl, knl](
-            X, F, O, stride, dilation, padding, 1,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[knl](
+            X, F, O, stride, dilation, padding, Int32(1),
             grid_dim=(gx, gy, n), block_dim=(_CONV_BS, _CONV_BS),
         )
     else:  # float16
@@ -397,16 +457,25 @@ def conv3d(
             _CONV_BS, None,
         ]
         var X = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var F = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), filt_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=filt_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
-        )
-        ctx.enqueue_function[knl, knl](
-            X, F, O, stride, dilation, padding, 1,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[knl](
+            X, F, O, stride, dilation, padding, Int32(1),
             grid_dim=(gx, gy, n), block_dim=(_CONV_BS, _CONV_BS),
         )
     ctx.synchronize()
@@ -424,33 +493,51 @@ def conv3d(
         var grid = (rows * cout + _BLOCK - 1) // _BLOCK
         if dt == DType.float32:
             var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[Float32](), b_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
             var O2 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-            )
-            ctx.enqueue_function[_bias_add_kernel_f32, _bias_add_kernel_f32](
-                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+            ctx.enqueue_function[_bias_add_kernel_f32](
+                O2, bias_lt, Int32(rows), Int32(cout), grid_dim=grid, block_dim=_BLOCK
             )
         elif dt == DType.bfloat16:
             var bias_lt = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
             var O2 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-            )
-            ctx.enqueue_function[_bias_add_kernel_bf16, _bias_add_kernel_bf16](
-                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+            ctx.enqueue_function[_bias_add_kernel_bf16](
+                O2, bias_lt, Int32(rows), Int32(cout), grid_dim=grid, block_dim=_BLOCK
             )
         else:
             var bias_lt = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[Float16](), b_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
             var O2 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float16](), o_rl
-            )
-            ctx.enqueue_function[_bias_add_kernel_f16, _bias_add_kernel_f16](
-                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=o_rl,
+    )
+            ctx.enqueue_function[_bias_add_kernel_f16](
+                O2, bias_lt, Int32(rows), Int32(cout), grid_dim=grid, block_dim=_BLOCK
             )
         ctx.synchronize()
 

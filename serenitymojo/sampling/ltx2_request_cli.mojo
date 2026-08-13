@@ -9,7 +9,6 @@ The compiled runner either admits those exact values or fails before loading
 the model; it never substitutes a smaller smoke profile.
 """
 
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
 from std.sys import argv

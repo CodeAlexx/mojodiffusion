@@ -4,7 +4,7 @@
 # tiled Wan/Qwen-style image VAE and writes a 1024 PNG. This proves the VAE half
 # of Anima's image path without porting MiniTrainDIT or prompt encoders.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.image.png import ValueRange, save_png
 from serenitymojo.io.dtype import STDtype

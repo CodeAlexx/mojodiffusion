@@ -40,8 +40,8 @@
 #
 # Mojo 1.0.0b1. Inference-only. No autograd, no Python at runtime.
 
-from collections import List
-from std.gpu.host import DeviceContext
+from std.collections import List
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar

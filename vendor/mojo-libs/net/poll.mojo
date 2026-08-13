@@ -12,7 +12,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from net.syscalls import sys_close, errno_str
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]

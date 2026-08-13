@@ -17,8 +17,8 @@
 #      pixi run mojo run -I . -Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda \
 #        serenitymojo/models/vae/parity/mageflow_vae_encode_probe.mojo
 
-from std.gpu.host import DeviceContext
-from math import sqrt
+from max.gpu.host import DeviceContext
+from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

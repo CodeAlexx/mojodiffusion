@@ -11,7 +11,7 @@
 #   /home/alex/serenityflow-v2/.venv/bin/python serenitymojo/training/parity/opt_schedulefree_oracle.py
 #   pixi run mojo run -I . serenitymojo/training/parity/opt_schedulefree_parity.mojo
 
-from sys import argv
+from std.sys import argv
 from serenitymojo.parity import ParityHarness
 from serenitymojo.training.opt_schedulefree import RAdamScheduleFree
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

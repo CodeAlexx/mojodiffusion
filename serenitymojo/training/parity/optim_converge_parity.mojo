@@ -37,7 +37,7 @@
 #   pixi run mojo run -I . serenitymojo/training/parity/optim_converge_parity.mojo
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -19,7 +19,7 @@
 # GPT-OSS feature concat [1,16,11520] (the per-layer RMSNorm is applied inside the
 # forward).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import isfinite
 from std.builtin.dtype import DType
 from serenitymojo.tensor import Tensor

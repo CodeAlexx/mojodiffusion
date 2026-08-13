@@ -80,7 +80,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import (
+from max.gpu.host import (
     DeviceContext, HostBuffer, DeviceStream, DeviceEvent,
 )
 from std.collections import List

@@ -6,7 +6,7 @@
 
 from std.collections import List, Optional
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.dtype import STDtype

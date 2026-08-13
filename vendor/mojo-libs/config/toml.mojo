@@ -554,7 +554,7 @@ def _bytes_to_str(b: List[UInt8]) -> String:
     var n = len(b)
     if n == 0:
         return String("")
-    return String(StringSlice(ptr=b.unsafe_ptr(), length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr(), length=n)))
 
 
 def _trim(s: String) -> String:

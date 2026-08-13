@@ -50,7 +50,7 @@
 # and never put Tensor in a collection; SdpaGrads is consume-once (move each
 # field out exactly once); host lists are the Copyable carriers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

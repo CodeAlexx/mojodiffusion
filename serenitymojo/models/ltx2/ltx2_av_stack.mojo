@@ -12,7 +12,7 @@
 # module (can't import), so ported here; scripts/ltx2_av_stack_oracle.py is the
 # numeric reference (gate parity/ltx2_av_stack_parity.mojo, cos>=0.999 F32).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.math import cos as fcos, sin as fsin, exp as fexp, log as flog

@@ -10,7 +10,7 @@
 #     serenitymojo/autograd_v2/tests/ltx2_weight_dtype_probe.mojo -o /tmp/ltx2_weight_dtype_probe
 #   env LD_LIBRARY_PATH=.pixi/envs/default/lib /tmp/ltx2_weight_dtype_probe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.ltx2_dit import LTX2Config, LTX2AVBlockWeights
 from serenitymojo.models.ltx2.ltx2_video_stack import LTX2VideoBlockSource

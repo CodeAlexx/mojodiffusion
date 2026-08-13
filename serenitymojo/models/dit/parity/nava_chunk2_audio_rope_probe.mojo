@@ -1,7 +1,7 @@
 # NAVA chunk 2 (audio 1D rope): rotate first 22 complex dims (44 real) of q
 # [1,34,24,128], passthrough last 84; positions = token*0.24 (temporal scaling),
 # axes_dims=[44], θ1e4. vs torch rope_apply_1d (qa_rope).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype

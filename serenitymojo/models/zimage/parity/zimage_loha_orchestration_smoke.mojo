@@ -10,7 +10,7 @@
 #     serenitymojo/models/zimage/parity/zimage_loha_orchestration_smoke.mojo \
 #     -o /tmp/zimage_loha_orch && /tmp/zimage_loha_orch
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.zimage.lora_block import ZIMAGE_SLOTS
 from serenitymojo.models.zimage.zimage_loha_stack import (

@@ -3,7 +3,6 @@
 #   pixi run --manifest-path /home/alex/rill/pixi.toml mojo run -I . http/tests/forms_test.mojo
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
 
 from http.cookies import (
@@ -227,7 +226,7 @@ def _write_hex(path: String, data: List[UInt8]) raises:
         var b = Int(data[i])
         out[i * 2] = hb[(b >> 4) & 0xF]
         out[i * 2 + 1] = hb[b & 0xF]
-    var s = String(StringSlice(ptr=TBytePtr(unsafe_from_address=Int(out)), length=len(data) * 2))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=TBytePtr(unsafe_from_address=Int(out)), length=len(data) * 2)))
     out.free()
     var f = open(path, "w")
     f.write(s)

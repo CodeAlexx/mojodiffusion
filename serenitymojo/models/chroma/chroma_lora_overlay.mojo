@@ -12,7 +12,7 @@
 # linear path.
 
 from std.collections import Dict, List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.sharded import ShardedSafeTensors

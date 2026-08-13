@@ -14,7 +14,7 @@
 #   expect: "T0 OK" with grad dtype=BF16, finite=true for both inputs.
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.autograd import Tape, backward

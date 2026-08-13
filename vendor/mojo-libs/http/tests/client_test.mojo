@@ -5,7 +5,7 @@
 #
 # Run via: python3 http/tests/client_test_driver.py  (it builds+runs this)
 
-from sys import argv
+from std.sys import argv
 from http.client import (
     get,
     request,

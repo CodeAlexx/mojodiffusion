@@ -39,7 +39,7 @@
 # output_dtype path for a bf16 run.
 
 from std.os import makedirs
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 

@@ -60,12 +60,13 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.vec_rms_norm import vec_rms_norm
+from serenitymojo.ops.norm import rms_norm_modulate_bf16
 from serenitymojo.ops.activations import swiglu_packed_value_gate
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.int8_quant import int8_dequant_groupwise_to_bf16
@@ -77,8 +78,10 @@ from serenitymojo.ops.attention_flash import (
     sdpa_flash_infer_fwd_cross_dynamic,
 )
 from serenitymojo.ops.sage_attention_int8 import (
+    SageInt8Scratch,
     sage_attention_int8_fwd,
     sage_attention_int8_fwd_dynamic,
+    sage_attention_int8_fwd_scratch,
 )
 from serenitymojo.models.dit.minimax_h3_int8_linear import (
     MiniMaxH3Int8QKV,
@@ -128,11 +131,23 @@ def _minimax_h3_attention_dispatch(
     scale: Float32,
     ctx: DeviceContext,
     attention_backend: Int,
+    sage_scratch: Optional[SageInt8Scratch] = None,
 ) raises -> Tensor:
-    """Exact cuDNN, raw Sage, or Sage with an exact query prefix."""
+    """Exact cuDNN, raw Sage, or Sage with an exact query prefix.
+
+    When `sage_scratch` is provided, Sage runs with zero device allocations
+    through the run-lifetime scratch; without it, every call allocates and
+    frees its own buffers (gate/probe surface — near the 24 GiB envelope
+    that churn intermittently OOMs mid-denoise, so product runners must
+    pass scratch).
+    """
     if attention_backend == MINIMAX_H3_ATTN_CUDNN:
         return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
     if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+        if sage_scratch:
+            return sage_attention_int8_fwd_scratch(
+                q, k, v, scale, sage_scratch.value(), ctx
+            )
         return sage_attention_int8_fwd_dynamic(q, k, v, scale, ctx)
     if attention_backend >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
         var prefix_rows = (
@@ -145,9 +160,15 @@ def _minimax_h3_attention_dispatch(
         # Compute the dominant video-query slab once with Sage, then replace
         # the small text+audio prefix with exact cross-SDPA against the same
         # complete K/V document.  T2VA packs rows as text|audio|video.
-        var approximate = sage_attention_int8_fwd_dynamic(
-            q, k, v, scale, ctx
-        )
+        var approximate: Tensor
+        if sage_scratch:
+            approximate = sage_attention_int8_fwd_scratch(
+                q, k, v, scale, sage_scratch.value(), ctx
+            )
+        else:
+            approximate = sage_attention_int8_fwd_dynamic(
+                q, k, v, scale, ctx
+            )
         var q_prefix = slice(q, 1, 0, prefix_rows, ctx)
         var exact_prefix = sdpa_flash_infer_fwd_cross_dynamic(
             q_prefix, k, v, scale, ctx
@@ -597,14 +618,14 @@ def _minimax_h3_block_swiglu_linear(
     low_headroom: Bool,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    """FC1 plus SwiGLU, fusing the W8A8 long-sequence path.
+    """FC1 plus SwiGLU, fusing the exact row-scale W8A8 path.
 
-    The ordinary path remains the accepted projection followed by the
-    accepted activation. At S>=60k, direct W8A8 can preserve those exact BF16
-    boundaries while avoiding the otherwise full `[S, 2*ffn]` allocation.
+    Direct W8A8 preserves the accepted projection-BF16 and activation-BF16
+    boundaries while avoiding the full `[S, 2*ffn]` allocation. Other weight
+    formats retain the accepted projection followed by the accepted activation.
     """
     ref weight = weights[name][]
-    if low_headroom and weight.dtype() == STDtype.I8:
+    if weight.dtype() == STDtype.I8:
         var scale_name = name + String(".scale")
         if scale_name in weights:
             ref weight_scale = weights[scale_name][]
@@ -625,9 +646,9 @@ def _minimax_h3_block_residual_linear(
     low_headroom: Bool,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    """FC2 plus residual gate, fusing the W8A8 long-sequence path."""
+    """FC2 plus residual gate, fusing the exact row-scale W8A8 path."""
     ref weight = weights[name][]
-    if low_headroom and weight.dtype() == STDtype.I8:
+    if weight.dtype() == STDtype.I8:
         var scale_name = name + String(".scale")
         if scale_name in weights:
             ref weight_scale = weights[scale_name][]
@@ -637,6 +658,25 @@ def _minimax_h3_block_residual_linear(
                 )
     var projected = _minimax_h3_block_linear(x, weights, name, ctx)
     return residual_gate(residual, gate, projected, ctx)
+
+
+def _minimax_h3_rms_norm_modulate(
+    x: Tensor,
+    weight: Tensor,
+    scale: Tensor,
+    shift: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Fuse the production BF16 RMSNorm/AdaLN pair; preserve all fallbacks."""
+    if x.dtype() == STDtype.BF16 and weight.dtype() == STDtype.BF16 \
+            and scale.dtype() == STDtype.BF16 \
+            and shift.dtype() == STDtype.BF16:
+        return rms_norm_modulate_bf16(
+            x, weight, scale, shift, eps, ctx
+        )
+    var normalized = vec_rms_norm(x, weight, eps, ctx)
+    return modulate(normalized, scale, shift, ctx)
 
 
 def _minimax_h3_gather_mod_chunk(
@@ -694,10 +734,10 @@ def _minimax_h3_prepare_low_headroom_mlp(
     var gate = _minimax_h3_gather_mod_chunk(
         mod, adaln_indices, 5, hidden, ctx
     )
-    var n2 = vec_rms_norm(
-        x1, weights[prefix + "norm2.weight"][], norm_eps, ctx
+    var mlp_in = _minimax_h3_rms_norm_modulate(
+        x1, weights[prefix + "norm2.weight"][], scale, shift,
+        norm_eps, ctx,
     )
-    var mlp_in = modulate(n2, scale, shift, ctx)
     ctx.synchronize()
     cu_mempool_trim_current(0)
     var act = _minimax_h3_block_swiglu_linear(
@@ -727,6 +767,7 @@ def _minimax_h3_low_headroom_attention[
     rotary_dim: Int,
     ctx: DeviceContext,
     attention_backend: Int,
+    sage_scratch: Optional[SageInt8Scratch] = None,
 ) raises -> Tensor:
     """Long-sequence attention in a lifetime isolated from the MLP.
 
@@ -744,8 +785,10 @@ def _minimax_h3_low_headroom_attention[
     var gate = _minimax_h3_gather_mod_chunk(
         mod, adaln_indices, 2, hidden, ctx
     )
-    var n1 = vec_rms_norm(x, weights[prefix + "norm1.weight"][], norm_eps, ctx)
-    var attn_in = modulate(n1, scale_msa, shift, ctx)
+    var attn_in = _minimax_h3_rms_norm_modulate(
+        x, weights[prefix + "norm1.weight"][], scale_msa, shift,
+        norm_eps, ctx,
+    )
     ctx.synchronize()
 
     comptime if HeadDim != 128:
@@ -754,7 +797,7 @@ def _minimax_h3_low_headroom_attention[
                 "minimax_h3_block_forward: sage-int8 requires head_dim=128"
             )
     var attn: Tensor
-    var attn_scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
+    var attn_scale = Float32(1.0) / (Float32(head_dim) ** Float32(0.5))
     var qkv_name = prefix + "attn.qkv_proj.weight"
     ref qkv_weight = weights[qkv_name][]
     if qkv_weight.dtype() == STDtype.BF16 or (
@@ -799,7 +842,7 @@ def _minimax_h3_low_headroom_attention[
                 )
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx,
-            attention_backend,
+            attention_backend, sage_scratch,
         )
         # Consume Q/K/V before the branch-local owner is destroyed.
         ctx.synchronize()
@@ -834,14 +877,13 @@ def _minimax_h3_low_headroom_attention[
                     "minimax_h3_block_forward: sage-int8 requires head_dim=128"
                 )
         attn = _minimax_h3_attention_dispatch(
-            q4, k4, v4, attn_scale, ctx, attention_backend,
+            q4, k4, v4, attn_scale, ctx, attention_backend, sage_scratch,
         )
         ctx.synchronize()
     var merged = reshape_owned(attn^, [1, S, inner])
-    var attn_out = _minimax_h3_block_linear(
-        merged, weights, prefix + "attn.out_proj.weight", ctx
+    var x1 = _minimax_h3_block_residual_linear(
+        merged, x, gate, weights, prefix + "attn.out_proj.weight", True, ctx
     )
-    var x1 = residual_gate(x, gate, attn_out, ctx)
     ctx.synchronize()
     cu_mempool_trim_current(0)
     return x1^
@@ -861,13 +903,14 @@ def _minimax_h3_block_forward_low_headroom[
     rotary_dim: Int,
     ctx: DeviceContext,
     attention_backend: Int,
+    sage_scratch: Optional[SageInt8Scratch] = None,
 ) raises -> Tensor:
     var prefix = minimax_h3_block_prefix(layer)
     var x1 = _minimax_h3_low_headroom_attention[Heads, HeadDim](
         x, weights, prefix, mod, adaln_indices, config.hidden_size,
         config.inner_dim(), config.num_attention_heads,
         config.attention_head_dim, config.norm_eps, config.qk_norm_eps,
-        cos, sin, rotary_dim, ctx, attention_backend,
+        cos, sin, rotary_dim, ctx, attention_backend, sage_scratch,
     )
     # The attention helper's local QKV/rope/SDPA tensors are destroyed only
     # after it returns. Trim here—not inside that helper—so their pool pages
@@ -895,10 +938,10 @@ def _minimax_h3_block_forward_low_headroom[
         var gate = _minimax_h3_gather_mod_chunk(
             mod, adaln_indices, 5, config.hidden_size, ctx
         )
-        var n2 = vec_rms_norm(
-            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        var mlp_in = _minimax_h3_rms_norm_modulate(
+            x1, weights[prefix + "norm2.weight"][], scale_mlp, shift,
+            config.norm_eps, ctx,
         )
-        var mlp_in = modulate(n2, scale_mlp, shift, ctx)
         ctx.synchronize()
         cu_mempool_trim_current(0)
         return minimax_h3_int8_mlp_residual_inplace(
@@ -920,10 +963,10 @@ def _minimax_h3_block_forward_low_headroom[
         var gate = _minimax_h3_gather_mod_chunk(
             mod, adaln_indices, 5, config.hidden_size, ctx
         )
-        var n2 = vec_rms_norm(
-            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        var mlp_in = _minimax_h3_rms_norm_modulate(
+            x1, weights[prefix + "norm2.weight"][], scale_mlp, shift,
+            config.norm_eps, ctx,
         )
-        var mlp_in = modulate(n2, scale_mlp, shift, ctx)
         ctx.synchronize()
         cu_mempool_trim_current(0)
         return minimax_h3_groupwise_mlp_residual_inplace(
@@ -942,10 +985,10 @@ def _minimax_h3_block_forward_low_headroom[
         var gate = _minimax_h3_gather_mod_chunk(
             mod, adaln_indices, 5, config.hidden_size, ctx
         )
-        var n2 = vec_rms_norm(
-            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
+        var mlp_in = _minimax_h3_rms_norm_modulate(
+            x1, weights[prefix + "norm2.weight"][], scale_mlp, shift,
+            config.norm_eps, ctx,
         )
-        var mlp_in = modulate(n2, scale_mlp, shift, ctx)
         ctx.synchronize()
         cu_mempool_trim_current(0)
         return minimax_h3_bf16_mlp_residual_inplace(
@@ -977,6 +1020,7 @@ def _minimax_h3_block_forward_impl[
     rotary_dim: Int,
     ctx: DeviceContext,
     attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
+    sage_scratch: Optional[SageInt8Scratch] = None,
 ) raises -> Tensor:
     """One `MiniMaxH3TransformerBlock`. Mirrors `models/minimax_h3/
     block_forward.mojo::_transformer_block` op-for-op (see that file for the
@@ -1070,7 +1114,7 @@ def _minimax_h3_block_forward_impl[
     if low_headroom:
         return _minimax_h3_block_forward_low_headroom[Heads, HeadDim](
             x, weights, layer, config, mod, adaln_indices, cos, sin,
-            rotary_dim, ctx, attention_backend,
+            rotary_dim, ctx, attention_backend, sage_scratch,
         )
     var shift_msa: Tensor
     var scale_msa: Tensor
@@ -1101,14 +1145,16 @@ def _minimax_h3_block_forward_impl[
         gate_mlp = Optional[Tensor](gate_mlp_t^)
 
     # ── Self-attention branch ──
-    var n1 = vec_rms_norm(x, weights[prefix + "norm1.weight"][], config.norm_eps, ctx)
-    var attn_in = modulate(n1, scale_msa, shift_msa, ctx)
+    var attn_in = _minimax_h3_rms_norm_modulate(
+        x, weights[prefix + "norm1.weight"][], scale_msa, shift_msa,
+        config.norm_eps, ctx,
+    )
     if low_headroom:
         # `attn_in` is now complete; release n1 plus shift/scale before the
         # 3*inner QKV output is allocated.
         ctx.synchronize()
 
-    var scale = Float32(1.0) / (Float32(head_dim) ** 0.5)
+    var scale = Float32(1.0) / (Float32(head_dim) ** Float32(0.5))
     # Dh=128 on sm_86 fails to instantiate the SDK's `flash_attention` MMA
     # tiling (serenitymojo/MAP.md gotcha 4); this is the cuDNN v9 shim
     # instead, which carries no such restriction. No mask, no causal — H3 is
@@ -1153,7 +1199,7 @@ def _minimax_h3_block_forward_impl[
         )
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v,
-            scale, ctx, attention_backend,
+            scale, ctx, attention_backend, sage_scratch,
         )
         # The split owner is branch-local.  Finish its final consumer before
         # its three buffers are returned to the stream-ordered allocator.
@@ -1178,15 +1224,15 @@ def _minimax_h3_block_forward_impl[
             cos, sin, heads, rotary_dim, config.qk_norm_eps, ctx,
         )
         attn = _minimax_h3_attention_dispatch(
-            q4, k4, v4, scale, ctx, attention_backend,
+            q4, k4, v4, scale, ctx, attention_backend, sage_scratch,
         )
         ctx.synchronize()
                                                                         # [1, S, heads, head_dim] bf16
     var merged = reshape_owned(attn^, [1, S, inner])
-    var attn_out = _minimax_h3_block_linear(
-        merged, weights, prefix + "attn.out_proj.weight", ctx
+    var x1 = _minimax_h3_block_residual_linear(
+        merged, x, gate_msa, weights, prefix + "attn.out_proj.weight", False,
+        ctx,
     )
-    var x1 = residual_gate(x, gate_msa, attn_out, ctx)
 
     # ── MLP branch ──
     var x2: Tensor
@@ -1205,11 +1251,9 @@ def _minimax_h3_block_forward_impl[
             prefix + "mlp.fc2.weight", True, ctx,
         )
     else:
-        var n2 = vec_rms_norm(
-            x1, weights[prefix + "norm2.weight"][], config.norm_eps, ctx
-        )
-        var mlp_in = modulate(
-            n2, scale_mlp.value(), shift_mlp.value(), ctx
+        var mlp_in = _minimax_h3_rms_norm_modulate(
+            x1, weights[prefix + "norm2.weight"][], scale_mlp.value(),
+            shift_mlp.value(), config.norm_eps, ctx,
         )
         # fc1 is swapped to [value;gate] by the transformed loader.
         var act = _minimax_h3_block_swiglu_linear(
@@ -1236,6 +1280,7 @@ def minimax_h3_block_forward[
     rotary_dim: Int,
     ctx: DeviceContext,
     attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
+    sage_scratch: Optional[SageInt8Scratch] = None,
 ) raises -> Tensor:
     """Static-S compatibility surface for parity gates and existing callers."""
     var x_shape = x.shape()
@@ -1243,7 +1288,7 @@ def minimax_h3_block_forward[
         raise Error("minimax_h3_block_forward: runtime S != static S")
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
-        ctx, attention_backend,
+        ctx, attention_backend, sage_scratch,
     )
 
 
@@ -1261,9 +1306,10 @@ def minimax_h3_block_forward_dynamic[
     rotary_dim: Int,
     ctx: DeviceContext,
     attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
+    sage_scratch: Optional[SageInt8Scratch] = None,
 ) raises -> Tensor:
     """Runtime-S product surface used by arbitrary H3 canvas geometry."""
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
-        ctx, attention_backend,
+        ctx, attention_backend, sage_scratch,
     )

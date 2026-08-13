@@ -32,7 +32,7 @@
 #
 # Mojo 1.0.0b1.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx, grid_dim, block_dim
 from std.math import isfinite
 from std.memory import alloc
@@ -397,16 +397,25 @@ def save_rgb24_frame(
 def _rgb24_from_bcthw_f32(
     x: LayoutTensor[DType.float32, _RGB_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
-    frames: Int,
-    source_height: Int,
-    source_width: Int,
-    output_height: Int,
-    output_width: Int,
-    crop_y: Int,
-    crop_x: Int,
-    range_tag: Int,
-    n: Int,
+    frames_w: Int32,
+    source_height_w: Int32,
+    source_width_w: Int32,
+    output_height_w: Int32,
+    output_width_w: Int32,
+    crop_y_w: Int32,
+    crop_x_w: Int32,
+    range_tag_w: Int32,
+    n_w: Int64,
 ):
+    var frames = Int(frames_w)
+    var source_height = Int(source_height_w)
+    var source_width = Int(source_width_w)
+    var output_height = Int(output_height_w)
+    var output_width = Int(output_width_w)
+    var crop_y = Int(crop_y_w)
+    var crop_x = Int(crop_x_w)
+    var range_tag = Int(range_tag_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var source_plane = source_height * source_width
@@ -442,16 +451,25 @@ def _rgb24_from_bcthw_f32(
 def _rgb24_from_bcthw_bf16(
     x: LayoutTensor[DType.bfloat16, _RGB_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
-    frames: Int,
-    source_height: Int,
-    source_width: Int,
-    output_height: Int,
-    output_width: Int,
-    crop_y: Int,
-    crop_x: Int,
-    range_tag: Int,
-    n: Int,
+    frames_w: Int32,
+    source_height_w: Int32,
+    source_width_w: Int32,
+    output_height_w: Int32,
+    output_width_w: Int32,
+    crop_y_w: Int32,
+    crop_x_w: Int32,
+    range_tag_w: Int32,
+    n_w: Int64,
 ):
+    var frames = Int(frames_w)
+    var source_height = Int(source_height_w)
+    var source_width = Int(source_width_w)
+    var output_height = Int(output_height_w)
+    var output_width = Int(output_width_w)
+    var crop_y = Int(crop_y_w)
+    var crop_x = Int(crop_x_w)
+    var range_tag = Int(range_tag_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var source_plane = source_height * source_width
@@ -487,16 +505,25 @@ def _rgb24_from_bcthw_bf16(
 def _rgb24_from_bcthw_f16(
     x: LayoutTensor[DType.float16, _RGB_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin],
-    frames: Int,
-    source_height: Int,
-    source_width: Int,
-    output_height: Int,
-    output_width: Int,
-    crop_y: Int,
-    crop_x: Int,
-    range_tag: Int,
-    n: Int,
+    frames_w: Int32,
+    source_height_w: Int32,
+    source_width_w: Int32,
+    output_height_w: Int32,
+    output_width_w: Int32,
+    crop_y_w: Int32,
+    crop_x_w: Int32,
+    range_tag_w: Int32,
+    n_w: Int64,
 ):
+    var frames = Int(frames_w)
+    var source_height = Int(source_height_w)
+    var source_width = Int(source_width_w)
+    var output_height = Int(output_height_w)
+    var output_width = Int(output_width_w)
+    var crop_y = Int(crop_y_w)
+    var crop_x = Int(crop_x_w)
+    var range_tag = Int(range_tag_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var source_plane = source_height * source_width
@@ -577,36 +604,48 @@ def save_rgb24_video(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n)
     var rl = RuntimeLayout[_RGB_DYN1].row_major(IndexList[1](n))
     var o = LayoutTensor[DType.uint8, _RGB_DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr(), rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=rl,
     )
     var grid = (n + _RGB_BLOCK - 1) // _RGB_BLOCK
     var range_tag = value_range.tag
     var dtype = video.dtype().to_mojo_dtype()
     if dtype == DType.float32:
         var x = LayoutTensor[DType.float32, _RGB_DYN1, MutAnyOrigin](
-            video.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_rgb24_from_bcthw_f32, _rgb24_from_bcthw_f32](
-            x, o, frames, source_height, source_width,
-            target_height, target_width, crop_y, crop_x, range_tag, n,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(video.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rgb24_from_bcthw_f32](
+            x, o, Int32(frames), Int32(source_height), Int32(source_width),
+            Int32(target_height), Int32(target_width), Int32(crop_y), Int32(crop_x), Int32(range_tag), Int64(n),
             grid_dim=grid, block_dim=_RGB_BLOCK,
         )
     elif dtype == DType.bfloat16:
         var x = LayoutTensor[DType.bfloat16, _RGB_DYN1, MutAnyOrigin](
-            video.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_rgb24_from_bcthw_bf16, _rgb24_from_bcthw_bf16](
-            x, o, frames, source_height, source_width,
-            target_height, target_width, crop_y, crop_x, range_tag, n,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(video.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rgb24_from_bcthw_bf16](
+            x, o, Int32(frames), Int32(source_height), Int32(source_width),
+            Int32(target_height), Int32(target_width), Int32(crop_y), Int32(crop_x), Int32(range_tag), Int64(n),
             grid_dim=grid, block_dim=_RGB_BLOCK,
         )
     elif dtype == DType.float16:
         var x = LayoutTensor[DType.float16, _RGB_DYN1, MutAnyOrigin](
-            video.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_rgb24_from_bcthw_f16, _rgb24_from_bcthw_f16](
-            x, o, frames, source_height, source_width,
-            target_height, target_width, crop_y, crop_x, range_tag, n,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(video.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rgb24_from_bcthw_f16](
+            x, o, Int32(frames), Int32(source_height), Int32(source_width),
+            Int32(target_height), Int32(target_width), Int32(crop_y), Int32(crop_x), Int32(range_tag), Int64(n),
             grid_dim=grid, block_dim=_RGB_BLOCK,
         )
     else:

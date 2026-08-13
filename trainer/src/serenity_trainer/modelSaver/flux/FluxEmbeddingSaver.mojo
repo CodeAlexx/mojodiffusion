@@ -6,7 +6,7 @@
 # This file provides plan metadata plus low-level safetensors writes. Tensor
 # storage dtype is preserved unless the explicit dtype override helper is used.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

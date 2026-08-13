@@ -39,7 +39,7 @@
 # F32 toy checkpoint (linked either way); plain `mojo run` cannot link it.)
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

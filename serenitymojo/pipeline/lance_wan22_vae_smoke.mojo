@@ -4,7 +4,7 @@
 # full Wan2.2 decoder body and write a 16x16 RGB PNG. It is a VAE wiring/load
 # gate, not a quality sample.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.image.png import save_png, ValueRange

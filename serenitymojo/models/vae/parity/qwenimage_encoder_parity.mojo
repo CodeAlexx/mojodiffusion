@@ -11,7 +11,7 @@
 # Run: pixi run mojo run -I . serenitymojo/models/vae/parity/qwenimage_encoder_parity.mojo
 # DEV-ONLY: Python never runs here. The .bin files are static host references.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

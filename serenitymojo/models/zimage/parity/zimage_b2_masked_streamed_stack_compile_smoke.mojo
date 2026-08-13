@@ -7,7 +7,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/models/zimage/parity/zimage_b2_masked_streamed_stack_compile_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos, isfinite, sin
 
 from serenitymojo.io.dtype import STDtype

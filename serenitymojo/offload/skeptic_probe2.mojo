@@ -2,7 +2,7 @@
 # double-unload safety. NOT scope code.
 # Run: cd /home/alex/mojodiffusion && pixi run mojo run -I . serenitymojo/offload/skeptic_probe2.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 

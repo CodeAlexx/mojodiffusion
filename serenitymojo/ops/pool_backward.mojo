@@ -37,7 +37,7 @@
 # activation dtype. Single d_x each, so plain `def` returning a `Tensor` (no
 # Movable multi-output struct needed).
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -59,10 +59,20 @@ def _maxpool2d_dx_kernel[dtype: DType](
     grad_y: LayoutTensor[dtype, _DYN1, MutAnyOrigin],  # [N*Ho*Wo*C]
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],       # [N*Hi*Wi*C]
     d_x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],     # [N*Hi*Wi*C]
-    N: Int, Hi: Int, Wi: Int, C: Int,
-    Kh: Int, Kw: Int, Sh: Int, Sw: Int,
-    Ho: Int, Wo: Int,
+    N_w: Int64, Hi_w: Int32, Wi_w: Int32, C_w: Int32,
+    Kh_w: Int32, Kw_w: Int32, Sh_w: Int32, Sw_w: Int32,
+    Ho_w: Int32, Wo_w: Int32,
 ):
+    var N = Int(N_w)
+    var Hi = Int(Hi_w)
+    var Wi = Int(Wi_w)
+    var C = Int(C_w)
+    var Kh = Int(Kh_w)
+    var Kw = Int(Kw_w)
+    var Sh = Int(Sh_w)
+    var Sw = Int(Sw_w)
+    var Ho = Int(Ho_w)
+    var Wo = Int(Wo_w)
     var idx = Int(global_idx.x)
     var total = N * Hi * Wi * C
     if idx >= total:
@@ -127,9 +137,16 @@ def _maxpool2d_dx_kernel[dtype: DType](
 def _upsample_nearest_dx_kernel[dtype: DType](
     grad_out: LayoutTensor[dtype, _DYN1, MutAnyOrigin],  # [N*Ho*Wo*C]
     d_x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],       # [N*Hi*Wi*C]
-    N: Int, Hi: Int, Wi: Int, C: Int,
-    scale: Int, Ho: Int, Wo: Int,
+    N_w: Int64, Hi_w: Int32, Wi_w: Int32, C_w: Int32,
+    scale_w: Int32, Ho_w: Int32, Wo_w: Int32,
 ):
+    var N = Int(N_w)
+    var Hi = Int(Hi_w)
+    var Wi = Int(Wi_w)
+    var C = Int(C_w)
+    var scale = Int(scale_w)
+    var Ho = Int(Ho_w)
+    var Wo = Int(Wo_w)
     var idx = Int(global_idx.x)
     var total = N * Hi * Wi * C
     if idx >= total:
@@ -209,56 +226,74 @@ def maxpool2d_backward[
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var xv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _maxpool2d_dx_kernel[DType.float32],
-            _maxpool2d_dx_kernel[DType.float32],
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_maxpool2d_dx_kernel[DType.float32]](
             gv, xv, dxv,
-            N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(C), Int32(Kh), Int32(Kw), Int32(Sh), Int32(Sw), Int32(Ho), Int32(Wo),
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif dt == DType.bfloat16:
         var xv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var gv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[
-            _maxpool2d_dx_kernel[DType.bfloat16],
-            _maxpool2d_dx_kernel[DType.bfloat16],
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_maxpool2d_dx_kernel[DType.bfloat16]](
             gv, xv, dxv,
-            N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(C), Int32(Kh), Int32(Kw), Int32(Sh), Int32(Sw), Int32(Ho), Int32(Wo),
             grid_dim=grid, block_dim=_BLOCK,
         )
     else:
         var xv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var gv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float16](), g_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[
-            _maxpool2d_dx_kernel[DType.float16],
-            _maxpool2d_dx_kernel[DType.float16],
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_maxpool2d_dx_kernel[DType.float16]](
             gv, xv, dxv,
-            N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(C), Int32(Kh), Int32(Kw), Int32(Sh), Int32(Sw), Int32(Ho), Int32(Wo),
             grid_dim=grid, block_dim=_BLOCK,
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
@@ -310,47 +345,56 @@ def upsample_nearest2d_backward[
     var dt = grad_out.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _upsample_nearest_dx_kernel[DType.float32],
-            _upsample_nearest_dx_kernel[DType.float32],
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_upsample_nearest_dx_kernel[DType.float32]](
             gv, dxv,
-            N, in_h, in_w, C, scale, Ho, Wo,
+            Int64(N), Int32(in_h), Int32(in_w), Int32(C), Int32(scale), Int32(Ho), Int32(Wo),
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif dt == DType.bfloat16:
         var gv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[
-            _upsample_nearest_dx_kernel[DType.bfloat16],
-            _upsample_nearest_dx_kernel[DType.bfloat16],
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_upsample_nearest_dx_kernel[DType.bfloat16]](
             gv, dxv,
-            N, in_h, in_w, C, scale, Ho, Wo,
+            Int64(N), Int32(in_h), Int32(in_w), Int32(C), Int32(scale), Int32(Ho), Int32(Wo),
             grid_dim=grid, block_dim=_BLOCK,
         )
     else:
         var gv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float16](), g_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[
-            _upsample_nearest_dx_kernel[DType.float16],
-            _upsample_nearest_dx_kernel[DType.float16],
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_upsample_nearest_dx_kernel[DType.float16]](
             gv, dxv,
-            N, in_h, in_w, C, scale, Ho, Wo,
+            Int64(N), Int32(in_h), Int32(in_w), Int32(C), Int32(scale), Int32(Ho), Int32(Wo),
             grid_dim=grid, block_dim=_BLOCK,
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)

@@ -26,7 +26,6 @@
 # =============================================================================
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from builtin.type_aliases import MutExternalOrigin
 
 
 # ---------- backend FFI helpers (idioms copied from keyframe_editor.mojo) ----------

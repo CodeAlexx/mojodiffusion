@@ -42,7 +42,7 @@
 
 from std.collections import List
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.builtin.dtype import DType
 
 from serenitymojo.tensor import Tensor

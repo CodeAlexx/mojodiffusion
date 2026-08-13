@@ -30,7 +30,7 @@
 # HEAVY GPU. Peak VRAM is also cross-checked via nvidia-smi by the wrapper that
 # launches this binary.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, isfinite
 
 from serenitymojo.tensor import Tensor

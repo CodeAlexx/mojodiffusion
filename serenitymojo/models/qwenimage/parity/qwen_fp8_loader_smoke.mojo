@@ -4,7 +4,7 @@
 # Qwen loader does not route F8_E4M3 checkpoint storage through the generic
 # F32/BF16 cast helper, and that the runtime tensor boundary is BF16.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.qwenimage.weights import load_qwen_tensor_bf16, load_qwen_host_bf16

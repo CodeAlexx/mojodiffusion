@@ -8,7 +8,7 @@
 # This is intentionally a bounded gate. The native 1024 full decoder is too expensive
 # for a smoke with the current naive NHWC conv backend.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.zimage_l2p_contract import (

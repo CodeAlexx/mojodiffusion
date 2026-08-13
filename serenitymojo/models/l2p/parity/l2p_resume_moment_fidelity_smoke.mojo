@@ -34,7 +34,7 @@
 #     -o /tmp/gate_l2p
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import (

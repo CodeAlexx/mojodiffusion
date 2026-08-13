@@ -40,7 +40,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. *** CODE-ONLY: compile-verified; NOT executed. ***
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, sin as fsin, pow as fpow, pi
 
 from serenitymojo.tensor import Tensor

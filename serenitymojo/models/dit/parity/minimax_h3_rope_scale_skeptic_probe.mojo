@@ -20,7 +20,7 @@
 #
 #   pixi run mojo run -I . serenitymojo/models/dit/parity/minimax_h3_rope_scale_skeptic_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.minimax_h3.dit_frontend import (

@@ -19,7 +19,7 @@ comptime CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = Int32(102)
 comptime CU_EVENT_DISABLE_TIMING = UInt32(2)
 
 
-def _ptr[pointee: AnyType](p: UnsafePointer[pointee, MutAnyOrigin]) -> BytePtr:
+def _ptr[pointee: AnyType, o: Origin, //](p: UnsafePointer[pointee, o]) -> BytePtr:
     return BytePtr(unsafe_from_address=Int(p))
 
 

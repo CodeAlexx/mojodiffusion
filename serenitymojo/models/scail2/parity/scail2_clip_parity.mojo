@@ -1,7 +1,7 @@
 # Deterministic SCAIL-2 CLIP visual block parity against scail2_clip_oracle.py.
 # This is a development gate; production math is scail2_clip_vision.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.sys import argv
 

@@ -24,7 +24,7 @@
 
 from std.collections import List
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.training.grad_accum import (

@@ -41,7 +41,7 @@
 # the loss replay (sdxl_train_ref_loss_replay, PASS @ 1.4e-6).
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

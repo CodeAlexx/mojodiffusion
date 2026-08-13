@@ -7,7 +7,6 @@
 # unlike multipart, which is binary and lives in multipart.mojo.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime CkBytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -19,7 +18,7 @@ def _sub(s: String, start: Int, end: Int) -> String:
         return String("")
     var sp = s.as_bytes()
     var base = CkBytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 fn _ck_hexv(c: Int) -> Int:
@@ -59,7 +58,7 @@ def _pct_decode(s: String, plus_as_space: Bool) -> String:
         out[w] = UInt8(c)
         w += 1
         i += 1
-    var res = String(StringSlice(ptr=CkBytePtr(unsafe_from_address=Int(out)), length=w))
+    var res = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=CkBytePtr(unsafe_from_address=Int(out)), length=w)))
     out.free()
     return res
 
@@ -102,7 +101,7 @@ def _pct_encode(s: String) -> String:
             out[w + 1] = _hex_digit((c >> 4) & 0xF)
             out[w + 2] = _hex_digit(c & 0xF)
             w += 3
-    var res = String(StringSlice(ptr=CkBytePtr(unsafe_from_address=Int(out)), length=w))
+    var res = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=CkBytePtr(unsafe_from_address=Int(out)), length=w)))
     out.free()
     return res
 

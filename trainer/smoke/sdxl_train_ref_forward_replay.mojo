@@ -36,7 +36,7 @@
 # crop (L) of the real noisy latent. The MAIN LOOP owns the final bar.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 
 from serenitymojo.io.dtype import STDtype

@@ -27,7 +27,7 @@
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar
 from serenitymojo.sampling.flow_match import build_sigma_schedule
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 
 def build_acestep_schedule(num_steps: Int, shift: Float32) raises -> List[Float32]:

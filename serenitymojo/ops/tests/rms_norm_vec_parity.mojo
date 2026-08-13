@@ -21,7 +21,7 @@
 #   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib \
 #     /tmp/rms_vec_par
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, sin
 from std.time import perf_counter_ns
 from std.utils.index import IndexList
@@ -92,18 +92,28 @@ def _bf16_fwd(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        g.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(g.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=g_rl,
+    )
     var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     if vec:
-        ctx.enqueue_function[
-            _rms_norm_kernel_bf16_vec, _rms_norm_kernel_bf16_vec
-        ](X, G, O, cols, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[_rms_norm_kernel_bf16_vec](X, G, O, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
     else:
-        ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
-            X, G, O, cols, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[_rms_norm_kernel_bf16](
+            X, G, O, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
     ctx.synchronize()
     return Tensor(out_buf^, x.shape().copy(), STDtype.BF16)
 
@@ -116,22 +126,33 @@ def _bf16_bwd_dx(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
     var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(go.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        g.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(g.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=g_rl,
+    )
     var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     if vec:
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel_vec[DType.bfloat16],
-            _rms_bwd_dx_kernel_vec[DType.bfloat16],
-        ](GO, X, G, DX, cols, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[_rms_bwd_dx_kernel_vec[DType.bfloat16]](GO, X, G, DX, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
     else:
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.bfloat16], _rms_bwd_dx_kernel[DType.bfloat16]
-        ](GO, X, G, DX, cols, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[_rms_bwd_dx_kernel[DType.bfloat16]](GO, X, G, DX, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
     ctx.synchronize()
     return Tensor(dx_buf^, x.shape().copy(), STDtype.BF16)
 
@@ -145,30 +166,38 @@ def _bench_fwd(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        g.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(g.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=g_rl,
+    )
     var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     # warmup
     for _ in range(5):
         if vec:
-            ctx.enqueue_function[
-                _rms_norm_kernel_bf16_vec, _rms_norm_kernel_bf16_vec
-            ](X, G, O, cols, eps, grid_dim=rows, block_dim=_TPB)
+            ctx.enqueue_function[_rms_norm_kernel_bf16_vec](X, G, O, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
         else:
-            ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
-                X, G, O, cols, eps, grid_dim=rows, block_dim=_TPB)
+            ctx.enqueue_function[_rms_norm_kernel_bf16](
+                X, G, O, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
     ctx.synchronize()
     var t0 = perf_counter_ns()
     for _ in range(iters):
         if vec:
-            ctx.enqueue_function[
-                _rms_norm_kernel_bf16_vec, _rms_norm_kernel_bf16_vec
-            ](X, G, O, cols, eps, grid_dim=rows, block_dim=_TPB)
+            ctx.enqueue_function[_rms_norm_kernel_bf16_vec](X, G, O, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
         else:
-            ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
-                X, G, O, cols, eps, grid_dim=rows, block_dim=_TPB)
+            ctx.enqueue_function[_rms_norm_kernel_bf16](
+                X, G, O, Int32(cols), eps, grid_dim=rows, block_dim=_TPB)
     ctx.synchronize()
     var t1 = perf_counter_ns()
     _ = out_buf  # keep alive

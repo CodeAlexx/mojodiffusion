@@ -29,7 +29,7 @@
 # (slice image rows → reshape [1,GH,GW,128] → permute [0,3,1,2] → negate), so with
 # B=0 (zero-init LoRA b) the produced velocity matches the predict B=0 gate / oracle.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

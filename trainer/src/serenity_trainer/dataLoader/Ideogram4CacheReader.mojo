@@ -18,7 +18,7 @@
 # If noise/noisy are absent, the reader creates deterministic device noise for
 # the current step and computes noisy = (1-t)*clean + t*noise.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

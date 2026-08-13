@@ -21,12 +21,12 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/unet_stack_finitediff.mojo -o /tmp/sdxl_stack_fd
 #   /tmp/sdxl_stack_fd
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from math import abs as fabs
+from std.math import abs as fabs
 
 from serenitymojo.models.sdxl.weights import ResBlockWeights
 from serenitymojo.models.sdxl.embed import EmbWeights

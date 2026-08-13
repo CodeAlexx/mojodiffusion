@@ -18,7 +18,7 @@
 #     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa \
 #     serenitymojo/autograd_v2/tests/krea2_flash_block_peak.mojo -o /tmp/krea2_flash_block_peak
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor

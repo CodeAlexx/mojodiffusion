@@ -25,7 +25,7 @@
 # / silu accumulate in F32 internally). No persistent F32 tensors held here.
 # The _rescale kernels read BF16 -> compute F32 -> store BF16.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -334,8 +334,9 @@ def _rescale_kernel_bf16(
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     inv_scale: Float32,
     shift: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
@@ -347,8 +348,9 @@ def _rescale_kernel_f32(
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     inv_scale: Float32,
     shift: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](x[i])
@@ -365,23 +367,35 @@ def _rescale(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var inv = Float32(1.0) / ZIMAGE_VAE_SCALING_FACTOR
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_rescale_kernel_f32, _rescale_kernel_f32](
-            X, O, inv, ZIMAGE_VAE_SHIFT_FACTOR, n, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rescale_kernel_f32](
+            X, O, inv, ZIMAGE_VAE_SHIFT_FACTOR, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_rescale_kernel_bf16, _rescale_kernel_bf16](
-            X, O, inv, ZIMAGE_VAE_SHIFT_FACTOR, n, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_rescale_kernel_bf16](
+            X, O, inv, ZIMAGE_VAE_SHIFT_FACTOR, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("_rescale: only F32/BF16 supported")

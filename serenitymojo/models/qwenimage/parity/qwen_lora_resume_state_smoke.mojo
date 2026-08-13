@@ -5,7 +5,7 @@
 # state sidecar round-trips. No model weights or denoise run.
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     QwenLoraSet,

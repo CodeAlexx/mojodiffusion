@@ -15,7 +15,7 @@
 #   pixi run mojo run -I . \
 #       serenitymojo/models/klein/parity/single_block_lora_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.parity import ParityHarness, ParityResult
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

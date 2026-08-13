@@ -21,7 +21,7 @@
 #     -Xlinker -L.pixi/envs/default/lib -Xlinker -lsqlite3 \
 #     serenitymojo/training/tests/lora_ema_parity.mojo -o /tmp/lora_ema_parity \
 #   && /tmp/lora_ema_parity
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.training.train_step import LoraAdapter

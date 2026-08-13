@@ -20,7 +20,7 @@
 
 from std.math import sin, cos
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.ltx2_dit import LTX2Config

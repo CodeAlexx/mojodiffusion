@@ -5,7 +5,7 @@
 #   grid-stride scatter to [li, li+stride, li+2*stride, li+3*stride]; block=256,
 #   grid=min(SMs*(maxThreadsPerSM/256), ceil(numel/256)).
 # CAVEAT (same as torch): the exact bytes depend on the GPU SM count via the grid.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx, block_dim, grid_dim
 from std.math import log, sqrt, sin, cos
 from std.ffi import external_call
@@ -40,11 +40,11 @@ struct _Quad(ImplicitlyCopyable, Movable):
     var c3: UInt32
 
 
-fn _mulhi(a: UInt32, b: UInt32) -> UInt32:
+def _mulhi(a: UInt32, b: UInt32) -> UInt32:
     return UInt32((UInt64(a) * UInt64(b)) >> 32)
 
 
-fn _round(q: _Quad, k0: UInt32, k1: UInt32) -> _Quad:
+def _round(q: _Quad, k0: UInt32, k1: UInt32) -> _Quad:
     var hi0 = _mulhi(_M0, q.c0)
     var lo0 = _M0 * q.c0
     var hi1 = _mulhi(_M1, q.c2)
@@ -52,7 +52,7 @@ fn _round(q: _Quad, k0: UInt32, k1: UInt32) -> _Quad:
     return _Quad(hi1 ^ q.c1 ^ k0, lo1, hi0 ^ q.c3 ^ k1, lo0)
 
 
-fn _philox10(q0: _Quad, k0: UInt32, k1: UInt32) -> _Quad:
+def _philox10(q0: _Quad, k0: UInt32, k1: UInt32) -> _Quad:
     var q = q0
     var kx = k0
     var ky = k1
@@ -69,7 +69,7 @@ fn _philox10(q0: _Quad, k0: UInt32, k1: UInt32) -> _Quad:
     return q
 
 
-fn _boxmuller(x: UInt32, y: UInt32) -> SIMD[DType.float32, 2]:
+def _boxmuller(x: UInt32, y: UInt32) -> SIMD[DType.float32, 2]:
     var u = Float32(x) * _INV + (_INV * Float32(0.5))
     var v = Float32(y) * _INV2PI + (_INV2PI * Float32(0.5))
     var s = sqrt(Float32(-2.0) * log(u))
@@ -77,8 +77,9 @@ fn _boxmuller(x: UInt32, y: UInt32) -> SIMD[DType.float32, 2]:
 
 
 def _randn_torch_kernel(
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], numel: Int, seed: UInt64
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], numel_w: Int64, seed: UInt64
 ):
+    var numel = Int(numel_w)
     var idx = Int(global_idx.x)
     var stride = Int(block_dim.x * grid_dim.x)
     var unroll = 4
@@ -144,10 +145,13 @@ def randn_torch(var shape: List[Int], seed: UInt64, ctx: DeviceContext) raises -
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = _query_grid(n)
-    ctx.enqueue_function[_randn_torch_kernel, _randn_torch_kernel](
-        O, n, seed, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_randn_torch_kernel](
+        O, Int64(n), seed, grid_dim=grid, block_dim=_BLOCK
     )
     return Tensor(out_buf^, shape^, STDtype.F32)

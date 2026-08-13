@@ -4,7 +4,7 @@
 # cached-context latent oracle into Mojo tensors, then exercises the Anima
 # linear FlowMatch CFG/Euler runtime surface without porting MiniTrainDIT yet.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

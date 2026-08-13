@@ -7,7 +7,7 @@
 # unconditional activations before releasing it.
 
 from std.collections import Dict, List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype
@@ -123,7 +123,7 @@ struct Wan22A14BStreamedDiT(Movable):
             applied += 1
         return applied
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         if name not in self.weights:
             raise Error(String("Wan A14B shared cache missing tensor: ") + name)
         return self.weights[name][]

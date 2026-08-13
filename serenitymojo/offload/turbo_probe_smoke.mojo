@@ -9,7 +9,7 @@
 #   CHECK 3: DeviceContext() is a singleton — ctx.id() == 0 for every call.
 #            Two DeviceContext() instances share ONE underlying CUDA context.
 #   CHECK 4: Cross-stream ordering via ctx.create_stream() +
-#            ctx.compile_function[fn, fn]() + DeviceStream.enqueue_function().
+#            ctx.compile_function[fn]() + DeviceStream.enqueue_function().
 #            FAIL-CLOSED: poison on default stream, compute on explicit stream,
 #            fence via DeviceEvent record/wait. Reports gate verdict (GREEN/RED).
 #
@@ -26,12 +26,12 @@
 #   Prior probe wrongly concluded "DeviceStream has no enqueue_function;
 #   multi-stream dispatch requires external_call". INCORRECT.
 #   The correct path (verified compiling under Mojo 1.0.0b1 / MAX 26.3):
-#     1. ctx.compile_function[fn, fn]() returns a DeviceFunction.
+#     1. ctx.compile_function[fn]() returns a DeviceFunction.
 #     2. stream.enqueue_function(compiled_fn, args..., grid_dim=, block_dim=)
 #        dispatches to that explicit stream.
 #   (Note: ctx.compile_function_checked[fn,fn] appears in newer upstream source
 #    but was NOT available in the installed Mojo 1.0.0b1 build;
-#    ctx.compile_function[fn, fn] is the available form and is equivalent.)
+#    ctx.compile_function[fn] is the available form and is equivalent.)
 #
 # GATE VERDICT: GREEN
 #   WITH-FENCE:  checksum = 4194304.0 (correct)
@@ -47,7 +47,7 @@
 # Run:
 #   /tmp/turbo_probe
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 
 
@@ -68,10 +68,11 @@ comptime POISON_VAL = Float32(-1.0)   # sentinel; expected sum if un-overwritten
 
 def _fill_kernel(
     buf: UnsafePointer[Float32, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
     value: Float32,
 ):
     """Fill buf[0..n) with `value`. Used to write the poison sentinel."""
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         buf[i] = value
@@ -148,7 +149,7 @@ def main() raises:
         + "  (same CUDA context; default-stream enqueues serialise)"
     )
     print("  NOTE: Two DeviceContext() != two independent CUDA streams.")
-    print("        Use ctx.create_stream() + ctx.compile_function[fn,fn]()")
+    print("        Use ctx.create_stream() + ctx.compile_function[fn]()")
     print("        + stream.enqueue_function(compiled, ...) for explicit streams.")
 
     # ── CHECK 4: Cross-stream ordering — fail-closed test ────────────────────
@@ -161,8 +162,8 @@ def main() raises:
 
     # Pre-compile kernels once (JIT-cached by context).
     # CORRECT FORM: ctx.compile_function[gpu_fn, cpu_fn]() -> DeviceFunction
-    var compiled_fill     = ctx.compile_function[_fill_kernel,     _fill_kernel]()
-    var compiled_checksum = ctx.compile_function[_checksum_kernel, _checksum_kernel]()
+    var compiled_fill     = ctx.compile_function[_fill_kernel]()
+    var compiled_checksum = ctx.compile_function[_checksum_kernel]()
 
     # Allocate device buffers.
     var large_slab = ctx.enqueue_create_buffer[DType.float32](LARGE_N)
@@ -186,9 +187,9 @@ def main() raises:
     # (a) POISON: fill large_sub with -1.0 using the default-stream kernel path.
     #     If fence fails and compute stream races ahead, it reads poison → sum = -N.
     var poison_grid = (LARGE_N + BLOCK - 1) // BLOCK
-    ctx.enqueue_function[_fill_kernel, _fill_kernel](
+    ctx.enqueue_function[_fill_kernel](
         large_sub.unsafe_ptr(),
-        LARGE_N,
+        Int64(LARGE_N),
         POISON_VAL,
         grid_dim=poison_grid,
         block_dim=BLOCK,
@@ -254,7 +255,7 @@ def main() raises:
     print("  2. create_sub_buffer: FEASIBLE")
     print("  3. DeviceContext() singleton (id=0): CONFIRMED")
     print("  4. Cross-stream dispatch — CORRECT API FORMS:")
-    print("       ctx.compile_function[fn, fn]() -> DeviceFunction")
+    print("       ctx.compile_function[fn]() -> DeviceFunction")
     print("       stream.enqueue_function(compiled, args..., grid_dim=, block_dim=)")
     print("       ctx.stream().record_event(ev)")
     print("       stream.enqueue_wait_for(ev)")

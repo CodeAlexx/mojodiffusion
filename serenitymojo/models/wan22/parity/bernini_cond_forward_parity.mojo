@@ -33,7 +33,7 @@
 #   pixi run mojo run -I . \
 #       serenitymojo/models/wan22/parity/bernini_cond_forward_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc
 from serenitymojo.parity import ParityHarness

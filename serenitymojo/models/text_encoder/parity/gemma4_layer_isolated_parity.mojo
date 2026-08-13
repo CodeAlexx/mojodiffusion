@@ -16,7 +16,7 @@
 #
 # Build: same cuDNN-shim linker flag set as gemma4_states_parity.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

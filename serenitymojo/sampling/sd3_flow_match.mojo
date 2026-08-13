@@ -11,7 +11,7 @@
 #   pred = uncond + scale * (cond - uncond)
 # The model timestep passed to the DiT is sigma * 1000.0.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.dit.sd3_contract import (
     SD3_LARGE_NUM_STEPS,

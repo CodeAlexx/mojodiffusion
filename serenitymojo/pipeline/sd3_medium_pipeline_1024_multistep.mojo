@@ -27,7 +27,7 @@
 #     serenitymojo/pipeline/sd3_medium_pipeline_1024_multistep.mojo \
 #     -o /tmp/sd3_medium && /tmp/sd3_medium
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -7,7 +7,7 @@
 # At cold start LoRA B=0, the LoRA stack is an identity overlay on the base
 # weights. Therefore this split trainer forward must match the same real-giger
 # torch predict fixture used by ideogram4_predict_gate.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

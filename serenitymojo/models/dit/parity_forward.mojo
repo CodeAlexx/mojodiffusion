@@ -6,7 +6,7 @@
 # Oracle dumps live in parity/*.bin (+ .shape). DEV-ONLY: Python never runs here.
 # Compile-time HL/WL/CAPLEN must match the oracle invocation (default 8 8 32).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -35,7 +35,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import sqrt, log
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -60,8 +60,12 @@ comptime _BLOCK = 256
 def _zero_pad_left_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    BC: Int, L: Int, Lo: Int, left: Int,
+    BC_w: Int32, L_w: Int32, Lo_w: Int32, left_w: Int32,
 ):
+    var BC = Int(BC_w)
+    var L = Int(L_w)
+    var Lo = Int(Lo_w)
+    var left = Int(left_w)
     var idx = Int(global_idx.x)
     var total = BC * Lo
     if idx >= total:
@@ -78,8 +82,12 @@ def _zero_pad_left_kernel_f32(
 def _zero_pad_left_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    BC: Int, L: Int, Lo: Int, left: Int,
+    BC_w: Int32, L_w: Int32, Lo_w: Int32, left_w: Int32,
 ):
+    var BC = Int(BC_w)
+    var L = Int(L_w)
+    var Lo = Int(Lo_w)
+    var left = Int(left_w)
     var idx = Int(global_idx.x)
     var total = BC * Lo
     if idx >= total:
@@ -96,8 +104,12 @@ def _zero_pad_left_kernel_bf16(
 def _zero_pad_left_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    BC: Int, L: Int, Lo: Int, left: Int,
+    BC_w: Int32, L_w: Int32, Lo_w: Int32, left_w: Int32,
 ):
+    var BC = Int(BC_w)
+    var L = Int(L_w)
+    var Lo = Int(Lo_w)
+    var left = Int(left_w)
     var idx = Int(global_idx.x)
     var total = BC * Lo
     if idx >= total:
@@ -140,33 +152,51 @@ def zero_pad_left1d(x: Tensor, left: Int, ctx: DeviceContext) raises -> Tensor:
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-        )
-        ctx.enqueue_function[_zero_pad_left_kernel_f32, _zero_pad_left_kernel_f32](
-            X, O, BC, L, Lo, left, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_zero_pad_left_kernel_f32](
+            X, O, Int32(BC), Int32(L), Int32(Lo), Int32(left), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-        )
-        ctx.enqueue_function[_zero_pad_left_kernel_bf16, _zero_pad_left_kernel_bf16](
-            X, O, BC, L, Lo, left, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_zero_pad_left_kernel_bf16](
+            X, O, Int32(BC), Int32(L), Int32(Lo), Int32(left), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
-        )
-        ctx.enqueue_function[_zero_pad_left_kernel_f16, _zero_pad_left_kernel_f16](
-            X, O, BC, L, Lo, left, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_zero_pad_left_kernel_f16](
+            X, O, Int32(BC), Int32(L), Int32(Lo), Int32(left), grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
 
@@ -185,8 +215,11 @@ def zero_pad_left1d(x: Tensor, left: Int, ctx: DeviceContext) raises -> Tensor:
 def _magnitude_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    BC: Int, F: Int, Tf: Int,
+    BC_w: Int32, F_w: Int32, Tf_w: Int32,
 ):
+    var BC = Int(BC_w)
+    var F = Int(F_w)
+    var Tf = Int(Tf_w)
     var idx = Int(global_idx.x)
     var total = BC * F * Tf
     if idx >= total:
@@ -207,8 +240,11 @@ def _magnitude_kernel_f32(
 def _magnitude_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    BC: Int, F: Int, Tf: Int,
+    BC_w: Int32, F_w: Int32, Tf_w: Int32,
 ):
+    var BC = Int(BC_w)
+    var F = Int(F_w)
+    var Tf = Int(Tf_w)
     var idx = Int(global_idx.x)
     var total = BC * F * Tf
     if idx >= total:
@@ -228,8 +264,11 @@ def _magnitude_kernel_bf16(
 def _magnitude_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    BC: Int, F: Int, Tf: Int,
+    BC_w: Int32, F_w: Int32, Tf_w: Int32,
 ):
+    var BC = Int(BC_w)
+    var F = Int(F_w)
+    var Tf = Int(Tf_w)
     var idx = Int(global_idx.x)
     var total = BC * F * Tf
     if idx >= total:
@@ -268,33 +307,51 @@ def magnitude(spec: Tensor, ctx: DeviceContext) raises -> Tensor:
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            spec.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(spec.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-        )
-        ctx.enqueue_function[_magnitude_kernel_f32, _magnitude_kernel_f32](
-            X, O, BC, F, Tf, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_magnitude_kernel_f32](
+            X, O, Int32(BC), Int32(F), Int32(Tf), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            spec.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(spec.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-        )
-        ctx.enqueue_function[_magnitude_kernel_bf16, _magnitude_kernel_bf16](
-            X, O, BC, F, Tf, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_magnitude_kernel_bf16](
+            X, O, Int32(BC), Int32(F), Int32(Tf), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            spec.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(spec.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
-        )
-        ctx.enqueue_function[_magnitude_kernel_f16, _magnitude_kernel_f16](
-            X, O, BC, F, Tf, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_magnitude_kernel_f16](
+            X, O, Int32(BC), Int32(F), Int32(Tf), grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
 
@@ -310,8 +367,9 @@ def magnitude(spec: Tensor, ctx: DeviceContext) raises -> Tensor:
 def _clamp_log_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int, lo: Float32, hi: Float32,
+    n_w: Int64, lo: Float32, hi: Float32,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](x[i])
@@ -325,8 +383,9 @@ def _clamp_log_kernel_f32(
 def _clamp_log_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int, lo: Float32, hi: Float32,
+    n_w: Int64, lo: Float32, hi: Float32,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
@@ -340,8 +399,9 @@ def _clamp_log_kernel_bf16(
 def _clamp_log_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    n: Int, lo: Float32, hi: Float32,
+    n_w: Int64, lo: Float32, hi: Float32,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
@@ -363,33 +423,51 @@ def clamp_log(
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_clamp_log_kernel_f32, _clamp_log_kernel_f32](
-            X, O, n, lo, hi, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_clamp_log_kernel_f32](
+            X, O, Int64(n), lo, hi, grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_clamp_log_kernel_bf16, _clamp_log_kernel_bf16](
-            X, O, n, lo, hi, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_clamp_log_kernel_bf16](
+            X, O, Int64(n), lo, hi, grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_clamp_log_kernel_f16, _clamp_log_kernel_f16](
-            X, O, n, lo, hi, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_clamp_log_kernel_f16](
+            X, O, Int64(n), lo, hi, grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
     return Tensor(out_buf^, x.shape(), x.dtype())

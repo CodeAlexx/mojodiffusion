@@ -9,7 +9,7 @@
 #   /home/alex/Downloads/dever_arcane_style_ideogram4%20%28arcvfx%29.safetensors
 # uses exactly the 34*6 block target set, rank 32, BF16, no alpha tensors, no
 # global adapters.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.sharded import ShardedSafeTensors

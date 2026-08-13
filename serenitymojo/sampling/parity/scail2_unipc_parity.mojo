@@ -2,7 +2,7 @@
 # wan/utils/fm_solvers_unipc.py at source commit 5cfe1b8.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.sampling.scail2_unipc import (

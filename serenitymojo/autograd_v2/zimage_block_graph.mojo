@@ -34,7 +34,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.unary import tanh_op, tanh_op_slab

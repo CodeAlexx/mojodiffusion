@@ -135,7 +135,7 @@
 
 from std.collections import List
 from std.math import fma, sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.benchmark import black_box
 
 from serenitymojo.tensor import Tensor

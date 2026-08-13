@@ -14,7 +14,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU (device round-trip via save_tensor_bin).
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts

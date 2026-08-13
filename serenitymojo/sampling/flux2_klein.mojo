@@ -14,7 +14,7 @@
 # combine stay on GPU through serenitymojo tensor ops. Production inference must
 # not route activations through host readback.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp
 
 from serenitymojo.tensor import Tensor

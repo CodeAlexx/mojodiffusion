@@ -10,7 +10,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -93,13 +92,13 @@ def h2_next_request(conn: Int) -> H2Req:
             var actual = h2_request_body(conn, Int32(sid), bp, blen)
             # blen came from out_blen so cap == actual; copy is exact
             var got = actual if actual < blen else blen
-            body = String(StringSlice(ptr=bp, length=got))
+            body = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=bp, length=got)))
             bodyb.free()
         res = H2Req(
             True,
             sid,
-            String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(mb)), length=ml)),
-            String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(pb)), length=pl)),
+            String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(mb)), length=ml))),
+            String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(pb)), length=pl))),
             body,
         )
     sidb.free()

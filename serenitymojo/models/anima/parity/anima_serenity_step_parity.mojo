@@ -25,7 +25,7 @@
 #       serenitymojo/models/anima/parity/anima_serenity_step_parity.mojo -o /tmp/anima_serenity_parity
 #   /tmp/anima_serenity_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc, ArcPointer
 from std.math import sqrt as fsqrt, log as flog, cos as fcos, sin as fsin, exp as fexp

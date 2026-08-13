@@ -22,7 +22,7 @@
 # (mean of cap_feats broadcast over the latent), so the per-step latent stats are
 # fully reproducible and exercise the real ported scheduler tensor op.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

@@ -39,7 +39,7 @@
 
 from std.math import exp as fexp
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -94,8 +94,9 @@ struct ClipConfig(Copyable, Movable, ImplicitlyCopyable):
 def _quick_gelu_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
@@ -106,8 +107,9 @@ def _quick_gelu_kernel_bf16(
 def _quick_gelu_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float32]](x[i])
@@ -118,8 +120,9 @@ def _quick_gelu_kernel_f32(
 def _quick_gelu_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
@@ -135,33 +138,51 @@ def _quick_gelu(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_quick_gelu_kernel_f32, _quick_gelu_kernel_f32](
-            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_quick_gelu_kernel_f32](
+            X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_quick_gelu_kernel_bf16, _quick_gelu_kernel_bf16](
-            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_quick_gelu_kernel_bf16](
+            X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_quick_gelu_kernel_f16, _quick_gelu_kernel_f16](
-            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_quick_gelu_kernel_f16](
+            X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
     return Tensor(out_buf^, x.shape(), x.dtype())
@@ -175,9 +196,11 @@ def _embed_kernel_bf16(
     pos: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     ids: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    seq: Int,
-    hidden: Int,
+    seq_w: Int32,
+    hidden_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var hidden = Int(hidden_w)
     var idx = Int(global_idx.x)
     var total = seq * hidden
     if idx < total:
@@ -198,9 +221,11 @@ def _embed_kernel_f32(
     pos: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     ids: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    seq: Int,
-    hidden: Int,
+    seq_w: Int32,
+    hidden_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var hidden = Int(hidden_w)
     var idx = Int(global_idx.x)
     var total = seq * hidden
     if idx < total:
@@ -217,9 +242,11 @@ def _embed_kernel_f16(
     pos: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     ids: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    seq: Int,
-    hidden: Int,
+    seq_w: Int32,
+    hidden_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var hidden = Int(hidden_w)
     var idx = Int(global_idx.x)
     var total = seq * hidden
     if idx < total:
@@ -295,7 +322,7 @@ struct ClipEncoder:
             name_to_idx[nm] = idx
         return ClipEncoder(weights^, name_to_idx^, config)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing CLIP weight: ") + name)
         var idx = self.name_to_idx[name]
@@ -339,46 +366,76 @@ struct ClipEncoder:
         var total = seq * hidden
         var grid = (total + _BLOCK - 1) // _BLOCK
         var IDS = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-            id_dev.unsafe_ptr().bitcast[Int32](), id_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(id_dev.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=id_rl,
+    )
         if dt == DType.float32:
             var TK = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                tok_table.buf.unsafe_ptr().bitcast[Float32](), tok_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(tok_table.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=tok_rl,
+    )
             var PO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                pos_table.buf.unsafe_ptr().bitcast[Float32](), pos_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(pos_table.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=pos_rl,
+    )
             var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-            )
-            ctx.enqueue_function[_embed_kernel_f32, _embed_kernel_f32](
-                TK, PO, IDS, O, seq, hidden, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+            ctx.enqueue_function[_embed_kernel_f32](
+                TK, PO, IDS, O, Int32(seq), Int32(hidden), grid_dim=grid, block_dim=_BLOCK
             )
         elif dt == DType.bfloat16:
             var TK = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                tok_table.buf.unsafe_ptr().bitcast[BFloat16](), tok_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(tok_table.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=tok_rl,
+    )
             var PO = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                pos_table.buf.unsafe_ptr().bitcast[BFloat16](), pos_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(pos_table.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=pos_rl,
+    )
             var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-            )
-            ctx.enqueue_function[_embed_kernel_bf16, _embed_kernel_bf16](
-                TK, PO, IDS, O, seq, hidden, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+            ctx.enqueue_function[_embed_kernel_bf16](
+                TK, PO, IDS, O, Int32(seq), Int32(hidden), grid_dim=grid, block_dim=_BLOCK
             )
         else:
             var TK = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                tok_table.buf.unsafe_ptr().bitcast[Float16](), tok_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(tok_table.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=tok_rl,
+    )
             var PO = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                pos_table.buf.unsafe_ptr().bitcast[Float16](), pos_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(pos_table.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=pos_rl,
+    )
             var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                out_buf.unsafe_ptr().bitcast[Float16](), out_rl
-            )
-            ctx.enqueue_function[_embed_kernel_f16, _embed_kernel_f16](
-                TK, PO, IDS, O, seq, hidden, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+            ctx.enqueue_function[_embed_kernel_f16](
+                TK, PO, IDS, O, Int32(seq), Int32(hidden), grid_dim=grid, block_dim=_BLOCK
             )
         ctx.synchronize()
         var sh = List[Int]()

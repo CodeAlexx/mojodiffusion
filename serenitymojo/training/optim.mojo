@@ -53,7 +53,7 @@
 
 from std.math import sqrt
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -88,8 +88,9 @@ def _adamw_kernel(
     weight_decay: Float32,
     bc1: Float32,
     bc2: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var gv = rebind[Scalar[DType.float32]](g[idx])
@@ -114,8 +115,9 @@ def _sgd_kernel(
     lr: Float32,
     momentum: Float32,
     weight_decay: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var gv = rebind[Scalar[DType.float32]](g[idx])
@@ -130,8 +132,9 @@ def _sgd_kernel(
 
 # ── scale a flat buffer in place, preserving storage dtype ───────────────────
 def _scale_kernel[dtype: DType](
-    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin], scale: Float32, n: Int
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin], scale: Float32, n_w: Int64
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var v = rebind[Scalar[dtype]](x[idx]).cast[DType.float32]() * scale
@@ -145,25 +148,28 @@ def _scale_tensor_in_place(mut x: Tensor, scale: Float32, ctx: DeviceContext) ra
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var XT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[
-            _scale_kernel[DType.float32], _scale_kernel[DType.float32]
-        ](XT, scale, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_scale_kernel[DType.float32]](XT, scale, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var XT = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[
-            _scale_kernel[DType.bfloat16], _scale_kernel[DType.bfloat16]
-        ](XT, scale, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_scale_kernel[DType.bfloat16]](XT, scale, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         var XT = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[
-            _scale_kernel[DType.float16], _scale_kernel[DType.float16]
-        ](XT, scale, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_scale_kernel[DType.float16]](XT, scale, Int64(n), grid_dim=grid, block_dim=_BLOCK)
 
 
 def _require_compute_storage(name: String, t: Tensor) raises:
@@ -225,16 +231,32 @@ def adamw_step(
 
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var pt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        param.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(param.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var gt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var mt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        m.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(m.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var vt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        v.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_adamw_kernel, _adamw_kernel](
-        pt, gt, mt, vt, lr, beta1, beta2, eps, weight_decay, bc1, bc2, n,
+    ctx.enqueue_function[_adamw_kernel](
+        pt, gt, mt, vt, lr, beta1, beta2, eps, weight_decay, bc1, bc2, Int64(n),
         grid_dim=grid, block_dim=_BLOCK,
     )
     ctx.synchronize()
@@ -263,14 +285,26 @@ def sgd_step(
 
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var pt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        param.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(param.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var gt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var bt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        momentum_buf.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(momentum_buf.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_sgd_kernel, _sgd_kernel](
-        pt, gt, bt, lr, momentum, weight_decay, n,
+    ctx.enqueue_function[_sgd_kernel](
+        pt, gt, bt, lr, momentum, weight_decay, Int64(n),
         grid_dim=grid, block_dim=_BLOCK,
     )
     ctx.synchronize()

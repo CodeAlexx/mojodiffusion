@@ -18,7 +18,7 @@
 # Run: pixi run mojo run -I . serenitymojo/models/dit/minimax_h3_frontend_probe.mojo
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

@@ -5,7 +5,7 @@
 # after-sdpa / after-mlp) used-VRAM, isolating the single biggest allocation.
 # This is a memory probe, NOT a parity gate.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sin as fsin
 
 from serenitymojo.tensor import Tensor

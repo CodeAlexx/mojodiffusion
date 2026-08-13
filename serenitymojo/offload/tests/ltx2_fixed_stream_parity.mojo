@@ -24,7 +24,7 @@
 #     $HOME/.local/lib/python3.12/site-packages/nvidia/cudnn/lib \
 #     /tmp/ltx2_fixed_stream_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.offload.ltx2_block_stream import (
     LTX2BlockStream, LTX2FixedStage, FP8Block,
 )

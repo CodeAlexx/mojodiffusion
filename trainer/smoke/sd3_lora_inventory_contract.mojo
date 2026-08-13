@@ -20,7 +20,7 @@
 #   trace from a real SD3 checkpoint, no Conv2d target coverage, no numeric
 #   forward/backward parity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

@@ -13,7 +13,7 @@
 #     model still has to supply the exact key inventory and reload mapping.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

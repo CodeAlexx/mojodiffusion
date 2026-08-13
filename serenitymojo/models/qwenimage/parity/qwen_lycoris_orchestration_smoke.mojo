@@ -10,7 +10,7 @@
 #     -o /tmp/qwen_lycoris_orch && /tmp/qwen_lycoris_orch
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import DBL_SLOTS
 from serenitymojo.models.qwenimage.qwenimage_lycoris_stack import (

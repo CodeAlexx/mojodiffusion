@@ -5,9 +5,9 @@
 # Run: cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #      pixi run mojo run -I . serenitymojo/ops/parity/vec_transpose_parity.mojo
 
-from sys import argv
+from std.sys import argv
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

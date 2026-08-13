@@ -9,7 +9,7 @@
 #       within the forward-recompute gap) + d(block0 out)=0.982 sanity.
 #   (d) CFG dropout mechanism (bs=1 coin flip; UNTESTED by oracle — CFG was off).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.collections import Optional
 from serenitymojo.tensor import Tensor

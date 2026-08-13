@@ -24,7 +24,7 @@
 #   pixi run mojo run -I . serenitymojo/training/grad_clip_smoke.mojo
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.optim import clip_grads_by_global_norm, TArc

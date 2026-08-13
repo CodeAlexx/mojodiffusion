@@ -9,7 +9,7 @@
 #     -o /tmp/flux_lycoris_orch && /tmp/flux_lycoris_orch
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.flux.flux_stack_lora import total_adapters
 from serenitymojo.models.flux.flux_lycoris_stack import (

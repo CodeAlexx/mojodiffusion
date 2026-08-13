@@ -20,7 +20,7 @@
 #   pixi run mojo run -I . serenitymojo/pipeline/klein_prepare_alina.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

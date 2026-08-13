@@ -17,7 +17,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/pipeline/klein_encode_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

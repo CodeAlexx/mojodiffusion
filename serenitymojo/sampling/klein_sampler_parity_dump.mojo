@@ -10,7 +10,7 @@
 # them.
 
 from std.collections import List
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import ArcPointer, alloc
 from std.time import perf_counter_ns
 

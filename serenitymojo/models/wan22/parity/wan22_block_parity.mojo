@@ -15,7 +15,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/wan22/parity/wan22_block_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from serenitymojo.parity import ParityHarness, ParityResult
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

@@ -41,7 +41,7 @@
 
 from std.collections import Optional
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
 
@@ -345,7 +345,7 @@ struct SdxlBackend(GenBackend, Movable):
     var latent: List[ArcPointer[Tensor]]            # 0/1 ([1,4,LH,LW] F32)
     var previous_denoised: List[ArcPointer[Tensor]] # 0/1, DPM++ 2M history
     var previous_sigma: Float32
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var load_seconds: Float64
     var text_encode_seconds: Float64
     var prepare_seconds: Float64
@@ -386,7 +386,7 @@ struct SdxlBackend(GenBackend, Movable):
         self.latent = List[ArcPointer[Tensor]]()
         self.previous_denoised = List[ArcPointer[Tensor]]()
         self.previous_sigma = 0.0
-        self.job_t0_ns = UInt(0)
+        self.job_t0_ns = Int(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
         self.prepare_seconds = 0.0
@@ -747,7 +747,7 @@ struct SdxlBackend(GenBackend, Movable):
         var init_sigma = sdxl_initial_noise_sigma(sigmas[0])
         var lh = self.params.height // 8
         var lw = self.params.width // 8
-        var nsh = [1, 4, lh, lw]
+        var nsh: List[Int] = [1, 4, lh, lw]
         var noise = randn(nsh.copy(), UInt64(self.params.seed), STDtype.F32, self.ctx)
         if self.params.variation_strength > 0.0:
             var vnoise = randn(

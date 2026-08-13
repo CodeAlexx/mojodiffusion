@@ -12,7 +12,7 @@
 #     -Xlinker -lserenity_cudnn_sdpa \
 #     serenitymojo/models/krea2/parity/krea2_text_fusion_sdpa_cudnn_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

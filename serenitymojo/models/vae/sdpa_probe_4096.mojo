@@ -5,7 +5,7 @@
 # verify only a SUBSET of query rows (every 256th) against the GPU output to keep
 # the CPU cost reasonable while still covering the full S range.
 from std.math import sqrt, exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.attention import sdpa

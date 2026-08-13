@@ -1,7 +1,7 @@
 # PARITY GATE for sd35_context_preonly_forward/backward (sd3.5 final block).
 # Run: oracle first, then
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sd35/parity/sd35_ctxpre_parity.mojo -o /tmp/sd35_ctxpre && /tmp/sd35_ctxpre
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc
 from serenitymojo.parity import ParityHarness

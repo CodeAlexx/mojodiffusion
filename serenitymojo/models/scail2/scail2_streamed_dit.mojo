@@ -5,7 +5,7 @@
 # BF16-resident; exactly one 32-tensor transformer block is dequantized at once.
 
 from std.collections import Dict, List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.time import perf_counter
 
@@ -70,7 +70,7 @@ struct Scail2StreamedDiT(Movable):
         self.stream = stream^
         self.config = Scail2Config.scail2_14b()
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         if name not in self.weights:
             raise Error(String("SCAIL-2 shared cache missing tensor: ") + name)
         return self.weights[name][]

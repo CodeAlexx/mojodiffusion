@@ -4,7 +4,7 @@
 # (HunyuanVideo-1.5 weights are NOT on disk — numeric gate is BLOCKED-no-weights).
 # Verification = clean compile (EXIT=0) + reference fidelity vs hunyuan15_dit.rs.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.models.dit.hunyuan15_dit import (

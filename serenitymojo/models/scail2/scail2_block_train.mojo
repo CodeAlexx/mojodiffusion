@@ -40,7 +40,7 @@
 # fan-in accumulated in a FIXED left-fold order (shared cross-attn query grad =
 # d_q_text + d_q_image) for bit-stability.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

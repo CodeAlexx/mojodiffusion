@@ -1,7 +1,7 @@
 # NAVA video VAE decode parity: Mojo Wan22VaeImageDecoder.decode_video_tokens on
 # NAVA's Wan2.2_VAE vs torch (F32 production). latent [1280,48] (5x16x16) ->
 # frames [1,3,17,256,256]. Gate cos>=0.999.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.parity import ParityHarness

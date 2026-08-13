@@ -17,7 +17,7 @@
 #     -Xlinker -L.pixi/envs/default/lib -Xlinker -lsqlite3 \
 #     serenitymojo/ops/tests/masked_loss_parity.mojo -o /tmp/masked_loss_parity && \
 #   /tmp/masked_loss_parity
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

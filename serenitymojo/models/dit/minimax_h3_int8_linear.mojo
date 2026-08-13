@@ -1,9 +1,10 @@
 from std.ffi import external_call
 from std.collections import List
-from std.gpu import barrier, block_dim, block_idx, global_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA
-from std.gpu.memory import AddressSpace
+from std.gpu import block_dim, block_idx, global_idx, grid_dim, thread_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp, min, round
 from std.utils.index import IndexList
@@ -34,10 +35,13 @@ comptime _SCALE_FLOOR = Float32(1.0e-30)
 def _h3_cast_f32_chunk_to_bf16(
     c: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    n: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    n_w: Int64,
 ):
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * n
@@ -83,15 +87,22 @@ def minimax_h3_bf16_linear_chunked(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](m * n * 2)
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, k))
     var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
     )
     var CFlat = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     for row_start in range(0, m, _MAX_GEMM_ROWS):
         var chunk_rows = min(_MAX_GEMM_ROWS, m - row_start)
@@ -102,20 +113,24 @@ def minimax_h3_bf16_linear_chunked(
             IndexList[2](chunk_rows, n)
         )
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k, a_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k)
+        ),
+        runtime_layout=a_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            c_buf.unsafe_ptr().bitcast[Float32](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
+    )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
         var total = chunk_rows * n
         var grid = (total + _BLOCK - 1) // _BLOCK
         if grid > 65535:
             grid = 65535
-        ctx.enqueue_function[
-            _h3_cast_f32_chunk_to_bf16, _h3_cast_f32_chunk_to_bf16
-        ](
-            CFlat, O, row_start, chunk_rows, n,
+        ctx.enqueue_function[_h3_cast_f32_chunk_to_bf16](
+            CFlat, O, Int32(row_start), Int32(chunk_rows), Int64(n),
             grid_dim=grid, block_dim=_BLOCK,
         )
     var out_shape = List[Int]()
@@ -163,10 +178,13 @@ def _h3_int8_dequant_rowscale(
     x_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     w_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    n: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    n_w: Int64,
 ):
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * n
@@ -191,9 +209,9 @@ def _h3_int8_dequant_swiglu_rowscale(
     x_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     w_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    f: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    f_w: Int32,
 ):
     """Dequantize packed `[value|gate]` FC1 rows and apply SwiGLU.
 
@@ -202,6 +220,9 @@ def _h3_int8_dequant_swiglu_rowscale(
     product with value. Only the otherwise materialized `[M, 2*f]` tensor is
     removed.
     """
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var f = Int(f_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * f
@@ -238,9 +259,9 @@ def _h3_int8_dequant_residual_gate_rowscale(
     residual: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     gate: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    n: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    n_w: Int64,
 ):
     """Dequantize FC2 and apply `residual + gate * fc2` directly.
 
@@ -248,6 +269,9 @@ def _h3_int8_dequant_residual_gate_rowscale(
     expression, matching `minimax_h3_int8_linear` followed by
     `residual_gate`; only the full intermediate FC2 tensor is removed.
     """
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * n
@@ -276,11 +300,14 @@ def _h3_int8_dequant_residual_gate_rowscale(
 def _h3_int8_rowscale_chunk(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    cols: Int,
-    rows: Int,
+    row_start_w: Int32,
+    cols_w: Int32,
+    rows_w: Int32,
 ):
     """Exact `int8_rowscale`, reading a row window from a full tensor."""
+    var row_start = Int(row_start_w)
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var row = Int(block_idx.x)
     if row >= rows:
         return
@@ -320,11 +347,14 @@ def _h3_int8_encode_chunk(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    rows: Int,
-    cols: Int,
+    row_start_w: Int32,
+    rows_w: Int32,
+    cols_w: Int32,
 ):
     """Exact `int8_encode_perrow`, writing one compact row window."""
+    var row_start = Int(row_start_w)
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = rows * cols
@@ -348,11 +378,14 @@ def _h3_int8_dequant_residual_gate_chunk(
     w_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     residual: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     gate: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    n: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    n_w: Int64,
 ):
     """Chunk-scale version that updates the residual buffer in place."""
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * n
@@ -384,11 +417,14 @@ def _h3_int8_dequant_qkv_rowscale(
     q: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     k: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    inner: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    inner_w: Int32,
 ):
     """Dequantize packed `[Q|K|V]` directly into three BF16 outputs."""
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var inner = Int(inner_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * inner
@@ -423,10 +459,12 @@ def _h3_int8_dequant_swiglu_chunk(
     x_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     w_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    chunk_rows: Int,
-    f: Int,
+    chunk_rows_w: Int32,
+    f_w: Int32,
 ):
     """Local-row FC1 dequant + exact two-boundary SwiGLU."""
+    var chunk_rows = Int(chunk_rows_w)
+    var f = Int(f_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * f
@@ -521,17 +559,28 @@ def minimax_h3_int8_linear(
     var flat_m = RuntimeLayout[_DYN1].row_major(IndexList[1](m))
     var flat_n = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        c.buf.unsafe_ptr().bitcast[Int32](), flat_c
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(c.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=flat_c,
     )
     var XS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_scale.buf.unsafe_ptr().bitcast[Float32](), flat_m
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=flat_m,
     )
     var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight_scale.buf.unsafe_ptr().bitcast[Float32](), flat_n
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=flat_n,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     for row_start in range(0, m, _MAX_GEMM_ROWS):
         var chunk_rows = min(_MAX_GEMM_ROWS, m - row_start)
@@ -542,10 +591,8 @@ def minimax_h3_int8_linear(
         var grid = (total + _BLOCK - 1) // _BLOCK
         if grid > 65535:
             grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_rowscale, _h3_int8_dequant_rowscale
-        ](
-            C, XS, WS, O, row_start, chunk_rows, n,
+        ctx.enqueue_function[_h3_int8_dequant_rowscale](
+            C, XS, WS, O, Int32(row_start), Int32(chunk_rows), Int64(n),
             grid_dim=grid, block_dim=_BLOCK,
         )
 
@@ -594,30 +641,42 @@ def minimax_h3_int8_qkv_linear(
     var k_buf = ctx.enqueue_create_buffer[DType.uint8](rows * inner * 2)
     var v_buf = ctx.enqueue_create_buffer[DType.uint8](rows * inner * 2)
     var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        c.buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(c.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(
             IndexList[1](accumulator_rows * packed_n)
         ),
     )
     var XS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows)),
     )
     var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](packed_n)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](packed_n)),
     )
     var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        q_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * inner)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * inner)),
     )
     var K = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        k_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * inner)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * inner)),
     )
     var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        v_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * inner)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * inner)),
     )
     for row_start in range(0, rows, _MAX_GEMM_ROWS):
         var chunk_rows = min(_MAX_GEMM_ROWS, rows - row_start)
@@ -629,11 +688,8 @@ def minimax_h3_int8_qkv_linear(
         var grid = (total + _BLOCK - 1) // _BLOCK
         if grid > 65535:
             grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_qkv_rowscale,
-            _h3_int8_dequant_qkv_rowscale,
-        ](
-            C, XS, WS, Q, K, V, row_start, chunk_rows, inner,
+        ctx.enqueue_function[_h3_int8_dequant_qkv_rowscale](
+            C, XS, WS, Q, K, V, Int32(row_start), Int32(chunk_rows), Int32(inner),
             grid_dim=grid, block_dim=_BLOCK,
         )
 
@@ -760,20 +816,28 @@ def minimax_h3_int8_swiglu_linear(
     var c = Tensor(c_buf^, c_shape^, STDtype.I32)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](m * f * 2)
     var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        c.buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(c.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
     )
     var XS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m)),
     )
     var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * f)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * f)),
     )
     for row_start in range(0, m, _MAX_GEMM_ROWS):
         var chunk_rows = min(_MAX_GEMM_ROWS, m - row_start)
@@ -784,11 +848,8 @@ def minimax_h3_int8_swiglu_linear(
         var grid = (total + _BLOCK - 1) // _BLOCK
         if grid > 65535:
             grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_swiglu_rowscale,
-            _h3_int8_dequant_swiglu_rowscale,
-        ](
-            C, XS, WS, O, row_start, chunk_rows, f,
+        ctx.enqueue_function[_h3_int8_dequant_swiglu_rowscale](
+            C, XS, WS, O, Int32(row_start), Int32(chunk_rows), Int32(f),
             grid_dim=grid, block_dim=_BLOCK,
         )
 
@@ -840,28 +901,40 @@ def minimax_h3_int8_residual_linear(
     var c = Tensor(c_buf^, c_shape^, STDtype.I32)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](m * n * 2)
     var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        c.buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(c.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
     )
     var XS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m)),
     )
     var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
     )
     var R = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        residual.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(residual.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        gate.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(gate.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     for row_start in range(0, m, _MAX_GEMM_ROWS):
         var chunk_rows = min(_MAX_GEMM_ROWS, m - row_start)
@@ -872,11 +945,8 @@ def minimax_h3_int8_residual_linear(
         var grid = (total + _BLOCK - 1) // _BLOCK
         if grid > 65535:
             grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_residual_gate_rowscale,
-            _h3_int8_dequant_residual_gate_rowscale,
-        ](
-            C, XS, WS, R, G, O, row_start, chunk_rows, n,
+        ctx.enqueue_function[_h3_int8_dequant_residual_gate_rowscale](
+            C, XS, WS, R, G, O, Int32(row_start), Int32(chunk_rows), Int64(n),
             grid_dim=grid, block_dim=_BLOCK,
         )
 
@@ -931,49 +1001,59 @@ def minimax_h3_int8_residual_linear_inplace(
     var c_shape: List[Int] = [accumulator_rows, n]
     var c = Tensor(c_buf^, c_shape^, STDtype.I32)
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * k)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * k)),
     )
     var XS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_scale_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_scale_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows)),
     )
     var XI = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        x_int8.buf.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * k)),
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(x_int8.buf.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * k)),
     )
     var C = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        c.buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(c.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](accumulator_rows * n)),
     )
     var WS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](n)),
     )
     var R = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        residual.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(residual.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        gate.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(gate.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](m * n)),
     )
     for row_start in range(0, m, _MAX_GEMM_ROWS):
         var chunk_rows = min(_MAX_GEMM_ROWS, m - row_start)
-        ctx.enqueue_function[
-            _h3_int8_rowscale_chunk, _h3_int8_rowscale_chunk
-        ](
-            X, XS, row_start, k, chunk_rows,
+        ctx.enqueue_function[_h3_int8_rowscale_chunk](
+            X, XS, Int32(row_start), Int32(k), Int32(chunk_rows),
             grid_dim=chunk_rows, block_dim=_BLOCK,
         )
         var quant_total = chunk_rows * k
         var quant_grid = (quant_total + _BLOCK - 1) // _BLOCK
         if quant_grid > 65535:
             quant_grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_encode_chunk, _h3_int8_encode_chunk
-        ](
-            X, XS, XI, row_start, chunk_rows, k,
+        ctx.enqueue_function[_h3_int8_encode_chunk](
+            X, XS, XI, Int32(row_start), Int32(chunk_rows), Int32(k),
             grid_dim=quant_grid, block_dim=_BLOCK,
         )
         _h3_gemm_s8s8s32_nt(
@@ -983,11 +1063,8 @@ def minimax_h3_int8_residual_linear_inplace(
         var grid = (total + _BLOCK - 1) // _BLOCK
         if grid > 65535:
             grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_residual_gate_chunk,
-            _h3_int8_dequant_residual_gate_chunk,
-        ](
-            C, XS, WS, R, G, row_start, chunk_rows, n,
+        ctx.enqueue_function[_h3_int8_dequant_residual_gate_chunk](
+            C, XS, WS, R, G, Int32(row_start), Int32(chunk_rows), Int64(n),
             grid_dim=grid, block_dim=_BLOCK,
         )
         # Reuse the same compact activation/accumulator buffers and prevent
@@ -1065,74 +1142,94 @@ def minimax_h3_int8_mlp_residual_inplace(
     var act_i8 = Tensor(act_i8_buf^, act_i8_shape^, STDtype.I8)
     var fc2_acc = Tensor(fc2_acc_buf^, fc2_acc_shape^, STDtype.I32)
     var In = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        mlp_in.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(mlp_in.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * hidden)),
     )
     var InScale = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        in_scale_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(in_scale_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity)),
     )
     var InI8 = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        in_i8.buf.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(in_i8.buf.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * hidden)),
     )
     var Fc1Acc = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        fc1_acc.buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(fc1_acc.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(
             IndexList[1](chunk_capacity * packed_ffn)
         ),
     )
     var Fc1Scale = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        fc1_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](packed_ffn)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(fc1_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](packed_ffn)),
     )
     var Act = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        act_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * ffn)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(act_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * ffn)),
     )
     var ActScale = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        act_scale_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(act_scale_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity)),
     )
     var ActI8 = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        act_i8.buf.unsafe_ptr(),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * ffn)),
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(act_i8.buf.unsafe_ptr())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * ffn)),
     )
     var Fc2Acc = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        fc2_acc.buf.unsafe_ptr().bitcast[Int32](),
-        RuntimeLayout[_DYN1].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(fc2_acc.buf.unsafe_ptr().bitcast[Int32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(
             IndexList[1](chunk_capacity * out_hidden)
         ),
     )
     var Fc2Scale = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        fc2_scale.buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](out_hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(fc2_scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](out_hidden)),
     )
     var Residual = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        residual.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(residual.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
     )
     var Gate = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        gate.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(gate.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
     )
 
     for row_start in range(0, rows, _MLP_GEMM_ROWS):
         var chunk_rows = min(_MLP_GEMM_ROWS, rows - row_start)
-        ctx.enqueue_function[
-            _h3_int8_rowscale_chunk, _h3_int8_rowscale_chunk
-        ](
-            In, InScale, row_start, hidden, chunk_rows,
+        ctx.enqueue_function[_h3_int8_rowscale_chunk](
+            In, InScale, Int32(row_start), Int32(hidden), Int32(chunk_rows),
             grid_dim=chunk_rows, block_dim=_BLOCK,
         )
         var in_total = chunk_rows * hidden
         var in_grid = (in_total + _BLOCK - 1) // _BLOCK
         if in_grid > 65535:
             in_grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_encode_chunk, _h3_int8_encode_chunk
-        ](
-            In, InScale, InI8, row_start, chunk_rows, hidden,
+        ctx.enqueue_function[_h3_int8_encode_chunk](
+            In, InScale, InI8, Int32(row_start), Int32(chunk_rows), Int32(hidden),
             grid_dim=in_grid, block_dim=_BLOCK,
         )
         _h3_gemm_s8s8s32_nt(
@@ -1143,26 +1240,19 @@ def minimax_h3_int8_mlp_residual_inplace(
         var act_grid = (act_total + _BLOCK - 1) // _BLOCK
         if act_grid > 65535:
             act_grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_swiglu_chunk,
-            _h3_int8_dequant_swiglu_chunk,
-        ](
-            Fc1Acc, InScale, Fc1Scale, Act, chunk_rows, ffn,
+        ctx.enqueue_function[_h3_int8_dequant_swiglu_chunk](
+            Fc1Acc, InScale, Fc1Scale, Act, Int32(chunk_rows), Int32(ffn),
             grid_dim=act_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _h3_int8_rowscale_chunk, _h3_int8_rowscale_chunk
-        ](
-            Act, ActScale, 0, ffn, chunk_rows,
+        ctx.enqueue_function[_h3_int8_rowscale_chunk](
+            Act, ActScale, Int32(0), Int32(ffn), Int32(chunk_rows),
             grid_dim=chunk_rows, block_dim=_BLOCK,
         )
         var act_i8_grid = (act_total + _BLOCK - 1) // _BLOCK
         if act_i8_grid > 65535:
             act_i8_grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_encode_chunk, _h3_int8_encode_chunk
-        ](
-            Act, ActScale, ActI8, 0, chunk_rows, ffn,
+        ctx.enqueue_function[_h3_int8_encode_chunk](
+            Act, ActScale, ActI8, Int32(0), Int32(chunk_rows), Int32(ffn),
             grid_dim=act_i8_grid, block_dim=_BLOCK,
         )
         _h3_gemm_s8s8s32_nt(
@@ -1173,12 +1263,9 @@ def minimax_h3_int8_mlp_residual_inplace(
         var out_grid = (out_total + _BLOCK - 1) // _BLOCK
         if out_grid > 65535:
             out_grid = 65535
-        ctx.enqueue_function[
-            _h3_int8_dequant_residual_gate_chunk,
-            _h3_int8_dequant_residual_gate_chunk,
-        ](
+        ctx.enqueue_function[_h3_int8_dequant_residual_gate_chunk](
             Fc2Acc, ActScale, Fc2Scale, Residual, Gate,
-            row_start, chunk_rows, out_hidden,
+            Int32(row_start), Int32(chunk_rows), Int64(out_hidden),
             grid_dim=out_grid, block_dim=_BLOCK,
         )
         ctx.synchronize()
@@ -1188,10 +1275,12 @@ def minimax_h3_int8_mlp_residual_inplace(
 def _h3_bf16_acc_swiglu_chunk(
     accumulator: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     output: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    chunk_rows: Int,
-    ffn: Int,
+    chunk_rows_w: Int32,
+    ffn_w: Int32,
 ):
     """Cast the BF16 projection boundary, then exact packed SwiGLU."""
+    var chunk_rows = Int(chunk_rows_w)
+    var ffn = Int(ffn_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * ffn
@@ -1217,11 +1306,14 @@ def _h3_bf16_acc_residual_gate_chunk(
     accumulator: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     residual: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     gate: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    row_start: Int,
-    chunk_rows: Int,
-    hidden: Int,
+    row_start_w: Int32,
+    chunk_rows_w: Int32,
+    hidden_w: Int32,
 ):
     """Cast FC2 to BF16 before the exact F32 residual expression."""
+    var row_start = Int(row_start_w)
+    var chunk_rows = Int(chunk_rows_w)
+    var hidden = Int(hidden_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var total = chunk_rows * hidden
@@ -1343,49 +1435,67 @@ def minimax_h3_bf16_mlp_residual_inplace(
         chunk_capacity * out_hidden * 4
     )
     var Fc1Weight = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        fc1_weight.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN2].row_major(IndexList[2](packed_ffn, hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(fc1_weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN2].row_major(IndexList[2](packed_ffn, hidden)),
     )
     var Fc2Weight = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        fc2_weight.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN2].row_major(IndexList[2](out_hidden, ffn)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(fc2_weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN2].row_major(IndexList[2](out_hidden, ffn)),
     )
     var Fc1AccFlat = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        fc1_acc_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(fc1_acc_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(
             IndexList[1](chunk_capacity * packed_ffn)
         ),
     )
     var ActFlat = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        act_buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * ffn)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(act_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](chunk_capacity * ffn)),
     )
     var Fc2AccFlat = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        fc2_acc_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(fc2_acc_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(
             IndexList[1](chunk_capacity * out_hidden)
         ),
     )
     var Residual = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        residual.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(residual.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
     )
     var Gate = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        gate.buf.unsafe_ptr().bitcast[BFloat16](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(gate.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN1].row_major(IndexList[1](rows * out_hidden)),
     )
     for row_start in range(0, rows, _GROUPWISE_MLP_ROWS):
         var chunk_rows = min(_GROUPWISE_MLP_ROWS, rows - row_start)
         var Input = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            mlp_in.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * hidden,
-            RuntimeLayout[_DYN2].row_major(IndexList[2](chunk_rows, hidden)),
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(mlp_in.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * hidden)
+        ),
+        runtime_layout=RuntimeLayout[_DYN2].row_major(IndexList[2](chunk_rows, hidden)),
+    )
         var Fc1Acc = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            fc1_acc_buf.unsafe_ptr().bitcast[Float32](),
-            RuntimeLayout[_DYN2].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(fc1_acc_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN2].row_major(
                 IndexList[2](chunk_rows, packed_ffn)
             ),
-        )
+    )
         matmul(
             ctx, Fc1Acc, Input, Fc1Weight,
             transpose_b=True, c_row_major=True,
@@ -1394,23 +1504,24 @@ def minimax_h3_bf16_mlp_residual_inplace(
         var act_grid = (act_total + _BLOCK - 1) // _BLOCK
         if act_grid > 65535:
             act_grid = 65535
-        ctx.enqueue_function[
-            _h3_bf16_acc_swiglu_chunk,
-            _h3_bf16_acc_swiglu_chunk,
-        ](
-            Fc1AccFlat, ActFlat, chunk_rows, ffn,
+        ctx.enqueue_function[_h3_bf16_acc_swiglu_chunk](
+            Fc1AccFlat, ActFlat, Int32(chunk_rows), Int32(ffn),
             grid_dim=act_grid, block_dim=_BLOCK,
         )
         var Act = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            act_buf.unsafe_ptr().bitcast[BFloat16](),
-            RuntimeLayout[_DYN2].row_major(IndexList[2](chunk_rows, ffn)),
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(act_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN2].row_major(IndexList[2](chunk_rows, ffn)),
+    )
         var Fc2Acc = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            fc2_acc_buf.unsafe_ptr().bitcast[Float32](),
-            RuntimeLayout[_DYN2].row_major(
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(fc2_acc_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=RuntimeLayout[_DYN2].row_major(
                 IndexList[2](chunk_rows, out_hidden)
             ),
-        )
+    )
         matmul(
             ctx, Fc2Acc, Act, Fc2Weight,
             transpose_b=True, c_row_major=True,
@@ -1419,11 +1530,8 @@ def minimax_h3_bf16_mlp_residual_inplace(
         var out_grid = (out_total + _BLOCK - 1) // _BLOCK
         if out_grid > 65535:
             out_grid = 65535
-        ctx.enqueue_function[
-            _h3_bf16_acc_residual_gate_chunk,
-            _h3_bf16_acc_residual_gate_chunk,
-        ](
-            Fc2AccFlat, Residual, Gate, row_start, chunk_rows, out_hidden,
+        ctx.enqueue_function[_h3_bf16_acc_residual_gate_chunk](
+            Fc2AccFlat, Residual, Gate, Int32(row_start), Int32(chunk_rows), Int32(out_hidden),
             grid_dim=out_grid, block_dim=_BLOCK,
         )
         ctx.synchronize()

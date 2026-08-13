@@ -35,7 +35,7 @@
 # Mojo 1.0.0b1: `def` not `fn`; no Python.
 
 from std.collections import List
-from math import sqrt
+from std.math import sqrt
 from serenitymojo.io.json_header import _Cursor, _parse_string, _skip_value
 from serenitymojo.training.train_config import (
     TrainConfig,

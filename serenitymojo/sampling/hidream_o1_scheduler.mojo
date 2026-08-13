@@ -29,7 +29,7 @@ from std.math import sqrt as fsqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar
 from serenitymojo.ops.cast import cast_tensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 
 # Hardcoded 28-step Dev timestep list (scheduler.rs:51-54 / pipeline.py:25-28).

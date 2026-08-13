@@ -21,7 +21,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -44,8 +44,15 @@ comptime _BLOCK = 256
 def _patchify_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var L = GH * GW
     var F = C * p * p
@@ -70,8 +77,15 @@ def _patchify_kernel_f32(
 def _patchify_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var L = GH * GW
     var F = C * p * p
@@ -96,8 +110,15 @@ def _patchify_kernel_bf16(
 def _patchify_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var L = GH * GW
     var F = C * p * p
@@ -146,33 +167,51 @@ def patchify(x: Tensor, patch: Int, ctx: DeviceContext) raises -> Tensor:
     var grid = (total + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_patchify_kernel_f32, _patchify_kernel_f32](
-            X, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_patchify_kernel_f32](
+            X, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_patchify_kernel_bf16, _patchify_kernel_bf16](
-            X, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_patchify_kernel_bf16](
+            X, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_patchify_kernel_f16, _patchify_kernel_f16](
-            X, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_patchify_kernel_f16](
+            X, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, L, F], x.dtype())
@@ -186,8 +225,15 @@ def patchify(x: Tensor, patch: Int, ctx: DeviceContext) raises -> Tensor:
 def _unpatchify_kernel_f32(
     seq: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var total = B * C * H * W
     if idx < total:
@@ -212,8 +258,15 @@ def _unpatchify_kernel_f32(
 def _unpatchify_kernel_bf16(
     seq: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var total = B * C * H * W
     if idx < total:
@@ -238,8 +291,15 @@ def _unpatchify_kernel_bf16(
 def _unpatchify_kernel_f16(
     seq: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    B: Int, C: Int, H: Int, W: Int, p: Int, GH: Int, GW: Int,
+    B_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, p_w: Int32, GH_w: Int32, GW_w: Int32,
 ):
+    var B = Int(B_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var p = Int(p_w)
+    var GH = Int(GH_w)
+    var GW = Int(GW_w)
     var idx = Int(global_idx.x)
     var total = B * C * H * W
     if idx < total:
@@ -295,33 +355,51 @@ def unpatchify(
     var grid = (total + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            seq.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(seq.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_unpatchify_kernel_f32, _unpatchify_kernel_f32](
-            S, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_unpatchify_kernel_f32](
+            S, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            seq.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(seq.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_unpatchify_kernel_bf16, _unpatchify_kernel_bf16](
-            S, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_unpatchify_kernel_bf16](
+            S, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var S = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            seq.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(seq.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_unpatchify_kernel_f16, _unpatchify_kernel_f16](
-            S, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_unpatchify_kernel_f16](
+            S, O, Int32(B), Int32(C), Int32(H), Int32(W), Int32(p), Int32(GH), Int32(GW), grid_dim=grid, block_dim=_BLOCK
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, C, H, W], seq.dtype())
@@ -336,8 +414,10 @@ def _deinterleave_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     ev: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     od: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int, K: Int,
+    rows_w: Int32, K_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var K = Int(K_w)
     var idx = Int(global_idx.x)
     var half = rows * K
     if idx < half:
@@ -352,8 +432,10 @@ def _deinterleave_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     ev: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     od: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    rows: Int, K: Int,
+    rows_w: Int32, K_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var K = Int(K_w)
     var idx = Int(global_idx.x)
     var half = rows * K
     if idx < half:
@@ -368,8 +450,10 @@ def _deinterleave_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     ev: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     od: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    rows: Int, K: Int,
+    rows_w: Int32, K_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var K = Int(K_w)
     var idx = Int(global_idx.x)
     var half = rows * K
     if idx < half:
@@ -411,42 +495,69 @@ def deinterleave_pair(
     var grid = (half + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var EV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            ev_buf.unsafe_ptr().bitcast[Float32](), h_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(ev_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=h_rl,
+    )
         var OD = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            od_buf.unsafe_ptr().bitcast[Float32](), h_rl
-        )
-        ctx.enqueue_function[_deinterleave_kernel_f32, _deinterleave_kernel_f32](
-            X, EV, OD, rows, K, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(od_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=h_rl,
+    )
+        ctx.enqueue_function[_deinterleave_kernel_f32](
+            X, EV, OD, Int32(rows), Int32(K), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var EV = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            ev_buf.unsafe_ptr().bitcast[BFloat16](), h_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(ev_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=h_rl,
+    )
         var OD = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            od_buf.unsafe_ptr().bitcast[BFloat16](), h_rl
-        )
-        ctx.enqueue_function[_deinterleave_kernel_bf16, _deinterleave_kernel_bf16](
-            X, EV, OD, rows, K, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(od_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=h_rl,
+    )
+        ctx.enqueue_function[_deinterleave_kernel_bf16](
+            X, EV, OD, Int32(rows), Int32(K), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var EV = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            ev_buf.unsafe_ptr().bitcast[Float16](), h_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(ev_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=h_rl,
+    )
         var OD = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            od_buf.unsafe_ptr().bitcast[Float16](), h_rl
-        )
-        ctx.enqueue_function[_deinterleave_kernel_f16, _deinterleave_kernel_f16](
-            X, EV, OD, rows, K, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(od_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=h_rl,
+    )
+        ctx.enqueue_function[_deinterleave_kernel_f16](
+            X, EV, OD, Int32(rows), Int32(K), grid_dim=grid, block_dim=_BLOCK
         )
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return (Tensor(ev_buf^, out_shape.copy(), x.dtype()), Tensor(od_buf^, out_shape^, x.dtype()))

@@ -10,7 +10,7 @@
 #       serenitymojo/models/ernie/parity/load_block_smoke.mojo -o /tmp/ernie_load_block_smoke
 #   /tmp/ernie_load_block_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.dit.ernie_contract import (
     ERNIE_TRANSFORMER_DIR, ERNIE_DIT_HIDDEN, ERNIE_DIT_HEAD_DIM, ERNIE_DIT_FFN_HIDDEN,

@@ -7,7 +7,7 @@
 #   - config theta = 5e6 (Ideogram), and
 #   - conditioning = 13-tap interleaved concat (ref pipeline_ideogram4 _encode_text
 #     414-480): stack(taps)->permute(1,2,3,0)->reshape => out[..,f*13+t]=tap_t[..,f].
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

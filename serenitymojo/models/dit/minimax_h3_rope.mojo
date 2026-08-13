@@ -80,7 +80,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import cos as fcos, sin as fsin
 from std.utils.index import IndexList
@@ -112,10 +112,10 @@ def _minimax_h3_rope_kernel[out_dtype: DType](
     cos_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],  # [rows, rotary_dim]
     sin_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],  # [rows, rotary_dim]
     angle_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],  # [rows, rotary_dim]
-    rows: Int,
-    freq_dim: Int,
-    half: Int,  # 3 * freq_dim
-    rotary_dim: Int,  # 2 * half
+    rows_w: Int32,
+    freq_dim_w: Int32,
+    half_w: Int32,  # 3 * freq_dim
+    rotary_dim_w: Int32,  # 2 * half
 ):
     """One thread per (row, output column) of the full `[rows, rotary_dim]`
     table. `col` folds onto `[0, half)` via `col if col < half else col -
@@ -124,6 +124,10 @@ def _minimax_h3_rope_kernel[out_dtype: DType](
     `d // freq_dim` selects the axis (0=t, 1=h, 2=w) and `d % freq_dim` the
     local frequency index, matching the oracle's `t-block, then h-block, then
     w-block` concatenation (dit_frontend.mojo:124-129)."""
+    var rows = Int(rows_w)
+    var freq_dim = Int(freq_dim_w)
+    var half = Int(half_w)
+    var rotary_dim = Int(rotary_dim_w)
     var idx = Int(global_idx.x)
     var total = rows * rotary_dim
     if idx >= total:
@@ -215,13 +219,22 @@ def build_minimax_h3_rope_tables(
     var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, rotary_dim))
 
     var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        positions.buf.unsafe_ptr().bitcast[Float32](), p_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(positions.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=p_rl,
     )
     var IF = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        inv_freq_tensor.buf.unsafe_ptr().bitcast[Float32](), if_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(inv_freq_tensor.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=if_rl,
     )
     var ANG = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        angle_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(angle_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
     )
 
     var total = rows * rotary_dim
@@ -229,30 +242,36 @@ def build_minimax_h3_rope_tables(
     var odt = out_dtype.to_mojo_dtype()
     if odt == DType.float32:
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
-        ctx.enqueue_function[
-            _minimax_h3_rope_kernel[DType.float32],
-            _minimax_h3_rope_kernel[DType.float32],
-        ](
-            P, IF, C, S, ANG, rows, rope_freq_dim, half, rotary_dim,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+        ctx.enqueue_function[_minimax_h3_rope_kernel[DType.float32]](
+            P, IF, C, S, ANG, Int32(rows), Int32(rope_freq_dim), Int32(half), Int32(rotary_dim),
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif odt == DType.bfloat16:
         var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-        )
-        ctx.enqueue_function[
-            _minimax_h3_rope_kernel[DType.bfloat16],
-            _minimax_h3_rope_kernel[DType.bfloat16],
-        ](
-            P, IF, C, S, ANG, rows, rope_freq_dim, half, rotary_dim,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+        ctx.enqueue_function[_minimax_h3_rope_kernel[DType.bfloat16]](
+            P, IF, C, S, ANG, Int32(rows), Int32(rope_freq_dim), Int32(half), Int32(rotary_dim),
             grid_dim=grid, block_dim=_BLOCK,
         )
     else:
@@ -261,9 +280,9 @@ def build_minimax_h3_rope_tables(
         )
     ctx.synchronize()
 
-    var cos_shape = [rows, rotary_dim]
-    var sin_shape = [rows, rotary_dim]
-    var angle_shape = [rows, rotary_dim]
+    var cos_shape: List[Int] = [rows, rotary_dim]
+    var sin_shape: List[Int] = [rows, rotary_dim]
+    var angle_shape: List[Int] = [rows, rotary_dim]
     return (
         Tensor(cos_buf^, cos_shape^, out_dtype),
         Tensor(sin_buf^, sin_shape^, out_dtype),

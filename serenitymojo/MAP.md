@@ -3181,13 +3181,49 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   GEMM because their split writers require three GEMMs; those writers are used
   only by the >=48k low-headroom route. `parity/minimax_h3_chunked_linear_parity.mojo`
   gates BF16, group-wise INT8, W8A8, Q/K, and final-layer equivalence.
+- `ops/norm.mojo::rms_norm_modulate_bf16` is the exact inference fusion for
+  H3's BF16 RMSNorm -> per-token AdaLN boundary. It duplicates the scalar
+  256-thread F32 reduction order and explicitly rounds the normed value to BF16
+  before re-upcasting for modulation. The H3 block selects it only when x,
+  weight, scale, and shift are all BF16; other dtypes retain the old two-op
+  path. `ops/parity/rms_norm_modulate_bf16_parity.mojo` is bit-exact at H3
+  width and broadcast geometry. Ordinary-length row-scale W8A8 now also takes
+  the existing direct SwiGLU and projection/residual epilogues; BF16 and
+  group-wise projection dispatch are unchanged.
 - `models/dit/minimax_h3_step_cache.mojo` — opt-in `high` Cache-DiT-style
   denoise acceleration. It recomputes front/back 8-block bands and may reuse
-  one group-32 INT8 middle residual after a 4-evaluation warmup; `exact` is the
-  no-reuse quality default. High preserves geometry, seconds, FPS, step count,
-  and audio, but decoded A/B showed visible video drift, so it remains
-  experimental. The model-scoped GPU gate proves reconstruction and decision
-  policy mechanics, not perceptual equivalence.
+  the group-32 INT8 middle residual after a 4-evaluation warmup; `exact` is the
+  no-reuse quality default. 2026-08-12 ADAPTIVE policy: the old
+  one-cached-evaluation-per-request cap (which limited `high` to ~5% of a
+  19-evaluation run) is replaced by a TeaCache-style ACCUMULATED drift budget
+  (each reuse adds its measured rel-L1 diff; denied once the running total
+  would exceed 0.24 = 2x the published 0.12 per-decision threshold; every
+  full refresh resets it) plus an EXACT TAIL (final 3 evaluations never
+  reuse and stop paying snapshot overhead). Warmup 4, per-decision 0.12,
+  max-2-consecutive keep their published Cache-DiT values;
+  `MiniMaxH3StepCache` now takes the schedule's evaluation count.
+  `parity/minimax_h3_step_cache_parity.mojo` gates reconstruction
+  (cos 0.99996) plus budget-refusal/reset/exact-tail and audio-veto
+  mechanics. AUDIO PROTECTION (2026-08-13, MJ-1136): audio rows are probed
+  separately (`minimax_h3_cache_probe_given_rows`) against TIGHTER
+  thresholds (0.06 per-decision / 0.12 budget) and can veto reuse — decoded
+  High+Sage audio corr improved 0.8683→0.8809 and attenuation halved
+  -4.4→-2.5 dB, keeping 5 of 8 skips. The application-side mask
+  (`minimax_h3_cache_set_audio_mask`) was MEASURED HARMFUL (corr 0.2140:
+  losing the middle-band contribution outright is worse than a stale
+  approximation) and is deliberately UNWIRED; its docstring carries the
+  numbers.
+  **Decoded A/B ACCEPTED 2026-08-12** (i2va 512x320x175, 20 steps, same
+  seed, `output/checks/cache_ab_20260812/`): High reused 8 of 19
+  evaluations, denoise 149.5->99.6 s (1.50x); mid/end frames visually
+  equivalent to exact, audio waveform corr 0.956 at matched loudness
+  (latent cos video 0.9938 / audio 0.9809). UI relabeled from
+  "experimental" to accepted-approximate. CAVEAT: combining High with
+  Sage INT8 passes video but ATTENUATES AUDIO ~4.4 dB (corr 0.868,
+  latent audio cos 0.9351) — the two approximations compound in the
+  audio rows; the Canvas helper text names this. One geometry/seed
+  accepted so far; other geometries inherit the label with that scope
+  stated.
 - `ops/sage_attention_int8.mojo` — OPT-IN Mojo-native Sage-style backend at
   the block self-attention seam: BF16 Q/K/V -> Q128/K64 signed-INT8 QK tensor
   cores -> online-softmax/BF16-PV with F32 accumulation -> BF16 output. Runtime flag on t2va, i2va,
@@ -3292,6 +3328,26 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   selected the fast runner, denoised in 10.2355 s with finite latents, completed
   the fresh GPU decode, and published 175 H.264/NVENC frames plus stereo AAC as
   `serenity.minimax_h3.result.v1 state=done`.
+- **2026-08-12 Sage scratch + product-geometry acceptance:** every Sage call
+  previously enqueued five fresh device buffers (incl. a full BF16 V-copy for
+  BSHD->BHSD layout), ~1.6 GiB at S=38k / ~3.2 GiB at S=75k, fifty times per
+  evaluation; near the 24-GiB envelope that churn intermittently OOMed
+  mid-denoise (video-0177 died at step 4). Fix: `SageInt8Scratch`
+  preallocated once per run (2.02 GiB at S=75,468) and reused by every
+  block/step through `sage_attention_int8_fwd_scratch` (zero steady-state
+  allocations; unfittable geometry fails at setup, not mid-run), threaded as
+  an Optional through the DiT and all three runners; and the token kernel now
+  reads V directly in pipeline BSHD (each 16-byte cp.async stays inside one
+  128-element head row), deleting the V-copy and its gather kernel.
+  `ops/tests/sage_attention_int8_scratch_gate.mojo`: scratch vs dynamic
+  BIT-IDENTICAL incl. smaller-S reuse; oversized-S rejected loudly. Op gate:
+  cos 0.99994 vs cuDNN; S=9145 1.191x (baseline 1.197x — neutral); the
+  S=1024 speed-bar failure PREDATES this change (per-thread quantizer,
+  MJ-1130). Controlled i2va A/B at 1344x768x243, S=75,468, same seed/binary:
+  cuDNN 306.7/234.6 s per evaluation vs Sage 158.6/155.7 s — hot-step
+  1.51x, ~79 s saved per evaluation (~25 min per 19-evaluation video),
+  nonfinite 0/0, latent cosine video 0.9949 / audio 0.9957 over 2 evals.
+  Sage stays the labeled approximate opt-in; cuDNN remains exact default.
 - **Sage production decision:** the original FP16 P×V accumulator overflowed
   at real S=9145 (saved video/audio latents were entirely non-finite), while
   cU-DNN with identical encoder/resident weights was finite; this isolated the
@@ -3307,6 +3363,16 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   but explicitly **experimental/approximate**; BF16 and exact-quality INT8 use
   cU-DNN. The bare CLI defaults to cU-DNN, while Canvas defaults to Sage with
   INT8 Fast and never silently relabels it as exact.
+- **2026-08-12 decode-failure retention:** H3 job cleanup deleted
+  `latents.safetensors` on EVERY failure, so a transient decode failure
+  destroyed the whole denoise (video-0190 lost a 3,434-s 1344x768x243 render;
+  the decode itself needs only ~12.9 GiB and succeeds on an idle card with
+  ~10 GiB free — measured on video-0192 — so its earlier OOM was VRAM
+  co-tenancy, not size). `minimax_h3.rs` now keeps
+  `latents.safetensors`/`latents_ckpt.safetensors` when the failing phase is
+  decode/decode_start/result (`cleanup_minimax_h3_intermediates(dir,
+  keep_latents)`), making decode failures retryable via the same runner's
+  `decode_only` mode instead of unrecoverable (MJ-1129).
 - **Serenity integration:** `MiniMax-H3-Mojo` is an installed video model with one
   `minimax_h3_serenity_runtime` T2VA executable. Requests independently select
   authored duration from 1 through the trained 15-second ceiling, delivery FPS
@@ -3592,6 +3658,19 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   saving is reported from the final rebuilt dispatch. The direct-QKV dispatch
   is W8A8-only at ordinary lengths so BF16 and INT8 Quality cannot trade one
   packed GEMM for three; all three modes receive the exact Q/K fusion.
+  The next exact-path pass fused the two BF16 block RMSNorm/AdaLN pairs and
+  removed the low-headroom-only restriction from the already bit-exact direct
+  W8A8 SwiGLU and projection/residual epilogues. The new RMS/AdaLN gate reports
+  zero mismatches/max-abs 0.0 at `[257,5376]` and `[513,1024]`; the existing
+  chunked-linear gate reports max-abs 0.0 for each admitted W8A8 boundary.
+  Nsight Systems 2026.4.1 attributes 0.4830 seconds/evaluation to RMS/AdaLN and
+  another 0.8056 seconds/evaluation to the ordinary-length W8A8 dispatch, for
+  1.2886 seconds of targeted GPU work removed. Fresh task-start/final exact
+  runs observed 46.8824 -> 44.1819 seconds/evaluation (5.76%, 1.061x) with
+  latent SHA `5d089b34...6f3f7c` unchanged. The final report is
+  `output/checks/h3_speed_probe_20260812/nsys2026_exact_after_w8a8_fusions/profile.nsys-rep`;
+  cU-DNN attention varied between captures, so kernel-family deltas—not the
+  larger wall delta—are the attribution evidence.
   Eight resident W8A8 blocks are safe through the measured S=37,951 boundary:
   exact cU-DNN fell to 49.8125 s/evaluation, saving another 0.8209 s, with a
   byte-identical latent. Twelve and sixteen blocks exhausted 24-GiB attention

@@ -16,7 +16,7 @@
 # Run: pixi run mojo run -I . serenitymojo/image/png_smoke.mojo
 
 from std.python import Python, PythonObject
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.image.png import crc32, adler32, save_png, ValueRange

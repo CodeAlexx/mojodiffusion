@@ -1,6 +1,6 @@
 # Dump serenitymojo Qwen3-0.6B last-token logits (F32 binary) at a fixed prefix,
 # for per-step parity vs HF. Prefix = prompt + first 5 (matched) greedy tokens.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, UnsafePointer
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 

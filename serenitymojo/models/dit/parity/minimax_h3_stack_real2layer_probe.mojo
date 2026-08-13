@@ -33,7 +33,7 @@
 
 from std.collections import Dict, List
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import sleep
 
 from serenitymojo.tensor import Tensor

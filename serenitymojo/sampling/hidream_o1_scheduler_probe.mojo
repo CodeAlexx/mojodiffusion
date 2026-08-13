@@ -2,7 +2,7 @@
 # Build: pixi run mojo build -I . -Xlinker -lm \
 #   serenitymojo/sampling/hidream_o1_scheduler_probe.mojo -o /tmp/hdsched
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.sampling.hidream_o1_scheduler import (

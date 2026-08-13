@@ -2,13 +2,22 @@
 
 from std.collections import List
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr
 from serenitymojo.tensor import Tensor
 
+
+# Mojo 1.0 rejects a COMPILE-TIME zero address ("Pointer is non-nullable; use
+# Optional[Pointer]"), but Optional cannot cross an FFI boundary -- the C ABI
+# here genuinely requires a NULL argument. Computing the address at runtime
+# yields the same null pointer without tripping the comptime constraint.
+@no_inline
+def _null_addr() -> Int:
+    var z = 0
+    return z
 
 def cudnn_conv3d_bf16_ndhwc(
     x: Tensor,
@@ -56,7 +65,7 @@ def cudnn_conv3d_bf16_ndhwc(
     )
     var x_ptr = BytePtr(unsafe_from_address=Int(x.buf.unsafe_ptr()))
     var w_ptr = BytePtr(unsafe_from_address=Int(weight.buf.unsafe_ptr()))
-    var b_ptr = BytePtr(unsafe_from_address=0)
+    var b_ptr = BytePtr(unsafe_from_address=_null_addr())
     if bias:
         b_ptr = BytePtr(
             unsafe_from_address=Int(bias.value().buf.unsafe_ptr())

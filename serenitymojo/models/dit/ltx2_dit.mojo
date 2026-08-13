@@ -40,7 +40,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in foundation ops.
 # *** CODE-ONLY: compile-verified; NOT executed. ***
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 
@@ -419,7 +419,7 @@ struct LTX2BlockWeights(Movable):
             weights^, name_to_idx^, has_gate, has_gate2, config
         )
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LTX2: missing weight ") + name)
         return self.weights[self.name_to_idx[name]][]
@@ -1094,7 +1094,7 @@ struct LTX2AVBlockWeights(Movable):
             return linear_fp8(x, w, self._scale_t(name), None, ctx)
         return linear(x, w, None, ctx)
 
-    def _scale_t(self, name: String) raises -> ref [self.scales] Tensor:
+    def _scale_t(self, name: String) raises -> ref [self.scales[String("")]] Tensor:
         """Per-output-row F32 [N] scale tensor for a resident-fp8 weight."""
         if name not in self.scales:
             raise Error(
@@ -1102,7 +1102,7 @@ struct LTX2AVBlockWeights(Movable):
             )
         return self.scales[name][]
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LTX2AV: missing weight ") + name)
         return self.weights[self.name_to_idx[name]][]

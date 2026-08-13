@@ -18,7 +18,7 @@
 #   /tmp/sdxl_lora_step
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt
 from std.memory import alloc, ArcPointer

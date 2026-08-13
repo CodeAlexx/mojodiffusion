@@ -15,7 +15,6 @@
 
 from std.collections import List
 from std.ffi import OwnedDLHandle as DLHandle
-from std.builtin.type_aliases import MutExternalOrigin
 from std.memory import UnsafePointer, alloc
 
 from serenitymojo.io.ffi import (
@@ -34,6 +33,15 @@ struct DecodedImage(Movable):
     var height: Int
     var rgb: List[UInt8]
 
+
+# Mojo 1.0 rejects a COMPILE-TIME zero address ("Pointer is non-nullable; use
+# Optional[Pointer]"), but Optional cannot cross an FFI boundary -- the C ABI
+# here genuinely requires a NULL argument. Computing the address at runtime
+# yields the same null pointer without tripping the comptime constraint.
+@no_inline
+def _null_addr() -> Int:
+    var z = 0
+    return z
 
 def _u32_at(p: UnsafePointer[UInt8, _], offset: Int) -> UInt32:
     return (p + offset).bitcast[UInt32]()[0]
@@ -64,15 +72,6 @@ def decode_png(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     # (no named external symbol, so JIT `mojo run` resolves and libpng need not be
     # linked). png16 lives in the pixi env lib dir (on the loader path).
     var lib = DLHandle("libpng16.so.16")
-    var f_begin = lib.get_function[
-        def(BytePtr, BytePtr) thin abi("C") -> Int32
-    ]("png_image_begin_read_from_file")
-    var f_finish = lib.get_function[
-        def(BytePtr, BytePtr, BytePtr, Int32, BytePtr) thin abi("C") -> Int32
-    ]("png_image_finish_read")
-    var f_free = lib.get_function[
-        def(BytePtr) thin abi("C") -> None
-    ]("png_image_free")
 
     var image = alloc[UInt8](PNG_IMAGE_BYTES)
     for i in range(PNG_IMAGE_BYTES):
@@ -87,7 +86,7 @@ def decode_png(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     for i in range(path_len):
         cpath[i] = path_bytes[i]
     cpath[path_len] = 0
-    var ok = f_begin(image_p, BytePtr(unsafe_from_address=Int(cpath)))
+    var ok = lib.call["png_image_begin_read_from_file", Int32](image_p, BytePtr(unsafe_from_address=Int(cpath)))
     cpath.free()
     if ok == 0:
         var msg = _png_message(image)
@@ -98,7 +97,7 @@ def decode_png(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     var width = Int(_u32_at(image, 12))
     var height = Int(_u32_at(image, 16))
     if width <= 0 or height <= 0:
-        f_free(image_p)
+        lib.call["png_image_free", NoneType](image_p)
         image.free()
         _ = lib^
         raise Error(String("PNG decode invalid dimensions for ") + path)
@@ -107,8 +106,8 @@ def decode_png(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     format_p[0] = PNG_FORMAT_RGBA
     var rgba_n = width * height * 4
     var rgba = alloc[UInt8](rgba_n)
-    var nullp = BytePtr(unsafe_from_address=0)
-    ok = f_finish(
+    var nullp = BytePtr(unsafe_from_address=_null_addr())
+    ok = lib.call["png_image_finish_read", Int32](
         image_p,
         nullp,
         BytePtr(unsafe_from_address=Int(rgba)),
@@ -118,12 +117,12 @@ def decode_png(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     if ok == 0:
         var msg2 = _png_message(image)
         rgba.free()
-        f_free(image_p)
+        lib.call["png_image_free", NoneType](image_p)
         image.free()
         _ = lib^
         raise Error(String("PNG decode pixels failed for ") + path + String(": ") + msg2)
 
-    f_free(image_p)
+    lib.call["png_image_free", NoneType](image_p)
     image.free()
     _ = lib^
 
@@ -181,20 +180,8 @@ def decode_jpeg(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     # Load libturbojpeg at runtime via a DLHandle + function pointers (see
     # decode_png rationale). libturbojpeg.so.0 lives in the pixi env lib dir.
     var lib = DLHandle("libturbojpeg.so.0")
-    var f_init = lib.get_function[
-        def() thin abi("C") -> BytePtr
-    ]("tjInitDecompress")
-    var f_hdr = lib.get_function[
-        def(BytePtr, BytePtr, Int, BytePtr, BytePtr, BytePtr, BytePtr) thin abi("C") -> Int32
-    ]("tjDecompressHeader3")
-    var f_dec = lib.get_function[
-        def(BytePtr, BytePtr, Int, BytePtr, Int32, Int32, Int32, Int32, Int32) thin abi("C") -> Int32
-    ]("tjDecompress2")
-    var f_destroy = lib.get_function[
-        def(BytePtr) thin abi("C") -> Int32
-    ]("tjDestroy")
 
-    var handle = f_init()
+    var handle = lib.call["tjInitDecompress", BytePtr]()
     if Int(handle) == 0:
         jpeg.free()
         _ = lib^
@@ -210,7 +197,7 @@ def decode_jpeg(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     sp[0] = 0
     cp[0] = 0
 
-    var rc = f_hdr(
+    var rc = lib.call["tjDecompressHeader3", Int32](
         handle,
         jpeg_p,
         jpeg_size,
@@ -220,7 +207,7 @@ def decode_jpeg(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
         BytePtr(unsafe_from_address=Int(cp)),
     )
     if rc != 0:
-        _ = f_destroy(handle)
+        _ = lib.call["tjDestroy", Int32](handle)
         wp.free()
         hp.free()
         sp.free()
@@ -236,14 +223,14 @@ def decode_jpeg(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     sp.free()
     cp.free()
     if width <= 0 or height <= 0:
-        _ = f_destroy(handle)
+        _ = lib.call["tjDestroy", Int32](handle)
         jpeg.free()
         _ = lib^
         raise Error(String("JPEG invalid dimensions: ") + path)
 
     var rgb_bytes = width * height * 3
     var dst = alloc[UInt8](rgb_bytes)
-    rc = f_dec(
+    rc = lib.call["tjDecompress2", Int32](
         handle,
         jpeg_p,
         jpeg_size,
@@ -254,7 +241,7 @@ def decode_jpeg(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
         TJPF_RGB,
         TJFLAG_NONE,
     )
-    _ = f_destroy(handle)
+    _ = lib.call["tjDestroy", Int32](handle)
     jpeg.free()
     _ = lib^
     if rc != 0:
@@ -281,15 +268,8 @@ def decode_webp(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
 
     var lib = DLHandle("libwebp.so.7")
     # int WebPGetInfo(const uint8_t* data, size_t size, int* w, int* h)
-    var fget = lib.get_function[
-        def(BytePtr, Int, PtrI32, PtrI32) thin abi("C") -> Int32
-    ]("WebPGetInfo")
     # uint8_t* WebPDecodeRGBA(const uint8_t* data, size_t size, int* w, int* h)
-    var fdec = lib.get_function[
-        def(BytePtr, Int, PtrI32, PtrI32) thin abi("C") -> BytePtr
-    ]("WebPDecodeRGBA")
     # void WebPFree(void* ptr)
-    var ffree = lib.get_function[def(BytePtr) thin abi("C") -> None]("WebPFree")
 
     # Slurp the whole file (mirrors decode_jpeg's read loop).
     var fd = sys_open(path, O_RDONLY, Int32(0))
@@ -320,7 +300,7 @@ def decode_webp(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     var hp = alloc[Int32](1)
     wp[0] = 0
     hp[0] = 0
-    var info = fget(data_p, dsize, wp, hp)
+    var info = lib.call["WebPGetInfo", Int32](data_p, dsize, wp, hp)
     if info == 0:
         wp.free()
         hp.free()
@@ -331,7 +311,7 @@ def decode_webp(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
     var height = Int(hp[0])
 
     # WebPDecodeRGBA returns a libwebp-malloc'd RGBA buffer (freed via WebPFree).
-    var rgba_ptr = fdec(data_p, dsize, wp, hp)
+    var rgba_ptr = lib.call["WebPDecodeRGBA", BytePtr](data_p, dsize, wp, hp)
     data.free()
     wp.free()
     hp.free()
@@ -352,7 +332,7 @@ def decode_webp(path: String, drop_alpha: Bool = False) raises -> DecodedImage:
         rgb.append(UInt8(r))
         rgb.append(UInt8(g))
         rgb.append(UInt8(b))
-    ffree(rgba_ptr)
+    lib.call["WebPFree", NoneType](rgba_ptr)
     # Hold the DLHandle alive past the last FFI use (OwnedDLHandle dlcloses ASAP).
     _ = lib^
     return DecodedImage(width, height, rgb^)

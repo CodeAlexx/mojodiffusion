@@ -45,7 +45,7 @@
 #
 # Mojo 1.0.0b1: def not fn; Tensor move-only crosses API as host List[Float32].
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt as fsqrt
 from std.memory import ArcPointer

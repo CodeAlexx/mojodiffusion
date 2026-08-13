@@ -21,7 +21,7 @@
 # Run (after scripts/ltx2_video_vae_decode_ref.py):
 #   /tmp/ltx2_video_vae_decode_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

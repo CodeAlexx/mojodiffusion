@@ -11,7 +11,7 @@
 from std.math import ceildiv, sqrt, exp, fmod
 from std.sys import has_accelerator
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 
 comptime dtype = DType.float32
@@ -423,7 +423,7 @@ def main() raises:
     var cb_buf = ctx.enqueue_create_buffer[dtype](N)
     var cb_t = LayoutTensor[dtype, img_layout](cb_buf)
     # fixed params (preserve_lightness = 0)
-    ctx.enqueue_function[colorbalance_kernel, colorbalance_kernel](
+    ctx.enqueue_function[colorbalance_kernel](
         in_t, cb_t,
         Float32(0.3), Float32(-0.2), Float32(0.1),   # shadows r,g,b
         Float32(-0.1), Float32(0.25), Float32(-0.15),# midtones r,g,b
@@ -438,7 +438,7 @@ def main() raises:
     # ====================== CAS ======================
     var cas_buf = ctx.enqueue_create_buffer[dtype](N)
     var cas_t = LayoutTensor[dtype, img_layout](cas_buf)
-    ctx.enqueue_function[cas_kernel, cas_kernel](
+    ctx.enqueue_function[cas_kernel](
         in_t, cas_t, Float32(0.8),  # strength (CAS slider style)
         grid_dim=gdim, block_dim=bdim,
     )
@@ -462,11 +462,11 @@ def main() raises:
     var blur_t = LayoutTensor[dtype, img_layout](blur_buf)
     var usm_buf = ctx.enqueue_create_buffer[dtype](N)
     var usm_t = LayoutTensor[dtype, img_layout](usm_buf)
-    ctx.enqueue_function[usm_blur_h_kernel, usm_blur_h_kernel](
+    ctx.enqueue_function[usm_blur_h_kernel](
         in_t, tmp_t, kt_dev, grid_dim=gdim, block_dim=bdim)
-    ctx.enqueue_function[usm_blur_v_kernel, usm_blur_v_kernel](
+    ctx.enqueue_function[usm_blur_v_kernel](
         tmp_t, blur_t, kt_dev, grid_dim=gdim, block_dim=bdim)
-    ctx.enqueue_function[usm_combine_kernel, usm_combine_kernel](
+    ctx.enqueue_function[usm_combine_kernel](
         in_t, blur_t, usm_t, amount, threshold, grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with usm_buf.map_to_host() as h:
@@ -489,7 +489,7 @@ def main() raises:
     var lut_t = LayoutTensor[dtype, lut_layout](lut_buf)
     var l3d_buf = ctx.enqueue_create_buffer[dtype](N)
     var l3d_t = LayoutTensor[dtype, img_layout](l3d_buf)
-    ctx.enqueue_function[lut3d_kernel, lut3d_kernel](
+    ctx.enqueue_function[lut3d_kernel](
         in_t, lut_t, l3d_t, grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with l3d_buf.map_to_host() as h:

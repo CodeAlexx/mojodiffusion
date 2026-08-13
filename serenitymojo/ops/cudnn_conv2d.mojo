@@ -6,8 +6,8 @@
 
 from std.collections import List
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr

@@ -4,7 +4,7 @@
 # block + 24 single block DiT forward on a tiny 2x2 image-token grid. It is a
 # model-wiring smoke, not a 1024x1024 production pass.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

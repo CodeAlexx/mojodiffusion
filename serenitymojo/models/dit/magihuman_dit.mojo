@@ -52,7 +52,7 @@
 # (super-res) DiT, and the unipc sampler. CHUNK A gates the shared block only.
 
 from std.math import exp
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from std.memory import ArcPointer
@@ -118,9 +118,11 @@ comptime _BLOCK = 256
 def _swiglu7_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var i = Int(global_idx.x)
     var total = rows * half
     if i < total:
@@ -158,15 +160,21 @@ def swiglu7(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var xrl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * d))
     var orl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * half))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), xrl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=xrl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), orl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=orl,
     )
     var total = rows * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_swiglu7_kernel_f32, _swiglu7_kernel_f32](
-        X, O, rows, half, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_swiglu7_kernel_f32](
+        X, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK
     )
     var oshape = List[Int]()
     for i in range(len(xshape) - 1):
@@ -303,7 +311,7 @@ def magihuman_shared_block_forward[L: Int, H: Int, Hkv: Int, DH: Int](
     var gsz = cfg.gating_size
     var rep = cfg.repeat_kv()
     var rope_dim = cfg.rope_dim
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
 
     var hb = cast_tensor(x_seq, STDtype.BF16, ctx)
 
@@ -446,8 +454,9 @@ def _concat_arc(dim: Int, pieces: List[ArcPointer[Tensor]], ctx: DeviceContext) 
 def _gelu7_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var xv = rebind[Scalar[DType.float32]](x[i])
@@ -465,14 +474,20 @@ def gelu7(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_gelu7_kernel_f32, _gelu7_kernel_f32](
-        X, O, n, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_gelu7_kernel_f32](
+        X, O, Int64(n), grid_dim=grid, block_dim=_BLOCK
     )
     var osh = x.shape()
     return Tensor(out_buf^, osh^, STDtype.F32)
@@ -551,7 +566,7 @@ def magihuman_mm_block_forward[L: Int, H: Int, Hkv: Int, DH: Int](
     var rep = cfg.repeat_kv()
     var rope_dim = cfg.rope_dim
     var qkv_out = cfg.qkv_out()
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
 
     var hb = cast_tensor(x_seq, STDtype.BF16, ctx)
 

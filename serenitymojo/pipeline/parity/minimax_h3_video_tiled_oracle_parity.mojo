@@ -30,7 +30,7 @@
 #     serenitymojo/pipeline/parity/minimax_h3_video_tiled_oracle_parity.mojo
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

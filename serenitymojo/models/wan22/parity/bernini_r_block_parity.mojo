@@ -5,7 +5,7 @@
 # argv: bernini_r_block_parity <official_transformer_dir> <fp8_cache_dir>
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, alloc
 from std.sys import argv
 

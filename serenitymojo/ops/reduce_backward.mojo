@@ -31,9 +31,10 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import sqrt, exp
-from std.gpu.host import DeviceContext
-from std.gpu import global_idx, thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu import global_idx, thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -53,8 +54,9 @@ def _sqrt_bwd_k[dtype: DType](
     g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var xv = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
@@ -68,8 +70,9 @@ def _square_bwd_k[dtype: DType](
     g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var xv = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
@@ -83,8 +86,9 @@ def _log_bwd_k[dtype: DType](
     g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         var xv = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
@@ -95,8 +99,9 @@ def _log_bwd_k[dtype: DType](
 def _broadcast_scalar_k[dtype: DType](
     o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     val: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         o[i] = rebind[o.element_type](val.cast[dtype]())
@@ -109,8 +114,9 @@ def _softmax_bwd_rows_k[dtype: DType](
     sm: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -149,8 +155,9 @@ def _logsoftmax_bwd_rows_k[dtype: DType](
     l: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -196,61 +203,79 @@ def _elementwise_bwd[
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var g = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var xt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         comptime if kind == 0:
-            ctx.enqueue_function[
-                _sqrt_bwd_k[DType.float32], _sqrt_bwd_k[DType.float32]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sqrt_bwd_k[DType.float32]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif kind == 1:
-            ctx.enqueue_function[
-                _square_bwd_k[DType.float32], _square_bwd_k[DType.float32]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_square_bwd_k[DType.float32]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _log_bwd_k[DType.float32], _log_bwd_k[DType.float32]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_log_bwd_k[DType.float32]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var g = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var xt = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         comptime if kind == 0:
-            ctx.enqueue_function[
-                _sqrt_bwd_k[DType.bfloat16], _sqrt_bwd_k[DType.bfloat16]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sqrt_bwd_k[DType.bfloat16]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif kind == 1:
-            ctx.enqueue_function[
-                _square_bwd_k[DType.bfloat16], _square_bwd_k[DType.bfloat16]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_square_bwd_k[DType.bfloat16]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _log_bwd_k[DType.bfloat16], _log_bwd_k[DType.bfloat16]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_log_bwd_k[DType.bfloat16]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         var g = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var xt = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         comptime if kind == 0:
-            ctx.enqueue_function[
-                _sqrt_bwd_k[DType.float16], _sqrt_bwd_k[DType.float16]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_sqrt_bwd_k[DType.float16]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         elif kind == 1:
-            ctx.enqueue_function[
-                _square_bwd_k[DType.float16], _square_bwd_k[DType.float16]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_square_bwd_k[DType.float16]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _log_bwd_k[DType.float16], _log_bwd_k[DType.float16]
-            ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
+            ctx.enqueue_function[_log_bwd_k[DType.float16]](g, xt, o, Int64(n), grid_dim=grid, block_dim=_BLOCK)
 
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     var sh = List[Int]()
@@ -305,37 +330,64 @@ def softmax_backward(
     var dt = softmax_out.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var sm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            softmax_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(softmax_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var g = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[
-            _softmax_bwd_rows_k[DType.float32],
-            _softmax_bwd_rows_k[DType.float32],
-        ](sm, g, o, cols, grid_dim=rows, block_dim=_TPB)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_softmax_bwd_rows_k[DType.float32]](sm, g, o, Int32(cols), grid_dim=rows, block_dim=_TPB)
     elif dt == DType.bfloat16:
         var sm = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            softmax_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(softmax_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var g = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[
-            _softmax_bwd_rows_k[DType.bfloat16],
-            _softmax_bwd_rows_k[DType.bfloat16],
-        ](sm, g, o, cols, grid_dim=rows, block_dim=_TPB)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_softmax_bwd_rows_k[DType.bfloat16]](sm, g, o, Int32(cols), grid_dim=rows, block_dim=_TPB)
     else:
         var sm = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            softmax_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(softmax_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var g = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[
-            _softmax_bwd_rows_k[DType.float16],
-            _softmax_bwd_rows_k[DType.float16],
-        ](sm, g, o, cols, grid_dim=rows, block_dim=_TPB)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_softmax_bwd_rows_k[DType.float16]](sm, g, o, Int32(cols), grid_dim=rows, block_dim=_TPB)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = List[Int]()
     os.append(rows); os.append(cols)
@@ -371,37 +423,64 @@ def logsoftmax_backward(
     var dt = logsoftmax_out.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var l = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            logsoftmax_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(logsoftmax_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var g = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[
-            _logsoftmax_bwd_rows_k[DType.float32],
-            _logsoftmax_bwd_rows_k[DType.float32],
-        ](l, g, o, cols, grid_dim=rows, block_dim=_TPB)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_logsoftmax_bwd_rows_k[DType.float32]](l, g, o, Int32(cols), grid_dim=rows, block_dim=_TPB)
     elif dt == DType.bfloat16:
         var l = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            logsoftmax_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(logsoftmax_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var g = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[
-            _logsoftmax_bwd_rows_k[DType.bfloat16],
-            _logsoftmax_bwd_rows_k[DType.bfloat16],
-        ](l, g, o, cols, grid_dim=rows, block_dim=_TPB)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_logsoftmax_bwd_rows_k[DType.bfloat16]](l, g, o, Int32(cols), grid_dim=rows, block_dim=_TPB)
     else:
         var l = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            logsoftmax_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(logsoftmax_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var g = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_out.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var o = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[
-            _logsoftmax_bwd_rows_k[DType.float16],
-            _logsoftmax_bwd_rows_k[DType.float16],
-        ](l, g, o, cols, grid_dim=rows, block_dim=_TPB)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_logsoftmax_bwd_rows_k[DType.float16]](l, g, o, Int32(cols), grid_dim=rows, block_dim=_TPB)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = List[Int]()
     os.append(rows); os.append(cols)
@@ -421,22 +500,28 @@ def _broadcast_bwd(
     var dt = dtype.to_mojo_dtype()
     if dt == DType.float32:
         var o = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl)
-        ctx.enqueue_function[
-            _broadcast_scalar_k[DType.float32], _broadcast_scalar_k[DType.float32]
-        ](o, grad_scalar, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_broadcast_scalar_k[DType.float32]](o, grad_scalar, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var o = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
-        ctx.enqueue_function[
-            _broadcast_scalar_k[DType.bfloat16], _broadcast_scalar_k[DType.bfloat16]
-        ](o, grad_scalar, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_broadcast_scalar_k[DType.bfloat16]](o, grad_scalar, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         var o = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl)
-        ctx.enqueue_function[
-            _broadcast_scalar_k[DType.float16], _broadcast_scalar_k[DType.float16]
-        ](o, grad_scalar, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_broadcast_scalar_k[DType.float16]](o, grad_scalar, Int64(n), grid_dim=grid, block_dim=_BLOCK)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     var sh = List[Int]()
     for i in range(len(in_shape)):

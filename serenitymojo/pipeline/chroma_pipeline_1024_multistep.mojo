@@ -29,7 +29,7 @@
 #     -o /tmp/chroma_1024 && /tmp/chroma_1024
 
 from std.collections import Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import cos as fcos, exp as fexp, log as flog, sin as fsin, sqrt
 
 from serenitymojo.tensor import Tensor
@@ -224,7 +224,7 @@ struct ChromaShared(Movable):
             name_to_idx[nm] = idx
         return ChromaShared(weights^, name_to_idx^)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("ChromaShared missing weight: ") + name)
         var idx = self.name_to_idx[name]
@@ -232,7 +232,11 @@ struct ChromaShared(Movable):
 
 
 # ── Block weight lookup ────────────────────────────────────────────────────────
-def _bw(ref block: Block, name: String) raises -> ref [block] Tensor:
+# Read borrow: weights are never mutated in forward, and an IMMUTABLE
+# interior ref lets two `_bw(...)` results coexist as sibling call
+# arguments — 1.0 rejects overlapping mutable interior refs in one
+# expression (the weight+bias pairs at every projection call).
+def _bw(block: Block, name: String) raises -> ref [block[String("")]] Tensor:
     if name not in block:
         raise Error(String("Block missing weight: ") + name)
     return block[name][]

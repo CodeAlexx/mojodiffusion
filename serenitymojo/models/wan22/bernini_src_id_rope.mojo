@@ -47,7 +47,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. Trig math in F32; storage dtype preserved.
 
 from std.math import exp, log, cos, sin
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -69,11 +69,13 @@ def _src_id_rotate_kernel[out_dtype: DType](
     sin_in: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     cos_out: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     sin_out: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
     source_id: Float32,
     theta: Float32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx >= total:
@@ -131,57 +133,84 @@ def apply_src_id_rope_rotation(
 
     if odt == DType.float32:
         var CI = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos_in.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos_in.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var SI = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin_in.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin_in.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var CO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var SO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[
-            _src_id_rotate_kernel[DType.float32],
-            _src_id_rotate_kernel[DType.float32],
-        ](CI, SI, CO, SO, rows, half, source_id, theta,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_src_id_rotate_kernel[DType.float32]](CI, SI, CO, SO, Int32(rows), Int32(half), source_id, theta,
           grid_dim=grid, block_dim=_BLOCK)
     elif odt == DType.bfloat16:
         var CI = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            cos_in.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_in.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var SI = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            sin_in.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_in.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var CO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var SO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[
-            _src_id_rotate_kernel[DType.bfloat16],
-            _src_id_rotate_kernel[DType.bfloat16],
-        ](CI, SI, CO, SO, rows, half, source_id, theta,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_src_id_rotate_kernel[DType.bfloat16]](CI, SI, CO, SO, Int32(rows), Int32(half), source_id, theta,
           grid_dim=grid, block_dim=_BLOCK)
     elif odt == DType.float16:
         var CI = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            cos_in.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_in.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var SI = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            sin_in.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_in.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var CO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            cos_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var SO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            sin_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[
-            _src_id_rotate_kernel[DType.float16],
-            _src_id_rotate_kernel[DType.float16],
-        ](CI, SI, CO, SO, rows, half, source_id, theta,
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_src_id_rotate_kernel[DType.float16]](CI, SI, CO, SO, Int32(rows), Int32(half), source_id, theta,
           grid_dim=grid, block_dim=_BLOCK)
     else:
         raise Error("apply_src_id_rope_rotation: dtype must be F32, BF16, or F16")

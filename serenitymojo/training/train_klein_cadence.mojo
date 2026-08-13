@@ -9,7 +9,7 @@
 # The separation is intentional. In-process 1024px sampling after step 500 can
 # OOM because the trainer's DeviceContext may still hold resident allocations.
 
-from sys import argv
+from std.sys import argv
 from std.collections import List
 
 from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY

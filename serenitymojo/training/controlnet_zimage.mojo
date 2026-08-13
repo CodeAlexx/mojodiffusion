@@ -49,7 +49,7 @@
 # Mojo 1.0.0b1: def + raises; no implicit Tensor copies; host List[Float32]
 # carriers at module boundaries.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer, alloc
 from std.math import sqrt

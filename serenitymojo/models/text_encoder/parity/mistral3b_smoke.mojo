@@ -10,7 +10,7 @@
 #   pixi run mojo run -I . -Xlinker -lm -Xlinker -lcuda \
 #     serenitymojo/models/text_encoder/parity/mistral3b_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

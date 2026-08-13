@@ -32,7 +32,7 @@
 #
 # Run:  pixi run mojo run serenitymojo/pipeline/ltx2_dit_forward_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.sys import argv
 

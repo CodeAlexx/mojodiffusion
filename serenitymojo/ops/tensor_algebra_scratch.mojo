@@ -5,7 +5,7 @@
 
 from std.builtin.dtype import DType
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -206,11 +206,15 @@ def _concat_dim1_rank2_2_f32_kernel(
     a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int,
-    ca: Int,
-    cb: Int,
-    n: Int,
+    rows_w: Int32,
+    ca_w: Int32,
+    cb_w: Int32,
+    n_w: Int64,
 ):
+    var rows = Int(rows_w)
+    var ca = Int(ca_w)
+    var cb = Int(cb_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var co = ca + cb
@@ -229,12 +233,17 @@ def _concat_dim1_rank2_3_f32_kernel(
     b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     c_t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int,
-    ca: Int,
-    cb: Int,
-    cc: Int,
-    n: Int,
+    rows_w: Int32,
+    ca_w: Int32,
+    cb_w: Int32,
+    cc_w: Int32,
+    n_w: Int64,
 ):
+    var rows = Int(rows_w)
+    var ca = Int(ca_w)
+    var cb = Int(cb_w)
+    var cc = Int(cc_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var co = ca + cb + cc
@@ -253,12 +262,17 @@ def _concat_dim1_rank2_3_f32_kernel(
 def _slice_dim1_rank2_f32_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    start: Int,
-    length: Int,
-    n: Int,
+    rows_w: Int32,
+    cols_w: Int32,
+    start_w: Int32,
+    length_w: Int32,
+    n_w: Int64,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
+    var start = Int(start_w)
+    var length = Int(length_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var r = idx // length
@@ -299,18 +313,25 @@ def concat2_scratch(
     var rl_b = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cb))
     var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
     var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        a.buf.unsafe_ptr().bitcast[Float32](), rl_a
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_a,
     )
     var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        b.buf.unsafe_ptr().bitcast[Float32](), rl_b
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_b,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), rl_o
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_o,
     )
     var grid = (out_n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _concat_dim1_rank2_2_f32_kernel, _concat_dim1_rank2_2_f32_kernel
-    ](A, B, O, rows, ca, cb, out_n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_concat_dim1_rank2_2_f32_kernel](A, B, O, Int32(rows), Int32(ca), Int32(cb), Int64(out_n), grid_dim=grid, block_dim=_BLOCK)
     return out^
 
 
@@ -349,21 +370,31 @@ def concat3_scratch(
     var rl_c = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cc))
     var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
     var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        a.buf.unsafe_ptr().bitcast[Float32](), rl_a
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_a,
     )
     var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        b.buf.unsafe_ptr().bitcast[Float32](), rl_b
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_b,
     )
     var C = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        c.buf.unsafe_ptr().bitcast[Float32](), rl_c
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_c,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), rl_o
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_o,
     )
     var grid = (out_n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _concat_dim1_rank2_3_f32_kernel, _concat_dim1_rank2_3_f32_kernel
-    ](A, B, C, O, rows, ca, cb, cc, out_n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_concat_dim1_rank2_3_f32_kernel](A, B, C, O, Int32(rows), Int32(ca), Int32(cb), Int32(cc), Int64(out_n), grid_dim=grid, block_dim=_BLOCK)
     return out^
 
 
@@ -395,13 +426,17 @@ def slice_scratch(
     var rl_x = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cols))
     var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl_x
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_x,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out.buf.unsafe_ptr().bitcast[Float32](), rl_o
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl_o,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _slice_dim1_rank2_f32_kernel, _slice_dim1_rank2_f32_kernel
-    ](X, O, rows, cols, start, length, n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_slice_dim1_rank2_f32_kernel](X, O, Int32(rows), Int32(cols), Int32(start), Int32(length), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     return out^

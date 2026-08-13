@@ -3,7 +3,7 @@
 # integrated build type-checks the whole unit. Not run here (build-only; GPU-free
 # build per unit instructions). Do NOT run.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.autograd import Tape, backward

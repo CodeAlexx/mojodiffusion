@@ -25,7 +25,7 @@
 #     serenitymojo/models/flux/parity/flux_block_device_parity.mojo -o /tmp/flux_dev_parity
 #   /tmp/flux_dev_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

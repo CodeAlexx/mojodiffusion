@@ -6,8 +6,8 @@
 # Zero q/k/v/mask: GEMM/softmax timing is value-independent.
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
-from time import perf_counter_ns
+from max.gpu.host import DeviceContext
+from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.attention import sdpa

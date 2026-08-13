@@ -27,7 +27,7 @@
 # (did NOT need the cudnn -Xlinker flags in this environment to reach sdpa —
 # see report; add them if `flame_cudnn_sdpa_bf16` comes up.)
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor, BatchedTensorUploader
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_streamed import (

@@ -19,8 +19,8 @@
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA RTX 3090 Ti, MAX 26.3.
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 from std.gpu import global_idx
 from std.memory import alloc
 from std.time import perf_counter_ns
@@ -158,8 +158,9 @@ def _add_kernel(
     c: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     a: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     d: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var total = n * n
     if i < total:
@@ -182,8 +183,8 @@ def _run_ops(
     matmul(ctx, c_lt, a_lt, b_lt, transpose_b=True, c_row_major=True)
     var total = N * N
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_add_kernel, _add_kernel](
-        c_lt, a_lt, d_lt, N, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_add_kernel](
+        c_lt, a_lt, d_lt, Int64(N), grid_dim=grid, block_dim=_BLOCK
     )
 
 
@@ -269,16 +270,28 @@ def main() raises:
     var dev_d = ctx.enqueue_create_buffer[DType.uint8](nbytes)
     var rl = RuntimeLayout[_DYN2].row_major(IndexList[2](N, N))
     var a_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dev_a.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_a.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var b_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dev_b.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_b.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var c_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dev_c.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_c.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var d_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dev_d.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_d.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
 
     # ── warmup: lets cuBLAS create handles/workspace + MAX compile kernels

@@ -6,7 +6,7 @@
 # BF16. The 27 shared BF16 tensors are published last as the completion marker.
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, alloc
 
 from serenitymojo.io.dtype import STDtype

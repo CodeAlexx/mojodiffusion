@@ -12,7 +12,7 @@
 
 from std.io.file import open
 from std.math import ceil, exp, floor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx, grid_dim, block_dim
 from std.utils.index import IndexList
 
@@ -123,11 +123,14 @@ def raw_rgb24_video_to_signed_ncdhw_bf16(
 def _rgb24_hwc_to_signed_ncdhw_bf16(
     x: LayoutTensor[DType.uint8, _VIDEO_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _VIDEO_DYN1, MutAnyOrigin],
-    frames: Int,
-    plane: Int,
-    n: Int,
+    frames_w: Int32,
+    plane_w: Int32,
+    n_w: Int64,
 ):
     """GPU transpose and normalization for an ffmpeg RGB24 byte stream."""
+    var frames = Int(frames_w)
+    var plane = Int(plane_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     while i < n:
@@ -193,23 +196,26 @@ def raw_rgb24_video_to_signed_ncdhw_bf16_device(
     var out_dev = ctx.enqueue_create_buffer[DType.uint8](expected * 2)
     var rl = RuntimeLayout[_VIDEO_DYN1].row_major(IndexList[1](expected))
     var x = LayoutTensor[DType.uint8, _VIDEO_DYN1, MutAnyOrigin](
-        raw_dev.unsafe_ptr(), rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(raw_dev.unsafe_ptr())
+        ),
+        runtime_layout=rl,
     )
     var o = LayoutTensor[DType.bfloat16, _VIDEO_DYN1, MutAnyOrigin](
-        out_dev.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_dev.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (
         expected + _VIDEO_CONVERT_BLOCK - 1
     ) // _VIDEO_CONVERT_BLOCK
-    ctx.enqueue_function[
-        _rgb24_hwc_to_signed_ncdhw_bf16,
-        _rgb24_hwc_to_signed_ncdhw_bf16,
-    ](
+    ctx.enqueue_function[_rgb24_hwc_to_signed_ncdhw_bf16](
         x,
         o,
-        frames,
-        plane,
-        expected,
+        Int32(frames),
+        Int32(plane),
+        Int64(expected),
         grid_dim=grid,
         block_dim=_VIDEO_CONVERT_BLOCK,
     )

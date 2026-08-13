@@ -43,7 +43,7 @@
 #     pixi run mojo run -I . serenitymojo/training/parity/train_skeleton.mojo
 
 from std.math import sin, sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear

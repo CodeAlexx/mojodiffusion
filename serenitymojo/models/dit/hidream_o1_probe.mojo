@@ -3,7 +3,7 @@
 # Build: pixi run mojo build -I . -Xlinker -lm \
 #   serenitymojo/models/dit/hidream_o1_probe.mojo -o /tmp/hdprobe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

@@ -10,7 +10,7 @@
 #   save q/k/v/d_out/mask[H*S,S]/d_q/d_k/d_v (see git log for the script).
 #
 # Build/run: standard test build + LD_LIBRARY_PATH (see klein_block_parity).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.attention_backward import sdpa_backward_masked

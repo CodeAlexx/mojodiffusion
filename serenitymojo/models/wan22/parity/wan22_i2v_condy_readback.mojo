@@ -4,7 +4,7 @@
 # weights. Confirms cond_y is [20,1,32,32] f32, computes std/mean (must match the
 # torch builder print), and patchifies (1,2,2) -> [S=256, 80].
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt
 from serenitymojo.io.safetensors import SafeTensors

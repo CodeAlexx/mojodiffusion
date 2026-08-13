@@ -27,7 +27,7 @@
 # Mojo 0.26.x, NVIDIA GPU. F32 device buffers; LayoutTensor flat-index kernels.
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -48,8 +48,9 @@ def _moment_kernel(
     beta1_comp: Float32,
     beta2_hat: Float32,
     one_minus_beta2_hat: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var gv = rebind[Scalar[DType.float32]](g[idx])
@@ -69,8 +70,9 @@ def _update_kernel(
     lr_eff: Float32,
     eps: Float32,
     weight_decay: Float32,
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx < n:
         var pv = rebind[Scalar[DType.float32]](p[idx])
@@ -150,13 +152,25 @@ def stableadamw_step(
 
     # 1) moment update (m, v) on device.
     var gt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var mt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        m.buf.unsafe_ptr().bitcast[Float32](), rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(m.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
     var vt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        v.buf.unsafe_ptr().bitcast[Float32](), rl)
-    ctx.enqueue_function[_moment_kernel, _moment_kernel](
-        gt, mt, vt, beta1_comp, beta2_hat, one_minus_beta2_hat, n,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+    ctx.enqueue_function[_moment_kernel](
+        gt, mt, vt, beta1_comp, beta2_hat, one_minus_beta2_hat, Int64(n),
         grid_dim=grid, block_dim=_BLOCK,
     )
     ctx.synchronize()
@@ -181,9 +195,13 @@ def stableadamw_step(
 
     # 3) param update with the per-tensor lr_eff.
     var pt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        param.buf.unsafe_ptr().bitcast[Float32](), rl)
-    ctx.enqueue_function[_update_kernel, _update_kernel](
-        pt, mt, vt, lr_eff, eps, weight_decay, n,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(param.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+    ctx.enqueue_function[_update_kernel](
+        pt, mt, vt, lr_eff, eps, weight_decay, Int64(n),
         grid_dim=grid, block_dim=_BLOCK,
     )
     ctx.synchronize()

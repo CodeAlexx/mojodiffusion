@@ -39,7 +39,7 @@
 #     semantics) on cumdist against uniform_sample*sum, clamped to [0, n-1]
 #     (replacement=True). See get_timestep_discrete discrete branch (SKEPTIC P0-1).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, sqrt, cos
 
 from serenitymojo.tensor import Tensor

@@ -36,7 +36,7 @@
 # foundation sdpa dispatch (via the [S] params on the block/stack/attn helpers).
 
 from std.math import cos as fcos, sin as fsin, exp as fexp, log as flog, sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

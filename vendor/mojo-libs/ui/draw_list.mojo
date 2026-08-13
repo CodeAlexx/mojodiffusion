@@ -2,7 +2,6 @@
 # in ONE FFI call (draw_triangles_batch) instead of one external_call per primitive.
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from builtin.type_aliases import MutExternalOrigin
 
 comptime WIN_W = 170
 comptime WIN_H = 80

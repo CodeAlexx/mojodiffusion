@@ -23,7 +23,7 @@
 #   * calculate_timestep_shift must be finite and > 0 (it is exp(mu)).
 # The mean/std/shift values are printed so the orchestrator can diff vs Serenity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, exp, isfinite
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors

@@ -6,7 +6,7 @@
 # the existing Ideogram4 tiled VAE decoder, so 2048 output avoids the full-frame
 # VAE activation peak.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.tensor import Tensor

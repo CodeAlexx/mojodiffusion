@@ -3,7 +3,7 @@
 # grows with L (K/V-cache host round-trip + O(L) concat). Measures cached-only
 # (no-cache at maxseq=2048 is ~1749 ms/tok CONSTANT, already measured) at several
 # N so we can see the L-growth curve and compare to that 1749 ms/tok ceiling.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.models.text_encoder.qwen3_magic import generate_greedy_cached

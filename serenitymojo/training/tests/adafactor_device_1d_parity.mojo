@@ -21,7 +21,7 @@
 #     serenitymojo/training/tests/adafactor_device_1d_parity.mojo -o /tmp/af_dev_1d_parity
 #   LD_LIBRARY_PATH=.pixi/envs/default/lib /tmp/af_dev_1d_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, sin
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

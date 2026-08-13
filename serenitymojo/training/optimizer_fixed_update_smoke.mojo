@@ -8,7 +8,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/training/optimizer_fixed_update_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.fused_adamw_multitensor import fused_adamw_step, TArc

@@ -1,5 +1,5 @@
 # gate: linear_fp8 (fused fp8 GEMM) vs dequant+linear (proven path), real qkv.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts

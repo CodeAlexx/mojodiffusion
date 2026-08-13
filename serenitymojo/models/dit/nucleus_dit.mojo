@@ -38,7 +38,7 @@
 # weights. A streaming runtime (mirroring Klein9BOffloaded + NucleusInferDit)
 # is sketched at the end (NOT compiled in this pass — see STUB note).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import (
     sqrt,
     cos as fcos,
@@ -284,7 +284,7 @@ struct NucleusDiT[S_IMG: Int, S_TXT: Int]:
             weights^, name_to_idx^, NucleusConfig.nucleus_image()
         )
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("NucleusDiT: missing weight: ") + name)
         var idx = self.name_to_idx[name]

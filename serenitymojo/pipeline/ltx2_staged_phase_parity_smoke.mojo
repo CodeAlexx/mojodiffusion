@@ -8,7 +8,7 @@
 # Python only generates fixed oracle tensors.  The phase math is recomputed here
 # in Mojo using the same sampling functions as ltx2_t2v_av_hq.mojo.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import alloc
 

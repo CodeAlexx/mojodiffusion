@@ -23,7 +23,7 @@
 #       /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib \
 #     serenitymojo/models/text_encoder/parity/gemma4_streamed_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.io.dtype import STDtype

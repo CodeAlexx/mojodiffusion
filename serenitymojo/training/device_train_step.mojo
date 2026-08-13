@@ -5,7 +5,7 @@
 # for parity/debug/checkpoint surfaces, but any result carrying full tensor
 # readbacks is marked as the compatibility slow path.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
 

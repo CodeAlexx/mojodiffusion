@@ -49,14 +49,13 @@
 #   LD_LIBRARY_PATH=serenitymojo/ops/cshim/lib:.pixi/envs/default/lib \
 #     output/bin/train_scail2_real [num_steps]
 
-from std.builtin.type_aliases import MutExternalOrigin
 from std.collections import List, Optional
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import UnsafePointer, alloc
 from std.time import perf_counter
-from sys import argv
+from std.sys import argv
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

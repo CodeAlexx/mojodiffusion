@@ -8,7 +8,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/embed_parity.mojo -o /tmp/sdxl_emb
 #   /tmp/sdxl_emb
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness, ParityResult

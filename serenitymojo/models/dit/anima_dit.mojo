@@ -30,9 +30,10 @@
 
 from std.math import exp as fexp, log as flog, cos as fcos, sin as fsin, sqrt as fsqrt, pow as fpow
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import global_idx, thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import global_idx, thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -125,10 +126,12 @@ comptime ANIMA_S_TXT = 256
 def _anima_sinusoidal_kernel[out_dtype: DType](
     t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
-    n: Int,
-    half: Int,
+    n_w: Int64,
+    half_w: Int32,
     neg_ln_max_period: Float32,
 ):
+    var n = Int(n_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = n * half
     if idx < total:
@@ -156,35 +159,38 @@ def _anima_sinusoidal_emb(
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, dim))
     var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        t.buf.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(t.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var total = n * half
     var grid = (total + _BLOCK - 1) // _BLOCK
     var odt = out_dtype.to_mojo_dtype()
     if odt == DType.float32:
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-        )
-        ctx.enqueue_function[
-            _anima_sinusoidal_kernel[DType.float32],
-            _anima_sinusoidal_kernel[DType.float32],
-        ](T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_anima_sinusoidal_kernel[DType.float32]](T, O, Int64(n), Int32(half), neg_ln, grid_dim=grid, block_dim=_BLOCK)
     elif odt == DType.bfloat16:
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-        )
-        ctx.enqueue_function[
-            _anima_sinusoidal_kernel[DType.bfloat16],
-            _anima_sinusoidal_kernel[DType.bfloat16],
-        ](T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_anima_sinusoidal_kernel[DType.bfloat16]](T, O, Int64(n), Int32(half), neg_ln, grid_dim=grid, block_dim=_BLOCK)
     else:
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
-        )
-        ctx.enqueue_function[
-            _anima_sinusoidal_kernel[DType.float16],
-            _anima_sinusoidal_kernel[DType.float16],
-        ](T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_anima_sinusoidal_kernel[DType.float16]](T, O, Int64(n), Int32(half), neg_ln, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var sh = List[Int]()
     sh.append(n)
@@ -204,12 +210,16 @@ def _adaln_modulate_kernel_bf16(
     shift: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B, D] (broadcast over S)
     scale: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B, D]
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B*S, D]
-    rows: Int,  # B*S
-    cols: Int,  # D
-    batch: Int,  # B
-    seq: Int,    # S
+    rows_w: Int32,  # B*S
+    cols_w: Int32,  # D
+    batch_w: Int32,  # B
+    seq_w: Int32,    # S
     eps: Float32,
 ):
+    var rows = Int(rows_w)
+    var cols = Int(cols_w)
+    var batch = Int(batch_w)
+    var seq = Int(seq_w)
     # One block per row; computes LayerNorm (mean + variance) then applies shift+scale.
     # Rust `modulate_pre_fused_bf16` is layernorm (not rms_norm) based on Cosmos DiT convention.
     var row = Int(block_idx.x)
@@ -289,19 +299,31 @@ def _apply_adaln_modulate(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var bd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](b, d))
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var Sh = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        shift.buf.unsafe_ptr().bitcast[BFloat16](), bd_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(shift.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bd_rl,
     )
     var Sc = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[BFloat16](), bd_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=bd_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
-    ctx.enqueue_function[_adaln_modulate_kernel_bf16, _adaln_modulate_kernel_bf16](
-        X, Sh, Sc, O, rows, d, b, s, Float32(1e-6),
+    ctx.enqueue_function[_adaln_modulate_kernel_bf16](
+        X, Sh, Sc, O, Int32(rows), Int32(d), Int32(b), Int32(s), Float32(1e-6),
         grid_dim=rows, block_dim=_TPB
     )
     ctx.synchronize()
@@ -415,12 +437,17 @@ def _rope_bshd_halfsplit_kernel[dtype: DType](
     c: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [S, D/2]
     s: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [S, D/2]
     o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [B*S*H, D]
-    B: Int,
-    S: Int,
-    H: Int,
-    D: Int,
-    half_d: Int,
+    B_w: Int32,
+    S_w: Int32,
+    H_w: Int32,
+    D_w: Int32,
+    half_d_w: Int32,
 ):
+    var B = Int(B_w)
+    var S = Int(S_w)
+    var H = Int(H_w)
+    var D = Int(D_w)
+    var half_d = Int(half_d_w)
     var idx = Int(global_idx.x)
     var total = B * S * H * half_d
     if idx < total:
@@ -465,55 +492,82 @@ def _rope_halfsplit_4d(
     var odt = x.dtype().to_mojo_dtype()
     if odt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            rope_cos.buf.unsafe_ptr().bitcast[Float32](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(rope_cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
+    )
         var Sv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            rope_sin.buf.unsafe_ptr().bitcast[Float32](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(rope_sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_bshd_halfsplit_kernel[DType.float32],
-            _rope_bshd_halfsplit_kernel[DType.float32],
-        ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_bshd_halfsplit_kernel[DType.float32]](X, C, Sv, O, Int32(B), Int32(S), Int32(H), Int32(D), Int32(half_d), grid_dim=grid, block_dim=_BLOCK)
     elif odt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            rope_cos.buf.unsafe_ptr().bitcast[BFloat16](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(rope_cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
         var Sv = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            rope_sin.buf.unsafe_ptr().bitcast[BFloat16](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(rope_sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_bshd_halfsplit_kernel[DType.bfloat16],
-            _rope_bshd_halfsplit_kernel[DType.bfloat16],
-        ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_bshd_halfsplit_kernel[DType.bfloat16]](X, C, Sv, O, Int32(B), Int32(S), Int32(H), Int32(D), Int32(half_d), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            rope_cos.buf.unsafe_ptr().bitcast[Float16](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(rope_cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=c_rl,
+    )
         var Sv = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            rope_sin.buf.unsafe_ptr().bitcast[Float16](), c_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(rope_sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=c_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_bshd_halfsplit_kernel[DType.float16],
-            _rope_bshd_halfsplit_kernel[DType.float16],
-        ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_bshd_halfsplit_kernel[DType.float16]](X, C, Sv, O, Int32(B), Int32(S), Int32(H), Int32(D), Int32(half_d), grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var osh = List[Int]()
     osh.append(B)
@@ -532,8 +586,15 @@ def _rope_halfsplit_4d(
 def _patchify_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # flat [B*T*H*W*C_pad]
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # flat [B*N*patch_dim]
-    B: Int, T: Int, nH: Int, nW: Int, pH: Int, pW: Int, Cp: Int,
+    B_w: Int32, T_w: Int32, nH_w: Int32, nW_w: Int32, pH_w: Int32, pW_w: Int32, Cp_w: Int32,
 ):
+    var B = Int(B_w)
+    var T = Int(T_w)
+    var nH = Int(nH_w)
+    var nW = Int(nW_w)
+    var pH = Int(pH_w)
+    var pW = Int(pW_w)
+    var Cp = Int(Cp_w)
     # Output index: flat index into [B, T*nH*nW, Cp*pH*pW]
     var idx = Int(global_idx.x)
     var patch_dim = Cp * pH * pW
@@ -566,8 +627,15 @@ def _patchify_kernel_bf16(
 def _patchify_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    B: Int, T: Int, nH: Int, nW: Int, pH: Int, pW: Int, Cp: Int,
+    B_w: Int32, T_w: Int32, nH_w: Int32, nW_w: Int32, pH_w: Int32, pW_w: Int32, Cp_w: Int32,
 ):
+    var B = Int(B_w)
+    var T = Int(T_w)
+    var nH = Int(nH_w)
+    var nW = Int(nW_w)
+    var pH = Int(pH_w)
+    var pW = Int(pW_w)
+    var Cp = Int(Cp_w)
     var idx = Int(global_idx.x)
     var patch_dim = Cp * pH * pW
     var total = B * T * nH * nW * patch_dim
@@ -639,23 +707,35 @@ def _anima_patchify(
 
     if dt == STDtype.BF16:
         var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            padded_buf.unsafe_ptr().bitcast[BFloat16](), p_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(padded_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=p_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
-        )
-        ctx.enqueue_function[_patchify_kernel_bf16, _patchify_kernel_bf16](
-            P, O, B, T, nH, nW, pH, pW, Cp, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_patchify_kernel_bf16](
+            P, O, Int32(B), Int32(T), Int32(nH), Int32(nW), Int32(pH), Int32(pW), Int32(Cp), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            padded_buf.unsafe_ptr().bitcast[Float32](), p_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(padded_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=p_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-        )
-        ctx.enqueue_function[_patchify_kernel_f32, _patchify_kernel_f32](
-            P, O, B, T, nH, nW, pH, pW, Cp, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
+    )
+        ctx.enqueue_function[_patchify_kernel_f32](
+            P, O, Int32(B), Int32(T), Int32(nH), Int32(nW), Int32(pH), Int32(pW), Int32(Cp), grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
 
@@ -669,10 +749,13 @@ def _anima_patchify(
 def _fill_padded_bf16_kernel(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [B*T*H*W*C]
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [B*T*H*W*Cp]
-    n_padded: Int,
-    C: Int,
-    Cp: Int,
+    n_padded_w: Int32,
+    C_w: Int32,
+    Cp_w: Int32,
 ):
+    var n_padded = Int(n_padded_w)
+    var C = Int(C_w)
+    var Cp = Int(Cp_w)
     var idx = Int(global_idx.x)
     if idx < n_padded:
         var c = idx % Cp
@@ -686,10 +769,13 @@ def _fill_padded_bf16_kernel(
 def _fill_padded_f32_kernel(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n_padded: Int,
-    C: Int,
-    Cp: Int,
+    n_padded_w: Int32,
+    C_w: Int32,
+    Cp_w: Int32,
 ):
+    var n_padded = Int(n_padded_w)
+    var C = Int(C_w)
+    var Cp = Int(Cp_w)
     var idx = Int(global_idx.x)
     if idx < n_padded:
         var c = idx % Cp
@@ -712,14 +798,20 @@ def _fill_padded_bf16(
     var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_src))
     var dst_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_padded))
     var Src = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
     )
     var Dst = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        padded_buf.unsafe_ptr().bitcast[BFloat16](), dst_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(padded_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=dst_rl,
     )
     var grid = (n_padded + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_fill_padded_bf16_kernel, _fill_padded_bf16_kernel](
-        Src, Dst, n_padded, C, Cp, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_fill_padded_bf16_kernel](
+        Src, Dst, Int32(n_padded), Int32(C), Int32(Cp), grid_dim=grid, block_dim=_BLOCK
     )
 
 
@@ -735,14 +827,20 @@ def _fill_padded_f32(
     var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_src))
     var dst_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_padded))
     var Src = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=src_rl,
     )
     var Dst = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        padded_buf.unsafe_ptr().bitcast[Float32](), dst_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(padded_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=dst_rl,
     )
     var grid = (n_padded + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_fill_padded_f32_kernel, _fill_padded_f32_kernel](
-        Src, Dst, n_padded, C, Cp, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_fill_padded_f32_kernel](
+        Src, Dst, Int32(n_padded), Int32(C), Int32(Cp), grid_dim=grid, block_dim=_BLOCK
     )
 
 
@@ -753,8 +851,15 @@ def _fill_padded_f32(
 def _unpatchify_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [B*N*patch_out_dim]
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [B*T*H*W*C]
-    B: Int, T: Int, nH: Int, nW: Int, pH: Int, pW: Int, C: Int,
+    B_w: Int32, T_w: Int32, nH_w: Int32, nW_w: Int32, pH_w: Int32, pW_w: Int32, C_w: Int32,
 ):
+    var B = Int(B_w)
+    var T = Int(T_w)
+    var nH = Int(nH_w)
+    var nW = Int(nW_w)
+    var pH = Int(pH_w)
+    var pW = Int(pW_w)
+    var C = Int(C_w)
     # Output index: [B, T, H, W, C] row-major (C varies fastest)
     var idx = Int(global_idx.x)
     var H = nH * pH
@@ -808,14 +913,20 @@ def _unpatchify(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_numel))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (out_numel + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_unpatchify_kernel_bf16, _unpatchify_kernel_bf16](
-        X, O, B, T, nH, nW, pH, pW, C, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_unpatchify_kernel_bf16](
+        X, O, Int32(B), Int32(T), Int32(nH), Int32(nW), Int32(pH), Int32(pW), Int32(C), grid_dim=grid, block_dim=_BLOCK
     )
     ctx.synchronize()
     var osh = List[Int]()
@@ -866,7 +977,7 @@ struct AnimaDiT:
         print("[AnimaDiT] loaded", len(weights), "tensors")
         return AnimaDiT(weights^, name_to_idx^)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("AnimaDiT: missing weight: ") + name)
         var idx = self.name_to_idx[name]
@@ -1207,11 +1318,15 @@ struct AnimaDiT:
 def _anima_gather_bshd_to_bhsd_bf16_f32(
     src: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B*S*H, Dh]
     dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],   # [B*H*S, Dh]
-    B: Int,
-    S: Int,
-    H: Int,
-    Dh: Int,
+    B_w: Int32,
+    S_w: Int32,
+    H_w: Int32,
+    Dh_w: Int32,
 ):
+    var B = Int(B_w)
+    var S = Int(S_w)
+    var H = Int(H_w)
+    var Dh = Int(Dh_w)
     var idx = Int(global_idx.x)
     var total = B * H * S * Dh
     if idx < total:
@@ -1258,43 +1373,59 @@ def _cross_sdpa_nomask[
     var bhsd_q_rl = RuntimeLayout[_DYN2l].row_major(IndexList[2](bhsd_q_rows, Dh))
     var bhsd_k_rl = RuntimeLayout[_DYN2l].row_major(IndexList[2](bhsd_k_rows, Dh))
 
-    var Qd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](q_f32.unsafe_ptr(), bhsd_q_rl)
-    var Kd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](k_f32.unsafe_ptr(), bhsd_k_rl)
-    var Vd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](v_f32.unsafe_ptr(), bhsd_k_rl)
+    var Qd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(q_f32.unsafe_ptr())
+        ),
+        runtime_layout=bhsd_q_rl,
+    )
+    var Kd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(k_f32.unsafe_ptr())
+        ),
+        runtime_layout=bhsd_k_rl,
+    )
+    var Vd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(v_f32.unsafe_ptr())
+        ),
+        runtime_layout=bhsd_k_rl,
+    )
 
     # Gather BF16 BSHD -> F32 BHSD compute scratch.
     var Qs = LayoutTensor[DType.bfloat16, _DYN2l, MutAnyOrigin](
-        q.buf.unsafe_ptr().bitcast[BFloat16](), q_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=q_src_rl,
     )
     var Ks = LayoutTensor[DType.bfloat16, _DYN2l, MutAnyOrigin](
-        k.buf.unsafe_ptr().bitcast[BFloat16](), k_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=k_src_rl,
     )
     var Vs = LayoutTensor[DType.bfloat16, _DYN2l, MutAnyOrigin](
-        v.buf.unsafe_ptr().bitcast[BFloat16](), k_src_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=k_src_rl,
     )
     var ngq = B * H * S_q * Dh
     var ngk = B * H * S_k * Dh
-    ctx.enqueue_function[
-        _anima_gather_bshd_to_bhsd_bf16_f32,
-        _anima_gather_bshd_to_bhsd_bf16_f32,
-    ](
-        Qs, Qd, B, S_q, H, Dh, grid_dim=(ngq + BLOCK - 1) // BLOCK, block_dim=BLOCK)
-    ctx.enqueue_function[
-        _anima_gather_bshd_to_bhsd_bf16_f32,
-        _anima_gather_bshd_to_bhsd_bf16_f32,
-    ](
-        Ks, Kd, B, S_k, H, Dh, grid_dim=(ngk + BLOCK - 1) // BLOCK, block_dim=BLOCK)
-    ctx.enqueue_function[
-        _anima_gather_bshd_to_bhsd_bf16_f32,
-        _anima_gather_bshd_to_bhsd_bf16_f32,
-    ](
-        Vs, Vd, B, S_k, H, Dh, grid_dim=(ngk + BLOCK - 1) // BLOCK, block_dim=BLOCK)
+    ctx.enqueue_function[_anima_gather_bshd_to_bhsd_bf16_f32](
+        Qs, Qd, Int32(B), Int32(S_q), Int32(H), Int32(Dh), grid_dim=(ngq + BLOCK - 1) // BLOCK, block_dim=BLOCK)
+    ctx.enqueue_function[_anima_gather_bshd_to_bhsd_bf16_f32](
+        Ks, Kd, Int32(B), Int32(S_k), Int32(H), Int32(Dh), grid_dim=(ngk + BLOCK - 1) // BLOCK, block_dim=BLOCK)
+    ctx.enqueue_function[_anima_gather_bshd_to_bhsd_bf16_f32](
+        Vs, Vd, Int32(B), Int32(S_k), Int32(H), Int32(Dh), grid_dim=(ngk + BLOCK - 1) // BLOCK, block_dim=BLOCK)
 
     # QKT scores [B*H, S_q, S_k]
     from linalg.matmul.vendor.blas import matmul
     from std.math import exp
-    from std.gpu import thread_idx, block_idx, barrier
-    from std.gpu.memory import AddressSpace
+    from std.gpu import thread_idx, block_idx
+    from max.gpu import barrier
+    from max.gpu.memory import AddressSpace
     from std.memory import stack_allocation
 
     var scores = ctx.enqueue_create_buffer[DType.float32](BH * S_q * S_k)
@@ -1306,30 +1437,44 @@ def _cross_sdpa_nomask[
     var scptr = scores.unsafe_ptr()
     for bh in range(BH):
         var A = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
-            qptr + bh * S_q * Dh, head_q_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(qptr + bh * S_q * Dh)
+        ),
+        runtime_layout=head_q_rl,
+    )
         var Bt = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
-            kptr + bh * S_k * Dh, head_k_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(kptr + bh * S_k * Dh)
+        ),
+        runtime_layout=head_k_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
-            scptr + bh * S_q * S_k, sc_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scptr + bh * S_q * S_k)
+        ),
+        runtime_layout=sc_rl,
+    )
         matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
 
     # Scale scores
     var sm_rows = BH * S_q
     var sc_full_rl = RuntimeLayout[_DYN2l].row_major(IndexList[2](sm_rows, S_k))
-    var sc_full = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](scptr, sc_full_rl)
+    var sc_full = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scptr)
+        ),
+        runtime_layout=sc_full_rl,
+    )
     var nsm = sm_rows * S_k
     var smgrid = (nsm + BLOCK - 1) // BLOCK
     from serenitymojo.ops.attention import _scale_f32
-    ctx.enqueue_function[_scale_f32, _scale_f32](
-        sc_full, scale, sm_rows, S_k, grid_dim=smgrid, block_dim=BLOCK)
+    ctx.enqueue_function[_scale_f32](
+        sc_full, scale, Int32(sm_rows), Int32(S_k), grid_dim=smgrid, block_dim=BLOCK)
 
     # Softmax over S_k dim (last dim)
     from serenitymojo.ops.attention import _softmax_rows_f32
-    ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
-        sc_full, S_k, grid_dim=sm_rows, block_dim=256)
+    ctx.enqueue_function[_softmax_rows_f32](
+        sc_full, Int32(S_k), grid_dim=sm_rows, block_dim=256)
 
     # P @ V -> out [B*H, S_q, Dh]
     var out_f32 = ctx.enqueue_create_buffer[DType.float32](bhsd_q_rows * Dh)
@@ -1338,14 +1483,23 @@ def _cross_sdpa_nomask[
     var vptr = v_f32.unsafe_ptr()
     for bh in range(BH):
         var P = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
-            scptr + bh * S_q * S_k, sc_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scptr + bh * S_q * S_k)
+        ),
+        runtime_layout=sc_rl,
+    )
         var Vh = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
-            vptr + bh * S_k * Dh, head_k_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(vptr + bh * S_k * Dh)
+        ),
+        runtime_layout=head_k_rl,
+    )
         var Oh = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
-            optr + bh * S_q * Dh, head_out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(optr + bh * S_q * Dh)
+        ),
+        runtime_layout=head_out_rl,
+    )
         matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
 
     # Scatter F32 BHSD -> BF16 BSHD output [B, S_q, H, Dh]
@@ -1353,14 +1507,22 @@ def _cross_sdpa_nomask[
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](B * S_q * H * Dh * 2)
     var out_src_rl = RuntimeLayout[_DYN2l].row_major(IndexList[2](bhsd_q_rows, Dh))
     var out_dst_rl = RuntimeLayout[_DYN2l].row_major(IndexList[2](src_q_rows, Dh))
-    var out_src = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](optr, out_src_rl)
+    var out_src = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(optr)
+        ),
+        runtime_layout=out_src_rl,
+    )
     var Od = LayoutTensor[DType.bfloat16, _DYN2l, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), out_dst_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_dst_rl,
     )
     var nsc = B * H * S_q * Dh
     var scgrid2 = (nsc + BLOCK - 1) // BLOCK
-    ctx.enqueue_function[_scatter_bhsd_to_bshd_bf16, _scatter_bhsd_to_bshd_bf16](
-        out_src, Od, B, S_q, H, Dh, grid_dim=scgrid2, block_dim=BLOCK)
+    ctx.enqueue_function[_scatter_bhsd_to_bshd_bf16](
+        out_src, Od, Int32(B), Int32(S_q), Int32(H), Int32(Dh), grid_dim=scgrid2, block_dim=BLOCK)
     ctx.synchronize()
 
     var osh = List[Int]()

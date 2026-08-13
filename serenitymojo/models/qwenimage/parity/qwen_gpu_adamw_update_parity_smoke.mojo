@@ -25,7 +25,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import has_accelerator
 
 from serenitymojo.models.klein.lora_block import LoraAdapter

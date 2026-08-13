@@ -3,7 +3,7 @@
 # comptime conv shapes are tiny; does NOT load weights or run the GPU forward
 # (GPU wedged; compile-only verification).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.vae.ldm_decoder import SDXLLdmDecoder

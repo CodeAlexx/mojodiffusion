@@ -12,7 +12,7 @@
 # table. The model still receives `expanded_timestep / 1000`, which is the sigma
 # value for this flow-matching schedule.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, sub

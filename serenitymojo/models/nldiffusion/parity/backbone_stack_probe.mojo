@@ -11,7 +11,7 @@
 #   cd /home/alex/mojodiffusion && \
 #     pixi run mojo run -I . serenitymojo/models/nldiffusion/parity/backbone_stack_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

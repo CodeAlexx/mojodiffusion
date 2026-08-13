@@ -222,7 +222,7 @@ from std.sys import argv
 from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -273,6 +273,7 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_forward_dynamic,
     minimax_h3_sage_exact_prefix_backend,
 )
+from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
     minimax_h3_load_qkv_device,
@@ -308,6 +309,7 @@ from serenitymojo.models.dit.minimax_h3_step_cache import (
     minimax_h3_cache_probe_rows,
     minimax_h3_cache_quantize_activation,
     minimax_h3_cache_should_reuse,
+    minimax_h3_cache_probe_given_rows,
     minimax_h3_cache_store_middle_residual,
 )
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
@@ -884,7 +886,7 @@ def _write_rgb_frames(
         var chw = permute(hwc, [2, 0, 1], ctx)                   # [3,H,W]
         var img = reshape(chw, [1, 3, height, width], ctx)
         var name = String(first_index + f)
-        while len(name) < 5:
+        while name.byte_length() < 5:
             name = String("0") + name
         save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
     return frames
@@ -937,7 +939,7 @@ def _minimax_h3_decode_video(
         1, 2, 2, ctx,
     )
     # [C,F,H,W] -> [1,F,H,W,C] NDHWC, the house layout the device VAE expects
-    var perm = [1, 2, 3, 0]
+    var perm: List[Int] = [1, 2, 3, 0]
     var grid_fhwc = permute(grid_cfhw, perm^, ctx)
     var latents = reshape(
         grid_fhwc, [1, latent_frames, latent_h, latent_w, latent_channels], ctx
@@ -954,8 +956,8 @@ def _minimax_h3_decode_video(
     # FL2VA/video_vae/config.json `latents_mean`/`latents_std` (24 per-channel
     # F32 values, verified 2026-08-03). Channel-last NDHWC broadcasts the
     # [24] tensors directly against the trailing axis.
-    var vid_lat_mean = [Float32(0.858090341091156), Float32(-0.9606591463088989), Float32(1.0661640167236328), Float32(-0.5090325474739075), Float32(-0.2727581858634949), Float32(-1.3675414323806763), Float32(-0.2553254961967468), Float32(-0.26907554268836975), Float32(-0.5376840829849243), Float32(-0.0464097298681736), Float32(0.6657370328903198), Float32(0.19690127670764923), Float32(-0.5460608005523682), Float32(-0.4035342037677765), Float32(-0.23683024942874908), Float32(0.25928452610969543), Float32(-0.30133944749832153), Float32(0.211341992020607), Float32(-1.1206848621368408), Float32(0.3581933379173279), Float32(-0.04225143790245056), Float32(0.2604829967021942), Float32(0.22864092886447906), Float32(0.7056031823158264)]
-    var vid_lat_std = [Float32(1.2223774194717407), Float32(1.2767263650894165), Float32(1.6831774711608887), Float32(1.7549455165863037), Float32(1.5636216402053833), Float32(2.194143533706665), Float32(0.9653137922286987), Float32(1.0569885969161987), Float32(0.841948926448822), Float32(0.7729952931404114), Float32(1.8955937623977661), Float32(0.946841835975647), Float32(0.7996809482574463), Float32(0.44988900423049927), Float32(0.7197399735450745), Float32(0.6936293244361877), Float32(2.961095094680786), Float32(2.7694199085235596), Float32(3.0496184825897217), Float32(2.1088054180145264), Float32(3.276226282119751), Float32(3.1627357006073), Float32(2.2816812992095947), Float32(2.6127843856811523)]
+    var vid_lat_mean: List[Float32] = [Float32(0.858090341091156), Float32(-0.9606591463088989), Float32(1.0661640167236328), Float32(-0.5090325474739075), Float32(-0.2727581858634949), Float32(-1.3675414323806763), Float32(-0.2553254961967468), Float32(-0.26907554268836975), Float32(-0.5376840829849243), Float32(-0.0464097298681736), Float32(0.6657370328903198), Float32(0.19690127670764923), Float32(-0.5460608005523682), Float32(-0.4035342037677765), Float32(-0.23683024942874908), Float32(0.25928452610969543), Float32(-0.30133944749832153), Float32(0.211341992020607), Float32(-1.1206848621368408), Float32(0.3581933379173279), Float32(-0.04225143790245056), Float32(0.2604829967021942), Float32(0.22864092886447906), Float32(0.7056031823158264)]
+    var vid_lat_std: List[Float32] = [Float32(1.2223774194717407), Float32(1.2767263650894165), Float32(1.6831774711608887), Float32(1.7549455165863037), Float32(1.5636216402053833), Float32(2.194143533706665), Float32(0.9653137922286987), Float32(1.0569885969161987), Float32(0.841948926448822), Float32(0.7729952931404114), Float32(1.8955937623977661), Float32(0.946841835975647), Float32(0.7996809482574463), Float32(0.44988900423049927), Float32(0.7197399735450745), Float32(0.6936293244361877), Float32(2.961095094680786), Float32(2.7694199085235596), Float32(3.0496184825897217), Float32(2.1088054180145264), Float32(3.276226282119751), Float32(3.1627357006073), Float32(2.2816812992095947), Float32(2.6127843856811523)]
     var lat_mean_t = Tensor.from_host(vid_lat_mean, [24], latents.dtype(), ctx)
     var lat_std_t = Tensor.from_host(vid_lat_std, [24], latents.dtype(), ctx)
     latents = add(mul(latents, lat_std_t, ctx), lat_mean_t, ctx)
@@ -1052,7 +1054,7 @@ def _minimax_h3_decode_video(
         var chw = permute(hwc, [2, 0, 1], ctx)                   # [3,H,W]
         var img = reshape(chw, [1, 3, height, width], ctx)
         var name = String(f)
-        while len(name) < 5:
+        while name.byte_length() < 5:
             name = String("0") + name
         save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
     print("  wrote", frames, "frames", height, "x", width, "to", out_dir)
@@ -1545,6 +1547,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     sin: Tensor,
     rotary_dim: Int,
     attention_backend: Int,
+    sage_scratch: Optional[SageInt8Scratch],
     step_index: Int,
     mut step_cache: MiniMaxH3StepCache,
     t2va_contiguous: Bool,
@@ -1594,10 +1597,32 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     if low_headroom_bf16:
         ctx.synchronize()
     var cache_probe_before = List[Float32]()
+    var cache_probe_audio_before = List[Float32]()
+    var cache_audio_probe_ids = List[Int]()
     if step_cache.enabled:
         cache_probe_before = minimax_h3_cache_probe_rows(
             hidden3, sequence_length, config.hidden_size, ctx
         )
+        # Audio veto: up to 16 evenly sampled audio rows held to a tighter
+        # drift budget (audio degrades before video under approximation).
+        var n_audio = len(geometry.audio_indices)
+        if n_audio > 0:
+            var want_rows = 16
+            if n_audio < want_rows:
+                want_rows = n_audio
+            if want_rows == 1:
+                cache_audio_probe_ids.append(geometry.audio_indices[0])
+            else:
+                for pi in range(want_rows):
+                    cache_audio_probe_ids.append(
+                        geometry.audio_indices[
+                            (pi * (n_audio - 1)) // (want_rows - 1)
+                        ]
+                    )
+            cache_probe_audio_before = minimax_h3_cache_probe_given_rows(
+                hidden3, cache_audio_probe_ids, sequence_length,
+                config.hidden_size, ctx,
+            )
     var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
     var reused_middle = False
     for layer in range(run_config.num_layers):
@@ -1685,6 +1710,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             rotary_dim,
             ctx,
             attention_backend,
+            sage_scratch,
         )
         # The block's last-use temporaries are stream-ordered but large enough
         # at S>=60k that carrying them into the next streamed weight load can
@@ -1703,8 +1729,13 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             var cache_probe_after = minimax_h3_cache_probe_rows(
                 hidden3, sequence_length, config.hidden_size, ctx
             )
+            var cache_probe_audio_after = minimax_h3_cache_probe_given_rows(
+                hidden3, cache_audio_probe_ids, sequence_length,
+                config.hidden_size, ctx,
+            )
             reused_middle = minimax_h3_cache_should_reuse(
-                step_index, cache_probe_before, cache_probe_after, step_cache
+                step_index, cache_probe_before, cache_probe_after, step_cache,
+                cache_probe_audio_before, cache_probe_audio_after,
             )
             if reused_middle:
                 minimax_h3_cache_apply_residual_inplace(
@@ -2550,7 +2581,24 @@ def main() raises:
             "from", resume_path,
         )
 
-    var step_cache = MiniMaxH3StepCache(step_cache_enabled)
+    # Sage attention runs the whole denoise through one preallocated scratch:
+    # its per-call transient buffers otherwise churn ~1-2 GiB fifty times per
+    # evaluation and intermittently OOM near the 24-GiB envelope
+    # (video-0177). Allocated after the resident store so a geometry that
+    # cannot hold both fails here, not minutes into denoise.
+    var sage_scratch = Optional[SageInt8Scratch](None)
+    if attention_backend != MINIMAX_H3_ATTN_CUDNN:
+        sage_scratch = Optional[SageInt8Scratch](
+            SageInt8Scratch(geometry.sequence_length, H3_HEADS, ctx)
+        )
+        ctx.synchronize()
+        print(
+            "  sage scratch: preallocated",
+            Float64(sage_scratch.value().resident_bytes())
+                / (1024.0 * 1024.0 * 1024.0),
+            "GiB for S=", geometry.sequence_length,
+        )
+    var step_cache = MiniMaxH3StepCache(step_cache_enabled, num_steps)
     for i in range(eval_start, eval_stop):
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
@@ -2579,7 +2627,8 @@ def main() raises:
                 modcache, global_row, block_adaln_indices,
                 transformer_shards, fp8_resident, reusable_w8a8_tail,
                 use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, i, step_cache, False,
+                rope[1], rotary_dim, attention_backend, sage_scratch, i,
+                step_cache, False,
                 ctx,
             )
             var target_video_out = slice(
@@ -2603,7 +2652,8 @@ def main() raises:
                 block_adaln_indices, transformer_shards, fp8_resident,
                 reusable_w8a8_tail,
                 use_resident, resident_scheme, resident_cache_path, rope[0],
-                rope[1], rotary_dim, attention_backend, i, step_cache, True,
+                rope[1], rotary_dim, attention_backend, sage_scratch, i,
+                step_cache, True,
                 ctx,
             )
             video_state = schedule.step_video_device(

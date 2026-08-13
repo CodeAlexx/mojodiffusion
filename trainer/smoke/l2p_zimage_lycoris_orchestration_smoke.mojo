@@ -45,7 +45,7 @@
 # EXPECT: "ALL GATES PASS — l2p_zimage_lycoris_orchestration_smoke".
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.zimage.lora_block import ZIMAGE_SLOTS
 from serenitymojo.models.zimage.zimage_lokr_stack import (

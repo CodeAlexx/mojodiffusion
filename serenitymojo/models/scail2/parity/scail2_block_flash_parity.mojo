@@ -27,7 +27,7 @@
 #   LD_LIBRARY_PATH=serenitymojo/ops/cshim/lib:.pixi/envs/default/lib \
 #     output/bin/scail2_block_flash_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.parity import ParityHarness, ParityResult
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY

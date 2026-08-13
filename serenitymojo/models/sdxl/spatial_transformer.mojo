@@ -41,12 +41,12 @@
 # back to context (summed across every transformer block) — required for cross-attn
 # LoRA training. All interior math F32.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from std.collections import Optional
-from math import sqrt
+from std.math import sqrt
 
 from serenitymojo.ops.norm import group_norm, layer_norm
 from serenitymojo.ops.norm_backward import group_norm_backward, layer_norm_backward

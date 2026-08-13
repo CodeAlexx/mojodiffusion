@@ -45,7 +45,7 @@
 #   /tmp/train_ernie_real
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, log as flog, exp as fexp, isfinite, sin as fsin, cos as fcos
 from std.memory import ArcPointer

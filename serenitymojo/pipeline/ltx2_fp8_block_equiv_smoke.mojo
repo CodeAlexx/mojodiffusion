@@ -22,7 +22,7 @@
 #       serenitymojo/pipeline/ltx2_fp8_block_equiv_smoke.mojo -o /tmp/ltx2_fp8_equiv
 #   LD_LIBRARY_PATH=/home/alex/libtorch-cu124/libtorch/lib /tmp/ltx2_fp8_equiv
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin
 
 from serenitymojo.tensor import Tensor

@@ -10,7 +10,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/weights_load_smoke.mojo -o /tmp/sdxl_wl
 #   /tmp/sdxl_wl
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.sdxl.weights import load_resblock_weights, ResBlockWeights
 from serenitymojo.models.sdxl.config import sdxl

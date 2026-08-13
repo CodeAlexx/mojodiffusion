@@ -5,7 +5,7 @@
 # The production helper must match a directly packed cuDNN tail-mask call on all
 # semantic rows and leave the original padded-text query rows zero after scatter.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

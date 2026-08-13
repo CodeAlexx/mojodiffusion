@@ -35,7 +35,7 @@
 # DTYPE: bf16 weights+activations, F32 accumulate (matches the bf16-GPU oracle).
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -194,7 +194,7 @@ struct WanVaceDit(Movable):
             w[key] = ArcPointer(Tensor.from_view(tv, ctx))
         return WanVaceDit(weights=w^, config=cfg)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         return self.weights[name][]
 
     # Sub-dict for vace block i (keys stripped of "vace_blocks.i." prefix). Block

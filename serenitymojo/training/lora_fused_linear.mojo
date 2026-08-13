@@ -35,9 +35,10 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.memory import ArcPointer, stack_allocation
 
 from serenitymojo.tensor import Tensor
@@ -93,11 +94,14 @@ def _lora_fwd_kernel[R: Int](
     a: UnsafePointer[BFloat16, MutAnyOrigin],      # [R, in]
     b: UnsafePointer[BFloat16, MutAnyOrigin],      # [out, R]
     delta: UnsafePointer[Float32, MutAnyOrigin],   # [M, out]
-    m_rows: Int,
-    in_f: Int,
-    out_f: Int,
+    m_rows_w: Int32,
+    in_f_w: Int32,
+    out_f_w: Int32,
     scale: Float32,
 ):
+    var m_rows = Int(m_rows_w)
+    var in_f = Int(in_f_w)
+    var out_f = Int(out_f_w)
     comptime TM = _TPB // R
     comptime KCP = _KC + _PAD
     var tid = Int(thread_idx.x)
@@ -208,11 +212,14 @@ def _lora_bwd_rows_kernel[R: Int](
     t_out: UnsafePointer[Float32, MutAnyOrigin],   # [M, R]
     dt_out: UnsafePointer[Float32, MutAnyOrigin],  # [M, R]
     dx: UnsafePointer[Float32, MutAnyOrigin],      # [M, in]
-    m_rows: Int,
-    in_f: Int,
-    out_f: Int,
+    m_rows_w: Int32,
+    in_f_w: Int32,
+    out_f_w: Int32,
     scale: Float32,
 ):
+    var m_rows = Int(m_rows_w)
+    var in_f = Int(in_f_w)
+    var out_f = Int(out_f_w)
     comptime TM = _TPB // R
     comptime KCP = _KC + _PAD
     comptime OCP = _OC + _PAD
@@ -392,11 +399,14 @@ def _lora_bwd_w_kernel[R: Int](
     dt_in: UnsafePointer[Float32, MutAnyOrigin],   # [M, R]
     d_a: UnsafePointer[Float32, MutAnyOrigin],     # [R, in]
     d_b: UnsafePointer[Float32, MutAnyOrigin],     # [out, R]
-    m_rows: Int,
-    in_f: Int,
-    out_f: Int,
+    m_rows_w: Int32,
+    in_f_w: Int32,
+    out_f_w: Int32,
     scale: Float32,
 ):
+    var m_rows = Int(m_rows_w)
+    var in_f = Int(in_f_w)
+    var out_f = Int(out_f_w)
     var gid = Int(block_idx.x) * _TPB + Int(thread_idx.x)
     var nb = out_f * R
     if gid < nb:
@@ -481,12 +491,20 @@ def lora_fused_fwd(
     var d_buf = ctx.enqueue_create_buffer[DType.uint8](m * out_f * 4)
     comptime TM = _TPB // 16
     var grid = (m + TM - 1) // TM
-    ctx.enqueue_function[_lora_fwd_kernel[16], _lora_fwd_kernel[16]](
-        x.buf.unsafe_ptr().bitcast[Float32](),
-        a.buf.unsafe_ptr().bitcast[BFloat16](),
-        b.buf.unsafe_ptr().bitcast[BFloat16](),
+    # 1.0 enforces pointer mutability on DevicePassable args; read-borrowed
+    # tensor inputs launder through the established unsafe_from_address idiom.
+    ctx.enqueue_function[_lora_fwd_kernel[16]](
+        UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        UnsafePointer[BFloat16, MutAnyOrigin](
+            unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        UnsafePointer[BFloat16, MutAnyOrigin](
+            unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
         d_buf.unsafe_ptr().bitcast[Float32](),
-        m, in_f, out_f, scale,
+        Int32(m), Int32(in_f), Int32(out_f), scale,
         grid_dim=grid, block_dim=_TPB,
     )
     return Tensor(d_buf^, out_shape^, STDtype.F32)
@@ -519,29 +537,39 @@ def lora_fused_bwd(
     var da_buf = ctx.enqueue_create_buffer[DType.uint8](16 * in_f * 4)
     var db_buf = ctx.enqueue_create_buffer[DType.uint8](out_f * 16 * 4)
 
-    var xp = x.buf.unsafe_ptr().bitcast[Float32]()
-    var dcp = d_contrib.buf.unsafe_ptr().bitcast[Float32]()
-    var ap = a.buf.unsafe_ptr().bitcast[BFloat16]()
-    var bp = b.buf.unsafe_ptr().bitcast[BFloat16]()
+    # 1.0 pointer-mut enforcement: read-borrowed tensor inputs launder to
+    # MutAnyOrigin for the kernel launches below (established idiom).
+    var xp = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+    )
+    var dcp = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(d_contrib.buf.unsafe_ptr().bitcast[Float32]())
+    )
+    var ap = UnsafePointer[BFloat16, MutAnyOrigin](
+        unsafe_from_address=Int(a.buf.unsafe_ptr().bitcast[BFloat16]())
+    )
+    var bp = UnsafePointer[BFloat16, MutAnyOrigin](
+        unsafe_from_address=Int(b.buf.unsafe_ptr().bitcast[BFloat16]())
+    )
     var tp = t_buf.unsafe_ptr().bitcast[Float32]()
     var dtp = dt_buf.unsafe_ptr().bitcast[Float32]()
 
     comptime TM = _TPB // 16
     var grid1 = (m + TM - 1) // TM
-    ctx.enqueue_function[_lora_bwd_rows_kernel[16], _lora_bwd_rows_kernel[16]](
+    ctx.enqueue_function[_lora_bwd_rows_kernel[16]](
         xp, dcp, ap, bp, tp, dtp,
         dx_buf.unsafe_ptr().bitcast[Float32](),
-        m, in_f, out_f, scale,
+        Int32(m), Int32(in_f), Int32(out_f), scale,
         grid_dim=grid1, block_dim=_TPB,
     )
 
     var n_w_threads = out_f * 16 + 16 * in_f
     var grid2 = (n_w_threads + _TPB - 1) // _TPB
-    ctx.enqueue_function[_lora_bwd_w_kernel[16], _lora_bwd_w_kernel[16]](
+    ctx.enqueue_function[_lora_bwd_w_kernel[16]](
         xp, dcp, tp, dtp,
         da_buf.unsafe_ptr().bitcast[Float32](),
         db_buf.unsafe_ptr().bitcast[Float32](),
-        m, in_f, out_f, scale,
+        Int32(m), Int32(in_f), Int32(out_f), scale,
         grid_dim=grid2, block_dim=_TPB,
     )
 

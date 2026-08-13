@@ -4,7 +4,7 @@
 # activations; oracle self-check vs captured block_0_output = cos 0.999987),
 # runs cosmos_block_forward, compares to `expected`. Gate cos >= 0.999.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -23,7 +23,7 @@
 #     serenitymojo/models/klein/parity/klein_block_int8_fwd_parity.mojo -o /tmp/klein_blk_i8_fwd && \
 #   LD_LIBRARY_PATH=.pixi/envs/default/lib:serenitymojo/ops/cshim/lib:/home/alex/.serenity/cudnn/lib:/usr/lib/x86_64-linux-gnu /tmp/klein_blk_i8_fwd
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, log as flog, cos as fcos, pi
 from std.memory import ArcPointer

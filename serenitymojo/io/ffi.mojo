@@ -22,7 +22,6 @@
 
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 
 # ── Linux x86-64 constants ────────────────────────────────────────────────────
@@ -81,10 +80,13 @@ def sys_sysconf(name: Int32) -> Int:
 def sys_open(path: String, flags: Int32, mode: Int32 = 0) -> Int:
     """open(2). Returns the fd, or -1 on error. `mode` (e.g. 0o644) is only
     consulted by libc when O_CREAT is in `flags`; default 0 for read paths.
-    A single 3-arg `external_call["open"]` signature is used everywhere so the
+    A single 3-arg `external_call["open64"]` signature is used everywhere so the
     symbol has ONE declaration (a 2-arg + 3-arg mix conflicts at lowering, the
     same class of collision that the stdlib builtin `open` would cause — which
     is why all file I/O in this lib routes through here, never `open()`).
+    Mojo 1.0: std.ffi itself now declares `open`, so this routes through the
+    glibc alias `open64` (identical semantics on LP64 Linux) to keep our
+    declaration from colliding with the stdlib's at lowering time.
 
     Mojo's `String.unsafe_ptr()` does NOT reliably point at a NUL-terminated C
     string for dynamically-built Strings (e.g. those produced by path joining /
@@ -101,7 +103,7 @@ def sys_open(path: String, flags: Int32, mode: Int32 = 0) -> Int:
         buf[i] = src[i]
     buf[n] = 0  # explicit NUL terminator for the C string
     var cstr = BytePtr(unsafe_from_address=Int(buf))
-    var fd = Int(external_call["open", Int32](cstr, flags, mode))
+    var fd = Int(external_call["open64", Int32](cstr, flags, mode))
     buf.free()
     return fd
 
@@ -119,7 +121,12 @@ def sys_mkdir(path: String, mode: Int32 = 0o755) -> Int:
         buf[i] = src[i]
     buf[n] = 0
     var cstr = BytePtr(unsafe_from_address=Int(buf))
-    var rc = Int(external_call["mkdir", Int32](cstr, mode))
+    # Mojo 1.0: std.ffi declares `mkdir` itself, and a second declaration
+    # collides at lowering. `mkdirat` with AT_FDCWD is the same syscall for a
+    # relative-to-cwd path and is not declared by the stdlib.
+    var rc = Int(
+        external_call["mkdirat", Int32](Int32(-100), cstr, mode)
+    )
     buf.free()
     return rc
 
@@ -176,13 +183,13 @@ def sys_mkdirs(path: String) -> Int:
     var acc = String("")
     for i in range(n):
         var c = src[i]
-        if c == ord("/"):
-            if len(acc) > 0:
+        if c == UInt8(ord("/")):
+            if acc.byte_length() > 0:
                 _ = sys_mkdir(acc)   # ignore EEXIST / -1
             acc += "/"
         else:
             acc += chr(Int(c))
-    if len(acc) > 0 and acc != String("/"):
+    if acc.byte_length() > 0 and acc != String("/"):
         _ = sys_mkdir(acc)
     return 0
 

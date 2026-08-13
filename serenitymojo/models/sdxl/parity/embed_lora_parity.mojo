@@ -17,7 +17,7 @@
 #       serenitymojo/models/sdxl/parity/embed_lora_parity.mojo -o /tmp/embed_lora_parity
 #   /tmp/embed_lora_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc
 from serenitymojo.parity import ParityHarness

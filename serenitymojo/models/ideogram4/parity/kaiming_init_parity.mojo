@@ -14,7 +14,7 @@
 # Run:
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/ideogram4/parity/kaiming_init_parity.mojo
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.ops.random import rand_uniform
 from serenitymojo.io.dtype import STDtype

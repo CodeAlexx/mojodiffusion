@@ -48,7 +48,7 @@
 
 from std.collections import Optional
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
 
@@ -372,7 +372,7 @@ struct FluxBackend(GenBackend, Movable):
     var dpmpp_update_steps: Int
     var dpmpp_second_order_steps: Int
     var vae_decode_grid: String            # executed decode path (result manifest)
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var load_seconds: Float64
     var text_encode_seconds: Float64
     var conditioning_cache_hit: Bool
@@ -415,7 +415,7 @@ struct FluxBackend(GenBackend, Movable):
         self.dpmpp_update_steps = 0
         self.dpmpp_second_order_steps = 0
         self.vae_decode_grid = String("")
-        self.job_t0_ns = UInt(0)
+        self.job_t0_ns = Int(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
         self.conditioning_cache_hit = False
@@ -793,7 +793,7 @@ struct FluxBackend(GenBackend, Movable):
         # non-divisor step counts. Execute the complete creator schedule instead
         # of silently dropping its final interval.
         self.runtime_steps = len(self.sched) - 1
-        var nsh = [1, AE_IN_CHANNELS, LATENT_H_, LATENT_W_]
+        var nsh: List[Int] = [1, AE_IN_CHANNELS, LATENT_H_, LATENT_W_]
         var noise = randn(nsh.copy(), UInt64(self.params.seed), STDtype.F32, self.ctx)
         if self.params.variation_strength > 0.0:
             var vnoise = randn(

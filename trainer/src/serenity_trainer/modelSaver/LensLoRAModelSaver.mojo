@@ -20,7 +20,7 @@
 # (key_sets is None for Lens → byte-identical); INTERNAL writes to
 # "<dest>/lora/lora.safetensors" (LoRASaverMixin.__save_internal).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 
 from serenity_trainer.model.LensModel import LensLoraSet

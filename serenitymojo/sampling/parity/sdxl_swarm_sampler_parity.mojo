@@ -7,7 +7,7 @@
 #                                   get_sigmas_exponential,
 #                                   sample_dpmpp_2m}
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

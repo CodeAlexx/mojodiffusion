@@ -5,7 +5,7 @@
 # token grid entirely on GPU: projections, timestep MLP, one double-stream
 # block, one single-stream block, and the final projection.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

@@ -32,7 +32,7 @@
 from std.math import ceildiv, sin, cos, sqrt
 from std.sys import has_accelerator
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 
 comptime dtype = DType.float32
@@ -141,8 +141,10 @@ def waterripple_kernel(
 def soul_kernel(
     inp: LayoutTensor[dtype, img_layout, MutAnyOrigin],
     out: LayoutTensor[dtype, img_layout, MutAnyOrigin],
-    progress_in: Float32, count: Int, max_scale: Float32, max_alpha: Float32, shrink: Int,
+    progress_in: Float32, count_w: Int64, max_scale: Float32, max_alpha: Float32, shrink_w: Int32,
 ):
+    var count = Int(count_w)
+    var shrink = Int(shrink_w)
     var gx = global_idx.x
     var gy = global_idx.y
     if gx >= UInt(W) or gy >= UInt(H):
@@ -178,8 +180,9 @@ def soul_kernel(
 def sway_kernel(
     inp: LayoutTensor[dtype, img_layout, MutAnyOrigin],
     out: LayoutTensor[dtype, img_layout, MutAnyOrigin],
-    speed: Float32, strength: Float32, density: Float32, horizontal: Int,
+    speed: Float32, strength: Float32, density: Float32, horizontal_w: Int32,
 ):
+    var horizontal = Int(horizontal_w)
     var gx = global_idx.x
     var gy = global_idx.y
     if gx >= UInt(W) or gy >= UInt(H):
@@ -547,8 +550,9 @@ fn light_hsl2rgb(h: Float32, s: Float32, z: Float32) -> (Float32, Float32, Float
 def lighting_kernel(
     inp: LayoutTensor[dtype, img_layout, MutAnyOrigin],
     out: LayoutTensor[dtype, img_layout, MutAnyOrigin],
-    progress_in: Float32, count: Int, saturation: Float32, light: Float32,
+    progress_in: Float32, count_w: Int64, saturation: Float32, light: Float32,
 ):
+    var count = Int(count_w)
     var gx = global_idx.x
     var gy = global_idx.y
     if gx >= UInt(W) or gy >= UInt(H):
@@ -598,8 +602,10 @@ def lighting_kernel(
 def jitter_kernel(
     inp: LayoutTensor[dtype, img_layout, MutAnyOrigin],
     out: LayoutTensor[dtype, img_layout, MutAnyOrigin],
-    progress_in: Float32, count: Int, max_scale: Float32, offset: Float32, shrink: Int,
+    progress_in: Float32, count_w: Int64, max_scale: Float32, offset: Float32, shrink_w: Int32,
 ):
+    var count = Int(count_w)
+    var shrink = Int(shrink_w)
     var gx = global_idx.x
     var gy = global_idx.y
     if gx >= UInt(W) or gy >= UInt(H):
@@ -716,7 +722,7 @@ def main() raises:
     # ---- WaterRipple (freq=24, amount=0.03) ----
     var wr_buf = ctx.enqueue_create_buffer[dtype](N)
     var wr_t = LayoutTensor[dtype, img_layout](wr_buf)
-    ctx.enqueue_function[waterripple_kernel, waterripple_kernel](
+    ctx.enqueue_function[waterripple_kernel](
         in_t, wr_t, Float32(24.0), Float32(0.03), grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with wr_buf.map_to_host() as h:
@@ -726,8 +732,8 @@ def main() raises:
     # ---- Soul (progress=0.37, count=1, max_scale=1.8, max_alpha=0.4, shrink=0) ----
     var soul_buf = ctx.enqueue_create_buffer[dtype](N)
     var soul_t = LayoutTensor[dtype, img_layout](soul_buf)
-    ctx.enqueue_function[soul_kernel, soul_kernel](
-        in_t, soul_t, Float32(0.37), 1, Float32(1.8), Float32(0.4), 0,
+    ctx.enqueue_function[soul_kernel](
+        in_t, soul_t, Float32(0.37), Int64(1), Float32(1.8), Float32(0.4), Int32(0),
         grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with soul_buf.map_to_host() as h:
@@ -737,8 +743,8 @@ def main() raises:
     # ---- Sway (speed_arg=time*m_speed=0.37*20=7.4, strength=20, density=20, horizontal=1) ----
     var sway_buf = ctx.enqueue_create_buffer[dtype](N)
     var sway_t = LayoutTensor[dtype, img_layout](sway_buf)
-    ctx.enqueue_function[sway_kernel, sway_kernel](
-        in_t, sway_t, Float32(7.4), Float32(20.0), Float32(20.0), 1,
+    ctx.enqueue_function[sway_kernel](
+        in_t, sway_t, Float32(7.4), Float32(20.0), Float32(20.0), Int32(1),
         grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with sway_buf.map_to_host() as h:
@@ -748,7 +754,7 @@ def main() raises:
     # ---- Star (progress=0.37, speed=10, layers=2, color=(1.0,0.1,0.9)) ----
     var star_buf = ctx.enqueue_create_buffer[dtype](N)
     var star_t = LayoutTensor[dtype, img_layout](star_buf)
-    ctx.enqueue_function[star_kernel2, star_kernel2](
+    ctx.enqueue_function[star_kernel2](
         in_t, star_t, Float32(0.37), Float32(10.0), Float32(2.0),
         Float32(1.0), Float32(0.1), Float32(0.9),
         grid_dim=gdim, block_dim=bdim)
@@ -760,8 +766,8 @@ def main() raises:
     # ---- Lighting (progress=0.37, count=1, saturation=0.3, light=0.3) ----
     var lit_buf = ctx.enqueue_create_buffer[dtype](N)
     var lit_t = LayoutTensor[dtype, img_layout](lit_buf)
-    ctx.enqueue_function[lighting_kernel, lighting_kernel](
-        in_t, lit_t, Float32(0.37), 1, Float32(0.3), Float32(0.3),
+    ctx.enqueue_function[lighting_kernel](
+        in_t, lit_t, Float32(0.37), Int64(1), Float32(0.3), Float32(0.3),
         grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with lit_buf.map_to_host() as h:
@@ -771,8 +777,8 @@ def main() raises:
     # ---- Jitter (progress=0.37, count=1, max_scale=1.1, offset=0.02, shrink=0) ----
     var jit_buf = ctx.enqueue_create_buffer[dtype](N)
     var jit_t = LayoutTensor[dtype, img_layout](jit_buf)
-    ctx.enqueue_function[jitter_kernel, jitter_kernel](
-        in_t, jit_t, Float32(0.37), 1, Float32(1.1), Float32(0.02), 0,
+    ctx.enqueue_function[jitter_kernel](
+        in_t, jit_t, Float32(0.37), Int64(1), Float32(1.1), Float32(0.02), Int32(0),
         grid_dim=gdim, block_dim=bdim)
     ctx.synchronize()
     with jit_buf.map_to_host() as h:

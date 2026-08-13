@@ -20,7 +20,7 @@
 #       serenitymojo/models/sdxl/parity/real_finitediff.mojo -o /tmp/sdxl_real_fd && \
 #     /tmp/sdxl_real_fd
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from serenitymojo.tensor import Tensor

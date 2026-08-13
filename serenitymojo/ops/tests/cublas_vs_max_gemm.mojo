@@ -29,7 +29,7 @@
 #   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib \
 #     /tmp/cublas_vs_max
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.math import sqrt
 from std.time import perf_counter_ns
 from std.utils.index import IndexList
@@ -67,13 +67,22 @@ def _max_matmul(
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, n))
     var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        a_buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(a_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
     )
     var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        b_buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(b_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
     )
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
     matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
 

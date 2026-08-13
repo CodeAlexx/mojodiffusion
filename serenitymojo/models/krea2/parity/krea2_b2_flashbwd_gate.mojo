@@ -8,7 +8,7 @@
 # from standalone-bwd BEYOND the standalone-vs-standalone noise floor → convicted.
 # Real-ish dims (H=48, Dh=128, L=1408) and real_len<L (padmask arm).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

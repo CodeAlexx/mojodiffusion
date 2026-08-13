@@ -3,7 +3,7 @@
 # long-sequence activations must never coexist with a full 18-19 GiB cache build.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.sharded import ShardedSafeTensors

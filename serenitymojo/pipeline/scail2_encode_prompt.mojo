@@ -10,7 +10,7 @@
 # The process exits after writing, releasing the resident UMT5 encoder before
 # CLIP, VAE, or the 14B denoiser starts.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys import argv
 

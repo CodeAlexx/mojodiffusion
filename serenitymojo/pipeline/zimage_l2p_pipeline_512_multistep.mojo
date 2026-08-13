@@ -19,7 +19,7 @@
 #   - CFG: pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)  [Rust form]
 #   - Euler: x_next = x + (sigma_next - sigma) * pred
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, exp as fexp, log as flog
 from std.memory import ArcPointer
 

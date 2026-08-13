@@ -5,7 +5,7 @@
 # and exercises:
 #   split trainer forward -> MSE flow loss -> final backward -> stack LoRA
 #   backward -> AdamW update.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -47,7 +47,7 @@
 from std.math import floor, ldexp, sqrt
 from std.memory import ArcPointer
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -105,7 +105,7 @@ def _rne_bf16_exact(v: Float32) -> BFloat16:
     if a < Float32(1.0e-38):
         return v.cast[DType.bfloat16]()
     var e = _binade_e(av)
-    var step = ldexp(Float64(1.0), e - 7)
+    var step = ldexp(Float64(1.0), Int32(e - 7))
     var y = av / step
     var kf = floor(y)
     var frac = y - kf
@@ -132,7 +132,7 @@ def _sr_bf16_exact(v: Float32, u: Float32) -> BFloat16:
         return v.cast[DType.bfloat16]()
     var av = Float64(a)
     var e = _binade_e(av)
-    var step = ldexp(Float64(1.0), e - 7)
+    var step = ldexp(Float64(1.0), Int32(e - 7))
     var y = av / step
     var kf = floor(y)
     var frac = y - kf
@@ -151,8 +151,8 @@ def _lora_adamw_serenity_kernel(
     m: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
-    nseg: Int,
-    total: Int,
+    nseg_w: Int32,
+    total_w: Int64,
     step_size: Float32,
     bc2_sqrt: Float32,
     decay: Float32,
@@ -160,8 +160,11 @@ def _lora_adamw_serenity_kernel(
     beta2: Float32,
     one_minus_beta2: Float32,
     eps: Float32,
-    seed_i: Int,
+    seed_i_w: Int32,
 ):
+    var nseg = Int(nseg_w)
+    var total = Int(total_w)
+    var seed_i = Int(seed_i_w)
     var gid = Int(global_idx.x)
     if gid >= total:
         return
@@ -320,25 +323,40 @@ def fused_lora_adamw_serenity_step(
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nseg + 1))
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        dev_p.unsafe_ptr().bitcast[BFloat16](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dev_p.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
     )
     var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dev_g.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_g.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dev_m.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_m.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dev_v.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_v.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        dev_off.unsafe_ptr().bitcast[Int64](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(dev_off.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
     )
 
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_lora_adamw_serenity_kernel, _lora_adamw_serenity_kernel](
-        P, G, M, V, OFF, nseg, total, step_size, bc2_sqrt, decay,
-        one_minus_beta1, beta2, one_minus_beta2, eps, Int(seed),
+    ctx.enqueue_function[_lora_adamw_serenity_kernel](
+        P, G, M, V, OFF, Int32(nseg), Int64(total), step_size, bc2_sqrt, decay,
+        one_minus_beta1, beta2, one_minus_beta2, eps, Int32(Int(seed)),
         grid_dim=grid, block_dim=_BLOCK,
     )
 
@@ -582,24 +600,39 @@ def fused_lora_adamw_serenity_step_resident(
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.total))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.nseg + 1))
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        state.dev_p.unsafe_ptr().bitcast[BFloat16](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_p.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
     )
     var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        state.dev_g.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_g.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        state.dev_m.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_m.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        state.dev_v.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_v.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        state.dev_off.unsafe_ptr().bitcast[Int64](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_off.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (state.total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_lora_adamw_serenity_kernel, _lora_adamw_serenity_kernel](
-        P, G, M, V, OFF, state.nseg, state.total, step_size, bc2_sqrt, decay,
-        one_minus_beta1, beta2, one_minus_beta2, eps, Int(seed),
+    ctx.enqueue_function[_lora_adamw_serenity_kernel](
+        P, G, M, V, OFF, Int32(state.nseg), Int64(state.total), step_size, bc2_sqrt, decay,
+        one_minus_beta1, beta2, one_minus_beta2, eps, Int32(Int(seed)),
         grid_dim=grid, block_dim=_BLOCK,
     )
 
@@ -637,9 +670,11 @@ def _lora_grads_gather_kernel(
     g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    nseg: Int,
-    total: Int,
+    nseg_w: Int32,
+    total_w: Int64,
 ):
+    var nseg = Int(nseg_w)
+    var total = Int(total_w)
     var gid = Int(global_idx.x)
     if gid >= total:
         return
@@ -700,32 +735,50 @@ def fused_lora_adamw_serenity_step_resident_devgrads(
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.nseg + 1))
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.nseg))
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        addr_dev.unsafe_ptr().bitcast[UInt64](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(addr_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
     )
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        state.dev_p.unsafe_ptr().bitcast[BFloat16](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_p.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
     )
     var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        state.dev_g.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_g.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        state.dev_m.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_m.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        state.dev_v.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_v.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        state.dev_off.unsafe_ptr().bitcast[Int64](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_off.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
     )
 
     var grid = (state.total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_lora_grads_gather_kernel, _lora_grads_gather_kernel](
-        GA, OFF, G, state.nseg, state.total,
+    ctx.enqueue_function[_lora_grads_gather_kernel](
+        GA, OFF, G, Int32(state.nseg), Int64(state.total),
         grid_dim=grid, block_dim=_BLOCK,
     )
-    ctx.enqueue_function[_lora_adamw_serenity_kernel, _lora_adamw_serenity_kernel](
-        P, G, M, V, OFF, state.nseg, state.total, step_size, bc2_sqrt, decay,
-        one_minus_beta1, beta2, one_minus_beta2, eps, Int(seed),
+    ctx.enqueue_function[_lora_adamw_serenity_kernel](
+        P, G, M, V, OFF, Int32(state.nseg), Int64(state.total), step_size, bc2_sqrt, decay,
+        one_minus_beta1, beta2, one_minus_beta2, eps, Int32(Int(seed)),
         grid_dim=grid, block_dim=_BLOCK,
     )
 

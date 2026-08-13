@@ -506,7 +506,7 @@ struct ShardedSafeTensors(Movable):
 
     def tensor_bytes(
         self, name: String
-    ) raises -> Span[UInt8, origin_of(self.shards)]:
+    ) raises -> Span[UInt8, origin_of(self.shards[0])]:
         """Origin-bound view of `name`'s raw bytes in its owning shard.
 
         The returned `Span` carries `origin_of(self.shards)` — a field of
@@ -526,7 +526,7 @@ struct ShardedSafeTensors(Movable):
 
     def tensor_view(
         self, name: String
-    ) raises -> TensorView[origin_of(self.shards)]:
+    ) raises -> TensorView[origin_of(self.shards[0])]:
         """Origin-bound `TensorView` (dtype + shape + byte span) for `name`.
         Same lifetime contract as `tensor_bytes`. The origin is inferred from
         the span at the call site via `from_parts`, sidestepping the Mojo

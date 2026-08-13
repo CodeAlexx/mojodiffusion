@@ -12,7 +12,7 @@
 #     serenitymojo/models/ideogram4/parity/ideogram4_lycoris_orchestration_smoke.mojo \
 #     -o /tmp/ideogram4_lycoris_orch && /tmp/ideogram4_lycoris_orch
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.training.lokr_stack import lokr_carrier_r_eff
 from serenitymojo.training.loha_stack import loha_carrier_r_eff
 from serenitymojo.models.ideogram4.block import I4_SLOTS_PER_BLOCK

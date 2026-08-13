@@ -25,7 +25,7 @@
 #     -o output/bin/sdxl_sample_resident_build_smoke
 
 from std.sys import has_accelerator
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 
 from serenitymojo.tensor import Tensor

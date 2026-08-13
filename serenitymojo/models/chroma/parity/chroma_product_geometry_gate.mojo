@@ -2,7 +2,7 @@
 # Exercises the actual generic pack/unpack and FLUX 3-axis RoPE used by Chroma.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.io.file import open
 
 from serenitymojo.io.dtype import STDtype

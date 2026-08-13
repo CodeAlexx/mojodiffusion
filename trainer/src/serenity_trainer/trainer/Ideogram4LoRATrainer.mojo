@@ -8,7 +8,7 @@
 # one at a time from Ideogram4TrainCache so the activation-heavy train step does
 # not compete with a resident dataset tensor pile.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.os import makedirs
 from std.time import perf_counter

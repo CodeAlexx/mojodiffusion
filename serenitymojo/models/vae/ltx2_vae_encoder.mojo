@@ -58,7 +58,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -202,7 +202,7 @@ struct LTX2VaeEncoderWeights(Movable):
             weights^, name_to_idx^, stat_std^, stat_mean^, ones_max^
         )
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LTX2 VAE Enc: missing weight: ") + name)
         var idx = self.name_to_idx[name]

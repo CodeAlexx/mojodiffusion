@@ -15,7 +15,7 @@
 # flux_tiled_decode — it is VAE-agnostic (operates on decoded image tensors);
 # only the decoder instance differs (ZImageDecoder vs the FLUX LDM decoder).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -9,10 +9,10 @@
 # y[m,n] = scale[n] * sum_k x[m,k]*decode(W[n,k])  (+ bias[n]).  F32 accumulate,
 # bf16 store. Tiled matmul (mirrors the MAX/GPU tiled-matmul idiom): B ≡ Wᵀ, so
 # sb[ty,tx] = decode(W[col, kt+ty]); sa[ty,tx] = x[row, kt+tx].
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import thread_idx, block_idx
-from std.gpu.memory import AddressSpace
-from std.gpu.sync import barrier
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
 from std.math import ceildiv
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -32,8 +32,12 @@ def _linear_fp8_kernel(
     scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],# [N]
     bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],# [N] BF16, ignored if !has_bias
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [M*N]
-    M: Int, N: Int, K: Int, has_bias: Int,
+    M_w: Int32, N_w: Int64, K_w: Int32, has_bias_w: Int32,
 ):
+    var M = Int(M_w)
+    var N = Int(N_w)
+    var K = Int(K_w)
+    var has_bias = Int(has_bias_w)
     var tx = Int(thread_idx.x)
     var ty = Int(thread_idx.y)
     var row = Int(block_idx.y) * _TILE + ty   # m
@@ -96,9 +100,24 @@ def linear_fp8(
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](N))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_out))
 
-    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-    var W = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), w_rl)
-    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](scale.buf.unsafe_ptr().bitcast[Float32](), s_rl)
+    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+    var W = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr())
+        ),
+        runtime_layout=w_rl,
+    )
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
+    )
 
     var has_bias = 1 if bias else 0
     var B: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin]
@@ -107,20 +126,31 @@ def linear_fp8(
             raise Error("linear_fp8: bias must be BF16")
         var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](bias.value().numel()))
         B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(bias.value().buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
     else:
         # Reuse a caller-owned BF16 buffer as the never-read dummy. This avoids
         # a per-call dummy allocation and fence on the no-bias hot path.
         B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
 
-    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
     var grid_x = ceildiv(N, _TILE)
     var grid_y = ceildiv(M, _TILE)
-    ctx.enqueue_function[_linear_fp8_kernel, _linear_fp8_kernel](
-        X, W, S, B, O, M, N, K, has_bias,
+    ctx.enqueue_function[_linear_fp8_kernel](
+        X, W, S, B, O, Int32(M), Int64(N), Int32(K), Int32(has_bias),
         grid_dim=(grid_x, grid_y), block_dim=(_TILE, _TILE),
     )
     if has_bias != 0:

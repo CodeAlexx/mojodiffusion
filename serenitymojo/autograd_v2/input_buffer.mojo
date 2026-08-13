@@ -18,7 +18,7 @@
 # (the caller-supplied output gradient is itself one contribution -
 # engine.rs:305-393).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.autograd_v2.node import TArc, _raw_add, _raw_add_slab
 from serenitymojo.autograd_v2.step_slab import StepSlab
 

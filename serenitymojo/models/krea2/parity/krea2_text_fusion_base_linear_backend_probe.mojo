@@ -11,7 +11,7 @@
 #     serenitymojo/models/krea2/parity/krea2_text_fusion_base_linear_backend_probe.mojo
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

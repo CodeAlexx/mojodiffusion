@@ -22,6 +22,13 @@ struct JSONValue(Copyable, Movable):
     var _arr: List[JSONValue]
     var _obj: Dict[String, JSONValue]
 
+    # Mojo 1.0 cannot decide `Deinitable` for a directly recursive value type
+    # (`_arr: List[JSONValue]` inside JSONValue). Declaring the destructor
+    # explicitly breaks the cycle; field destructors still run after it, so
+    # this is equivalent to the synthesized one.
+    def __del__(deinit self):
+        pass
+
     def __init__(out self):
         """Default value is JSON null."""
         self.kind = JSON_NULL

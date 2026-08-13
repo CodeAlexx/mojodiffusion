@@ -7,7 +7,7 @@
 # input/output is BF16 because the cuDNN inference ABI is BF16.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

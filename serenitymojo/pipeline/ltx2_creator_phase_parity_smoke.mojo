@@ -7,7 +7,7 @@
 #   * first/last raw transformer velocity capture
 #   * first/last Euler velocity and next-latent updates for both modalities
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

@@ -12,7 +12,7 @@
 #
 # Target: cos >= 0.999 (matches the Rust parity bar).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, exp as fexp, cos as fcos, sin as fsin, pow as fpow
 
 from serenitymojo.tensor import Tensor

@@ -16,7 +16,6 @@
 # just keep the JSONDoc alive while you query it.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 comptime NodePtr = UnsafePointer[Node, MutExternalOrigin]
@@ -509,7 +508,7 @@ fn _unescape(p: BytePtr, off: Int, ln: Int) -> String:
             has_esc = True
             break
     if not has_esc:
-        return String(StringSlice(ptr=p + off, length=ln))
+        return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p + off, length=ln)))
     var buf = List[UInt8]()
     var i = 0
     while i < ln:
@@ -577,7 +576,7 @@ fn _b2s(b: List[UInt8]) -> String:
     var out_buf = alloc[UInt8](n)
     for i in range(n):
         out_buf[i] = b[i]
-    var s = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(out_buf)), length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(out_buf)), length=n)))
     out_buf.free()
     return s
 

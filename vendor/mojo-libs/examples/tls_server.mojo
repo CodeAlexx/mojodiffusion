@@ -14,7 +14,7 @@
 #       -Xlinker -rpath -Xlinker <brotli> -Xlinker -lssl -Xlinker -lcrypto
 #   /tmp/mojohttps cert.pem key.pem        # https://localhost:8443
 
-from sys import argv
+from std.sys import argv
 from net.tcp import TCPListener
 from net.poll import Epoll, EPOLLIN, EVENT_SIZE, rd_u64
 from net.syscalls import BytePtr, sys_accept, sys_close, sys_fcntl, F_GETFL, F_SETFL, O_NONBLOCK
@@ -147,7 +147,7 @@ def handle_ws(
     while True:
         var r = conn_read(ssl, tp, READ_CHUNK)
         if r > 0:
-            acc += String(StringSlice(ptr=tmp, length=r))
+            acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=tmp, length=r)))
         elif r == -1:
             break  # would block
         else:
@@ -195,7 +195,7 @@ def handle_readable(
     while True:
         var r = conn_read(ssl, tp, READ_CHUNK)
         if r > 0:
-            acc += String(StringSlice(ptr=tmp, length=r))
+            acc += String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=tmp, length=r)))
         elif r == -1:
             break
         else:

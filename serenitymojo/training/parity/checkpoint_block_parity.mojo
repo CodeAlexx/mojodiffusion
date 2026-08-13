@@ -24,9 +24,9 @@
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo run -I . serenitymojo/training/parity/checkpoint_block_parity.mojo
 
-from collections import List
-from math import sqrt
-from std.gpu.host import DeviceContext
+from std.collections import List
+from std.math import sqrt
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

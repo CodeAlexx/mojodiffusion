@@ -1,7 +1,7 @@
 # sqa_par_parity.mojo — gate the PARALLEL single-query attention (sqa_device_par)
 # against the serial sqa_device (already validated end-to-end by decoder_cache_test)
 # on random inputs across L. Same F32-accumulate math → expect cos ~1.0.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.llm.sqa import sqa_device, sqa_device_par

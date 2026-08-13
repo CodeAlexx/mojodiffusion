@@ -10,7 +10,7 @@
 #   pixi run mojo run -I . \
 #     serenitymojo/models/text_encoder/parity/qwen3_preattn_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.parity import ParityHarness

@@ -5,7 +5,7 @@
 # BF16 tensor boundaries on ingest; host F32 conversion is comparison-only.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

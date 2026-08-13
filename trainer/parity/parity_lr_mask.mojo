@@ -1,5 +1,5 @@
 # Parity vs Serenity lr_ref.json + masked_loss_ref.json
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenity_trainer.util.lr_scheduler_util import LrSchedule, LR_COSINE

@@ -17,7 +17,7 @@
 #
 # Mojo 1.0.0b1. Loud-fail: prints FAIL + raises on any arm under threshold.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

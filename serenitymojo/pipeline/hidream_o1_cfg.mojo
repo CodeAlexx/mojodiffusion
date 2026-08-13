@@ -36,7 +36,7 @@
 # scheduler unchanged (the only DiT addition is the pad-aware MASK builder +
 # forward_padded wrapper — no math touched). Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

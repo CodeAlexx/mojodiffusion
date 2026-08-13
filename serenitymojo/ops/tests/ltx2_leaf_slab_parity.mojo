@@ -10,7 +10,7 @@
 #   env LD_LIBRARY_PATH=.pixi/envs/default/lib /tmp/ltx2_leaf_slab_parity
 
 from std.math import sin, cos, sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.autograd_v2.step_slab import StepSlab

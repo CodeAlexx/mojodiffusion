@@ -1,7 +1,7 @@
 # kandinsky5_stage_probe.mojo — localize the block-0 mismatch by gating each
 # sub-stage (after self-attn, after cross-attn) against the oracle dumps.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

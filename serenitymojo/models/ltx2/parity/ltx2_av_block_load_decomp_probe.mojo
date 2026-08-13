@@ -22,7 +22,7 @@
 #   -Xlinker -lcuda serenitymojo/models/ltx2/parity/ltx2_av_block_load_decomp_probe.mojo \
 #   -o /tmp/ltx2_av_load_decomp && /tmp/ltx2_av_load_decomp
 
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.collections import List
 from std.memory import ArcPointer
 from std.time import perf_counter_ns

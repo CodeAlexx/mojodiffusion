@@ -11,7 +11,7 @@
 #
 # Build/run only through the capped orchestrator path on this workstation.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.time import perf_counter_ns
 

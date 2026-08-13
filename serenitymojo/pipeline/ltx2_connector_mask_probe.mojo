@@ -9,7 +9,7 @@
 #
 # Build+run like the connector smoke (GPU; needs the cudnn sdpa shim links).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

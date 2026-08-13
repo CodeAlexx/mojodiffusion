@@ -40,7 +40,7 @@ def _parse_style(s: String) raises -> Dict[String, String]:
         var start = i
         while i < n and Int(b[i]) != 59:   # ';'
             i += 1
-        var decl = String(StringSlice(ptr=b.unsafe_ptr() + start, length=i - start))
+        var decl = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + start, length=i - start)))
         i += 1
         var colon = decl.find(String(":"))
         if colon > 0:
@@ -61,7 +61,7 @@ def _strip(s: String, a: Int, b_: Int) -> String:
         j -= 1
     if j <= i:
         return String("")
-    return String(StringSlice(ptr=b.unsafe_ptr() + i, length=j - i))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + i, length=j - i)))
 
 
 def _prop(node: XmlNode, style: Dict[String, String], key: String) raises -> String:
@@ -95,7 +95,7 @@ def _poly_points(raw: String) raises -> List[Float64]:
         while i < n and ((Int(b[i]) >= 48 and Int(b[i]) <= 57) or Int(b[i]) == 46 or Int(b[i]) == 101 or Int(b[i]) == 69):
             i += 1
         if i > start:
-            out.append(atof(String(StringSlice(ptr=b.unsafe_ptr() + start, length=i - start))))
+            out.append(atof(String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + start, length=i - start)))))
         else:
             i += 1
     return out^

@@ -13,7 +13,7 @@
 # dims — here we broadcast by indexing the same coeff for every inner element).
 
 from std.math import sqrt, exp, tanh, log
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 
@@ -29,7 +29,7 @@ struct VbCoefficients(Copyable, Movable):
     var sqrt_recip_alphas_cumprod: List[Float32]
     var sqrt_recipm1_alphas_cumprod: List[Float32]
 
-    fn __init__(
+    def __init__(
         out self,
         betas: List[Float32],
         posterior_log_variance_clipped: List[Float32],
@@ -51,7 +51,7 @@ comptime _LOG2 = Float32(0.6931471805599453)            # np.log(2.0)
 
 
 # normal_kl  (vb_loss.py:14-31): elementwise KL between two gaussians.
-fn _normal_kl(
+def _normal_kl(
     mean1: Float32, logvar1: Float32, mean2: Float32, logvar2: Float32
 ) -> Float32:
     var d = mean1 - mean2
@@ -65,16 +65,16 @@ fn _normal_kl(
 
 
 # approx_standard_normal_cdf  (vb_loss.py:34-39)
-fn _approx_standard_normal_cdf(x: Float32) -> Float32:
+def _approx_standard_normal_cdf(x: Float32) -> Float32:
     return 0.5 * (1.0 + tanh(_SQRT_2_OVER_PI * (x + 0.044715 * (x * x * x))))
 
 
-fn _clamp_min(v: Float32, lo: Float32) -> Float32:
+def _clamp_min(v: Float32, lo: Float32) -> Float32:
     return v if v > lo else lo
 
 
 # discretized_gaussian_log_likelihood  (vb_loss.py:42-70)
-fn _discretized_gaussian_log_likelihood(
+def _discretized_gaussian_log_likelihood(
     x: Float32, means: Float32, log_scales: Float32
 ) -> Float32:
     var centered_x = x - means
@@ -97,7 +97,7 @@ fn _discretized_gaussian_log_likelihood(
 
 
 # __predict_x_0_from_eps  (vb_loss.py:118-128)
-fn _predict_x_0_from_eps(
+def _predict_x_0_from_eps(
     coefficients: VbCoefficients, x_t: Float32, t: Int, eps: Float32
 ) -> Float32:
     return (
@@ -107,7 +107,7 @@ fn _predict_x_0_from_eps(
 
 
 # __q_posterior_mean_variance  (vb_loss.py:73-96): returns (mean, log_var).
-fn _q_posterior_mean(
+def _q_posterior_mean(
     coefficients: VbCoefficients, x_0: Float32, x_t: Float32, t: Int
 ) -> Float32:
     return (
@@ -117,7 +117,7 @@ fn _q_posterior_mean(
 
 
 # __p_mean_variance  (vb_loss.py:99-115): returns (predicted_mean, predicted_log_variance).
-fn _p_mean_variance(
+def _p_mean_variance(
     coefficients: VbCoefficients,
     x_t: Float32,
     t: Int,
@@ -138,7 +138,7 @@ fn _p_mean_variance(
 
 
 # __vb_terms_bpd  (vb_loss.py:131-176): per-element variational-bound term (bits).
-fn _vb_term(
+def _vb_term(
     coefficients: VbCoefficients,
     x_0: Float32,
     x_t: Float32,

@@ -5,7 +5,7 @@
 # parity by default, explicit cuDNN flash paths when a caller has accepted the
 # flash numerics and saved-forward contract.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

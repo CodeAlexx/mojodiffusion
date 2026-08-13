@@ -9,7 +9,7 @@
 # Tensor.to_host(), Tensor.from_host(), or introduce an F32 storage boundary.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.models.zimage.full_finetune_inventory import (

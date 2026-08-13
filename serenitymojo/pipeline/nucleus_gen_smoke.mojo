@@ -28,7 +28,7 @@
 #   * The NucleusAI/Nucleus-Image snapshot is NOT present on this box; paths are
 #     placeholders. RUN requires downloading the checkpoint.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

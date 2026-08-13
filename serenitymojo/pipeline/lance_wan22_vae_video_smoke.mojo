@@ -4,7 +4,7 @@
 # uses random latent tokens with T_lat=3 and writes the first decoded frame as a
 # 16x16 RGB PNG. It is not a quality sample.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.components.artifacts import save_video_frame_png
 from serenitymojo.io.dtype import STDtype

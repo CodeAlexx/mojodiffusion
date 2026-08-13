@@ -28,9 +28,10 @@
 
 from std.math import sqrt
 from std.memory import ArcPointer, stack_allocation
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.atomic import Atomic
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -76,9 +77,11 @@ def _global_sq_kernel[g_dtype: DType](
     g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
     out_scalar: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    ntensors: Int,
-    total: Int,
+    ntensors_w: Int32,
+    total_w: Int64,
 ):
+    var ntensors = Int(ntensors_w)
+    var total = Int(total_w)
     var sh = stack_allocation[
         _BLOCK, Scalar[DType.float32], address_space=AddressSpace.SHARED
     ]()
@@ -114,9 +117,11 @@ def _global_stats_kernel[g_dtype: DType](
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
     out_scalar: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     out_nonfinite: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
-    ntensors: Int,
-    total: Int,
+    ntensors_w: Int32,
+    total_w: Int64,
 ):
+    var ntensors = Int(ntensors_w)
+    var total = Int(total_w)
     var sh = stack_allocation[
         _BLOCK, Scalar[DType.float32], address_space=AddressSpace.SHARED
     ]()
@@ -169,10 +174,8 @@ def _launch_global_sq[g_dtype: DType](
     total: Int,
     nblocks: Int,
 ) raises:
-    ctx.enqueue_function[
-        _global_sq_kernel[g_dtype], _global_sq_kernel[g_dtype]
-    ](
-        GA, OFF, OUT, nt, total, grid_dim=nblocks, block_dim=_BLOCK,
+    ctx.enqueue_function[_global_sq_kernel[g_dtype]](
+        GA, OFF, OUT, Int32(nt), Int64(total), grid_dim=nblocks, block_dim=_BLOCK,
     )
 
 
@@ -186,10 +189,8 @@ def _launch_global_stats[g_dtype: DType](
     total: Int,
     nblocks: Int,
 ) raises:
-    ctx.enqueue_function[
-        _global_stats_kernel[g_dtype], _global_stats_kernel[g_dtype]
-    ](
-        GA, OFF, OUT, BAD, nt, total, grid_dim=nblocks, block_dim=_BLOCK,
+    ctx.enqueue_function[_global_stats_kernel[g_dtype]](
+        GA, OFF, OUT, BAD, Int32(nt), Int64(total), grid_dim=nblocks, block_dim=_BLOCK,
     )
 
 
@@ -237,13 +238,29 @@ def on_device_grad_stats(
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(off_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
+    )
     var OUT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scal_dev.unsafe_ptr().bitcast[Float32](), s_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scal_dev.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
+    )
     var BAD = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        bad_dev.unsafe_ptr().bitcast[Int64](), s_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(bad_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=s_rl,
+    )
 
     var nblocks = (total + _BLOCK - 1) // _BLOCK
     if nblocks > _GRID_CAP:
@@ -313,13 +330,29 @@ def on_device_grad_stats_with_arena(
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(off_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
+    )
     var OUT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scal_dev.unsafe_ptr().bitcast[Float32](), s_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scal_dev.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
+    )
     var BAD = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        bad_dev.unsafe_ptr().bitcast[Int64](), s_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(bad_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=s_rl,
+    )
 
     var nblocks = (total + _BLOCK - 1) // _BLOCK
     if nblocks > _GRID_CAP:
@@ -385,11 +418,23 @@ def on_device_global_norm(
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(off_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
+    )
     var OUT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scal_dev.unsafe_ptr().bitcast[Float32](), s_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scal_dev.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
+    )
 
     var nblocks = (total + _BLOCK - 1) // _BLOCK
     if nblocks > _GRID_CAP:
@@ -428,8 +473,9 @@ def _per_tensor_sq_kernel[g_dtype: DType](
     g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     lens: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
     out_ss: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    ntensors: Int,
+    ntensors_w: Int32,
 ):
+    var ntensors = Int(ntensors_w)
     var sh = stack_allocation[
         _BLOCK, Scalar[DType.float32], address_space=AddressSpace.SHARED
     ]()
@@ -491,24 +537,30 @@ def on_device_per_tensor_sumsq(
 
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt))
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var LENS = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        len_dev.unsafe_ptr().bitcast[Int64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(len_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OUT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_dev.unsafe_ptr().bitcast[Float32](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_dev.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=a_rl,
+    )
 
     if grad_dtype == STDtype.F32:
-        ctx.enqueue_function[
-            _per_tensor_sq_kernel[DType.float32], _per_tensor_sq_kernel[DType.float32]
-        ](GA, LENS, OUT, nt, grid_dim=nt, block_dim=_BLOCK)
+        ctx.enqueue_function[_per_tensor_sq_kernel[DType.float32]](GA, LENS, OUT, Int32(nt), grid_dim=nt, block_dim=_BLOCK)
     elif grad_dtype == STDtype.BF16:
-        ctx.enqueue_function[
-            _per_tensor_sq_kernel[DType.bfloat16], _per_tensor_sq_kernel[DType.bfloat16]
-        ](GA, LENS, OUT, nt, grid_dim=nt, block_dim=_BLOCK)
+        ctx.enqueue_function[_per_tensor_sq_kernel[DType.bfloat16]](GA, LENS, OUT, Int32(nt), grid_dim=nt, block_dim=_BLOCK)
     else:
-        ctx.enqueue_function[
-            _per_tensor_sq_kernel[DType.float16], _per_tensor_sq_kernel[DType.float16]
-        ](GA, LENS, OUT, nt, grid_dim=nt, block_dim=_BLOCK)
+        ctx.enqueue_function[_per_tensor_sq_kernel[DType.float16]](GA, LENS, OUT, Int32(nt), grid_dim=nt, block_dim=_BLOCK)
 
     var out_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 4)
     ctx.enqueue_copy(dst_buf=out_host, src_buf=out_dev)
@@ -527,10 +579,12 @@ def on_device_per_tensor_sumsq(
 def _global_scale_kernel(
     g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
-    ntensors: Int,
-    total: Int,
+    ntensors_w: Int32,
+    total_w: Int64,
     s: Float32,
 ):
+    var ntensors = Int(ntensors_w)
+    var total = Int(total_w)
     var stride = Int(block_dim.x) * _GRID_CAP
     var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     while gid < total:
@@ -576,14 +630,22 @@ def on_device_scale_tensors_f32(
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
     var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
-        g_dev.unsafe_ptr().bitcast[UInt64](), a_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ),
+        runtime_layout=a_rl,
+    )
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
-        off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(off_dev.unsafe_ptr().bitcast[Int64]())
+        ),
+        runtime_layout=o_rl,
+    )
 
     var nblocks = (total + _BLOCK - 1) // _BLOCK
     if nblocks > _GRID_CAP:
         nblocks = _GRID_CAP
-    ctx.enqueue_function[_global_scale_kernel, _global_scale_kernel](
-        GA, OFF, nt, total, s, grid_dim=nblocks, block_dim=_BLOCK,
+    ctx.enqueue_function[_global_scale_kernel](
+        GA, OFF, Int32(nt), Int64(total), s, grid_dim=nblocks, block_dim=_BLOCK,
     )
     ctx.synchronize()

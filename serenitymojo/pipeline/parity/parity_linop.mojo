@@ -3,7 +3,7 @@
 # oracle's after_final_layer (IMAGE tokens). If near-perfect, my linear op is
 # fine and the velocity gap is purely projecting the upstream 0.99995 fl_scaled
 # difference. If still ~0.9997, my linear op itself diverges from torch Linear.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import alloc
 from serenitymojo.tensor import Tensor

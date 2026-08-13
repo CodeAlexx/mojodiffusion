@@ -21,7 +21,7 @@
 #     -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib \
 #     serenitymojo/models/ltx2/parity/ltx2_int4_forward_parity.mojo -o /tmp/ltx2_int4_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer
 from std.math import sqrt

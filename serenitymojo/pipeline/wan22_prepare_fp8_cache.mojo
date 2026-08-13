@@ -2,7 +2,7 @@
 # the exact Mojo E4M3 resident store. Development/artifact preparation only.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.dit.wan22_dit import Wan22Config, Wan22DiT
 

@@ -23,7 +23,7 @@
 # (_qwen_template + pad-to-N_ENC with PAD 151643); it is NOT imported to keep
 # this smoke's build light (importing the CLI pulls the full DiT/VAE stack).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.tensor import Tensor

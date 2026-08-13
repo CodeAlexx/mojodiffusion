@@ -11,8 +11,8 @@
 #   -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_int4_gemm
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu.host._nvidia_cuda import CUDA
+from max.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host._nvidia_cuda import CUDA
 from serenitymojo.io.ffi import BytePtr
 
 

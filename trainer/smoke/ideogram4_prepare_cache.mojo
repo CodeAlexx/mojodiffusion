@@ -25,9 +25,9 @@
 #   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib \
 #     /tmp/ideogram4_prepare <stage_dir> <out_cache.safetensors> <n>
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
-from sys import argv
+from std.sys import argv
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

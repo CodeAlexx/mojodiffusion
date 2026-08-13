@@ -6,7 +6,6 @@
 
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -29,7 +28,7 @@ def http_date() -> String:
         BytePtr(unsafe_from_address=Int(buf)), 64,
         BytePtr(unsafe_from_address=Int(fb)), tm,
     )
-    var s = String(StringSlice(ptr=BytePtr(unsafe_from_address=Int(buf)), length=n))
+    var s = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=BytePtr(unsafe_from_address=Int(buf)), length=n)))
     tt.free()
     fb.free()
     buf.free()

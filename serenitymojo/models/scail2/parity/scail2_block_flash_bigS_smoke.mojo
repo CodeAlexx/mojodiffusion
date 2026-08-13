@@ -36,7 +36,7 @@
 #     kill $POLL; echo "peak VRAM MiB:"; sort -n /tmp/vram.log | tail -1 )
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sin, cos, sqrt
 from std.time import perf_counter
 

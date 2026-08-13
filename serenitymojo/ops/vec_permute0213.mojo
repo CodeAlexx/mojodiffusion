@@ -24,7 +24,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. Non-F32 input falls back to the dtype-preserving
 # general permute.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -47,9 +47,14 @@ comptime _VW = 4
 def _vec_permute0213_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    B: Int, S: Int, H: Int, Dh: Int,
-    nchunks: Int,   # = B*H*S*(Dh/4)
+    B_w: Int32, S_w: Int32, H_w: Int32, Dh_w: Int32,
+    nchunks_w: Int32,   # = B*H*S*(Dh/4)
 ):
+    var B = Int(B_w)
+    var S = Int(S_w)
+    var H = Int(H_w)
+    var Dh = Int(Dh_w)
+    var nchunks = Int(nchunks_w)
     var chunk = Int(global_idx.x)
     if chunk >= nchunks:
         return
@@ -88,14 +93,20 @@ def vec_permute0213(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var grid = (nchunks + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_vec_permute0213_kernel, _vec_permute0213_kernel](
-        X, O, B, S, H, Dh, nchunks, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_vec_permute0213_kernel](
+        X, O, Int32(B), Int32(S), Int32(H), Int32(Dh), Int32(nchunks), grid_dim=grid, block_dim=_BLOCK
     )
     var oshape = List[Int]()
     oshape.append(B); oshape.append(H); oshape.append(S); oshape.append(Dh)

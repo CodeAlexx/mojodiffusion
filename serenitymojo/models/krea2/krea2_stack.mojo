@@ -34,7 +34,7 @@
 # Mojo 1.0.0b1: `def` only; Tensor move-only (never in a collection); ArcPointer
 # [Tensor] is the Copyable device carrier; no-bias linear = linear(x,w,None,ctx).
 
-from std.gpu.host import (
+from max.gpu.host import (
     DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent,
 )
 from std.collections import List, Optional

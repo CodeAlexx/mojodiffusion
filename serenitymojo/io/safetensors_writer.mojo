@@ -33,7 +33,7 @@
 # uint8 buffers throughout.
 
 from std.memory import alloc, UnsafePointer, ArcPointer
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .dtype import STDtype
 from .ffi import (
     BytePtr,

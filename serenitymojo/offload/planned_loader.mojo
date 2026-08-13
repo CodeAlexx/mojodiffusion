@@ -4,7 +4,7 @@
 # current synchronous mmap/H2D backend, but moves block order, lookahead,
 # branch accounting, and dtype policy into one shared object.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.offload.block_loader import Block, BlockLoader
 from serenitymojo.offload.plan import BlockPlan, DTypePolicy, OffloadConfig

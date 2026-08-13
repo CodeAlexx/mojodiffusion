@@ -17,7 +17,7 @@
 
 from std.collections import List
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.klein.klein_stack_lora import (
     DBL_SLOTS,

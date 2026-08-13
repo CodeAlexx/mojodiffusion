@@ -11,7 +11,7 @@
 # backward), so the band is looser than the block-0-isolated gate: 32-layer bf16 +
 # forward-recompute error + the dQ value-tolerance on each layer's self-q A grad.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

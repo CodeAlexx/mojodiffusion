@@ -12,7 +12,7 @@
 # only the 377 tensors used by the 31-block visual forward. Creator F32 weights
 # are cast once to F16 at load, matching CLIPModel(dtype=torch.float16).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 
@@ -165,7 +165,7 @@ struct Scail2ClipVision(Movable):
         self.weights = weights^
         self.name_to_idx = name_to_idx^
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing loaded SCAIL-2 CLIP tensor: ") + name)
         return self.weights[self.name_to_idx[name]][]

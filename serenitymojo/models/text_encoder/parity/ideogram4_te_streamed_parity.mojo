@@ -19,7 +19,7 @@
 #     -o /tmp/i4_te_streamed_parity
 #   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib /tmp/i4_te_streamed_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.tensor import Tensor

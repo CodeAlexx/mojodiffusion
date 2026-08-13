@@ -1,5 +1,5 @@
 # Dump the exact stage-1 initial latents randn draw for structure analysis.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor

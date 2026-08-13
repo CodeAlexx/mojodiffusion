@@ -26,7 +26,7 @@
 # F32 only in the foundation kernel registers (no persistent F32).
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

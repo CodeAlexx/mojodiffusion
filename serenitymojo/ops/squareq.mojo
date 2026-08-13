@@ -24,9 +24,10 @@
 # `dequant_int4_g64` exactly; the rotation matches `rht_grouped` to bf16
 # rounding. Gate: ops/parity/squareq_parity.mojo. Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import AddressSpace
-from std.gpu.host import DeviceContext
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
 from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -53,8 +54,9 @@ comptime _INV_SQRT_SEG: Float32 = 0.0625  # 1/sqrt(256)
 def _rht256_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [rows*K] flat in
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [rows*K] flat out
-    segs_per_row: Int,
+    segs_per_row_w: Int32,
 ):
+    var segs_per_row = Int(segs_per_row_w)
     var seg = Int(block_idx.x)                # global segment index
     var tid = Int(thread_idx.x)               # 0.._SEG_TPB-1
     var row = seg // segs_per_row
@@ -102,10 +104,13 @@ def _sq_dequant_ih256_kernel[
     qweight: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],   # [out*in/2]
     wscales: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [(in/group)*out]
     o_out: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [out*in]
-    out_f: Int,
-    in_f: Int,
-    group: Int,
+    out_f_w: Int32,
+    in_f_w: Int32,
+    group_w: Int32,
 ):
+    var out_f = Int(out_f_w)
+    var in_f = Int(in_f_w)
+    var group = Int(group_w)
     var segs_per_row = in_f // _SEG
     var seg = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -184,14 +189,20 @@ def rht256_grouped(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.numel() * 2)
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
     )
     comptime kern = _rht256_kernel
-    ctx.enqueue_function[kern, kern](
-        X, O, segs_per_row, grid_dim=rows * segs_per_row, block_dim=_SEG_TPB
+    ctx.enqueue_function[kern](
+        X, O, Int32(segs_per_row), grid_dim=rows * segs_per_row, block_dim=_SEG_TPB
     )
     var oshape = List[Int]()
     for i in range(len(shp)):
@@ -240,17 +251,26 @@ def squareq_dequant_derotate(
     var ws_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups * out_f))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * in_f))
     var QW = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        qweight.buf.unsafe_ptr(), qw_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(qweight.buf.unsafe_ptr())
+        ),
+        runtime_layout=qw_rl,
     )
     var WS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        wscales.buf.unsafe_ptr().bitcast[BFloat16](), ws_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(wscales.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=ws_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
     )
     comptime kern = _sq_dequant_ih256_kernel[SIGN_MODE, NIBBLE_ORDER]
-    ctx.enqueue_function[kern, kern](
-        QW, WS, O, out_f, in_f, group,
+    ctx.enqueue_function[kern](
+        QW, WS, O, Int32(out_f), Int32(in_f), Int32(group),
         grid_dim=out_f * (in_f // _SEG), block_dim=_SEG_TPB,
     )
     return Tensor(out_buf^, [out_f, in_f], STDtype.BF16)
@@ -286,9 +306,11 @@ def _sq8_dequant_ih256_kernel(
     q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],       # [out*in]
     s8: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [out]
     o_out: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # [out*in]
-    out_f: Int,
-    in_f: Int,
+    out_f_w: Int32,
+    in_f_w: Int32,
 ):
+    var out_f = Int(out_f_w)
+    var in_f = Int(in_f_w)
     var segs_per_row = in_f // _SEG
     var seg = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -347,17 +369,26 @@ def squareq_w8_reconstruct_weight(
     var rl_q = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f * in_f))
     var rl_s = RuntimeLayout[_DYN1].row_major(IndexList[1](out_f))
     var Q = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
-        q8.buf.unsafe_ptr().bitcast[Int8](), rl_q
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(q8.buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=rl_q,
     )
     var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        s8.buf.unsafe_ptr().bitcast[BFloat16](), rl_s
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(s8.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl_s,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), rl_q
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl_q,
     )
     comptime kern = _sq8_dequant_ih256_kernel
-    ctx.enqueue_function[kern, kern](
-        Q, S, O, out_f, in_f,
+    ctx.enqueue_function[kern](
+        Q, S, O, Int32(out_f), Int32(in_f),
         grid_dim=out_f * (in_f // _SEG), block_dim=_SEG_TPB,
     )
     var w_res = Tensor(out_buf^, [out_f, in_f], STDtype.BF16)

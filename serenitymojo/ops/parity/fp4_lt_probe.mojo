@@ -16,7 +16,7 @@
 #     -Xlinker -rpath -Xlinker '$ORIGIN/../../.pixi/envs/default/lib' \
 #     serenitymojo/ops/parity/fp4_lt_probe.mojo -o output/checks/fp4_lt_probe
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.ops.fp4_gemm import fp4_gemm_nt_rc

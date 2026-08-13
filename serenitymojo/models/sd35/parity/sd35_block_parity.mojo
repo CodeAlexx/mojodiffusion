@@ -17,7 +17,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/sd35/parity/sd35_block_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc
 from serenitymojo.parity import ParityHarness, ParityResult

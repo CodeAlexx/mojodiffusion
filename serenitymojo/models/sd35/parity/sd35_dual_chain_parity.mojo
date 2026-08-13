@@ -13,7 +13,7 @@
 #       serenitymojo/models/sd35/parity/sd35_dual_chain_parity.mojo -o /tmp/sd35_dual_chain
 #   /tmp/sd35_dual_chain
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc
 from serenitymojo.parity import ParityHarness

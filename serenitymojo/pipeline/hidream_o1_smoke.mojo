@@ -29,7 +29,7 @@
 # (see report — the AR-prefix length builder needs the token_types_bin logic
 # from build_t2i_input/pipeline.rs:317-333, transcribed below).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

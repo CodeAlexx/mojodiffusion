@@ -16,7 +16,7 @@
 #       serenitymojo/models/sd35/parity/sd35_dual_block_parity.mojo -o /tmp/sd35_dual_block
 #   /tmp/sd35_dual_block
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness

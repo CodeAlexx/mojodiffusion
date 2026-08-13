@@ -6,7 +6,7 @@
 # added before the single cross_attn.o projection, exactly as the oracle does.
 
 from std.collections import Dict
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype
@@ -98,7 +98,7 @@ def scail2_block_forward[
         # padding would be a different attention distribution.
         raise Error("SCAIL-2 oracle attends all 512 padded text tokens")
     var dim = cfg.dim
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
 
     # e0 is the batch-1 broadcastable [1,1,6,D] form. The official expanded
     # [1,6,D] row is identical for every token, so no S-sized F32 copy is made.

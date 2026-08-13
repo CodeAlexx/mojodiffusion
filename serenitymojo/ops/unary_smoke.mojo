@@ -36,7 +36,7 @@
 #   uses BF16, STFT uses F32) is covered; flag F16 for a future micro-gate.
 
 from std.math import sin, exp, sqrt, tanh, pi
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.unary import (

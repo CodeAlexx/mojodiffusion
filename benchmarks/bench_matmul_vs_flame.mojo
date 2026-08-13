@@ -5,12 +5,12 @@
 # Mirrors ops/linear.mojo's BF16 branch exactly: A[M,K]bf16, B[N,K]bf16,
 # transpose_b=True, c_row_major=True, F32 accumulate. Values irrelevant to GEMM perf.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from linalg.matmul.vendor.blas import matmul
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 
 comptime _DYN2 = Layout.row_major(-1, -1)
 
@@ -26,13 +26,22 @@ def bench_gemm(name: String, m: Int, k: Int, n: Int, ctx: DeviceContext) raises:
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, n))
     var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        a_buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(a_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=a_rl,
     )
     var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        b_buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(b_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
     )
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(c_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=c_rl,
     )
 
     for _ in range(30):

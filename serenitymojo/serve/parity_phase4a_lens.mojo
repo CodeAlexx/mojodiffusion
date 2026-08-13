@@ -4,7 +4,7 @@
 # -> offset-97 trim -> FIRST 64 post-offset rows) and dumps the 4 layers' [64,2880]
 # post-trim features + the token ids, so an HF GptOssModel reference can compare.
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

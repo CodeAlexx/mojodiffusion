@@ -11,7 +11,7 @@
 # intentional and limited to TrainState masters plus Adam moments.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.zimage.full_finetune_inventory import (
     zimage_full_finetune_checkpoint_key_manifest,

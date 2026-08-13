@@ -12,7 +12,6 @@
 # header block (ASCII) is turned into a String for parsing.
 
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 
 comptime MpBytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 
@@ -60,7 +59,7 @@ def _bytes_to_str(s: String, start: Int, end: Int) -> String:
         return String("")
     var sp = s.as_bytes()
     var base = MpBytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 fn _span_str(sp: Span[UInt8, _], start: Int, end: Int) -> String:
@@ -70,7 +69,7 @@ fn _span_str(sp: Span[UInt8, _], start: Int, end: Int) -> String:
     if n <= 0:
         return String("")
     var base = MpBytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
-    return String(StringSlice(ptr=base, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=base, length=n)))
 
 
 fn _find_seq(hay: Span[UInt8, _], needle: Span[UInt8, _], start: Int) -> Int:

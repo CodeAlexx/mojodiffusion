@@ -16,7 +16,7 @@
 #   pixi run mojo run -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/pipeline/ltx2_hq_lora_stack_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.lora import LoraSet
 from serenitymojo.models.dit.ltx2_dit import LTX2Config, LTX2AVBlockWeights

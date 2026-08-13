@@ -4,7 +4,7 @@
 # from Serenity's dumped `output.predicted` and `output.target`. It does not
 # claim Anima transformer forward, backward, optimizer, or sampler parity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import abs
 from std.time import perf_counter_ns
 

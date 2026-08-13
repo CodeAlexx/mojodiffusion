@@ -52,7 +52,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -270,7 +270,7 @@ def hunyuan15_double_block[
     comptime S = S_IMG + S_TXT
     var dim = cfg.hidden_size
     var eps = cfg.eps
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
 
     # ── img_mod / txt_mod: Linear(SiLU(vec)) -> chunk(6) (F32) ──
     var vec_silu = silu(vec, ctx)
@@ -410,7 +410,7 @@ struct Hunyuan15Dit(Movable):
             w[key] = ArcPointer(Tensor.from_view(tv, ctx))
         return Hunyuan15Dit(weights=w^, config=cfg)
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         return self.weights[name][]
 
     # Block weights sub-dict for block i (keys stripped of "double_blocks.i.").

@@ -11,7 +11,7 @@ across the whole sequence. It is the post-generation media primitive used by
 the Serenity Rust control plane; model execution remains Mojo + MAX.
 """
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.image.png import ValueRange, save_png

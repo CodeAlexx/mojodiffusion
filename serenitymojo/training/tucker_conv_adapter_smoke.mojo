@@ -29,8 +29,7 @@ from std.collections import List
 from std.math import abs
 from std.ffi import external_call
 from std.memory import alloc, UnsafePointer, ArcPointer
-from std.builtin.type_aliases import MutExternalOrigin
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -11,9 +11,9 @@
 #      pixi run mojo run -I . serenitymojo/ops/parity/vec_rms_norm_parity.mojo
 #  bitrot: ... vec_rms_norm_parity.mojo BITROT
 
-from sys import argv
+from std.sys import argv
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

@@ -34,7 +34,7 @@
 # Run:   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib \
 #   /tmp/klein_block_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.builtin.dtype import DType
 from std.collections import Optional

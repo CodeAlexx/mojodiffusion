@@ -30,7 +30,7 @@
 # the reproduced adapter_after carries ~bf16 rounding vs Serenity's F32 dump.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.time import perf_counter_ns
 

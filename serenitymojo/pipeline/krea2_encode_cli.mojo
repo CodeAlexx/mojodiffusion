@@ -31,7 +31,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.text_encoder.krea2_qwen3vl_4b import (
     load_krea2_qwen3vl_4b,

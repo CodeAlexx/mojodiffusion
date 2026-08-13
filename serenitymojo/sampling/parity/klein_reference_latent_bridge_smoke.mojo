@@ -7,7 +7,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/sampling/parity/klein_reference_latent_bridge_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.serve.backend import JobParams
 from serenitymojo.sampling.klein_reference_latent_bridge import (

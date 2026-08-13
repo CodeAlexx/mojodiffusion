@@ -10,7 +10,7 @@
 #   pixi run mojo run -I . serenitymojo/ops/parity/reduce_bwd_parity.mojo
 
 from std.math import exp as _expf, log as _logf
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness, ParityResult

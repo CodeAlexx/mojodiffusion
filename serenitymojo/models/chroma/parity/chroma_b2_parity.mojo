@@ -27,7 +27,7 @@
 # real_len=S), matching the landed chroma_stack_device_parity gate.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.math import sqrt
 

@@ -1,7 +1,7 @@
 # Tiny compile/run check for the core Klein SerenityTrainer-style LoRA adapter helper.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.klein.lora_adapter import (

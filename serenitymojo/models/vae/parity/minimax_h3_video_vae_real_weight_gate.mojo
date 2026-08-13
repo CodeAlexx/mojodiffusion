@@ -74,7 +74,7 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo run -I . -Xlinker -lm \
 #     serenitymojo/models/vae/parity/minimax_h3_video_vae_real_weight_gate.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

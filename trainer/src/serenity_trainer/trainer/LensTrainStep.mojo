@@ -34,7 +34,7 @@
 #
 # Dtype: params/moments/grads BF16; LR factor + grad norm host F32. No persistent F32.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 
 from serenity_trainer.util.config.TrainConfig import TrainConfig

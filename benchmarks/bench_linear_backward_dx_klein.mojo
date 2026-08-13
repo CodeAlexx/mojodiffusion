@@ -4,7 +4,7 @@
 # linear backward. These shapes are used repeatedly in single/double block
 # backward and determine whether the remaining cost lives in common linalg.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

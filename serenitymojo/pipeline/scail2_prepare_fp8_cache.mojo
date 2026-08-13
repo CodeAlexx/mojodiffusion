@@ -1,7 +1,7 @@
 # One-shot/resumable SCAIL-2 14B persistent E4M3 block-cache preparation.
 # Usage: scail2_prepare_fp8_cache <canonical transformer dir> <cache dir>
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.models.scail2.scail2_fp8_stream import (

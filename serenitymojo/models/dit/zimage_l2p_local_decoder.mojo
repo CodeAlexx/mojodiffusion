@@ -4,7 +4,7 @@
 # decoder. It deliberately gates real checkpoint math on small tensors before
 # claiming the full [1,3,1024,1024] -> [1,3,1024,1024] decoder path.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -80,11 +80,15 @@ def _load_conv_weight_rscf(
 def _maxpool2x2_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n_dim: Int,
-    h: Int,
-    w: Int,
-    c: Int,
+    n_dim_w: Int32,
+    h_w: Int32,
+    w_w: Int32,
+    c_w: Int32,
 ):
+    var n_dim = Int(n_dim_w)
+    var h = Int(h_w)
+    var w = Int(w_w)
+    var c = Int(c_w)
     var idx = Int(global_idx.x)
     var oh = h // 2
     var ow = w // 2
@@ -115,11 +119,15 @@ def _maxpool2x2_kernel_f32(
 def _maxpool2x2_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    n_dim: Int,
-    h: Int,
-    w: Int,
-    c: Int,
+    n_dim_w: Int32,
+    h_w: Int32,
+    w_w: Int32,
+    c_w: Int32,
 ):
+    var n_dim = Int(n_dim_w)
+    var h = Int(h_w)
+    var w = Int(w_w)
+    var c = Int(c_w)
     var idx = Int(global_idx.x)
     var oh = h // 2
     var ow = w // 2
@@ -150,11 +158,15 @@ def _maxpool2x2_kernel_bf16(
 def _maxpool2x2_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    n_dim: Int,
-    h: Int,
-    w: Int,
-    c: Int,
+    n_dim_w: Int32,
+    h_w: Int32,
+    w_w: Int32,
+    c_w: Int32,
 ):
+    var n_dim = Int(n_dim_w)
+    var h = Int(h_w)
+    var w = Int(w_w)
+    var c = Int(c_w)
     var idx = Int(global_idx.x)
     var oh = h // 2
     var ow = w // 2
@@ -202,33 +214,51 @@ def maxpool2x2_nhwc(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[_maxpool2x2_kernel_f32, _maxpool2x2_kernel_f32](
-            X, O, n, h, w, c, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_maxpool2x2_kernel_f32](
+            X, O, Int32(n), Int32(h), Int32(w), Int32(c), grid_dim=grid, block_dim=_BLOCK
         )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
-        ctx.enqueue_function[_maxpool2x2_kernel_bf16, _maxpool2x2_kernel_bf16](
-            X, O, n, h, w, c, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_maxpool2x2_kernel_bf16](
+            X, O, Int32(n), Int32(h), Int32(w), Int32(c), grid_dim=grid, block_dim=_BLOCK
         )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), in_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
-        )
-        ctx.enqueue_function[_maxpool2x2_kernel_f16, _maxpool2x2_kernel_f16](
-            X, O, n, h, w, c, grid_dim=grid, block_dim=_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_maxpool2x2_kernel_f16](
+            X, O, Int32(n), Int32(h), Int32(w), Int32(c), grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()
     var oshape = List[Int]()

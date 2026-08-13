@@ -30,7 +30,7 @@
 from std.sys import argv
 from std.math import cos as fcos, sin as fsin, exp as fexp, log as flog
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

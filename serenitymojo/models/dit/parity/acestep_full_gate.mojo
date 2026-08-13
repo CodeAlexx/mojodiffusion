@@ -7,7 +7,7 @@
 # full Mojo acestep_forward (timestep MLP x2, proj_in conv1d, 24 DiT layers,
 # final AdaLN, proj_out convT1d, crop). Gate cos >= 0.99 (deep 24-layer chain).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

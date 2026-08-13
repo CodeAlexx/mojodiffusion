@@ -61,7 +61,7 @@
 #   (mojo run/JIT cannot resolve flame_cudnn_sdpa_bf16 — build a binary.)
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

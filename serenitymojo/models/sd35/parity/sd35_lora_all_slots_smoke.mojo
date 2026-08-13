@@ -5,7 +5,7 @@
 # d_A/d_B buffers for ctx/x qkv, proj, fc1, and fc2.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.models.sd35.sd35_block import (
     JointBlockWeights,

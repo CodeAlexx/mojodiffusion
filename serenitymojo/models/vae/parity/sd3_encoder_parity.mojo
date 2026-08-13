@@ -15,7 +15,7 @@
 # Run: pixi run mojo run -I . serenitymojo/models/vae/parity/sd3_encoder_parity.mojo
 # DEV-ONLY: Python never runs here; the .bin files are static host references.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import alloc
 from serenitymojo.tensor import Tensor

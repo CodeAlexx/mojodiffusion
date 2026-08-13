@@ -24,9 +24,10 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
-from std.gpu import global_idx, grid_dim, block_dim, block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu import global_idx, grid_dim, block_dim, block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import round
 from std.utils.index import IndexList
@@ -53,9 +54,11 @@ comptime _SCALE_FLOOR = Float32(1.0e-30)
 def _int8_rowscale_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [rows*cols]
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
-    cols: Int,
-    rows: Int,
+    cols_w: Int32,
+    rows_w: Int32,
 ):
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var r = Int(block_idx.x)
     if r >= rows:
         return
@@ -98,9 +101,11 @@ def _int8_encode_perrow_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [n]
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
     o: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],      # [n] (int8 bits)
-    cols: Int,
-    n: Int,
+    cols_w: Int32,
+    n_w: Int64,
 ):
+    var cols = Int(cols_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var i = idx
@@ -129,9 +134,11 @@ def _int8_encode_perrow_kernel(
 def _int8_rowscale_f32_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows*cols] F32
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
-    cols: Int,
-    rows: Int,
+    cols_w: Int32,
+    rows_w: Int32,
 ):
+    var cols = Int(cols_w)
+    var rows = Int(rows_w)
     var r = Int(block_idx.x)
     if r >= rows:
         return
@@ -172,9 +179,11 @@ def _int8_encode_perrow_f32_kernel(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [n] F32
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
     o: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],      # [n] (int8 bits)
-    cols: Int,
-    n: Int,
+    cols_w: Int32,
+    n_w: Int64,
 ):
+    var cols = Int(cols_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var i = idx
@@ -214,14 +223,20 @@ def int8_rowscale(w: Tensor, ctx: DeviceContext) raises -> Tensor:
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cols))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     # BLOCK-per-row: grid.x = rows (max 16384 here, well under the 2^31-1 limit).
-    ctx.enqueue_function[_int8_rowscale_kernel, _int8_rowscale_kernel](
-        X, S, cols, rows, grid_dim=rows, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_rowscale_kernel](
+        X, S, Int32(cols), Int32(rows), grid_dim=rows, block_dim=_BLOCK,
     )
     var s_shape: List[Int] = [rows]
     return Tensor(out_buf^, s_shape^, STDtype.F32)
@@ -251,19 +266,28 @@ def int8_encode_perrow(w: Tensor, scale: Tensor, ctx: DeviceContext) raises -> T
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr(), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_int8_encode_perrow_kernel, _int8_encode_perrow_kernel](
-        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_encode_perrow_kernel](
+        X, S, O, Int32(cols), Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
     return Tensor(out_buf^, w.shape(), STDtype.I8)
 
@@ -304,13 +328,19 @@ def int8_groupscale(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
-    ctx.enqueue_function[_int8_rowscale_kernel, _int8_rowscale_kernel](
-        X, S, group_size, groups, grid_dim=groups, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_rowscale_kernel](
+        X, S, Int32(group_size), Int32(groups), grid_dim=groups, block_dim=_BLOCK,
     )
     var s_shape: List[Int] = [rows, groups_per_row]
     return Tensor(out_buf^, s_shape^, STDtype.F32)
@@ -362,19 +392,28 @@ def int8_encode_groupwise(
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr(), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_int8_encode_perrow_kernel, _int8_encode_perrow_kernel](
-        X, S, O, group_size, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_encode_perrow_kernel](
+        X, S, O, Int32(group_size), Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
     return Tensor(out_buf^, w.shape(), STDtype.I8)
 
@@ -397,13 +436,19 @@ def int8_rowscale_f32(w: Tensor, ctx: DeviceContext) raises -> Tensor:
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cols))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
-    ctx.enqueue_function[_int8_rowscale_f32_kernel, _int8_rowscale_f32_kernel](
-        X, S, cols, rows, grid_dim=rows, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_rowscale_f32_kernel](
+        X, S, Int32(cols), Int32(rows), grid_dim=rows, block_dim=_BLOCK,
     )
     var s_shape: List[Int] = [rows]
     return Tensor(out_buf^, s_shape^, STDtype.F32)
@@ -434,19 +479,28 @@ def int8_encode_perrow_f32(w: Tensor, scale: Tensor, ctx: DeviceContext) raises 
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr(), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_int8_encode_perrow_f32_kernel, _int8_encode_perrow_f32_kernel](
-        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_encode_perrow_f32_kernel](
+        X, S, O, Int32(cols), Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
     return Tensor(out_buf^, w.shape(), STDtype.I8)
 
@@ -459,8 +513,9 @@ def int8_encode_perrow_f32(w: Tensor, scale: Tensor, ctx: DeviceContext) raises 
 def _max_reduce_kernel(
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [n]
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [1]
-    n: Int,
+    n_w: Int64,
 ):
+    var n = Int(n_w)
     if Int(global_idx.x) == 0:
         var m: Float32 = 0.0
         for i in range(n):
@@ -478,13 +533,19 @@ def int8_tensorwise_scale(w: Tensor, ctx: DeviceContext) raises -> Tensor:
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        rowsc.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(rowsc.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=o_rl,
     )
-    ctx.enqueue_function[_max_reduce_kernel, _max_reduce_kernel](
-        S, O, rows, grid_dim=1, block_dim=1,
+    ctx.enqueue_function[_max_reduce_kernel](
+        S, O, Int64(rows), grid_dim=1, block_dim=1,
     )
     var sh: List[Int] = [1]
     return Tensor(out_buf^, sh^, STDtype.F32)
@@ -501,17 +562,28 @@ def int8_encode_tensorwise(w: Tensor, scale1: Tensor, ctx: DeviceContext) raises
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale1.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale1.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
-    var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr(), o_rl)
+    var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=o_rl,
+    )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_int8_encode_perrow_kernel, _int8_encode_perrow_kernel](
-        X, S, O, n, n, grid_dim=grid, block_dim=_BLOCK,     # cols = n → all use scale[0]
+    ctx.enqueue_function[_int8_encode_perrow_kernel](
+        X, S, O, Int32(n), Int64(n), grid_dim=grid, block_dim=_BLOCK,     # cols = n → all use scale[0]
     )
     return Tensor(out_buf^, w.shape(), STDtype.I8)
 
@@ -538,8 +610,10 @@ comptime _TV_PAD = 33      # shared word-row stride (pad kills load-phase confli
 def _int8_transpose_vec_kernel(
     x: LayoutTensor[DType.uint32, _DYN1, MutAnyOrigin],   # [N*K/4] words ([N,K] bytes)
     o: LayoutTensor[DType.uint32, _DYN1, MutAnyOrigin],   # [K*N/4] words ([K,N] bytes)
-    N: Int, K: Int,
+    N_w: Int64, K_w: Int32,
 ):
+    var N = Int(N_w)
+    var K = Int(K_w)
     var tx = Int(thread_idx.x)   # 0..31
     var ty = Int(thread_idx.y)   # 0..31
     var shared = stack_allocation[
@@ -575,8 +649,10 @@ def _int8_transpose_vec_kernel(
 def _int8_transpose_kernel(
     x: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],   # [N,K] int8 bits
     o: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],   # [K,N] int8 bits
-    N: Int, K: Int,
+    N_w: Int64, K_w: Int32,
 ):
+    var N = Int(N_w)
+    var K = Int(K_w)
     var tile = LayoutTensor[
         DType.uint8, _T_TILE_LAYOUT, MutAnyOrigin,
         address_space=AddressSpace.SHARED,
@@ -612,23 +688,41 @@ def int8_transpose(w_i8: Tensor, ctx: DeviceContext) raises -> Tensor:
     if N % _TV_ROWS == 0 and K % _TV_ROWS == 0:
         var xw_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total // 4))
         var Xw = LayoutTensor[DType.uint32, _DYN1, MutAnyOrigin](
-            w_i8.buf.unsafe_ptr().bitcast[UInt32](), xw_rl)
+        unsafe_ptr=Pointer[Scalar[DType.uint32], MutAnyOrigin](
+            unsafe_from_address=Int(w_i8.buf.unsafe_ptr().bitcast[UInt32]())
+        ),
+        runtime_layout=xw_rl,
+    )
         var Ow = LayoutTensor[DType.uint32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[UInt32](), xw_rl)
-        ctx.enqueue_function[_int8_transpose_vec_kernel, _int8_transpose_vec_kernel](
-            Xw, Ow, N, K,
+        unsafe_ptr=Pointer[Scalar[DType.uint32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[UInt32]())
+        ),
+        runtime_layout=xw_rl,
+    )
+        ctx.enqueue_function[_int8_transpose_vec_kernel](
+            Xw, Ow, Int64(N), Int32(K),
             grid_dim=(K // (_TV_WCOLS * 4), N // _TV_ROWS),
             block_dim=(_T_TILE, _T_TILE),
         )
     else:
         var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
         var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
-        var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w_i8.buf.unsafe_ptr(), x_rl)
-        var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr(), o_rl)
+        var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(w_i8.buf.unsafe_ptr())
+        ),
+        runtime_layout=x_rl,
+    )
+        var O = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr())
+        ),
+        runtime_layout=o_rl,
+    )
         var gx = (K + _T_TILE - 1) // _T_TILE
         var gy = (N + _T_TILE - 1) // _T_TILE
-        ctx.enqueue_function[_int8_transpose_kernel, _int8_transpose_kernel](
-            X, O, N, K, grid_dim=(gx, gy), block_dim=(_T_TILE, _T_TILE),
+        ctx.enqueue_function[_int8_transpose_kernel](
+            X, O, Int64(N), Int32(K), grid_dim=(gx, gy), block_dim=(_T_TILE, _T_TILE),
         )
     var outsh: List[Int] = [K, N]
     return Tensor(out_buf^, outsh^, STDtype.I8)
@@ -652,9 +746,11 @@ def _int8_dequant_perrow_kernel(
     x: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],      # [n] int8 bits
     s: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [rows]
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [n]
-    cols: Int,
-    n: Int,
+    cols_w: Int32,
+    n_w: Int64,
 ):
+    var cols = Int(cols_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var i = idx
@@ -672,10 +768,12 @@ def _int8_dequant_groupwise_f16scale_kernel(
     x: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
     s: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    group_size: Int,
-    n: Int,
+    group_size_w: Int32,
+    n_w: Int64,
 ):
     """Groupwise decode variant for compact FP16 resident scales."""
+    var group_size = Int(group_size_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     var i = idx
@@ -729,18 +827,29 @@ def int8_dequant_perrow_to_bf16(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_rows))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), x_rl)
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr())
+        ),
+        runtime_layout=x_rl,
+    )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel](
-        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_dequant_perrow_kernel](
+        X, S, O, Int32(cols), Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
     return Tensor(out_buf^, w.shape(), STDtype.BF16)
 
@@ -798,18 +907,29 @@ def int8_dequant_perrow_to_bf16_into(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_rows))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), x_rl)
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr())
+        ),
+        runtime_layout=x_rl,
+    )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        dst.buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dst.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
-    ctx.enqueue_function[_int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel](
-        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    ctx.enqueue_function[_int8_dequant_perrow_kernel](
+        X, S, O, Int32(cols), Int64(n), grid_dim=grid, block_dim=_BLOCK,
     )
 
 
@@ -890,26 +1010,33 @@ def int8_dequant_groupwise_to_bf16_into(
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](groups))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
-        w.buf.unsafe_ptr(), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(w.buf.unsafe_ptr())
+        ),
+        runtime_layout=x_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        dst.buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dst.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
     )
     var grid = (n + _BLOCK - 1) // _BLOCK
     if grid > 65535:
         grid = 65535
     if scale.dtype() == STDtype.F32:
         var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
-        )
-        ctx.enqueue_function[
-            _int8_dequant_perrow_kernel, _int8_dequant_perrow_kernel
-        ](X, S, O, group_size, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=s_rl,
+    )
+        ctx.enqueue_function[_int8_dequant_perrow_kernel](X, S, O, Int32(group_size), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     else:
         var S = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            scale.buf.unsafe_ptr().bitcast[Float16](), s_rl
-        )
-        ctx.enqueue_function[
-            _int8_dequant_groupwise_f16scale_kernel,
-            _int8_dequant_groupwise_f16scale_kernel,
-        ](X, S, O, group_size, n, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(scale.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=s_rl,
+    )
+        ctx.enqueue_function[_int8_dequant_groupwise_f16scale_kernel](X, S, O, Int32(group_size), Int64(n), grid_dim=grid, block_dim=_BLOCK)

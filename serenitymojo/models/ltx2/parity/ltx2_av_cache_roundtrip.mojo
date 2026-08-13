@@ -12,7 +12,7 @@
 #   -Xlinker -lcuda serenitymojo/models/ltx2/parity/ltx2_av_cache_roundtrip.mojo \
 #   -o /tmp/ltx2_av_cache_roundtrip && /tmp/ltx2_av_cache_roundtrip
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 
 from serenitymojo.tensor import Tensor

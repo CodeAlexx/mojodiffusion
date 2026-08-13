@@ -1,7 +1,7 @@
 # kandinsky5_rope_probe.mojo — isolate self-attn: compare q pre/post RoPE and the
 # raw self-attn output against oracle dumps. Pinpoints whether RoPE or attn diverges.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -7,7 +7,7 @@
 #   3) save ai-toolkit/PEFT LoRA plus Adam train state,
 #   4) reload LoRA + train state and resume.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenity_trainer.modelLoader.Ideogram4LoRALoader import (
     load_ideogram4_block_stack_lora,

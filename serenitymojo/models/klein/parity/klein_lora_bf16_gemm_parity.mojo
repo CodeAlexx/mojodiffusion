@@ -25,7 +25,7 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo run -I . \
 #     serenitymojo/models/klein/parity/klein_lora_bf16_gemm_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import ArcPointer
 from serenitymojo.parity import ParityHarness

@@ -26,7 +26,7 @@
 # Movable-only (never store a Tensor in a collection).
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.safetensors import SafeTensors

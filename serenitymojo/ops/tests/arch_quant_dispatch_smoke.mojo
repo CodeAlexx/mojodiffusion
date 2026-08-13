@@ -15,7 +15,7 @@
 #   require(int4) RAISES. On the 3090 Ti: sm_86, int4=1 fp8=0 fp4=0,
 #   selected=int4-w4a4, require(fp8) RAISES.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.testing import assert_true, assert_equal, assert_raises
 
 from serenitymojo.ops.arch import (

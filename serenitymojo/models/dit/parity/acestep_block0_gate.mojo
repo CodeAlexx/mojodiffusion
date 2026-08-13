@@ -19,7 +19,7 @@
 #   3) n = rms_norm(x, mlp_norm); n = (1+c_scale)*n + c_shift
 #      swiglu MLP: down(silu(gate(n))*up(n)).  x = x + c_gate * mlp
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

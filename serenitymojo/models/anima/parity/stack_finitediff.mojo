@@ -30,7 +30,7 @@
 #       serenitymojo/models/anima/parity/stack_finitediff.mojo -o /tmp/anima_stack_fd
 #   /tmp/anima_stack_fd
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.math import abs as fabs
 from std.memory import alloc, ArcPointer

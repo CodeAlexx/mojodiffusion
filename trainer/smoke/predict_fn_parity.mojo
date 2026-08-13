@@ -1,5 +1,5 @@
 # Per-function predict parity vs Serenity (parity/predict_fn_ref.json).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenity_trainer.model.ZImageVAE import scale_latents

@@ -10,7 +10,7 @@
 #     pixi run mojo run -I . \
 #       serenitymojo/models/lingbotvideo/parity/vae_encode_tiled_probe.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor

@@ -6,7 +6,7 @@
 # encode step will feed the `reference_latent_nchw` argument later.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

@@ -3,7 +3,7 @@
 # Upsample2D uses F.interpolate(scale_factor=2, mode="nearest"), i.e.
 #   out[n,oh,ow,c] = in[n, oh//2, ow//2, c]  (each input cell -> 2x2 block).
 # Non-square H!=W catches any oh/ow index swap.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.vae.upsample import upsample_nearest2x_nhwc

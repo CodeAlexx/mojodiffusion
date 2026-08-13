@@ -2,7 +2,6 @@
 
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from std.builtin.type_aliases import MutExternalOrigin
 from std.time import perf_counter
 from mojoui.render.backend import Backend
 

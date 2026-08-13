@@ -3,7 +3,7 @@
 # 257-token image branch, SCAIL RoPE, one-block stream and video-only head.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.sys import argv
 
 from serenitymojo.io.dtype import STDtype

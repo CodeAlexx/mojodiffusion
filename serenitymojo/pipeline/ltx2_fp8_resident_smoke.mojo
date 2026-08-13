@@ -6,7 +6,7 @@
 # existing AV-forward-required keys are present as BF16 tensors. This gates the
 # speed-path plumbing without the cost of a full 22B generation.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream, drop_block

@@ -31,8 +31,8 @@
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA sm_86+, cuDNN v9 (pip wheel libs).
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -61,7 +61,7 @@ def _strides_bhnd(n_eff: Int, h: Int, dh: Int) -> UnsafePointer[Int64, MutAnyOri
     s[1] = Int64(dh)
     s[2] = Int64(h * dh)
     s[3] = Int64(1)
-    return s
+    return UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(s))
 
 
 def _stats_strides(n_q: Int, h: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
@@ -72,7 +72,7 @@ def _stats_strides(n_q: Int, h: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
     s[1] = Int64(n_q)
     s[2] = Int64(1)
     s[3] = Int64(1)
-    return s
+    return UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(s))
 
 
 def _pad_seq[

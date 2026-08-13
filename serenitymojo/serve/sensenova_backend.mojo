@@ -59,7 +59,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in ops.
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
 
@@ -325,7 +325,7 @@ struct SensenovaBackendShape[
     var caps: List[ArcPointer[SensenovaCaps]]   # 0/1 (cond + uncond KV caches)
     var img: List[ArcPointer[Tensor]]           # 0/1 ([1,3,H,W] BF16 image)
     var tsched: List[Float32]                   # NUM_STEPS+1 timestep grid
-    var job_t0_ns: UInt
+    var job_t0_ns: Int
     var load_seconds: Float64
     var text_encode_seconds: Float64
     var prepare_seconds: Float64
@@ -350,7 +350,7 @@ struct SensenovaBackendShape[
         self.caps = List[ArcPointer[SensenovaCaps]]()
         self.img = List[ArcPointer[Tensor]]()
         self.tsched = List[Float32]()
-        self.job_t0_ns = UInt(0)
+        self.job_t0_ns = Int(0)
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
         self.prepare_seconds = 0.0

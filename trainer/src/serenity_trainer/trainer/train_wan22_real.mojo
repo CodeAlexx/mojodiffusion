@@ -38,9 +38,9 @@
 #       trainer/src/serenity_trainer/trainer/train_wan22_real.mojo \
 #       -o output/verification/bin/train_wan22_real
 
-from sys import argv
+from std.sys import argv
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.time import perf_counter_ns
 from std.os import listdir

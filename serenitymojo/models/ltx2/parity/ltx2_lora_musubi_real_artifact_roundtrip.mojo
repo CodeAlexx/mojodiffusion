@@ -20,7 +20,7 @@
 #   comfy format = 768 keys, no alphas)
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 
 from serenitymojo.io.safetensors import SafeTensors

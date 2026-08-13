@@ -1,7 +1,7 @@
 # Compile probe for nucleus_moe.mojo — imports + constructs the plan type.
 # COMPILE ONLY (GPU wedged). EXIT=0 == pass.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.models.dit.nucleus_moe import (
     ExpertChoicePlan,
     expert_choice_route,

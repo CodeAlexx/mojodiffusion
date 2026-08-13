@@ -3,7 +3,7 @@
 # This decodes deterministic latent noise through the VAE stored inside the
 # SD3.5 Large checkpoint. It intentionally does not run MMDiT or text encoders.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.sd3_contract import (

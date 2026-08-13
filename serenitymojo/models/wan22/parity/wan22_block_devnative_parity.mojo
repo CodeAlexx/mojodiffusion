@@ -22,7 +22,7 @@
 #   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib \
 #     /tmp/wan22_block_devnative_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY
 from std.memory import alloc

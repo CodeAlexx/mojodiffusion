@@ -14,7 +14,7 @@
 # Schedule math is F32 host scalar work. Tensor CFG and Euler update use
 # tensor_algebra operations and preserve the input tensor storage dtype.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp
 
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, sub

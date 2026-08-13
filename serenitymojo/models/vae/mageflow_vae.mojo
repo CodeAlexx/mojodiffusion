@@ -25,7 +25,7 @@
 # [3,3,C,C] (off-diagonal = 0). Numerically exact; a dedicated depthwise kernel
 # is a perf follow-up (dense is C× the MACs — trivial at bring-up spatial sizes).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from std.math import cos as _cos, sqrt as _sqrt
@@ -294,8 +294,16 @@ def load_conv_rscf_f32(
 def _patch_gather_kernel(
     src: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
-    N: Int, H: Int, W: Int, C: Int, d: Int, nph: Int, npw: Int, total: Int,
+    N_w: Int64, H_w: Int32, W_w: Int32, C_w: Int32, d_w: Int32, nph_w: Int32, npw_w: Int32, total_w: Int64,
 ):
+    var N = Int(N_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var C = Int(C_w)
+    var d = Int(d_w)
+    var nph = Int(nph_w)
+    var npw = Int(npw_w)
+    var total = Int(total_w)
     var idx = Int(global_idx.x)
     if idx < total:
         var c = idx % C
@@ -319,8 +327,16 @@ def _patch_gather_kernel(
 def _patch_scatter_kernel(
     src: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
-    N: Int, H: Int, W: Int, C: Int, d: Int, nph: Int, npw: Int, total: Int,
+    N_w: Int64, H_w: Int32, W_w: Int32, C_w: Int32, d_w: Int32, nph_w: Int32, npw_w: Int32, total_w: Int64,
 ):
+    var N = Int(N_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var C = Int(C_w)
+    var d = Int(d_w)
+    var nph = Int(nph_w)
+    var npw = Int(npw_w)
+    var total = Int(total_w)
     var idx = Int(global_idx.x)
     if idx < total:
         var c = idx % C
@@ -341,8 +357,10 @@ def _patch_scatter_kernel(
 def _copy_block_kernel(
     src: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
-    off: Int, n: Int,
+    off_w: Int32, n_w: Int64,
 ):
+    var off = Int(off_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         dst[i] = src[off + i]
@@ -351,8 +369,10 @@ def _copy_block_kernel(
 def _write_block_kernel(
     src: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
-    off: Int, n: Int,
+    off_w: Int32, n_w: Int64,
 ):
+    var off = Int(off_w)
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i < n:
         dst[off + i] = src[i]
@@ -361,7 +381,10 @@ def _write_block_kernel(
 def _lt(x: Tensor) -> LayoutTensor[DType.float32, _L1, MutAnyOrigin]:
     var rl = RuntimeLayout[_L1].row_major(IndexList[1](x.numel()))
     return LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
 
 
@@ -376,11 +399,14 @@ def _gather_patches(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](total * 4)
     var out_rl = RuntimeLayout[_L1].row_major(IndexList[1](total))
     var D = LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     var grid = (total + _MBLK - 1) // _MBLK
-    ctx.enqueue_function[_patch_gather_kernel, _patch_gather_kernel](
-        _lt(x4), D, N, H, W, C, d, nph, npw, total, grid_dim=grid, block_dim=_MBLK
+    ctx.enqueue_function[_patch_gather_kernel](
+        _lt(x4), D, Int64(N), Int32(H), Int32(W), Int32(C), Int32(d), Int32(nph), Int32(npw), Int64(total), grid_dim=grid, block_dim=_MBLK
     )
     var osh = List[Int](); osh.append(NP); osh.append(T); osh.append(C)
     return Tensor(out_buf^, osh^, STDtype.F32)
@@ -391,11 +417,14 @@ def _extract_block(x: Tensor, pb: Int, T: Int, C: Int, ctx: DeviceContext) raise
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
     var out_rl = RuntimeLayout[_L1].row_major(IndexList[1](n))
     var D = LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     var grid = (n + _MBLK - 1) // _MBLK
-    ctx.enqueue_function[_copy_block_kernel, _copy_block_kernel](
-        _lt(x), D, pb * n, n, grid_dim=grid, block_dim=_MBLK
+    ctx.enqueue_function[_copy_block_kernel](
+        _lt(x), D, Int32(pb * n), Int64(n), grid_dim=grid, block_dim=_MBLK
     )
     var osh = List[Int](); osh.append(T); osh.append(C)
     return Tensor(out_buf^, osh^, STDtype.F32)
@@ -444,11 +473,14 @@ def patched_attn(
         var attn = softmax_lastdim(scores, ctx)  # softmax over keys (last dim)
         var outp = linear(attn, vb_t, Optional[Tensor](), ctx, transpose_b=False)  # attn@v
         var OD = LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-            outpad_buf.unsafe_ptr().bitcast[Float32](), outpad_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(outpad_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=outpad_rl,
+    )
         var gridw = (T * C + _MBLK - 1) // _MBLK
-        ctx.enqueue_function[_write_block_kernel, _write_block_kernel](
-            _lt(outp), OD, pb * T * C, T * C, grid_dim=gridw, block_dim=_MBLK
+        ctx.enqueue_function[_write_block_kernel](
+            _lt(outp), OD, Int32(pb * T * C), Int64(T * C), grid_dim=gridw, block_dim=_MBLK
         )
     var opsh = List[Int](); opsh.append(NP); opsh.append(T); opsh.append(C)
     var outpad = Tensor(outpad_buf^, opsh^, STDtype.F32)
@@ -457,12 +489,15 @@ def patched_attn(
     var sc_buf = ctx.enqueue_create_buffer[DType.uint8](N * H * W * C * 4)
     var sc_rl = RuntimeLayout[_L1].row_major(IndexList[1](N * H * W * C))
     var SC = LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-        sc_buf.unsafe_ptr().bitcast[Float32](), sc_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sc_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=sc_rl,
     )
     var stotal = NP * T * C
     var grids = (stotal + _MBLK - 1) // _MBLK
-    ctx.enqueue_function[_patch_scatter_kernel, _patch_scatter_kernel](
-        _lt(outpad), SC, N, H, W, C, d, nph, npw, stotal, grid_dim=grids, block_dim=_MBLK
+    ctx.enqueue_function[_patch_scatter_kernel](
+        _lt(outpad), SC, Int64(N), Int32(H), Int32(W), Int32(C), Int32(d), Int32(nph), Int32(npw), Int64(stotal), grid_dim=grids, block_dim=_MBLK
     )
     var ao = Tensor(sc_buf^, n4^, STDtype.F32)
 
@@ -544,8 +579,12 @@ def cod_decode[SH_H: Int, SH_W: Int](
 def _col_slice_kernel(
     src: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
-    Wc: Int, col0: Int, ncol: Int, total: Int,
+    Wc_w: Int32, col0_w: Int32, ncol_w: Int32, total_w: Int64,
 ):
+    var Wc = Int(Wc_w)
+    var col0 = Int(col0_w)
+    var ncol = Int(ncol_w)
+    var total = Int(total_w)
     var idx = Int(global_idx.x)
     if idx < total:
         var r = idx // ncol
@@ -560,11 +599,14 @@ def _col_slice(x: Tensor, col0: Int, ncol: Int, ctx: DeviceContext) raises -> Te
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](total * 4)
     var out_rl = RuntimeLayout[_L1].row_major(IndexList[1](total))
     var D = LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     var grid = (total + _MBLK - 1) // _MBLK
-    ctx.enqueue_function[_col_slice_kernel, _col_slice_kernel](
-        _lt(x), D, Wc, col0, ncol, total, grid_dim=grid, block_dim=_MBLK
+    ctx.enqueue_function[_col_slice_kernel](
+        _lt(x), D, Int32(Wc), Int32(col0), Int32(ncol), Int64(total), grid_dim=grid, block_dim=_MBLK
     )
     var osh = List[Int](); osh.append(R); osh.append(ncol)
     return Tensor(out_buf^, osh^, STDtype.F32)
@@ -573,8 +615,16 @@ def _col_slice(x: Tensor, col0: Int, ncol: Int, ctx: DeviceContext) raises -> Te
 def _fold_kernel(
     src: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _L1, MutAnyOrigin],
-    L: Int, P: Int, C: Int, H: Int, W: Int, d: Int, npw: Int, total: Int,
+    L_w: Int32, P_w: Int32, C_w: Int32, H_w: Int32, W_w: Int32, d_w: Int32, npw_w: Int32, total_w: Int64,
 ):
+    var L = Int(L_w)
+    var P = Int(P_w)
+    var C = Int(C_w)
+    var H = Int(H_w)
+    var W = Int(W_w)
+    var d = Int(d_w)
+    var npw = Int(npw_w)
+    var total = Int(total_w)
     var idx = Int(global_idx.x)
     if idx < total:
         var c = idx % C
@@ -707,12 +757,15 @@ def final_fold[SH_H: Int, SH_W: Int](
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](3 * H * W * 4)
     var out_rl = RuntimeLayout[_L1].row_major(IndexList[1](3 * H * W))
     var D = LayoutTensor[DType.float32, _L1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
     )
     var total = L * 256 * 3
     var grid = (total + _MBLK - 1) // _MBLK
-    ctx.enqueue_function[_fold_kernel, _fold_kernel](
-        _lt(rgb_rows), D, L, 256, 3, H, W, 16, SH_W, total,
+    ctx.enqueue_function[_fold_kernel](
+        _lt(rgb_rows), D, Int32(L), Int32(256), Int32(3), Int32(H), Int32(W), Int32(16), Int32(SH_W), Int64(total),
         grid_dim=grid, block_dim=_MBLK
     )
     var osh = List[Int](); osh.append(1); osh.append(3); osh.append(H); osh.append(W)

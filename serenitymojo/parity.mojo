@@ -14,7 +14,7 @@
 
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 
 @fieldwise_init

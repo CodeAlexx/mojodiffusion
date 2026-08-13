@@ -33,7 +33,7 @@
 
 from std.math import sqrt
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.utils.index import IndexList
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
@@ -73,7 +73,7 @@ def _lora_adamw_plain_kernel(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     m: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    total: Int,
+    total_w: Int64,
     lr: Float32,
     beta1: Float32,
     beta2: Float32,
@@ -84,6 +84,7 @@ def _lora_adamw_plain_kernel(
     clip_scale: Float32,   # global-norm clip factor (1.0 = no clip); folded here so
     # the clip is a free per-element GPU mul (no separate 54M-element host pass).
 ):
+    var total = Int(total_w)
     var gid = Int(global_idx.x)
     if gid >= total:
         return
@@ -110,7 +111,7 @@ def _lora_adamw_plain_kernel_bf16_state(
     g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     m: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     v: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    total: Int,
+    total_w: Int64,
     lr: Float32,
     beta1: Float32,
     beta2: Float32,
@@ -120,6 +121,7 @@ def _lora_adamw_plain_kernel_bf16_state(
     weight_decay: Float32,
     clip_scale: Float32,
 ):
+    var total = Int(total_w)
     var gid = Int(global_idx.x)
     if gid >= total:
         return
@@ -270,21 +272,33 @@ def fused_lora_adamw_plain_step(
 
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        dev_p.unsafe_ptr().bitcast[BFloat16](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dev_p.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
     )
     var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dev_g.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_g.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dev_m.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_m.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
     var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dev_v.unsafe_ptr().bitcast[Float32](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dev_v.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
     )
 
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_lora_adamw_plain_kernel, _lora_adamw_plain_kernel](
-        P, G, M, V, total, lr, beta1, beta2, bc1, bc2, eps, weight_decay, clip_scale,
+    ctx.enqueue_function[_lora_adamw_plain_kernel](
+        P, G, M, V, Int64(total), lr, beta1, beta2, bc1, bc2, eps, weight_decay, clip_scale,
         grid_dim=grid, block_dim=_BLOCK,
     )
 
@@ -584,39 +598,57 @@ def _lora_adamw_plain_resident_launch(
 
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.total))
     var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        state.dev_p.unsafe_ptr().bitcast[BFloat16](), t_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_p.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
     )
     var grid = (state.total + _BLOCK - 1) // _BLOCK
     if state.grad_dtype == STDtype.F32 and state.moment_dtype == STDtype.F32:
         var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            state.dev_g.unsafe_ptr().bitcast[Float32](), t_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_g.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
+    )
         var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            state.dev_m.unsafe_ptr().bitcast[Float32](), t_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_m.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
+    )
         var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            state.dev_v.unsafe_ptr().bitcast[Float32](), t_rl
-        )
-        ctx.enqueue_function[_lora_adamw_plain_kernel, _lora_adamw_plain_kernel](
-            P, G, M, V, state.total, lr, beta1, beta2, bc1, bc2, eps, weight_decay,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_v.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
+    )
+        ctx.enqueue_function[_lora_adamw_plain_kernel](
+            P, G, M, V, Int64(state.total), lr, beta1, beta2, bc1, bc2, eps, weight_decay,
             clip_scale,
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif state.grad_dtype == STDtype.BF16 and state.moment_dtype == STDtype.BF16:
         var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            state.dev_g.unsafe_ptr().bitcast[BFloat16](), t_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_g.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
+    )
         var M = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            state.dev_m.unsafe_ptr().bitcast[BFloat16](), t_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_m.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
+    )
         var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            state.dev_v.unsafe_ptr().bitcast[BFloat16](), t_rl
-        )
-        ctx.enqueue_function[
-            _lora_adamw_plain_kernel_bf16_state,
-            _lora_adamw_plain_kernel_bf16_state,
-        ](
-            P, G, M, V, state.total, lr, beta1, beta2, bc1, bc2, eps,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(state.dev_v.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=t_rl,
+    )
+        ctx.enqueue_function[_lora_adamw_plain_kernel_bf16_state](
+            P, G, M, V, Int64(state.total), lr, beta1, beta2, bc1, bc2, eps,
             weight_decay, clip_scale,
             grid_dim=grid, block_dim=_BLOCK,
         )

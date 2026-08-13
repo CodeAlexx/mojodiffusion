@@ -25,7 +25,7 @@
 # owns the final parity bar; this smoke prints cos / max_abs for re-verification.
 
 from std.collections import List, Optional
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.io.dtype import STDtype

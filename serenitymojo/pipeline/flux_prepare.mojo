@@ -33,7 +33,7 @@
 #       -o /tmp/flux_prepare && /tmp/flux_prepare
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import ArcPointer
 

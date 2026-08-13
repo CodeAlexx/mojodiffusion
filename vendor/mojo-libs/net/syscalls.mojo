@@ -8,7 +8,6 @@
 
 from std.ffi import external_call
 from std.memory import UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 # Byte pointer into memory owned outside Mojo's origin tracking (kernel buffers,
 # C strings, hand-packed structs). Matches the mojo:ffi guidance for foreign mem.
@@ -113,4 +112,4 @@ def errno_str() -> String:
     var n = 0
     while p[n] != 0:
         n += 1
-    return String(StringSlice(ptr=p, length=n))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p, length=n)))

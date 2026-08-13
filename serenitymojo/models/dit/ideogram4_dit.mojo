@@ -1,7 +1,7 @@
 # models/dit/ideogram4_dit.mojo — Ideogram-4 DiT (pure Mojo, inference).
 # 1:1 port of /home/alex/ideogram4-ref/src/ideogram4/modeling_ideogram4.py.
 # Reuses foundation ops; fp8 weights are dequantized to BF16 at load.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.math import cos as fcos, sin as fsin, exp, log, floor
 from std.utils.index import IndexList
@@ -67,12 +67,15 @@ def load_w_bf16(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises
 def _embedscalar_sinusoid_kernel(
     t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    dim: Int,
-    half: Int,
+    dim_w: Int32,
+    half_w: Int32,
     log_scale_over_halfm1: Float32,  # ln(1e4)/(half-1)
     prescale: Float32,               # 1e4
-    n: Int,
+    n_w: Int64,
 ):
+    var dim = Int(dim_w)
+    var half = Int(half_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx >= n:
         return
@@ -100,15 +103,25 @@ def ideogram4_embedscalar_sinusoid(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * STDtype.BF16.byte_size())
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](N))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](t.buf.unsafe_ptr().bitcast[Float32](), t_rl)
-    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
+    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(t.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=t_rl,
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=o_rl,
+    )
     var lsf = Float32(log(Float64(10000.0)) / Float64(half - 1))
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_embedscalar_sinusoid_kernel, _embedscalar_sinusoid_kernel](
-        T, O, dim, half, lsf, Float32(10000.0), n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_embedscalar_sinusoid_kernel](
+        T, O, Int32(dim), Int32(half), lsf, Float32(10000.0), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     # No synchronize: single-stream ordering; downstream same-stream reads see
     # the result, host syncs only at .to_host(). (was a per-op pipeline drain)
-    var out_shape = [N, dim]
+    var out_shape: List[Int] = [N, dim]
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
 
 
@@ -135,8 +148,13 @@ def _rope_kernel[dt: DType](
     cosx: LayoutTensor[dt, _DYN1, MutAnyOrigin],
     sinx: LayoutTensor[dt, _DYN1, MutAnyOrigin],
     o: LayoutTensor[dt, _DYN1, MutAnyOrigin],
-    L: Int, H: Int, Dh: Int, half: Int, n: Int,
+    L_w: Int32, H_w: Int32, Dh_w: Int32, half_w: Int32, n_w: Int64,
 ):
+    var L = Int(L_w)
+    var H = Int(H_w)
+    var Dh = Int(Dh_w)
+    var half = Int(half_w)
+    var n = Int(n_w)
     var idx = Int(global_idx.x)
     if idx >= n:
         return
@@ -165,13 +183,33 @@ def apply_rope_ideogram(x: Tensor, cosf: Tensor, sinf: Tensor, ctx: DeviceContex
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * STDtype.BF16.byte_size())
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](L * Dh))
-    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-    var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](cosf.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
-    var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](sinf.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
-    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+    var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cosf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
+    var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sinf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_rope_kernel[DType.bfloat16], _rope_kernel[DType.bfloat16]](
-        X, C, S, O, L, H, Dh, half, n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_rope_kernel[DType.bfloat16]](
+        X, C, S, O, Int32(L), Int32(H), Int32(Dh), Int32(half), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     # No synchronize: single-stream ordering; this rope output feeds SDPA on the
     # same stream. Per-call sync here drained the pipeline 2x/layer (q,k).
     var os = sh.copy()
@@ -188,13 +226,33 @@ def apply_rope_ideogram_slab(x: Tensor, cosf: Tensor, sinf: Tensor, ctx: DeviceC
     var out_buf = slab.alloc(n * STDtype.BF16.byte_size())
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](L * Dh))
-    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-    var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](cosf.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
-    var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](sinf.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
-    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
+    var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cosf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
+    var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sinf.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=c_rl,
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_rope_kernel[DType.bfloat16], _rope_kernel[DType.bfloat16]](
-        X, C, S, O, L, H, Dh, half, n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[_rope_kernel[DType.bfloat16]](
+        X, C, S, O, Int32(L), Int32(H), Int32(Dh), Int32(half), Int64(n), grid_dim=grid, block_dim=_BLOCK)
     # No synchronize: single-stream ordering; this rope output feeds SDPA on the
     # same stream. Per-call sync here drained the pipeline 2x/layer (q,k).
     var os = sh.copy()
@@ -222,7 +280,7 @@ def ideogram4_attention[S: Int](
     k = rms_norm(k, normk_w, Float32(1.0e-5), ctx)
     q = apply_rope_ideogram(q, cosf, sinf, ctx)
     k = apply_rope_ideogram(k, cosf, sinf, ctx)
-    var scale = Float32(1.0 / (Float32(head_dim) ** 0.5))
+    var scale = Float32(1.0 / (Float32(head_dim) ** Float32(0.5)))
     var attn = ideogram4_sdpa_product_fwd[1, S, 18, 256](q, k, v, scale, ctx)  # [1,L,H,Dh]
     var merged = reshape(attn, [1, L, hidden], ctx)
     return linear(merged, o_w, None, ctx)

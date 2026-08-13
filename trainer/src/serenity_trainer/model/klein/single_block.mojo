@@ -66,7 +66,7 @@
 # Mojo 1.0.0b1: `def` not `fn`; Tensor move-only (return Movable structs, never
 # store Tensor in a collection); no-bias linear = linear(x, w, Optional(None), ctx).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

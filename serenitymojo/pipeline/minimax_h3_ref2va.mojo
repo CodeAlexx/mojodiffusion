@@ -139,7 +139,7 @@ from std.collections import Dict, List
 from std.sys import argv
 from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -285,6 +285,7 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_forward,
     minimax_h3_block_forward_dynamic,
 )
+from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
     minimax_h3_load_qkv_device,
@@ -319,6 +320,7 @@ from serenitymojo.models.dit.minimax_h3_step_cache import (
     minimax_h3_cache_probe_rows,
     minimax_h3_cache_quantize_activation,
     minimax_h3_cache_should_reuse,
+    minimax_h3_cache_probe_given_rows,
     minimax_h3_cache_store_middle_residual,
 )
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
@@ -2041,8 +2043,24 @@ def _minimax_h3_ref2va_denoise_and_save(
     # — never re-mixed, never stepped. Target rows are the F32 accumulating
     # Euler state, exactly like t2va's video_state/audio_state. ───────────
     var t_denoise0 = perf_counter_ns()
-    var step_cache = MiniMaxH3StepCache(step_cache_enabled)
-
+    # Sage attention runs the whole denoise through one preallocated scratch:
+    # its per-call transient buffers otherwise churn ~1-2 GiB fifty times per
+    # evaluation and intermittently OOM near the 24-GiB envelope
+    # (video-0177). Allocated after the resident store so a geometry that
+    # cannot hold both fails here, not minutes into denoise.
+    var sage_scratch = Optional[SageInt8Scratch](None)
+    if attention_backend != MINIMAX_H3_ATTN_CUDNN:
+        sage_scratch = Optional[SageInt8Scratch](
+            SageInt8Scratch(plan.sequence_length(), MINIMAX_H3_HEADS, ctx)
+        )
+        ctx.synchronize()
+        print(
+            "  sage scratch: preallocated",
+            Float64(sage_scratch.value().resident_bytes())
+                / (1024.0 * 1024.0 * 1024.0),
+            "GiB for S=", plan.sequence_length(),
+        )
+    var step_cache = MiniMaxH3StepCache(step_cache_enabled, num_steps)
     for i in range(num_steps):
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
@@ -2076,10 +2094,37 @@ def _minimax_h3_ref2va_denoise_and_save(
             embed.hidden, [1, plan.sequence_length(), config.hidden_size], ctx
         )
         var cache_probe_before = List[Float32]()
+        var cache_probe_audio_before = List[Float32]()
+        var cache_audio_probe_ids = List[Int]()
         if step_cache.enabled:
             cache_probe_before = minimax_h3_cache_probe_rows(
                 hidden3, plan.sequence_length(), config.hidden_size, ctx
             )
+            # Audio veto: sample TARGET audio rows (skip the condition-audio
+            # prefix) and hold them to the tighter drift budget.
+            var n_audio = len(plan.layout.audio_indices)
+            var first_target = plan.num_condition_audio_rows
+            if n_audio > first_target:
+                var target_count = n_audio - first_target
+                var want_rows = 16
+                if target_count < want_rows:
+                    want_rows = target_count
+                if want_rows == 1:
+                    cache_audio_probe_ids.append(
+                        plan.layout.audio_indices[first_target]
+                    )
+                else:
+                    for pi in range(want_rows):
+                        cache_audio_probe_ids.append(
+                            plan.layout.audio_indices[
+                                first_target
+                                + (pi * (target_count - 1)) // (want_rows - 1)
+                            ]
+                        )
+                cache_probe_audio_before = minimax_h3_cache_probe_given_rows(
+                    hidden3, cache_audio_probe_ids, plan.sequence_length(),
+                    config.hidden_size, ctx,
+                )
         var first_block_snapshot = Optional[MiniMaxH3QuantizedActivation](None)
         var reused_middle = False
 
@@ -2193,7 +2238,7 @@ def _minimax_h3_ref2va_denoise_and_save(
                 ](
                     hidden3, block_w, layer, config, modcache.block_mod[layer][],
                     block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
-                    attention_backend,
+                    attention_backend, sage_scratch,
                 )
                 block_w.clear()
                 if (
@@ -2203,8 +2248,13 @@ def _minimax_h3_ref2va_denoise_and_save(
                     var cache_probe_after = minimax_h3_cache_probe_rows(
                         hidden3, plan.sequence_length(), config.hidden_size, ctx
                     )
+                    var cache_probe_audio_after = minimax_h3_cache_probe_given_rows(
+                        hidden3, cache_audio_probe_ids, plan.sequence_length(),
+                        config.hidden_size, ctx,
+                    )
                     reused_middle = minimax_h3_cache_should_reuse(
-                        i, cache_probe_before, cache_probe_after, step_cache
+                        i, cache_probe_before, cache_probe_after, step_cache,
+                        cache_probe_audio_before, cache_probe_audio_after,
                     )
                     if reused_middle:
                         minimax_h3_cache_apply_residual_inplace(

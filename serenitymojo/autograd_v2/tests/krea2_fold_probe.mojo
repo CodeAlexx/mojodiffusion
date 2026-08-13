@@ -2,7 +2,7 @@
 # BALANCED tree (q+k)+(v+g) bit-for-bit in F32 on a krea2-shaped d_x?
 # (krea2_block.mojo:677 d_xm = add(add(bw_q,bw_k), add(bw_v,bw_g))).
 # Decides the fine-grained graph's d_xm assembly (C15).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.random import randn

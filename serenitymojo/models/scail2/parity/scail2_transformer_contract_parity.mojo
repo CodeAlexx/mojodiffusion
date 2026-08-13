@@ -2,7 +2,7 @@
 # shared Wan path: exact-erf image MLP GELU and retained-F32 residual streams.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.scail2.scail2_block import (

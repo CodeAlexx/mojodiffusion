@@ -17,7 +17,7 @@
 # The loader FAILS LOUD on any missing/mis-shaped tensor; callers treat any
 # load error as "rebuild the cache" (self-healing).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

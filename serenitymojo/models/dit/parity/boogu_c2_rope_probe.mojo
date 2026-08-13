@@ -12,7 +12,7 @@
 #     && pixi run mojo run -I . serenitymojo/models/dit/parity/boogu_c2_rope_probe.mojo
 
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.boogu_dit import build_boogu_rope_tables

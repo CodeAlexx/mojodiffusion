@@ -46,7 +46,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU, inference-only, GPU-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.memory import ArcPointer
 from std.utils.index import IndexList
@@ -464,7 +464,7 @@ struct BooguBlock(Movable):
         k = repeat_kv_f32(k, S, BOOGU_KV_HEADS, BOOGU_GQA_NREP, BOOGU_HEAD_DIM, ctx)
         v = repeat_kv_f32(v, S, BOOGU_KV_HEADS, BOOGU_GQA_NREP, BOOGU_HEAD_DIM, ctx)
         # full attention (mask all-True, b=1) => sdpa_nomask. scale = 1/sqrt(120).
-        var scale = Float32(1.0 / (Float32(BOOGU_HEAD_DIM) ** 0.5))
+        var scale = Float32(1.0 / (Float32(BOOGU_HEAD_DIM) ** Float32(0.5)))
         var attn = sdpa_nomask[1, S, BOOGU_HEADS, BOOGU_HEAD_DIM](q, k, v, scale, ctx)
         var merged = reshape(attn, [1, S, BOOGU_HIDDEN_SIZE], ctx)
         return linear(merged, self.to_out_w, None, ctx)        # to_out.0 (no bias)
@@ -789,7 +789,7 @@ struct BooguDoubleStreamBlock(Movable):
         k = repeat_kv_f32(k, JOINT, BOOGU_KV_HEADS, BOOGU_GQA_NREP, BOOGU_HEAD_DIM, ctx)
         v = repeat_kv_f32(v, JOINT, BOOGU_KV_HEADS, BOOGU_GQA_NREP, BOOGU_HEAD_DIM, ctx)
         # full attention (mask all-True, b=1) => sdpa_nomask. scale = 1/sqrt(120).
-        var scale = Float32(1.0 / (Float32(BOOGU_HEAD_DIM) ** 0.5))
+        var scale = Float32(1.0 / (Float32(BOOGU_HEAD_DIM) ** Float32(0.5)))
         var attn = sdpa_nomask[1, JOINT, BOOGU_HEADS, BOOGU_HEAD_DIM](q, k, v, scale, ctx)
         var merged = reshape(attn, [1, JOINT, BOOGU_HIDDEN_SIZE], ctx)
         # split instruct-first, per-stream out projections, re-concat instruct-first.
@@ -822,7 +822,7 @@ struct BooguDoubleStreamBlock(Movable):
         k = rope_interleaved(k, cos_k, sin_k, ctx)
         k = repeat_kv_f32(k, L_IMG, BOOGU_KV_HEADS, BOOGU_GQA_NREP, BOOGU_HEAD_DIM, ctx)
         v = repeat_kv_f32(v, L_IMG, BOOGU_KV_HEADS, BOOGU_GQA_NREP, BOOGU_HEAD_DIM, ctx)
-        var scale = Float32(1.0 / (Float32(BOOGU_HEAD_DIM) ** 0.5))
+        var scale = Float32(1.0 / (Float32(BOOGU_HEAD_DIM) ** Float32(0.5)))
         var attn = sdpa_nomask[1, L_IMG, BOOGU_HEADS, BOOGU_HEAD_DIM](q, k, v, scale, ctx)
         var merged = reshape(attn, [1, L_IMG, BOOGU_HIDDEN_SIZE], ctx)
         return linear(merged, self.sa_to_out, None, ctx)        # to_out.0 (no bias)
@@ -1066,8 +1066,14 @@ struct BooguNormOut(Movable):
 def _boogu_unpatch_kernel_f32(
     inp: LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin],
-    C: Int, H_OUT: Int, W_OUT: Int, p: Int, w_tok: Int, F: Int,
+    C_w: Int32, H_OUT_w: Int32, W_OUT_w: Int32, p_w: Int32, w_tok_w: Int32, F_w: Int32,
 ):
+    var C = Int(C_w)
+    var H_OUT = Int(H_OUT_w)
+    var W_OUT = Int(W_OUT_w)
+    var p = Int(p_w)
+    var w_tok = Int(w_tok_w)
+    var F = Int(F_w)
     var idx = Int(global_idx.x)
     var total = C * H_OUT * W_OUT
     if idx < total:
@@ -1088,8 +1094,14 @@ def _boogu_unpatch_kernel_f32(
 def _boogu_unpatch_kernel_bf16(
     inp: LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin],
-    C: Int, H_OUT: Int, W_OUT: Int, p: Int, w_tok: Int, F: Int,
+    C_w: Int32, H_OUT_w: Int32, W_OUT_w: Int32, p_w: Int32, w_tok_w: Int32, F_w: Int32,
 ):
+    var C = Int(C_w)
+    var H_OUT = Int(H_OUT_w)
+    var W_OUT = Int(W_OUT_w)
+    var p = Int(p_w)
+    var w_tok = Int(w_tok_w)
+    var F = Int(F_w)
     var idx = Int(global_idx.x)
     var total = C * H_OUT * W_OUT
     if idx < total:
@@ -1110,8 +1122,14 @@ def _boogu_unpatch_kernel_bf16(
 def _boogu_unpatch_kernel_f16(
     inp: LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin],
-    C: Int, H_OUT: Int, W_OUT: Int, p: Int, w_tok: Int, F: Int,
+    C_w: Int32, H_OUT_w: Int32, W_OUT_w: Int32, p_w: Int32, w_tok_w: Int32, F_w: Int32,
 ):
+    var C = Int(C_w)
+    var H_OUT = Int(H_OUT_w)
+    var W_OUT = Int(W_OUT_w)
+    var p = Int(p_w)
+    var w_tok = Int(w_tok_w)
+    var F = Int(F_w)
     var idx = Int(global_idx.x)
     var total = C * H_OUT * W_OUT
     if idx < total:
@@ -1167,33 +1185,51 @@ def boogu_unpatchify(
     var grid = (total + _UNPATCH_BLOCK - 1) // _UNPATCH_BLOCK
     if dt == DType.float32:
         var I = LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin](
-            img_tokens.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(img_tokens.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_boogu_unpatch_kernel_f32, _boogu_unpatch_kernel_f32](
-            I, O, C, H_OUT, W_OUT, p, w_tok, Fdim, grid_dim=grid, block_dim=_UNPATCH_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_boogu_unpatch_kernel_f32](
+            I, O, Int32(C), Int32(H_OUT), Int32(W_OUT), Int32(p), Int32(w_tok), Int32(Fdim), grid_dim=grid, block_dim=_UNPATCH_BLOCK
         )
     elif dt == DType.bfloat16:
         var I = LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin](
-            img_tokens.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(img_tokens.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_boogu_unpatch_kernel_bf16, _boogu_unpatch_kernel_bf16](
-            I, O, C, H_OUT, W_OUT, p, w_tok, Fdim, grid_dim=grid, block_dim=_UNPATCH_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_boogu_unpatch_kernel_bf16](
+            I, O, Int32(C), Int32(H_OUT), Int32(W_OUT), Int32(p), Int32(w_tok), Int32(Fdim), grid_dim=grid, block_dim=_UNPATCH_BLOCK
         )
     else:  # float16
         var I = LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin](
-            img_tokens.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(img_tokens.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_boogu_unpatch_kernel_f16, _boogu_unpatch_kernel_f16](
-            I, O, C, H_OUT, W_OUT, p, w_tok, Fdim, grid_dim=grid, block_dim=_UNPATCH_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_boogu_unpatch_kernel_f16](
+            I, O, Int32(C), Int32(H_OUT), Int32(W_OUT), Int32(p), Int32(w_tok), Int32(Fdim), grid_dim=grid, block_dim=_UNPATCH_BLOCK
         )
     ctx.synchronize()
     return Tensor(out_buf^, [C, H_OUT, W_OUT], img_tokens.dtype())
@@ -1253,8 +1289,14 @@ comptime BOOGU_N_SINGLE_STREAM = 32
 def _boogu_patch_kernel_f32(
     inp: LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin],
-    C: Int, H_IN: Int, W_IN: Int, p: Int, w_tok: Int, F: Int,
+    C_w: Int32, H_IN_w: Int32, W_IN_w: Int32, p_w: Int32, w_tok_w: Int32, F_w: Int32,
 ):
+    var C = Int(C_w)
+    var H_IN = Int(H_IN_w)
+    var W_IN = Int(W_IN_w)
+    var p = Int(p_w)
+    var w_tok = Int(w_tok_w)
+    var F = Int(F_w)
     var idx = Int(global_idx.x)
     var img_len = (H_IN // p) * (W_IN // p)
     var total = img_len * F
@@ -1276,8 +1318,14 @@ def _boogu_patch_kernel_f32(
 def _boogu_patch_kernel_bf16(
     inp: LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin],
-    C: Int, H_IN: Int, W_IN: Int, p: Int, w_tok: Int, F: Int,
+    C_w: Int32, H_IN_w: Int32, W_IN_w: Int32, p_w: Int32, w_tok_w: Int32, F_w: Int32,
 ):
+    var C = Int(C_w)
+    var H_IN = Int(H_IN_w)
+    var W_IN = Int(W_IN_w)
+    var p = Int(p_w)
+    var w_tok = Int(w_tok_w)
+    var F = Int(F_w)
     var idx = Int(global_idx.x)
     var img_len = (H_IN // p) * (W_IN // p)
     var total = img_len * F
@@ -1299,8 +1347,14 @@ def _boogu_patch_kernel_bf16(
 def _boogu_patch_kernel_f16(
     inp: LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin],
-    C: Int, H_IN: Int, W_IN: Int, p: Int, w_tok: Int, F: Int,
+    C_w: Int32, H_IN_w: Int32, W_IN_w: Int32, p_w: Int32, w_tok_w: Int32, F_w: Int32,
 ):
+    var C = Int(C_w)
+    var H_IN = Int(H_IN_w)
+    var W_IN = Int(W_IN_w)
+    var p = Int(p_w)
+    var w_tok = Int(w_tok_w)
+    var F = Int(F_w)
     var idx = Int(global_idx.x)
     var img_len = (H_IN // p) * (W_IN // p)
     var total = img_len * F
@@ -1369,33 +1423,51 @@ def boogu_patchify(
     var grid = (total + _UNPATCH_BLOCK - 1) // _UNPATCH_BLOCK
     if dt == DType.float32:
         var I = LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin](
-            latent.buf.unsafe_ptr().bitcast[Float32](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(latent.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float32, _UNPATCH_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_boogu_patch_kernel_f32, _boogu_patch_kernel_f32](
-            I, O, C, H_IN, W_IN, p, w_tok, Fdim, grid_dim=grid, block_dim=_UNPATCH_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_boogu_patch_kernel_f32](
+            I, O, Int32(C), Int32(H_IN), Int32(W_IN), Int32(p), Int32(w_tok), Int32(Fdim), grid_dim=grid, block_dim=_UNPATCH_BLOCK
         )
     elif dt == DType.bfloat16:
         var I = LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin](
-            latent.buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(latent.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _UNPATCH_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_boogu_patch_kernel_bf16, _boogu_patch_kernel_bf16](
-            I, O, C, H_IN, W_IN, p, w_tok, Fdim, grid_dim=grid, block_dim=_UNPATCH_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_boogu_patch_kernel_bf16](
+            I, O, Int32(C), Int32(H_IN), Int32(W_IN), Int32(p), Int32(w_tok), Int32(Fdim), grid_dim=grid, block_dim=_UNPATCH_BLOCK
         )
     else:  # float16
         var I = LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin](
-            latent.buf.unsafe_ptr().bitcast[Float16](), rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(latent.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
         var O = LayoutTensor[DType.float16, _UNPATCH_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), rl
-        )
-        ctx.enqueue_function[_boogu_patch_kernel_f16, _boogu_patch_kernel_f16](
-            I, O, C, H_IN, W_IN, p, w_tok, Fdim, grid_dim=grid, block_dim=_UNPATCH_BLOCK
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=rl,
+    )
+        ctx.enqueue_function[_boogu_patch_kernel_f16](
+            I, O, Int32(C), Int32(H_IN), Int32(W_IN), Int32(p), Int32(w_tok), Int32(Fdim), grid_dim=grid, block_dim=_UNPATCH_BLOCK
         )
     ctx.synchronize()
     return Tensor(out_buf^, [img_len, Fdim], latent.dtype())

@@ -21,7 +21,7 @@
 #     pixi run mojo run -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/models/krea2/parity/krea2_resume_moment_fidelity_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import (
     NamedLora,

@@ -16,7 +16,7 @@
 #       serenitymojo/offload/resident_byte_identity_smoke.mojo -o /tmp/resid_id \
 #     && /tmp/resid_id
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader

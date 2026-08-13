@@ -27,7 +27,7 @@
 #
 # Expected output: all checks PASS.
 
-from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
 from std.gpu import global_idx
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
@@ -61,10 +61,11 @@ def _ablation_copy_kernel(
 
 def _dummy_compute_kernel(
     buf: UnsafePointer[Float32, MutAnyOrigin],
-    n: Int,
+    n_w: Int64,
 ):
     """Slow single-thread sequential kernel on the default stream to simulate
     model compute. Thread 0 does n additions so the kernel takes real time."""
+    var n = Int(n_w)
     var i = Int(global_idx.x)
     if i == 0:
         var acc = Float32(0.0)
@@ -240,12 +241,10 @@ def main() raises:
     var dummy_buf = ctx.enqueue_create_buffer[DType.float32](DUMMY_N)
     # Launch a heavy dummy kernel on the DEFAULT stream.
     # The copy stream for layers.2 runs concurrently with this.
-    var compiled_dummy = ctx.compile_function[
-        _dummy_compute_kernel, _dummy_compute_kernel
-    ]()
-    ctx.enqueue_function[_dummy_compute_kernel, _dummy_compute_kernel](
+    var compiled_dummy = ctx.compile_function[_dummy_compute_kernel]()
+    ctx.enqueue_function[_dummy_compute_kernel](
         dummy_buf.unsafe_ptr(),
-        DUMMY_N,
+        Int64(DUMMY_N),
         grid_dim=1,
         block_dim=1,
     )
@@ -315,7 +314,7 @@ def main() raises:
     var abl_copy_stream = ctx.create_stream()
 
     # Pre-compile the ablation copy kernel (same byte-copy as turbo's _h2d_copy_kernel).
-    var compiled_abl = ctx.compile_function[_ablation_copy_kernel, _ablation_copy_kernel]()
+    var compiled_abl = ctx.compile_function[_ablation_copy_kernel]()
 
     # Compute thread/block grid for ablation copy.
     comptime ABL_BLOCK = 256
@@ -405,9 +404,9 @@ def main() raises:
 
     # Run a real compute kernel on the default stream while copy_stream writes slot-0.
     # This is the "consuming compute on A" — default stream is busy, copy stream writes B.
-    ctx.enqueue_function[_dummy_compute_kernel, _dummy_compute_kernel](
+    ctx.enqueue_function[_dummy_compute_kernel](
         dummy_buf.unsafe_ptr(),
-        DUMMY_N,
+        Int64(DUMMY_N),
         grid_dim=1,
         block_dim=1,
     )

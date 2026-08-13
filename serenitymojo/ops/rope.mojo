@@ -23,7 +23,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -43,9 +43,11 @@ def _rope_interleaved_kernel_f32(
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,  # D/2
+    rows_w: Int32,
+    half_w: Int32,  # D/2
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -64,9 +66,11 @@ def _rope_interleaved_kernel_bf16(
     cos: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -85,9 +89,11 @@ def _rope_interleaved_kernel_f16(
     cos: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -106,9 +112,11 @@ def _rope_interleaved_kernel_f32_tables[x_dtype: DType](
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -129,11 +137,14 @@ def _rope_interleaved_head_broadcast_kernel[
     cos: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
     o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
-    heads: Int,
+    rows_w: Int32,
+    half_w: Int32,
+    heads_w: Int32,
 ):
     """Interleaved RoPE with one compact table row shared by all heads."""
+    var rows = Int(rows_w)
+    var half = Int(half_w)
+    var heads = Int(heads_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -154,9 +165,11 @@ def _rope_halfsplit_kernel_f32(
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -175,9 +188,11 @@ def _rope_halfsplit_kernel_bf16(
     cos: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -196,9 +211,11 @@ def _rope_halfsplit_kernel_f16(
     cos: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -217,9 +234,11 @@ def _rope_halfsplit_kernel_f32_tables[x_dtype: DType](
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -238,9 +257,11 @@ def _rope_halfsplit_full_kernel_f32(
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -261,9 +282,11 @@ def _rope_halfsplit_full_kernel_bf16(
     cos: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -284,9 +307,11 @@ def _rope_halfsplit_full_kernel_f16(
     cos: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -309,11 +334,14 @@ def _rope_halfsplit_full_head_broadcast_kernel[
     cos: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[table_dtype, _DYN2, MutAnyOrigin],
     o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
-    heads: Int,
+    rows_w: Int32,
+    half_w: Int32,
+    heads_w: Int32,
 ):
     """Full-width half-split RoPE with one compact table row per token."""
+    var rows = Int(rows_w)
+    var half = Int(half_w)
+    var heads = Int(heads_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -335,9 +363,11 @@ def _rope_halfsplit_full_kernel_f32_tables[x_dtype: DType](
     cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
     o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
-    rows: Int,
-    half: Int,
+    rows_w: Int32,
+    half_w: Int32,
 ):
+    var rows = Int(rows_w)
+    var half = Int(half_w)
     var idx = Int(global_idx.x)
     var total = rows * half
     if idx < total:
@@ -448,76 +478,112 @@ def rope_interleaved(
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_interleaved_kernel_f32, _rope_interleaved_kernel_f32
-        ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_interleaved_kernel_f32](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_f32_tables[DType.bfloat16],
-                _rope_interleaved_kernel_f32_tables[DType.bfloat16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_f32_tables[DType.bfloat16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_bf16, _rope_interleaved_kernel_bf16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_bf16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_f32_tables[DType.float16],
-                _rope_interleaved_kernel_f32_tables[DType.float16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_f32_tables[DType.float16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_f16, _rope_interleaved_kernel_f16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_f16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
@@ -566,99 +632,112 @@ def rope_interleaved_head_broadcast(
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_interleaved_head_broadcast_kernel[
-                DType.float32, DType.float32
-            ],
-            _rope_interleaved_head_broadcast_kernel[
-                DType.float32, DType.float32
-            ],
-        ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_interleaved_head_broadcast_kernel[ DType.float32, DType.float32 ]](X, C, S, O, Int32(rows), Int32(half), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.bfloat16, DType.float32
-                ],
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.bfloat16, DType.float32
-                ],
-            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_head_broadcast_kernel[ DType.bfloat16, DType.float32 ]](X, C, S, O, Int32(rows), Int32(half), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.bfloat16, DType.bfloat16
-                ],
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.bfloat16, DType.bfloat16
-                ],
-            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_head_broadcast_kernel[ DType.bfloat16, DType.bfloat16 ]](X, C, S, O, Int32(rows), Int32(half), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.float16, DType.float32
-                ],
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.float16, DType.float32
-                ],
-            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_head_broadcast_kernel[ DType.float16, DType.float32 ]](X, C, S, O, Int32(rows), Int32(half), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.float16, DType.float16
-                ],
-                _rope_interleaved_head_broadcast_kernel[
-                    DType.float16, DType.float16
-                ],
-            ](X, C, S, O, rows, half, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_head_broadcast_kernel[ DType.float16, DType.float16 ]](X, C, S, O, Int32(rows), Int32(half), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x_dt)
 
 
@@ -683,76 +762,112 @@ def rope_interleaved_slab(
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_interleaved_kernel_f32, _rope_interleaved_kernel_f32
-        ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_interleaved_kernel_f32](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_f32_tables[DType.bfloat16],
-                _rope_interleaved_kernel_f32_tables[DType.bfloat16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_f32_tables[DType.bfloat16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_bf16, _rope_interleaved_kernel_bf16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_bf16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_f32_tables[DType.float16],
-                _rope_interleaved_kernel_f32_tables[DType.float16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_f32_tables[DType.float16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_interleaved_kernel_f16, _rope_interleaved_kernel_f16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_interleaved_kernel_f16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
@@ -781,76 +896,112 @@ def rope_halfsplit(
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_halfsplit_kernel_f32, _rope_halfsplit_kernel_f32
-        ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_halfsplit_kernel_f32](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_f32_tables[DType.bfloat16],
-                _rope_halfsplit_kernel_f32_tables[DType.bfloat16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_f32_tables[DType.bfloat16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_bf16, _rope_halfsplit_kernel_bf16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_bf16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_f32_tables[DType.float16],
-                _rope_halfsplit_kernel_f32_tables[DType.float16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_f32_tables[DType.float16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_f16, _rope_halfsplit_kernel_f16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_f16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
@@ -876,76 +1027,112 @@ def rope_halfsplit_slab(
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_halfsplit_kernel_f32, _rope_halfsplit_kernel_f32
-        ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_halfsplit_kernel_f32](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_f32_tables[DType.bfloat16],
-                _rope_halfsplit_kernel_f32_tables[DType.bfloat16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_f32_tables[DType.bfloat16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_bf16, _rope_halfsplit_kernel_bf16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_bf16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_f32_tables[DType.float16],
-                _rope_halfsplit_kernel_f32_tables[DType.float16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_f32_tables[DType.float16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_kernel_f16, _rope_halfsplit_kernel_f16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_kernel_f16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
@@ -974,76 +1161,112 @@ def rope_halfsplit_full(
 
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
-        ctx.enqueue_function[
-            _rope_halfsplit_full_kernel_f32, _rope_halfsplit_full_kernel_f32
-        ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
+        ctx.enqueue_function[_rope_halfsplit_full_kernel_f32](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_kernel_f32_tables[DType.bfloat16],
-                _rope_halfsplit_full_kernel_f32_tables[DType.bfloat16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_kernel_f32_tables[DType.bfloat16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_kernel_bf16, _rope_halfsplit_full_kernel_bf16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_kernel_bf16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         if table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_kernel_f32_tables[DType.float16],
-                _rope_halfsplit_full_kernel_f32_tables[DType.float16],
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_kernel_f32_tables[DType.float16]](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_kernel_f16, _rope_halfsplit_full_kernel_f16
-            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_kernel_f16](X, C, S, O, Int32(rows), Int32(half), grid_dim=grid, block_dim=_BLOCK)
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
@@ -1092,97 +1315,110 @@ def rope_halfsplit_full_head_broadcast(
 
     if mojo_x_dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-        )
-        ctx.enqueue_function[
-            _rope_halfsplit_full_head_broadcast_kernel[
-                DType.float32, DType.float32
-            ],
-            _rope_halfsplit_full_head_broadcast_kernel[
-                DType.float32, DType.float32
-            ],
-        ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_rope_halfsplit_full_head_broadcast_kernel[ DType.float32, DType.float32 ]](X, C, S, O, Int32(rows), Int32(d // 2), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
     elif mojo_x_dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
         if mojo_table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.bfloat16, DType.float32
-                ],
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.bfloat16, DType.float32
-                ],
-            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_head_broadcast_kernel[ DType.bfloat16, DType.float32 ]](X, C, S, O, Int32(rows), Int32(d // 2), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.bfloat16, DType.bfloat16
-                ],
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.bfloat16, DType.bfloat16
-                ],
-            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_head_broadcast_kernel[ DType.bfloat16, DType.bfloat16 ]](X, C, S, O, Int32(rows), Int32(d // 2), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
         if mojo_table_dt == DType.float32:
             var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.float16, DType.float32
-                ],
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.float16, DType.float32
-                ],
-            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_head_broadcast_kernel[ DType.float16, DType.float32 ]](X, C, S, O, Int32(rows), Int32(d // 2), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
         else:
             var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(cos.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
             var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
-            )
-            ctx.enqueue_function[
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.float16, DType.float16
-                ],
-                _rope_halfsplit_full_head_broadcast_kernel[
-                    DType.float16, DType.float16
-                ],
-            ](X, C, S, O, rows, d // 2, heads, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(sin.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=f_rl,
+    )
+            ctx.enqueue_function[_rope_halfsplit_full_head_broadcast_kernel[ DType.float16, DType.float16 ]](X, C, S, O, Int32(rows), Int32(d // 2), Int32(heads), grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x.dtype())

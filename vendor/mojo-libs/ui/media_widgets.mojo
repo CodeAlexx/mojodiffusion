@@ -18,7 +18,6 @@
 #     .button/.toggle/.sep/.gap/.label/.right/.at                      (icon items + cursor)
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from builtin.type_aliases import MutExternalOrigin
 from core_widgets import UiContext, measure_text
 from draw_list_paths import DrawList, Col4
 

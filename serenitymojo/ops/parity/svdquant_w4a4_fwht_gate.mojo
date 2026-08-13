@@ -7,7 +7,7 @@
 # Run:  LD_LIBRARY_PATH=.pixi/envs/default/lib /tmp/w4a4_fwht
 
 from std.math import sqrt, sin
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.svdquant_w4a4 import fwht_quant

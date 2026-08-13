@@ -5,7 +5,7 @@
 # safetensors into a state-dict carrier and marks the model handle as having
 # loaded LoRA data. CKPT loading remains outside Mojo product runtime.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.sharded import ShardedSafeTensors

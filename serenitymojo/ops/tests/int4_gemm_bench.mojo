@@ -17,7 +17,7 @@
 # Run:
 #   LD_LIBRARY_PATH=serenitymojo/ops/cshim/lib:.pixi/envs/default/lib /tmp/int4_gemm_bench
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.time import perf_counter_ns
 from serenitymojo.ops.cublas_gemm import cublas_gemm_bf16_nt
 from serenitymojo.ops.int4_gemm import int4_gemm_s4_nt

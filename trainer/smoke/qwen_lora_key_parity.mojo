@@ -13,7 +13,7 @@
 # This is bounded by design: it checks a tiny representative Qwen state dict,
 # not numeric model parity or the full 60-layer target inventory.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

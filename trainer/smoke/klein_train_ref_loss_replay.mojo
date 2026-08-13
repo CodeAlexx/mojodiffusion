@@ -5,7 +5,7 @@
 # claim Klein/Flux2 transformer backward, optimizer, full-finetune, or sampler
 # parity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import abs
 from std.time import perf_counter_ns
 

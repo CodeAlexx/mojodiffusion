@@ -9,7 +9,7 @@
 
 from std.math import sqrt
 from std.pathlib import Path
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

@@ -30,7 +30,7 @@
 
 from std.collections import List
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.os import listdir
 
 from serenitymojo.tensor import Tensor

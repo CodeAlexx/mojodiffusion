@@ -32,10 +32,10 @@
 #
 # Mojo 0.26.x. Inference-only. No autograd, no Python at runtime.
 
-from collections import List, Optional
+from std.collections import List, Optional
 from std.math import exp, log
-from std.gpu.host import DeviceContext
-from memory import ArcPointer
+from max.gpu.host import DeviceContext
+from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar

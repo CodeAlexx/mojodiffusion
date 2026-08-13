@@ -1,6 +1,6 @@
 # Stage-2 precondition gate: the new tensor_algebra _slab ops must be BYTE-identical
 # to their non-slab versions (only the allocation source changes, contract C8).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.random import randn

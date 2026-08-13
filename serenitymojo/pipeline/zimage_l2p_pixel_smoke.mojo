@@ -4,7 +4,7 @@
 # VAE latent. This smoke exercises that model-specific GPU data path at the
 # production 1024 profile: [1,3,1024,1024] <-> [1,4096,768].
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.zimage_l2p_contract import (

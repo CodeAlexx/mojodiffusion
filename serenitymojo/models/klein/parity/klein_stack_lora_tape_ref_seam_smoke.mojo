@@ -31,7 +31,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/klein/parity/klein_stack_lora_tape_ref_seam_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sin as _msin, cos as _mcos
 from serenitymojo.tensor import Tensor

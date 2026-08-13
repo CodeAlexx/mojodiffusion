@@ -24,7 +24,7 @@ def _trim(s: String) -> String:
         j -= 1
     if j <= i:
         return String("")
-    return String(StringSlice(ptr=b.unsafe_ptr() + i, length=j - i))
+    return String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + i, length=j - i)))
 
 
 def _lower(s: String) -> String:
@@ -127,7 +127,7 @@ def _nums_in_parens(s: String) raises -> List[Float64]:
                 break
             i += 1
         if i > start:
-            out.append(atof(String(StringSlice(ptr=b.unsafe_ptr() + start, length=i - start))))
+            out.append(atof(String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + start, length=i - start)))))
         else:
             i += 1
     return out^
@@ -163,7 +163,7 @@ def parse_viewbox(raw: String) raises -> List[Float64]:
         while i < n and ((Int(b[i]) >= 48 and Int(b[i]) <= 57) or Int(b[i]) == 46 or Int(b[i]) == 101 or Int(b[i]) == 69):
             i += 1
         if i > start:
-            out.append(atof(String(StringSlice(ptr=b.unsafe_ptr() + start, length=i - start))))
+            out.append(atof(String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + start, length=i - start)))))
         else:
             i += 1
     return out^
@@ -184,7 +184,7 @@ def parse_transform(raw: String) raises -> Affine:
         var nstart = i
         while i < n and ((Int(b[i]) >= 65 and Int(b[i]) <= 90) or (Int(b[i]) >= 97 and Int(b[i]) <= 122)):
             i += 1
-        var fname = _lower(String(StringSlice(ptr=b.unsafe_ptr() + nstart, length=i - nstart)))
+        var fname = _lower(String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + nstart, length=i - nstart))))
         # gather args within parens
         var sub = String("")
         var j = i
@@ -195,7 +195,7 @@ def parse_transform(raw: String) raises -> Affine:
             j += 1
         # build "(...)" string for _nums_in_parens
         if j <= n:
-            sub = String(StringSlice(ptr=b.unsafe_ptr() + pstart, length=(j - pstart) + 1)) if j < n else String("()")
+            sub = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=b.unsafe_ptr() + pstart, length=(j - pstart) + 1))) if j < n else String("()")
         var args = _nums_in_parens(sub)
         i = j + 1
 

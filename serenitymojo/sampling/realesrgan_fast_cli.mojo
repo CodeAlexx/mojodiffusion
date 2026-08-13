@@ -17,7 +17,7 @@
 #   env LD_LIBRARY_PATH=.pixi/envs/default/lib /tmp/realesrgan_fast_cli in.png out.png
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.serve.image_io import decode_image_any, image_to_signed_nchw

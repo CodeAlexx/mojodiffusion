@@ -10,7 +10,7 @@
 # trainer path. `encode()` is available for sampled latents but is not used by
 # Z-Image LoRA training.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

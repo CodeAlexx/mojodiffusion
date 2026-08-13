@@ -18,7 +18,7 @@
 #
 # Everything else (forward, mrope, masks, denorm, unpatchify) is copied verbatim
 # from the parity-verified pipeline/ideogram4_generate.mojo.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys import argv
 from serenitymojo.tensor import Tensor

@@ -16,7 +16,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Inference-only.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 
@@ -853,7 +853,7 @@ def krea2_sample_latent[
     # generating from `seed`. Isolates whether the noise stream drives composition.
     var _inject = env_or("KREA2_INJECT_NOISE", String(""))
     var latent: Tensor
-    if len(_inject) > 0:
+    if _inject.byte_length() > 0:
         latent = load_tensor_bin(_inject, ctx)
         print("[krea2-infer] INJECTED noise latent from ", _inject)
     else:
@@ -909,7 +909,7 @@ def krea2_sample_latent[
     var warm_t = _t_scalar(ts[0], ctx)
     comptime if CONDL > 0:
         var warm_v = _krea2_edit_velocity[LH, LW, LTMAX, LFULL, CONDL](
-            st, key_prefix, cond_w, fin, lora, cond,
+            st, key_prefix, cond_w, fin, lora, first_lora.copy(), cond,
             warm_img, cond_tokens.value(), warm_t, ctx,
             resident, resident_sq, resident_i8, host_i8,
             attn_bias_c.copy(), use_refiner_mask,
@@ -1158,7 +1158,7 @@ def _lanpaint_branch_velocity_kick(
     # Upstream run_damped midpoint correction:
     #   v += sqrt(Gamma) * (C_new - C_previous) * dt
     var delta = sub(c_new, c_previous, ctx)
-    var sqrt_gamma = gamma ** 0.5
+    var sqrt_gamma = gamma ** Float32(0.5)
     var v_unknown = add(
         velocity, mul_scalar(delta, sqrt_gamma * dt_unknown, ctx), ctx
     )
@@ -1261,7 +1261,7 @@ def krea2_sample_lanpaint_latent[
         var one_minus_t = Float32(1.0) - t_cur
         var denom = one_minus_t * one_minus_t + t_cur * t_cur
         var abt = (one_minus_t * one_minus_t) / denom
-        var vp_factor = abt ** 0.5 + (Float32(1.0) - abt) ** 0.5
+        var vp_factor = abt ** Float32(0.5) + (Float32(1.0) - abt) ** Float32(0.5)
 
         # Comfy flow noise_scaling(t, noise, source), then replace only known
         # pixels before switching to LanPaint's VP notation.

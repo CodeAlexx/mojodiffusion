@@ -18,7 +18,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import exp
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -45,8 +45,9 @@ def _vec_swiglu_kernel(
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     u: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    nchunks: Int,
+    nchunks_w: Int32,
 ):
+    var nchunks = Int(nchunks_w)
     var chunk = Int(global_idx.x)
     if chunk >= nchunks:
         return
@@ -74,17 +75,26 @@ def vec_swiglu(x_gate: Tensor, x_up: Tensor, ctx: DeviceContext) raises -> Tenso
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x_gate.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_gate.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_gate.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var U = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_up.buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x_up.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=rl,
     )
     var nchunks = n // _VW
     var grid = (nchunks + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_vec_swiglu_kernel, _vec_swiglu_kernel](
-        G, U, O, nchunks, grid_dim=grid, block_dim=_BLOCK
+    ctx.enqueue_function[_vec_swiglu_kernel](
+        G, U, O, Int32(nchunks), grid_dim=grid, block_dim=_BLOCK
     )
     return Tensor(out_buf^, x_gate.shape(), STDtype.F32)

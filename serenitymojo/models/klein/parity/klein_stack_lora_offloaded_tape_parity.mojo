@@ -10,7 +10,7 @@
 # It does not load Klein-9B and does not accept product CPU_OFFLOADED parity.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from serenitymojo.io.ffi import O_RDONLY, file_size, sys_close, sys_open, sys_pread

@@ -7,7 +7,7 @@
 # The .serenity `qwen_3_8b.safetensors` file is Comfy-quantized; this smoke uses
 # the dense BF16 HF cache because the current Mojo Qwen3 path has no dequantizer.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer

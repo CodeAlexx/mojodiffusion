@@ -38,7 +38,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -331,7 +331,7 @@ def wan22_block_forward[
 ) raises -> Tensor:
     var dim = cfg.dim
     var eps = cfg.eps
-    var scale = 1.0 / Float32(DH) ** 0.5
+    var scale = 1.0 / Float32(DH) ** Float32(0.5)
 
     # ── Block modulation: e = (modulation + e0).chunk(6) ──
     var modulation_rows = S
@@ -826,7 +826,7 @@ struct Wan22DiT(Movable):
         )
         return merged_count
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[String("")]] Tensor:
         return self.weights[name][]
 
     # Block weights sub-dict for block i (keys stripped of the "blocks.i." prefix).

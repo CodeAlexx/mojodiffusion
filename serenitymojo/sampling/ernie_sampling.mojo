@@ -7,7 +7,7 @@
 # velocity. Schedule scalars are F32 host math; tensor updates preserve input
 # storage dtype through tensor_algebra ops.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, sub
 from serenitymojo.tensor import Tensor

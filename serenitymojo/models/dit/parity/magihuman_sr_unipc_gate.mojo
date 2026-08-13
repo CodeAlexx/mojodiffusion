@@ -6,7 +6,7 @@
 # We replicate the canonical formula in host F64 and compare the Mojo GPU step at
 # several step indices. Gate cos >= 0.999. (No checkpoint needed — pure sampler.)
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness

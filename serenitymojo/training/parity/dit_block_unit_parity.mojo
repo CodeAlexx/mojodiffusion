@@ -17,7 +17,7 @@
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo run -I . serenitymojo/training/parity/dit_block_unit_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from serenitymojo.parity import ParityHarness
 from serenitymojo.training.dit_block import (

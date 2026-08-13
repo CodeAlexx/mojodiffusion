@@ -21,9 +21,9 @@
 #     pixi run mojo run -I . serenitymojo/sampling/parity/dpmpp_2m_tensor_smoke.mojo
 #   (add a trailing `--bitrot` arg for the deliberate-wrong demo)
 
-from collections import List
-from sys import argv
-from std.gpu.host import DeviceContext
+from std.collections import List
+from std.sys import argv
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

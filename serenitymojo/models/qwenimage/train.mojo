@@ -17,7 +17,7 @@
 # Run: cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #      pixi run mojo run -I . serenitymojo/models/qwenimage/train.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.models.qwenimage.config import qwen_image
 
 

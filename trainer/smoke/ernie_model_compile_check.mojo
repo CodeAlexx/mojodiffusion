@@ -10,7 +10,7 @@
 # This is not a parity gate. It uses tiny synthetic tensors only to instantiate
 # Ernie patch/unpatch and VAE scale/unscale helpers.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

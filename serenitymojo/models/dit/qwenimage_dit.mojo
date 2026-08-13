@@ -55,11 +55,10 @@
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in foundation ops.
 # *** CODE-ONLY: compile-verified; NOT executed (GPU wedged). ***
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.ffi import external_call
 from std.math import sqrt, cos as fcos, sin as fsin, exp as fexp, log as flog, pow as fpow
 from std.memory import alloc, ArcPointer, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -465,7 +464,7 @@ struct QwenImageDit(Movable):
         sharded.release_to_os()
         return QwenImageDit(weights^, name_to_idx^, QwenImageConfig.qwen_image())
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("missing weight: ") + name)
         var idx = self.name_to_idx[name]

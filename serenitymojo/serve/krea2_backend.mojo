@@ -24,7 +24,7 @@
 # watchdog — only a 15 s Ready handshake, sent at worker-loop start before any load).
 # cancel() is honored between the major phases.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import Optional
 from std.memory import ArcPointer
 from std.time import perf_counter_ns

@@ -8,7 +8,7 @@
 from std.sys import has_accelerator
 from std.math import ceildiv, floor
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 
 from image.buffer import Image
@@ -32,12 +32,16 @@ def _clamp255(v: Int) -> Int:
 def _k_pixel(
     inp: DevPtr,
     dst: DevPtr,
-    npix: Int,
-    channels: Int,
-    op: Int,
+    npix_w: Int32,
+    channels_w: Int32,
+    op_w: Int32,
     fparam: Float64,
-    iparam: Int,
+    iparam_w: Int32,
 ):
+    var npix = Int(npix_w)
+    var channels = Int(channels_w)
+    var op = Int(op_w)
+    var iparam = Int(iparam_w)
     var tid = Int(global_idx.x)
     if tid >= npix:
         return
@@ -83,8 +87,8 @@ def _run_pixel(img: Image, op: Int, fparam: Float64, iparam: Int) raises -> Imag
     var dout = ctx.enqueue_create_buffer[DType.uint8](n)
     ctx.enqueue_copy(din, hin)
 
-    ctx.enqueue_function[_k_pixel, _k_pixel](
-        din.unsafe_ptr(), dout.unsafe_ptr(), npix, img.channels, op, fparam, iparam,
+    ctx.enqueue_function[_k_pixel](
+        din.unsafe_ptr(), dout.unsafe_ptr(), Int32(npix), Int32(img.channels), Int32(op), fparam, Int32(iparam),
         grid_dim=ceildiv(npix, BLOCK), block_dim=BLOCK,
     )
 
@@ -128,14 +132,19 @@ def _k_convolve(
     inp: DevPtr,
     dst: DevPtr,
     kbuf: FloatPtr,
-    w: Int,
-    h: Int,
-    channels: Int,
-    kw: Int,
-    kh: Int,
+    w_w: Int32,
+    h_w: Int32,
+    channels_w: Int32,
+    kw_w: Int32,
+    kh_w: Int32,
     div: Float64,
     bias: Float64,
 ):
+    var w = Int(w_w)
+    var h = Int(h_w)
+    var channels = Int(channels_w)
+    var kw = Int(kw_w)
+    var kh = Int(kh_w)
     var tid = Int(global_idx.x)
     if tid >= w * h:
         return
@@ -186,9 +195,9 @@ def gpu_convolve(
     var dk = ctx.enqueue_create_buffer[DType.float64](nk)
     ctx.enqueue_copy(dk, hk)
 
-    ctx.enqueue_function[_k_convolve, _k_convolve](
+    ctx.enqueue_function[_k_convolve](
         din.unsafe_ptr(), dout.unsafe_ptr(), dk.unsafe_ptr(),
-        img.width, img.height, img.channels, kw, kh, div, bias,
+        Int32(img.width), Int32(img.height), Int32(img.channels), Int32(kw), Int32(kh), div, bias,
         grid_dim=ceildiv(npix, BLOCK), block_dim=BLOCK,
     )
 

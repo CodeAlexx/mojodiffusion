@@ -30,7 +30,7 @@
 # the same one the Boogu/krea2/ideogram Qwen3-VL gates validated at cos>=0.999.
 #
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in foundation ops.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import slice
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config

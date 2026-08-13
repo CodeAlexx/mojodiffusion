@@ -1,6 +1,6 @@
 # Qwen-Image SerenityTrainer FlowMatch scheduler smoke.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.sampling.qwenimage_sampling import (

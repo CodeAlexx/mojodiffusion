@@ -62,7 +62,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype
@@ -185,7 +185,7 @@ struct MiniMaxH3VideoEncoderDevice(Movable):
         self.name_to_idx = name_to_idx^
         self.config = config.copy()
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(
                 String("MiniMax-H3 video encoder device: missing weight ") + name

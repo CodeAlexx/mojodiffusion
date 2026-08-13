@@ -8,7 +8,7 @@
 # no requantization occur on a cache hit.
 
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
 
 from serenitymojo.io.dtype import STDtype

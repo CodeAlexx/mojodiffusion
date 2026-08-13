@@ -1,7 +1,7 @@
 # magic_time_breakdown.mojo — locate the captioner's ~4:45 wall time: split it into
 # tokenize / model-load / prompt-prime / generate. decode_step calls inlined with
 # perf_counter checkpoints (mirrors generate_greedy_cached).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.pipeline.ideogram4_magic import _system_prompt

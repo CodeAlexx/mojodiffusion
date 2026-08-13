@@ -15,7 +15,7 @@
 #   target.<i>  [tokens, 128]  or [1, tokens, 128]   (noise - clean)
 # Single-sample aliases "hidden" / "target" are also accepted.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

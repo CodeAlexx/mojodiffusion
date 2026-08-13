@@ -12,7 +12,6 @@
 #   pan_pad(ui, id, x, y, size, mut lr, mut fb) -> Bool         2D pan (L/R x F/B), drag dot
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from builtin.type_aliases import MutExternalOrigin
 from std.math import sin, cos
 from core_widgets import UiContext
 

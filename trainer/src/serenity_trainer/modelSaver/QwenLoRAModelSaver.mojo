@@ -8,7 +8,7 @@
 #       embedding_saver_class=None,
 #   )
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 

@@ -10,7 +10,7 @@
 # Low-level write helpers preserve tensor storage dtype by default. Use the
 # explicit dtype override helper when a caller intentionally wants conversion.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.io.dtype import STDtype

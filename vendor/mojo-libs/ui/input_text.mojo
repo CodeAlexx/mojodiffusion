@@ -2,7 +2,6 @@
 # Logic takes INJECTED codepoints (verifiable headless); pump_live() drains get_char().
 from std.ffi import external_call
 from std.memory import UnsafePointer, alloc
-from builtin.type_aliases import MutExternalOrigin
 
 
 fn to_cstr_bytes(b: List[UInt8]) raises -> UnsafePointer[Int8, MutExternalOrigin]:

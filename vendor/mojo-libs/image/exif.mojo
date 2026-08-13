@@ -98,9 +98,9 @@ struct ExifData(Movable):
         self.entries = copy.entries.copy()
         self.little = copy.little
 
-    def __init__(out self, *, deinit take: Self):
-        self.entries = take.entries^
-        self.little = take.little
+    def __init__(out self, *, deinit move: Self):
+        self.entries = move.entries^
+        self.little = move.little
 
     # ---- low-level lookups ----
     def has(self, tag: Int) -> Bool:

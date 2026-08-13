@@ -4,7 +4,7 @@
 # profile with real weights, one denoise step, and all streamed layers to prove
 # the production token geometry before the cached/sparse attention path lands.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.components.artifacts import (

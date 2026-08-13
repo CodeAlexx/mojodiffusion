@@ -6,7 +6,7 @@
 
 from std.collections import List
 from std.math import sqrt
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.training.dora_save import read_dora_module
 from serenitymojo.training.dora_adapter import dora_forward, dora_backward

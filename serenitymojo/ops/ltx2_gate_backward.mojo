@@ -15,7 +15,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU. `def` not `fn`.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -32,8 +32,11 @@ def _gate_dgates_kernel[dtype: DType](
     dag: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [SQ*inner]  d_att_g
     af: LayoutTensor[dtype, _DYN1, MutAnyOrigin],    # [SQ*inner]  att_flat
     dg: LayoutTensor[dtype, _DYN1, MutAnyOrigin],    # [SQ*H]      d_gates out
-    sq: Int, h: Int, dh: Int,
+    sq_w: Int32, h_w: Int32, dh_w: Int32,
 ):
+    var sq = Int(sq_w)
+    var h = Int(h_w)
+    var dh = Int(dh_w)
     var idx = Int(global_idx.x)
     var total = sq * h
     if idx < total:
@@ -68,34 +71,64 @@ def ltx2_gate_dgates(
     var dt = d_att_g.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var DAG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            d_att_g.buf.unsafe_ptr().bitcast[Float32](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(d_att_g.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var AF = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            att_flat.buf.unsafe_ptr().bitcast[Float32](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(att_flat.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl)
-        ctx.enqueue_function[
-            _gate_dgates_kernel[DType.float32], _gate_dgates_kernel[DType.float32],
-        ](DAG, AF, DG, sq, h, dh, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_gate_dgates_kernel[DType.float32]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var DAG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            d_att_g.buf.unsafe_ptr().bitcast[BFloat16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(d_att_g.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var AF = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            att_flat.buf.unsafe_ptr().bitcast[BFloat16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(att_flat.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl)
-        ctx.enqueue_function[
-            _gate_dgates_kernel[DType.bfloat16], _gate_dgates_kernel[DType.bfloat16],
-        ](DAG, AF, DG, sq, h, dh, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_gate_dgates_kernel[DType.bfloat16]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
     else:
         var DAG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            d_att_g.buf.unsafe_ptr().bitcast[Float16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(d_att_g.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var AF = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            att_flat.buf.unsafe_ptr().bitcast[Float16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(att_flat.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl)
-        ctx.enqueue_function[
-            _gate_dgates_kernel[DType.float16], _gate_dgates_kernel[DType.float16],
-        ](DAG, AF, DG, sq, h, dh, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_gate_dgates_kernel[DType.float16]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
     var sh = [sq, h]
     return Tensor(out_buf^, sh^, d_att_g.dtype())
 
@@ -120,33 +153,63 @@ def ltx2_gate_dgates_slab(
     var dt = d_att_g.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var DAG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            d_att_g.buf.unsafe_ptr().bitcast[Float32](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(d_att_g.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var AF = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            att_flat.buf.unsafe_ptr().bitcast[Float32](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(att_flat.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=in_rl,
+    )
         var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), out_rl)
-        ctx.enqueue_function[
-            _gate_dgates_kernel[DType.float32], _gate_dgates_kernel[DType.float32],
-        ](DAG, AF, DG, sq, h, dh, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_gate_dgates_kernel[DType.float32]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var DAG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            d_att_g.buf.unsafe_ptr().bitcast[BFloat16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(d_att_g.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var AF = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            att_flat.buf.unsafe_ptr().bitcast[BFloat16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(att_flat.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl)
-        ctx.enqueue_function[
-            _gate_dgates_kernel[DType.bfloat16], _gate_dgates_kernel[DType.bfloat16],
-        ](DAG, AF, DG, sq, h, dh, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_gate_dgates_kernel[DType.bfloat16]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
     else:
         var DAG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            d_att_g.buf.unsafe_ptr().bitcast[Float16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(d_att_g.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var AF = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            att_flat.buf.unsafe_ptr().bitcast[Float16](), in_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(att_flat.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=in_rl,
+    )
         var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float16](), out_rl)
-        ctx.enqueue_function[
-            _gate_dgates_kernel[DType.float16], _gate_dgates_kernel[DType.float16],
-        ](DAG, AF, DG, sq, h, dh, grid_dim=grid, block_dim=_BLOCK)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=out_rl,
+    )
+        ctx.enqueue_function[_gate_dgates_kernel[DType.float16]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
     var sh = [sq, h]
     return Tensor(out_buf^, sh^, d_att_g.dtype())

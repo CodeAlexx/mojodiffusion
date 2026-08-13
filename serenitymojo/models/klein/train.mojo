@@ -12,7 +12,7 @@
 # Run: cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #      pixi run mojo run -I . serenitymojo/models/klein/train.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.training.train_step import run_synthetic
 from serenitymojo.models.klein.config import klein_9b, klein_4b
 

@@ -19,7 +19,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/klein/parity/klein_single_block_int8_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, log as flog, cos as fcos, pi
 from std.memory import ArcPointer

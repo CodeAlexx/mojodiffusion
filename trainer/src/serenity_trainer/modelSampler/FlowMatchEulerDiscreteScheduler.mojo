@@ -52,7 +52,7 @@
 # a true F32 accumulation, NOT a BF16-storage two-op path (which would double-
 # round dt*model_output then the sum).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.tensor_algebra import add, mul_scalar

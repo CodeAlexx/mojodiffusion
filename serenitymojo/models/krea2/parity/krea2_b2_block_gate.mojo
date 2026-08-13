@@ -14,7 +14,7 @@
 #     serenitymojo/models/krea2/parity/krea2_b2_block_gate.mojo -o output/bin/krea2_b2_block_gate
 #   output/bin/krea2_b2_block_gate
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, cos as mcos, sin as msin
 from std.memory import ArcPointer

@@ -9,7 +9,7 @@
 #     -o /tmp/krea2_flow_patchify_fused_smoke && \
 #   /tmp/krea2_flow_patchify_fused_smoke
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor

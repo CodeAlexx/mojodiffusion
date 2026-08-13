@@ -33,7 +33,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. Storage dtype is preserved; each thread accumulates
 # in F32 scalar registers and stores the final gradient in the input/weight dtype.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -74,11 +74,24 @@ def _conv2d_dx_kernel[dtype: DType](
     grad_y: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*Ho*Wo*Cout]
     weight: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [Kh*Kw*Cin*Cout]
     d_x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],      # [N*Hi*Wi*Cin]
-    N: Int, Hi: Int, Wi: Int, Cin: Int,
-    Kh: Int, Kw: Int, Cout: Int,
-    Ho: Int, Wo: Int,
-    sh: Int, sw: Int, ph: Int, pw: Int,
+    N_w: Int64, Hi_w: Int32, Wi_w: Int32, Cin_w: Int32,
+    Kh_w: Int32, Kw_w: Int32, Cout_w: Int32,
+    Ho_w: Int32, Wo_w: Int32,
+    sh_w: Int32, sw_w: Int32, ph_w: Int32, pw_w: Int32,
 ):
+    var N = Int(N_w)
+    var Hi = Int(Hi_w)
+    var Wi = Int(Wi_w)
+    var Cin = Int(Cin_w)
+    var Kh = Int(Kh_w)
+    var Kw = Int(Kw_w)
+    var Cout = Int(Cout_w)
+    var Ho = Int(Ho_w)
+    var Wo = Int(Wo_w)
+    var sh = Int(sh_w)
+    var sw = Int(sw_w)
+    var ph = Int(ph_w)
+    var pw = Int(pw_w)
     var idx = Int(global_idx.x)
     var total = N * Hi * Wi * Cin
     if idx >= total:
@@ -131,11 +144,24 @@ def _conv2d_dw_kernel[dtype: DType](
     grad_y: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*Ho*Wo*Cout]
     x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],        # [N*Hi*Wi*Cin]
     d_w: LayoutTensor[dtype, _DYN1, MutAnyOrigin],      # [Kh*Kw*Cin*Cout]
-    N: Int, Hi: Int, Wi: Int, Cin: Int,
-    Kh: Int, Kw: Int, Cout: Int,
-    Ho: Int, Wo: Int,
-    sh: Int, sw: Int, ph: Int, pw: Int,
+    N_w: Int64, Hi_w: Int32, Wi_w: Int32, Cin_w: Int32,
+    Kh_w: Int32, Kw_w: Int32, Cout_w: Int32,
+    Ho_w: Int32, Wo_w: Int32,
+    sh_w: Int32, sw_w: Int32, ph_w: Int32, pw_w: Int32,
 ):
+    var N = Int(N_w)
+    var Hi = Int(Hi_w)
+    var Wi = Int(Wi_w)
+    var Cin = Int(Cin_w)
+    var Kh = Int(Kh_w)
+    var Kw = Int(Kw_w)
+    var Cout = Int(Cout_w)
+    var Ho = Int(Ho_w)
+    var Wo = Int(Wo_w)
+    var sh = Int(sh_w)
+    var sw = Int(sw_w)
+    var ph = Int(ph_w)
+    var pw = Int(pw_w)
     var idx = Int(global_idx.x)
     var total = Kh * Kw * Cin * Cout
     if idx >= total:
@@ -173,8 +199,12 @@ def _conv2d_dw_kernel[dtype: DType](
 def _conv2d_db_kernel[dtype: DType](
     grad_y: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*Ho*Wo*Cout]
     d_b: LayoutTensor[dtype, _DYN1, MutAnyOrigin],      # [Cout]
-    N: Int, Ho: Int, Wo: Int, Cout: Int,
+    N_w: Int64, Ho_w: Int32, Wo_w: Int32, Cout_w: Int32,
 ):
+    var N = Int(N_w)
+    var Ho = Int(Ho_w)
+    var Wo = Int(Wo_w)
+    var Cout = Int(Cout_w)
     var co = Int(global_idx.x)
     if co >= Cout:
         return
@@ -281,100 +311,154 @@ def conv2d_backward[
     var dt = dtype.to_mojo_dtype()
     if dt == DType.float32:
         var xv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var wv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float32](), w_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=w_rl,
+    )
         var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            grad_y.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(grad_y.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=x_rl,
+    )
         var dwv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            dw_buf.unsafe_ptr().bitcast[Float32](), w_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(dw_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=w_rl,
+    )
         var dbv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            db_buf.unsafe_ptr().bitcast[Float32](), b_rl)
-        ctx.enqueue_function[
-            _conv2d_dx_kernel[DType.float32], _conv2d_dx_kernel[DType.float32]
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(db_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=b_rl,
+    )
+        ctx.enqueue_function[_conv2d_dx_kernel[DType.float32]](
             gv, wv, dxv,
-            N, Hi, Wi, Cin, Kh, Kw, Cout, Ho, Wo,
-            stride_h, stride_w, pad_h, pad_w,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(Cin), Int32(Kh), Int32(Kw), Int32(Cout), Int32(Ho), Int32(Wo),
+            Int32(stride_h), Int32(stride_w), Int32(pad_h), Int32(pad_w),
             grid_dim=dx_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _conv2d_dw_kernel[DType.float32], _conv2d_dw_kernel[DType.float32]
-        ](
+        ctx.enqueue_function[_conv2d_dw_kernel[DType.float32]](
             gv, xv, dwv,
-            N, Hi, Wi, Cin, Kh, Kw, Cout, Ho, Wo,
-            stride_h, stride_w, pad_h, pad_w,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(Cin), Int32(Kh), Int32(Kw), Int32(Cout), Int32(Ho), Int32(Wo),
+            Int32(stride_h), Int32(stride_w), Int32(pad_h), Int32(pad_w),
             grid_dim=dw_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _conv2d_db_kernel[DType.float32], _conv2d_db_kernel[DType.float32]
-        ](gv, dbv, N, Ho, Wo, Cout, grid_dim=db_grid, block_dim=_BLOCK)
+        ctx.enqueue_function[_conv2d_db_kernel[DType.float32]](gv, dbv, Int64(N), Int32(Ho), Int32(Wo), Int32(Cout), grid_dim=db_grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var xv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var wv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[BFloat16](), w_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w_rl,
+    )
         var gv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            grad_y.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_y.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var dwv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            dw_buf.unsafe_ptr().bitcast[BFloat16](), w_rl)
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(dw_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w_rl,
+    )
         var dbv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            db_buf.unsafe_ptr().bitcast[BFloat16](), b_rl)
-        ctx.enqueue_function[
-            _conv2d_dx_kernel[DType.bfloat16], _conv2d_dx_kernel[DType.bfloat16]
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(db_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=b_rl,
+    )
+        ctx.enqueue_function[_conv2d_dx_kernel[DType.bfloat16]](
             gv, wv, dxv,
-            N, Hi, Wi, Cin, Kh, Kw, Cout, Ho, Wo,
-            stride_h, stride_w, pad_h, pad_w,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(Cin), Int32(Kh), Int32(Kw), Int32(Cout), Int32(Ho), Int32(Wo),
+            Int32(stride_h), Int32(stride_w), Int32(pad_h), Int32(pad_w),
             grid_dim=dx_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _conv2d_dw_kernel[DType.bfloat16], _conv2d_dw_kernel[DType.bfloat16]
-        ](
+        ctx.enqueue_function[_conv2d_dw_kernel[DType.bfloat16]](
             gv, xv, dwv,
-            N, Hi, Wi, Cin, Kh, Kw, Cout, Ho, Wo,
-            stride_h, stride_w, pad_h, pad_w,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(Cin), Int32(Kh), Int32(Kw), Int32(Cout), Int32(Ho), Int32(Wo),
+            Int32(stride_h), Int32(stride_w), Int32(pad_h), Int32(pad_w),
             grid_dim=dw_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _conv2d_db_kernel[DType.bfloat16], _conv2d_db_kernel[DType.bfloat16]
-        ](gv, dbv, N, Ho, Wo, Cout, grid_dim=db_grid, block_dim=_BLOCK)
+        ctx.enqueue_function[_conv2d_db_kernel[DType.bfloat16]](gv, dbv, Int64(N), Int32(Ho), Int32(Wo), Int32(Cout), grid_dim=db_grid, block_dim=_BLOCK)
     else:
         var xv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var wv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            weight.buf.unsafe_ptr().bitcast[Float16](), w_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=w_rl,
+    )
         var gv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            grad_y.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(grad_y.buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=g_rl,
+    )
         var dxv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(dx_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=x_rl,
+    )
         var dwv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            dw_buf.unsafe_ptr().bitcast[Float16](), w_rl)
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(dw_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=w_rl,
+    )
         var dbv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-            db_buf.unsafe_ptr().bitcast[Float16](), b_rl)
-        ctx.enqueue_function[
-            _conv2d_dx_kernel[DType.float16], _conv2d_dx_kernel[DType.float16]
-        ](
+        unsafe_ptr=Pointer[Scalar[DType.float16], MutAnyOrigin](
+            unsafe_from_address=Int(db_buf.unsafe_ptr().bitcast[Float16]())
+        ),
+        runtime_layout=b_rl,
+    )
+        ctx.enqueue_function[_conv2d_dx_kernel[DType.float16]](
             gv, wv, dxv,
-            N, Hi, Wi, Cin, Kh, Kw, Cout, Ho, Wo,
-            stride_h, stride_w, pad_h, pad_w,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(Cin), Int32(Kh), Int32(Kw), Int32(Cout), Int32(Ho), Int32(Wo),
+            Int32(stride_h), Int32(stride_w), Int32(pad_h), Int32(pad_w),
             grid_dim=dx_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _conv2d_dw_kernel[DType.float16], _conv2d_dw_kernel[DType.float16]
-        ](
+        ctx.enqueue_function[_conv2d_dw_kernel[DType.float16]](
             gv, xv, dwv,
-            N, Hi, Wi, Cin, Kh, Kw, Cout, Ho, Wo,
-            stride_h, stride_w, pad_h, pad_w,
+            Int64(N), Int32(Hi), Int32(Wi), Int32(Cin), Int32(Kh), Int32(Kw), Int32(Cout), Int32(Ho), Int32(Wo),
+            Int32(stride_h), Int32(stride_w), Int32(pad_h), Int32(pad_w),
             grid_dim=dw_grid, block_dim=_BLOCK,
         )
-        ctx.enqueue_function[
-            _conv2d_db_kernel[DType.float16], _conv2d_db_kernel[DType.float16]
-        ](gv, dbv, N, Ho, Wo, Cout, grid_dim=db_grid, block_dim=_BLOCK)
+        ctx.enqueue_function[_conv2d_db_kernel[DType.float16]](gv, dbv, Int64(N), Int32(Ho), Int32(Wo), Int32(Cout), grid_dim=db_grid, block_dim=_BLOCK)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     # ── wrap outputs ─────────────────────────────────────────────────────────

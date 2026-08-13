@@ -2,7 +2,7 @@
 # REPLAY, at real ideogram4 dims. The slab block is fully alloc-routed (StepSlab +
 # scratch) and de-synced, so the region is captureable. Replay eliminates the host
 # op-construction overhead that the trainer is bound on (memory: ~2s/step host).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor

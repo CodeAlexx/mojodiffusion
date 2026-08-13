@@ -2,7 +2,7 @@
 # Proves generate_greedy_cached == generate_greedy TOKEN-FOR-TOKEN (greedy is
 # deterministic → exact equality, not tolerance) AND times both so the speedup
 # is MEASURED, not assumed. Qwen3-0.6B (the checkpoint the decoder gate uses).
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.models.text_encoder.qwen3_magic import (

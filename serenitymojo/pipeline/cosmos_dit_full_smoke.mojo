@@ -14,7 +14,7 @@
 # chain). The per-block numeric math is additionally covered by the block-0 gate
 # (cos 0.99999605); this gate covers the FULL chain at large S via the tiled SDPA.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

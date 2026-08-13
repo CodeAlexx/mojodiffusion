@@ -3,7 +3,7 @@
 # Run:
 #   pixi run mojo run -I . serenitymojo/models/krea2/parity/krea2_live_devp_view_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.builtin.dtype import DType
 from std.memory import ArcPointer
 

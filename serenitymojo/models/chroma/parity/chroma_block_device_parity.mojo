@@ -26,7 +26,7 @@
 #     serenitymojo/models/chroma/parity/chroma_block_device_parity.mojo -o /tmp/chroma_dev_parity
 #   /tmp/chroma_dev_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer

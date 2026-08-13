@@ -51,7 +51,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -322,7 +322,7 @@ struct LTX2AudioVaeDecoderWeights(Movable):
     def has(self, name: String) -> Bool:
         return name in self.name_to_idx
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LTX2 AudioVAE: missing weight: ") + name)
         var idx = self.name_to_idx[name]

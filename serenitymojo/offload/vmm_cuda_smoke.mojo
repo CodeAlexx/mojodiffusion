@@ -4,7 +4,7 @@
 # support/granularity, reserves and frees one VA range, and maps/unmaps a tiny
 # physical allocation when supported. It does not implement residency policy.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.offload.vmm_cuda import (
     vmm_supported,

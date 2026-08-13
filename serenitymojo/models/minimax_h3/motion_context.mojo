@@ -8,7 +8,7 @@
 # continuation artifact shared by all H3 runners.
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import round, sqrt
 from std.memory import ArcPointer
 

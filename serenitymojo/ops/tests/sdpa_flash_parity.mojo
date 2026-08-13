@@ -30,7 +30,7 @@
 #   LD_LIBRARY_PATH=/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib \
 #     /tmp/sdpa_flash_par
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor

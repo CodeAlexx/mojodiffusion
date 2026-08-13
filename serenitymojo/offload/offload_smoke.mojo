@@ -13,7 +13,7 @@
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA. Run:
 #   pixi run mojo run -I . serenitymojo/offload/offload_smoke.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 

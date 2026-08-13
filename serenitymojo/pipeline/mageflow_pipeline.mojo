@@ -33,7 +33,7 @@
 #     -Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda \
 #     serenitymojo/pipeline/mageflow_pipeline.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, log, cos as _cos
 
 from serenitymojo.tensor import Tensor

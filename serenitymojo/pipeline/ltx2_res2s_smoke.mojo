@@ -28,7 +28,7 @@
 # on the coefficients, the midpoint sample, and the combined update against
 # Python golden constants (computed with the reference phi/coeff formulas).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, log, sqrt
 
 from serenitymojo.io.dtype import STDtype

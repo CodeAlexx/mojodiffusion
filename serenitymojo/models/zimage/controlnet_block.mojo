@@ -59,7 +59,7 @@
 # Mojo 1.0.0b1: `def` + raises; no implicit Tensor copies; host List[Float32]
 # carriers at the block boundary (same contract as block.mojo / zimage_stack.mojo).
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor

@@ -61,9 +61,8 @@
 #   4. Keep _select_prompt / _load_prompt_json unchanged — they are shared infra.
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc, UnsafePointer
-from std.builtin.type_aliases import MutExternalOrigin
 from std.ffi import external_call
 from std.time import sleep
 

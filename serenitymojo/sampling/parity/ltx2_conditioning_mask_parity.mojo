@@ -7,7 +7,7 @@ The Mojo model receives timesteps multiplied by 1000 before AdaLN.
 """
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.pipeline.ltx2_t2v_av_hq import (
     _request_hq_i2v_mask,

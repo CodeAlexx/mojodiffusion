@@ -15,7 +15,7 @@
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/models/sdxl/parity/unet_stack_parity.mojo -o /tmp/sdxl_stack_parity
 #   /tmp/sdxl_stack_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, alloc
 from std.collections import Optional
 from serenitymojo.tensor import Tensor

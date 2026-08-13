@@ -39,9 +39,10 @@
 #      output AFTER the feed-forward residual add.
 #   8. Checkpoint keys are prefixed `model.language_model.` .
 
-from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from std.gpu import block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.math import cos as fcos, exp as fexp, log as flog, sin as fsin, sqrt
 from std.memory import ArcPointer, stack_allocation
 from std.utils.index import IndexList
@@ -203,9 +204,10 @@ def _gemma4_rms_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     w: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
     eps: Float32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -239,9 +241,10 @@ def _gemma4_rms_kernel(
 def _gemma4_rms_noscale_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    cols: Int,
+    cols_w: Int32,
     eps: Float32,
 ):
+    var cols = Int(cols_w)
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var shared = stack_allocation[
@@ -283,16 +286,25 @@ def gemma4_rms_norm(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var w_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var W = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[BFloat16](), w_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(weight.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=w_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
-    ctx.enqueue_function[_gemma4_rms_kernel, _gemma4_rms_kernel](
-        X, W, O, cols, GEMMA4_EPS,
+    ctx.enqueue_function[_gemma4_rms_kernel](
+        X, W, O, Int32(cols), GEMMA4_EPS,
         grid_dim=rows, block_dim=_TPB,
     )
     return Tensor(out_buf^, shape^, STDtype.BF16)
@@ -308,15 +320,19 @@ def gemma4_rms_norm_noscale(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(x.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
     var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=x_rl,
     )
-    ctx.enqueue_function[
-        _gemma4_rms_noscale_kernel, _gemma4_rms_noscale_kernel
-    ](
-        X, O, cols, GEMMA4_EPS,
+    ctx.enqueue_function[_gemma4_rms_noscale_kernel](
+        X, O, Int32(cols), GEMMA4_EPS,
         grid_dim=rows, block_dim=_TPB,
     )
     return Tensor(out_buf^, shape^, STDtype.BF16)

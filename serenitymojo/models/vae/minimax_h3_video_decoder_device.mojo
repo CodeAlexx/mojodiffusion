@@ -95,7 +95,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.memory import ArcPointer
 from std.math import sqrt
@@ -179,7 +179,7 @@ struct MiniMaxH3VideoDecoderDevice(Movable):
         self.name_to_idx = name_to_idx^
         self.config = config.copy()
 
-    def _w(self, name: String) raises -> ref [self.weights] Tensor:
+    def _w(self, name: String) raises -> ref [self.weights[0]] Tensor:
         if name not in self.name_to_idx:
             raise Error(
                 String("MiniMax-H3 video decoder device: missing weight ") + name
@@ -471,8 +471,15 @@ def _vit_block_forward[S: Int, H: Int, Dh: Int](
 def _unpack_patches_kernel_f32(
     src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    t_dim: Int, h_dim: Int, w_dim: Int, c_dim: Int, pt: Int, ps: Int, total: Int,
+    t_dim_w: Int32, h_dim_w: Int32, w_dim_w: Int32, c_dim_w: Int32, pt_w: Int32, ps_w: Int32, total_w: Int64,
 ):
+    var t_dim = Int(t_dim_w)
+    var h_dim = Int(h_dim_w)
+    var w_dim = Int(w_dim_w)
+    var c_dim = Int(c_dim_w)
+    var pt = Int(pt_w)
+    var ps = Int(ps_w)
+    var total = Int(total_w)
     var idx = Int(global_idx.x)
     if idx >= total:
         return
@@ -500,8 +507,15 @@ def _unpack_patches_kernel_f32(
 def _unpack_patches_kernel_bf16(
     src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     dst: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    t_dim: Int, h_dim: Int, w_dim: Int, c_dim: Int, pt: Int, ps: Int, total: Int,
+    t_dim_w: Int32, h_dim_w: Int32, w_dim_w: Int32, c_dim_w: Int32, pt_w: Int32, ps_w: Int32, total_w: Int64,
 ):
+    var t_dim = Int(t_dim_w)
+    var h_dim = Int(h_dim_w)
+    var w_dim = Int(w_dim_w)
+    var c_dim = Int(c_dim_w)
+    var pt = Int(pt_w)
+    var ps = Int(ps_w)
+    var total = Int(total_w)
     var idx = Int(global_idx.x)
     if idx >= total:
         return
@@ -544,24 +558,36 @@ def _unpack_patches(
     var grid = (total + _UNPACK_BLOCK - 1) // _UNPACK_BLOCK
     if dt_ == DType.float32:
         var S_ = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            patch_tokens.buf.unsafe_ptr().bitcast[Float32](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(patch_tokens.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=src_rl,
+    )
         var D = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), dst_rl
-        )
-        ctx.enqueue_function[_unpack_patches_kernel_f32, _unpack_patches_kernel_f32](
-            S_, D, t_dim, h_dim, w_dim, out_channels, pt, ps, total,
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=dst_rl,
+    )
+        ctx.enqueue_function[_unpack_patches_kernel_f32](
+            S_, D, Int32(t_dim), Int32(h_dim), Int32(w_dim), Int32(out_channels), Int32(pt), Int32(ps), Int64(total),
             grid_dim=grid, block_dim=_UNPACK_BLOCK,
         )
     elif dt_ == DType.bfloat16:
         var S_ = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            patch_tokens.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
-        )
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(patch_tokens.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
         var D = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), dst_rl
-        )
-        ctx.enqueue_function[_unpack_patches_kernel_bf16, _unpack_patches_kernel_bf16](
-            S_, D, t_dim, h_dim, w_dim, out_channels, pt, ps, total,
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=dst_rl,
+    )
+        ctx.enqueue_function[_unpack_patches_kernel_bf16](
+            S_, D, Int32(t_dim), Int32(h_dim), Int32(w_dim), Int32(out_channels), Int32(pt), Int32(ps), Int64(total),
             grid_dim=grid, block_dim=_UNPACK_BLOCK,
         )
     else:

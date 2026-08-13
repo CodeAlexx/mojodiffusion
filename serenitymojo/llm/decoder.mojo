@@ -10,7 +10,7 @@
 # Correctness gate (no HF needed): cached-decode logits == the verified no-cache
 # Qwen3Encoder.lm_logits_last, token-for-token.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.math import cos as fcos, sin as fsin, exp as fexp, log as flog
 from serenitymojo.tensor import Tensor

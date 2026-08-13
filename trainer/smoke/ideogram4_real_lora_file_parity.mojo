@@ -7,7 +7,7 @@
 #   34 layers * 6 block targets = 204 adapters
 #   408 tensors = lora_A + lora_B for every adapter
 #   BF16 tensors, rank 32, alpha omitted -> loader defaults alpha to rank.
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

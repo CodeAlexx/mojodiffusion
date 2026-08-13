@@ -35,7 +35,7 @@
 # Run (GPU; FP8 streaming keeps DiT bounded):
 #   pixi run mojo run -I . serenitymojo/pipeline/ltx2_t2v_av_hq.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, pow as fpow, log as flog, exp as fexp, pi
 from std.memory import alloc, ArcPointer
 from std.sys import argv
@@ -1788,7 +1788,7 @@ def _ltx2_proc_read_bytes() raises -> Int:
     if n <= 0:
         buf.free()
         raise Error("LTX2 hardware safety gate: cannot read /proc/self/io")
-    var text = String(StringSlice(ptr=buf, length=n))
+    var text = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=buf, length=n)))
     buf.free()
     for line in text.split("\n"):
         var row = String(line)

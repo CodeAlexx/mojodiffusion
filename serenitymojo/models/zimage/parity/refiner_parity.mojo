@@ -18,7 +18,7 @@
 #       serenitymojo/models/zimage/parity/refiner_parity.mojo -o /tmp/zimage_refiner_parity
 #   /tmp/zimage_refiner_parity
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness, ParityResult

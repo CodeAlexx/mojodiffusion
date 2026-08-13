@@ -15,7 +15,7 @@
 #   840 keys, BF16 tensors, rank 16, alpha 1.0. This is key/shape/dtype parity
 #   only; it does not claim Anima transformer forward/backward parity.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors

@@ -18,10 +18,9 @@
 #
 # Mojo 1.0.0b1, NVIDIA.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import ArcPointer, alloc, UnsafePointer
 from std.builtin.dtype import DType
-from std.builtin.type_aliases import MutExternalOrigin
 from std.collections import Optional
 from std.ffi import external_call
 from std.sys import argv

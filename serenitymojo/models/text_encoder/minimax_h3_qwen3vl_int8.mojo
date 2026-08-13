@@ -17,7 +17,7 @@
 # BOTH raw files exist at the exact byte sizes implied by the source header.
 # Interrupted builds simply resume at the first missing pair.
 
-from std.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host import DeviceContext, HostBuffer
 from std.gpu import global_idx
 from std.memory import ArcPointer
 from std.math import sqrt
@@ -101,10 +101,13 @@ def _h3_visual_rows_bf16[add_mode: Bool](
     hidden: LayoutTensor[DType.bfloat16, _H3_VISUAL_DYN1, MutAnyOrigin],
     values: LayoutTensor[DType.float32, _H3_VISUAL_DYN1, MutAnyOrigin],
     positions: LayoutTensor[DType.int32, _H3_VISUAL_DYN1, MutAnyOrigin],
-    seq: Int,
-    rows: Int,
-    width: Int,
+    seq_w: Int32,
+    rows_w: Int32,
+    width_w: Int32,
 ):
+    var seq = Int(seq_w)
+    var rows = Int(rows_w)
+    var width = Int(width_w)
     var idx = Int(global_idx.x)
     if idx < rows * width:
         var source_row = idx // width
@@ -165,29 +168,40 @@ def _h3_i8_visual_rows_device(
     )
     var hidden_tensor = LayoutTensor[
         DType.bfloat16, _H3_VISUAL_DYN1, MutAnyOrigin
-    ](hidden.buf.unsafe_ptr().bitcast[BFloat16](), hidden_layout)
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(hidden.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=hidden_layout,
+    )
     var source_tensor = LayoutTensor[
         DType.float32, _H3_VISUAL_DYN1, MutAnyOrigin
-    ](source.buf.unsafe_ptr().bitcast[Float32](), source_layout)
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(source.buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=source_layout,
+    )
     var positions_tensor = LayoutTensor[
         DType.int32, _H3_VISUAL_DYN1, MutAnyOrigin
-    ](pos_device.unsafe_ptr(), positions_layout)
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(pos_device.unsafe_ptr())
+        ),
+        runtime_layout=positions_layout,
+    )
     var total = rows * H3_HIDDEN
     var grid = (total + _H3_VISUAL_BLOCK - 1) // _H3_VISUAL_BLOCK
     if add_mode:
-        ctx.enqueue_function[
-            _h3_visual_rows_bf16[True], _h3_visual_rows_bf16[True]
-        ](
+        ctx.enqueue_function[_h3_visual_rows_bf16[True]](
             hidden_tensor, source_tensor, positions_tensor,
-            shape[1], rows, H3_HIDDEN,
+            Int32(shape[1]), Int32(rows), Int32(H3_HIDDEN),
             grid_dim=grid, block_dim=_H3_VISUAL_BLOCK,
         )
     else:
-        ctx.enqueue_function[
-            _h3_visual_rows_bf16[False], _h3_visual_rows_bf16[False]
-        ](
+        ctx.enqueue_function[_h3_visual_rows_bf16[False]](
             hidden_tensor, source_tensor, positions_tensor,
-            shape[1], rows, H3_HIDDEN,
+            Int32(shape[1]), Int32(rows), Int32(H3_HIDDEN),
             grid_dim=grid, block_dim=_H3_VISUAL_BLOCK,
         )
 

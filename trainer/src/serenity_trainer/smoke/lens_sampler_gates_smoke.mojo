@@ -25,7 +25,7 @@
 # transformer input + text features are cast to BF16 per step (the trained boundary).
 # The oracle is f32/bf16 mixed — the 0.999 / 28 dB bars account for the bf16<->f32 gap.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import log10, isfinite
 from std.time import perf_counter
 

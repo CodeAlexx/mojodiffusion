@@ -9,7 +9,7 @@
 #   pixi run mojo run -I . serenitymojo/models/zimage/parity/zimage_lora_resume_state_smoke.mojo
 
 from std.builtin.dtype import DType
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors

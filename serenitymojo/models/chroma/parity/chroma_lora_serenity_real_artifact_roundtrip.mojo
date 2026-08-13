@@ -16,7 +16,7 @@
 #   (SerenityTrainer 423c3b36, "#chroma LoRA 24GB" preset, rank 16, alpha 1.0)
 
 from std.sys import argv
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.models.chroma.chroma_stack_lora import (

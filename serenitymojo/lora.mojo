@@ -36,7 +36,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. File I/O via io/safetensors only.
 
 from std.memory import ArcPointer
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors, TensorRef

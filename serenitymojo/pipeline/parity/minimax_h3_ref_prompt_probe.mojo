@@ -108,7 +108,8 @@ def _split(s: String, sep: String) raises -> List[String]:
             out.append(rest)
             break
         out.append(String(rest[byte=0 : at]))
-        rest = String(rest[byte = at + seplen :])
+        var _tmp_rest = String(rest[byte = at + seplen :])
+        rest = _tmp_rest^
     return out^
 
 

@@ -9,7 +9,7 @@
 # its tiling skips. This isolates that: zero the pad rows of grad_y, run M=L vs M=2L,
 # and check whether the pad rows of d_x come back ZERO.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt
 from serenitymojo.tensor import Tensor

@@ -8,7 +8,7 @@
 # operation; this module owns the dimensions and schedule scalars that those GPU
 # operations must obey.
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp
 
 from serenitymojo.tensor import Tensor

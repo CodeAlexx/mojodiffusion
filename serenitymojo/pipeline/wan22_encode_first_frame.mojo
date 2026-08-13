@@ -9,7 +9,7 @@
 # output key: first_latent [48,1,H/16,W/16] F32
 
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import round
 from std.memory import ArcPointer
 from std.sys import argv

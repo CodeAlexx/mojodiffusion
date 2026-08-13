@@ -10,7 +10,7 @@
 #
 # Parity gate: serenitymojo/models/dit/tests/seedvr2_sampler_parity.mojo
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar

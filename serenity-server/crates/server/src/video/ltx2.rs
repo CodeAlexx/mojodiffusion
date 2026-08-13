@@ -39,7 +39,11 @@ pub(super) const LTX2_REFHQ_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8";
 pub(super) const LTX2_REFHQ_BF16_CHECKPOINT: &str = "ltx-2.3-22b-dev-fp8-dequant-bf16";
 pub(super) const LTX2_REFHQ_DISTILLATION_ADAPTER: &str =
     "checkpoints/ltx-2.3-22b-distilled-lora-384-1.1.safetensors";
-pub(super) const LTX2_CUDA_CACHE: &str = "/dev/shm/serenity-ltx2-cuda-cache";
+// Persistent DISK path, deliberately not /dev/shm: the CUDA JIT cache is the
+// only thing standing between a freshly deployed binary and a ~10-20 minute
+// first-job compile tax (MJ-1135 measured 1306 s cold vs 142 s warm on the
+// same request). tmpfs lost it on every reboot and charged it against RAM.
+pub(super) const LTX2_CUDA_CACHE: &str = "output/cuda_cache_video";
 pub(super) const LTX2_SAMPLER_PARITY_REPORT: &str = "output/checks/ltx2_sampler_parity.json";
 pub(super) const LTX2_VAE_PARITY_REPORT: &str = "output/checks/ltx2_vae_frame_parity.json";
 pub(super) const LTX2_AUDIO_PARITY_REPORT: &str = "output/checks/ltx2_audio_parity.json";

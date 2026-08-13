@@ -1655,7 +1655,12 @@ pub(super) fn start_minimax_h3_request(
             let _ = bus.send((thread_video_id.clone(), event));
         };
         let fail = |phase: &str, error: String| {
-            cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+            // Decode-side failures leave a complete denoise behind; keep the
+            // latents so the decode can be retried instead of losing the
+            // render (see cleanup_minimax_h3_intermediates).
+            let keep_latents =
+                phase == "decode" || phase == "decode_start" || phase == "result";
+            cleanup_minimax_h3_intermediates(&thread_out_dir, keep_latents);
             let _ = write_minimax_h3_job_status(&thread_out_dir, "failed", phase, 0, steps, &error);
             publish(WorkerEvent::Failed { error });
         };
@@ -1855,7 +1860,6 @@ pub(super) fn start_minimax_h3_request(
         let decode_log = match std::fs::File::create(&decode_log_path) {
             Ok(file) => file,
             Err(error) => {
-                cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
                 fail(
                     "decode_start",
                     format!("cannot create MiniMax-H3 decode log: {error}"),
@@ -1866,7 +1870,6 @@ pub(super) fn start_minimax_h3_request(
         let decode_stderr = match decode_log.try_clone() {
             Ok(file) => file,
             Err(error) => {
-                cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
                 fail(
                     "decode_start",
                     format!("cannot clone MiniMax-H3 decode log: {error}"),
@@ -1910,7 +1913,6 @@ pub(super) fn start_minimax_h3_request(
             .as_ref()
             .is_ok_and(std::process::ExitStatus::success)
         {
-            cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
             fail(
                 "decode",
                 format!(
@@ -1937,7 +1939,6 @@ pub(super) fn start_minimax_h3_request(
             repo_root().join(authored)
         };
         if !artifact.is_file() {
-            cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
             fail(
                 "result",
                 format!(
@@ -2036,6 +2037,16 @@ pub(super) fn start_minimax_h3_request(
 }
 
 pub(super) fn cleanup_minimax_h3_conditioned_intermediates(out_dir: &std::path::Path) {
+    cleanup_minimax_h3_intermediates(out_dir, false);
+}
+
+/// `keep_latents` retains `latents.safetensors`/`latents_ckpt.safetensors` so a
+/// failed decode can be retried without repeating the denoise. A decode failure
+/// is usually transient VRAM co-tenancy, while the latents represent the whole
+/// GPU cost of the job: video-0190 lost a 57-minute 1344x768 render to this
+/// cleanup, and the isolated decode retry at the same geometry succeeded with
+/// ~10 GiB free (decode peak ~12.9 GiB, measured 2026-08-12).
+pub(super) fn cleanup_minimax_h3_intermediates(out_dir: &std::path::Path, keep_latents: bool) {
     let Ok(entries) = std::fs::read_dir(out_dir) else {
         return;
     };
@@ -2043,10 +2054,11 @@ pub(super) fn cleanup_minimax_h3_conditioned_intermediates(out_dir: &std::path::
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let generated_frame = name.starts_with("frame_") && name.ends_with(".png");
+        let latent_artifact =
+            name == "latents.safetensors" || name == "latents_ckpt.safetensors";
         let transient = generated_frame
             || name == "audio.wav"
-            || name == "latents.safetensors"
-            || name == "latents_ckpt.safetensors"
+            || (latent_artifact && !keep_latents)
             || name == ".gpu_guard"
             || name == "ref_prompt.txt"
             || name.starts_with("keyframe_first.")
@@ -2319,7 +2331,12 @@ pub(super) fn start_minimax_h3_conditioned_request(
             let _ = bus.send((thread_video_id.clone(), event));
         };
         let fail = |phase: &str, error: String| {
-            cleanup_minimax_h3_conditioned_intermediates(&thread_out_dir);
+            // Decode-side failures leave a complete denoise behind; keep the
+            // latents so the decode can be retried instead of losing the
+            // render (see cleanup_minimax_h3_intermediates).
+            let keep_latents =
+                phase == "decode" || phase == "decode_start" || phase == "result";
+            cleanup_minimax_h3_intermediates(&thread_out_dir, keep_latents);
             let _ = write_minimax_h3_job_status(&thread_out_dir, "failed", phase, 0, steps, &error);
             publish(WorkerEvent::Failed { error });
         };

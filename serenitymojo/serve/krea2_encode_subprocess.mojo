@@ -24,6 +24,7 @@ from max.gpu.host import DeviceContext
 from std.time import sleep
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
+from serenitymojo.tokenizer.tokenizer_cache import qwen3_tokenizer_open
 from serenitymojo.models.text_encoder.krea2_qwen3vl_4b import (
     load_krea2_qwen3vl_4b, encode_krea2_stack,
 )
@@ -67,7 +68,9 @@ def krea2_encode_child_run(
     write the two BF16 context tensors, then RETURN so the process exits and the OS
     reclaims ALL encoder VRAM."""
     var ctx = DeviceContext()
-    var tok = Qwen3Tokenizer(String(KREA2_TOK_JSON))
+    var tok = qwen3_tokenizer_open(
+        String(KREA2_TOK_JSON), String(KREA2_TOK_JSON) + ".mjtok"
+    )
     var enc = load_krea2_qwen3vl_4b(String(KREA2_TE_DIR), ctx)
     var lt_pos = _krea2_encode_one(enc, tok, prompt, String("POS"), pos_bin, ctx)
     var lt_neg = _krea2_encode_one(enc, tok, negative, String("NEG"), neg_bin, ctx)
@@ -79,7 +82,9 @@ def _krea2_encode_in_process(
     ctx: DeviceContext,
 ) raises:
     """Fallback: encode in THIS process (correct; TE VRAM stays in the pool)."""
-    var tok = Qwen3Tokenizer(String(KREA2_TOK_JSON))
+    var tok = qwen3_tokenizer_open(
+        String(KREA2_TOK_JSON), String(KREA2_TOK_JSON) + ".mjtok"
+    )
     var enc = load_krea2_qwen3vl_4b(String(KREA2_TE_DIR), ctx)
     _ = _krea2_encode_one(enc, tok, prompt, String("POS"), pos_bin, ctx)
     _ = _krea2_encode_one(enc, tok, negative, String("NEG"), neg_bin, ctx)

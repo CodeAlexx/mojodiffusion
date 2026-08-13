@@ -66,6 +66,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
+from serenitymojo.tokenizer.tokenizer_cache import qwen3_tokenizer_open
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config, _clone
 from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.io.train_config_reader import read_model_config
@@ -314,7 +315,10 @@ def _encode_text_pair(
     var qwen_cfg = _qwen_cfg_for_variant(variant)
     _require_file(String("Qwen3 tokenizer"), qwen_dir + String("/tokenizer.json"))
 
-    var tok = Qwen3Tokenizer(qwen_dir + String("/tokenizer.json"))
+    var tok = qwen3_tokenizer_open(
+        qwen_dir + String("/tokenizer.json"),
+        qwen_dir + String("/tokenizer.json.mjtok"),
+    )
     # max_layer=26: the klein taps are layers [8,17,26]; skipping lm_head +
     # layers 27..35 is what makes the 9B encoder fit the 16GB 5080 (the full
     # load is ~16.4GB and OOMs before denoise ever starts).

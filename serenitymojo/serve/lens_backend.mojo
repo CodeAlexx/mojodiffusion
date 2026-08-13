@@ -106,6 +106,7 @@ from serenitymojo.image.png import _quantize, ValueRange
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
+from serenitymojo.tokenizer.tokenizer_cache import qwen3_tokenizer_open
 from serenitymojo.models.text_encoder.gpt_oss_encoder import (
     GptOssEncoder, GptOssConfig, lens_extract_layers,
 )
@@ -485,7 +486,10 @@ struct LensBackend(GenBackend, Movable):
         if not self.loaded:
             self._load_model()  # resident weights + RoPE tables (needed by encode)
         _print_vram("before GPT-OSS encode")
-        var tok = Qwen3Tokenizer(String(LENS_TOKENIZER_JSON), True)  # o200k=True
+        var tok = qwen3_tokenizer_open(
+            String(LENS_TOKENIZER_JSON),
+            String(LENS_TOKENIZER_JSON) + ".mjtok", True,  # o200k=True
+        )
         var cond = _encode_one_prompt(
             self.resident[0][], tok, self.params.prompt, self.ctx
         )

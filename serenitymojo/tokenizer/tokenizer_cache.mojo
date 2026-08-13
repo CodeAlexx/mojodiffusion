@@ -253,13 +253,15 @@ def qwen3_tokenizer_load_cached(
 
 
 def qwen3_tokenizer_open(
-    source_path: String, cache_path: String
+    source_path: String, cache_path: String, pre_o200k: Bool = False
 ) raises -> Qwen3Tokenizer:
     """Load from the cache when it is valid, otherwise parse the JSON and write
-    one. The call a runtime should make."""
+    one. The call a runtime should make. `pre_o200k` only matters on the miss
+    path (the cache stores and restores the flag itself); pass the same value
+    the direct constructor would get."""
     try:
         return qwen3_tokenizer_load_cached(source_path, cache_path)
     except:
-        var tokenizer = Qwen3Tokenizer(source_path)
+        var tokenizer = Qwen3Tokenizer(source_path, pre_o200k)
         qwen3_tokenizer_cache_write(tokenizer, source_path, cache_path)
         return tokenizer^

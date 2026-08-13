@@ -33,7 +33,7 @@ comptime CACHE = "/home/alex/mojodiffusion/output/checks/qwen3vl_32b_tokenizer.m
 comptime PROMPTS = 12
 
 
-def _seconds(start: UInt, stop: UInt) -> Float64:
+def _seconds(start: Int, stop: Int) -> Float64:
     return Float64(Int(stop) - Int(start)) / 1.0e9
 
 

@@ -81,6 +81,7 @@ from serenitymojo.serve.backend import (
     reject_unsupported_conditioning_mask_params, reject_unsupported_lanpaint_params,
 )
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
+from serenitymojo.tokenizer.tokenizer_cache import qwen3_tokenizer_open
 
 
 comptime COND = "models/ideogram4/transformer/diffusion_pytorch_model.safetensors"
@@ -658,7 +659,9 @@ struct Ideogram4Backend(GenBackend, Movable):
             self._ensure_static_b[GH, GW](BUCKET_SQUARE)
 
     def _encode(mut self) raises:
-        var tok = Qwen3Tokenizer(String(TOK_JSON))
+        var tok = qwen3_tokenizer_open(
+            String(TOK_JSON), String(TOK_JSON) + ".mjtok"
+        )
         var ids = tok.encode(_render_chat_prompt(self.params.prompt))
         self.prompt_tokens = len(ids)
         if self.prompt_tokens > TEXT_TOKENS:

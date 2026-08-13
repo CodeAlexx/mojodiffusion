@@ -112,6 +112,7 @@ from serenitymojo.models.dit.sd3_mmdit import (
 from serenitymojo.models.sd35.sd3_lokr_overlay import (
     Sd3LokrOverlay, load_sd3_large_lokr,
 )
+from serenitymojo.serve.external_command import ExternalCommand
 from serenitymojo.serve.sd3_decode_subprocess import decode_subprocess
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
@@ -522,6 +523,10 @@ struct Sd3Backend(GenBackend, Movable):
     var cancel_flag: Bool
     var phase: Int
     var announced: Bool
+    var sidecar: ExternalCommand
+    var encode_started: Bool
+    var encode_sidecar_running: Bool
+    var encode_t0_ns: Int
     var cur: Int
     var params: JobParams
     var cfg: Float32
@@ -560,6 +565,10 @@ struct Sd3Backend(GenBackend, Movable):
         self.cancel_flag = False
         self.phase = S3PHASE_IDLE
         self.announced = False
+        self.sidecar = ExternalCommand()
+        self.encode_started = False
+        self.encode_sidecar_running = False
+        self.encode_t0_ns = 0
         self.cur = 0
         self.params = JobParams()
         self.cfg = Float32(4.5)
@@ -690,6 +699,8 @@ struct Sd3Backend(GenBackend, Movable):
         self.cancel_flag = False
         self.cur = 0
         self.announced = False
+        self.encode_started = False
+        self.encode_sidecar_running = False
         self.phase = S3PHASE_ENCODE
         self.job_t0_ns = perf_counter_ns()
         self.load_seconds = 0.0
@@ -884,12 +895,16 @@ struct Sd3Backend(GenBackend, Movable):
         self.caps = List[ArcPointer[Sd3Caps]]()
         self.caps.append(ArcPointer(caps^))
 
-    def _encode(mut self) raises:
-        """Encode in a short-lived Mojo process, then load the four BF16 tensors.
+    def _encode_start(mut self) raises -> Bool:
+        """Begin the process-isolated encode; returns True if the conditioning
+        cache satisfied the request immediately (nothing launched).
 
         Process exit is the measured reclamation boundary on this runtime. It
         keeps the proven `_assemble_one` math while ensuring CLIP/T5 allocations
-        are gone before the SD3.5 MMDiT worker loads its first block.
+        are gone before the SD3.5 MMDiT worker loads its first block. The
+        producer runs as a POLLABLE sidecar (klein_backend's ExternalCommand
+        pattern) — the old blocking `_shell` froze the worker event loop for
+        the whole 15-30 s encode, so progress/cancel went unserviced.
         """
         if (
             len(self.cap_cache) == 1
@@ -908,7 +923,7 @@ struct Sd3Backend(GenBackend, Movable):
                 cached.pooled_uncond.clone(self.ctx),
             )))
             self.text_conditioning_cache_hit = True
-            return
+            return True
 
         var stem = self.params.out_dir + "/." + self.params.job_id
         var prompt_path = stem + ".sd3_prompt.txt"
@@ -918,11 +933,14 @@ struct Sd3Backend(GenBackend, Movable):
         write_text_file(negative_path, self.params.negative)
         var cmd = String(CONDITIONING_PRODUCER) + " '" + prompt_path + "' '"
         cmd += negative_path + "' '" + cache_path + "'"
-        var rc = _shell(cmd)
-        if rc != 0:
-            raise Error(
-                String("sd3: conditioning producer failed with status ") + String(rc)
-            )
+        self.sidecar.start(String("sd3 conditioning"), cmd)
+        return False
+
+    def _encode_finish(mut self) raises:
+        """Load the four BF16 tensors the finished producer wrote."""
+        self.sidecar.require_success()
+        var stem = self.params.out_dir + "/." + self.params.job_id
+        var cache_path = stem + ".sd3_conditioning.safetensors"
         var st = ShardedSafeTensors.open(cache_path)
         var caps = Sd3Caps(
             Tensor.from_view_as_bf16(st.tensor_view(String("context")), self.ctx),
@@ -1234,6 +1252,10 @@ struct Sd3Backend(GenBackend, Movable):
         self.cur = 0
         self.cancel_flag = False
         self.announced = False
+        if self.encode_sidecar_running:
+            self.sidecar.kill()
+        self.encode_started = False
+        self.encode_sidecar_running = False
         self.caps = List[ArcPointer[Sd3Caps]]()
         self.sched = List[ArcPointer[SD3FlowMatchScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
@@ -1254,24 +1276,39 @@ struct Sd3Backend(GenBackend, Movable):
         try:
             if self.phase == S3PHASE_ENCODE:
                 if not self.announced:
-                    # announce BEFORE the long blocking encode tick (per-job
-                    # CLIP-L + CLIP-G + T5-XXL load + dual-prompt forward).
                     self.announced = True
                     r.step = 0
                     r.phase = String("encoding")
                     return r^
-                var encode_t0 = perf_counter_ns()
-                self._encode()
-                # `_encode` owns ~11 GiB of temporary CLIP/T5 tensors. They are
-                # destructed at the return boundary above, but the CUDA async
-                # pool retains those freed pages until explicitly trimmed.
+                if not self.encode_started:
+                    self.encode_t0_ns = perf_counter_ns()
+                    var cache_hit = self._encode_start()
+                    self.encode_started = True
+                    self.encode_sidecar_running = not cache_hit
+                    if self.encode_sidecar_running:
+                        r.step = 0
+                        r.phase = String("encoding")
+                        return r^
+                if self.encode_sidecar_running:
+                    # Poll the sidecar and keep servicing the event loop —
+                    # the old blocking `_shell` starved progress/cancel here.
+                    if not self.sidecar.poll():
+                        r.step = 0
+                        r.phase = String("encoding")
+                        return r^
+                    self._encode_finish()
+                    self.encode_sidecar_running = False
+                # The producer's CLIP/T5 allocations die with its process, but
+                # this worker's CUDA async pool still holds pages freed by the
+                # cap-cache load path until explicitly trimmed.
                 self.ctx.synchronize()
                 cu_mempool_trim_current(0)
                 self.ctx.synchronize()
                 _print_vram("after encoder scope-exit trim")
-                self.text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+                self.text_encode_seconds = Float64(perf_counter_ns() - self.encode_t0_ns) / 1.0e9
                 self._record_vram()
                 self.announced = False
+                self.encode_started = False
                 self.phase = S3PHASE_LOAD
                 r.step = 0
                 return r^

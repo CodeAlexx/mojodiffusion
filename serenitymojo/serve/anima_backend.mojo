@@ -76,6 +76,7 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
+from serenitymojo.tokenizer.tokenizer_cache import qwen3_tokenizer_open
 from serenitymojo.tokenizer.t5_tokenizer import T5Tokenizer
 
 from serenitymojo.ops.linear import linear
@@ -731,7 +732,9 @@ struct AnimaBackend(GenBackend, Movable):
         F32 lists. The negative is the literal params.negative (empty string ->
         empty-prompt CFG, matching the reference trainer/diffusers unconditional)."""
         _print_vram("before text encode (Qwen3 + adapter load)")
-        var qtok = Qwen3Tokenizer(String(QWEN3_TOK_JSON))
+        var qtok = qwen3_tokenizer_open(
+            String(QWEN3_TOK_JSON), String(QWEN3_TOK_JSON) + ".mjtok"
+        )
         var t5tok = T5Tokenizer.load(String(T5_TOK_JSON))
         var pos_tokens = tokenize_anima_text(self.params.prompt, qtok, t5tok)
         var neg_tokens = tokenize_anima_text(self.params.negative, qtok, t5tok)

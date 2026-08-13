@@ -183,7 +183,7 @@ def main() raises:
     var ref_stage_dir = String("")
     if len(a) >= 5:
         ref_stage_dir = String(a[4])
-    var edit_mode = len(ref_stage_dir) > 0
+    var edit_mode = ref_stage_dir.byte_length() > 0
 
     var ctx = DeviceContext()
     print("=== Klein prepare:", num_samples, "images -> VAE latent + Qwen3 caption -> cache ===")

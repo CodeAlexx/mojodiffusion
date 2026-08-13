@@ -823,7 +823,7 @@ var GenerateTab = (function () {
             '<div id="gen-h3-attention-row" class="gen-param-row" data-param-search="attention cudnn sage int8"><label class="gen-label" for="gen-h3-attention">Attention</label>' +
             '<select id="gen-h3-attention" class="gen-select"><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option></select></div>' +
             '<div id="gen-h3-step-cache-row" class="gen-param-row" data-param-search="denoise acceleration cache exact high speed"><label class="gen-label" for="gen-h3-step-cache">Denoise acceleration</label>' +
-            '<select id="gen-h3-step-cache" class="gen-select"><option value="exact">Exact · quality default</option><option value="high">Experimental cached · quality loss</option></select></div>' +
+            '<select id="gen-h3-step-cache" class="gen-select"><option value="exact">Exact · quality default</option><option value="high">High · adaptive cache, ~1.5x, approximate</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
             '<select id="gen-audio-policy" class="gen-select"><option value="none">No audio</option><option value="generate">Generate audio</option></select></div>' +
             '<div class="gen-param-row" data-param-search="camera motion dolly jib focus static"><label class="gen-label" for="gen-camera-motion">Camera Motion</label>' +
@@ -1040,6 +1040,13 @@ var GenerateTab = (function () {
     function buildGenerateBatchHTML() {
         return '<div class="gen-workspace-batch-head"><strong>Current Batch</strong><span id="gen-batch-status">Idle</span></div>' +
             '<div id="gen-batch-strip" class="gen-workspace-batch-strip"><div class="gen-workspace-batch-empty">New results appear here</div></div>' +
+            '<div id="gen-action-bar" class="gen-action-bar" style="display:none">' +
+            '<button class="gen-action-btn" id="gen-download" title="Download"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>' +
+            '<button class="gen-action-btn" id="gen-to-canvas" title="Coming in Canvas tab" disabled><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></button>' +
+            '<button class="gen-action-btn" id="gen-to-timeline" title="Send to Timeline"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg></button>' +
+            '<button class="gen-action-btn gen-action-btn-wide" id="gen-reuse-params" title="Restore every parameter used for this result"><i data-lucide="rotate-ccw"></i><span>Reuse parameters</span></button>' +
+            '<button class="gen-action-btn" id="gen-clear-preview" title="Clear"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>' +
+            '</div>' +
             '<div id="gen-metadata-panel" class="gen-metadata-panel">' +
             '<div class="gen-metadata-title">Selected result</div>' +
             '<div id="gen-metadata-summary" class="gen-metadata-summary"></div>' +
@@ -1097,19 +1104,65 @@ var GenerateTab = (function () {
             '</div>' +
             '<img id="gen-preview-img" class="gen-preview-img" style="display:none" alt="Generated image">' +
             '<video id="gen-preview-video" class="gen-preview-video" style="display:none" autoplay loop playsinline controls></video>' +
-            '<div id="gen-action-bar" class="gen-action-bar" style="display:none">' +
-            '<button class="gen-action-btn" id="gen-download" title="Download"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>' +
-            '<button class="gen-action-btn" id="gen-to-canvas" title="Coming in Canvas tab" disabled><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></button>' +
-            '<button class="gen-action-btn" id="gen-to-timeline" title="Send to Timeline"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg></button>' +
-            '<button class="gen-action-btn gen-action-btn-wide" id="gen-reuse-params" title="Restore every parameter used for this result"><i data-lucide="rotate-ccw"></i><span>Reuse parameters</span></button>' +
-            '<button class="gen-action-btn" id="gen-clear-preview" title="Clear"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>' +
-            '</div>' +
             '</div>' +
             '<div id="gen-progress-label" class="gen-progress-label"></div>' +
             '<div id="gen-progress" class="gen-progress"><div id="gen-progress-bar" class="gen-progress-bar"></div></div>' +
             '<div id="gen-error-banner" class="gen-error-banner"></div>' +
             '<div id="gen-ws-indicator" class="gen-ws-indicator"><span class="gen-ws-dot"></span><span>Reconnecting...</span></div>';
     }
+    // Double-click the preview (image or video) -> fullscreen viewer with an
+    // X (or Escape) to return. The overlay clones the media source so the
+    // in-page preview keeps playing state independently.
+    function openFullscreenPreview(sourceEl) {
+        if (!sourceEl || !sourceEl.src) return;
+        var overlay = document.createElement('div');
+        overlay.className = 'gen-fullscreen-overlay';
+        var media;
+        if (sourceEl.tagName === 'VIDEO') {
+            media = document.createElement('video');
+            media.src = sourceEl.src;
+            media.autoplay = true;
+            media.loop = true;
+            media.controls = true;
+            media.playsInline = true;
+        } else {
+            media = document.createElement('img');
+            media.src = sourceEl.src;
+            media.alt = 'Fullscreen result';
+        }
+        var close = document.createElement('button');
+        close.className = 'gen-fullscreen-close';
+        close.title = 'Close (Esc)';
+        close.textContent = '×';
+        function tearDown() {
+            document.removeEventListener('keydown', onKey);
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        }
+        function onKey(ev) {
+            if (ev.key === 'Escape') tearDown();
+        }
+        close.addEventListener('click', tearDown);
+        overlay.addEventListener('dblclick', function (ev) {
+            if (ev.target === overlay) tearDown();
+        });
+        document.addEventListener('keydown', onKey);
+        overlay.appendChild(media);
+        overlay.appendChild(close);
+        document.body.appendChild(overlay);
+    }
+    function wireFullscreenPreview() {
+        if (els.previewImg) {
+            els.previewImg.addEventListener('dblclick', function () {
+                openFullscreenPreview(els.previewImg);
+            });
+        }
+        if (els.previewVideo) {
+            els.previewVideo.addEventListener('dblclick', function () {
+                openFullscreenPreview(els.previewVideo);
+            });
+        }
+    }
+
     function cacheElements() {
         els.model = document.getElementById('gen-model');
         els.modelSearch = document.getElementById('gen-model-search');
@@ -1180,6 +1233,7 @@ var GenerateTab = (function () {
         els.empty = document.getElementById('gen-empty');
         els.previewImg = document.getElementById('gen-preview-img');
         els.previewVideo = document.getElementById('gen-preview-video');
+        wireFullscreenPreview();
         els.actionBar = document.getElementById('gen-action-bar');
         els.download = document.getElementById('gen-download');
         els.reuseParams = document.getElementById('gen-reuse-params');

@@ -1554,9 +1554,9 @@ var CanvasTab = (function () {
             '<label class="cv-setting-label" for="cv-h3-step-cache">Denoise acceleration</label>' +
             '<select id="cv-h3-step-cache" class="cv-select">' +
             '<option value="exact">Exact · every block, every step</option>' +
-            '<option value="high">Experimental cached · faster, quality loss</option>' +
+            '<option value="high">High · adaptive cache, ~1.5x, approximate</option>' +
             '</select>' +
-            '<div class="cv-helper-text">Exact is the quality default. Cached mode may visibly change the result.</div>' +
+            '<div class="cv-helper-text">Exact is the quality default. High skips blocks adaptively (accepted decoded A/B); combining High with Sage attention audibly lowers audio level.</div>' +
             '</details>' +
             '</div>' +
             '</div>' +

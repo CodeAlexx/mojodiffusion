@@ -773,6 +773,47 @@
     gap: 8px;
     margin-top: 12px;
 }
+/* Rail placement: the bar lives in the right batch panel, above Selected
+   result. Centered, wrap-friendly at narrow rail widths. */
+.gen-workspace-batch-panel .gen-action-bar {
+    margin: 10px 8px 8px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+/* Double-click fullscreen viewer */
+.gen-fullscreen-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 4000;
+    background: rgba(8, 9, 14, 0.97);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.gen-fullscreen-overlay img,
+.gen-fullscreen-overlay video {
+    max-width: 100vw;
+    max-height: 100vh;
+    object-fit: contain;
+}
+.gen-fullscreen-close {
+    position: absolute;
+    top: 14px;
+    right: 18px;
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-surface);
+    color: var(--shell-text);
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 4001;
+}
+.gen-fullscreen-close:hover {
+    border-color: var(--shell-text-muted);
+}
 .gen-action-btn {
     width: 36px;
     height: 36px;

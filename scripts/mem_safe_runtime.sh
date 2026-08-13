@@ -107,6 +107,15 @@ cleanup_runtime() {
 }
 trap cleanup_runtime INT TERM EXIT
 
+# A --user *service* starts with a clean environment (unlike mem_safe.sh's
+# env-inheriting scope). Forward the toolchain roots too, so `mojo build`
+# under this wrapper can resolve std/max — builds moved here after the
+# 2026-08-13 oomd session kill (low-MemoryHigh scope reclaim; MJ-1140).
+extra_env=()
+[[ -n "${CONDA_PREFIX:-}" ]] && extra_env+=(--setenv="CONDA_PREFIX=$CONDA_PREFIX")
+[[ -n "${MODULAR_HOME:-}" ]] && extra_env+=(--setenv="MODULAR_HOME=$MODULAR_HOME")
+[[ -n "${LD_LIBRARY_PATH:-}" ]] && extra_env+=(--setenv="LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+
 systemd-run --user \
   --quiet --wait --collect --pipe --service-type=exec \
   --unit="$unit_name" \
@@ -117,6 +126,7 @@ systemd-run --user \
   --property=OOMPolicy=kill \
   --property=ManagedOOMMemoryPressure=auto \
   --setenv="PATH=$PATH" \
+  "${extra_env[@]}" \
   -- "$prog_path" "$@" &
 runtime_runner_pid="$!"
 

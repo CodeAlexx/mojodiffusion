@@ -762,6 +762,487 @@ def _sage_attention_int8_token_kernel(
 
 
 @always_inline
+def _shfl_idx4_u32(value: UInt32, src_lane: Int32) -> UInt32:
+    """Width-4 index shuffle (same segment config as `_shfl_xor4_f32`)."""
+    var r = inlined_assembly[
+        "shfl.sync.idx.b32 $0, $1, $2, 0x1c03, 0xffffffff;",
+        _RegisterPackType[UInt32],
+        constraints="=r,r,r",
+    ](value, src_lane)
+    return r[0]
+
+
+def _sage_quant_v_dmajor_bf16(
+    src: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],  # BSHD [S,H,128]
+    v8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],       # [H,128,S_pad]
+    vs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],    # [H,128]
+    S_w: Int32,
+    S_pad_w: Int32,
+    H_w: Int32,
+):
+    """Per-(head, channel) INT8 V quantization, written d-major.
+
+    d-major ([H][128][S_pad]) makes the PV s8 B-fragment two direct 4-byte
+    shared loads per tile instead of a transposing ldmatrix (8-bit data has
+    no `.trans` ldmatrix). One thread owns one (head, d) pair: max-abs pass,
+    then the quantize pass. The padded tail is zero-filled so partial final
+    KV tiles multiply zeros, matching the P-side OOB zeroing."""
+    var S = Int(S_w)
+    var S_pad = Int(S_pad_w)
+    var H = Int(H_w)
+    var hd = Int(global_idx.x)
+    if hd >= H * _HEAD_DIM:
+        return
+    var head = hd // _HEAD_DIM
+    var d = hd - head * _HEAD_DIM
+    var amax = Float32(0.0)
+    for s in range(S):
+        var val = Float32(rebind[Scalar[DType.bfloat16]](
+            src[(s * H + head) * _HEAD_DIM + d]
+        ))
+        var a = val if val >= 0 else -val
+        amax = amax if amax > a else a
+    var scale = amax / Float32(127.0)
+    if scale < Float32(1e-30):
+        scale = Float32(1e-30)
+    vs[hd] = rebind[vs.element_type](scale)
+    var inv = Float32(1.0) / scale
+    var base = hd * S_pad
+    for s in range(S):
+        var val = Float32(rebind[Scalar[DType.bfloat16]](
+            src[(s * H + head) * _HEAD_DIM + d]
+        ))
+        var q = val * inv
+        q = q + Float32(0.5) if q >= 0 else q - Float32(0.5)
+        var qi = q.cast[DType.int32]()
+        qi = Int32(127) if qi > 127 else qi
+        qi = Int32(-127) if qi < -127 else qi
+        v8[base + s] = rebind[v8.element_type](qi.cast[DType.int8]())
+    for s in range(S, S_pad):
+        v8[base + s] = rebind[v8.element_type](Int8(0))
+
+
+def _sage_attention_int8_pv8_token_kernel(
+    q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
+    k8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
+    qs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    ks: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    v8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],   # [H,128,S_pad] d-major
+    vs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [H,128]
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    S_w: Int32,
+    S_pad_w: Int32,
+    H_w: Int32,
+    scale: Float32,
+):
+    """INT8 QK + online softmax + INT8 PV (INT-FlashAttention recipe).
+
+    Identical to `_sage_attention_int8_token_kernel` through the softmax;
+    the PV half quantizes P per row as round(127*exp(s - m)) — the row scale
+    is the online-softmax row max the kernel already tracks — runs PV on the
+    same m16n8k32 s8 MMA as QK (INT32 tile accumulators), and folds
+    (v_scale/127) into the F32 online accumulator per tile, so the exact
+    rescale-by-exp(m_old - m_new) semantics are preserved. The row sums l
+    stay exact F32 (the 1/127 is folded at accumulate time instead).
+    P register repack C-fragment -> s8 A-fragment runs on width-4 index
+    shuffles (each pk word carries both query rows: 16 shuffles per tile)."""
+    var S = Int(S_w)
+    var S_pad = Int(S_pad_w)
+    var H = Int(H_w)
+    var tid = Int(thread_idx.x)
+    var warp = tid >> 5
+    var lane = tid & 31
+    var group = lane >> 2
+    var thread = lane & 3
+    var head = Int(block_idx.y)
+    var q_start = Int(block_idx.x) * (_WARPS * _Q_TILE) + warp * _Q_TILE
+    var q0 = q_start + group
+    var q1 = q0 + 8
+
+    var k_sh = stack_allocation[
+        2 * _KV_TILE * _HEAD_DIM, Scalar[DType.int8],
+        address_space=AddressSpace.SHARED,
+    ]()
+    # d-major s8 V tile: [128 d][_KV_TILE kv] per stage (half the BF16 bytes).
+    var v_sh = stack_allocation[
+        2 * _KV_TILE * _HEAD_DIM, Scalar[DType.int8],
+        address_space=AddressSpace.SHARED,
+    ]()
+
+    var out_frag = SIMD[DType.float32, 64](0.0)
+    var m0 = _NEG_BIG
+    var m1 = _NEG_BIG
+    var l0 = Float32(0.0)
+    var l1 = Float32(0.0)
+
+    # Per-lane V dequant scales for the 32 output columns this lane owns:
+    # d = nt*8 + thread*2 + par  (the epilogue mapping), pre-divided by 127.
+    var vs_frag = SIMD[DType.float32, 32](0.0)
+    comptime for nt in range(16):
+        comptime for par in range(2):
+            vs_frag[nt * 2 + par] = rebind[Scalar[DType.float32]](
+                vs[head * _HEAD_DIM + nt * 8 + thread * 2 + par]
+            ) * Float32(1.0 / 127.0)
+
+    var q_frag = SIMD[DType.int8, 64](0)
+    comptime for chunk in range(4):
+        comptime k_off = chunk * 32
+        comptime for i in range(16):
+            comptime row_hi = not (i < 4 or (i >= 8 and i < 12))
+            var qr = q_start + group + (8 if row_hi else 0)
+            var d = thread * 4 + (i & 3) \
+                + (16 if i >= 8 else 0) + k_off
+            if qr < S:
+                q_frag[chunk * 16 + i] = rebind[Scalar[DType.int8]](
+                    q8[(head * S + qr) * _HEAD_DIM + d]
+                )
+    var qscale = rebind[Scalar[DType.float32]](
+        qs[
+            (head * ceildiv(S, _Q_QUANT_BLOCK)
+                + q_start // _Q_QUANT_BLOCK)
+            * _Q_SCALES_PER_BLOCK + group
+        ]
+    )
+
+    # Prime stage zero (K identical to the BF16-PV kernel; V from d-major s8:
+    # 16 contiguous kv bytes per cp.async, one head-row of d at a time).
+    var k_copy = tid
+    while k_copy < (_KV_TILE * _HEAD_DIM) // 16:
+        var valid = Int32(16) if k_copy * 16 < S * _HEAD_DIM else Int32(0)
+        var k_elem = k_copy * 16
+        var k_row = k_elem // _HEAD_DIM
+        var k_col = k_elem - k_row * _HEAD_DIM
+        var k_phys = k_row * _HEAD_DIM \
+            + (k_col ^ ((k_row & 7) * 16))
+        _ = inlined_assembly[
+            (
+                "cp.async.cg.shared.global [$1], [$2], 16, $3; "
+                "mov.u32 $0, 0;"
+            ),
+            UInt32,
+            constraints="=r,r,l,r",
+            has_side_effect=True,
+        ](k_sh + k_phys, k8.ptr + head * S * _HEAD_DIM + k_elem, valid)
+        k_copy += _WARPS * 32
+    var v_copy = tid
+    while v_copy < (_KV_TILE * _HEAD_DIM) // 16:
+        # v_copy indexes 16-byte groups of the d-major tile: d = group//4,
+        # kv = (group%4)*16.
+        var valid = Int32(16) if v_copy * 16 < _HEAD_DIM * S_pad else Int32(0)
+        var d_row = (v_copy * 16) // _KV_TILE
+        var kv_off = (v_copy * 16) - d_row * _KV_TILE
+        _ = inlined_assembly[
+            (
+                "cp.async.cg.shared.global [$1], [$2], 16, $3; "
+                "mov.u32 $0, 0;"
+            ),
+            UInt32,
+            constraints="=r,r,l,r",
+            has_side_effect=True,
+        ](
+            v_sh + d_row * _KV_TILE + kv_off,
+            v8.ptr + (head * _HEAD_DIM + d_row) * S_pad + kv_off,
+            valid,
+        )
+        v_copy += _WARPS * 32
+    _ = inlined_assembly[
+        "cp.async.commit_group; mov.u32 $0, 0;",
+        UInt32,
+        constraints="=r",
+        has_side_effect=True,
+    ]()
+    _ = inlined_assembly[
+        "cp.async.wait_group 0; mov.u32 $0, 0;",
+        UInt32,
+        constraints="=r",
+        has_side_effect=True,
+    ]()
+    barrier()
+
+    var key_start = 0
+    var stage = 0
+    while key_start < S:
+        var next_start = key_start + _KV_TILE
+        var next_stage = stage ^ 1
+        if next_start < S:
+            var valid_tokens = S - next_start
+            if valid_tokens > _KV_TILE:
+                valid_tokens = _KV_TILE
+            k_copy = tid
+            while k_copy < (_KV_TILE * _HEAD_DIM) // 16:
+                var valid = Int32(16) \
+                    if k_copy * 16 < valid_tokens * _HEAD_DIM else Int32(0)
+                var k_elem = k_copy * 16
+                var k_row = k_elem // _HEAD_DIM
+                var k_col = k_elem - k_row * _HEAD_DIM
+                var k_phys = k_row * _HEAD_DIM \
+                    + (k_col ^ ((k_row & 7) * 16))
+                _ = inlined_assembly[
+                    (
+                        "cp.async.cg.shared.global [$1], [$2], 16, $3; "
+                        "mov.u32 $0, 0;"
+                    ),
+                    UInt32,
+                    constraints="=r,r,l,r",
+                    has_side_effect=True,
+                ](
+                    k_sh + next_stage * _KV_TILE * _HEAD_DIM + k_phys,
+                    k8.ptr + (head * S + next_start) * _HEAD_DIM + k_elem,
+                    valid,
+                )
+                k_copy += _WARPS * 32
+            v_copy = tid
+            while v_copy < (_KV_TILE * _HEAD_DIM) // 16:
+                # S_pad is _KV_TILE-aligned, so the full 16-byte group is
+                # always inside the padded row; the pad itself is zeros.
+                var d_row = (v_copy * 16) // _KV_TILE
+                var kv_off = (v_copy * 16) - d_row * _KV_TILE
+                _ = inlined_assembly[
+                    (
+                        "cp.async.cg.shared.global [$1], [$2], 16, $3; "
+                        "mov.u32 $0, 0;"
+                    ),
+                    UInt32,
+                    constraints="=r,r,l,r",
+                    has_side_effect=True,
+                ](
+                    v_sh + next_stage * _KV_TILE * _HEAD_DIM
+                        + d_row * _KV_TILE + kv_off,
+                    v8.ptr + (head * _HEAD_DIM + d_row) * S_pad
+                        + next_start + kv_off,
+                    Int32(16),
+                )
+                v_copy += _WARPS * 32
+            _ = inlined_assembly[
+                "cp.async.commit_group; mov.u32 $0, 0;",
+                UInt32,
+                constraints="=r",
+                has_side_effect=True,
+            ]()
+
+        var k_stage_base = stage * _KV_TILE * _HEAD_DIM
+        var v_stage_base = stage * _KV_TILE * _HEAD_DIM
+
+        var kscale = rebind[Scalar[DType.float32]](
+            ks[
+                (head * ceildiv(S, _K_QUANT_BLOCK)
+                    + key_start // _K_QUANT_BLOCK)
+                * _K_SCALES_PER_BLOCK + thread
+            ]
+        )
+        var score_factor = qscale * kscale * scale
+
+        var scores = SIMD[DType.int32, 32](0)
+        comptime for chunk_pair in range(2):
+            var af0 = SIMD[DType.int8, 16]()
+            comptime for i in range(16):
+                af0[i] = q_frag[(chunk_pair * 2) * 16 + i]
+            var k_next = SIMD[DType.int8, 64](0)
+            comptime for n_half in range(8):
+                var matrix = lane >> 3
+                var matrix_row = lane & 7
+                var k_row = n_half * _QK_N + matrix_row
+                var k_col = chunk_pair * 64 + matrix * 16
+                var k_addr = k_stage_base + k_row * _HEAD_DIM \
+                    + (k_col ^ ((k_row & 7) * 16))
+                var kr = inlined_assembly[
+                    (
+                        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                        "{$0, $1, $2, $3}, [$4];"
+                    ),
+                    _RegisterPackType[UInt32, UInt32, UInt32, UInt32],
+                    constraints="=r,=r,=r,=r,r",
+                ](k_sh + k_addr)
+                var bf = bitcast[DType.int8, 8](
+                    SIMD[DType.uint32, 2](kr[0], kr[1])
+                )
+                var bf_next = bitcast[DType.int8, 8](
+                    SIMD[DType.uint32, 2](kr[2], kr[3])
+                )
+                comptime for i in range(8):
+                    k_next[n_half * 8 + i] = bf_next[i]
+                var cf = SIMD[DType.int32, 4](
+                    scores[n_half * 4], scores[n_half * 4 + 1],
+                    scores[n_half * 4 + 2], scores[n_half * 4 + 3],
+                )
+                var df = _mma_m16n8k32_s8(af0, bf, cf)
+                comptime for i in range(4):
+                    scores[n_half * 4 + i] = df[i]
+            var af1 = SIMD[DType.int8, 16]()
+            comptime for i in range(16):
+                af1[i] = q_frag[(chunk_pair * 2 + 1) * 16 + i]
+            comptime for n_half in range(8):
+                var bf = SIMD[DType.int8, 8]()
+                comptime for i in range(8):
+                    bf[i] = k_next[n_half * 8 + i]
+                var cf = SIMD[DType.int32, 4](
+                    scores[n_half * 4], scores[n_half * 4 + 1],
+                    scores[n_half * 4 + 2], scores[n_half * 4 + 3],
+                )
+                var df = _mma_m16n8k32_s8(af1, bf, cf)
+                comptime for i in range(4):
+                    scores[n_half * 4 + i] = df[i]
+
+        var tile_m0 = _NEG_BIG
+        var tile_m1 = _NEG_BIG
+        comptime for n_half in range(8):
+            var key0 = key_start + n_half * _QK_N + thread * 2
+            var key1 = key0 + 1
+            var s00 = Float32(scores[n_half * 4]) \
+                * score_factor
+            var s01 = Float32(scores[n_half * 4 + 1]) \
+                * score_factor
+            var s10 = Float32(scores[n_half * 4 + 2]) \
+                * score_factor
+            var s11 = Float32(scores[n_half * 4 + 3]) \
+                * score_factor
+            if key0 < S:
+                tile_m0 = tile_m0 if tile_m0 > s00 else s00
+                tile_m1 = tile_m1 if tile_m1 > s10 else s10
+            if key1 < S:
+                tile_m0 = tile_m0 if tile_m0 > s01 else s01
+                tile_m1 = tile_m1 if tile_m1 > s11 else s11
+        var peer = _shfl_xor4_f32(tile_m0, 1)
+        tile_m0 = tile_m0 if tile_m0 > peer else peer
+        peer = _shfl_xor4_f32(tile_m0, 2)
+        tile_m0 = tile_m0 if tile_m0 > peer else peer
+        peer = _shfl_xor4_f32(tile_m1, 1)
+        tile_m1 = tile_m1 if tile_m1 > peer else peer
+        peer = _shfl_xor4_f32(tile_m1, 2)
+        tile_m1 = tile_m1 if tile_m1 > peer else peer
+
+        var m_new0 = m0 if m0 > tile_m0 else tile_m0
+        var m_new1 = m1 if m1 > tile_m1 else tile_m1
+        var corr0 = Float32(0.0) if m0 == _NEG_BIG else exp(m0 - m_new0)
+        var corr1 = Float32(0.0) if m1 == _NEG_BIG else exp(m1 - m_new1)
+        comptime for nt in range(16):
+            comptime base = nt * 4
+            out_frag[base + 0] *= corr0
+            out_frag[base + 1] *= corr0
+            out_frag[base + 2] *= corr1
+            out_frag[base + 3] *= corr1
+
+        # pk[n_half]: this lane's four P values for one 8-column group,
+        # quantized to [0,127] and packed row0-pair | row1-pair (low|high u16)
+        # so ONE shuffled word serves both query rows of the A-fragment.
+        var pk = SIMD[DType.uint32, 8](0)
+        var tile_l0 = Float32(0.0)
+        var tile_l1 = Float32(0.0)
+        comptime for n_half in range(8):
+            var key0 = key_start + n_half * _QK_N + thread * 2
+            var key1 = key0 + 1
+            var p00 = exp(
+                Float32(scores[n_half * 4]) * score_factor - m_new0
+            ) if q0 < S and key0 < S else Float32(0.0)
+            var p01 = exp(
+                Float32(scores[n_half * 4 + 1]) * score_factor - m_new0
+            ) if q0 < S and key1 < S else Float32(0.0)
+            var p10 = exp(
+                Float32(scores[n_half * 4 + 2]) * score_factor - m_new1
+            ) if q1 < S and key0 < S else Float32(0.0)
+            var p11 = exp(
+                Float32(scores[n_half * 4 + 3]) * score_factor - m_new1
+            ) if q1 < S and key1 < S else Float32(0.0)
+            var i00 = (p00 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i01 = (p01 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i10 = (p10 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            var i11 = (p11 * Float32(127.0) + Float32(0.5)).cast[DType.uint32]()
+            pk[n_half] = i00 | (i01 << 8) | (i10 << 16) | (i11 << 24)
+            tile_l0 += p00 + p01
+            tile_l1 += p10 + p11
+        tile_l0 += _shfl_xor4_f32(tile_l0, 1)
+        tile_l0 += _shfl_xor4_f32(tile_l0, 2)
+        tile_l1 += _shfl_xor4_f32(tile_l1, 1)
+        tile_l1 += _shfl_xor4_f32(tile_l1, 2)
+        l0 = l0 * corr0 + tile_l0
+        l1 = l1 * corr1 + tile_l1
+        m0 = m_new0
+        m1 = m_new1
+
+        # ── INT8 PV: P[16,64] x V8[64,128] as two k=32 s8 MMA chunks.
+        # Each chunk folds straight into the F32 accumulator: per-chunk INT32
+        # sums are <= 127*127*32 < 2^24, so f32(a)+f32(b) == f32(a+b) exactly
+        # and no 64-register INT32 accumulator array is needed. ──
+        comptime for c in range(2):
+            # A-fragment repack: lane t's kv rows {4t..4t+3, 16+4t..16+4t+3}
+            # live on source lanes src_a/src_b = 2*(t&1), +1, in pk words
+            # 4c + (t>>1) (first 16 kv) and 4c + 2 + (t>>1) (second 16 kv).
+            var src_a = Int32(2 * (thread & 1))
+            var src_b = src_a + 1
+            var lo_sel = thread < 2
+            var xa = _shfl_idx4_u32(pk[4 * c], src_a)
+            var ya = _shfl_idx4_u32(pk[4 * c + 1], src_a)
+            var xb = _shfl_idx4_u32(pk[4 * c], src_b)
+            var yb = _shfl_idx4_u32(pk[4 * c + 1], src_b)
+            var xc = _shfl_idx4_u32(pk[4 * c + 2], src_a)
+            var yc = _shfl_idx4_u32(pk[4 * c + 3], src_a)
+            var xd = _shfl_idx4_u32(pk[4 * c + 2], src_b)
+            var yd = _shfl_idx4_u32(pk[4 * c + 3], src_b)
+            var wa = xa if lo_sel else ya
+            var wb = xb if lo_sel else yb
+            var wc = xc if lo_sel else yc
+            var wd = xd if lo_sel else yd
+            var wa8 = bitcast[DType.uint8, 4](SIMD[DType.uint32, 1](wa))
+            var wb8 = bitcast[DType.uint8, 4](SIMD[DType.uint32, 1](wb))
+            var wc8 = bitcast[DType.uint8, 4](SIMD[DType.uint32, 1](wc))
+            var wd8 = bitcast[DType.uint8, 4](SIMD[DType.uint32, 1](wd))
+            var af = SIMD[DType.int8, 16](0)
+            af[0] = wa8[0].cast[DType.int8]()
+            af[1] = wa8[1].cast[DType.int8]()
+            af[2] = wb8[0].cast[DType.int8]()
+            af[3] = wb8[1].cast[DType.int8]()
+            af[4] = wa8[2].cast[DType.int8]()
+            af[5] = wa8[3].cast[DType.int8]()
+            af[6] = wb8[2].cast[DType.int8]()
+            af[7] = wb8[3].cast[DType.int8]()
+            af[8] = wc8[0].cast[DType.int8]()
+            af[9] = wc8[1].cast[DType.int8]()
+            af[10] = wd8[0].cast[DType.int8]()
+            af[11] = wd8[1].cast[DType.int8]()
+            af[12] = wc8[2].cast[DType.int8]()
+            af[13] = wc8[3].cast[DType.int8]()
+            af[14] = wd8[2].cast[DType.int8]()
+            af[15] = wd8[3].cast[DType.int8]()
+            var v_sh_u32 = v_sh.bitcast[Scalar[DType.uint32]]()
+            comptime for nt in range(16):
+                var d_col = nt * 8 + (lane >> 2)
+                var b_word = (v_stage_base + d_col * _KV_TILE
+                    + c * 32 + 4 * thread) >> 2
+                var bf = bitcast[DType.int8, 8](SIMD[DType.uint32, 2](
+                    rebind[Scalar[DType.uint32]](v_sh_u32[b_word]),
+                    rebind[Scalar[DType.uint32]](v_sh_u32[b_word + 4]),
+                ))
+                var df = _mma_m16n8k32_s8(af, bf, SIMD[DType.int32, 4](0))
+                comptime base = nt * 4
+                out_frag[base + 0] += Float32(df[0]) * vs_frag[nt * 2]
+                out_frag[base + 1] += Float32(df[1]) * vs_frag[nt * 2 + 1]
+                out_frag[base + 2] += Float32(df[2]) * vs_frag[nt * 2]
+                out_frag[base + 3] += Float32(df[3]) * vs_frag[nt * 2 + 1]
+
+        if next_start < S:
+            _ = inlined_assembly[
+                "cp.async.wait_group 0; mov.u32 $0, 0;",
+                UInt32,
+                constraints="=r",
+                has_side_effect=True,
+            ]()
+            barrier()
+        key_start = next_start
+        stage = next_stage
+
+    comptime for nt in range(16):
+        comptime base = nt * 4
+        comptime for i in range(4):
+            var qr = q_start + group + (8 if i >= 2 else 0)
+            var d = nt * 8 + thread * 2 + (i & 1)
+            if qr < S:
+                var denom = l0 if i < 2 else l1
+                o[(qr * H + head) * _HEAD_DIM + d] = rebind[o.element_type](
+                    (Float32(out_frag[base + i]) / denom).cast[DType.bfloat16]()
+                )
+
+
+@always_inline
 def _sage_enqueue_forward(
     Q: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     K: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
@@ -926,6 +1407,167 @@ def sage_attention_int8_fwd_dynamic(
     )
     _sage_enqueue_forward(
         Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx
+    )
+    return Tensor(out_buf^, want^, STDtype.BF16)
+
+
+def sage_attention_int8_pv8_fwd_dynamic(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """EXPERIMENTAL fully-INT8 Sage: INT8 QK *and* INT8 PV.
+
+    Same Q/K quantization chain as `sage_attention_int8_fwd_dynamic`; V is
+    additionally quantized per (head, channel) and PV runs on the same
+    m16n8k32 s8 MMA as QK (INT-FlashAttention recipe: P as
+    round(127*exp(s-m)), the 1/127 and per-channel V scales folded into the
+    F32 online accumulator, row sums exact F32). Probe/gating entry only —
+    NOT wired to any product path until the parity + audio gates pass."""
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 \
+            or v.dtype() != STDtype.BF16:
+        raise Error("sage_attention_int8_pv8_fwd requires BF16 Q/K/V")
+    var qsh = q.shape()
+    var ksh = k.shape()
+    var vsh = v.shape()
+    if len(qsh) != 4 or ksh != qsh or vsh != qsh:
+        raise Error("sage_attention_int8_pv8_fwd shape mismatch")
+    var B = qsh[0]
+    var S = qsh[1]
+    var H = qsh[2]
+    var Dh = qsh[3]
+    if B != 1 or Dh != _HEAD_DIM:
+        raise Error("sage_attention_int8_pv8_fwd requires B=1, Dh=128")
+    var S_pad = ceildiv(S, _KV_TILE) * _KV_TILE
+    var want = List[Int]()
+    want.append(B)
+    want.append(S)
+    want.append(H)
+    want.append(Dh)
+    var rows = H * S
+    var elems = rows * Dh
+    var qscale_elems = H * ceildiv(S, _Q_QUANT_BLOCK) \
+        * _Q_SCALES_PER_BLOCK
+    var kscale_elems = H * ceildiv(S, _K_QUANT_BLOCK) \
+        * _K_SCALES_PER_BLOCK
+    var q8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
+    var k8_buf = ctx.enqueue_create_buffer[DType.uint8](elems)
+    var qs_buf = ctx.enqueue_create_buffer[DType.uint8](qscale_elems * 4)
+    var ks_buf = ctx.enqueue_create_buffer[DType.uint8](kscale_elems * 4)
+    var km_buf = ctx.enqueue_create_buffer[DType.uint8](H * Dh * 2)
+    var v8_buf = ctx.enqueue_create_buffer[DType.uint8](H * Dh * S_pad)
+    var vscale_buf = ctx.enqueue_create_buffer[DType.uint8](H * Dh * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](elems * 2)
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](elems))
+    var qscale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](qscale_elems))
+    var kscale_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](kscale_elems))
+    var hd_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](H * Dh))
+    var v8_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](H * Dh * S_pad))
+    var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var K = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(k.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(v.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var Q8u = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(q8_buf.unsafe_ptr())
+        ),
+        runtime_layout=src_rl,
+    )
+    var K8u = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(k8_buf.unsafe_ptr())
+        ),
+        runtime_layout=src_rl,
+    )
+    var Q8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(q8_buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var K8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(k8_buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=src_rl,
+    )
+    var QS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(qs_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=qscale_rl,
+    )
+    var KS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(ks_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=kscale_rl,
+    )
+    var KM = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(km_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=hd_rl,
+    )
+    var V8 = LayoutTensor[DType.int8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=Int(v8_buf.unsafe_ptr().bitcast[Int8]())
+        ),
+        runtime_layout=v8_rl,
+    )
+    var VS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(vscale_buf.unsafe_ptr().bitcast[Float32]())
+        ),
+        runtime_layout=hd_rl,
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=src_rl,
+    )
+    ctx.enqueue_function[_sage_k_mean_bf16](
+        K, KM, Int32(S), Int32(H),
+        grid_dim=ceildiv(H * _HEAD_DIM, _WARPS * 32),
+        block_dim=_WARPS * 32,
+    )
+    ctx.enqueue_function[_sage_quant_q_per_thread_bf16](
+        Q, Q8u, QS, Int32(S), Int32(H),
+        grid_dim=(ceildiv(S, _Q_QUANT_BLOCK), H),
+        block_dim=_WARPS * 32,
+    )
+    ctx.enqueue_function[_sage_quant_k_per_thread_bf16](
+        K, K8u, KS, KM, Int32(S), Int32(H),
+        grid_dim=(ceildiv(S, _K_QUANT_BLOCK), H),
+        block_dim=_K_SCALES_PER_BLOCK * 32,
+    )
+    ctx.enqueue_function[_sage_quant_v_dmajor_bf16](
+        V, V8, VS, Int32(S), Int32(S_pad), Int32(H),
+        grid_dim=ceildiv(H * _HEAD_DIM, _WARPS * 32),
+        block_dim=_WARPS * 32,
+    )
+    ctx.enqueue_function[_sage_attention_int8_pv8_token_kernel](
+        Q8, K8, QS, KS, V8, VS, O,
+        Int32(S), Int32(S_pad), Int32(H), scale,
+        grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
+        block_dim=_WARPS * 32,
     )
     return Tensor(out_buf^, want^, STDtype.BF16)
 

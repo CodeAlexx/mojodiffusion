@@ -110,7 +110,7 @@ from serenitymojo.ops.activations import silu
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear_bias
 from serenitymojo.ops.norm import rms_norm, layer_norm
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask_infer
 from serenitymojo.ops.tensor_algebra import (
     add, concat, mul, mul_scalar, reshape, reshape_owned, slice, zeros_device,
 )
@@ -185,9 +185,6 @@ struct MiniMaxH3VideoDecoderDevice(Movable):
                 String("MiniMax-H3 video decoder device: missing weight ") + name
             )
         return self.weights[self.name_to_idx[name]][]
-
-    def _bias(self, name: String, ctx: DeviceContext) raises -> Tensor:
-        return self._w(name).clone(ctx)
 
     def has(self, name: String) -> Bool:
         return name in self.name_to_idx
@@ -300,12 +297,19 @@ def minimax_h3_video_decoder_device_load(
         if name.find(".attn.to_qkv.") >= 0:
             continue  # handled per-block below, once per block not per key
         var t = Tensor.from_view(shards.tensor_view(name), ctx)
+        # BF16-resident: the checkpoint stores F32 (9.9 GiB resident); flash
+        # decode is gated at 66 dB vs the F32 math reference and every op in
+        # this file is dtype-polymorphic, so narrow once at load (~5 GiB,
+        # BF16 GEMMs, native-BF16 flash path — no per-call cast round-trip).
+        if t.dtype() == STDtype.F32:
+            t = cast_tensor(t, STDtype.BF16, ctx)
         name_to_idx[name] = len(weights)
         weights.append(TArc(t^))
+    var resident_dtype = STDtype.BF16 if qkv_dtype == STDtype.F32 else qkv_dtype
     for layer in range(config.num_layers):
         _split_qkv_at_load(
             shards, _block_prefix(layer), config.heads, config.dim_head,
-            embed_dim, qkv_dtype, ctx, weights, name_to_idx,
+            embed_dim, resident_dtype, ctx, weights, name_to_idx,
         )
     return MiniMaxH3VideoDecoderDevice(weights^, name_to_idx^, config)
 
@@ -321,14 +325,14 @@ def _swiglu_ff(
     var dim = config.dim()
     var inner = dim * config.ffn_mult
     var projected = linear_bias(
-        x, decoder._w(prefix + ".ff.w1.weight"), decoder._bias(prefix + ".ff.w1.bias", ctx), ctx,
+        x, decoder._w(prefix + ".ff.w1.weight"), decoder._w(prefix + ".ff.w1.bias"), ctx,
     )
     var rank = len(projected.shape())
     var gate = slice(projected, rank - 1, 0, inner, ctx)
     var value = slice(projected, rank - 1, inner, inner, ctx)
     var gated = mul(silu(gate, ctx), value, ctx)
     return linear_bias(
-        gated, decoder._w(prefix + ".ff.w2.weight"), decoder._bias(prefix + ".ff.w2.bias", ctx), ctx,
+        gated, decoder._w(prefix + ".ff.w2.weight"), decoder._w(prefix + ".ff.w2.bias"), ctx,
     )
 
 
@@ -395,7 +399,8 @@ def _apply_rope(
 def _vit_attention[S: Int, H: Int, Dh: Int](
     x: Tensor, prefix: String, config: MiniMaxH3VideoDecoderDeviceConfig,
     decoder: MiniMaxH3VideoDecoderDevice,
-    cos_t: Tensor, sin_t: Tensor, rot_dim: Int, ctx: DeviceContext,
+    cos_t: Tensor, sin_t: Tensor, rot_dim: Int, qk_ones: Tensor,
+    ctx: DeviceContext,
 ) raises -> Tensor:
     if config.heads != H or config.dim_head != Dh:
         raise Error(
@@ -405,53 +410,46 @@ def _vit_attention[S: Int, H: Int, Dh: Int](
     var head_dim = Dh
     var q = linear_bias(
         x, decoder._w(prefix + ".attn.to_q.weight"),
-        decoder._bias(prefix + ".attn.to_q.bias", ctx), ctx,
+        decoder._w(prefix + ".attn.to_q.bias"), ctx,
     )
     var k = linear_bias(
         x, decoder._w(prefix + ".attn.to_k.weight"),
-        decoder._bias(prefix + ".attn.to_k.bias", ctx), ctx,
+        decoder._w(prefix + ".attn.to_k.bias"), ctx,
     )
     var v = linear_bias(
         x, decoder._w(prefix + ".attn.to_v.weight"),
-        decoder._bias(prefix + ".attn.to_v.bias", ctx), ctx,
+        decoder._w(prefix + ".attn.to_v.bias"), ctx,
     )
     q = reshape(q, [1, S, heads, head_dim], ctx)
     k = reshape(k, [1, S, heads, head_dim], ctx)
     v = reshape(v, [1, S, heads, head_dim], ctx)
 
-    var ones_host = List[Float32](capacity=head_dim)
-    for _ in range(head_dim):
-        ones_host.append(Float32(1.0))
-    var ones = Tensor.from_host(ones_host, [head_dim], q.dtype(), ctx)
-    q = rms_norm(q, ones, config.norm_eps, ctx)
-    var ones2_host = List[Float32](capacity=head_dim)
-    for _ in range(head_dim):
-        ones2_host.append(Float32(1.0))
-    var ones2 = Tensor.from_host(ones2_host, [head_dim], k.dtype(), ctx)
-    k = rms_norm(k, ones2, config.norm_eps, ctx)
+    q = rms_norm(q, qk_ones, config.norm_eps, ctx)
+    k = rms_norm(k, qk_ones, config.norm_eps, ctx)
 
     q = _apply_rope(q, cos_t, sin_t, rot_dim, ctx)
     k = _apply_rope(k, cos_t, sin_t, rot_dim, ctx)
 
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
-    var attn = sdpa_nomask[1, S, H, Dh](q, k, v, scale, ctx)
+    var attn = sdpa_nomask_infer[1, S, H, Dh](q, k, v, scale, ctx)
     var flat = reshape_owned(attn^, [1, S, heads * head_dim])
     return linear_bias(
         flat, decoder._w(prefix + ".attn.to_out.weight"),
-        decoder._bias(prefix + ".attn.to_out.bias", ctx), ctx,
+        decoder._w(prefix + ".attn.to_out.bias"), ctx,
     )
 
 
 def _vit_block_forward[S: Int, H: Int, Dh: Int](
     var hidden: Tensor, prefix: String, config: MiniMaxH3VideoDecoderDeviceConfig,
     decoder: MiniMaxH3VideoDecoderDevice,
-    cos_t: Tensor, sin_t: Tensor, rot_dim: Int, ctx: DeviceContext,
+    cos_t: Tensor, sin_t: Tensor, rot_dim: Int, qk_ones: Tensor,
+    ctx: DeviceContext,
 ) raises -> Tensor:
     """`hidden = hidden + attn(norm1(hidden))*scale1;
        hidden = hidden + ff(norm2(hidden))*scale2` (base_module.py
     TransformerBlock.forward:262-282)."""
     var normed = rms_norm(hidden, decoder._w(prefix + ".norm1.weight"), config.norm_eps, ctx)
-    var attn_out = _vit_attention[S, H, Dh](normed, prefix, config, decoder, cos_t, sin_t, rot_dim, ctx)
+    var attn_out = _vit_attention[S, H, Dh](normed, prefix, config, decoder, cos_t, sin_t, rot_dim, qk_ones, ctx)
     hidden = add(hidden, mul(attn_out, decoder._w(prefix + ".scale1"), ctx), ctx)
 
     var normed2 = rms_norm(hidden, decoder._w(prefix + ".norm2.weight"), config.norm_eps, ctx)
@@ -639,13 +637,19 @@ def minimax_h3_video_decode_device[S: Int, H: Int, Dh: Int](
     var pqw_shape = decoder._w("post_quant_conv.weight").shape()
     var pqw2d = reshape(decoder._w("post_quant_conv.weight"), [pqw_shape[0], pqw_shape[1]], ctx)
     var tokens_in = reshape(latents, [1, num_tokens, config.latent_channels], ctx)
+    # Weights are BF16-resident (see load); bridge the caller's latents dtype
+    # at the entry and restore it at the exit so the pipeline contract
+    # (F32 latents in, F32 pixels out) is unchanged.
+    var resident_dtype = pqw2d.dtype()
+    if tokens_in.dtype() != resident_dtype:
+        tokens_in = cast_tensor(tokens_in, resident_dtype, ctx)
     var post_quant = linear_bias(
-        tokens_in, pqw2d, decoder._bias("post_quant_conv.bias", ctx), ctx,
+        tokens_in, pqw2d, decoder._w("post_quant_conv.bias"), ctx,
     )  # [1,num_tokens,z_ch]
 
     var hidden = linear_bias(
         post_quant, decoder._w("decoder.x_embedder.weight"),
-        decoder._bias("decoder.x_embedder.bias", ctx), ctx,
+        decoder._w("decoder.x_embedder.bias"), ctx,
     )  # [1, num_tokens, dim]
 
     var zero_tok = zeros_device([1, 1, dim], hidden.dtype(), ctx)
@@ -654,10 +658,17 @@ def minimax_h3_video_decode_device[S: Int, H: Int, Dh: Int](
 
     var rope = _build_rope_tables(lt, lh, lw, num_suffix, config, ctx)
 
+    # One [Dh] all-ones gain for the unweighted q/k RMSNorm, built ONCE per
+    # decode call — previously rebuilt (a sync host upload) twice per block.
+    var ones_host = List[Float32](capacity=config.dim_head)
+    for _ in range(config.dim_head):
+        ones_host.append(Float32(1.0))
+    var qk_ones = Tensor.from_host(ones_host, [config.dim_head], resident_dtype, ctx)
+
     var current = full^
     for layer in range(config.num_layers):
         current = _vit_block_forward[S, H, Dh](
-            current^, _block_prefix(layer), config, decoder, rope.cos, rope.sin, rope.rotary_dim, ctx
+            current^, _block_prefix(layer), config, decoder, rope.cos, rope.sin, rope.rotary_dim, qk_ones, ctx
         )
 
     var normed_out = layer_norm(
@@ -666,11 +677,14 @@ def minimax_h3_video_decode_device[S: Int, H: Int, Dh: Int](
     )
     var projected = linear_bias(
         normed_out, decoder._w("decoder.proj_out.weight"),
-        decoder._bias("decoder.proj_out.bias", ctx), ctx,
+        decoder._w("decoder.proj_out.bias"), ctx,
     )  # [1, S, patch_dim]
 
     var patch_tokens = slice(projected, 1, 0, num_tokens, ctx)
-    return _unpack_patches(
+    var out = _unpack_patches(
         patch_tokens, config.out_channels, config.patch_size_t, config.patch_size,
         lt, lh, lw, ctx,
     )
+    if out.dtype() != latents.dtype():
+        out = cast_tensor(out, latents.dtype(), ctx)
+    return out^

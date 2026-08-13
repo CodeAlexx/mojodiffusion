@@ -563,3 +563,54 @@ struct BatchedTensorUploader(Movable):
         self.tensors_uploaded += 1
         self.bytes_uploaded += nbytes
         return Tensor(dev^, tv.shape.copy(), tv.dtype)
+
+    def from_view_raw[
+        mut: Bool, //, origin: Origin[mut=mut]
+    ](mut self, tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+        """`from_view` without the compute-dtype gate — verbatim byte staging
+        that PRESERVES the on-disk dtype, the uploader twin of
+        `Tensor.from_view_raw`. Use for storage dtypes (I8/FP8 quant weights,
+        packed scales) that are dequantized on the GPU later; ops that need a
+        compute dtype must dequantize first."""
+        var nbytes = tv.nbytes()
+        var expected = tv.numel() * tv.dtype.byte_size()
+        if nbytes != expected:
+            raise Error(
+                String("BatchedTensorUploader: view nbytes=")
+                + String(nbytes)
+                + " != numel*byte_size="
+                + String(expected)
+            )
+        var offset = (self.cursor + 255) & ~255
+        if offset + nbytes > self.capacity:
+            self.finish(ctx)
+            offset = 0
+        if nbytes > self.capacity:
+            var large_host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+            var large_dst = BytePtr(
+                unsafe_from_address=Int(large_host.unsafe_ptr())
+            )
+            var large_src = BytePtr(
+                unsafe_from_address=Int(tv.data.unsafe_ptr())
+            )
+            _ = sys_memcpy(large_dst, large_src, nbytes)
+            var large_dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+            ctx.enqueue_copy(dst_buf=large_dev, src_buf=large_host)
+            ctx.synchronize()
+            self.fence_count += 1
+            self.tensors_uploaded += 1
+            self.bytes_uploaded += nbytes
+            return Tensor(large_dev^, tv.shape.copy(), tv.dtype)
+        var dst = BytePtr(
+            unsafe_from_address=Int(self.host.unsafe_ptr()) + offset
+        )
+        var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+        _ = sys_memcpy(dst, src, nbytes)
+        var host_view = self.host.create_sub_buffer[DType.uint8](offset, nbytes)
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host_view)
+        self.cursor = offset + nbytes
+        self.pending = True
+        self.tensors_uploaded += 1
+        self.bytes_uploaded += nbytes
+        return Tensor(dev^, tv.shape.copy(), tv.dtype)

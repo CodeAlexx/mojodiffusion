@@ -124,22 +124,35 @@ fi
 
 # ── 4. Artifact checks ─────────────────────────────────────────────────────
 fail=0
-NFRAMES=$(ls "$OUT"/frame_*.png 2>/dev/null | wc -l)
-echo "frames written: $NFRAMES (want $FRAMES)"
-[ "$NFRAMES" = "$FRAMES" ] || { echo "FAIL: frame count"; fail=1; }
+# Frames are ONE raw RGB24 stream (frames.rgb) since the PNG-writer removal;
+# the count check is exact byte math, the anchor frames are extracted with
+# ffmpeg below.
+RGB_BYTES=$(stat -c %s "$OUT/frames.rgb" 2>/dev/null || echo 0)
+WANT_BYTES=$((FRAMES * CANVAS_W * CANVAS_H * 3))
+NFRAMES=$((RGB_BYTES / (CANVAS_W * CANVAS_H * 3)))
+echo "frames written: $NFRAMES (want $FRAMES; $RGB_BYTES bytes)"
+[ "$RGB_BYTES" = "$WANT_BYTES" ] || { echo "FAIL: frames.rgb size"; fail=1; }
 [ -s "$OUT/audio.wav" ] || { echo "FAIL: no audio.wav"; fail=1; }
 [ -s "$OUT/result.json" ] || { echo "FAIL: no result.json"; fail=1; }
 [ -s "$OUT/latents.safetensors" ] || { echo "FAIL: no latents.safetensors"; fail=1; }
 
-# The frame that should look like the keyframe, per mode.
+# The frame that should look like the keyframe, per mode — extracted from the
+# raw stream on demand.
+extract_frame() {  # <index> <out.png>
+  ffmpeg -v error -y -f rawvideo -pixel_format rgb24 \
+    -video_size "${CANVAS_W}x${CANVAS_H}" \
+    -skip_initial_bytes $(($1 * CANVAS_W * CANVAS_H * 3)) \
+    -i "$OUT/frames.rgb" -frames:v 1 "$2"
+}
 case "$MODE" in
-  i2va|fl2va) ANCHOR_FRAME=$(printf "%s/frame_%05d.png" "$OUT" 0) ;;
-  l2va)       ANCHOR_FRAME=$(printf "%s/frame_%05d.png" "$OUT" $((FRAMES - 1))) ;;
+  i2va|fl2va) ANCHOR_FRAME="$OUT/anchor_first.png"; extract_frame 0 "$ANCHOR_FRAME" ;;
+  l2va)       ANCHOR_FRAME="$OUT/anchor_last.png"; extract_frame $((FRAMES - 1)) "$ANCHOR_FRAME" ;;
 esac
 echo ""
 echo "LOOK AT THIS: $ANCHOR_FRAME should closely match $KEYFRAME"
 if [ "$MODE" = fl2va ]; then
-  echo "         and: $(printf '%s/frame_%05d.png' "$OUT" $((FRAMES - 1))) should match $LAST"
+  extract_frame $((FRAMES - 1)) "$OUT/anchor_last.png"
+  echo "         and: $OUT/anchor_last.png should match $LAST"
 fi
 "$VENV" - "$ANCHOR_FRAME" "$KEYFRAME" <<'PY' || true
 import sys

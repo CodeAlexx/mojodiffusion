@@ -227,7 +227,7 @@ from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.patchify3d import unpatchify3d
-from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.image.png import save_rgb24_video, ValueRange
 from serenitymojo.models.vae.minimax_h3_video_decoder_device import (
     minimax_h3_video_released_decoder_config,
     minimax_h3_video_decoder_device_load,
@@ -871,24 +871,22 @@ def _write_rgb_frames(
     first_index: Int,     # global frame number of rgb's frame 0
     ctx: DeviceContext,
 ) raises -> Int:
-    """Write one PNG per frame, numbered from `first_index`. Factored out of
-    `_minimax_h3_decode_video` so the STREAMING decode path can call it once
-    per temporal part with a running offset and never hold the whole video —
-    the numbering is identical either way, which is what keeps
-    `ffmpeg -i frame_%05d.png` working unchanged."""
+    """Append this part's frames to ONE raw RGB24 stream (`frames.rgb`),
+    positioned by `first_index` — the STREAMING decode path calls this once
+    per temporal part and never holds the whole video. Replaces the per-frame
+    PNG writer: PNG spent ~370 ms/frame in CPU deflate (~65 s per 175-frame
+    job, worse at 768p); the raw path is one GPU convert kernel + one PCIe
+    crossing + one positional write per part, and NVENC muxes rawvideo
+    directly."""
     var ps = rgb.shape()
     var frames = ps[1]
     var height = ps[2]
     var width = ps[3]
-    for f in range(frames):
-        var one = slice(rgb, 1, f, 1, ctx)                       # [1,1,H,W,3]
-        var hwc = reshape(one, [height, width, 3], ctx)
-        var chw = permute(hwc, [2, 0, 1], ctx)                   # [3,H,W]
-        var img = reshape(chw, [1, 3, height, width], ctx)
-        var name = String(first_index + f)
-        while name.byte_length() < 5:
-            name = String("0") + name
-        save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
+    var chw = permute(rgb, [0, 4, 1, 2, 3], ctx)                 # [1,3,F,H,W]
+    save_rgb24_video(
+        chw, out_dir + "/frames.rgb", ctx, ValueRange.UNIT, 0, 0,
+        first_index * height * width * 3,
+    )
     return frames
 
 
@@ -1036,27 +1034,13 @@ def _minimax_h3_decode_video(
         pixels, minimax_h3_pixel_norm_constants(String("imagenet")), ctx
     )
 
-    # DELIBERATELY NOT refactored to call `_write_rgb_frames` (which is the
-    # same loop with `first_index` added). Factoring it out is the obvious
-    # cleanup and it was done, then REVERTED: it changed this binary — .text
-    # +864 bytes, .rodata -16 (a deduplicated string) — and the six-shot batch
-    # builds its remaining per-shot binaries FROM THIS SOURCE on demand, so the
-    # default path has to stay byte-for-byte what shots 2-4 already ran. The
-    # duplication buys a provable no-op for the in-flight batch and should be
-    # collapsed the moment that batch is done.
+    # (The July six-shot byte-identical constraint that kept this loop
+    # duplicated is over; both paths now share `_write_rgb_frames`.)
     var ps = rgb.shape()
     var frames = ps[1]
     var height = ps[2]
     var width = ps[3]
-    for f in range(frames):
-        var one = slice(rgb, 1, f, 1, ctx)                       # [1,1,H,W,3]
-        var hwc = reshape(one, [height, width, 3], ctx)
-        var chw = permute(hwc, [2, 0, 1], ctx)                   # [3,H,W]
-        var img = reshape(chw, [1, 3, height, width], ctx)
-        var name = String(f)
-        while name.byte_length() < 5:
-            name = String("0") + name
-        save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
+    _ = _write_rgb_frames(rgb, out_dir, 0, ctx)
     print("  wrote", frames, "frames", height, "x", width, "to", out_dir)
     return frames
 
@@ -1064,17 +1048,28 @@ def _minimax_h3_decode_video(
 def _minimax_h3_mux_av(
     out_dir: String,
     frames: Int,
+    width: Int,
+    height: Int,
     input_fps: Int,
     output_fps: Int,
     trim_start_frames: Int = 0,
 ) raises -> String:
-    """Mux with NVENC, trimming a continuation overlap in picture and sound."""
+    """Mux with NVENC, trimming a continuation overlap in picture and sound.
+
+    Video input is the single raw RGB24 stream `_write_rgb_frames` produced
+    (`frames.rgb`); the continuation trim is a byte-exact
+    `-skip_initial_bytes` (frame size is constant), not a timestamp seek."""
     if trim_start_frames < 0:
         raise Error("MiniMax-H3 trim-start frames cannot be negative")
     var mp4 = out_dir + String("/video.mp4")
-    var cmd = String("ffmpeg -v error -y -framerate ") + String(input_fps)
-    cmd += String(" -start_number ") + String(trim_start_frames) + String(" -i ")
-    cmd += shell_quote(out_dir + String("/frame_%05d.png"))
+    var cmd = String("ffmpeg -v error -y -f rawvideo -pixel_format rgb24")
+    cmd += String(" -video_size ") + String(width) + String("x") + String(height)
+    cmd += String(" -framerate ") + String(input_fps)
+    if trim_start_frames > 0:
+        cmd += String(" -skip_initial_bytes ") + String(
+            trim_start_frames * width * height * 3
+        )
+    cmd += String(" -i ") + shell_quote(out_dir + String("/frames.rgb"))
     if trim_start_frames > 0:
         var trim_seconds = (
             Float64(trim_start_frames) / Float64(input_fps)
@@ -2179,8 +2174,8 @@ def main() raises:
             config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
         )
         var artifact = _minimax_h3_mux_av(
-            out_dir, output_frames, runtime_fps, output_fps,
-            trim_start_frames,
+            out_dir, output_frames, runtime_width, runtime_height,
+            runtime_fps, output_fps, trim_start_frames,
         )
         _minimax_h3_write_decode_result(
             out_dir, artifact, output_frames, runtime_width, runtime_height,
@@ -2267,14 +2262,11 @@ def main() raises:
     else:
         print("  preflight: transformer OK (adaLN + ", config.num_layers, "blocks + frontend)")
 
-    if not partial_mode:
-        print("  preflight: opening text_encoder shards:", String(TEXT_ENCODER_DIR))
-        var text_encoder_shards = ShardedSafeTensors.open(String(TEXT_ENCODER_DIR))
-        print(
-            "  preflight: ", text_encoder_shards.num_shards(), "shard(s), ",
-            text_encoder_shards.num_tensors(), "tensors",
-        )
-    else:
+    # Text-encoder shards are NOT opened here: the old preflight parsed every
+    # shard header only to print the count — on a conditioning-cache hit the
+    # encoder is never read at all, and on a miss the encoder loader itself
+    # fails loudly, by name, at the tensor that is actually missing.
+    if partial_mode:
         print("  preflight: text_encoder SKIPPED (PARTIAL MODE — conditioning is stubbed)")
 
     print("  preflight: opening audio_vae:", String(AUDIO_VAE_PATH))
@@ -2846,8 +2838,8 @@ def main() raises:
     var t_vid1 = perf_counter_ns()
     print("  video decode done (", Float64(t_vid1 - t_vid0) / 1.0e9, "s)")
     var artifact = _minimax_h3_mux_av(
-        out_dir, output_frames, runtime_fps, output_fps,
-        trim_start_frames,
+        out_dir, output_frames, runtime_width, runtime_height,
+        runtime_fps, output_fps, trim_start_frames,
     )
     _minimax_h3_write_decode_result(
         out_dir, artifact, output_frames, runtime_width, runtime_height,

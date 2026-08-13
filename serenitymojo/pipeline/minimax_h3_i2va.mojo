@@ -107,7 +107,7 @@ from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.patchify3d import unpatchify3d
-from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.image.png import save_rgb24_video, ValueRange
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.sharded import ShardedSafeTensors
@@ -763,19 +763,17 @@ def _decode_audio(
 def _write_rgb_frames(
     rgb: Tensor, out_dir: String, first_index: Int, ctx: DeviceContext
 ) raises -> Int:
+    # Appends to ONE raw RGB24 stream, positioned by `first_index` — see the
+    # t2va copy's docstring for the PNG-deflate cost this replaces.
     var ps = rgb.shape()
     var frames = ps[1]
     var height = ps[2]
     var width = ps[3]
-    for f in range(frames):
-        var one = slice(rgb, 1, f, 1, ctx)
-        var hwc = reshape(one, [height, width, 3], ctx)
-        var chw = permute(hwc, [2, 0, 1], ctx)
-        var img = reshape(chw, [1, 3, height, width], ctx)
-        var name = String(first_index + f)
-        while name.byte_length() < 5:
-            name = String("0") + name
-        save_png(img, out_dir + "/frame_" + name + ".png", ctx, ValueRange.UNIT)
+    var chw = permute(rgb, [0, 4, 1, 2, 3], ctx)                 # [1,3,F,H,W]
+    save_rgb24_video(
+        chw, out_dir + "/frames.rgb", ctx, ValueRange.UNIT, 0, 0,
+        first_index * height * width * 3,
+    )
     return frames
 
 

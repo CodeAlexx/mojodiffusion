@@ -3714,7 +3714,13 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   INT8 and BF16 renders remain the quality evidence.
 - `models/vae/minimax_h3_video_{encoder,decoder}_device.mojo` — native-key
   ViT VAE, vendor-oracle cos 0.9999999978 / 0.9999999999998. Fused to_qkv is
-  PER-HEAD interleaved; ff.w1 gate-FIRST.
+  PER-HEAD interleaved; ff.w1 gate-FIRST. Decoder is BF16-RESIDENT since
+  2026-08-12 (checkpoint F32 narrowed once at load, ~9.9→~5 GiB) with
+  `sdpa_nomask_infer` flash attention — no [H,S,S] score slab (the decode-OOM
+  class), decode of the 512x320x175 reference latents 464→74 s. Gates: flash
+  alone 66.1 dB mean vs F32-math frames; BF16+flash 54.3 dB mean / 52.6 min,
+  audio byte-identical. External contract unchanged (F32 latents in / F32
+  pixels out; entry/exit casts).
 - `models/vae/minimax_h3_ref_encode.mojo` — reference encode chain; the
   vendor's fp16 round-trip BEFORE latent normalize is mandatory
   (encoders.py:586-588); video refs SAMPLE seed 42 CPU-gen, audio refs MODE.

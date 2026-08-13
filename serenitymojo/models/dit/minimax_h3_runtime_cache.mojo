@@ -16,7 +16,7 @@ from serenitymojo.io.ffi import BytePtr, sys_memcpy
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.tensor import Tensor
+from serenitymojo.tensor import BatchedTensorUploader, Tensor
 from serenitymojo.models.minimax_h3.fp8_policy import (
     H3_FP8_BF16_KEEP,
     H3_FP8_ROW,
@@ -166,20 +166,18 @@ def _check_common_metadata(
 
 
 def _load_raw_h2d(
-    st: SafeTensors, name: String, ctx: DeviceContext
+    st: SafeTensors, name: String, mut up: BatchedTensorUploader,
+    ctx: DeviceContext,
 ) raises -> Tensor:
+    """Stage through the caller's bounded pinned slab; the old per-tensor
+    host-alloc + `ctx.synchronize()` fenced EVERY cached tensor (hundreds per
+    resident load) — the uploader fences only on slab reuse and `finish()`."""
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var view = from_parts(info.dtype, info.shape.copy(), bytes)
-    var nbytes = view.nbytes()
-    var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
-    var dst = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
-    var src = BytePtr(unsafe_from_address=Int(view.data.unsafe_ptr()))
-    _ = sys_memcpy(dst, src, nbytes)
-    var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
-    ctx.enqueue_copy(dst_buf=dev, src_buf=host)
-    ctx.synchronize()
-    return Tensor(dev^, view.shape.copy(), view.dtype)
+    # from_view_raw, not from_view: resident payloads are STORAGE dtypes
+    # (I8 quant weights, F32/F16 scales) that the compute-dtype gate rejects.
+    return up.from_view_raw(view, ctx)
 
 
 def _load_raw_h2d_into(
@@ -295,6 +293,7 @@ def load_minimax_h3_resident_cache(
 
     # Scratch must be allocated before the 16 GiB store, exactly like the
     # fresh-build path, to preserve the measured fragmentation headroom.
+    var uploader = BatchedTensorUploader(256 * 1024 * 1024, ctx)
     var scratch = List[ArcPointer[Tensor]]()
     if (
         nblocks > 0
@@ -346,8 +345,8 @@ def load_minimax_h3_resident_cache(
                     ):
                         raise Error(String("MiniMax-H3 resident cache scale mismatch: ") + name)
                 quant_names.append(name.copy())
-                quant.append(ArcPointer(_load_raw_h2d(st, weight_name, ctx)))
-                scales.append(ArcPointer(_load_raw_h2d(st, scale_name, ctx)))
+                quant.append(ArcPointer(_load_raw_h2d(st, weight_name, uploader, ctx)))
+                scales.append(ArcPointer(_load_raw_h2d(st, scale_name, uploader, ctx)))
                 qslot += 1
             elif cls == H3_FP8_BF16_KEEP:
                 var keep_name = prefix + String("keep.") + String(kslot)
@@ -355,7 +354,7 @@ def load_minimax_h3_resident_cache(
                 if ki.dtype != STDtype.BF16 or ki.shape != shape:
                     raise Error(String("MiniMax-H3 resident cache keep mismatch: ") + name)
                 keep_names.append(name.copy())
-                keeps.append(ArcPointer(_load_raw_h2d(st, keep_name, ctx)))
+                keeps.append(ArcPointer(_load_raw_h2d(st, keep_name, uploader, ctx)))
                 kslot += 1
             else:
                 raise Error(String("MiniMax-H3 resident cache class mismatch: ") + name)
@@ -374,6 +373,7 @@ def load_minimax_h3_resident_cache(
         # cache setup. Multi-block prefix loads retain their useful progress.
         if nblocks > 1 and ((i + 1) % 5 == 0 or i + 1 == nblocks):
             print("  resident cache: loaded block", i + 1, "/", nblocks)
+    uploader.finish(ctx)
     return MiniMaxH3ResidentFp8(
         blocks^, start_layer, scratch^, scheme
     )
@@ -553,6 +553,7 @@ def load_minimax_h3_modcache(
         != distinct_timesteps \
         or _meta_i64(st, String("__meta__.nblocks"), -1) != config.num_layers:
         raise Error("MiniMax-H3 modulation cache schedule mismatch")
+    var uploader = BatchedTensorUploader(256 * 1024 * 1024, ctx)
     var mods = List[ArcPointer[Tensor]]()
     var expected_shape: List[Int] = [
         distinct_timesteps * config.adaln_rows_per_timestep(),
@@ -563,12 +564,13 @@ def load_minimax_h3_modcache(
         var info = st.tensor_info(name)
         if info.dtype != STDtype.BF16 or info.shape != expected_shape:
             raise Error(String("MiniMax-H3 modulation cache block mismatch: ") + String(i))
-        mods.append(ArcPointer(_load_raw_h2d(st, name, ctx)))
+        mods.append(ArcPointer(_load_raw_h2d(st, name, uploader, ctx)))
     var final_info = st.tensor_info(String("final"))
     var final_shape: List[Int] = [
         distinct_timesteps, config.final_adaln_out_features
     ]
     if final_info.dtype != STDtype.BF16 or final_info.shape != final_shape:
         raise Error("MiniMax-H3 modulation cache final tensor mismatch")
-    var final = ArcPointer(_load_raw_h2d(st, String("final"), ctx))
+    var final = ArcPointer(_load_raw_h2d(st, String("final"), uploader, ctx))
+    uploader.finish(ctx)
     return MiniMaxH3ModCache(mods^, final^, distinct_timesteps)

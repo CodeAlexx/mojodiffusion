@@ -563,6 +563,7 @@ def save_rgb24_video(
     value_range: ValueRange = ValueRange.SIGNED,
     output_height: Int = 0,
     output_width: Int = 0,
+    file_offset: Int = 0,
 ) raises:
     """Write `[1,3,F,H,W]` as contiguous frame-major RGB24.
 
@@ -574,6 +575,12 @@ def save_rgb24_video(
     size in the same conversion kernel. This lets LTX2 run its required
     64-pixel-aligned internal grid while emitting the advertised 960x544
     profile without a second full-frame tensor allocation.
+
+    `file_offset` > 0 writes this chunk at that byte position WITHOUT
+    truncating — streaming decoders append successive temporal parts to one
+    growing file (offset = frames_already_written * H * W * 3, deterministic,
+    no O_APPEND pwrite quirks). Offset 0 keeps the truncate-and-write
+    behavior every existing caller relies on.
     """
     var shape = video.shape()
     if len(shape) != 5 or shape[0] != 1 or shape[1] != 3:
@@ -654,13 +661,16 @@ def save_rgb24_video(
     var host = ctx.enqueue_create_host_buffer[DType.uint8](n)
     ctx.enqueue_copy(dst_buf=host, src_buf=out_buf)
     ctx.synchronize()
-    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, Int32(0o644))
+    var open_flags = O_WRONLY | O_CREAT
+    if file_offset == 0:
+        open_flags |= O_TRUNC
+    var fd = sys_open(path, open_flags, Int32(0o644))
     if fd < 0:
         raise Error(String("save_rgb24_video: cannot open for write: ") + path)
     var hp = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
     var done = 0
     while done < n:
-        var got = sys_pwrite(fd, hp + done, n - done, done)
+        var got = sys_pwrite(fd, hp + done, n - done, file_offset + done)
         if got <= 0:
             break
         done += got

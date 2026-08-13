@@ -1250,6 +1250,9 @@ fn prepare_minimax_h3_resident_cache_if_needed(
         .current_dir(repo_root())
         .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
         .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+        .env("CUDA_MODULE_LOADING", "EAGER")
+        .env("LD_BIND_NOW", "1")
+        .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(stderr))
         .status()
@@ -1743,6 +1746,9 @@ pub(super) fn start_minimax_h3_request(
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
             .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .env("CUDA_MODULE_LOADING", "EAGER")
+            .env("LD_BIND_NOW", "1")
+            .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
             .arg(&thread_prompt)
             .arg(&thread_out_dir)
             .arg(steps.to_string())
@@ -1882,6 +1888,9 @@ pub(super) fn start_minimax_h3_request(
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
             .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .env("CUDA_MODULE_LOADING", "EAGER")
+            .env("LD_BIND_NOW", "1")
+            .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
             .arg("decode")
             .arg(&thread_out_dir)
             .arg(steps.to_string())
@@ -2053,7 +2062,8 @@ pub(super) fn cleanup_minimax_h3_intermediates(out_dir: &std::path::Path, keep_l
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let generated_frame = name.starts_with("frame_") && name.ends_with(".png");
+        let generated_frame = (name.starts_with("frame_") && name.ends_with(".png"))
+            || name == "frames.rgb";
         let latent_artifact =
             name == "latents.safetensors" || name == "latents_ckpt.safetensors";
         let transient = generated_frame
@@ -2418,7 +2428,10 @@ pub(super) fn start_minimax_h3_conditioned_request(
         command
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
-            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE);
+            .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .env("CUDA_MODULE_LOADING", "EAGER")
+            .env("LD_BIND_NOW", "1")
+            .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1");
         if thread_task == "ref2va" || thread_combined_continuation {
             let prompt_path = thread_out_dir.join("ref_prompt.txt");
             let conditioned_prompt =
@@ -2595,6 +2608,9 @@ pub(super) fn start_minimax_h3_conditioned_request(
             .current_dir(repo_root())
             .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
             .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
+            .env("CUDA_MODULE_LOADING", "EAGER")
+            .env("LD_BIND_NOW", "1")
+            .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
             .arg("decode")
             .arg(&thread_out_dir)
             .arg(steps.to_string())

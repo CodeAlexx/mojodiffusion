@@ -2109,7 +2109,6 @@ fn run_worker_driver(
                     Ok(DriverCtl::EvictIdle(done)) => {
                         if let Some(mut h) = handle.take() {
                             h.kill();
-                            std::thread::sleep(std::time::Duration::from_millis(800));
                         }
                         let _ = done.send(true);
                     }
@@ -2117,7 +2116,6 @@ fn run_worker_driver(
                         if !kind_can_share_gpu_with_sam(&current_kind) {
                             if let Some(mut h) = handle.take() {
                                 h.kill();
-                                std::thread::sleep(std::time::Duration::from_millis(800));
                             }
                         }
                         let _ = done.send(true);
@@ -2136,7 +2134,6 @@ fn run_worker_driver(
                 Ok(DriverCtl::EvictIdle(done)) => {
                     if let Some(mut h) = handle.take() {
                         h.kill();
-                        std::thread::sleep(std::time::Duration::from_millis(800));
                     }
                     let _ = done.send(true);
                     continue;
@@ -2145,7 +2142,6 @@ fn run_worker_driver(
                     if !kind_can_share_gpu_with_sam(&current_kind) {
                         if let Some(mut h) = handle.take() {
                             h.kill();
-                            std::thread::sleep(std::time::Duration::from_millis(800));
                         }
                     }
                     let _ = done.send(true);

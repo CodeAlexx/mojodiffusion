@@ -104,10 +104,10 @@ def sqa_device(
     host `sqa_gpu` path. dh must be 128."""
     var o_buf = ctx.enqueue_create_buffer[DType.uint8](H * dh * 2)  # bf16
     var scale = Float32(1.0) / Float32(Float64(dh) ** 0.5)
-    var qp = q.buf.unsafe_ptr().bitcast[BFloat16]()
-    var kp = kc.buf.unsafe_ptr().bitcast[BFloat16]()
-    var vp = vc.buf.unsafe_ptr().bitcast[BFloat16]()
-    var op = o_buf.unsafe_ptr().bitcast[BFloat16]()
+    var qp = BPtr(unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]()))
+    var kp = BPtr(unsafe_from_address=Int(kc.buf.unsafe_ptr().bitcast[BFloat16]()))
+    var vp = BPtr(unsafe_from_address=Int(vc.buf.unsafe_ptr().bitcast[BFloat16]()))
+    var op = BPtr(unsafe_from_address=Int(o_buf.unsafe_ptr().bitcast[BFloat16]()))
     if dh == 128:
         ctx.enqueue_function[_k_sqa_dev[128]](
             qp, kp, vp, op, Int32(H), Int32(H_kv), Int32(L), scale,
@@ -233,10 +233,10 @@ def sqa_device_par(
                     + " exceeds _SQA_MAXL=" + String(_SQA_MAXL))
     var o_buf = ctx.enqueue_create_buffer[DType.uint8](H * dh * 2)
     var scale = Float32(1.0) / Float32(Float64(dh) ** 0.5)
-    var qp = q.buf.unsafe_ptr().bitcast[BFloat16]()
-    var kp = kc.buf.unsafe_ptr().bitcast[BFloat16]()
-    var vp = vc.buf.unsafe_ptr().bitcast[BFloat16]()
-    var op = o_buf.unsafe_ptr().bitcast[BFloat16]()
+    var qp = BPtr(unsafe_from_address=Int(q.buf.unsafe_ptr().bitcast[BFloat16]()))
+    var kp = BPtr(unsafe_from_address=Int(kc.buf.unsafe_ptr().bitcast[BFloat16]()))
+    var vp = BPtr(unsafe_from_address=Int(vc.buf.unsafe_ptr().bitcast[BFloat16]()))
+    var op = BPtr(unsafe_from_address=Int(o_buf.unsafe_ptr().bitcast[BFloat16]()))
     ctx.enqueue_function[_k_sqa_par[128, _SQA_MAXL]](
         qp, kp, vp, op, Int32(H), Int32(H_kv), Int32(L), scale,
         grid_dim=H, block_dim=_SQA_TPB,

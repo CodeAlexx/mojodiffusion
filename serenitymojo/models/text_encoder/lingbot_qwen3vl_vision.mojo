@@ -166,7 +166,7 @@ struct Qwen3VLVisionModel(Movable):
 
             # Split fused qkv weight/bias into q/k/v.
             var wsuf = String(key.removesuffix("qkv.weight"))
-            if len(wsuf) != len(key):
+            if wsuf.byte_length() != key.byte_length():
                 var hbase = Int(tv.data.unsafe_ptr())
                 var row_bytes = V_HID * tv.dtype.byte_size()   # 1024 cols
                 var blk_bytes = V_HID * row_bytes              # 1024 rows
@@ -178,7 +178,7 @@ struct Qwen3VLVisionModel(Movable):
                 model._add(wsuf + "v.weight", v^)
                 continue
             var bsuf = String(key.removesuffix("qkv.bias"))
-            if len(bsuf) != len(key):
+            if bsuf.byte_length() != key.byte_length():
                 var hbase = Int(tv.data.unsafe_ptr())
                 var blk_bytes = V_HID * tv.dtype.byte_size()
                 var q = _slice_to_device(hbase, 0 * blk_bytes, blk_bytes, [V_HID], tv.dtype, ctx)

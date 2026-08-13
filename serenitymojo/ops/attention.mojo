@@ -340,19 +340,19 @@ def _attn_pv_matmul[
     for bh in range(BH):
         var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scores_ptr + bh * Sq * Skv)
+            unsafe_from_address=Int(scores_ptr.unsafe_offset(bh * Sq * Skv))
         ),
         runtime_layout=p_rl,
     )
         var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vf32ptr + bh * Skv * Dh)
+            unsafe_from_address=Int(vf32ptr.unsafe_offset(bh * Skv * Dh))
         ),
         runtime_layout=v_rl,
     )
         var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(out_ptr + bh * Sq * Dh)
+            unsafe_from_address=Int(out_ptr.unsafe_offset(bh * Sq * Dh))
         ),
         runtime_layout=o_rl,
     )
@@ -396,19 +396,19 @@ def _attn_pv_matmul_slab[
     for bh in range(BH):
         var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scores_ptr + bh * Sq * Skv)
+            unsafe_from_address=Int(scores_ptr.unsafe_offset(bh * Sq * Skv))
         ),
         runtime_layout=p_rl,
     )
         var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vf32ptr + bh * Skv * Dh)
+            unsafe_from_address=Int(vf32ptr.unsafe_offset(bh * Skv * Dh))
         ),
         runtime_layout=v_rl,
     )
         var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(out_ptr + bh * Sq * Dh)
+            unsafe_from_address=Int(out_ptr.unsafe_offset(bh * Sq * Dh))
         ),
         runtime_layout=o_rl,
     )
@@ -474,19 +474,19 @@ def _sdpa_math_storage[
     for bh in range(BH):
         var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(qptr + bh * S * Dh)
+            unsafe_from_address=Int(qptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(kptr + bh * S * Dh)
+            unsafe_from_address=Int(kptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * S * S)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
@@ -523,19 +523,19 @@ def _sdpa_math_storage[
         for bh in range(BH):
             var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * S * S)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
             var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vptr + bh * S * Dh)
+            unsafe_from_address=Int(vptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * S * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
@@ -753,19 +753,19 @@ def _sdpa_nomask_math_storage_dynamic[dtype: DType](
     for bh in range(BH):
         var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(qptr + bh * S * Dh)
+            unsafe_from_address=Int(qptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(kptr + bh * S * Dh)
+            unsafe_from_address=Int(kptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * S * S)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
@@ -798,19 +798,19 @@ def _sdpa_nomask_math_storage_dynamic[dtype: DType](
         for bh in range(BH):
             var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * S * S)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
             var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vptr + bh * S * Dh)
+            unsafe_from_address=Int(vptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * S * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
@@ -942,13 +942,13 @@ def _sdpa_math_storage_chunked[
         # QKᵀ for this head -> scores[S,S] (row-major).
         var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(qptr + bh * S * Dh)
+            unsafe_from_address=Int(qptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(kptr + bh * S * Dh)
+            unsafe_from_address=Int(kptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
@@ -970,7 +970,7 @@ def _sdpa_math_storage_chunked[
         if apply_mask:
             var mh = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(maskptr + bh * S * S)
+            unsafe_from_address=Int(maskptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
@@ -1000,7 +1000,7 @@ def _sdpa_math_storage_chunked[
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * S * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
@@ -1008,13 +1008,13 @@ def _sdpa_math_storage_chunked[
         else:
             var Vh = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(vptr + bh * S * Dh)
+            unsafe_from_address=Int(vptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * S * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
@@ -2206,19 +2206,19 @@ def _sdpa_cross_math_storage[
     for bh in range(BH):
         var Q = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(qptr + bh * Sq * Dh)
+            unsafe_from_address=Int(qptr.unsafe_offset(bh * Sq * Dh))
         ),
         runtime_layout=q_head_rl,
     )
         var Kt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(kptr + bh * Skv * Dh)
+            unsafe_from_address=Int(kptr.unsafe_offset(bh * Skv * Dh))
         ),
         runtime_layout=kv_head_rl,
     )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * Sq * Skv)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * Sq * Skv))
         ),
         runtime_layout=sc_rl,
     )
@@ -2246,19 +2246,19 @@ def _sdpa_cross_math_storage[
         for bh in range(BH):
             var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * Sq * Skv)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * Sq * Skv))
         ),
         runtime_layout=sc_rl,
     )
             var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vptr + bh * Skv * Dh)
+            unsafe_from_address=Int(vptr.unsafe_offset(bh * Skv * Dh))
         ),
         runtime_layout=kv_head_rl,
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * Sq * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * Sq * Dh))
         ),
         runtime_layout=q_head_rl,
     )
@@ -3157,19 +3157,19 @@ def _sdpa_math_storage_slab[
     for bh in range(BH):
         var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(qptr + bh * S * Dh)
+            unsafe_from_address=Int(qptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(kptr + bh * S * Dh)
+            unsafe_from_address=Int(kptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * S * S)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
@@ -3206,19 +3206,19 @@ def _sdpa_math_storage_slab[
         for bh in range(BH):
             var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * S * S)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * S * S))
         ),
         runtime_layout=sc_rl,
     )
             var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vptr + bh * S * Dh)
+            unsafe_from_address=Int(vptr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * S * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * S * Dh))
         ),
         runtime_layout=head_rl,
     )
@@ -3486,19 +3486,19 @@ def _sdpa_cross_math_storage_slab[
     for bh in range(BH):
         var Q = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(qptr + bh * Sq * Dh)
+            unsafe_from_address=Int(qptr.unsafe_offset(bh * Sq * Dh))
         ),
         runtime_layout=q_head_rl,
     )
         var Kt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[dtype], MutAnyOrigin](
-            unsafe_from_address=Int(kptr + bh * Skv * Dh)
+            unsafe_from_address=Int(kptr.unsafe_offset(bh * Skv * Dh))
         ),
         runtime_layout=kv_head_rl,
     )
         var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * Sq * Skv)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * Sq * Skv))
         ),
         runtime_layout=sc_rl,
     )
@@ -3526,19 +3526,19 @@ def _sdpa_cross_math_storage_slab[
         for bh in range(BH):
             var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(scptr + bh * Sq * Skv)
+            unsafe_from_address=Int(scptr.unsafe_offset(bh * Sq * Skv))
         ),
         runtime_layout=sc_rl,
     )
             var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(vptr + bh * Skv * Dh)
+            unsafe_from_address=Int(vptr.unsafe_offset(bh * Skv * Dh))
         ),
         runtime_layout=kv_head_rl,
     )
             var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
-            unsafe_from_address=Int(optr + bh * Sq * Dh)
+            unsafe_from_address=Int(optr.unsafe_offset(bh * Sq * Dh))
         ),
         runtime_layout=q_head_rl,
     )

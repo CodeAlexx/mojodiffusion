@@ -127,7 +127,7 @@ def _argmax(logits: Tensor, ctx: DeviceContext) raises -> Int:
     return best
 
 
-def _s(a: UInt, b: UInt) -> Float64:
+def _s(a: Int, b: Int) -> Float64:
     return Float64(Int(b) - Int(a)) / 1.0e9
 
 

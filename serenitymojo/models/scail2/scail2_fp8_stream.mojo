@@ -205,7 +205,7 @@ def _valid_block_shape(suffix: String, shape: List[Int]) -> Bool:
     var scale = False
     if suffix.endswith(SCAIL2_FP8_SCALE_SUFFIX):
         base = _substr(
-            suffix, 0, len(suffix) - len(SCAIL2_FP8_SCALE_SUFFIX)
+            suffix, 0, suffix.byte_length() - SCAIL2_FP8_SCALE_SUFFIX.byte_length()
         )
         scale = True
     if base == String("ffn.0.weight"):
@@ -327,13 +327,13 @@ def _valid_block_cache_file(path: String, index: Int) raises -> Bool:
         var name = String(raw_name)
         if not name.startswith(prefix):
             return False
-        var suffix = _substr(name, len(prefix), len(name))
+        var suffix = _substr(name, prefix.byte_length(), name.byte_length())
         var tv = st.tensor_view(name)
         if not _valid_block_shape(suffix, tv.shape):
             return False
         if suffix.endswith(SCAIL2_FP8_SCALE_SUFFIX):
             var base = _substr(
-                suffix, 0, len(suffix) - len(SCAIL2_FP8_SCALE_SUFFIX)
+                suffix, 0, suffix.byte_length() - SCAIL2_FP8_SCALE_SUFFIX.byte_length()
             )
             if not _is_large_block_suffix(base) or tv.dtype != STDtype.F32:
                 return False
@@ -371,13 +371,13 @@ def _valid_block_cache_metadata(path: String, index: Int) raises -> Bool:
         var name = String(raw_name)
         if not name.startswith(prefix):
             return False
-        var suffix = _substr(name, len(prefix), len(name))
+        var suffix = _substr(name, prefix.byte_length(), name.byte_length())
         var tv = st.tensor_view(name)
         if not _valid_block_shape(suffix, tv.shape):
             return False
         if suffix.endswith(SCAIL2_FP8_SCALE_SUFFIX):
             var base = _substr(
-                suffix, 0, len(suffix) - len(SCAIL2_FP8_SCALE_SUFFIX)
+                suffix, 0, suffix.byte_length() - SCAIL2_FP8_SCALE_SUFFIX.byte_length()
             )
             if not _is_large_block_suffix(base) or tv.dtype != STDtype.F32:
                 return False
@@ -429,7 +429,7 @@ def prepare_scail2_14b_fp8_cache(
             var name = String(raw_name)
             if not name.startswith(prefix):
                 continue
-            var suffix = _substr(name, len(prefix), len(name))
+            var suffix = _substr(name, prefix.byte_length(), name.byte_length())
             var tv = source.tensor_view(name)
             source_count += 1
             if _is_large_block_suffix(suffix):
@@ -636,7 +636,7 @@ struct Scail2A14BFP8Stream(Movable):
                     raise Error(
                         String("SCAIL-2 resident: unexpected tensor ") + name
                     )
-                var short_name = _substr(name, len(prefix), len(name))
+                var short_name = _substr(name, prefix.byte_length(), name.byte_length())
                 var tv = st.tensor_view(name)
                 rb.add(short_name, tv.dtype, tv.shape.copy(), _own_bytes(tv))
             total_bytes += rb.nbytes()
@@ -716,7 +716,7 @@ struct Scail2A14BFP8Stream(Movable):
             var name = String(raw_name)
             if not name.startswith(prefix) or name.endswith(SCAIL2_FP8_SCALE_SUFFIX):
                 continue
-            var short_name = _substr(name, len(prefix), len(name))
+            var short_name = _substr(name, prefix.byte_length(), name.byte_length())
             var tv = st.tensor_view(name)
             if tv.dtype == STDtype.F8_E4M3:
                 var scale_tv = st.tensor_view(name + String(SCAIL2_FP8_SCALE_SUFFIX))
@@ -749,7 +749,7 @@ struct Scail2A14BFP8Stream(Movable):
             var name = String(raw_name)
             if not name.startswith(prefix) or name.endswith(SCAIL2_FP8_SCALE_SUFFIX):
                 continue
-            var short_name = _substr(name, len(prefix), len(name))
+            var short_name = _substr(name, prefix.byte_length(), name.byte_length())
             var tv = st.tensor_view(name)
             if tv.dtype == STDtype.F8_E4M3:
                 var scale_tv = st.tensor_view(name + String(SCAIL2_FP8_SCALE_SUFFIX))

@@ -61,7 +61,9 @@ def encode_ideogram_taps(enc: Qwen3Encoder, ids: List[Int], ctx: DeviceContext) 
     var states = enc.encode_layer_states(ids, ctx)  # 36 x [1,L,4096]
     var L = states[0][].shape()[1]
     var H = states[0][].shape()[2]
-    var s4 = [1, L, H, 1]
+    # Annotated: on Mojo 1.0 a bare bracket literal infers Array[Int, 4], which
+    # reshape's List[Int] parameter will not accept.
+    var s4: List[Int] = [1, L, H, 1]
     var r0 = reshape(states[0][], s4.copy(), ctx)
     var r1 = reshape(states[3][], s4.copy(), ctx)
     var r2 = reshape(states[6][], s4.copy(), ctx)

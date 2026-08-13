@@ -23,7 +23,12 @@ from serenitymojo.io.ffi import BytePtr
 comptime CU_STREAM_CAPTURE_MODE_GLOBAL: Int32 = 0
 
 
-def _ptr[pointee: AnyType](p: UnsafePointer[pointee, MutAnyOrigin]) -> BytePtr:
+def _ptr[pointee: AnyType, origin: MutOrigin](
+    p: UnsafePointer[pointee, origin]
+) -> BytePtr:
+    # Origin-generic on Mojo 1.0: alloc[] hands back MutUntrackedOrigin, which
+    # no longer converts to MutAnyOrigin. The body already launders through the
+    # address, so accepting any mutable origin changes nothing at runtime.
     return BytePtr(unsafe_from_address=Int(p))
 
 

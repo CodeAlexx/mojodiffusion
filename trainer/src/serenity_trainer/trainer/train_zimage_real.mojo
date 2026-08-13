@@ -1586,7 +1586,7 @@ def _train_one_step_bucket[
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
     train_cfg: TrainConfig,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     mut slab: StepSlab,
     mut fwd_slab: StepSlab,
     mut cap_buckets: List[ZImageCaptureBucket],
@@ -2049,7 +2049,7 @@ def _train_one_step_bucket_capture[
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
     train_cfg: TrainConfig,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     mut slab: StepSlab,
     mut fwd_slab: StepSlab,
     mut cap_buckets: List[ZImageCaptureBucket],
@@ -2383,7 +2383,7 @@ def _full_ft_step[
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
     train_cfg: TrainConfig,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     ctx: DeviceContext,
 ) raises -> StepResult:
     comptime HT_B = LAT_H_B // PATCH
@@ -2743,7 +2743,7 @@ def _cn_step[
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
     train_cfg: TrainConfig,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     ctx: DeviceContext,
 ) raises -> StepResult:
     comptime HT_B = LAT_H_B // PATCH
@@ -4192,7 +4192,7 @@ def _train_one_step_bucket_b2[
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
     train_cfg: TrainConfig,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     b2_device_grad_smoke: Bool,
     mut adamw_shared_arena: TrainingArena,
     ctx: DeviceContext,
@@ -4423,8 +4423,8 @@ def _train_one_step_bucket_b2[
     var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
     var gn_before = Float64(0.0)
     var nonfinite_lora_grads = 0
-    var t_bwd: UInt
-    var t_opt: UInt
+    var t_bwd: Int
+    var t_opt: Int
     if b2_device_grad_smoke:
         var wrote = zimage_stack_lora_backward_main_device_b2_masked_streamed_adamw_device_grads[
             H, Dh, N_IMG_B, N_TXT_B, S_B

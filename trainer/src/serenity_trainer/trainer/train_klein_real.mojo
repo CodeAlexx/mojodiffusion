@@ -1986,7 +1986,7 @@ def main() raises:
         var empty_txt = List[Float32]()
         var loss: Float32
         var g: KleinLoraGrads
-        var t_bwd0 = UInt(0)
+        var t_bwd0 = Int(0)  # perf_counter_ns() returns Int on Mojo 1.0
         if runtime_profile:
             print("PROG_STAGE step=", k, " total=", run_steps, " phase=forward_begin")
         var t_fwd0 = perf_counter_ns()

@@ -381,7 +381,10 @@ struct Automagic3DeviceState(Movable):
         return off
 
 
-def _dynf(p: UnsafePointer[Float32, MutAnyOrigin], n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
+# Origin-generic on Mojo 1.0: callers pass pointers carrying their buffer's
+# tracked origin, which no longer converts to MutAnyOrigin. The body already
+# rebuilds the pointer from its address, so this is a type-level widening only.
+def _dynf[origin: MutOrigin](p: UnsafePointer[Float32, origin], n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
     return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
             unsafe_from_address=Int(p)

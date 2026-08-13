@@ -651,7 +651,7 @@ struct KreaTrainCache(Movable):
         False (the reader discovered "" for them). Cheap — no device load."""
         if index < 0 or index >= self.len():
             return False
-        return len(self.ref_keys[index]) > 0
+        return self.ref_keys[index].byte_length() > 0
 
     def ref_hw_at(self, index: Int) raises -> Tuple[Int, Int]:
         """(LH, LW) of sample `index`'s cached reference latent — HEADER-ONLY (no
@@ -687,7 +687,7 @@ struct KreaTrainCache(Movable):
                 + " out of range [0," + String(self.len()) + ")"
             )
         var key = self.ref_keys[index]
-        if len(key) == 0:
+        if key.byte_length() == 0:
             raise Error(
                 String("KreaTrainCache.load_ref: sample ") + String(index)
                 + " has no ref.<i> reference latent; re-run the edit prepare"
@@ -722,7 +722,7 @@ struct KreaTrainCache(Movable):
         (cond latent + position delta + position scale). Cheap — header only."""
         if index < 0 or index >= self.len():
             return False
-        if len(self.ref_keys[index]) == 0:
+        if self.ref_keys[index].byte_length() == 0:
             return False
         if self._cond_delta_key(index) not in self.src.name_to_shard:
             return False

@@ -455,7 +455,7 @@ def _train_one_step_l2p(
     mut micro_in_window: Int,
     mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
     mut adamw_state_ready: Bool,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
     var t0 = perf_counter_ns()
@@ -877,7 +877,7 @@ def _train_one_step_l2p_b2(
     weight_decay: Float32,
     mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
     mut adamw_state_ready: Bool,
-    train_start_ns: UInt,
+    train_start_ns: Int,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
     var t0 = perf_counter_ns()

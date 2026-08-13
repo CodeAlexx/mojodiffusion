@@ -36,7 +36,10 @@ def _workflow_string(obj: JSONValue, key: String) raises -> String:
 
 def _workflow_canonical_type_id(var type_id: String) -> String:
     if type_id.startswith("comfy/"):
-        type_id = String(type_id.removeprefix("comfy/"))
+        # Mojo 1.0 rejects constructing a String from a slice of the same
+        # String it is assigned back into — materialize through a temporary.
+        var stripped = String(type_id.removeprefix("comfy/"))
+        type_id = stripped^
     return type_id^
 
 

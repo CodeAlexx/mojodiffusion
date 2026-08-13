@@ -34,4 +34,4 @@ fi
   -o lib/libserenity_cudnn_sdpa.so
 
 echo "built: $(ls -la lib/libserenity_cudnn_sdpa.so)"
-nm -D lib/libserenity_cudnn_sdpa.so | rg 'flame_cudnn|serenity_cudnn|serenity_cublas'
+nm -D lib/libserenity_cudnn_sdpa.so | grep -E 'flame_cudnn|serenity_cudnn|serenity_cublas'

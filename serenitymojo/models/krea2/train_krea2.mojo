@@ -2512,10 +2512,14 @@ def _lora_save_path(cfg: TrainConfig, step: Int) raises -> String:
 # to the SAME sidecar the weights save wrote. Mirrors klein's _img_in_ref_path.
 def _krea2_img_in_ref_path_for_lora(lora_path: String) -> String:
     var base = lora_path
+    # Mojo 1.0 rejects building a String from a slice of the String it is
+    # assigned back into — materialize each strip through a temporary.
     if base.endswith(String(".state")):
-        base = String(base.removesuffix(String(".state")))
+        var stripped_state = String(base.removesuffix(String(".state")))
+        base = stripped_state^
     if base.endswith(String(".safetensors")):
-        base = String(base.removesuffix(String(".safetensors")))
+        var stripped_st = String(base.removesuffix(String(".safetensors")))
+        base = stripped_st^
     return base + String("_img_in_ref.safetensors")
 
 

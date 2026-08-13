@@ -2172,9 +2172,20 @@ def _sdpa_backward_rect_storage_slab[
     var go_f32ptr = go_f32.unsafe_ptr().bitcast[Float32]()
     var k_f32ptr = k_f32.unsafe_ptr().bitcast[Float32]()
     var q_f32ptr = q_f32.unsafe_ptr().bitcast[Float32]()
-    _cast_bwd_f32[dtype](goptr, go_f32ptr, q_bhsd_rows * Dh, ctx)
-    _cast_bwd_f32[dtype](kptr, k_f32ptr, kv_bhsd_rows * Dh, ctx)
-    _cast_bwd_f32[dtype](qptr, q_f32ptr, q_bhsd_rows * Dh, ctx)
+    # Mojo 1.0 origin strictness: these carry the slab's tracked origin, which
+    # no longer converts to the kernel's MutAnyOrigin parameter. Launder through
+    # the address like the LayoutTensor sites above -- identical address math.
+    comptime AnyP = UnsafePointer[Scalar[dtype], MutAnyOrigin]
+    comptime AnyF32P = UnsafePointer[Float32, MutAnyOrigin]
+    var goptr_any = AnyP(unsafe_from_address=Int(goptr))
+    var kptr_any = AnyP(unsafe_from_address=Int(kptr))
+    var qptr_any = AnyP(unsafe_from_address=Int(qptr))
+    var go_f32_any = AnyF32P(unsafe_from_address=Int(go_f32ptr))
+    var k_f32_any = AnyF32P(unsafe_from_address=Int(k_f32ptr))
+    var q_f32_any = AnyF32P(unsafe_from_address=Int(q_f32ptr))
+    _cast_bwd_f32[dtype](goptr_any, go_f32_any, q_bhsd_rows * Dh, ctx)
+    _cast_bwd_f32[dtype](kptr_any, k_f32_any, kv_bhsd_rows * Dh, ctx)
+    _cast_bwd_f32[dtype](qptr_any, q_f32_any, q_bhsd_rows * Dh, ctx)
     for bh in range(BH):
         var Pdv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](

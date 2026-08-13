@@ -279,7 +279,15 @@ def adam8bit_fast_equivalence_gate() raises:
             Float32(1.0e-8), Float32(0.01),
         )
         _ = _adam8bit_step_fast(
-            p_fast, g_bf.unsafe_ptr(), n, gscale, st_fast, qs, qu, k,
+            p_fast,
+            # Mojo 1.0 origin strictness: launder the tracked buffer origin to
+            # the kernel helper's MutAnyOrigin. Address math is unchanged and
+            # _adam8bit_step_fast's body is untouched (its FMA contraction is
+            # bit-sensitive -- see the autograd-v2 skill).
+            UnsafePointer[BFloat16, MutAnyOrigin](
+                unsafe_from_address=Int(g_bf.unsafe_ptr())
+            ),
+            n, gscale, st_fast, qs, qu, k,
             Float32(1.0e-5), Float32(0.9), Float32(0.999),
             Float32(1.0e-8), Float32(0.01),
         )
@@ -648,7 +656,7 @@ def _fullft_open_ckpt_fd(out_dir: String, header: String) raises -> Int:
     var head = alloc[UInt8](8 + hlen)
     var hl = UInt64(hlen)
     for b in range(8):
-        head[b] = UInt8((hl >> (8 * b)) & 0xFF)
+        head[b] = UInt8((hl >> UInt64(8 * b)) & 0xFF)
     var hb = header.as_bytes()
     for b in range(hlen):
         head[8 + b] = hb[b]

@@ -501,7 +501,9 @@ def main() raises:
     print("  TODO: replace with wan22_build_rope for real training.")
 
     # ── LoRA / LyCORIS carrier set (identity at init) ─────────────────────────
-    var lora = build_wan22_lora_set(NUM_BLOCKS, DIM, train_cfg.lora_rank, train_cfg.lora_alpha)
+    var lora = build_wan22_lora_set(
+        NUM_BLOCKS, DIM, FFN, train_cfg.lora_rank, train_cfg.lora_alpha
+    )
     var lokr_masters = empty_flat_lokr_set()
     var loha_masters = empty_flat_loha_set()
     var dora_masters = empty_wan22_direct_dora_set()

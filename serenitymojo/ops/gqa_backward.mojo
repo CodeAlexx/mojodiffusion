@@ -209,7 +209,7 @@ def repeat_kv_backward(
     )
         ctx.enqueue_function[_repeat_kv_bwd_kernel[DType.float16]](DDST, DSRC, Int32(s), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
-    var sh = [1, s, h_kv, dh]
+    var sh: List[Int] = [1, s, h_kv, dh]
     return Tensor(out_buf^, sh^, d_dst.dtype())
 
 
@@ -277,7 +277,7 @@ def repeat_kv_f32_slab(
         runtime_layout=out_rl,
     )
         ctx.enqueue_function[_repeat_kv_fwd_kernel[DType.float16]](SRC, DST, Int32(s), Int32(h), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK)
-    var sh = [1, s, h, dh]
+    var sh: List[Int] = [1, s, h, dh]
     return Tensor(out_buf^, sh^, x.dtype())
 
 
@@ -341,5 +341,5 @@ def repeat_kv_backward_slab(
         runtime_layout=src_rl,
     )
         ctx.enqueue_function[_repeat_kv_bwd_kernel[DType.float16]](DDST, DSRC, Int32(s), Int32(h_kv), Int32(dh), Int32(n_rep), grid_dim=grid, block_dim=_BLOCK)
-    var sh = [1, s, h_kv, dh]
+    var sh: List[Int] = [1, s, h_kv, dh]
     return Tensor(out_buf^, sh^, d_dst.dtype())

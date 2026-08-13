@@ -3720,7 +3720,13 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   class), decode of the 512x320x175 reference latents 464→74 s. Gates: flash
   alone 66.1 dB mean vs F32-math frames; BF16+flash 54.3 dB mean / 52.6 min,
   audio byte-identical. External contract unchanged (F32 latents in / F32
-  pixels out; entry/exit casts).
+  pixels out; entry/exit casts). 2026-08-13 BATCHED tile decode
+  (`minimax_h3_video_decode_device_batched` + one stacked call in
+  `minimax_h3_video_tiled_decode`): all spatial tiles of a clip run as ONE
+  runtime-B pass through `sdpa_flash_infer_fwd_dynamic` — the per-tile call
+  storm was ~98% of product-geometry decode. 1344x768x243: 449→205 s
+  (521 s pre-rebuild → 2.54x total); 512x320x175: 74→60 s. Gated
+  BYTE-IDENTICAL frames+audio vs the per-tile path at both geometries.
 - `models/vae/minimax_h3_ref_encode.mojo` — reference encode chain; the
   vendor's fp16 round-trip BEFORE latent normalize is mandatory
   (encoders.py:586-588); video refs SAMPLE seed 42 CPU-gen, audio refs MODE.

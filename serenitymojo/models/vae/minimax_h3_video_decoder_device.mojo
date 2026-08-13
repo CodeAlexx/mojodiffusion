@@ -111,6 +111,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear_bias
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.attention import sdpa_nomask_infer
+from serenitymojo.ops.attention_flash import sdpa_flash_infer_fwd_dynamic
 from serenitymojo.ops.tensor_algebra import (
     add, concat, mul, mul_scalar, reshape, reshape_owned, slice, zeros_device,
 )
@@ -598,6 +599,160 @@ def _unpack_patches(
 # ─────────────────────────────────────────────────────────────────────────────
 # Top-level forward.
 # ─────────────────────────────────────────────────────────────────────────────
+def _vit_attention_dyn(
+    x: Tensor,  # [B, S, dim]
+    prefix: String, config: MiniMaxH3VideoDecoderDeviceConfig,
+    decoder: MiniMaxH3VideoDecoderDevice,
+    cos_t: Tensor, sin_t: Tensor, rot_dim: Int, qk_ones: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Runtime-shape twin of `_vit_attention` for the BATCHED tile path:
+    attention runs through the cuDNN dynamic entry (runtime B/S), so one
+    call covers every tile of a clip instead of one launch storm per tile."""
+    var xs = x.shape()
+    var Bt = xs[0]
+    var St = xs[1]
+    var heads = config.heads
+    var head_dim = config.dim_head
+    var q = linear_bias(
+        x, decoder._w(prefix + ".attn.to_q.weight"),
+        decoder._w(prefix + ".attn.to_q.bias"), ctx,
+    )
+    var k = linear_bias(
+        x, decoder._w(prefix + ".attn.to_k.weight"),
+        decoder._w(prefix + ".attn.to_k.bias"), ctx,
+    )
+    var v = linear_bias(
+        x, decoder._w(prefix + ".attn.to_v.weight"),
+        decoder._w(prefix + ".attn.to_v.bias"), ctx,
+    )
+    q = reshape(q, [Bt, St, heads, head_dim], ctx)
+    k = reshape(k, [Bt, St, heads, head_dim], ctx)
+    v = reshape(v, [Bt, St, heads, head_dim], ctx)
+    q = rms_norm(q, qk_ones, config.norm_eps, ctx)
+    k = rms_norm(k, qk_ones, config.norm_eps, ctx)
+    q = _apply_rope(q, cos_t, sin_t, rot_dim, ctx)
+    k = _apply_rope(k, cos_t, sin_t, rot_dim, ctx)
+    var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    var attn = sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
+    var flat = reshape_owned(attn^, [Bt, St, heads * head_dim])
+    return linear_bias(
+        flat, decoder._w(prefix + ".attn.to_out.weight"),
+        decoder._w(prefix + ".attn.to_out.bias"), ctx,
+    )
+
+
+def _vit_block_forward_dyn(
+    var hidden: Tensor, prefix: String,
+    config: MiniMaxH3VideoDecoderDeviceConfig,
+    decoder: MiniMaxH3VideoDecoderDevice,
+    cos_t: Tensor, sin_t: Tensor, rot_dim: Int, qk_ones: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var normed = rms_norm(hidden, decoder._w(prefix + ".norm1.weight"), config.norm_eps, ctx)
+    var attn_out = _vit_attention_dyn(normed, prefix, config, decoder, cos_t, sin_t, rot_dim, qk_ones, ctx)
+    hidden = add(hidden, mul(attn_out, decoder._w(prefix + ".scale1"), ctx), ctx)
+    var normed2 = rms_norm(hidden, decoder._w(prefix + ".norm2.weight"), config.norm_eps, ctx)
+    var ff_out = _swiglu_ff(normed2, prefix, config, decoder, ctx)
+    hidden = add(hidden, mul(ff_out, decoder._w(prefix + ".scale2"), ctx), ctx)
+    return hidden^
+
+
+def minimax_h3_video_decode_device_batched(
+    decoder: MiniMaxH3VideoDecoderDevice,
+    latents: Tensor,  # [B, T, H, W, latent_channels] NDHWC — B stacked tiles
+    ctx: DeviceContext,
+) raises -> List[Tensor]:
+    """Decode B same-shape latent tiles in ONE pass through the ViT.
+
+    The spatially tiled product decode previously ran one full
+    `minimax_h3_video_decode_device` per tile — at 1344x768x243 that is
+    ~270 calls whose GEMM content is seconds but whose per-call launch/alloc
+    overhead measured ~98% of a 449 s decode. Every non-attention op here is
+    leading-dim agnostic, and attention runs the cuDNN dynamic entry with
+    runtime B, so the whole clip's tiles cost one launch chain. Returns the
+    per-tile decoded volumes in batch order (the blend/stitch consumer is
+    unchanged). BF16-resident weights required (the shipped configuration)."""
+    var config = decoder.config.copy()
+    if config.t_causal:
+        raise Error(
+            "MiniMax-H3 video decoder device (batched): t_causal=True not"
+            " implemented"
+        )
+    var ls = latents.shape()
+    var Bt = ls[0]
+    var lt = ls[1]
+    var lh = ls[2]
+    var lw = ls[3]
+    var num_tokens = lt * lh * lw
+    var num_suffix = 1 + config.num_register_tokens
+    var S = num_tokens + num_suffix
+    var dim = config.dim()
+
+    var pqw_shape = decoder._w("post_quant_conv.weight").shape()
+    var pqw2d = reshape(decoder._w("post_quant_conv.weight"), [pqw_shape[0], pqw_shape[1]], ctx)
+    if pqw2d.dtype() != STDtype.BF16:
+        raise Error(
+            "MiniMax-H3 batched decode requires the BF16-resident decoder"
+        )
+    var tokens_in = reshape(latents, [Bt, num_tokens, config.latent_channels], ctx)
+    if tokens_in.dtype() != STDtype.BF16:
+        tokens_in = cast_tensor(tokens_in, STDtype.BF16, ctx)
+    var post_quant = linear_bias(
+        tokens_in, pqw2d, decoder._w("post_quant_conv.bias"), ctx,
+    )
+    var hidden = linear_bias(
+        post_quant, decoder._w("decoder.x_embedder.weight"),
+        decoder._w("decoder.x_embedder.bias"), ctx,
+    )  # [B, num_tokens, dim]
+
+    # Suffix rows: shared register tokens replicated per batch element + the
+    # one zero token. Tiny tensors — a B-long concat chain is fine.
+    var regs_b = decoder._w("decoder.register_tokens").clone(ctx)
+    for _ in range(Bt - 1):
+        regs_b = concat(0, ctx, regs_b, decoder._w("decoder.register_tokens"))
+    var zero_tok = zeros_device([Bt, 1, dim], hidden.dtype(), ctx)
+    var h1 = concat(1, ctx, hidden, regs_b)
+    var full = concat(1, ctx, h1, zero_tok)  # [B, S, dim]
+
+    var rope = _build_rope_tables(lt, lh, lw, num_suffix, config, ctx)
+    var ones_host = List[Float32](capacity=config.dim_head)
+    for _ in range(config.dim_head):
+        ones_host.append(Float32(1.0))
+    var qk_ones = Tensor.from_host(ones_host, [config.dim_head], STDtype.BF16, ctx)
+
+    var current = full^
+    for layer in range(config.num_layers):
+        current = _vit_block_forward_dyn(
+            current^, _block_prefix(layer), config, decoder,
+            rope.cos, rope.sin, rope.rotary_dim, qk_ones, ctx
+        )
+
+    var normed_out = layer_norm(
+        current, decoder._w("decoder.norm_out.weight"),
+        decoder._w("decoder.norm_out.bias"), config.norm_eps, ctx,
+    )
+    var projected = linear_bias(
+        normed_out, decoder._w("decoder.proj_out.weight"),
+        decoder._w("decoder.proj_out.bias"), ctx,
+    )  # [B, S, patch_dim]
+
+    var out = List[Tensor]()
+    var pd = projected.shape()[2]
+    for b in range(Bt):
+        var one = slice(projected, 0, b, 1, ctx)              # [1, S, pd]
+        var patch_tokens = slice(one, 1, 0, num_tokens, ctx)  # [1, ntok, pd]
+        var vol = _unpack_patches(
+            patch_tokens, config.out_channels, config.patch_size_t,
+            config.patch_size, lt, lh, lw, ctx,
+        )
+        if vol.dtype() != STDtype.F32:
+            vol = cast_tensor(vol, STDtype.F32, ctx)
+        out.append(vol^)
+    _ = pd
+    return out^
+
+
 def minimax_h3_video_decode_device[S: Int, H: Int, Dh: Int](
     decoder: MiniMaxH3VideoDecoderDevice,
     latents: Tensor,  # [1, T, H, W, latent_channels] NDHWC (sampled latent)

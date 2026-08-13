@@ -58,6 +58,7 @@ from serenitymojo.models.vae.minimax_h3_video_encoder_device import (
 )
 from serenitymojo.models.vae.minimax_h3_video_decoder_device import (
     MiniMaxH3VideoDecoderDevice, minimax_h3_video_decode_device,
+    minimax_h3_video_decode_device_batched,
 )
 
 comptime TArc = ArcPointer[Tensor]
@@ -269,7 +270,12 @@ def minimax_h3_video_tiled_decode[
             )
         return minimax_h3_video_decode_device[S_TILE, HEADS, DIM_HEAD](decoder, latents, ctx)
 
-    var raw = List[TArc]()
+    # Stack every tile's latent and decode them as ONE batch: the per-tile
+    # decode calls were ~98% launch/alloc overhead at product geometry
+    # (521 s -> 449 s was all the BF16+flash rebuild could recover through
+    # ~270 separate calls). The batched path shares one launch chain per
+    # clip; the blend/stitch below is unchanged.
+    var stacked = List[TArc]()
     for i in range(i_max):
         var i_pos_px = y_layout.start_idx[i]
         var i_len_px = _clamp_tile_len(i_pos_px, y_layout.lengths[i], height)
@@ -296,11 +302,14 @@ def minimax_h3_video_tiled_decode[
                     " match the comptime LATENT_TILE_W -- non-uniform tiling"
                     " unsupported here"
                 )
-            var tile_latent = slice(row_slice, 3, j_pos, j_len, ctx)
-            var dec_tile = minimax_h3_video_decode_device[S_TILE, HEADS, DIM_HEAD](
-                decoder, tile_latent, ctx
-            )
-            raw.append(TArc(dec_tile^))
+            stacked.append(TArc(slice(row_slice, 3, j_pos, j_len, ctx)))
+    var batch = stacked[0][].clone(ctx)
+    for t in range(1, len(stacked)):
+        batch = concat(0, ctx, batch, stacked[t][])
+    var decoded = minimax_h3_video_decode_device_batched(decoder, batch, ctx)
+    var raw = List[TArc]()
+    for _ in range(len(decoded)):
+        raw.append(TArc(decoded.pop(0)))
 
     var result_rows = List[TArc]()
     for i in range(i_max):

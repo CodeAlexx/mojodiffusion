@@ -1443,6 +1443,58 @@ def _load_ctx_len(
     return v
 
 
+def _postconn_stat(path: String) -> List[Int]:
+    """[size, mtime] of a file, or [-1,-1] — keys the post-connector sidecar
+    to its pre-connector dump (same convention as the H3 runtime caches)."""
+    var n = path.byte_length()
+    var cbuf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        cbuf[i] = src[i]
+    cbuf[n] = 0
+    var statbuf = alloc[UInt8](160)
+    var rc = Int(
+        external_call["stat", Int32](
+            _HQEnvPtr(unsafe_from_address=Int(cbuf)),
+            _HQEnvPtr(unsafe_from_address=Int(statbuf)),
+        )
+    )
+    var size = -1
+    var mtime = -1
+    if rc == 0:
+        var q = statbuf.bitcast[Int64]()
+        size = Int(q[6])
+        mtime = Int(q[11])
+    cbuf.free()
+    statbuf.free()
+    var out: List[Int] = [size, mtime]
+    return out^
+
+
+def _postconn_i64(st: ShardedSafeTensors, key: String) raises -> Int:
+    """Read a raw-LE i64 meta tensor (H3 runtime-cache convention) — F32
+    round-trips cannot hold an mtime exactly."""
+    if not _st_has(st, key):
+        return -1
+    var tv = st.tensor_view(key)
+    if tv.nbytes() != 8:
+        return -1
+    var value = 0
+    for i in range(8):
+        value |= Int(tv.data.unsafe_ptr()[i]) << (8 * i)
+    return value
+
+
+def _postconn_i64_tensor(value: Int, ctx: DeviceContext) raises -> Tensor:
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](8)
+    host.unsafe_ptr().bitcast[Int64]()[0] = Int64(value)
+    var dev = ctx.enqueue_create_buffer[DType.uint8](8)
+    ctx.enqueue_copy(dst_buf=dev, src_buf=host)
+    ctx.synchronize()
+    var shape: List[Int] = [1]
+    return Tensor(dev^, shape^, STDtype.I64)
+
+
 def _load_video_nag_context(
     v_conn: LTX2ConnectorWeights,
     ctx: DeviceContext,
@@ -2072,15 +2124,6 @@ def run_single_p[
     )
     var conditioning_t0 = perf_counter()
     print("  [connector] loading + running video/audio (BF16 storage)")
-    var v_conn = LTX2ConnectorWeights.load(
-        _ckpt_fp8(), String("video_embeddings_connector"),
-        LTX2ConnectorConfig.video(), ctx,
-    )
-    var a_conn = LTX2ConnectorWeights.load(
-        _ckpt_fp8(), String("audio_embeddings_connector"),
-        LTX2ConnectorConfig.audio(), ctx,
-    )
-
     # FULL 1024-token contexts (no tail slice): use the entire dump.
     var _ctx_dump_path = context_path.copy()
     if _ctx_dump_path.byte_length() == 0:
@@ -2089,28 +2132,92 @@ def run_single_p[
         _ctx_dump_path = _audio_ctx_dump()
     else:
         print("  [ctx] OVERRIDE dump:", _ctx_dump_path)
-    var dump = ShardedSafeTensors.open(_ctx_dump_path)
-    var video_pre = Tensor.from_view_as_bf16(dump.tensor_view("video_context"), ctx)  # [1,1024,4096]
-    var audio_pre = Tensor.from_view_as_bf16(dump.tensor_view("audio_context"), ctx)  # [1,1024,2048]
-    _ = _stats(String("video_pre(FULL 1024)"), video_pre, ctx)
-    _ = _stats(String("audio_pre(FULL 1024 REAL)"), audio_pre, ctx)
 
-    var ctx_valid = _load_ctx_len(dump, String("video_len"), ctx)
-    print("  [ctx] valid rows:", ctx_valid, "/", N_TXT,
-          "(pads -> learnable registers)")
-    var enc = ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](
-        v_conn, video_pre, ctx, valid_len=ctx_valid
-    )
-    var aenc = ltx2_connector_forward[N_TXT, A_HEADS, A_HDIM](
-        a_conn, audio_pre, ctx, valid_len=ctx_valid
-    )
+    # Post-connector sidecar, keyed to the pre-connector dump's size+mtime:
+    # a hit skips BOTH connector weight loads AND the 8+8 transformer-block
+    # forwards, which previously ran per request (repo finding: conditioning
+    # was cached PRE-connector only).
+    var _post_path = _ctx_dump_path + String(".postconn.v1.safetensors")
+    var _pre_sm = _postconn_stat(_ctx_dump_path)
+    var _post_enc = List[Tensor]()
+    var _post_aenc = List[Tensor]()
+    var _post_valid = 0
+    try:
+        var post = ShardedSafeTensors.open(_post_path)
+        if (
+            _pre_sm[0] > 0
+            and _postconn_i64(post, String("src_size")) == _pre_sm[0]
+            and _postconn_i64(post, String("src_mtime")) == _pre_sm[1]
+        ):
+            _post_enc.append(
+                Tensor.from_view(post.tensor_view(String("enc")), ctx)
+            )
+            _post_aenc.append(
+                Tensor.from_view(post.tensor_view(String("aenc")), ctx)
+            )
+            _post_valid = _postconn_i64(post, String("valid"))
+    except:
+        pass
+
+    var enc: Tensor
+    var aenc: Tensor
+    var ctx_valid: Int
+    if len(_post_enc) == 1 and len(_post_aenc) == 1:
+        print("  [ctx] post-connector cache HIT:", _post_path)
+        enc = _post_enc.pop()
+        aenc = _post_aenc.pop()
+        ctx_valid = _post_valid
+    else:
+        var v_conn = LTX2ConnectorWeights.load(
+            _ckpt_fp8(), String("video_embeddings_connector"),
+            LTX2ConnectorConfig.video(), ctx,
+        )
+        var a_conn = LTX2ConnectorWeights.load(
+            _ckpt_fp8(), String("audio_embeddings_connector"),
+            LTX2ConnectorConfig.audio(), ctx,
+        )
+        var dump = ShardedSafeTensors.open(_ctx_dump_path)
+        var video_pre = Tensor.from_view_as_bf16(dump.tensor_view("video_context"), ctx)  # [1,1024,4096]
+        var audio_pre = Tensor.from_view_as_bf16(dump.tensor_view("audio_context"), ctx)  # [1,1024,2048]
+        _ = _stats(String("video_pre(FULL 1024)"), video_pre, ctx)
+        _ = _stats(String("audio_pre(FULL 1024 REAL)"), audio_pre, ctx)
+
+        ctx_valid = _load_ctx_len(dump, String("video_len"), ctx)
+        print("  [ctx] valid rows:", ctx_valid, "/", N_TXT,
+              "(pads -> learnable registers)")
+        enc = ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](
+            v_conn, video_pre, ctx, valid_len=ctx_valid
+        )
+        aenc = ltx2_connector_forward[N_TXT, A_HEADS, A_HDIM](
+            a_conn, audio_pre, ctx, valid_len=ctx_valid
+        )
+        var _pn = List[String]()
+        var _pt = List[ArcPointer[Tensor]]()
+        _pn.append(String("enc"))
+        _pt.append(ArcPointer(_clone(enc, ctx)))
+        _pn.append(String("aenc"))
+        _pt.append(ArcPointer(_clone(aenc, ctx)))
+        _pn.append(String("valid"))
+        _pt.append(ArcPointer(_postconn_i64_tensor(ctx_valid, ctx)))
+        _pn.append(String("src_size"))
+        _pt.append(ArcPointer(_postconn_i64_tensor(_pre_sm[0], ctx)))
+        _pn.append(String("src_mtime"))
+        _pt.append(ArcPointer(_postconn_i64_tensor(_pre_sm[1], ctx)))
+        save_safetensors(_pn^, _pt^, _post_path, ctx)
+        print("  [ctx] post-connector cache SAVED:", _post_path)
     _ = _stats(String("enc"), enc, ctx)
     _ = _stats(String("aenc"), aenc, ctx)
     var nag = NAGContext.disabled(ctx)
     if use_nag:
         print("  [NAG] loading video null context (audio NAG disabled: no audio null dump)")
+        # NAG needs the video connector regardless of the post-conn cache;
+        # loaded here lazily so the cached fast path stays connector-free.
+        var nag_conn = LTX2ConnectorWeights.load(
+            _ckpt_fp8(), String("video_embeddings_connector"),
+            LTX2ConnectorConfig.video(), ctx,
+        )
         var nag_v = _load_video_nag_context(
-            v_conn, ctx, negative_context_path
+            nag_conn, ctx, negative_context_path
         )
         _ = _stats(String("nag_video_context"), nag_v, ctx)
         var nag_a = _nag_audio_placeholder(ctx)

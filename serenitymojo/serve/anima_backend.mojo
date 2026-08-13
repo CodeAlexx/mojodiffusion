@@ -499,6 +499,12 @@ struct AnimaBackend(GenBackend, Movable):
     # context host lists (cond + uncond), [B*S_TXT*JOINT] F32, produced at ENCODE.
     var has_ctx: Bool
     var ctx_cond: List[Float32]
+    # Keyed (prompt \x1f negative) conditioning cache, capacity 4 drop-oldest
+    # — each repeat prompt previously re-loaded Qwen3-0.6B + the adapter from
+    # disk and re-ran both forwards.
+    var cap_cache_keys: List[String]
+    var cap_cache_cond: List[List[Float32]]
+    var cap_cache_uncond: List[List[Float32]]
     var ctx_uncond: List[Float32]
     # working latent (channels-last [B,H,W,C] F32), produced at LOAD, updated each
     # DENOISE tick.
@@ -531,6 +537,9 @@ struct AnimaBackend(GenBackend, Movable):
         self.has_ctx = False
         self.ctx_cond = List[Float32]()
         self.ctx_uncond = List[Float32]()
+        self.cap_cache_keys = List[String]()
+        self.cap_cache_cond = List[List[Float32]]()
+        self.cap_cache_uncond = List[List[Float32]]()
         self.has_latent = False
         self.latent = List[Float32]()
         self.job_t0_ns = Int(0)
@@ -731,6 +740,16 @@ struct AnimaBackend(GenBackend, Movable):
         net.llm_adapter (loaded then freed) -> context_cond / context_uncond host
         F32 lists. The negative is the literal params.negative (empty string ->
         empty-prompt CFG, matching the reference trainer/diffusers unconditional)."""
+        var want_key = self.params.prompt + String("\x1f") + self.params.negative
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] != want_key:
+                continue
+            print("[anima] conditioning cache HIT (slot", slot, "of",
+                  len(self.cap_cache_keys), ") — skipping Qwen3+adapter")
+            self.ctx_cond = self.cap_cache_cond[slot].copy()
+            self.ctx_uncond = self.cap_cache_uncond[slot].copy()
+            self.has_ctx = True
+            return
         _print_vram("before text encode (Qwen3 + adapter load)")
         var qtok = qwen3_tokenizer_open(
             String(QWEN3_TOK_JSON), String(QWEN3_TOK_JSON) + ".mjtok"
@@ -748,6 +767,13 @@ struct AnimaBackend(GenBackend, Movable):
         self.ctx_cond = encode_anima_context_host(pos_tokens^, enc, wts, self.ctx)
         self.ctx_uncond = encode_anima_context_host(neg_tokens^, enc, wts, self.ctx)
         self.has_ctx = True
+        if len(self.cap_cache_keys) >= 4:
+            _ = self.cap_cache_keys.pop(0)
+            _ = self.cap_cache_cond.pop(0)
+            _ = self.cap_cache_uncond.pop(0)
+        self.cap_cache_keys.append(want_key.copy())
+        self.cap_cache_cond.append(self.ctx_cond.copy())
+        self.cap_cache_uncond.append(self.ctx_uncond.copy())
         # enc / wts drop here (Movable-not-Copyable -> freed at scope exit).
         _print_vram("after text encode (encoder + adapter freed)")
 

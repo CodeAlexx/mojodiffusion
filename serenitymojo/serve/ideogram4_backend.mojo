@@ -415,6 +415,12 @@ struct Ideogram4Backend(GenBackend, Movable):
     var cfg: Float32
     var prompt_tokens: Int
     var text_features: List[TArc]
+    # Keyed-by-prompt conditioning cache (neg path is image-only zeros here),
+    # capacity 4 drop-oldest — repeat prompts previously re-paid the streamed
+    # layer-by-layer TE read (~1.9 GB from disk) every job.
+    var cap_cache_keys: List[String]
+    var cap_cache_feats: List[TArc]
+    var cap_cache_tokens: List[Int]
     var llm: List[TArc]
     var neg_llm: List[TArc]
     var text_zpad: List[TArc]
@@ -463,6 +469,9 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.cfg = Float32(7.0)
         self.prompt_tokens = 0
         self.text_features = List[TArc]()
+        self.cap_cache_keys = List[String]()
+        self.cap_cache_feats = List[TArc]()
+        self.cap_cache_tokens = List[Int]()
         self.llm = List[TArc]()
         self.neg_llm = List[TArc]()
         self.text_zpad = List[TArc]()
@@ -659,6 +668,17 @@ struct Ideogram4Backend(GenBackend, Movable):
             self._ensure_static_b[GH, GW](BUCKET_SQUARE)
 
     def _encode(mut self) raises:
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] != self.params.prompt:
+                continue
+            print("[ideogram4] conditioning cache HIT (slot", slot, "of",
+                  len(self.cap_cache_keys), ") — skipping streamed TE")
+            self.prompt_tokens = self.cap_cache_tokens[slot]
+            self.text_features = List[TArc]()
+            self.text_features.append(TArc(
+                self.cap_cache_feats[slot][].clone(self.ctx)
+            ))
+            return
         var tok = qwen3_tokenizer_open(
             String(TOK_JSON), String(TOK_JSON) + ".mjtok"
         )
@@ -705,6 +725,15 @@ struct Ideogram4Backend(GenBackend, Movable):
             self.text_features.append(TArc(zeroed^))
         else:
             self.text_features = feats_list^
+        if len(self.cap_cache_keys) >= 4:
+            _ = self.cap_cache_keys.pop(0)
+            _ = self.cap_cache_feats.pop(0)
+            _ = self.cap_cache_tokens.pop(0)
+        self.cap_cache_keys.append(self.params.prompt.copy())
+        self.cap_cache_feats.append(TArc(
+            self.text_features[0][].clone(self.ctx)
+        ))
+        self.cap_cache_tokens.append(self.prompt_tokens)
 
     def _single_trunk(self) raises -> Bool:
         """True when the card cannot hold both 8.7GB fp8 trunks (17.4GB > any

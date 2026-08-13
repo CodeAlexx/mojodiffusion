@@ -329,6 +329,12 @@ struct QwenImageBackend(GenBackend, Movable):
     var params: JobParams
     var cfg: Float32
     var caps: List[ArcPointer[QwenCaps]]      # 0/1
+    # Keyed (prompt \x1f negative) conditioning cache, capacity 4 drop-oldest
+    # — this backend previously printed "cache MISS -> fork encoder child"
+    # with NO cache behind it; every repeat prompt re-paid the ~16 GB child
+    # encoder fork (3-25 s).
+    var cap_cache_keys: List[String]
+    var cap_cache: List[ArcPointer[QwenCaps]]
     var sched: List[ArcPointer[Scheduler]]    # 0/1
     var latent: List[ArcPointer[Tensor]]      # 0/1 (packed)
     var lora: List[ArcPointer[QwenLoraDeviceSet]]  # 0/1, per job
@@ -352,6 +358,8 @@ struct QwenImageBackend(GenBackend, Movable):
         self.params = JobParams()
         self.cfg = Float32(4.0)
         self.caps = List[ArcPointer[QwenCaps]]()
+        self.cap_cache_keys = List[String]()
+        self.cap_cache = List[ArcPointer[QwenCaps]]()
         self.sched = List[ArcPointer[Scheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
         self.lora = List[ArcPointer[QwenLoraDeviceSet]]()
@@ -465,10 +473,31 @@ struct QwenImageBackend(GenBackend, Movable):
         fork preflight is the STREAMED-encoder child bar (~3.6 GB) — the child
         itself picks streamed vs resident encode by free VRAM (see
         _encode_captions_child_lowvram above)."""
+        var want_key = self.params.prompt + String("\x1f") + self.params.negative
+        for slot in range(len(self.cap_cache_keys)):
+            if self.cap_cache_keys[slot] != want_key:
+                continue
+            print("[qwenimage] conditioning cache HIT (slot", slot, "of",
+                  len(self.cap_cache_keys), ") — skipping encoder child")
+            ref cached = self.cap_cache[slot][]
+            self.caps = List[ArcPointer[QwenCaps]]()
+            self.caps.append(ArcPointer(QwenCaps(
+                cached.pos.clone(self.ctx), cached.neg.clone(self.ctx),
+                cached.real_pos, cached.real_neg,
+            )))
+            return
         var caps = _encode_captions_child_lowvram(
             self.params.prompt, self.params.negative, self.ctx
         )
         _print_vram("after text encode (encoder child reaped)")
+        if len(self.cap_cache_keys) >= 4:
+            _ = self.cap_cache_keys.pop(0)
+            _ = self.cap_cache.pop(0)
+        self.cap_cache_keys.append(want_key.copy())
+        self.cap_cache.append(ArcPointer(QwenCaps(
+            caps.pos.clone(self.ctx), caps.neg.clone(self.ctx),
+            caps.real_pos, caps.real_neg,
+        )))
         self.caps = List[ArcPointer[QwenCaps]]()
         self.caps.append(ArcPointer(caps^))
 

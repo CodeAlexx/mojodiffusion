@@ -297,6 +297,18 @@ struct TurboBlockLoader(Movable):
             index_starts.append(start)
             index_lengths.append(count)
 
+        # Allocate the two pinned host slabs and two device slabs BEFORE the
+        # block-store fill: pinned allocations charge on touch, and creating
+        # them after the fill (when the cgroup already holds store + residual
+        # cache charge) slammed a 24G MemoryMax scope into direct reclaim —
+        # the tail PSI spike of the MJ-1144 desktop kills. Here the footprint
+        # is still small, so they charge without pressure.
+        var host0 = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
+        var host1 = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
+        var dev0 = ctx.enqueue_create_buffer[DType.uint8](max_bytes)
+        var dev1 = ctx.enqueue_create_buffer[DType.uint8](max_bytes)
+        ctx.synchronize()
+
         # Optional persistent pinned block store. The default keeps startup
         # bounded to two slot-sized pinned slabs; hot prefetches fill the active
         # host slot from mmap before dispatching H2D.
@@ -318,6 +330,15 @@ struct TurboBlockLoader(Movable):
         var block_store: HostBuffer[DType.uint8]
         if use_block_store:
             block_store = ctx.enqueue_create_host_buffer[DType.uint8](total_store_bytes)
+            # Release consumed mmap ranges every ~2 GB of fill progress: the
+            # pinned store grows monotonically while the checkpoint's mapped
+            # pages are pure transients, so retaining both until the end
+            # doubles the footprint (~34 GB for a 17 GB DiT) and drives the
+            # host into sustained reclaim (PSI >15% within seconds; the
+            # systemd-oomd desktop kills of 2026-08-13, MJ-1144). Blocks are
+            # copied forward-only, so dropped pages are never refaulted.
+            var release_stride = 2 * 1024 * 1024 * 1024
+            var bytes_since_release = 0
             for pi in range(len(prefixes)):
                 var dst_base = store_offsets[pi]
                 var offset = 0
@@ -330,6 +351,10 @@ struct TurboBlockLoader(Movable):
                     var dst = BytePtr(unsafe_from_address=Int(block_store.unsafe_ptr())) + dst_base + offset
                     _ = sys_memcpy(dst, src, nb)
                     offset += nb
+                bytes_since_release += store_nbytes[pi]
+                if bytes_since_release >= release_stride:
+                    sharded.release_to_os()
+                    bytes_since_release = 0
             # The complete weight source now lives in pinned host RAM. Drop the
             # checkpoint-backed page-cache copy immediately so load-once does
             # not retain both copies and pressure the host into OOM.
@@ -337,14 +362,8 @@ struct TurboBlockLoader(Movable):
         else:
             block_store = ctx.enqueue_create_host_buffer[DType.uint8](1)
 
-        # Allocate two pinned host slabs and two device slabs.
-        var host0 = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
-        var host1 = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
-        var dev0 = ctx.enqueue_create_buffer[DType.uint8](max_bytes)
-        var dev1 = ctx.enqueue_create_buffer[DType.uint8](max_bytes)
-        ctx.synchronize()
-
-        # Allocate events and copy stream.
+        # Allocate events and copy stream. (Slabs were created before the
+        # store fill — see above.)
         var ev0 = ctx.create_event[disable_timing=True]()
         var ev1 = ctx.create_event[disable_timing=True]()
         var compute_done0 = ctx.create_event[disable_timing=True]()

@@ -9,6 +9,43 @@ file is "where does X live". First target: Z-Image text→image.
 
 ## 1. Entry points
 
+- **Ideogram-4 dual-trunk on 24GB (2026-08-14, MJ-1142)**: the serve backend
+  runs the TRUE KJ dual-trunk (separate cond/uncond fp8 transformers) at
+  1024² on a 24GB card via `Ideogram4UncondStream`
+  (`models/dit/ideogram4_resident.mojo`): uncond layers live in a pinned host
+  slab and stage one layer (~275MB) at a time into a fixed device slab
+  (sub-buffer views, zero arena churn). Byte-exactness gates:
+  `ops/tests/ideogram4_uncond_stream_gate.mojo` (max_abs=0.0 on real weights)
+  and end-to-end 1024 renders pixel-identical to the resident path. Per-layer
+  + per-phase fences in the denoise release each pass's ~5GB transient family;
+  `serve/serenity_worker_ideogram4.mojo` self-arms
+  `MODULAR_DEVICE_CONTEXT_SYNC_MODE=true` pre-DeviceContext (the async pool
+  grows to the cumulative transient peak and OOMs direct cuBLAS workspace
+  allocs — house precedent `models/nldiffusion/parity/tiled_decode_probe.mojo`).
+  Residency policy: >=26GB both trunks resident; 20-26GB streamed uncond;
+  <20GB the historical single-trunk approximation.
+  `SERENITY_IDEOGRAM4_UNCOND_STREAM=1/0` forces, `SERENITY_IDEOGRAM4_MEMTRACE=1`
+  prints per-pass device usage. Prompts MUST be the structured JSON caption
+  schema (`/home/alex/ideogram4-ref/docs/prompting.md`) — bare text renders
+  near-uniform gray.
+- **Loader memory discipline (2026-08-13/14, MJ-1144)**: `offload/turbo_loader.mojo`
+  releases consumed checkpoint mmap every ~2GB during the pinned block-store
+  fill and pre-allocates its transfer slabs (peak ~34G → ~19G for a 17G DiT;
+  byte-neutral — klein step-1 loss bit-identical pre/post).
+  `models/text_encoder/qwen3_encoder.mojo` loads with a sliding WILLNEED
+  prefetch window + release-behind (16GB cold load 10+min → ~33s);
+  `io/sharded.mojo` gained public `prefetch_tensor`. Big loads on shared
+  boxes: watched scope + PSI tripwire, never bare (see the klein gate scripts
+  pattern).
+- **Weight-gate trainer builds (2026-08-14)**: `training/train_wan22_real.mojo`
+  (the REAL 2303-line musubi wan22 trainer — the fork under `trainer/src` is
+  frozen by user decision) builds as `output/bin/serenity_wan22_real_trainer`;
+  `training/train_ltx2_av.mojo` builds as `output/bin/serenity_ltx2_av_trainer`
+  (first Mojo-1.0 build; 3-step weight gate on `ltx2_val_smoke` PASS x3
+  identical: 0.4036/0.2961/0.3761). Neither has a pixi task — build explicitly
+  with the trainer common flags.
+
+
 - **SCAIL-2 base animation**: `pipeline/scail2_stage_inputs.mojo` owns
   Python-free user media ingest; `pipeline/scail2_animation.mojo` performs the
   pure-Mojo 896x512x65 character-animation denoise with pinned 14B streamed FP8 weights;

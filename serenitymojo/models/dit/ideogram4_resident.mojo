@@ -4,8 +4,9 @@
 # per-step re-dequant, and both cond+uncond transformers fit GPU-resident
 # (~9.3GB each) so CFG runs without streaming. Math identical to ideogram4_dit's
 # ideogram4_forward (parity-gated); only the weight source + matmul differ.
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.memory import ArcPointer
+from serenitymojo.io.ffi import sys_memcpy, BytePtr
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
@@ -312,3 +313,213 @@ def ideogram4_forward_r[S: Int](
         w, x_in, llm_in, t_in, masks, cosf, sinf, 0,
         num_layers, num_heads, head_dim, hidden, ctx
     )
+
+
+struct Ideogram4UncondStream(Movable):
+    """TRUE dual-trunk uncond on cards that cannot hold BOTH fp8 trunks
+    resident (MJ-1142: 2x9.3GB + 1024^2 activations OOMs the 24GB 3090 Ti).
+
+    The uncond trunk's per-layer tensors live VERBATIM in one pinned host
+    slab; non-layer tensors (embedders, projections, final layer) stay
+    device-resident in `active`. During the uncond pass each layer is staged
+    into `active` right before its block runs and the previous layer's
+    device buffers are Arc-dropped — ~one layer (~275MB) resident instead of
+    9.3GB. Copies and kernels share the context stream, so no fences are
+    needed and the math/bytes are identical to the resident trunk (same
+    tensors, same kernels, same order)."""
+
+    var active: Ideogram4Weights
+    var host: HostBuffer[DType.uint8]
+    var slab: DeviceBuffer[DType.uint8]
+    var e_name: List[String]
+    var e_layer: List[Int]
+    var e_off: List[Int]
+    var e_rel: List[Int]
+    var e_nbytes: List[Int]
+    var e_shape: List[ArcPointer[List[Int]]]
+    var e_dtype: List[STDtype]
+    var staged: List[String]
+    var staged_layer: Int
+
+    def __init__(
+        out self,
+        var active: Ideogram4Weights,
+        var host: HostBuffer[DType.uint8],
+        var slab: DeviceBuffer[DType.uint8],
+        var e_name: List[String],
+        var e_layer: List[Int],
+        var e_off: List[Int],
+        var e_rel: List[Int],
+        var e_nbytes: List[Int],
+        var e_shape: List[ArcPointer[List[Int]]],
+        var e_dtype: List[STDtype],
+    ):
+        self.active = active^
+        self.host = host^
+        self.slab = slab^
+        self.e_name = e_name^
+        self.e_layer = e_layer^
+        self.e_off = e_off^
+        self.e_rel = e_rel^
+        self.e_nbytes = e_nbytes^
+        self.e_shape = e_shape^
+        self.e_dtype = e_dtype^
+        self.staged = List[String]()
+        self.staged_layer = -1
+
+    @staticmethod
+    def load_stream(
+        st: ShardedSafeTensors, ctx: DeviceContext
+    ) raises -> Ideogram4UncondStream:
+        """Split the checkpoint: non-layer tensors -> device (exactly like
+        Ideogram4Weights.load); `layers.<i>.*` tensors -> verbatim bytes in a
+        pinned host slab with an entry table. F8/F32/BF16 all copy verbatim
+        (dtype conversions in the resident load are identity for this
+        checkpoint), so staged device tensors are byte-identical to resident
+        ones."""
+        var d = Dict[String, ArcPointer[Tensor]]()
+        var names = List[String]()
+        var layers = List[Int]()
+        var offs = List[Int]()
+        var rels = List[Int]()
+        var nbs = List[Int]()
+        var shapes = List[ArcPointer[List[Int]]]()
+        var dts = List[STDtype]()
+        var total = 0
+        var layer_cursor = Dict[Int, Int]()
+        var max_layer_bytes = 0
+        var lp = String("layers.")
+        for ref nm in st.names():
+            if nm.find(lp) != 0:
+                continue
+            var info = st.tensor_info(nm)
+            names.append(nm.copy())
+            var nb = info.shape.copy()
+            var numel = 1
+            for i in range(len(nb)):
+                numel *= nb[i]
+            var b = numel * info.dtype.byte_size()
+            var ci = lp.byte_length()
+            var raw = nm.as_bytes()
+            var li = 0
+            while ci < len(raw) and Int(raw[ci]) >= 48 and Int(raw[ci]) <= 57:
+                li = li * 10 + (Int(raw[ci]) - 48)
+                ci += 1
+            layers.append(li)
+            offs.append(total)
+            var cur = 0
+            if li in layer_cursor:
+                cur = layer_cursor[li]
+            # 256-byte alignment inside the slab keeps every staged tensor
+            # naturally aligned for the fp8 GEMM loads.
+            cur = (cur + 255) & ~255
+            rels.append(cur)
+            layer_cursor[li] = cur + b
+            if cur + b > max_layer_bytes:
+                max_layer_bytes = cur + b
+            nbs.append(b)
+            shapes.append(ArcPointer(info.shape.copy()))
+            dts.append(info.dtype)
+            total += b
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](total)
+        ctx.synchronize()
+        for i in range(len(names)):
+            var span = st.tensor_bytes(names[i])
+            var dst = BytePtr(
+                unsafe_from_address=Int(host.unsafe_ptr()) + offs[i]
+            )
+            var src = BytePtr(unsafe_from_address=Int(span.unsafe_ptr()))
+            _ = sys_memcpy(dst, src, nbs[i])
+        st.release_to_os()
+        for ref nm in st.names():
+            if nm.find(lp) == 0:
+                continue
+            var info = st.tensor_info(nm)
+            if info.dtype == STDtype.F8_E4M3:
+                d[nm] = ArcPointer(Tensor.from_view_raw(
+                    from_parts(info.dtype, info.shape.copy(), st.tensor_bytes(nm)), ctx))
+            elif info.dtype == STDtype.F32:
+                d[nm] = ArcPointer(Tensor.from_view_as_f32(
+                    from_parts(info.dtype, info.shape.copy(), st.tensor_bytes(nm)), ctx))
+            else:
+                d[nm] = ArcPointer(Tensor.from_view(st.tensor_view(nm), ctx))
+        # ONE fixed staging slab, reused for every layer: per-layer
+        # create/free churn makes the caching arena hoard the whole card and
+        # starves direct driver allocs (the 45MB cuBLAS workspace OOM).
+        var slab = ctx.enqueue_create_buffer[DType.uint8](max_layer_bytes)
+        ctx.synchronize()
+        return Ideogram4UncondStream(
+            Ideogram4Weights(d^), host^, slab^, names^, layers^, offs^,
+            rels^, nbs^, shapes^, dts^,
+        )
+
+    def stage_layer(mut self, li: Int, ctx: DeviceContext) raises:
+        """Drop the previously staged layer's device tensors and upload layer
+        `li` from the pinned slab. Stream-ordered with subsequent kernels."""
+        if self.staged_layer == li:
+            return
+        for ref nm in self.staged:
+            if nm in self.active.t:
+                _ = self.active.t.pop(nm)
+        self.staged = List[String]()
+        for i in range(len(self.e_name)):
+            if self.e_layer[i] != li:
+                continue
+            var dsub = self.slab.create_sub_buffer[DType.uint8](
+                self.e_rel[i], self.e_nbytes[i]
+            )
+            var hv = self.host.create_sub_buffer[DType.uint8](
+                self.e_off[i], self.e_nbytes[i]
+            )
+            ctx.enqueue_copy(dst_buf=dsub, src_buf=hv)
+            var view = self.slab.create_sub_buffer[DType.uint8](
+                self.e_rel[i], self.e_nbytes[i]
+            )
+            self.active.t[self.e_name[i]] = ArcPointer(
+                Tensor(view^, self.e_shape[i][].copy(), self.e_dtype[i])
+            )
+            self.staged.append(self.e_name[i].copy())
+        self.staged_layer = li
+
+    def forward_streamed[S: Int](
+        mut self,
+        x_in: Tensor, llm_in: Tensor, t_in: Tensor, masks: Ideogram4Masks,
+        cosf: Tensor, sinf: Tensor,
+        num_layers: Int, num_heads: Int, head_dim: Int, hidden: Int,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """Byte-identical twin of `ideogram4_forward_r` (the N_TXT=0 uncond
+        path) that stages each layer just-in-time from the pinned slab."""
+        var L = x_in.shape()[1]
+        var llm = mul(llm_in, masks.llm_mask, ctx)
+        var x = mul(x_in, masks.img_mask, ctx)
+        x = mul(_lin(self.active, x, "input_proj.weight", "input_proj.bias", ctx), masks.img_mask, ctx)
+
+        var t_cond = reshape(_t_embed_r(self.active, t_in, hidden, ctx), [1, 1, hidden], ctx)
+        var adaln_input = silu(_lin(self.active, t_cond, "adaln_proj.weight", "adaln_proj.bias", ctx), ctx)
+
+        llm = rms_norm(llm, self.active.w("llm_cond_norm.weight"), Float32(1.0e-6), ctx)
+        llm = mul(_lin(self.active, llm, "llm_cond_proj.weight", "llm_cond_proj.bias", ctx), masks.llm_mask, ctx)
+
+        var h = add(x, llm, ctx)
+        var iemb = reshape(gather_rows(self.active.w("embed_image_indicator.weight"), masks.img_ids, ctx), [1, L, hidden], ctx)
+        h = add(h, iemb, ctx)
+
+        for li in range(num_layers):
+            self.stage_layer(li, ctx)
+            var p = String("layers.") + String(li) + "."
+            h = _block_r_masked[S, 0](
+                self.active, p, h, adaln_input, cosf, sinf, 0,
+                num_heads, head_dim, hidden, ctx
+            )
+            # Fence each layer: without it the pass's dequant/activation
+            # transients stay live until the next sync (~4.5GB per uncond
+            # pass, measured job-0207/0208) and the arena hoards the card
+            # until a direct cuBLAS workspace alloc OOMs. ~ms per fence vs
+            # tens-of-seconds steps.
+            ctx.synchronize()
+
+        var fscale = add_scalar(_lin(self.active, silu(adaln_input, ctx), "final_layer.adaln_modulation.weight", "final_layer.adaln_modulation.bias", ctx), Float32(1.0), ctx)
+        var hn = mul(layer_norm_no_affine(h, Float32(1.0e-6), ctx), fscale, ctx)
+        var out = _lin(self.active, hn, "final_layer.linear.weight", "final_layer.linear.bias", ctx)
+        return cast_tensor(out, STDtype.F32, ctx)

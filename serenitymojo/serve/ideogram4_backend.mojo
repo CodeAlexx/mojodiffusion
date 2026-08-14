@@ -25,6 +25,7 @@ from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.env import env_or
 from serenitymojo.io.ffi import (
     BytePtr, sys_open, sys_close, sys_pwrite, O_WRONLY, O_CREAT, O_TRUNC, O_RDONLY,
 )
@@ -36,6 +37,7 @@ from serenitymojo.models.dit.ideogram4_mrope import build_ideogram4_mrope
 from serenitymojo.models.dit.ideogram4_resident import (
     Ideogram4Weights, Ideogram4Masks, ideogram4_forward_r,
     ideogram4_forward_r_masked, ideogram4_build_masks,
+    Ideogram4UncondStream,
 )
 from serenitymojo.models.text_encoder.ideogram_qwen3vl_streamed import (
     encode_ideogram_taps_streamed,
@@ -395,6 +397,7 @@ struct Ideogram4Backend(GenBackend, Movable):
     var load_stage: Int
     var cond: List[ArcPointer[Ideogram4Weights]]
     var uncond: List[ArcPointer[Ideogram4Weights]]
+    var uncond_stream: List[Ideogram4UncondStream]
 
     # Static per-bucket sequence helpers, safe to retain across jobs. Each of the
     # three lists holds one entry per resolution bucket (index == bucket id), built
@@ -450,6 +453,7 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.load_stage = 0
         self.cond = List[ArcPointer[Ideogram4Weights]]()
         self.uncond = List[ArcPointer[Ideogram4Weights]]()
+        self.uncond_stream = List[Ideogram4UncondStream]()
         # Per-bucket static caches, built lazily and retained across jobs.
         self.static_ready = List[Bool](capacity=BUCKET_COUNT)
         var cms = List[ArcPointer[Ideogram4Masks]]()
@@ -648,6 +652,7 @@ struct Ideogram4Backend(GenBackend, Movable):
     def _free_transformers(mut self):
         self.cond = List[ArcPointer[Ideogram4Weights]]()
         self.uncond = List[ArcPointer[Ideogram4Weights]]()
+        self.uncond_stream = List[Ideogram4UncondStream]()
         self.loaded = False
         self.load_stage = 0
 
@@ -766,6 +771,23 @@ struct Ideogram4Backend(GenBackend, Movable):
         >=20GB cards."""
         return self.total_vram_bytes < 20 * 1024 * 1024 * 1024
 
+    def _uncond_streamed(self) raises -> Bool:
+        """TRUE dual-trunk with the uncond trunk block-streamed from pinned
+        host (MJ-1142): both fp8 trunks resident (2x9.3GB) plus 1024^2
+        activations OOM a 24GB card, so 20-26GB cards keep the exact KJ
+        uncond math but stage one uncond layer (~275MB) at a time. >=26GB
+        cards keep both trunks resident; <20GB cards keep the single-trunk
+        approximation. SERENITY_IDEOGRAM4_UNCOND_STREAM=1/0 force-overrides
+        for A/B."""
+        var ov = env_or(String("SERENITY_IDEOGRAM4_UNCOND_STREAM"), String(""))
+        if ov == "1":
+            return True
+        if ov == "0":
+            return False
+        if self._single_trunk():
+            return False
+        return self.total_vram_bytes < 26 * 1024 * 1024 * 1024
+
     def _load_one(mut self) raises -> Bool:
         if self.loaded:
             return True
@@ -800,6 +822,13 @@ struct Ideogram4Backend(GenBackend, Movable):
                 print("[ideogram4] single-trunk uncond (<20GB card): sharing cond weights")
                 self.uncond = List[ArcPointer[Ideogram4Weights]]()
                 self.uncond.append(self.cond[0])
+            elif self._uncond_streamed():
+                print("[ideogram4] streamed uncond (MJ-1142): true dual-trunk, uncond layers staged from pinned host")
+                self.uncond = List[ArcPointer[Ideogram4Weights]]()
+                self.uncond_stream = List[Ideogram4UncondStream]()
+                self.uncond_stream.append(Ideogram4UncondStream.load_stream(
+                    ShardedSafeTensors.open(String(UNCOND)), self.ctx
+                ))
             else:
                 print("[ideogram4] loading unconditional fp8 transformer")
                 self.uncond = List[ArcPointer[Ideogram4Weights]]()
@@ -967,14 +996,35 @@ struct Ideogram4Backend(GenBackend, Movable):
             self.prompt_tokens,
             LAYERS, HEADS, HEAD_DIM, HIDDEN, self.ctx,
         )
+        # Fence between the passes: the cond pass's ~5GB of S=TOTAL transients
+        # only free at a sync; without this they stack under the uncond pass
+        # and the arena commits the whole card (MJ-1142 step-2/3 deaths,
+        # measured via memtrace job-0210: flat 11.9GB with the fences).
+        self.ctx.synchronize()
+        if env_or(String("SERENITY_IDEOGRAM4_MEMTRACE"), String("")) == "1":
+            var mi_c = cu_mem_get_info()
+            print("  [memtrace] after cond pass: used", mi_c.used_bytes() // (1024*1024), "MiB")
         var pos_v = slice(cout, 1, TEXT_TOKENS, NIMG_, self.ctx)
         var t2 = Tensor.from_host([model_t], [1], STDtype.F32, self.ctx)
         var z_bf = cast_tensor(self.latent[0][], STDtype.BF16, self.ctx)
-        var nout = ideogram4_forward_r[NIMG_](
-            self.uncond[0][], z_bf, self.neg_llm[0][], t2, self.uncond_masks[idx][],
-            self.ropes[idx][].uncond[0], self.ropes[idx][].uncond[1],
-            LAYERS, HEADS, HEAD_DIM, HIDDEN, self.ctx,
-        )
+        var nout: Tensor
+        if len(self.uncond_stream) == 1:
+            nout = self.uncond_stream[0].forward_streamed[NIMG_](
+                z_bf, self.neg_llm[0][], t2, self.uncond_masks[idx][],
+                self.ropes[idx][].uncond[0], self.ropes[idx][].uncond[1],
+                LAYERS, HEADS, HEAD_DIM, HIDDEN, self.ctx,
+            )
+        else:
+            nout = ideogram4_forward_r[NIMG_](
+                self.uncond[0][], z_bf, self.neg_llm[0][], t2, self.uncond_masks[idx][],
+                self.ropes[idx][].uncond[0], self.ropes[idx][].uncond[1],
+                LAYERS, HEADS, HEAD_DIM, HIDDEN, self.ctx,
+            )
+        # Same fence after the uncond pass (its S=NIMG transient family).
+        self.ctx.synchronize()
+        if env_or(String("SERENITY_IDEOGRAM4_MEMTRACE"), String("")) == "1":
+            var mi_u = cu_mem_get_info()
+            print("  [memtrace] after uncond pass: used", mi_u.used_bytes() // (1024*1024), "MiB")
         var v = add(
             mul_scalar(pos_v, step_cfg, self.ctx),
             mul_scalar(nout, Float32(1.0) - step_cfg, self.ctx),

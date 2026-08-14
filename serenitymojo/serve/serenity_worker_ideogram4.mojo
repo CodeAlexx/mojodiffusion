@@ -21,6 +21,8 @@
 #   child->parent : {"ev":"ready"} | progress | done | failed | cancelled
 
 from std.sys import argv
+from std.memory import alloc, UnsafePointer
+from std.ffi import external_call
 from std.time import sleep
 from json.parser import loads
 
@@ -84,7 +86,33 @@ def _ideogram4_worker_loop(mut backend: Ideogram4Backend, fd: Int32) raises:
                 break
 
 
+comptime _CStr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+def _cstr(s: String) -> _CStr:
+    var n = s.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = s.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    return buf
+
+
 def main() raises:
+    # MJ-1142: ideogram4's dual-trunk CFG runs two transient size families
+    # (cond S=TOTAL, uncond S=NIMG) at 1024^2 — the default async device
+    # allocator grows to the cumulative transient peak and OOMs a direct
+    # cuBLAS workspace alloc with ~12GB free (measured: variable death step
+    # 3-13, flat 11.9GB used). The runtime's SYNCHRONOUS allocator frees
+    # back to the driver each op; house precedent: nldiffusion
+    # tiled_decode_probe. setenv(overwrite=0) respects an operator override;
+    # must run BEFORE the first DeviceContext().
+    _ = external_call["setenv", Int32](
+        _cstr(String("MODULAR_DEVICE_CONTEXT_SYNC_MODE")),
+        _cstr(String("true")),
+        Int32(0),
+    )
     var args = argv()
     if len(args) < 2:
         print("usage: serenity_worker_ideogram4 <fd>")

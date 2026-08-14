@@ -158,3 +158,62 @@ for nm2, t2 in [("qkv_a",qkv_a),("qkv_b",qkv_b),("out_a",out_a),("out_b",out_b),
 save_file(bundle, OUT)
 print("wrote", OUT, "tensors:", len(bundle))
 print("out.std", out.float().std().item(), "d_x.std", x.grad.float().std().item())
+
+# ── 2-BLOCK CHAIN ARM: blocks 0+1 composed (no LoRA), for the Mojo stack
+# driver's recompute + d_x-handoff gate. Same inputs; fresh grads.
+want1 = {}
+for shard in sorted(glob.glob(f"{CKPT}/model-*.safetensors")):
+    with open(shard, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        header = json.loads(fh.read(n))
+    hit = [k for k in header if k.startswith("blocks.1.")]
+    if hit:
+        sd = load_file(shard)
+        for k in hit:
+            want1[k[len("blocks.1."):]] = sd[k]
+        del sd
+block1 = MiniMaxH3TransformerBlock(cfg)
+m1, u1 = block1.load_state_dict(want1, strict=False)
+assert not m1 and not u1, (m1, u1)
+block1 = block1.cuda().to(torch.bfloat16)
+block1.train()
+
+block.zero_grad(set_to_none=True)
+block1.zero_grad(set_to_none=True)
+x2 = x.detach().clone().requires_grad_(True)
+temb2 = temb.detach().clone().requires_grad_(True)
+mod0 = block.adaln_proj(temb2).view(-1, 6 * block.hidden_size).to(x2.dtype)
+mod1 = block1.adaln_proj(temb2).view(-1, 6 * block1.hidden_size).to(x2.dtype)
+mod0.retain_grad(); mod1.retain_grad()
+
+def _run_block(b, xin, m):
+    sa, sca, ga, sm, scm, gm = m.chunk(6, dim=-1)
+    nh = b._norm_and_modulate(b.norm1, xin, sa, sca, idx)
+    at = b.attn(nh, (cos, sin), None)
+    hm = xin + ga.index_select(0, idx) * at
+    n2 = b._norm_and_modulate(b.norm2, hm, sm, scm, idx)
+    return hm + gm.index_select(0, idx) * b.mlp(n2)
+
+h1 = _run_block(block, x2, mod0)
+h2 = _run_block(block1, h1, mod1)
+loss2 = (h2.float() * w.float()).sum()
+loss2.backward()
+
+chain = {
+    "chain_h1": h1.detach().float().cpu(),
+    "chain_out": h2.detach().float().cpu(),
+    "chain_d_x": x2.grad.float().cpu(),
+    "chain_mod1": mod1.detach().float().cpu(),
+    "chain_d_mod0": mod0.grad.float().cpu(),
+    "chain_d_mod1": mod1.grad.float().cpu(),
+}
+for name, p in block.named_parameters():
+    if p.grad is not None:
+        chain["chain_b0_d_" + name.replace(".", "_")] = p.grad.float().cpu()
+for name, p in block1.named_parameters():
+    if p.grad is not None:
+        chain["chain_b1_d_" + name.replace(".", "_")] = p.grad.float().cpu()
+bundle2 = dict(load_file(OUT))
+bundle2.update(chain)
+save_file(bundle2, OUT)
+print("chain arm added:", len(chain), "tensors; chain_out.std", h2.float().std().item())

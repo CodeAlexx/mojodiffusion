@@ -113,7 +113,7 @@ struct LTX2Int4BlockStream(Movable):
         var max_idx = -1
         for ref nm in st.names():
             if nm.startswith(prefix):
-                var rest = _substr(nm, len(prefix), len(nm))
+                var rest = _substr(nm, prefix.byte_length(), nm.byte_length())
                 var dot = _first_dot(rest)
                 if dot > 0:
                     try:
@@ -168,15 +168,15 @@ struct LTX2Int4BlockStream(Movable):
         for ref nm in self.sharded.names():
             if not nm.startswith(bp):
                 continue
-            var canon = _substr(nm, len(bp), len(nm))
+            var canon = _substr(nm, bp.byte_length(), nm.byte_length())
 
             if canon.endswith(".qweight"):
                 # ── Quantized linear: reconstruct dense BF16 W. Flavor is
                 #    detected PER LINEAR by `.smooth` presence (class-A carries
                 #    it; squareq_w4 has no smooth tensor at all). ──
-                var qsuf = len(String(".qweight"))
-                var base = _substr(canon, 0, len(canon) - qsuf)  # prefix-stripped
-                var full = _substr(nm, 0, len(nm) - qsuf)        # full slab base
+                var qsuf = String(".qweight").byte_length()
+                var base = _substr(canon, 0, canon.byte_length() - qsuf)  # prefix-stripped
+                var full = _substr(nm, 0, nm.byte_length() - qsuf)        # full slab base
                 var qtv = self.sharded.tensor_view(full + ".qweight")
                 var qweight = Tensor.from_view_raw(qtv, ctx)     # I8/U8 [out, in/2]
                 var wtv = self.sharded.tensor_view(full + ".wscales")
@@ -227,8 +227,8 @@ struct LTX2Int4BlockStream(Movable):
                 # A quantized class-A linear's bias is emitted by the .qweight
                 # branch; skip it here to avoid a duplicate. All other biases
                 # (non-quantized layers) pass through.
-                var bsuf = len(String(".bias"))
-                var bbase = _substr(nm, 0, len(nm) - bsuf)
+                var bsuf = String(".bias").byte_length()
+                var bbase = _substr(nm, 0, nm.byte_length() - bsuf)
                 if (bbase + ".qweight") in self.sharded.name_to_shard:
                     continue
                 var tv = self.sharded.tensor_view(nm)

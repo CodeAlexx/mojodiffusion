@@ -796,7 +796,7 @@ def print_levers_summary(cfg: LTX2TrainerConfig):
         print("  levers: all default-off (legacy byte-identical path)")
     # val_loss + sampling are OUTPUT features (no training-math effect), reported
     # separately so they never flip the levers-default line above.
-    if len(cfg.val_cache_dir) > 0 and cfg.validate_every > 0:
+    if cfg.val_cache_dir.byte_length() > 0 and cfg.validate_every > 0:
         print("  [val] val_loss every", cfg.validate_every, "steps @", cfg.val_cache_dir,
               " (deterministic per-val-index sigma+noise; documented deviation)")
     if cfg.sample_every > 0:

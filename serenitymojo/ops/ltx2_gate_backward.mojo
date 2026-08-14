@@ -129,7 +129,7 @@ def ltx2_gate_dgates(
         runtime_layout=out_rl,
     )
         ctx.enqueue_function[_gate_dgates_kernel[DType.float16]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
-    var sh = [sq, h]
+    var sh: List[Int] = [sq, h]
     return Tensor(out_buf^, sh^, d_att_g.dtype())
 
 
@@ -211,5 +211,5 @@ def ltx2_gate_dgates_slab(
         runtime_layout=out_rl,
     )
         ctx.enqueue_function[_gate_dgates_kernel[DType.float16]](DAG, AF, DG, Int32(sq), Int32(h), Int32(dh), grid_dim=grid, block_dim=_BLOCK)
-    var sh = [sq, h]
+    var sh: List[Int] = [sq, h]
     return Tensor(out_buf^, sh^, d_att_g.dtype())

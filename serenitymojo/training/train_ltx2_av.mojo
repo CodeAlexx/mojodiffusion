@@ -325,7 +325,7 @@ def _te_for_latent(lat_name: String, te_names: List[String]) raises -> String:
     for ref te in te_names:
         # te = "<X>_ltx2_te.safetensors" -> X
         var b = te.as_bytes()
-        var keep = len(b) - len("_ltx2_te.safetensors")
+        var keep = len(b) - String("_ltx2_te.safetensors").byte_length()
         if keep <= 0:
             continue
         var x = String("")
@@ -820,9 +820,9 @@ def _run_geometry[
         # RNH=4, DS=2: ref reaches 8·32 vs target 9·32) — musubi-faithful.
         comptime assert DS_P >= 1, "v2v: reference_downscale (DS) must be >= 1"
     var ckpt = cfg.ltx2_checkpoint
-    if len(ckpt) == 0:
+    if ckpt.byte_length() == 0:
         ckpt = serenity_checkpoint(String(DEFAULT_CKPT_NAME))
-    if len(cfg.dataset_cache_dir) == 0:
+    if cfg.dataset_cache_dir.byte_length() == 0:
         raise Error("train_ltx2_av: --dataset_cache_dir is required (musubi-native cache)")
     _ = sys_mkdirs(cfg.output_dir)
 
@@ -1082,7 +1082,7 @@ def _run_geometry[
 
     # ── resume (F32-exact masters+moments preferred; bf16-master fallback) ────
     var start_step = 1
-    if len(cfg.resume_from) > 0:
+    if cfg.resume_from.byte_length() > 0:
         var rf = cfg.resume_from
         var prefixes = _all_prefixes(mods)
         var probe_prefix = prefixes[0].copy()
@@ -1224,7 +1224,7 @@ def _run_geometry[
     # tensors match. Fail LOUD if the slab does not open.
     var squareq_slab = env_or("LTX2_SQUAREQ_SLAB", String(""))
     var src: LTX2VideoBlockSource
-    if len(squareq_slab) > 0:
+    if squareq_slab.byte_length() > 0:
         try:
             src = LTX2VideoBlockSource.open_int4(
                 ckpt, squareq_slab, model_cfg, stack_f32)
@@ -1269,7 +1269,7 @@ def _run_geometry[
     # blocks come from the packed slab — there is nothing to park. The implicit
     # default (42) just switches off; an EXPLICIT --resident_blocks > 0 is a
     # contradiction and fails loud.
-    if len(squareq_slab) > 0 and n_resident > 0:
+    if squareq_slab.byte_length() > 0 and n_resident > 0:
         if resident_explicit:
             raise Error(
                 "train_ltx2_av: --resident_blocks > 0 is the fp8 residency"
@@ -1331,7 +1331,7 @@ def _run_geometry[
     # no save/restore guard) — deterministic-by-index is strictly better for
     # overfit detection; the loss FORMULA/mean/cadence are musubi-exact
     # (hv:3155-3167). C13: off unless BOTH --val_cache_dir and --validate_every.
-    var val_on = len(cfg.val_cache_dir) > 0 and cfg.validate_every > 0
+    var val_on = cfg.val_cache_dir.byte_length() > 0 and cfg.validate_every > 0
 
     # v2v (P5): sampling (A2a) + validation (A2b) are both wired. v2v validation
     # requires the val cache's OWN references (--val_reference_cache_dir) ONLY when
@@ -2090,10 +2090,10 @@ def _run_geometry_av[
 ) raises:
     comptime S_V = NF * NH * NW
     var ckpt = cfg.ltx2_checkpoint
-    if len(ckpt) == 0:
+    if ckpt.byte_length() == 0:
         # AV needs the audio-carrying distilled checkpoint.
         ckpt = serenity_checkpoint(String(AV_DEFAULT_CKPT_NAME))
-    if len(cfg.dataset_cache_dir) == 0:
+    if cfg.dataset_cache_dir.byte_length() == 0:
         raise Error("train_ltx2_av (AV): --dataset_cache_dir is required (tri-pair cache)")
     _ = sys_mkdirs(cfg.output_dir)
 
@@ -2196,7 +2196,7 @@ def _run_geometry_av[
     # tensors match. fp8 residency is a contradiction here — fail loud.
     var squareq_slab = env_or("LTX2_SQUAREQ_SLAB", String(""))
     var src: LTX2AVBlockSource
-    if len(squareq_slab) > 0:
+    if squareq_slab.byte_length() > 0:
         if n_resident > 0:
             raise Error(
                 "train_ltx2_av (AV): --resident_blocks/LTX2_RESIDENT_BLOCKS > 0"

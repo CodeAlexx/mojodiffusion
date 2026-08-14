@@ -734,7 +734,7 @@ struct LTX2BlockStream(Movable):
                 or nm.endswith(".scale_input")
             ):
                 continue
-            var canon = _substr(nm, len(bp), len(nm))
+            var canon = _substr(nm, bp.byte_length(), nm.byte_length())
             var tv = self.sharded.tensor_view(nm)
             var numel = 1
             for k in range(len(tv.shape)):
@@ -798,7 +798,7 @@ struct LTX2BlockStream(Movable):
                 or nm.endswith(".scale_input")
             ):
                 continue
-            var canon = _substr(nm, len(bp), len(nm))
+            var canon = _substr(nm, bp.byte_length(), nm.byte_length())
             var slot = stage.slot_for(canon)
             var e_nbytes = stage.layout[slot].nbytes
             var e_shape = stage.layout[slot].shape.copy()

@@ -85,10 +85,49 @@ h_mid = x + gate_attn.index_select(0, idx) * attention
 norm_h2 = block._norm_and_modulate(block.norm2, h_mid, shift_mlp, scale_mlp, idx)
 ff = block.mlp(norm_h2)
 out = h_mid + gate_mlp.index_select(0, idx) * ff
+
+# ── LoRA arm: rank-16 adapters on the four musubi targets. RANDOM A and B
+# (zeros-B is the canonical init but zeroes the d_A signal — degenerate for
+# a gate); scale = alpha/rank = 1.0 (alpha 16). y += scale * (x@A^T)@B^T.
+RANK, LORA_SCALE = 16, 1.0
+def _mk(out_f, in_f, seed):
+    gl = torch.Generator(device="cpu").manual_seed(seed)
+    a = (0.05 * torch.randn(RANK, in_f, generator=gl)).cuda().bfloat16().requires_grad_(True)
+    b = (0.05 * torch.randn(out_f, RANK, generator=gl)).cuda().bfloat16().requires_grad_(True)
+    return a, b
+qkv_a, qkv_b = _mk(block.attn.qkv_proj.out_features, block.attn.qkv_proj.in_features, 71)
+out_a, out_b = _mk(block.attn.out_proj.out_features, block.attn.out_proj.in_features, 72)
+fc1_a, fc1_b = _mk(block.mlp.fc1.out_features, block.mlp.fc1.in_features, 73)
+fc2_a, fc2_b = _mk(block.mlp.fc2.out_features, block.mlp.fc2.in_features, 74)
+
+def _lora(x, a, b):
+    return LORA_SCALE * ((x @ a.T) @ b.T)
+
+# rebuild the forward WITH lora contributions (same math + lora adds)
+norm_h_l = block._norm_and_modulate(block.norm1, x, shift_attn, scale_attn, idx)
+qkv_l = block.attn.qkv_proj(norm_h_l) + _lora(norm_h_l, qkv_a, qkv_b)
+q_l, k_l, v_l = qkv_l.chunk(3, dim=-1)
+bsz, seq, _ = q_l.shape
+hd = block.attn.head_dim
+q_l = q_l.view(bsz, seq, -1, hd); k_l = k_l.view(bsz, seq, -1, hd); v_l = v_l.view(bsz, seq, -1, hd)
+q_l = block.attn.q_norm(q_l); k_l = block.attn.k_norm(k_l)
+import musubi_tuner.minimax_h3.model as _m
+q_l = _m._apply_rotary_emb(q_l, cos, sin); k_l = _m._apply_rotary_emb(k_l, cos, sin)
+att_l = torch.nn.functional.scaled_dot_product_attention(
+    q_l.transpose(1, 2), k_l.transpose(1, 2), v_l.transpose(1, 2)
+).transpose(1, 2).reshape(bsz, seq, -1)
+attn_y_l = block.attn.out_proj(att_l) + _lora(att_l, out_a, out_b)
+h_mid_l = x + gate_attn.index_select(0, idx) * attn_y_l
+norm_h2_l = block._norm_and_modulate(block.norm2, h_mid_l, shift_mlp, scale_mlp, idx)
+fc1_out_l = block.mlp.fc1(norm_h2_l) + _lora(norm_h2_l, fc1_a, fc1_b)
+gate_l, value_l = fc1_out_l.chunk(2, dim=-1)
+swi_l = torch.nn.functional.silu(gate_l) * value_l
+ff_l = block.mlp.fc2(swi_l) + _lora(swi_l, fc2_a, fc2_b)
+out_lora = h_mid_l + gate_mlp.index_select(0, idx) * ff_l
 # scalar loss: seeded projection so every output element carries gradient
 w = torch.randn(out.shape, generator=g).cuda().bfloat16()
 loss = (out.float() * w.float()).sum()
-loss.backward()
+loss.backward(retain_graph=True)
 
 bundle = {
     "in_x": x.detach().float().cpu(),
@@ -106,6 +145,16 @@ bundle = {
 for name, p in block.named_parameters():
     if p.grad is not None:
         bundle["d_" + name.replace(".", "_")] = p.grad.float().cpu()
+# ── LoRA arm backward: base grads captured above; zero everything shared,
+# then backprop the lora-arm loss so d_lora_* are pure second-pass grads.
+block.zero_grad(set_to_none=True)
+loss_l = (out_lora.float() * w.float()).sum()
+loss_l.backward()
+bundle["lora_out"] = out_lora.detach().float().cpu()
+for nm2, t2 in [("qkv_a",qkv_a),("qkv_b",qkv_b),("out_a",out_a),("out_b",out_b),
+               ("fc1_a",fc1_a),("fc1_b",fc1_b),("fc2_a",fc2_a),("fc2_b",fc2_b)]:
+    bundle["lora_" + nm2] = t2.detach().float().cpu()
+    bundle["d_lora_" + nm2] = t2.grad.float().cpu()
 save_file(bundle, OUT)
 print("wrote", OUT, "tensors:", len(bundle))
 print("out.std", out.float().std().item(), "d_x.std", x.grad.float().std().item())

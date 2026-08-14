@@ -13,6 +13,10 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import reshape
 from serenitymojo.models.minimax_h3.h3_block_train import (
     H3BlockTrainWeights, h3_block_train_forward, h3_block_train_backward,
+    H3BlockLoraDevice, h3_block_train_forward_lora, h3_block_train_backward_lora,
+)
+from serenitymojo.models.klein.lora_block import (
+    LoraAdapterDevice, KleinLoraDeviceGradTensors,
 )
 from std.memory import ArcPointer
 
@@ -158,8 +162,64 @@ def main() raises:
         if c < 0.999:
             ok = False
 
+    # ── LoRA arm ──────────────────────────────────────────────────────────
+    comptime RANK = 16
+    comptime INNER = H * Dh
+    var la_names: List[String] = [
+        String("qkv"), String("out"), String("fc1"), String("fc2"),
+    ]
+    var la_in: List[Int] = [D, INNER, D, F]
+    var la_out: List[Int] = [3 * INNER, D, 2 * F, D]
+    var adapters = List[LoraAdapterDevice]()
+    for i in range(4):
+        var a = _bf16(orc, String("lora_") + la_names[i] + String("_a"), ctx)
+        var b = _bf16(orc, String("lora_") + la_names[i] + String("_b"), ctx)
+        adapters.append(LoraAdapterDevice(
+            ArcPointer(a^), ArcPointer(b^), RANK, la_in[i], la_out[i], Float32(1.0),
+        ))
+    var lora = H3BlockLoraDevice(
+        Optional[LoraAdapterDevice](adapters[0].copy()),
+        Optional[LoraAdapterDevice](adapters[1].copy()),
+        Optional[LoraAdapterDevice](adapters[2].copy()),
+        Optional[LoraAdapterDevice](adapters[3].copy()),
+    )
+
+    var fwd_l = h3_block_train_forward_lora[H, Dh, S](
+        x_sd, w, lora, mod, idx, cos, sin, D, F, ROTARY, EPS, ctx,
+    )
+    ctx.synchronize()
+    var lora_out_ref = reshape(_f32(orc, String("lora_out"), ctx), [S, D], ctx)
+    var c_lout = _cos(fwd_l.out[], lora_out_ref, ctx)
+    print("cos(lora_out) =", c_lout)
+    if c_lout < 0.999:
+        ok = False
+
+    var bwd_l = h3_block_train_backward_lora[H, Dh, S](
+        d_out, w, lora, fwd_l.saved, idx, cos, sin, mod_table_rows,
+        D, F, ROTARY, EPS, ctx,
+    )
+    ctx.synchronize()
+    for i in range(4):
+        var g: KleinLoraDeviceGradTensors
+        if i == 0:
+            g = bwd_l.lora.qkv.value().copy()
+        elif i == 1:
+            g = bwd_l.lora.out.value().copy()
+        elif i == 2:
+            g = bwd_l.lora.fc1.value().copy()
+        else:
+            g = bwd_l.lora.fc2.value().copy()
+        var ra = _f32(orc, String("d_lora_") + la_names[i] + String("_a"), ctx)
+        var rb = _f32(orc, String("d_lora_") + la_names[i] + String("_b"), ctx)
+        var ca = _cos(g.d_a[], ra, ctx)
+        var cb = _cos(g.d_b[], rb, ctx)
+        print("cos(d_lora_" + la_names[i] + "_a) =", ca)
+        print("cos(d_lora_" + la_names[i] + "_b) =", cb)
+        if ca < 0.999 or cb < 0.999:
+            ok = False
+
     if ok:
-        print("PASS: h3 training block fwd+bwd matches torch autograd (cos>=0.999)")
+        print("PASS: h3 training block fwd+bwd (+LoRA) matches torch autograd (cos>=0.999)")
     else:
         print("FAIL: h3 training block parity below bar")
         raise Error("minimax_h3_block_train_parity failed")

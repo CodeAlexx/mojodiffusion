@@ -2395,7 +2395,7 @@ struct TurboPlannedLoader(Movable):
         `tag`. Every loader sharing a stage MUST pass a DISTINCT tag — slots are keyed
         `<tag>|<prefix>` precisely because two experts name their blocks identically
         (see Fp8hStage). Call before the first prefetch/await."""
-        if len(tag) == 0:
+        if tag.byte_length() == 0:
             raise Error(
                 "share_fp8h_stage: a non-empty tag is required — sharing slabs with"
                 " an empty tag would let two experts' identical block prefixes"

@@ -493,6 +493,16 @@ struct ShardedSafeTensors(Movable):
                 if nm in self.name_to_shard and self.name_to_shard[nm] == idx:
                     self.shards[idx][].prefetch_tensor(nm)
 
+    def prefetch_tensor(self, name: String) raises:
+        """Ask Linux to read one tensor's byte range ahead (MADV_WILLNEED).
+        Loaders that consume tensors in storage order should prefetch a
+        bounded window ahead of the copy loop: cold demand-faulting reads a
+        16 GB checkpoint at ~25 MB/s (minutes), while windowed WILLNEED runs
+        the disk at full sequential speed with bounded page-cache residency
+        (pair with `release_tensor` behind the loop)."""
+        var idx = self.shard_index(name)
+        self.shards[idx][].prefetch_tensor(name)
+
     def shard_index(self, name: String) raises -> Int:
         """The shard index that owns `name`."""
         if name not in self.name_to_shard:

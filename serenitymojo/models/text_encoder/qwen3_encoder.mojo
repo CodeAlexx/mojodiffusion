@@ -556,7 +556,12 @@ struct Qwen3Encoder:
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
         var uploader = BatchedTensorUploader(256 * 1024 * 1024, ctx)
-        # Deterministic order is irrelevant; we look up by name.
+        # Deterministic order is irrelevant; we look up by name. Select first,
+        # then upload in storage order with a sliding prefetch window: cold
+        # demand-faulting reads the 16 GB checkpoint at ~25 MB/s (a 10+ minute
+        # load, 2026-08-13); windowed WILLNEED keeps the disk sequential while
+        # release_tensor drops consumed source pages right behind the loop.
+        var selected = List[String]()
         for ref nm in sharded.names_storage_order():
             if max_layer >= 0:
                 if nm == "lm_head.weight":
@@ -571,11 +576,19 @@ struct Qwen3Encoder:
                         ci += 1
                     if li > max_layer:
                         continue
-            var tv = sharded.tensor_view(nm)
+            selected.append(nm.copy())
+        comptime PREFETCH_WINDOW = 16  # ~40 MB avg tensors -> ~640 MB in flight
+        var ahead = 0
+        for i in range(len(selected)):
+            while ahead < len(selected) and ahead <= i + PREFETCH_WINDOW:
+                sharded.prefetch_tensor(selected[ahead])
+                ahead += 1
+            var tv = sharded.tensor_view(selected[i])
             var t = uploader.from_view(tv, ctx)
             var idx = len(weights)
             weights.append(ArcPointer(t^))
-            name_to_idx[nm] = idx
+            name_to_idx[selected[i]] = idx
+            sharded.release_tensor(selected[i])
         uploader.finish(ctx)
         # Every selected weight is now owned by a device Tensor and the final
         # batched H2D has been fenced.  Do not leave the clean checkpoint pages

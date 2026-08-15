@@ -665,3 +665,138 @@ def h3_block_train_backward_lora[
     )
     var lgrads = H3BlockLoraGrads(lg_qkv^, lg_out^, lg_fc1^, lg_fc2^)
     return H3BlockTrainLoraBackward(base^, lgrads^)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FROZEN-BASE LoRA backward: identical chain, but NO gradients for anything
+# frozen — base weight grads (4 huge GEMMs + ~770MB/block), rms d_g, and the
+# adaln d_mod scatter are all skipped (the rms_norm frozen-d_g lesson,
+# applied block-wide). Only d_x and the adapter grads come back. d_x-only
+# linear backwards return F32; cast to bf16 at each junction (one rounding,
+# the same rounding the full path's bf16 d_x carries).
+# ═══════════════════════════════════════════════════════════════════════════
+from serenitymojo.ops.linalg_backward import linear_backward_dx
+from serenitymojo.ops.norm_backward import rms_norm_backward_dx
+from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.io.dtype import STDtype
+
+
+struct H3BlockLoraFrozenBackward(Copyable, Movable):
+    var d_x: TArc
+    var lora: H3BlockLoraGrads
+
+    def __init__(out self, var d_x: TArc, var lora: H3BlockLoraGrads):
+        self.d_x = d_x^
+        self.lora = lora^
+
+
+def _bf16(t: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if t.dtype() == STDtype.BF16:
+        return t.clone(ctx)
+    return cast_tensor(t, STDtype.BF16, ctx)
+
+
+def h3_block_train_backward_lora_frozen[
+    H: Int, Dh: Int
+](
+    d_out: Tensor,
+    w: H3BlockTrainWeights,
+    lora: H3BlockLoraDevice,
+    saved: H3BlockTrainSaved,
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3BlockLoraFrozenBackward:
+    var S = d_out.shape()[0]
+    comptime I = H * Dh
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var scale_msa = slice(saved.mod_rows[], 1, 1 * D, D, ctx)
+    var gate_msa = slice(saved.mod_rows[], 1, 2 * D, D, ctx)
+    var scale_mlp = slice(saved.mod_rows[], 1, 4 * D, D, ctx)
+    var gate_mlp = slice(saved.mod_rows[], 1, 5 * D, D, ctx)
+
+    var d_h_mid = d_out.clone(ctx)
+    var d_ff_y = mul(d_out, gate_mlp, ctx)
+
+    var d_swi = _bf16(linear_backward_dx(d_ff_y, w.fc2_w[], S, F, D, ctx), ctx)
+    var lg_fc2 = Optional[KleinLoraDeviceGradTensors](None)
+    if lora.fc2:
+        var g = klein_lora_bwd_device_resident_tensors(
+            d_ff_y, saved.swi[], lora.fc2.value(), S, ctx
+        )
+        d_swi = add(d_swi, g.d_x[], ctx)
+        lg_fc2 = Optional[KleinLoraDeviceGradTensors](g^)
+
+    var sgb = swiglu_backward(d_swi, saved.fc_gate[], saved.fc_value[], ctx)
+    var d_fc1_out = concat(1, ctx, sgb.d_gate, sgb.d_up)
+
+    var d_n2m = _bf16(
+        linear_backward_dx(d_fc1_out, w.fc1_w[], S, D, 2 * F, ctx), ctx
+    )
+    var lg_fc1 = Optional[KleinLoraDeviceGradTensors](None)
+    if lora.fc1:
+        var g = klein_lora_bwd_device_resident_tensors(
+            d_fc1_out, saved.n2m[], lora.fc1.value(), S, ctx
+        )
+        d_n2m = add(d_n2m, g.d_x[], ctx)
+        lg_fc1 = Optional[KleinLoraDeviceGradTensors](g^)
+
+    var sp1_mlp = add_scalar(scale_mlp, Float32(1.0), ctx)
+    var d_n2 = mul(d_n2m, sp1_mlp, ctx)
+
+    var d_n2x = rms_norm_backward_dx(d_n2, saved.h_mid[], w.norm2_w[], eps, ctx)
+    d_h_mid = add(d_h_mid, d_n2x, ctx)
+
+    var d_x = d_h_mid.clone(ctx)
+    var d_attn_y = mul(d_h_mid, gate_msa, ctx)
+
+    var d_att_flat = _bf16(
+        linear_backward_dx(d_attn_y, w.out_w[], S, I, D, ctx), ctx
+    )
+    var lg_out = Optional[KleinLoraDeviceGradTensors](None)
+    if lora.out:
+        var g = klein_lora_bwd_device_resident_tensors(
+            d_attn_y, saved.att_flat[], lora.out.value(), S, ctx
+        )
+        d_att_flat = add(d_att_flat, g.d_x[], ctx)
+        lg_out = Optional[KleinLoraDeviceGradTensors](g^)
+
+    var d_att = _reshaped(d_att_flat, [1, S, H, Dh], ctx)
+    var sb = sdpa_backward_dynamic(
+        saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx,
+    )
+
+    var cos_x = _expand_table(cos, S, H, rotary_dim, ctx)
+    var sin_x = _expand_table(sin, S, H, rotary_dim, ctx)
+    var d_q_rms = _partial_rope_backward(sb.d_q, cos_x, sin_x, H, rotary_dim, ctx)
+    var d_k_rms = _partial_rope_backward(sb.d_k, cos_x, sin_x, H, rotary_dim, ctx)
+
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+
+    var d_q_flat = _reshaped(d_q_pre, [S, I], ctx)
+    var d_k_flat = _reshaped(d_k_pre, [S, I], ctx)
+    var d_v_flat = _reshaped(sb.d_v, [S, I], ctx)
+    var d_qkv = concat(1, ctx, d_q_flat, d_k_flat, d_v_flat)
+
+    var d_n1m = _bf16(
+        linear_backward_dx(d_qkv, w.qkv_w[], S, D, 3 * I, ctx), ctx
+    )
+    var lg_qkv = Optional[KleinLoraDeviceGradTensors](None)
+    if lora.qkv:
+        var g = klein_lora_bwd_device_resident_tensors(
+            d_qkv, saved.n1m[], lora.qkv.value(), S, ctx
+        )
+        d_n1m = add(d_n1m, g.d_x[], ctx)
+        lg_qkv = Optional[KleinLoraDeviceGradTensors](g^)
+
+    var sp1_msa = add_scalar(scale_msa, Float32(1.0), ctx)
+    var d_n1 = mul(d_n1m, sp1_msa, ctx)
+
+    var d_n1x = rms_norm_backward_dx(d_n1, saved.x[], w.norm1_w[], eps, ctx)
+    d_x = add(d_x, d_n1x, ctx)
+
+    var lgrads = H3BlockLoraGrads(lg_qkv^, lg_out^, lg_fc1^, lg_fc2^)
+    return H3BlockLoraFrozenBackward(TArc(d_x^), lgrads^)

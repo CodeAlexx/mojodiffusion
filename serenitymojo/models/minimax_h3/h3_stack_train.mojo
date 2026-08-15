@@ -225,3 +225,87 @@ struct H3StackLoraOnlyGrads(Copyable, Movable):
     ):
         self.d_x = d_x^
         self.lora = lora^
+
+
+# ── FP8-RESIDENT variants: weights dequantized per block on-device ──────────
+from serenitymojo.models.minimax_h3.h3_train_block_store_fp8 import (
+    H3TrainBlockStoreFp8,
+)
+from serenitymojo.models.minimax_h3.h3_block_train import (
+    h3_block_train_backward_lora_frozen,
+)
+
+
+def h3_stack_train_forward_streamed_fp8[
+    H: Int, Dh: Int
+](
+    x_in: Tensor,
+    mut store: H3TrainBlockStoreFp8,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackTrainForward:
+    var n = store.num_blocks
+    if len(mods) != n or len(loras) != n:
+        raise Error("h3_stack_train_forward_streamed_fp8: mods/loras length mismatch")
+    var inputs = List[TArc]()
+    var h = x_in.clone(ctx)
+    for i in range(n):
+        inputs.append(TArc(h.clone(ctx)))
+        var bw = store.stage(i, ctx)
+        var f = h3_block_train_forward_lora[H, Dh](
+            h, bw, loras[i], mods[i][], adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx,
+        )
+        h = f.out[].clone(ctx)
+        _ = f^
+        _ = bw^
+        # fence: bounds the transient peak (dequant weights + act set)
+        ctx.synchronize()
+    return H3StackTrainForward(TArc(h^), inputs^)
+
+
+def h3_stack_train_backward_streamed_fp8[
+    H: Int, Dh: Int
+](
+    d_out: Tensor,
+    fwd: H3StackTrainForward,
+    mut store: H3TrainBlockStoreFp8,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackLoraOnlyGrads:
+    """FP8-resident recompute backward: LoRA grads only (adaln frozen,
+    frozen-base grads dropped) — same discipline as the bf16 streamed arm."""
+    var n = store.num_blocks
+    if len(fwd.block_inputs) != n:
+        raise Error("h3_stack_train_backward_streamed_fp8: forward length mismatch")
+    var lora_rev = List[H3BlockLoraGrads]()
+    var d = d_out.clone(ctx)
+    for r in range(n):
+        var i = n - 1 - r
+        var bw = store.stage(i, ctx)
+        var f = h3_block_train_forward_lora[H, Dh](
+            fwd.block_inputs[i][], bw, loras[i], mods[i][],
+            adaln_indices, cos, sin, D, F, rotary_dim, eps, ctx,
+        )
+        var b = h3_block_train_backward_lora_frozen[H, Dh](
+            d, bw, loras[i], f.saved, adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx,
+        )
+        d = b.d_x[].clone(ctx)
+        lora_rev.append(b.lora.copy())
+        _ = b^
+        _ = f^
+        _ = bw^
+        ctx.synchronize()
+    var lora = List[H3BlockLoraGrads]()
+    for r in range(n):
+        lora.append(lora_rev[n - 1 - r].copy())
+    return H3StackLoraOnlyGrads(TArc(d^), lora^)

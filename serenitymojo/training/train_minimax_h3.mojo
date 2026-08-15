@@ -57,9 +57,6 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_condition_embed, minimax_h3_token_refiner_dynamic,
     _minimax_h3_video_patch_embed_bf16,
 )
-from serenitymojo.models.dit.minimax_h3_modcache import (
-    MiniMaxH3ModCache, minimax_h3_build_modulation_cache,
-)
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 from serenitymojo.models.minimax_h3.packing import (
     minimax_h3_build_packed_sequence, minimax_h3_build_row_timesteps,
@@ -73,12 +70,15 @@ from serenitymojo.models.minimax_h3.h3_train_sigma import (
     h3_noisy_input, h3_velocity_target,
     h3_modality_loss, h3_joint_token_loss, h3_loss_grad,
 )
-from serenitymojo.models.minimax_h3.h3_train_block_store import H3TrainBlockStore
+from serenitymojo.models.minimax_h3.h3_train_block_store_fp8 import (
+    H3TrainBlockStoreFp8,
+)
+from serenitymojo.models.minimax_h3.h3_train_modgrid import H3TrainModGrid
 from serenitymojo.models.minimax_h3.h3_block_train import (
     H3BlockLoraDevice, H3BlockLoraGrads,
 )
 from serenitymojo.models.minimax_h3.h3_stack_train import (
-    h3_stack_train_forward_streamed, h3_stack_train_backward_streamed,
+    h3_stack_train_forward_streamed_fp8, h3_stack_train_backward_streamed_fp8,
 )
 from serenitymojo.models.minimax_h3.h3_final_train import (
     H3FinalTrainWeights, h3_final_train_forward, h3_final_train_backward,
@@ -368,25 +368,50 @@ def main() raises:
         TArc(cast_tensor(Tensor.from_view(sharded.tensor_view(String("final_layer.audio_out.bias")), ctx), STDtype.BF16, ctx)),
     )
 
-    # AdaLN mod grid: EXACT tables at 1000 sigma nodes, built once with the
-    # gated modcache pass (one 24.3GB streamed read; device-resident ~9.3GB).
-    print("[h3-train] building adaln mod grid (", SIGMA_NODES, "nodes )...")
-    var tg0 = perf_counter_ns()
-    var grid_ts = List[Float32]()
-    for k in range(SIGMA_NODES):
-        var sigma_node = Float32(k) / Float32(SIGMA_NODES - 1)
-        grid_ts.append(Float32(1.0) - sigma_node)  # timestep = 1 - sigma
-    var gt_sh: List[Int] = [SIGMA_NODES]
-    var grid_ts_tensor = Tensor.from_host(grid_ts, gt_sh^, STDtype.F32, ctx)
-    var grid_temb = minimax_h3_timestep_embedding(grid_ts_tensor, frontend_w, config, ctx)
-    var modgrid = minimax_h3_build_modulation_cache(sharded, grid_temb, config, ctx)
+    # AdaLN grid: exact tables at 1000 sigma nodes, HOST sidecar (frees
+    # ~9.7GB VRAM for the fp8-resident base); per-step fetch is ~10MB H2D.
+    var grid_path = ckpt + "/../h3_train_modgrid_" + String(SIGMA_NODES) + ".safetensors"
+    var modgrid = H3TrainModGrid.build_or_load(
+        grid_path, sharded, frontend_w, config, SIGMA_NODES, ctx,
+    )
     ctx.synchronize()
-    print("[h3-train] mod grid built in",
-          Float64(perf_counter_ns() - tg0) / 1.0e9, "s;",
-          Float64(modgrid.total_bytes()) / 1.0e9, "GB device")
 
-    # streamed block store (the 50-block mmap-staging streamer)
-    var store = H3TrainBlockStore.open(ckpt, N_BLOCKS, ctx)
+    # Refined text embeds depend only on the cached captions — precompute
+    # once per item (condition_proj + token refiner), park on HOST, then
+    # drop those weights from VRAM (~0.9GB) and skip their per-step compute.
+    print("[h3-train] precomputing per-item text embeds...")
+    var text_embeds_host = List[List[BFloat16]]()
+    var text_embeds_rows = List[Int]()
+    for i in range(len(items)):
+        var tei = h3_read_text_cache(items[i].te_path, ctx)
+        var th = tei.hidden[].clone(ctx)
+        if th.dtype() != STDtype.BF16:
+            th = cast_tensor(th, STDtype.BF16, ctx)
+        var t0e = minimax_h3_condition_embed(th, frontend_w, ctx)
+        var te_ref = minimax_h3_token_refiner_dynamic[H3_HEADS, H3_HEAD_DIM](
+            t0e, frontend_w, config, ctx
+        )
+        text_embeds_host.append(te_ref.to_host_bf16(ctx))
+        text_embeds_rows.append(te_ref.shape()[0])
+        ctx.synchronize()
+    # slim weight dict: per-step needs ONLY the video patch projection
+    var step_w = Dict[String, ArcPointer[Tensor]]()
+    step_w[String("video_patch_proj.weight")] = frontend_w[String("video_patch_proj.weight")].copy()
+    step_w[String("video_patch_proj.bias")] = frontend_w[String("video_patch_proj.bias")].copy()
+    var empty_w = Dict[String, ArcPointer[Tensor]]()
+    frontend_w = empty_w^
+    ctx.synchronize()
+    print("[h3-train] text embeds cached; frontend weights slimmed")
+
+    # FP8-RESIDENT frozen base (krea2 pattern): ~19.25GB on-device, zero
+    # per-step host->device weight traffic.
+    print("[h3-train] building fp8-resident base (one streamed pass)...")
+    # tail blocks stream bf16 from the retained mmap store
+    var tq0 = perf_counter_ns()
+    var resident_blocks = _arg_int(String("resident_blocks"), 42)
+    var store = H3TrainBlockStoreFp8.open(ckpt, N_BLOCKS, resident_blocks, ctx)
+    print("[h3-train] fp8 base resident in",
+          Float64(perf_counter_ns() - tq0) / 1.0e9, "s")
 
     # LoRA state: init or resume
     var rng = _Rng(UInt64(seed))
@@ -456,14 +481,11 @@ def main() raises:
         if not lat.has_video or lat.lat_f != 1:
             raise Error("maiden arm expects image items ([24,1,H,W]): " + it.item_key)
         var te = h3_read_text_cache(it.te_path, ctx)
-        # upstream trains in dit_dtype bf16: cast cached latents/text down
-        # exactly like its .to(dtype) load (caches may be stored F32)
+        # upstream trains in dit_dtype bf16: cast cached latents down exactly
+        # like its .to(dtype) load (caches may be stored F32)
         var x0 = lat.video[].clone(ctx)
         if x0.dtype() != STDtype.BF16:
             x0 = cast_tensor(x0, STDtype.BF16, ctx)
-        var text_hidden = te.hidden[].clone(ctx)
-        if text_hidden.dtype() != STDtype.BF16:
-            text_hidden = cast_tensor(text_hidden, STDtype.BF16, ctx)
 
         # ── sigma (image branch), quantized to the grid ──────────────────────
         var sigma_raw = _image_sigma(rng, lat.lat_h, lat.lat_w)
@@ -507,26 +529,28 @@ def main() raises:
 
         # image t2va layout is [text | video] contiguous (no cond/audio rows):
         # compose the frozen frontend directly and concat the two streams.
-        var video_embeds = _minimax_h3_video_patch_embed_bf16(x_rows, frontend_w, ctx)
-        var text0 = minimax_h3_condition_embed(text_hidden, frontend_w, ctx)
-        var text_embeds = minimax_h3_token_refiner_dynamic[H3_HEADS, H3_HEAD_DIM](
-            text0, frontend_w, config, ctx
+        var video_embeds = _minimax_h3_video_patch_embed_bf16(x_rows, step_w, ctx)
+        var item_i = order[epoch_pos]
+        var tesh: List[Int] = [text_embeds_rows[item_i], H3_D]
+        var text_embeds = Tensor.from_host_bf16(
+            text_embeds_host[item_i], tesh^, ctx
         )
         var hidden0 = concat(0, ctx, text_embeds, video_embeds)
         if hidden0.shape()[0] != S:
             raise Error("packed length mismatch (text+video != S)")
 
-        # ── per-row grid addressing: node k for every row ────────────────────
+        # ── per-step mod tables: fetch ONLY this node's rows (host grid) ─────
         var node_idx = List[Int]()
         for _ in range(S):
-            node_idx.append(node)
+            node_idx.append(0)  # fetched tables carry just this node's rows
         var adaln_idx = minimax_h3_adaln_indices(node_idx, layout.token_tags)
+        var final_mod_rows = modgrid.final_row(node, ctx)
 
         # ── 50-block streamed LoRA forward ───────────────────────────────────
         var mods = List[TArc]()
         for b in range(N_BLOCKS):
-            mods.append(modgrid.block_mod[b].copy())
-        var fwd = h3_stack_train_forward_streamed[H3_HEADS, H3_HEAD_DIM](
+            mods.append(TArc(modgrid.block_rows(b, node, ctx)))
+        var fwd = h3_stack_train_forward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
             hidden0, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )
@@ -534,7 +558,7 @@ def main() raises:
         # ── final layer twin ─────────────────────────────────────────────────
         var empty_idx = List[Int]()
         var ffwd = h3_final_train_forward(
-            fwd.out[], final_w, modgrid.final_mod[], node_idx,
+            fwd.out[], final_w, final_mod_rows, node_idx,
             layout.video_indices, empty_idx, H3_EPS, ctx,
         )
 
@@ -554,7 +578,7 @@ def main() raises:
             d_video, d_audio, ffwd.saved, final_w, node_idx,
             layout.video_indices, empty_idx, S, H3_EPS, ctx,
         )
-        var grads = h3_stack_train_backward_streamed[H3_HEADS, H3_HEAD_DIM](
+        var grads = h3_stack_train_backward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
             d_hidden, fwd, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )

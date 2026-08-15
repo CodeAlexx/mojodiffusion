@@ -3831,3 +3831,39 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - `pipeline/parity/`, `models/*/parity/` — every gate above; oracle scripts
   run the vendor's OWN classes (AutoencoderKLLegacy etc.) via the torchref
   venv, GPU bf16/F32 — never CPU-fp32 references.
+
+## MiniMax-H3 LoRA trainer (2026-08-14/15, pushed ..c6753f5)
+- PURE-MOJO H3 LoRA trainer, torchref (pinned upstream @ 04324c28) = oracle.
+  Entry `training/train_minimax_h3.mojo` (image-mode maiden arm): mmh3 cache
+  pair -> image-branch sigma (resolution-aware logit-normal, 1000-node grid
+  quantization — documented deviation) -> bit-exact noising/target
+  (`models/minimax_h3/h3_train_sigma.mojo`) -> frozen frontend ([text|video]
+  contiguous, per-item text embeds precomputed) -> 50-block streamed LoRA
+  fwd + recompute bwd (`h3_stack_train.mojo`) -> final-layer twin
+  (`h3_final_train.mojo`) -> token loss + d_pred -> fused AdamW on F32
+  masters -> lora_unet_* saves + full resume state.
+- Stores: `h3_train_block_store.mojo` (mmap -> ~770MB pinned staging -> fixed
+  slab; v1's 38.5GB pinned fill KILLED the desktop 08-14 11:08 — unreclaimable
+  pages) and `h3_train_block_store_fp8.mojo` (HYBRID: 42/50 blocks E4M3 +
+  per-row scales resident, dequant-to-bf16 per stage, tail streamed; 46 OOMs
+  on 24GB). AdaLN: `h3_train_modgrid.mojo` — exact modcache tables at 1000
+  sigma nodes, build-once host sidecar (~9.7GB VRAM freed).
+- Speed: 49 -> 34 (fp8 base + frozen-base bwd skipping discarded weight
+  grads/rms d_g/d_mod) -> 11.5s/step (cuDNN flash train attention, dynamic
+  dims — math-mode sdpa bwd per-head loops were ~14k launches/step). Phase
+  split at 11.5s: fwd 4.0 / bwd 7.4. Same-seed loss parity vs exact arm:
+  4 decimals.
+- Gates (all PASS, output/checks): block fwd+bwd + LoRA 21/21 vs torch on
+  real block-0; 2-real-block stack chain 9/9; 50-block real-weight smoke;
+  mmh3 cache reader 36/36 BIT-exact vs upstream-writer fixture; sigma/x_t
+  bit-exact 5 sigma cases; final layer cos 1.0; sdpa_backward_dynamic
+  bit-identical; lora overlay 200 adapters + exact runtime add (never fused).
+- Runtime S: `sdpa_backward_rect_dynamic`(+storage) and flash train
+  fwd/bwd dynamic twins — captions vary per item, upstream avoids padding.
+- Caches: upstream scripts on the eri set (118 latents via downloaded video
+  VAE; TE via nvfp4 conditioner streamed — bf16 32B needs ~51GB host, unsafe
+  on 62GB; dedicated `.venv` in the h3 worktree). Weights:
+  `.serenity/models/checkpoints/MiniMax-H3/single_file/`.
+- Inference LoRA overlay: `models/minimax_h3/h3_lora_overlay.mojo` +
+  `minimax_h3_load_block_device_lora` + runtime `--lora=`/`--lora-mult=`
+  (streamed bf16 base; W' computed IN VRAM at load, checkpoints untouched).

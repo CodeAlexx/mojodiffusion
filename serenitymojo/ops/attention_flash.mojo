@@ -1380,3 +1380,152 @@ def sdpa_flash_backward_padmask_dispatch(
         String("sdpa_flash_backward_padmask_dispatch: no bucket (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh) + ")"
     )
+
+
+# ── RUNTIME-DIM train fwd/bwd (per-item sequence lengths in trainers) ─────────
+def sdpa_flash_train_fwd_dynamic(
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashFwd:
+    """Runtime-dim twin of `sdpa_flash_train_fwd` (same shim entry; pad math
+    at runtime; real lengths drive the shim's padding mask)."""
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_train_fwd_dynamic: q/k/v must be BF16")
+    var qshape = q.shape()
+    if len(qshape) != 4:
+        raise Error("sdpa_flash_train_fwd_dynamic: q must be [B,S,H,Dh]")
+    var B = qshape[0]
+    var S = qshape[1]
+    var H = qshape[2]
+    var Dh = qshape[3]
+    var S_PAD = ((S + 127) // 128) * 128
+
+    var q_pad = _pad_seq_dynamic(q, S_PAD, H, Dh, ctx)
+    var k_pad = _pad_seq_dynamic(k, S_PAD, H, Dh, ctx)
+    var v_pad = _pad_seq_dynamic(v, S_PAD, H, Dh, ctx)
+
+    var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * S_PAD * H * Dh * 2)
+    ctx.enqueue_memset[DType.uint8](o_buf, 0)
+    var o_shape: List[Int] = [B, S_PAD, H, Dh]
+    var o_pad = Tensor(o_buf^, o_shape^, STDtype.BF16)
+
+    var stats_buf = ctx.enqueue_create_buffer[DType.uint8](B * H * S_PAD * 4)
+    ctx.enqueue_memset[DType.uint8](stats_buf, 0)
+    var stats_shape: List[Int] = [B, H, S_PAD, 1]
+    var stats = Tensor(stats_buf^, stats_shape^, STDtype.F32)
+
+    var qs = _strides_bhnd(S_PAD, H, Dh)
+    var ks = _strides_bhnd(S_PAD, H, Dh)
+    var vs = _strides_bhnd(S_PAD, H, Dh)
+    var os_ = _strides_bhnd(S_PAD, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bf16_train_fwd", Int32](
+        _dev_ptr(q_pad), _dev_ptr(k_pad), _dev_ptr(v_pad),
+        _dev_ptr(o_pad), _dev_ptr(stats),
+        Int32(B), Int32(H), Int32(S_PAD), Int32(S_PAD), Int32(Dh),
+        scale,
+        qs, ks, vs, os_,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),
+        Int32(S), Int32(S),
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_train_fwd_dynamic: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S) + " S_PAD=" + String(S_PAD)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+
+    var o_view = _unpad_seq_dynamic(o_pad, S, H, Dh, ctx)
+    var o: Tensor
+    if S_PAD != S:
+        # re-box the view as an owning copy (outlives o_pad's borrow rules)
+        var o_buf2 = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
+        ctx.enqueue_copy(dst_buf=o_buf2, src_buf=o_view.buf)
+        var sh: List[Int] = [B, S, H, Dh]
+        o = Tensor(o_buf2^, sh^, STDtype.BF16)
+    else:
+        o = o_view^
+    return SdpaFlashFwd(o^, o_pad^, q_pad^, k_pad^, v_pad^, stats^)
+
+
+def sdpa_flash_backward_dynamic(
+    fwd: SdpaFlashFwd,
+    d_out: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """Runtime-dim twin of `sdpa_flash_backward`."""
+    var doshape = d_out.shape()
+    if len(doshape) != 4:
+        raise Error("sdpa_flash_backward_dynamic: d_out must be [B,S,H,Dh]")
+    var B = doshape[0]
+    var S = doshape[1]
+    var H = doshape[2]
+    var Dh = doshape[3]
+    var S_PAD = fwd.q_pad.shape()[1]
+    var do_pad = _pad_seq_dynamic(d_out, S_PAD, H, Dh, ctx)
+
+    var nbytes = B * S_PAD * H * Dh * 2
+    var dq_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dk_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dv_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    ctx.enqueue_memset[DType.uint8](dq_buf, 0)
+    ctx.enqueue_memset[DType.uint8](dk_buf, 0)
+    ctx.enqueue_memset[DType.uint8](dv_buf, 0)
+    var g_shape: List[Int] = [B, S_PAD, H, Dh]
+    var dq_pad = Tensor(dq_buf^, g_shape.copy(), STDtype.BF16)
+    var dk_pad = Tensor(dk_buf^, g_shape.copy(), STDtype.BF16)
+    var dv_pad = Tensor(dv_buf^, g_shape^, STDtype.BF16)
+
+    var qs = _strides_bhnd(S_PAD, H, Dh)
+    var ks = _strides_bhnd(S_PAD, H, Dh)
+    var vs = _strides_bhnd(S_PAD, H, Dh)
+    var os_ = _strides_bhnd(S_PAD, H, Dh)
+    var dos = _strides_bhnd(S_PAD, H, Dh)
+    var dqs = _strides_bhnd(S_PAD, H, Dh)
+    var dks = _strides_bhnd(S_PAD, H, Dh)
+    var dvs = _strides_bhnd(S_PAD, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bwd_bf16", Int32](
+        _dev_ptr(fwd.q_pad), _dev_ptr(fwd.k_pad), _dev_ptr(fwd.v_pad),
+        _dev_ptr(fwd.o_pad), _dev_ptr(do_pad), _dev_ptr(fwd.stats),
+        _dev_ptr(dq_pad), _dev_ptr(dk_pad), _dev_ptr(dv_pad),
+        Int32(B), Int32(H), Int32(S_PAD), Int32(S_PAD), Int32(Dh),
+        scale,
+        qs, ks, vs, os_, dos, dqs, dks, dvs,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),
+        Int32(S), Int32(S),
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    dos.free(); dqs.free(); dks.free(); dvs.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_backward_dynamic: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S) + " S_PAD=" + String(S_PAD) + ")"
+        )
+
+    var dq_v = _unpad_seq_dynamic(dq_pad, S, H, Dh, ctx)
+    var dk_v = _unpad_seq_dynamic(dk_pad, S, H, Dh, ctx)
+    var dv_v = _unpad_seq_dynamic(dv_pad, S, H, Dh, ctx)
+    if S_PAD != S:
+        var sz = B * S * H * Dh * 2
+        var dq_o = ctx.enqueue_create_buffer[DType.uint8](sz)
+        var dk_o = ctx.enqueue_create_buffer[DType.uint8](sz)
+        var dv_o = ctx.enqueue_create_buffer[DType.uint8](sz)
+        ctx.enqueue_copy(dst_buf=dq_o, src_buf=dq_v.buf)
+        ctx.enqueue_copy(dst_buf=dk_o, src_buf=dk_v.buf)
+        ctx.enqueue_copy(dst_buf=dv_o, src_buf=dv_v.buf)
+        var sh: List[Int] = [B, S, H, Dh]
+        return SdpaFlashGrads(
+            Tensor(dq_o^, sh.copy(), STDtype.BF16),
+            Tensor(dk_o^, sh.copy(), STDtype.BF16),
+            Tensor(dv_o^, sh^, STDtype.BF16),
+        )
+    return SdpaFlashGrads(dq_v^, dk_v^, dv_v^)

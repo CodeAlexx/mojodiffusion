@@ -263,8 +263,11 @@ def h3_stack_train_forward_streamed_fp8[
         h = f.out[].clone(ctx)
         _ = f^
         _ = bw^
-        # fence: bounds the transient peak (dequant weights + act set)
-        ctx.synchronize()
+        # fence policy: tail blocks MUST fence (mmap slab reuse); resident
+        # blocks fence every 8th to bound the async transient peak without
+        # paying 50 pipeline drains per pass.
+        if i + 1 >= store.resident or (i % 8) == 7:
+            ctx.synchronize()
     return H3StackTrainForward(TArc(h^), inputs^)
 
 
@@ -304,7 +307,8 @@ def h3_stack_train_backward_streamed_fp8[
         _ = b^
         _ = f^
         _ = bw^
-        ctx.synchronize()
+        if i <= store.resident or (i % 8) == 0:
+            ctx.synchronize()
     var lora = List[H3BlockLoraGrads]()
     for r in range(n):
         lora.append(lora_rev[n - 1 - r].copy())

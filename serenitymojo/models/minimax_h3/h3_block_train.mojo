@@ -38,6 +38,9 @@ from serenitymojo.ops.norm_backward import rms_norm_backward
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
 from serenitymojo.ops.attention import sdpa_nomask_dynamic
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_dynamic, sdpa_flash_backward_dynamic,
+)
 from serenitymojo.ops.attention_backward import sdpa_backward_dynamic
 from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
 from serenitymojo.ops.rope_struct_backward import rope_halfsplit_full_backward
@@ -502,7 +505,9 @@ def h3_block_train_forward_lora[
     var q_rope = _partial_rope(q_rms, cos, sin, H, rotary_dim, ctx)
     var k_rope = _partial_rope(k_rms, cos, sin, H, rotary_dim, ctx)
 
-    var att = sdpa_nomask_dynamic(q_rope, k_rope, v, scale, ctx)
+    var att_f = sdpa_flash_train_fwd_dynamic(q_rope, k_rope, v, scale, ctx)
+    var att = att_f.o.clone(ctx)
+    _ = att_f^
     var att_flat = _reshaped(att, [S, I], ctx)
     var attn_base = linear(att_flat, w.out_w[], no_bias, ctx)
     var attn_y = _lora_add(attn_base, att_flat, lora.out, S, ctx)
@@ -764,9 +769,11 @@ def h3_block_train_backward_lora_frozen[
         lg_out = Optional[KleinLoraDeviceGradTensors](g^)
 
     var d_att = _reshaped(d_att_flat, [1, S, H, Dh], ctx)
-    var sb = sdpa_backward_dynamic(
-        saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx,
+    var flash_fwd = sdpa_flash_train_fwd_dynamic(
+        saved.q_rope[], saved.k_rope[], saved.v[], scale, ctx,
     )
+    var sb = sdpa_flash_backward_dynamic(flash_fwd, d_att, scale, ctx)
+    _ = flash_fwd^
 
     var cos_x = _expand_table(cos, S, H, rotary_dim, ctx)
     var sin_x = _expand_table(sin, S, H, rotary_dim, ctx)

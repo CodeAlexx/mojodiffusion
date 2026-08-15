@@ -550,12 +550,16 @@ def main() raises:
         var mods = List[TArc]()
         for b in range(N_BLOCKS):
             mods.append(TArc(modgrid.block_rows(b, node, ctx)))
+        ctx.synchronize()
+        var tp0 = perf_counter_ns()
         var fwd = h3_stack_train_forward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
             hidden0, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )
 
         # ── final layer twin ─────────────────────────────────────────────────
+        ctx.synchronize()
+        var tp1 = perf_counter_ns()
         var empty_idx = List[Int]()
         var ffwd = h3_final_train_forward(
             fwd.out[], final_w, final_mod_rows, node_idx,
@@ -578,11 +582,15 @@ def main() raises:
             d_video, d_audio, ffwd.saved, final_w, node_idx,
             layout.video_indices, empty_idx, S, H3_EPS, ctx,
         )
+        ctx.synchronize()
+        var tp2 = perf_counter_ns()
         var grads = h3_stack_train_backward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
             d_hidden, fwd, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )
 
+        ctx.synchronize()
+        var tp3 = perf_counter_ns()
         # ── fused AdamW on the F32 masters ───────────────────────────────────
         var params = List[TArc]()
         var gts = List[TArc]()
@@ -607,6 +615,12 @@ def main() raises:
         loras = _compute_loras(states, rank, scale, ctx)
         ctx.synchronize()
 
+        var tp4 = perf_counter_ns()
+        print("[phase] fwd", Float64(tp1 - tp0) / 1.0e9,
+              "final+loss", Float64(tp2 - tp1) / 1.0e9,
+              "bwd", Float64(tp3 - tp2) / 1.0e9,
+              "opt", Float64(tp4 - tp3) / 1.0e9,
+              "prep", Float64(tp0 - t_step0) / 1.0e9)
         var dt = Float64(perf_counter_ns() - t_step0) / 1.0e9
         print("[h3-train] step", step, "loss", loss, "sigma", sigma,
               "S", S, "item", it.item_key, "dt", dt, "s")

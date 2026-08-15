@@ -181,14 +181,14 @@ def h3_stack_train_backward_streamed[
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> H3StackLoraOnlyGrads:
-    """Streamed recompute backward. Returns LoRA grads + d_mod per block
-    (the trainable set); frozen-base weight grads are NOT retained — at 50
-    blocks they would be another 38.5GB."""
+    """Streamed recompute backward. Returns LoRA grads per block (the
+    trainable set). Frozen-base weight grads are NOT retained (38.5GB at
+    50 blocks) and neither is d_mod (adaln is frozen; with grid-sized mod
+    tables retaining it would be another ~9.3GB)."""
     var n = store.num_blocks
     if len(fwd.block_inputs) != n:
         raise Error("h3_stack_train_backward_streamed: forward length mismatch")
     var lora_rev = List[H3BlockLoraGrads]()
-    var dmod_rev = List[TArc]()
     var d = d_out.clone(ctx)
     for r in range(n):
         var i = n - 1 - r
@@ -203,31 +203,25 @@ def h3_stack_train_backward_streamed[
             mod_rows, D, F, rotary_dim, eps, ctx,
         )
         d = b.base.d_x[].clone(ctx)
-        dmod_rev.append(b.base.d_mod)
         lora_rev.append(b.lora.copy())
         _ = b^
         _ = f^
         _ = bw^
         ctx.synchronize()
     var lora = List[H3BlockLoraGrads]()
-    var dmod = List[TArc]()
     for r in range(n):
         lora.append(lora_rev[n - 1 - r].copy())
-        dmod.append(dmod_rev[n - 1 - r])
-    return H3StackLoraOnlyGrads(TArc(d^), lora^, dmod^)
+    return H3StackLoraOnlyGrads(TArc(d^), lora^)
 
 
 struct H3StackLoraOnlyGrads(Copyable, Movable):
     var d_x: TArc
     var lora: List[H3BlockLoraGrads]
-    var d_mod: List[TArc]
 
     def __init__(
         out self,
         var d_x: TArc,
         var lora: List[H3BlockLoraGrads],
-        var d_mod: List[TArc],
     ):
         self.d_x = d_x^
         self.lora = lora^
-        self.d_mod = d_mod^

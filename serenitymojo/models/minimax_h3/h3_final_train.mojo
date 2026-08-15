@@ -19,6 +19,7 @@
 from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
+from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.linear import linear_bias
 from serenitymojo.ops.linalg_backward import linear_backward
@@ -123,9 +124,16 @@ def h3_final_train_forward(
     var m = add(mul(n, sp1, ctx), shift, ctx)              # [Sm, D]
 
     var mv = slice(m, 0, 0, sv, ctx)
-    var ma = slice(m, 0, sv, sa, ctx)
     var video = linear_bias(mv, w.video_out_w[], w.video_out_b[], ctx)
-    var audio = linear_bias(ma, w.audio_out_w[], w.audio_out_b[], ctx)
+    # image items pack no audio rows: skip the audio head (0-row GEMM guard)
+    var audio: Tensor
+    if sa > 0:
+        var ma = slice(m, 0, sv, sa, ctx)
+        audio = linear_bias(ma, w.audio_out_w[], w.audio_out_b[], ctx)
+    else:
+        var vals: List[Float32] = [Float32(0)]
+        var ash: List[Int] = [1]
+        audio = Tensor.from_host(vals, ash^, STDtype.BF16, ctx)
 
     return H3FinalTrainForward(
         TArc(video^), TArc(audio^),
@@ -153,10 +161,14 @@ def h3_final_train_backward(
     var pa = d_audio.shape()[1]
 
     var mv = slice(saved.m[], 0, 0, sv, ctx)
-    var ma = slice(saved.m[], 0, sv, sa, ctx)
     var gv = linear_backward(d_video, mv, w.video_out_w[], sv, D, pv, ctx)
-    var ga = linear_backward(d_audio, ma, w.audio_out_w[], sa, D, pa, ctx)
-    var d_m = concat(0, ctx, gv.d_x, ga.d_x)               # [Sm, D]
+    var d_m: Tensor
+    if sa > 0:
+        var ma = slice(saved.m[], 0, sv, sa, ctx)
+        var ga = linear_backward(d_audio, ma, w.audio_out_w[], sa, D, pa, ctx)
+        d_m = concat(0, ctx, gv.d_x, ga.d_x)               # [Sm, D]
+    else:
+        d_m = gv.d_x.clone(ctx)
 
     # m = n*(1+scale) + shift  =>  d_n = d_m * (1+scale)
     var sp1 = add_scalar(saved.scale_rows[], Float32(1.0), ctx)

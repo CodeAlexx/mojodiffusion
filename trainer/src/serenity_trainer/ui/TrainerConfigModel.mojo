@@ -398,7 +398,7 @@ struct TrainerUIConfig(Movable):
         # .mojo via the levers optimizer dispatch). Appended LAST so existing
         # option indices stay stable.
         self.optimizer_options.append(String("SCHEDULE_FREE_ADAMW"))
-        # ai-toolkit Automagic3 (serenitymojo training/automagic3.mojo via the
+        # torchref Automagic3 (serenitymojo training/automagic3.mojo via the
         # levers optimizer dispatch). Appended LAST so existing option indices
         # stay stable. Emits "AUTOMAGIC3" verbatim into the runner config
         # (io/train_config_reader.mojo _optimizer_int -> TRAIN_OPTIMIZER_AUTOMAGIC3).

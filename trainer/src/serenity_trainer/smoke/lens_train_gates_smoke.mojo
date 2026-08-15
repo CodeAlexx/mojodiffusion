@@ -23,7 +23,7 @@
 # GATE C — save/resume. Saves the trained LoRA via the REAL save_lens_lora, reloads
 #   into a fresh LensLoraSet via the REAL load_lens_lora, asserts loaded A/B ==
 #   saved A/B (max |Δ| < 1e-4, BF16-exact), then runs ONE more train step on the
-#   reloaded set (loss finite + in range). NOTE: PEFT/ai-toolkit LoRA files persist
+#   reloaded set (loss finite + in range). NOTE: PEFT/torchref LoRA files persist
 #   ONLY the adapter weights (lora_down/lora_up/alpha) — NOT the AdamW moments — so
 #   this gate is weight-resume correctness, not optimizer-state resume.
 #

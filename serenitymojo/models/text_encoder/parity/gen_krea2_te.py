@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # gen_krea2_te.py — Krea-2 Qwen3-VL-4B text-encoder parity oracle. Dev tool, NOT shipped.
 #
-# Replicates ai-toolkit krea2/src/text_encoder.py::encode_krea_prompt EXACTLY:
+# Replicates torchref krea2/src/text_encoder.py::encode_krea_prompt EXACTLY:
 #   - load the REAL Qwen3-VL-4B-Instruct (bf16), drop the vision tower (text-only),
 #   - tokenize PROMPT_TEMPLATE_ENCODE_PREFIX + prompt and (separately, via the
 #     Qwen2TokenizerFast "processor") the assistant suffix; concat -> input_ids,

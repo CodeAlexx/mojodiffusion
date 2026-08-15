@@ -1,6 +1,6 @@
 # Ideogram4FineTuneModelSaver.mojo - full transformer save contract.
 #
-# ai-toolkit's full save unwraps the Ideogram4 transformer, dequantizes any QTensor,
+# torchref's full save unwraps the Ideogram4 transformer, dequantizes any QTensor,
 # casts to the requested dtype, and writes a safetensors file with ideogram4 meta.
 
 from serenity_trainer.util.enum.ModelType import MODEL_TYPE_IDEOGRAM_4, model_type_str

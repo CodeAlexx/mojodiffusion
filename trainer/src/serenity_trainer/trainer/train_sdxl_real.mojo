@@ -1642,7 +1642,7 @@ def main() raises:
         print("RESULT: REAL run OK — ", train_label, " grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        # save each ST's adapters under its real prefix (kohya-loadable PEFT).
+        # save each ST's adapters under its real prefix (torchref-loadable PEFT).
         var prefixes = sdxl_st_prefixes()
         for s in range(N_ST):
             var save_path = sdxl_output_lora_path_for_st(train_cfg, run_steps, s)

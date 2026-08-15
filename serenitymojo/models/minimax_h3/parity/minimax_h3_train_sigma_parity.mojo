@@ -1,5 +1,5 @@
 # minimax_h3_train_sigma_parity — gate the H3 training sigma policy, noising,
-# joint token loss, and loss gradient against torch (musubi functions called
+# joint token loss, and loss gradient against torch (torchref functions called
 # directly in h3_sigma_oracle.py). Bars: sigmas/timesteps f32-exact, x_t and
 # velocity targets bf16 BIT-exact (max_abs == 0), loss rel <= 1e-5, loss
 # grads cos >= 0.999999.

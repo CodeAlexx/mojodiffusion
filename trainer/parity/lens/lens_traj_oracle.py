@@ -9,7 +9,7 @@ and is gated: latent_final cos>=0.999 (trajectory) + decoded-image PSNR (full sa
 Isolates RNG: latent0 is dumped (no generator mismatch). Sequential to fit 24GB:
 encode (free) -> transformer denoise (bf16) -> vae decode.
 
-Run: /home/alex/ai-toolkit/venv/bin/python parity/lens/lens_traj_oracle.py
+Run: /home/alex/torchref-image/venv/bin/python parity/lens/lens_traj_oracle.py
 """
 import importlib.util, json, os, gc
 import numpy as np, torch

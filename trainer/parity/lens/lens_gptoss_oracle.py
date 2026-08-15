@@ -7,7 +7,7 @@ encoder port can be parity-gated on byte-identical token ids. S=160 (>128) so th
 sliding-window-vs-full-causal mask alternation (even/odd layers) is exercised.
 
 Run with the transformers-v5 env:
-  /home/alex/ai-toolkit/venv/bin/python parity/lens/lens_gptoss_oracle.py
+  /home/alex/torchref-image/venv/bin/python parity/lens/lens_gptoss_oracle.py
 """
 import importlib.util
 import json

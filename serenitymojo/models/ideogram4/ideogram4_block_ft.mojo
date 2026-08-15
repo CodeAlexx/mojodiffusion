@@ -48,8 +48,8 @@
 # 0*scale) = base), so its Ideogram4BlockActs tape is the base tape — the gate
 # (models/ideogram4/parity/ideogram4_block_ft_parity.mojo) drives it that way.
 #
-# Oracle: ideogram4_aitoolkit_oracle.py IDEOGRAM4_FT_ORACLE=1 (base-only mode —
-# per MJ-1041 the ideogram4 oracle is ai-toolkit; the LoRA-mode refs are NOT
+# Oracle: ideogram4_torchref_oracle.py IDEOGRAM4_FT_ORACLE=1 (base-only mode —
+# per MJ-1041 the ideogram4 oracle is torchref; the LoRA-mode refs are NOT
 # valid for FT dX, and the base weights are frozen there so they carry no
 # W.grad at all). Gate bar cos >= 0.999 at the REAL dims (S=260, Hidden=4608,
 # H=18, Dh=256, FF=12288, Adaln=512 — real checkpoint block-0 weights).

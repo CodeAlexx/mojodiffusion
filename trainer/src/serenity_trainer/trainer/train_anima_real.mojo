@@ -16,7 +16,7 @@
 #   loss   = mean((pred - target)^2)                  (MSE, rs:907-926)
 #   d_out  = 2/N * (pred - target)                    (dMSE/dpred)
 #   backward -> global-norm clip(1.0) -> AdamW        (rs:988-1024)
-#   save LoRA (kohya net.blocks.<i>.* keys)           (rs:1136-1155)
+#   save LoRA (torchref net.blocks.<i>.* keys)           (rs:1136-1155)
 #
 # The DiT operates in PATCH SPACE. The cached latent [B,16,H',W'] is:
 #   1. lifted to 5D [B,T=1,H',W',16] (channels-last),
@@ -1582,7 +1582,7 @@ def main() raises:
     print("loss first =", first_loss, "  last =", last_loss,
           "  delta =", last_loss - first_loss)
 
-    # ── final LoRA save (kohya net.blocks.<i>.* keys, rs:1136-1155) ──
+    # ── final LoRA save (torchref net.blocks.<i>.* keys, rs:1136-1155) ──
     if lokr_active:
         var npairs = save_anima_lokr(lokr_masters, lora_out, ctx)
         print("saved", npairs, "LoKr adapter modules to", lora_out)

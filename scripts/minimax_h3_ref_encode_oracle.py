@@ -60,7 +60,7 @@ EVERY stage is the vendor's own code, not a transcription:
     the device (encoders.py:617-630).
 
 Run (GPU, VAE in fp32; check nvidia-smi first):
-    /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_ref_encode_oracle.py
+    /home/alex/torchref/venv/bin/python scripts/minimax_h3_ref_encode_oracle.py
 Writes: output/minimax_h3_ref2va/ref_encode_ref.safetensors (+ .json sidecar)
 """
 

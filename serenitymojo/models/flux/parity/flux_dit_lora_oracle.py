@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # flux_dit_lora_oracle.py — BFL torch reference for the FLUX DiT forward WITH a
-# Kohya-BFL LoRA additively applied. Verifies the Mojo runtime overlay
+# torchref-BFL LoRA additively applied. Verifies the Mojo runtime overlay
 # (flux_lora_overlay.mojo) is numerically correct — not just "changes output".
 #
 # Reuses the EXACT Gate B inputs (reads flux_dit_img/txt/vec/tg.bin) and the same
 # tiny 4x4 grid, so the only delta vs Gate B is the LoRA. Applies the SAME math
-# the Mojo overlay applies: for each Kohya target, delta = (up @ down)*(alpha/r),
+# the Mojo overlay applies: for each torchref target, delta = (up @ down)*(alpha/r),
 # added onto the BFL base weight. Dtype faithful to the Mojo: base fp16->bf16->fp32,
 # up/down bf16->fp32 (the Mojo computes the delta in bf16); fp32 accumulation.
 #

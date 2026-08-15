@@ -23,7 +23,7 @@
 #   theta=1e3 (krea2.py:55-68 KREA2_MMDIT_CONFIG + SingleMMDiTConfig defaults).
 #   in/out channels for the `first`/`last` Linears = channels·patch² = 16·4 = 64.
 #
-# ── LoRA RECIPE (ai-toolkit krea2.py + lora_special.py + config_modules.py) ────
+# ── LoRA RECIPE (torchref krea2.py + lora_special.py + config_modules.py) ────
 #   krea2.py:148  self.target_lora_modules = ["SingleStreamDiT"]  → the LoRA
 #   network (LoRASpecialNetwork, lora_special.py:338-405) wraps every nn.Linear
 #   (LINEAR_MODULES, lora_special.py:29) found UNDER a SingleStreamDiT-class
@@ -35,7 +35,7 @@
 #       attn.wq  attn.wk  attn.wv  attn.gate  attn.wo
 #       mlp.gate  mlp.up  mlp.down
 #   NOTE: `mod.lin` is a torch.nn.Parameter (DoubleSharedModulation.lin,
-#   mmdit.py:125), NOT an nn.Linear, so ai-toolkit does NOT LoRA-wrap it. The
+#   mmdit.py:125), NOT an nn.Linear, so torchref does NOT LoRA-wrap it. The
 #   prenorm/postnorm/qknorm scales are also non-Linear → frozen. So each wrapped
 #   block contributes 8 LoRA adapters (NOT 9 — the brief's "mod_lin" target is
 #   not what the oracle produces; flagged in the handoff). The current Mojo

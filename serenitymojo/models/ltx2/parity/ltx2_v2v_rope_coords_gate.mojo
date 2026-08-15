@@ -2,13 +2,13 @@
 #
 # LTX-2 IC-LoRA / V2V two-grid RoPE COORDS gate (P5 unit 2). HOST-ONLY -- no
 # DeviceContext, no GPU: exercises _build_v2v_coords (the pre-rope combined pixel
-# coords the trainer's v2v head feeds _compute_rope) and asserts the musubi
+# coords the trainer's v2v head feeds _compute_rope) and asserts the torchref
 # two-grid geometry (ltx2_train_network.py:3386-3424): ref grid PREPENDED, ref
 # H/W coords *reference_downscale so both grids CO-LOCATE from origin 0 under the
 # fixed BASE_HW normalization, target grid does NOT continue from ref.
 #
 # The rope-from-coords math (_compute_rope) is the already-gated single-grid
-# spine path (musubi-exact bf16, cos 0.9999943) and is exercised on-device by the
+# spine path (torchref-exact bf16, cos 0.9999943) and is exercised on-device by the
 # S=320 block parity gate; this gate isolates the NEW two-grid coord geometry.
 #
 # Run (no GPU needed):

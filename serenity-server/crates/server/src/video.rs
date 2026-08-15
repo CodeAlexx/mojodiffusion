@@ -780,7 +780,7 @@ fn readiness_doc() -> Value {
                     "available": wan22_product_accepted,
                     "max_count": 1,
                     "base_model": "Wan-AI/Wan2.2-TI2V-5B",
-                    "format": "AI Toolkit/DiffusionModel block LoRA",
+                    "format": "torchref/DiffusionModel block LoRA",
                     "merge": "BF16: additive delta on each RAM-staged block; FP8: one-time resident dequant-add-requant",
                 }
             },

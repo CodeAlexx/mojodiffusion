@@ -1,4 +1,4 @@
-# flux_dit_lora_parity.mojo — GATE B-LoRA: FLUX DiT forward WITH a Kohya-BFL LoRA
+# flux_dit_lora_parity.mojo — GATE B-LoRA: FLUX DiT forward WITH a torchref-BFL LoRA
 # overlay, parity vs the BFL torch oracle (flux_dit_lora_oracle.py). Confirms the
 # runtime additive overlay (flux_lora_overlay.mojo) is numerically CORRECT (right
 # transpose + scale), not merely non-trivial.
@@ -64,7 +64,7 @@ def _abs(v: Float32) -> Float32:
 
 def main() raises:
     var ctx = DeviceContext()
-    print("=== GATE B-LoRA: FLUX DiT forward + Kohya LoRA overlay parity vs BFL ===")
+    print("=== GATE B-LoRA: FLUX DiT forward + torchref LoRA overlay parity vs BFL ===")
 
     var img_h = _read_bin_f32(REF_DIR + "flux_dit_img.bin")
     var txt_h = _read_bin_f32(REF_DIR + "flux_dit_txt.bin")
@@ -119,5 +119,5 @@ def main() raises:
     print("  mean-abs-diff          =", sad / Float32(len(oracle)))
     if cos < 0.99:
         raise Error("FLUX DiT LoRA-overlay parity FAIL: cos " + String(cos) + " < 0.99")
-    print("VERDICT: PASS — FLUX DiT + Kohya LoRA overlay correct, cos vs BFL+LoRA =",
+    print("VERDICT: PASS — FLUX DiT + torchref LoRA overlay correct, cos vs BFL+LoRA =",
           cos, "(>= 0.99)")

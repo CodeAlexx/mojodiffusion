@@ -1,9 +1,9 @@
 # Parity: Ideogram-4 TEXT ENCODER (Qwen3-VL -> the 13-tap llm_features the DiT
-# consumes) vs **ai-toolkit** oracle (NOT ideogram4-ref).
+# consumes) vs **torchref** oracle (NOT ideogram4-ref).
 #
-# Oracle = ideogram4_aitoolkit_encoder_oracle.py: loads the REAL bf16 Qwen3-VL text
+# Oracle = ideogram4_torchref_encoder_oracle.py: loads the REAL bf16 Qwen3-VL text
 # tower (via Qwen3VLForConditionalGeneration -- the public AutoModel path RANDOM-inits
-# it in transformers 4.57.6) and runs ai-toolkit src/pipeline.py::get_qwen3_vl_features
+# it in transformers 4.57.6) and runs torchref src/pipeline.py::get_qwen3_vl_features
 # verbatim over FIXED token ids: taps QWEN3_VL_ACTIVATION_LAYERS =
 # (0,3,6,9,12,15,18,21,24,27,30,33,35) = the post-decoder-layer hidden states (NO final
 # model.norm), then stack->permute(1,2,3,0)->reshape => llm_features[..,f*13+t]=tap_t[..,f].
@@ -16,10 +16,10 @@
 #
 # Run (oracle FIRST):
 #   /home/alex/serenityflow-v2/.venv/bin/python \
-#     serenitymojo/models/text_encoder/parity/ideogram4_aitoolkit_encoder_oracle.py
+#     serenitymojo/models/text_encoder/parity/ideogram4_torchref_encoder_oracle.py
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #   pixi run mojo run -I . \
-#     serenitymojo/models/text_encoder/parity/ideogram4_aitoolkit_encoder_parity.mojo
+#     serenitymojo/models/text_encoder/parity/ideogram4_torchref_encoder_parity.mojo
 from max.gpu.host import DeviceContext
 from std.memory import alloc
 from serenitymojo.tensor import Tensor
@@ -33,8 +33,8 @@ from serenitymojo.models.text_encoder.ideogram_qwen3vl import (
 
 comptime TE = "/home/alex/.serenity/models/ideogram-4-fp8/text_encoder/model.safetensors"
 comptime DIR = "/home/alex/mojodiffusion/serenitymojo/models/text_encoder/parity/"
-comptime FX = DIR + "ideogram4_aitoolkit_encoder.safetensors"
-comptime IDS_BIN = DIR + "ideogram4_aitoolkit_encoder_ids.bin"
+comptime FX = DIR + "ideogram4_torchref_encoder.safetensors"
+comptime IDS_BIN = DIR + "ideogram4_torchref_encoder_ids.bin"
 comptime COS_BAR = 0.999
 comptime HIDDEN = 4096
 comptime NTAPS = 13
@@ -68,7 +68,7 @@ def _read_ids_i32(path: String) raises -> List[Int]:
 
 def main() raises:
     var ctx = DeviceContext()
-    print("=== Ideogram-4 TEXT ENCODER (Qwen3-VL 13-tap) parity vs ai-toolkit ===")
+    print("=== Ideogram-4 TEXT ENCODER (Qwen3-VL 13-tap) parity vs torchref ===")
 
     var ids = _read_ids_i32(IDS_BIN)
     var L = len(ids)
@@ -81,7 +81,7 @@ def main() raises:
 
     # ---- per-tap comparison (subset that the oracle dumped) ----
     # encode_layer_states[i] = output of layer i (post-layer, pre-final-norm) -- the
-    # SAME convention as ai-toolkit's captured[layer_idx] (recorded AFTER decoder_layer).
+    # SAME convention as torchref's captured[layer_idx] (recorded AFTER decoder_layer).
     var states = enc.encode_layer_states(ids, ctx)  # 36 x [1,L,4096]
     if len(states) != 36:
         raise Error("expected 36 layer states, got " + String(len(states)))
@@ -115,8 +115,8 @@ def main() raises:
     # ---- FAIL LOUD ----
     if not all_pass:
         raise Error(
-            "ideogram4 ai-toolkit TEXT ENCODER parity FAILED (cos < "
+            "ideogram4 torchref TEXT ENCODER parity FAILED (cos < "
             + String(COS_BAR)
             + ") -- a wrong tap layer-set, RoPE/MRoPE phase, or fp8-vs-bf16 weight gap."
         )
-    print("VERDICT: PASS -- mojo Ideogram-4 Qwen3-VL taps + llm_features match ai-toolkit (cos >= 0.999)")
+    print("VERDICT: PASS -- mojo Ideogram-4 Qwen3-VL taps + llm_features match torchref (cos >= 0.999)")

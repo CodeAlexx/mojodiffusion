@@ -1,5 +1,5 @@
-# training/automagic3.mojo — pure-Mojo port of ai-toolkit Automagic3
-# (/home/alex/ai-toolkit/toolkit/optimizers/automagic3.py), wired through
+# training/automagic3.mojo — pure-Mojo port of torchref Automagic3
+# (/home/alex/torchref-image/toolkit/optimizers/automagic3.py), wired through
 # training/levers.mojo (the ONE shared optimizer dispatch — Tier-1 modularity).
 #
 # Adaptive optimizer: an HF-Adafactor-FACTORED second moment (dim>=2; full

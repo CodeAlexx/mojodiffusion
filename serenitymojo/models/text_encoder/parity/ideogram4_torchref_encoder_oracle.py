@@ -1,8 +1,8 @@
 # DEV-ONLY parity oracle for the Ideogram-4 TEXT ENCODER (Qwen3-VL -> the 13-tap
-# llm_features the DiT consumes), oracled against **ai-toolkit** (NOT ideogram4-ref).
+# llm_features the DiT consumes), oracled against **torchref** (NOT ideogram4-ref).
 #
-# Mirrors EXACTLY ai-toolkit's production text-feature path:
-#   ai-toolkit/extensions_built_in/diffusion_models/ideogram4/
+# Mirrors EXACTLY torchref's production text-feature path:
+#   torchref/extensions_built_in/diffusion_models/ideogram4/
 #     ideogram4.py::_load_text_encoder() loads the PUBLIC bf16
 #       "Qwen/Qwen3-VL-8B-Instruct" (NOT the ideogram fp8 copy -- the comment there
 #       says bf16 is "higher precision than dequantizing the fp8 weights").
@@ -18,7 +18,7 @@
 #
 # Run:
 #   /home/alex/serenityflow-v2/.venv/bin/python \
-#     serenitymojo/models/text_encoder/parity/ideogram4_aitoolkit_encoder_oracle.py
+#     serenitymojo/models/text_encoder/parity/ideogram4_torchref_encoder_oracle.py
 import os
 import struct
 import warnings
@@ -28,7 +28,7 @@ from transformers import Qwen3VLForConditionalGeneration
 from transformers.masking_utils import create_causal_mask
 
 # NOTE on the loader (verified 2026-06-25, transformers 4.57.6):
-# ai-toolkit's _load_text_encoder uses AutoModel.from_pretrained(QWEN3_VL_PATH).
+# torchref's _load_text_encoder uses AutoModel.from_pretrained(QWEN3_VL_PATH).
 # In transformers 4.57.6 AutoModel maps qwen3_vl -> bare Qwen3VLModel, which expects
 # keys "language_model.*". But the public checkpoint is saved as the architecture it
 # declares -- Qwen3VLForConditionalGeneration -- whose keys are "model.language_model.*".
@@ -36,17 +36,17 @@ from transformers.masking_utils import create_causal_mask
 # whole text tower ("Some weights ... were not initialized ... newly initialized"). That
 # random model is a useless oracle. We instead load the DECLARED architecture
 # Qwen3VLForConditionalGeneration (real weights, no random-init) and access its
-# .model.language_model -- which is the SAME nn.Module ai-toolkit calls
+# .model.language_model -- which is the SAME nn.Module torchref calls
 # text_encoder.language_model on, just reached through the correctly-loaded wrapper.
-# (ai-toolkit's own venv pins transformers 5.5.3 where AutoModel may strip the prefix;
+# (torchref's own venv pins transformers 5.5.3 where AutoModel may strip the prefix;
 # either way the production INTENT is the real bf16 Qwen3-VL text tower, which this
 # loader delivers deterministically.) We PROVE real weights below by byte-comparing a
 # loaded language_model tensor against the on-disk checkpoint shard (the "newly
 # initialized" notice is emitted via `logging`, not `warnings`, so it can't be caught).
 
-# Same constant ai-toolkit uses (src/transformer.py:40).
+# Same constant torchref uses (src/transformer.py:40).
 QWEN3_VL_ACTIVATION_LAYERS = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
-# ai-toolkit _load_text_encoder: te_path defaults to QWEN3_VL_PATH (the public bf16).
+# torchref _load_text_encoder: te_path defaults to QWEN3_VL_PATH (the public bf16).
 QWEN3_VL_PATH = "Qwen/Qwen3-VL-8B-Instruct"
 
 OUT = "/home/alex/mojodiffusion/serenitymojo/models/text_encoder/parity"
@@ -69,10 +69,10 @@ FIXED_IDS = [
 
 @torch.no_grad()
 def get_qwen3_vl_features(language_model, token_ids, attention_mask, pos_2d, want_taps):
-    """Verbatim re-implementation of ai-toolkit src/pipeline.py::get_qwen3_vl_features
+    """Verbatim re-implementation of torchref src/pipeline.py::get_qwen3_vl_features
     (commit-pinned logic) that ALSO returns the per-tap raw hidden states so the gate
     can compare each tap layer individually, not just the concat. `language_model` is
-    the SAME nn.Module ai-toolkit reaches as text_encoder.language_model."""
+    the SAME nn.Module torchref reaches as text_encoder.language_model."""
 
     inputs_embeds = language_model.embed_tokens(token_ids)
 
@@ -81,7 +81,7 @@ def get_qwen3_vl_features(language_model, token_ids, attention_mask, pos_2d, wan
     mrope_position_ids = position_ids_4d[1:]
 
     # transformers 4.57.6 create_causal_mask signature: kwarg is `input_embeds` (no
-    # trailing s) and it requires `cache_position`. ai-toolkit runs on transformers
+    # trailing s) and it requires `cache_position`. torchref runs on transformers
     # 5.5.3 (kwarg `inputs_embeds`, no cache_position) -- same lower-triangular result
     # for an all-ones attention_mask with sequential positions.
     seq_len_ = inputs_embeds.shape[1]
@@ -151,7 +151,7 @@ def main():
     full.eval()
     full.requires_grad_(False)
     full.to(dev)
-    # The SAME nn.Module ai-toolkit calls text_encoder.language_model on.
+    # The SAME nn.Module torchref calls text_encoder.language_model on.
     language_model = full.model.language_model
 
     # GROUND-TRUTH real-weight proof: a loaded layer-0 q_proj must byte-match the disk
@@ -169,7 +169,7 @@ def main():
 
     L = len(FIXED_IDS)
     token_ids = torch.tensor([FIXED_IDS], dtype=torch.long, device=dev)  # (1, L)
-    # ai-toolkit get_prompt_embeds: attention_mask = ones; pos_2d = cumsum(mask)-1.
+    # torchref get_prompt_embeds: attention_mask = ones; pos_2d = cumsum(mask)-1.
     attention_mask = torch.ones_like(token_ids)
     pos_2d = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0).to(torch.long)
 
@@ -195,11 +195,11 @@ def main():
     for i in want_taps:
         fx[f"tap_{i}"] = taps[i].float().cpu()                        # [1,L,4096]
 
-    save_file(fx, f"{OUT}/ideogram4_aitoolkit_encoder.safetensors")
+    save_file(fx, f"{OUT}/ideogram4_torchref_encoder.safetensors")
 
     # Also dump ids as a raw little-endian int32 .bin so the mojo gate can read them
     # byte-identically via FFI (avoids any safetensors int-dtype ambiguity in mojo).
-    with open(f"{OUT}/ideogram4_aitoolkit_encoder_ids.bin", "wb") as f:
+    with open(f"{OUT}/ideogram4_torchref_encoder_ids.bin", "wb") as f:
         f.write(struct.pack(f"<{L}i", *FIXED_IDS))
 
     # Per-tap stats for the report.
@@ -209,7 +209,7 @@ def main():
         print(f"    tap_{i:2d}: shape={tuple(t.shape)} std={t.std():.5f} mean={t.mean():+.5f}")
     lf = llm_features.float()
     print(f"[E] llm_features std={lf.std():.5f} mean={lf.mean():+.5f}")
-    print(f"[E] saved fixture -> {OUT}/ideogram4_aitoolkit_encoder.safetensors")
+    print(f"[E] saved fixture -> {OUT}/ideogram4_torchref_encoder.safetensors")
     print(f"[E] L={L}  taps_compared={want_taps}  layer_set={QWEN3_VL_ACTIVATION_LAYERS}")
 
 

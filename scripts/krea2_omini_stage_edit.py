@@ -53,8 +53,8 @@
 #
 # Run (default bucket 512 — the OminiControl training resolution). Needs
 # numpy+PIL+safetensors; the krea2_stage_images.py-cited serenityflow-v2 venv
-# does not exist on this box — the ai-toolkit venv does (verified importable):
-#   /home/alex/ai-toolkit/venv/bin/python \
+# does not exist on this box — the torchref venv does (verified importable):
+#   /home/alex/torchref-image/venv/bin/python \
 #     scripts/krea2_omini_stage_edit.py \
 #     /home/alex/datasets/qwen_edit_test /home/alex/trainings/krea2_omini_edit_stage 512
 

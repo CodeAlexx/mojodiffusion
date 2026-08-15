@@ -1,8 +1,8 @@
 # v2v_cache.mojo -- LTX-2 IC-LoRA / V2V reference-latent cache pairing (P5 u1).
 #
 # Host-side plumbing that pairs a downscaled REFERENCE latent with each target
-# latent, mirroring musubi-tuner's TRAINING route
-# (src/musubi_tuner/dataset/image_video_dataset.py):
+# latent, mirroring torchref's TRAINING route
+# (src/torchref/dataset/image_video_dataset.py):
 #   * the reference latent lives in a SEPARATE reference_cache_directory, under
 #     the SAME basename as the target cache file
 #     (image_video_dataset.py:2780-2781
@@ -19,7 +19,7 @@
 # ALL functions here are host-side (NO DeviceContext): path construction, key
 # discovery, and fail-loud rank/channel validation. The GPU load
 # (Tensor.from_view_as_bf16) stays in the trainer -> the v2v forward wiring is
-# P5 unit 2. musubi's `v2v_ref_latent` name (the sample-prompt route,
+# P5 unit 2. torchref's `v2v_ref_latent` name (the sample-prompt route,
 # ltx2_cache_latents.py:1019) is the SEMANTIC name for this stream; the
 # dataset/training file itself uses the standard latents_* key.
 
@@ -27,7 +27,7 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 
 
 def reference_cache_path(lat_path: String, ref_cache_dir: String) -> String:
-    """ref_cache_dir + "/" + basename(lat_path) -- musubi basename route
+    """ref_cache_dir + "/" + basename(lat_path) -- torchref basename route
     (image_video_dataset.py:2781)."""
     var b = lat_path.as_bytes()
     var start = 0
@@ -67,7 +67,7 @@ def discover_ref_latent_key(st: ShardedSafeTensors) raises -> String:
 def assert_reference_latent(
     st: ShardedSafeTensors, ref_key: String, channels: Int
 ) raises:
-    """musubi asserts 5D + channel match (ltx2_train_network.py path); the stored
+    """torchref asserts 5D + channel match (ltx2_train_network.py path); the stored
     ltx2 latent is [C,F,H,W] (batch squeezed at ltx2_cache_latents.py:678
     `ref_latent = latent[0]`), so accept rank 4 [C,F,H,W] or rank 5 [1,C,F,H,W].
     Fail loud on wrong rank, channel mismatch, or a non-positive spatial dim."""

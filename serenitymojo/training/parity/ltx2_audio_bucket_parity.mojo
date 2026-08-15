@@ -1,6 +1,6 @@
 # training/parity/ltx2_audio_bucket_parity.mojo
 #
-# Musubi LTX2 AV audio bucket policy gate.
+# Torchref LTX2 AV audio bucket policy gate.
 #
 # Run:
 #   pixi run mojo run -I . serenitymojo/training/parity/ltx2_audio_bucket_parity.mojo
@@ -64,7 +64,7 @@ def _expect_raise_missing_audio_batches() raises -> Bool:
 
 def run_ltx2_audio_bucket_parity(print_details: Bool = True) raises:
     if print_details:
-        print("--- Musubi audio bucket parity ---")
+        print("--- Torchref audio bucket parity ---")
 
     _check(audio_bucket_strategy_from_string("pad") == AUDIO_BUCKET_PAD, "pad strategy parser")
     _check(audio_bucket_strategy_from_string("truncate") == AUDIO_BUCKET_TRUNCATE, "truncate strategy parser")

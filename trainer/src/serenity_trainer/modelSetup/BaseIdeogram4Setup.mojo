@@ -1,6 +1,6 @@
 # BaseIdeogram4Setup.mojo - build-only Ideogram4 training contract.
 #
-# This records the ai-toolkit training pipeline facts in Serenity Trainer form:
+# This records the torchref training pipeline facts in Serenity Trainer form:
 # patchified 32-channel VAE latents -> 128-channel image tokens, CustomFlowMatch
 # add_noise, Qwen3-VL 13-tap text features, transformer receives 1 - t, and its
 # output is negated so the trainer predicts noise-clean velocity.

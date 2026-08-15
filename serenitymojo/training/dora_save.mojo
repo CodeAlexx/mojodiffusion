@@ -1,7 +1,7 @@
 # training/dora_save.mojo — save / reopen TRAINED DoRA adapters.
 #
 # Two on-disk shape conventions use the same key names:
-# - upstream LyCORIS/Kohya DoRA: output-axis `dora_scale` [out,1].
+# - upstream LyCORIS/torchref DoRA: output-axis `dora_scale` [out,1].
 # - SerenityTrainer default DoRA: input-axis `dora_scale` [1,in] when
 #   lora_decompose_output_axis=false.
 #
@@ -23,7 +23,7 @@
 # Same ecosystem-unloadable bug class as the T2.F LoHa/OFT key fixes. DOCUMENTED
 # CHOICE: the upstream-lycoris LoCon(wd=True) schema above — pip lycoris is the
 # only live upstream loader on this box (campaign oracle), and lora_up/lora_down
-# + dora_scale is also ComfyUI's kohya-DoRA path. Gate:
+# + dora_scale is also ComfyUI's torchref-DoRA path. Gate:
 # lycoris_family_load_check.py loads a Mojo-saved file through
 # LoConModule.make_module_from_state_dict and reproduces the forward BIT-EXACT.
 #

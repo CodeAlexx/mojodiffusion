@@ -383,7 +383,7 @@ def _levers_optimizer_lazy_init(
             st.a8.append(Adam8bitState(len(adapters[i].a)))
             st.a8.append(Adam8bitState(len(adapters[i].b)))
     elif cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
-        # ai-toolkit Automagic3: HF-factored 2nd moment + sign-history vote.
+        # torchref Automagic3: HF-factored 2nd moment + sign-history vote.
         # A is [rank, in_f], B is [out_f, rank] — both 2D factored. The shared
         # adaptive lr is seeded ONCE from cfg.lr (the controller adapts away
         # from it; step_lr is ignored). H = sign-history window (default 8).
@@ -518,7 +518,7 @@ def levers_optimizer_step_host(
             )
             _levers_writeback_bf16(adapters[i].b, pb)
     elif cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
-        # ai-toolkit Automagic3 — the structural special case (landmine 3):
+        # torchref Automagic3 — the structural special case (landmine 3):
         # ONE group-pooled adaptive lr. step_lr (the scheduler) is IGNORED;
         # the controller self-adapts st.auto3_ctl.lr. Reset the per-step vote
         # accumulators ONCE, run every A and B (each accumulates its

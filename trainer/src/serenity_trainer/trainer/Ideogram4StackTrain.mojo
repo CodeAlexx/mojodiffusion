@@ -77,11 +77,11 @@ comptime IDEOGRAM4_V2_GRAPH_PATH = IDEOGRAM4_V2_ENGINE and IDEOGRAM4_V2_GRAPH
 # validate_for on F32-expected, adamw_step's BF16 check on the fallback).
 comptime IDEOGRAM4_FUSED_ADAMW = True
 
-# On-device global-norm grad clip (ai-toolkit trains ideogram4 with
+# On-device global-norm grad clip (torchref trains ideogram4 with
 # max_grad_norm=1.0; this trainer historically applied NO clip — a parity
 # gap). False (default) preserves current numerics: clip_scale is forced to
 # 1.0 by passing max_grad_norm=0.0 into the shared ABI. True folds
-# cfg.clip_grad_norm (config default 1.0, matching ai-toolkit) into the fused
+# cfg.clip_grad_norm (config default 1.0, matching torchref) into the fused
 # update via the device global-norm fold — flipping it is the user's parity
 # decision, not this campaign's. Only meaningful when IDEOGRAM4_FUSED_ADAMW
 # is True (the fallback loop has no clip seam).

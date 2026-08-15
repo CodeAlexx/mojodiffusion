@@ -1,6 +1,6 @@
 // Folder captioner endpoints for the serenity web trainer.
 //
-// Spawns webui/captioner.py (ai-toolkit venv) over an image folder, pumps its
+// Spawns webui/captioner.py (torchref venv) over an image folder, pumps its
 // CAPJSON progress lines into a polled status object, and writes .txt sidecars
 // next to each image. Self-contained module state (OnceLock) so main.rs only
 // grows by `mod captioner;` + three route lines — the training path and its

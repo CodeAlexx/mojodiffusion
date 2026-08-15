@@ -1,6 +1,6 @@
 # sampling/krea2_sampler.mojo — Krea-2 (krea2) flow-matching sampler.
 #
-# Reference: ai-toolkit krea2 src/pipeline.py — `timesteps()` (138-160) +
+# Reference: torchref krea2 src/pipeline.py — `timesteps()` (138-160) +
 # `Krea2Pipeline.__call__` (185-260). Krea-2 is a PLAIN flow-matching model:
 #   time runs t=1 (pure noise) -> t=0 (clean); velocity = noise - clean;
 #   x_t = (1-t)*clean + t*noise. NO time flip / negation (pipeline.py:6-11).

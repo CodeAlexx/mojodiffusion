@@ -23,7 +23,7 @@ The request mirrors the pipeline invocation exactly:
   prompt = output/minimax_h3_prompts/ref2va_vendor_768p.txt (3554 bytes)
 
 Run:
-    /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_ref2va_conditioning_oracle.py
+    /home/alex/torchref/venv/bin/python scripts/minimax_h3_ref2va_conditioning_oracle.py
 Writes: output/minimax_h3_ref2va/conditioning_oracle.safetensors (+ .json)
 """
 

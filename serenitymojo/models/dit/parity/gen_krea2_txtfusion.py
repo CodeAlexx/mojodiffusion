@@ -1,6 +1,6 @@
 """Krea-2 TextFusionTransformer parity oracle (chunk 6).
 
-Imports ai-toolkit's krea2 ``TextFusionTransformer`` + ``_mask`` DIRECTLY from
+Imports torchref's krea2 ``TextFusionTransformer`` + ``_mask`` DIRECTLY from
 mmdit.py. Instantiates the production config (num_txt_layers=12, txt_dim=2560,
 heads=20, multiplier=4, kvheads=20) bf16-on-cuda with random weights, runs it on a
 random context [1, Lt, 12, 2560] (CORRECT axis order: Lt tokens, 12 layers) with a
@@ -25,7 +25,7 @@ from einops import rearrange
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from safetensors.torch import save_file
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 import mmdit  # noqa: E402
 from mmdit import TextFusionTransformer, _mask  # noqa: E402
 

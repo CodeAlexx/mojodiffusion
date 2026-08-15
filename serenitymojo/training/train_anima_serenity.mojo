@@ -36,7 +36,7 @@
 #  5. LoRA save in Serenity diffusers key naming (save_anima_lora_serenity) — mirrors what
 #     AnimaLoRASaver dumps (transformer_lora.state_dict() diffusers names attn1/attn2/
 #     ff with lora_down/lora_up + alpha; AnimaLoRASaver.py:25, LoRAModule.py:547-551).
-#     The existing kohya save (save_anima_lora) is ALSO emitted (cheap).
+#     The existing torchref save (save_anima_lora) is ALSO emitted (cheap).
 #
 # Run (SEPARATE command, after build):
 #   cd /home/alex/mojodiffusion
@@ -781,7 +781,7 @@ def _parse_int(s: String) -> Int:
 def _giger3_ckpt_paths(step: Int) -> List[String]:
     var tag = String(GIGER3_TRAIN_DIR) + String("/giger3_lora_step") + String(step)
     var out = List[String]()
-    out.append(tag + String(".safetensors"))          # 0: PEFT kohya keys
+    out.append(tag + String(".safetensors"))          # 0: PEFT torchref keys
     out.append(tag + String("_serenity_keys.safetensors"))  # 1: Serenity diffusers keys
     out.append(tag + String(".opt.safetensors"))      # 2: Adam-state sidecar (A/B+m/v)
     return out^
@@ -1154,7 +1154,7 @@ def main() raises:
             print("[Anima-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
         # ── CHECKPOINT EVERY N (dataset mode): at (step+1)%ckpt_every==0 save the
-        #    LoRA (PEFT kohya + SerenityTrainer diffusers keys) AND the Adam-state sidecar
+        #    LoRA (PEFT torchref + SerenityTrainer diffusers keys) AND the Adam-state sidecar
         #    (.opt.safetensors: A/B + m/v) to step-tagged paths under giger3_train/.
         #    The tag is the COMPLETED step count (step+1) so resume passes start_step
         #    = tag and t = step+1 stays continuous. ─
@@ -1241,9 +1241,9 @@ def main() raises:
         print("dataset run complete — checkpoints under", GIGER3_TRAIN_DIR)
         return
 
-    # ── DELTA 5: reference trainer diffusers-keyed save (reference trainer-loadable) + kohya save (cheap) ──
-    var n_kohya = save_anima_lora(lora, String(LORA_OUT), ctx)
-    print("saved", n_kohya, "LoRA adapter pairs (kohya keys) to", LORA_OUT)
+    # ── DELTA 5: reference trainer diffusers-keyed save (reference trainer-loadable) + torchref save (cheap) ──
+    var n_torchref = save_anima_lora(lora, String(LORA_OUT), ctx)
+    print("saved", n_torchref, "LoRA adapter pairs (torchref keys) to", LORA_OUT)
     var n_saved = save_anima_lora_serenity(lora, ALPHA, String(LORA_OUT_SERENITY), ctx)
     print("saved", n_saved, "LoRA adapters (Serenity diffusers keys) to", LORA_OUT_SERENITY)
 

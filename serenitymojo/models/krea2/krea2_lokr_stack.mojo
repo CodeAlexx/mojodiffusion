@@ -180,8 +180,8 @@ def krea2_lokr_zero_leg_l1(set: Krea2LoKrSet) -> Float64:
 
 # save: krea2 module prefix (diffusion_model.blocks.<bi>.attn.{wq,wk,wv,gate,wo}/
 # .mlp.{gate,up,down}) + lokr keys from save_lokr_peft. PROVISIONAL lokr key
-# convention (matches the plain-LoRA krea2 prefix; ai-toolkit krea2 LoKr keys to
-# be confirmed against a real ai-toolkit krea2 LoKr save).
+# convention (matches the plain-LoRA krea2 prefix; torchref krea2 LoKr keys to
+# be confirmed against a real torchref krea2 LoKr save).
 def _krea2_lokr_prefix(bi: Int, slot: Int) raises -> String:
     var b = String("diffusion_model.blocks.") + String(bi)
     if slot == 0:

@@ -1,10 +1,10 @@
 # models/text_encoder/krea2_qwen3vl_4b.mojo — Krea-2 Qwen3-VL-4B TEXT path (LM only).
 #
 # Krea-2's text encoder is Qwen3-VL-4B-Instruct (text-only; the vision tower is
-# dropped — ai-toolkit krea2.py:213-216 sets `text_encoder.model.visual = None`).
+# dropped — torchref krea2.py:213-216 sets `text_encoder.model.visual = None`).
 # Krea-2 conditions on a STACK of 12 selected hidden-state layers, NOT a single
 # layer, then drops the leading system-prompt rows. Reference:
-#   ai-toolkit/extensions_built_in/diffusion_models/krea2/src/text_encoder.py
+#   torchref/extensions_built_in/diffusion_models/krea2/src/text_encoder.py
 #     SELECT_LAYERS = (2,5,8,11,14,17,20,23,26,29,32,35)          # HF-indexed
 #     PROMPT_TEMPLATE_ENCODE_START_IDX = 34                        # prefix drop
 #     hiddens = stack([states.hidden_states[i] for i in SELECT_LAYERS], dim=2)

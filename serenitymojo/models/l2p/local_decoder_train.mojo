@@ -1,39 +1,39 @@
 # models/l2p/local_decoder_train.mojo — FROZEN MicroDiffusionModel U-Net head
 # with a TRAINING forward (saves activations) + backward that produces ONLY
 # d_feat (the gradient w.r.t. the DiT feature map). The decoder weights are
-# FROZEN (ai-toolkit get_model_has_grad()==False + EDv2 train_l2p.rs: local_decoder
+# FROZEN (torchref get_model_has_grad()==False + EDv2 train_l2p.rs: local_decoder
 # excluded from LoRA, requires_grad false) so we do NOT accumulate weight grads —
 # we only need to backprop THROUGH the conv U-Net to the bottleneck feat input.
 #
 # Reference (read FULL):
-#   ai-toolkit  extensions_built_in/diffusion_models/z_image/z_image_l2p_model.py
+#   torchref  extensions_built_in/diffusion_models/z_image/z_image_l2p_model.py
 #               MicroDiffusionModel.forward (enc1..4 + pool, bottleneck fuses
 #               feat, up4..1 + dec4..1, out_conv).
 #   EDv2        crates/eridiffusion-core/src/models/l2p/local_decoder.rs
 #   forward gate (inference, BF16, no acts): models/dit/zimage_l2p_local_decoder.mojo
 #
-# Math (ai-toolkit, NCHW logically; we run NHWC for the conv/pool/upsample
+# Math (torchref, NCHW logically; we run NHWC for the conv/pool/upsample
 # kernels which are NHWC-only):
 #   e1 = silu(conv3x3(x,   3   -> 64 ));  p1 = maxpool2x2(e1)
 #   e2 = silu(conv3x3(p1,  64  -> 128));  p2 = maxpool2x2(e2)
 #   e3 = silu(conv3x3(p2,  128 -> 256));  p3 = maxpool2x2(e3)
 #   e4 = silu(conv3x3(p3,  256 -> 512));  p4 = maxpool2x2(e4)
 #   b  = silu(conv1x1(cat[p4, feat],  512+3840 -> 512))   # bottleneck
-#        (ai-toolkit interpolates feat to p4 spatial; at 512² p4 is 2×2 and
+#        (torchref interpolates feat to p4 spatial; at 512² p4 is 2×2 and
 #         feat is [1,3840,32,32]→ here feat ALREADY arrives at p4 spatial via the
 #         caller's reshape, so NO interpolate. The 512² training bucket gives
 #         feat grid 32×32; p4 grid = 512/16/2/2/2/2 = 2×2. THE CALLER MUST PASS
 #         feat AT p4 SPATIAL [1,3840,2,2] — see note in train_l2p_real. NOTE: the
 #         inference gate passes feat at H/16 = 32×32 and the bottleneck asserts
 #         feat == p4 spatial; that path uses a DIFFERENT image size. Here we
-#         follow ai-toolkit EXACTLY: F.interpolate(feat -> p4 spatial, nearest).)
+#         follow torchref EXACTLY: F.interpolate(feat -> p4 spatial, nearest).)
 #   d4 = silu(conv3x3(cat[ up4 = conv3x3(upsample2x(b)),  e4],  512+512 -> 256))
 #   d3 = silu(conv3x3(cat[ up3 = conv3x3(upsample2x(d4)), e3],  256+256 -> 128))
 #   d2 = silu(conv3x3(cat[ up2 = conv3x3(upsample2x(d3)), e2],  128+128 -> 64 ))
 #   d1 = silu(conv3x3(cat[ up1 = conv3x3(upsample2x(d2)), e1],  64+64   -> 64 ))
 #   out= conv1x1(d1, 64 -> 3)
 #
-# NOTE on ai-toolkit's bottleneck: ai-toolkit's forward computes p4 by pooling
+# NOTE on torchref's bottleneck: torchref's forward computes p4 by pooling
 # FOUR times (e1..e4 each followed by a pool), so at 512² p4 is 32/2^? — actually
 # 512 -> enc convs keep spatial; ONLY the 4 maxpools halve: 512→256→128→64→32.
 # So p4 grid = 32×32 == feat grid. THE INTERPOLATE IS THEN A NO-OP. (The L2P
@@ -41,7 +41,7 @@
 # They coincide BY DESIGN.) We assert feat grid == p4 grid and skip interpolate.
 #
 # DTYPE: F32 throughout (the maxpool/upsample/silu/conv backward kernels are
-# F32-only; ai-toolkit runs the decoder in the model dtype but the L2P loss is
+# F32-only; torchref runs the decoder in the model dtype but the L2P loss is
 # computed in F32 and the decoder is small — F32 is the faithful + numerically
 # safe choice for the training head).
 #
@@ -415,7 +415,7 @@ def l2p_decoder_backward[H: Int, W: Int, GH: Int, GW: Int](
     # The encoder branch (d_p4 + the e4/e3/e2/e1 skip grads) does NOT contribute
     # to d_feat: the encoder consumes ONLY `noisy` (a detached training input,
     # requires_grad=False), so its gradient terminates at the noisy image and is
-    # discarded. ai-toolkit's autograd does the same — noisy is built under
+    # discarded. torchref's autograd does the same — noisy is built under
     # no_grad / detached, so d_noisy is never propagated. We therefore drop
     # d_p4 and the d_e*_skip terms. (They are computed above only because
     # cat_backward returns both halves; keeping the reads documents intent.)

@@ -1,6 +1,6 @@
 # chroma_lora_overlay.mojo — runtime additive LoRA for Chroma1-HD inference.
 #
-# Chroma checkpoints use Diffusers split projections while ai-toolkit Chroma
+# Chroma checkpoints use Diffusers split projections while torchref Chroma
 # LoRAs may use the original BFL fused names.  This loader maps both surfaces
 # to the exact projection names consumed by the product forward:
 #
@@ -150,7 +150,7 @@ def load_chroma_lora(
     multiplier: Float32,
     ctx: DeviceContext,
 ) raises -> ChromaLoraOverlay:
-    """Load ai-toolkit BFL-fused or Diffusers/PEFT Chroma LoRA factors."""
+    """Load torchref BFL-fused or Diffusers/PEFT Chroma LoRA factors."""
     var st = ShardedSafeTensors.open(path)
     var nameset = Dict[String, Bool]()
     for ref name in st.names():
@@ -322,7 +322,7 @@ def load_chroma_lora(
     )
     if n_added == 0:
         raise Error(
-            String("chroma lora: no ai-toolkit BFL or Diffusers/PEFT targets matched in ")
+            String("chroma lora: no torchref BFL or Diffusers/PEFT targets matched in ")
             + path
         )
     return ChromaLoraOverlay(entries^)

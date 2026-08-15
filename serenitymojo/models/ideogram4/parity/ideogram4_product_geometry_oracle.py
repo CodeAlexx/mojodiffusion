@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Creator-stack oracle for Ideogram-4 product geometry.
 
-Uses ai-toolkit's production Ideogram pipeline and MRoPE implementation. The
+Uses torchref's production Ideogram pipeline and MRoPE implementation. The
 compact binary is consumed by ideogram4_product_geometry_gate.mojo.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 
-ROOT = Path("/home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src")
+ROOT = Path("/home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src")
 PIPELINE_SRC = ROOT / "pipeline.py"
 TRANSFORMER_SRC = ROOT / "transformer.py"
 REPO = Path(__file__).resolve().parents[4]
@@ -114,7 +114,7 @@ def main() -> None:
     assert all(len(row) == RECORD_FLOATS for row in records)
     values = [value for row in records for value in row]
     OUT.write_bytes(struct.pack(f"<{len(values)}f", *values))
-    print(f"[oracle] ai-toolkit Ideogram-4 records={len(records)} floats={len(values)}")
+    print(f"[oracle] torchref Ideogram-4 records={len(records)} floats={len(values)}")
     for row in records:
         print(
             f"  {int(row[0])}x{int(row[1])}: grid={int(row[2])}x{int(row[3])} "

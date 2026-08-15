@@ -1,7 +1,7 @@
 # serenitymojo/models/mageflow/mageflow_stack_lora.mojo
 #
 # Mage-Flow-Base 12-block LoRA stack: full-depth fwd+bwd with block-swap
-# OFFLOAD streaming (TurboPlannedLoader), AdamW step, and ai-toolkit-keyed
+# OFFLOAD streaming (TurboPlannedLoader), AdamW step, and torchref-keyed
 # save/resume. 12 LoRA targets/block x 12 blocks = 144 adapters.
 #
 # The block math is BANKED and NOT reimplemented: qwenimage_block.mojo::
@@ -32,7 +32,7 @@
 # (kaiming-A/zero-B init via make_lora_adapter, qwenimage_stack_lora.mojo:
 # 106-124), the offload block/mod readers, _lora_adamw, lora_save.
 #
-# SAVE KEYS (ai-toolkit / PEFT):
+# SAVE KEYS (torchref / PEFT):
 #   diffusion_model.transformer_blocks.{i}.<suffix>.lora_A.weight / .lora_B.weight
 # suffixes: attn.to_q/to_k/to_v/to_out.0, img_mlp.net.0.proj, img_mlp.net.2,
 # attn.add_q_proj/add_k_proj/add_v_proj/to_add_out, txt_mlp.net.0.proj,
@@ -380,7 +380,7 @@ def mageflow_lora_adamw_step(
         )
 
 
-# ── ai-toolkit save keys: diffusion_model.transformer_blocks.{i}.<suffix> ─────
+# ── torchref save keys: diffusion_model.transformer_blocks.{i}.<suffix> ─────
 def _mageflow_lora_prefix(block_idx: Int, slot: Int) -> String:
     return String("diffusion_model.transformer_blocks.") + String(block_idx) \
         + "." + _slot_suffix(slot)
@@ -408,7 +408,7 @@ def _mageflow_named_loras(set: MageFlowLoraSet) -> List[NamedLora]:
 def save_mageflow_lora(
     set: MageFlowLoraSet, path: String, ctx: DeviceContext
 ) raises -> Int:
-    # PEFT/ai-toolkit pairs: <prefix>.lora_A.weight / <prefix>.lora_B.weight.
+    # PEFT/torchref pairs: <prefix>.lora_A.weight / <prefix>.lora_B.weight.
     return save_lora_peft(_mageflow_named_loras(set), path, ctx)
 
 

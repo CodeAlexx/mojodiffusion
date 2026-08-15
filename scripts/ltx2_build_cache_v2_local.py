@@ -12,7 +12,7 @@ dataset.json replaced by a directory of mp4s:
   -> save {"latent": ...} per sample
 
 Gate: norm-std ~1.0 class (vs raw ~0.16).
-Run (CPU-only): /home/alex/ai-toolkit/venv/bin/python \
+Run (CPU-only): /home/alex/torchref-image/venv/bin/python \
     scripts/ltx2_build_cache_v2_local.py --limit 12
 """
 import argparse, glob, os, time

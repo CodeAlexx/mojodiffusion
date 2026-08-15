@@ -160,7 +160,7 @@
       ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "SDXL executes Comfy Euler/DDIM-alias and DPM++ 2M over normal, Karras, exponential, simple, or DDIM-uniform schedules. Kohya LoRAs compose separately; remaining Swarm algorithms stay fail-loud until their distinct denoise loops are implemented and proven."
+      "reason": "SDXL executes Comfy Euler/DDIM-alias and DPM++ 2M over normal, Karras, exponential, simple, or DDIM-uniform schedules. torchref LoRAs compose separately; remaining Swarm algorithms stay fail-loud until their distinct denoise loops are implemented and proven."
     },
     {
       "backend": "anima",

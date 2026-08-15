@@ -1,4 +1,4 @@
-"""Smoke tests for the Ideogram4 ai-toolkit -> Serenity Trainer bridge."""
+"""Smoke tests for the Ideogram4 torchref -> Serenity Trainer bridge."""
 
 from serenity_trainer.dataLoader.Ideogram4BaseDataLoader import (
     ideogram4_caption_looks_structured_json,
@@ -27,10 +27,10 @@ from serenity_trainer.modelSetup.ideogram4LoraTargets import (
     ideogram4_convert_lora_key_before_save,
     ideogram4_lora_count,
 )
-from serenity_trainer.util.config.AIToolkitIdeogram4Config import (
-    ai_toolkit_ideogram4_to_train_config,
-    ai_toolkit_ideogram4_to_trainer_ui_config,
-    read_ai_toolkit_ideogram4_config,
+from serenity_trainer.util.config.TorchrefIdeogram4Config import (
+    torchref_ideogram4_to_train_config,
+    torchref_ideogram4_to_trainer_ui_config,
+    read_torchref_ideogram4_config,
 )
 from serenity_trainer.util.create import (
     create_model_loader,
@@ -123,8 +123,8 @@ def test_loader_setup_saver_data_contracts() raises:
     _expect(ideogram4_caption_looks_structured_json(String("{\"compositional_deconstruction\":{\"elements\":[]}}")), "structured caption detector")
 
 
-def test_ai_toolkit_config_bridge() raises:
-    var src = read_ai_toolkit_ideogram4_config(String("/home/alex/ai-toolkit/config/gigerver3_ideogram4_lora.yaml"))
+def test_torchref_config_bridge() raises:
+    var src = read_torchref_ideogram4_config(String("/home/alex/torchref-image/config/gigerver3_ideogram4_lora.yaml"))
     _expect(src.name == String("gigerver3_ideogram4_lora_v1"), "recipe name")
     _expect(src.model_arch == String("ideogram4"), "recipe arch")
     _expect(src.dataset_folder_path == String("/home/alex/1/datasets/gigerver3_json"), "recipe dataset")
@@ -137,12 +137,12 @@ def test_ai_toolkit_config_bridge() raises:
     _expect(src.quantize and src.quantize_te and src.low_vram, "recipe quant flags")
     _expect(len(src.sample_prompts) == 5, "recipe sample prompts")
 
-    var train_cfg = ai_toolkit_ideogram4_to_train_config(src)
+    var train_cfg = torchref_ideogram4_to_train_config(src)
     _expect(train_cfg.learning_rate == Float32(0.0001), "train cfg lr")
     _expect(train_cfg.lora_rank == 16, "train cfg rank")
     _expect(train_cfg.gradient_accumulation_steps == 1, "train cfg accum")
 
-    var ui_cfg = ai_toolkit_ideogram4_to_trainer_ui_config(src)
+    var ui_cfg = torchref_ideogram4_to_trainer_ui_config(src)
     _expect(ui_cfg.backend_target == String("ideogram4"), "ui backend")
     _expect(ui_cfg.base_model_name == String("/home/alex/.serenity/models/ideogram-4-fp8"), "ui local model root")
     _expect(ui_cfg.max_train_steps == Float32(2000.0), "ui max steps")
@@ -155,5 +155,5 @@ def main() raises:
     test_model_type_and_factory()
     test_model_sampler_contract()
     test_loader_setup_saver_data_contracts()
-    test_ai_toolkit_config_bridge()
+    test_torchref_config_bridge()
     print("PASS: ideogram4 port contract")

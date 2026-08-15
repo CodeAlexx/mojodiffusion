@@ -1,6 +1,6 @@
 # training/parity/ltx2_masked_av_loss_parity.mojo
 #
-# Musubi LTX2 masked video/audio loss parity gate.
+# Torchref LTX2 masked video/audio loss parity gate.
 #
 # Run:
 #   pixi run mojo run -I . serenitymojo/training/parity/ltx2_masked_av_loss_parity.mojo
@@ -99,7 +99,7 @@ def _audio_bt_mask() -> List[Bool]:
 
 def run_ltx2_masked_av_loss_parity(print_details: Bool = True) raises:
     if print_details:
-        print("--- Musubi masked AV loss parity ---")
+        print("--- Torchref masked AV loss parity ---")
 
     _check(ltx2_loss_kind_from_string("mse") == LTX2_LOSS_MSE, "mse parser")
     _check(ltx2_loss_kind_from_string("l1") == LTX2_LOSS_MAE, "l1 parser")

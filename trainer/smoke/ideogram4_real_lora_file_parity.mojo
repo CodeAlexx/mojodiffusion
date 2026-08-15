@@ -1,9 +1,9 @@
-# Real ai-toolkit Ideogram4 LoRA file key/shape/dtype gate.
+# Real torchref Ideogram4 LoRA file key/shape/dtype gate.
 #
 # Fixture:
 #   /home/alex/Downloads/dever_arcane_style_ideogram4%20%28arcvfx%29.safetensors
 #
-# Verifies the file is the ai-toolkit block-stack inventory:
+# Verifies the file is the torchref block-stack inventory:
 #   34 layers * 6 block targets = 204 adapters
 #   408 tensors = lora_A + lora_B for every adapter
 #   BF16 tensors, rank 32, alpha omitted -> loader defaults alpha to rank.

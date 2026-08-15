@@ -1,6 +1,6 @@
 # gen_krea2_vae.py — torch reference for the krea2 VAE DECODE (latent -> RGB).
 #
-# krea2 (ai-toolkit extensions_built_in/diffusion_models/krea2/krea2.py) uses the
+# krea2 (torchref extensions_built_in/diffusion_models/krea2/krea2.py) uses the
 # Qwen-Image VAE (AutoencoderKLQwenImage, "Qwen/Qwen-Image" subfolder="vae", f8,
 # 16 latent channels). Its decode_latents (krea2.py:445-471) is, EXACTLY:
 #

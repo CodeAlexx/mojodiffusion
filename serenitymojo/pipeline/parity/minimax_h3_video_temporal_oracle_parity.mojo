@@ -28,7 +28,7 @@
 # blend order (temporal-then-spatial instead of spatial-then-temporal) would
 # show up and nowhere else.
 #
-# Oracle: scratchpad/vvae_temporal_oracle_gen.py (OneTrainer venv, GPU F32) —
+# Oracle: scratchpad/vvae_temporal_oracle_gen.py (torchref venv, GPU F32) —
 #   z [1,24,27,30,52] NCDHW randn(seed 9137) -> decode_temporal ->
 #   [1,3,90,480,832], both dumped NDHWC. 90 = 17*5 + 5, the vendor's own
 #   output-frame plan for 5 chunks.

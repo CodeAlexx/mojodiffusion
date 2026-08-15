@@ -1,6 +1,6 @@
-# lora_save.mojo — PEFT/ai-toolkit LoRA adapter save & load.
+# lora_save.mojo — PEFT/torchref LoRA adapter save & load.
 #
-# Save format (MOJO_TRAINER_RUNTIME_API_GUIDE.md §21-22; PEFT/ai-toolkit-
+# Save format (MOJO_TRAINER_RUNTIME_API_GUIDE.md §21-22; PEFT/torchref-
 # compatible safetensors):
 #     <prefix>.lora_A.weight   = A = lora_down.weight  [rank, in]
 #     <prefix>.lora_B.weight   = B = lora_up.weight    [out, rank]
@@ -9,7 +9,7 @@
 # entry per lora sub-module keyed by `module.prefix` (LoRAModule.py line 758),
 # and registers `alpha` as a buffer (LoRAModule.py line 303). Serenity's
 # internal names are lora_down/lora_up; the PEFT export name is lora_A/lora_B —
-# A==down, B==up (runtime guide §22, ai-toolkit convention).
+# A==down, B==up (runtime guide §22, torchref convention).
 #
 # BF16 storage is preserved byte-for-byte: save_safetensors copies each device
 # buffer D2H raw (no F32 cast), and load uses Tensor.from_view (dtype-preserving).

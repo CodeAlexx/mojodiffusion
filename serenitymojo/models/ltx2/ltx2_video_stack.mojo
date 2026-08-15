@@ -1,7 +1,7 @@
 # serenitymojo/models/ltx2/ltx2_video_stack.mojo
 #
 # LTX-2.3 22B VIDEO-MODE (audio=None) FULL TRAINING STACK: frozen head + N
-# streamed transformer blocks (video-only train arm) + frozen musubi tail, with
+# streamed transformer blocks (video-only train arm) + frozen torchref tail, with
 # per-block factorized LoRA on the 8 video-mode targets and a hand-chained
 # backward through the tail into the last block.
 #
@@ -14,19 +14,19 @@
 # (pipeline/ltx2_t2v_av_mvp.mojo) composes ltx2_block_forward_av. Streaming +
 # per-block recompute-in-backward mirror models/ltx2/ltx2_stack_lora.mojo.
 #
-# HEAD (frozen, no backward — grad stops at block-0 input): patchify (musubi
+# HEAD (frozen, no backward — grad stops at block-0 input): patchify (torchref
 # VideoLatentPatchifier, patch_size (1,1,1): `b c f h w -> b (f h w) c`) ->
 # patchify_proj; adaln_single(sigma) -> (v_temb [1,S_V,9D], v_embedded
 # [1,S_V,D]); prompt_adaln_single(sigma) -> v_prompt_ts [1,N_TXT,2D]; 3D video
 # RoPE. All head math mirrors the proven AV MVP spine (ltx2_t2v_av_mvp.mojo:
 # _timestep_embedding / _adaln_single / _compute_rope / _build_video_coords).
 # The text context `enc` is the cached POST-connector video_prompt_embeds
-# (musubi video_only_encoder runs the connector at cache time — it is NOT re-run
+# (torchref video_only_encoder runs the connector at cache time — it is NOT re-run
 # here; the DiT consumes the encoder output directly via each block's
 # prompt_scale_shift_table KV-modulation).
 #
-# TAIL (frozen): musubi _process_output "AdaLN Structural Fix" done in F32
-#   (musubi model.py:797): x32 = layer_norm(x.f32, no-affine, eps);
+# TAIL (frozen): torchref _process_output "AdaLN Structural Fix" done in F32
+#   (torchref model.py:797): x32 = layer_norm(x.f32, no-affine, eps);
 #   shift/scale = scale_shift_table[0/1] + embedded_timestep (F32);
 #   x = (x32*(1+scale)+shift).to(dtype); pred = proj_out(x). Backward through the
 #   tail is required: d_pred -> proj_out dx -> F32 modulate -> F32 layer_norm dx
@@ -166,7 +166,7 @@ def _attach_block_lora(
         w.add_lora_factor_arc(names[s], lora_a[base + s].copy(), lora_b[base + s].copy(), scale)
 
 
-# ── frozen tail (musubi _process_output, F32 interior) ───────────────────────
+# ── frozen tail (torchref _process_output, F32 interior) ───────────────────────
 struct LTX2VideoTail(Movable):
     var sst: Tensor        # [2,VD]  F32 (bf16-roundtripped)
     var proj_w: Tensor     # [128,VD] stack dtype
@@ -221,7 +221,7 @@ def _st_has(st: ShardedSafeTensors, name: String) -> Bool:
     return False
 
 
-# The cached `video_prompt_embeds` is POST-connector: the musubi
+# The cached `video_prompt_embeds` is POST-connector: the torchref
 # Embeddings1DConnector runs at TE-CACHE time inside the text encoder
 # (text_encoders/gemma/encoders/video_only_encoder.py::_run_connector), NOT in
 # the DiT forward — so the DiT (and this stack) consumes the cached embeds
@@ -230,7 +230,7 @@ def _st_has(st: ShardedSafeTensors, name: String) -> Bool:
 # fully-valid mask, so maskless cross-attn (attn2's sdpa_cross_nomask) is
 # faithful ONLY when `prompt_attention_mask` is all-ones. FAIL LOUD otherwise so
 # a future cache with different connector semantics can never silently train
-# maskless. (Measured 2026-07-09: all-ones for every sample in ltx2_musubi_v3.)
+# maskless. (Measured 2026-07-09: all-ones for every sample in ltx2_torchref_v3.)
 def assert_prompt_mask_all_ones(
     te_path: String, mask_name: String = "prompt_attention_mask"
 ) raises:
@@ -529,7 +529,7 @@ struct LTX2VideoStackHead(Movable):
         self, latent: Tensor, enc: Tensor, sigma: Float32,
         nf: Int, nh: Int, nw: Int, frame_rate: Float64, ctx: DeviceContext,
     ) raises -> LTX2VideoHeadOut:
-        # patchify: [1,C,NF,NH,NW] -> [1,C,S_V] -> [1,S_V,C]  (musubi p=(1,1,1))
+        # patchify: [1,C,NF,NH,NW] -> [1,C,S_V] -> [1,S_V,C]  (torchref p=(1,1,1))
         var lsh = latent.shape()
         var C = lsh[1]
         var latent_c = cast_tensor(latent, self.dt, ctx)   # to head compute dtype
@@ -556,10 +556,10 @@ struct LTX2VideoStackHead(Movable):
         )
 
     # IC-LoRA / v2v head: reference latent (CLEAN) PREPENDED to the target latent
-    # (noisy) on the token axis (musubi ltx2_train_network.py:3354-3356). Same
+    # (noisy) on the token axis (torchref ltx2_train_network.py:3354-3356). Same
     # patchify_proj + adaln weights; the ONLY differences are (a) two patchify
     # calls concatenated ref-first, (b) per-token AdaLN ts = [0 x S_REF,
-    # sigma*1000 x S_TGT] (musubi torch.where(cond_mask,0,sigma) :3376-3377), and
+    # sigma*1000 x S_TGT] (torchref torch.where(cond_mask,0,sigma) :3376-3377), and
     # (c) the two-grid rope _build_v2v_rope. Inlined patchify (NOT shared with
     # forward) so the committed t2v head stays byte-identical.
     def forward_v2v[S_COMB: Int, S_REF: Int, S_TGT: Int, N_TXT: Int](
@@ -635,13 +635,13 @@ def _timestep_embedding(
     return Tensor.from_host(out, _sh2(n, dim), dtype, ctx)
 
 
-# 3D video RoPE for the [NF,NH,NW] grid at frame_rate — MUSUBI-EXACT dtype
+# 3D video RoPE for the [NF,NH,NW] grid at frame_rate — TORCHREF-EXACT dtype
 # pipeline (VAE sf 8/32/32, causal offset 1, pos_embed_max_pos 20, base_hw
 # 2048, theta 10000, ckpt config: rope_type=split, frequencies_precision=
 # float64, use_middle=true). Returns halfsplit cos/sin [S_V*32, 64] in
 # (token,head) row order.
 #
-# DTYPE CONTRACT (measured 2026-07-16, ltx2 fwd-parity gate): musubi's
+# DTYPE CONTRACT (measured 2026-07-16, ltx2 fwd-parity gate): torchref's
 # LTX2Wrapper casts positions to BF16 (`.to(video_latents.dtype)`,
 # lora_ltx2.py:349) and divides the temporal axis by frame_rate IN BF16; the
 # mid/frac/scale chain then runs in bf16 inside generate_freqs, and the final
@@ -649,8 +649,8 @@ def _timestep_embedding(
 # quantizes at bf16 ulp (-0.998 -> -0.99609375) — invisible at F=1 (constant
 # temporal phase cancels in q.k) but a REAL per-frame phase error at F>=2.
 # The old f64-everywhere builder produced video-arm pred cos 0.9958-0.9991 vs
-# musubi (bar 0.999); replicating the bf16 rounding is required for parity.
-# Freq grid stays f64 theta^(i/(n-1))*pi/2 rounded to F32 (musubi np64 path).
+# torchref (bar 0.999); replicating the bf16 rounding is required for parity.
+# Freq grid stays f64 theta^(i/(n-1))*pi/2 rounded to F32 (torchref np64 path).
 comptime _POS_MAX = Float64(20.0)
 comptime _BASE_HW = Float64(2048.0)
 comptime _VAE_T = Float64(8.0)
@@ -701,7 +701,7 @@ def _build_video_rope(
     var num_heads = 32
     var dim = VD
     # coords [3, P, 2] — integer pixel coords (bf16-exact), temporal axis
-    # divided by frame_rate IN BF16 (musubi wrapper semantics).
+    # divided by frame_rate IN BF16 (torchref wrapper semantics).
     var coords = List[Float32]()
     coords.resize(3 * P * 2, Float32(0.0))
     var fr32 = Float32(frame_rate)
@@ -716,7 +716,7 @@ def _build_video_rope(
 # ── IC-LoRA / v2v two-grid RoPE (P5) ─────────────────────────────────────────
 # Reference grid PREPENDED to the target grid on the token axis, ref H/W pixel
 # coords *reference_downscale so both grids co-locate from origin 0 under the
-# fixed BASE_HW=2048 normalization (musubi ltx2_train_network.py:3386-3424:
+# fixed BASE_HW=2048 normalization (torchref ltx2_train_network.py:3386-3424:
 # ref_positions[:,1/2,...] *= reference_downscale_factor; combined = cat dim=2).
 # Same spine convention as _build_video_rope (causal offset 1, temporal
 # /frame_rate in bf16, fixed max_pos [20,2048,2048]); ONE _compute_rope over the
@@ -769,7 +769,7 @@ def _compute_rope(
     var denom = Float64(freq_count - 1)
     if denom < 1.0:
         denom = 1.0
-    # musubi np64 grid: f64 theta^(i/(n-1)) * pi/2, stored as an f32 tensor
+    # torchref np64 grid: f64 theta^(i/(n-1)) * pi/2, stored as an f32 tensor
     var freq = List[Float32]()
     for i in range(freq_count):
         freq.append(Float32(fpow(theta, Float64(i) / denom) * pi / 2.0))
@@ -780,7 +780,7 @@ def _compute_rope(
     sin_tok.resize(P * half_dim, Float32(0.0))
     for p in range(P):
         # mid/frac/scale run in BF16 per-op (the positions tensor is bf16 on
-        # the musubi side; every torch op rounds its result to bf16)
+        # the torchref side; every torch op rounds its result to bf16)
         var scaled = List[Float32]()
         for d in range(num_pos_dims):
             var s0 = _bf16_rne(coords[(d * P + p) * 2 + 0])

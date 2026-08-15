@@ -1,6 +1,6 @@
 # serenitymojo/models/minimax_h3/h3_train_block_store.mojo
 #
-# mmap-staging streamer for H3 TRAINING block weights (raw musubi layout,
+# mmap-staging streamer for H3 TRAINING block weights (raw torchref layout,
 # bf16 verbatim from the FL2VA diffusers shards — no conversion).
 #
 # v2 DESIGN (the 08-14 oomd lesson): v1 filled a single 38.5GB pinned host

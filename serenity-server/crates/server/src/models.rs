@@ -784,7 +784,7 @@ fn detect_lora_target_arch(header: &str) -> &'static str {
         && (header.contains(".lora_A.weight\"") || header.contains(".lora_down.weight\""))
     {
         // Diffusers PEFT FLUX.1 adapters do not use the older
-        // lora_transformer_* Kohya key prefix.
+        // lora_transformer_* torchref key prefix.
         "flux"
     } else if header.contains("\"lora_transformer_single_transformer_blocks")
         || header.contains("\"lora_transformer_transformer_blocks")

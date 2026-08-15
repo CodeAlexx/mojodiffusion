@@ -1,7 +1,7 @@
 # models/dit/kandinsky5_dit.mojo — Kandinsky-5.0 DiT (T2V Lite), pure Mojo + MAX.
 #
 # Inference-only, GPU-only. References (read line-by-line, READ-ONLY):
-#   /home/alex/musubi-tuner/src/musubi_tuner/kandinsky5/models/{dit,nn,utils}.py
+#   /home/alex/torchref-video/src/torchref/kandinsky5/models/{dit,nn,utils}.py
 #       (the canonical DiffusionTransformer3D oracle)
 #   /home/alex/EriDiffusion/inference-flame/src/models/kandinsky5_dit.rs (Rust port)
 #

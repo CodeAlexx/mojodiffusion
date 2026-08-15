@@ -346,7 +346,7 @@ comptime THETA = Float32(1.0e3)
 # = REAL 512px training: reads a 64×64-latent 512px cache via sample_padded (real
 # conditioning + pos). The 512px cache is built by re-staging the source images at
 # 512 (krea2_stage_images.py <dataset> <stage_512> 512) then prepare_cache <stage_512>
-# <cache_512> n 512. ai-toolkit trains krea2 at 512 → this is the matched-resolution
+# <cache_512> n 512. torchref trains krea2 at 512 → this is the matched-resolution
 # real-data run. The 1024px arm is the same two steps at 1024 plus
 # `-D KREA2_RES_512=0 -D KREA2_LTMAX=<>= the cache's max LT>` on the build.
 # The DEFAULT stays 512 (the value this was pinned to before it became a build
@@ -411,7 +411,7 @@ comptime IMGLEN = (LH // 2) * (LW // 2)   # 1024 (512px) | 4096 (1024px)
 # KREA2_RES_512 (above) picks 512px(64×64 latent) vs 1024px(128×128); LTMAX is the
 # caption bucket length (must be >= the dataset's max caption token count — the loop
 # fails loud at L<the LT>LTMAX check> otherwise, and the cache reader fails loud on a
-# resolution/latent-shape mismatch). The default values are the eri2/ai-toolkit
+# resolution/latent-shape mismatch). The default values are the eri2/torchref
 # 512px run (KREA2_RES_512=True, LTMAX=384 >= eri2's max LT 282). The separate
 # 512px giger real-cache smoke uses `mojo build -DKREA2_LTMAX=896` so it does not
 # change the reproducible synthetic-devicegrad default. For 1024px/giger: set
@@ -479,7 +479,7 @@ comptime LW_S = LH_S
 comptime IMGLEN_S = (LH_S // 2) * (LW_S // 2)   # 1024 (512px) / 4096 (1024px)
 comptime LFULL_S = LTMAX + IMGLEN_S             # 1408 @512-sample == training LFULL
 
-# Checkpoint retention (honors ai-toolkit max_step_saves_to_keep). Prune the periodic
+# Checkpoint retention (honors torchref max_step_saves_to_keep). Prune the periodic
 # save KREA2_KEEP_CHECKPOINTS back, keeping every KREA2_CKPT_MILESTONE-th + the final.
 # 0 = keep all (the pre-2026-06-28 behavior).
 comptime KREA2_KEEP_CHECKPOINTS = 8
@@ -2320,7 +2320,7 @@ def _build_host_lora_omini_edit(
 
 
 def _build_host_lora_full_surface(rank: Int, alpha: Float32) raises -> List[LoraAdapter]:
-    """Build ai-toolkit's full Krea2 LoRA surface in optimizer order.
+    """Build torchref's full Krea2 LoRA surface in optimizer order.
 
     The first 224 adapters are the current main-block product path. The final
     32 adapters are txtfusion layerwise/refiner blocks and stay BF16 at device
@@ -2345,16 +2345,16 @@ def _build_host_lora_full_surface(rank: Int, alpha: Float32) raises -> List[Lora
 
 
 # ── LoRA SAVE (MJ-0805): write the trained adapters as a RE-LOADABLE PEFT file ─
-# The PEFT module prefix MUST match the keys ai-toolkit/inference krea2 LoRAs LOAD
-# by — VERIFIED against a real ai-toolkit krea2 save (output/my_first_lora_v1/*.
+# The PEFT module prefix MUST match the keys torchref/inference krea2 LoRAs LOAD
+# by — VERIFIED against a real torchref krea2 save (output/my_first_lora_v1/*.
 # safetensors): `diffusion_model.blocks.<bi>.attn.{wq,wk,wv,gate,wo}` and
 # `.mlp.{gate,up,down}`, with save_lora_peft appending `.lora_A.weight`[rank,in] /
 # `.lora_B.weight`[out,rank] (BF16). The slot order matches _build_host_lora
-# (0=wq 1=wk 2=wv 3=gate 4=wo 5=mlp_gate 6=mlp_up 7=mlp_down). NOTE: ai-toolkit
+# (0=wq 1=wk 2=wv 3=gate 4=wo 5=mlp_gate 6=mlp_up 7=mlp_down). NOTE: torchref
 # ALSO trains/saves txtfusion layerwise/refiner blocks because their names contain
 # "blocks". This default PEFT save writes the 28x8=224 main-block adapters.
 # The opt-in KREA2_TXTFUSION_LORA path uses the full-surface save/resume helpers
-# for the 256-adapter surface; that surface smoke is not a full ai-toolkit
+# for the 256-adapter surface; that surface smoke is not a full torchref
 # numeric oracle.
 def _krea2_lora_prefix(bi: Int, slot: Int) raises -> String:
     var b = String("diffusion_model.blocks.") + String(bi)
@@ -2576,7 +2576,7 @@ def save_krea2_lora_full_surface(
     """Write main-block plus txtfusion LoRA adapters in the 256-slot order.
 
     The first 224 entries preserve the existing product key order. Entries
-    224..255 append ai-toolkit-style txtfusion layerwise/refiner modules.
+    224..255 append torchref-style txtfusion layerwise/refiner modules.
     """
     if len(host_lora) != KREA2_FULL_SURFACE_ADAPTERS:
         raise Error(
@@ -5061,10 +5061,10 @@ def main() raises:
             else:
                 sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
             var lt = sample.text_len
-            # ai-toolkit krea2 recipe: timestep_type="linear" + content_or_style=
+            # torchref krea2 recipe: timestep_type="linear" + content_or_style=
             # "balanced" => sigma UNIFORM over linspace(1000,1,1000)/1000. The old
             # sample_timestep_logit_normal here was the EDv2 qwenimage preset, NOT
-            # the ai-toolkit krea2 oracle — it never sampled sigma>0.9, squashing
+            # the torchref krea2 oracle — it never sampled sigma>0.9, squashing
             # the loss band to <0.23 (oracle band: median 0.0975, max 0.99, 12%>0.3).
             var sigma = sample_timestep_krea2_aitk_linear_balanced(
                 seed_base + UInt64(step)
@@ -5161,7 +5161,7 @@ def main() raises:
     # ── sample at START (step 0): baseline render BEFORE any training so progress
     # is comparable from the base model. Gated to runs that actually sample during
     # training (sample_every <= steps) so short smokes with sample_every=999 stay
-    # fast; cfg.sample_skip_first != 0 suppresses (ai-toolkit skip_first_sample).
+    # fast; cfg.sample_skip_first != 0 suppresses (torchref skip_first_sample).
     # (A3 device-fast runs do their step-0 render INSIDE the A3 branch, wrapped in
     # the state offload. Non-A3 runs render the baseline AFTER step 1: rendering
     # BEFORE the first training step fragments the MAX pool so badly that step-1's
@@ -5239,10 +5239,10 @@ def main() raises:
             else:
                 sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
             var lt = sample.text_len
-            # ai-toolkit krea2 recipe: timestep_type="linear" + content_or_style=
+            # torchref krea2 recipe: timestep_type="linear" + content_or_style=
             # "balanced" => sigma UNIFORM over linspace(1000,1,1000)/1000. The old
             # sample_timestep_logit_normal here was the EDv2 qwenimage preset, NOT
-            # the ai-toolkit krea2 oracle — it never sampled sigma>0.9, squashing
+            # the torchref krea2 oracle — it never sampled sigma>0.9, squashing
             # the loss band to <0.23 (oracle band: median 0.0975, max 0.99, 12%>0.3).
             var sigma = sample_timestep_krea2_aitk_linear_balanced(
                 seed_base + UInt64(step)
@@ -5700,7 +5700,7 @@ def main() raises:
         var lt = sample.text_len    # natural caption length (for the additive pad mask)
 
         # flow-match t (= blend coeff = model timestep) per step (seed + step stream).
-        # ai-toolkit krea2 recipe: uniform sigma (linear+balanced), NOT logit-normal
+        # torchref krea2 recipe: uniform sigma (linear+balanced), NOT logit-normal
         # (that was the EDv2 qwenimage preset — see the note at the other call sites).
         var sigma = sample_timestep_krea2_aitk_linear_balanced(
             seed_base + UInt64(pair_lead)

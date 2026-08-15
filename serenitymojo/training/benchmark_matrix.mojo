@@ -1,7 +1,7 @@
 # training/benchmark_matrix.mojo — canonical cross-model trainer speed matrix.
 
 from serenitymojo.training.perf_record import (
-    PERF_LANE_AI_TOOLKIT,
+    PERF_LANE_TORCHREF,
     PERF_LANE_SERENITY_TRAINER,
     training_perf_lane_name,
 )
@@ -66,9 +66,9 @@ def training_benchmark_case(index: Int) raises -> TrainingBenchmarkCase:
     if index == 0:
         return TrainingBenchmarkCase(
             String("krea2"),
-            PERF_LANE_AI_TOOLKIT,
+            PERF_LANE_TORCHREF,
             String("serenitymojo/models/krea2/train_krea2.mojo"),
-            String("/home/alex/ai-toolkit or local ai-toolkit-origin Krea2 artifacts"),
+            String("/home/alex/torchref-image or local torchref-origin Krea2 artifacts"),
             String("single-stream DiT LoRA"),
             String("BF16"),
             1,

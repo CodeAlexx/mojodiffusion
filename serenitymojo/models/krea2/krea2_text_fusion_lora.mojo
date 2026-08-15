@@ -269,7 +269,7 @@ def _text_device_grad_for_adamw_state(
 ) raises -> TArc:
     if t[].dtype() == state.grad_dtype:
         return t.copy()
-    # The optimizer buffer owns the grad storage dtype. Krea2/ai-toolkit uses
+    # The optimizer buffer owns the grad storage dtype. Krea2/torchref uses
     # BF16 grads; legacy callers can still request F32 through the state.
     var tg = TArc(cast_tensor(t[], state.grad_dtype, ctx))
     keepalive.append(tg.copy())
@@ -478,7 +478,7 @@ def krea2_text_fusion_block_lora_backward_dev[
     var g_wo = bw_wo.lora.copy()
     var d_attn_flat = mul(d_gated, saved.sg[], ctx)
     var d_sg = mul(d_gated, saved.attn_flat[], ctx)
-    # ai-toolkit/PyTorch differentiates from the saved BF16 sigmoid output.
+    # torchref/PyTorch differentiates from the saved BF16 sigmoid output.
     var d_gate_pre = sigmoid_backward_from_output(d_sg, saved.sg[], ctx)
 
     var d_att = reshape(d_attn_flat, [B, S, HEADS, HEADDIM], ctx)

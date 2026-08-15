@@ -1,5 +1,5 @@
 # models/dit/parity/krea2_rope_parity_probe.mojo — PARITY GATE for krea2 chunk 1
-# (Krea2Config + 3-axis interleaved RoPE) vs a real ai-toolkit torch oracle.
+# (Krea2Config + 3-axis interleaved RoPE) vs a real torchref torch oracle.
 #
 # Oracle: krea2_rope_oracle.safetensors, generated from the REAL
 # PositionalEncoding + ropeapply (mmdit.py). All tensors F32:

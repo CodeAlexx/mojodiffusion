@@ -55,7 +55,7 @@
 #                    for exactly the same reason.
 #
 # Run:
-#   /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_ref_encode_oracle.py
+#   /home/alex/torchref/venv/bin/python scripts/minimax_h3_ref_encode_oracle.py
 #   pixi run mojo build -O2 -j 1 -I . -I vendor/mojo-libs \
 #     -Xlinker -lm -Xlinker -lcuda \
 #     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa \

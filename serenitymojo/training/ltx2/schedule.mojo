@@ -114,8 +114,8 @@ struct LTX2AVTimestepHandoff(Copyable, Movable):
     var coupled_audio_timestep: Bool
 
 
-def normalize_musubi_training_timestep(timestep: Float32) -> Float32:
-    # Musubi emits training timesteps as sigma * 1000 and normalizes before DiT.
+def normalize_torchref_training_timestep(timestep: Float32) -> Float32:
+    # Torchref emits training timesteps as sigma * 1000 and normalizes before DiT.
     return model_timestep_to_sigma(timestep)
 
 
@@ -126,8 +126,8 @@ def independent_audio_sigma_from_uniform(
 ) raises -> Float32:
     if uniform01 < Float32(0.0) or uniform01 > Float32(1.0):
         raise Error("audio timestep uniform sample must be in [0, 1]")
-    var min_sigma = normalize_musubi_training_timestep(min_timestep)
-    var max_sigma = normalize_musubi_training_timestep(max_timestep)
+    var min_sigma = normalize_torchref_training_timestep(min_timestep)
+    var max_sigma = normalize_torchref_training_timestep(max_timestep)
     if max_sigma < min_sigma:
         raise Error("invalid independent audio timestep range")
     return uniform01 * (max_sigma - min_sigma) + min_sigma
@@ -136,7 +136,7 @@ def independent_audio_sigma_from_uniform(
 def coupled_audio_sigma_from_timestep_row(raw_video_timesteps: List[Float32]) raises -> Float32:
     if len(raw_video_timesteps) == 0:
         raise Error("expected at least one video timestep")
-    return normalize_musubi_training_timestep(raw_video_timesteps[0])
+    return normalize_torchref_training_timestep(raw_video_timesteps[0])
 
 
 def prepare_av_model_sigmas_from_scalar_timestep(
@@ -146,7 +146,7 @@ def prepare_av_model_sigmas_from_scalar_timestep(
     min_timestep: Float32 = 0.0,
     max_timestep: Float32 = 1000.0,
 ) raises -> LTX2AVTimestepHandoff:
-    var video_sigma = normalize_musubi_training_timestep(raw_video_timestep)
+    var video_sigma = normalize_torchref_training_timestep(raw_video_timestep)
     if independent_audio_timestep:
         return LTX2AVTimestepHandoff(
             video_sigma,

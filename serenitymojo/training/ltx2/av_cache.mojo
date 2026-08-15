@@ -1,7 +1,7 @@
 # av_cache.mojo -- LTX-2 AV tri-pair cache pairing (P6.2).
 #
 # Host-side plumbing that pairs, with each video latent cache file
-# `.../{stem}_ltx2.safetensors`, its two siblings in the SAME dir (musubi
+# `.../{stem}_ltx2.safetensors`, its two siblings in the SAME dir (torchref
 # ltx2_cache_latents.py:260 basename route):
 #   * `{stem}_ltx2_audio.safetensors`  audio_latents_{T}x{mel}x{C}_{dtype}
 #                                      ([C,T,mel]) + audio_lengths_int32 (scalar)

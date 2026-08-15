@@ -2,7 +2,7 @@
 #
 # LTX-2 P6.2 AV tri-pair cache-reader ROUND-TRIP gate. Reads the synthetic
 # tri-pair written by scripts/ltx2_av_smoke_cache.py and asserts the reader
-# (training/ltx2/av_cache.mojo) pairs + loads every stream by the musubi basename
+# (training/ltx2/av_cache.mojo) pairs + loads every stream by the torchref basename
 # route: video latent + audio_latents [C,T,mel] (+ audio_lengths) + video/audio
 # prompt embeds. Also checks the [C,T,mel] -> [1,S_A=T,patch_in=C*mel] reshape the
 # audio patchify consumes.

@@ -8,7 +8,7 @@
 # port of pipeline_ideogram4, final_z/final_latent/decoded all gated vs torch).
 #
 # ── PORT SPEC (1:1) ───────────────────────────────────────────────────────────
-# ai-toolkit ideogram4/src/pipeline.py denoise + decode (mirrored by the torch
+# torchref ideogram4/src/pipeline.py denoise + decode (mirrored by the torch
 # oracle ideogram4_oracle.py::stage_E and serenitymojo/pipeline/ideogram4_pipeline.mojo):
 #   schedule: mean = known_mean + 0.5*log(HW / 512^2)   (scheduler.py get_schedule)
 #             si   = make_step_intervals(steps)

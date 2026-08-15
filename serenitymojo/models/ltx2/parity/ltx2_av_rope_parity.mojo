@@ -4,7 +4,7 @@
 #
 # Proves the importable Mojo rope builder (models/ltx2/ltx2_av_rope.mojo
 # ltx2_av_build_rope) reproduces the oracle's 4 rope pairs (v/a/ca_v/ca_a),
-# built at the MUSUBI-CORRECT causal_offset=1. The runner needs a proven rope;
+# built at the TORCHREF-CORRECT causal_offset=1. The runner needs a proven rope;
 # the stack gates only ever LOADED rope from the oracle dump (never built it),
 # so this closes the last ungated AV numeric surface.
 #

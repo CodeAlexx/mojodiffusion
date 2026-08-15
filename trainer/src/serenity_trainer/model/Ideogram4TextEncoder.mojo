@@ -1,14 +1,14 @@
 # Ideogram4TextEncoder.mojo — Ideogram-4 Qwen3-VL-8B 13-tap text encoder.
 #
 # ════════════════════════════════════════════════════════════════════════════
-# PORT SPEC — the EXACT ai-toolkit code path reproduced.
+# PORT SPEC — the EXACT torchref code path reproduced.
 # ════════════════════════════════════════════════════════════════════════════
-# ai-toolkit ideogram4.py: the text encoder is the frozen, stock
+# torchref ideogram4.py: the text encoder is the frozen, stock
 #   Qwen/Qwen3-VL-8B-Instruct language model. Conditioning = the "13-tap"
 #   interleaved concat of selected decoder hidden states
 #   (QWEN3_VL_ACTIVATION_LAYERS = [0,3,6,9,12,15,18,21,24,27,30,33,35]):
 #     stack(taps, 0).permute(1,2,3,0).reshape(1, L, 4096*13 = 53248)
-#   (ai-toolkit pipeline _encode_text; reference dump in
+#   (torchref pipeline _encode_text; reference dump in
 #    serenitymojo ideogram4_oracle.py stage_B / stage_E).
 #   The stored weights are weight-only FP8 (e4m3 + per-row .weight_scale,
 #   keys language_model.*) — dequantized to BF16 at load.

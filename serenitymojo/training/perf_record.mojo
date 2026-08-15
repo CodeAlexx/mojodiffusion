@@ -2,11 +2,11 @@
 #
 # This is intentionally a contract module, not a profiler. Product trainers fill
 # this record from their measured loop/profiler data; parity and speed gates can
-# then compare SerenityTrainer/ai-toolkit, Mojo, and Rust/Flame lanes without each
+# then compare SerenityTrainer/torchref, Mojo, and Rust/Flame lanes without each
 # model inventing its own log format.
 
 comptime PERF_LANE_SERENITY_TRAINER = 0
-comptime PERF_LANE_AI_TOOLKIT = 1
+comptime PERF_LANE_TORCHREF = 1
 comptime PERF_LANE_MOJO_CURRENT = 2
 comptime PERF_LANE_RUST_FLAME_OP = 3
 
@@ -209,8 +209,8 @@ def emit_training_perf_record(record: TrainingPerfRecord) raises:
 def training_perf_lane_name(lane: Int) -> String:
     if lane == PERF_LANE_SERENITY_TRAINER:
         return String("serenity_trainer")
-    if lane == PERF_LANE_AI_TOOLKIT:
-        return String("ai-toolkit")
+    if lane == PERF_LANE_TORCHREF:
+        return String("torchref")
     if lane == PERF_LANE_MOJO_CURRENT:
         return String("mojo-current")
     if lane == PERF_LANE_RUST_FLAME_OP:

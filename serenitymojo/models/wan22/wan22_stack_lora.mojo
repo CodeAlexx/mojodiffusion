@@ -16,7 +16,7 @@
 #           gate_sa, shift_ffn, scale_ffn, gate_ffn  (each [S,dim])
 #   - head.modulation [1,2,dim] + e_head [1,S,dim] -> head shift/scale [1,S,dim]
 #   - LoRA targets: 10 per block — self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}
-#     (in=out=dim each) + ffn.0 (dim->ffn) + ffn.2 (ffn->dim), matching Musubi's
+#     (in=out=dim each) + ffn.0 (dim->ffn) + ffn.2 (ffn->dim), matching Torchref's
 #     wrapped-linear set. 40 blocks -> 400 adapters.
 #   - CHECKPOINT KEYS: blocks.{i}.self_attn.q.weight etc. (NOT fused).
 #
@@ -420,7 +420,7 @@ def _sin_embed(t: Float32, S: Int, freq_dim: Int, theta: Float32 = Float32(10000
     var half = freq_dim // 2
     var out = List[Float32]()
     # ⚠ COS FIRST, THEN SIN. This ordering is the ORACLE's:
-    #   musubi wan/modules/model.py:37
+    #   torchref wan/modules/model.py:37
     #     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     # and it is what OUR OWN INFERENCE uses (ops/embeddings.mojo:73-75,
     # "COS first (cols [0, half)), SIN second"), reached from the streamed DiT via
@@ -436,7 +436,7 @@ def _sin_embed(t: Float32, S: Int, freq_dim: Int, theta: Float32 = Float32(10000
     #     — i.e. worse than predicting zero, which is anti-correlation, not weakness;
     #   * a trained LoRA scoring 0.179 @ t=0.30 and 0.178 @ t=0.95 — a flow-match loss
     #     that does NOT vary with t means the model cannot read t.
-    # The Musubi BLOCK parity gate could never catch this: the block takes e0 as an
+    # The Torchref BLOCK parity gate could never catch this: the block takes e0 as an
     # INPUT, so the time embedding is upstream of every gate we had.
     for _ in range(S):
         for k in range(half):
@@ -1874,9 +1874,9 @@ def wan22_lora_adamw_step_resident(
 
 # ── PEFT-keyed save ───────────────────────────────────────────────────────────
 # Key format: "diffusion_model.blocks.{i}.self_attn.q.lora_A.weight" etc.
-# ai-toolkit / ComfyUI Wan LoRA convention: `diffusion_model.` prefix + lora_A/lora_B
-# (ai-toolkit stores internally as `transformer.` and rewrites to `diffusion_model.`
-# on save for ComfyUI — see ai-toolkit base_audio_model.py:73-84 / network_mixins.py).
+# torchref / ComfyUI Wan LoRA convention: `diffusion_model.` prefix + lora_A/lora_B
+# (torchref stores internally as `transformer.` and rewrites to `diffusion_model.`
+# on save for ComfyUI — see torchref base_audio_model.py:73-84 / network_mixins.py).
 # Save + resume both use this function, so keys stay internally consistent.
 def _wan22_lora_prefixes(num_blocks: Int) -> List[String]:
     var out = List[String]()
@@ -1960,7 +1960,7 @@ def load_wan22_lora_resume(
 #
 # Mirrors the base T2V offload fwd/bwd above, but per block calls the CERTIFIED
 # wan22_i2v_block_lora_forward/backward (models/wan22/wan22_block.mojo, cos>=0.999
-# vs Musubi). Deltas vs the T2V stack:
+# vs Torchref). Deltas vs the T2V stack:
 #   (a) TWO frozen contexts — computed ONCE before the block loop, threaded
 #       (copied) into every block: context_txt = text_embedding(umt5) [TXT,dim]
 #       (frozen, embedded here) and context_img [IMG,dim] (frozen CLIP already

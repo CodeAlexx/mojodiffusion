@@ -1,17 +1,17 @@
-# ltx2_lora_musubi_native_roundtrip.mojo — round-trip musubi's NATIVE
+# ltx2_lora_torchref_native_roundtrip.mojo — round-trip torchref's NATIVE
 # 1152-key LTX-2 LoRA artifact (lora_unet_* flat underscored keys, per-module
 # {alpha, lora_down.weight, lora_up.weight}, all BF16) through the Mojo
-# resume/save surface. Companion to ltx2_lora_musubi_real_artifact_roundtrip
+# resume/save surface. Companion to ltx2_lora_torchref_real_artifact_roundtrip
 # (which covers the 768-key comfy conversion); payload byte comparison is done
 # by scripts/check_ltx2_lora_keys.py.
 #
 #   pixi run mojo build -O2 -I . -Xlinker -lm -Xlinker -lcuda \
-#     serenitymojo/models/ltx2/parity/ltx2_lora_musubi_native_roundtrip.mojo \
+#     serenitymojo/models/ltx2/parity/ltx2_lora_torchref_native_roundtrip.mojo \
 #     -o /tmp/ltx2_lora_native_roundtrip
 #   /tmp/ltx2_lora_native_roundtrip <in.safetensors> <out.safetensors>
 #
 # Oracle for the 2026-07-16 gate:
-#   output/ltx2_musubi_ref/ltx2_musubi_ref.safetensors (1152 keys, rank 32)
+#   output/ltx2_torchref_ref/ltx2_torchref_ref.safetensors (1152 keys, rank 32)
 
 from std.sys import argv
 from max.gpu.host import DeviceContext
@@ -33,7 +33,7 @@ def _require(ok: Bool, msg: String) raises:
 
 
 def _native_prefixes(v2v: Bool) raises -> List[String]:
-    # musubi native: lora_unet_model_transformer_blocks_{bi}_{fam}_{proj}
+    # torchref native: lora_unet_model_transformer_blocks_{bi}_{fam}_{proj}
     # with dots flattened to underscores (to_out.0 -> to_out_0). v2v appends the
     # two video FFN modules per block (ff.net.0.proj -> ff_net_0_proj, ff.net.2 ->
     # ff_net_2) AFTER the 8 attention modules, matching the driver slot order.

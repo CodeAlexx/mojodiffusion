@@ -48,7 +48,7 @@ def default_readiness() -> LTX2Readiness:
     #                   retained), digits identical across arms
     #                   (parity/ltx2_av_stack_bwd_parity.mojo)
     #   av_lora_runtime — training/train_ltx2_av.mojo _run_geometry_av: 4-step
-    #                   runs RC=0, both modality losses moving, 672-key musubi
+    #                   runs RC=0, both modality losses moving, 672-key torchref
     #                   audio save (1344 tensors, 14 modules/block x48), and the
     #                   final-step inactive-slot assert max|A|,|B| == 0
     return LTX2Readiness(

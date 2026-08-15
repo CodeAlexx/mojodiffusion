@@ -23,7 +23,7 @@
 #            = δ*(|d| - 0.5*δ)    otherwise
 #     d_pred = clamp(d, -δ, δ)/N
 # NOTE divergence from SimpleTuner's OWN "huber": SimpleTuner implements the
-# kohya pseudo-Huber  2c·(sqrt(d²+c²) − c)  (simpletuner/helpers/models/
+# torchref pseudo-Huber  2c·(sqrt(d²+c²) − c)  (simpletuner/helpers/models/
 # common.py:4470-4472) — phase T1.A spec mandates torch semantics; the
 # pseudo-Huber is a separate lever if ever wanted. Also note SimpleTuner's
 # FLOW_MATCHING branch always uses plain L2 (common.py:4562-4564); huber/
@@ -112,7 +112,7 @@ def mae_loss_grad(pred: List[Float32], target: List[Float32]) raises -> LossGrad
     """loss = mean(|pred-target|); d_pred = sign(pred-target)/N.
 
     Matches torch.nn.functional.l1_loss(reduction='mean') value + autograd
-    (subgradient 0 at d==0, as torch). This is musubi's loss_type mae|l1
+    (subgradient 0 at d==0, as torch). This is torchref's loss_type mae|l1
     (ltx2 LEVERS CONTRACT: mae=|d|). Reduction accumulated in F64 like the
     sibling losses; per-element math F32."""
     _check_inputs(pred, target, "mae_loss_grad")

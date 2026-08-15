@@ -1,6 +1,6 @@
 # cache_records.mojo -- LTX-2 cache record and safetensors key contract.
 #
-# Mirrors musubi-tuner's ltx2 cache names. These are records and names only; a
+# Mirrors torchref's ltx2 cache names. These are records and names only; a
 # future data loader should use serenitymojo.io.safetensors to read the tensors.
 
 comptime ARCHITECTURE_LTX2 = "ltx2"

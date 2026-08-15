@@ -4,7 +4,7 @@
 # Proves the trainer driver can:
 #   1) stage cache metadata + one transformer weight set,
 #   2) stream one real Giger sample into the train step,
-#   3) save ai-toolkit/PEFT LoRA plus Adam train state,
+#   3) save torchref/PEFT LoRA plus Adam train state,
 #   4) reload LoRA + train state and resume.
 
 from max.gpu.host import DeviceContext

@@ -1017,7 +1017,7 @@ comptime WDIR_CA_O = 7
 
 
 # Optional LoRA adapters for the block's 10 trained linears: 8 attention
-# projections + ffn.0 (dim->ffn) + ffn.2 (ffn->dim). Mirrors Musubi wrapping
+# projections + ffn.0 (dim->ffn) + ffn.2 (ffn->dim). Mirrors Torchref wrapping
 # self_attn.{q,k,v,o} + cross_attn.{q,k,v,o} + ffn.0 + ffn.2.
 struct WanBlockLora(Copyable, Movable):
     var sa_q: Optional[LoraAdapter]
@@ -2391,7 +2391,7 @@ def wan22_block_direct_lycoris_backward[
 # WAN 2.1 I2V-14B VARIANT — DUAL CROSS-ATTENTION (WanI2VCrossAttention)
 #
 # The ONLY new compute vs the certified block: the cross-attn is
-# WanI2VCrossAttention (musubi model.py:284-340) instead of WanCrossAttention.
+# WanI2VCrossAttention (torchref model.py:284-340) instead of WanCrossAttention.
 # The context prepends 257 CLIP-image tokens (projected to `dim` by the frozen
 # img_emb/MLPProj OUTSIDE the block) to the umt5 text tokens; the block splits
 # context at 257:

@@ -90,9 +90,9 @@ def main() raises:
         var prompt = _read_text(stage_dir + "/prompt." + String(i) + ".txt")
         var ids = tok.encode(prompt)
         # natural_len = real token count BEFORE padding (capped at NT for truncation).
-        # ai-toolkit encodes at the caption's natural length then masks/pads later;
+        # torchref encodes at the caption's natural length then masks/pads later;
         # we pad-to-NT before encode, so we record the real length and zero the pad
-        # feature rows below (matching ai-toolkit get_qwen3_vl_features stacked*text_mask).
+        # feature rows below (matching torchref get_qwen3_vl_features stacked*text_mask).
         var natural_len = len(ids)
         if natural_len > NT:
             natural_len = NT
@@ -106,7 +106,7 @@ def main() raises:
         var feats = ideogram4_encode_text(tenc, ids, ctx)
         # Zero the encoder features at pad positions [natural_len, NT): build a
         # [1,NT,1] mask (1.0 real / 0.0 pad) and broadcast-multiply. This is the
-        # ai-toolkit pipeline.py:156-157 `stacked * text_mask` step (the encoder
+        # torchref pipeline.py:156-157 `stacked * text_mask` step (the encoder
         # itself never masked — ideogram_qwen3vl.mojo). Skip when no padding.
         var feats_masked: Tensor
         if natural_len < NT:
@@ -130,7 +130,7 @@ def main() raises:
         tensors.append(TArc(llm^))
         # text_len.<i> scalar: the natural (pre-pad) token count. The cache reader
         # threads it to ideogram4_build_packed_inputs so the DiT indicator is 0 at
-        # pad positions (ai-toolkit pipeline.py:249) and pad position_ids hold at
+        # pad positions (torchref pipeline.py:249) and pad position_ids hold at
         # real_len-1. Absent => callers default text_len=NT (all-real).
         var tl_host = List[Float32]()
         tl_host.append(Float32(natural_len))

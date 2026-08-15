@@ -2,7 +2,7 @@
 """Compare Krea2 resumed vs uninterrupted LoRA/state artifacts.
 
 This is a Mojo product-path save/resume equivalence gate. It does not claim
-ai-toolkit/SerenityTrainer parity. With `--atol 0` it requires byte-equivalent tensor
+torchref/SerenityTrainer parity. With `--atol 0` it requires byte-equivalent tensor
 values. With nonzero `--atol` it is a bounded product-path continuation check;
 record the tolerance and any observed same-step nondeterminism beside the result.
 """
@@ -121,11 +121,11 @@ def main() -> int:
     if not (peft_ok and state_ok):
         return 1
     if args.atol == 0.0:
-        scope = "Mojo product-path byte-equivalent resume; not ai-toolkit parity"
+        scope = "Mojo product-path byte-equivalent resume; not torchref parity"
     else:
         scope = (
             "Mojo product-path bounded resume equivalence; "
-            "not byte parity or ai-toolkit parity"
+            "not byte parity or torchref parity"
         )
     print(f"[krea2-resume-equivalence] PASS save_resume_equivalence scope={scope}")
     return 0

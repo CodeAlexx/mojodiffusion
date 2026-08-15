@@ -7,12 +7,12 @@
 # weights: parity/h3_block_oracle.py -> output/checks/h3_block0_oracle
 # .safetensors, gate parity/minimax_h3_block_train_parity.mojo.
 #
-# WEIGHT LAYOUT: RAW musubi/checkpoint order — `attn.qkv_proj.weight`
+# WEIGHT LAYOUT: RAW torchref/checkpoint order — `attn.qkv_proj.weight`
 # [3*inner, hidden] rows [q|k|v], `mlp.fc1.weight` [2*ffn, hidden] rows
-# [gate|value] (musubi model.py:279-291: chunk(2) -> (gate, value),
+# [gate|value] (torchref model.py:279-291: chunk(2) -> (gate, value),
 # silu(gate)*value). NOT the `minimax_h3_load_block_device` transformed
 # layout: training grads must land in the oracle/LoRA convention with no
-# permutation step. Oracle source (musubi akane/minimax-h3 @ 04324c28
+# permutation step. Oracle source (torchref-h3 @ 04324c28
 # model.py:336-399):
 #   mod   = adaln_proj(temb).view(-1, 6*hidden)        (precomputed table
 #           here — the modcache contract; adaln stays FROZEN in training)
@@ -397,7 +397,7 @@ def h3_block_train_backward[
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LoRA VARIANT — the four musubi targets (qkv_proj / out_proj / fc1 / fc2).
+# LoRA VARIANT — the four torchref targets (qkv_proj / out_proj / fc1 / fc2).
 # Adapters are additive overlays y += scale·B(A(x)) on top of the frozen base
 # projections; math + device helpers are the gated Klein LoRA path
 # (models/klein/lora_block.mojo). With all four adapters absent this reduces

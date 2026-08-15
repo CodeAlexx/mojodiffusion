@@ -289,7 +289,7 @@ def main() raises:
     # Sample-prompt source. argv 17 (sample_prompt_json) is the explicit
     # override; when it is absent the levers config's standard
     # validation_prompts_file supplies the inline sampler prompts. ideogram4 is
-    # AI-toolkit-oracle, so this only ADDS the standard file source — no argv or
+    # Torchref-oracle, so this only ADDS the standard file source — no argv or
     # key is renamed. The file is consulted only when the inline sampler is
     # enabled (argv 12 > 0); with sampling off the key is timing-inert and
     # silently ignored (it configures the sampler, not a mistraining risk).

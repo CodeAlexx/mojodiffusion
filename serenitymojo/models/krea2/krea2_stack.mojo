@@ -16,7 +16,7 @@
 #   d_velocity → final-layer bwd (FROZEN, d_x only) → single-stream block bwd ×N
 #   (Phase-1's backward: LoRA dA/dB + d_x carry) → STOP.
 # The text-fusion blocks + first/embedders are BEFORE the single-stream blocks →
-# frozen-skip in this file. ai-toolkit output also contains text-fusion LoRA
+# frozen-skip in this file. torchref output also contains text-fusion LoRA
 # under `diffusion_model.txtfusion.*`; that is a known product-parity blocker,
 # not an architectural exclusion.
 #
@@ -2384,7 +2384,7 @@ def _krea2_device_grad_for_adamw_state(
 ) raises -> TArc:
     if t[].dtype() == state.grad_dtype:
         return t.copy()
-    # The resident optimizer state defines grad storage. Krea2/ai-toolkit keeps
+    # The resident optimizer state defines grad storage. Krea2/torchref keeps
     # LoRA grads BF16; old F32-state callers still get an explicit cast here.
     var tg = TArc(cast_tensor(t[], state.grad_dtype, ctx))
     keepalive.append(tg.copy())

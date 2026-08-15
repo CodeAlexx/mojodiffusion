@@ -1,7 +1,7 @@
 """Krea-2 Attention parity oracle (the highest-risk op: GQA + QKNorm + RoPE + gate).
 
-Imports ai-toolkit's krea2 ``Attention`` + ``PositionalEncoding`` DIRECTLY from
-mmdit.py (torch+einops only, bypassing the ai-toolkit package __init__). Builds a
+Imports torchref's krea2 ``Attention`` + ``PositionalEncoding`` DIRECTLY from
+mmdit.py (torch+einops only, bypassing the torchref package __init__). Builds a
 production-arch Attention (dim=6144, heads=48, kvheads=12, bias=False) bf16-on-cuda
 with random weights, runs it on a random x + a real 3-axis RoPE freqs table, and
 dumps everything so the Mojo probe can run krea2_attention with the EXACT weights
@@ -20,7 +20,7 @@ import sys
 import torch
 from safetensors.torch import save_file
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import Attention, PositionalEncoding  # noqa: E402
 
 OUT = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/krea2_attention_oracle.safetensors"

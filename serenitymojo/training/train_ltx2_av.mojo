@@ -1,43 +1,43 @@
-# train_ltx2_av.mojo — LTX-2.3 22B VIDEO-MODE LoRA trainer (musubi-tuner oracle).
+# train_ltx2_av.mojo — LTX-2.3 22B VIDEO-MODE LoRA trainer (torchref oracle).
 #
 # PRODUCTION MILESTONE-1 (2026-07-09): the real video-mode training loop over the
 # lead-gated composition layer:
 #   per-block arm   models/ltx2/ltx2_video_backward.mojo   (torch gate cos 1.0)
 #   stack + tail    models/ltx2/ltx2_video_stack.mojo      (2-block torch gate cos
 #                   1.0 fwd/d_input/16x2 LoRA; 48-block real-depth smoke PASS)
-# Oracle = kohya musubi-tuner (SerenityTrainer does not support LTX-2). Recipe pinned
-# from the pinned musubi-tuner oracle (docs/ltx_2.md + ltx2_train_network.py):
-#   * cache: musubi-NATIVE files ({key}_..._ltx2.safetensors latents +
+# Oracle = torchref (SerenityTrainer does not support LTX-2). Recipe pinned
+# from the pinned torchref oracle (docs/ltx_2.md + ltx2_train_network.py):
+#   * cache: torchref-NATIVE files ({key}_..._ltx2.safetensors latents +
 #     {key}_ltx2_te.safetensors video_prompt_embeds/prompt_attention_mask).
-#     The TE embeds are POST-connector (musubi runs Embeddings1DConnector at
+#     The TE embeds are POST-connector (torchref runs Embeddings1DConnector at
 #     TE-cache time) => used DIRECTLY as block context; mask asserted all-ones
 #     (connector replaces pads with learnable registers — measured 2026-07-09).
 #   * sigma: shifted_logit_normal, mode STRETCHED for ltx 2.3 (percentile
 #     stretch 3.0902/-2.5758, eps=1e-3 reflect, 10% uniform), std 1.0, shift
 #     auto-interpolated from sequence length (0.95@1024tok -> 2.05@4096tok,
 #     UNCLAMPED — ltx2_train_network.py:1768/1799). Math in
-#     training/ltx2/schedule.mojo (verified line-exact vs musubi).
+#     training/ltx2/schedule.mojo (verified line-exact vs torchref).
 #   * target = noise - latent; plain MSE mean (weighting_scheme FORCED none,
 #     ltx2_train_network.py:7332); video_loss_weight default 1.0.
 #   * optimizer: torch-default AdamW (betas .9/.999, eps 1e-8, wd 0.01),
 #     lr 1e-4, CONSTANT schedule, global grad clip max_norm=1.0
 #     (hv_train_network.py:4141 default / :3581 clip call). Masters are F32
-#     (musubi ss_full_bf16=False keeps trainable params F32,
+#     (torchref ss_full_bf16=False keeps trainable params F32,
 #     hv_train_network.py:2504); bf16 ONLY at save. The bf16-master era
 #     (pre-2026-07-16-evening) absorbed 30-57% of A-updates per step — see
 #     _adamw_host_list_f32. Anchor digits re-baselined (grad path sees
 #     unrounded F32 kaiming A from step 1; loss@step1 unchanged, B=0).
 #   * LoRA: rank 32 / alpha 32 (docs/ltx_2.md standard command), video-mode
 #     active surface = {attn1,attn2}x{to_q,to_k,to_v,to_out.0} = 8/block x 48
-#     = 384 adapters (musubi t2v preset also CREATES audio-module adapters but
+#     = 384 adapters (torchref t2v preset also CREATES audio-module adapters but
 #     they receive no grads with audio=None; we train+save the video set).
-#     Init: A ~ kaiming-uniform U(-1/sqrt(in), +1/sqrt(in)) (kohya), B = 0.
+#     Init: A ~ kaiming-uniform U(-1/sqrt(in), +1/sqrt(in)) (torchref), B = 0.
 #   * save keys: diffusion_model.transformer_blocks.N.<module>.lora_A/B.weight
-#     (musubi convert_lora_to_comfy target format; training/ltx2/lora_surface).
+#     (torchref convert_lora_to_comfy target format; training/ltx2/lora_surface).
 #
 # DTYPE (milestone-1): stack fwd+bwd F32 end-to-end (the frozen block backward
 # is an F32 carrier — see the real-depth smoke header); head runs BF16 (the
-# musubi network dtype) with outputs cast to F32. Speed pass comes later; the
+# torchref network dtype) with outputs cast to F32. Speed pass comes later; the
 # 48-block streamed F32 step measured ~58s on the real dev-fp8 checkpoint.
 #
 # LEVERS NOTE: loss/optimizer stay the literal legacy-default formulas
@@ -46,22 +46,22 @@
 #
 # VAL_LOSS (P2): --val_cache_dir + --validate_every run a forward-ONLY eval over
 # the val cache at cadence (same F32 MSE-mean loss formula + levers seam as train,
-# mean of per-sample scalars — musubi-exact hv:3155-3167). DELIBERATE DEVIATION:
-# musubi's val noise+sigma are FRESH UNSEEDED global-RNG draws that ADVANCE the
+# mean of per-sample scalars — torchref-exact hv:3155-3167). DELIBERATE DEVIATION:
+# torchref's val noise+sigma are FRESH UNSEEDED global-RNG draws that ADVANCE the
 # training RNG (hv:3027/3029, no guard); ours are DETERMINISTIC per val-index on
 # isolated seed streams (sigma seed cfg.seed*10007+1, noise cfg.seed*2000003+idx*
 # 104729) — reproducible + isolated by construction, strictly better for overfit
 # detection. Same-class, NOT bit-parity. Default-off.
 # SAMPLING (P2): --sample_every saves the COMFY/PEFT artifact (<base>.safetensors)
-# AND the native musubi artifact (<base>.native.safetensors), plus a ready-to-run
+# AND the native torchref artifact (<base>.native.safetensors), plus a ready-to-run
 # render command file (NEVER auto-run — staged-loader rule). The render path is
 # scripts/ltx2_hq_ref_run.py (loads COMFY keys via LTXV_LORA_COMFY_RENAMING_MAP):
-# musubi's OWN generator OOMs on 24GB loading Gemma next to the resident DiT
+# torchref's OWN generator OOMs on 24GB loading Gemma next to the resident DiT
 # (MEASURED 2026-07-16, campaign plan P2 — bf16-single-file AND its 8bit+swap-44
 # recipe both, then "Generation complete" over an EMPTY dir). The native artifact
-# is kept as the musubi-parity export (that generator returns once precached
+# is kept as the torchref-parity export (that generator returns once precached
 # prompts are wired).
-# RESUME (musubi parity): musubi keeps LoRA masters in F32 (network_dtype F32,
+# RESUME (torchref parity): torchref keeps LoRA masters in F32 (network_dtype F32,
 # hv_train_network.py:2504; bf16 ONLY under opt-in --full_bf16 with stochastic
 # rounding) and on resume restores network weights + optimizer state + step
 # (metadata priority, scheduler fallback). We match that: --resume loads the
@@ -72,7 +72,7 @@
 # warm case, so its trainer_warn_warm_resume banner does not apply). The loop
 # continues at saved_step+1. Because our sigma/noise/sample streams are
 # (seed,step)-DERIVED (no RNG pickle), restoring the step alone restores every
-# stream EXACTLY — stronger than musubi's RNG-state-pickle approach. Resume scope
+# stream EXACTLY — stronger than torchref's RNG-state-pickle approach. Resume scope
 # (seed / dataset size+identity / token layout) is guarded through the shared
 # trainer_core 5-field __meta__ (trainer_state_meta + trainer_resume_meta_guard);
 # legacy 2-field metas still resume (step,seed only).
@@ -86,7 +86,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo build -O2 -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/training/train_ltx2_av.mojo -o /tmp/ltx2_av_trainer
-#   /tmp/ltx2_av_trainer --dataset_cache_dir /path/to/ltx2_musubi_v3/cache \
+#   /tmp/ltx2_av_trainer --dataset_cache_dir /path/to/ltx2_torchref_v3/cache \
 #       --output_dir ./output/ltx2_video_lora --max_steps 4
 
 from std.sys import argv
@@ -211,7 +211,7 @@ comptime EPS = Float32(1e-6)
 comptime LAT_KEY = "latents_4x9x16_bfloat16"
 comptime ENC_KEY = "video_prompt_embeds_bfloat16"
 comptime DEFAULT_CKPT_NAME = "ltx-2.3-22b-dev-fp8.safetensors"
-comptime MAX_GRAD_NORM = Float32(1.0)   # musubi hv_train_network default
+comptime MAX_GRAD_NORM = Float32(1.0)   # torchref hv_train_network default
 
 
 def _has_arg(args: List[String], name: String) -> Bool:
@@ -258,7 +258,7 @@ def _apply_sigma_rescale(sigma: Float32, cfg: LTX2TrainerConfig) -> Float32:
         + cfg.min_timestep / Float32(1000.0)
 
 
-# ── musubi-recipe sigma for one step (s_v = token count of the geometry) ─────
+# ── torchref-recipe sigma for one step (s_v = token count of the geometry) ─────
 def _sample_sigma(cfg: LTX2TrainerConfig, step: Int, s_v: Int) raises -> Float32:
     if cfg.timestep_sampling != SIGMA_SHIFTED_LOGIT_NORMAL:
         # SIGMA_UNIFORM
@@ -283,7 +283,7 @@ def _sample_sigma(cfg: LTX2TrainerConfig, step: Int, s_v: Int) raises -> Float32
         ), cfg)
 
 
-# ── cache enumeration: pair musubi latent/TE files, filter to the comptime
+# ── cache enumeration: pair torchref latent/TE files, filter to the comptime
 #    geometry (klein bucket-filter pattern) ───────────────────────────────────
 struct CacheItem(Copyable, Movable):
     var lat_path: String
@@ -314,7 +314,7 @@ struct CacheItem(Copyable, Movable):
         return self.mask_path.byte_length() > 0
 
 
-# Pair a latent file with its TE file. Musubi latent names are
+# Pair a latent file with its TE file. Torchref latent names are
 # `{itemkey}[_{window}]_{WxH}_ltx2.safetensors` and item keys themselves may
 # contain underscores (e.g. `16989751_095_f66d`), so a first-underscore split
 # is WRONG. Robust rule: the TE file is `{X}_ltx2_te.safetensors` where X is
@@ -380,7 +380,7 @@ def _enumerate_cache(dir: String, lat_key: String) raises -> List[CacheItem]:
 
 
 # ── IC-LoRA / v2v: pair a downscaled REFERENCE latent with every target ──────
-# Host-side (no ctx): sets CacheItem.ref_lat_path via the musubi basename route
+# Host-side (no ctx): sets CacheItem.ref_lat_path via the torchref basename route
 # (serenitymojo/training/ltx2/v2v_cache.mojo). Fails loud on a missing/malformed
 # reference cache. The forward that PREPENDS the reference tokens is P5 unit 2;
 # this only makes the paired cache readable.
@@ -412,7 +412,7 @@ def _cadence_reached(period: Int, start_update: Int, max_update: Int) -> Bool:
     return (max_update // period) > (start_update // period)
 
 
-# IC-LoRA / v2v first-frame conditioning (musubi ltx2_train_network.py:3327-3343,
+# IC-LoRA / v2v first-frame conditioning (torchref ltx2_train_network.py:3327-3343,
 # default p=0.1): a PER-STEP (per-batch) Bernoulli scalar drawn on its OWN seed
 # base (distinct from caption-dropout's seed*31 — P7 stream-registry note). Video
 # arms only (the num_frames>1 guard lives at the comptime NFp>1 call sites).
@@ -485,7 +485,7 @@ def _any_true(m: List[Bool]) -> Bool:
     return False
 
 
-# musubi infer_ic_lora_strategy_from_preset (ltx2_train_network.py:85): the LoRA
+# torchref infer_ic_lora_strategy_from_preset (ltx2_train_network.py:85): the LoRA
 # target preset maps the "auto" IC-LoRA strategy — v2v preset -> v2v,
 # audio_ref_only_ic -> audio_ref_only_ic, else none.
 def _infer_ic_lora_strategy(preset: Int) -> String:
@@ -526,13 +526,13 @@ def _perm021() -> List[Int]:
     var p = List[Int](); p.append(0); p.append(2); p.append(1); return p^
 
 
-# patchify [1,C,NF,NH,NW] -> [1,s_v,C] (musubi VideoLatentPatchifier p=(1,1,1):
+# patchify [1,C,NF,NH,NW] -> [1,s_v,C] (torchref VideoLatentPatchifier p=(1,1,1):
 # token order f outer, h, w inner — same as the gated stack head).
 def _patchify_tokens(x5: Tensor, s_v: Int, ctx: DeviceContext) raises -> Tensor:
     return permute(reshape(x5, _sh3(1, C, s_v), ctx), _perm021(), ctx)
 
 
-# F32 master adapter (musubi keeps trainable LoRA params in F32 —
+# F32 master adapter (torchref keeps trainable LoRA params in F32 —
 # ss_full_bf16=False default; hv_train_network.py:2504). Params/moments stay
 # F32 for the whole run; bf16 happens ONLY at save (LoraAdapter constructor
 # downcast). MEASURED 2026-07-16: the previous bf16-master write-back absorbed
@@ -561,7 +561,7 @@ struct F32Lora(Copyable, Movable):
         self.vb = vb^
 
 
-# ── video-mode LoRA master set (kohya init) ──────────────────────────────────
+# ── video-mode LoRA master set (torchref init) ──────────────────────────────────
 # slot count is PRESET-DERIVED: t2v = 8 attention modules; v2v = +2 video FFN
 # (ff.net.0.proj, ff.net.2) = 10. Everything below drives off len(mods).
 def _module_paths(preset: Int) -> List[String]:
@@ -612,7 +612,7 @@ def _strip_suffix(s: String, suf: String) -> String:
 
 
 # LR for the CURRENT (1-based) optimizer step via the config-JSON LR levers.
-# Routes through transformers_lr_for_step (musubi's LR path IS transformers), NOT
+# Routes through transformers_lr_for_step (torchref's LR path IS transformers), NOT
 # the flame lr_for_step whose warmup ramp (step+1)/W diverges. transformers
 # optimizer step k consumes lambda(k-1), so we pass step-1 (0-based). base = the
 # ltx2-effective cfg.learning_rate, horizon = cfg.max_steps (argv wins). Default
@@ -622,7 +622,7 @@ def _ltx2_step_lr(cfg: LTX2TrainerConfig, step: Int) raises -> Float32:
     if kind != LR_CONSTANT and kind != LR_LINEAR and kind != LR_COSINE:
         raise Error(
             String("train_ltx2_av: lr_scheduler ") + String(kind)
-            + " not wired for ltx2 (musubi exposes constant|linear|cosine;"
+            + " not wired for ltx2 (torchref exposes constant|linear|cosine;"
             + " cosine_with_restarts/polynomial/rex owed follow-up)")
     return transformers_lr_for_step(
         cfg.learning_rate, step - 1, cfg.levers.lr_warmup_steps,
@@ -649,10 +649,10 @@ def _write_text_file(path: String, body: String) raises:
     _ = sys_close(fd)
 
 
-# musubi NATIVE lora_unet_* key stem for (block, module) — dots -> underscores
+# torchref NATIVE lora_unet_* key stem for (block, module) — dots -> underscores
 # (to_out.0 -> to_out_0). DERIVED from mods[s] so it aligns with the master slot
 # regardless of module order (same construction the 1152-key native round-trip
-# gate exercises: ltx2_lora_musubi_native_roundtrip.mojo). save_lora_serenity_trainer
+# gate exercises: ltx2_lora_torchref_native_roundtrip.mojo). save_lora_serenity_trainer
 # appends .alpha/.lora_down.weight/.lora_up.weight.
 def _native_prefix(bi: Int, module_path: String) -> String:
     var b = module_path.as_bytes()
@@ -668,16 +668,16 @@ def _native_prefix(bi: Int, module_path: String) -> String:
 
 # Write a ready-to-run (NOT auto-executed) render command. Render path = the
 # PROVEN HQ script with the COMFY/PEFT artifact (ltx2_hq_ref_run.py --user-lora,
-# comfy keys via LTXV_LORA_COMFY_RENAMING_MAP) — the musubi generator MEASURED-
+# comfy keys via LTXV_LORA_COMFY_RENAMING_MAP) — the torchref generator MEASURED-
 # FAILS on 24GB (2026-07-16, campaign plan P2: its in-process Gemma encode OOMs
 # next to the resident DiT under both its bf16-single-file AND 8bit+swap-44
 # recipes, then prints "Generation complete" over an EMPTY dir). The .native
-# artifact is still saved alongside (musubi-parity; that generator path can
+# artifact is still saved alongside (torchref-parity; that generator path can
 # return once precached-prompt support is wired). Kept a command FILE because
 # renders must never run concurrently with the trainer (staged-loader rule).
 # Write a ready-to-run (NOT auto-executed) render command. Render path = the
 # PROVEN HQ script with the COMFY/PEFT artifact (ltx2_hq_ref_run.py --user-lora,
-# comfy keys via LTXV_LORA_COMFY_RENAMING_MAP) — the musubi generator MEASURED-
+# comfy keys via LTXV_LORA_COMFY_RENAMING_MAP) — the torchref generator MEASURED-
 # FAILS on 24GB (2026-07-16, campaign plan P2). Kept a command FILE because
 # renders must never run concurrently with the trainer (staged-loader rule).
 #
@@ -687,7 +687,7 @@ def _native_prefix(bi: Int, module_path: String) -> String:
 #   --v2v-ref-latent <path>  a safetensors with a single latents_{F}x{H}x{W}_*
 #                            key (the SAME format as the training ref cache) —
 #                            load it, patchify (patch=1), and PREPEND it on the
-#                            token axis (musubi ltx2_train_network.py:3354-3356);
+#                            token axis (torchref ltx2_train_network.py:3354-3356);
 #   --v2v-downscale <int>    reference_downscale — multiply the ref H/W rope
 #                            coords by this (co-location, :3402-3405);
 #   and build the two-grid rope with the SPINE convention (fixed max_pos
@@ -735,7 +735,7 @@ def _write_sample_cmd(
 
 
 def _kaiming_a(rank: Int, in_f: Int, seed: UInt64) -> List[Float32]:
-    # kohya LoRA A init: kaiming_uniform_(a=sqrt(5)) == U(-1/sqrt(in), +1/sqrt(in))
+    # torchref LoRA A init: kaiming_uniform_(a=sqrt(5)) == U(-1/sqrt(in), +1/sqrt(in))
     var bound = Float32(1.0) / sqrt(Float32(in_f))
     var out = List[Float32]()
     for i in range(rank * in_f):
@@ -794,9 +794,9 @@ def _lora_to_device(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# The training run for ONE comptime geometry. Video mode over musubi-native
+# The training run for ONE comptime geometry. Video mode over torchref-native
 # caches; `S_Vp = NFp*NHp*NWp` tokens; images are 1-frame samples (NFp=1),
-# exactly musubi's image handling ("treated as 1-frame samples (F=1)").
+# exactly torchref's image handling ("treated as 1-frame samples (F=1)").
 # ═════════════════════════════════════════════════════════════════════════════
 def _run_geometry[
     S_Vp: Int, NFp: Int, NHp: Int, NWp: Int,
@@ -814,19 +814,19 @@ def _run_geometry[
     comptime if S_REF > 0:
         comptime assert S_REF + S_TGT == S_Vp, "v2v: S_REF + S_TGT must equal S_Vp"
         comptime assert S_REF == RNFp * RNHp * RNWp, "v2v: S_REF must equal RNFp*RNHp*RNWp"
-        # NO exact-multiple assert: musubi multiplies ref positions by the INTEGER
+        # NO exact-multiple assert: torchref multiplies ref positions by the INTEGER
         # reference_downscale (ltx2_train_network.py:3402-3405), so ref×DS only
         # APPROXIMATELY co-locates on non-power-of-2 target extents (e.g. NH=9,
-        # RNH=4, DS=2: ref reaches 8·32 vs target 9·32) — musubi-faithful.
+        # RNH=4, DS=2: ref reaches 8·32 vs target 9·32) — torchref-faithful.
         comptime assert DS_P >= 1, "v2v: reference_downscale (DS) must be >= 1"
     var ckpt = cfg.ltx2_checkpoint
     if ckpt.byte_length() == 0:
         ckpt = serenity_checkpoint(String(DEFAULT_CKPT_NAME))
     if cfg.dataset_cache_dir.byte_length() == 0:
-        raise Error("train_ltx2_av: --dataset_cache_dir is required (musubi-native cache)")
+        raise Error("train_ltx2_av: --dataset_cache_dir is required (torchref-native cache)")
     _ = sys_mkdirs(cfg.output_dir)
 
-    print("[ltx2-video-lora] musubi-oracle trainer — geometry",
+    print("[ltx2-video-lora] torchref-oracle trainer — geometry",
           "S_V=", S_Vp, "(", NFp, "x", NHp, "x", NWp, ") N_TXT=", N_TXT,
           "blocks=", NUM_LAYERS, "key=", lat_key)
     var items = _enumerate_cache(cfg.dataset_cache_dir, lat_key)
@@ -869,7 +869,7 @@ def _run_geometry[
                 or cfg.levers.suffix_conditioning_p > Float32(0.0)) \
                and cfg.levers.temporal_boundary * (NHp * NWp) >= S_TGT:
                 print("[ltx2-v2v] WARN: temporal_boundary covers the whole grid — prefix/suffix degenerate to full conditioning")
-    # first-frame conditioning probability (default 0.0 OFF; musubi 0.1). Video
+    # first-frame conditioning probability (default 0.0 OFF; torchref 0.1). Video
     # arms only (comptime NFp>1 gates it).
     var first_frame_p = Float32(0.0)
     for i in range(len(args)):
@@ -890,7 +890,7 @@ def _run_geometry[
     if cfg.levers.val_reference_cache_dir.byte_length() > 0:
         val_ref_cache_dir = cfg.levers.val_reference_cache_dir
     # ic_lora_strategy: config default "auto"; argv override; config WINS when set
-    # to a non-"auto" value. "auto" -> infer from the LoRA preset (musubi
+    # to a non-"auto" value. "auto" -> infer from the LoRA preset (torchref
     # infer_ic_lora_strategy_from_preset). audio_ref_only_ic fail-loud (P6).
     var ic_strategy = String("auto")
     for i in range(len(args)):
@@ -932,7 +932,7 @@ def _run_geometry[
     var model_cfg = LTX2Config.ltx2()
 
     # ── SPEED PASS speed flags (LTX2_FAST is now the DEFAULT — band gate PASSED
-    #    n=100 vs the musubi oracle 2026-07-16, lead-authorized for production) ──
+    #    n=100 vs the torchref oracle 2026-07-16, lead-authorized for production) ──
     #   DEFAULT (no flag) = LTX2_FAST: bf16 stack + device optimizer (~7.3 s/step,
     #                        ~20% vs the 9.4 F32-host baseline).
     #   LTX2_F32_STACK=1   = ESCAPE HATCH: F32 stack + host AdamW = the old default
@@ -952,7 +952,7 @@ def _run_geometry[
 
     # ── P4 grad-accumulation ─────────────────────────────────────────────────
     # accum_steps micro-steps SUM into one window, MEAN, then ONE optimizer step
-    # (musubi-faithful for LoRA: bs1×accum-N grads == musubi's bs-N per-sample-
+    # (torchref-faithful for LoRA: bs1×accum-N grads == torchref's bs-N per-sample-
     # sigma stack — no cross-sample ops). max_steps counts UPDATES (total micros
     # = max_steps×accum). accum==1 -> window bypassed, BYTE-IDENTICAL to the
     # per-step path (sum-of-one/÷1, trainer_core:251-252). true bs>1 is DEFERRED
@@ -988,7 +988,7 @@ def _run_geometry[
     # loads bf16 (run_f32=False): fwd + recompute-bwd GEMMs run bf16 (rms_norm
     # still F32-accumulates — ops/norm.mojo:20-21, carrier-safe). LoRA masters stay
     # F32; the compute (side-GEMMs) is bf16. FORK-1 (lead-ruled): bf16-LoRA-compute
-    # IS musubi's OWN class — musubi wraps the transformer in accelerator.autocast()
+    # IS torchref's OWN class — torchref wraps the transformer in accelerator.autocast()
     # bf16 (hv:3846-3853; parity ref-gen replicates with torch.autocast bf16), and
     # LoRA wraps the Linears as org_forward + lora_up(lora_down(x))*scale
     # (lora.py:140-142), so under autocast the F32-master LoRA params run bf16 GEMMs
@@ -1000,7 +1000,7 @@ def _run_geometry[
     var stack_dt = STDtype.F32 if stack_f32 else STDtype.BF16
     if bf16_stack:
         print("  [speed] bf16 stack carriers ON (DEFAULT; fwd+recompute-bwd GEMMs bf16;",
-              "norms F32; LoRA F32-master / bf16-compute = musubi autocast class)")
+              "norms F32; LoRA F32-master / bf16-compute = torchref autocast class)")
     else:
         print("  [speed] F32 stack (", "LTX2_F32_STACK escape" if f32_escape else "lever optimizer", ")")
 
@@ -1326,10 +1326,10 @@ def _run_geometry[
     # _sample_sigma with a val-namespaced seed (cfg.seed*10007+1) keyed on the val
     # index; noise seeded cfg.seed*2000003 + index*104729 (distinct multipliers
     # from the training sigma/noise streams -> decorrelated + never colliding).
-    # This is a DOCUMENTED DEVIATION from musubi, whose val noise+sigma are FRESH
+    # This is a DOCUMENTED DEVIATION from torchref, whose val noise+sigma are FRESH
     # UNSEEDED global-RNG draws that even ADVANCE the training RNG (hv:3027/3029,
     # no save/restore guard) — deterministic-by-index is strictly better for
-    # overfit detection; the loss FORMULA/mean/cadence are musubi-exact
+    # overfit detection; the loss FORMULA/mean/cadence are torchref-exact
     # (hv:3155-3167). C13: off unless BOTH --val_cache_dir and --validate_every.
     var val_on = cfg.val_cache_dir.byte_length() > 0 and cfg.validate_every > 0
 
@@ -1444,13 +1444,13 @@ def _run_geometry[
             _load_bf16(item.te_path, String(ENC_KEY), ctx), _sh3(1, N_TXT, VD), ctx)
 
         # ── caption-dropout lever (MJ-1113) ─────────────────────────────────
-        # musubi drops a caption by ZEROING the cached video_prompt_embeds row
+        # torchref drops a caption by ZEROING the cached video_prompt_embeds row
         # AND collapsing the text mask to idx-0-only; the mask collapse is PROVEN
-        # forward-IRRELEVANT once the embeds are zeroed (bit-identical in musubi's
+        # forward-IRRELEVANT once the embeds are zeroed (bit-identical in torchref's
         # own runtime — output/ltx2_dropout_probe/probe.log). So we replace `enc`
         # with a same-shape zero bf16 tensor and leave the mask all-ones
         # (assert_prompt_mask_all_ones stays). DETERMINISM: the drop pick stream is
-        # seed*31+step (levers.mojo:100) — musubi's CPython-MT19937 PER-SAMPLE
+        # seed*31+step (levers.mojo:100) — torchref's CPython-MT19937 PER-SAMPLE
         # dropout ORDER is NOT reproduced (distribution-class, same treatment as
         # our sigma/noise/sample streams — intake doc LEVERS CONTRACT).
         if cap_drop_on and caption_dropout_pick(
@@ -1463,7 +1463,7 @@ def _run_geometry[
             ctx.synchronize()
         var tm_load = perf_counter_ns()
 
-        # ── musubi flow-match noising (F32) ─────────────────────────────────
+        # ── torchref flow-match noising (F32) ─────────────────────────────────
         # sigma keyed on the TARGET-grid token count (== S_Vp on the t2v path);
         # v2v noises ONLY the target latent, ref flows clean (lead ruling 2).
         var sigma = _sample_sigma(cfg, step, S_TGT)
@@ -1504,7 +1504,7 @@ def _run_geometry[
             ctx.synchronize()
         var tm_noise = perf_counter_ns()
 
-        # ── head (BF16, musubi network dtype) -> F32 stack inputs ────────────
+        # ── head (BF16, torchref network dtype) -> F32 stack inputs ────────────
         var noisy_bf16 = cast_tensor(noisy, STDtype.BF16, ctx)
         var ho: LTX2VideoHeadOut
         comptime if S_REF > 0:
@@ -1521,7 +1521,7 @@ def _run_geometry[
             ho = head.forward[S_Vp, N_TXT](noisy_bf16, enc, sigma, NFp, NHp, NWp, FRAME_RATE, ctx)
         # stack_dt = F32 (default, C13) or BF16 (LTX2_BF16_STACK). The stack GEMMs
         # follow the block-weight dtype (bf16 when run_f32=False); feeding bf16
-        # carriers here keeps the whole stack in musubi's bf16-autocast class.
+        # carriers here keeps the whole stack in torchref's bf16-autocast class.
         var hidden = cast_tensor(ho.hidden, stack_dt, ctx)
         var v_temb = cast_tensor(ho.v_temb, stack_dt, ctx)
         var v_embedded = cast_tensor(ho.v_embedded, stack_dt, ctx)
@@ -1676,7 +1676,7 @@ def _run_geometry[
 
         # ── clip + optimizer: DEVICE-fused (Phase A) or HOST (C13) ───────────
         # step_lr = scheduled LR (default constant/warmup0 -> cfg.learning_rate
-        # EXACTLY). Both arms clip at musubi max_norm=1.0 then take one decoupled-
+        # EXACTLY). Both arms clip at torchref max_norm=1.0 then take one decoupled-
         # WD AdamW step. The fused device kernel is FORMULA-IDENTICAL to
         # _adamw_host_list_f32 (same bias correction, same WD-before-subtract,
         # clip_scale folded into g); value-class vs host (device FMA + F32 norm
@@ -1727,7 +1727,7 @@ def _run_geometry[
                 Float32(0.9), Float32(0.999), Float32(1e-8), cfg.weight_decay,
                 ctx, clip_scale)
         else:
-            # ── musubi global grad clip (max_norm=1.0, default-ON) — HOST ─────
+            # ── torchref global grad clip (max_norm=1.0, default-ON) — HOST ─────
             var sq = 0.0
             for ai in range(len(grads.d_a)):
                 for i in range(len(grads.d_a[ai])):
@@ -1910,7 +1910,7 @@ def _run_geometry[
                     var sd = _slot_dims(mods[s])
                     var pfx = diffusion_lora_prefix(bi, mods[s])
                     # PEFT file: bf16 happens HERE (LoraAdapter constructor
-                    # downcast) — matching musubi's f32-train/bf16-save.
+                    # downcast) — matching torchref's f32-train/bf16-save.
                     named.append(NamedLora(
                         pfx.copy(),
                         LoraAdapter(
@@ -1953,12 +1953,12 @@ def _run_geometry[
         # keys (LTXV_LORA_COMFY_RENAMING_MAP) — so we MUST emit <base>.safetensors
         # here (not only at save cadence) so the .sh's --user-lora always exists.
         # The NATIVE (save_lora_serenity_trainer, alpha/lora_down/lora_up) artifact is
-        # kept alongside as the musubi-parity export (the musubi generator path may
+        # kept alongside as the torchref-parity export (the torchref generator path may
         # return once precached-prompt support is wired). The .sh is NOT
         # auto-executed (staged-loader rule; never concurrent with the trainer).
         if cfg.sample_every > 0 and _opt_idx % cfg.sample_every == 0:
             var named = List[NamedLora]()   # comfy/PEFT — the HQ render artifact
-            var nat = List[NamedLora]()     # native — musubi-parity export
+            var nat = List[NamedLora]()     # native — torchref-parity export
             for bi in range(NUM_LAYERS):
                 for s in range(n_slots):
                     ref msrc = masters[bi * n_slots + s]
@@ -2008,7 +2008,7 @@ def _run_geometry[
 # per block — no fp8-resident) and the committed backward consumes saved acts for
 # ALL blocks, so NONE of the video runner's fp8-resident/device-opt/capture/accum
 # machinery applies — F32 masters + _adamw_host_list_f32. Numeric pieces gated at
-# the musubi-correct rope (causal_offset=1, max_pos [20,2048,2048]): stack fwd
+# the torchref-correct rope (causal_offset=1, max_pos [20,2048,2048]): stack fwd
 # 37/0, bwd 115/0, rope 8/8, loss-combine 4/4, cache round-trip 9/9.
 comptime AD_INNER = 2048   # audio inner_dim
 # AV arm checkpoint: the DISTILLED fp8-dequant-bf16 model carries the audio
@@ -2049,7 +2049,7 @@ def _av_slot_dims(w0: LTX2AVBlockWeights, module_path: String) raises -> Tuple[I
 
 
 # tri-pair audio latent [C,T,mel] -> [1, S_A=T, patch_in=C*mel] (the audio
-# patchify input; musubi ltx2_cache_latents.py:473-490 stores [C,T,mel]). Mirrors
+# patchify input; torchref ltx2_cache_latents.py:473-490 stores [C,T,mel]). Mirrors
 # the gated ltx2_av_cache_roundtrip reshape.
 def _load_audio_latent_tokens(apath: String, akey: String, ctx: DeviceContext) raises -> Tensor:
     var ast = ShardedSafeTensors.open(apath)
@@ -2068,7 +2068,7 @@ def _load_audio_latent_tokens(apath: String, akey: String, ctx: DeviceContext) r
 
 
 def _load_audio_length(apath: String, alen_key: String) raises -> Int:
-    """`audio_lengths_*` is I32 — musubi ltx2_cache_latents.py:483-490 writes
+    """`audio_lengths_*` is I32 — torchref ltx2_cache_latents.py:483-490 writes
     `torch.tensor(effective_steps, dtype=torch.int32)`. Read the raw bytes:
     from_view_as_f32 REJECTS I32 (io/dtype.mojo:154-166 admits BF16/F16/F32
     only), which is what made the first AV micro-run die with
@@ -2077,7 +2077,7 @@ def _load_audio_length(apath: String, alen_key: String) raises -> Int:
     var info = ast.tensor_info(alen_key)
     if info.dtype != STDtype.I32:
         raise Error(String("av audio cache key '") + alen_key + "' must be I32"
-            + " (musubi writes torch.int32); got " + info.dtype.name())
+            + " (torchref writes torch.int32); got " + info.dtype.name())
     var bytes = ast.tensor_bytes(alen_key)
     var v = Int(bytes.unsafe_ptr().bitcast[Int32]()[0])
     return v
@@ -2252,7 +2252,7 @@ def _run_geometry_av[
     else:
         print("  [resident] OFF (--resident_blocks 0); blocks stream per visit")
 
-    # rope built ONCE (geometry-fixed, musubi-correct offset=1 + max_pos 2048).
+    # rope built ONCE (geometry-fixed, torchref-correct offset=1 + max_pos 2048).
     var rope = ltx2_av_build_rope[NF, NH, NW, S_A](ctx)
 
     var t_start = perf_counter_ns()
@@ -2476,11 +2476,11 @@ def main() raises:
     levers_optimizer_validate(cfg.levers, String("train_ltx2_av"))
 
     # P4: true bs>1 is DEFERRED (B=1 comptime-baked in every stack/block/flash
-    # shape; accum is the musubi-equivalent for LoRA — plan P4). FAIL LOUD here,
+    # shape; accum is the torchref-equivalent for LoRA — plan P4). FAIL LOUD here,
     # before ANY DeviceContext, so it's provable without touching the GPU.
     if cfg.batch_size > 1:
         raise Error(String("train_ltx2_av: batch_size>1 is DEFERRED (accum is the")
-            + " musubi-equivalent for LoRA — see plan P4). Got batch_size="
+            + " torchref-equivalent for LoRA — see plan P4). Got batch_size="
             + String(cfg.batch_size) + "; use --gradient_accumulation_steps N instead.")
 
     if cfg.ltx_mode == MODE_AV:
@@ -2521,7 +2521,7 @@ def main() raises:
     elif geometry == "video_v2v":
         # IC-LoRA / v2v video arm (P5): target 4x9x16 (576) + single-image
         # reference 1x8x8-class downscaled to 1x4x8 (32, DS=2) -> S_COMB=608.
-        # Ref grid is APPROXIMATE co-location (9 != 4*2) — musubi-faithful. First-
+        # Ref grid is APPROXIMATE co-location (9 != 4*2) — torchref-faithful. First-
         # frame Bernoulli fires here (NFp>1); --reference_cache_dir required.
         _run_geometry[608, 4, 9, 16, 32, 1, 4, 8, 2](
             cfg, args, String("latents_4x9x16_bfloat16"))

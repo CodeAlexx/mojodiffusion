@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Byte-compare two LTX-2 LoRA safetensors (musubi comfy vs Mojo re-save).
+"""Byte-compare two LTX-2 LoRA safetensors (torchref comfy vs Mojo re-save).
 
 Usage: check_ltx2_lora_keys.py <original.safetensors> <resaved.safetensors>
 

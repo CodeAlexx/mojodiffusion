@@ -15,7 +15,7 @@
 #   2) NO caption rendering. Krea-2's conditioning is NOT the ideogram4 structured-
 #      JSON/chat-template digest. The Mojo prepare tokenizes
 #      KREA2_TPL_PREFIX + <raw caption> + KREA2_TPL_SUFFIX itself (krea2_paths.mojo,
-#      == ai-toolkit text_encoder.py:26-34 PROMPT_TEMPLATE_ENCODE_PREFIX/SUFFIX),
+#      == torchref text_encoder.py:26-34 PROMPT_TEMPLATE_ENCODE_PREFIX/SUFFIX),
 #      so this stager writes the RAW caption text unchanged. We must NOT pre-wrap it
 #      (the DROP_IDX=34 prefix-drop in encode_krea2_stack assumes the exact template).
 #
@@ -30,7 +30,7 @@
 # --uncond (caption dropout, flag-gated, default-off): ALSO write uncond.txt = the
 #   empty caption "". The Mojo prepare encodes it through the SAME PREFIX+""+SUFFIX
 #   path into the llm_uncond cache tensor; trainers substitute it when the seeded
-#   dropout schedule fires (matches ai-toolkit caption_dropout / the ideogram4
+#   dropout schedule fires (matches torchref caption_dropout / the ideogram4
 #   precedent). Note: for "" the template is just PREFIX+SUFFIX, whose length must
 #   still exceed DROP_IDX=34 — it does (the prefix alone is 34 tokens, the suffix
 #   adds 5, so LT=5 for the empty render, the same LT_NEG the inference pipeline uses).

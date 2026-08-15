@@ -1,5 +1,5 @@
 # models/dit/parity/krea2_blockops_parity_probe.mojo — PARITY GATE for krea2
-# chunk 2 leaf ops (RMSNorm + SwiGLU) vs a real ai-toolkit torch oracle, plus
+# chunk 2 leaf ops (RMSNorm + SwiGLU) vs a real torchref torch oracle, plus
 # compile-verified numeric self-checks for the two Modulations (no torch needed —
 # they are vec + param then chunk).
 #

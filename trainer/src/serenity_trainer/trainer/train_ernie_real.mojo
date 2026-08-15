@@ -24,7 +24,7 @@
 #   7. loss = mean MSE(pred, target) in F32;  d_loss = (2/N)*(pred - target).
 #   8. ernie_stack_lora_backward_resident_device -> LoRA d_A/d_B for all 7*36 adapters.
 #   9. host global-L2-norm clip (max_norm = 1.0; train_ernie.rs:1072) -> ernie_lora_adamw_step.
-#  10. save_ernie_lora at the end (PEFT/ai-toolkit keys, inference-loadable).
+#  10. save_ernie_lora at the end (PEFT/torchref keys, inference-loadable).
 #
 # Per-step line (stdout):
 #   [Ernie-lora] step k/total | epoch e/E | loss ... | grad_norm ... | ...s/step | elapsed ... | ETA ...

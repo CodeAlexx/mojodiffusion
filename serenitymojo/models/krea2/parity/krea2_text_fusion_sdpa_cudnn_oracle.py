@@ -3,7 +3,7 @@
 
 This is a diagnostic oracle for the TextFusion LoRA parity blocker.  It dumps
 BF16 q/k/v/d_out plus PyTorch `SDPBackend.CUDNN_ATTENTION` O/dQ/dK/dV for the
-two exact no-mask shapes used by ai-toolkit TextFusion:
+two exact no-mask shapes used by torchref TextFusion:
 
   - layerwise: [B=16, S=12, H=20, Dh=128]
   - refiner:   [B=1,  S=16, H=20, Dh=128]

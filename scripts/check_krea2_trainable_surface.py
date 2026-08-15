@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Check Krea2 ai-toolkit vs Mojo trainable LoRA surface coverage.
+"""Check Krea2 torchref vs Mojo trainable LoRA surface coverage.
 
 This is a blocker/readiness gate, not parity evidence. The current expected
-state is a known mismatch: ai-toolkit saves txtfusion LoRA tensors while the
+state is a known mismatch: torchref saves txtfusion LoRA tensors while the
 Mojo Krea2 smoke saves only main block LoRA tensors. The common main-block
 LoRA tensor names, shapes, and dtypes are expected to match.
 """
@@ -16,8 +16,8 @@ from pathlib import Path
 from safetensors import safe_open
 
 
-DEFAULT_AI_TOOLKIT = Path(
-    "/home/alex/ai-toolkit/output/my_first_lora_v1/my_first_lora_v1_000002994.safetensors"
+DEFAULT_TORCHREF = Path(
+    "/home/alex/torchref-image/output/my_first_lora_v1/my_first_lora_v1_000002994.safetensors"
 )
 DEFAULT_MOJO = Path(
     "/tmp/krea2_devicegrad_realcache_smoke/krea2_devicegrad_realcache_smoke_2.safetensors"
@@ -104,7 +104,7 @@ def _print_summary(label: str, summary: SurfaceSummary) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ai-toolkit", default=str(DEFAULT_AI_TOOLKIT))
+    parser.add_argument("--torchref", default=str(DEFAULT_TORCHREF))
     parser.add_argument("--mojo", default=str(DEFAULT_MOJO))
     parser.add_argument(
         "--expect-known-mismatch",
@@ -114,7 +114,7 @@ def main() -> int:
     parser.add_argument(
         "--expect-match",
         action="store_true",
-        help="pass only when Mojo covers the ai-toolkit key surface exactly",
+        help="pass only when Mojo covers the torchref key surface exactly",
     )
     args = parser.parse_args()
 
@@ -123,13 +123,13 @@ def main() -> int:
         return 2
 
     try:
-        ai = _load_surface(Path(args.ai_toolkit))
+        ai = _load_surface(Path(args.torchref))
         mojo = _load_surface(Path(args.mojo))
     except FileNotFoundError as exc:
         print(f"[krea2-surface] FAIL missing safetensors: {exc}")
         return 1
 
-    _print_summary("ai_toolkit", ai)
+    _print_summary("torchref", ai)
     _print_summary("mojo", mojo)
 
     missing_from_mojo = ai.keys - mojo.keys
@@ -202,7 +202,7 @@ def main() -> int:
             return 1
         print(
             "[krea2-surface] PASS known_mismatch "
-            "ai_toolkit_total=512 mojo_total=448 common_keys=448 "
+            "torchref_total=512 mojo_total=448 common_keys=448 "
             "missing_txtfusion=64 block_key_delta=0 shape_mismatch=0 dtype_mismatch=0 "
             "ai_target_prefixes=256 mojo_target_prefixes=224"
         )

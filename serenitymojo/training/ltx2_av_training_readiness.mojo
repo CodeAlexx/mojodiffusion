@@ -29,7 +29,7 @@ from serenitymojo.training.train_config import (
 
 comptime LTX2_BLOCKS = 48
 
-# musubi-tuner networks/lora_ltx2.py default LTX2_INCLUDE_PATTERNS_T2V:
+# torchref networks/lora_ltx2.py default LTX2_INCLUDE_PATTERNS_T2V:
 #   .*\.to_k$, .*\.to_q$, .*\.to_v$, .*\.to_out\.0$
 # It applies to all attention modules inside BasicAVTransformerBlock.
 comptime ATTN_PROJECTIONS_PER_MODULE = 4
@@ -37,7 +37,7 @@ comptime T2V_ATTENTION_MODULES_PER_BLOCK = 6
 comptime T2V_SLOTS_PER_BLOCK = T2V_ATTENTION_MODULES_PER_BLOCK * ATTN_PROJECTIONS_PER_MODULE
 comptime T2V_ADAPTERS_TOTAL = LTX2_BLOCKS * T2V_SLOTS_PER_BLOCK
 
-# musubi v2v preset adds video ff.net.{0.proj,2} and audio_ff.net.{0.proj,2}.
+# torchref v2v preset adds video ff.net.{0.proj,2} and audio_ff.net.{0.proj,2}.
 comptime V2V_EXTRA_FFN_SLOTS_PER_BLOCK = 4
 comptime V2V_SLOTS_PER_BLOCK = T2V_SLOTS_PER_BLOCK + V2V_EXTRA_FFN_SLOTS_PER_BLOCK
 comptime V2V_ADAPTERS_TOTAL = LTX2_BLOCKS * V2V_SLOTS_PER_BLOCK

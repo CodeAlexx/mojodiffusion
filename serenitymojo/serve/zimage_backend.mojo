@@ -29,7 +29,7 @@
 #
 # LoRA: forward overlay only — never fused. At most ONE overlay per job. Two
 # file formats load: the trainer resume format (load_zimage_lora_main_only_
-# resume) and the comfy/kohya export (musubi-tuner networks.lora_zimage,
+# resume) and the comfy/torchref export (torchref networks.lora_zimage,
 # lora_unet_layers_* keys with fused qkv → exact split, F5). Bare names
 # resolve against the scanner's loras dir (F4).
 
@@ -979,10 +979,10 @@ struct ZImageBackend(GenBackend, Movable):
                 var path = self.lora_paths[li]
                 var mult = self.lora_mults[li]
                 if zimage_lora_file_is_comfy(path):
-                    # F5: comfy/kohya export (musubi-tuner networks.lora_zimage:
+                    # F5: comfy/torchref export (torchref networks.lora_zimage:
                     # lora_unet_layers_* keys, fused qkv) — key-rename + exact
                     # qkv split; rank/alpha come from the file.
-                    print("[zimage][lora] loading comfy/kohya overlay", path)
+                    print("[zimage][lora] loading comfy/torchref overlay", path)
                     var lora = load_zimage_lora_main_only_comfy(
                         NUM_NR, NUM_CR, MAIN_DEPTH, D, F, mult,
                         path, self.ctx,

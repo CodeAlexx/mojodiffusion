@@ -8,7 +8,7 @@ execution is CUDA-only; CPU is used only to stage checkpoint bytes and write
 the small parity artifact.
 
 Run:
-  /home/alex/OneTrainer/venv/bin/python \
+  /home/alex/torchref/venv/bin/python \
     scripts/minimax_h3_ref2va_vision_tower_device_oracle.py
 """
 

@@ -3,14 +3,14 @@
 # PARITY GATE for the SCAIL-2 i2v WanAttentionBlock LoRA training unit
 # (models/scail2/scail2_block_train.mojo scail2_block_lora_{forward,backward}).
 # Consumes the dump from scail2_block_lora_oracle.py (a torch-autograd reference
-# forked from the certified Wan2.2 i2v Musubi oracle, with the residual stream
+# forked from the certified Wan2.2 i2v Torchref oracle, with the residual stream
 # pinned in float32). Compares x_out, d_x, d_context (IMG + TXT), and the 12
 # adapters' d_A/d_B against the torch reference.
 #
 # ALL comparisons gate at cos>=0.999 (forward, d_x, and EVERY LoRA d_A/d_B).
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/ai-toolkit/venv/bin/python \
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/scail2/parity/scail2_block_lora_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/scail2/parity/scail2_block_lora_parity.mojo
@@ -34,7 +34,7 @@ from serenitymojo.models.scail2.scail2_block_train import (
 
 comptime REF_DIR = "/home/alex/mojodiffusion/serenitymojo/models/scail2/parity/"
 
-# Reduced SCAIL-2 i2v block dims (DH real = 128); IMG=257 fixed by musubi split.
+# Reduced SCAIL-2 i2v block dims (DH real = 128); IMG=257 fixed by torchref split.
 comptime H = 4
 comptime DH = 128
 comptime DIM = H * DH           # 512

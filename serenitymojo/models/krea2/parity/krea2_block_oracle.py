@@ -3,14 +3,14 @@
 #
 # Torch oracle for ONE Krea-2-Raw SingleStreamBlock WITH LoRA on the 8 block
 # nn.Linears (wq wk wv gate wo mlp_gate mlp_up mlp_down). Replicates the EXACT
-# math of the ai-toolkit reference (extensions_built_in/diffusion_models/krea2/
+# math of the torchref reference (extensions_built_in/diffusion_models/krea2/
 # src/mmdit.py: SingleStreamBlock.forward 328-337, Attention.forward 212-228,
 # QKNorm/RMSNorm 153-177, SwiGLU 180-194, DoubleSharedModulation 122-133) and of
 # serenitymojo/models/krea2/krea2_block.mojo's forward. Dumps .bin references the
 # Mojo gate (krea2_block_parity.mojo) reads and compares at cos >= 0.999,
 # INCLUDING d_x and d_A/d_B for all 8 adapters.
 #
-# LoRA math (ai-toolkit lora_special.py / network_mixins.py):
+# LoRA math (torchref lora_special.py / network_mixins.py):
 #   y' = linear(x, W) + scale*((x @ Aᵀ) @ Bᵀ),  A=[rank,in] (lora_down),
 #        B=[out,rank] (lora_up), scale = alpha/rank.  (multiplier=1.0 in training)
 #

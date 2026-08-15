@@ -2,7 +2,7 @@
 #
 # WHY: the levers host path (levers_optimizer_step_host -> automagic3_step_2d)
 # runs the WHOLE optimizer on the CPU as List[Float32] loops over ~54M LoRA
-# elements/step (~10s on krea2). ai-toolkit's automagic3 is a torch optimizer =
+# elements/step (~10s on krea2). torchref's automagic3 is a torch optimizer =
 # GPU. This module moves the per-matrix math onto the device so automagic3 is
 # fast, mirroring the fused_lora_adamw_plain_step pack->upload->kernel pattern.
 #
@@ -668,7 +668,7 @@ def automagic3_device_step(
     ctx: DeviceContext,
 ) raises -> Float32:
     """One GPU automagic3 step over ALL adapters (A,B). Math on device (gated
-    vs host == ai-toolkit); SR bf16 writeback on host (verified fn). Returns the
+    vs host == torchref); SR bf16 writeback on host (verified fn). Returns the
     self-adapted lr after this step's vote."""
     var na = len(adapters)
     if na == 0:

@@ -22,7 +22,7 @@ from serenitymojo.lora import (
     SLOT_COLS,
     SLOT_ROWRANGE,
     FMT_DIFFUSION_MODEL,
-    FMT_KOHYA_SDXL,
+    FMT_TORCHREF_SDXL,
     FMT_ZIMAGE_TRAINER,
 )
 
@@ -38,11 +38,11 @@ def main() raises:
     print("detect(train_klein bare .lora_A.weight) =", fmt_dm,
           "expect", FMT_DIFFUSION_MODEL)
 
-    var kohya_keys = List[String]()
-    kohya_keys.append(String("lora_unet_input_blocks_4_1_attn1_to_q.lora_down.weight"))
-    kohya_keys.append(String("lora_unet_input_blocks_4_1_attn1_to_q.lora_up.weight"))
-    var fmt_kohya = _detect_format(kohya_keys)
-    print("detect(kohya lora_unet_/lora_down) =", fmt_kohya, "expect", FMT_KOHYA_SDXL)
+    var torchref_keys = List[String]()
+    torchref_keys.append(String("lora_unet_input_blocks_4_1_attn1_to_q.lora_down.weight"))
+    torchref_keys.append(String("lora_unet_input_blocks_4_1_attn1_to_q.lora_up.weight"))
+    var fmt_torchref = _detect_format(torchref_keys)
+    print("detect(torchref lora_unet_/lora_down) =", fmt_torchref, "expect", FMT_TORCHREF_SDXL)
 
     var zimg_keys = List[String]()
     zimg_keys.append(String("layers.0.attention.to_q.lora_A"))

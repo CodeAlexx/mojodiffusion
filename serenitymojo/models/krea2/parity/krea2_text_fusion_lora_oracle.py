@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ai-toolkit BF16 oracle for Krea2 TextFusion LoRA.
+"""torchref BF16 oracle for Krea2 TextFusion LoRA.
 
-Runs ai-toolkit's real `TextFusionTransformer` module at the configured Krea2
+Runs torchref's real `TextFusionTransformer` module at the configured Krea2
 training dtype (`bf16`) and dumps forward output, input gradient, and all
 txtfusion LoRA dA/dB tensors. This is reference behavior for the txtfusion
 submodule; it does not replace full real-cache product trainer parity.
@@ -15,7 +15,7 @@ import torch
 from safetensors.torch import save_file
 
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import TextFusionTransformer  # noqa: E402
 
 

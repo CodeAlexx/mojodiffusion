@@ -1,6 +1,6 @@
 # serenitymojo/pipeline/mageflow_lora_infer.mojo
 #
-# Mage-Flow-Base T2I inference with a TRAINED LoRA (ai-toolkit/PEFT format):
+# Mage-Flow-Base T2I inference with a TRAINED LoRA (torchref/PEFT format):
 # loads output/mageflow_eri2/mageflow_eri2_lora_step3000.safetensors (144
 # adapters, diffusion_model.transformer_blocks.{i}.<mod>.lora_A/B.weight,
 # rank16 alpha16 -> live scale 1.0) into the trainer's MageFlowLoraSet and

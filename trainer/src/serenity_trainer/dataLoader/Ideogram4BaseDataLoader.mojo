@@ -1,6 +1,6 @@
 # Ideogram4BaseDataLoader.mojo - build-only Ideogram4 dataset/caption contract.
 #
-# ai-toolkit uses structured JSON captions for Ideogram4. Token shuffling must
+# torchref uses structured JSON captions for Ideogram4. Token shuffling must
 # stay disabled because JSON key order and object grouping matter.
 
 from serenity_trainer.modelSetup.BaseIdeogram4Setup import (

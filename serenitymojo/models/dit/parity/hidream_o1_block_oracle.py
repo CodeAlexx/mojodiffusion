@@ -4,7 +4,7 @@
 #
 # The block = one Qwen3-VL text decoder layer. Math is SOURCED (not re-derived)
 # from the on-box authoritative copy of the DiffSynth/Qwen3-VL layer:
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/hidream/src/
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/hidream/src/
 #     hidream_o1/qwen3_vl_transformers.py
 #   - Qwen3VLTextRMSNorm.forward (:448): F32 x*rsqrt(mean(x^2)+eps), * weight
 #   - Qwen3VLTextAttention.forward (:531): q/k/v proj (no bias) -> per-head

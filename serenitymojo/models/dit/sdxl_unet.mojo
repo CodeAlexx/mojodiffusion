@@ -285,7 +285,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
 
         for i in range(len(lora_paths)):
             var overlay = LoraSet.load(lora_paths[i])
-            if overlay.format_name() != "KohyaSdxl":
+            if overlay.format_name() != "torchrefSdxl":
                 raise Error(
                     String("SDXL LoRA has unsupported tensor format: ")
                     + overlay.format_name() + String(" (") + lora_paths[i] + String(")")

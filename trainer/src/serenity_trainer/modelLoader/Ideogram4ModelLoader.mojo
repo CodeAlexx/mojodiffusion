@@ -1,7 +1,7 @@
 # Ideogram4ModelLoader.mojo - trainer-side Ideogram4 loader contract.
 #
 # Source facts:
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/ideogram4.py
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/ideogram4.py
 #   /home/alex/mojodiffusion/serenitymojo/models/dit/ideogram4_resident.mojo
 #   /home/alex/mojodiffusion/serenitymojo/pipeline/ideogram4_generate.mojo
 #

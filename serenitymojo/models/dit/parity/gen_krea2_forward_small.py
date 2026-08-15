@@ -25,9 +25,9 @@ import torch
 from einops import rearrange, repeat
 from safetensors.torch import save_file
 
-# Import mmdit.py DIRECTLY (torch+einops only) to bypass the ai-toolkit package
+# Import mmdit.py DIRECTLY (torch+einops only) to bypass the torchref package
 # __init__ chain (which pulls torchao/quanto, absent here).
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import SingleMMDiTConfig, SingleStreamDiT  # noqa: E402
 
 # KREA2_MMDIT_CONFIG copied verbatim from krea2.py:55-68 (the "single_mmdit_large_wide"

@@ -15,7 +15,7 @@
 # GATE (b) GRAD-FLOW: after one AdamW step (up off zero), fresh fwd+bwd, feed the
 #   {down, up} grads into GradCoverage.measure → coverage_pct==100, dead==0.
 # GATE (c) SAVE: save → reopen → assert lora_down/lora_up/alpha keys + shapes +
-#   byte-exact values (round-trips through the Kohya OIHW <-> Flame RSCF permute).
+#   byte-exact values (round-trips through the torchref OIHW <-> Flame RSCF permute).
 # GATE (d) default-off + trainer AOT-build verified out-of-band (trainer fails
 #   loud on adapter_algo==7); see the builder report.
 #

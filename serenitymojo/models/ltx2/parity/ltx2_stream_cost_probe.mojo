@@ -36,8 +36,8 @@ from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream
 from serenitymojo.models.dit.ltx2_dit import LTX2AVBlockWeights
 
 comptime DEV_CKPT = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
-comptime CACHE_LAT = "/home/alex/datasets/ltx2_musubi_v3/cache/0288f3d69c08e816d81b014da620db49_00000-025_0512x0288_ltx2.safetensors"
-comptime CACHE_TE = "/home/alex/datasets/ltx2_musubi_v3/cache/0288f3d69c08e816d81b014da620db49_ltx2_te.safetensors"
+comptime CACHE_LAT = "/home/alex/datasets/ltx2_ref_v3/cache/0288f3d69c08e816d81b014da620db49_00000-025_0512x0288_ltx2.safetensors"
+comptime CACHE_TE = "/home/alex/datasets/ltx2_ref_v3/cache/0288f3d69c08e816d81b014da620db49_ltx2_te.safetensors"
 comptime NF = 4
 comptime NH = 9
 comptime NW = 16

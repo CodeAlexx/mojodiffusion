@@ -5,7 +5,7 @@
 #   Part A — REAL VAE ENCODE (flux2/Qwen-Image VAE correctness):
 #     Load the SAME QwenImageVaeEncoder krea2_prepare_cache uses, encode the parity
 #     real image (qie_img_128x128.bin, [1,3,128,128] in [-1,1]) as the TARGET and a
-#     horizontally-flipped copy as the REFERENCE, then apply the ai-toolkit
+#     horizontally-flipped copy as the REFERENCE, then apply the torchref
 #     normalization (z-mean)/std (exactly krea2_prepare_cache._encode_one_latent).
 #     Reports the normalized-latent std of both (the "encoder actually ran" check).
 #   Part B — CACHE WRITE + READ-BACK (the additive-slot proof):
@@ -110,7 +110,7 @@ def _hflip_nchw(v: List[Float32], c: Int, h: Int, w: Int) -> List[Float32]:
 
 
 def _normalize(lat_bf16: Tensor, ctx: DeviceContext) raises -> Tensor:
-    """(z - latents_mean) / latents_std per channel -> BF16 (== the ai-toolkit
+    """(z - latents_mean) / latents_std per channel -> BF16 (== the torchref
     boundary krea2_prepare_cache._encode_one_latent stores as clean/ref)."""
     var mean_ch = Tensor.from_host(_vae_mean(), [1, 16, 1, 1], STDtype.F32, ctx)
     var std_ch = Tensor.from_host(_vae_std(), [1, 16, 1, 1], STDtype.F32, ctx)

@@ -25,7 +25,7 @@
 # keys img_attn.qkv.0/.1/.2). A rank-r adapter on a fused [3D,D] weight is NOT
 # the same low-rank family as three independent rank-r adapters on the 3 D-slices.
 # Modelling them separately is the reference trainer-faithful recipe AND makes the saved keys
-# round-trip with reference trainer-trained / ai-toolkit LoRAs.
+# round-trip with reference trainer-trained / torchref LoRAs.
 #
 # WHY THE TRAINER MATH IS THE AUTHORITY (identical to Ernie/Klein lora_block):
 #   For a projection y = linear(x, W) (W [out,in]), LoRA-adapted output is

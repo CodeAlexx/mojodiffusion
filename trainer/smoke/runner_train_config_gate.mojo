@@ -296,7 +296,7 @@ def _gate_optimizer_runner() raises:
 
     # flipped: AUTOMAGIC3 (dropdown index 6, appended after SCHEDULE_FREE_ADAMW)
     # — emits "AUTOMAGIC3" verbatim, round-trips to TRAIN_OPTIMIZER_AUTOMAGIC3
-    # (ai-toolkit adaptive optimizer, serenitymojo training/automagic3.mojo via
+    # (torchref adaptive optimizer, serenitymojo training/automagic3.mojo via
     # the levers dispatch).
     ui.optimizer_index = 6
     var json_am = trainer_ui_runner_train_config_json(ui)

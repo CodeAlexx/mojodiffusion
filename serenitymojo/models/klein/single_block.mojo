@@ -133,7 +133,7 @@ from serenitymojo.ops.int8_linear import (
 # the payload is present. FORWARD-ONLY dispatch — every backward arm keeps
 # consuming the reconstructed BF16 W_hat the loader put in the Block under the
 # weight's own name (ops/squareq_nvfp4.mojo header: disclosed numerics-mismatch
-# STE, same class as ai-toolkit's).
+# STE, same class as torchref's).
 from serenitymojo.ops.squareq_nvfp4 import squareq_nvfp4_linear
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────

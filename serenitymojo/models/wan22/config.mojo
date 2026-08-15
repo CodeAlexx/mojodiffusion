@@ -68,7 +68,7 @@ struct Wan22TrainConfig(Copyable, Movable, ImplicitlyCopyable):
     #   I2V-A14B: in_dim=36 = noisy_latent(16) + y(20) [y = mask(4)+image_latent(16)]
     #             -> packed 144 ; out_dim STILL 16 (velocity of the 16-ch latent);
     #             boundary 0.900. Block/stack/LoRA/dual-expert compute is IDENTICAL
-    #             to T2V (WanCrossAttention: no CLIP, no k_img/v_img — musubi
+    #             to T2V (WanCrossAttention: no CLIP, no k_img/v_img — torchref
     #             model.py:379-380). Only the input channels + boundary differ.
     @staticmethod
     def t2v_a14b() -> Wan22TrainConfig:
@@ -92,7 +92,7 @@ struct Wan22TrainConfig(Copyable, Movable, ImplicitlyCopyable):
     # Wan2.1 uses the SAME WanAttentionBlock as Wan2.2 (WanCrossAttention, no CLIP,
     # no k_img/v_img) with a SINGLE DiT (boundary=None → no timestep split). The
     # per-batch modulation of 2.1 is numerically identical to the 2.2 per-token
-    # block when the single timestep's e0 is broadcast across all tokens (musubi
+    # block when the single timestep's e0 is broadcast across all tokens (torchref
     # force_v2_1_time_embedding), so the certified 2.2 block/stack/LoRA compute
     # carries over UNCHANGED. Same flow-match (target=noise-x0), same 10-target
     # LoRA set (attn q/k/v/o ×2 + ffn.0 + ffn.2), same Wan2.1 VAE + umt5, in_dim=16.

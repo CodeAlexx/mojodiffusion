@@ -39,12 +39,12 @@
 # rectangular RoPE, and whole/tiled VAE decode at compile time. steps/guidance
 # (=cfg)/seed remain runtime job inputs.
 #
-# LoRA: HONORED via Flux1Offloaded.load_with_lora (Kohya/sd-scripts BFL FLUX
+# LoRA: HONORED via Flux1Offloaded.load_with_lora (torchref/sd-scripts BFL FLUX
 # LoRA, additive overlay W += scale·up@down at the requested multiplier — the saved
 # checkpoint is never fused, per the LoRA-never-fused rule). Because a LoRA
 # changes the resident DiT, a LoRA job (or a LoRA change) reloads the DiT; only
 # base (no-LoRA) jobs keep the resident handle. The loader accepts both
-# Kohya/sd-scripts BFL keys and common Diffusers/PEFT Transformer2DModel keys.
+# torchref/sd-scripts BFL keys and common Diffusers/PEFT Transformer2DModel keys.
 
 from std.collections import Optional
 from std.ffi import external_call
@@ -475,7 +475,7 @@ struct FluxBackend(GenBackend, Movable):
         if len(params.loras) > 1:
             raise Error(
                 "flux: only a single LoRA overlay is supported per job"
-                " (one additive Kohya-BFL overlay); submit at most one LoRA"
+                " (one additive torchref-BFL overlay); submit at most one LoRA"
             )
         if params.init_image.byte_length() > 0:
             raise Error(

@@ -22,7 +22,7 @@
 #     nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
 #     nn.init.zeros_(lora_up.weight)
 #   → make_lora_adapter: A = small-uniform (kaiming-ish, see note), B = 0
-#     (PEFT identity at step 0). Save format (PEFT/ai-toolkit):
+#     (PEFT identity at step 0). Save format (PEFT/torchref):
 #     <prefix>.lora_down.weight (=A) / <prefix>.lora_up.weight (=B).
 # scale = alpha / rank (LoRAModule.py:564).
 # AdamW: Serenity uses torch AdamW over the trainable A/B params. The host AdamW

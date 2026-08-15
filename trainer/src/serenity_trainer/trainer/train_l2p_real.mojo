@@ -1,18 +1,18 @@
 # training/train_l2p_real.mojo — Z-Image L2P (pixel-space) LoRA REAL training loop.
 #
-# FAITHFUL to ai-toolkit (authoritative reference) + EDv2 train_l2p.rs (the
+# FAITHFUL to torchref (authoritative reference) + EDv2 train_l2p.rs (the
 # parity-verified Rust port). L2P = Z-Image-Turbo DiT body (reused VERBATIM) +
 # 16×16 pixel-space patchify x_embedder + FROZEN MicroDiffusionModel U-Net head
 # (the `local_decoder`). LoRA trains ONLY the 30 main DiT `layers` blocks.
 #
 # Reference (read FULL):
-#   ai-toolkit  extensions_built_in/diffusion_models/z_image/z_image_l2p_model.py
+#   torchref  extensions_built_in/diffusion_models/z_image/z_image_l2p_model.py
 #               (MicroDiffusionModel + L2P forward + FakeVAE pixel path)
-#   ai-toolkit  toolkit/samplers/custom_flowmatch_sampler.py (add_noise, linear ts)
-#   ai-toolkit  jobs/process/BaseSDTrainProcess.py (uniform timestep, noise, loss)
+#   torchref  toolkit/samplers/custom_flowmatch_sampler.py (add_noise, linear ts)
+#   torchref  jobs/process/BaseSDTrainProcess.py (uniform timestep, noise, loss)
 #   EDv2        crates/eridiffusion-cli/src/bin/train_l2p.rs (cross-ref recipe)
 #
-# RECIPE (ai-toolkit / EDv2, all four prior divergences FIXED here):
+# RECIPE (torchref / EDv2, all four prior divergences FIXED here):
 #   1. CACHE: reads {pixel [3,512,512] F32, cap_feats [1,seq,2560] F32} via
 #      L2PCache (NOT the Klein {latent,text_embedding,text_mask} contract).
 #      cap_feats seq VARIES per sample and is ALREADY trimmed to valid tokens —
@@ -20,13 +20,13 @@
 #   2. HEAD: runs the REAL FROZEN local_decoder (MicroDiffusionModel U-Net)
 #      forward+backward (models/l2p/local_decoder_train.mojo). The DiT's last
 #      image-token hidden [N_IMG, D] IS the feature map (NO final layer-norm /
-#      modulate / linear — ai-toolkit has none). pred = local_decoder(noisy, feat).
+#      modulate / linear — torchref has none). pred = local_decoder(noisy, feat).
 #   3. TIMESTEP: UNIFORM UNSHIFTED — t_int = randint(0, NUM_TRAIN_TIMESTEPS)+1,
-#      sigma = t_int / NUM_TRAIN_TIMESTEPS (ai-toolkit timestep_type='linear').
+#      sigma = t_int / NUM_TRAIN_TIMESTEPS (torchref timestep_type='linear').
 #      shift=3.0 is the INFERENCE sigma schedule only; it does NOT apply here.
 #   4. LoRA: 30 main blocks, 7 Z-Image slots (to_q/to_k/to_v/to_out.0/w1/w3/w2).
 #      PEFT save keys via save_zimage_lora_main_only.
-#      NOTE (#4 partial): ai-toolkit/EDv2 also LoRA the per-block
+#      NOTE (#4 partial): torchref/EDv2 also LoRA the per-block
 #      adaLN_modulation.0 (8th target). The Mojo Z-Image LoRA infra is hardwired
 #      to ZIMAGE_SLOTS=7 with no adaLN slot; adding it is a cross-cutting change
 #      to the shared Z-Image LoRA stack (struct + fwd + bwd + AdamW + save) that
@@ -188,7 +188,7 @@ comptime NUM_NR = 2
 comptime NUM_CR = 2
 comptime MAIN_DEPTH = 30
 
-# ── recipe (ai-toolkit / EDv2 / l2p.json) ────────────────────────────────────
+# ── recipe (torchref / EDv2 / l2p.json) ────────────────────────────────────
 comptime RANK = 16
 comptime ALPHA = Float32(16.0)
 comptime LR = Float32(3.0e-4)
@@ -231,7 +231,7 @@ def _host_noise_l2p(n: Int, seed: UInt64) -> List[Float32]:
 
 
 def _uniform_t_int(seed: UInt64, num_steps: Int) -> Int:
-    """Uniform integer in [1, num_steps] (ai-toolkit/EDv2: randint(0,num)+1)."""
+    """Uniform integer in [1, num_steps] (torchref/EDv2: randint(0,num)+1)."""
     var state = seed * 6364136223846793005 + 1442695040888963407
     var u = UInt64((state >> 11)) % UInt64(num_steps)
     return Int(u) + 1
@@ -474,13 +474,13 @@ def _train_one_step_l2p(
 
     var pix_h = cast_tensor(s.pixel, STDtype.F32, ctx).to_host(ctx)  # [3,512,512] flat
 
-    # ── timestep: UNIFORM UNSHIFTED (ai-toolkit timestep_type='linear') ───────
+    # ── timestep: UNIFORM UNSHIFTED (torchref timestep_type='linear') ───────
     var t_int = _uniform_t_int(SEED_BASE + step_seed, NUM_TRAIN_TIMESTEPS)
     var sigma = Float32(t_int) / Float32(NUM_TRAIN_TIMESTEPS)
     # DiT timestep input: v_in = (1 - sigma). build_l2p_adaln does t_val*T_SCALE
     # with NO internal inversion, and the verified inference contract is
     # zimage_l2p_model_timestep(sigma) = (1-sigma)*1000 (zimage_l2p_contract.mojo:105;
-    # ai-toolkit (1000-timestep)/1000; EDv2 dit.rs t=(1-v)*time_scale).
+    # torchref (1000-timestep)/1000; EDv2 dit.rs t=(1-v)*time_scale).
     var t_value = Float32(1.0) - sigma
 
     # ── pixel noise + noisy pixels (rectified flow) ──────────────────────────
@@ -540,7 +540,7 @@ def _train_one_step_l2p(
     var t_prep = perf_counter_ns()
 
     # ── DiT stack forward (last-block hidden = the feature map; NO final layer)
-    # We reuse the proven stack forward. ai-toolkit L2P has no final layer-norm/
+    # We reuse the proven stack forward. torchref L2P has no final layer-norm/
     # modulate/linear; we pass an IDENTITY-shaped final layer purely so the
     # existing forward runs, but we IGNORE fwd.out and use saved.x_final (the
     # last main-block output) as the feature source. f_scale=zeros, out_ch=D,
@@ -1209,7 +1209,7 @@ def main() raises:
     var direct_active = dora_active or oft_active
     var direct_targets = 1 if train_cfg.lokr_targets == 1 else 2
 
-    print("=== Z-Image L2P REAL LoRA training loop (ai-toolkit faithful) ===")
+    print("=== Z-Image L2P REAL LoRA training loop (torchref faithful) ===")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " F=", F)
     print("  pixel input: C=", PIX_C, " H=", PIX_H, " W=", PIX_W,
           " patch=", PATCH, " feat grid=", HT, "x", WT)

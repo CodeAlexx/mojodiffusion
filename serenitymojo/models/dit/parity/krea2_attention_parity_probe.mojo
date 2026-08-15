@@ -1,6 +1,6 @@
 # models/dit/parity/krea2_attention_parity_probe.mojo — PARITY GATE for krea2
 # chunk 3 (the Attention op: GQA + QKNorm + RoPE + sigmoid-gate) vs a real
-# ai-toolkit torch oracle.
+# torchref torch oracle.
 #
 # Oracle: krea2_attention_oracle.safetensors (weights BF16, rest F32):
 #   x [1,32,6144], wq/gate_w/wo [6144,6144], wk/wv [1536,6144],

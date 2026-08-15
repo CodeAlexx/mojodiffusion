@@ -386,7 +386,7 @@ struct _HQLoraStack(Movable):
     var distilled: LoraSet
     var camera_static: LoraSet
     var detailer: LoraSet
-    # Runtime TRAINED LoRA overlays (Mojo trainer / musubi comfy format,
+    # Runtime TRAINED LoRA overlays (Mojo trainer / torchref comfy format,
     # diffusion_model.transformer_blocks.* keys). The indexed environment
     # contract has no fixed stack length. LTX2_TRAINED_LORA remains a legacy
     # one-overlay compatibility input for direct runner invocations.

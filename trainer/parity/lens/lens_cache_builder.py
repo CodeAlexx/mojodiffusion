@@ -8,7 +8,7 @@ consumes. Keys (LensBaseDataLoader cache fields):
   text_encoder_hidden_state [L, 4*2880=11520] (EncodeLensText: 4 layers concat dim=-1, cropped)
   tokens_mask               [L]
 
-Run: /home/alex/ai-toolkit/venv/bin/python parity/lens/lens_cache_builder.py
+Run: /home/alex/torchref-image/venv/bin/python parity/lens/lens_cache_builder.py
 """
 import importlib.util, json, os
 import numpy as np, torch

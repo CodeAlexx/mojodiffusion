@@ -14,7 +14,7 @@
 # kind of drift a hand-written expectation would reproduce instead of catch.
 #
 # Run:
-#   /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_keyframe_prompt_oracle.py
+#   /home/alex/torchref/venv/bin/python scripts/minimax_h3_keyframe_prompt_oracle.py
 #   pixi run mojo build -O0 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_keyframe_prompt_probe.mojo \
 #     -o /tmp/h3_keyframe_prompt_probe -Xlinker -lm \

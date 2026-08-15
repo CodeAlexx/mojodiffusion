@@ -1,5 +1,5 @@
 # automagic3_parity_probe.mojo — parity gate for training/automagic3.mojo vs the
-# REAL ai-toolkit Automagic3 (fused=False) oracle.
+# REAL torchref Automagic3 (fused=False) oracle.
 #
 # Oracle: /home/alex/EriTrainer/trainer/parity/automagic3/oracle.safetensors
 #   (gen_oracle.py: seed 1234, lr0=1e-4, beta2=0.999, eps=1e-30, H=8, N=14;

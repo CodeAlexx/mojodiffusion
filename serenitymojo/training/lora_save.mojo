@@ -7,11 +7,11 @@
 # training/loop.mojo persists the GENERIC optimizer state (param.<i>/adam_m.<i>/
 # adam_v.<i>/__meta__) for an opaque parameter set. It does NOT know the LoRA
 # key naming, so a loop checkpoint cannot be opened by an inference loader
-# (lora.mojo) or by ai-toolkit. This module writes the trained A/B in the
+# (lora.mojo) or by torchref. This module writes the trained A/B in the
 # canonical PEFT key convention, plus explicit model parity variants, so:
 #   * lora.mojo::LoraSet.load detects it as FMT_DIFFUSION_MODEL and merges it,
 #   * the validation sampler (training/validation_sampler.mojo) can load it,
-#   * external tools (ai-toolkit / diffusers PEFT) open it.
+#   * external tools (torchref / diffusers PEFT) open it.
 #
 # ── Key convention (the EXACT inverse of how lora.mojo LOADS) ────────────────
 # lora.mojo::_suffix_a / _suffix_b (lora.mojo:~200-215) for FMT_DIFFUSION_MODEL:
@@ -169,7 +169,7 @@ def _shape1(n: Int) -> List[Int]:
 # ─────────────────────────────────────────────────────────────────────────────
 # SAVE: pack each adapter's A [rank,in] and B [out,rank] into a single
 # safetensors via the proven byte-exact writer (io/safetensors_writer.mojo:186).
-# Keys are PEFT/ai-toolkit: "<prefix>.lora_A.weight" / "<prefix>.lora_B.weight".
+# Keys are PEFT/torchref: "<prefix>.lora_A.weight" / "<prefix>.lora_B.weight".
 # ─────────────────────────────────────────────────────────────────────────────
 def save_lora_peft(
     adapters: List[NamedLora], path: String, ctx: DeviceContext
@@ -225,7 +225,7 @@ def save_lora_serenity_trainer(
         "<prefix>.lora_down.weight"  BF16 [rank, in]   (== LoraAdapter.a)
         "<prefix>.lora_up.weight"    BF16 [out, rank]  (== LoraAdapter.b)
 
-    This is separate from `save_lora_peft` so existing generic PEFT/ai-toolkit
+    This is separate from `save_lora_peft` so existing generic PEFT/torchref
     saves keep their lora_A/lora_B convention. Qwen uses this path for direct
     SerenityTrainer parity."""
     if len(adapters) == 0:

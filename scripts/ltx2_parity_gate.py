@@ -18,7 +18,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 CUDNN_LIB = Path(
-    "/home/alex/musubi-tuner-ref/.venv/lib/python3.10/site-packages/nvidia/cudnn/lib"
+    "/home/alex/torchref-video-ref/.venv/lib/python3.10/site-packages/nvidia/cudnn/lib"
 )
 
 STAGED_PHASE_REQUIRED: tuple[str, ...] = tuple(
@@ -212,7 +212,7 @@ GATES: tuple[Gate, ...] = (
                 "serenitymojo/pipeline/ltx2_hq_lora_stack_smoke.mojo",
             ),
         ),
-        note="Distilled + camera-static + detailer + local Musubi LoRA block apply.",
+        note="Distilled + camera-static + detailer + local Torchref LoRA block apply.",
     ),
     Gate(
         "lora_factorized_surface",
@@ -544,7 +544,7 @@ GATES: tuple[Gate, ...] = (
                 "serenitymojo/training/parity/ltx2_masked_av_loss_parity.mojo",
             ),
         ),
-        note="Musubi masked video/audio loss parity: broadcast masks, all-false fallback, MSE/MAE/Huber.",
+        note="Torchref masked video/audio loss parity: broadcast masks, all-false fallback, MSE/MAE/Huber.",
     ),
     Gate(
         "trainer_audio_ref_ic",
@@ -562,7 +562,7 @@ GATES: tuple[Gate, ...] = (
                 "serenitymojo/training/parity/ltx2_audio_ref_ic_contract.mojo",
             ),
         ),
-        note="Musubi audio_ref_only_ic contract: ref concat, zero timesteps/targets, loss mask, positions, attention masks.",
+        note="Torchref audio_ref_only_ic contract: ref concat, zero timesteps/targets, loss mask, positions, attention masks.",
     ),
     Gate(
         "trainer_parity_audit",
@@ -580,7 +580,7 @@ GATES: tuple[Gate, ...] = (
                 "serenitymojo/training/parity/ltx2_trainer_parity_audit.mojo",
             ),
         ),
-        note="Musubi/LTX2 trainer foundation audit across config/cache/schedule/loss/LoRA/checkpoint/validation.",
+        note="Torchref/LTX2 trainer foundation audit across config/cache/schedule/loss/LoRA/checkpoint/validation.",
     ),
     Gate(
         "trainer_real_build",

@@ -14,7 +14,7 @@
 # stay >=0.999 (report the worst cos across the two runs).
 #
 # Flash needs cuDNN-shim + CUDA linkage -> build a BINARY (JIT can't cuInit):
-#   /home/alex/ai-toolkit/venv/bin/python \
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/scail2/parity/scail2_block_lora_oracle.py   # oracle FIRST
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo build --optimization-level 2 -I . \
@@ -46,7 +46,7 @@ from serenitymojo.models.scail2.scail2_block_train import (
 
 comptime REF_DIR = "/home/alex/mojodiffusion/serenitymojo/models/scail2/parity/"
 
-# Reduced SCAIL-2 i2v block dims (DH real = 128); IMG=257 fixed by musubi split.
+# Reduced SCAIL-2 i2v block dims (DH real = 128); IMG=257 fixed by torchref split.
 comptime H = 4
 comptime DH = 128
 comptime DIM = H * DH           # 512

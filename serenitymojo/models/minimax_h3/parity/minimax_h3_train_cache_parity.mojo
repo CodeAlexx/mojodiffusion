@@ -1,6 +1,6 @@
 # minimax_h3_train_cache_parity — gate the Mojo mmh3 cache reader against
-# files written by MUSUBI'S OWN save functions (h3_train_cache_fixture.py,
-# run first with the musubi venv). Checks: item discovery + pairing, every
+# files written by TORCHREF'S OWN save functions (h3_train_cache_fixture.py,
+# run first with the torchref venv). Checks: item discovery + pairing, every
 # logical key, shapes, dtype handling (bf16 / int64 / bool), and f64 value
 # sums vs the torch-computed sidecar (rel 1e-9 — same f64 accumulation, only
 # summation order differs).
@@ -195,7 +195,7 @@ def main() raises:
             g.want_int(name + ".empty_tags_sum", esum)
 
     if g.ok:
-        print("PASS: mmh3 cache reader matches musubi-written fixture")
+        print("PASS: mmh3 cache reader matches torchref-written fixture")
     else:
         print("FAIL: mmh3 cache reader parity below bar")
         raise Error("minimax_h3_train_cache_parity failed")

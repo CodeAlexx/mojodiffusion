@@ -2,7 +2,7 @@
 # ref-sliced block-output cotangent (P5 unit 2). HOST-side, mirroring the
 # existing fwd->bwd host loss seam (the levers-loss seam).
 #
-# musubi contract (ltx2_train_network.py:3452-3459 + ltx2_train.py:178-225):
+# torchref contract (ltx2_train_network.py:3452-3459 + ltx2_train.py:178-225):
 #   * SLICE the reference off before the loss:  target_pred = pred[:, ref_seq_len:]
 #   * target_velocity = patchify(noise - latents)  (target tokens only)
 #   * target_loss_mask = ~target_conditioning_mask
@@ -16,7 +16,7 @@
 from std.math import abs as _abs
 
 
-# loss = sum((pred-tgt)^2 * mask) / (n_true * dim)  == musubi _masked_mse (mse),
+# loss = sum((pred-tgt)^2 * mask) / (n_true * dim)  == torchref _masked_mse (mse),
 # target-token normalized. mask is per TARGET TOKEN, broadcast over dim.
 # d_block_out [s_comb*dim] row-major: ref rows (0..s_ref-1) = 0; target row t,
 # channel d = 2*(pred-tgt)*mask[t] / (n_true*dim).
@@ -47,7 +47,7 @@ def v2v_target_cotangent(
 
     # denominator = number of masked ELEMENTS = n_true * dim (sum over broadcast)
     if n_true == 0:
-        # musubi fallback: denom==0 -> per_elem.mean(); no target in loss -> the
+        # torchref fallback: denom==0 -> per_elem.mean(); no target in loss -> the
         # loss is the plain mean and the gradient normalizes by all target elems.
         var msum0 = Float32(0.0)
         var denom0 = Float32(s_tgt * dim)

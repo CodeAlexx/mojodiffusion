@@ -4,7 +4,7 @@
 # Torch oracle for the Krea-2-Raw SINGLE-STREAM STACK + final layer WITH LoRA on
 # the 8 per-block nn.Linears, at REDUCED depth (NBLOCKS=4). This is the Phase-2
 # (stack) counterpart of krea2_block_oracle.py (Phase-1, one block): it drives the
-# REAL ai-toolkit module (SingleStreamDiT, mmdit.py) so the stack-forward velocity
+# REAL torchref module (SingleStreamDiT, mmdit.py) so the stack-forward velocity
 # AND the per-block LoRA dA/dB are produced by the reference's own autograd.
 #
 # WHAT IS GATED (the NEW Phase-2 code): the N single-stream blocks (the verified
@@ -31,7 +31,7 @@
 # plain math-softmax sdpa, so F32+MATH is the faithful oracle (no bf16 rounding on
 # the gated single-stream path; the Phase-1 block oracle used f64 manual softmax).
 #
-# LoRA math (ai-toolkit lora_special.py): y' = linear(x,W) + scale*((x@Aᵀ)@Bᵀ),
+# LoRA math (torchref lora_special.py): y' = linear(x,W) + scale*((x@Aᵀ)@Bᵀ),
 #   A=[rank,in] (lora_down), B=[out,rank] (lora_up), scale=alpha/rank. NONZERO B so
 #   dA is non-degenerate (unlike production zero-init). Real HEADS=48/KVHEADS=12.
 #
@@ -49,9 +49,9 @@ from einops import rearrange, repeat
 from safetensors.torch import save_file
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-# Import mmdit.py DIRECTLY (torch+einops only) to bypass the ai-toolkit package
+# Import mmdit.py DIRECTLY (torch+einops only) to bypass the torchref package
 # __init__ chain (torchao/quanto, absent here). Same path as gen_krea2_forward_small.py.
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 import mmdit  # noqa: E402
 from mmdit import SingleMMDiTConfig, SingleStreamDiT, temb  # noqa: E402
 

@@ -204,7 +204,7 @@ struct Ideogram4FinalLinearLoRA[Hidden: Int, Out: Int](Movable):
         var raw = _final_linear_lora_forward(
             tape, hidden_tokens, base_w, base_b, self.adapter, ctx
         )
-        # ai-toolkit Ideogram4 returns negative velocity from predict_velocity;
+        # torchref Ideogram4 returns negative velocity from predict_velocity;
         # training target is noise - clean. Match that sign here.
         var predicted = tape.record_mul(raw, _const_like(raw, Float32(-1.0), ctx), ctx)
         var loss = tape.mse_loss(predicted, target_velocity, ctx)

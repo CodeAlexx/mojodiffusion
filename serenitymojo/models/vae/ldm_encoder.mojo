@@ -554,7 +554,7 @@ def load_sd3_embedded_ldm_encoder[
 
 
 # ── Ideogram-4 VAE encoder (Flux2-family / diffusers AutoencoderKL, z=32) ──────
-# Training-path encoder for ai-toolkit ideogram4.py::encode_images (455-476).
+# Training-path encoder for torchref ideogram4.py::encode_images (455-476).
 # Mirror of load_ideogram4_vae_decoder (ldm_decoder.mojo): DIFFUSERS keys
 # (encoder.down_blocks.N.resnets.M / .downsamplers.0.conv / .mid_block.* /
 # .conv_norm_out / .conv_out), latent_ch 32, WITH quant_conv — Encoder.forward
@@ -603,7 +603,7 @@ def load_ideogram4_vae_encoder[
     )
 
 
-# Ideogram patchify (ai-toolkit src/pipeline.py:40, patch=2): deterministic VAE
+# Ideogram patchify (torchref src/pipeline.py:40, patch=2): deterministic VAE
 # mean NCHW [1, AE_CH, 2*GH, 2*GW] -> packed [1, 4*AE_CH, GH, GW]
 #   view(1,AE,GH,2,GW,2).permute(0,3,5,1,2,4).reshape(1,4*AE,GH,GW)
 def ideogram4_patchify_latents[
@@ -620,7 +620,7 @@ def ideogram4_patchify_latents[
     return reshape(pe, s4^, ctx)              # [1,4*AE_CH,GH,GW]
 
 
-# Per-128-channel latent norm (ai-toolkit encode_images:474-475):
+# Per-128-channel latent norm (torchref encode_images:474-475):
 #   latents = (patched - shift) / scale ,  shift/scale [128] -> [1,128,1,1].
 # Done in F32 (matches the oracle's float() normalization).
 def ideogram4_normalize_latents(

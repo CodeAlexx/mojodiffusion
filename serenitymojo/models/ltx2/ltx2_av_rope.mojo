@@ -13,10 +13,10 @@
 #   _video_temporal_coords  :414-421
 #   _mp1/_mp3               :424-429
 #   4-pair assembly (run()) :655-666
-# CAUSAL_OFFSET = 1 is MUSUBI-CORRECT: musubi ltx_2/components/patchifiers.py:240
+# CAUSAL_OFFSET = 1 is TORCHREF-CORRECT: torchref ltx_2/components/patchifiers.py:240
 # ("+1 ensures the timestamp corresponds to the first fully-available sample"),
 # official ltx2_python_reference.py:111, MVP ltx2_t2v_av_mvp.mojo:128, SimpleTuner
-# ltxvideo2 default. (The AV oracle's prior CAUSAL_OFFSET=0 was musubi-wrong and
+# ltxvideo2 default. (The AV oracle's prior CAUSAL_OFFSET=0 was torchref-wrong and
 # was corrected 2026-07-18; see scripts/ltx2_av_block_bwd_oracle.py:65.)
 #
 # F32 output (the training stack runs F32 per block, to_f32; the oracle rope dump
@@ -41,7 +41,7 @@ comptime CA_DIM = 2048      # audio_cross_attention_dim
 comptime ROPE_THETA = Float64(10000.0)
 comptime POS_EMBED_MAX_POS = Float64(20.0)
 comptime BASE_HW = Float64(2048.0)
-comptime CAUSAL_OFFSET = Float64(1.0)   # MUSUBI-CORRECT (see header)
+comptime CAUSAL_OFFSET = Float64(1.0)   # TORCHREF-CORRECT (see header)
 comptime VAE_SF0 = Float64(8.0)
 comptime VAE_SF1 = Float64(32.0)
 comptime VAE_SF2 = Float64(32.0)

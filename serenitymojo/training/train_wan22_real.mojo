@@ -2,11 +2,11 @@
 #
 # REAL Wan2.2-T2V (A14B, low-noise expert) LoRA TRAINING LOOP.
 # Pure Mojo + MAX, GPU, block-swap offload. Wires the EXISTING, parity-green
-# engine (models/wan22/wan22_stack_lora.mojo) into a musubi-recipe training loop.
+# engine (models/wan22/wan22_stack_lora.mojo) into a torchref-recipe training loop.
 # This file does NOT reimplement any block/stack math — it is the LOOP only.
 #
 # ── ORACLE / RECIPE ──────────────────────────────────────────────────────────
-# Oracle = kohya-ss/musubi-tuner `wan_train_network.py` + `hv_train_network.py`
+# Oracle = torchref-ss/torchref `wan_train_network.py` + `hv_train_network.py`
 # (trainer_base). Recipe this loop matches:
 #   * Latent + text come from cache (Wan2.1-VAE 16-ch latents; umt5-xxl varlen
 #     text). scale_shift_latents is IDENTITY for Wan — NO extra latent scaling
@@ -15,7 +15,7 @@
 #     pure noise. Training TARGET = velocity = (noise - x0). Loss = plain
 #     per-element MSE then mean (NO min-SNR, weighting_scheme=None by default).
 #   * Timestep sampling — BOTH modes, config/env selectable:
-#       - "sigma"  (musubi DEFAULT): t ~ Uniform(0,1].
+#       - "sigma"  (torchref DEFAULT): t ~ Uniform(0,1].
 #       - "shift"  (doc-recommended): t = sigmoid(randn * sigmoid_scale), then the
 #         discrete-flow shift map  t = (t*S)/(1 + (S-1)*t),  S = discrete_flow_shift
 #         (recommended 3.0). Enable with env WAN22_SHIFT_TIMESTEPS=1;
@@ -48,7 +48,7 @@
 #   (b) Dual high/low-noise expert switching at the t=0.875 boundary — DONE.
 #       Two resident bases + two streaming loaders (low + high checkpoints); per
 #       step t>=boundary selects the HIGH expert, else LOW; ONE shared LoRA trains
-#       across both (Musubi wan_train_network.py swap_high_low_weights:584). Enable
+#       across both (Torchref wan_train_network.py swap_high_low_weights:584). Enable
 #       by presence of the high-noise checkpoint (WAN22_DUAL_EXPERT=0 forces off).
 #       This is the switching-mechanism smoke — per-block grad parity is already
 #       certified; dual switching is NOT a new parity claim.
@@ -126,7 +126,7 @@ from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 
 # ── Wan2.1 I2V-14B: the DUAL cross-attn block (WanI2VCrossAttention) + 12-target
 #    LoRA + the frozen CLIP MLPProj context assembler (WAN21_I2V=1 path). The
-#    block fwd/bwd is CERTIFIED against Musubi at cos>=0.999 by
+#    block fwd/bwd is CERTIFIED against Torchref at cos>=0.999 by
 #    models/wan22/parity/wan22_i2v21_block_lora_parity.mojo. ──────────────────
 from std.collections import Optional
 from serenitymojo.ops.linear import linear
@@ -179,10 +179,10 @@ comptime FG = 1
 comptime HG = 16               # latent H=32 -> patch-grid 32/2 = 16
 comptime WG = 16               # latent W=32 -> patch-grid 32/2 = 16
 comptime S = FG * HG * WG        # 256 image tokens
-comptime TXT = 512               # umt5 cross-attn kv length (musubi text_len)
+comptime TXT = 512               # umt5 cross-attn kv length (torchref text_len)
 
 # ── optimizer / recipe defaults (config overrides where present) ──────────────
-comptime DEFAULT_LR = Float32(2.0e-4)          # musubi doc example
+comptime DEFAULT_LR = Float32(2.0e-4)          # torchref doc example
 comptime DEFAULT_MAX_GRAD_NORM = Float32(1.0)  # hv_train_network default
 comptime DEFAULT_SIGMOID_SCALE = Float32(1.0)  # shift-mode sigmoid scale
 comptime DEFAULT_DISCRETE_FLOW_SHIFT = Float32(3.0)
@@ -352,8 +352,8 @@ def _sigmoid(x: Float32) -> Float32:
     return Float32(1.0) / (Float32(1.0) + exp(-x))
 
 
-# ── musubi timestep sampler (both modes) ──────────────────────────────────────
-# "sigma"  : t ~ Uniform(0,1]  (musubi default).
+# ── torchref timestep sampler (both modes) ──────────────────────────────────────
+# "sigma"  : t ~ Uniform(0,1]  (torchref default).
 # "shift"  : t = sigmoid(randn*sigmoid_scale); then t = (t*Sd)/(1+(Sd-1)*t),
 #            Sd = discrete_flow_shift.
 def _sample_t(
@@ -491,7 +491,7 @@ def _wan_patch_layout_self_gate() raises:
 # process-separated request/result manifest is built. `main` rejects every
 # sample_every>0 before DeviceContext because this training monomorphization is
 # S=256, the standing 1024px sampler needs S=4096, and production validation uses
-# the Musubi-aligned UniPC pipeline. The layout math below is nevertheless kept
+# the Torchref-aligned UniPC pipeline. The layout math below is nevertheless kept
 # correct so this dormant code cannot preserve the old channel-permutation bug.
 #
 # Historical design choices:
@@ -689,7 +689,7 @@ def _build_rope_proven(ctx: DeviceContext) raises -> List[List[Float32]]:
     return res^
 
 
-# ── global grad clip over all LoRA d_A/d_B (musubi max_grad_norm) ─────────────
+# ── global grad clip over all LoRA d_A/d_B (torchref max_grad_norm) ─────────────
 def _clip(mut grads: Wan22LoraGradSet, max_norm: Float32) -> Float32:
     var ss = Float32(0.0)
     for i in range(len(grads.d_a)):
@@ -922,7 +922,7 @@ def _run_wan21_train[H: Int](
         out_path = String("/home/alex/mojodiffusion/output/wan21_lora/") \
             + variant_name + String("_lora.safetensors")
 
-    print("==== Wan2.1-T2V", variant_name, "(SINGLE-EXPERT) LoRA trainer — musubi recipe ====")
+    print("==== Wan2.1-T2V", variant_name, "(SINGLE-EXPERT) LoRA trainer — torchref recipe ====")
     print("VARIANT:", variant_name, " (Wan2.1 single DiT; no dual high/low-noise expert)")
     print("arch: dim=", dim, " blocks=", num_blocks, " heads=", H, " head_dim=", Dh,
           " ffn=", ffn, " in_ch=", IN_CH, " out_ch=", OUT_CH)
@@ -1093,20 +1093,20 @@ def _run_wan21_train[H: Int](
 #
 # The genuinely-new-compute variant: every WanAttentionBlock runs
 # WanI2VCrossAttention (models/wan22/wan22_block.mojo wan22_i2v_block_lora_*),
-# whose fwd+bwd is CERTIFIED against Musubi at cos>=0.999 by
+# whose fwd+bwd is CERTIFIED against Torchref at cos>=0.999 by
 # models/wan22/parity/wan22_i2v21_block_lora_parity.mojo. Single expert (boundary
 # None), 36-ch input (IN_CH_I2V=144 packed), 12-target LoRA (10 + k_img + v_img).
 #
 # The 257 CLIP-image tokens are projected to `dim` by the FROZEN img_emb/MLPProj
 # (mlpproj_forward below) and become the block's context_img; the umt5 tokens are
 # context_txt. Assembling those two into every block's cross-attn IS the I2V
-# context "prepend" (musubi concats then splits at 257; our block takes the two
+# context "prepend" (torchref concats then splits at 257; our block takes the two
 # halves directly, so no separate concat is needed).
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Frozen CLIP MLPProj (img_emb.proj): LayerNorm(1280) -> Linear(1280,1280) ->
 # GELU -> Linear(1280,dim) -> LayerNorm(dim). Maps CLIP [257,1280] -> [257,dim].
-# NOTE: torch nn.GELU() here is the EXACT (erf) GELU (musubi model.py:518,
+# NOTE: torch nn.GELU() here is the EXACT (erf) GELU (torchref model.py:518,
 # approximate="none") — NOT the tanh approximation the block FFN uses. mlpproj_forward
 # below uses ops.activations.gelu_exact (erf) to match. img_emb.proj keys:
 #   proj.0 = LayerNorm(1280)   proj.1 = Linear(1280,1280)   proj.2 = GELU (no params)
@@ -1156,7 +1156,7 @@ def mlpproj_forward(
     var fc1w = Tensor.from_host(w.fc1_w.copy(), [CLIP_DIM, CLIP_DIM], STDtype.BF16, ctx)
     var fc1b = Tensor.from_host(w.fc1_b.copy(), [CLIP_DIM], STDtype.BF16, ctx)
     var h = linear(ln1, fc1w, Optional[Tensor](fc1b^), ctx)
-    # EXACT (erf) GELU — Musubi MLPProj is torch.nn.GELU() (approximate="none",
+    # EXACT (erf) GELU — Torchref MLPProj is torch.nn.GELU() (approximate="none",
     # model.py:518), NOT the tanh-approx the block FFN uses. gelu_exact matches
     # torch's erf form (ops/activations.mojo:440).
     var g = gelu_exact(h, ctx)
@@ -1180,10 +1180,10 @@ def _st_host_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Li
 
 # ── Load the RESIDENT frozen CLIP MLPProj (img_emb.proj.*) ─────────────────────
 # Sequential(LayerNorm(1280), Linear(1280,1280), GELU, Linear(1280,dim),
-# LayerNorm(dim)) — musubi model.py:510-521. Keys img_emb.proj.{0,1,3,4}.{weight,
+# LayerNorm(dim)) — torchref model.py:510-521. Keys img_emb.proj.{0,1,3,4}.{weight,
 # bias} (index 2 = GELU, no params). `prefix` honors detect_wan22_prefix ("" for
 # bare Wan2.x keys, "model.diffusion_model." for ComfyUI-repackaged files).
-# NOTE: exact key layout VERIFIED against musubi source; re-confirm the on-disk
+# NOTE: exact key layout VERIFIED against torchref source; re-confirm the on-disk
 # header once the 14B I2V safetensors lands (weights-absent compile-check here).
 def load_wan21_i2v_mlpproj(
     st: SafeTensors, ctx: DeviceContext, prefix: String = String(""),
@@ -1292,7 +1292,7 @@ def _run_wan21_i2v_train[H: Int](
     var lr = cfg.lr if cfg.lr > Float32(0.0) else DEFAULT_LR
     var steps = cfg.max_steps if cfg.max_steps > 0 else 1
 
-    print("==== Wan2.1 I2V-14B (DUAL cross-attn) LoRA trainer — musubi recipe ====")
+    print("==== Wan2.1 I2V-14B (DUAL cross-attn) LoRA trainer — torchref recipe ====")
     print("VARIANT: i2v_14b  (Wan2.1 single DiT; boundary=None; NO high/low-noise expert)")
     print("arch: dim=", dim, " blocks=", num_blocks, " heads=", H, " head_dim=", Dh,
           " ffn=", ffn, " in_dim=36 packed IN_CH_I2V=", IN_CH_I2V, " out_ch=", OUT_CH)
@@ -1302,7 +1302,7 @@ def _run_wan21_i2v_train[H: Int](
           " (12/block: 8 attn + ffn.0 + ffn.2 + cross_attn.k_img + cross_attn.v_img)")
     print("optim: lr=", lr, "  steps:", steps)
     print("ckpt:", ckpt)
-    print("[wan21-i2v] block fwd/bwd CERTIFIED vs Musubi (cos>=0.999):",
+    print("[wan21-i2v] block fwd/bwd CERTIFIED vs Torchref (cos>=0.999):",
           "models/wan22/parity/wan22_i2v21_block_lora_parity.mojo")
 
     # ── checkpoint-absent guard (14B I2V weights not downloaded) ───────────────
@@ -1491,14 +1491,14 @@ def main() raises:
 
     # Pure-host correctness gate and fail-loud sampler preflight happen before
     # DeviceContext/model allocation. The trainer is fixed at S=256, while the
-    # standing 1024px preview requires S=4096 and the production Musubi recipe is
+    # standing 1024px preview requires S=4096 and the production Torchref recipe is
     # the process-separated UniPC sampler, not this legacy in-process Euler loop.
     _wan_patch_layout_self_gate()
     if cfg.sample_every > 0:
         raise Error(
             String("WAN sample_every>0 is unsupported in-process: training uses S=256, ")
             + String("the required 1024px sampler uses S=4096, and validation must use ")
-            + String("the Musubi-aligned process-separated pipeline/wan22_lora_sample. ")
+            + String("the Torchref-aligned process-separated pipeline/wan22_lora_sample. ")
             + String("Set sample_every=0 and sample saved checkpoints externally.")
         )
 
@@ -1564,7 +1564,7 @@ def main() raises:
                 + String("' (expected t2v_1.3b | t2v_14b)"))
         return
 
-    print("==== Wan2.2-A14B (low-noise) LoRA trainer — musubi recipe ====")
+    print("==== Wan2.2-A14B (low-noise) LoRA trainer — torchref recipe ====")
     print("     (T2V default; config i2v=true or WAN22_I2V=1 for the I2V-A14B 36-ch variant)")
     print("config:", config_path)
 
@@ -1572,7 +1572,7 @@ def main() raises:
     # I2V-A14B differs from T2V-A14B ONLY in the DiT input (36ch = noisy_latent 16
     # + y 20) and the dual-expert boundary (0.900 vs 0.875). The block/stack/LoRA/
     # dual-expert compute is IDENTICAL (WanCrossAttention; no CLIP, no k_img/v_img —
-    # musubi model.py:379-380). So I2V is a DATA-PATH + INPUT-CHANNEL change here:
+    # torchref model.py:379-380). So I2V is a DATA-PATH + INPUT-CHANNEL change here:
     # patchified input width IN_CH_I2V=144, boundary I2V_BOUNDARY, I2V checkpoint.
     var i2v_env = _env_str(String("WAN22_I2V"))
     var i2v_mode = (i2v_env == String("1")) if i2v_env.byte_length() > 0 \
@@ -1613,7 +1613,7 @@ def main() raises:
         else DEFAULT_DISCRETE_FLOW_SHIFT
     var shift_mode = _env_is_set(String("WAN22_SHIFT_TIMESTEPS"))
 
-    # ── DUAL HIGH/LOW-NOISE EXPERT config (Musubi wan_train_network.py) ─────────
+    # ── DUAL HIGH/LOW-NOISE EXPERT config (Torchref wan_train_network.py) ─────────
     # Wan2.2-A14B ships TWO DiTs: low-noise (`--dit`) + high-noise (`--dit_high_noise`),
     # split at `timestep_boundary` (T2V default 0.875). ONE shared LoRA network trains
     # across BOTH experts (swap_high_low_weights :584 swaps the BASE state_dict under
@@ -1855,7 +1855,7 @@ def main() raises:
 
     # build_wan22_lora_set creates 10 adapters/block: the 8 ATTENTION projections
     # (self_attn.{q,k,v,o} + cross_attn.{q,k,v,o}) + ffn.0 (dim->ffn) + ffn.2
-    # (ffn->dim), matching Musubi's wrapped-linear set (parity-gated cos>=0.999).
+    # (ffn->dim), matching Torchref's wrapped-linear set (parity-gated cos>=0.999).
     var lora = build_wan22_lora_set(NUM_BLOCKS, DIM, FFN, rank, alpha)
     print("[lora] adapters:", wan22_total_adapters(lora))
 
@@ -2033,7 +2033,7 @@ def main() raises:
     for step in range(start_step, steps):
         var t0 = perf_counter_ns()
 
-        # ── timestep + flow-match target (musubi: x_t=(1-t)x0+t*noise, tgt=noise-x0)
+        # ── timestep + flow-match target (torchref: x_t=(1-t)x0+t*noise, tgt=noise-x0)
         # `step` is the GLOBAL optimizer step, so on a resume the sigma draw and the
         # `step % n_cache` data order continue the original sequence exactly.
         var t = _sample_t(shift_mode, step, seed,
@@ -2042,7 +2042,7 @@ def main() raises:
         if alt_t:
             t = t_low_pin if (step % 2 == 0) else t_high_pin
 
-        # ── EXPERT SELECT (Musubi wan_train_network.py:546-569). Musubi decides
+        # ── EXPERT SELECT (Torchref wan_train_network.py:546-569). Torchref decides
         #    high_noise from the FIRST sampled timestep and rejection-samples the
         #    whole batch to that side; for our batch=1 loop the single sampled t
         #    directly selects the expert (no rejection needed). Sample/inference
@@ -2097,7 +2097,7 @@ def main() raises:
         for i in range(len(x0)):
             img_tokens.append((Float32(1.0) - t) * x0[i] + t * noise[i])
             target.append(noise[i] - x0[i])
-        # Musubi compares the unpatchified prediction with canonical velocity.
+        # Torchref compares the unpatchified prediction with canonical velocity.
         # This raw-stack loop therefore repacks the target to the head's c-fast
         # output order before MSE/backward.
         target = _wan_patch_input_to_head(target^, S, SAMPLE_LAT_C)
@@ -2119,8 +2119,8 @@ def main() raises:
         else:
             model_in = img_tokens.copy()
 
-        # Timestep-embedding input scale — CONFIRMED against the musubi oracle
-        # (kohya-ss/musubi-tuner src/musubi_tuner/hv_train.py::
+        # Timestep-embedding input scale — CONFIRMED against the torchref oracle
+        # (torchref-ss/torchref src/torchref/hv_train.py::
         #  get_noisy_model_input_and_timesteps, lines ~703-708):
         #     noisy_model_input = (1 - t) * latents + t * noise   # t = sigma in [0,1]
         #     timesteps = t * 1000.0

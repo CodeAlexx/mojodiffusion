@@ -20,8 +20,8 @@
 # gate (bernini_cond_forward_parity.mojo) can verify at cos>=0.999 AND check the
 # identity/rotation split + the target-region slice offset.
 #
-# Run (SEPARATE command, ai-toolkit venv):
-#   /home/alex/ai-toolkit/venv/bin/python \
+# Run (SEPARATE command, torchref venv):
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/wan22/parity/bernini_cond_forward_oracle.py
 
 import os

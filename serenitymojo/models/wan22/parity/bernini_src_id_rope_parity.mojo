@@ -11,7 +11,7 @@
 # the stock wan rope table (max_abs == 0), the defining invariant.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/ai-toolkit/venv/bin/python \
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/wan22/parity/bernini_src_id_rope_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . \

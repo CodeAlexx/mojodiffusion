@@ -9,7 +9,7 @@ predict on the SAME (scaled_noisy_packed, text_features, target) must match.
 Sequential to fit 24GB: encode caption (free) -> vae-encode image (free) ->
 transformer forward (bf16, matches Mojo storage dtype).
 
-Run: /home/alex/ai-toolkit/venv/bin/python parity/lens/lens_loss_oracle.py
+Run: /home/alex/torchref-image/venv/bin/python parity/lens/lens_loss_oracle.py
 """
 import importlib.util, json, os, gc
 import torch

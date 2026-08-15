@@ -2,8 +2,8 @@
 #
 # LTX-2.3 22B JOINT AUDIO-VIDEO TRANSFORMER BLOCK — forward only.
 #
-# Port of musubi-tuner BasicAVTransformerBlock._forward
-#   /home/alex/musubi-tuner/src/musubi_tuner/ltx_2/model/transformer/transformer.py
+# Port of torchref BasicAVTransformerBlock._forward
+#   /home/alex/torchref-video/src/torchref/ltx_2/model/transformer/transformer.py
 #   lines 466-802 (the real math; `forward` above is offload/checkpoint boilerplate).
 #
 # ── MEASURED WEIGHT SHAPES (block-0, ltx-2.3-22b-dev.safetensors) ────────────
@@ -40,7 +40,7 @@
 #     audio_to_video_attn.to_k.weight/bias    [4096,2048]   K in audio space
 #     audio_to_video_attn.to_v.weight/bias    [4096,2048]   V in audio space
 #     audio_to_video_attn.to_out.0.weight/bias [4096,4096]  out in video space
-#       NOTE: musubi names these [out,in] (PyTorch Linear weight convention).
+#       NOTE: torchref names these [out,in] (PyTorch Linear weight convention).
 #       The Attention module for a2v has query_dim=video.dim=4096,
 #       context_dim=audio.dim=2048, heads=audio.heads=32, dim_head=audio.d_head=64.
 #       So head_dim for cross-modal = Da/Ha = 2048/32 = 64.
@@ -221,7 +221,7 @@ def _rms_no_affine(
 #    row_idx: which row of scale_shift_table to use.
 #    Returns [B, 1, D] (broadcast-ready for [B, S, D] hidden states).
 #
-#    Math (musubi get_ada_values standard mode):
+#    Math (torchref get_ada_values standard mode):
 #      ada = table[row_idx] + temb[:, row_idx*D : (row_idx+1)*D]
 #    (table is broadcast over batch; temb carries the sigma-conditioned delta.)
 def _ada_vec(
@@ -287,7 +287,7 @@ def _apply_head_gate[S: Int, H: Int, Dh: Int](
 # ── Per-head gate for cross-modal (Din ≠ H*Dh) ───────────────────────────────
 # Cross-modal attention has gate_in dim = Dout (query stream dim) while the
 # attention output dim = H*Dh. These differ (e.g. a2v: Dout=4096, H*Dh=2048).
-# musubi applies gate_logits = to_gate_logits(x) where x = modulated Q input.
+# torchref applies gate_logits = to_gate_logits(x) where x = modulated Q input.
 # gate_in: [B, Sq, Din]  gate_w: [H, Din]  gate_b: [H]
 # attn_flat: [B, Sq, H*Dh]
 # Returns [B, Sq, H*Dh] after per-head gating.
@@ -314,7 +314,7 @@ def _apply_head_gate_cross[Sq: Int, H: Int, Dh: Int, Din: Int](
 #
 # Implements the math-mode path (gather BSHD->BHSD F32, Q@Kᵀ, softmax, P@V,
 # scatter) with Sq ≠ Skv. No additive mask (cross-modal and cross-attn here
-# are unmasked in the base model — mask=None in musubi _forward for these paths).
+# are unmasked in the base model — mask=None in torchref _forward for these paths).
 #
 # Q: [B, Sq, H, Dh]  K,V: [B, Skv, H, Dh]  -> out [B, Sq, H, Dh]  (q's dtype)
 # All in bf16; F32 internally; returns bf16.
@@ -695,7 +695,7 @@ def _cross_attn_path[B: Int, S: Int, N_TXT: Int, H: Int, Dh: Int](
 
 
 # ── Cross-modal attention (audio_to_video or video_to_audio) ─────────────────
-# Musubi _forward pre-normalizes vx and ax ONCE (vx_norm3, ax_norm3) before both
+# Torchref _forward pre-normalizes vx and ax ONCE (vx_norm3, ax_norm3) before both
 # a2v and v2a paths. We receive pre-normalized tensors here and apply the
 # AdaLN modulation inside. NO re-normalization.
 #
@@ -708,7 +708,7 @@ def _cross_attn_path[B: Int, S: Int, N_TXT: Int, H: Int, Dh: Int](
 # to_q: [H*Dh, Dout],  to_k/v: [H*Dh, Dkv],  to_out: [Dout, H*Dh].
 # rope_q_cos/sin: [Sq, H*Dh]  cross-modal RoPE for Q (interleaved).
 # rope_k_cos/sin: [Skv, H*Dh] cross-modal RoPE for K.
-# gate_w: [H, Dout]  gate_b: [H]  per-head gate (musubi to_gate_logits on mod_xq).
+# gate_w: [H, Dout]  gate_b: [H]  per-head gate (torchref to_gate_logits on mod_xq).
 # Returns updated hidden state for the query stream [B, Sq, Dout].
 def _cross_modal_attn[B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int, Dout: Int, Dkv: Int](
     norm_xq:  Tensor,    # [B, Sq, Dout]  bf16  pre-normalized query stream
@@ -722,10 +722,10 @@ def _cross_modal_attn[B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int, Dout: Int, Dkv
     wv: Tensor, bv: Tensor,                # [H*Dh, Dkv]  / [H*Dh]
     q_norm_w: Tensor, k_norm_w: Tensor,    # [H*Dh]
     wo: Tensor, bo: Tensor,                # [Dout, H*Dh] / [Dout]
-    # BUG1 FIX: cross-modal RoPE tables (interleaved, matching musubi attention.py:424-426)
+    # BUG1 FIX: cross-modal RoPE tables (interleaved, matching torchref attention.py:424-426)
     rope_q_cos: Tensor, rope_q_sin: Tensor,   # [Sq, H*Dh] bf16  cross PE for Q
     rope_k_cos: Tensor, rope_k_sin: Tensor,   # [Skv, H*Dh] bf16 cross PE for K
-    # BUG2 FIX: per-head gate (musubi to_gate_logits applied on mod_xq)
+    # BUG2 FIX: per-head gate (torchref to_gate_logits applied on mod_xq)
     gate_w: Tensor,    # [H, Dout]
     var gate_b: Tensor, # [H]
     eps: Float32,
@@ -758,7 +758,7 @@ def _cross_modal_attn[B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int, Dout: Int, Dkv
     var v4 = reshape(v, _sh4(B, Skv, H, Dh), ctx)
 
     # BUG1 FIX: Apply interleaved RoPE to cross-modal Q and K.
-    # musubi attention.py lines 424-426: q = apply_rotary_emb(q, pe); k = apply_rotary_emb(k, k_pe)
+    # torchref attention.py lines 424-426: q = apply_rotary_emb(q, pe); k = apply_rotary_emb(k, k_pe)
     # A2V: Q gets video.cross_positional_embeddings, K gets audio.cross_positional_embeddings.
     # V2A: Q gets audio.cross_positional_embeddings, K gets video.cross_positional_embeddings.
     # rope_q_cos/sin [Sq, H*Dh], rope_k_cos/sin [Skv, H*Dh] (passed in per-call).
@@ -771,7 +771,7 @@ def _cross_modal_attn[B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int, Dout: Int, Dkv
     )
     var attn_flat = reshape(attn, _sh3(B, Sq, H * Dh), ctx)  # [B,Sq,H*Dh]
 
-    # BUG2 FIX: Per-head gate (musubi attention.py lines 479-488).
+    # BUG2 FIX: Per-head gate (torchref attention.py lines 479-488).
     # gate_logits = to_gate_logits(x) where x = mod_xq (the modulated Q input).
     # gate_w [H, Dout], mod_xq [B, Sq, Dout] -> gates [B, Sq, H] -> scale attn heads.
     # Dout may differ from H*Dh for cross-modal (e.g. a2v: Dout=4096, H*Dh=2048).
@@ -813,7 +813,7 @@ def _ffn_path[B: Int, S: Int](
     var h1g = gelu(h1, ctx)
     var ff = linear(h1g, wff2, Optional[Tensor](_clone_t(bff2, ctx)), ctx)     # [B,S,D]
 
-    # Clamp output to ±60000 (bf16 overflow guard; musubi default ffn_clamp=60000).
+    # Clamp output to ±60000 (bf16 overflow guard; torchref default ffn_clamp=60000).
     # We implement clamp via add_scalar min/max. No clamp op in tensor_algebra —
     # use a simple elementwise approach: clamp via max(-60000, min(60000, ff)).
     # FLAG: ops/tensor_algebra.mojo has no clamp; implementing inline below.
@@ -1186,12 +1186,12 @@ def ltx2_av_block_forward[B: Int, Sv: Int, N_TXT: Int, Sa: Int](
     var gate_v2a    = _ada_vec(w.a_a2v_table, across_g_temb,  0, Da, ctx)
 
     # 5a. audio_to_video_attn: Q=video, KV=audio.
-    # Musubi: vx_scaled = modulate(vx_norm3, scale_a2v_v, shift_a2v_v)
+    # Torchref: vx_scaled = modulate(vx_norm3, scale_a2v_v, shift_a2v_v)
     #         ax_scaled = modulate(ax_norm3, scale_a2v_a, shift_a2v_a)
     #         vx += gate_a2v * audio_to_video_attn(Q=vx_scaled, KV=ax_scaled)
     # to_q: [H*Dh_a, Dv]=[2048,4096]; to_k/v: [H*Dh_a, Da]=[2048,2048]; to_out: [Dv,H*Dh_a]=[4096,2048]
     # SDPA: Sq=Sv, Skv=Sa, H=Ha=32, Dh=Dh_a=64.
-    # BUG1: Q=video gets vcross_pe, K=audio gets across_pe (musubi transformer.py:716-717).
+    # BUG1: Q=video gets vcross_pe, K=audio gets across_pe (torchref transformer.py:716-717).
     # BUG2: gate_w=a2v_gate_w [32,4096], gate_in=mod_xq=[B,Sv,Dv=4096].
     vx2 = _cross_modal_attn[B, Sv, Sa, Ha, Dh_a, Dv, Da](
         vx_norm3, ax_norm3, vx2,
@@ -1210,12 +1210,12 @@ def ltx2_av_block_forward[B: Int, Sv: Int, N_TXT: Int, Sa: Int](
     )
 
     # 5b. video_to_audio_attn: Q=audio, KV=video.
-    # Musubi: ax_scaled = modulate(ax_norm3, scale_v2a_a, shift_v2a_a)
+    # Torchref: ax_scaled = modulate(ax_norm3, scale_v2a_a, shift_v2a_a)
     #         vx_scaled = modulate(vx_norm3, scale_v2a_v, shift_v2a_v)
     #         ax += gate_v2a * video_to_audio_attn(Q=ax_scaled, KV=vx_scaled)
     # to_q: [H*Dh_a, Da]=[2048,2048]; to_k/v: [H*Dh_a, Dv]=[2048,4096]; to_out: [Da,H*Dh_a]=[2048,2048]
     # SDPA: Sq=Sa, Skv=Sv, H=Ha=32, Dh=Dh_a=64.
-    # BUG1: Q=audio gets across_pe, K=video gets vcross_pe (musubi transformer.py:740-741).
+    # BUG1: Q=audio gets across_pe, K=video gets vcross_pe (torchref transformer.py:740-741).
     # BUG2: gate_w=v2a_gate_w [32,2048], gate_in=mod_xq=[B,Sa,Da=2048].
     ax2 = _cross_modal_attn[B, Sa, Sv, Ha, Dh_a, Da, Dv](
         ax_norm3, vx_norm3, ax2,

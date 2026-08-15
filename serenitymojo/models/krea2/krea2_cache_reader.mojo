@@ -5,7 +5,7 @@
 # (models/dit/krea2_dit.mojo krea2_forward) + the stack LoRA forward
 # (models/krea2/krea2_stack.mojo) consume — with zero glue for Phase 4 (the trainer):
 #
-#   clean   [1, 16, LH, LW]   BF16  normalized VAE latent (ai-toolkit BF16 boundary)
+#   clean   [1, 16, LH, LW]   BF16  normalized VAE latent (torchref BF16 boundary)
 #   img     [1, imglen, 64]   BF16  PATCHIFIED clean (the krea2_forward `img` input)
 #   context [1, LT, 12, 2560] BF16  Qwen3-VL-4B 12-layer stack (`context`)
 #   pos     [1, LFULL, 3]     F32   txt zeros [LT,3] + img grid [imglen,3] (`pos`)
@@ -26,7 +26,7 @@
 # owns the activation memory), the same discover/validate/materialise shape, and the
 # same optional uncond (caption-dropout) accessor.
 #
-# WHY THE READER PATCHIFIES + BUILDS pos (instead of caching them): ai-toolkit keeps
+# WHY THE READER PATCHIFIES + BUILDS pos (instead of caching them): torchref keeps
 # `latents` UNPACKED through training (pipeline.py:102 "latents stay in (B,C,h,w)")
 # and patchify/pos are derived deterministically inside predict_velocity from the
 # latent's h//patch,w//patch (pipeline.py:78-90). So the cache stores only the
@@ -34,7 +34,7 @@
 # pipeline `_patchify`, the 'b c (h ph) (w pw) -> b (h w) (c ph pw)' rearrange) and
 # the pos grid (== `_build_pos`) on demand. This lets the TRAINER add flow-noise in
 # latent space (noisy=(1-t)*clean+t*noise; target=noise-clean) on `clean` BEFORE
-# patchify — exactly ai-toolkit's order — by re-patchifying the noised latent with
+# patchify — exactly torchref's order — by re-patchifying the noised latent with
 # krea2_patchify (exposed below) rather than the cached `img`. `img` is provided as a
 # convenience (the noise-free patchify); the noising itself is Phase 4.
 #
@@ -446,7 +446,7 @@ def krea2_build_edit_attn_bias(
 # Build the additive REFINER txtmask [1, heads, ltmax, ltmax] F32 for the txtfusion
 # refiner blocks (self-attention over the LTMAX text slots). -inf on the text-pad key
 # columns [real_text_len, ltmax); 0 else. When real_text_len >= ltmax returns an all-
-# zero mask (== full attention). Matches ai-toolkit + krea-ai/krea-2 which MASK the
+# zero mask (== full attention). Matches torchref + krea-ai/krea-2 which MASK the
 # refiner (mmdit.py:288); the serenity fixed-LTMAX pad path previously passed None,
 # which let the ZERO pad contaminate the text conditioning and blow up CFG on long
 # prompts (base -> black). Reuses the same pad-mask kernel (H=heads, lfull=ltmax).

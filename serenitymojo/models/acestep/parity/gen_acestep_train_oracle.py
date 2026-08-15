@@ -10,8 +10,8 @@ The Mojo trainer step differentiates against these dumps:
   loss:     mse(out0, flow)                 vs  loss_scalar     (~exact bf16)
   backward: LoRA A/B grads                  vs  grad_<name>     (cos, measured band)
 
-Run with the ai-toolkit venv (torch 2.12 + peft):
-  /home/alex/ai-toolkit/venv/bin/python scratchpad/acestep_train_ref_dump.py
+Run with the torchref venv (torch 2.12 + peft):
+  /home/alex/torchref-image/venv/bin/python scratchpad/acestep_train_ref_dump.py
 
 Reference runtime caveat: torch 2.12+cu130 vs ACE-Step's pinned 2.10+cu128 —
 same weights/modeling/recipe; minor-version matmul/layernorm diffs are within

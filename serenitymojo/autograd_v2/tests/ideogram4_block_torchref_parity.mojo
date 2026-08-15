@@ -1,7 +1,7 @@
-# autograd_v2/tests/ideogram4_block_aitoolkit_parity.mojo — ai-toolkit ORACLE gate.
+# autograd_v2/tests/ideogram4_block_torchref_parity.mojo — torchref ORACLE gate.
 #
 # Proves the serenitymojo Ideogram-4 block forward+backward matches the
-# ai-toolkit production oracle fixture (block 0), NOT a self-consistency compare.
+# torchref production oracle fixture (block 0), NOT a self-consistency compare.
 #
 # Sibling of autograd_v2/tests/ideogram4_block_parity.mojo (the engine==hand-chain
 # bit gate). That gate feeds SYNTHETIC inputs and compares the engine against the
@@ -28,9 +28,9 @@
 #
 # Run (oracle FIRST if the fixture is missing):
 #   /home/alex/serenityflow-v2/.venv/bin/python \
-#     serenitymojo/models/dit/parity/ideogram4_aitoolkit_oracle.py
+#     serenitymojo/models/dit/parity/ideogram4_torchref_oracle.py
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg
-#   pixi run mojo run -I . serenitymojo/autograd_v2/tests/ideogram4_block_aitoolkit_parity.mojo
+#   pixi run mojo run -I . serenitymojo/autograd_v2/tests/ideogram4_block_torchref_parity.mojo
 
 from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
@@ -66,10 +66,10 @@ from serenitymojo.models.ideogram4.config import (
 
 # Real block-0 checkpoint (fp8) — the SAME file the oracle dequantized to bf16.
 comptime CKPT_DIR = "/home/alex/.serenity/models/ideogram-4-fp8/transformer"
-# ai-toolkit oracle fixture (block 0).
+# torchref oracle fixture (block 0).
 comptime FIX = (
     "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/"
-    "ideogram4_aitoolkit_block0.safetensors"
+    "ideogram4_torchref_block0.safetensors"
 )
 
 # Geometry — fixed by the oracle (GH=GW=16 -> NIMG=256, NTEXT=4 -> L=260).
@@ -124,7 +124,7 @@ def _fix_lora(
 
 def main() raises:
     var ctx = DeviceContext()
-    print("=== Ideogram-4 BLOCK ai-toolkit ORACLE parity (cos >= 0.999) ===")
+    print("=== Ideogram-4 BLOCK torchref ORACLE parity (cos >= 0.999) ===")
 
     var fx = ShardedSafeTensors.open(String(FIX))
     var ck = ShardedSafeTensors.open(String(CKPT_DIR))
@@ -207,9 +207,9 @@ def main() raises:
 
     print("------------------------------------------------------------")
     if n_fail == 0:
-        print("IDEOGRAM4 BLOCK ai-toolkit PARITY PASS (all 15 captures cos >= 0.999)")
+        print("IDEOGRAM4 BLOCK torchref PARITY PASS (all 15 captures cos >= 0.999)")
     else:
         raise Error(
-            String("IDEOGRAM4 BLOCK ai-toolkit PARITY FAIL: ")
+            String("IDEOGRAM4 BLOCK torchref PARITY FAIL: ")
             + String(n_fail) + " capture(s) below cos 0.999"
         )

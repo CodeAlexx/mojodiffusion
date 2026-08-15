@@ -1,7 +1,7 @@
 # models/dit/parity/krea2_txtfusion_parity_probe.mojo — PARITY GATE for krea2
 # chunk 6 (TextFusionTransformer: 2 layerwise blocks over the 12-layer axis ->
 # Linear(12->1) projector -> 2 refiner blocks over the Lt tokens) vs a real
-# ai-toolkit torch oracle. TWO gated cases, both FAIL-LOUD (non-zero exit on
+# torchref torch oracle. TWO gated cases, both FAIL-LOUD (non-zero exit on
 # cos < 0.999) so a stale oracle cannot false-green this.
 #
 #   CASE A (b==1 INFERENCE): keep is all-ones (no text padding at b==1 — see

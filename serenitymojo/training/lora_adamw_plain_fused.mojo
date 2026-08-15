@@ -939,7 +939,7 @@ def lora_adamw_plain_preloaded_shared_abi_train_step(
             arena_after.sync_count - arena_before.sync_count,
             stats.nonfinite_count,
             PERF_FAST_PATH_DEVICE,
-            String("krea2-ai-toolkit-bf16-adamw-preloaded"),
+            String("krea2-torchref-bf16-adamw-preloaded"),
             String(""),
         )
         result.validate()

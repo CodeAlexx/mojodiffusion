@@ -6,7 +6,7 @@
 # is untouched.
 #
 # Formats:
-#   * Kohya / sd-scripts BFL LoRA (`lora_unet_double_blocks_{i}_img_attn_qkv`
+#   * torchref / sd-scripts BFL LoRA (`lora_unet_double_blocks_{i}_img_attn_qkv`
 #     .lora_down/.lora_up/.alpha), whose targets already match fused BFL weights.
 #   * Diffusers/PEFT FLUX LoRA (`transformer.transformer_blocks.{i}...lora_A/B`),
 #     including separate q/k/v and single-block MLP factors. Those deltas are
@@ -106,7 +106,7 @@ struct FluxLoraOverlay(Movable):
         return result^
 
 
-# ── Kohya BFL suffix -> BFL module weight suffix (module names contain '_', so a
+# ── torchref BFL suffix -> BFL module weight suffix (module names contain '_', so a
 #    fixed lookup is required; naive '_'->'.' would corrupt img_attn etc.) ──────
 def _double_targets() -> Tuple[List[String], List[String]]:
     var ko = List[String]()
@@ -210,8 +210,8 @@ def _try_add_diffusers(
     n_added += 1
 
 
-# ── Load Kohya-BFL or Diffusers/PEFT FLUX LoRA into an additive overlay ───────
-def load_flux_kohya_lora(
+# ── Load torchref-BFL or Diffusers/PEFT FLUX LoRA into an additive overlay ───────
+def load_flux_torchref_lora(
     path: String, num_double: Int, num_single: Int,
     multiplier: Float32, ctx: DeviceContext,
 ) raises -> FluxLoraOverlay:
@@ -332,6 +332,6 @@ def load_flux_kohya_lora(
           "(multiplier", multiplier, ")")
     if n_added == 0:
         raise Error(
-            String("flux lora: no Kohya-BFL or Diffusers/PEFT targets matched in ") + path
+            String("flux lora: no torchref-BFL or Diffusers/PEFT targets matched in ") + path
         )
     return FluxLoraOverlay(entries^)

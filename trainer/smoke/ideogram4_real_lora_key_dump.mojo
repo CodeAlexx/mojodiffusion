@@ -1,4 +1,4 @@
-# ideogram4_real_lora_key_dump.mojo — print a small summary of a real ai-toolkit
+# ideogram4_real_lora_key_dump.mojo — print a small summary of a real torchref
 # Ideogram-4 LoRA safetensors file. This is an audit helper, not a gate.
 from max.gpu.host import DeviceContext
 

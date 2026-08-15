@@ -347,7 +347,7 @@
           },
           {
             "title": "LoRA compatibility uses exact arch-string equality that can never match Klein",
-            "problem": "_model_lora_compatible requires m == t (serenity_daemon.mojo:2724). A Klein model's arch is 'flux-2/klein' (model_scan.mojo:164) but detect_lora_target_arch returns 'flux' for Flux-family LoRAs (model_scan.mojo:230-233) and has NO 'flux-2/klein' branch. So every real Klein LoRA is reported as incompatible with every Klein model in /v1/models, even though klein_backend DOES load AI-Toolkit/Comfy Flux2-Klein LoRAs (per the reboot doc). The UI compatibility card contradicts what the backend actually accepts.",
+            "problem": "_model_lora_compatible requires m == t (serenity_daemon.mojo:2724). A Klein model's arch is 'flux-2/klein' (model_scan.mojo:164) but detect_lora_target_arch returns 'flux' for Flux-family LoRAs (model_scan.mojo:230-233) and has NO 'flux-2/klein' branch. So every real Klein LoRA is reported as incompatible with every Klein model in /v1/models, even though klein_backend DOES load Torchref/Comfy Flux2-Klein LoRAs (per the reboot doc). The UI compatibility card contradicts what the backend actually accepts.",
             "parts": "model_scan.mojo (detect_arch vs detect_lora_target_arch) <-> serenity_daemon.mojo (_model_lora_compatible)",
             "fix": "Add a family-equivalence map (klein/flux-2 LoRAs <-> 'flux-2/klein' models) instead of string equality, and add explicit klein LoRA markers to detect_lora_target_arch. Make the UI compatibility verdict consistent with backend admission, which is the documented source of truth (model_scan.mojo:30)."
           },

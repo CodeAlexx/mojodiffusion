@@ -13,7 +13,7 @@
 #            comptime block in this file or add a config-reader call.
 #
 #   argv[2]  LoRA safetensors path, or "-"/"base"/"" for base model.
-#            HONORED: a Kohya/sd-scripts BFL FLUX LoRA (lora_unet_double_blocks_*)
+#            HONORED: a torchref/sd-scripts BFL FLUX LoRA (lora_unet_double_blocks_*)
 #            is applied as a runtime ADDITIVE overlay (W += scale·up@down) onto the
 #            offloaded DiT blocks at multiplier 1.0 (the saved checkpoint is never
 #            fused). Diffusers-format LoRAs are not yet supported (fail-loud).
@@ -397,7 +397,7 @@ def _legacy_disk_streaming_main_disabled() raises:
     var _lora_path = String("")
     if lora_raw != String("-") and lora_raw != String("base") and lora_raw != String(""):
         _lora_path = lora_raw
-        print("[lora] Kohya-BFL LoRA overlay enabled (multiplier 1.0):", _lora_path)
+        print("[lora] torchref-BFL LoRA overlay enabled (multiplier 1.0):", _lora_path)
 
     # argv[3]: sample prompts JSON
     var prompts_json = String(a[3])

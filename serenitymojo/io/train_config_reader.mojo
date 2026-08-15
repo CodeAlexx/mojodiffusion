@@ -283,7 +283,7 @@ def _optimizer_int(s: String) raises -> Int:
     elif s == "SCHEDULE_FREE_ADAMW":
         return TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW
     elif s == "AUTOMAGIC3" or s == "AUTOMAGIC_3" or s == "AUTOMAGIC-3":
-        # ai-toolkit Automagic3: HF-factored 2nd moment + sign-history
+        # torchref Automagic3: HF-factored 2nd moment + sign-history
         # exp(vote) adaptive lr; host-F32 via training/levers.mojo
         # (training/automagic3.mojo), gated by
         # training/parity/automagic3_parity_probe.mojo vs the Python oracle.
@@ -603,8 +603,8 @@ def _lr_scaler_int(s: String) raises -> Int:
 def _loss_fn_int(s: String) raises -> Int:
     # LOSS_FN_MSE 0 / LOSS_FN_HUBER 1 / LOSS_FN_SMOOTH_L1 2 / LOSS_FN_MAE 3
     # (train_config.mojo; T1.A torch-semantics loss selector). mae|l1 = |d|
-    # (musubi loss_type mae|l1). NOTE musubi calls smooth_l1 "huber" — for
-    # musubi-huber semantics use "smooth_l1" with smooth_l1_beta=huber_delta.
+    # (torchref loss_type mae|l1). NOTE torchref calls smooth_l1 "huber" — for
+    # torchref-huber semantics use "smooth_l1" with smooth_l1_beta=huber_delta.
     if s == "mse" or s == "MSE":
         return 0
     elif s == "huber" or s == "HUBER":
@@ -658,7 +658,7 @@ def _timestep_distribution_int(s: String) raises -> Int:
 
 
 def _adapter_algo_int(s: String) raises -> Int:
-    # Keep these spellings aligned with ai-toolkit's network.type values plus
+    # Keep these spellings aligned with torchref's network.type values plus
     # Serenity's historical adapter_algo values.
     if s == "lora" or s == "LORA":
         return TRAIN_ADAPTER_ALGO_LORA
@@ -1087,7 +1087,7 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.mask_cache_dir = sc.s
-        # ── LTX2 P6 AV (audio) arm (P6.0); absent -> musubi defaults -> C13 ──────
+        # ── LTX2 P6 AV (audio) arm (P6.0); absent -> torchref defaults -> C13 ──────
         elif key == "audio_loss_balance_mode":
             var sc = _read_scalar(cur)
             if sc.is_string:

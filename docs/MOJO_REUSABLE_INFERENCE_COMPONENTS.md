@@ -84,7 +84,7 @@ per-model static constructors + a `<X>Encoder` with `.load(...)` + `.encode...()
   (dim-0 concat of same-bucket samples). Ports `reference/flame-diffusion-master/
   src/dataset.rs` + `prepare_klein.rs`. **Byte-exact write/read round trip.**
 - `serenitymojo/training/lora_save.mojo` (201 L) — `save_lora_peft` / 
-  `load_lora_for_resume`: trained LoRA A/B ↔ PEFT/ai-toolkit safetensors,
+  `load_lora_for_resume`: trained LoRA A/B ↔ PEFT/torchref safetensors,
   byte-exact (the LoRA-weights half of resume; optimizer state lives in
   `training/loop.mojo` TrainState).
 

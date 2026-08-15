@@ -290,7 +290,7 @@ def main() raises:
     )
     _check(String("a8-step-2"), st_8.a8[3].step == 2)
 
-    # 7. AUTOMAGIC3 routes to the ai-toolkit adaptive optimizer; lazy state (2
+    # 7. AUTOMAGIC3 routes to the torchref adaptive optimizer; lazy state (2
     # factored Automagic3State per adapter); ONE shared adaptive lr in
     # auto3_ctl seeded from cfg.lr; params move; the scheduler step_lr is
     # IGNORED; during the H=8 warmup the controller abstains so lr stays at the

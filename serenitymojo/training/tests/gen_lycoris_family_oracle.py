@@ -20,11 +20,11 @@
 # the forward against the y dumped here.
 #
 # Layout conversions (documented, mirrored from the in-tree save modules):
-#   LoCon  down: Kohya OIHW [R,Cin,Kh,Kw]  -> Flame RSCF [Kh,Kw,Cin,R]  permute(2,3,1,0)
-#   LoCon  up:   Kohya OIHW [Cout,R,1,1]   -> Flame [R,Cout]            squeeze+T
-#   Tucker down: Kohya [R,Cin,1,1]         -> Flame [Cin,R]             squeeze+T
-#   Tucker mid:  Kohya [Ro,Ri,Kh,Kw]       -> Flame [Kh,Kw,Ri,Ro]       permute(2,3,1,0)
-#   Tucker up:   Kohya [Cout,R,1,1]        -> Flame [R,Cout]            squeeze+T
+#   LoCon  down: torchref OIHW [R,Cin,Kh,Kw]  -> Flame RSCF [Kh,Kw,Cin,R]  permute(2,3,1,0)
+#   LoCon  up:   torchref OIHW [Cout,R,1,1]   -> Flame [R,Cout]            squeeze+T
+#   Tucker down: torchref [R,Cin,1,1]         -> Flame [Cin,R]             squeeze+T
+#   Tucker mid:  torchref [Ro,Ri,Kh,Kw]       -> Flame [Kh,Kw,Ri,Ro]       permute(2,3,1,0)
+#   Tucker up:   torchref [Cout,R,1,1]        -> Flame [R,Cout]            squeeze+T
 #   LoHa: upstream DW = (w1a@w1b)*(w2a@w2b)*s  [out,in] with w1a [out,R], w1b [R,in].
 #         Mojo  DW = (w1a@w1b)(.)(w2a@w2b)*s  [in,out] with w1a [in,R],  w1b [R,out].
 #         DW_mojo = DW_up^T  =>  mojo.w1a = up.w1b^T, mojo.w1b = up.w1a^T (pair 2 same).
@@ -52,7 +52,7 @@
 #         lycoris DoRA (chosen over PEFT lora_A/lora_B+lora_magnitude_vector
 #         because pip lycoris is the only LIVE upstream loader on this box and
 #         the campaign oracle; the lycoris keys lora_down/lora_up + dora_scale
-#         are also ComfyUI's kohya-DoRA path). Layouts identical (lora_down
+#         are also ComfyUI's torchref-DoRA path). Layouts identical (lora_down
 #         [r,in], lora_up [out,r], dora_scale [out,1]); norm eps =
 #         torch.finfo(float32).eps (the Mojo gate passes the same eps). The
 #         dora_scale stays UNQUANTIZED F32 — upstream keeps it float32 even in

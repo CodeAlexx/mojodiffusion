@@ -43,7 +43,7 @@ def _fmt_name(f: Int) -> String:
     elif f == 2:
         return String("DIFFUSION_MODEL (PEFT)")
     elif f == 3:
-        return String("KOHYA_SDXL")
+        return String("TORCHREF_SDXL")
     return String("LTX2_DISTILLED")
 
 

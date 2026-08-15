@@ -32,7 +32,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 import mmdit  # noqa: E402
 from mmdit import SingleStreamBlock, SingleMMDiTConfig, _mask  # noqa: E402
 

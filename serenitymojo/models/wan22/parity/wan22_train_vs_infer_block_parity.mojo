@@ -7,7 +7,7 @@
 #   inference: models/dit/wan22_dit.mojo::wan22_block_forward
 #
 # These are two independent implementations of the same Wan2.2 block. Each is
-# separately gated (training vs Musubi at cos>=0.999; inference via the Bernini/Wan
+# separately gated (training vs Torchref at cos>=0.999; inference via the Bernini/Wan
 # product gates), and each is self-consistent — which is exactly why the gap hid.
 # Nothing ever checked them AGAINST EACH OTHER, and a LoRA is trained in the first
 # and rendered by the second. If they differ, an adapter learned in one is not valid

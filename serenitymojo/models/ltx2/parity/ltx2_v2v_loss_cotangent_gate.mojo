@@ -2,7 +2,7 @@
 #
 # LTX-2 IC-LoRA / V2V loss+cotangent self-check gate (P5 unit 2). HOST-ONLY --
 # no DeviceContext, no GPU. Validates v2v_target_cotangent:
-#   * loss == sum((pred-tgt)^2 * mask)/(n_true*dim)  (musubi _masked_mse, mse),
+#   * loss == sum((pred-tgt)^2 * mask)/(n_true*dim)  (torchref _masked_mse, mse),
 #   * ref rows of d_block_out are ZERO (the ref slice),
 #   * masked-out target rows are ZERO,
 #   * target-in-loss rows: d_block == d(loss)/d(block_out) by FINITE DIFFERENCE.

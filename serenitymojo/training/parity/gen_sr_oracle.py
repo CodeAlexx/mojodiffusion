@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # Oracle for the automagic3 bf16 STOCHASTIC-ROUNDING writeback.
-# Runs ai-toolkit's ACTUAL Automagic3._sr_truncate over many draws at fixed
+# Runs torchref's ACTUAL Automagic3._sr_truncate over many draws at fixed
 # fractional positions and measures (a) P(round up) and (b) the unbiased mean.
 # SR is random, so parity vs the Mojo port is DISTRIBUTIONAL, not bit-exact:
 # both must match the analytic P(up)=frac, mean=x within Monte-Carlo error.
 import sys, struct
 import torch
-sys.path.insert(0, "/home/alex/ai-toolkit")
+sys.path.insert(0, "/home/alex/torchref-image")
 from toolkit.optimizers.automagic3 import Automagic3
 
 N = 2_000_000
@@ -17,7 +17,7 @@ V_LO = 1.0
 V_HI = 1.0 + ULP
 fracs = [0.1, 0.25, 0.5, 0.75, 0.9]
 
-print(f"# automagic3 SR oracle (ai-toolkit _sr_truncate), N={N}, bf16 ULP@1={ULP}")
+print(f"# automagic3 SR oracle (torchref _sr_truncate), N={N}, bf16 ULP@1={ULP}")
 print(f"# V_LO={V_LO}  V_HI={V_HI}")
 print("frac     analytic_p_up   oracle_p_up   oracle_mean   target_mean   |bias|")
 torch.manual_seed(42)

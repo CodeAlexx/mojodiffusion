@@ -1,18 +1,18 @@
-# models/dit/parity/ideogram4_aitoolkit_predict_parity.mojo — ai-toolkit ORACLE gate
+# models/dit/parity/ideogram4_torchref_predict_parity.mojo — torchref ORACLE gate
 # for the Ideogram-4 FULL FORWARD STACK ("predict"): input_proj -> 34 blocks ->
 # final_layer -> velocity, plus MRoPE.
 #
 # Proves the serenitymojo Ideogram-4 FULL forward (models/dit/ideogram4_dit.mojo)
-# matches the ai-toolkit PRODUCTION predict_velocity composition, NOT the invalid
-# ideogram4-ref path. Sibling of the verified per-BLOCK ai-toolkit gate
-#   autograd_v2/tests/ideogram4_block_aitoolkit_parity.mojo (cos>=0.99998).
+# matches the torchref PRODUCTION predict_velocity composition, NOT the invalid
+# ideogram4-ref path. Sibling of the verified per-BLOCK torchref gate
+#   autograd_v2/tests/ideogram4_block_torchref_parity.mojo (cos>=0.99998).
 #
-# Reads the NEW ai-toolkit fixture
-#   serenitymojo/models/dit/parity/ideogram4_aitoolkit_predict.safetensors
-# (from ideogram4_aitoolkit_predict_oracle.py) and the SAME fp8 checkpoint.
+# Reads the NEW torchref fixture
+#   serenitymojo/models/dit/parity/ideogram4_torchref_predict.safetensors
+# (from ideogram4_torchref_predict_oracle.py) and the SAME fp8 checkpoint.
 #
 # Captures compared (cos >= 0.999, FAIL-LOUD on any miss):
-#   * mrope_cos / mrope_sin   (build_ideogram4_mrope vs the ai-toolkit f32 MRoPE)
+#   * mrope_cos / mrope_sin   (build_ideogram4_mrope vs the torchref f32 MRoPE)
 #   * block0_out / block16_out / block33_out  (instrumented forward, same helpers)
 #   * transformer_out         (raw model output, before -velocity reshape)
 #   * velocity                (toolkit velocity = -image_velocity, reshaped)
@@ -21,16 +21,16 @@
 #   - the model is fed model_t = 1 - t (t=0.7 toolkit -> model_t=0.3),
 #   - velocity = -(transformer_out[:, NTEXT:] reshaped to (gh,gw,c)).
 #
-# NOTE ON MRoPE: the ai-toolkit production MRoPE keeps inv_freq in float32; the
+# NOTE ON MRoPE: the torchref production MRoPE keeps inv_freq in float32; the
 # mojo build_ideogram4_mrope bf16-ROUNDS inv_freq (ideogram4-ref convention). This
 # gate MEASURES whether that bf16-inv mojo MRoPE still matches the f32-inv oracle
 # at the IMAGE_POSITION_OFFSET=65536 positions. The cos table is the evidence.
 #
 # Run (oracle FIRST if the fixture is missing):
 #   /home/alex/serenityflow-v2/.venv/bin/python \
-#     serenitymojo/models/dit/parity/ideogram4_aitoolkit_predict_oracle.py
+#     serenitymojo/models/dit/parity/ideogram4_torchref_predict_oracle.py
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg
-#   pixi run mojo run -I . serenitymojo/models/dit/parity/ideogram4_aitoolkit_predict_parity.mojo
+#   pixi run mojo run -I . serenitymojo/models/dit/parity/ideogram4_torchref_predict_parity.mojo
 
 from max.gpu.host import DeviceContext
 
@@ -58,7 +58,7 @@ from serenitymojo.models.dit.ideogram4_mrope import build_ideogram4_mrope
 comptime T = "/home/alex/.serenity/models/ideogram-4-fp8/transformer/diffusion_pytorch_model.safetensors"
 comptime FX = (
     "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/"
-    "ideogram4_aitoolkit_predict.safetensors"
+    "ideogram4_torchref_predict.safetensors"
 )
 
 # Geometry — fixed by the oracle (GH=GW=16 -> NIMG=256, NTEXT=4 -> L=260, t=0.7).
@@ -162,7 +162,7 @@ def _forward_capture[Sx: Int](
 
 def main() raises:
     var ctx = DeviceContext()
-    print("=== Ideogram-4 PREDICT (full forward) ai-toolkit ORACLE parity (cos >= 0.999) ===")
+    print("=== Ideogram-4 PREDICT (full forward) torchref ORACLE parity (cos >= 0.999) ===")
 
     var st = ShardedSafeTensors.open(T)
     var fx = ShardedSafeTensors.open(String(FX))
@@ -177,7 +177,7 @@ def main() raises:
     var h = ParityHarness(BAR)
     var n_fail = 0
 
-    # ── MRoPE (mojo bf16-inv builder vs ai-toolkit f32-inv oracle) ──
+    # ── MRoPE (mojo bf16-inv builder vs torchref f32-inv oracle) ──
     var sec = [24, 20, 20]
     var cs = build_ideogram4_mrope(pos, HEAD_DIM, sec, Float32(5000000.0), ctx, STDtype.BF16)
     var ref_cos = Tensor.from_view_as_f32(fx.tensor_view("out.mrope_cos"), ctx).to_host(ctx)
@@ -238,7 +238,7 @@ def main() raises:
     # f32-inv_freq MRoPE, loaded as bf16) instead of the mojo bf16-inv builder.
     # If block16/block33/transformer_out now PASS, it proves the mojo forward
     # COMPOSITION is faithful and the ONLY divergence is the MRoPE inv_freq dtype
-    # (mojo bf16-rounds inv_freq; ai-toolkit production keeps it float32).
+    # (mojo bf16-rounds inv_freq; torchref production keeps it float32).
     print("--- diagnostic: forward fed the oracle's (f32-inv) cos/sin -------------")
     var ocos = cast_tensor(Tensor.from_view(fx.tensor_view("out.mrope_cos"), ctx), STDtype.BF16, ctx)
     var osin = cast_tensor(Tensor.from_view(fx.tensor_view("out.mrope_sin"), ctx), STDtype.BF16, ctx)
@@ -255,10 +255,10 @@ def main() raises:
 
     print("------------------------------------------------------------")
     if n_fail == 0:
-        print("IDEOGRAM4 PREDICT ai-toolkit PARITY PASS (all 7 captures cos >= 0.999)")
+        print("IDEOGRAM4 PREDICT torchref PARITY PASS (all 7 captures cos >= 0.999)")
     else:
         raise Error(
-            String("IDEOGRAM4 PREDICT ai-toolkit PARITY FAIL: ")
+            String("IDEOGRAM4 PREDICT torchref PARITY FAIL: ")
             + String(n_fail) + " capture(s) below cos 0.999"
         )
 

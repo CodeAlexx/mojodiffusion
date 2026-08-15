@@ -8,7 +8,7 @@
 #
 # Run the oracle first, then this probe:
 #   cd /home/alex/mojodiffusion
-#   /home/alex/musubi-tuner/.venv/bin/python serenitymojo/models/dit/parity/kandinsky5_gen_oracle.py
+#   /home/alex/torchref-video/.venv/bin/python serenitymojo/models/dit/parity/kandinsky5_gen_oracle.py
 #   pixi run mojo run -I . serenitymojo/models/dit/parity/kandinsky5_block_parity.mojo
 
 from max.gpu.host import DeviceContext

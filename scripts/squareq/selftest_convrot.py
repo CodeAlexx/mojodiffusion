@@ -30,7 +30,7 @@ DEFAULT_H3 = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transform
 FAMILIES = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
 DEFAULT_BLOCKS = (0, 25, 49)
 
-# GO/NO-GO on the rotation itself (set by the team lead from the OneTrainer
+# GO/NO-GO on the rotation itself (set by the team lead from the torchref
 # prior art: dxqb's PR #1632 W8A8 ConvRot on Qwen was "not proven useful").
 # NOTE ON THE COS BAR: at int8 weight precision cos is already ~0.9999, so a
 # +0.0005 cos improvement is unreachable by ANY int8 method — the bar would

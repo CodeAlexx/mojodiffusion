@@ -13,16 +13,16 @@
 #   v_pred  = (noisy - x_pred) / sigma_floored
 #   target  = noise - clean
 #   loss    = MSE(v_pred, target);  dL/dx_pred = -(2/N)*diff/sigma_floored
-#   (ai-toolkit recipe: PLAIN MSE, no per-timestep weight. The DiffSynth
+#   (torchref recipe: PLAIN MSE, no per-timestep weight. The DiffSynth
 #    gauss-shift weight w(i)=norm(exp(-2*((t-500)/1000)^2)-min) is OFF by
 #    default — flip APPLY_GAUSS_SHIFT_WEIGHT to restore it.)
 #   sigma_floored = max(sigma, 0.002994012087583542)  [shift-3 prod floor]
-#   LoRA    : rank 32 default, alpha=rank (scale 1.0), lr 1e-4. ai-toolkit
+#   LoRA    : rank 32 default, alpha=rank (scale 1.0), lr 1e-4. torchref
 #             wraps EVERY transformer Linear → 257 adapters: 252 block
 #             (q/k/v/o/gate/up/down × 36 layers) + 5 RESIDENT HEAD
 #             (x_embedder.proj1, x_embedder.proj2, t_embedder1.mlp.0,
 #             t_embedder1.mlp.2, final_layer2.linear).
-#   noise_scale = 8.0 (ai-toolkit DEFAULT_NOISE_SCALE), grad clip @ 1.0,
+#   noise_scale = 8.0 (torchref DEFAULT_NOISE_SCALE), grad clip @ 1.0,
 #   optimizer = AdamW (eps 1e-6, the bitsandbytes AdamW8bit O1 default).
 #
 # DATA: stage-A dir (scripts/ideogram4_stage_images.py): images.safetensors
@@ -59,9 +59,9 @@
 # 10-step fp8-vs-bf16 loss-trajectory cosine >= 0.999 + step-1 adapter-grad
 # cosine >= 0.999 (argv[8] grad dump). NOTE: the old 3-step anchor
 # 0.05885428/0.33308488/0.5214583 was under the DiffSynth recipe (gauss-shift
-# weight ON + noise_scale 7.5 + no head adapters); the ai-toolkit recipe here
+# weight ON + noise_scale 7.5 + no head adapters); the torchref recipe here
 # (plain MSE, noise_scale 8.0, grad clip, 257 adapters) produces a NEW
-# trajectory — re-anchor against an ai-toolkit/torch dump (a fresh anchor is
+# trajectory — re-anchor against an torchref/torch dump (a fresh anchor is
 # part of this fix's gate, NOT the old one).
 #
 # ── T1 RUNTIME CONFIG + PRECEDENCE (Tier-1 lever wiring, levers.mojo) ────────
@@ -87,7 +87,7 @@
 #     SCHEDULE_FREE_ADAMW + beta1/beta2/eps/weight_decay — the default
 #     fused-AdamW path reads cfg hypers too; TrainConfig defaults equal the
 #     old literals 0.9/0.999/1e-8/0.01, so the no-config path is unchanged).
-#   * ai-toolkit uses PLAIN MSE — the DiffSynth gauss-shift weight wt(t_id)
+#   * torchref uses PLAIN MSE — the DiffSynth gauss-shift weight wt(t_id)
 #     is OFF by default (comptime APPLY_GAUSS_SHIFT_WEIGHT=False, wt==1.0).
 #     When opted in, wt multiplies loss AND grad (on top of levers_loss_grad).
 #   * no LR scheduler in this trainer: step_lr == the constant resolved lr
@@ -250,16 +250,16 @@ comptime F = 12288
 comptime LAYERS = 36
 comptime PATCH = 32
 comptime PATCH_VEC = 3072         # 32*32*3
-# ai-toolkit pipeline.DEFAULT_NOISE_SCALE = 8.0 (noise is scaled by this BEFORE
+# torchref pipeline.DEFAULT_NOISE_SCALE = 8.0 (noise is scaled by this BEFORE
 # add_noise: noisy = (1-sigma)*clean + sigma*(noise*noise_scale)).
 comptime NOISE_SCALE = Float32(8.0)
 comptime SHIFT = Float64(3.0)
 comptime EPS = Float32(1.0e-6)
 comptime SEED = UInt64(42)
-# ai-toolkit global-norm gradient clip @ 1.0 (BaseSDTrainProcess clips grads
+# torchref global-norm gradient clip @ 1.0 (BaseSDTrainProcess clips grads
 # before the optimizer step). Mirrors the chroma/flux/anima trainers.
 comptime CLIP_GRAD_NORM = Float32(1.0)
-# ai-toolkit pipeline.T_EPS = 0.001 → shift-3 production sigma floor. The
+# torchref pipeline.T_EPS = 0.001 → shift-3 production sigma floor. The
 # smallest training sigma (i=999) is shift(1 - 999/1000) = 3*0.001/(1+2*0.001)
 # = 0.002994012087583542. linspace starting at 1.0 - 999/1000 = 0.001 is the
 # PRE-SHIFT value; the Rust port documents the 0.001 floor as a previous bug —
@@ -269,8 +269,8 @@ comptime SIGMA_FLOOR = Float32(0.002994012087583542)
 # [config.json] argv is present, cfg.caption_dropout_prob replaces this (see
 # the runtime-config precedence block in the header).
 comptime HIDREAM_CAPTION_DROPOUT = Float32(0.0)
-# ai-toolkit recipe: PLAIN MSE loss, NO per-timestep weight. The DiffSynth
-# gauss-shift weight wt(t_id) is OFF by default to match ai-toolkit (its
+# torchref recipe: PLAIN MSE loss, NO per-timestep weight. The DiffSynth
+# gauss-shift weight wt(t_id) is OFF by default to match torchref (its
 # SDTrainer only weights timesteps when linear_timesteps / timestep_type
 # "weighted" is configured; hidream_o1 uses neither — see SDTrainer.py:831-851,
 # default loss = F.mse_loss(...).mean()). Flip to True ONLY to reproduce the
@@ -302,7 +302,7 @@ def _slot_name(slot: Int) raises -> String:
     return names[slot].copy()
 
 
-# ── RESIDENT-HEAD LoRA (ai-toolkit wraps EVERY Linear in the transformer, so
+# ── RESIDENT-HEAD LoRA (torchref wraps EVERY Linear in the transformer, so
 # the 5 resident-head linears get adapters too: 252 block + 5 head = 257). The
 # heads, in fixed order [0..4]:
 #   0 x_embedder.proj1      in=PATCH_VEC(3072) out=1024  (no bias)
@@ -341,9 +341,9 @@ def _head_base_key(h: Int) raises -> String:
 
 
 def _head_save_name(h: Int) raises -> String:
-    """The LoRA module path (ai-toolkit diffusion_model.* shape) for head
+    """The LoRA module path (torchref diffusion_model.* shape) for head
     0..4, sans the .lora_A/.lora_B suffix."""
-    # ai-toolkit convert_lora_weights_before_save strips ".model." (transformer.->
+    # torchref convert_lora_weights_before_save strips ".model." (transformer.->
     # diffusion_model. then .model.->.), so the saved key has NO ".model." segment.
     var names: List[String] = [
         String("diffusion_model.x_embedder.proj1"),
@@ -1216,7 +1216,7 @@ def _adamw_host(
 
 
 def _global_grad_norm(g_a: List[List[Float32]], g_b: List[List[Float32]]) -> Float64:
-    """L2 norm over the FLATTENED concat of every adapter grad (the ai-toolkit /
+    """L2 norm over the FLATTENED concat of every adapter grad (the torchref /
     torch clip_grad_norm_ convention: one norm across all trainable params)."""
     var sq = Float64(0.0)
     for k in range(len(g_a)):
@@ -1256,7 +1256,7 @@ def _clip_grads_all(
     mut hg_a: List[List[Float32]], mut hg_b: List[List[Float32]],
     max_norm: Float32,
 ) -> Float64:
-    """ai-toolkit global grad-norm clip @ max_norm over ALL trainable params
+    """torchref global grad-norm clip @ max_norm over ALL trainable params
     (chroma/flux _clip pattern, extended to the block + head adapter grads):
     one norm across both sets, then if ||g|| > max_norm scale every grad by
     max_norm/||g||. Returns the pre-clip norm. No-op when already under the cap
@@ -1355,11 +1355,11 @@ def main() raises:
     train_cfg.lr = lr
     train_cfg.lora_rank = rank
     train_cfg.max_steps = steps
-    # ai-toolkit O1 default optimizer = bitsandbytes AdamW8bit, eps 1e-6 (not
+    # torchref O1 default optimizer = bitsandbytes AdamW8bit, eps 1e-6 (not
     # the 1e-8 the generic TrainConfig default carries). With NO config the
     # generic default leaks 1e-8 in, so override it here; a config's
     # optimizer.eps still wins (the user set it explicitly). max_grad_norm
-    # already defaults to 1.0 (== ai-toolkit clip), so leave it.
+    # already defaults to 1.0 (== torchref clip), so leave it.
     if not has_config:
         train_cfg.eps = Float32(1.0e-6)
     var caption_dropout_p = HIDREAM_CAPTION_DROPOUT
@@ -1508,11 +1508,11 @@ def main() raises:
     else:
         print("[HiDreamO1-direct] block resident LoRA params skipped")
 
-    # ── RESIDENT-HEAD LoRA (the +5 that make the count 257; ai-toolkit wraps
+    # ── RESIDENT-HEAD LoRA (the +5 that make the count 257; torchref wraps
     # every transformer Linear, heads included). Own host pack + own fused
     # AdamW resident state + own device views — the 252-block machinery above
     # is untouched. B init = ZERO (lora_B starts at 0 = no-op delta, the
-    # ai-toolkit/zimage convention), A init = the same LCG pattern.
+    # torchref/zimage convention), A init = the same LCG pattern.
     var head_ads = List[LoraAdapter]()
     if lokr_active:
         head_ads = flat_lokr_carrier_list(head_lokr)
@@ -1725,7 +1725,7 @@ def main() raises:
     if use_b2 and levers_loss_active(train_cfg):
         raise Error(
             "train_hidream_o1: batch_size==2 is not wired for the loss levers path"
-            " (b2 uses the ai-toolkit plain-MSE velocity loss)"
+            " (b2 uses the torchref plain-MSE velocity loss)"
         )
     if use_b2:
         print("[batch-2] row-stacked TRUE batch-2 active (2 samples/step, plain-LoRA)")
@@ -2081,7 +2081,7 @@ def main() raises:
         st = st * 6364136223846793005 + 1442695040888963407
         var t_id = Int((st >> 33) % UInt64(1000))
         var sigma = sw.sigmas[t_id]
-        # ai-toolkit = plain MSE, no per-timestep weight: wt == 1.0 by default.
+        # torchref = plain MSE, no per-timestep weight: wt == 1.0 by default.
         # (APPLY_GAUSS_SHIFT_WEIGHT True restores the old DiffSynth recipe.)
         var wt = Float32(1.0)
         if APPLY_GAUSS_SHIFT_WEIGHT:
@@ -2263,7 +2263,7 @@ def main() raises:
         var d_full = List[Float32]()
         for _ in range(base):
             d_full.append(0.0)
-        # ai-toolkit floors sigma before the velocity divide (pipeline
+        # torchref floors sigma before the velocity divide (pipeline
         # sigma.clamp_min(T_EPS)); the shift-3 production floor is
         # SIGMA_FLOOR (== the schedule's own min at i=999, so a no-op for the
         # current schedule but explicit and matching the reference clamp).
@@ -2273,7 +2273,7 @@ def main() raises:
         if levers_loss_active(train_cfg):
             # T1.A loss levers (training/levers.mojo): huber / smooth_l1 /
             # min-SNR-flow over (v_pred, target). wt == 1.0 by default
-            # (ai-toolkit plain MSE); only the opt-in APPLY_GAUSS_SHIFT_WEIGHT
+            # (torchref plain MSE); only the opt-in APPLY_GAUSS_SHIFT_WEIGHT
             # restores the DiffSynth per-timestep weight on loss AND grad. The
             # x-prediction chain rule dv_pred/dx_pred = -1/sigma is unchanged.
             var v_pred_l = List[Float32]()
@@ -2556,7 +2556,7 @@ def main() raises:
             save_safetensors(gnames, gtensors, grad_dump, ctx)
             print("[grad-dump] ", grad_dump)
 
-        # ai-toolkit global grad-norm clip @ 1.0 over ALL 257 adapters' grads
+        # torchref global grad-norm clip @ 1.0 over ALL 257 adapters' grads
         # (block 252 + head 5), then each optimizer steps its own set.
         var grad_norm: Float64
         if dora_active:
@@ -2762,7 +2762,7 @@ def main() raises:
         # Shared UI progress line (the serenity-trainer TrainerRuntimeBridge
         # progress parser shape, same as the config-driven runners). Purely
         # additive stdout — the detail line above and all loss anchors are
-        # untouched. grad_norm = the pre-clip global norm (ai-toolkit clip).
+        # untouched. grad_norm = the pre-clip global norm (torchref clip).
         print_trainer_progress(
             String("HiDreamO1"), step, steps, n_samples, loss,
             grad_norm, Float64(t1 - t0) / 1.0e9, 0.0,

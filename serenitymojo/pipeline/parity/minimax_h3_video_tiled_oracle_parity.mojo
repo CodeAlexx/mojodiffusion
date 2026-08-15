@@ -18,7 +18,7 @@
 # output too (i.e. inherent to tiling/steps/resolution, not a port bug).
 #
 # Oracle: /tmp/claude-1000/-home-alex-mojodiffusion/7e1531cb-f7e2-44a5-9d63-8604853a656a/
-#   scratchpad/vvae_tiled_oracle_gen.py (OneTrainer venv, GPU F32) —
+#   scratchpad/vvae_tiled_oracle_gen.py (torchref venv, GPU F32) —
 #   z [1,24,2,30,52] NCDHW randn(seed 4321) -> tiled_decode -> [1,3,8,480,832],
 #   both dumped NDHWC. Splits it reported: H starts [0,112,224] overlap 144 px,
 #   W starts [0,192,384,576] overlap 64 px — every tile 256 px = 16 latent,

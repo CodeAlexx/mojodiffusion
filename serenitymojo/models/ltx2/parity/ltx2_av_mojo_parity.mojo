@@ -4,7 +4,7 @@
 #
 # This runs the ACTUAL Mojo `ltx2_av_block_forward[1, 64, 16, 32]` with real
 # block-0 weights from the checkpoint and compares its outputs against the
-# oracle (block0_ref.safetensors) produced by musubi's
+# oracle (block0_ref.safetensors) produced by torchref's
 # BasicAVTransformerBlock._forward in Python.
 #
 # Run:
@@ -27,7 +27,7 @@ from serenitymojo.models.ltx2.ltx2_av_block import (
 # block0_ref_halfd.safetensors: same inputs as block0_ref.safetensors BUT with
 # PE tables in half-D format (cos/sin[B, S, D/2] from even-indexed elements of
 # the original full-D random tables, then repeat_interleave(2) before passing to
-# musubi, so the oracle PE matches Mojo's rope_interleaved half-D convention).
+# torchref, so the oracle PE matches Mojo's rope_interleaved half-D convention).
 comptime REF_ST   = "/home/alex/mojodiffusion/output/ltx2_av/block0_ref_mojo_compat.safetensors"
 comptime HALFD_PE = "/home/alex/mojodiffusion/output/ltx2_av/block0_halfd_pe.safetensors"
 comptime INTER_ST = "/home/alex/mojodiffusion/output/ltx2_av/block0_intermediates.safetensors"

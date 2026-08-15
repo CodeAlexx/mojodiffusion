@@ -1,9 +1,9 @@
 # automagic3_sr_parity_gate.mojo — oracle gate for the bf16 STOCHASTIC-ROUNDING
-# writeback (sr_truncate_f32_to_bits). SR is random, so parity vs ai-toolkit's
+# writeback (sr_truncate_f32_to_bits). SR is random, so parity vs torchref's
 # _sr_truncate is DISTRIBUTIONAL: over many draws at a fixed fractional position
 # between two bf16 grid points, the Mojo port must (a) round UP with probability
 # == that fraction and (b) be UNBIASED (mean == x). Compare the printed numbers
-# against gen_sr_oracle.py (ai-toolkit) — both must match the analytic fraction.
+# against gen_sr_oracle.py (torchref) — both must match the analytic fraction.
 #
 # Build (-O2 to avoid the -O3 compile OOM):
 #   pixi run mojo build --optimization-level 2 -I . \

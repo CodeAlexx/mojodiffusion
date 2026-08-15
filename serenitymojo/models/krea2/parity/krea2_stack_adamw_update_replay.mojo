@@ -1,6 +1,6 @@
-# Krea2 reduced-depth ai-toolkit stack AdamW update replay.
+# Krea2 reduced-depth torchref stack AdamW update replay.
 #
-# Consumes the NBLOCKS=4 ai-toolkit SingleStreamDiT oracle dump from
+# Consumes the NBLOCKS=4 torchref SingleStreamDiT oracle dump from
 # krea2_stack_oracle.py and replays one AdamW step over the reduced-depth block
 # LoRA tensors through the shared device train-step ABI. This is optimizer
 # parity for the already-gated block-stack gradient surface; it is not real-cache
@@ -211,12 +211,12 @@ def _append_device_inputs(
     trainables.append(
         name.copy(),
         TArc(_tensor_from_loaded(st, k_before, ctx)),
-        String("krea2-reduced-depth-ai-toolkit-adapter-before"),
+        String("krea2-reduced-depth-torchref-adapter-before"),
     )
     grads.append(
         name.copy(),
         TArc(_tensor_from_loaded(st, k_grad, ctx)),
-        String("krea2-reduced-depth-ai-toolkit-adapter-grad"),
+        String("krea2-reduced-depth-torchref-adapter-grad"),
     )
     state.append(
         TArc(Tensor.from_host(_zeros(n), info.shape.copy(), STDtype.F32, ctx)),
@@ -385,5 +385,5 @@ def main() raises:
         update_result.sync_count,
     )
     print(
-        "[krea2-stack-adamw-update-mojo] scope=reduced-depth ai-toolkit SingleStreamDiT block-stack gradient plus shared-device AdamW update replay; not real-cache, full-28-block, txtfusion, or convergence parity"
+        "[krea2-stack-adamw-update-mojo] scope=reduced-depth torchref SingleStreamDiT block-stack gradient plus shared-device AdamW update replay; not real-cache, full-28-block, txtfusion, or convergence parity"
     )

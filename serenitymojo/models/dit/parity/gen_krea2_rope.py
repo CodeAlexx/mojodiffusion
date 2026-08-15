@@ -1,6 +1,6 @@
 """Krea-2 3-axis RoPE parity oracle (serenitymojo gate).
 
-Imports ai-toolkit's krea2 ``PositionalEncoding`` + ``ropeapply`` (the validated
+Imports torchref's krea2 ``PositionalEncoding`` + ``ropeapply`` (the validated
 oracle the user's live Krea-2 training exercises) and dumps, for a FIXED seeded
 ``pos`` (B=1, L, 3) and FIXED q/k, the layout-independent ground truth
 (``q_roped``/``k_roped``) plus the per-pair ``cos``/``sin`` tables. The Mojo
@@ -20,8 +20,8 @@ import torch
 from safetensors.torch import save_file
 
 # Import mmdit.py directly (its only deps are torch+einops) to bypass the
-# ai-toolkit package __init__ chain (which pulls torchao, absent here).
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+# torchref package __init__ chain (which pulls torchao, absent here).
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import PositionalEncoding, ropeapply  # noqa: E402
 
 OUT = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/krea2_rope_oracle.safetensors"

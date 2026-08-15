@@ -1,6 +1,6 @@
 """Krea-2 embedders + input/output heads parity oracle (chunk 5).
 
-Imports ai-toolkit's krea2 ``temb`` fn, ``RMSNorm``, ``GELU``-Sequential mirrors,
+Imports torchref's krea2 ``temb`` fn, ``RMSNorm``, ``GELU``-Sequential mirrors,
 and ``LastLayer`` DIRECTLY from mmdit.py (torch+einops only). The MLP heads
 (tmlp/tproj/txtmlp) and ``first`` are tiny nn.Sequential / nn.Linear stacks at the
 production dims, rebuilt here with the SAME dims + random weights (rather than
@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import temb as temb_fn, RMSNorm, LastLayer  # noqa: E402
 
 OUT = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/krea2_embedders_oracle.safetensors"

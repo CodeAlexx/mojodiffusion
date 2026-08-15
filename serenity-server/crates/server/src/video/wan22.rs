@@ -196,7 +196,7 @@ pub(super) fn wan22_ti2v5b_lora_header(doc: &Value) -> Result<usize, String> {
         }
         if !key.starts_with("diffusion_model.blocks.") {
             return Err(format!(
-                "unsupported Wan LoRA key '{key}'; TI2V-5B admits AI Toolkit/DiffusionModel block adapters"
+                "unsupported Wan LoRA key '{key}'; TI2V-5B admits torchref/DiffusionModel block adapters"
             ));
         }
         let prefix = key.trim_end_matches(".lora_A.weight");
@@ -266,7 +266,7 @@ pub(super) fn wan22_ti2v5b_lora_header(doc: &Value) -> Result<usize, String> {
     }
     if pairs == 0 {
         return Err(
-            "no AI Toolkit/DiffusionModel Wan TI2V-5B LoRA A/B pairs were found".to_string(),
+            "no torchref/DiffusionModel Wan TI2V-5B LoRA A/B pairs were found".to_string(),
         );
     }
     Ok(pairs)

@@ -1,4 +1,4 @@
-# Ideogram-4 seven-shape geometry/MRoPE/tile gate against the ai-toolkit oracle.
+# Ideogram-4 seven-shape geometry/MRoPE/tile gate against the torchref oracle.
 
 from std.collections import List
 from max.gpu.host import DeviceContext

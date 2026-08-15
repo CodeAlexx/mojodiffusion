@@ -3,7 +3,7 @@
 # Companion to ideogram_caption_parity_probe.mojo (the committed 126-case gate).
 # This one exercises the high-risk surfaces the original gate was BLIND to (the
 # skeptic's 5 blockers + verified-correct edges), regenerated from the REAL
-# ai-toolkit Python (no GPU, no LLM):
+# torchref Python (no GPU, no LLM):
 #   - embedded NUL (0x00) and every control char 0x00-0x1f (BLOCKER 1) — carried
 #     in the fixture file as \uXXXX ESCAPES, decoded to raw bytes by the parser;
 #   - float reserialize 1e2→100.0 / 1.5e3→1500.0 / -0.0 (BLOCKER 2);

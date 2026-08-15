@@ -2,7 +2,7 @@
 #
 # MiniMax-H3 FINAL LAYER training twin: forward + hand-chained backward for
 # the d_x handoff into block 49. Heads stay FROZEN (no weight grads) — the
-# backward returns only d_hidden. Oracle: musubi akane/minimax-h3 @ 04324c28
+# backward returns only d_hidden. Oracle: torchref-h3 @ 04324c28
 # model.py:400-433 (MiniMaxH3FinalLayer.forward):
 #
 #   shift, scale = adaln_proj(temb).chunk(2)      (mod TABLE precomputed here

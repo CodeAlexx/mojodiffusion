@@ -60,7 +60,7 @@ from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat, add
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 from serenitymojo.models.flux.flux_lora_overlay import (
-    FluxLoraOverlay, load_flux_kohya_lora,
+    FluxLoraOverlay, load_flux_torchref_lora,
 )
 
 
@@ -568,7 +568,7 @@ struct Flux1Offloaded(Movable):
         var loader = BlockLoader.open(path)
         return Flux1Offloaded(shared^, loader^, FluxLoraOverlay.empty())
 
-    # Same as load(), plus an additive Kohya-BFL LoRA overlay (W += scale·up@down,
+    # Same as load(), plus an additive torchref-BFL LoRA overlay (W += scale·up@down,
     # added onto streamed blocks at inference; the saved checkpoint is untouched).
     @staticmethod
     def load_with_lora(
@@ -577,7 +577,7 @@ struct Flux1Offloaded(Movable):
     ) raises -> Flux1Offloaded:
         var shared = Flux1DiT.load_shared(path, config, ctx)
         var loader = BlockLoader.open(path)
-        var lora = load_flux_kohya_lora(
+        var lora = load_flux_torchref_lora(
             lora_path, config.num_double, config.num_single, multiplier, ctx
         )
         return Flux1Offloaded(shared^, loader^, lora^)

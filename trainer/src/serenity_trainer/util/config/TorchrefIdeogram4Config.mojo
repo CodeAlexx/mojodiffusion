@@ -1,7 +1,7 @@
-# AIToolkitIdeogram4Config.mojo - native bridge for ai-toolkit Ideogram4 recipes.
+# TorchrefIdeogram4Config.mojo - native bridge for torchref Ideogram4 recipes.
 #
 # Deliberately no yaml dependency and no Python. This is a small scanner for the
-# ai-toolkit config shape used by /home/alex/ai-toolkit/config/*ideogram4*.yaml.
+# torchref config shape used by /home/alex/torchref-image/config/*ideogram4*.yaml.
 
 from serenity_trainer.ui.TrainerConfigModel import (
     TrainerUIConfig,
@@ -189,7 +189,7 @@ def _read_prompt_list(text: String, sample_start: Int) -> List[String]:
     return prompts^
 
 
-struct AIToolkitIdeogram4Config(Movable):
+struct TorchrefIdeogram4Config(Movable):
     var name: String
     var training_folder: String
     var device: String
@@ -280,10 +280,10 @@ struct AIToolkitIdeogram4Config(Movable):
         self.sample_prompts = List[String]()
 
 
-def read_ai_toolkit_ideogram4_config(path: String) raises -> AIToolkitIdeogram4Config:
+def read_torchref_ideogram4_config(path: String) raises -> TorchrefIdeogram4Config:
     var raw_text = _read_text_file(path)
     var text = _ascii_working_copy(raw_text)
-    var cfg = AIToolkitIdeogram4Config()
+    var cfg = TorchrefIdeogram4Config()
 
     var config_start = _section_start(text, String("config"))
     var network_start = _section_start(text, String("network"))
@@ -378,13 +378,13 @@ def read_ai_toolkit_ideogram4_config(path: String) raises -> AIToolkitIdeogram4C
     return cfg^
 
 
-def ai_toolkit_ideogram4_resolved_model_root(cfg: AIToolkitIdeogram4Config) -> String:
+def torchref_ideogram4_resolved_model_root(cfg: TorchrefIdeogram4Config) -> String:
     if cfg.model_name_or_path == String(IDEOGRAM4_HF_REPO):
         return String(IDEOGRAM4_LOCAL_ROOT)
     return cfg.model_name_or_path.copy()
 
 
-def ai_toolkit_ideogram4_to_train_config(src: AIToolkitIdeogram4Config) -> TrainConfig:
+def torchref_ideogram4_to_train_config(src: TorchrefIdeogram4Config) -> TrainConfig:
     var cfg = TrainConfig.adamw_lora_defaults()
     cfg.learning_rate = src.lr
     cfg.epochs = 1
@@ -398,11 +398,11 @@ def ai_toolkit_ideogram4_to_train_config(src: AIToolkitIdeogram4Config) -> Train
     return cfg^
 
 
-def ai_toolkit_ideogram4_to_trainer_ui_config(src: AIToolkitIdeogram4Config) -> TrainerUIConfig:
+def torchref_ideogram4_to_trainer_ui_config(src: TorchrefIdeogram4Config) -> TrainerUIConfig:
     var cfg = TrainerUIConfig()
     cfg.backend_target = String("ideogram4")
     cfg.run_name = src.name.copy()
-    cfg.base_model_name = ai_toolkit_ideogram4_resolved_model_root(src)
+    cfg.base_model_name = torchref_ideogram4_resolved_model_root(src)
     cfg.model_arch = src.model_arch.copy()
     cfg.model_quantize = src.quantize
     cfg.model_quantize_text_encoder = src.quantize_te

@@ -1,7 +1,7 @@
 # ltx2_levers_f32_writeback.mojo — F32-MASTER levers optimizer no-rounding gate.
 #
 # The existing optimizer parity gates validate the *_step fns (F32 params) vs
-# their torch/bnb/ai-toolkit oracles — but ALL of them drove the bf16-master
+# their torch/bnb/torchref oracles — but ALL of them drove the bf16-master
 # wrapper (cast -> step -> RNE/SR bf16 writeback). None asserts the ONE property
 # the F32-master path (MJ-1112, levers_optimizer_step_host_f32) exists for: the
 # step introduces NO bf16 rounding anywhere. This gate seeds F32 params carrying

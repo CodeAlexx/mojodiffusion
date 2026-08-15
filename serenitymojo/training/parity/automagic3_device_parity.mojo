@@ -1,6 +1,6 @@
 # automagic3_device_parity.mojo — ORACLE GATE for the GPU automagic3 step.
 #
-# Drives the HOST automagic3 (already gated == ai-toolkit, see
+# Drives the HOST automagic3 (already gated == torchref, see
 # AUTOMAGIC3_SKEPTIC_FINDINGS B1/probe) and the DEVICE kernel on byte-identical
 # inputs for N steps, then compares the F32 master params, the factored row/col
 # 2nd-moment state, and the self-adapted lr trajectory. Device must match host

@@ -3,7 +3,7 @@
 # Klein (FLUX.2) FULL DiT STACK *WITH LoRA* on every SerenityTrainer-wrapped
 # projection: forward (saving acts) + full-depth backward (training) that uses
 # the already-parity-verified per-block LoRA variants for EVERY block, COLLECTS
-# every adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit save
+# every adapter's d_A/d_B, and supports an AdamW step + a PEFT/torchref save
 # across all adapters. This file COMPOSES; it rebuilds NOTHING.
 #
 # WHAT IS ALREADY PROVEN (cos>=0.999 vs torch) AND ONLY REUSED HERE
@@ -4522,7 +4522,7 @@ def _load_klein_flux2_double_blocks_lora(
     num_double: Int, num_single: Int, rank: Int, alpha: Float32,
     D: Int, F: Int, ctx: DeviceContext,
 ) raises -> KleinLoraSet:
-    # AI Toolkit / Comfy Flux2-Klein exports use model-weight keys directly:
+    # torchref / Comfy Flux2-Klein exports use model-weight keys directly:
     # diffusion_model.double_blocks.{i}.img_attn.qkv/proj and *_mlp.{0,2}.
     # The live Klein sampler wants per-slot q/k/v/out/ff_in/ff_out adapters.
     var set = build_klein_lora_set(num_double, num_single, D, F, rank, alpha)

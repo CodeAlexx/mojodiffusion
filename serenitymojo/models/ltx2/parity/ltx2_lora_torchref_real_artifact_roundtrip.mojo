@@ -1,9 +1,9 @@
-# ltx2_lora_musubi_real_artifact_roundtrip.mojo — round-trip a REAL musubi
+# ltx2_lora_torchref_real_artifact_roundtrip.mojo — round-trip a REAL torchref
 # LTX-2 LoRA comfy artifact through the Mojo resume/save surface.
 #
 # Loads the artifact with load_lora_for_resume (384 video-mode t2v prefixes:
 # 48 blocks x {attn1,attn2} x {to_q,to_k,to_v,to_out.0}; the loader's
-# diffusion_model.-prefix fallback matches musubi's convert_lora_to_comfy key
+# diffusion_model.-prefix fallback matches torchref's convert_lora_to_comfy key
 # style), re-saves through save_lora_peft with the same diffusion_model keys,
 # and asserts key inventory. Payload byte comparison against the original is
 # done by the companion Python step (scripts/check_ltx2_lora_keys.py) — this
@@ -11,12 +11,12 @@
 # without loss-of-key. Pattern: chroma_lora_serenity_real_artifact_roundtrip.mojo.
 #
 #   pixi run mojo build -O2 -I . serenitymojo/models/ltx2/parity/\
-#     ltx2_lora_musubi_real_artifact_roundtrip.mojo -o /tmp/ltx2_lora_roundtrip
+#     ltx2_lora_torchref_real_artifact_roundtrip.mojo -o /tmp/ltx2_lora_roundtrip
 #   /tmp/ltx2_lora_roundtrip <in.comfy.safetensors> <out.safetensors>
 #
 # Oracle for the 2026-07-16 gate:
-#   /home/alex/mojodiffusion/output/ltx2_musubi_ref/ltx2_musubi_ref.comfy.safetensors
-#   (musubi-tuner dd96141, video band-ref recipe, rank 32, alpha 32 -> scale 1.0;
+#   /home/alex/mojodiffusion/output/ltx2_torchref_ref/ltx2_torchref_ref.comfy.safetensors
+#   (torchref dd96141, video band-ref recipe, rank 32, alpha 32 -> scale 1.0;
 #   comfy format = 768 keys, no alphas)
 
 from std.sys import argv

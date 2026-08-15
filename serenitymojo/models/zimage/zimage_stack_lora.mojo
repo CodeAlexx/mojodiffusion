@@ -3,7 +3,7 @@
 # Z-IMAGE (NextDiT) FULL DiT STACK *WITH LoRA* on every trained projection:
 # forward (saving ckpt-inputs) + reduced/full-depth backward (training) using the
 # parity-verified per-block LoRA variants (models/zimage/lora_block.mojo), COLLECTS
-# every adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit save
+# every adapter's d_A/d_B, and supports an AdamW step + a PEFT/torchref save
 # across all 7 × (num_nr + num_cr + num_main) adapters. This file COMPOSES; it
 # rebuilds NOTHING. Mirrors models/ernie/ernie_stack_lora.mojo (the PROVEN pattern).
 #
@@ -38,7 +38,7 @@
 #   are the diffusers submodule paths under prefix "transformer.":
 #       transformer.<stream>.<i>.attention.{to_q,to_k,to_v,to_out.0}
 #       transformer.<stream>.<i>.feed_forward.{w1,w3,w2}
-#   with kohya lora_down/lora_up (PeftBase LoRAModule.py:143-144). We REUSE
+#   with torchref lora_down/lora_up (PeftBase LoRAModule.py:143-144). We REUSE
 #   save_lora_peft, which emits PEFT "<prefix>.lora_A.weight"/".lora_B.weight" — the
 #   convention train_klein and the inference lora.mojo loader use (lora_save.mojo
 #   header) — using the diffusers module path as <prefix> (the Ernie precedent:
@@ -2249,7 +2249,7 @@ def zimage_stack_lora_backward_main_device[
 
 
 # ── L2P no-final backward: feed d_x[S,D] DIRECTLY into the main-block chain ────
-# Z-Image L2P (ai-toolkit z_image_l2p_model.py) has NO final layer-norm /
+# Z-Image L2P (torchref z_image_l2p_model.py) has NO final layer-norm /
 # modulate / linear on the image tokens — the last DiT block output IS the
 # feature map handed to the local_decoder. So the L2P trainer computes the
 # feature-map gradient itself (via the local_decoder backward) and feeds it here
@@ -2578,7 +2578,7 @@ def zimage_lora_adamw_step_main_only_resident(
     )
 
 
-# ── per-block PEFT/kohya prefix scheme (the INVERSE of the inference target map) ─
+# ── per-block PEFT/torchref prefix scheme (the INVERSE of the inference target map) ─
 # slot -> diffusers module suffix (transformer_z_image.py + zimage/weights.mojo).
 def _slot_suffix(slot: Int) -> String:
     if slot == SLOT_Q:
@@ -2618,7 +2618,7 @@ def zimage_lora_prefixes(set: ZImageLoraSet) -> List[String]:
     return out^
 
 
-# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
+# ── SAVE every adapter as a PEFT/torchref safetensors ──────────────────────
 def save_zimage_lora(set: ZImageLoraSet, path: String, ctx: DeviceContext) raises -> Int:
     var named = List[NamedLora]()
     for bi in range(set.num_blocks()):
@@ -2710,7 +2710,7 @@ def load_zimage_lora_main_only_state(
     return template^
 
 
-# ── COMFY/KOHYA Z-IMAGE LoRA LOAD (musubi-tuner networks.lora_zimage) ────────
+# ── COMFY/TORCHREF Z-IMAGE LoRA LOAD (torchref networks.lora_zimage) ────────
 # Key shape (verified on eri2_zimage_lora_comfy.safetensors, 2026-06-10):
 #   lora_unet_layers_{i}_attention_qkv.{lora_down.weight,lora_up.weight,alpha}
 #   lora_unet_layers_{i}_attention_out.{...}
@@ -2722,10 +2722,10 @@ def load_zimage_lora_main_only_state(
 #   ΔW_qkv = up @ down  ⇒  ΔW_q = up[0:D] @ down (rows; k/v the next chunks)
 # so to_q/to_k/to_v share A=down and take the matching B row-chunk (q,k,v
 # order — the Z-Image qkv Linear is the standard q|k|v concat).
-# Per-module scale = mult * alpha/rank (kohya: missing .alpha ⇒ scale = mult).
+# Per-module scale = mult * alpha/rank (torchref: missing .alpha ⇒ scale = mult).
 
 def zimage_lora_file_is_comfy(path: String) raises -> Bool:
-    """True when the file uses the comfy/kohya Z-Image export naming
+    """True when the file uses the comfy/torchref Z-Image export naming
     (`lora_unet_layers_...` keys) rather than the trainer resume format."""
     var st = SafeTensors.open(path)
     for ref n in st.names():
@@ -2749,7 +2749,7 @@ def _comfy_scale(
 ) raises -> Float32:
     var key_alpha = key + ".alpha"
     if key_alpha not in st.tensors:
-        return mult  # kohya convention: no .alpha ⇒ alpha = rank ⇒ scale 1·mult
+        return mult  # torchref convention: no .alpha ⇒ alpha = rank ⇒ scale 1·mult
     var alpha_h = _read_f32(st, key_alpha, ctx)
     if len(alpha_h) != 1:
         raise Error(String("zimage comfy lora: .alpha must be scalar for ") + key)
@@ -2834,7 +2834,7 @@ def load_zimage_lora_main_only_comfy(
     num_nr: Int, num_cr: Int, num_main: Int, D: Int, F: Int,
     mult: Float32, path: String, ctx: DeviceContext,
 ) raises -> ZImageLoraSet:
-    """Load a comfy/kohya Z-Image LoRA export into the flat ZImageLoraSet
+    """Load a comfy/torchref Z-Image LoRA export into the flat ZImageLoraSet
     order (nr|cr|main × Q,K,V,O,W1,W3,W2). rank/alpha come from the FILE
     (per module); `mult` is the request's LoRA weight. nr/cr slots get
     scale-0 placeholders (the format carries main layers only)."""

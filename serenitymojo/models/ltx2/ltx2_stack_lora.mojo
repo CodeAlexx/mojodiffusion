@@ -19,7 +19,7 @@
 #   (3) LEGACY NARROW LoRA TARGET SET:
 #       attn1.to_q, attn1.to_k, attn1.to_v, attn1.to_out.0 -> 4 adapters/block,
 #       4*48 = 192 total. Flat-indexed bi*4 + {0:q,1:k,2:v,3:o}.
-#       This is NOT musubi's production T2V preset, which targets all AV
+#       This is NOT torchref's production T2V preset, which targets all AV
 #       attention modules. See training/ltx2_av_training_readiness.mojo.
 #   (4) RoPE is SPLIT type (rope_halfsplit). cos/sin built via
 #       models/dit/ltx2_rope.build_ltx2_rope, flattened to [S*H, Dh//2] in the
@@ -525,7 +525,7 @@ def ltx2_lora_adamw_step_resident(
     )
 
 
-# PEFT-keyed save. Module prefix mirrors musubi lora_ltx2.py naming:
+# PEFT-keyed save. Module prefix mirrors torchref lora_ltx2.py naming:
 #   transformer_blocks.{bi}.attn1.{to_q,to_k,to_v,to_out.0}
 def save_ltx2_lora(lora: LTX2LoraSet, path: String, ctx: DeviceContext) raises -> Int:
     var slot_names = List[String]()
@@ -546,7 +546,7 @@ def save_ltx2_lora(lora: LTX2LoraSet, path: String, ctx: DeviceContext) raises -
 # The PEFT save above is inference-only (A/B). This `.state` variant additionally
 # carries adam_m/adam_v via the shared training/lora_save.mojo plumbing so a resumed
 # run does NOT zero AdamW momentum (the MJ-1077 / MJ-1088 warm-restart class). The
-# musubi module prefixes match save_ltx2_lora exactly, so a `.state` written here
+# torchref module prefixes match save_ltx2_lora exactly, so a `.state` written here
 # and a PEFT file written there index the SAME flat adapter order.
 def _ltx2_lora_prefixes(num_layers: Int) -> List[String]:
     var slot_names = List[String]()

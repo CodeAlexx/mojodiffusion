@@ -27,7 +27,7 @@
 # tower's O(P^2) attention stays tractable while staying a REAL geometry.
 #
 # Run (CPU, ~10-20 min for the host tower; build -O2):
-#   CUDA_VISIBLE_DEVICES="" /home/alex/OneTrainer/venv/bin/python \
+#   CUDA_VISIBLE_DEVICES="" /home/alex/torchref/venv/bin/python \
 #     scripts/minimax_h3_keyframe_vision_e2e_oracle.py
 #   pixi run mojo build -O2 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_keyframe_vision_e2e_probe.mojo \

@@ -1,7 +1,7 @@
 """Krea-2 sampler schedule oracle — the reference `timesteps()` output.
 
 Regenerates the pinned values in sampling/krea2_sampler_smoke.mojo. The body of
-`timesteps()` is copied VERBATIM from ai-toolkit krea2 src/pipeline.py:138-160
+`timesteps()` is copied VERBATIM from torchref krea2 src/pipeline.py:138-160
 (the module can't be imported directly — its relative `from .mmdit import ...`
 needs the package context — so the pure schedule fn is inlined here; it depends
 only on `math` + `torch.linspace`).
@@ -22,7 +22,7 @@ import torch
 
 
 def timesteps(seq_len, steps, x1, x2, y1=0.5, y2=1.15, sigma=1.0, mu=None):
-    # VERBATIM ai-toolkit krea2 src/pipeline.py:138-160.
+    # VERBATIM torchref krea2 src/pipeline.py:138-160.
     ts = torch.linspace(1, 0, steps + 1)
     if mu is None:
         slope = (y2 - y1) / (x2 - x1)

@@ -35,7 +35,7 @@
 # Size support: the finite seven-shape 1024-area product ladder. Every arm is
 # comptime-specialized at its exact latent H/W; steps/cfg/seed stay runtime.
 #
-# SDXL kohya LoRAs are merged sequentially at UNet load, including creator-style
+# SDXL torchref LoRAs are merged sequentially at UNet load, including creator-style
 # convolution adapters. Img2img remains fail-loud until its conditioning path is
 # implemented.
 

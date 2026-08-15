@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Generate the byte-matched fixture for the ltx2 trainer forward+loss parity
-gate (musubi torch runtime vs Mojo stack). Writes:
+gate (torchref torch runtime vs Mojo stack). Writes:
   <out>/fixture.safetensors   noise_i (BF16, latent shape), sigma_i (F32 [1])
   <out>/pairs.txt             one line per pair: <arm> <lat_file> <te_file> <sigma>
-Noise is stored BF16 because the musubi trainer's actual per-step noise is
+Noise is stored BF16 because the torchref trainer's actual per-step noise is
 randn_like(bf16 cache latents) — both sides upcast the SAME bf16 bytes to f32.
 """
 import os
@@ -14,7 +14,7 @@ import torch
 from safetensors.torch import save_file
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/alex/mojodiffusion/output/ltx2_parity_fwd"
-VID = "/home/alex/datasets/ltx2_musubi_v3/cache"
+VID = "/home/alex/datasets/ltx2_ref_v3/cache"
 IMG = "/home/alex/datasets/ltx2_eri2_512/cache"
 os.makedirs(OUT, exist_ok=True)
 

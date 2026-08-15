@@ -6,7 +6,7 @@
 #   - official 22B distilled LoRA
 #   - camera static LoRA
 #   - IC detailer LoRA
-#   - local Musubi-trained Comfy LoRA
+#   - local Torchref-trained Comfy LoRA
 #
 # The test uses the same LoraSet.apply_to_av_block path as inference. Header-only
 # coverage is not enough: every block-0 key for each LoRA must map to a real
@@ -34,8 +34,8 @@ comptime CAMERA_STATIC_LORA = (
 comptime DETAILER_LORA = (
     "/home/alex/.serenity/models/loras/ltx-2-19b-ic-lora-detailer.safetensors"
 )
-comptime LOCAL_MUSUBI_LORA = (
-    "/home/alex/musubi-tuner/output/ltx23_eri2/ltx23_eri2_lora.comfy.safetensors"
+comptime LOCAL_TORCHREF_LORA = (
+    "/home/alex/torchref-video/output/ltx23_eri2/ltx23_eri2_lora.comfy.safetensors"
 )
 comptime BLOCK_IDX = 0
 comptime MULT = Float32(1.0)
@@ -146,14 +146,14 @@ def main() raises:
     if detailer_applied != detailer_block:
         raise Error("detailer LoRA block apply count mismatch")
 
-    print("[load/apply] local Musubi-trained LoRA")
-    var local = LoraSet.load(String(LOCAL_MUSUBI_LORA))
+    print("[load/apply] local Torchref-trained LoRA")
+    var local = LoraSet.load(String(LOCAL_TORCHREF_LORA))
     var local_pairs = local.num_lora_pairs_in_file()
     var local_mappings = local.num_mappings()
     var local_block = local.ltx2_block_mapping_count(BLOCK_IDX)
     var local_global = local.ltx2_global_mapping_count()
     _check_counts(
-        String("local_musubi"),
+        String("local_torchref"),
         local_pairs,
         local_mappings,
         576,
@@ -164,7 +164,7 @@ def main() raises:
     )
     var local_applied = local.apply_to_av_block(BLOCK_IDX, block, MULT, ctx)
     if local_applied != local_block:
-        raise Error("local Musubi LoRA block apply count mismatch")
+        raise Error("local Torchref LoRA block apply count mismatch")
 
     var total_block = (
         distilled_applied + camera_applied + detailer_applied + local_applied

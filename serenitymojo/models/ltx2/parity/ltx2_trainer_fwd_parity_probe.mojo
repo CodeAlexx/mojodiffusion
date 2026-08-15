@@ -1,5 +1,5 @@
 # ltx2_trainer_fwd_parity_probe.mojo — MOJO side of the trainer forward+loss
-# parity gate vs musubi's own runtime (scripts/ltx2_parity_ref_gen.py).
+# parity gate vs torchref's own runtime (scripts/ltx2_parity_ref_gen.py).
 #
 # Byte-matched inputs: the SAME cache latents/TE embeds (bf16 files) and the
 # SAME fixture noise (BF16) + sigma; runs the production driver's exact

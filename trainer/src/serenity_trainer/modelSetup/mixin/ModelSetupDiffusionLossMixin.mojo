@@ -37,7 +37,7 @@ def min_snr_weight(snr_in: Float32, gamma: Float32, v_prediction: Bool) -> Float
 
 def debiased_estimation_weight(snr_in: Float32, v_prediction: Bool) -> Float32:
     var w = snr_in
-    if w > 1.0e3:        # torch.clip(weight, max=1e3) — Kohya stability fix
+    if w > 1.0e3:        # torch.clip(weight, max=1e3) — torchref stability fix
         w = 1.0e3
     if v_prediction:
         w = w + 1.0

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract the per-step loss band from a training log (MJ-1041 band gate).
 
-Works on: musubi train.log (tqdm postfix `loss_v=X` per step) and the Mojo
+Works on: torchref train.log (tqdm postfix `loss_v=X` per step) and the Mojo
 trainer log (`loss X` on the progress line). Prints median / frac>thr / max.
 
 Usage: ltx2_band_extract.py <log> [--key loss_v|loss] [--thr 0.30]
@@ -22,7 +22,7 @@ for i, a in enumerate(sys.argv):
 text = open(path, errors="replace").read().replace("\r", "\n")
 vals = []
 if key == "loss_v":
-    # musubi tqdm postfix: take the LAST loss_v per step index
+    # torchref tqdm postfix: take the LAST loss_v per step index
     per_step = {}
     for m in re.finditer(r"steps:\s+\d+%\|[^|]*\|\s+(\d+)/\d+.*?loss_v=([0-9.eE+-]+)", text):
         per_step[int(m.group(1))] = float(m.group(2))

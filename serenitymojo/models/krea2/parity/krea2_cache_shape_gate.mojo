@@ -12,7 +12,7 @@
 #   img     [1, imglen, 64]      imglen = (LH/2)*(LW/2)         (the `img` input)
 #   context [1, LT, 12, 2560]                                   (the `context` input)
 #   pos     [1, LT+imglen, 3]    == LFULL                       (the `pos` input)
-#   clean   [1, 16, LH, LW]      ai-toolkit batch.latents (trainer noises this)
+#   clean   [1, 16, LH, LW]      torchref batch.latents (trainer noises this)
 #   text_len == LT
 # Plus the patchify/pos helpers reproduce the inference pipeline's _patchify/_build_pos.
 #

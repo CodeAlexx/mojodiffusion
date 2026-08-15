@@ -1,7 +1,7 @@
 # ideogram_bc_glue.mojo — pure-Mojo 1:1 port of the DETERMINISTIC glue around
 # module A for the two Ideogram-4 captioner pipelines:
-#   B = Ideogram4Captioner (image → JSON)   — ai-toolkit extensions_built_in/captioner/Ideogram4Captioner.py
-#   C = upsample_ideogram4_caption (idea → JSON) — ai-toolkit ui_scripts/upsample_ideogram4_caption.py
+#   B = Ideogram4Captioner (image → JSON)   — torchref extensions_built_in/captioner/Ideogram4Captioner.py
+#   C = upsample_ideogram4_caption (idea → JSON) — torchref ui_scripts/upsample_ideogram4_caption.py
 #
 # Spec (read line-by-line): /home/alex/EriTrainer/IDEOGRAM_BC_GLUE_PORT_SPEC.md
 # Oracle generator (verbatim glue): /home/alex/EriTrainer/trainer/parity/ideogram_bc_glue/gen_glue_fixtures.py

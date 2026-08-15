@@ -54,7 +54,7 @@
 #   manifest.json : {"samples":[{"task":..,"file":..,"cond_count":..}, ...]}
 #
 # USAGE:
-#   /home/alex/ai-toolkit/venv/bin/python scripts/bernini_r_build_cache.py \
+#   /home/alex/torchref-image/venv/bin/python scripts/bernini_r_build_cache.py \
 #       --manifest <manifest.json> --out-dir <cache_dir>
 
 from __future__ import annotations

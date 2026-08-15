@@ -37,7 +37,7 @@
 #     :49    TIMESTEP_SHIFT_DEFAULT = 1.0   (inference-time schedule uses 3.0, :146)
 #     :46    NUM_TRAIN_TIMESTEPS = 1000
 #   crates/eridiffusion-core/src/models/sd35.rs:
-#     :32-39 LoRA targets (kohya SD3 SingleDiTBlock set): per joint block
+#     :32-39 LoRA targets (torchref SD3 SingleDiTBlock set): per joint block
 #            x_block.attn.{qkv,proj}, x_block.mlp.{fc1,fc2},
 #            context_block.attn.{qkv,proj}, context_block.mlp.{fc1,fc2},
 #            dual blocks add x_block.attn2.{qkv,proj}.

@@ -1,7 +1,7 @@
-# ideogram_caption.mojo — pure-Mojo 1:1 port of ai-toolkit's
+# ideogram_caption.mojo — pure-Mojo 1:1 port of torchref's
 # toolkit/ideogram_caption.py (module A: the deterministic caption formatter).
 #
-# Reference (line-by-line truth): /home/alex/ai-toolkit/toolkit/ideogram_caption.py
+# Reference (line-by-line truth): /home/alex/torchref-image/toolkit/ideogram_caption.py
 # Spec:                           /home/alex/EriTrainer/IDEOGRAM_CAPTIONER_PORT_SPEC.md
 #
 # This is HOST string/JSON logic only — NO GPU, NO LLM, NO torch. It normalizes /

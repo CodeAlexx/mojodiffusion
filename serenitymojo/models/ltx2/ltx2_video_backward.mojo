@@ -3,9 +3,9 @@
 # LTX-2.3 22B VIDEO-ONLY (audio=None) BLOCK — activation-saving TRAIN forward +
 # hand-chained BACKWARD for the video-mode T2V LoRA surface.
 #
-# This is the video-only training arm musubi runs when the audio modality is
+# This is the video-only training arm torchref runs when the audio modality is
 # absent (BasicAVTransformerBlock._forward, audio=None):
-#   /home/alex/musubi-tuner/src/musubi_tuner/ltx_2/model/transformer/transformer.py
+#   /home/alex/torchref-video/src/torchref/ltx_2/model/transformer/transformer.py
 #     run_vx  :589  -> True    (video present + enabled + numel>0)
 #     run_ax  :590  -> False   (audio is None)
 #     run_a2v :592  -> False   (run_vx AND audio-not-None -> False)
@@ -27,7 +27,7 @@
 # BACKWARD SCOPE (LoRA training; base FROZEN):
 #   outputs d_hidden (video stream input grad) + d_A/d_B for the video-mode
 #   surface = 8 pairs/block: {to_q,to_k,to_v,to_out.0} x {attn1, attn2}
-#   (musubi LTX2_INCLUDE_PATTERNS_T2V restricted to the video-active modules).
+#   (torchref LTX2_INCLUDE_PATTERNS_T2V restricted to the video-active modules).
 #
 # Parity gate: serenitymojo/models/ltx2/parity/ltx2_video_bwd_parity.mojo vs the
 # torch.autograd oracle scripts/ltx2_video_block_bwd_oracle.py.

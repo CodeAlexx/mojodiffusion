@@ -5,7 +5,7 @@
 #   anima_sample_cli <lora_peft.safetensors|base> <context.safetensors|sample_prompts.json> <out.png> [seed] [prompt_id]
 #
 # Loads the Anima base DiT (BF16 resident base + F32 stack base), OVERLAYS a PEFT
-# LoRA additively (scale*B*A at the inference linears, ai-toolkit forward overlay,
+# LoRA additively (scale*B*A at the inference linears, torchref forward overlay,
 # NEVER fused — [[LoRA never fused]]), runs the 30-step 1024 rectified-flow Euler
 # CFG denoise, and writes a scaled latent for fresh-process 1024 VAE decode.
 #

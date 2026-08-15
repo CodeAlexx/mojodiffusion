@@ -2,9 +2,9 @@
 # encode (image -> packed normalized latent) + sampling decode seam.
 #
 # ════════════════════════════════════════════════════════════════════════════
-# PORT SPEC — the EXACT ai-toolkit code path reproduced.
+# PORT SPEC — the EXACT torchref code path reproduced.
 # ════════════════════════════════════════════════════════════════════════════
-# ai-toolkit extensions_built_in/diffusion_models/ideogram4/ideogram4.py
+# torchref extensions_built_in/diffusion_models/ideogram4/ideogram4.py
 #   encode_images (455-476):
 #     moments = vae.encoder(image)        # diffusers AutoencoderKL Encoder,
 #                                         #   INCLUDES quant_conv (autoencoder.py:201)
@@ -49,7 +49,7 @@ comptime IDEOGRAM4_LATENT_NORM_PATH = "/home/alex/mojodiffusion/serenitymojo/mod
 
 
 # Training-side encoder: image NCHW [1,3,8*LH,8*LW] (range [-1,1]) ->
-# packed normalized latent [1,128,LH/2,LW/2] (== ai-toolkit batch.latents).
+# packed normalized latent [1,128,LH/2,LW/2] (== torchref batch.latents).
 # LH/LW are the VAE-latent spatial dims (image/8); packed grid = LH/2 x LW/2.
 struct Ideogram4VaeEncoder[LH: Int, LW: Int](Movable):
     var enc: LdmVaeEncoder[Self.LH, Self.LW, IDEOGRAM4_VAE_LATENT_CHANNELS]
@@ -86,7 +86,7 @@ struct Ideogram4VaeEncoder[LH: Int, LW: Int](Movable):
             ctx,
         )
 
-    # ai-toolkit encode_images: image -> (patched - shift) / scale.
+    # torchref encode_images: image -> (patched - shift) / scale.
     def encode(self, image_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
         return encode_ideogram4_latents[Self.LH, Self.LW](
             self.enc, image_nchw, self.latent_shift, self.latent_scale, ctx

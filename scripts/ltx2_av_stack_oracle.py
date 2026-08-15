@@ -18,7 +18,7 @@ block to head + 2 blocks + tail — the composition the Mojo AV training STACK
           / audio_proj_out -> video/audio velocity pred [1,S,128].
 
 Full S_A=16, no attention padding mask (scout verdict 2026-07-18: audio padding
-is LOSS-ONLY; no attention-level masking exists in musubi).
+is LOSS-ONLY; no attention-level masking exists in torchref).
 
 Dumps the byte-identical inputs + block-0/1 weight refs + reference outputs
 (video/audio velocity AND pre-tail hidden for stage isolation) for the Mojo gate
@@ -268,8 +268,8 @@ def build_lora(w, device, seed0, requires_grad=False):
 def build_rope(device):
     vcoords = build_video_coords(NF, NH, NW, VAE_SF, CAUSAL_OFFSET, FRAME_RATE, device)
     acoords = build_audio_coords(S_A, AUDIO_SCALE_FACTOR, CAUSAL_OFFSET, device)
-    # video h/w max_pos = FIXED [20,2048,2048] in musubi (rope.py:190) — not the
-    # geometry-dependent VAE_SF*grid (musubi-WRONG; corrected 2026-07-18, rope gate).
+    # video h/w max_pos = FIXED [20,2048,2048] in torchref (rope.py:190) — not the
+    # geometry-dependent VAE_SF*grid (torchref-WRONG; corrected 2026-07-18, rope gate).
     v_cos, v_sin = compute_rope(vcoords, INNER_DIM,
                                 [POS_EMBED_MAX_POS, 2048.0, 2048.0],
                                 ROPE_THETA, NUM_HEADS, device)

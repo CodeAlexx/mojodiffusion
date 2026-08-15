@@ -14,8 +14,8 @@ Preprocess: open RGB -> center-crop to square (min side) -> resize to 512x512
 output/alina_stage contract that klein_prepare_alina.mojo's _load_image reads
 (SafeTensors key "image", rank-4 [1,3,512,512], F32).
 
-CPU-only. Uses the ai-toolkit venv's numpy + PIL + safetensors:
-  /home/alex/ai-toolkit/venv/bin/python \
+CPU-only. Uses the torchref venv's numpy + PIL + safetensors:
+  /home/alex/torchref-image/venv/bin/python \
       serenitymojo/training/klein_stage_images.py
 
 Run with no args for the defaults below, or:

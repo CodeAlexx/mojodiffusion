@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build the CORRECT LTX-2 Mojo training cache (v2) from the disney dataset.
 
-CPU-only. Run with the ai-toolkit venv:
-  /home/alex/ai-toolkit/venv/bin/python /home/alex/disney_cache_tools/build_ltx2_cache_v2.py [--limit N]
+CPU-only. Run with the torchref venv:
+  /home/alex/torchref-image/venv/bin/python /home/alex/disney_cache_tools/build_ltx2_cache_v2.py [--limit N]
 
 WHAT THIS FIXES vs v1 (/home/alex/datasets/ltx2_cache_512):
   v1 (build_disney_caches.py) saved the RAW VAE posterior mean (std ~0.164) and

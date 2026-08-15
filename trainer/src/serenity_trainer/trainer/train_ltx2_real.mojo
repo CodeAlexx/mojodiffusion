@@ -7,7 +7,7 @@
 # on the full AV block forward/backward. See
 # `training/ltx2_av_training_readiness.mojo` for the executable readiness gate.
 #
-# TRANSLATION of the musubi-tuner LTX-2 LoRA recipe onto the Mojo LTX-2 LoRA
+# TRANSLATION of the torchref LTX-2 LoRA recipe onto the Mojo LTX-2 LoRA
 # OFFLOAD stack (models/ltx2/ltx2_stack_lora.mojo). Streams all 48 identical
 # transformer_blocks block-by-block via TurboPlannedLoader; the frozen
 # patchify_proj/proj_out + adaln_single conditioning network are resident. No
@@ -20,16 +20,16 @@
 #     adaln_single(sigma) -> 6*D delta (frozen) ADDED on top. Built once/step.
 #   - Legacy narrowed LoRA target set:
 #     attn1.to_q/to_k/to_v/to_out.0 -> 4 adapters x 48 = 192 total.
-#     musubi's production T2V preset targets all AV attention modules; see
+#     torchref's production T2V preset targets all AV attention modules; see
 #     ltx2_av_training_readiness.mojo.
 #   - RoPE: SPLIT type (rope_halfsplit), tables [S*H, Dh//2] split layout.
 #
-# Per step (flow-match; musubi ltx2_scheduler.py + ltx2_train.py):
+# Per step (flow-match; torchref ltx2_scheduler.py + ltx2_train.py):
 #   1. load cached latent tokens [N, in_ch] (already patchify-ready)
 #   2. sigma via logit-normal (shift=1.0 -> identity sigmoid(N(0,1)) clamp);
 #      ltx2_scheduler SD3-shift with shift=1.0 is identity.
 #   3. noisy = (1-sigma)*latent + sigma*noise ; target = noise - latent
-#        (musubi ltx2_train.py _build_noisy_input_for_sigma:
+#        (torchref ltx2_train.py _build_noisy_input_for_sigma:
 #         noisy_input = (1-sigma)*latents + sigma*noise; velocity = noise - x0)
 #   4. adaln_delta = adaln_single(timestep_embed(sigma))   (frozen, once/step)
 #   5. ltx2_stack_lora_forward_offload(noisy, adaln_delta, ...) -> pred [N,out_ch]
@@ -468,7 +468,7 @@ def main() raises:
                 sigma = Float32(1.0)
             if sigma < Float32(1.0e-3):
                 sigma = Float32(1.0e-3)
-        var t_model = sigma * Float32(NUM_TRAIN_TIMESTEPS)   # musubi: timesteps = sigma*1000
+        var t_model = sigma * Float32(NUM_TRAIN_TIMESTEPS)   # torchref: timesteps = sigma*1000
 
         # ── flow-match: noisy=(1-sigma)*latent+sigma*noise ; target=noise-latent ──
         var noise = _host_noise(S * IN_CH, SEED_BASE * UInt64(7919) + step_seed)

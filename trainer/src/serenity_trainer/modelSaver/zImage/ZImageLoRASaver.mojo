@@ -24,7 +24,7 @@
 #   <prefix>.lora_B.weight   = lora_up.weight    = adapter.b  [out, rank]
 # (and optionally <prefix>.alpha as a scalar — Serenity stores alpha inside the
 # module's state_dict; here alpha is recoverable from rank·scale and is emitted as
-# a 1-element tensor for round-trip fidelity, matching ai-toolkit/PEFT exporters).
+# a 1-element tensor for round-trip fidelity, matching torchref/PEFT exporters).
 #
 # The Z-Image LoRA prefixes are exactly the 30·7 module paths enumerated by
 # modelSetup/ZImageLoRASetup.mojo::zimage_lora_target_prefixes (block-major,
@@ -52,7 +52,7 @@ from serenity_trainer.modelSetup import zImageLoraTargets as LT
 comptime TArc = ArcPointer[Tensor]
 
 
-# Whether to also emit a "<prefix>.alpha" scalar per adapter (PEFT/ai-toolkit do).
+# Whether to also emit a "<prefix>.alpha" scalar per adapter (PEFT/torchref do).
 comptime EMIT_ALPHA = True
 
 

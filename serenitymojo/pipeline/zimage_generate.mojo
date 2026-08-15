@@ -4,7 +4,7 @@
 #   tokenizer → Qwen3-4B encoder (layer-34 penultimate) → CFG denoise loop
 #   (dual Mojo Z-Image stack forward + rectified-flow Euler) → Z-Image VAE decode.
 #
-# LoRA behavior is AI Toolkit-style FORWARD OVERLAY, not a weight merge:
+# LoRA behavior is torchref-style FORWARD OVERLAY, not a weight merge:
 #   base projection forward + lora_up(lora_down(x)) * multiplier * alpha/rank.
 # Do not swap this back to `LoraSet.merge_into_indexed`; the production trainer
 # saves main-layer PEFT/PERT adapters and sampling must exercise that same path.

@@ -72,7 +72,7 @@ comptime TRAIN_OPTIMIZER_PRODIGY = 5
 comptime TRAIN_OPTIMIZER_SGD = 6
 comptime TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW = 7
 comptime TRAIN_OPTIMIZER_ADAMW_8BIT = 8  # T2.A bnb block-wise 8-bit AdamW
-comptime TRAIN_OPTIMIZER_AUTOMAGIC3 = 9  # ai-toolkit adaptive (levers.mojo)
+comptime TRAIN_OPTIMIZER_AUTOMAGIC3 = 9  # torchref adaptive (levers.mojo)
 
 comptime TRAIN_TIME_UNIT_EPOCH = 0
 comptime TRAIN_TIME_UNIT_STEP = 1
@@ -92,7 +92,7 @@ comptime EMA_MODE_CPU = 2
 comptime LOSS_FN_MSE = 0
 comptime LOSS_FN_HUBER = 1
 comptime LOSS_FN_SMOOTH_L1 = 2
-comptime LOSS_FN_MAE = 3  # mean |d| (== musubi loss_type mae|l1); grad sign(d)/N
+comptime LOSS_FN_MAE = 3  # mean |d| (== torchref loss_type mae|l1); grad sign(d)/N
 
 # Adapter algorithm selector. Preserve the historical numeric values because
 # older configs and tests already use them.
@@ -378,7 +378,7 @@ struct TrainConfig(Copyable, Movable):
 
     # ── cached-input / AV trainer contract (default-off) ──
     # train_modality: 0=video, 1=audio-video, 2=audio.
-    # lora_target_preset mirrors musubi LTX2 presets:
+    # lora_target_preset mirrors torchref LTX2 presets:
     #   0=legacy_video_attn1, 1=t2v, 2=v2v, 3=audio,
     #   4=audio_ref_only_ic, 5=full.
     # Production AV trainers should set modality=AV, require cached video/text/
@@ -427,7 +427,7 @@ struct TrainConfig(Copyable, Movable):
     # Rolling checkpoint retention: keep only the newest N checkpoint(+.state) pairs,
     # pruned live after each save. 0 (default / absent) = keep all (the per-model
     # trainer may fall back to its own comptime default when this is 0). Config key
-    # `save_max_keep` (mirrors ai-toolkit max_step_saves_to_keep).
+    # `save_max_keep` (mirrors torchref max_step_saves_to_keep).
     var save_max_keep: Int
 
     # ── T2.B quantized-resident base weights (default-off == "") ────────────
@@ -462,9 +462,9 @@ struct TrainConfig(Copyable, Movable):
     var resident_blocks: Int
 
     # ── LTX2 IC-LoRA / v2v (P5 (d)); all default-OFF -> C13 byte-identical ──────
-    var ic_lora_strategy: String        # "auto"|"none"|"v2v"|"audio_ref_only_ic" (musubi IC_LORA_STRATEGIES)
+    var ic_lora_strategy: String        # "auto"|"none"|"v2v"|"audio_ref_only_ic" (torchref IC_LORA_STRATEGIES)
     var reference_downscale: Int        # >=1, default 1 (integer ref position multiplier)
-    var first_frame_conditioning_p: Float32  # default 0.0 (musubi 0.1); video arms only
+    var first_frame_conditioning_p: Float32  # default 0.0 (torchref 0.1); video arms only
     var reference_cache_dir: String     # train ref latents (reference_cache_directory route)
     var val_reference_cache_dir: String # val ref latents
     # ── LTX2 intrinsic-conditioning set (P5.5); all default-off -> C13 ──────────
@@ -478,7 +478,7 @@ struct TrainConfig(Copyable, Movable):
     var spatial_crop_x2: Int
     var mask_conditioning_p: Float32         # Inpaint (P5.5 u2); default 0.0
     var mask_cache_dir: String               # per-sample binary latent mask cache
-    # ── LTX2 P6 AV (audio) arm (P6.0); all musubi-default -> C13. Surface only;
+    # ── LTX2 P6 AV (audio) arm (P6.0); all torchref-default -> C13. Surface only;
     #    the trainer CONSUMES these at P6.2+ (config-wins there). Defaults cited
     #    from ltx2_train_network.py:6541-6776/7215-7227 + audio_loss_balance.py. ─
     var audio_loss_balance_mode: String          # "none"|"inv_freq"|"ema_mag"|"uncertainty"
@@ -492,7 +492,7 @@ struct TrainConfig(Copyable, Movable):
     var uncertainty_lr: Float32                  # -1.0 sentinel = unset -> learning_rate; >0 when set
     var video_caption_dropout_rate: Float32      # 0.0, [0,1] (AV only)
     var audio_caption_dropout_rate: Float32      # 0.0, [0,1] (AV only)
-    var separate_audio_buckets: Bool             # False (musubi None -> off)
+    var separate_audio_buckets: Bool             # False (torchref None -> off)
     var audio_bucket_strategy: String            # "" sentinel -> "pad"; {"pad","truncate"}
     var audio_bucket_interval: Float32           # 0.0 sentinel -> 2.0; >0 when set
     var min_audio_batches_per_accum: Int         # 0 (0=off) XOR audio_batch_probability
@@ -879,7 +879,7 @@ struct TrainConfig(Copyable, Movable):
         spatial_crop_x2: Int = 0,
         mask_conditioning_p: Float32 = Float32(0.0),   # P5.5 u2 inpaint — default-off
         var mask_cache_dir: String = String(""),
-        var audio_loss_balance_mode: String = String("none"),  # P6.0 AV arm — musubi defaults
+        var audio_loss_balance_mode: String = String("none"),  # P6.0 AV arm — torchref defaults
         audio_loss_balance_beta: Float32 = Float32(0.01),
         audio_loss_balance_eps: Float32 = Float32(0.05),
         audio_loss_balance_min: Float32 = Float32(0.05),

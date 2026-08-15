@@ -1,7 +1,7 @@
 # serenitymojo.captioner — pure-Mojo host-side caption logic (no GPU, no LLM).
 #
 # Modules:
-#   ideogram_caption — faithful 1:1 port of ai-toolkit's
+#   ideogram_caption — faithful 1:1 port of torchref's
 #                       toolkit/ideogram_caption.py (module A): normalize /
 #                       migrate / minify already-structured Ideogram-4 captions
 #                       into the compact model-string, pass prose through

@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Compare the ltx2 trainer fwd parity dumps: musubi runtime (ref_out) vs the
+"""Compare the ltx2 trainer fwd parity dumps: torchref runtime (ref_out) vs the
 Mojo stack (mojo_out) on byte-matched inputs.
 
 Bars (pre-stated, numeric-parity-testing skill):
   - pred cosine >= 0.999 per pair (forward pass; weights bit-identical —
     proven — so the only free variable is arithmetic: Mojo F32 stack vs
-    musubi bf16 autocast).
-  - loss: |mojo - ref| reported; the target-arithmetic class differs (musubi
+    torchref bf16 autocast).
+  - loss: |mojo - ref| reported; the target-arithmetic class differs (torchref
     computes noise-lat in bf16, Mojo in F32), so losses are compared as
     values + relative diff, not bit-equal.
 """

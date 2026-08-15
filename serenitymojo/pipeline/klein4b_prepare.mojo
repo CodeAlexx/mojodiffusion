@@ -181,7 +181,7 @@ def main() raises:
     var num_samples = atol(String(a[3]))
     if num_samples <= 0:
         raise Error("klein_prepare: N must be > 0")
-    # IMAGE-EDIT convention (mirrors ai-toolkit / SimpleTuner control_path):
+    # IMAGE-EDIT convention (mirrors torchref / SimpleTuner control_path):
     # the target image lives at <stage_dir>/sample_<i>.safetensors and its
     # matching REFERENCE image lives at <ref_stage_dir>/sample_<i>.safetensors
     # (SAME base filename across two parallel dirs). When ref_stage_dir is given

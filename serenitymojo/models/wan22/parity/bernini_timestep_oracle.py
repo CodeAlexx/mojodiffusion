@@ -14,7 +14,7 @@
 # (mode density(raw), logit density(z), shifted_sigma(idx)) for the bit-exact
 # gate against the Mojo closed forms.
 #
-# Run: /home/alex/ai-toolkit/venv/bin/python \
+# Run: /home/alex/torchref-image/venv/bin/python \
 #        serenitymojo/models/wan22/parity/bernini_timestep_oracle.py
 
 import importlib.util

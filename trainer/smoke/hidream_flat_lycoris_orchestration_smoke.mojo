@@ -4,7 +4,7 @@
 # REAL slot geometry. HiDream dispatches LyCORIS through the SHARED flat carrier
 # stack (serenitymojo/training/flat_lycoris_stack.mojo) in TWO sets — 252 block
 # adapters (36 language-model layers × 7 slots q/k/v/o/gate/up/down) + 5 resident
-# HEAD adapters (ai-toolkit wraps every Linear ⇒ 252+5=257). No per-model
+# HEAD adapters (torchref wraps every Linear ⇒ 252+5=257). No per-model
 # orchestration gate existed; this closes that audit cell.
 #
 # Proves at HiDream's REAL dims (NOT toy):

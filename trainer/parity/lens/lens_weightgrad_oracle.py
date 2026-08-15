@@ -9,7 +9,7 @@ target Linears so the Mojo finetune backward (dW accumulation) can be gated.
 Uses the SAME fixed forward inputs as the LoRA backward oracle (dit_fwd_in_*),
 same MSE(out, target_v) loss → identical g_l/x_l. dW_l computed via fwd/bwd hooks.
 
-Run: /home/alex/ai-toolkit/venv/bin/python parity/lens/lens_weightgrad_oracle.py
+Run: /home/alex/torchref-image/venv/bin/python parity/lens/lens_weightgrad_oracle.py
 """
 import importlib.util, json, os
 import torch

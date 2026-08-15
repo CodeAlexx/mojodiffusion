@@ -1,6 +1,6 @@
 # pipeline/krea2_pipeline.mojo — Krea-2 (krea2) text->image inference pipeline.
 #
-# Full T2I path (DiT/VAE half), pure Mojo + MAX, GPU-only. Mirrors the ai-toolkit
+# Full T2I path (DiT/VAE half), pure Mojo + MAX, GPU-only. Mirrors the torchref
 # reference Krea2Pipeline.__call__ (krea2 src/pipeline.py:185-260) + the
 # patchify/pos construction in `prepare` (pipeline.py:66-90) and
 # `predict_velocity` (pipeline.py:93-130):

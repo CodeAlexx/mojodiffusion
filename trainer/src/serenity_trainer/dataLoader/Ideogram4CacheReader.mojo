@@ -45,7 +45,7 @@ struct Ideogram4TrainSample(Copyable, Movable):
     var t_flow: Float32
     # natural (pre-pad) caption token count; defaults to NT (all real) when the
     # cache predates the text_len.<i> scalar. Passed to ideogram4_build_packed_inputs
-    # so the DiT indicator is 0 at text-pad positions (ai-toolkit pipeline.py:249).
+    # so the DiT indicator is 0 at text-pad positions (torchref pipeline.py:249).
     var text_len: Int
     var index: Int
 

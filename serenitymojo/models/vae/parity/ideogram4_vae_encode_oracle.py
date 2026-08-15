@@ -1,5 +1,5 @@
 # DEV-ONLY parity oracle for the Ideogram-4 VAE *encoder* (training path).
-# Mirrors ai-toolkit ideogram4.py::encode_images (lines 455-476):
+# Mirrors torchref ideogram4.py::encode_images (lines 455-476):
 #   moments = vae.encoder(image)            # [1,64,H/8,W/8]  (NO quant_conv — encoder() is called directly)
 #   mean    = moments[:, :32]               # DiagonalGaussian mode (deterministic; training uses mean)
 #   patched = patchify_latents(mean, 2)     # [1,128,gh,gw]
@@ -20,7 +20,7 @@ PATCH = 2
 
 
 def patchify_latents(z, patch_size=2):
-    # ai-toolkit src/pipeline.py:40 — (B,ae_ch,H8,W8) -> (B, ae_ch*patch^2, gh, gw)
+    # torchref src/pipeline.py:40 — (B,ae_ch,H8,W8) -> (B, ae_ch*patch^2, gh, gw)
     b, ae_ch, h8, w8 = z.shape
     ph = pw = patch_size
     gh, gw = h8 // ph, w8 // pw

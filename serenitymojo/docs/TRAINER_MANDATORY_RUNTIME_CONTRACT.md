@@ -51,7 +51,7 @@ fix process separation, offload, or sampler memory instead.
 
 Every trainer checkpoint cadence must write both files:
 
-- PEFT/ai-toolkit LoRA safetensors for inference and external tools.
+- PEFT/torchref LoRA safetensors for inference and external tools.
 - Trainer-state safetensors carrying LoRA A/B plus AdamW `m/v` moments for exact
   Mojo resume.
 

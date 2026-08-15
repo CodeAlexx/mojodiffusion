@@ -38,7 +38,7 @@ file is "where does X live". First target: Z-Image text→image.
   boxes: watched scope + PSI tripwire, never bare (see the klein gate scripts
   pattern).
 - **Weight-gate trainer builds (2026-08-14)**: `training/train_wan22_real.mojo`
-  (the REAL 2303-line musubi wan22 trainer — the fork under `trainer/src` is
+  (the REAL 2303-line torchref wan22 trainer — the fork under `trainer/src` is
   frozen by user decision) builds as `output/bin/serenity_wan22_real_trainer`;
   `training/train_ltx2_av.mojo` builds as `output/bin/serenity_ltx2_av_trainer`
   (first Mojo-1.0 build; 3-step weight gate on `ltx2_val_smoke` PASS x3
@@ -104,7 +104,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `ops/cast.mojo` | `cast_tensor`: GPU materialized F32<->BF16/F16 casts. | ✅ |
 | `ops/fp8.mojo` | FP8 E4M3→BF16 dequant: `fp8_e4m3_dequant_to_bf16` (per-tensor), `fp8_e4m3_dequant_perrow_to_bf16` + `load_fp8_dequant` (per-output-row, Ideogram-4). serenitymojo's first fp8-weight path. | ✅ per-row cos 0.99999878 |
 | `ops/random.mojo` | `randn`: GPU deterministic standard-normal fill matching Rust rand 0.8 `StdRng` seed stream. | ✅ |
-| `ops/random_torch.mojo` | `randn_torch`: **torch-bit-compatible** Philox4x32-10 + curand Box-Muller randn (faithful port of flame-core `rng/torch_compat.rs`). A given seed reproduces `torch.randn` on the SAME GPU (grid depends on SM count, per torch). Used by krea2 inference so seeds match ai-toolkit/reference compositions. | ✅ cos 1.00000012 / 100% within 1e-5 vs torch (3090) |
+| `ops/random_torch.mojo` | `randn_torch`: **torch-bit-compatible** Philox4x32-10 + curand Box-Muller randn (faithful port of flame-core `rng/torch_compat.rs`). A given seed reproduces `torch.randn` on the SAME GPU (grid depends on SM count, per torch). Used by krea2 inference so seeds match torchref/reference compositions. | ✅ cos 1.00000012 / 100% within 1e-5 vs torch (3090) |
 | `ops/linear.mojo` | `linear(x, w, bias)` = x @ wᵀ + b (vendor BLAS matmul, F32 accum). | ✅ |
 | `ops/norm.mojo` | `rms_norm`, `layer_norm`, `group_norm` (NHWC) — hand-rolled. | ✅ |
 | `ops/rope.mojo` | `rope_interleaved` (FLUX/Klein), `rope_halfsplit` (Z-Image), `rope_halfsplit_full` (Qwen2.5-VL mRoPE). | ✅ |
@@ -124,9 +124,9 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/dit/zimage_dit.mojo` | `NextDiT[HL,WL,CAPLEN]` Z-Image transformer + `NextDiTConfig`. | ✅ cos 0.99985 |
 | `models/dit/klein_dit.mojo` | `Klein9BDiT` / `Klein9BOffloaded`: FLUX.2 Klein 9B DiT, full all-block and offloaded 1024 forward. | ✅ one-step 1024 |
 | `models/dit/ideogram4_dit.mojo` | Ideogram-4 single-stream DiT (fp8 weights→BF16, per-layer load); `ideogram4_forward[S]` + block/attention/t-embed/RoPE helpers. First fp8-weight model; ref = diffusers `ideogram4-ref` (NOT SerenityTrainer). | ✅ 34-layer velocity cos 0.9996 |
-| `models/dit/ideogram4_mrope.mojo` | `build_ideogram4_mrope`: 3-axis (t,h,w) interleaved MRoPE cos/sin (**f32 inv_freq** — matches ai-toolkit production; was bf16-rounded, fixed 2026-06-25). | ✅ cos 0.99999999 |
-| `models/dit/sdxl_unet.mojo` | SDXL UNet with kohya/Diffusers LoRA attachment. Read-only convolution weights remain borrowed and disposable contiguous tensors use metadata-only owned reshapes, avoiding redundant device copies without cache or lifecycle machinery. | ✅ `job-0059` exact RGB; 30.6527 s / 30 steps at 1024px |
-| `models/krea2/` (LoRA TRAINING) | krea2 LoRA-training port: `config.mojo`, `krea2_block.mojo` (SingleStreamDiT block fwd/save-acts + bwd + 8 LoRA Linears, + flash-padmask masked-attn arm on `real_len`), `krea2_stack.mojo` (stack fwd + LoRA backward final→×28, `*_streamed` + `Krea2ResidentFp8`/`Krea2ResidentCond` resident-base path), `krea2_cache_reader.mojo` (LT-bucket pad), `train_krea2.mojo` (LTMAX=768 bucket, `quantized_resident="fp8_e4m3"`, `KREA2_V2_GRAPH` seam). VAE=Qwen-Image, TE=Qwen3-VL-4B. Oracle=ai-toolkit. | 🟢 Phases 1-3 cos ~1.0; 4a trainer RUNS multi-sample, ZERO per-step disk (fp8-resident base + resident cond), ~65s/step; masked-pad+fp8+C13 gates PASS — see `parity/KREA2_TRAINING_PARITY_LEDGER.md` |
+| `models/dit/ideogram4_mrope.mojo` | `build_ideogram4_mrope`: 3-axis (t,h,w) interleaved MRoPE cos/sin (**f32 inv_freq** — matches torchref production; was bf16-rounded, fixed 2026-06-25). | ✅ cos 0.99999999 |
+| `models/dit/sdxl_unet.mojo` | SDXL UNet with torchref/Diffusers LoRA attachment. Read-only convolution weights remain borrowed and disposable contiguous tensors use metadata-only owned reshapes, avoiding redundant device copies without cache or lifecycle machinery. | ✅ `job-0059` exact RGB; 30.6527 s / 30 steps at 1024px |
+| `models/krea2/` (LoRA TRAINING) | krea2 LoRA-training port: `config.mojo`, `krea2_block.mojo` (SingleStreamDiT block fwd/save-acts + bwd + 8 LoRA Linears, + flash-padmask masked-attn arm on `real_len`), `krea2_stack.mojo` (stack fwd + LoRA backward final→×28, `*_streamed` + `Krea2ResidentFp8`/`Krea2ResidentCond` resident-base path), `krea2_cache_reader.mojo` (LT-bucket pad), `train_krea2.mojo` (LTMAX=768 bucket, `quantized_resident="fp8_e4m3"`, `KREA2_V2_GRAPH` seam). VAE=Qwen-Image, TE=Qwen3-VL-4B. Oracle=torchref. | 🟢 Phases 1-3 cos ~1.0; 4a trainer RUNS multi-sample, ZERO per-step disk (fp8-resident base + resident cond), ~65s/step; masked-pad+fp8+C13 gates PASS — see `parity/KREA2_TRAINING_PARITY_LEDGER.md` |
 | `models/text_encoder/qwen3_encoder.mojo` | `Qwen3Encoder` + `Qwen3Config` (Z-Image/Klein text encoder). | ✅ |
 | `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ✅ base 512 runtime smoke / parity pending |
 | `models/text_encoder/ideogram_qwen3vl.mojo` | `load_ideogram_qwen3vl` / `encode_ideogram_taps`: Ideogram-4 Qwen3-VL text path (reuses `Qwen3Encoder`; θ=5e6, fp8 load, 13-tap concat → [1,L,53248]). | ✅ 13-tap cos 0.99998625 |
@@ -249,7 +249,7 @@ load-bearing; measure before patching a gated oracle.**
 
 **P6.2 AV arm CLOSES.** The joint audio+video LoRA arm trains end to end.
 - `_run_geometry_av` (training/train_ltx2_av.mojo): 4 steps RC=0, both modality
-  losses moving, 672-key musubi audio save (1344 tensors, 14 modules/block x48,
+  losses moving, 672-key torchref audio save (1344 tensors, 14 modules/block x48,
   zero leakage from the 14 inactive video slots), final-step inactive-slot assert
   max|A|,|B| == 0.
 - **Recompute conductor** (models/ltx2/ltx2_av_stack.mojo). The AV backward was a
@@ -268,7 +268,7 @@ load-bearing; measure before patching a gated oracle.**
   fp8 and dequant-bf16 checkpoints MEASURED bit-identical on this path (86/86 keys,
   parity/ltx2_av_ckpt_equiv_probe.mojo), so no anchor moves.
 - int32 `audio_lengths` read fixed: `from_view_as_f32` rejects I32
-  (io/dtype.mojo:154-166); musubi writes torch.int32. Now dtype-assert +
+  (io/dtype.mojo:154-166); torchref writes torch.int32. Now dtype-assert +
   tensor_bytes + bitcast[Int32].
 
 **SHARED LOADER — repo-wide speed fix (serenitymojo/tensor.mojo).**
@@ -308,9 +308,9 @@ contracts are pinned and ready.
 
 ## 2026-07-18: LTX2 P6 AV arm — P6.0 knobs, P6.1 AV TRAINING FORWARD STACK (gated), P6.2 dead-key gate
 
-- **P6.0 (2c36a1a)**: 20 AV knobs at musubi defaults + parse-time validation
+- **P6.0 (2c36a1a)**: 20 AV knobs at torchref defaults + parse-time validation
   (3/3 fail-louds measured); audio/audio_ref LoRA presets fail-loud with
-  musubi-exact counts re-verified (audio 672 = 14/blk, audio_ref 864 = 18/blk
+  torchref-exact counts re-verified (audio 672 = 14/blk, audio_ref 864 = 18/blk
   vs networks/lora_ltx2.py:539-618); historical training/ltx2/ contract stubs
   audited — ADOPT config/cache_records/masked_loss/schedule/lora_surface/
   audio_buckets, SUPERSEDE checkpointing/validation/readiness; acceptance
@@ -321,7 +321,7 @@ contracts are pinned and ready.
   per-modality patchify, ported F32 from the proven inference MVP), streamed
   per-block `LTX2AVBlockWeights` + 24-slot LoRA attach, loops the GATED
   `ltx2_block_forward_av_train` saving full `LTX2AVBlockActs`, per-stream
-  tail. Full-S_A UNMASKED by design: musubi audio padding is LOSS-only, no
+  tail. Full-S_A UNMASKED by design: torchref audio padding is LOSS-only, no
   attention mask exists (lora_ltx2.py:428-437 vs video :379-388). Oracle
   `scripts/ltx2_av_stack_oracle.py` reuses the gated block oracle's run_block
   (acts cross-check 1.0000000); gate `parity/ltx2_av_stack_parity.mojo` 36/36
@@ -362,7 +362,7 @@ contracts are pinned and ready.
   3 conversion sites; the 4 step fns were always F32 math) + F32AdapterView +
   the trainer seam; adafactor/schedule-free/adamw8bit/automagic3 on F32
   masters. Gates: NEW no-rounding gate (sub-bf16 survival >90% all families),
-  bnb + ai-toolkit oracles re-run PASS, skeptic clean.
+  bnb + torchref oracles re-run PASS, skeptic clean.
 - **LeversOptimizerState resume sidecar** (`training/levers_optimizer_sidecar
   .mojo`, host-direct): per-family save/load (8bit codes+absmax, qmaps
   rebuilt; automagic3 bit-packed sign history + RNG). Gate: save@2→restore→
@@ -371,9 +371,9 @@ contracts are pinned and ready.
   bf16+device 7.3 s/step (−21%; synergy: bf16 halves activations, un-washing
   the device-opt arm — device-opt ALONE is a wash, the krea2 devgrad-wall
   class). Video 10.8→8.5. save-acts arm measured NET-NEGATIVE (+0.7s @K=14)
-  — kept default-off. **DEFAULT = bf16+device** (= musubi's own autocast
+  — kept default-off. **DEFAULT = bf16+device** (= torchref's own autocast
   class incl. LoRA GEMMs over F32 masters); `LTX2_F32_STACK=1` escape
-  byte-exact vs the F32-era anchors. **Band gate (lead, n=100 vs the musubi
+  byte-exact vs the F32-era anchors. **Band gate (lead, n=100 vs the torchref
   oracle): loss == the F32 class, inside 1 SEM; grad-norm distribution
   clean.** Anchors re-baselined (bf16 digits deterministic across 3 runs;
   F32-era + pre-rope-fix digits kept as era notes). `--timing` per-section
@@ -418,7 +418,7 @@ contracts are pinned and ready.
 
 ## 2026-07-17 (night): LTX2 P5 IC-LoRA/V2V units 1-2 + RENDER QUALITY RECIPE
 
-- **P5 IC-LoRA/V2V (musubi feature; units 1-2 SHIPPED 5b45d3c/4740444, CPU-gated)**:
+- **P5 IC-LoRA/V2V (torchref feature; units 1-2 SHIPPED 5b45d3c/4740444, CPU-gated)**:
   source-PINNED mechanics (scout + lead 4/4 spot-verified; the survey's
   position-scaling "division" was INVERTED — source MULTIPLIES ref H/W by
   round(tgt/ref) so grids CO-LOCATE from origin; ref PREPENDED in the model
@@ -427,7 +427,7 @@ contracts are pinned and ready.
   _masked_mse). Built: `parity/ltx2_ic_v2v_oracle.py` (line-cited mirror, dumps
   every intermediate + the exact d_block_out cotangent; image512 + video grids);
   `training/ltx2/v2v_cache.mojo` + CacheItem.ref_lat_path + --reference_cache_dir
-  (musubi's TRAINING-route pairing; round-trip gate w/ 3 fail-loud negatives);
+  (torchref's TRAINING-route pairing; round-trip gate w/ 3 fail-loud negatives);
   `_build_v2v_coords/_build_v2v_rope` in ltx2_video_stack (t2v refactored onto
   the SAME _fill_grid_coords source); S=320 comptime arm; `training/ltx2/
   v2v_loss.mojo` (ref-slice masked-MSE cotangent, FD-gated 9.8e-6).
@@ -439,15 +439,15 @@ contracts are pinned and ready.
   10×2 LoRA, max_abs 1e-8..1e-10); flags-off anchors BYTE-IDENTICAL;
   live v2v smoke 4 steps @S=320 6.8s/step (pairing, finite loss, live
   grads, save; fail-loud negatives verified). Tail shipped: sampling-guard
-  reachability fix, explicit-DS dispatch (musubi multiplies by the LITERAL
+  reachability fix, explicit-DS dispatch (torchref multiplies by the LITERAL
   int flag — approx co-location on odd extents is source-faithful),
-  video_v2v S=608 arm, first-frame Bernoulli (default 0.0; musubi's 0.1
+  video_v2v S=608 arm, first-frame Bernoulli (default 0.0; torchref's 0.1
   documented), video512 oracle dumps (+_ff differs at NFp=4, no-op at
   single-frame as designed). **P5 + P5.5 BOTH CLOSED (07-18)**: S=608 gate cos 1.0; v2v sampling
   cmd surface + validation (whose battery caught+fixed the bf16-default
   val crash shipped since the speed pass); spine-rope oracle (variant B
-  vs musubi's own precompute_freqs_cis, cos 0.99999976 both grids);
-  config/UI seam both repos; REAL-DATA v2v run (69 musubi-cached disney
+  vs torchref's own precompute_freqs_cis, cos 0.99999976 both grids);
+  config/UI seam both repos; REAL-DATA v2v run (69 torchref-cached disney
   refs, 50 steps, loss 0.48->0.26 expected class, 480-pair save).
   **P5.5 intrinsic conditioning COMPLETE** (training/ltx2/
   conditioning_mask.mojo + mask_cache.mojo + scripts/
@@ -463,16 +463,16 @@ contracts are pinned and ready.
   LR×optimizer×rank — any change re-rolls it; a ladder+eyeball verdict,
   never a constant). "Our trainer for loras works." Extension 2500→3500
   resumed BIT-EXACT from the F32 state sidecar.
-- **Musubi fork issue sweep + OFFICIAL trainer audit (07-17 night)**: fork
-  #92 = musubi's first_frame_p defaults 0.1 and silently fires on video ⇒
+- **Torchref fork issue sweep + OFFICIAL trainer audit (07-17 night)**: fork
+  #92 = torchref's first_frame_p defaults 0.1 and silently fires on video ⇒
   the video-oracle band was biased LOW (the audit's open +0.037 residual
   matches the predicted video-only split; confound re-run queued). #100
   v2v plateau 0.3-0.4 = confirmed-expected flow-matching floor. Official
-  Lightricks trainer (80GB-class): BEHIND musubi on trainer features,
+  Lightricks trainer (80GB-class): BEHIND torchref on trainer features,
   numerics AGREE; adds the intrinsic-conditioning set (prefix/suffix/mask/
   spatial_crop → extension/inpaint/outpaint LoRA modes) as new campaign
   item; first-frame-p is MODE-dependent in official recipes (t2v none,
-  i2v 0.5) — musubi's global 0.1 is the outlier.
+  i2v 0.5) — torchref's global 0.1 is the outlier.
 - **RENDER QUALITY RECIPE (scripts/ltx2_hq_ref_run.py, 3efeedf)**: single-
   variable no-LoRA A/B convicted: MESH = distilled-ckpt-as-stage-1-base
   (official HQ requires the FULL model; fix = dev base), GRAIN = 2.0-era
@@ -485,7 +485,7 @@ contracts are pinned and ready.
 ## 2026-07-16 (night): LTX2 v2v PRESET (P3.1) — FFN LoRA, 10 slots/block, GATED cos 1.0
 
 - `--lora_target_preset v2v` = t2v's 8 attention slots + ff.net.0.proj/ff.net.2
-  (musubi preset parity, lora_ltx2:549-558). Slots are PRESET-DERIVED
+  (torchref preset parity, lora_ltx2:549-558). Slots are PRESET-DERIVED
   (video_lora_names(preset), loops off n_slots — t2v stays 8, byte-identical).
 - FFN LoRA grads: two CONDITIONAL `_lora_pair_bwd` calls in
   `ltx2_video_backward.mojo` (inputs RECOMPUTED from saved acts hs2/h1_v —
@@ -495,7 +495,7 @@ contracts are pinned and ready.
   [16384,rank] + [rank,16384]/[4096,rank] — the VD×VD assumption is gone);
   per-slot kaiming bounds; save/state/native/resume all per-slot.
 - Render cmd template swapped to `ltx2_hq_ref_run.py --user-lora` (comfy keys
-  + renaming map; musubi's generator measured-OOMs on 24GB — see P2 plan).
+  + renaming map; torchref's generator measured-OOMs on 24GB — see P2 plan).
 - **GATES (lead re-run)**: v2v block backward vs torch **cos 1.0 on d_hidden +
   all 10×2 LoRA grads** (new sibling gate + --v2v oracle; t2v gate regression
   PASS); C13 t2v anchors byte-exact; v2v GPU run 480 adapters, FFN grads flow
@@ -507,19 +507,19 @@ contracts are pinned and ready.
 
 - **What landed (Phase A, Mojo)**: `--config <json>` → shared TrainConfig on
   LTX2TrainerConfig (`levers` field; keys-absent = all-off = byte-identical);
-  loss seam (mse | NEW mae torch-gated | musubi-"huber"≡smooth_l1 with a LOUD
-  remap at the ltx2 config layer — a verbatim musubi config gets musubi
+  loss seam (mse | NEW mae torch-gated | torchref-"huber"≡smooth_l1 with a LOUD
+  remap at the ltx2 config layer — a verbatim torchref config gets torchref
   semantics); scheduled LR via NEW `transformers_lr_for_step` (lr_schedule.mojo,
   additive) — **found: the flame `lr_for_step` warmup ramp is (step+1)/W vs
   transformers' step/W, measured 0.2 divergence; ltx2 does NOT use it**;
-  min/max_timestep sigma-domain affine rescale (musubi ltx2:2011-2016 form,
+  min/max_timestep sigma-domain affine rescale (torchref ltx2:2011-2016 form,
   identity-guarded); levers optimizers FAIL LOUD (bf16-master path would
   re-round F32 masters — MJ-1112, F32 variant = plan P3). Skeptic D1 closed:
   `masked_mae_loss_grad` + levers masked-MAE branch, torch-gated.
 - **Phase B (serenity-trainer UI seam)**: ltx2 preset wired (presets.json) +
   NEW "ltx2" argv shape in main.rs (flag argv + --resume append) +
   TrainerConfigModel ltx2 emission (arch dims + loss/LR levers; UI scheduler
-  default forced to CONSTANT for musubi parity) + `_gate_ltx2` in
+  default forced to CONSTANT for torchref parity) + `_gate_ltx2` in
   runner_train_config_gate (default-off + mae/sl1/cosine/adafactor flips) +
   pixi `ltx2-live-trainer-build` retargeted to the production train_ltx2_av
   (**+ -O2 added — the task line carried the -O3 compile-OOM default**).
@@ -531,15 +531,15 @@ contracts are pinned and ready.
   0.4560 set was pre-MJ-1109) · lever routing proofs (mae dispatches, huber
   remap + beta propagation) · **UI e2e**: UI-emitted config through the wired
   binary with the exact runner argv → trains, anchor 0.4602 exact.
-- Campaign plan: `docs/LTX2_MUSUBI_FEATURE_CAMPAIGN_PLAN.md` (P1 DONE; next
+- Campaign plan: `docs/LTX2_TORCHREF_FEATURE_CAMPAIGN_PLAN.md` (P1 DONE; next
   P2 = caption dropout [design settled by the bit-exact mask probe, MJ-1113] +
   val_loss + PYTHON-rendered in-training sampling).
 
-## 2026-07-16 (late): LTX2 RESUME LOADER — F32-exact lossless resume, GATED bit-exact (feature 1 of the full-musubi campaign)
+## 2026-07-16 (late): LTX2 RESUME LOADER — F32-exact lossless resume, GATED bit-exact (feature 1 of the full-torchref campaign)
 
-- **Scope ruling (Alex)**: ltx2 campaign = the FULL musubi feature surface (docs/ltx_2.md menu),
-  not just the numeric audit. Backlog + contract: `docs/LTX2_MUSUBI_INTAKE_2026-07-16.md`
-  "SCOPE RULING" section + memory `feedback_ltx2_full_musubi_features`. This entry = feature #1.
+- **Scope ruling (Alex)**: ltx2 campaign = the FULL torchref feature surface (docs/ltx_2.md menu),
+  not just the numeric audit. Backlog + contract: `docs/LTX2_TORCHREF_INTAKE_2026-07-16.md`
+  "SCOPE RULING" section + memory `feedback_ltx2_full_torchref_features`. This entry = feature #1.
 - **What landed**: `--resume <ckpt|.state|stem>` in `training/train_ltx2_av.mojo` — F32-exact
   masters+moments restore (new `.lora_A/B.master` F32 keys; the old bf16-A/B-only state would
   re-round masters every resume = the MJ-1108 class), step continuation from the shared 5-field
@@ -559,21 +559,21 @@ contracts are pinned and ready.
   (`scripts/check_ltx2_resume_continuation.py`): image512 continuous 8-step vs save@4→resume→8 —
   steps 5-8 digit-identical live, final artifacts **768/768 (PEFT) + 3073/3073 (state)
   BYTE-EXACT**. Resume is lossless: (seed,step)-derived sigma/noise/sample streams mean
-  step-restore reproduces the whole trajectory (stronger than musubi's RNG pickle).
+  step-restore reproduces the whole trajectory (stronger than torchref's RNG pickle).
 - **Skeptic residue (LOW, shared trainer_core, ledgered)**: `trainer_state_meta` stores
   step/seed as Float32 → spurious seed-warn / wrong step for values ≥2^24 (warn-only /
   practically unreachable). `trainer_resume_meta_guard` is warn-only by design on
   geometry/cache mismatch.
-- **musubi resume contract** (pinned from source, in the intake doc): accelerate state dir
-  restores network weights + optimizer + scheduler + 4 RNG streams; F32 masters are musubi's
+- **torchref resume contract** (pinned from source, in the intake doc): accelerate state dir
+  restores network weights + optimizer + scheduler + 4 RNG streams; F32 masters are torchref's
   DEFAULT (`hv_train_network.py:2504`); `--autoresume`/`--reset_optimizer*` flag semantics
   recorded — Mojo analogs = follow-up pass.
 
-## 2026-07-16 (evening): LTX2 musubi-parity audit — full recipe chain measured CLEAN; no divergence convicted
-- **Directive**: Alex — "fix ltx2 training, musubi trainer is the oracle for all"; chroma-template
+## 2026-07-16 (evening): LTX2 torchref-parity audit — full recipe chain measured CLEAN; no divergence convicted
+- **Directive**: Alex — "fix ltx2 training, torchref trainer is the oracle for all"; chroma-template
   audit (intake → fresh oracle baselines → round-trip gate → matched runs → divergence loop).
-  Detail doc (local-only): `serenitymojo/docs/LTX2_MUSUBI_INTAKE_2026-07-16.md`.
-- **Phase 0 intake** (musubi @ dd96141, cited file:line in the detail doc): shifted_logit_normal
+  Detail doc (local-only): `serenitymojo/docs/LTX2_TORCHREF_INTAKE_2026-07-16.md`.
+- **Phase 0 intake** (torchref @ dd96141, cited file:line in the detail doc): shifted_logit_normal
   for ltx 2.3 = STRETCHED mode; video-mode shift UNCLAMPED linear interp (0.7896 @576tok video,
   0.675 @256tok image); LR constant NO warmup; torch-default AdamW wd 0.01; plain f32 MSE on
   noise−latents; t2v preset = q/k/v/out.0 × 48 blocks = 384 modules, scale α/r; TE-cache masks
@@ -582,32 +582,32 @@ contracts are pinned and ready.
 - **Phase 1 fresh oracle baselines** (100 steps, seed 42, 3090 Ti): VIDEO loss mean 0.3160
   (median 0.2838 / frac>0.30 0.44 — reproduces the prior band gate digits), grad 3.6e-2,
   22.2 s/it, 12.0 GiB. IMAGE (lr 6e-5, dim/α 64, up 0.3): mean 0.6628, 21.8 s/it, 13.2 GiB.
-  New script `scripts/ltx2_musubi_image_ref.sh`.
-- **Phase 2 round-trip gates PASS**: NEW `models/ltx2/parity/ltx2_lora_musubi_real_artifact_
-  roundtrip.mojo` + `scripts/check_ltx2_lora_keys.py` — real musubi comfy artifacts (video
+  New script `scripts/ltx2_torchref_image_ref.sh`.
+- **Phase 2 round-trip gates PASS**: NEW `models/ltx2/parity/ltx2_lora_torchref_real_artifact_
+  roundtrip.mojo` + `scripts/check_ltx2_lora_keys.py` — real torchref comfy artifacts (video
   rank-32 AND image rank-64) through load_lora_for_resume → save_lora_peft = **768/768 keys
   BIT-EXACT both arms**.
 - **Phase 3 matched Mojo runs**: IMAGE Δmean +0.013 INSIDE 1-SEM (PASS). VIDEO seed-42 mean
   +0.052 (2.4σ) → isolation loop: σ-RNG stream KS-fair (73rd pct of torch-100-draw D), draw
-  reweighting explains only 0.014, checkpoint dequant BIT-IDENTICAL to musubi's export
+  reweighting explains only 0.014, checkpoint dequant BIT-IDENTICAL to torchref's export
   (bf16(f32(fp8)·scale), sampled blocks 0/24/47), seed-1337 rerun mean 0.3440 with band
   metrics (median 0.2799 / frac 0.42) STRADDLING the oracle → window MEAN is high-variance at
   n=100 (U-shaped loss(σ)); **same class, nothing convicted**. NEGATIVE result recorded:
   oracle σ-replay via seed-42 CUDA RNG does NOT reproduce (corr −0.14) — device RNG has other
-  consumers; σ-conditioning the oracle needs musubi-side logging.
-- **Speed/VRAM**: Mojo 11.1 s/step video / 9.8 image ≈ **2× faster than musubi** (~22 both
-  arms); VRAM 22.5-22.7 GiB (fp8-resident 42 blocks) vs musubi 12-13 GiB (`--resident_blocks`
-  is the knob). Mojo-trained artifact schema = musubi comfy (768 keys, 0 diffs, 384/384 B
+  consumers; σ-conditioning the oracle needs torchref-side logging.
+- **Speed/VRAM**: Mojo 11.1 s/step video / 9.8 image ≈ **2× faster than torchref** (~22 both
+  arms); VRAM 22.5-22.7 GiB (fp8-resident 42 blocks) vs torchref 12-13 GiB (`--resident_blocks`
+  is the knob). Mojo-trained artifact schema = torchref comfy (768 keys, 0 diffs, 384/384 B
   nonzero) → torch-loadable (Alex 2026-07-16: Python = INTERIM ltx2 render/LoRA-eval oracle
   until Mojo gen matches; not a policy shift).
 - **Open tail** (pre-existing, needs in-scope call): resume loader, levers config-JSON routing,
   LORA_TRAINED_MULT, AV(audio) arm, image-arm overtraining guidance; weak 2/2 Mojo-video-mean-
-  high direction (p=0.25) resolvable only with n=400 windows or musubi σ logging.
+  high direction (p=0.25) resolvable only with n=400 windows or torchref σ logging.
 - **BYTE-MATCHED FWD PARITY GATE (the parity-testing loop) — CONVICTION #2 + FIX (MJ-1109)**:
-  12 (sample,σ,noise) pairs through musubi's OWN runtime vs the Mojo stack (new
+  12 (sample,σ,noise) pairs through torchref's OWN runtime vs the Mojo stack (new
   `ltx2_trainer_fwd_parity_probe.mojo` + `scripts/ltx2_parity_*.py`). Round 1: image PASS
-  0.9997+, video FAIL 0.9958-0.9991 → stage isolation (rope-table dump vs musubi's own rope
-  fns) convicted DIGIT-EXACT: musubi runs positions/frac/scale in **BF16** (wrapper casts to
+  0.9997+, video FAIL 0.9958-0.9991 → stage isolation (rope-table dump vs torchref's own rope
+  fns) convicted DIGIT-EXACT: torchref runs positions/frac/scale in **BF16** (wrapper casts to
   video dtype; temporal scaled −0.998 → −0.99609375) + bf16 final tables; Mojo built rope in
   f64. Invisible at F=1 (constant temporal phase cancels in q·k), real per-frame error at F≥2.
   FIX: bf16-RNE per-op replication in `_build_video_rope`/`_compute_rope` → tables 99.95%
@@ -616,7 +616,7 @@ contracts are pinned and ready.
   self-conditioning (47× amplification at σ=0.05 vs 16× at σ=0.5; residual ratios match
   exactly). Anchors re-baselined again (rope change shifts every forward).
 - **COVERAGE EXTENSION (same evening, "full coverage" push) — CONVICTION + FIX**: the driver
-  held LoRA masters as bf16 with per-step write-back; musubi keeps trainable params **F32**
+  held LoRA masters as bf16 with per-step write-back; torchref keeps trainable params **F32**
   (ss_full_bf16=False, measured). Torch A/B (real A tensors, measured grad scale, 400 steps):
   bf16 path **absorbs 30-57% of A-updates/step, 28% final-delta relerr** — invisible at n=100
   (windows identical pre/post), material at the 2500-step class. FIX: `F32Lora` masters +
@@ -920,7 +920,7 @@ Ref = diffusers `/home/alex/ideogram4-ref` (NOT SerenityTrainer). DiT `models/di
   completes end-to-end (grads 0.9999918).
 - **Conviction rule (MJ-1075)**: measured s/step + VRAM convicts host-boundedness;
   to_host GREP COUNTS DO NOT (fast models carry hundreds on cold paths).
-- **T7 export** (wifi-down transfer): complete krea2 + ideogram4 ai-toolkit training
+- **T7 export** (wifi-down transfer): complete krea2 + ideogram4 torchref training
   kits as plain folders (exFAT: no symlinks — HF blobs renamed via snapshot link map).
 - **CAMPAIGN CLOSE (late evening)**: chroma device stack SHIPPED — 139→3.6-4.0s/step
   (~35×), loss/grads/LoRA-B BIT-IDENTICAL vs host (chroma_block_device.mojo + stack
@@ -1009,8 +1009,8 @@ Ref = diffusers `/home/alex/ideogram4-ref` (NOT SerenityTrainer). DiT `models/di
   loads. Next unit alongside the flux port.
 
 ## 2026-07-05/06 late: save/resume best-in-class + boxjana run + tomorrow's queue
-- **Save/resume AUDIT vs SerenityTrainer/SimpleTuner/ai-toolkit/musubi** (docs/SAVE_RESUME_
-  AUDIT_2026-07-05.md in serenity-trainer): we tiered w/ SerenityTrainer/ai-toolkit, behind
+- **Save/resume AUDIT vs SerenityTrainer/SimpleTuner/torchref/torchref** (docs/SAVE_RESUME_
+  AUDIT_2026-07-05.md in serenity-trainer): we tiered w/ SerenityTrainer/torchref, behind
   accelerate tools on state breadth, ahead of all on safetensors-not-pickle state,
   prune-AFTER-save (SimpleTuner deletes-before-durable!), save-before-sample, wrong-
   artifact rejection.
@@ -1361,7 +1361,7 @@ primary UI.** Committed to serenity-trainer `eguitrainer/` (README = the doc).
   sharded index.json + atomic writes; fp8 dtypes already native (premise
   corrected). Real gaps: per-tensor bounds validation (S, standalone
   robustness patch — recommended) + __metadata__ write (S, pair with the
-  kohya-format work ERI-0228/MJ-0206). Everything else SKIP.
+  torchref-format work ERI-0228/MJ-0206). Everything else SKIP.
 
 ## 2026-07-07: AUDIT ITEM 4 DONE — 7 resume-fidelity gates authored + GPU-PASSED
 - serenitymojo/models/{ernie,anima,sd35,ltx2,wan22,hidream,l2p}/parity/
@@ -1720,7 +1720,7 @@ primary UI.** Committed to serenity-trainer `eguitrainer/` (README = the doc).
   "flame-archive eri2_klein9b_512" DOES NOT EXIST on disk. hidream: stage-dir
   format (images.safetensors + caption.N.txt) absent. ltx2/wan22: caches
   gone (measured earlier tonight). ideogram4: eri2 staged dir exists but
-  ai-toolkit argv anchor deferred.
+  torchref argv anchor deferred.
 - CONSEQUENCE: wave-3 migrations gate on zimage runtime anchor + build/
   verbatim/byte-print bars for the rest — recorded honestly. FLEET NOTE for
   Alex: ~5 trainers have no runnable cache on disk; a cache-restaging round
@@ -1745,7 +1745,7 @@ primary UI.** Committed to serenity-trainer `eguitrainer/` (README = the doc).
   (WARM banner via the parameterized core call — byte-identity proven by
   the hidream precedent). zimage + ideogram4: untouched = evidenced-stayed
   (zimage's machinery lives in step helpers like l2p; ideogram4 is
-  ai-toolkit-argv shaped). sdxl driver assessed, not migrated (parked).
+  torchref-argv shaped). sdxl driver assessed, not migrated (parked).
 - PROVENANCE NOTE: the agent's final report was lost to context-death;
   verification = disk evidence (3 files modified, 3 binaries built exit-0)
   + diff spot-check for print discipline. Anchors: klein/ltx2/wan22 have NO
@@ -1932,7 +1932,7 @@ New box = RTX 5080 (compute_cap 12.0 / sm_120), CUDA 13.1, 16GB (was 3090 sm_86
 ## 2026-07-08: LTX2 BUILD-OUT — trainer ALIVE (measured), correctness phase in flight
 - REVISED VERDICT: train_ltx2_real is NOT a scaffold — it is FAIL-CLOSED by
   design. Behind --legacy-video-only sits a complete video-only loop
-  (48 blocks, 192 LoRA adapters attn1 q/k/v/out ×48, musubi-tuner recipe,
+  (48 blocks, 192 LoRA adapters attn1 q/k/v/out ×48, torchref recipe,
   chroma-mirror loop, TurboPlannedLoader streaming). The raise guards the
   unbuilt AV path (ltx2_av_backward.mojo + parity gate EXIST; the gate's
   torch-oracle fixture output/ltx2_av_bwd/av_block0_bwd_ref.safetensors is
@@ -2502,21 +2502,21 @@ Span views; quantize-at-load needs copies anyway). fp8 COMPUTE _scaled_mm =
 new tensor-core kernel work, not a borrow (dequant+cuBLAS measured faster
 than hand-tiled fp8 GEMM per ideogram4_resident.mojo:3).
 
-## 2026-07-09: LTX2 PRODUCTION VIDEO-MODE TRAINER — FIRST RUN (musubi oracle, MJ-1092)
-- Mandate (Alex): ltx2 training with kohya musubi-tuner as the oracle (SerenityTrainer
+## 2026-07-09: LTX2 PRODUCTION VIDEO-MODE TRAINER — FIRST RUN (torchref oracle, MJ-1092)
+- Mandate (Alex): ltx2 training with torchref as the oracle (SerenityTrainer
   unsupported). Everything below lead-verified on clean serial builds.
 - BLOCK ARMS GATED: AV block bwd re-greened (fixture regenerated; 2 d_x + 24x2
   LoRA grads worst cos 1.0) + NEW video-only (audio=None) arm
-  models/ltx2/ltx2_video_backward.mojo mirroring musubi run_ax=False guards
+  models/ltx2/ltx2_video_backward.mojo mirroring torchref run_ax=False guards
   (transformer.py:589-593) — gate cos 1.0 (fwd + d_hidden + 8x2 LoRA).
   TRAP recorded: ltx2_dit.mojo:515 ltx2_block_forward_video_only is a bounded
-  SMOKE deviating from musubi (no attn2 gate / prompt KV-mod) — never build on it.
+  SMOKE deviating from torchref (no attn2 gate / prompt KV-mod) — never build on it.
 - STACK: models/ltx2/ltx2_video_stack.mojo (head patchify_proj/adaln/rope +
-  48 streamed blocks per-block-recompute + frozen F32 musubi tail
+  48 streamed blocks per-block-recompute + frozen F32 torchref tail
   norm_out/scale_shift/proj_out WITH backward-through-tail — the legacy
   loss~1052 omission). Gates: 2-block+tail torch parity ALL cos 1.0;
   real-depth dev-fp8 smoke PASS (5.6GB peak, 58s F32 fwd+bwd, 384/384 grads).
-- CACHE = MUSUBI-NATIVE: /home/alex/datasets/ltx2_musubi_v3 built with musubi's
+- CACHE = TORCHREF-NATIVE: /home/alex/datasets/ltx2_ref_v3 built with torchref's
   own scripts (69 disney @512x288x25f -> latents_4x9x16_bfloat16 [128,4,9,16]
   + POST-connector video_prompt_embeds [1024,4096]). MEASURED: connector runs
   at TE-cache time; prompt mask ALL-ONES (pads -> learnable registers) =>
@@ -2524,46 +2524,46 @@ than hand-tiled fp8 GEMM per ideogram4_resident.mojo:3).
   --gemma_load_in_8bit crashes (bnb SCB); use --gemma_safetensors fp8 file.
 - TRAINER: training/train_ltx2_av.mojo is now the REAL video-mode loop
   (stretched shifted-logit-normal sigma — schedule.mojo verified line-exact vs
-  musubi; noise-latent MSE weighting-none; global clip 1.0; torch-default AdamW
+  torchref; noise-latent MSE weighting-none; global clip 1.0; torch-default AdamW
   lr 1e-4 rank/alpha 32; comfy-format save + state sidecar). Build:
   -O2 -Xlinker -lm -Xlinker -lcuda -> /tmp/ltx2_av_trainer.
 - **FIRST RUN (4-step anchor): loss 0.4560/0.2272/0.2194/0.2596 (sigma .82/.46/
   .72/.32), gn 0.0414/0.0077/0.0142/0.0069, ~58s/step, 384-pair PEFT+state
   saved. LOSS-MAGNITUDE QUESTION CLOSED: faithful arch = O(0.2-0.5) class.**
-- Musubi trap: --optimizer_type defaults to EMPTY -> getattr(torch.optim,'')
-  crash; pass adamw explicitly (scripts/ltx2_musubi_band_ref.sh does).
-- OPEN: musubi 100-step band gate (running, output/ltx2_musubi_ref) · head
+- Torchref trap: --optimizer_type defaults to EMPTY -> getattr(torch.optim,'')
+  crash; pass adamw explicitly (scripts/ltx2_torchref_band_ref.sh does).
+- OPEN: torchref 100-step band gate (running, output/ltx2_torchref_ref) · head
   cos-gate · resume loader · levers routing at config-JSON stage · AV-mode
   stack · speed pass (58s F32 -> bf16 carriers/flash).
 
 ## 2026-07-09 (later): LTX2 TRAINER — BAND GATE PASS + L2P RUN LAUNCHED
 - HEAD COS-GATE folded into the stack parity gate (lead-verified): hidden0 /
   v_temb / v_embedded / v_prompt_ts / v_cos / v_sin ALL cos 1.0. Fixture rope
-  corrected to musubi-faithful (causal_offset=1, max_pos [20,2048,2048]); both
+  corrected to torchref-faithful (causal_offset=1, max_pos [20,2048,2048]); both
   head traps now gated NUMERICALLY (patchify token order f/h/w, F64 rope freqs).
 - ANCHOR REPRODUCIBLE: 4-step digits identical across a full rebuild
   (0.4560/0.2272/0.2194/0.2596 + grad norms) — trainer deterministic at 4dp.
-- **MJ-1093 (FIXED, ledger)**: musubi --fp8_base SILENTLY DROPS
+- **MJ-1093 (FIXED, ledger)**: torchref --fp8_base SILENTLY DROPS
   weight_scale/input_scale of scaled-fp8 exports (strict=False; no scale
   handling in its loader) -> flat loss ~5.26 (worse than predict-zero ~2.0).
   Fix: scripts/ltx2_dequant_fp8_to_bf16.py dev arm ->
   ltx-2.3-22b-dev-fp8-dequant-bf16.safetensors (42GB, w*weight_scale folded).
-  Musubi arg traps: needs explicit --optimizer_type adamw AND script-level
-  --mixed_precision bf16 (both in scripts/ltx2_musubi_band_ref.sh now).
+  Torchref arg traps: needs explicit --optimizer_type adamw AND script-level
+  --mixed_precision bf16 (both in scripts/ltx2_torchref_band_ref.sh now).
   Empirically sealed: same cache, descaled weights -> 5.26 collapses to 0.284.
-- **BAND GATE PASS (MJ-1041 discipline)**: corrected musubi oracle (100 steps,
-  SAME musubi-native cache, 22.0s/step) median 0.2840 / 44%>0.30 / max 0.71;
+- **BAND GATE PASS (MJ-1041 discipline)**: corrected torchref oracle (100 steps,
+  SAME torchref-native cache, 22.0s/step) median 0.2840 / 44%>0.30 / max 0.71;
   Mojo trainer live band at n=34: median 0.2896 / 44.12%>0.30 — statistically
   indistinguishable. Extractor: scripts/ltx2_band_extract.py.
-- **SAVE FORMAT EXACT**: Mojo LoRA file vs musubi's own ComfyUI export — 768
+- **SAVE FORMAT EXACT**: Mojo LoRA file vs torchref's own ComfyUI export — 768
   keys, identical names/BF16/shapes, zero diff (drop-in interchangeable).
-  Reference LoRA: output/ltx2_musubi_ref/ltx2_musubi_ref.comfy.safetensors;
-  invalid fp8-scales run quarantined at output/ltx2_musubi_ref_INVALID_fp8scales.
+  Reference LoRA: output/ltx2_torchref_ref/ltx2_torchref_ref.comfy.safetensors;
+  invalid fp8-scales run quarantined at output/ltx2_torchref_ref_INVALID_fp8scales.
 - L2P RUN IN FLIGHT: 400 steps @ ~58s/step detached
   (output/ltx2_video_lora_l2p/train.log, ckpts every 100, ETA ~20:50) -> then
   the sample-shift render verdict (distilled gen pipeline + --lora).
 - Speed target defined: Mojo 58s/step (F32-streamed correctness baseline) vs
-  musubi 22s (bf16 swap-36) — levers: bf16 carriers, residency, flash.
+  torchref 22s (bf16 swap-36) — levers: bf16 carriers, residency, flash.
 
 ## 2026-07-09 (evening): LTX2 TRAINER SPEED — 58.8 -> 14.8s/step (4x, anchor digit-exact)
 - Alex: "kill it, get speed down." Probe (models/ltx2/parity/
@@ -2575,16 +2575,16 @@ than hand-tiled fp8 GEMM per ideogram4_resident.mojo:3).
   0..41 (~17.6GB — full 48 = 20.1GB OOMs vs the F32 working set), tail 6
   streamed de-synced; --resident_blocks N.
 - GATE: anchor digits + grad norms IDENTICAL at 14.7-15.0s/step, VRAM 22.1GB.
-  Now 1.5x FASTER than the musubi oracle (22s bf16 swap-36).
+  Now 1.5x FASTER than the torchref oracle (22s bf16 swap-36).
 - Next levers if needed: device-resident LoRA + fused device AdamW + device
-  clip (kills the ~403MB/step host round-trips), bf16 fwd carriers (musubi's
+  clip (kills the ~403MB/step host round-trips), bf16 fwd carriers (torchref's
   own numerics class), pinned streamed tail.
 - L2P 400-step run RELAUNCHED at the new speed (deterministic same-seed
   trajectory; output/ltx2_video_lora_l2p_v2, ETA ~1h40m).
 
 ## 2026-07-09 (night): LTX2 CAMPAIGN COMPLETE — L2P VERDICT PASS (MJ-1092 CLOSED)
 - 400-step run @14.8s/step (1h38m): full band n=400 median 0.2908 / 47.25%>0.30
-  / max 1.07 / min 0.0164 vs musubi oracle 0.2840/44%/0.71/0.033 — class match
+  / max 1.07 / min 0.0164 vs torchref oracle 0.2840/44%/0.71/0.033 — class match
   across the whole distribution.
 - A/B render (ff1f0bc): `LTX2_TRAINED_LORA=<peft>` env overlay in
   pipeline/ltx2_t2v_av_hq.mojo (_HQLoraStack.trained @1.0). Same-seed single
@@ -2600,7 +2600,7 @@ than hand-tiled fp8 GEMM per ideogram4_resident.mojo:3).
   carriers −2-3s; floor ~6-8s/step) · webui preset.
 
 ## 2026-07-10: LTX2 IMAGE (identity) TRAINING + the render-conds finding (MJ-1094)
-- IMAGE ARM SHIPPED (0f45ed5): musubi treats images as 1-frame samples (F=1,
+- IMAGE ARM SHIPPED (0f45ed5): torchref treats images as 1-frame samples (F=1,
   video mode) — trainer gained `--geometry image512` ([128,1,16,16] = 256 tok
   @512x512, comptime dispatch; video arm default/unchanged) + a TE-pairing fix
   (item keys can contain underscores -> longest-prefix match vs the actual
@@ -2608,14 +2608,14 @@ than hand-tiled fp8 GEMM per ideogram4_resident.mojo:3).
   guide + BitPoet chara helper): lr 6e-5, rank/alpha 64,
   shifted_logit_uniform_prob 0.30 (30% low-noise for fine detail), ~3000
   steps, save/250. config.mojo now parses --shifted_logit_uniform_prob/eps.
-- ERI2 IDENTITY RUN: 118-img vrtlEri2 cache (musubi's own scripts, 512x512,
+- ERI2 IDENTITY RUN: 118-img vrtlEri2 cache (torchref's own scripts, 512x512,
   enable_bucket=false -> ONE geometry; --gemma_safetensors fp8 file). Ran to
   step ~2700 @13.2s/step (stopped per Alex; step-2500 = verdict ckpt; 11 ckpts
   kept, image-class loss band median ~0.63 range 0.18-1.13 stable).
-- **MJ-1094 (FIXED, ledger): musubi's gemma TE is NOT the model's inference
+- **MJ-1094 (FIXED, ledger): torchref's gemma TE is NOT the model's inference
   conditioning.** The model conditions on feature_extract_and_project over ALL
   49 gemma hidden layers via text_embedding_projection.video_aggregate_embed
-  ([4096,188160] BF16, unprefixed in dev-fp8). musubi's TE emits a different
+  ([4096,188160] BF16, unprefixed in dev-fp8). torchref's TE emits a different
   4096-dim feature — renders were coherent but PROMPT-IGNORING (chaos-crowd
   class) with both 37- and 175-token prompts. Its cache is fine for TRAINING
   (self-consistent), wrong for RENDER conds. FIX: inference-flame
@@ -2631,7 +2631,7 @@ than hand-tiled fp8 GEMM per ideogram4_resident.mojo:3).
   (1250/1500) and/or lower mult (make LORA_TRAINED_MULT env-tunable).
 - Artifacts: output/ltx2_eri2_lora (ckpts + trigger_prompt.txt + flame_ctx),
   output/ltx2_eri2_render_{A4,B4}, output/ltx2_eri2_video (5s mp4).
-  Dead-end kept documented: scripts/ltx2_encode_prompt_hidden.py (musubi TE).
+  Dead-end kept documented: scripts/ltx2_encode_prompt_hidden.py (torchref TE).
 
 ## 2026-07-11: LingBot super-res refiner + temporal/tiled VAE ENCODE (5080, inference)
 Closed the LingBot-Video handoff §7 remaining inference work. All pure-Mojo,
@@ -2844,11 +2844,11 @@ work itself lives in the serenity-trainer + serenity-server trees).
   `serenity-server/tests/refs/serenityflow__krea2_t2i{,_lora}.{request,lowered}.json`
   (graph parity test green). serve/sample_cli_backend.mojo's CLI contract also
   carries a lora slot.
-- **krea2 inference FIXES (2026-07-13, found via an ai-toolkit reference oracle, GPU-verified :7811):**
+- **krea2 inference FIXES (2026-07-13, found via an torchref reference oracle, GPU-verified :7811):**
   (1) **CFG refiner-mask** — the txtfusion refiner attended UNMASKED over the LTMAX zero-pad
   (`refiner_mask=None`), diluting each velocity's text conditioning by its pad-count; at cfg>1 the
   long-cond/short-uncond dilution mismatch blew up → NaN → black (base went fully black; LoRA →
-  tiny centered thumbnail). Both ai-toolkit + krea-ai/krea-2 mask the refiner (mmdit.py:288). Fix =
+  tiny centered thumbnail). Both torchref + krea-ai/krea-2 mask the refiner (mmdit.py:288). Fix =
   additive **bf16** `[1,TXTHEADS,LT,LT]` mask (`krea2_build_refiner_mask`, krea2_cache_reader.mojo)
   passed to `krea2_text_fusion` (`sdpa` enforces mask.dtype==q.dtype — F32 mask silently crashed).
   base LT=349 cfg=3.5 black→full-frame; giger-LoRA collapse→full-frame; short-prompt regression clean.
@@ -2856,7 +2856,7 @@ work itself lives in the serenity-trainer + serenity-server trees).
   DIFFERENT (still valid — measured spatially iid) composition (seed 60002 letterboxed vs the
   reference's fill). Now uses `ops/random_torch.randn_torch` → seed 60002 fills the frame matching the
   reference (mean 41.6 vs 41.9). Diagnostic env hook `KREA2_INJECT_NOISE=<KLNCAPV1 .bin>` loads a fixed
-  noise latent instead of generating. The reusable block-swap ai-toolkit oracle proved fp8-resident
+  noise latent instead of generating. The reusable block-swap torchref oracle proved fp8-resident
   base + our trained LoRA + sampler + VAE are ALL faithful (quality ≈ bf16 reference).
 - **serenityUI (:7811) MULTI-MODEL WORKERS — GPU-verified 2026-07-12**: all 7 addable
   worker binaries BUILT CLEAN from the existing serve/ sources (no drift):
@@ -2924,47 +2924,47 @@ work itself lives in the serenity-trainer + serenity-server trees).
   models and 13 templates, the three video backends, exact fixed profiles,
   request routing, gallery identity/scrolling, and zero browser errors.
 
-## 2026-07-21: Wan 2.2 + Wan 2.1 LoRA TRAINERS — all verticals RUN on real weights (Musubi-parity, 5080)
+## 2026-07-21: Wan 2.2 + Wan 2.1 LoRA TRAINERS — all verticals RUN on real weights (Torchref-parity, 5080)
 
 Supersedes the "wan22 trainer blocked on data" note (2026-07-08): the 14B A14B
 weights were downloaded and all Wan LoRA trainers now run + are parity-certified
-against the **Musubi Tuner** oracle (`/home/alex/musubi-tuner`, not diffusers).
-NOTE: Musubi trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
+against the **Torchref Tuner** oracle (`/home/alex/torchref-video`, not diffusers).
+NOTE: Torchref trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
 
 - **Entry point**: `training/train_wan22_real.mojo` — one loop, env-selected variant:
   default = Wan2.2 T2V-A14B; `WAN22_I2V=1` = Wan2.2 I2V-A14B (36-ch);
   `WAN21_MODEL=t2v_1.3b|t2v_14b` = Wan2.1 T2V; `WAN21_I2V=1` = Wan2.1 I2V-14B (CLIP).
-  Flow-match `x_t=(1-t)x0+t·noise`, target=`noise-x0`, MSE (musubi recipe cited).
+  Flow-match `x_t=(1-t)x0+t·noise`, target=`noise-x0`, MSE (torchref recipe cited).
   Compile needs `-Xlinker -L/usr/lib/x86_64-linux-gnu -Xlinker -lcuda` (offload loader).
 - **Dual high/low-noise expert** (Wan2.2 A14B): two resident bases + two streamed
   loaders, per-step `use_high = t >= boundary` (T2V 0.875 / I2V 0.900); ONE shared
-  LoRA (musubi swaps base under the network). Env: `WAN22_DIT_HIGH_NOISE`,
+  LoRA (torchref swaps base under the network). Env: `WAN22_DIT_HIGH_NOISE`,
   `WAN22_TIMESTEP_BOUNDARY`, `WAN22_DUAL_EXPERT`. Peak VRAM ~5.9G streamed.
 - **`models/wan22/wan22_block.mojo`**: FFN LoRA added (10 targets: attn q/k/v/o×2 +
   ffn.0/ffn.2). `wan22_i2v_block_lora_forward/backward[H,Dh,S,TXT,IMG]` = Wan2.1
   `WanI2VCrossAttention` (k_img/v_img + norm_k_img; text-SDPA + img-SDPA share q,
-  ADD before o) — 12 targets. Certified vs musubi WanAttentionBlock cos≥0.999.
+  ADD before o) — 12 targets. Certified vs torchref WanAttentionBlock cos≥0.999.
 - **`models/wan22/wan22_stack_lora.mojo`**: `wan22_i2v_stack_lora_{forward,backward}_offload`
   (i2v block per layer, frozen context threaded once, 12/block LoRA); `Wan22I2VLoraSet`.
-  **LoRA save = ai-toolkit/ComfyUI format**: `_wan22_lora_prefixes` emits
+  **LoRA save = torchref/ComfyUI format**: `_wan22_lora_prefixes` emits
   `diffusion_model.blocks.N.<mod>.lora_A/lora_B.weight` (+ k_img/v_img for i2v-2.1).
 - **`models/wan22/weights.mojo`**: runtime patch_embed (in_dim 16/36 → 64/144 packed);
   `detect_wan22_prefix` auto-detects bare (2.2, 2.1-14B) vs `model.diffusion_model.`
   (2.1-1.3B) checkpoint keys; MLPProj (`img_emb.proj.{0,1,3,4}`) resident for i2v-2.1.
 - **`offload/wan22_plan.mojo`**: `prefix` param + `build_wan21_i2v_block_plan` (streams
   cross_attn.{k_img,v_img,norm_k_img}). **`ops/activations.mojo`**: `gelu_exact` (erf)
-  for the CLIP MLPProj (musubi nn.GELU() default; NOT the ffn tanh-gelu).
-- **Data cache**: `models/wan22/parity/wan22_build_data_cache.py` (Musubi WanVAE 16-ch
+  for the CLIP MLPProj (torchref nn.GELU() default; NOT the ffn tanh-gelu).
+- **Data cache**: `models/wan22/parity/wan22_build_data_cache.py` (Torchref WanVAE 16-ch
   + umt5; `--i2v` adds cond_y[20], `--i2v21` adds CLIP `clip[257,1280]` via the
   onlyvisual xlm-roberta-vit-h-14). Mojo readers in the trainer patchify via patchify3d.
-- **Parity gates**: `models/wan22/parity/wan22_block_lora_{musubi_oracle.py,parity_musubi.mojo}`
-  (10-target T2V/2.2) + `wan22_i2v21_block_lora_{musubi_oracle.py,parity.mojo}`
+- **Parity gates**: `models/wan22/parity/wan22_block_lora_{torchref_oracle.py,parity_torchref.mojo}`
+  (10-target T2V/2.2) + `wan22_i2v21_block_lora_{torchref_oracle.py,parity.mojo}`
   (12-target i2v-2.1). Both PASS cos≥0.999. Oracle `.bin` dumps gitignored.
 - **Verified real-weight smokes** (own-gate): T2V-A14B (dual, 400 ad), I2V-A14B (dual@0.900,
   400 ad), T2V-1.3B (300 ad, ~12s/step), T2V-14B (400 ad), I2V-14B-CLIP (480 ad).
   All finite loss, LoRA saved diffusion_model.-prefixed. Perf ~106-144s/step (14B
   streamed) — a lever, not correctness. `configs/wan22_{real_smoke_2step,dual_smoke_4step}.json`.
-- **Save↔load closed**: these ai-toolkit-format saves load back through the inference
+- **Save↔load closed**: these torchref-format saves load back through the inference
   loader `lora.mojo` `FMT_DIFFUSION_MODEL` with NO conversion (`_map_diffusion_model`
   strips `diffusion_model.`). Superseded on 2026-07-29 for TI2V-5B inference:
   `Wan22DiT.merge_lora_fp8_resident` now applies compatible 5B block LoRAs once
@@ -2975,8 +2975,8 @@ NOTE: Musubi trains Wan2.2 **14B-only** (no 5B) — the trainer targets A14B.
 The inference LoRA loader `serenitymojo/lora.mojo` (`LoraSet`) is the single
 merge-at-load / at-dequant apply path (INFERENCE-only; `training/lora_save.mojo` is
 its inverse). Auto-detects 5 key formats (`_detect_format`, `lora.mojo:192-237`):
-`FMT_KOHYA_SDXL`, `FMT_LTX2_DISTILLED` (AV cross-modal families, matched first),
-**`FMT_DIFFUSION_MODEL`** (`diffusion_model.<mod>.lora_A/lora_B.weight` = ai-toolkit/
+`FMT_TORCHREF_SDXL`, `FMT_LTX2_DISTILLED` (AV cross-modal families, matched first),
+**`FMT_DIFFUSION_MODEL`** (`diffusion_model.<mod>.lora_A/lora_B.weight` = torchref/
 ComfyUI = what the Wan/Klein/LTX2 trainers save), `FMT_ZIMAGE_TRAINER`,
 `FMT_KLEIN_TRAINER` (split→fused QKV). Scale `(alpha/rank)·multiplier`; absent
 `.alpha` ⇒ `scale=multiplier`. Resident `merge_into*` SKIPS unmatched base keys
@@ -3030,7 +3030,7 @@ AND bwd — zero block-math changes.
   tight on 16G — measured peak 5.9G synthetic / 3.8G real-cache).
 - **Trainer**: `training/train_mageflow_real.mojo` — logit-normal σ (shift 6.0),
   `x_t=(1-σ)x0+σ·noise`, target=`noise−x0`, RAW-σ timestep, levers MSE, AdamW +
-  clip 1.0; saves ai-toolkit `diffusion_model.transformer_blocks.{i}.*.lora_A/B`
+  clip 1.0; saves torchref `diffusion_model.transformer_blocks.{i}.*.lora_A/B`
   + `.state` (F32 adam moments). Configs `configs/mageflow_base_{smoke,real4}.json`.
 - **Cache**: `training/mageflow_cache_builder.mojo` — PURE-MOJO (Qwen3-VL text
   cond + MageVAE encode, offload-staged) → `klein_dataset` layout at
@@ -3829,5 +3829,5 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   Discovery loop: run w/ default comptime; each raise prints the exact
   -D value (H3_TEXT_TOKENS, H3_REF_SEQ_LEN).
 - `pipeline/parity/`, `models/*/parity/` — every gate above; oracle scripts
-  run the vendor's OWN classes (AutoencoderKLLegacy etc.) via the OneTrainer
+  run the vendor's OWN classes (AutoencoderKLLegacy etc.) via the torchref
   venv, GPU bf16/F32 — never CPU-fp32 references.

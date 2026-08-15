@@ -319,7 +319,7 @@ struct Krea2OminiLayout(Copyable, Movable):
 # UNCONDITIONALLY and never branch itself.
 #
 # WHY the split is a single boundary and the TXT_pad tail lands in the t=0 span:
-# that is exactly what the ai-toolkit krea2 reference does (mmdit.py
+# that is exactly what the torchref krea2 reference does (mmdit.py
 # SingleStreamBlock.forward tuple-vec branch `(vec, refvec, split)`), and pad
 # rows' values are never read downstream, so matching the reference costs
 # nothing and removes a needless divergence. (An earlier draft of the seam plan

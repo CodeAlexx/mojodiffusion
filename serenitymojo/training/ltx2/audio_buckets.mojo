@@ -1,6 +1,6 @@
 # audio_buckets.mojo -- LTX-2 AV audio bucket policy contract.
 #
-# Mirrors the Musubi LTX2 dataset/bucket behavior without implementing the
+# Mirrors the Torchref LTX2 dataset/bucket behavior without implementing the
 # full dataloader. The future collation path should use these functions as its
 # readiness surface before it batches video/audio/text tensors.
 
@@ -62,7 +62,7 @@ def quantize_audio_latent_time(audio_t: Int, bucket_step: Int, strategy: Int) ra
             return bucket_step
         return q
     if strategy == AUDIO_BUCKET_PAD:
-        # Musubi's current LTX2 audio bucket path adds half a bucket before
+        # Torchref's current LTX2 audio bucket path adds half a bucket before
         # integer division. This is a round-to-nearest bucket policy.
         var q = ((audio_t + bucket_step // 2) // bucket_step) * bucket_step
         if q < bucket_step:

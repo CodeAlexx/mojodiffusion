@@ -1,6 +1,6 @@
 # krea2_vae_parity_probe.mojo — krea2 VAE DECODE parity vs the torch oracle.
 #
-# krea2 (ai-toolkit krea2.py) decodes its 16-ch latents with the Qwen-Image VAE
+# krea2 (torchref krea2.py) decodes its 16-ch latents with the Qwen-Image VAE
 # (AutoencoderKLQwenImage, "Qwen/Qwen-Image"), denorm = z * std + mean. The Mojo
 # QwenImageVaeDecoder already implements exactly that: its decode() does
 #   z = z / inv_std + mean   with inv_std = 1/std   ==   z * std + mean

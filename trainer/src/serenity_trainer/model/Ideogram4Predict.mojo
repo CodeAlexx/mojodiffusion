@@ -1,12 +1,12 @@
 # Ideogram4Predict.mojo — Ideogram-4 TRAINING predict path (1:1 port).
 #
 # Pure Mojo + MAX, INFERENCE-style forward (no autograd here — the LoRA backward
-# is a separate later chunk). This mirrors the ai-toolkit training pipeline's
+# is a separate later chunk). This mirrors the torchref training pipeline's
 # velocity prediction so the trainer can compute a flow-matching loss against the
 # transformer's output.
 #
 # ── PORT SPEC (1:1) ───────────────────────────────────────────────────────────
-# ai-toolkit extensions_built_in/diffusion_models/ideogram4/src/pipeline.py
+# torchref extensions_built_in/diffusion_models/ideogram4/src/pipeline.py
 #   ::predict_velocity (lines 152-250) — packs [text ++ image] tokens, builds the
 #   indicator / segment_ids / position_ids tensors, flips flow-time t -> model-time
 #   (1 - t), runs the transformer, slices the image tokens back to a (B,128,gh,gw)
@@ -20,7 +20,7 @@
 #   serenitymojo.models.dit.ideogram4_dit.ideogram4_forward[S]
 #   serenitymojo.models.dit.ideogram4_mrope.build_ideogram4_mrope
 #
-# segment_ids NOTE: ai-toolkit passes segment_ids (text region = 1 where
+# segment_ids NOTE: torchref passes segment_ids (text region = 1 where
 # text_mask, else SEQUENCE_PADDING_INDICATOR=-1; image region = 1). For a SINGLE
 # sample (b=1) with all-real text (text_mask all ones), segment_ids is all-1, and
 # ideogram4_forward does not take segment_ids — position info enters only via the
@@ -97,7 +97,7 @@ struct Ideogram4PackedInputs(Movable):
 #
 # text_len: the NATURAL (pre-pad) token count of THIS sample's caption. When a
 # caption is shorter than the fixed NT bucket, positions [text_len, NT) are
-# right-padding. ai-toolkit pipeline.py:249 sets the indicator there to 0
+# right-padding. torchref pipeline.py:249 sets the indicator there to 0
 # (indicator[:, :nt] = text_mask_long * LLM_TOKEN_INDICATOR; pad -> 0), and the
 # encoder already zeroed those FEATURE rows (pipeline.py:156-157 stacked*text_mask
 # = our prepare-time zeroing). Default text_len = NT (all real, no padding) keeps
@@ -139,7 +139,7 @@ def ideogram4_build_packed_inputs[
     var llm_full = concat(1, ctx, llm_features, llm_zeros)           # [1,SEQ,53248]
 
     # position_ids: host-built F32 [1,SEQ,3].
-    # ai-toolkit pipeline.py:262 text_pos = (text_mask.cumsum(-1)-1).clamp(min=0):
+    # torchref pipeline.py:262 text_pos = (text_mask.cumsum(-1)-1).clamp(min=0):
     #   real position i (i < real_len) -> i ; pad position (i >= real_len) holds
     #   at the last real index (real_len-1, clamped to >=0). All-real (real_len==NT)
     #   reproduces the old 0..NT-1 ramp.
@@ -163,7 +163,7 @@ def ideogram4_build_packed_inputs[
     var position_ids = Tensor.from_host(pos_host^, [1, SEQ, 3], STDtype.F32, ctx)
 
     # indicator: host-built F32 [1,SEQ]; text -> 3 (mask*LLM_TOKEN_INDICATOR),
-    # text-pad -> 0 (ai-toolkit pipeline.py:249: text_mask_long * 3), image -> 2.
+    # text-pad -> 0 (torchref pipeline.py:249: text_mask_long * 3), image -> 2.
     var ind_host = List[Float32]()
     for i in range(NT):
         if i < real_len:

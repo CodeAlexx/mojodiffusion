@@ -9,9 +9,9 @@
 # loader the trainer uses). Bars: cos >= 0.999 for the v1 captures (unchanged)
 # and cos >= 0.9999 for the 7 NEW 1D arms (FULL_SURFACE_PLAN Phase B bar).
 #
-# Oracle: per MJ-1041 the ideogram4 oracle is AI-TOOLKIT —
-# models/dit/parity/ideogram4_aitoolkit_oracle.py in its BASE-ONLY mode
-# (IDEOGRAM4_FT_ORACLE=1 -> ideogram4_aitoolkit_block0_ft.safetensors). The
+# Oracle: per MJ-1041 the ideogram4 oracle is TORCHREF —
+# models/dit/parity/ideogram4_torchref_oracle.py in its BASE-ONLY mode
+# (IDEOGRAM4_FT_ORACLE=1 -> ideogram4_torchref_block0_ft.safetensors). The
 # LoRA-mode fixture is NOT valid for FT (the adapters shift the dX chain and,
 # through downstream activations, the dW values — krea2 trap; and its base
 # weights are frozen, so it has no W.grad refs at all).
@@ -26,7 +26,7 @@
 # Run (oracle FIRST, as SEPARATE commands — never chained after a mojo build):
 #   cd /home/alex/mojodiffusion
 #   IDEOGRAM4_FT_ORACLE=1 /home/alex/SerenityTrainer/venv/bin/python \
-#       serenitymojo/models/dit/parity/ideogram4_aitoolkit_oracle.py
+#       serenitymojo/models/dit/parity/ideogram4_torchref_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo build --optimization-level 2 --target-accelerator sm_120 \
 #       -I . -I /home/alex/MOJO-libs -Xlinker -lm \
@@ -79,10 +79,10 @@ from serenitymojo.models.ideogram4.config import (
 
 # Real block-0 checkpoint (fp8) — the SAME file the oracle dequantized to bf16.
 comptime CKPT_DIR = "/home/alex/.serenity/models/ideogram-4-fp8/transformer"
-# ai-toolkit FT oracle fixture (block 0, base-only graph).
+# torchref FT oracle fixture (block 0, base-only graph).
 comptime FIX = (
     "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/"
-    "ideogram4_aitoolkit_block0_ft.safetensors"
+    "ideogram4_torchref_block0_ft.safetensors"
 )
 
 # Geometry — fixed by the oracle (GH=GW=16 -> NIMG=256, NTEXT=4 -> L=260).
@@ -122,7 +122,7 @@ def _fix_ref_f32(
 
 def main() raises:
     var ctx = DeviceContext()
-    print("=== Ideogram-4 BLOCK FULL-FT ai-toolkit ORACLE parity (cos >= 0.999) ===")
+    print("=== Ideogram-4 BLOCK FULL-FT torchref ORACLE parity (cos >= 0.999) ===")
     print("S=", S, " Hidden=", Hidden, " H=", Heads, " Dh=", Dh, " FF=", FF,
           " Adaln=", Adaln, " (base-only oracle: IDEOGRAM4_FT_ORACLE=1)")
 

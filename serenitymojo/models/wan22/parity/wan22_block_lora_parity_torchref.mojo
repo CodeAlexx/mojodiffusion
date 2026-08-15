@@ -1,17 +1,17 @@
-# serenitymojo/models/wan22/parity/wan22_block_lora_parity_musubi.mojo
+# serenitymojo/models/wan22/parity/wan22_block_lora_parity_torchref.mojo
 #
-# MUSUBI-TUNER PARITY GATE for the Wan2.2 WanAttentionBlock LoRA training unit
+# TORCHREF-TUNER PARITY GATE for the Wan2.2 WanAttentionBlock LoRA training unit
 # (models/wan22/wan22_block.mojo wan22_block_lora_*). Identical structure to
 # wan22_block_lora_parity.mojo but consumes the dump produced by
-# wan22_block_lora_musubi_oracle.py (the reference driven through Musubi Tuner's
+# wan22_block_lora_torchref_oracle.py (the reference driven through Torchref Tuner's
 # REAL WanAttentionBlock.forward at real A14B dims). Compares x_out, d_x,
-# d_context, and the 8 adapters' d_A/d_B against the Musubi reference.
+# d_context, and the 8 adapters' d_A/d_B against the Torchref reference.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/ai-toolkit/venv/bin/python \
-#       serenitymojo/models/wan22/parity/wan22_block_lora_musubi_oracle.py
+#   /home/alex/torchref-image/venv/bin/python \
+#       serenitymojo/models/wan22/parity/wan22_block_lora_torchref_oracle.py
 #   rm -f serenitymojo.mojopkg
-#   pixi run mojo run -I . serenitymojo/models/wan22/parity/wan22_block_lora_parity_musubi.mojo
+#   pixi run mojo run -I . serenitymojo/models/wan22/parity/wan22_block_lora_parity_torchref.mojo
 
 from max.gpu.host import DeviceContext
 from std.collections import List, Optional
@@ -156,7 +156,7 @@ def _check_lora(
 
 def main() raises:
     var ctx = DeviceContext()
-    print("==== wan22_block_lora_parity_musubi (Wan2.2 A14B block + 8 LoRA vs Musubi) ====")
+    print("==== wan22_block_lora_parity_torchref (Wan2.2 A14B block + 8 LoRA vs Torchref) ====")
     print("H=", H, " Dh=", Dh, " DIM=", DIM, " S=", S, " TXT=", TXT, " FFN=", FFN, " RANK=", RANK)
 
     var x = _in("lin_x")
@@ -175,7 +175,7 @@ def main() raises:
     var allok = True
 
     print("")
-    print("---- forward output vs Musubi ----")
+    print("---- forward output vs Torchref ----")
     _check(harness, "x_out", fwd.x_out, _in("lref_x_out"), allok)
 
     var d_out = _in("lin_d_out")
@@ -184,12 +184,12 @@ def main() raises:
     )
 
     print("")
-    print("---- input grads vs Musubi (incl LoRA branch) ----")
+    print("---- input grads vs Torchref (incl LoRA branch) ----")
     _check(harness, "d_x (img)    ", g.base.d_x, _in("lref_d_x"), allok)
     _check(harness, "d_context(txt)", g.base.d_context, _in("lref_d_context"), allok)
 
     print("")
-    print("---- LoRA d_A / d_B vs Musubi (10 adapters; bf16 gate 0.995) ----")
+    print("---- LoRA d_A / d_B vs Torchref (10 adapters; bf16 gate 0.995) ----")
     _check_lora("sa_q dA", g.sa_q_da, _in("lref_sa_q_dA"), allok)
     _check_lora("sa_q dB", g.sa_q_db, _in("lref_sa_q_dB"), allok)
     _check_lora("sa_k dA", g.sa_k_da, _in("lref_sa_k_dA"), allok)
@@ -213,6 +213,6 @@ def main() raises:
 
     print("")
     if allok:
-        print("VERDICT: PASS -- Wan2.2 A14B block LoRA fwd+bwd matches Musubi (cos>=0.999)")
+        print("VERDICT: PASS -- Wan2.2 A14B block LoRA fwd+bwd matches Torchref (cos>=0.999)")
     else:
         print("VERDICT: FAIL -- at least one output diverged (see FAIL lines above)")

@@ -1,11 +1,11 @@
-# Ideogram4LoRALoader.mojo — runtime reload for ai-toolkit/PEFT Ideogram4 LoRAs.
+# Ideogram4LoRALoader.mojo — runtime reload for torchref/PEFT Ideogram4 LoRAs.
 #
 # Reads block-stack adapters from safetensors:
 #   diffusion_model.layers.N.<slot>.lora_A.weight  [rank, in]
 #   diffusion_model.layers.N.<slot>.lora_B.weight  [out, rank]
 #   optional .alpha scalar; if absent, alpha defaults to rank.
 #
-# The real ai-toolkit fixture:
+# The real torchref fixture:
 #   /home/alex/Downloads/dever_arcane_style_ideogram4%20%28arcvfx%29.safetensors
 # uses exactly the 34*6 block target set, rank 32, BF16, no alpha tensors, no
 # global adapters.

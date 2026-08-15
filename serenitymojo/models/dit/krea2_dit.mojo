@@ -1,6 +1,6 @@
 # models/dit/krea2_dit.mojo — Krea-2-Raw (krea2) single-stream MMDiT.
 #
-# Reference: ai-toolkit krea2 src/mmdit.py (`SingleStreamDiT`). This file holds
+# Reference: torchref krea2 src/mmdit.py (`SingleStreamDiT`). This file holds
 # the inference port, chunk by chunk: the `Krea2Config` struct + 3-axis
 # interleaved RoPE (chunk 1), RMSNorm/SwiGLU/Modulations (chunk 2), Attention
 # (chunk 3), SingleStreamBlock (chunk 4), and the embedders + input/output heads
@@ -2224,7 +2224,7 @@ def krea2_forward[
     # → ZERO per-step disk reads (the user's no-repetitive-disk-read directive). The
     # LoRA overlay applies ON TOP of the dequant'd weight. Default None = disk stream.
     ref_tokens: Optional[Tensor] = Optional[Tensor](None),
-    # OPT-IN img-EDIT reference conditioning (the ai-toolkit "krea2 o-edit" additive
+    # OPT-IN img-EDIT reference conditioning (the torchref "krea2 o-edit" additive
     # input projection). ref_tokens [1, imglen, 64] = the SOURCE image VAE-encoded +
     # patchified (SAME layout as `img`). When BOTH ref_tokens AND img_in_ref_w are
     # present the `first` projection becomes  img = first(img) + linear(ref, img_in_ref)
@@ -2327,7 +2327,7 @@ def krea2_forward[
 
     # WEIGHT DTYPE (the real raw.safetensors is MIXED precision): block matmul
     # weights are bf16 on disk, but the embedders/heads/norms/mod (first/tmlp/tproj/
-    # txtmlp/last/projector, every .scale, every mod.lin) are F32. The ai-toolkit
+    # txtmlp/last/projector, every .scale, every mod.lin) are F32. The torchref
     # reference casts EVERY floating param to bf16 at load (krea2.py:190 `v.to(bf16)`)
     # → the whole model runs bf16 (what chunks 1-7 gated against). We mirror it via
     # the _wb / _scale loaders (defined above): _wb = every float weight/bias/mod.lin

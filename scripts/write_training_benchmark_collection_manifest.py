@@ -31,7 +31,7 @@ class BenchmarkCollectionCase:
 CASES: tuple[BenchmarkCollectionCase, ...] = (
     BenchmarkCollectionCase(
         model="krea2",
-        correctness_lane="ai-toolkit",
+        correctness_lane="torchref",
         mojo_runner="serenitymojo/models/krea2/train_krea2.mojo",
         target_batch=1,
         target_resolution="512 or 1024",
@@ -44,16 +44,16 @@ CASES: tuple[BenchmarkCollectionCase, ...] = (
             "build train_krea2.mojo with -DKREA2_LTMAX=896, run krea2devicegrad"
         ),
         blocker=(
-            "needs ai-toolkit real-cache parity, profiler-complete transfer/sync "
+            "needs torchref real-cache parity, profiler-complete transfer/sync "
             "accounting beyond the counted streaming fences, phase timings, "
             "trainable-surface closure for txtfusion LoRA, and "
-            "longer measured run; reduced-depth ai-toolkit block-stack gradient "
+            "longer measured run; reduced-depth torchref block-stack gradient "
             "plus shared-device AdamW replay is collected separately at "
             "artifacts/training_perf/krea2_stack_adamw_update_replay_2026-06-30.md; "
             "the current trainable-surface blocker is recorded at "
             "artifacts/training_perf/krea2_trainable_surface_blocker_2026-06-30.md; "
             "it currently records missing_txtfusion=64 and shape_mismatch=0 "
-            "after aligning the Mojo smoke to ai-toolkit rank/alpha 32; "
+            "after aligning the Mojo smoke to torchref rank/alpha 32; "
             "the 384-token synthetic fixture is retained "
             "separately at artifacts/training_perf/krea2_devicegrad_smoke_2026-06-30.jsonl"
         ),
@@ -172,7 +172,7 @@ def build_manifest() -> str:
         "",
         "## Lane Boundaries",
         "",
-        "- SerenityTrainer or ai-toolkit correctness lane: source-of-truth behavior, convergence, and market speed target.",
+        "- SerenityTrainer or torchref correctness lane: source-of-truth behavior, convergence, and market speed target.",
         "- Mojo current lane: product-path baseline emitted as `TrainingPerfRecord` JSONL.",
         "- Rust/Flame lane: op/block reference only; not a convergence or trainer-parity oracle.",
         "",
@@ -204,15 +204,15 @@ def build_manifest() -> str:
         var_correctness_lane = "not collected in this manifest."
         if case.model == "krea2":
             var_correctness_lane = (
-                "reduced-depth ai-toolkit SingleStreamDiT block-stack gradient plus "
+                "reduced-depth torchref SingleStreamDiT block-stack gradient plus "
                 "shared-device AdamW update replay collected at "
                 "artifacts/training_perf/krea2_stack_adamw_update_replay_2026-06-30.md; "
                 "trainable-surface blocker collected at "
                 "artifacts/training_perf/krea2_trainable_surface_blocker_2026-06-30.md "
-                "with ai_toolkit_total=512, mojo_total=448, missing_txtfusion=64, "
+                "with torchref_total=512, mojo_total=448, missing_txtfusion=64, "
                 "shape_mismatch=0, ai_target_prefixes=256, and mojo_target_prefixes=224; "
                 "opt-in full-surface txtfusion key/dtype smoke and bounded Mojo product-path resume smoke "
-                "are collected; real-cache ai-toolkit loss/gradient/update/resume parity, full-depth "
+                "are collected; real-cache torchref loss/gradient/update/resume parity, full-depth "
                 "selected-gradient "
                 "parity, sampling, and convergence are still missing."
             )
@@ -240,7 +240,7 @@ def build_manifest() -> str:
                 "",
                 f"- status: {case.status}",
                 f"- correctness lane: {case.correctness_lane}",
-                f"- SerenityTrainer or ai-toolkit correctness lane: {var_correctness_lane}",
+                f"- SerenityTrainer or torchref correctness lane: {var_correctness_lane}",
                 f"- Mojo current lane: {var_mojo_lane}",
                 "- Rust/Flame lane: op/block reference only; not collected in this manifest.",
                 f"- mojo runner: `{case.mojo_runner}`",

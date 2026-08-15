@@ -1809,7 +1809,7 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             KLEIN_STACK_LORA,
             category="lora",
-            label="Klein AI Toolkit LoRA key mapping",
+            label="Klein torchref LoRA key mapping",
             needles=[
                 "_load_klein_flux2_double_blocks_lora",
                 "diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight",
@@ -1818,7 +1818,7 @@ def check_family_surfaces() -> list[Check]:
                 "loaded Flux2/Klein double_blocks adapters",
             ],
             severity=P1,
-            acceptance="Klein LoRA loading recognizes AI Toolkit/Comfy Flux2-Klein double_blocks and single_blocks keys and rejects shape-incompatible files before sampling.",
+            acceptance="Klein LoRA loading recognizes torchref/Comfy Flux2-Klein double_blocks and single_blocks keys and rejects shape-incompatible files before sampling.",
         ),
         check_contains(
             SERENITYFLOW_LATENT_NODES,
@@ -2266,13 +2266,13 @@ KLEIN_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
 KLEIN_LORA_DAEMON_SMOKE_ACCEPTANCE = (
     "A real dispatch-mode daemon smoke runs bounded Klein 9B LoRA txt2img through "
     "Qwen3 cap-cache precache plus the staged Klein sampler, emits a PNG with genparams, "
-    "writes the Klein daemon result manifest, and proves the AI Toolkit/Comfy LoRA loader path."
+    "writes the Klein daemon result manifest, and proves the torchref/Comfy LoRA loader path."
 )
 
 KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
     "A real dispatch-mode daemon smoke runs SerenityFlow's Klein 9B edit-LoRA Comfy graph through "
     "graph LoRA lowering, ReferenceLatent metadata lowering, Qwen3 cap-cache precache, and the "
-    "staged Klein ReferenceLatent sampler with the AI Toolkit/Comfy LoRA loaded."
+    "staged Klein ReferenceLatent sampler with the torchref/Comfy LoRA loaded."
 )
 
 KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE = (

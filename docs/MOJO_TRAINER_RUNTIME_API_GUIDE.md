@@ -18,8 +18,8 @@ numbers, but runtime prepare/train/sample code must stay Mojo.
 - Do not make production trainers depend on SerenityTrainer, Python, PyTorch, or Rust
   caches. If the Mojo trainer needs a text encoder, VAE encoder, sampler, cache
   writer, or image decoder, build or reuse the Mojo implementation.
-- Keep LoRA saves in the generic PEFT/ai-toolkit-compatible safetensors format:
-  `<prefix>.lora_A.weight` and `<prefix>.lora_B.weight`. `/home/alex/ai-toolkit`
+- Keep LoRA saves in the generic PEFT/torchref-compatible safetensors format:
+  `<prefix>.lora_A.weight` and `<prefix>.lora_B.weight`. `/home/alex/torchref-image`
   and the inference side already understand that format.
 - Do not run full-F32 Z-Image. SerenityTrainer does not train Z-Image full-F32, and
   full-F32 base residency OOMs on the local 24 GB target. Large base projection
@@ -108,7 +108,7 @@ Z-Image 1024 sampling hook:
 - It loads the same BF16/BP16-preserving Mojo Z-Image stack as the trainer,
   loads main-only PEFT/PERT LoRA adapters, denoises at 1024, then decodes with
   the Mojo Z-Image VAE.
-- LoRA sampling must use AI Toolkit-style forward overlay:
+- LoRA sampling must use torchref-style forward overlay:
   `base_forward(x) + lora_up(lora_down(x)) * multiplier * alpha/rank`.
   Do not use `LoraSet.merge_into_indexed` for Z-Image production sampling; that
   bypasses the trainer's main-only overlay path and is not the reference.

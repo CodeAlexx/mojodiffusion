@@ -1,14 +1,14 @@
 # serenitymojo/models/minimax_h3/h3_train_sigma.mojo
 #
 # MiniMax-H3 training sigma policy, noising, and joint velocity loss.
-# Oracle: musubi-tuner akane/minimax-h3 @ 04324c28 —
+# Oracle: torchref-h3 @ 04324c28 —
 #   minimax_h3/training.py: _shift_unchecked (:61), prepare_joint_noisy_inputs
 #   (:103-179), _modality_loss/_joint_loss (:272-352);
 #   minimax_h3_train_network.py: _base_sigma (:1239, uniform => base sigma IS
 #   the U[0,1) draw), _apply_timestep_focus (:109), parser defaults (:2506:
 #   timestep_sampling=uniform, discrete_flow_shift pinned 1.0).
 #
-# Recipe (musubi defaults, AV video item):
+# Recipe (torchref defaults, AV video item):
 #   base_sigma u ~ U[0,1)          (shared unshifted coordinate, ONE per item)
 #   sigma_m    = shift(u, s_m)     shift(σ,s) = s·σ / (1 + (s−1)·σ)
 #                s_video = 12.0, s_audio = 3.0 (images: both 1.0)
@@ -19,7 +19,7 @@
 #                Σ_m = masked sum of (pred−target)², n_m = masked element count
 #                defaults w_v = w_a = 1.0, no sample weighting
 #
-# DTYPE CONTRACT (matches torch bf16 semantics exactly): musubi expands sigma
+# DTYPE CONTRACT (matches torch bf16 semantics exactly): torchref expands sigma
 # with .to(dtype=latents.dtype) — σ is bf16-ROUNDED before the noising math,
 # and every elementwise op computes in f32 then rounds to bf16 (torch CUDA
 # bf16 kernels upcast internally). Our mul_scalar/add/sub bf16 paths do the
@@ -64,7 +64,7 @@ def _bf16_round(x: Float32) -> Float32:
 def h3_noisy_input(
     x0: Tensor, noise: Tensor, sigma: Float32, ctx: DeviceContext
 ) raises -> Tensor:
-    """x_t = (1 − σ)·x0 + σ·noise with musubi's exact bf16 rounding: σ is
+    """x_t = (1 − σ)·x0 + σ·noise with torchref's exact bf16 rounding: σ is
     bf16-rounded first (torch .to(dtype=bf16) expansion), (1 − σ_bf16) is a
     bf16 tensor-op result, and each multiply/add rounds to bf16."""
     var s = _bf16_round(sigma)
@@ -122,7 +122,7 @@ def h3_joint_token_loss(
     video_weight: Float64, audio_weight: Float64,
 ) raises -> Float64:
     """_joint_loss balance="token" (training.py:344-347): weighted totals over
-    weighted element counts. Weights zero out per musubi when a modality has
+    weighted element counts. Weights zero out per torchref when a modality has
     no active elements."""
     var wv = video_weight if video.elements > 0 else Float64(0)
     var wa = audio_weight if audio.elements > 0 else Float64(0)

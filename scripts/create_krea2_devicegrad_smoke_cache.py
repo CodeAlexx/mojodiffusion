@@ -3,7 +3,7 @@
 
 The fixture is intentionally synthetic. It exercises the Mojo product trainer's
 cache reader and multi-step device-grad/live-dev_p path without claiming
-ai-toolkit or SerenityTrainer data parity.
+torchref or SerenityTrainer data parity.
 """
 
 from __future__ import annotations

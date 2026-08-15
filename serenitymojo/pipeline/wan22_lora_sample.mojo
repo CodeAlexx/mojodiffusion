@@ -9,7 +9,7 @@
 # The loop below mirrors `pipeline/wan22_t2v.mojo::_denoise_scoped` — the repo's
 # gated Wan inference — op for op:
 #     scheduler = UniPcMultistepScheduler(1000, steps, shift, 2)
-#     model_t   = int64(max(sigma * 1000, 0))       (Musubi scheduler contract)
+#     model_t   = int64(max(sigma * 1000, 0))       (Torchref scheduler contract)
 #     v         = (1-g)*v_uncond + g*v_cond          (plain CFG)
 #     x         = scheduler.step(v, x)
 # The only deltas are the A14B spine (`Wan22A14BStreamedDiT`, which computes the
@@ -83,9 +83,9 @@ comptime NUM_TRAIN_TIMESTEPS = Float32(1000.0)
 # Expert switch on the raw sigma, exactly as the trainer selects it
 # (train_wan22_real.mojo: `use_high = dual_expert and (t >= boundary)`).
 comptime BOUNDARY = Float32(0.875)
-comptime SHIFT_DEFAULT = Float64(12.0)  # Musubi Wan2.2 T2V-A14B inference
-comptime LOW_GUIDANCE_DEFAULT = Float32(3.0)  # Musubi T2V-A14B low expert
-comptime HIGH_GUIDANCE_DEFAULT = Float32(4.0)  # Musubi T2V-A14B high expert
+comptime SHIFT_DEFAULT = Float64(12.0)  # Torchref Wan2.2 T2V-A14B inference
+comptime LOW_GUIDANCE_DEFAULT = Float32(3.0)  # Torchref T2V-A14B low expert
+comptime HIGH_GUIDANCE_DEFAULT = Float32(4.0)  # Torchref T2V-A14B high expert
 
 
 def _load_embed(
@@ -197,7 +197,7 @@ def _run_expert(
     print("  ", phase_name, "guidance=", guidance)
     var x = x_in^
     for i in range(start_step, end_step):
-        # Musubi keeps float sigmas for UniPC integration but exposes an int64
+        # Torchref keeps float sigmas for UniPC integration but exposes an int64
         # timestep to WanModel (`timesteps = sigmas * 1000; .to(torch.int64)`).
         # Int() truncates toward zero, matching torch's float-to-int conversion.
         var raw_model_t = sigmas[i] * Float64(NUM_TRAIN_TIMESTEPS)
@@ -269,7 +269,7 @@ def main() raises:
     var shift = SHIFT_DEFAULT
     if len(args) >= 12:
         shift = Float64(atof(String(args[11])))
-    # Musubi pads raw UMT5 embeddings to 512, projects them (including projection
+    # Torchref pads raw UMT5 embeddings to 512, projects them (including projection
     # bias), and passes context_lens=None. Default to attending all 512 projected
     # rows. Set this to 1 only to reproduce the previous masked sampler for A/B.
     var legacy_text_mask = False
@@ -320,7 +320,7 @@ def main() raises:
     # Wan2.2 T2V-A14B's two DiTs are inference experts, not merely a training
     # mechanism. The high-noise expert owns sigma >= 0.875 and establishes global
     # layout/motion; the low-noise expert owns the remaining trajectory and refines
-    # detail. Musubi's training-time sample hook temporarily swaps to the low model,
+    # detail. Torchref's training-time sample hook temporarily swaps to the low model,
     # but that hook is not the standalone A14B inference recipe.
     var switch_step = 0
     if dual_expert:

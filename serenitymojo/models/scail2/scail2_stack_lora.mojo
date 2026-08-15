@@ -415,7 +415,7 @@ def scail2_lora_adamw_step(
 
 
 # ── PEFT-keyed save (12 targets/block; diffusion_model.-prefixed) ─────────────
-# ai-toolkit / ComfyUI Wan LoRA convention: `diffusion_model.` prefix + lora_A /
+# torchref / ComfyUI Wan LoRA convention: `diffusion_model.` prefix + lora_A /
 # lora_B keys. Maps each of the 12 targets to its checkpoint key:
 #   blocks.{i}.self_attn.{q,k,v,o}, blocks.{i}.cross_attn.{q,k,v,o,k_img,v_img},
 #   blocks.{i}.ffn.{0,2}.

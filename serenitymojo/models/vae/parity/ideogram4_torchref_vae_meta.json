@@ -1,5 +1,5 @@
 {
-  "oracle": "ai-toolkit",
+  "oracle": "torchref",
   "H": 256,
   "W": 256,
   "ae_ch": 32,

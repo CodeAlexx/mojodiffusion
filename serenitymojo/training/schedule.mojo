@@ -359,7 +359,7 @@ def _uniform_index(seed: UInt64, high_exclusive: Int) -> Int:
 def sample_timestep_krea2_aitk_sigmoid_balanced(
     table_seed: UInt64, index_seed: UInt64, num_train_timesteps: Int = 1000
 ) raises -> Float32:
-    """ai-toolkit Krea2 default timestep policy, distribution-level.
+    """torchref Krea2 default timestep policy, distribution-level.
 
     Mirrors CustomFlowMatchEulerDiscreteScheduler.set_train_timesteps("sigmoid")
     plus BaseSDTrainProcess content_or_style="balanced" index sampling:
@@ -391,7 +391,7 @@ def sample_timestep_krea2_aitk_sigmoid_balanced(
             j -= 1
         vals[j + 1] = key
 
-    # ai-toolkit's default flowmatch balanced path uses torch.randint(0, 999)
+    # torchref's default flowmatch balanced path uses torch.randint(0, 999)
     # when num_train_timesteps=1000, excluding the final sorted entry.
     var idx = _uniform_index(index_seed, num_train_timesteps - 1)
     return Float32(vals[idx] / Float64(1000.0))
@@ -400,7 +400,7 @@ def sample_timestep_krea2_aitk_sigmoid_balanced(
 def sample_timestep_krea2_aitk_linear_balanced(
     index_seed: UInt64, num_train_timesteps: Int = 1000
 ) raises -> Float32:
-    """ai-toolkit flowmatch timestep_type="linear", content_or_style="balanced".
+    """torchref flowmatch timestep_type="linear", content_or_style="balanced".
 
     CustomFlowMatchEulerDiscreteScheduler builds
       timesteps = linspace(1000, 1, 1000)
@@ -478,7 +478,7 @@ def sample_timestep_discrete_qwen(
 #   Uniform : t ~ U(0,1)   = rand 0.8.5 Standard<f32> = top-24-bits(word)/2^24
 #             (timestep_dist.rs:172). One ChaCha word at word_pos 0.
 #   Sigmoid : t = sigmoid(noising_weight * (z + noising_bias)), z ~ N(0,1)
-#             (timestep_dist.rs:173-180; musubi-style). One Box-Muller draw.
+#             (timestep_dist.rs:173-180; torchref-style). One Box-Muller draw.
 # Both reuse the SAME ChaCha12 stream as the production path so the draw is
 # deterministic per seed. Distribution-level (not byte) parity is gated
 # statistically (0.999 cos of the histogram), per the task.
@@ -505,7 +505,7 @@ def sample_timestep_uniform(seed: UInt64) -> Float32:
 def sample_timestep_sigmoid(seed: UInt64, weight: Float32, bias: Float32) -> Float32:
     """t = sigmoid(weight * (z + bias)), z ~ N(0,1).
 
-    Mirrors timestep_dist.rs:173-180 (musubi-style continuous sigmoid). With
+    Mirrors timestep_dist.rs:173-180 (torchref-style continuous sigmoid). With
     weight=1.8, bias=0 this is the Z-Image pipeline default. One Box-Muller
     N(0,1) draw from the seed's stream."""
     var ks = _expand_key(seed)

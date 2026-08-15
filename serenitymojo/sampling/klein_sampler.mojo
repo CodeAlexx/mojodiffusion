@@ -1,10 +1,10 @@
 # sampling/klein_sampler.mojo — INDEPENDENT Klein (FLUX.2) sampler that REUSES
 # the verified training forward (klein_stack_lora_forward) with the LoRA applied
-# as LIVE adapters — NO merge, PEFT-loaded, exactly the ai-toolkit application:
+# as LIVE adapters — NO merge, PEFT-loaded, exactly the torchref application:
 #   out = W·x + (alpha/rank)·B·(A·x)      (klein_stack_lora_forward does this)
 #
 # Why reuse the training forward (not Klein9BDiT.forward_full):
-#   * ai-toolkit / EDv2 never merge LoRA — they apply it live. The training
+#   * torchref / EDv2 never merge LoRA — they apply it live. The training
 #     forward already does this and is diffusers-parity-verified (cos 0.9999).
 #   * It is [H,Dh,N_IMG,N_TXT,S]-generic, so its attention sizes to cfg.n_heads
 #     (24 for 4B) — avoiding the forward_full sdpa_nomask[1,S,32,128] 9B hardcode.

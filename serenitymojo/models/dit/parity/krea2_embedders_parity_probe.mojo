@@ -1,6 +1,6 @@
 # models/dit/parity/krea2_embedders_parity_probe.mojo — PARITY GATE for krea2
 # chunk 5 (the embedders + input/output heads): temb, tmlp, tproj, txtmlp, first,
-# LastLayer — each vs a real ai-toolkit torch oracle.
+# LastLayer — each vs a real torchref torch oracle.
 #
 # Oracle: krea2_embedders_oracle.safetensors (weights BF16, scales/biases/te/t/
 # vec/outputs F32). Per-piece tensors named with the obvious prefixes (see

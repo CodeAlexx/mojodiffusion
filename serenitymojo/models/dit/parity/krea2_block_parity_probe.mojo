@@ -1,6 +1,6 @@
 # models/dit/parity/krea2_block_parity_probe.mojo — PARITY GATE for krea2 chunk 4
 # (the SingleStreamBlock: DoubleSharedModulation -> 2 AdaLN-Zero gated residual
-# branches over chunk-3 Attention + chunk-2 SwiGLU) vs a real ai-toolkit torch
+# branches over chunk-3 Attention + chunk-2 SwiGLU) vs a real torchref torch
 # oracle.
 #
 # Oracle: krea2_block_oracle.safetensors (weights BF16, scales/x-extras F32):

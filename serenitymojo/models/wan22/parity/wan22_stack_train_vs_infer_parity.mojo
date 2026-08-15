@@ -8,8 +8,8 @@
 #
 # WHY (2026-07-25): the block-level gates all PASS —
 #   * our train block vs our infer block: cos 0.9999771 (wan22_train_vs_infer_block_parity)
-#   * our train block vs MUSUBI's WanAttentionBlock: cos >= 0.9998 on all 20 LoRA grads
-#     (wan22_block_lora_parity_musubi)
+#   * our train block vs TORCHREF's WanAttentionBlock: cos >= 0.9998 on all 20 LoRA grads
+#     (wan22_block_lora_parity_torchref)
 # yet the TRAINING stack scores MSE ~2.1 at t=0.30 on real cached data, which is WORSE
 # than predicting zero (var(noise - x0) = 1 + var(x0) ~ 1.2), while the INFERENCE stack
 # renders clean 1024px images from the same weights. Something between the block and the

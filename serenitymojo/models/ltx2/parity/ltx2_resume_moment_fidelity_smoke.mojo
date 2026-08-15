@@ -8,7 +8,7 @@
 # persists AdamW moments, so a resume today would restart momentum at zero. This
 # gate exercises the SHARED training/lora_save.mojo moment-state plumbing
 # (save_lora_train_state / load_lora_train_state) with ltx2's real adapter SHAPES
-# and musubi prefix naming, proving the round-trip ltx2 WOULD use once a native
+# and torchref prefix naming, proving the round-trip ltx2 WOULD use once a native
 # ltx2 state save is wired. See FINAL NOTE below.
 #
 # What it proves:
@@ -66,7 +66,7 @@ def _val(i: Int, j: Int, salt: Int) -> Float32:
     return Float32(k) * Float32(0.0625)
 
 
-# Reconstruct save_ltx2_lora's musubi module prefixes (4 per block, flat order).
+# Reconstruct save_ltx2_lora's torchref module prefixes (4 per block, flat order).
 def _ltx2_prefixes(num_layers: Int) -> List[String]:
     var out = List[String]()
     for bi in range(num_layers):

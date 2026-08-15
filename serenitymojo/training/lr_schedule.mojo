@@ -169,11 +169,11 @@ def lr_for_step(
         return constant_lr(base_lr, step, warmup_steps)
 
 
-# ── transformers.optimization parity (musubi's get_scheduler) ─────────────────
+# ── transformers.optimization parity (torchref's get_scheduler) ─────────────────
 # The flame constant_lr warmup ramp above is (step+1)/W — it completes warmup one
 # step EARLY vs transformers' step/max(1,W) (MEASURED divergence, ltx2 LR gate).
-# musubi's LR path IS transformers.get_scheduler, so the LTX2 trainer routes
-# through THIS function (not the flame lr_for_step) for the kinds musubi exposes:
+# torchref's LR path IS transformers.get_scheduler, so the LTX2 trainer routes
+# through THIS function (not the flame lr_for_step) for the kinds torchref exposes:
 # constant / constant_with_warmup / linear / cosine. `step` is the 0-based
 # scheduler index — transformers uses lambda(current_step), and optimizer step k
 # (1-based) consumes lambda(k-1). Post-warmup decay targets 0 (transformers has
@@ -192,14 +192,14 @@ def transformers_lr_for_step(
 ) -> Float32:
     """transformers.get_scheduler LR (× base_lr) for 0-based `step`.
 
-    kind reuses the lr_schedule enum for the musubi-exposed subset:
+    kind reuses the lr_schedule enum for the torchref-exposed subset:
       LR_CONSTANT(0)  -> get_constant_schedule (warmup==0: flat base for every
                          step) OR get_constant_schedule_with_warmup (warmup>0:
                          ramp step/max(1,W) then flat base).
       LR_LINEAR(1)    -> get_linear_schedule_with_warmup (ramp then decay to 0).
       LR_COSINE(2)    -> get_cosine_schedule_with_warmup, num_cycles=0.5 FIXED
                          (transformers default): decay to 0.
-    Other kinds are not musubi-exposed; the ltx2 wiring rejects them before this."""
+    Other kinds are not torchref-exposed; the ltx2 wiring rejects them before this."""
     if kind == LR_CONSTANT:
         if warmup_steps > 0 and step < warmup_steps:
             return base_lr * _tf_warmup_factor(step, warmup_steps)

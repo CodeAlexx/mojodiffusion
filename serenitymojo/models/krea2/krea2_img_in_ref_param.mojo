@@ -6,7 +6,7 @@
 #
 # The img_in_ref reference-conditioning projection as a STANDALONE TRAINED
 # PARAMETER that lives alongside the krea2 LoRA set. krea2 is text-to-image only;
-# ai-toolkit's "krea2 o-edit" ADDS image-EDIT reference conditioning. This is the
+# torchref's "krea2 o-edit" ADDS image-EDIT reference conditioning. This is the
 # same parallel additive input projection Klein uses:
 #     img = first(noise_tokens) + linear(ref_tokens, img_in_ref)
 # where img_in_ref is a full [D, in_ch] matrix (NOT low-rank).

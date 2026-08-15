@@ -89,7 +89,7 @@ def unpack_int4(qb: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# MSE scale-sweep fractions (ai-toolkit ConvRot precedent: absmax is not the
+# MSE scale-sweep fractions (torchref ConvRot precedent: absmax is not the
 # MSE-optimal int4 scale; sweeping fractions of absmax per group and keeping
 # the min-MSE one cut worst-layer output error ~34% combined with g32 —
 # measured on Klein-4B single_blocks.0.linear2, 2026-07-28). Deterministic.

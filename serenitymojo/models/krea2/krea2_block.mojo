@@ -661,7 +661,7 @@ def _mod6_b2(
 # `timesteps=[t, t] + [zeros]*len(conditions)`). That is ONE row boundary
 # `split` == Krea2OminiLayout.cond_off(): rows [0, split) use the mods(t) chunks,
 # rows [split, L) use the mods(t=0) chunks. The TXT_pad tail therefore sits in
-# the t=0 span — matching the ai-toolkit krea2 reference exactly (mmdit.py
+# the t=0 span — matching the torchref krea2 reference exactly (mmdit.py
 # SingleStreamBlock.forward tuple-vec branch `(vec, refvec, split)`); pad-row
 # values are never read downstream, so this is a free, divergence-removing
 # choice.

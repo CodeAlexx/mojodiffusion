@@ -26,7 +26,7 @@
 #   grad), and d_A/d_B for every attached factorized LoRA adapter — the
 #   production surface is 24 pairs/block: {to_q,to_k,to_v,to_out.0} x
 #   {attn1, attn2, audio_attn1, audio_attn2, audio_to_video_attn,
-#    video_to_audio_attn} (musubi LTX2_INCLUDE_PATTERNS_T2V).
+#    video_to_audio_attn} (torchref LTX2_INCLUDE_PATTERNS_T2V).
 #   Base weight grads / modulation-vector grads / text-context grads are NOT
 #   produced (frozen / upstream-shared / untrained leaves).
 #

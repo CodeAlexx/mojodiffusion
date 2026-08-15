@@ -6,11 +6,11 @@ quant-training, i.e. does base+low-rank recover a layer's OUTPUT well, comparabl
 to a trained ARA (which fits outputs on real activations)?
 
 On a REAL LTX-2 ff.net weight (in {2048,8192}), weight int4 (group-64, the
-TRAINING/W4A16 case: acts bf16, no rotation), rank r in {16 (ai-toolkit), 128
+TRAINING/W4A16 case: acts bf16, no rotation), rank r in {16 (torchref), 128
 (our slab)}, we measure OUTPUT relL2 vs the fp teacher for FIVE reconstructions:
 
   int4-only                : Wdq = dequant_g64(int4(W))                  (no overlay)
-  A: int4 + SVD  (data-free): Wdq + SVD_r(W - Wdq)      <- ai-toolkit ARA STRUCTURE, our SVD
+  A: int4 + SVD  (data-free): Wdq + SVD_r(W - Wdq)      <- torchref ARA STRUCTURE, our SVD
   A: int4 + OPT  (trained  ): Wdq + argmin_rank-r ||X(R-BA)^T||   <- trained-ARA UPPER BOUND
   B: SVDQuant SVD (data-free): L=SVD_r(W); dequant_g64(int4(W-L)) + L    <- OUR decomposition
   B: SVDQuant OPT (act-aware): L=act-optimal rank-r; int4(W-L) + L

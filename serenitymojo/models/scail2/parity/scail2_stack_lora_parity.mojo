@@ -10,7 +10,7 @@
 # ALSO asserts per-block-RECOMPUTE backward == save-all backward at cos>=0.9999.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/ai-toolkit/venv/bin/python \
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/scail2/parity/scail2_stack_lora_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/scail2/parity/scail2_stack_lora_parity.mojo

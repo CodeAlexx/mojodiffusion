@@ -62,7 +62,7 @@ def run_acceptance(print_details: Bool = True) raises -> LTX2Readiness:
 
     _check(target_count_for_preset(PRESET_T2V) == DEFAULT_T2V_TARGETS_TOTAL, "T2V LoRA target count")
     _check(len(modules_per_block_for_preset(PRESET_T2V)) == 24, "T2V modules per block")
-    # P6.0: AV LoRA surface counts — module SETS verified vs musubi
+    # P6.0: AV LoRA surface counts — module SETS verified vs torchref
     # networks/lora_ltx2.py:539-618. audio = audio_attn1/attn2 (8) + audio_ff (2)
     # + video_to_audio_attn (4) = 14/block x48 = 672. audio_ref_only_ic adds
     # audio_to_video_attn (4) = 18/block x48 = 864.

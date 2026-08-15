@@ -170,7 +170,7 @@ creator-preprocess pixels, and stable inspected eyes/facial/mechanical detail.
 `Wan22DiTOffloaded` keeps 15 exact-BF16 shared tensors resident and streams
 each of the 30 transformer blocks once per denoise step, running positive and
 negative CFG through the same materialized block. `load_with_lora` validates
-AI Toolkit/DiffusionModel adapter shapes, merges globals once, and applies each
+torchref/DiffusionModel adapter shapes, merges globals once, and applies each
 delta to the freshly streamed block without rewriting the checkpoint. The
 resident row-scaled FP8 route remains available as an explicit speed option.
 
@@ -201,9 +201,9 @@ computes `delta = scale·(B@A)`, and either **merges** into resident base weight
 LTX-2 blocks (re-added each dequant, never fused to disk). Full API + line refs in
 the repo-root `docs/MOJO_MODULES.md` "LoRA — lora.mojo" section; summary:
 
-- **5 formats** (`_detect_format`): `FMT_KOHYA_SDXL`, `FMT_LTX2_DISTILLED`,
+- **5 formats** (`_detect_format`): `FMT_TORCHREF_SDXL`, `FMT_LTX2_DISTILLED`,
   **`FMT_DIFFUSION_MODEL`** (`diffusion_model.<module>.lora_A/lora_B.weight` = the
-  ai-toolkit/ComfyUI format the Wan2.2/2.1 + Klein + LTX-2 trainers save → loads
+  torchref/ComfyUI format the Wan2.2/2.1 + Klein + LTX-2 trainers save → loads
   back with NO conversion), `FMT_ZIMAGE_TRAINER`, `FMT_KLEIN_TRAINER`.
 - **Scale** `(alpha/rank)·multiplier`; absent `.alpha` ⇒ `scale=multiplier`.
 - **KJNodes `LTX2LoraLoaderAdvanced`** (`LoraStreamMults`): five per-stream
@@ -1447,7 +1447,7 @@ Pure-CPU PNG encoder (uncompressed STORED deflate — valid PNG, just larger). N
   Config keys: `train_timestep_shift` (training σ-draw decouple — the
   disfigured-faces fix; inference keeps `timestep_shift`), cold-exact resume
   via `resume_state`/`start_step`/`warm_resume`, save cadence writes
-  ai-toolkit-format LoRA + `.state` (F32 Adam moments), in-train 1024²
+  torchref-format LoRA + `.state` (F32 Adam moments), in-train 1024²
   sampling with token-count-verified baked prompts.
 - `pipeline/mageflow_lora_infer.mojo`: standalone Base+LoRA inference driver
   (argv: lora path, seed; 144-adapter fail-loud load, 20-step CFG-5 1024²).

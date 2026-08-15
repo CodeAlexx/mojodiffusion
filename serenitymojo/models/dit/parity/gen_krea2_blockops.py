@@ -1,7 +1,7 @@
 """Krea-2 SingleStreamBlock leaf-op parity oracle (RMSNorm + SwiGLU).
 
-Imports ai-toolkit's krea2 ``RMSNorm`` and ``SwiGLU`` DIRECTLY from mmdit.py (its
-only deps are torch+einops, bypassing the ai-toolkit package __init__ which pulls
+Imports torchref's krea2 ``RMSNorm`` and ``SwiGLU`` DIRECTLY from mmdit.py (its
+only deps are torch+einops, bypassing the torchref package __init__ which pulls
 torchao/quanto). Random-inits both in **bf16 on cuda** (the production dtype),
 runs them on a random bf16 input, and dumps input + weights + outputs to
 safetensors so the Mojo probe can run krea2_rmsnorm / krea2_swiglu with the EXACT
@@ -19,9 +19,9 @@ import sys
 import torch
 from safetensors.torch import save_file
 
-# Import mmdit.py directly (torch+einops only) to bypass the ai-toolkit package
+# Import mmdit.py directly (torch+einops only) to bypass the torchref package
 # __init__ chain (torchao/quanto absent here).
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import RMSNorm, SwiGLU  # noqa: E402
 
 OUT = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/krea2_blockops_oracle.safetensors"

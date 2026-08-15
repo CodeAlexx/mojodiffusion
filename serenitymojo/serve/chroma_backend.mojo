@@ -58,7 +58,7 @@
 # denoise remains slower than square on the 16GB product GPU.
 #
 # LoRA: one runtime additive Chroma overlay is supported.  The product path
-# accepts ai-toolkit BFL-fused and Diffusers/PEFT projection keys and never
+# accepts torchref BFL-fused and Diffusers/PEFT projection keys and never
 # modifies the checkpoint. img2img: NOT supported — fail loud.
 
 from std.collections import Optional

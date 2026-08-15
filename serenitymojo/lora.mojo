@@ -28,7 +28,7 @@
 #   edv2-reference (FLUX/Klein)  : `diffusion_model.<key>.lora_A.weight`.
 #   Z-Image trainer              : bare `<prefix>.lora_A` with split
 #                                  attention.to_q/to_k/to_v → fused qkv RowRange.
-#   kohya / sd-scripts (SDXL)    : `lora_unet_<path>.lora_down.weight` /
+#   torchref / sd-scripts (SDXL)    : `lora_unet_<path>.lora_down.weight` /
 #                                  `.lora_up.weight` + per-module `.alpha`
 #                                  (scalar, shape []). Confirmed F16 alpha in
 #                                  my_sdxl_lora_v1.safetensors.
@@ -63,7 +63,7 @@ comptime SLOT_ROWRANGE = 3
 comptime FMT_KLEIN_TRAINER = 0
 comptime FMT_ZIMAGE_TRAINER = 1
 comptime FMT_DIFFUSION_MODEL = 2
-comptime FMT_KOHYA_SDXL = 3
+comptime FMT_TORCHREF_SDXL = 3
 comptime FMT_LTX2_DISTILLED = 4
 """LTX-2.3 22B distilled rank-384 LoRA. Keys
 `diffusion_model.transformer_blocks.{i}.<module>.lora_{A,B}.weight` for the six
@@ -193,11 +193,11 @@ struct LTX2BlockLoraDeltaSet(Copyable, Movable):
 
 def _detect_format(names: List[String]) -> Int:
     """Detect the LoRA file format from its key shapes. Mirrors
-    lora_merge.rs::detect_format (lines 91-111). Order matters: kohya first
+    lora_merge.rs::detect_format (lines 91-111). Order matters: torchref first
     (lora_unet_/te + lora_down/up), then DiffusionModel (.lora_A.weight),
     then Z-Image trainer (split attention/feed_forward), else KleinTrainer."""
-    var has_kohya_prefix = False
-    var has_kohya_suffix = False
+    var has_torchref_prefix = False
+    var has_torchref_suffix = False
     var has_dm_suffix = False
     var has_zimage = False
     var has_ltx2 = False
@@ -207,9 +207,9 @@ def _detect_format(names: List[String]) -> Int:
             or n.startswith("lora_te1_")
             or n.startswith("lora_te2_")
         ):
-            has_kohya_prefix = True
+            has_torchref_prefix = True
         if n.endswith(".lora_down.weight") or n.endswith(".lora_up.weight"):
-            has_kohya_suffix = True
+            has_torchref_suffix = True
         if n.endswith(".lora_A.weight") or n.endswith(".lora_B.weight"):
             has_dm_suffix = True
         if (
@@ -226,8 +226,8 @@ def _detect_format(names: List[String]) -> Int:
             or (".audio_attn1." in n)
         ):
             has_ltx2 = True
-    if has_kohya_prefix and has_kohya_suffix:
-        return FMT_KOHYA_SDXL
+    if has_torchref_prefix and has_torchref_suffix:
+        return FMT_TORCHREF_SDXL
     # LTX-2 must be checked BEFORE the generic DiffusionModel branch: it shares
     # the `.lora_A.weight` suffix but needs the LTX-2 base-key map + scale rule.
     if has_ltx2 and has_dm_suffix:
@@ -243,7 +243,7 @@ def _suffix_a(fmt: Int) -> String:
     """lora_A suffix for the format (lora_merge.rs:427-431)."""
     if fmt == FMT_DIFFUSION_MODEL or fmt == FMT_LTX2_DISTILLED:
         return ".lora_A.weight"
-    if fmt == FMT_KOHYA_SDXL:
+    if fmt == FMT_TORCHREF_SDXL:
         return ".lora_down.weight"
     return ".lora_A"  # KleinTrainer / ZImageTrainer
 
@@ -252,7 +252,7 @@ def _suffix_b(fmt: Int) -> String:
     """lora_B suffix for the format (lora_merge.rs:427-431)."""
     if fmt == FMT_DIFFUSION_MODEL or fmt == FMT_LTX2_DISTILLED:
         return ".lora_B.weight"
-    if fmt == FMT_KOHYA_SDXL:
+    if fmt == FMT_TORCHREF_SDXL:
         return ".lora_up.weight"
     return ".lora_B"  # KleinTrainer / ZImageTrainer
 
@@ -432,7 +432,7 @@ def _rewrite_sdxl_resblock_tail(encoded: String) -> String:
     """Diffusers SDXL ResBlock leaf names -> LDM checkpoint leaf names.
 
     This is the Mojo equivalent of EriDiffusion
-    `rewrite_kohya_diffusers_to_ldm::rewrite_resblock_submodule`.
+    `rewrite_torchref_diffusers_to_ldm::rewrite_resblock_submodule`.
     It is called only after a ResBlock root matched, so transformer-block
     `norm1`/`norm2` names are never rewritten accidentally.
     """
@@ -452,7 +452,7 @@ def _rewrite_sdxl_root(
     resblock: Bool = False,
     downsample: Bool = False,
 ) -> String:
-    """Replace one exact kohya-encoded module root, preserving its leaf tail."""
+    """Replace one exact torchref-encoded module root, preserving its leaf tail."""
     var tail = String("")
     if prefix == old_root:
         pass
@@ -467,8 +467,8 @@ def _rewrite_sdxl_root(
     return new_root + tail
 
 
-def _rewrite_kohya_diffusers_to_ldm(prefix: String) -> String:
-    """Rewrite an SDXL kohya Diffusers prefix to Serenity's LDM prefix.
+def _rewrite_torchref_diffusers_to_ldm(prefix: String) -> String:
+    """Rewrite an SDXL torchref Diffusers prefix to Serenity's LDM prefix.
 
     This is a direct table port of the creator/reference implementation in
     `/home/alex/.serenity/parity/src/lora_merge.rs`. Returning ""
@@ -730,8 +730,8 @@ def _map_klein_split_qkv(prefix: String, out_dim: Int) -> LoraMapping:
 
 
 def _resolve_mapping(fmt: Int, prefix: String) -> LoraMapping:
-    """Dispatch the prefix → (base_key, slot) mapping by format. kohya SDXL
-    naming-rewrite is NOT ported (SDXL UNet not in this stack); kohya prefixes
+    """Dispatch the prefix → (base_key, slot) mapping by format. torchref SDXL
+    naming-rewrite is NOT ported (SDXL UNet not in this stack); torchref prefixes
     are resolved by direct dotted-name reconstruction only — see merge_into.
 
     NOTE: the Klein split→fused QKV case (`.img_attn`/`.txt_attn.to_q/k/v` →
@@ -742,7 +742,7 @@ def _resolve_mapping(fmt: Int, prefix: String) -> LoraMapping:
         return _map_klein_trainer(prefix)
     if fmt == FMT_ZIMAGE_TRAINER:
         return _map_zimage_trainer(prefix)
-    # FMT_DIFFUSION_MODEL, FMT_KOHYA_SDXL and FMT_LTX2_DISTILLED all strip the
+    # FMT_DIFFUSION_MODEL, FMT_TORCHREF_SDXL and FMT_LTX2_DISTILLED all strip the
     # `diffusion_model.` prefix and append `.weight` (SLOT_FULL). For LTX-2 the
     # base linears are SEPARATE to_q/to_k/to_v (no fused-QKV remap), so the
     # generic DiffusionModel mapper is exactly correct: it yields the full base
@@ -802,9 +802,9 @@ struct LoraSet(Movable):
         `<prefix>{suffix_a}` pair into a (base_key, slot) mapping. The data
         segment is mmap'd — tensors are loaded H2D lazily in `merge_into`.
 
-        kohya SDXL text-encoder modules (`lora_te*`) are intentionally excluded
+        torchref SDXL text-encoder modules (`lora_te*`) are intentionally excluded
         from this UNet merge object. Call `resolve_sdxl_mappings` against the
-        loaded SDXL UNet before merging so Diffusers and LDM kohya names resolve
+        loaded SDXL UNet before merging so Diffusers and LDM torchref names resolve
         through the exact base-weight inventory."""
         var st = SafeTensors.open(path)
         var names = st.names()
@@ -819,8 +819,8 @@ struct LoraSet(Movable):
             var prefix = _strip_suffix(n, sa)
             if prefix.byte_length() == 0:
                 continue
-            # kohya text-encoder LoRAs are not merged into the UNet base.
-            if fmt == FMT_KOHYA_SDXL and (
+            # torchref text-encoder LoRAs are not merged into the UNet base.
+            if fmt == FMT_TORCHREF_SDXL and (
                 prefix.startswith("lora_te1_") or prefix.startswith("lora_te2_")
             ):
                 continue
@@ -848,34 +848,34 @@ struct LoraSet(Movable):
     def resolve_sdxl_mappings(
         mut self, name_to_idx: Dict[String, Int]
     ) raises -> Int:
-        """Resolve kohya SDXL prefixes against the loaded LDM UNet inventory.
+        """Resolve torchref SDXL prefixes against the loaded LDM UNet inventory.
 
         A forward table from real base keys avoids ambiguous underscore
         decoding (`to_out_0`, `input_blocks_4_1`, etc.). Diffusers-style roots
         are first rewritten with the exact EriDiffusion conversion table above.
         Returns the number of LoRA modules that target a real base tensor.
         """
-        if self.format != FMT_KOHYA_SDXL:
+        if self.format != FMT_TORCHREF_SDXL:
             return len(self.mappings)
 
-        var kohya_to_base = Dict[String, String]()
+        var torchref_to_base = Dict[String, String]()
         for ref entry in name_to_idx.items():
             var key = entry.key
             var module = _strip_suffix(key, ".weight")
             if module.byte_length() == 0:
                 continue
-            kohya_to_base[String("lora_unet_") + module.replace(".", "_")] = key
+            torchref_to_base[String("lora_unet_") + module.replace(".", "_")] = key
 
         var resolved = List[LoraMapping]()
         for ref mapping in self.mappings:
             var candidate = mapping.prefix.copy()
-            if candidate not in kohya_to_base:
-                candidate = _rewrite_kohya_diffusers_to_ldm(candidate)
-            if candidate.byte_length() == 0 or candidate not in kohya_to_base:
+            if candidate not in torchref_to_base:
+                candidate = _rewrite_torchref_diffusers_to_ldm(candidate)
+            if candidate.byte_length() == 0 or candidate not in torchref_to_base:
                 continue
             resolved.append(LoraMapping(
                 mapping.prefix.copy(),
-                kohya_to_base[candidate].copy(),
+                torchref_to_base[candidate].copy(),
                 SLOT_FULL,
                 0,
                 0,
@@ -896,7 +896,7 @@ struct LoraSet(Movable):
             return String("DiffusionModel")
         if self.format == FMT_LTX2_DISTILLED:
             return String("LTX2Distilled")
-        return String("KohyaSdxl")
+        return String("torchrefSdxl")
 
     def release_to_os(self):
         """Drop mmap-backed file pages after tensors have been uploaded to GPU.
@@ -1079,7 +1079,7 @@ struct LoraSet(Movable):
         `<prefix>.alpha` scalar if present, else module_rank (→ scale =
         multiplier). There is NO file-level alpha/rank knob — `multiplier` is the
         only caller adjustment. This reads per-module alpha for ALL formats and
-        is load-bearing: a musubi/kohya LoRA with alpha=3 rank=96 would
+        is load-bearing: a torchref/torchref LoRA with alpha=3 rank=96 would
         otherwise be ~32× too strong (lora.rs:60-64), and a mixed-rank file is
         handled correctly per module.
 

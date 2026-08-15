@@ -5,7 +5,7 @@ Runs a Qwen3-VL vision-language model over every image in a folder and writes a
 `<stem>.txt` caption sidecar next to each image. Emits one machine-readable
 `CAPJSON {...}` line per event on stdout so the Rust supervisor can pump progress
 into the UI exactly like it pumps training runs. Model-loading and generation
-follow ai-toolkit's Qwen3VLCaptioner (extensions_built_in/captioner) so the
+follow torchref's Qwen3VLCaptioner (extensions_built_in/captioner) so the
 numerics match the captioner the user already trusts.
 
 Invoked as:
@@ -36,7 +36,7 @@ def patch_qwen_vl_patch_embed(model):
     """Qwen-VL's vision patch_embed is a Conv3d whose kernel == stride, i.e. a plain
     linear projection of each flattened patch. bf16 Conv3d has no fast cuDNN kernel and
     falls back to a slow path. Swap it for the equivalent F.linear (a GEMM). Verbatim
-    from ai-toolkit's Qwen3VLCaptioner."""
+    from torchref's Qwen3VLCaptioner."""
     import torch
     import torch.nn.functional as F
     patched = 0

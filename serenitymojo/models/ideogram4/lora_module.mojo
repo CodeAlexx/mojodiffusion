@@ -2,7 +2,7 @@
 # Forward (LoRAModule.forward, line 328-329):
 #   out = orig_forward(x) + lora_up(dropout(lora_down(x))) * (alpha/rank)
 # Init: lora_down = kaiming_uniform_(a=sqrt(5)); lora_up = zeros_  (PEFT identity
-# at step 0 → B=0). Save format (PEFT/ai-toolkit): <prefix>.lora_A.weight (=down),
+# at step 0 → B=0). Save format (PEFT/torchref): <prefix>.lora_A.weight (=down),
 # <prefix>.lora_B.weight (=up).
 #
 # Reuses ONLY mojodiffusion serenitymojo {autograd tape, tensor, ops}. The LoRA

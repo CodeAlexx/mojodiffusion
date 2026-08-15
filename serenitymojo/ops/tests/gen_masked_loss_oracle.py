@@ -89,7 +89,7 @@ CASES = {
     "serenity_huber_d01_bin_norm": (huber_elem(0.1), mask_bin, 0.1, True),
     "serenity_huber_d1_soft": (huber_elem(1.0), mask_soft, 0.2, False),
     "serenity_sl1_b05_bin_norm": (sl1_elem(0.5), mask_bin, 0.1, True),
-    # MAE (musubi loss_type mae|l1) — closes the LOSS_FN_MAE masked-dispatch
+    # MAE (torchref loss_type mae|l1) — closes the LOSS_FN_MAE masked-dispatch
     # gap (skeptic D1 2026-07-16)
     "st_mae_soft": (mae_elem, mask_soft, 0.0, False),
     "serenity_mae_bin_norm": (mae_elem, mask_bin, 0.1, True),

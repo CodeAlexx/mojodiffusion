@@ -21,7 +21,7 @@ node pw_board_scalars_gate.js
 
 ## TB-run import (new, ships with this wave)
 `scripts/board_import_tfevents.py <tb_run_dir> [run_name]` — puts any
-TensorBoard run (SerenityTrainer, ai-toolkit, ...) side-by-side with Mojo runs in
+TensorBoard run (SerenityTrainer, torchref, ...) side-by-side with Mojo runs in
 /board: same tags, same charts, same compare views. Idempotent (PK dedupe),
 WAL-safe while the server runs, unknown tags flow through end-to-end (the tag
 sidebar and charts are fully dynamic — verified with `lr/transformer` and

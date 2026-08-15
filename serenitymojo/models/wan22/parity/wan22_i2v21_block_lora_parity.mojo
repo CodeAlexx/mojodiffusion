@@ -1,20 +1,20 @@
 # serenitymojo/models/wan22/parity/wan22_i2v21_block_lora_parity.mojo
 #
-# MUSUBI-TUNER PARITY GATE for the Wan2.1 I2V-14B WanAttentionBlock (dual
+# TORCHREF-TUNER PARITY GATE for the Wan2.1 I2V-14B WanAttentionBlock (dual
 # cross-attention, WanI2VCrossAttention) LoRA training unit
 # (models/wan22/wan22_block.mojo wan22_i2v_block_lora_*). Consumes the dump from
-# wan22_i2v21_block_lora_musubi_oracle.py (reference driven through Musubi's REAL
+# wan22_i2v21_block_lora_torchref_oracle.py (reference driven through Torchref's REAL
 # WanAttentionBlock.forward at real 14B dims). Compares x_out, d_x, d_context
-# (IMG + TXT), and the 12 adapters' d_A/d_B against the Musubi reference.
+# (IMG + TXT), and the 12 adapters' d_A/d_B against the Torchref reference.
 #
 # Core outputs (x_out, d_x, d_context) gate at cos>=0.999 (strict). LoRA d_A/d_B
 # gate at cos>=0.995 (the SAME bf16 threshold the certified base gate
-# wan22_block_lora_parity_musubi.mojo uses — native bf16 rank-r factor grads
+# wan22_block_lora_parity_torchref.mojo uses — native bf16 rank-r factor grads
 # carry more rounding than full activations). Raw cos is printed for all.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/ai-toolkit/venv/bin/python \
-#       serenitymojo/models/wan22/parity/wan22_i2v21_block_lora_musubi_oracle.py
+#   /home/alex/torchref-image/venv/bin/python \
+#       serenitymojo/models/wan22/parity/wan22_i2v21_block_lora_torchref_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/models/wan22/parity/wan22_i2v21_block_lora_parity.mojo
 
@@ -35,7 +35,7 @@ from serenitymojo.models.wan22.wan22_block import (
 
 comptime REF_DIR = "/home/alex/mojodiffusion/serenitymojo/models/wan22/parity/"
 
-# Real Wan2.1 I2V-14B block dims, small sequence, IMG=257 (musubi fixed).
+# Real Wan2.1 I2V-14B block dims, small sequence, IMG=257 (torchref fixed).
 comptime H = 40
 comptime Dh = 128
 comptime DIM = H * Dh          # 5120
@@ -174,7 +174,7 @@ def _check_lora(
 
 def main() raises:
     var ctx = DeviceContext()
-    print("==== wan22_i2v21_block_lora_parity (Wan2.1 I2V-14B DUAL cross-attn + 12 LoRA vs Musubi) ====")
+    print("==== wan22_i2v21_block_lora_parity (Wan2.1 I2V-14B DUAL cross-attn + 12 LoRA vs Torchref) ====")
     print("H=", H, " Dh=", Dh, " DIM=", DIM, " S=", S, " TXT=", TXT, " IMG=", IMG, " FFN=", FFN, " RANK=", RANK)
 
     var x = _in("i2vin_x")
@@ -195,7 +195,7 @@ def main() raises:
     var allok = True
 
     print("")
-    print("---- forward output vs Musubi ----")
+    print("---- forward output vs Torchref ----")
     _check(harness, "x_out", fwd.x_out, _in("i2vref_x_out"), allok)
 
     var d_out = _in("i2vin_d_out")
@@ -204,13 +204,13 @@ def main() raises:
     )
 
     print("")
-    print("---- input grads vs Musubi (incl LoRA branch) ----")
+    print("---- input grads vs Torchref (incl LoRA branch) ----")
     _check(harness, "d_x (img latent) ", g.base.base.d_x, _in("i2vref_d_x"), allok)
     _check(harness, "d_context_txt    ", g.base.base.d_context, _in("i2vref_d_context_txt"), allok)
     _check(harness, "d_context_img    ", g.d_context_img, _in("i2vref_d_context_img"), allok)
 
     print("")
-    print("---- LoRA d_A / d_B vs Musubi (12 adapters; bf16 gate 0.995) ----")
+    print("---- LoRA d_A / d_B vs Torchref (12 adapters; bf16 gate 0.995) ----")
     _check_lora("sa_q dA", g.base.sa_q_da, _in("i2vref_sa_q_dA"), allok)
     _check_lora("sa_q dB", g.base.sa_q_db, _in("i2vref_sa_q_dB"), allok)
     _check_lora("sa_k dA", g.base.sa_k_da, _in("i2vref_sa_k_dA"), allok)
@@ -239,6 +239,6 @@ def main() raises:
 
     print("")
     if allok:
-        print("VERDICT: PASS -- Wan2.1 I2V-14B dual-cross-attn block LoRA fwd+bwd matches Musubi")
+        print("VERDICT: PASS -- Wan2.1 I2V-14B dual-cross-attn block LoRA fwd+bwd matches Torchref")
     else:
         print("VERDICT: FAIL -- at least one output diverged (see FAIL lines above)")

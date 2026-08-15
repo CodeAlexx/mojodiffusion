@@ -1,6 +1,6 @@
 # lora_surface.mojo -- AV LoRA target surface definitions for LTX-2.
 #
-# Musubi's LTX2 t2v preset targets Q/K/V/Out projections in all six AV
+# Torchref's LTX2 t2v preset targets Q/K/V/Out projections in all six AV
 # attention families inside BasicAVTransformerBlock. FFN targets are preset
 # extensions, not part of the default t2v attention surface.
 

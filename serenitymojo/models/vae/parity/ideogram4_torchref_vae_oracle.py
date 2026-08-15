@@ -1,8 +1,8 @@
 # DEV-ONLY parity oracle for the Ideogram-4 VAE *encoder* (training data path),
-# oracled against **ai-toolkit** (NOT ideogram4-ref).
+# oracled against **torchref** (NOT ideogram4-ref).
 #
-# Mirrors EXACTLY the ai-toolkit production encode used to build training latents:
-#   ai-toolkit/extensions_built_in/diffusion_models/ideogram4/ideogram4.py
+# Mirrors EXACTLY the torchref production encode used to build training latents:
+#   torchref/extensions_built_in/diffusion_models/ideogram4/ideogram4.py
 #     encode_images() lines 556-578:
 #       ae_channels = vae.params.z_channels            # 32
 #       moments = self.vae.encoder(images)             # incl. quant_conv (vae.py:225)
@@ -19,16 +19,16 @@
 # quantify the mojo F32-norm choice (ldm_encoder.mojo:626 ideogram4_normalize_latents
 # casts to F32 before the divide).
 #
-# Uses ai-toolkit's OWN vae.py + latent_norm.py + pipeline.patchify_latents.
+# Uses torchref's OWN vae.py + latent_norm.py + pipeline.patchify_latents.
 import sys, os, json, importlib.util, torch
 from safetensors.torch import load_file, save_file
 
-# Load ai-toolkit's ideogram4 src modules DIRECTLY by file path. We cannot
+# Load torchref's ideogram4 src modules DIRECTLY by file path. We cannot
 # `import extensions_built_in...` because that package's __init__ chain pulls in
 # chroma -> torchao (not installed in this venv). vae.py / latent_norm.py only
 # need torch+einops; patchify_latents only needs torch. So load each file as an
-# isolated module — same source ai-toolkit runs, no package side effects.
-SRC = "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src"
+# isolated module — same source torchref runs, no package side effects.
+SRC = "/home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src"
 
 
 def _load(modname, path):
@@ -47,7 +47,7 @@ convert_diffusers_state_dict = _vae.convert_diffusers_state_dict
 get_latent_norm = _ln.get_latent_norm
 
 
-# Inlined verbatim from ai-toolkit src/pipeline.py:80-88 (patch=2). pipeline.py
+# Inlined verbatim from torchref src/pipeline.py:80-88 (patch=2). pipeline.py
 # itself has a relative `.transformer` import + transformers.masking_utils that
 # won't resolve when loaded standalone; this fn is pure torch and self-contained.
 def patchify_latents(z: torch.Tensor, patch_size: int = 2) -> torch.Tensor:
@@ -76,7 +76,7 @@ def main():
     ae.eval()
     ae.requires_grad_(False)
     ae_ch = ae.params.z_channels
-    print(f"[V] ai-toolkit AutoEncoder loaded, z_channels={ae_ch}, dtype={DT}")
+    print(f"[V] torchref AutoEncoder loaded, z_channels={ae_ch}, dtype={DT}")
 
     # Same deterministic input the prior oracle (and mojo probe) used: seed 7,
     # randn-uniform [-1,1], so the mojo gate can reuse one fixed image tensor.
@@ -111,10 +111,10 @@ def main():
         "latent_shift": shift_f32.reshape(-1).cpu(),     # [128] f32
         "latent_scale": scale_f32.reshape(-1).cpu(),     # [128] f32
     }
-    save_file(fx, f"{OUT}/ideogram4_aitoolkit_vae.safetensors")
+    save_file(fx, f"{OUT}/ideogram4_torchref_vae.safetensors")
     json.dump(
         {
-            "oracle": "ai-toolkit",
+            "oracle": "torchref",
             "H": H, "W": W, "ae_ch": int(ae_ch), "patch": PATCH,
             "gh": H // 8 // PATCH, "gw": W // 8 // PATCH,
             "vae_dtype": "bfloat16",
@@ -127,10 +127,10 @@ def main():
             "img_seed": 7,
             "uses_self_bn": False,  # BatchNorm2d self.bn is defined but NOT called in encode_images
         },
-        open(f"{OUT}/ideogram4_aitoolkit_vae_meta.json", "w"), indent=2,
+        open(f"{OUT}/ideogram4_torchref_vae_meta.json", "w"), indent=2,
     )
     print(
-        f"[V] saved ai-toolkit encode fixture: moments{tuple(moments.shape)} "
+        f"[V] saved torchref encode fixture: moments{tuple(moments.shape)} "
         f"mean_std={mean.float().std():.4f} latents{tuple(latents_prod.shape)} "
         f"latents_std_prod={latents_prod.float().std():.4f} "
         f"latents_std_f32norm={latents_f32.std():.4f}"

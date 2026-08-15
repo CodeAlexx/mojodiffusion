@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # DEV-ONLY parity oracle for the serenitymojo Ideogram-4 LoRA BLOCK trainer.
 #
-# Source of truth: ai-toolkit's production Ideogram-4 implementation
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src/transformer.py
+# Source of truth: torchref's production Ideogram-4 implementation
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src/transformer.py
 # This REPLACES the earlier (invalid) ideogram4-ref forward oracle. It captures the
 # per-block (layer 0) FORWARD and BACKWARD that the mojo
 #   serenitymojo/models/ideogram4/block.mojo : ideogram4_block_lora_forward / _backward
 # (and the autograd_v2 graph adapter) must match.
 #
-# Dtype: bf16 — the dtype the ai-toolkit production path actually runs the block in
+# Dtype: bf16 — the dtype the torchref production path actually runs the block in
 # (_dequantize_fp8_state_dict folds the fp8 weights to bf16; the model runs bf16).
 # This is NOT "lowering to match a bf16 port" — bf16 IS production here.
 #
@@ -24,9 +24,9 @@
 #
 # Run:
 #   /home/alex/serenityflow-v2/.venv/bin/python \
-#     serenitymojo/models/dit/parity/ideogram4_aitoolkit_oracle.py
+#     serenitymojo/models/dit/parity/ideogram4_torchref_oracle.py
 #
-# Output: serenitymojo/models/dit/parity/ideogram4_aitoolkit_block0.safetensors
+# Output: serenitymojo/models/dit/parity/ideogram4_torchref_block0.safetensors
 #
 # IDEOGRAM4_FT_ORACLE=1 (full-FT rollout, 2026-07-08): BASE-ONLY mode — the
 # krea2 KREA2_FT_ORACLE / chroma CHROMA_FT_ORACLE pattern. The full-finetune
@@ -34,11 +34,11 @@
 # anywhere, and a LoRA-inclusive graph shifts BOTH dX (adapter path) and,
 # through downstream activations, dW — so the FT refs must exclude LoRA
 # entirely: no LoraLinear wrapping, ALL base block params requires_grad, and
-# the fixture goes to a SEPARATE file (ideogram4_aitoolkit_block0_ft.safetensors)
+# the fixture goes to a SEPARATE file (ideogram4_torchref_block0_ft.safetensors)
 # with bwd.grad.<param> = torch-autograd W.grad for every block param. Same
 # seeds → the fwd.* inputs are byte-identical in both modes.
 #   IDEOGRAM4_FT_ORACLE=1 /home/alex/SerenityTrainer/venv/bin/python \
-#     serenitymojo/models/dit/parity/ideogram4_aitoolkit_oracle.py
+#     serenitymojo/models/dit/parity/ideogram4_torchref_oracle.py
 
 import os
 import sys
@@ -48,17 +48,17 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-AITK = "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src"
+AITK = "/home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src"
 sys.path.insert(0, AITK)
 
-# Import ai-toolkit's PRODUCTION transformer module (authoritative forward).
+# Import torchref's PRODUCTION transformer module (authoritative forward).
 import transformer as i4  # noqa: E402
 
 ROOT = "/home/alex/.serenity/models/ideogram-4-fp8/transformer"
 CKPT = os.path.join(ROOT, "diffusion_pytorch_model.safetensors")
 OUT_DIR = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity"
-OUT = os.path.join(OUT_DIR, "ideogram4_aitoolkit_block0.safetensors")
-OUT_FT = os.path.join(OUT_DIR, "ideogram4_aitoolkit_block0_ft.safetensors")
+OUT = os.path.join(OUT_DIR, "ideogram4_torchref_block0.safetensors")
+OUT_FT = os.path.join(OUT_DIR, "ideogram4_torchref_block0_ft.safetensors")
 
 # IDEOGRAM4_FT_ORACLE=1 -> base-only full-finetune reference (see header).
 FT_MODE = os.environ.get("IDEOGRAM4_FT_ORACLE") == "1"
@@ -89,7 +89,7 @@ def _dequant_fp8(w_fp8, scale):
 
 def load_block0_weights():
     """Load layer-0 weights from the fp8 checkpoint, dequantized to bf16, exactly
-    as the ai-toolkit production loader does (fp8 .weight + sibling .weight_scale)."""
+    as the torchref production loader does (fp8 .weight + sibling .weight_scale)."""
     cfg = i4.Ideogram4Config()
     block = i4.Ideogram4TransformerBlock(
         hidden_size=cfg.emb_dim,

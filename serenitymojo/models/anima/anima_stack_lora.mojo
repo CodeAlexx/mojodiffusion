@@ -3,7 +3,7 @@
 # ANIMA (Cosmos-Predict2 MiniTrainDIT) FULL 28-block STACK *WITH LoRA* on every
 # trained projection: forward (saving ckpt-inputs) + full-depth backward (training)
 # that uses the parity-verified per-block LoRA variants (models/anima/lora_block.mojo),
-# COLLECTS every adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit
+# COLLECTS every adapter's d_A/d_B, and supports an AdamW step + a PEFT/torchref
 # save across all 10×num_blocks adapters. This file COMPOSES; it rebuilds NOTHING.
 #
 # WHAT IS ALREADY PROVEN (cos>=0.999 vs torch) AND ONLY REUSED HERE
@@ -1122,7 +1122,7 @@ def anima_lora_adamw_step_resident(
     )
 
 
-# ── per-block kohya/inference prefix scheme (the INVERSE of the inference map) ─
+# ── per-block torchref/inference prefix scheme (the INVERSE of the inference map) ─
 # inference-flame anima.rs linear_no_bias chokepoint uses these base weight keys
 # (LoraStack::apply matches against the weight_key minus the LoRA suffix). For the
 # DiffusionModel LoRA format the saved prefix is the base key WITHOUT `.weight`:

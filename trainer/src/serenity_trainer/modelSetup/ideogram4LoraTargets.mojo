@@ -1,7 +1,7 @@
 # ideogram4LoraTargets.mojo - Ideogram4 LoRA target metadata.
 #
-# ai-toolkit wraps target module class Ideogram4Transformer2DModel. The saved
-# LoRA keys keep the normal transformer prefix, then ai-toolkit converts
+# torchref wraps target module class Ideogram4Transformer2DModel. The saved
+# LoRA keys keep the normal transformer prefix, then torchref converts
 # "transformer." <-> "diffusion_model." at save/load boundaries.
 #
 # Native weight names match:

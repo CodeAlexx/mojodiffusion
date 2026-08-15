@@ -59,7 +59,7 @@
 # block (LTX2AVBlockWeights in ltx2_dit.mojo) with audio_attn*, audio_ff,
 # audio_to_video_attn, video_to_audio_attn. This weights.mojo targets the legacy
 # VIDEO-ONLY LoRA training surface, which only touches attn1.to_{q,k,v,out.0}.
-# musubi's production T2V preset targets all AV attention modules; the audio and
+# torchref's production T2V preset targets all AV attention modules; the audio and
 # cross-modal branches are SKIPPED by this loader.
 #
 # Mojo 0.26.x+: def not fn; move-only Tensor; host List[Float32] carriers.

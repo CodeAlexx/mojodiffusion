@@ -1,22 +1,22 @@
 # training/tucker_save.mojo — save / reopen TRAINED Tucker conv adapters in the
-# LyCORIS / Kohya Tucker-LoCon key convention.
+# LyCORIS / torchref Tucker-LoCon key convention.
 #
 # Mirrors EDv2 eri-lycoris/lycoris-rs/src/loader.rs build_locon WITH a mid factor
 # (loader.rs:351,383-392) + upstream lycoris/modules/locon.py Tucker
 # custom_state_dict + ops/tucker.rs rebuild_conv_tucker:
 #
-#   "<prefix>.lora_down.weight"  F32 [rank, Cin, 1, 1]    (Kohya OIHW, 1x1)
-#   "<prefix>.lora_mid.weight"   F32 [rank, rank, Kh, Kw] (Kohya OIHW core)
-#   "<prefix>.lora_up.weight"    F32 [Cout, rank, 1, 1]   (Kohya OIHW, 1x1)
+#   "<prefix>.lora_down.weight"  F32 [rank, Cin, 1, 1]    (torchref OIHW, 1x1)
+#   "<prefix>.lora_mid.weight"   F32 [rank, rank, Kh, Kw] (torchref OIHW core)
+#   "<prefix>.lora_up.weight"    F32 [Cout, rank, 1, 1]   (torchref OIHW, 1x1)
 #   "<prefix>.alpha"             F32 [1]
 #
 # ── INTERNAL vs ON-DISK LAYOUT ────────────────────────────────────────────────
 # Our adapter stores Flame-RSCF:
 #   down [1,1,Cin,rank], core [Kh,Kw,rank,rank] (= [Kh,Kw,Rin,Rout]), up [1,1,rank,Cout].
-# loader.rs permutes Kohya OIHW [O,I,KH,KW] → Flame [2,3,1,0] = [KH,KW,I,O].
-# We invert on SAVE: Flame [KH,KW,I,O] → Kohya [O,I,KH,KW] = permute [3,2,0,1].
-# For the mid/core, Kohya [Rout,Rin,Kh,Kw] → Flame [Kh,Kw,Rin,Rout] (so O=Rout,
-# I=Rin); we save Flame[Kh,Kw,Rin,Rout] → Kohya[Rout,Rin,Kh,Kw].
+# loader.rs permutes torchref OIHW [O,I,KH,KW] → Flame [2,3,1,0] = [KH,KW,I,O].
+# We invert on SAVE: Flame [KH,KW,I,O] → torchref [O,I,KH,KW] = permute [3,2,0,1].
+# For the mid/core, torchref [Rout,Rin,Kh,Kw] → Flame [Kh,Kw,Rin,Rout] (so O=Rout,
+# I=Rin); we save Flame[Kh,Kw,Rin,Rout] → torchref[Rout,Rin,Kh,Kw].
 #
 # ── AGENT-DEFAULT (flagged) ───────────────────────────────────────────────────
 # Key spellings lora_down / lora_mid / lora_up + `.alpha`, the `.weight` suffix,
@@ -57,7 +57,7 @@ def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(v^, sh^, STDtype.F32, ctx)
 
 
-# Flame down [1,1,Cin,R] (= [Cin,R]) → Kohya [R,Cin,1,1] (= [R,Cin]).
+# Flame down [1,1,Cin,R] (= [Cin,R]) → torchref [R,Cin,1,1] (= [R,Cin]).
 def _down_to_oihw(d: List[Float32], Cin: Int, R: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(R * Cin):
@@ -68,7 +68,7 @@ def _down_to_oihw(d: List[Float32], Cin: Int, R: Int) -> List[Float32]:
     return out^
 
 
-# Flame up [1,1,R,Cout] (= [R,Cout]) → Kohya [Cout,R,1,1] (= [Cout,R]).
+# Flame up [1,1,R,Cout] (= [R,Cout]) → torchref [Cout,R,1,1] (= [Cout,R]).
 def _up_to_oihw(u: List[Float32], R: Int, Cout: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(Cout * R):
@@ -79,7 +79,7 @@ def _up_to_oihw(u: List[Float32], R: Int, Cout: Int) -> List[Float32]:
     return out^
 
 
-# Flame core [Kh,Kw,Rin,Rout] → Kohya mid [Rout,Rin,Kh,Kw] (permute [3,2,0,1]).
+# Flame core [Kh,Kw,Rin,Rout] → torchref mid [Rout,Rin,Kh,Kw] (permute [3,2,0,1]).
 def _core_to_oihw(c: List[Float32], Kh: Int, Kw: Int, Ri: Int, Ro: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(Ro * Ri * Kh * Kw):
@@ -94,7 +94,7 @@ def _core_to_oihw(c: List[Float32], Kh: Int, Kw: Int, Ri: Int, Ro: Int) -> List[
     return out^
 
 
-# Kohya down [R,Cin,1,1] → Flame [1,1,Cin,R] (= [Cin,R]).
+# torchref down [R,Cin,1,1] → Flame [1,1,Cin,R] (= [Cin,R]).
 def _down_from_oihw(d: List[Float32], R: Int, Cin: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(Cin * R):
@@ -105,7 +105,7 @@ def _down_from_oihw(d: List[Float32], R: Int, Cin: Int) -> List[Float32]:
     return out^
 
 
-# Kohya up [Cout,R,1,1] → Flame [1,1,R,Cout] (= [R,Cout]).
+# torchref up [Cout,R,1,1] → Flame [1,1,R,Cout] (= [R,Cout]).
 def _up_from_oihw(u: List[Float32], Cout: Int, R: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(R * Cout):
@@ -116,7 +116,7 @@ def _up_from_oihw(u: List[Float32], Cout: Int, R: Int) -> List[Float32]:
     return out^
 
 
-# Kohya mid [Rout,Rin,Kh,Kw] → Flame core [Kh,Kw,Rin,Rout].
+# torchref mid [Rout,Rin,Kh,Kw] → Flame core [Kh,Kw,Rin,Rout].
 def _core_from_oihw(c: List[Float32], Ro: Int, Ri: Int, Kh: Int, Kw: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(Kh * Kw * Ri * Ro):
@@ -132,7 +132,7 @@ def _core_from_oihw(c: List[Float32], Ro: Int, Ri: Int, Kh: Int, Kw: Int) -> Lis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVE: pack down + mid(core) + up + alpha (Kohya OIHW). Returns adapter count.
+# SAVE: pack down + mid(core) + up + alpha (torchref OIHW). Returns adapter count.
 # ─────────────────────────────────────────────────────────────────────────────
 def save_tucker_peft(
     adapters: List[NamedTucker], path: String, ctx: DeviceContext

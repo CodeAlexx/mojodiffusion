@@ -1,7 +1,7 @@
 # serenitymojo/models/minimax_h3/h3_train_cache.mojo
 #
-# Musubi-NATIVE MiniMax-H3 training cache reader (mmh3_* contract).
-# Oracle: musubi-tuner akane/minimax-h3 @ 04324c28 —
+# Torchref-NATIVE MiniMax-H3 training cache reader (mmh3_* contract).
+# Oracle: torchref-h3 @ 04324c28 —
 #   minimax_h3/cache.py (keys + validation), integration.py:1512-1585
 #   (latent writer), conditioning.py:475-529 (TE writer),
 #   image_video_dataset.py:193-213 (paths).
@@ -26,9 +26,9 @@
 #   varlen_mmh3_empty_hidden_states_{dt} + varlen_mmh3_empty_token_tags_int64
 #                                          (present iff --cache_guidance_empty)
 #
-# Keys carry a musubi dtype suffix (torch names: bfloat16/float32/int64/...)
+# Keys carry a torchref dtype suffix (torch names: bfloat16/float32/int64/...)
 # except bool masks (_mask suffix) and 0-dim scalars. `varlen_` prefixes
-# variable-length tensors. Logical matching mirrors musubi's _logical_key:
+# variable-length tensors. Logical matching mirrors torchref's _logical_key:
 # strip varlen_, strip one trailing dtype suffix.
 from std.os import listdir
 from max.gpu.host import DeviceContext
@@ -59,7 +59,7 @@ def _substr(s: String, start: Int, end: Int) raises -> String:
 
 
 def _known_dtype_suffixes() -> List[String]:
-    # torch dtype names musubi's dtype_to_str can emit; none is a "_"+suffix
+    # torch dtype names torchref's dtype_to_str can emit; none is a "_"+suffix
     # of another, so a single endswith pass is unambiguous.
     var s = List[String]()
     s.append(String("bfloat16"))
@@ -78,7 +78,7 @@ def _known_dtype_suffixes() -> List[String]:
 
 
 def h3_cache_logical_key(key: String) raises -> String:
-    """Mirror musubi model_utils.remove_dtype_suffix + varlen_ strip."""
+    """Mirror torchref model_utils.remove_dtype_suffix + varlen_ strip."""
     var k = key
     if k.startswith("varlen_"):
         k = _substr(k, 7, k.byte_length())
@@ -163,7 +163,7 @@ struct H3CacheItemPaths(Copyable, Movable):
 
 
 def h3_discover_cache_items(cache_dir: String) raises -> List[H3CacheItemPaths]:
-    """Enumerate paired latent+TE caches (musubi discovery: glob *_mmh3_te)."""
+    """Enumerate paired latent+TE caches (torchref discovery: glob *_mmh3_te)."""
     var entries = listdir(cache_dir)
     var latents = List[String]()
     var tes = List[String]()
@@ -189,7 +189,7 @@ def h3_discover_cache_items(cache_dir: String) raises -> List[H3CacheItemPaths]:
                     )
                 found_latent = Optional[String](latents[j])
         if not found_latent:
-            continue  # TE without latents: not trainable (musubi pairs too)
+            continue  # TE without latents: not trainable (torchref pairs too)
         items.append(H3CacheItemPaths(
             base^,
             cache_dir + "/" + found_latent.value(),
@@ -247,7 +247,7 @@ def h3_read_latent_cache(path: String, ctx: DeviceContext) raises -> H3LatentCac
                 raise Error("h3 cache: multiple audio latent tensors")
             audio_key = Optional[String](n)
         elif n.startswith("latents_") and not n.startswith("latents_audio"):
-            # musubi: fullmatch latents_\d+x\d+x\d+_.+ — digit follows the '_'
+            # torchref: fullmatch latents_\d+x\d+x\d+_.+ — digit follows the '_'
             var b = n.as_bytes()
             if b[8] >= 48 and b[8] <= 57:
                 if video_key:

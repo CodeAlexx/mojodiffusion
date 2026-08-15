@@ -391,9 +391,9 @@ struct LTX2TrainerConfig(Copyable, Movable):
             raise Error("LTX2TrainerConfig: audio_only_sequence_resolution must be 0 or >= 32")
         self._validate_p6_av()
 
-    # ── LTX2 P6 AV-arm parse-time validation (P6.0). Musubi ranges
+    # ── LTX2 P6 AV-arm parse-time validation (P6.0). Torchref ranges
     #    (ltx2_train_network.py:2197-2218) + the lead-mandated XOR fail-loud.
-    #    Unconditional (matches musubi's always-run block); every musubi default
+    #    Unconditional (matches torchref's always-run block); every torchref default
     #    passes, so a default/video-only config never raises (C13). Consumption is
     #    P6.2 — this only rejects out-of-range knobs at load time.
     def _validate_p6_av(self) raises:
@@ -663,7 +663,7 @@ struct LTX2TrainerConfig(Copyable, Movable):
                 cfg.sample_prompt = value
             # ── LTX2 P6 AV arm (P6.0) — thin argv onto the levers (space-form;
             #    the config JSON / UI seam is the primary surface). validate() at
-            #    the end enforces the XOR + musubi ranges. A later --config
+            #    the end enforces the XOR + torchref ranges. A later --config
             #    wholesale-replaces the lever set (config-wins); full config-wins
             #    consumption is P6.2. ──────────────────────────────────────────
             elif a == "--audio_loss_balance_mode" and i + 1 < len(args):
@@ -729,9 +729,9 @@ struct LTX2TrainerConfig(Copyable, Movable):
             elif (value := _strip_arg_value(a, String("--config_json"))) != "":
                 cfg.levers = read_model_config(value)
             i += 1
-        # MUSUBI-PARITY TRANSLATION (skeptic S1): musubi's loss_type "huber" IS
+        # TORCHREF-PARITY TRANSLATION (skeptic S1): torchref's loss_type "huber" IS
         # F.smooth_l1_loss(beta=huber_delta) — hv_train_network.py:499-506 maps
-        # huber|smooth_l1 to the SAME formula. A musubi config copied verbatim
+        # huber|smooth_l1 to the SAME formula. A torchref config copied verbatim
         # must not silently get torch-huber (clamped-grad) semantics, so for
         # ltx2 a HUBER tag is remapped to SMOOTH_L1 with beta = huber_delta,
         # LOUDLY. (Other models keep the reader's torch-huber meaning.)
@@ -740,7 +740,7 @@ struct LTX2TrainerConfig(Copyable, Movable):
             cfg.levers.smooth_l1_beta = cfg.levers.huber_delta
             print("  [levers] NOTE: loss_fn 'huber' remapped to smooth_l1(beta=",
                   cfg.levers.smooth_l1_beta,
-                  ") — musubi's huber IS smooth_l1 (hv_train_network.py:499-506)")
+                  ") — torchref's huber IS smooth_l1 (hv_train_network.py:499-506)")
         # ltx2 argv WINS for its own fields. NOTE (skeptic S4): the scheduler
         # (_ltx2_step_lr) reads cfg.learning_rate/cfg.max_steps DIRECTLY; this
         # copy only keeps cfg.levers self-consistent for print_levers_summary

@@ -1,4 +1,4 @@
-# masked_loss.mojo -- Musubi-compatible LTX2 AV masked loss contracts.
+# masked_loss.mojo -- Torchref-compatible LTX2 AV masked loss contracts.
 
 from std.collections import List
 from std.math import abs
@@ -45,7 +45,7 @@ def av_combine_loss(
     video_loss: Float32, audio_loss: Float32,
     video_weight: Float32, audio_weight: Float32,
 ) -> Float32:
-    """P6.2 AV loss combine (musubi ltx2_train): video*vw + audio*aw. The caller
+    """P6.2 AV loss combine (torchref ltx2_train): video*vw + audio*aw. The caller
     passes the MIGRATED levers weights (cfg.levers.{video,audio}_loss_weight) —
     the no-longer-dead path the loss-combine gate proves end-to-end."""
     return video_loss * video_weight + audio_loss * audio_weight

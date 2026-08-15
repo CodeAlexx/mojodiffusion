@@ -40,11 +40,11 @@
 # The hand-written forward in this file is cross-checked, on the same device,
 # same weights, same inputs, against the REAL reference module
 # mmdit.SingleStreamBlock imported from
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src/mmdit.py
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src/mmdit.py
 # with LoRA disabled, in BOTH modulation modes:
 #   * single-vec  (vec)                    -> uniform mods(t)
 #   * tuple-vec   (vec, refvec, split)     -> per-segment mods(t) | mods(0)
-# NOTE (finding, see the handoff): the ai-toolkit krea2 reference ALREADY
+# NOTE (finding, see the handoff): the torchref krea2 reference ALREADY
 # implements the per-segment modulation the intake brief listed as the one
 # structural change to build (mmdit.py SingleStreamBlock.forward tuple branch,
 # and SingleStreamDiT.forward `reflen` / `blockvec = (tvec, tproj(t0), split)`).
@@ -405,7 +405,7 @@
 #
 # RUN (never chain after a mojo build with &&)
 #   cd /home/alex/mojodiffusion
-#   /home/alex/OneTrainer/venv/bin/python scripts/krea2_omini_torch_oracle.py
+#   /home/alex/torchref/venv/bin/python scripts/krea2_omini_torch_oracle.py
 #
 # Env overrides: KREA2_OMINI_BLOCKS="0,27"  KREA2_OMINI_RANK  KREA2_OMINI_ALPHA
 #                KREA2_OMINI_OUT_DIR  KREA2_OMINI_SKIP_F32ENV=1
@@ -429,7 +429,7 @@ CACHE = os.environ.get(
 )
 TGT_SAMPLE = int(os.environ.get("KREA2_OMINI_TGT_SAMPLE", "0"))
 COND_SAMPLE = int(os.environ.get("KREA2_OMINI_COND_SAMPLE", "1"))
-MMDIT_SRC = "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src"
+MMDIT_SRC = "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src"
 OUT_DIR = os.environ.get(
     "KREA2_OMINI_OUT_DIR",
     "/home/alex/mojodiffusion/serenitymojo/models/krea2/parity",

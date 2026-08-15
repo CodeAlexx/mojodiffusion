@@ -14,7 +14,7 @@
 #
 # TRAINING: forward-only. The backward stays dequant-bf16 dX (plan decision);
 # blocks that take this path in fwd MUST use the reconstructed-bf16 weight in
-# bwd recompute — a numerics-mismatch STE like ai-toolkit's, disclosed.
+# bwd recompute — a numerics-mismatch STE like torchref's, disclosed.
 # Mojo 1.0.0b1, NVIDIA sm_120 (Blackwell).
 
 from std.gpu import thread_idx, block_idx

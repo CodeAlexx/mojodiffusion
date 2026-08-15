@@ -162,7 +162,7 @@ def _run_gate[S_V: Int, N_TXT: Int](
     var v_prompt_ts = _load(dump, "video_prompt_ts", ctx)
     # VARIANT B: build the TRAINER's rope (_build_v2v_rope) rather than consuming
     # the oracle's dumped cos/sin — gates the rope BUILDER + block together at the
-    # trainer operating point vs the musubi-spine oracle. _build_v2v_rope emits
+    # trainer operating point vs the torchref-spine oracle. _build_v2v_rope emits
     # [P*H,hrd] token-major directly (same layout _load_rope produces).
     var v_cos: Tensor
     var v_sin: Tensor
@@ -245,7 +245,7 @@ def _run_gate[S_V: Int, N_TXT: Int](
 
 # --grid image512 (S=320) | video512 (S=608, target 4x9x16 + ref 1x4x8).
 # --build-rope = VARIANT B: build the trainer rope (_build_v2v_rope) + block and
-#   gate vs the SPINE oracle dump (musubi precompute rope, trainer operating
+#   gate vs the SPINE oracle dump (torchref precompute rope, trainer operating
 #   point). Default (no flag) = the block-gate-family rope (dumped av rope).
 # The chosen grid's oracle dump must exist (run ltx2_ic_v2v_oracle.py --grid <g>
 #   [--spine-rope] for variant B).

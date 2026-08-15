@@ -1,6 +1,6 @@
 # DEV-ONLY oracle for the Ideogram-4 TRAINING predict path on a REAL giger3
 # sample (real image -> VAE latent, real .json caption -> Qwen3-VL features),
-# 1:1 from ai-toolkit ideogram4: encode_images + get_prompt_embeds + the flow
+# 1:1 from torchref ideogram4: encode_images + get_prompt_embeds + the flow
 # add_noise + predict_velocity (pipeline.py) + get_loss_target.
 # Loads ONE model at a time (VAE -> Qwen -> transformer) for 24GB.
 # Dumps the latent/noise/t/features + every packed intermediate + velocity+target
@@ -42,7 +42,7 @@ def main():
     img = (torch.from_numpy(__import__("numpy").asarray(im)).float() / 255.0).permute(2, 0, 1).unsqueeze(0)
     img = (img * 2.0 - 1.0).to(dev)                                        # [1,3,512,512]
 
-    # ── VAE encode (ai-toolkit encode_images) -> latents [1,128,32,32] ──
+    # ── VAE encode (torchref encode_images) -> latents [1,128,32,32] ──
     ae = AutoEncoder(AutoEncoderParams())
     ae.load_state_dict(convert_diffusers_state_dict(load_file(f"{ROOT}/vae/diffusion_pytorch_model.safetensors")))
     ae.to(device=dev, dtype=dt); ae.eval()
@@ -97,10 +97,10 @@ def main():
     noise = torch.randn(1, 128, GH, GW, device=dev, dtype=torch.float32)
     t = torch.tensor([0.7], device=dev, dtype=torch.float32)
     t01 = t.view(-1, 1, 1, 1)
-    noisy = (1.0 - t01) * latents + t01 * noise                          # ai-toolkit flow add_noise
+    noisy = (1.0 - t01) * latents + t01 * noise                          # torchref flow add_noise
     target = (noise - latents)                                           # get_loss_target
 
-    # ── predict_velocity (COPY of ai-toolkit pipeline.py:152-250, dump intermediates) ──
+    # ── predict_velocity (COPY of torchref pipeline.py:152-250, dump intermediates) ──
     from ideogram4.modeling_ideogram4 import Ideogram4Config, Ideogram4Transformer
     sd = load_file(f"{ROOT}/transformer/diffusion_pytorch_model.safetensors")
     m = Ideogram4Transformer(Ideogram4Config()); m.to(dt)

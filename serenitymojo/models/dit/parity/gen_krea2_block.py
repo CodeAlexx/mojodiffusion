@@ -1,6 +1,6 @@
 """Krea-2 SingleStreamBlock parity oracle (chunk 4 — AdaLN composition).
 
-Imports ai-toolkit's krea2 ``SingleStreamBlock`` + ``PositionalEncoding`` DIRECTLY
+Imports torchref's krea2 ``SingleStreamBlock`` + ``PositionalEncoding`` DIRECTLY
 from mmdit.py (torch+einops only). Builds a production-arch block (features=6144,
 heads=48, multiplier=4, kvheads=12, bias=False) bf16-on-cuda with random weights,
 runs it on a random x + a random vec + a real 3-axis RoPE freqs table, and dumps
@@ -24,7 +24,7 @@ import sys
 import torch
 from safetensors.torch import save_file
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 from mmdit import SingleStreamBlock, PositionalEncoding  # noqa: E402
 
 OUT = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/krea2_block_oracle.safetensors"

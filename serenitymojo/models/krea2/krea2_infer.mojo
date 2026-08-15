@@ -301,7 +301,7 @@ def build_conditioning[LT: Int, LFULL: Int, CONDL: Int = 0](
     # our fixed-LTMAX pad fills [real_text_len, LT) with ZEROS. Without a mask those
     # zero-pad columns contaminate the text conditioning ∝ pad count, so cond (long,
     # little pad) and uncond (short, lots of pad) diverge and CFG blows up → black.
-    # Mask the pad columns to match ai-toolkit / krea-ai/krea-2 (mmdit.py:288).
+    # Mask the pad columns to match torchref / krea-ai/krea-2 (mmdit.py:288).
     # NOTE: the masked sdpa (ops/attention.sdpa) requires mask.dtype == q.dtype;
     # the refiner runs BF16 at inference, so cast the F32 additive mask to BF16.
     var refiner_mask: Optional[Tensor]
@@ -529,7 +529,7 @@ def _t_scalar(v: Float32, ctx: DeviceContext) raises -> Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LoRA OVERLAY loader — a saved PEFT/ai-toolkit .safetensors (diffusion_model.*
+# LoRA OVERLAY loader — a saved PEFT/torchref .safetensors (diffusion_model.*
 # .lora_A/.lora_B, 224 adapters) → Krea2StackLora (ADDED overlay, never fused).
 # Composes the generic reader (moments zeroed) + the host→device grouping.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -858,7 +858,7 @@ def krea2_sample_latent[
         print("[krea2-infer] INJECTED noise latent from ", _inject)
     else:
         # torch-parity Philox randn (bit-compatible with torch.randn on this GPU) so
-        # a given seed reproduces the reference/ai-toolkit composition. [[project_krea2_noise_letterbox]]
+        # a given seed reproduces the reference/torchref composition. [[project_krea2_noise_letterbox]]
         latent = randn_torch([1, 16, LH, LW], UInt64(seed), ctx)
     var seq = krea2_packed_seq_len(LH * 8, LW * 8)
     # Creator contract: Raw derives mu from resolution; the distilled Turbo

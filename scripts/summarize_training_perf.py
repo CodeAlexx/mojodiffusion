@@ -24,7 +24,7 @@ class MatrixCase:
 
 
 MATRIX: tuple[MatrixCase, ...] = (
-    MatrixCase("krea2", "ai-toolkit", "single-stream DiT LoRA", "512 or 1024"),
+    MatrixCase("krea2", "torchref", "single-stream DiT LoRA", "512 or 1024"),
     MatrixCase("zimage", "serenity_trainer", "large transformer LoRA", "1024/batch-2 target"),
     MatrixCase("klein", "serenity_trainer", "offloaded DiT LoRA", "1024"),
     MatrixCase(
@@ -120,7 +120,7 @@ def build_markdown(records: list[tuple[Path, dict]]) -> str:
         "Generated from `artifacts/training_perf/*.jsonl`.",
         "",
         "Evidence labels are intentionally conservative. A present Mojo scorecard",
-        "does not imply SerenityTrainer/ai-toolkit parity, production readiness, or a",
+        "does not imply SerenityTrainer/torchref parity, production readiness, or a",
         "device-fast path.",
         "",
         "| Model | Mojo Scorecard | Lane | Family | Resolution | Artifact | Steps | Seconds/Step | Peak VRAM Bytes | Transfers | Syncs | Full Readbacks | Fast Path Label | Phase Timings |",
@@ -136,7 +136,7 @@ def build_markdown(records: list[tuple[Path, dict]]) -> str:
             "",
             "## Current Gaps",
             "",
-            "- Reference lanes are not represented here; SerenityTrainer/ai-toolkit and Rust/Flame records still need separate artifacts.",
+            "- Reference lanes are not represented here; SerenityTrainer/torchref and Rust/Flame records still need separate artifacts.",
             "- `host-grad-compat-slow` means the record is not a device-fast product claim.",
             "- Phase timing coverage is incomplete when all phase fields are zero or only save/sample timing is populated.",
         ]

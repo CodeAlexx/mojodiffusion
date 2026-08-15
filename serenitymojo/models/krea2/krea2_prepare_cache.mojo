@@ -6,7 +6,7 @@
 # the GATED Mojo encoders (QwenImageVaeEncoder, Qwen3Tokenizer + encode_krea2_stack)
 # into the indexed safetensors training cache the KreaCacheReader streams:
 #
-#   clean.<i>     [1, 16, LH, LW]      BF16  normalized VAE latent (ai-toolkit boundary)
+#   clean.<i>     [1, 16, LH, LW]      BF16  normalized VAE latent (torchref boundary)
 #   context.<i>   [1, LT, 12, 2560]    BF16  Qwen3-VL-4B 12-layer stack (== krea2_forward `context`)
 #   text_len.<i>  [1]                  F32   LT (caption natural token count - DROP_IDX)
 #   (optional)    context_uncond [1,LTu,12,2560] BF16 + text_len_uncond [1] F32
@@ -17,19 +17,19 @@
 # WHY THESE EXACT TENSORS (read from the consumers):
 #   * The DiT forward (models/dit/krea2_dit.mojo krea2_forward:1304) consumes `img`
 #     [1,imglen,64] (PATCHIFIED latent) and `context` [1,LT,12,2560] and `pos`
-#     [1,LFULL,3]. ai-toolkit keeps `latents` UNPACKED (B,C,h,w) all the way through
+#     [1,LFULL,3]. torchref keeps `latents` UNPACKED (B,C,h,w) all the way through
 #     training — patchify is internal to predict_velocity/model.forward (pipeline.py
 #     :85,102-117). So the cache stores the UNPACKED normalized latent `clean`
-#     [1,16,LH,LW] (== ai-toolkit batch.latents) and the reader patchifies on demand
+#     [1,16,LH,LW] (== torchref batch.latents) and the reader patchifies on demand
 #     (after flow-noising), and builds `pos` deterministically from LH/LW + LT. This
 #     lets the trainer add noise in latent space (noisy=(1-t)*clean+t*noise; target
-#     = noise-clean, krea2.py:403) BEFORE the patchify, exactly like ai-toolkit.
+#     = noise-clean, krea2.py:403) BEFORE the patchify, exactly like torchref.
 #   * `context` is the encode_krea2_stack output [1,LT,12,2560] — un-flattened, which
 #     is exactly what krea2_forward wants (predict_velocity reshapes its flattened
 #     (B,Lt,n*d) back to (B,Lt,n,d); we never flatten, so no reshape needed).
 #
-# LATENT NORMALIZATION (the ai-toolkit data semantics, krea2.py encode_images:430-443):
-#     z = vae.encode(img).latent_dist.SAMPLE()           # ai-toolkit SAMPLES the dist
+# LATENT NORMALIZATION (the torchref data semantics, krea2.py encode_images:430-443):
+#     z = vae.encode(img).latent_dist.SAMPLE()           # torchref SAMPLES the dist
 #     latents_mean = cfg.latents_mean.view(1,16,1,1,1)
 #     latents_std  = 1.0 / cfg.latents_std.view(1,16,1,1,1)
 #     latents = (z - latents_mean) * latents_std         # == (z - mean) / std
@@ -37,13 +37,13 @@
 #   the deterministic posterior MEAN ([1,16,LH,LW], gated by qwenimage_encoder_parity
 #   cos+max_abs), and we apply the SAME per-channel (z-mean)/std using the decoder's
 #   _vae_mean()/_vae_std() (single source of truth — the decoder's denorm z*std+mean
-#   is the exact inverse). DIVERGENCE (surfaced, not hidden): ai-toolkit uses
+#   is the exact inverse). DIVERGENCE (surfaced, not hidden): torchref uses
 #   .latent_dist.SAMPLE() (a random Gaussian draw per epoch); we use the deterministic
 #   MEAN (.mode()) for a REPRODUCIBLE cache. This matches the deterministic cache
 #   convention used by the other Serenity trainers and removes the per-epoch
 #   VAE-sampling noise, which is a deliberate, conventional simplification.
 #
-# CAPTION (== ai-toolkit text_encoder.py encode_krea_prompt + the Mojo inference path):
+# CAPTION (== torchref text_encoder.py encode_krea_prompt + the Mojo inference path):
 #   ids = tokenize(KREA2_TPL_PREFIX + <raw caption> + KREA2_TPL_SUFFIX)  (krea2_paths)
 #   context = encode_krea2_stack(enc, ids)   # 12-layer stack, DROP_IDX=34 prefix-drop
 #   LT = len(stack) = len(ids) - 34. Mirrors krea2_encode_cli exactly. NO ideogram4-
@@ -124,7 +124,7 @@ def _normalize_latent(
     mean_lat: Tensor, mean_ch: Tensor, std_ch: Tensor, ctx: DeviceContext
 ) raises -> Tensor:
     """(z - latents_mean) / latents_std, per channel. mean_lat [1,16,LH,LW] F32;
-    mean_ch/std_ch [1,16,1,1] F32. == ai-toolkit (z - mean) * (1/std)."""
+    mean_ch/std_ch [1,16,1,1] F32. == torchref (z - mean) * (1/std)."""
     var centered = sub(mean_lat, mean_ch, ctx)   # [1,16,LH,LW]
     return div(centered, std_ch, ctx)            # [1,16,LH,LW]
 
@@ -134,7 +134,7 @@ def _encode_context(
 ) raises -> Tensor:
     """Tokenize PREFIX + caption + SUFFIX, encode the 12-layer krea2 stack -> context
     [1,LT,12,2560] BF16 (LT = stack.shape()[1] = len(ids) - DROP_IDX). Mirrors
-    krea2_encode_cli._encode_one / ai-toolkit encode_krea_prompt.
+    krea2_encode_cli._encode_one / torchref encode_krea_prompt.
 
     TAKES AN ALREADY-LOADED ENCODER. It used to take `enc_dir` and call
     load_krea2_qwen3vl_4b ITSELF, i.e. it re-loaded the 9.6 GB Qwen3-VL-4B from
@@ -209,7 +209,7 @@ def _encode_one_latent_key[IH: Int, IW: Int](
     mean_ch: Tensor, std_ch: Tensor, ctx: DeviceContext,
 ) raises -> Tensor:
     """<key>.<i> [1,3,IH,IW] -> deterministic MEAN latent [1,16,IH/8,IW/8] ->
-    ai-toolkit-normalized BF16 latent. venc is the bucket-resident encoder. The
+    torchref-normalized BF16 latent. venc is the bucket-resident encoder. The
     key is a parameter so the OminiControl EDIT stage can push BOTH the target
     ("image") and the condition ("cond_image") of the SAME staged record through
     the IDENTICAL encoder + normalization — the condition latent must live on the

@@ -52,7 +52,7 @@ comptime MASK_KEY = "text_mask"
 comptime CONTROL_KEY = "control_latent"
 
 # ── L2P (Z-Image pixel-space) cache keys ──────────────────────────────────────
-# The L2P precompute (EDv2 prepare_l2p.rs / ai-toolkit FakeVAE path) stores RAW
+# The L2P precompute (EDv2 prepare_l2p.rs / torchref FakeVAE path) stores RAW
 # PIXELS + Qwen3 caption features, NOT VAE latents / padded text embeddings:
 #   pixel:     F32 [3, H, W]      RGB normalized to [-1, 1]   (rank-3, NO batch axis)
 #   cap_feats: F32 [1, seq, 2560] Qwen3 hidden states, seq VARIES per sample
@@ -370,7 +370,7 @@ def _sort_strings(mut xs: List[String]):
 
 
 # ── L2P (Z-Image pixel-space) cache reader ────────────────────────────────────
-# Reads the {pixel, cap_feats} contract from prepare_l2p.rs / ai-toolkit, NOT
+# Reads the {pixel, cap_feats} contract from prepare_l2p.rs / torchref, NOT
 # the {latent, text_embedding, text_mask} Klein contract. Separate struct so the
 # Klein reader's rank-4 latent assertion never runs on an L2P cache.
 

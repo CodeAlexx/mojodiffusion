@@ -12,9 +12,9 @@ fits on CPU. Everything is REAL:
     (block keys only; bf16-roundtripped F32 to match the Mojo BF16 loader),
   * head: real patchify_proj + real adaln_single + real prompt_adaln_single for
     ONE fixed sigma (the AdaLN-single conditioning the DiT actually consumes),
-  * tail: real top-level scale_shift_table[2,4096] + real proj_out, the musubi
+  * tail: real top-level scale_shift_table[2,4096] + real proj_out, the torchref
     _process_output "AdaLN Structural Fix" done in F32
-    (musubi model.py:_process_output:797).
+    (torchref model.py:_process_output:797).
   * factorized LoRA y = Wx + b + scale*B(A x) on the 8 video-mode targets per
     block ({to_q,to_k,to_v,to_out.0} x {attn1, attn2}), A AND B random nonzero.
 
@@ -53,9 +53,9 @@ import ltx2_av_block_bwd_oracle as av       # noqa: E402  (helper math)
 import ltx2_video_block_bwd_oracle as vid   # noqa: E402  (per-block video fwd)
 
 CKPT = av.CKPT   # distilled dequant-bf16 export (blocks + head + tail, video path)
-# Real musubi TE cache row source for the context (POST-connector embeds); real
+# Real torchref TE cache row source for the context (POST-connector embeds); real
 # distribution beats synthetic. First N_TXT rows sliced below.
-CACHE_TE = "/home/alex/datasets/ltx2_musubi_v3/cache/0288f3d69c08e816d81b014da620db49_ltx2_te.safetensors"
+CACHE_TE = "/home/alex/datasets/ltx2_ref_v3/cache/0288f3d69c08e816d81b014da620db49_ltx2_te.safetensors"
 OUT_DIR = "/home/alex/mojodiffusion/output/ltx2_video_stack"
 OUT = os.path.join(OUT_DIR, "video_stack_bwd_ref.safetensors")
 
@@ -154,7 +154,7 @@ def adaln_single(hw, base, ts_vals):
     return mod, embedded
 
 
-# ── tail: musubi _process_output (F32 AdaLN Structural Fix) ──────────────────
+# ── tail: torchref _process_output (F32 AdaLN Structural Fix) ──────────────────
 def tail_process_output(x, v_embedded, sst, proj_w, proj_b, eps):
     x32 = x.to(torch.float32)
     emb32 = v_embedded.to(torch.float32)                       # [1,S_V,4096]
@@ -169,7 +169,7 @@ def tail_process_output(x, v_embedded, sst, proj_w, proj_b, eps):
 
 def load_real_context(n_txt):
     """First n_txt rows of a REAL POST-connector video_prompt_embeds cache row
-    (bf16-roundtripped F32). musubi's cache mask is all-ones so every row is a
+    (bf16-roundtripped F32). torchref's cache mask is all-ones so every row is a
     valid token — slicing the head rows lands entirely in real context."""
     with safe_open(CACHE_TE, framework="pt") as st:
         m = st.get_tensor("prompt_attention_mask")
@@ -186,7 +186,7 @@ def build_stack_inputs():
     latent = av.synth((1, LATENT_C, NF, NH, NW), av.SEED + 700, DEV, scale=0.5)
     inp["latent"] = latent
     inp["enc_hs"] = load_real_context(N_TXT)   # real POST-connector context rows
-    # 3D video rope — MUSUBI-FAITHFUL params so the Mojo head's rope can be gated
+    # 3D video rope — TORCHREF-FAITHFUL params so the Mojo head's rope can be gated
     # against this: causal_offset=1 (get_pixel_coords causal_fix) + max_pos
     # [20, 2048, 2048] (POS_EMBED_MAX_POS / BASE_HW), matching the AV MVP spine
     # and ltx2_video_stack.mojo::_build_video_rope. rope freqs stay F64 (no bf16
@@ -238,7 +238,7 @@ def main():
     inp = build_stack_inputs()
 
     # ── head (FROZEN) ───────────────────────────────────────────────────────
-    # patchify: [1,C,F,H,W] -> [1,C,S_V] -> [1,S_V,C]   (musubi einops p=1)
+    # patchify: [1,C,F,H,W] -> [1,C,S_V] -> [1,S_V,C]   (torchref einops p=1)
     tokens = inp["latent"].reshape(1, LATENT_C, S_V).permute(0, 2, 1)
     hidden0 = tokens @ hw["patchify_proj.weight"].t() + hw["patchify_proj.bias"]
     ts_v = torch.full((S_V,), SIGMA * TS_MULT, dtype=torch.float32, device=DEV)

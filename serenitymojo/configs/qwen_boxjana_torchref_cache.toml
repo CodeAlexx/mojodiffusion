@@ -7,5 +7,5 @@ bucket_no_upscale = false
 
 [[datasets]]
 image_directory = "/home/alex/1/datasets/boxjana"
-cache_directory = "/home/alex/1/datasets/boxjana/qwen_cache_musubi"
+cache_directory = "/home/alex/1/datasets/boxjana/qwen_cache_torchref"
 num_repeats = 1

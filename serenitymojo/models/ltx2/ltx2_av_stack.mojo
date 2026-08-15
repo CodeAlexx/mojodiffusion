@@ -307,7 +307,7 @@ def _output_stage(
                      _load(st, pre + proj_key + ".bias", ctx), ctx)
 
 
-# the 24 AV LoRA target modules (musubi LTX2_INCLUDE_PATTERNS_T2V), slot order.
+# the 24 AV LoRA target modules (torchref LTX2_INCLUDE_PATTERNS_T2V), slot order.
 def _av_lora_slots() -> List[String]:
     var mods = List[String]()
     mods.append(String("attn1")); mods.append(String("attn2"))

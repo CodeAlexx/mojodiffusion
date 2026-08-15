@@ -1,7 +1,7 @@
 # ideogram_bc_glue_parity_probe.mojo — byte-exact parity gate for the pure-Mojo
 # port of the B+C captioner GLUE (ideogram_bc_glue.mojo).
 #
-# Loads the fixture set produced from ai-toolkit's OWN deterministic glue (no GPU,
+# Loads the fixture set produced from torchref's OWN deterministic glue (no GPU,
 # no LLM) and asserts every case is BYTE-IDENTICAL. 12 groups:
 #   b_compute_aspect_ratio   in [w,h]               → out string
 #   b_build_prompt           in {caption_prompt,ar} → out_sha256_len + out_head/out_tail
@@ -262,7 +262,7 @@ def main() raises:
     # ── ADVERSARIAL: fence-load-bearing extract_json + full_glue ────────────────
     # The committed fixtures' fenced inputs happen NOT to distinguish the fence-strip
     # from the brace-span fallback (the {...} between fences is the same span the
-    # brace logic finds). These extra cases (regenerated from the REAL ai-toolkit
+    # brace logic finds). These extra cases (regenerated from the REAL torchref
     # glue) DO distinguish it: a closing fence followed by prose with a stray '}', so
     # without a correct lazy-DOTALL first-fence scanner the brace-span over-extends
     # and parses differently. This makes the hand-rolled fence scanner genuinely
@@ -321,7 +321,7 @@ def main() raises:
     # ── ADVERSARIAL: bbox float() coercion (FRAGILE #1 fix) ─────────────────────
     # Python `[float(v) for v in bbox]` coerces numbers, bools (True→1.0/False→0.0)
     # and numeric strings ("100"→100.0); None/list/dict or a non-numeric string raise
-    # → drop the box. Generated from the REAL ai-toolkit glue. B SWAPS x/y, C does not.
+    # → drop the box. Generated from the REAL torchref glue. B SWAPS x/y, C does not.
     var bcc = adv.get("b_convert_bbox_coerce")
     for i in range(len(bcc.arr)):
         var c = bcc.arr[i].copy()

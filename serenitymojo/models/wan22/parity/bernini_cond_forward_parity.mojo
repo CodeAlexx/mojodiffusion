@@ -27,7 +27,7 @@
 #   full 40-block packed forward+backward on the real Bernini-R fp8 base.
 #
 # Run (oracle FIRST, SEPARATE command):
-#   /home/alex/ai-toolkit/venv/bin/python \
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/wan22/parity/bernini_cond_forward_oracle.py
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . \

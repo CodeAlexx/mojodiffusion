@@ -2,14 +2,14 @@
 # DEV-ONLY parity oracle for the serenitymojo Ideogram-4 FULL FORWARD STACK
 # ("predict": input_proj -> 34 blocks -> final_layer -> velocity) + MRoPE.
 #
-# Source of truth: ai-toolkit's PRODUCTION Ideogram-4 implementation
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src/transformer.py
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src/pipeline.py
-#   /home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/ideogram4.py
+# Source of truth: torchref's PRODUCTION Ideogram-4 implementation
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src/transformer.py
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src/pipeline.py
+#   /home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/ideogram4.py
 # This REPLACES the earlier (INVALID) ideogram4-ref forward oracle
 #   serenitymojo/models/dit/parity/ideogram4_predict_oracle.py (imports
 #   /home/alex/ideogram4-ref). It is the FULL-composition sibling of the verified
-#   per-block ai-toolkit oracle (ideogram4_aitoolkit_oracle.py): same checkpoint,
+#   per-block torchref oracle (ideogram4_torchref_oracle.py): same checkpoint,
 #   same fp8->bf16 fold, same geometry, same packing scheme.
 #
 # What it captures (so the mojo full forward can be gated element-wise):
@@ -25,13 +25,13 @@
 # casts everything else to bf16; the model runs bf16. This is NOT "lowering to a
 # bf16 port" — bf16 IS production here.
 #
-# IMPORTANT MRoPE provenance: ai-toolkit's _load_transformer re-registers
+# IMPORTANT MRoPE provenance: torchref's _load_transformer re-registers
 #   inv_freq = 1/theta^(arange(0,head_dim,2)/head_dim)  in torch.float32
 # (transformer.py:95-98 builds it f32 too) and NEVER casts the rotary_emb buffer
 # to bf16. So production MRoPE runs FULLY float32. The earlier ideogram4-ref mrope
 # oracle cast the whole module .to(bf16) (bf16-rounded inv_freq). At the
 # IMAGE_POSITION_OFFSET=65536 positions this f32-vs-bf16 inv_freq choice changes
-# cos/sin materially. This oracle captures the FAITHFUL ai-toolkit f32 cos/sin.
+# cos/sin materially. This oracle captures the FAITHFUL torchref f32 cos/sin.
 #
 # Inputs: NON-DEGENERATE (randn, fixed seed). GH=GW=16, NTEXT=4 -> L=260, t=0.7.
 # All tokens share segment_id=1 (single packed sample) so the native SDPA block
@@ -40,9 +40,9 @@
 #
 # Run:
 #   /home/alex/serenityflow-v2/.venv/bin/python \
-#     serenitymojo/models/dit/parity/ideogram4_aitoolkit_predict_oracle.py
+#     serenitymojo/models/dit/parity/ideogram4_torchref_predict_oracle.py
 #
-# Output: serenitymojo/models/dit/parity/ideogram4_aitoolkit_predict.safetensors
+# Output: serenitymojo/models/dit/parity/ideogram4_torchref_predict.safetensors
 
 import os
 import sys
@@ -52,23 +52,23 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-AITK = "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4/src"
+AITK = "/home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4/src"
 sys.path.insert(0, AITK)
 # pipeline.py uses package-relative imports (`from .transformer import ...`), so
 # import the package and pull both modules from it (transformer == i4 alias).
 import importlib  # noqa: E402
 
-_PKG_PARENT = "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/ideogram4"
+_PKG_PARENT = "/home/alex/torchref-image/extensions_built_in/diffusion_models/ideogram4"
 sys.path.insert(0, _PKG_PARENT)
 
-# ai-toolkit PRODUCTION transformer + the predict_velocity packing (authoritative).
+# torchref PRODUCTION transformer + the predict_velocity packing (authoritative).
 i4 = importlib.import_module("src.transformer")
 predict_velocity = importlib.import_module("src.pipeline").predict_velocity
 
 ROOT = "/home/alex/.serenity/models/ideogram-4-fp8/transformer"
 CKPT = os.path.join(ROOT, "diffusion_pytorch_model.safetensors")
 OUT_DIR = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity"
-OUT = os.path.join(OUT_DIR, "ideogram4_aitoolkit_predict.safetensors")
+OUT = os.path.join(OUT_DIR, "ideogram4_torchref_predict.safetensors")
 
 DEV = torch.device("cuda")
 DT = torch.bfloat16  # production dtype (fp8 -> bf16)
@@ -95,7 +95,7 @@ def _dequant_fp8(w_fp8, scale):
 
 def load_transformer():
     """Load the FULL transformer from the fp8 checkpoint, dequantized to bf16
-    exactly as the ai-toolkit production loader (_dequantize_fp8_state_dict ->
+    exactly as the torchref production loader (_dequantize_fp8_state_dict ->
     load_state_dict(assign=True)); then re-register inv_freq in float32 (the
     production _load_transformer step)."""
     cfg = i4.Ideogram4Config()
@@ -140,7 +140,7 @@ def load_transformer():
 
 def build_inputs(cfg):
     """NON-DEGENERATE flow inputs at the parity geometry. latents/noise/t in the
-    ai-toolkit (B,128,gh,gw) latent layout that predict_velocity consumes."""
+    torchref (B,128,gh,gw) latent layout that predict_velocity consumes."""
     g = torch.Generator(device=DEV).manual_seed(SEED)
     # latents (B,128,gh,gw) and noise (same shape); flow add_noise + target.
     latents = torch.randn(1, cfg.in_channels, GH, GW, device=DEV,

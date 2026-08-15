@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ltx2_lr_schedule_oracle.py — transformers.optimization LR reference for the
-# LTX2 LR-lever parity gate. musubi's LR path IS transformers.get_scheduler, so
+# LTX2 LR-lever parity gate. torchref's LR path IS transformers.get_scheduler, so
 # this dumps get_scheduler's per-step LR factor (base_lr=1.0) as the oracle the
 # Mojo transformers_lr_for_step must reproduce.
 #

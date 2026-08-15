@@ -1,5 +1,5 @@
 # ltx2_rope_table_dump.mojo — dump the TRAINING head's video-RoPE cos/sin
-# tables for the parity comparison vs musubi's own rope functions
+# tables for the parity comparison vs torchref's own rope functions
 # (scripts/ltx2_rope_table_compare.py). Stage-isolation probe for the
 # 2026-07-16 video-arm fwd-parity FAIL (cos 0.9958-0.9991 vs bar 0.999).
 #

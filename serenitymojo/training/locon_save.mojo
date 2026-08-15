@@ -1,11 +1,11 @@
 # training/locon_save.mojo — save / reopen TRAINED LoCon conv adapters in the
-# LyCORIS / Kohya (diffusers PEFT) conv key convention.
+# LyCORIS / torchref (diffusers PEFT) conv key convention.
 #
 # Mirrors EDv2 eri-lycoris/lycoris-rs/src/loader.rs build_locon (loader.rs:353-394)
 # and upstream lycoris/modules/locon.py custom_state_dict:
 #
-#   "<prefix>.lora_down.weight"  F32 [rank, Cin, Kh, Kw]   (Kohya OIHW)
-#   "<prefix>.lora_up.weight"    F32 [Cout, rank, 1, 1]    (Kohya OIHW, 1x1)
+#   "<prefix>.lora_down.weight"  F32 [rank, Cin, Kh, Kw]   (torchref OIHW)
+#   "<prefix>.lora_up.weight"    F32 [Cout, rank, 1, 1]    (torchref OIHW, 1x1)
 #   "<prefix>.alpha"             F32 [1]
 #
 # (The Tucker `.lora_mid.weight` key is part of the convention but LoCon-no-Tucker
@@ -13,9 +13,9 @@
 #
 # ── INTERNAL vs ON-DISK LAYOUT ────────────────────────────────────────────────
 # Our adapter stores Flame-RSCF:  down [Kh,Kw,Cin,rank], up [1,1,rank,Cout].
-# The on-disk Kohya convention is OIHW:  down [rank,Cin,Kh,Kw], up [Cout,rank,1,1].
-# loader.rs:372-382 permutes Kohya→Flame via PyTorch[O,I,KH,KW]→[2,3,1,0]=[KH,KW,I,O].
-# We invert that on SAVE: Flame[KH,KW,I,O] → Kohya[O,I,KH,KW] is permute [3,2,0,1].
+# The on-disk torchref convention is OIHW:  down [rank,Cin,Kh,Kw], up [Cout,rank,1,1].
+# loader.rs:372-382 permutes torchref→Flame via PyTorch[O,I,KH,KW]→[2,3,1,0]=[KH,KW,I,O].
+# We invert that on SAVE: Flame[KH,KW,I,O] → torchref[O,I,KH,KW] is permute [3,2,0,1].
 # We open-code the index remap (no Tensor.permute on host F32 lists).
 #
 # ── AGENT-DEFAULT (flagged) ───────────────────────────────────────────────────
@@ -56,7 +56,7 @@ def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(v^, sh^, STDtype.F32, ctx)
 
 
-# Flame RSCF down [Kh,Kw,Cin,R] → Kohya OIHW [R,Cin,Kh,Kw]  (permute [3,2,0,1]).
+# Flame RSCF down [Kh,Kw,Cin,R] → torchref OIHW [R,Cin,Kh,Kw]  (permute [3,2,0,1]).
 def _down_rscf_to_oihw(d: List[Float32], Kh: Int, Kw: Int, Cin: Int, R: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(R * Cin * Kh * Kw):
@@ -71,7 +71,7 @@ def _down_rscf_to_oihw(d: List[Float32], Kh: Int, Kw: Int, Cin: Int, R: Int) -> 
     return out^
 
 
-# Flame RSCF up [1,1,R,Cout] (= [R,Cout]) → Kohya OIHW [Cout,R,1,1] (= [Cout,R]).
+# Flame RSCF up [1,1,R,Cout] (= [R,Cout]) → torchref OIHW [Cout,R,1,1] (= [Cout,R]).
 def _up_rscf_to_oihw(u: List[Float32], R: Int, Cout: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(Cout * R):
@@ -82,7 +82,7 @@ def _up_rscf_to_oihw(u: List[Float32], R: Int, Cout: Int) -> List[Float32]:
     return out^
 
 
-# Kohya OIHW down [R,Cin,Kh,Kw] → Flame RSCF [Kh,Kw,Cin,R].
+# torchref OIHW down [R,Cin,Kh,Kw] → Flame RSCF [Kh,Kw,Cin,R].
 def _down_oihw_to_rscf(d: List[Float32], R: Int, Cin: Int, Kh: Int, Kw: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(Kh * Kw * Cin * R):
@@ -97,7 +97,7 @@ def _down_oihw_to_rscf(d: List[Float32], R: Int, Cin: Int, Kh: Int, Kw: Int) -> 
     return out^
 
 
-# Kohya OIHW up [Cout,R,1,1] → Flame RSCF [1,1,R,Cout] (= [R,Cout]).
+# torchref OIHW up [Cout,R,1,1] → Flame RSCF [1,1,R,Cout] (= [R,Cout]).
 def _up_oihw_to_rscf(u: List[Float32], Cout: Int, R: Int) -> List[Float32]:
     var out = List[Float32]()
     for _ in range(R * Cout):
@@ -109,7 +109,7 @@ def _up_oihw_to_rscf(u: List[Float32], Cout: Int, R: Int) -> List[Float32]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVE: pack each LoCon adapter's down + up + alpha (Kohya OIHW). Returns count.
+# SAVE: pack each LoCon adapter's down + up + alpha (torchref OIHW). Returns count.
 # ─────────────────────────────────────────────────────────────────────────────
 def save_locon_peft(
     adapters: List[NamedLoCon], path: String, ctx: DeviceContext

@@ -1,7 +1,7 @@
 # ideogram_caption_parity_probe.mojo — byte-exact parity gate for the pure-Mojo
-# port of ai-toolkit's toolkit/ideogram_caption.py (module A).
+# port of torchref's toolkit/ideogram_caption.py (module A).
 #
-# Loads the 126-case fixture set produced from ai-toolkit's OWN code (no GPU,
+# Loads the 126-case fixture set produced from torchref's OWN code (no GPU,
 # no LLM) and asserts our Mojo fn(in) == out BYTE-IDENTICAL for every case.
 #
 # Fixture file: /home/alex/EriTrainer/trainer/parity/ideogram_caption/fixtures.json

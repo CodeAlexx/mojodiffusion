@@ -35,7 +35,7 @@
 # completely wrong sample.
 #
 # Run (host mode, no GPU):
-#   CUDA_VISIBLE_DEVICES="" /home/alex/OneTrainer/venv/bin/python \
+#   CUDA_VISIBLE_DEVICES="" /home/alex/torchref/venv/bin/python \
 #     scripts/minimax_h3_keyframe_encode_oracle.py \
 #       output/minimax_h3_keyframe/prepared_keyframe_192x128.png \
 #       output/minimax_h3_keyframe/keyframe_encode_ref_DRYRUN.safetensors 7 --dry-run

@@ -22,7 +22,7 @@
 # Host only: no Tensor, no DeviceContext, no GPU.
 #
 # Run:
-#   /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_ref2va_conditioning_oracle.py
+#   /home/alex/torchref/venv/bin/python scripts/minimax_h3_ref2va_conditioning_oracle.py
 #   pixi run mojo build -O2 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_ref2va_presentation_probe.mojo \
 #     -o <scratch>/h3_ref2va_pres_probe && <scratch>/h3_ref2va_pres_probe

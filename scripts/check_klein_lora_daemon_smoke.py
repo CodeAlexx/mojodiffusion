@@ -248,7 +248,7 @@ def validate_report(report: dict[str, Any], args: argparse.Namespace) -> list[st
         blockers,
     )
     require(log_markers.get("sample_command_has_lora") is True, "daemon log missing LoRA sample argv", blockers)
-    require(log_markers.get("loaded_adapter_count") is True, "daemon log missing AI Toolkit LoRA loader count", blockers)
+    require(log_markers.get("loaded_adapter_count") is True, "daemon log missing torchref LoRA loader count", blockers)
     require(log_markers.get("done_staged_sample") is True, "daemon log missing staged sample completion", blockers)
     return blockers
 

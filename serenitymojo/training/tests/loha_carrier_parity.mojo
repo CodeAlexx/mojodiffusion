@@ -7,7 +7,7 @@
 # All four factors are seeded NONZERO so every grad arm is exercised (the
 # historical LoHa bug = a dead factor). No oracle file needed — the LoHa
 # primitive (loha_forward/loha_backward) is itself the reference (already gated
-# vs ai-toolkit 1.8.3 in lycoris_family_parity / MJ-1020).
+# vs torchref 1.8.3 in lycoris_family_parity / MJ-1020).
 #
 # Build/run:
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \

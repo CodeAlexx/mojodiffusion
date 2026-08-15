@@ -39,7 +39,7 @@ from einops import rearrange, repeat
 from safetensors.torch import save_file
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-sys.path.insert(0, "/home/alex/ai-toolkit/extensions_built_in/diffusion_models/krea2/src")
+sys.path.insert(0, "/home/alex/torchref-image/extensions_built_in/diffusion_models/krea2/src")
 import mmdit  # noqa: E402
 from mmdit import SingleMMDiTConfig, SingleStreamDiT, temb  # noqa: E402
 

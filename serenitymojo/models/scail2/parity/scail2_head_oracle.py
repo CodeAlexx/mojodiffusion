@@ -24,7 +24,7 @@
 # FROZEN).
 #
 # Run (SEPARATE command, BEFORE the mojo gate):
-#   /home/alex/ai-toolkit/venv/bin/python \
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/scail2/parity/scail2_head_oracle.py
 
 import os

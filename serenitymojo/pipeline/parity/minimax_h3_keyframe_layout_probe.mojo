@@ -53,7 +53,7 @@
 #   && /tmp/h3_keyframe_layout_probe
 #
 # The derivation itself (re-run it to re-check the embedded literals):
-#   /home/alex/OneTrainer/venv/bin/python scripts/minimax_h3_keyframe_layout_derive.py
+#   /home/alex/torchref/venv/bin/python scripts/minimax_h3_keyframe_layout_derive.py
 
 from std.collections import List
 

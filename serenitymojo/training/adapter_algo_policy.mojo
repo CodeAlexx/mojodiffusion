@@ -1,6 +1,6 @@
 # training/adapter_algo_policy.mojo -- shared LyCORIS adapter selection guards.
 #
-# The parser accepts ai-toolkit-style network_algorithm strings. A trainer must
+# The parser accepts torchref-style network_algorithm strings. A trainer must
 # still opt into the math path it can actually execute, so unsupported LyCORIS
 # variants fail before checkpoint load instead of silently training plain LoRA.
 

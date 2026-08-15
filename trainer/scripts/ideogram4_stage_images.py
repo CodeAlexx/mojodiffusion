@@ -36,20 +36,20 @@ import numpy as np
 from PIL import Image
 from safetensors.numpy import save_file
 
-# ai-toolkit (the production oracle) digests the caption before templating:
+# torchref (the production oracle) digests the caption before templating:
 # plain-text captions pass through unchanged, structured JSON is minified
 # (separators=(",",":")). The previous json.dumps({"high_level_description":...})
 # wrap injected ~30% extra JSON-scaffold tokens (measured 30→23 ids) that leaked
-# into the maskless DiT. Use ai-toolkit's exact digest.
-sys.path.insert(0, "/home/alex/ai-toolkit")
+# into the maskless DiT. Use torchref's exact digest.
+sys.path.insert(0, "/home/alex/torchref-image")
 from toolkit.ideogram_caption import digest_caption_string
 
 
 def render_prompt(caption: str) -> str:
-    """Caption -> ai-toolkit digest -> Qwen3-VL chat template.
+    """Caption -> torchref digest -> Qwen3-VL chat template.
     The ONE render pipeline for real captions and the --uncond empty render.
 
-    Mirrors ai-toolkit extensions_built_in/diffusion_models/ideogram4/
+    Mirrors torchref extensions_built_in/diffusion_models/ideogram4/
     ideogram4.py::get_prompt_embeds (522-526):
       p = digest_caption_string(prompt)
       apply_chat_template([{role:user, content:[{type:text, text:p}]}],

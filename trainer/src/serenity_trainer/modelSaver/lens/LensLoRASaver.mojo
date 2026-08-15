@@ -59,7 +59,7 @@ from serenity_trainer.modelSetup import lensLoraTargets as LT
 
 comptime TArc = ArcPointer[Tensor]
 
-# Whether to also emit a "<prefix>.alpha" scalar per adapter (PEFT/ai-toolkit do).
+# Whether to also emit a "<prefix>.alpha" scalar per adapter (PEFT/torchref do).
 comptime EMIT_ALPHA = True
 
 

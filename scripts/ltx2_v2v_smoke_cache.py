@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic paired cache for the LTX-2 IC-LoRA / v2v SMOKE (P5 u3 + tail).
 
-CPU-only, no GPU, no Mojo compile. Writes a tiny musubi-native dataset the
+CPU-only, no GPU, no Mojo compile. Writes a tiny torchref-native dataset the
 train_ltx2_av.mojo v2v arms can read end-to-end:
   <root>/cache/sampleN_ltx2.safetensors      target latent  (geometry key)
   <root>/cache/sampleN_ltx2_te.safetensors   video_prompt_embeds_bfloat16 [1024,4096]

@@ -569,7 +569,7 @@ attention projection.
   back into the flat `KleinLoraGrads` (`:194`).
 - `klein_lora_adamw_step` (`:462`) — walks both flat lists in lockstep and runs
   the trainer's `_lora_adamw` on every adapter (reused, not reimplemented).
-- `save_klein_lora` (`:519`) — emits all 80 adapters via the PEFT/ai-toolkit
+- `save_klein_lora` (`:519`) — emits all 80 adapters via the PEFT/torchref
   writer (`save_lora_peft`); `load_klein_lora_resume` (`:540`) reloads them in
   the same flat order (AdamW moments zeroed, resumed from a `loop.mojo`
   TrainState checkpoint).

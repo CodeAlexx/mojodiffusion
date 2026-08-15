@@ -22,7 +22,7 @@ set -euo pipefail
 
 REPO=/home/alex/mojodiffusion
 SCRATCH="${H3_SMOKE_SCRATCH:-/tmp/h3_i2va_smoke}"
-VENV=/home/alex/OneTrainer/venv/bin/python
+VENV=/home/alex/torchref/venv/bin/python
 CSHIM="$REPO/serenitymojo/ops/cshim/lib"
 
 MODE="${1:?usage: $0 <i2va|l2va|fl2va> <keyframe.png> [<last.png>]}"

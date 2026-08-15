@@ -1,9 +1,9 @@
 # ltx2_lr_schedule_parity.mojo — LTX2 LR-lever parity vs transformers.optimization.
 #
-# musubi's LR path IS transformers.get_scheduler, so the LTX2 trainer routes its
+# torchref's LR path IS transformers.get_scheduler, so the LTX2 trainer routes its
 # scheduled LR through `transformers_lr_for_step` (training/lr_schedule.mojo). This
 # gate proves that function reproduces transformers.get_scheduler for the four
-# musubi-exposed kinds (constant / constant_with_warmup / linear / cosine) over
+# torchref-exposed kinds (constant / constant_with_warmup / linear / cosine) over
 # warmups {0, 5, 10} at the probe steps {0, 1, W-1, W, W+1, mid, total-1}.
 #
 # It ALSO measures the FLAME `lr_for_step` (the SerenityTrainer port) against the same

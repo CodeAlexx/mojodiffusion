@@ -3,7 +3,7 @@
 # Executable parity audit for the LTX-2 trainer surface.
 #
 # This gate compares the current Mojo LTX2 trainer contracts against the
-# Musubi/LTX2 behavior that must be covered before the trainer can be called
+# Torchref/LTX2 behavior that must be covered before the trainer can be called
 # production AV-ready. It intentionally passes when foundation contracts match
 # and production blockers are explicitly tracked.
 #
@@ -52,7 +52,7 @@ from serenitymojo.training.ltx2.checkpointing import (
     lora_emergency_path,
     lora_final_path,
     lora_latest_path,
-    musubi_step_lora_filename,
+    torchref_step_lora_filename,
     resume_checkpoint_contract,
     resume_token_is_latest,
     save_checkpoint_contract,
@@ -101,7 +101,7 @@ from serenitymojo.training.ltx2.schedule import (
     flow_match_noisy_value,
     flow_match_target_value,
     independent_audio_sigma_from_uniform,
-    normalize_musubi_training_timestep,
+    normalize_torchref_training_timestep,
     prepare_av_model_sigmas_from_scalar_timestep,
     prepare_av_model_sigmas_from_token_timesteps,
     shifted_logit_normal_sigma_legacy,
@@ -193,7 +193,7 @@ def _gate_config_cli() raises:
 
 def _gate_cache_records() raises:
     print("--- data / cache record parity foundation ---")
-    _check(String(FORMAT_VERSION) == "1.0.1", "Musubi cache format version")
+    _check(String(FORMAT_VERSION) == "1.0.1", "Torchref cache format version")
     _check(String(VIDEO_CACHE_SUFFIX) == "_ltx2.safetensors", "video cache suffix")
     _check(String(AUDIO_CACHE_SUFFIX) == "_ltx2_audio.safetensors", "audio cache suffix")
     _check(String(TEXT_CACHE_SUFFIX) == "_ltx2_te.safetensors", "text cache suffix")
@@ -314,8 +314,8 @@ def _gate_schedule_loss() raises:
 
 
 def _gate_timestep_handoff() raises:
-    print("--- Musubi timestep handoff parity ---")
-    _check(_close(normalize_musubi_training_timestep(250.0), 0.25), "normalize raw timestep to sigma")
+    print("--- Torchref timestep handoff parity ---")
+    _check(_close(normalize_torchref_training_timestep(250.0), 0.25), "normalize raw timestep to sigma")
 
     var scalar = prepare_av_model_sigmas_from_scalar_timestep(375.0, False)
     _check(_close(scalar.video_head_sigma, 0.375), "scalar video sigma")
@@ -342,7 +342,7 @@ def _gate_timestep_handoff() raises:
 def _gate_lora_surface() raises:
     print("--- LoRA surface parity foundation ---")
     _check(target_count_for_preset(PRESET_T2V) == DEFAULT_T2V_TARGETS_TOTAL, "T2V target count")
-    _check(target_count_for_preset(PRESET_T2V) == 1152, "T2V Musubi count")
+    _check(target_count_for_preset(PRESET_T2V) == 1152, "T2V Torchref count")
     _check(target_count_for_preset(PRESET_V2V) == 1344, "V2V IC-LoRA count")
     _check(target_count_for_preset(PRESET_AUDIO) == 672, "audio-only count")
     _check(target_count_for_preset(PRESET_AUDIO_REF_ONLY_IC) == 864, "audio-ref IC count")
@@ -367,7 +367,7 @@ def _gate_lora_surface() raises:
 def _gate_checkpoint_validation() raises:
     print("--- checkpoint / resume / validation parity foundation ---")
     _check(lobo_step_lora_filename(25) == "lora_step_000025.safetensors", "Lobo step filename")
-    _check(musubi_step_lora_filename("ltx23_lora", 25) == "ltx23_lora-step00000025.safetensors", "Musubi step filename")
+    _check(torchref_step_lora_filename("ltx23_lora", 25) == "ltx23_lora-step00000025.safetensors", "Torchref step filename")
     _check(train_state_filename(25) == "train_state_step_000025.train_state.safetensors", "train state filename")
     _check(resume_token_is_latest("latest") and resume_token_is_latest("auto"), "resume latest tokens")
     var cfg = LTX2TrainerConfig.default()
@@ -401,7 +401,7 @@ def _print_production_gates():
     print("  PENDING reference image/video cache records for IC-LoRA/V2V")
     print("  GATED audio_ref_only_ic composition contract; PENDING reference-audio cache records")
     print("  PENDING GPU audio bucket collation using gated separate_audio_buckets/pad/truncate/quota policy")
-    print("  PENDING FPS resampling and audio time-stretch parity with Musubi cache behavior")
+    print("  PENDING FPS resampling and audio time-stretch parity with Torchref cache behavior")
     print("SCHEDULE/NOISE/LOSS")
     print("  PENDING device RNG parity for per-sample video/audio independent timesteps")
     print("  GATED masked video/audio scalar parity; PENDING GPU/backward integration and reference-token exclusions")
@@ -420,7 +420,7 @@ def _print_production_gates():
     print("  PENDING gradient checkpointing/block swap backward parity")
     print("  PENDING optimizer state coverage for AdamW8Bit-compatible, AdamW, Prodigy/Lion/Adafactor/StableAdamW/ScheduleFree where enabled")
     print("CHECKPOINT/RESUME")
-    print("  PENDING original Musubi LoRA format plus Comfy conversion sidecar")
+    print("  PENDING original Torchref LoRA format plus Comfy conversion sidecar")
     print("  PENDING optimizer, scheduler, RNG, dataloader, EMA/uncertainty/projector state resume")
     print("  PENDING rotation, latest/final/emergency, autoresume, reset_optimizer/reset_dataloader")
     print("VALIDATION/SAMPLING")

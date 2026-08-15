@@ -15,7 +15,7 @@
 # wrong exactly where a dev geometry is used.
 #
 # Run:
-#   CUDA_VISIBLE_DEVICES="" /home/alex/OneTrainer/venv/bin/python \
+#   CUDA_VISIBLE_DEVICES="" /home/alex/torchref/venv/bin/python \
 #     scripts/minimax_h3_vision_preprocess_oracle.py
 #   pixi run mojo build -O0 -j 1 -I . -I vendor/mojo-libs \
 #     serenitymojo/pipeline/parity/minimax_h3_vision_preprocess_probe.mojo \

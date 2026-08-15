@@ -884,7 +884,7 @@ impl App {
 
     fn ui_captioner(&mut self, ui: &mut egui::Ui) {
         ui.heading("Captioner");
-        ui.weak("Qwen-VL folder captioner (server-side, ai-toolkit venv) — writes .txt sidecars.");
+        ui.weak("Qwen-VL folder captioner (server-side, torchref venv) — writes .txt sidecars.");
         ui.add_space(4.0);
         egui::Grid::new("cap").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Folder");

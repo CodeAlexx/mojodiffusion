@@ -5,7 +5,7 @@
 # Runs the FULL 48-block video-mode training stack at milestone-1 geometry
 # (latents [128,4,9,16] -> S_V=576, N_TXT=1024) with the REAL head, 48 blocks
 # STREAMED from the dev-fp8 checkpoint (per-tensor fp8->bf16 dequant, then upcast
-# to F32), and the frozen musubi tail — one forward + one backward with 384
+# to F32), and the frozen torchref tail — one forward + one backward with 384
 # attached LoRA adapters (8/block, both A and B seeded nonzero so d_A and d_B are
 # exercised).
 #
@@ -17,7 +17,7 @@
 # (The BF16 forward path was separately observed finite — the AV MVP spine runs
 # the same BF16-capable video forward and generates video.)
 #
-# Loads a REAL musubi cache sample (latent + POST-connector video_prompt_embeds).
+# Loads a REAL torchref cache sample (latent + POST-connector video_prompt_embeds).
 # The loss proxy is 0.5*sum(pred^2) (d_pred = pred), which drives a full backward.
 #
 # Asserts: finite pred, finite d_input, finite + NONZERO LoRA grads, correct
@@ -50,8 +50,8 @@ from serenitymojo.models.ltx2.ltx2_video_stack import (
 )
 
 comptime DEV_CKPT = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
-comptime CACHE_LAT = "/home/alex/datasets/ltx2_musubi_v3/cache/0288f3d69c08e816d81b014da620db49_00000-025_0512x0288_ltx2.safetensors"
-comptime CACHE_TE = "/home/alex/datasets/ltx2_musubi_v3/cache/0288f3d69c08e816d81b014da620db49_ltx2_te.safetensors"
+comptime CACHE_LAT = "/home/alex/datasets/ltx2_ref_v3/cache/0288f3d69c08e816d81b014da620db49_00000-025_0512x0288_ltx2.safetensors"
+comptime CACHE_TE = "/home/alex/datasets/ltx2_ref_v3/cache/0288f3d69c08e816d81b014da620db49_ltx2_te.safetensors"
 
 comptime NF = 4
 comptime NH = 9

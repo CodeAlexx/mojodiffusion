@@ -12,8 +12,8 @@
 # feature). Dumps the final complex freqs' real (cos) / imag (sin) per source_id
 # as [S, head_dim/2] F32 .bin files the Mojo gate reads at cos>=0.999.
 #
-# Run (SEPARATE command, ai-toolkit venv):
-#   /home/alex/ai-toolkit/venv/bin/python \
+# Run (SEPARATE command, torchref venv):
+#   /home/alex/torchref-image/venv/bin/python \
 #       serenitymojo/models/wan22/parity/bernini_src_id_rope_oracle.py
 
 import os

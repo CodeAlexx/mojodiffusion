@@ -1,6 +1,6 @@
 # training/parity/ltx2_audio_ref_ic_contract.mojo
 #
-# Musubi LTX2 audio_ref_only_ic conditioning contract.
+# Torchref LTX2 audio_ref_only_ic conditioning contract.
 #
 # Run:
 #   pixi run mojo run -I . serenitymojo/training/parity/ltx2_audio_ref_ic_contract.mojo
@@ -50,7 +50,7 @@ def _seq(start: Float32, n: Int) -> List[Float32]:
 
 def run_ltx2_audio_ref_ic_contract(print_details: Bool = True) raises:
     if print_details:
-        print("--- Musubi audio_ref_only_ic contract ---")
+        print("--- Torchref audio_ref_only_ic contract ---")
 
     comptime B = 1
     comptime C = 1

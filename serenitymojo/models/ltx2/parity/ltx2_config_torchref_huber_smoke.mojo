@@ -1,5 +1,5 @@
-# ltx2_config_musubi_huber_smoke.mojo — gate the musubi-huber -> smooth_l1 remap
-# in LTX2TrainerConfig.from_args (skeptic S1). musubi's loss_type "huber" IS
+# ltx2_config_torchref_huber_smoke.mojo — gate the torchref-huber -> smooth_l1 remap
+# in LTX2TrainerConfig.from_args (skeptic S1). torchref's loss_type "huber" IS
 # F.smooth_l1_loss(beta=huber_delta) (hv_train_network.py:499-506), so an ltx2
 # --config with loss_fn "huber" must land as smooth_l1(beta=huber_delta) — NOT
 # torch-huber (clamped-grad). Also asserts an all-off config stays mse (C13).
@@ -7,7 +7,7 @@
 # path (not read_model_config, which keeps the reader's torch-huber meaning).
 #
 #   pixi run mojo build -O2 -I . -Xlinker -lm -Xlinker -lcuda \
-#     serenitymojo/models/ltx2/parity/ltx2_config_musubi_huber_smoke.mojo \
+#     serenitymojo/models/ltx2/parity/ltx2_config_torchref_huber_smoke.mojo \
 #     -o /tmp/ltx2_huber_gate && /tmp/ltx2_huber_gate
 
 from serenitymojo.training.ltx2.config import LTX2TrainerConfig
@@ -42,8 +42,8 @@ def _args(cfg_path: String) -> List[String]:
 
 
 def main() raises:
-    # 1) musubi-huber remap: loss_fn "huber" + huber_delta 0.7 -> smooth_l1(0.7).
-    var hp = String("/tmp/ltx2_musubi_huber_smoke.json")
+    # 1) torchref-huber remap: loss_fn "huber" + huber_delta 0.7 -> smooth_l1(0.7).
+    var hp = String("/tmp/ltx2_ref_huber_smoke.json")
     _write(hp, String('{ "model_type": "ltx2", "loss_fn": "huber", "huber_delta": 0.7 }'))
     var ch = LTX2TrainerConfig.from_args(_args(hp))
     _require(
@@ -54,11 +54,11 @@ def main() raises:
         _close32(ch.levers.smooth_l1_beta, Float32(0.7)),
         String("smooth_l1_beta must == huber_delta 0.7; got ") + String(ch.levers.smooth_l1_beta),
     )
-    print("  PASS musubi-huber-remap  loss_fn=", ch.levers.loss_fn,
+    print("  PASS torchref-huber-remap  loss_fn=", ch.levers.loss_fn,
           " smooth_l1_beta=", ch.levers.smooth_l1_beta)
 
     # 2) all-off config leaves loss_fn == mse (C13 default-off).
-    var op = String("/tmp/ltx2_musubi_alloff_smoke.json")
+    var op = String("/tmp/ltx2_ref_alloff_smoke.json")
     _write(op, String('{ "model_type": "ltx2" }'))
     var co = LTX2TrainerConfig.from_args(_args(op))
     _require(

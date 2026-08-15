@@ -232,7 +232,7 @@ def _synth(n: Int, seed: UInt64) -> List[Float32]:
     return out^
 
 
-# global grad clip over all LoRA d_A/d_B (musubi max_grad_norm).
+# global grad clip over all LoRA d_A/d_B (torchref max_grad_norm).
 def _clip(mut grads: Wan22LoraGradSet, max_norm: Float32) -> Float32:
     var ss = Float32(0.0)
     for i in range(len(grads.d_a)):

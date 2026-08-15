@@ -29,7 +29,7 @@
   "learning_rate": 3e-4,
   "lora_rank": 16,
   "lora_alpha": 16.0,
-  "_comment_timestep": "TRAINING uses UNIFORM UNSHIFTED sigma sampling (ai-toolkit timestep_type='linear' / EDv2 train_l2p.rs: t_int = randint(0,train_num_steps)+1, sigma = t_int/train_num_steps). The earlier timestep_shift=3.0 was the INFERENCE sigma schedule (FLUX-shift) leaking into training and is WRONG for the train loop. sample_shift (inference only) = 3.0; train_shift retired.",
+  "_comment_timestep": "TRAINING uses UNIFORM UNSHIFTED sigma sampling (torchref timestep_type='linear' / EDv2 train_l2p.rs: t_int = randint(0,train_num_steps)+1, sigma = t_int/train_num_steps). The earlier timestep_shift=3.0 was the INFERENCE sigma schedule (FLUX-shift) leaking into training and is WRONG for the train loop. sample_shift (inference only) = 3.0; train_shift retired.",
   "train_num_steps": 1000,
   "sample_shift": 3.0,
   "max_grad_norm": 1.0,

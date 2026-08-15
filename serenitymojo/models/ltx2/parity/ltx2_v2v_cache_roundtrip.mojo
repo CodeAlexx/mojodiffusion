@@ -8,7 +8,7 @@
 # ShardedSafeTensors.tensor_bytes (a raw host span). Also checks the fail-loud
 # negatives: missing ref file, channel mismatch, ambiguous latents_* key.
 #
-# Mirrors musubi's training route: reference latent = a SEPARATE file in a
+# Mirrors torchref's training route: reference latent = a SEPARATE file in a
 # reference_cache_directory under the SAME basename as the target, keyed
 # `latents_{F}x{H}x{W}_bfloat16` on its own downscaled grid.
 #
@@ -87,7 +87,7 @@ def main() raises:
     var ref_shape = _sh(CHANNELS, 4, 4, 8)
     var ref_bytes = _write_latent(ref_path, ref_key, ref_shape)
 
-    # 1) reference_cache_path == musubi basename route
+    # 1) reference_cache_path == torchref basename route
     var derived = reference_cache_path(tgt_path, String(REFCACHE))
     print("  [path] derived:", derived)
     if derived != ref_path:

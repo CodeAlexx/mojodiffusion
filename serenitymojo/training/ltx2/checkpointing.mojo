@@ -30,7 +30,7 @@ def lobo_step_lora_filename(step: Int) -> String:
     return String("lora_step_") + _zero_pad(step, 6) + String(".safetensors")
 
 
-def musubi_step_lora_filename(job_name: String, step: Int) -> String:
+def torchref_step_lora_filename(job_name: String, step: Int) -> String:
     return job_name + String("-step") + _zero_pad(step, 8) + String(".safetensors")
 
 

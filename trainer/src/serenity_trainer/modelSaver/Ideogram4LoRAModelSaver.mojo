@@ -1,6 +1,6 @@
 # Ideogram4LoRAModelSaver.mojo - Ideogram4 LoRA save contract.
 #
-# ai-toolkit conversion:
+# torchref conversion:
 #   save: key.replace("transformer.", "diffusion_model.")
 #   load: key.replace("diffusion_model.", "transformer.")
 

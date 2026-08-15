@@ -162,7 +162,7 @@ struct LoraAdapter(Copyable, Movable):
         self.vb = vb^
 
 
-# PEFT/ai-toolkit init: A ~ small randn, B = 0 (adapter identity at step 0).
+# PEFT/torchref init: A ~ small randn, B = 0 (adapter identity at step 0).
 def _make_lora(cfg: TrainConfig, in_f: Int, out_f: Int, seed: UInt64) -> LoraAdapter:
     var r = cfg.lora_rank
     var scale = (cfg.lora_alpha / Float32(r))  # multiplier=1.0 at train time
@@ -277,10 +277,10 @@ def _adamw_host_list(
 
 
 # F32-master variant: identical update math, params stay F32 (no per-step bf16
-# write-back). MEASURED 2026-07-16 (ltx2 musubi audit): bf16 write-back at
+# write-back). MEASURED 2026-07-16 (ltx2 torchref audit): bf16 write-back at
 # LoRA-A magnitudes (rms ~9e-3, lr 1e-4) silently absorbs 30-57% of per-step
 # updates and drifts the 400-step weight delta ~28% relerr vs the F32 path.
-# musubi/torch keep F32 trainable params (ss_full_bf16=False default) and
+# torchref/torch keep F32 trainable params (ss_full_bf16=False default) and
 # downcast to bf16 only at save — drivers matching a torch oracle must use
 # THIS variant and hold F32 masters.
 def _adamw_host_list_f32(

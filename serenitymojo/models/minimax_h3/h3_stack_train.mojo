@@ -9,9 +9,10 @@
 # contract; adaln stays frozen.
 #
 # v1 API takes device-resident per-block weights (fine to the ~2-8 block
-# gates). The 50-block real-depth arm plugs a pinned-host store + fixed
-# device slab streamer into the same loop (stage_block hook) — blocks are
-# ~770MB bf16 each, 38.5GB total, never device-resident during training.
+# gates). The 50-block real-depth arm plugs the mmap-staging store
+# (H3TrainBlockStore: checkpoint mmap → ~770MB pinned staging → fixed
+# device slab) into the same loop — blocks are ~770MB bf16 each, never
+# bulk-resident on host OR device during training.
 # Gate: parity/minimax_h3_stack_train_parity.mojo vs the 2-block chain arm
 # of parity/h3_block_oracle.py (real block-0/1 weights).
 from max.gpu.host import DeviceContext
@@ -128,3 +129,105 @@ def h3_stack_train_backward[
         base.append(base_rev[n - 1 - r].copy())
         lora.append(lora_rev[n - 1 - r].copy())
     return H3StackTrainGrads(TArc(d^), base^, lora^)
+
+
+# ── STREAMED variants: weights staged per block from H3TrainBlockStore ──────
+from serenitymojo.models.minimax_h3.h3_train_block_store import H3TrainBlockStore
+
+
+def h3_stack_train_forward_streamed[
+    H: Int, Dh: Int, S: Int
+](
+    x_in: Tensor,
+    mut store: H3TrainBlockStore,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackTrainForward:
+    var n = store.num_blocks
+    if len(mods) != n or len(loras) != n:
+        raise Error("h3_stack_train_forward_streamed: mods/loras length mismatch")
+    var inputs = List[TArc]()
+    var h = x_in.clone(ctx)
+    for i in range(n):
+        inputs.append(TArc(h.clone(ctx)))
+        var bw = store.stage(i, ctx)
+        var f = h3_block_train_forward_lora[H, Dh, S](
+            h, bw, loras[i], mods[i][], adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx,
+        )
+        h = f.out[].clone(ctx)
+        _ = f^
+        _ = bw^
+        # fence: the NEXT stage() overwrites the slab; block i's kernels
+        # must have consumed it. Also releases this block's transients.
+        ctx.synchronize()
+    return H3StackTrainForward(TArc(h^), inputs^)
+
+
+def h3_stack_train_backward_streamed[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: Tensor,
+    fwd: H3StackTrainForward,
+    mut store: H3TrainBlockStore,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackLoraOnlyGrads:
+    """Streamed recompute backward. Returns LoRA grads + d_mod per block
+    (the trainable set); frozen-base weight grads are NOT retained — at 50
+    blocks they would be another 38.5GB."""
+    var n = store.num_blocks
+    if len(fwd.block_inputs) != n:
+        raise Error("h3_stack_train_backward_streamed: forward length mismatch")
+    var lora_rev = List[H3BlockLoraGrads]()
+    var dmod_rev = List[TArc]()
+    var d = d_out.clone(ctx)
+    for r in range(n):
+        var i = n - 1 - r
+        var mod_rows = mods[i][].shape()[0]
+        var bw = store.stage(i, ctx)
+        var f = h3_block_train_forward_lora[H, Dh, S](
+            fwd.block_inputs[i][], bw, loras[i], mods[i][],
+            adaln_indices, cos, sin, D, F, rotary_dim, eps, ctx,
+        )
+        var b = h3_block_train_backward_lora[H, Dh, S](
+            d, bw, loras[i], f.saved, adaln_indices, cos, sin,
+            mod_rows, D, F, rotary_dim, eps, ctx,
+        )
+        d = b.base.d_x[].clone(ctx)
+        dmod_rev.append(b.base.d_mod)
+        lora_rev.append(b.lora.copy())
+        _ = b^
+        _ = f^
+        _ = bw^
+        ctx.synchronize()
+    var lora = List[H3BlockLoraGrads]()
+    var dmod = List[TArc]()
+    for r in range(n):
+        lora.append(lora_rev[n - 1 - r].copy())
+        dmod.append(dmod_rev[n - 1 - r])
+    return H3StackLoraOnlyGrads(TArc(d^), lora^, dmod^)
+
+
+struct H3StackLoraOnlyGrads(Copyable, Movable):
+    var d_x: TArc
+    var lora: List[H3BlockLoraGrads]
+    var d_mod: List[TArc]
+
+    def __init__(
+        out self,
+        var d_x: TArc,
+        var lora: List[H3BlockLoraGrads],
+        var d_mod: List[TArc],
+    ):
+        self.d_x = d_x^
+        self.lora = lora^
+        self.d_mod = d_mod^

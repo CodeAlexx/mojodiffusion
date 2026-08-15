@@ -54,7 +54,7 @@ struct H3StackTrainGrads(Copyable, Movable):
 
 
 def h3_stack_train_forward[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     x_in: Tensor,
     blocks: List[H3BlockTrainWeights],
@@ -73,7 +73,7 @@ def h3_stack_train_forward[
         inputs.append(TArc(h.clone(ctx)))
         # forward WITHOUT retaining the act set: the recompute backward
         # rebuilds it per block; transients free per iteration.
-        var f = h3_block_train_forward_lora[H, Dh, S](
+        var f = h3_block_train_forward_lora[H, Dh](
             h, blocks[i], loras[i], mods[i][], adaln_indices, cos, sin,
             D, F, rotary_dim, eps, ctx,
         )
@@ -83,7 +83,7 @@ def h3_stack_train_forward[
 
 
 def h3_stack_train_backward[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     d_out: Tensor,
     fwd: H3StackTrainForward,
@@ -106,11 +106,11 @@ def h3_stack_train_backward[
         var i = n - 1 - r
         var mod_rows = mods[i][].shape()[0]
         # recompute block i's forward with saved activations
-        var f = h3_block_train_forward_lora[H, Dh, S](
+        var f = h3_block_train_forward_lora[H, Dh](
             fwd.block_inputs[i][], blocks[i], loras[i], mods[i][],
             adaln_indices, cos, sin, D, F, rotary_dim, eps, ctx,
         )
-        var b = h3_block_train_backward_lora[H, Dh, S](
+        var b = h3_block_train_backward_lora[H, Dh](
             d, blocks[i], loras[i], f.saved, adaln_indices, cos, sin,
             mod_rows, D, F, rotary_dim, eps, ctx,
         )
@@ -136,7 +136,7 @@ from serenitymojo.models.minimax_h3.h3_train_block_store import H3TrainBlockStor
 
 
 def h3_stack_train_forward_streamed[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     x_in: Tensor,
     mut store: H3TrainBlockStore,
@@ -155,7 +155,7 @@ def h3_stack_train_forward_streamed[
     for i in range(n):
         inputs.append(TArc(h.clone(ctx)))
         var bw = store.stage(i, ctx)
-        var f = h3_block_train_forward_lora[H, Dh, S](
+        var f = h3_block_train_forward_lora[H, Dh](
             h, bw, loras[i], mods[i][], adaln_indices, cos, sin,
             D, F, rotary_dim, eps, ctx,
         )
@@ -169,7 +169,7 @@ def h3_stack_train_forward_streamed[
 
 
 def h3_stack_train_backward_streamed[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     d_out: Tensor,
     fwd: H3StackTrainForward,
@@ -194,11 +194,11 @@ def h3_stack_train_backward_streamed[
         var i = n - 1 - r
         var mod_rows = mods[i][].shape()[0]
         var bw = store.stage(i, ctx)
-        var f = h3_block_train_forward_lora[H, Dh, S](
+        var f = h3_block_train_forward_lora[H, Dh](
             fwd.block_inputs[i][], bw, loras[i], mods[i][],
             adaln_indices, cos, sin, D, F, rotary_dim, eps, ctx,
         )
-        var b = h3_block_train_backward_lora[H, Dh, S](
+        var b = h3_block_train_backward_lora[H, Dh](
             d, bw, loras[i], f.saved, adaln_indices, cos, sin,
             mod_rows, D, F, rotary_dim, eps, ctx,
         )

@@ -115,7 +115,7 @@ def main() raises:
     for i in range(len(idx_h)):
         idx.append(Int(idx_h[i]))
 
-    var fwd = h3_stack_train_forward[H, Dh, S](
+    var fwd = h3_stack_train_forward[H, Dh](
         x, blocks, loras, mods, idx, cos, sin, D, F, ROTARY, EPS, ctx,
     )
     ctx.synchronize()
@@ -134,7 +134,7 @@ def main() raises:
     fwd.block_inputs[1] = ArcPointer(
         cast_tensor(h1_ref, STDtype.BF16, ctx)
     )
-    var grads = h3_stack_train_backward[H, Dh, S](
+    var grads = h3_stack_train_backward[H, Dh](
         d_out, fwd, blocks, loras, mods, idx, cos, sin,
         D, F, ROTARY, EPS, ctx,
     )

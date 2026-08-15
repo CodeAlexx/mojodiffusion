@@ -92,7 +92,7 @@ def main() raises:
 
     print("[smoke] forward (50 blocks, streamed)...")
     var t2 = perf_counter_ns()
-    var fwd = h3_stack_train_forward_streamed[H, Dh, S](
+    var fwd = h3_stack_train_forward_streamed[H, Dh](
         x, store, loras, mods, idx, cos, sin, D, F, ROTARY, EPS, ctx,
     )
     ctx.synchronize()
@@ -104,7 +104,7 @@ def main() raises:
     var d_out = randn(dsh^, UInt64(45), STDtype.BF16, ctx)
     print("[smoke] recompute backward (50 blocks, streamed)...")
     var t4 = perf_counter_ns()
-    var grads = h3_stack_train_backward_streamed[H, Dh, S](
+    var grads = h3_stack_train_backward_streamed[H, Dh](
         d_out, fwd, store, loras, mods, idx, cos, sin,
         D, F, ROTARY, EPS, ctx,
     )

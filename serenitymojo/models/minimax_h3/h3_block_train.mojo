@@ -37,8 +37,8 @@ from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.norm_backward import rms_norm_backward
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
-from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.attention_backward import sdpa_backward
+from serenitymojo.ops.attention import sdpa_nomask_dynamic
+from serenitymojo.ops.attention_backward import sdpa_backward_dynamic
 from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
 from serenitymojo.ops.rope_struct_backward import rope_halfsplit_full_backward
 from serenitymojo.ops.tensor_algebra import (
@@ -222,7 +222,7 @@ def _row_modulate(
 
 
 def h3_block_train_forward[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     x_in: Tensor,
     w: H3BlockTrainWeights,
@@ -232,6 +232,7 @@ def h3_block_train_forward[
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> H3BlockTrainForward:
+    var S = x_in.shape()[0]
     comptime I = H * Dh
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var no_bias = Optional[Tensor](None)
@@ -263,7 +264,7 @@ def h3_block_train_forward[
     var q_rope = _partial_rope(q_rms, cos, sin, H, rotary_dim, ctx)
     var k_rope = _partial_rope(k_rms, cos, sin, H, rotary_dim, ctx)
 
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att = sdpa_nomask_dynamic(q_rope, k_rope, v, scale, ctx)
     var att_flat = _reshaped(att, [S, I], ctx)
     var attn_y = linear(att_flat, w.out_w[], no_bias, ctx)  # [S, D]
     var h_mid = add(x, mul(gate_msa, attn_y, ctx), ctx)
@@ -290,7 +291,7 @@ def h3_block_train_forward[
 
 
 def h3_block_train_backward[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     d_out: Tensor,             # [S, D] upstream grad
     w: H3BlockTrainWeights,
@@ -301,6 +302,7 @@ def h3_block_train_backward[
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> H3BlockTrainGrads:
+    var S = d_out.shape()[0]
     comptime I = H * Dh
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
@@ -346,7 +348,7 @@ def h3_block_train_backward[
 
     # sdpa
     var d_att = _reshaped(lb_out.d_x, [1, S, H, Dh], ctx)
-    var sb = sdpa_backward[1, S, H, Dh](
+    var sb = sdpa_backward_dynamic(
         saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx,
     )
 
@@ -458,7 +460,7 @@ def _lora_add(
 
 
 def h3_block_train_forward_lora[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     x_in: Tensor,
     w: H3BlockTrainWeights,
@@ -469,6 +471,7 @@ def h3_block_train_forward_lora[
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> H3BlockTrainForward:
+    var S = x_in.shape()[0]
     comptime I = H * Dh
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var no_bias = Optional[Tensor](None)
@@ -499,7 +502,7 @@ def h3_block_train_forward_lora[
     var q_rope = _partial_rope(q_rms, cos, sin, H, rotary_dim, ctx)
     var k_rope = _partial_rope(k_rms, cos, sin, H, rotary_dim, ctx)
 
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att = sdpa_nomask_dynamic(q_rope, k_rope, v, scale, ctx)
     var att_flat = _reshaped(att, [S, I], ctx)
     var attn_base = linear(att_flat, w.out_w[], no_bias, ctx)
     var attn_y = _lora_add(attn_base, att_flat, lora.out, S, ctx)
@@ -537,7 +540,7 @@ struct H3BlockTrainLoraBackward(Copyable, Movable):
 
 
 def h3_block_train_backward_lora[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int
 ](
     d_out: Tensor,
     w: H3BlockTrainWeights,
@@ -549,6 +552,7 @@ def h3_block_train_backward_lora[
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> H3BlockTrainLoraBackward:
+    var S = d_out.shape()[0]
     comptime I = H * Dh
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
@@ -610,7 +614,7 @@ def h3_block_train_backward_lora[
         lg_out = Optional[KleinLoraDeviceGradTensors](g^)
 
     var d_att = _reshaped(d_att_flat, [1, S, H, Dh], ctx)
-    var sb = sdpa_backward[1, S, H, Dh](
+    var sb = sdpa_backward_dynamic(
         saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx,
     )
 

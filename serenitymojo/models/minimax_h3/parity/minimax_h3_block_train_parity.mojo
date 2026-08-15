@@ -102,7 +102,7 @@ def main() raises:
     # x arrives [1,S,D]; the block takes [S,D]
     var x_sd = reshape(x, [S, D], ctx)
 
-    var fwd = h3_block_train_forward[H, Dh, S](
+    var fwd = h3_block_train_forward[H, Dh](
         x_sd, w, mod, idx, cos, sin, D, F, ROTARY, EPS, ctx,
     )
     ctx.synchronize()
@@ -114,7 +114,7 @@ def main() raises:
     # upstream grad: d_out = loss_w (loss = sum(out*w))
     var d_out = cast_tensor(reshape(loss_w, [S, D], ctx), STDtype.BF16, ctx)
     var mod_table_rows = mod.shape()[0]
-    var grads = h3_block_train_backward[H, Dh, S](
+    var grads = h3_block_train_backward[H, Dh](
         d_out, w, fwd.saved, idx, cos, sin, mod_table_rows, D, F, ROTARY, EPS, ctx,
     )
     ctx.synchronize()
@@ -184,7 +184,7 @@ def main() raises:
         Optional[LoraAdapterDevice](adapters[3].copy()),
     )
 
-    var fwd_l = h3_block_train_forward_lora[H, Dh, S](
+    var fwd_l = h3_block_train_forward_lora[H, Dh](
         x_sd, w, lora, mod, idx, cos, sin, D, F, ROTARY, EPS, ctx,
     )
     ctx.synchronize()
@@ -194,7 +194,7 @@ def main() raises:
     if c_lout < 0.999:
         ok = False
 
-    var bwd_l = h3_block_train_backward_lora[H, Dh, S](
+    var bwd_l = h3_block_train_backward_lora[H, Dh](
         d_out, w, lora, fwd_l.saved, idx, cos, sin, mod_table_rows,
         D, F, ROTARY, EPS, ctx,
     )

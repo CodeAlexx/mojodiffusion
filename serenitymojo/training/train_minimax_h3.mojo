@@ -456,6 +456,14 @@ def main() raises:
         if not lat.has_video or lat.lat_f != 1:
             raise Error("maiden arm expects image items ([24,1,H,W]): " + it.item_key)
         var te = h3_read_text_cache(it.te_path, ctx)
+        # upstream trains in dit_dtype bf16: cast cached latents/text down
+        # exactly like its .to(dtype) load (caches may be stored F32)
+        var x0 = lat.video[].clone(ctx)
+        if x0.dtype() != STDtype.BF16:
+            x0 = cast_tensor(x0, STDtype.BF16, ctx)
+        var text_hidden = te.hidden[].clone(ctx)
+        if text_hidden.dtype() != STDtype.BF16:
+            text_hidden = cast_tensor(text_hidden, STDtype.BF16, ctx)
 
         # ── sigma (image branch), quantized to the grid ──────────────────────
         var sigma_raw = _image_sigma(rng, lat.lat_h, lat.lat_w)
@@ -471,8 +479,8 @@ def main() raises:
         # ── noise + target (gated bit-exact vs torch) ────────────────────────
         var vsh: List[Int] = [24, 1, lat.lat_h, lat.lat_w]
         var noise = randn(vsh^, UInt64(seed * 1000003 + step), STDtype.BF16, ctx)
-        var x_t = h3_noisy_input(lat.video[], noise, sigma, ctx)
-        var target = h3_velocity_target(lat.video[], noise, ctx)
+        var x_t = h3_noisy_input(x0, noise, sigma, ctx)
+        var target = h3_velocity_target(x0, noise, ctx)
         # the frontend's patch projection is an fp32-trap path (checkpoint F32
         # weights): feed F32 rows (exact bf16 upcast), it rne-casts back down.
         var x_rows = cast_tensor(
@@ -500,7 +508,7 @@ def main() raises:
         # image t2va layout is [text | video] contiguous (no cond/audio rows):
         # compose the frozen frontend directly and concat the two streams.
         var video_embeds = _minimax_h3_video_patch_embed_bf16(x_rows, frontend_w, ctx)
-        var text0 = minimax_h3_condition_embed(te.hidden[], frontend_w, ctx)
+        var text0 = minimax_h3_condition_embed(text_hidden, frontend_w, ctx)
         var text_embeds = minimax_h3_token_refiner_dynamic[H3_HEADS, H3_HEAD_DIM](
             text0, frontend_w, config, ctx
         )

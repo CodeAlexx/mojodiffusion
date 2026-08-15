@@ -82,6 +82,9 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import TensorView
 from serenitymojo.tensor import BatchedTensorUploader, Tensor
+from serenitymojo.models.minimax_h3.h3_lora_overlay import (
+    H3LoraOverlay, h3_overlay_slot_of,
+)
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     MINIMAX_H3_QKV_DEINTERLEAVED_MARKER,
@@ -387,6 +390,71 @@ def minimax_h3_block_uploader(ctx: DeviceContext) raises -> BatchedTensorUploade
     """The block-sized pinned slab for `minimax_h3_load_block_device_up` —
     hoist ONE of these around a streamed block loop."""
     return BatchedTensorUploader(_H3_BLOCK_UPLOAD_BYTES, ctx)
+
+
+def minimax_h3_load_block_device_lora(
+    st: ShardedSafeTensors,
+    layer: Int,
+    config: MiniMaxH3DiTConfig,
+    overlay: H3LoraOverlay,
+    ctx: DeviceContext,
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """`minimax_h3_load_block_device` with a LoRA OVERLAY applied to the RAW
+    weights BEFORE the qkv/fc1 transforms (adapters are trained in the raw
+    layout). One-shot slab like the plain wrapper; the delta math lives in
+    h3_lora_overlay.apply_raw (F32 overlay add, one bf16 rounding)."""
+    var uploader = BatchedTensorUploader(_H3_BLOCK_UPLOAD_BYTES, ctx)
+    var qkv_name = minimax_h3_block_prefix(layer) + "attn.qkv_proj.weight"
+    var fc1_name = minimax_h3_block_prefix(layer) + "mlp.fc1.weight"
+    var prefix_len = minimax_h3_block_prefix(layer).byte_length()
+    var heads = config.num_attention_heads
+    var head_dim = config.attention_head_dim
+    var hidden = config.hidden_size
+    var ffn = config.ffn_hidden_size
+
+    var weights = Dict[String, ArcPointer[Tensor]]()
+    var transform_sources = List[ArcPointer[Tensor]]()
+    var names = minimax_h3_block_tensor_names(layer)
+    for i in range(len(names)):
+        ref name = names[i]
+        var loaded = uploader.from_view(st.tensor_view(name), ctx)
+        st.release_tensor(name)
+        # overlay in RAW space (before any transform)
+        var suffix_bytes = name.as_bytes()
+        var suf = List[UInt8]()
+        for bi in range(prefix_len, name.byte_length()):
+            suf.append(suffix_bytes[bi])
+        var slot = h3_overlay_slot_of(String(unsafe_from_utf8=suf))
+        var raw: Tensor
+        if slot >= 0 and overlay.has(layer, slot):
+            # the overlay add must see settled slab bytes
+            uploader.finish(ctx)
+            raw = overlay.apply_raw(layer, slot, loaded, ctx)
+            _ = loaded^
+        else:
+            raw = loaded^
+        if name == qkv_name:
+            var transformed = _minimax_h3_qkv_deinterleave_bf16_device(
+                raw, heads, head_dim, hidden, ctx
+            )
+            transform_sources.append(ArcPointer(raw^))
+            weights[name] = ArcPointer(transformed^)
+        elif name == fc1_name:
+            var transformed = _minimax_h3_fc1_swap_bf16_device(
+                raw, ffn, hidden, ctx
+            )
+            transform_sources.append(ArcPointer(raw^))
+            weights[name] = ArcPointer(transformed^)
+        else:
+            weights[name] = ArcPointer(raw^)
+
+    uploader.finish(ctx)
+    transform_sources.clear()
+
+    minimax_h3_check_block_weights(weights, layer, config)
+    weights[MINIMAX_H3_QKV_DEINTERLEAVED_MARKER] = ArcPointer(_minimax_h3_marker_tensor(ctx))
+    weights[MINIMAX_H3_FC1_SWAPPED_MARKER] = ArcPointer(_minimax_h3_marker_tensor(ctx))
+    return weights^
 
 
 def minimax_h3_load_block_device(

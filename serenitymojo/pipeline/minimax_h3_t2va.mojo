@@ -249,7 +249,7 @@ from serenitymojo.pipeline.minimax_h3_video_vae_pixel_norm import (
     minimax_h3_pixel_norm_constants,
 )
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.io.ffi import sys_system
+from serenitymojo.io.ffi import sys_system, BytePtr
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.safetensors import SafeTensors
@@ -276,8 +276,10 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_sage_exact_prefix_backend,
 )
 from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
+from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
+    minimax_h3_load_block_device_lora,
     minimax_h3_load_qkv_device,
     minimax_h3_load_fc1_device,
 )
@@ -408,6 +410,21 @@ comptime TRANSFORMER_SHARD_COUNT = 13
 # downloads (a shard file existing but only half-written) are the LAST
 # thing this touches, not the first.
 # ═════════════════════════════════════════════════════════════════════════════
+def _h3_parse_f32(v: String) -> Float32:
+    from std.memory import alloc
+    var n = v.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = v.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var out = external_call["atof", Float64](
+        BytePtr(unsafe_from_address=Int(buf))
+    )
+    buf.free()
+    return Float32(out)
+
+
 def _h3_zero_pad5(n: Int) -> String:
     var s = String(n)
     while s.byte_length() < 5:
@@ -1540,6 +1557,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     use_resident: Bool,
     resident_scheme: Int,
     resident_cache_path: String,
+    ref lora_overlay: Optional[H3LoraOverlay],
     cos: Tensor,
     sin: Tensor,
     rotary_dim: Int,
@@ -1686,13 +1704,24 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
                         tail, layer, config, ctx
                     )
                 else:
-                    block_w = minimax_h3_load_block_device(
-                        transformer_shards, layer, config, ctx
-                    )
+                    if lora_overlay:
+                        block_w = minimax_h3_load_block_device_lora(
+                            transformer_shards, layer, config,
+                            lora_overlay.value(), ctx,
+                        )
+                    else:
+                        block_w = minimax_h3_load_block_device(
+                            transformer_shards, layer, config, ctx
+                        )
         else:
-            block_w = minimax_h3_load_block_device(
-                transformer_shards, layer, config, ctx
-            )
+            if lora_overlay:
+                block_w = minimax_h3_load_block_device_lora(
+                    transformer_shards, layer, config, lora_overlay.value(), ctx,
+                )
+            else:
+                block_w = minimax_h3_load_block_device(
+                    transformer_shards, layer, config, ctx
+                )
         hidden3 = minimax_h3_block_forward_dynamic[
             H3_HEADS, H3_HEAD_DIM
         ](
@@ -1792,6 +1821,8 @@ def _job_main(raw_args: List[String]) raises:
     var output_fps = FPS
     var runtime_text_tokens = TEXT_TOKENS
     var use_resident = DIT_FP8_RESIDENT != 0
+    var lora_path = String("")
+    var lora_mult = Float32(1.0)
     var resident_blocks_requested = DIT_RESIDENT_BLOCKS
     var quant = String("int8") if use_resident else String("bf16")
     var attention_backend = MINIMAX_H3_ATTN_CUDNN
@@ -1851,6 +1882,18 @@ def _job_main(raw_args: List[String]) raises:
             if len(fields) != 2:
                 raise Error("invalid --resident-blocks flag")
             resident_blocks_requested = atol(String(fields[1]))
+            continue
+        if arg.startswith("--lora="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --lora flag")
+            lora_path = String(fields[1])
+            continue
+        if arg.startswith("--lora-mult="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --lora-mult flag")
+            lora_mult = _h3_parse_f32(String(fields[1]))
             continue
         if arg.startswith("--quant="):
             var fields = arg.split("=")
@@ -1977,6 +2020,10 @@ def _job_main(raw_args: List[String]) raises:
             String("unknown --quant value: ") + quant
             + String(" (expected bf16, int8, or int8-fast)")
         )
+    var _lora_overlay = Optional[H3LoraOverlay](None)
+    if lora_path != String("") and use_resident:
+        print("  --lora forces the streamed bf16 base (resident path has no overlay yet)")
+        use_resident = False
     if quant == String("bf16") and attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
         raise Error(
             "MiniMax-H3 Sage attention is INT8-only; use --attention-backend=cudnn"
@@ -2280,6 +2327,12 @@ def _job_main(raw_args: List[String]) raises:
     _ = sys_system(String("mkdir -p '") + out_dir + "'")
 
     var ctx = DeviceContext()
+    if lora_path != String(""):
+        print("  loading LoRA overlay:", lora_path, " mult:", lora_mult)
+        _lora_overlay = Optional[H3LoraOverlay](
+            H3LoraOverlay.load(lora_path, lora_mult, ctx)
+        )
+        print("  LoRA overlay adapters:", _lora_overlay.value().adapters)
 
     # ── 1. Conditioning (real, or STUBBED in partial mode — see file header) ──
     var t_cond0 = perf_counter_ns()
@@ -2619,7 +2672,8 @@ def _job_main(raw_args: List[String]) raises:
                 placeholder_ts, geometry, frontend_w, config, run_config,
                 modcache, global_row, block_adaln_indices,
                 transformer_shards, fp8_resident, reusable_w8a8_tail,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
+                use_resident, resident_scheme, resident_cache_path,
+                _lora_overlay, rope[0],
                 rope[1], rotary_dim, attention_backend, sage_scratch, i,
                 step_cache, False,
                 ctx,
@@ -2644,7 +2698,8 @@ def _job_main(raw_args: List[String]) raises:
                 frontend_w, config, run_config, modcache, global_row,
                 block_adaln_indices, transformer_shards, fp8_resident,
                 reusable_w8a8_tail,
-                use_resident, resident_scheme, resident_cache_path, rope[0],
+                use_resident, resident_scheme, resident_cache_path,
+                _lora_overlay, rope[0],
                 rope[1], rotary_dim, attention_backend, sage_scratch, i,
                 step_cache, True,
                 ctx,

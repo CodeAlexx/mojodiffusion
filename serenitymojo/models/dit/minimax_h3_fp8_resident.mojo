@@ -84,6 +84,13 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16_into
 from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.tensor_algebra import add_in_place
+from serenitymojo.models.minimax_h3.h3_lora_overlay import (
+    H3LoraOverlay, h3_overlay_slot_of,
+)
+from serenitymojo.models.dit.minimax_h3_loader_device import (
+    _minimax_h3_qkv_deinterleave_bf16_device, _minimax_h3_fc1_swap_bf16_device,
+)
 from serenitymojo.ops.int8_quant import (
     int8_dequant_groupwise_to_bf16_into,
     int8_encode_groupwise,
@@ -337,6 +344,7 @@ def minimax_h3_build_resident_fp8(
     num_layers: Int = -1,
     start_layer: Int = 0,
     scheme: Int = MINIMAX_H3_RESIDENT_INT8,
+    lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
 ) raises -> MiniMaxH3ResidentFp8:
     if (
         scheme != MINIMAX_H3_RESIDENT_E4M3
@@ -435,6 +443,32 @@ def minimax_h3_build_resident_fp8(
                     )
                 else:
                     _fill_from_host_bf16(raw, dst, ctx)
+                # LoRA overlay: add the scaled delta (RAW space) through the
+                # SAME transform as the base weight, in-place on scratch,
+                # BEFORE quantization. Never touches the shard bytes or any
+                # on-disk cache (callers must build fresh + not save).
+                if lora_overlay:
+                    var pl = minimax_h3_block_prefix(layer).byte_length()
+                    var nb = name.as_bytes()
+                    var sfx = List[UInt8]()
+                    for bi in range(pl, name.byte_length()):
+                        sfx.append(nb[bi])
+                    var lslot = h3_overlay_slot_of(String(unsafe_from_utf8=sfx))
+                    if lslot >= 0 and lora_overlay.value().has(layer, lslot):
+                        var d_raw = lora_overlay.value().delta_raw(layer, lslot, ctx)
+                        var d_t: Tensor
+                        if name == qkv_name:
+                            d_t = _minimax_h3_qkv_deinterleave_bf16_device(
+                                d_raw, heads, head_dim, hidden, ctx
+                            )
+                        elif name == fc1_name:
+                            d_t = _minimax_h3_fc1_swap_bf16_device(
+                                d_raw, ffn, hidden, ctx
+                            )
+                        else:
+                            d_t = d_raw.clone(ctx)
+                        add_in_place(dst, d_t, ctx)
+                        ctx.synchronize()
                 # THE two-function encode swap the scheme flag selects (its
                 # dequant twin is in minimax_h3_resident_block_weights).
                 var s: Tensor

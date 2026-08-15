@@ -115,6 +115,22 @@ struct H3LoraOverlay(Copyable, Movable):
             return False
         return Bool(self.down[layer * H3_OVERLAY_SLOTS + slot])
 
+    def delta_raw(
+        self, layer: Int, slot: Int, ctx: DeviceContext
+    ) raises -> Tensor:
+        """Scaled delta alone (bf16 [out, in]): mult·(alpha/rank)·(up@down).
+        For build paths that add into an existing staged weight (e.g. the
+        int8 resident store) before quantization."""
+        var idx = layer * H3_OVERLAY_SLOTS + slot
+        var d16 = cast_tensor(self.down[idx].value()[], STDtype.BF16, ctx)
+        var u16 = cast_tensor(self.up[idx].value()[], STDtype.BF16, ctx)
+        var no_bias = Optional[Tensor](None)
+        # bf16 GEMM (F32-accumulated) keeps the transient at one bf16
+        # [out,in] instead of two F32 copies — the fat F32 chain OOM'd
+        # next to a fully built resident store.
+        var delta = linear(u16, d16, no_bias^, ctx, transpose_b=False)
+        return mul_scalar(delta, self.scale[idx], ctx)
+
     def apply_raw(
         self, layer: Int, slot: Int, w_raw: Tensor, ctx: DeviceContext
     ) raises -> Tensor:

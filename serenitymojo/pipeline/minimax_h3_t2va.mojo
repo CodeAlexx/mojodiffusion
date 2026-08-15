@@ -2021,9 +2021,8 @@ def _job_main(raw_args: List[String]) raises:
             + String(" (expected bf16, int8, or int8-fast)")
         )
     var _lora_overlay = Optional[H3LoraOverlay](None)
-    if lora_path != String("") and use_resident:
-        print("  --lora forces the streamed bf16 base (resident path has no overlay yet)")
-        use_resident = False
+    if lora_path != String("") and use_resident and resident_blocks_requested == 0:
+        raise Error("--lora with --resident-blocks=0 is unsupported (groupwise tail cache has no overlay)")
     if quant == String("bf16") and attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
         raise Error(
             "MiniMax-H3 Sage attention is INT8-only; use --attention-backend=cudnn"
@@ -2543,18 +2542,30 @@ def _job_main(raw_args: List[String]) raises:
             resident_cache_save_allowed = (
                 resident_blocks == GROUPWISE_RUNTIME_CACHE_BLOCKS
             )
-        fp8_resident = Optional[MiniMaxH3ResidentFp8](
-            _minimax_h3_get_resident_cached(
-                transformer_shards,
-                config,
-                resident_blocks,
-                resident_scheme,
-                resident_cache_path,
-                ctx,
-                resident_cache_save_allowed,
-                resident_scheme == MINIMAX_H3_RESIDENT_INT8,
+        if _lora_overlay:
+            # LoRA overlay: quantize a FRESH store with the delta added
+            # pre-quantization. Never load or save the shared disk cache —
+            # an overlaid store must not poison base-model runs.
+            print("  resident store: fresh build with LoRA overlay (cache bypassed)")
+            fp8_resident = Optional[MiniMaxH3ResidentFp8](
+                minimax_h3_build_resident_fp8(
+                    transformer_shards, config, ctx, resident_blocks,
+                    0, resident_scheme, _lora_overlay,
+                )
             )
-        )
+        else:
+            fp8_resident = Optional[MiniMaxH3ResidentFp8](
+                _minimax_h3_get_resident_cached(
+                    transformer_shards,
+                    config,
+                    resident_blocks,
+                    resident_scheme,
+                    resident_cache_path,
+                    ctx,
+                    resident_cache_save_allowed,
+                    resident_scheme == MINIMAX_H3_RESIDENT_INT8,
+                )
+            )
         if (
             resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
             and resident_blocks < run_config.num_layers

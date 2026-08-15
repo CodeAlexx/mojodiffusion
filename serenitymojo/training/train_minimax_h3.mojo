@@ -650,7 +650,9 @@ def _save_all(
             tensors.append(states[st_i].b_m)
             names.append(key + ".alpha")
             var avals: List[Float32] = [alpha]
-            var ash: List[Int] = [1]
+            # 0-DIM scalar (shape []) — the kohya/upstream convention; a [1]
+            # tensor breaks strict consumers doing float(alpha).
+            var ash = List[Int]()
             tensors.append(TArc(Tensor.from_host(avals, ash^, STDtype.F32, ctx)))
     var lora_path = (
         out_dir + "/" + name + "_step" + String(step) + ".safetensors"

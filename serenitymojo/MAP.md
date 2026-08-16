@@ -3867,3 +3867,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - Inference LoRA overlay: `models/minimax_h3/h3_lora_overlay.mojo` +
   `minimax_h3_load_block_device_lora` + runtime `--lora=`/`--lora-mult=`
   (streamed bf16 base; W' computed IN VRAM at load, checkpoints untouched).
+- Convergence: released H3 is CFG-DISTILLED — plain LoRA loss cannot bind
+  identity (maiden 2000-step eri run: loss fell, zero likeness; every other
+  stage eliminated — cache decode, save keys, overlay, conditioner cos
+  0.9975). Fix per upstream field reports: guidance-consistent objective
+  (second empty-cond forward, c_hat=(g+(s-1)*g_empty)/s, s=3) — needs
+  empty-cond TE cache pairs. Diagnostic:
+  `models/minimax_h3/parity/minimax_h3_cond_probe.mojo` dumps OUR runtime
+  conditioner embeds for a prompt -> safetensors for cos vs cached TE.

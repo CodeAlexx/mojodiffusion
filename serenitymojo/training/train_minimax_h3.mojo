@@ -647,14 +647,17 @@ def main() raises:
         # With guidance: pred = c_hat = g/s + g_empty*(s-1)/s (F32 combine,
         # bf16 result like upstream's model-dtype arithmetic); chain rule
         # scales d_g by 1/s after the plain loss grad.
+        # upstream-default "sigma" schedule: effective scale tapers to 1 at
+        # low noise so identity-detail steps train at full gradient strength
+        # (flat scale divides d_g by s exactly where detail is learned).
+        var s_eff = Float32(1.0) + (guidance_scale - Float32(1.0)) * sigma
         var pred_rows: Tensor
         if use_guidance:
-            var s = guidance_scale
             var g32 = cast_tensor(ffwd.video[], STDtype.F32, ctx)
             var e32 = cast_tensor(g_empty.value(), STDtype.F32, ctx)
             var chat = add(
-                mul_scalar(g32, Float32(1.0) / s, ctx),
-                mul_scalar(e32, (s - Float32(1.0)) / s, ctx),
+                mul_scalar(g32, Float32(1.0) / s_eff, ctx),
+                mul_scalar(e32, (s_eff - Float32(1.0)) / s_eff, ctx),
                 ctx,
             )
             pred_rows = cast_tensor(chat, STDtype.BF16, ctx)
@@ -670,7 +673,7 @@ def main() raises:
         if use_guidance:
             d_video = mul_scalar_bf16out(
                 cast_tensor(d_video, STDtype.F32, ctx),
-                Float32(1.0) / guidance_scale, ctx,
+                Float32(1.0) / s_eff, ctx,
             )
 
         # ── backward chain ───────────────────────────────────────────────────

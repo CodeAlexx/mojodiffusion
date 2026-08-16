@@ -16,7 +16,7 @@ from serenitymojo.models.minimax_h3.h3_train_sigma import (
 )
 
 comptime ORACLE = "/home/alex/mojodiffusion/output/checks/h3_guidance_fixture.safetensors"
-comptime SCALE = Float32(3.0)
+comptime SCALE = Float32(2.1)  # 1+(3-1)*0.55 — sigma-schedule effective scale
 
 
 def _load(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:

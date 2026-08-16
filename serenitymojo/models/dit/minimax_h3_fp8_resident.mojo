@@ -397,6 +397,7 @@ def minimax_h3_build_resident_fp8(
     var ffn = config.ffn_hidden_size
 
     var blocks = List[MiniMaxH3BlockResidentFp8]()
+    var overlay_applied = 0
     for i in range(n):
         var layer = start_layer + i
         var qkv_name = minimax_h3_block_prefix(layer) + "attn.qkv_proj.weight"
@@ -469,6 +470,7 @@ def minimax_h3_build_resident_fp8(
                             d_t = d_raw.clone(ctx)
                         add_in_place(dst, d_t, ctx)
                         ctx.synchronize()
+                        overlay_applied += 1
                 # THE two-function encode swap the scheme flag selects (its
                 # dequant twin is in minimax_h3_resident_block_weights).
                 var s: Tensor
@@ -528,6 +530,13 @@ def minimax_h3_build_resident_fp8(
                 "(layer", layer, ")",
             )
 
+    if lora_overlay:
+        print("  fp8-resident: LoRA deltas applied to", overlay_applied, "linears")
+        if overlay_applied == 0:
+            raise Error(
+                "minimax_h3_build_resident_fp8: overlay present but ZERO"
+                " deltas applied — slot/prefix matching is broken"
+            )
     # Sanity: the pre-allocated scratch must line up slot-for-slot with what
     # the per-layer loop actually quantized (both derive from
     # minimax_h3_block_tensor_names order filtered by class).

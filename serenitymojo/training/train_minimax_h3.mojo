@@ -47,7 +47,9 @@ from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import full_device, concat
+from serenitymojo.ops.tensor_algebra import (
+    full_device, concat, add, mul_scalar, mul_scalar_bf16out,
+)
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig, minimax_h3_released_config,
@@ -394,6 +396,38 @@ def main() raises:
         text_embeds_host.append(te_ref.to_host_bf16(ctx))
         text_embeds_rows.append(te_ref.shape()[0])
         ctx.synchronize()
+    # Guidance-consistent objective (CFG-distilled base): teacher forward on
+    # EMPTY conditioning per step, c_hat = (g + (s-1)*g_empty)/s, loss vs
+    # c_hat with d_g scaled by 1/s. The released H3 is guidance-distilled;
+    # the plain velocity loss cannot bind identity onto it (maiden 2000-step
+    # run: loss fell, zero likeness). Requires empty-cond TE cache pairs.
+    var guidance_scale = _arg_f32(String("guidance_scale"), Float32(0.0))
+    var empty_embeds_host = List[BFloat16]()
+    var empty_embeds_rows = 0
+    var empty_tags = List[Int]()
+    if guidance_scale > Float32(0.0):
+        if guidance_scale <= Float32(1.0):
+            raise Error("--guidance_scale must be > 1 (or 0 to disable)")
+        var te0 = h3_read_text_cache(items[0].te_path, ctx)
+        if not te0.has_empty:
+            raise Error(
+                "--guidance_scale needs empty-cond TE caches (re-cache with"
+                " the guidance-empty flag)"
+            )
+        var eh = te0.empty_hidden[].clone(ctx)
+        if eh.dtype() != STDtype.BF16:
+            eh = cast_tensor(eh, STDtype.BF16, ctx)
+        var e0 = minimax_h3_condition_embed(eh, frontend_w, ctx)
+        var e_ref = minimax_h3_token_refiner_dynamic[H3_HEADS, H3_HEAD_DIM](
+            e0, frontend_w, config, ctx
+        )
+        empty_embeds_host = e_ref.to_host_bf16(ctx)
+        empty_embeds_rows = e_ref.shape()[0]
+        empty_tags = te0.empty_tags.copy()
+        ctx.synchronize()
+        print("[h3-train] guidance objective ON: scale", guidance_scale,
+              "empty tokens", empty_embeds_rows)
+
     # slim weight dict: per-step needs ONLY the video patch projection
     var step_w = Dict[String, ArcPointer[Tensor]]()
     step_w[String("video_patch_proj.weight")] = frontend_w[String("video_patch_proj.weight")].copy()
@@ -552,6 +586,49 @@ def main() raises:
             mods.append(TArc(modgrid.block_rows(b, node, ctx)))
         ctx.synchronize()
         var tp0 = perf_counter_ns()
+
+        # ── guidance teacher: EMPTY-cond forward, keep only its video rows ──
+        # Runs BEFORE the student pass so its retained activations free first
+        # (peak stays one graph deep). Same node's mod tables / final rows.
+        var use_guidance = guidance_scale > Float32(0.0)
+        var g_empty = Optional[Tensor](None)
+        if use_guidance:
+            var anchors_e = List[Int]()
+            var layout_e = minimax_h3_build_packed_sequence(
+                empty_tags, 1, lat.lat_h, lat.lat_w, 0, 2, 2, anchors_e,
+            )
+            var S_e = layout_e.sequence_length
+            var pos_e_f32 = List[Float32](capacity=len(layout_e.position_ids))
+            for i in range(len(layout_e.position_ids)):
+                pos_e_f32.append(Float32(layout_e.position_ids[i]))
+            var pos_e_sh: List[Int] = [S_e * 3]
+            var pos_e = Tensor.from_host(pos_e_f32, pos_e_sh^, STDtype.F32, ctx)
+            var rope_e = build_minimax_h3_rope_tables(
+                pos_e, ctx, config.rope_inv_freq_len
+            )
+            var tesh_e: List[Int] = [empty_embeds_rows, H3_D]
+            var e_text = Tensor.from_host_bf16(empty_embeds_host, tesh_e^, ctx)
+            var hidden0_e = concat(0, ctx, e_text, video_embeds)
+            if hidden0_e.shape()[0] != S_e:
+                raise Error("guidance: packed length mismatch (empty+video != S_e)")
+            var node_idx_e = List[Int]()
+            for _ in range(S_e):
+                node_idx_e.append(0)
+            var adaln_idx_e = minimax_h3_adaln_indices(
+                node_idx_e, layout_e.token_tags
+            )
+            var fwd_e = h3_stack_train_forward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
+                hidden0_e, store, loras, mods, adaln_idx_e,
+                rope_e[0], rope_e[1], H3_D, H3_F, rope_e[0].shape()[1], H3_EPS, ctx,
+            )
+            var empty_idx_e = List[Int]()
+            var ffwd_e = h3_final_train_forward(
+                fwd_e.out[], final_w, final_mod_rows, node_idx_e,
+                layout_e.video_indices, empty_idx_e, H3_EPS, ctx,
+            )
+            g_empty = Optional[Tensor](ffwd_e.video[].clone(ctx))
+            ctx.synchronize()
+
         var fwd = h3_stack_train_forward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
             hidden0, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
@@ -567,13 +644,34 @@ def main() raises:
         )
 
         # ── loss + d_pred (gated bit-exact vs torch) ─────────────────────────
+        # With guidance: pred = c_hat = g/s + g_empty*(s-1)/s (F32 combine,
+        # bf16 result like upstream's model-dtype arithmetic); chain rule
+        # scales d_g by 1/s after the plain loss grad.
+        var pred_rows: Tensor
+        if use_guidance:
+            var s = guidance_scale
+            var g32 = cast_tensor(ffwd.video[], STDtype.F32, ctx)
+            var e32 = cast_tensor(g_empty.value(), STDtype.F32, ctx)
+            var chat = add(
+                mul_scalar(g32, Float32(1.0) / s, ctx),
+                mul_scalar(e32, (s - Float32(1.0)) / s, ctx),
+                ctx,
+            )
+            pred_rows = cast_tensor(chat, STDtype.BF16, ctx)
+        else:
+            pred_rows = ffwd.video[].clone(ctx)
         var empty_mask = List[Bool]()
-        var ml = h3_modality_loss(ffwd.video[], target_rows, empty_mask, ctx)
+        var ml = h3_modality_loss(pred_rows, target_rows, empty_mask, ctx)
         var loss = ml.total / Float64(ml.elements)
         var none_mask = Optional[Tensor](None)
         var d_video = h3_loss_grad(
-            ffwd.video[], target_rows, none_mask^, 1.0, Float64(ml.elements), ctx,
+            pred_rows, target_rows, none_mask^, 1.0, Float64(ml.elements), ctx,
         )
+        if use_guidance:
+            d_video = mul_scalar_bf16out(
+                cast_tensor(d_video, STDtype.F32, ctx),
+                Float32(1.0) / guidance_scale, ctx,
+            )
 
         # ── backward chain ───────────────────────────────────────────────────
         var d_audio_sh: List[Int] = [1, 1]

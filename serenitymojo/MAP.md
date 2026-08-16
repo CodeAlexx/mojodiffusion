@@ -3875,3 +3875,17 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   empty-cond TE cache pairs. Diagnostic:
   `models/minimax_h3/parity/minimax_h3_cond_probe.mojo` dumps OUR runtime
   conditioner embeds for a prompt -> safetensors for cos vs cached TE.
+- Guidance objective (in OUR trainer, `--guidance_scale 3`): per-step
+  no-grad TEACHER forward on the cached EMPTY conditioning (own packed
+  layout/rope/adaln idx, same sigma-node mod tables; runs before the
+  student pass so one activation graph is live at a time), then
+  c_hat = g/s + g_empty·(s-1)/s (F32 combine, one bf16 round), plain loss
+  vs target on c_hat, d_g scaled 1/s. Gate:
+  `parity/minimax_h3_guidance_math_gate.mojo` vs torch autograd (bf16 GPU
+  oracle): c_hat cos 0.99999, loss rel 5.9e-6, d_g cos 0.99999. Cost:
+  11.5 -> 15.8s/step. NOTE the upstream trainer itself was UNUSABLE as the
+  A/B arm on this box: three runs (bf16 / fp8_base / convrot int8, with and
+  without guidance) all produced ALL-ZERO lora_up weights — backward
+  delivers exact-zero grads on an attached graph (probed: forwards run,
+  loss attached, direct autograd.grad returns 0.0, params optimizer-bound);
+  cause in the fork undiagnosed, zero-up tripwire caught it at step 250.

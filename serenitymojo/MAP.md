@@ -3869,7 +3869,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   explicitly a different numeric trajectory, not exact-BF16 parity.
 - Production-recipe speed gate (rank 32 MLP-only, guidance 3.5, preservation
   0.02 at probability 0.25, 48/50 resident): first stable clean steps measure
-  9.13-10.18s and preservation-active steps 10.83-12.25s at about 20.1-20.9
+  9.80s median and preservation-active steps 11.82s median at about 20.1-20.9
   GiB. The earlier dense-preservation 42/50 run measured 13-14s/step. These
   timings include the extra guidance teacher and recompute backward; first-step
   compilation and failed 50/50/NN experiments are excluded.

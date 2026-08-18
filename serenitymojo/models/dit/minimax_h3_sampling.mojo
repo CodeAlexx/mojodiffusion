@@ -165,6 +165,13 @@ comptime MINIMAX_H3_AUDIO_TAG = 2
 comptime MINIMAX_H3_ANCHOR_FIRST = 0
 comptime MINIMAX_H3_ANCHOR_LAST = 1
 
+# Experimental multi-keyframe anchors encode a fractional point on the target
+# rotary timeline as BASE + parts-per-million.  The released FIRST/LAST codes
+# above remain byte-for-byte unchanged; only the explicit mk2va runtime emits
+# these additional codes.
+comptime MINIMAX_H3_ANCHOR_FRACTION_BASE = 1000000
+comptime MINIMAX_H3_ANCHOR_FRACTION_SCALE = 1000000
+
 # Audio is channel-major stereo, same source as packing.mojo:75.
 comptime MINIMAX_H3_AUDIO_CHANNELS = 2
 
@@ -759,8 +766,26 @@ def minimax_h3_build_sampling_geometry(
                 + minimax_h3_sampling_temporal_span(num_latent_frames)
                 - ROPE_FRAME_RESCALE
             )
+        elif anchor >= MINIMAX_H3_ANCHOR_FRACTION_BASE \
+                and anchor <= (
+                    MINIMAX_H3_ANCHOR_FRACTION_BASE
+                    + MINIMAX_H3_ANCHOR_FRACTION_SCALE
+                ):
+            var fraction = Float64(
+                anchor - MINIMAX_H3_ANCHOR_FRACTION_BASE
+            ) / Float64(MINIMAX_H3_ANCHOR_FRACTION_SCALE)
+            anchor_time = (
+                text_time
+                + fraction * (
+                    minimax_h3_sampling_temporal_span(num_latent_frames)
+                    - ROPE_FRAME_RESCALE
+                )
+            )
         else:
-            raise Error("MiniMax-H3 sampling geometry: a keyframe anchor must be first or last")
+            raise Error(
+                "MiniMax-H3 sampling geometry: a keyframe anchor must be"
+                " first, last, or an encoded experimental fraction"
+            )
         var row_start = condition_start + index * rows_per_frame
         for row in range(rows_per_frame):
             var base = 3 * (row_start + row)
@@ -816,6 +841,64 @@ def minimax_h3_build_sampling_geometry(
         num_condition_rows,
         0,
     )
+
+
+def minimax_h3_localize_semantic_rope_anchors(
+    mut geometry: MiniMaxH3SamplingGeometry,
+    pad_positions: List[Int],
+    num_text_tokens: Int,
+    num_keyframes: Int,
+    rows_per_frame: Int,
+) raises -> Int:
+    """Put each Qwen image grid on its matching VAE anchor's time coordinate.
+
+    Multi-keyframe H3 carries the same picture through two conditioning paths:
+    VAE rows in the packed media sequence and Qwen3-VL ``image_pad`` rows in
+    the text prefix.  The released text presentation gives every image-pad row
+    its ordinary text position.  For long mk2va timelines that leaves the six
+    semantic grids crowded near the beginning even though the VAE references
+    are anchored across the full target.  This opt-in transform changes only
+    the temporal RoPE coordinate of image-pad rows; prose-token positions and
+    both spatial coordinates remain byte-identical.
+
+    Returns the number of semantic rows localized per keyframe so the product
+    path can report the exact applied geometry.
+    """
+    if num_text_tokens < 1:
+        raise Error("semantic RoPE anchors require positive text rows")
+    if num_keyframes < 1:
+        raise Error("semantic RoPE anchors require at least one keyframe")
+    if rows_per_frame < 1:
+        raise Error("semantic RoPE anchors require positive rows_per_frame")
+    if len(geometry.position_ids) != geometry.sequence_length * 3:
+        raise Error("semantic RoPE anchors received malformed position_ids")
+    if geometry.num_condition_video_rows != num_keyframes * rows_per_frame:
+        raise Error("semantic RoPE anchors do not match condition row count")
+    if len(pad_positions) == 0 or len(pad_positions) % num_keyframes != 0:
+        raise Error(
+            "semantic RoPE anchors: image-pad rows do not divide by"
+            " keyframe count"
+        )
+
+    var vision_rows_per_keyframe = len(pad_positions) // num_keyframes
+    for keyframe_index in range(num_keyframes):
+        var condition_row = (
+            num_text_tokens + keyframe_index * rows_per_frame
+        )
+        if condition_row >= geometry.sequence_length:
+            raise Error("semantic RoPE anchor condition row is out of range")
+        var anchor_time = geometry.position_ids[3 * condition_row]
+        for vision_row in range(vision_rows_per_keyframe):
+            var pad_index = (
+                keyframe_index * vision_rows_per_keyframe + vision_row
+            )
+            var text_row = pad_positions[pad_index]
+            if text_row < 0 or text_row >= num_text_tokens:
+                raise Error(
+                    "semantic RoPE anchors: image-pad row is outside text"
+                )
+            geometry.position_ids[3 * text_row] = anchor_time
+    return vision_rows_per_keyframe
 
 
 def minimax_h3_build_sampling_row_timesteps(

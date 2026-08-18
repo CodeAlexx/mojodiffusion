@@ -19,6 +19,9 @@ from serenitymojo.models.klein.lora_block import LoraAdapterDevice
 from serenitymojo.models.minimax_h3.h3_stack_train import (
     h3_stack_train_forward, h3_stack_train_backward,
 )
+from serenitymojo.models.minimax_h3.h3_qkv_layout import (
+    h3_qkv_deinterleave_rows,
+)
 
 comptime ORACLE = "/home/alex/mojodiffusion/output/checks/h3_block0_oracle.safetensors"
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transformer"
@@ -79,8 +82,9 @@ def _block_weights(
             Tensor.from_view(sharded.tensor_view(p + names[i]), ctx),
             STDtype.BF16, ctx,
         )))
+    var qkv = h3_qkv_deinterleave_rows(wt[0][], H, Dh, ctx)
     return H3BlockTrainWeights(
-        wt[0], wt[1], wt[2], wt[3], wt[4], wt[5], wt[6], wt[7],
+        ArcPointer(qkv^), wt[1], wt[2], wt[3], wt[4], wt[5], wt[6], wt[7],
     )
 
 

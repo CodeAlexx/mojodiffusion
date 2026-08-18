@@ -36,8 +36,7 @@ pub(super) const MINIMAX_H3_FPS: i64 = 24;
 // existing polling contract is untouched. Success is still latents +
 // motion_context on disk; failure is the "[serve] job FAILED" sentinel or a
 // dead worker. Deferred video decode keeps its fresh process.
-static H3_WARM_WORKER: std::sync::Mutex<Option<std::process::Child>> =
-    std::sync::Mutex::new(None);
+static H3_WARM_WORKER: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 
 pub(super) fn minimax_h3_warm_enabled() -> bool {
     std::env::var("SERENITY_H3_WARM").ok().as_deref() == Some("1")
@@ -139,8 +138,13 @@ pub(super) const MINIMAX_H3_MIN_SECONDS: f64 = 1.0;
 // beneath the sequence-token envelope proven by the largest accepted 15 s
 // request; the UI computes the same resolution-dependent limit.
 pub(super) const MINIMAX_H3_TRAINED_MAX_SECONDS: f64 = 15.0;
-pub(super) const MINIMAX_H3_MAX_SECONDS: f64 = 60.0;
-pub(super) const MINIMAX_H3_MAX_INTERNAL_FRAMES: i64 = 1450;
+// T2VA alone admits the strict three-minute research envelope. Conditioned
+// modes retain their existing 60-second cap because their dedicated runners
+// still enforce the 1,450-frame envelope.
+pub(super) const MINIMAX_H3_MAX_SECONDS: f64 = 180.0;
+pub(super) const MINIMAX_H3_MAX_INTERNAL_FRAMES: i64 = 4323;
+pub(super) const MINIMAX_H3_CONDITIONED_MAX_SECONDS: f64 = 60.0;
+pub(super) const MINIMAX_H3_CONDITIONED_MAX_INTERNAL_FRAMES: i64 = 1450;
 pub(super) const MINIMAX_H3_LONG_CONTEXT_MAX_SEQUENCE_TOKENS: i64 = 107_000;
 pub(super) const MINIMAX_H3_MOTION_CONTEXT_DEFAULT_FRAMES: i64 = 22;
 pub(super) const MINIMAX_H3_MOTION_CONTEXT_WINDOWS: [i64; 3] = [5, 22, 39];
@@ -351,14 +355,20 @@ pub(super) fn minimax_h3_runtime_geometry(
     if requested_output_frames < 1 {
         return Err("MiniMax-H3 output frame count must be positive".to_string());
     }
+    let task = minimax_h3_task(body);
+    let max_seconds = if task == "t2va" {
+        MINIMAX_H3_MAX_SECONDS
+    } else {
+        MINIMAX_H3_CONDITIONED_MAX_SECONDS
+    };
     let duration = body
         .get("duration_seconds")
         .and_then(Value::as_f64)
         .unwrap_or(requested_output_frames as f64 / fps as f64);
-    if !(MINIMAX_H3_MIN_SECONDS..=MINIMAX_H3_MAX_SECONDS).contains(&duration) {
+    if !(MINIMAX_H3_MIN_SECONDS..=max_seconds).contains(&duration) {
         return Err(format!(
             "MiniMax-H3 duration must be {} through {} seconds",
-            MINIMAX_H3_MIN_SECONDS, MINIMAX_H3_MAX_SECONDS,
+            MINIMAX_H3_MIN_SECONDS, max_seconds,
         ));
     }
     // Seconds is the authored control. Derive both delivery and model timeline
@@ -366,7 +376,6 @@ pub(super) fn minimax_h3_runtime_geometry(
     // request back into a fixed profile duration.
     let output_frames = (duration * fps as f64).round().max(1.0) as i64;
     let model_output_frames = (duration * MINIMAX_H3_FPS as f64).round().max(1.0) as i64;
-    let task = minimax_h3_task(body);
     let motion_context_frames = if task == "continue" {
         body.get("motion_context_frames")
             .and_then(Value::as_i64)
@@ -377,10 +386,15 @@ pub(super) fn minimax_h3_runtime_geometry(
     let trim_start_frames = motion_context_frames;
     let internal_frames =
         minimax_h3_align_internal_frames(model_output_frames + motion_context_frames);
-    if internal_frames > MINIMAX_H3_MAX_INTERNAL_FRAMES {
+    let max_internal_frames = if task == "t2va" {
+        MINIMAX_H3_MAX_INTERNAL_FRAMES
+    } else {
+        MINIMAX_H3_CONDITIONED_MAX_INTERNAL_FRAMES
+    };
+    if internal_frames > max_internal_frames {
         return Err(format!(
             "MiniMax-H3 single-pass internal frame envelope exceeds {} frames",
-            MINIMAX_H3_MAX_INTERNAL_FRAMES,
+            max_internal_frames,
         ));
     }
     let latent_h = height / 16;
@@ -1116,7 +1130,7 @@ pub(super) fn minimax_h3_conditioned_task_document(task: &str, label: &str) -> V
             "seconds_max": if task == "ref2va" {
                 MINIMAX_H3_TRAINED_MAX_SECONDS
             } else {
-                MINIMAX_H3_MAX_SECONDS
+                MINIMAX_H3_CONDITIONED_MAX_SECONDS
             },
             "trained_seconds_max": MINIMAX_H3_TRAINED_MAX_SECONDS,
             "long_context_max_sequence_tokens": MINIMAX_H3_LONG_CONTEXT_MAX_SEQUENCE_TOKENS,
@@ -1209,7 +1223,7 @@ pub(super) fn minimax_h3_continuation_task_document() -> Value {
             "resolutions": minimax_h3_native_resolution_documents(),
             "resolution_role": "must_match_source_job",
             "seconds_min": MINIMAX_H3_MIN_SECONDS,
-            "seconds_max": MINIMAX_H3_MAX_SECONDS,
+            "seconds_max": MINIMAX_H3_CONDITIONED_MAX_SECONDS,
             "trained_seconds_max": MINIMAX_H3_TRAINED_MAX_SECONDS,
             "long_context_max_sequence_tokens": MINIMAX_H3_LONG_CONTEXT_MAX_SEQUENCE_TOKENS,
             "long_context_policy": "experimental_single_pass_plus_pinned_overlap",
@@ -1745,8 +1759,7 @@ pub(super) fn start_minimax_h3_request(
             // Decode-side failures leave a complete denoise behind; keep the
             // latents so the decode can be retried instead of losing the
             // render (see cleanup_minimax_h3_intermediates).
-            let keep_latents =
-                phase == "decode" || phase == "decode_start" || phase == "result";
+            let keep_latents = phase == "decode" || phase == "decode_start" || phase == "result";
             cleanup_minimax_h3_intermediates(&thread_out_dir, keep_latents);
             let _ = write_minimax_h3_job_status(&thread_out_dir, "failed", phase, 0, steps, &error);
             publish(WorkerEvent::Failed { error });
@@ -2178,10 +2191,9 @@ pub(super) fn cleanup_minimax_h3_intermediates(out_dir: &std::path::Path, keep_l
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let generated_frame = (name.starts_with("frame_") && name.ends_with(".png"))
-            || name == "frames.rgb";
-        let latent_artifact =
-            name == "latents.safetensors" || name == "latents_ckpt.safetensors";
+        let generated_frame =
+            (name.starts_with("frame_") && name.ends_with(".png")) || name == "frames.rgb";
+        let latent_artifact = name == "latents.safetensors" || name == "latents_ckpt.safetensors";
         let transient = generated_frame
             || name == "audio.wav"
             || (latent_artifact && !keep_latents)
@@ -2460,8 +2472,7 @@ pub(super) fn start_minimax_h3_conditioned_request(
             // Decode-side failures leave a complete denoise behind; keep the
             // latents so the decode can be retried instead of losing the
             // render (see cleanup_minimax_h3_intermediates).
-            let keep_latents =
-                phase == "decode" || phase == "decode_start" || phase == "result";
+            let keep_latents = phase == "decode" || phase == "decode_start" || phase == "result";
             cleanup_minimax_h3_intermediates(&thread_out_dir, keep_latents);
             let _ = write_minimax_h3_job_status(&thread_out_dir, "failed", phase, 0, steps, &error);
             publish(WorkerEvent::Failed { error });

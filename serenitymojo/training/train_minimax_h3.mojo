@@ -26,9 +26,9 @@
 # bit-exact) -> patchify -> packed layout + rope (gated inference frontend,
 # frozen) -> frontend embed -> 50-block streamed LoRA fwd (mmap store) ->
 # final-layer twin -> token loss + d_pred -> final bwd -> streamed recompute
-# bwd -> fused AdamW on masters -> refresh bf16 copies. Save LoRA
-# (lora_unet_* torchref key format, F32) every --save_every + full resume
-# state (masters + moments + step); auto-resume when the state file exists.
+# bwd -> fused AdamW on masters -> refresh bf16 copies. Save canonical stack
+# PEFT LoRA (diffusion_model.*.lora_A/B.weight, BF16) every --save_every plus
+# the unchanged F32 full-resume state (masters + moments + step).
 from std.collections import Dict
 from std.math import sqrt, exp, log, cos
 from std.ffi import external_call
@@ -72,20 +72,27 @@ from serenitymojo.models.minimax_h3.h3_train_sigma import (
     h3_noisy_input, h3_velocity_target,
     h3_modality_loss, h3_joint_token_loss, h3_loss_grad,
 )
-from serenitymojo.models.minimax_h3.h3_train_block_store_fp8 import (
-    H3TrainBlockStoreFp8,
+from serenitymojo.models.minimax_h3.h3_train_block_store_int8 import (
+    H3TrainBlockStoreInt8,
 )
 from serenitymojo.models.minimax_h3.h3_train_modgrid import H3TrainModGrid
 from serenitymojo.models.minimax_h3.h3_block_train import (
     H3BlockLoraDevice, H3BlockLoraGrads,
 )
 from serenitymojo.models.minimax_h3.h3_stack_train import (
-    h3_stack_train_forward_streamed_fp8, h3_stack_train_backward_streamed_fp8,
+    h3_stack_train_forward_streamed_int8,
+    h3_stack_train_backward_streamed_int8,
 )
 from serenitymojo.models.minimax_h3.h3_final_train import (
     H3FinalTrainWeights, h3_final_train_forward, h3_final_train_backward,
 )
 from serenitymojo.training.fused_adamw_multitensor import fused_adamw_step
+from serenitymojo.training.lora_save import (
+    F32NamedLora, save_lora_peft_host_f32,
+)
+from serenitymojo.models.minimax_h3.h3_lora_format import (
+    h3_lora_peft_prefix, h3_lora_legacy_slot_key,
+)
 from serenitymojo.io.ffi import BytePtr
 from serenitymojo.pipeline.minimax_h3_t2va import _minimax_h3_load_frontend_weights
 
@@ -123,18 +130,6 @@ def _slot_out_in(slot: Int) raises -> Tuple[Int, Int]:
         return (2 * H3_F, H3_D)      # mlp.fc1
     if slot == 3:
         return (H3_D, H3_F)          # mlp.fc2
-    raise Error("bad slot")
-
-
-def _slot_key(slot: Int) raises -> String:
-    if slot == 0:
-        return String("attn_qkv_proj")
-    if slot == 1:
-        return String("attn_out_proj")
-    if slot == 2:
-        return String("mlp_fc1")
-    if slot == 3:
-        return String("mlp_fc2")
     raise Error("bad slot")
 
 
@@ -294,7 +289,7 @@ def _state_names() raises -> List[String]:
     var names = List[String]()
     for b in range(N_BLOCKS):
         for s in range(SLOT_NAMES_LEN):
-            var base = String("b") + String(b) + "_" + _slot_key(s)
+            var base = String("b") + String(b) + "_" + h3_lora_legacy_slot_key(s)
             names.append(base + "_a_p")
             names.append(base + "_b_p")
             names.append(base + "_a_m")
@@ -341,13 +336,28 @@ def main() raises:
     var seed = _arg_int(String("seed"), 42)
     var save_every = _arg_int(String("save_every"), 250)
     var sample_every = _arg_int(String("sample_every"), 1000)
+    var baseline_only = _arg_int(String("baseline_only"), 0) != 0
     if cache_dir == String(""):
         raise Error("--cache_dir is required")
+    if rank <= 0:
+        raise Error("--dim must be positive")
+    # Canonical PEFT files carry A/B only. Match the rest of the stack's
+    # alpha=rank contract instead of silently changing inference strength.
+    if alpha != Float32(rank):
+        raise Error(
+            "H3 canonical PEFT export requires --alpha == --dim because the "
+            "external artifact does not carry per-module alpha"
+        )
     var scale = alpha / Float32(rank)
 
     print("[h3-train] cache_dir:", cache_dir)
     print("[h3-train] recipe: dim", rank, "alpha", alpha, "lr", lr,
           "steps", max_steps, "seed", seed)
+    if baseline_only:
+        print(
+            "[h3-train] BASELINE ONLY: fresh zero-output LoRA; "
+            "no backward, optimizer, resume, or checkpoint writes"
+        )
 
     var items = h3_discover_cache_items(cache_dir)
     if len(items) == 0:
@@ -396,11 +406,15 @@ def main() raises:
         text_embeds_host.append(te_ref.to_host_bf16(ctx))
         text_embeds_rows.append(te_ref.shape()[0])
         ctx.synchronize()
-    # Guidance-consistent objective (CFG-distilled base): teacher forward on
-    # EMPTY conditioning per step, c_hat = (g + (s-1)*g_empty)/s, loss vs
-    # c_hat with d_g scaled by 1/s. The released H3 is guidance-distilled;
-    # the plain velocity loss cannot bind identity onto it (maiden 2000-step
-    # run: loss fell, zero likeness). Requires empty-cond TE cache pairs.
+    # Optional guidance-consistent objective for the CFG-distilled base:
+    # teacher forward on EMPTY conditioning per step,
+    # c_hat = (g + (s-1)*g_empty)/s, loss vs c_hat with d_g scaled by 1/s.
+    # The earlier no-guidance likeness failure is not evidence against the
+    # plain objective: that run trained against raw per-head-interleaved QKV
+    # while sampling used deinterleaved QKV, and inference requantized away
+    # much of the adapter. Re-test the default one-pass objective after those
+    # two root fixes before requiring this slower two-forward arm. Guidance
+    # requires empty-cond TE cache pairs.
     var guidance_scale = _arg_f32(String("guidance_scale"), Float32(0.0))
     var empty_embeds_host = List[BFloat16]()
     var empty_embeds_rows = 0
@@ -437,14 +451,14 @@ def main() raises:
     ctx.synchronize()
     print("[h3-train] text embeds cached; frontend weights slimmed")
 
-    # FP8-RESIDENT frozen base (krea2 pattern): ~19.25GB on-device, zero
-    # per-step host->device weight traffic.
-    print("[h3-train] building fp8-resident base (one streamed pass)...")
+    # Direct W8A8 resident frozen base (Klein trainer pattern): compact INT8
+    # weights stay on device and execute directly; no per-visit BF16 expansion.
+    print("[h3-train] building direct-int8 resident base (one streamed pass)...")
     # tail blocks stream bf16 from the retained mmap store
     var tq0 = perf_counter_ns()
     var resident_blocks = _arg_int(String("resident_blocks"), 42)
-    var store = H3TrainBlockStoreFp8.open(ckpt, N_BLOCKS, resident_blocks, ctx)
-    print("[h3-train] fp8 base resident in",
+    var store = H3TrainBlockStoreInt8.open(ckpt, N_BLOCKS, resident_blocks, ctx)
+    print("[h3-train] direct-int8 base resident in",
           Float64(perf_counter_ns() - tq0) / 1.0e9, "s")
 
     # LoRA state: init or resume
@@ -459,7 +473,7 @@ def main() raises:
         have_state = True
     except:
         have_state = False
-    if have_state:
+    if have_state and not baseline_only:
         var st = SafeTensors.open(state_path)
         var names = _state_names()
         var ni = 0
@@ -617,7 +631,7 @@ def main() raises:
             var adaln_idx_e = minimax_h3_adaln_indices(
                 node_idx_e, layout_e.token_tags
             )
-            var fwd_e = h3_stack_train_forward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
+            var fwd_e = h3_stack_train_forward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
                 hidden0_e, store, loras, mods, adaln_idx_e,
                 rope_e[0], rope_e[1], H3_D, H3_F, rope_e[0].shape()[1], H3_EPS, ctx,
             )
@@ -629,7 +643,7 @@ def main() raises:
             g_empty = Optional[Tensor](ffwd_e.video[].clone(ctx))
             ctx.synchronize()
 
-        var fwd = h3_stack_train_forward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
+        var fwd = h3_stack_train_forward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
             hidden0, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )
@@ -666,6 +680,23 @@ def main() raises:
         var empty_mask = List[Bool]()
         var ml = h3_modality_loss(pred_rows, target_rows, empty_mask, ctx)
         var loss = ml.total / Float64(ml.elements)
+
+        # Dataset-level untrained-loss baseline. Fresh LoRA B matrices are
+        # exactly zero, so this is the corrected frozen base function. Stop at
+        # the measured loss: backward/optimizer work cannot change the result
+        # and would double the time needed for the 200-sample characterization.
+        if baseline_only:
+            ctx.synchronize()
+            var tp_baseline = perf_counter_ns()
+            print("[phase] fwd", Float64(tp1 - tp0) / 1.0e9,
+                  "final+loss", Float64(tp_baseline - tp1) / 1.0e9,
+                  "bwd", 0.0, "opt", 0.0,
+                  "prep", Float64(tp0 - t_step0) / 1.0e9)
+            var dt_baseline = Float64(tp_baseline - t_step0) / 1.0e9
+            print("[h3-train] step", step, "loss", loss, "sigma", sigma,
+                  "S", S, "item", it.item_key, "dt", dt_baseline, "s")
+            continue
+
         var none_mask = Optional[Tensor](None)
         var d_video = h3_loss_grad(
             pred_rows, target_rows, none_mask^, 1.0, Float64(ml.elements), ctx,
@@ -685,7 +716,7 @@ def main() raises:
         )
         ctx.synchronize()
         var tp2 = perf_counter_ns()
-        var grads = h3_stack_train_backward_streamed_fp8[H3_HEADS, H3_HEAD_DIM](
+        var grads = h3_stack_train_backward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
             d_hidden, fwd, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )
@@ -727,39 +758,43 @@ def main() raises:
               "S", S, "item", it.item_key, "dt", dt, "s")
 
         # ── save / sample snapshots ──────────────────────────────────────────
-        if step % save_every == 0 or step == max_steps or step % sample_every == 0:
-            _save_all(states, rank, alpha, step, rng_draws, out_dir, name, ctx)
+        if not baseline_only and (
+            step % save_every == 0 or step == max_steps or
+            step % sample_every == 0
+        ):
+            _save_all(states, rank, step, rng_draws, out_dir, name, ctx)
 
     print("[h3-train] DONE at step", max_steps)
 
 
 def _save_all(
-    states: List[_AdapterState], rank: Int, alpha: Float32,
+    states: List[_AdapterState], rank: Int,
     step: Int, rng_draws: Int, out_dir: String, name: String,
     ctx: DeviceContext,
 ) raises:
-    # 1) LoRA in torchref key format (F32, alpha scalars)
-    var names = List[String]()
-    var tensors = List[TArc]()
+    # 1) External LoRA: same canonical BF16 PEFT contract as LTX and the rest
+    # of the stack. Download F32 masters and pack on the host so save cadence
+    # never allocates a second ~150 MiB adapter set in scarce H3 VRAM.
+    var adapters = List[F32NamedLora]()
     for b in range(N_BLOCKS):
         for s in range(SLOT_NAMES_LEN):
             var st_i = b * SLOT_NAMES_LEN + s
-            var key = String("lora_unet_blocks_") + String(b) + "_" + _slot_key(s)
-            names.append(key + ".lora_down.weight")
-            tensors.append(states[st_i].a_m)
-            names.append(key + ".lora_up.weight")
-            tensors.append(states[st_i].b_m)
-            names.append(key + ".alpha")
-            var avals: List[Float32] = [alpha]
-            # 0-DIM scalar (shape []) — the kohya/upstream convention; a [1]
-            # tensor breaks strict consumers doing float(alpha).
-            var ash = List[Int]()
-            tensors.append(TArc(Tensor.from_host(avals, ash^, STDtype.F32, ctx)))
+            var dims = _slot_out_in(s)
+            var a_host = states[st_i].a_m[].to_host(ctx)
+            var b_host = states[st_i].b_m[].to_host(ctx)
+            adapters.append(F32NamedLora(
+                h3_lora_peft_prefix(b, s),
+                a_host^,
+                b_host^,
+                rank,
+                dims[1],
+                dims[0],
+            ))
     var lora_path = (
         out_dir + "/" + name + "_step" + String(step) + ".safetensors"
     )
-    save_safetensors(names, tensors, lora_path, ctx)
-    print("[h3-train] saved LoRA:", lora_path)
+    var n_pairs = save_lora_peft_host_f32(adapters, lora_path)
+    print("[h3-train] saved PEFT LoRA:", lora_path, "pairs", n_pairs)
 
     # 2) resume state (masters + moments + step + rng position)
     var snames = _state_names()

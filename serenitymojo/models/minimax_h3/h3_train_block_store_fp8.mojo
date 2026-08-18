@@ -9,7 +9,8 @@
 # carry one fp8 rounding.
 #
 # Build: one pass THROUGH the gated mmap store (H3TrainBlockStore.stage) —
-# bf16 slab views -> rowscale -> encode -> resident U8+scales. The mmap
+# BF16 block views with QKV already deinterleaved to [q_all;k_all;v_all] ->
+# rowscale -> encode -> resident U8+scales. The mmap
 # store is dropped afterwards; steady-state training does ZERO host->device
 # weight traffic.
 from max.gpu.host import DeviceContext

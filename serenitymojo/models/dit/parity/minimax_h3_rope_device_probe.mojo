@@ -36,8 +36,8 @@ from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 
 
 def _synthetic_positions() -> List[Float64]:
-    """Flat `[rows*3]` (t, h, w) grid, row-major. 6 rows spanning small,
-    zero, and larger magnitudes on both axes."""
+    """Flat `[rows*3]` (t, h, w) grid, row-major. 8 rows spanning small,
+    zero, larger magnitudes, and the exact 120-second H3 packed boundary."""
     var p = List[Float64]()
     # row 0: origin.
     p.append(0.0); p.append(0.0); p.append(0.0)
@@ -51,12 +51,16 @@ def _synthetic_positions() -> List[Float64]:
     p.append(15.0); p.append(320.0); p.append(320.0)
     # row 5: many rotary-time units in (a several-second clip).
     p.append(200.0); p.append(5.0); p.append(11.0)
+    # row 6: final packed text coordinate in the six-anchor 120 s request.
+    p.append(1975.0); p.append(0.0); p.append(0.0)
+    # row 7: final media coordinate (origin 1976 + 4825-unit span - 1).
+    p.append(6800.0); p.append(32.0); p.append(64.0)
     return p^
 
 
 def main() raises:
     var ctx = DeviceContext()
-    var rows = 6
+    var rows = 8
     var freq_dim = MINIMAX_H3_ROPE_FREQ_DIM
     var theta = MINIMAX_H3_ROPE_THETA
     var rotary_dim = 2 * 3 * freq_dim
@@ -157,5 +161,53 @@ def main() raises:
         raise Error("probe: FAIL sin diverges from the oracle")
     if max_half_diff != Float32(0.0):
         raise Error("probe: FAIL the two table halves are not identical")
+
+    # 6. Opt-in RIFLEx gate.  The official one-line rule replaces frequency
+    # k-1 with `0.9 * 2*pi / L_test`.  H3's media clock begins after the packed
+    # text rows, so the device implementation keeps text untouched and applies
+    # that frequency to media-local time with phase continuity at the origin.
+    var riflex_k = 10
+    var riflex_origin = Float32(1976.0)
+    var riflex_span = Float32(4825.0)
+    var riflex = build_minimax_h3_rope_tables(
+        positions, ctx, freq_dim, theta, STDtype.F32,
+        riflex_k, riflex_origin, riflex_span,
+    )
+    var expected_riflex_angles = oracle.angles.copy()
+    var old_frequency = inv_freq[riflex_k - 1]
+    var new_frequency = Float32(
+        Float64(0.9) * Float64(6.283185307179586476925286766559)
+        / Float64(riflex_span)
+    )
+    var selected = riflex_k - 1
+    for r in range(rows):
+        var position = Float32(position_ids[3 * r])
+        if position >= riflex_origin:
+            var expected_angle = (
+                riflex_origin * old_frequency
+                + (position - riflex_origin) * new_frequency
+            )
+            expected_riflex_angles[r * rotary_dim + selected] = expected_angle
+            expected_riflex_angles[
+                r * rotary_dim + half + selected
+            ] = expected_angle
+    var riflex_angle_result = harness_tight.compare(
+        riflex[2], expected_riflex_angles, ctx
+    )
+    print(
+        "riflex k=", riflex_k, " old_frequency=", old_frequency,
+        " new_frequency=", new_frequency,
+    )
+    print("riflex angles:", riflex_angle_result)
+    if not riflex_angle_result.passed:
+        raise Error("probe: FAIL RIFLEx angles diverge from the reference rule")
+
+    var riflex_host = riflex[2].to_host(ctx)
+    var media_cell = 7 * rotary_dim + selected  # row 7 is final media time.
+    if riflex_host[media_cell] == oracle.angles[media_cell]:
+        raise Error("probe: FAIL RIFLEx negative control did not change media")
+    var text_cell = 6 * rotary_dim + selected  # row 6 is final text time.
+    if riflex_host[text_cell] != oracle.angles[text_cell]:
+        raise Error("probe: FAIL RIFLEx changed packed text RoPE")
 
     print("minimax_h3_rope_device_probe PASS")

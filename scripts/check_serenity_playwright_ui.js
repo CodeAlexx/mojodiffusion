@@ -888,15 +888,15 @@ async function run() {
           && controls.duration === 4 && controls.frames === 96,
         `Generate H3 ${quant} changed authored geometry: ${JSON.stringify(controls)}`);
       }
-      await setGenerateH3Geometry("Free", 512, 320, 60, 24);
+      await setGenerateH3Geometry("Free", 320, 192, 180, 24);
       const generateH3LongContext = await readGenerateH3Controls();
       assert(generateH3LongContext.aspect === "Free"
-        && generateH3LongContext.width === 512 && generateH3LongContext.height === 320
-        && generateH3LongContext.durationMax === 60
-        && generateH3LongContext.duration === 60
-        && generateH3LongContext.frames === 1440,
+        && generateH3LongContext.width === 320 && generateH3LongContext.height === 192
+        && generateH3LongContext.durationMax === 180
+        && generateH3LongContext.duration === 180
+        && generateH3LongContext.frames === 4320,
       `Generate H3 long-context controls did not expand: ${JSON.stringify(generateH3LongContext)}`);
-      await page.locator("#gen-prompt").fill("Playwright H3 single-pass 60-second request");
+      await page.locator("#gen-prompt").fill("Playwright H3 monolithic single-pass 180-second request");
       const generateH3VideoBefore = videoRequests.length;
       await page.locator("#gen-btn").click();
       for (let attempt = 0; attempt < 100 && videoRequests.length === generateH3VideoBefore; attempt += 1) {
@@ -911,9 +911,9 @@ async function run() {
         && !Object.prototype.hasOwnProperty.call(generateH3Request, "source_image")
         && generateH3Request.quant === "bf16"
         && generateH3Request.attention_backend === "cudnn"
-        && generateH3Request.width === 512 && generateH3Request.height === 320
-        && generateH3Request.duration_seconds === 60
-        && generateH3Request.frames === 1440 && generateH3Request.fps === 24
+        && generateH3Request.width === 320 && generateH3Request.height === 192
+        && generateH3Request.duration_seconds === 180
+        && generateH3Request.frames === 4320 && generateH3Request.fps === 24
         && generateH3Request.steps === 31
         && generateH3Request.step_cache === "exact",
       `H3 Generate submitted the wrong runtime geometry: ${JSON.stringify(generateH3Request)}`);
@@ -1178,10 +1178,10 @@ async function run() {
         && h3UnifiedSurface.lastFrame && !h3UnifiedSurface.advancedOpen,
       `H3 Canvas is not one progressive-disclosure surface: ${JSON.stringify(h3UnifiedSurface)}`);
 
-      await setH3Geometry("custom", 60, 24, 512, 320);
+      await setH3Geometry("custom", 180, 24, 320, 192);
       const h3LongT2va = await readH3Controls();
-      assert(h3LongT2va.durationMax === 60 && h3LongT2va.duration === 60
-        && h3LongT2va.frames === 1440,
+      assert(h3LongT2va.durationMax === 180 && h3LongT2va.duration === 180
+        && h3LongT2va.frames === 4320,
       `H3 Canvas T2VA long context did not expand: ${JSON.stringify(h3LongT2va)}`);
       const h3SourceChooserPromise = page.waitForEvent("filechooser");
       await page.locator("#cv-h3-source-button").click();

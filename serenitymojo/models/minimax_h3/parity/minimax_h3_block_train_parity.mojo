@@ -15,6 +15,9 @@ from serenitymojo.models.minimax_h3.h3_block_train import (
     H3BlockTrainWeights, h3_block_train_forward, h3_block_train_backward,
     H3BlockLoraDevice, h3_block_train_forward_lora, h3_block_train_backward_lora,
 )
+from serenitymojo.models.minimax_h3.h3_qkv_layout import (
+    h3_qkv_deinterleave_rows,
+)
 from serenitymojo.models.klein.lora_block import (
     LoraAdapterDevice, KleinLoraDeviceGradTensors,
 )
@@ -68,7 +71,9 @@ def main() raises:
     var ctx = DeviceContext()
     var orc = SafeTensors.open(String(ORACLE))
 
-    # ── block-0 weights, RAW layout, bf16 (matches the oracle's block dtype) ──
+    # ── block-0 weights, training layout, bf16 ───────────────────────────────
+    # The shard QKV is per-head fused; use the same shared deinterleave as the
+    # production training store before entering the contiguous-q/k/v block.
     var sharded = ShardedSafeTensors.open(String(CKPT))
     var p = String("blocks.0.")
     var names: List[String] = [
@@ -83,8 +88,9 @@ def main() raises:
             Tensor.from_view(sharded.tensor_view(p + names[i]), ctx),
             STDtype.BF16, ctx,
         )))
+    var qkv = h3_qkv_deinterleave_rows(wt[0][], H, Dh, ctx)
     var w = H3BlockTrainWeights(
-        wt[0], wt[1], wt[2], wt[3], wt[4], wt[5], wt[6], wt[7],
+        ArcPointer(qkv^), wt[1], wt[2], wt[3], wt[4], wt[5], wt[6], wt[7],
     )
 
     # ── oracle inputs ──

@@ -49,6 +49,19 @@ comptime _HEAD_DIM = 128
 comptime _NEG_BIG = Float32(-1.0e30)
 
 
+@fieldwise_init
+struct SageUltraViCoConfig(Copyable, Movable, ImplicitlyCopyable):
+    """Packed-H3 coordinates for opt-in training-free score decay."""
+
+    var video_start: Int
+    var rows_per_frame: Int
+    var window_frames: Int
+    var repeat_period_frames: Int
+    var repeat_radius_frames: Int
+    var alpha: Float32
+    var beta: Float32
+
+
 @always_inline
 def _mma_m16n8k32_s8(
     a: SIMD[DType.int8, 16],
@@ -112,6 +125,195 @@ def _shfl_xor4_f32(value: Float32, xor_mask: Int32) -> Float32:
         SIMD[DType.uint32, 1](r[0])
     )
     return Float32(out[0])
+
+
+@always_inline
+def _sage_ultravico_decay_score(
+    score: Float32,
+    query_row: Int,
+    key_row: Int,
+    video_start: Int,
+    rows_per_frame: Int,
+    window_frames: Int,
+    repeat_period_frames: Int,
+    repeat_radius_frames: Int,
+    alpha: Float32,
+    beta: Float32,
+) -> Float32:
+    """Training-free long-video score decay, restricted to video rows.
+
+    This is the packed-H3 translation of UltraViCo's online attention rule.
+    Positive, distant video-to-video logits are attenuated by ``alpha``;
+    distances close to a measured repetition harmonic use the stronger
+    ``beta``.  Prefix interactions and non-positive logits are unchanged.
+    A negative ``video_start`` disables the rule exactly.
+    """
+    if video_start < 0 or score <= 0.0:
+        return score
+    if rows_per_frame <= 0 or query_row < video_start or key_row < video_start:
+        return score
+    # UltraViCo measures distance in flattened visual-token rows and scales
+    # its temporal thresholds by the number of rows per frame.  Keeping that
+    # form is source-faithful and avoids integer division in the score loop.
+    var distance = query_row - key_row
+    if distance < 0:
+        distance = -distance
+    var window_rows = window_frames * rows_per_frame
+    if distance <= window_rows:
+        return score
+    if repeat_period_frames > 0:
+        var repeat_period_rows = repeat_period_frames * rows_per_frame
+        var repeat_radius_rows = repeat_radius_frames * rows_per_frame
+        var remainder = distance % repeat_period_rows
+        var harmonic_distance = remainder
+        var upper_distance = repeat_period_rows - remainder
+        if upper_distance < harmonic_distance:
+            harmonic_distance = upper_distance
+        if harmonic_distance <= repeat_radius_rows:
+            return score * beta
+    return score * alpha
+
+
+@always_inline
+def _sage_ultravico_uniform_tile_factor(
+    q_start: Int,
+    key_start: Int,
+    S: Int,
+    video_start: Int,
+    window_rows: Int,
+    repeat_period_rows: Int,
+    repeat_radius_rows: Int,
+    alpha: Float32,
+    beta: Float32,
+) -> Float32:
+    """Return one exact factor for a whole 16x64 tile, or -1 if mixed.
+
+    UltraViCo's factor depends only on the query/key row distance, not the
+    attention head or score value.  Almost every streamed tile lies wholly in
+    the exact, alpha, or beta band.  Classifying that interval once avoids a
+    dynamic integer remainder for every score in both online-softmax passes.
+    The few tiles crossing the video prefix, local window, or harmonic edge
+    return -1 and retain the scalar source rule below.
+    """
+    if video_start < 0 or q_start >= S:
+        return 1.0
+
+    var q_end = q_start + _Q_TILE - 1
+    if q_end >= S:
+        q_end = S - 1
+    var key_end = key_start + _KV_TILE - 1
+    if key_end >= S:
+        key_end = S - 1
+
+    # Prefix-only tiles are unchanged. A tile straddling the target-video
+    # boundary is deliberately handled score by score.
+    if q_end < video_start or key_end < video_start:
+        return 1.0
+    if q_start < video_start or key_start < video_start:
+        return -1.0
+
+    var distance_min: Int
+    var distance_max: Int
+    if q_end < key_start:
+        distance_min = key_start - q_end
+        distance_max = key_end - q_start
+    elif key_end < q_start:
+        distance_min = q_start - key_end
+        distance_max = q_end - key_start
+    else:
+        distance_min = 0
+        var left_span = q_end - key_start
+        var right_span = key_end - q_start
+        distance_max = left_span if left_span > right_span else right_span
+
+    if distance_max <= window_rows:
+        return 1.0
+    if distance_min <= window_rows:
+        return -1.0
+    if repeat_period_rows <= 0:
+        return alpha
+
+    # Find the first harmonic band intersecting [distance_min, distance_max].
+    # If none intersects, alpha is uniform. If the interval lies entirely in
+    # that band, beta is uniform; otherwise this is an exact fallback tile.
+    var first_center = 0
+    var first_candidate = distance_min - repeat_radius_rows
+    if first_candidate > 0:
+        first_center = (
+            ceildiv(first_candidate, repeat_period_rows)
+            * repeat_period_rows
+        )
+    var band_start = first_center - repeat_radius_rows
+    var band_end = first_center + repeat_radius_rows
+    if band_start > distance_max:
+        return alpha
+    if distance_min >= band_start and distance_max <= band_end:
+        return beta
+    return -1.0
+
+
+@always_inline
+def _sage_ultravico_decay_score_tiled(
+    score: Float32,
+    query_row: Int,
+    key_row: Int,
+    tile_factor: Float32,
+    video_start: Int,
+    rows_per_frame: Int,
+    window_frames: Int,
+    repeat_period_frames: Int,
+    repeat_radius_frames: Int,
+    alpha: Float32,
+    beta: Float32,
+) -> Float32:
+    """Apply a tile-uniform factor or the exact scalar boundary rule."""
+    if score <= 0.0:
+        return score
+    if tile_factor >= 0.0:
+        return score if tile_factor == 1.0 else score * tile_factor
+    return _sage_ultravico_decay_score(
+        score, query_row, key_row, video_start, rows_per_frame,
+        window_frames, repeat_period_frames, repeat_radius_frames, alpha, beta,
+    )
+
+
+@always_inline
+def _sage_ultravico_decay_score_fast(
+    score: Float32,
+    query_row: Int,
+    key_row: Int,
+    video_start: Int,
+    window_rows: Int,
+    repeat_period_rows: Int,
+    repeat_radius_rows: Int,
+    repeat_period_inv: Float32,
+    alpha: Float32,
+    beta: Float32,
+) -> Float32:
+    """Register-light equivalent of the modulo score rule.
+
+    Distances in H3's admitted sequence envelope are exactly representable as
+    F32. Rounding distance/period selects the nearest harmonic; either choice
+    at an exact half-period has the same distance. This removes dynamic integer
+    remainder and the tile classifier from the register-heavy attention body.
+    """
+    if video_start < 0 or score <= 0.0:
+        return score
+    if query_row < video_start or key_row < video_start:
+        return score
+    var distance = query_row - key_row
+    if distance < 0:
+        distance = -distance
+    if distance <= window_rows:
+        return score
+    if repeat_period_rows > 0:
+        var nearest = Int(round(Float32(distance) * repeat_period_inv))
+        var harmonic_distance = distance - nearest * repeat_period_rows
+        if harmonic_distance < 0:
+            harmonic_distance = -harmonic_distance
+        if harmonic_distance <= repeat_radius_rows:
+            return score * beta
+    return score * alpha
 
 
 def _sage_int8_mma_tile_kernel(
@@ -360,7 +562,7 @@ def _sage_quant_k_per_thread_bf16(
         idx += 32
 
 
-def _sage_attention_int8_token_kernel(
+def _sage_attention_int8_token_kernel[ULTRAVICO: Bool, OUT_HALF: Int](
     q8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
     k8: LayoutTensor[DType.int8, _DYN1, MutAnyOrigin],
     qs: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
@@ -370,6 +572,13 @@ def _sage_attention_int8_token_kernel(
     S_w: Int32,
     H_w: Int32,
     scale: Float32,
+    ultravico_video_start_w: Int32,
+    ultravico_window_rows_w: Int32,
+    ultravico_repeat_period_rows_w: Int32,
+    ultravico_repeat_radius_rows_w: Int32,
+    ultravico_repeat_period_inv: Float32,
+    ultravico_alpha: Float32,
+    ultravico_beta: Float32,
 ):
     """INT8 QK + online softmax + BF16 PV, tiled M128 x N64.
 
@@ -378,8 +587,20 @@ def _sage_attention_int8_token_kernel(
     probabilities stay in registers; this avoids both the old single-producer
     warp bottleneck and an H*S*S score slab.
     """
+    comptime OUT_TILES = 16 if OUT_HALF < 0 else 8
+    comptime V_WIDTH = _HEAD_DIM
+    comptime OUT_COL_START = 0 if OUT_HALF < 0 else OUT_HALF * 64
     var S = Int(S_w)
     var H = Int(H_w)
+    var ultravico_video_start = -1
+    var ultravico_window_rows = 0
+    var ultravico_repeat_period_rows = 0
+    var ultravico_repeat_radius_rows = 0
+    comptime if ULTRAVICO:
+        ultravico_video_start = Int(ultravico_video_start_w)
+        ultravico_window_rows = Int(ultravico_window_rows_w)
+        ultravico_repeat_period_rows = Int(ultravico_repeat_period_rows_w)
+        ultravico_repeat_radius_rows = Int(ultravico_repeat_radius_rows_w)
     var tid = Int(thread_idx.x)
     var warp = tid >> 5
     var lane = tid & 31
@@ -398,12 +619,14 @@ def _sage_attention_int8_token_kernel(
         address_space=AddressSpace.SHARED,
     ]()
     var v_sh = stack_allocation[
-        2 * _KV_TILE * _HEAD_DIM, Scalar[DType.bfloat16],
+        2 * _KV_TILE * V_WIDTH, Scalar[DType.bfloat16],
         address_space=AddressSpace.SHARED,
     ]()
 
-    # Each lane holds its four outputs from all sixteen 16x8 PV tiles.
-    var out_frag = SIMD[DType.float32, 64](0.0)
+    # The plain kernel keeps all sixteen output tiles. UltraViCo uses two
+    # 64-channel launches so its score-decay state cannot spill the accumulator
+    # slab to local memory.
+    var out_frag = SIMD[DType.float32, OUT_TILES * 4](0.0)
     var m0 = _NEG_BIG
     var m1 = _NEG_BIG
     var l0 = Float32(0.0)
@@ -452,12 +675,12 @@ def _sage_attention_int8_token_kernel(
         ](k_sh + k_phys, k8.ptr + head * S * _HEAD_DIM + k_elem, valid)
         k_copy += _WARPS * 32
     var v_copy = tid
-    while v_copy < (_KV_TILE * _HEAD_DIM) // 8:
-        var valid = Int32(16) if v_copy * 8 < S * _HEAD_DIM else Int32(0)
+    while v_copy < (_KV_TILE * V_WIDTH) // 8:
+        var valid = Int32(16) if v_copy * 8 < S * V_WIDTH else Int32(0)
         var v_elem = v_copy * 8
-        var v_row = v_elem // _HEAD_DIM
-        var v_col = v_elem - v_row * _HEAD_DIM
-        var v_phys = v_row * _HEAD_DIM \
+        var v_row = v_elem // V_WIDTH
+        var v_col = v_elem - v_row * V_WIDTH
+        var v_phys = v_row * V_WIDTH \
             + (v_col ^ ((v_row & 7) * 8))
         _ = inlined_assembly[
             (
@@ -520,13 +743,13 @@ def _sage_attention_int8_token_kernel(
                 )
                 k_copy += _WARPS * 32
             v_copy = tid
-            while v_copy < (_KV_TILE * _HEAD_DIM) // 8:
+            while v_copy < (_KV_TILE * V_WIDTH) // 8:
                 var valid = Int32(16) \
-                    if v_copy * 8 < valid_tokens * _HEAD_DIM else Int32(0)
+                    if v_copy * 8 < valid_tokens * V_WIDTH else Int32(0)
                 var v_elem = v_copy * 8
-                var v_row = v_elem // _HEAD_DIM
-                var v_col = v_elem - v_row * _HEAD_DIM
-                var v_phys = v_row * _HEAD_DIM \
+                var v_row = v_elem // V_WIDTH
+                var v_col = v_elem - v_row * V_WIDTH
+                var v_phys = v_row * V_WIDTH \
                     + (v_col ^ ((v_row & 7) * 8))
                 _ = inlined_assembly[
                     (
@@ -537,7 +760,7 @@ def _sage_attention_int8_token_kernel(
                     constraints="=r,r,l,r",
                     has_side_effect=True,
                 ](
-                    v_sh + next_stage * _KV_TILE * _HEAD_DIM + v_phys,
+                    v_sh + next_stage * _KV_TILE * V_WIDTH + v_phys,
                     v.ptr + ((next_start + v_row) * H + head) * _HEAD_DIM
                         + v_col,
                     valid,
@@ -551,7 +774,7 @@ def _sage_attention_int8_token_kernel(
             ]()
 
         var k_stage_base = stage * _KV_TILE * _HEAD_DIM
-        var v_stage_base = stage * _KV_TILE * _HEAD_DIM
+        var v_stage_base = stage * _KV_TILE * V_WIDTH
 
         var kscale = rebind[Scalar[DType.float32]](
             ks[
@@ -636,6 +859,31 @@ def _sage_attention_int8_token_kernel(
                 * score_factor
             var s11 = Float32(scores[n_half * 4 + 3]) \
                 * score_factor
+            comptime if ULTRAVICO:
+                s00 = _sage_ultravico_decay_score_fast(
+                    s00, q0, key0, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
+                s01 = _sage_ultravico_decay_score_fast(
+                    s01, q0, key1, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
+                s10 = _sage_ultravico_decay_score_fast(
+                    s10, q1, key0, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
+                s11 = _sage_ultravico_decay_score_fast(
+                    s11, q1, key1, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
             if key0 < S:
                 tile_m0 = tile_m0 if tile_m0 > s00 else s00
                 tile_m1 = tile_m1 if tile_m1 > s10 else s10
@@ -655,7 +903,7 @@ def _sage_attention_int8_token_kernel(
         var m_new1 = m1 if m1 > tile_m1 else tile_m1
         var corr0 = Float32(0.0) if m0 == _NEG_BIG else exp(m0 - m_new0)
         var corr1 = Float32(0.0) if m1 == _NEG_BIG else exp(m1 - m_new1)
-        comptime for nt in range(16):
+        comptime for nt in range(OUT_TILES):
             comptime base = nt * 4
             out_frag[base + 0] *= corr0
             out_frag[base + 1] *= corr0
@@ -668,17 +916,46 @@ def _sage_attention_int8_token_kernel(
         comptime for n_half in range(8):
             var key0 = key_start + n_half * _QK_N + thread * 2
             var key1 = key0 + 1
+            var score00 = Float32(scores[n_half * 4]) * score_factor
+            var score01 = Float32(scores[n_half * 4 + 1]) * score_factor
+            var score10 = Float32(scores[n_half * 4 + 2]) * score_factor
+            var score11 = Float32(scores[n_half * 4 + 3]) * score_factor
+            comptime if ULTRAVICO:
+                score00 = _sage_ultravico_decay_score_fast(
+                    score00, q0, key0, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
+                score01 = _sage_ultravico_decay_score_fast(
+                    score01, q0, key1, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
+                score10 = _sage_ultravico_decay_score_fast(
+                    score10, q1, key0, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
+                score11 = _sage_ultravico_decay_score_fast(
+                    score11, q1, key1, ultravico_video_start,
+                    ultravico_window_rows, ultravico_repeat_period_rows,
+                    ultravico_repeat_radius_rows, ultravico_repeat_period_inv,
+                    ultravico_alpha, ultravico_beta,
+                )
             var p00 = exp(
-                Float32(scores[n_half * 4]) * score_factor - m_new0
+                score00 - m_new0
             ) if q0 < S and key0 < S else Float32(0.0)
             var p01 = exp(
-                Float32(scores[n_half * 4 + 1]) * score_factor - m_new0
+                score01 - m_new0
             ) if q0 < S and key1 < S else Float32(0.0)
             var p10 = exp(
-                Float32(scores[n_half * 4 + 2]) * score_factor - m_new1
+                score10 - m_new1
             ) if q1 < S and key0 < S else Float32(0.0)
             var p11 = exp(
-                Float32(scores[n_half * 4 + 3]) * score_factor - m_new1
+                score11 - m_new1
             ) if q1 < S and key1 < S else Float32(0.0)
             probs[n_half * 4] = p00.cast[DType.bfloat16]()
             probs[n_half * 4 + 1] = p01.cast[DType.bfloat16]()
@@ -695,20 +972,23 @@ def _sage_attention_int8_token_kernel(
         m0 = m_new0
         m1 = m_new1
 
-        # Four K=16 slices times sixteen N=8 output tiles cover P[16,64]
-        # x V[64,128]. Both operands are already register/shared resident.
+        # Four K=16 slices cover either all sixteen N=8 output tiles (plain)
+        # or one exact eight-tile output half (UltraViCo).
         comptime for k_chunk in range(4):
             var pf = SIMD[DType.bfloat16, 8]()
             comptime for i in range(4):
                 pf[i] = probs[(k_chunk * 2) * 4 + i]
                 pf[i + 4] = probs[(k_chunk * 2 + 1) * 4 + i]
-            comptime for nt_pair in range(8):
+            comptime for nt_pair in range(OUT_TILES // 2):
+                comptime v_nt_pair = (
+                    nt_pair if OUT_HALF < 0 else nt_pair + OUT_HALF * 4
+                )
                 var matrix = lane >> 3
                 var matrix_row = lane & 7
                 var v_row = k_chunk * 16 \
                     + (matrix & 1) * 8 + matrix_row
-                var v_col = nt_pair * 16 + (matrix >> 1) * 8
-                var v_addr = v_stage_base + v_row * _HEAD_DIM \
+                var v_col = v_nt_pair * 16 + (matrix >> 1) * 8
+                var v_addr = v_stage_base + v_row * V_WIDTH \
                     + (v_col ^ ((v_row & 7) * 8))
                 var vr = inlined_assembly[
                     (
@@ -749,11 +1029,12 @@ def _sage_attention_int8_token_kernel(
         key_start = next_start
         stage = next_stage
 
-    comptime for nt in range(16):
+    comptime for nt in range(OUT_TILES):
         comptime base = nt * 4
+        comptime out_nt = nt if OUT_HALF < 0 else nt + OUT_HALF * 8
         comptime for i in range(4):
             var qr = q_start + group + (8 if i >= 2 else 0)
-            var d = nt * 8 + thread * 2 + (i & 1)
+            var d = out_nt * 8 + thread * 2 + (i & 1)
             if qr < S:
                 var denom = l0 if i < 2 else l1
                 o[(qr * H + head) * _HEAD_DIM + d] = rebind[o.element_type](
@@ -1280,6 +1561,14 @@ def _sage_enqueue_forward(
     H: Int,
     scale: Float32,
     ctx: DeviceContext,
+    ultravico_video_start: Int = -1,
+    ultravico_rows_per_frame: Int = 0,
+    ultravico_window_frames: Int = 0,
+    ultravico_repeat_period_frames: Int = 0,
+    ultravico_repeat_radius_frames: Int = 0,
+    ultravico_alpha: Float32 = 1.0,
+    ultravico_beta: Float32 = 1.0,
+    ultravico_split_output: Bool = False,
 ) raises:
     """The single kernel sequence both entry points share: K mean, per-thread
     Q/K quantization, then the INT8-QK/BF16-PV attention kernel reading V
@@ -1299,11 +1588,63 @@ def _sage_enqueue_forward(
         grid_dim=(ceildiv(S, _K_QUANT_BLOCK), H),
         block_dim=_K_SCALES_PER_BLOCK * 32,
     )
-    ctx.enqueue_function[_sage_attention_int8_token_kernel](
-        Q8, K8, QS, KS, V, O, Int32(S), Int32(H), scale,
-        grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
-        block_dim=_WARPS * 32,
+    var ultravico_window_rows = (
+        ultravico_window_frames * ultravico_rows_per_frame
     )
+    var ultravico_repeat_period_rows = (
+        ultravico_repeat_period_frames * ultravico_rows_per_frame
+    )
+    var ultravico_repeat_radius_rows = (
+        ultravico_repeat_radius_frames * ultravico_rows_per_frame
+    )
+    var ultravico_repeat_period_inv = Float32(0.0)
+    if ultravico_repeat_period_rows > 0:
+        ultravico_repeat_period_inv = (
+            Float32(1.0) / Float32(ultravico_repeat_period_rows)
+        )
+    if ultravico_video_start < 0:
+        ctx.enqueue_function[_sage_attention_int8_token_kernel[False, -1]](
+            Q8, K8, QS, KS, V, O, Int32(S), Int32(H), scale,
+            Int32(-1), Int32(0), Int32(0), Int32(0), Float32(0.0),
+            Float32(1.0), Float32(1.0),
+            grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
+            block_dim=_WARPS * 32,
+        )
+    elif ultravico_split_output:
+        ctx.enqueue_function[_sage_attention_int8_token_kernel[True, 0]](
+            Q8, K8, QS, KS, V, O, Int32(S), Int32(H), scale,
+            Int32(ultravico_video_start), Int32(ultravico_window_rows),
+            Int32(ultravico_repeat_period_rows),
+            Int32(ultravico_repeat_radius_rows),
+            ultravico_repeat_period_inv,
+            ultravico_alpha, ultravico_beta,
+            grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
+            block_dim=_WARPS * 32,
+        )
+        ctx.enqueue_function[_sage_attention_int8_token_kernel[True, 1]](
+            Q8, K8, QS, KS, V, O, Int32(S), Int32(H), scale,
+            Int32(ultravico_video_start), Int32(ultravico_window_rows),
+            Int32(ultravico_repeat_period_rows),
+            Int32(ultravico_repeat_radius_rows),
+            ultravico_repeat_period_inv,
+            ultravico_alpha, ultravico_beta,
+            grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
+            block_dim=_WARPS * 32,
+        )
+    else:
+        # The full-output specialization is the default. The exact split
+        # variant remains available only for controlled mechanics gates; the
+        # real-geometry Nsight A/B rejected it as slower.
+        ctx.enqueue_function[_sage_attention_int8_token_kernel[True, -1]](
+            Q8, K8, QS, KS, V, O, Int32(S), Int32(H), scale,
+            Int32(ultravico_video_start), Int32(ultravico_window_rows),
+            Int32(ultravico_repeat_period_rows),
+            Int32(ultravico_repeat_radius_rows),
+            ultravico_repeat_period_inv,
+            ultravico_alpha, ultravico_beta,
+            grid_dim=(ceildiv(S, _WARPS * _Q_TILE), H),
+            block_dim=_WARPS * 32,
+        )
 
 
 def sage_attention_int8_fwd_dynamic(
@@ -1312,6 +1653,14 @@ def sage_attention_int8_fwd_dynamic(
     v: Tensor,
     scale: Float32,
     ctx: DeviceContext,
+    ultravico_video_start: Int = -1,
+    ultravico_rows_per_frame: Int = 0,
+    ultravico_window_frames: Int = 0,
+    ultravico_repeat_period_frames: Int = 0,
+    ultravico_repeat_radius_frames: Int = 0,
+    ultravico_alpha: Float32 = 1.0,
+    ultravico_beta: Float32 = 1.0,
+    ultravico_split_output: Bool = False,
 ) raises -> Tensor:
     """Opt-in no-mask, non-causal BF16 attention for H3 geometry.
 
@@ -1427,7 +1776,11 @@ def sage_attention_int8_fwd_dynamic(
         runtime_layout=src_rl,
     )
     _sage_enqueue_forward(
-        Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx
+        Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx,
+        ultravico_video_start, ultravico_rows_per_frame,
+        ultravico_window_frames, ultravico_repeat_period_frames,
+        ultravico_repeat_radius_frames, ultravico_alpha, ultravico_beta,
+        ultravico_split_output,
     )
     return Tensor(out_buf^, want^, STDtype.BF16)
 
@@ -1662,6 +2015,14 @@ def sage_attention_int8_fwd_scratch(
     scale: Float32,
     scratch: SageInt8Scratch,
     ctx: DeviceContext,
+    ultravico_video_start: Int = -1,
+    ultravico_rows_per_frame: Int = 0,
+    ultravico_window_frames: Int = 0,
+    ultravico_repeat_period_frames: Int = 0,
+    ultravico_repeat_radius_frames: Int = 0,
+    ultravico_alpha: Float32 = 1.0,
+    ultravico_beta: Float32 = 1.0,
+    ultravico_split_output: Bool = False,
 ) raises -> Tensor:
     """Sage forward through preallocated scratch: zero device allocations.
 
@@ -1772,7 +2133,11 @@ def sage_attention_int8_fwd_scratch(
         runtime_layout=src_rl,
     )
     _sage_enqueue_forward(
-        Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx
+        Q, K, V, Q8u, K8u, Q8, K8, QS, KS, KM, O, S, H, scale, ctx,
+        ultravico_video_start, ultravico_rows_per_frame,
+        ultravico_window_frames, ultravico_repeat_period_frames,
+        ultravico_repeat_radius_frames, ultravico_alpha, ultravico_beta,
+        ultravico_split_output,
     )
     var out_view = DeviceBuffer[DType.uint8](
         ctx, scratch.out[].buf.unsafe_ptr(), elems * 2, owning=False

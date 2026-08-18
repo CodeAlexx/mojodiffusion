@@ -33,6 +33,10 @@ task_gid="$(id -g)"
 task_dir="$PWD"
 unit_name="serenity-memory-$(date +%Y%m%d-%H%M%S)-$$"
 auth_mode="${MEM_SAFE_SYSTEM_AUTH:-cached-sudo}"
+extra_env=()
+[[ -n "${CONDA_PREFIX:-}" ]] && extra_env+=(--setenv="CONDA_PREFIX=$CONDA_PREFIX")
+[[ -n "${MODULAR_HOME:-}" ]] && extra_env+=(--setenv="MODULAR_HOME=$MODULAR_HOME")
+[[ -n "${LD_LIBRARY_PATH:-}" ]] && extra_env+=(--setenv="LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
 
 if (( EUID == 0 )); then
   systemd_runner=(systemd-run)
@@ -57,4 +61,5 @@ exec "${systemd_runner[@]}" \
   --property="MemorySwapMax=$SWAP_MAX" \
   --property=OOMPolicy=kill \
   --setenv="PATH=$PATH" \
+  "${extra_env[@]}" \
   -- "$prog_path" "$@"

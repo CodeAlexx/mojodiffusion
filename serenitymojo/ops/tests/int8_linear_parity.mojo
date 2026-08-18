@@ -3,12 +3,15 @@
 #   bwd:  dX  = grad @ W      (cosine vs bf16 matmul, contract N)
 # Weight is tensorwise-quantized (== reference trainer) and transposed for the backward.
 #
-# Build (cshim + libm):
-#   pixi run mojo build --optimization-level 2 --target-accelerator sm_120 -I . \
-#     -I /home/alex/MOJO-libs -Xlinker -lm \
-#     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa \
-#     -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib \
-#     serenitymojo/ops/tests/int8_linear_parity.mojo -o /tmp/int8_linear_parity
+# Build (rootless, bounded, cshim + libm):
+#   MEM_MAX=8G scripts/mem_safe_runtime.sh pixi run mojo build \
+#     --optimization-level 2 --disable-warnings -j 1 -I . -I vendor/mojo-libs \
+#     -Xlinker=-L/home/alex/mojodiffusion/.pixi/envs/default/lib \
+#     -Xlinker=-lm -Xlinker=-lcuda -Xlinker=-lcublas \
+#     -Xlinker=-Lserenitymojo/ops/cshim/lib \
+#     -Xlinker=-lserenity_cudnn_sdpa \
+#     serenitymojo/ops/tests/int8_linear_parity.mojo \
+#     -o output/checks/int8_linear_unaligned_gate/int8_linear_parity
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from max.gpu.host import DeviceContext
@@ -139,4 +142,43 @@ def main() raises:
     print("W8A8 f32 bands max|nn - nt| =", max_diff_b)
     if max_diff_b != 0.0:
         print("FAIL: bwd_nt_f32_bands != bwd_nn_f32_bands (expected bit-identical)"); return
+
+    # H3 packed sequence lengths include variable caption rows, so M is not
+    # generally GEMM-aligned. Exercise only the two shared wrappers used by the
+    # resident H3 training path with a deliberately unaligned row count. The
+    # other variants above keep their established aligned coverage.
+    comptime MU = 65
+    var xuh = _gaussian(MU * K, 13, 1.0)
+    var guh = _gaussian(MU * N, 15, 1.0)
+    var xu = Tensor.from_host(xuh.copy(), [MU, K], STDtype.BF16, ctx)
+    var gu = Tensor.from_host(guh.copy(), [MU, N], STDtype.BF16, ctx)
+    var xu_h = xu.to_host(ctx)
+    var gu_h = gu.to_host(ctx)
+    var out_u = int8_linear_fwd(xu, w_8, w_scale, ctx)
+    var dx_u = int8_linear_bwd(gu, w_8t, w_scale, ctx)
+    if out_u.shape()[0] != MU or out_u.shape()[1] != N:
+        raise Error("W8A8 padded forward returned the wrong shape")
+    if dx_u.shape()[0] != MU or dx_u.shape()[1] != K:
+        raise Error("W8A8 padded backward returned the wrong shape")
+    var out_u_h = out_u.to_host(ctx)
+    var dx_u_h = dx_u.to_host(ctx)
+    var ref_fu = List[Float32]()
+    for m in range(MU):
+        for n in range(N):
+            var acc: Float32 = 0.0
+            for k in range(K):
+                acc += xu_h[m * K + k] * w_h[n * K + k]
+            ref_fu.append(acc)
+    var ref_bu = List[Float32]()
+    for m in range(MU):
+        for k in range(K):
+            var acc: Float32 = 0.0
+            for n in range(N):
+                acc += gu_h[m * N + n] * w_h[n * K + k]
+            ref_bu.append(acc)
+    var cos_fu = _cos(out_u_h, ref_fu)
+    var cos_bu = _cos(dx_u_h, ref_bu)
+    print("W8A8 unaligned M=65 fwd cosine =", cos_fu, "  bwd cosine =", cos_bu)
+    if cos_fu < 0.99 or cos_bu < 0.99:
+        print("FAIL: unaligned W8A8 padding cosine"); return
     print("PASS: int8 W8A8 fwd+bwd+bwd_nn+nt_f32(+bands) (tensorwise weight) match bf16 (cos>=0.99); nt==nn bit-identical")

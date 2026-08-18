@@ -62,6 +62,30 @@ struct NamedLora(Copyable, Movable):
     var adapter: LoraAdapter
 
 
+# A host-F32 source adapter for trainers whose exact masters do not already
+# live in LoraAdapter host lists. The external artifact is still canonical BF16
+# PEFT; this representation only avoids staging a second full adapter set in
+# device memory at save cadence.
+struct F32NamedLora(Copyable, Movable):
+    var prefix: String
+    var a: List[Float32]
+    var b: List[Float32]
+    var rank: Int
+    var in_f: Int
+    var out_f: Int
+
+    def __init__(
+        out self, var prefix: String, var a: List[Float32], var b: List[Float32],
+        rank: Int, in_f: Int, out_f: Int,
+    ):
+        self.prefix = prefix^
+        self.a = a^
+        self.b = b^
+        self.rank = rank
+        self.in_f = in_f
+        self.out_f = out_f
+
+
 # ── F32-EXACT trainer state for one adapter (resume-critical payload) ─────────
 # The driver (train_ltx2_av.mojo) keeps its LoRA masters in F32 (struct F32Lora)
 # because a per-step bf16 write-back absorbs 30-57% of the A-updates (MJ-1108).
@@ -212,6 +236,49 @@ def save_lora_peft(
         tensors.append(ArcPointer(_bf16_2d(a.b.copy(), a.out_f, a.rank, ctx)))
 
     save_safetensors(names, tensors, path, ctx)
+    return len(adapters)
+
+
+def save_lora_peft_host_f32(
+    adapters: List[F32NamedLora], path: String,
+) raises -> Int:
+    """Write host-F32 A/B sources as the same BF16 PEFT artifact emitted by
+    `save_lora_peft`, without allocating output tensors on the GPU.
+
+    This is for device-master trainers that download their exact F32 masters at
+    save cadence. It emits only canonical `<prefix>.lora_A.weight` and
+    `<prefix>.lora_B.weight` tensors; F32 masters and optimizer state belong in
+    a separate resume sidecar."""
+    if len(adapters) == 0:
+        raise Error("save_lora_peft_host_f32: refusing to write an empty LoRA file")
+
+    var names = List[String]()
+    var descs = List[HostTensorDesc]()
+    for ref nl in adapters:
+        if len(nl.a) != nl.rank * nl.in_f:
+            raise Error(
+                String("save_lora_peft_host_f32: A numel ") + String(len(nl.a))
+                + " != rank*in " + String(nl.rank * nl.in_f)
+                + " for '" + nl.prefix + "'"
+            )
+        if len(nl.b) != nl.out_f * nl.rank:
+            raise Error(
+                String("save_lora_peft_host_f32: B numel ") + String(len(nl.b))
+                + " != out*rank " + String(nl.out_f * nl.rank)
+                + " for '" + nl.prefix + "'"
+            )
+        names.append(nl.prefix + ".lora_A.weight")
+        descs.append(HostTensorDesc(
+            STDtype.BF16, _shape2(nl.rank, nl.in_f),
+            _bf16_le_bytes_from_f32(nl.a),
+        ))
+        names.append(nl.prefix + ".lora_B.weight")
+        descs.append(HostTensorDesc(
+            STDtype.BF16, _shape2(nl.out_f, nl.rank),
+            _bf16_le_bytes_from_f32(nl.b),
+        ))
+
+    save_safetensors_host(names, descs, path)
     return len(adapters)
 
 

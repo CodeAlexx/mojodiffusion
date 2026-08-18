@@ -1123,6 +1123,64 @@ profiles, the 1.2886-second kernel-family reduction is the attribution result;
 the larger wall delta is an observed end-to-end result, not a stable attention
 speed claim.
 
+### MiniMax-H3 60-second quality A/B (2026-08-17/18)
+
+The controlled quality test used one monolithic packed trajectory at 512x384
+native geometry (center-cropped to 512x380 delivery), 1,450 internal frames,
+six clean 512x384 semantic-RoPE anchors, seed 271828, ten scheduler points
+(nine evaluations), exact step cache, and the groupwise Quality weight store.
+The only A/B variable was `sage-int8` versus `sage-int8-ultravico`; neither arm
+used RIFLEx. Both runs completed with zero non-finite video/audio values, no
+cgroup OOM/OOM-kill, and produced exact 60.000-second, 1,440-frame, 24-FPS
+H.264/AAC-stereo artifacts. A `freezedetect=n=-50dB:d=0.5` scan reported no
+event in either output.
+
+Plain Sage completed 2,263.1799 seconds of denoise in 43:12.98 wall including
+conditioning and a first-use ten-point modcache build. UltraViCo completed
+3,999.7682 seconds of denoise in 1:09:17 wall with cache hits, making its
+denoise 1.7673x slower. Its final trajectory was materially different rather
+than a no-op: plain-versus-UltraViCo cosine was 0.86214134 for video rows and
+0.86029606 for audio rows. Decoded inspection nevertheless rejected UltraViCo
+for this story. Both arms landed the six authored anchor scenes, while their
+between-anchor chronology still failed beyond H3's trained 15-second range:
+plain Sage retained the duel at 45 seconds but returned to the child/water
+scene at 55 seconds; UltraViCo introduced the crown early at 45 seconds and
+also returned to child/water at 55 seconds before recovering the final anchor.
+
+The quality conclusion is therefore precision-specific: groupwise Quality is
+the clear visual improvement over the earlier W8A8 proof, while UltraViCo is
+not accepted as the long-context policy for this workload. Existing same-seed
+short product evidence also records W8A8-versus-groupwise final video-latent
+cosine 0.93862942 and BF16-versus-groupwise 0.97470209. Evidence lives in
+`output/checks/h3_quality_ab_10pt_groupwise_sage_20260817/`,
+`output/checks/h3_quality_ab_10pt_groupwise_ultravico_20260817/`, and the
+synchronized comparison
+`output/checks/h3_quality_ab_10pt_groupwise_sage_vs_ultravico_20260817.mp4`.
+
+The follow-on controlled arm used the same native/delivery geometry, seed, six
+clean anchors, exact step cache, and one monolithic trajectory, but switched to
+streamed BF16 DiT weights, exact cU-DNN attention, RIFLEx k=10, and 20 scheduler
+points (19 evaluations). All evaluations remained finite; the 24-GiB memory
+cap held; and the fresh decode produced exactly 60.000 seconds, 1,440 frames,
+24 FPS, and stereo audio. The denoise took 8,606.7900 seconds across the
+one-evaluation gate and checkpoint resume, about 1.91x the matching W8A8 exact
+cU-DNN + RIFLEx run. The final BF16-versus-W8A8 latent cosine was 0.96074450
+for video and 0.95759520 for audio, so the precision change was material.
+
+Decoded review found crisper individual frames and stable character identity,
+but it did not accept BF16/RIFLEx as a long-context solution. The crown appeared
+early around 30 seconds, the duel landed around 36 seconds, the child/water
+scene returned around 55 seconds, and the final crown recovered around 59
+seconds. FFmpeg freeze detection found a 0.50-second event from 55.75 to 56.25
+seconds. Raising precision therefore improved rendering but did not repair the
+60-second story order or recurrence failure. Further precision or resolution
+alone is not the next quality gate; the next experiment must add explicit
+temporal conditioning or time-gated semantic-anchor attention while retaining
+the required single monolithic denoise. The BF16 artifact and controlled
+comparison are in
+`output/checks/h3_quality_bf16_cudnn_riflex_gate1_20260817/` and
+`output/checks/h3_quality_ab_20pt_w8a8_vs_bf16_cudnn_riflex_20260818.mp4`.
+
 ## LTX-2.5 Gemma-4 conditioning and experimental inference (2026-08-12)
 
 - `models/text_encoder/gemma4_ltx_streamed.mojo` implements the Gemma-4-12B
@@ -1170,7 +1228,11 @@ speed claim.
   rootless transient user service with a hard host-memory/swap ceiling, desktop
   reserve admission, OOM grouping, and final `memory.peak`/`memory.events`
   evidence. It is the runtime counterpart to `scripts/mem_safe.sh`, not a
-  model offload mechanism.
+  model offload mechanism. MiniMax-H3 training requires the launcher's explicit
+  `H3_ALLOW_USER_SLICE=1` admission; that makes the transient child a managed
+  pressure-kill target while retaining the rootless hard cap and desktop
+  reserve check. `scripts/run_minimax_h3_training_probe.sh` supplies this opt-in
+  and does not require `sudo`.
 
 ## Shared model and encoder warm loading (2026-08-12)
 
@@ -1253,8 +1315,9 @@ Operating guide (recipes, gotchas, avoid-list, learnings ledger) for this whole
 surface: `docs/MOJO_TRAINING_FREE_EDITING.md`.
 
 | `models/minimax_h3/h3_block_train.mojo` + `h3_stack_train.mojo` + `h3_final_train.mojo` (2026-08-14/15) | H3 TRAINING twins: block fwd+bwd with LoRA (raw layout, indexed AdaLN, partial rope, qk rms), 50-block recompute stack with d_x handoff (bf16-streamed + fp8-resident arms, frozen-base backward), final-layer fwd + frozen d_hidden. | **GPU-GATED** (torch autograd on real weights: block+LoRA 21/21, 2-block chain 9/9, final cos 1.0, 50-block smoke) |
-| `models/minimax_h3/h3_train_block_store.mojo` + `h3_train_block_store_fp8.mojo` + `h3_train_modgrid.mojo` (2026-08-15) | Trainer weight residency: mmap→pinned-staging→slab streamer; hybrid fp8 E4M3+per-row-scale resident base (42/50 default) with per-stage dequant; 1000-node exact AdaLN grid as build-once host sidecar. | **GPU-GATED** (smoke + same-seed loss A/B 0.1-0.5%; 46-resident OOMs 24GB) |
+| `models/minimax_h3/h3_train_block_store.mojo` + `h3_train_block_store_int8.mojo` + `h3_train_modgrid.mojo` (2026-08-15/18) | Trainer weight residency: mmap→bounded staging; direct tensorwise-W8A8 frozen base for 42/50 resident blocks with eight BF16 streamed tails; 1000-node exact AdaLN grid as a build-once host sidecar. | **GPU-GATED** (fresh 200-step run, no OOM; direct-W8A8 first-sample loss is 2.22% below streamed BF16, so it is a measured fast trajectory, not exact BF16 parity) |
 | `models/minimax_h3/h3_train_cache.mojo` + `h3_train_sigma.mojo` (2026-08-14) | torchref-native mmh3 cache reader (latents/audio/masks/keyframes/TE + task ids) and the training sigma policy (per-modality shift, bf16-rounded noising, token-balance loss, d_pred seed). | **GPU-GATED** (reader 36/36 bit-exact vs upstream-writer fixture; x_t/targets BIT-exact, loss 1e-7, grad cos 1.0) |
-| `models/minimax_h3/h3_lora_overlay.mojo` (2026-08-15) | Inference LoRA overlay: parses trainer lora_unet_* saves, W' = W + mult·(α/r)·(up@down) in VRAM at block load (raw layout, pre-transform); runtime `--lora=`/`--lora-mult=`; never fused into saved files. | **GPU-GATED** (200 adapters, overlay add exact on real block-0 within bf16 rounding) |
-| `training/train_minimax_h3.mojo` (2026-08-15) | H3 LoRA trainer entry (image-mode maiden arm): official torchref recipe (dim/α 16, AdamW 1e-4, batch 1), save/resume, fused AdamW on F32 masters, cuDNN flash train attention. 11.5s/step on 24GB. | **LIVE** (maiden eri run; fixture + real-data sanity + resume PASS) |
+| `models/minimax_h3/h3_lora_overlay.mojo` + `h3_lora_format.mojo` + `h3_qkv_layout.mojo` (2026-08-15/18) | Canonical PEFT inference overlay with legacy-load compatibility. QKV/FC1 runtime transforms apply to LoRA-B rows, and resident INT8 bases receive activation-time deltas rather than destructive requantized merges; runtime `--lora=`/`--lora-mult=`. | **GPU-GATED** (canonical A/B roundtrip exact; 200 adapters loaded; matched real H3 eval changes 107,519/107,520 video-latent elements and all audio-latent elements) |
+| `training/train_minimax_h3.mojo` (2026-08-15/18) | H3 LoRA trainer entry: dim/alpha 16, AdamW 1e-4, batch 1, canonical PEFT save, full F32 master/moment resume, cuDNN flash train attention, direct-W8A8 42/50 base. Rootless launcher is hard-capped and O2/-j1 builds avoid compiler SIGKILL. | **LIVE** (fresh 200 steps: 10.00s median, first/last-20 loss 0.367875/0.216782, zero nonfinite; all 200 A/B tensors finite and fully nonzero; resume step 200→201 PASS; this is not a 200-step convergence claim) |
+| `ops/int8_linear.mojo` + `ops/tests/int8_linear_parity.mojo` (2026-08-18) | Shared tensorwise W8A8 wrapper pads runtime activation rows to the next multiple of four for the cuBLAS INT8 contract, then returns the original shape. This covers variable H3 caption lengths without padding the model sequence itself. | **GPU-GATED** (unaligned M=65 forward/backward cosine 0.999931/0.999934; former real failure M=737 passes through 200 steps) |
 | `ops/attention_backward.mojo` `sdpa_backward_rect_dynamic` + `ops/attention_flash.mojo` train `_dynamic` twins (2026-08-15) | Runtime-dim SDPA train backward (math) and cuDNN flash train fwd/bwd — per-item sequence lengths without padding. | **GPU-GATED** (math twin BIT-identical to comptime at S=384; flash arm same-seed loss to 4 decimals + gates re-run green) |

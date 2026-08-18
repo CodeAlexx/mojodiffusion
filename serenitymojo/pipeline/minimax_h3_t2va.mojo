@@ -279,7 +279,6 @@ from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
 from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
-    minimax_h3_load_block_device_lora,
     minimax_h3_load_qkv_device,
     minimax_h3_load_fc1_device,
 )
@@ -355,6 +354,7 @@ from serenitymojo.models.minimax_h3.audio_decoder import (
     minimax_h3_audio_decode,
 )
 from serenitymojo.models.minimax_h3_device.audio_decoder_device import (
+    MiniMaxH3AudioDeviceWeights,
     minimax_h3_audio_device_weights,
     minimax_h3_audio_decode_device,
 )
@@ -493,7 +493,7 @@ comptime FRAMES = get_defined_int["H3_FRAMES", 22]()
 comptime TEXT_TOKENS = get_defined_int["H3_TEXT_TOKENS", 32]()
 comptime FPS = 24
 comptime MINIMAX_H3_TRAINED_MAX_FRAMES = 362
-comptime MINIMAX_H3_SINGLE_PASS_MAX_FRAMES = 1450
+comptime MINIMAX_H3_SINGLE_PASS_MAX_FRAMES = 4323
 # Direct-CLI guard. The server uses a slightly lower 107k estimate so real
 # prompt rows retain headroom beneath this measured maximum-shape envelope.
 comptime MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE = 109303
@@ -1003,9 +1003,29 @@ def _minimax_h3_decode_video(
         var last_h = 0
         var last_w = 0
         while stream.has_next():
-            var part = stream.next_part[
-                LATENT_TILE, LATENT_TILE, 32, 64, 5, VAE_TOKENS_PER_CLIP
-            ](decoder, ctx)
+            # The released 256 px spatial tile becomes 16 latent cells only
+            # on axes larger than 256 px.  At this proof's 320x192 geometry,
+            # H is a single 192 px / 12-latent-cell tile while W is split into
+            # 256 px / 16-cell tiles.  Keep the normal product specialization
+            # unchanged and select the exact rectangular specialization only
+            # for this admitted long-generation geometry.
+            var part: Optional[Tensor]
+            if latent_h == 12 and latent_w == 20:
+                part = stream.next_part[
+                    12, 16, 32, 64, 5, VAE_TOKENS_PER_CLIP
+                ](decoder, ctx)
+            elif latent_h == 14 and latent_w == 20:
+                # 320x224 is the smallest landscape canvas which keeps the
+                # Qwen vision preprocessor on its identity path.  H is one
+                # 14-cell tile while W retains the released 16-cell tile.
+                part = stream.next_part[
+                    14, 16, 32, 64, 5, VAE_TOKENS_PER_CLIP
+                ](decoder, ctx)
+            else:
+                part = stream.next_part[
+                    LATENT_TILE, LATENT_TILE, 32, 64, 5,
+                    VAE_TOKENS_PER_CLIP,
+                ](decoder, ctx)
             if part:
                 var rgb_part = minimax_h3_video_pixel_denormalize(
                     part.value(), norm, ctx
@@ -1290,6 +1310,82 @@ def _minimax_h3_denormalize_audio_channel(
     return out^
 
 
+def _minimax_h3_decode_audio_channel_windowed(
+    ref dev_weights: MiniMaxH3AudioDeviceWeights,
+    config: MiniMaxH3AudioDecoderConfig,
+    latents: List[Float32],
+    num_latents: Int,
+    channel_name: String,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    """Decode one continuous channel with exact-position halo windows.
+
+    BigVGAN is fully convolutional, but a 180-second monolithic activation
+    volume exceeds 24 GiB.  Each 30-second core is decoded with 64 latent
+    samples (1.6 seconds) of real neighboring context on both sides; only the
+    center samples belonging to that core are retained.  This is not a second
+    generation or an audio stitch: every retained sample has its original
+    global position and a halo wider than the decoder's convolutional
+    receptive radius.  Global ends retain the model's native padding.
+    """
+    comptime CORE_LATENTS = 1200
+    comptime HALO_LATENTS = 64
+
+    if len(latents) != config.latent_channels * num_latents:
+        raise Error("MiniMax-H3 windowed audio latent shape mismatch")
+
+    var samples_per_latent = 1
+    for i in range(len(config.decoder_rates)):
+        samples_per_latent *= config.decoder_rates[i]
+    var expected_samples = num_latents * samples_per_latent
+    var out = List[Float32](capacity=expected_samples)
+    var core_start = 0
+    var window_index = 0
+    while core_start < num_latents:
+        var core_end = core_start + CORE_LATENTS
+        if core_end > num_latents:
+            core_end = num_latents
+        var input_start = core_start - HALO_LATENTS
+        if input_start < 0:
+            input_start = 0
+        var input_end = core_end + HALO_LATENTS
+        if input_end > num_latents:
+            input_end = num_latents
+        var input_len = input_end - input_start
+
+        var window = List[Float32](
+            capacity=config.latent_channels * input_len
+        )
+        for c in range(config.latent_channels):
+            for t in range(input_start, input_end):
+                window.append(latents[c * num_latents + t])
+
+        var decoded = minimax_h3_audio_decode_device(
+            dev_weights, config, window, input_len, ctx
+        )
+        var keep_start = (core_start - input_start) * samples_per_latent
+        var keep_len = (core_end - core_start) * samples_per_latent
+        if keep_start < 0 or keep_start + keep_len > len(decoded):
+            raise Error("MiniMax-H3 windowed audio crop exceeds decode output")
+        for i in range(keep_len):
+            out.append(decoded[keep_start + i])
+
+        window_index += 1
+        print(
+            "  audio", channel_name, "window", window_index,
+            "core_latents", core_start, "..", core_end,
+            "input_latents", input_start, "..", input_end,
+        )
+        core_start = core_end
+
+    if len(out) != expected_samples:
+        raise Error(
+            String("MiniMax-H3 windowed audio wrote ") + String(len(out))
+            + " samples; expected " + String(expected_samples)
+        )
+    return out^
+
+
 def _minimax_h3_decode_audio(
     audio_state: Tensor,  # [NUM_AUDIO_ROWS, audio_latents_dim] F32, row space
     num_audio_latents: Int,
@@ -1297,8 +1393,8 @@ def _minimax_h3_decode_audio(
     out_dir: String,
     ctx: DeviceContext,
 ) raises -> Int:
-    """Unpack -> denormalize -> host BigVGAN decode x2 (stereo, independent
-    per channel per the vendor's own convention) -> interleave -> WAV.
+    """Unpack -> denormalize -> device BigVGAN decode x2 (stereo, independent
+    per channel per the vendor's own convention) -> channel-major WAV.
     Returns the waveform length in samples (for the result JSON)."""
     var rows_host = audio_state.to_host(ctx)  # [Na*C] row-major: row*C+c
     var latents_2ct = minimax_h3_unpack_audio(rows_host, num_audio_latents, audio_channels)
@@ -1327,8 +1423,12 @@ def _minimax_h3_decode_audio(
     # Device BigVGAN (gate: models/minimax_h3_device/parity/, 11/11 vs host
     # oracle, e2e waveform cos 0.999999999994677 / max_abs 5.7e-6).
     var dev_weights = minimax_h3_audio_device_weights(weights, dec_cfg, ctx)
-    var wave_l = minimax_h3_audio_decode_device(dev_weights, dec_cfg, ch0, num_audio_latents, ctx)
-    var wave_r = minimax_h3_audio_decode_device(dev_weights, dec_cfg, ch1, num_audio_latents, ctx)
+    var wave_l = _minimax_h3_decode_audio_channel_windowed(
+        dev_weights, dec_cfg, ch0, num_audio_latents, String("L"), ctx
+    )
+    var wave_r = _minimax_h3_decode_audio_channel_windowed(
+        dev_weights, dec_cfg, ch1, num_audio_latents, String("R"), ctx
+    )
     if len(wave_l) != len(wave_r):
         raise Error("minimax_h3_t2va: L/R waveform length mismatch")
 
@@ -1704,24 +1804,13 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
                         tail, layer, config, ctx
                     )
                 else:
-                    if lora_overlay:
-                        block_w = minimax_h3_load_block_device_lora(
-                            transformer_shards, layer, config,
-                            lora_overlay.value(), ctx,
-                        )
-                    else:
-                        block_w = minimax_h3_load_block_device(
-                            transformer_shards, layer, config, ctx
-                        )
+                    block_w = minimax_h3_load_block_device(
+                        transformer_shards, layer, config, ctx
+                    )
         else:
-            if lora_overlay:
-                block_w = minimax_h3_load_block_device_lora(
-                    transformer_shards, layer, config, lora_overlay.value(), ctx,
-                )
-            else:
-                block_w = minimax_h3_load_block_device(
-                    transformer_shards, layer, config, ctx
-                )
+            block_w = minimax_h3_load_block_device(
+                transformer_shards, layer, config, ctx
+            )
         hidden3 = minimax_h3_block_forward_dynamic[
             H3_HEADS, H3_HEAD_DIM
         ](
@@ -1737,6 +1826,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             ctx,
             attention_backend,
             sage_scratch,
+            lora_overlay=lora_overlay,
         )
         # The block's last-use temporaries are stream-ordered but large enough
         # at S>=60k that carrying them into the next streamed weight load can
@@ -1843,6 +1933,7 @@ def _job_main(raw_args: List[String]) raises:
     var motion_context_path = String("")
     var motion_context_frames = 22
     var trim_start_frames = 0
+    var temporal_rope_scale = Float32(1.0)
     for i in range(len(raw_args)):
         var arg = String(raw_args[i])
         if arg.startswith("--width="):
@@ -1997,6 +2088,12 @@ def _job_main(raw_args: List[String]) raises:
                 raise Error("invalid --trim-start-frames flag")
             trim_start_frames = atol(String(fields[1]))
             continue
+        if arg.startswith("--temporal-rope-scale="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --temporal-rope-scale flag")
+            temporal_rope_scale = _h3_parse_f32(String(fields[1]))
+            continue
         args.append(arg)
     var motion_context_enabled = motion_context_path != String("")
     if motion_context_enabled:
@@ -2046,6 +2143,7 @@ def _job_main(raw_args: List[String]) raises:
             " [--motion-context=PATH]"
             " [--motion-context-frames=5|22|39]"
             " [--trim-start-frames=N]"
+            " [--temporal-rope-scale=F]"
             " [--defer-video-decode]"
         )
         print(
@@ -2066,6 +2164,14 @@ def _job_main(raw_args: List[String]) raises:
     var max_blocks = 50
     if len(args) >= 6:
         max_blocks = atol(String(args[5]))
+    var decode_only_request = (
+        len(args) >= 7
+        and (
+            String(args[6]) == "decode_only"
+            or String(args[6]) == "decode_audio_only"
+            or String(args[6]) == "decode_video_only"
+        )
+    )
 
     # Resolve exact text geometry before creating a DeviceContext or running
     # the 50-layer encoder. Unlike padding to a fixed DiT budget, using the
@@ -2090,6 +2196,9 @@ def _job_main(raw_args: List[String]) raises:
         raise Error("MiniMax-H3 output frames must be positive")
     if output_fps < 1 or output_fps > 120:
         raise Error("MiniMax-H3 output FPS must be in [1,120]")
+    if temporal_rope_scale <= Float32(0.0) \
+            or temporal_rope_scale > Float32(1.0):
+        raise Error("MiniMax-H3 temporal RoPE scale must be in (0,1]")
     if motion_context_enabled:
         if runtime_fps != MINIMAX_H3_MOTION_CONTEXT_FPS:
             raise Error("MiniMax-H3 motion context requires native 24 FPS")
@@ -2144,7 +2253,7 @@ def _job_main(raw_args: List[String]) raises:
     if runtime_frames < 5 or runtime_frames > MINIMAX_H3_SINGLE_PASS_MAX_FRAMES \
             or runtime_frames % 17 != 5:
         raise Error(
-            "MiniMax-H3 internal frames must be in [5, 1450] and satisfy"
+            "MiniMax-H3 internal frames must be in [5, 4323] and satisfy"
             " frames % 17 == 5"
         )
     if (
@@ -2156,7 +2265,11 @@ def _job_main(raw_args: List[String]) raises:
             "MiniMax-H3 internal frames do not cover the requested output"
             " after motion-context trimming"
         )
-    if runtime_frames > MINIMAX_H3_TRAINED_MAX_FRAMES \
+    # Decode-only loads already-denoised row-space latents and never allocates
+    # the packed DiT sequence.  The long-context envelope protects denoising,
+    # not the spatially tiled video VAE or windowed audio VAE.
+    if not decode_only_request \
+            and runtime_frames > MINIMAX_H3_TRAINED_MAX_FRAMES \
             and sequence_length > MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE:
         raise Error(
             String("MiniMax-H3 experimental single-pass long context S=")
@@ -2194,12 +2307,14 @@ def _job_main(raw_args: List[String]) raises:
         if mkdir_rc != 0:
             raise Error("MiniMax-H3 could not create the runtime cache directory")
 
-    # ── DECODE-ONLY MODE: argv[6] == "decode_only" reuses a prior run's saved
-    # latents (out_dir/latents.safetensors) and runs ONLY the decode tail —
-    # a decode-layer fix costs ~2 minutes instead of a 30-minute denoise.
-    if len(args) >= 7 and String(args[6]) == "decode_only":
+    # ── DECODE-ONLY MODES reuse a prior run's saved row-space latents.
+    # The split modes are load-bearing for unusually long generations: the
+    # audio BigVGAN and video VAE must not share one 24 GiB CUDA process when
+    # either decoder alone approaches the card's allocation ceiling.
+    if decode_only_request:
+        var decode_mode = String(args[6])
         var ctx2 = DeviceContext()
-        print("  DECODE-ONLY: loading", out_dir + "/latents.safetensors")
+        print(" ", decode_mode, ": loading", out_dir + "/latents.safetensors")
         var lat_st = SafeTensors.open(out_dir + "/latents.safetensors")
         var vinfo = lat_st.tensor_info("video_state_rows")
         var video_rows = Tensor.from_view(
@@ -2213,13 +2328,28 @@ def _job_main(raw_args: List[String]) raises:
         _assert_finite_rows("video_state_rows", video_rows, ctx2)
         _assert_finite_rows("audio_state_rows", audio_rows, ctx2)
         var config2 = minimax_h3_released_config()
-        _ = _minimax_h3_decode_audio(
-            audio_rows, num_audio_latents, config2.audio_latents_dim, out_dir, ctx2
-        )
-        var nframes = _minimax_h3_decode_video(
-            video_rows, num_latent_frames, latent_h, latent_w,
-            config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
-        )
+        if decode_mode != "decode_video_only":
+            _ = _minimax_h3_decode_audio(
+                audio_rows, num_audio_latents, config2.audio_latents_dim,
+                out_dir, ctx2,
+            )
+            if decode_mode == "decode_audio_only":
+                print("  DECODE-AUDIO-ONLY done:", out_dir + "/audio.wav")
+                return
+
+        var nframes = 0
+        if decode_mode != "decode_audio_only":
+            nframes = _minimax_h3_decode_video(
+                video_rows, num_latent_frames, latent_h, latent_w,
+                config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
+            )
+            if decode_mode == "decode_video_only":
+                print(
+                    "  DECODE-VIDEO-ONLY done:", nframes, "frames ->",
+                    out_dir + "/frames.rgb",
+                )
+                return
+
         var artifact = _minimax_h3_mux_av(
             out_dir, output_frames, runtime_width, runtime_height,
             runtime_fps, output_fps, trim_start_frames,
@@ -2253,6 +2383,7 @@ def _job_main(raw_args: List[String]) raises:
     print("  resident_backend=", resident_backend_name)
     print("  quant=", quant)
     print("  encoder_storage=", encoder_storage_name)
+    print("  temporal_rope_scale=", temporal_rope_scale)
 
     # ── PREFLIGHT (before DeviceContext) ──────────────────────────────────
     var t_preflight0 = perf_counter_ns()
@@ -2427,6 +2558,33 @@ def _job_main(raw_args: List[String]) raises:
             != num_condition_audio_rows + num_audio_rows:
         raise Error("minimax_h3_t2va: audio row count mismatch")
 
+    # Experimental one-pass long-context position interpolation. H3 was
+    # released for at most 15 seconds, so an unscaled 60-second target drives
+    # media MM-RoPE four times beyond the trained temporal span and changes
+    # every row through global self-attention. Keep text positions exact and
+    # compress only media time around the canonical text/media boundary.
+    # Scale 1.0 is the source-faithful default and is byte-identical to the
+    # previous path; callers must opt in explicitly for long extrapolation.
+    if temporal_rope_scale != Float32(1.0):
+        var media_origin = Float64(runtime_text_tokens)
+        var media_scale = Float64(temporal_rope_scale)
+        for i in range(len(geometry.audio_indices)):
+            var row = geometry.audio_indices[i]
+            var offset = 3 * row
+            geometry.position_ids[offset] = media_origin + (
+                geometry.position_ids[offset] - media_origin
+            ) * media_scale
+        for i in range(len(geometry.video_indices)):
+            var row = geometry.video_indices[i]
+            var offset = 3 * row
+            geometry.position_ids[offset] = media_origin + (
+                geometry.position_ids[offset] - media_origin
+            ) * media_scale
+        print(
+            "  temporal RoPE interpolation: media scale=",
+            temporal_rope_scale, " origin=", runtime_text_tokens,
+        )
+
     # ── 3. MM-RoPE tables (device) ─────────────────────────────────────────
     var positions_f32 = List[Float32](capacity=len(geometry.position_ids))
     for i in range(len(geometry.position_ids)):
@@ -2542,30 +2700,23 @@ def _job_main(raw_args: List[String]) raises:
             resident_cache_save_allowed = (
                 resident_blocks == GROUPWISE_RUNTIME_CACHE_BLOCKS
             )
+        # The base resident cache is adapter-independent. LoRA stays in its
+        # own BF16 activation branch, so loading an adapter does not rebuild
+        # or risk poisoning the shared INT8 cache.
         if _lora_overlay:
-            # LoRA overlay: quantize a FRESH store with the delta added
-            # pre-quantization. Never load or save the shared disk cache —
-            # an overlaid store must not poison base-model runs.
-            print("  resident store: fresh build with LoRA overlay (cache bypassed)")
-            fp8_resident = Optional[MiniMaxH3ResidentFp8](
-                minimax_h3_build_resident_fp8(
-                    transformer_shards, config, ctx, resident_blocks,
-                    0, resident_scheme, _lora_overlay,
-                )
+            print("  resident store: base cache + activation LoRA overlay")
+        fp8_resident = Optional[MiniMaxH3ResidentFp8](
+            _minimax_h3_get_resident_cached(
+                transformer_shards,
+                config,
+                resident_blocks,
+                resident_scheme,
+                resident_cache_path,
+                ctx,
+                resident_cache_save_allowed,
+                resident_scheme == MINIMAX_H3_RESIDENT_INT8,
             )
-        else:
-            fp8_resident = Optional[MiniMaxH3ResidentFp8](
-                _minimax_h3_get_resident_cached(
-                    transformer_shards,
-                    config,
-                    resident_blocks,
-                    resident_scheme,
-                    resident_cache_path,
-                    ctx,
-                    resident_cache_save_allowed,
-                    resident_scheme == MINIMAX_H3_RESIDENT_INT8,
-                )
-            )
+        )
         if (
             resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
             and resident_blocks < run_config.num_layers
@@ -2824,6 +2975,8 @@ def _job_main(raw_args: List[String]) raises:
     result_body += String("  \"fps\":") + String(output_fps) + String(",\n")
     result_body += String("  \"internal_fps\":") + String(runtime_fps) + String(",\n")
     result_body += String("  \"sequence_length\":") + String(sequence_length) + String(",\n")
+    result_body += String("  \"temporal_rope_scale\":") \
+        + String(temporal_rope_scale) + String(",\n")
     result_body += String("  \"motion_context\":") \
         + json_bool(motion_context_enabled) + String(",\n")
     result_body += String("  \"motion_context_frames\":") \

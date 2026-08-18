@@ -116,6 +116,9 @@ def _minimax_h3_rope_kernel[out_dtype: DType](
     freq_dim_w: Int32,
     half_w: Int32,  # 3 * freq_dim
     rotary_dim_w: Int32,  # 2 * half
+    riflex_time_frequency_index_w: Int32,  # 1-based; 0 disables RIFLEx
+    riflex_media_time_origin: Float32,
+    riflex_time_frequency: Float32,
 ):
     """One thread per (row, output column) of the full `[rows, rotary_dim]`
     table. `col` folds onto `[0, half)` via `col if col < half else col -
@@ -142,6 +145,25 @@ def _minimax_h3_rope_kernel[out_dtype: DType](
     )
     var freq = rebind[Scalar[DType.float32]](inv_freq[local_i])
     var angle = pos * freq
+    # RIFLEx replaces one intrinsic *temporal* RoPE frequency so an
+    # extrapolated video remains inside a single period.  H3 packs text and
+    # media into one self-attention sequence, unlike the reference models'
+    # separate text cross-attention.  Therefore apply the replacement only to
+    # media-time coordinates and keep the phase continuous at the first media
+    # row: origin*old + (position-origin)*new.  Media/media relative angles
+    # exactly use the RIFLEx frequency while text/text RoPE remains unchanged.
+    if (
+        riflex_time_frequency_index_w > 0
+        and axis == 0
+        and local_i + 1 == Int(riflex_time_frequency_index_w)
+    ):
+        var pos_f = Float32(pos)
+        if pos_f >= riflex_media_time_origin:
+            var freq_f = Float32(freq)
+            angle = (
+                riflex_media_time_origin * freq_f
+                + (pos_f - riflex_media_time_origin) * riflex_time_frequency
+            )
     angle_t[row, col] = rebind[angle_t.element_type](angle)
     cos_t[row, col] = rebind[cos_t.element_type](fcos(angle).cast[out_dtype]())
     sin_t[row, col] = rebind[sin_t.element_type](fsin(angle).cast[out_dtype]())
@@ -153,6 +175,9 @@ def build_minimax_h3_rope_tables(
     rope_freq_dim: Int = MINIMAX_H3_ROPE_FREQ_DIM,
     rope_theta: Float64 = MINIMAX_H3_ROPE_THETA,
     out_dtype: STDtype = STDtype.F32,
+    riflex_time_frequency_index: Int = 0,
+    riflex_media_time_origin: Float32 = Float32(0.0),
+    riflex_time_span: Float32 = Float32(0.0),
 ) raises -> Tuple[Tensor, Tensor, Tensor]:
     """Device 3-axis MM-RoPE cos/sin/angle tables for MiniMax-H3.
 
@@ -171,6 +196,12 @@ def build_minimax_h3_rope_tables(
                layout, but the apply kernels accept either as a table dtype
                distinct from the activation dtype). `angles` is always F32
                (a diagnostic tap, not a runtime tensor).
+    riflex_time_frequency_index: one-based intrinsic temporal frequency index;
+               0 preserves the released RoPE byte-for-byte.  When enabled,
+               the selected media-time frequency becomes
+               `0.9 * 2*pi / riflex_time_span`, the official RIFLEx Eq. (8)
+               implementation.  `riflex_media_time_origin` is H3's packed
+               media clock origin, normally the number of text rows.
 
     returns (cos, sin, angles), each `[rows, rotary_dim]` where
             `rotary_dim = 2 * 3 * rope_freq_dim` (96 for the released config).
@@ -186,6 +217,21 @@ def build_minimax_h3_rope_tables(
     if rope_freq_dim <= 0:
         raise Error(
             "build_minimax_h3_rope_tables: rope_freq_dim must be positive"
+        )
+    if (
+        riflex_time_frequency_index < 0
+        or riflex_time_frequency_index > rope_freq_dim
+    ):
+        raise Error(
+            "build_minimax_h3_rope_tables: RIFLEx index must be 0..rope_freq_dim"
+        )
+    if riflex_time_frequency_index > 0 and (
+        riflex_media_time_origin < Float32(0.0)
+        or riflex_time_span <= Float32(0.0)
+    ):
+        raise Error(
+            "build_minimax_h3_rope_tables: enabled RIFLEx needs nonnegative"
+            " media origin and positive time span"
         )
     var pn = positions.numel()
     if pn % MINIMAX_H3_NUM_AXES != 0:
@@ -203,6 +249,13 @@ def build_minimax_h3_rope_tables(
 
     var half = MINIMAX_H3_NUM_AXES * rope_freq_dim
     var rotary_dim = 2 * half
+    var riflex_time_frequency = Float32(0.0)
+    if riflex_time_frequency_index > 0:
+        # Official implementation: freqs[k-1] = 0.9 * 2*pi / L_test.
+        riflex_time_frequency = Float32(
+            Float64(0.9) * Float64(6.283185307179586476925286766559)
+            / Float64(riflex_time_span)
+        )
 
     var cos_buf = ctx.enqueue_create_buffer[DType.uint8](
         rows * rotary_dim * out_dtype.byte_size()
@@ -255,6 +308,8 @@ def build_minimax_h3_rope_tables(
     )
         ctx.enqueue_function[_minimax_h3_rope_kernel[DType.float32]](
             P, IF, C, S, ANG, Int32(rows), Int32(rope_freq_dim), Int32(half), Int32(rotary_dim),
+            Int32(riflex_time_frequency_index), riflex_media_time_origin,
+            riflex_time_frequency,
             grid_dim=grid, block_dim=_BLOCK,
         )
     elif odt == DType.bfloat16:
@@ -272,6 +327,8 @@ def build_minimax_h3_rope_tables(
     )
         ctx.enqueue_function[_minimax_h3_rope_kernel[DType.bfloat16]](
             P, IF, C, S, ANG, Int32(rows), Int32(rope_freq_dim), Int32(half), Int32(rotary_dim),
+            Int32(riflex_time_frequency_index), riflex_media_time_origin,
+            riflex_time_frequency,
             grid_dim=grid, block_dim=_BLOCK,
         )
     else:

@@ -95,6 +95,23 @@ if [[ "$prog_path" != /* ]]; then
   prog_path="$(realpath "$prog_path")"
 fi
 
+# A long-lived H3 training process needs an explicit rootless opt-in. The
+# 2026-08-16 guided run proved that a 24G child cap with the child left at
+# ManagedOOMMemoryPressure=auto was not enough: oomd selected the parent user
+# service at step 389. Opted-in H3 runs make their transient child an explicit
+# pressure-kill target and are expected to use a tighter cap/reserve than an
+# ordinary generation job. The caller must make that tradeoff explicit.
+managed_oom_pressure=auto
+if [[ "$(basename "$prog_path")" == "train_minimax_h3" ]]; then
+  if [[ "${H3_ALLOW_USER_SLICE:-0}" != 1 ]]; then
+    echo "mem_safe_runtime: H3 training requires H3_ALLOW_USER_SLICE=1" >&2
+    echo "mem_safe_runtime: use the bounded H3 trainer launcher" >&2
+    exit 78
+  fi
+  managed_oom_pressure=kill
+  echo "mem_safe_runtime: rootless H3 training explicitly admitted" >&2
+fi
+
 unit_name="serenity-runtime-memory-$(date +%Y%m%d-%H%M%S)-$$"
 unit_cgroup="${user_service}/app.slice/${unit_name}.service"
 
@@ -124,7 +141,7 @@ systemd-run --user \
   --property="MemoryMax=$MEM_MAX" \
   --property="MemorySwapMax=$SWAP_MAX" \
   --property=OOMPolicy=kill \
-  --property=ManagedOOMMemoryPressure=auto \
+  --property="ManagedOOMMemoryPressure=$managed_oom_pressure" \
   --setenv="PATH=$PATH" \
   "${extra_env[@]}" \
   -- "$prog_path" "$@" &

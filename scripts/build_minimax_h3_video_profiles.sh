@@ -15,13 +15,16 @@ if [[ -x "$output" && "${H3_REBUILD_PROFILES:-0}" != 1 ]]; then
 fi
 
 echo "building unified MiniMax-H3 request runner: $output"
-H3_BUILD_MEM_MAX=${H3_BUILD_MEM_MAX:-12G} \
-H3_BUILD_MEM_HIGH=${H3_BUILD_MEM_HIGH:-10G} \
+# H3's whole-program Mojo compile can exceed 10 GiB. Keep the accepted O2/-j1
+# shape inside the rootless large-job service: hard cap, OOM group, desktop
+# reserve admission, and no sudo/password handoff.
+H3_BUILD_MEM_MAX=${H3_BUILD_MEM_MAX:-24G} \
+H3_BUILD_MEM_HIGH=${H3_BUILD_MEM_HIGH:-infinity} \
 H3_BUILD_SWAP_MAX=${H3_BUILD_SWAP_MAX:-2G} \
 MEM_MAX="$H3_BUILD_MEM_MAX" MEM_HIGH="$H3_BUILD_MEM_HIGH" \
 SWAP_MAX="$H3_BUILD_SWAP_MAX" \
-  pixi run scripts/mem_safe.sh mojo build \
-    --optimization-level 2 -j 1 -I . -I vendor/mojo-libs \
+  scripts/mem_safe_runtime.sh pixi run mojo build \
+    --optimization-level 2 --disable-warnings -j 1 -I . -I vendor/mojo-libs \
     -D H3_TEXT_TOKENS=241 \
     -D H3_VAE_STREAM_DECODE=1 \
     -D H3_FP8_RESIDENT=0 \

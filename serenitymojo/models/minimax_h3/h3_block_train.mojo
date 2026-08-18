@@ -7,12 +7,13 @@
 # weights: parity/h3_block_oracle.py -> output/checks/h3_block0_oracle
 # .safetensors, gate parity/minimax_h3_block_train_parity.mojo.
 #
-# WEIGHT LAYOUT: RAW torchref/checkpoint order — `attn.qkv_proj.weight`
-# [3*inner, hidden] rows [q|k|v], `mlp.fc1.weight` [2*ffn, hidden] rows
-# [gate|value] (torchref model.py:279-291: chunk(2) -> (gate, value),
-# silu(gate)*value). NOT the `minimax_h3_load_block_device` transformed
-# layout: training grads must land in the oracle/LoRA convention with no
-# permutation step. Oracle source (torchref-h3 @ 04324c28
+# WEIGHT LAYOUT: training runtime order — `attn.qkv_proj.weight`
+# [3*inner, hidden] rows [q_all|k_all|v_all], deinterleaved by
+# H3TrainBlockStore from the released checkpoint's per-head fused rows;
+# `mlp.fc1.weight` remains checkpoint order [gate|value]
+# (torchref model.py:279-291: chunk(2) -> (gate, value), silu(gate)*value).
+# LoRA QKV B is therefore canonical module-output order [q_all|k_all|v_all]
+# and needs no inference-time row transform. Oracle source (torchref-h3 @ 04324c28
 # model.py:336-399):
 #   mod   = adaln_proj(temb).view(-1, 6*hidden)        (precomputed table
 #           here — the modcache contract; adaln stays FROZEN in training)
@@ -39,7 +40,7 @@ from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
 from serenitymojo.ops.attention import sdpa_nomask_dynamic
 from serenitymojo.ops.attention_flash import (
-    sdpa_flash_train_fwd_dynamic, sdpa_flash_backward_dynamic,
+    sdpa_flash_train_fwd_dynamic, sdpa_flash_backward_dynamic, SdpaFlashFwd,
 )
 from serenitymojo.ops.attention_backward import sdpa_backward_dynamic
 from serenitymojo.ops.rope import rope_halfsplit_full_head_broadcast
@@ -48,6 +49,8 @@ from serenitymojo.ops.tensor_algebra import (
     mul, add, add_scalar, slice, concat, reshape, gather_rows, full_device,
 )
 from serenitymojo.ops.shape_backward import index_select_backward
+from serenitymojo.ops.int8_linear import int8_linear_fwd, int8_linear_bwd
+from serenitymojo.ops.int8_quant import int8_transpose
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -57,7 +60,12 @@ def _reshaped(t: Tensor, var shape: List[Int], ctx: DeviceContext) raises -> Ten
 
 
 struct H3BlockTrainWeights(Copyable, Movable):
-    """RAW-layout block weights (device tensors, borrowed by fwd/bwd)."""
+    """Training-layout block weights (device tensors, borrowed by fwd/bwd).
+
+    The four projection fields are BF16 on the legacy/streamed path. The
+    direct resident path carries I8 tensors there and supplies a matching
+    H3BlockTrainInt8 payload; projection helpers then ignore the BF16 arm.
+    """
     var qkv_w: TArc     # [3*inner, hidden] rows [q|k|v]
     var out_w: TArc     # [hidden, inner]
     var fc1_w: TArc     # [2*ffn, hidden] rows [gate|value]
@@ -102,6 +110,15 @@ struct H3BlockTrainSaved(Copyable, Movable):
     var fc_value: TArc   # [S, F]
     var swi: TArc        # [S, F] silu(gate)*value
     var ff_y: TArc       # [S, D] fc2 output (pre-gate)
+    # cuDNN flash saved set. The production LoRA recompute fills these with
+    # shallow Arc handles so backward reuses that exact forward's padded
+    # q/k/v/o and LSE statistics instead of running attention a third time.
+    # Legacy math-forward constructors leave them empty.
+    var flash_q_pad: Optional[TArc]
+    var flash_k_pad: Optional[TArc]
+    var flash_v_pad: Optional[TArc]
+    var flash_o_pad: Optional[TArc]
+    var flash_stats: Optional[TArc]
 
     def __init__(
         out self,
@@ -111,6 +128,11 @@ struct H3BlockTrainSaved(Copyable, Movable):
         var att_flat: TArc, var attn_y: TArc, var h_mid: TArc,
         var n2: TArc, var n2m: TArc,
         var fc_gate: TArc, var fc_value: TArc, var swi: TArc, var ff_y: TArc,
+        var flash_q_pad: Optional[TArc] = None,
+        var flash_k_pad: Optional[TArc] = None,
+        var flash_v_pad: Optional[TArc] = None,
+        var flash_o_pad: Optional[TArc] = None,
+        var flash_stats: Optional[TArc] = None,
     ):
         self.x = x^
         self.mod_rows = mod_rows^
@@ -130,6 +152,11 @@ struct H3BlockTrainSaved(Copyable, Movable):
         self.fc_value = fc_value^
         self.swi = swi^
         self.ff_y = ff_y^
+        self.flash_q_pad = flash_q_pad^
+        self.flash_k_pad = flash_k_pad^
+        self.flash_v_pad = flash_v_pad^
+        self.flash_o_pad = flash_o_pad^
+        self.flash_stats = flash_stats^
 
 
 struct H3BlockTrainForward(Copyable, Movable):
@@ -452,6 +479,32 @@ struct H3BlockLoraGrads(Copyable, Movable):
         self.fc2 = fc2^
 
 
+struct H3BlockTrainInt8(Copyable, Movable):
+    """Tensorwise W8A8 payload for the four frozen H3 projections.
+
+    Slot order is qkv/out/fc1/fc2. Weights remain in their stored [N,K]
+    orientation; backward transposes one resident INT8 matrix on visit so the
+    dX GEMM uses the fast NT kernel without doubling persistent VRAM.
+    """
+    var w8: List[TArc]
+    var scale: List[TArc]
+
+    def __init__(out self, var w8: List[TArc], var scale: List[TArc]):
+        self.w8 = w8^
+        self.scale = scale^
+
+
+def _h3_base_fwd(
+    x: Tensor, w_bf: Tensor, int8: Optional[H3BlockTrainInt8], slot: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if int8:
+        ref p = int8.value()
+        return int8_linear_fwd(x, p.w8[slot][], p.scale[slot][], ctx)
+    var no_bias = Optional[Tensor](None)
+    return linear(x, w_bf, no_bias^, ctx)
+
+
 def _lora_add(
     base: Tensor, x: Tensor, lo: Optional[LoraAdapterDevice], rows: Int,
     ctx: DeviceContext,
@@ -473,12 +526,11 @@ def h3_block_train_forward_lora[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
+    base_int8: Optional[H3BlockTrainInt8] = None,
 ) raises -> H3BlockTrainForward:
     var S = x_in.shape()[0]
     comptime I = H * Dh
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var no_bias = Optional[Tensor](None)
-
     var x = x_in.clone(ctx)
     var mod_rows = gather_rows(mod, adaln_indices, ctx)
     var shift_msa = slice(mod_rows, 1, 0 * D, D, ctx)
@@ -491,7 +543,7 @@ def h3_block_train_forward_lora[
     var n1 = rms_norm(x, w.norm1_w[], eps, ctx)
     var n1m = _row_modulate(n1, scale_msa, shift_msa, ctx)
 
-    var qkv_base = linear(n1m, w.qkv_w[], no_bias, ctx)
+    var qkv_base = _h3_base_fwd(n1m, w.qkv_w[], base_int8, 0, ctx)
     var qkv = _lora_add(qkv_base, n1m, lora.qkv, S, ctx)
     var q_flat = slice(qkv, 1, 0 * I, I, ctx)
     var k_flat = slice(qkv, 1, 1 * I, I, ctx)
@@ -507,20 +559,37 @@ def h3_block_train_forward_lora[
 
     var att_f = sdpa_flash_train_fwd_dynamic(q_rope, k_rope, v, scale, ctx)
     var att = att_f.o.clone(ctx)
+    # Shallow device-buffer handles, matching the proven Klein flash tape.
+    # No D2D copies: Tensor(...buf.copy()) only bumps the buffer reference.
+    var flash_q_pad = TArc(Tensor(
+        att_f.q_pad.buf.copy(), att_f.q_pad.shape(), att_f.q_pad.dtype()
+    ))
+    var flash_k_pad = TArc(Tensor(
+        att_f.k_pad.buf.copy(), att_f.k_pad.shape(), att_f.k_pad.dtype()
+    ))
+    var flash_v_pad = TArc(Tensor(
+        att_f.v_pad.buf.copy(), att_f.v_pad.shape(), att_f.v_pad.dtype()
+    ))
+    var flash_o_pad = TArc(Tensor(
+        att_f.o_pad.buf.copy(), att_f.o_pad.shape(), att_f.o_pad.dtype()
+    ))
+    var flash_stats = TArc(Tensor(
+        att_f.stats.buf.copy(), att_f.stats.shape(), att_f.stats.dtype()
+    ))
     _ = att_f^
     var att_flat = _reshaped(att, [S, I], ctx)
-    var attn_base = linear(att_flat, w.out_w[], no_bias, ctx)
+    var attn_base = _h3_base_fwd(att_flat, w.out_w[], base_int8, 1, ctx)
     var attn_y = _lora_add(attn_base, att_flat, lora.out, S, ctx)
     var h_mid = add(x, mul(gate_msa, attn_y, ctx), ctx)
 
     var n2 = rms_norm(h_mid, w.norm2_w[], eps, ctx)
     var n2m = _row_modulate(n2, scale_mlp, shift_mlp, ctx)
-    var fc1_base = linear(n2m, w.fc1_w[], no_bias, ctx)
+    var fc1_base = _h3_base_fwd(n2m, w.fc1_w[], base_int8, 2, ctx)
     var fc1_out = _lora_add(fc1_base, n2m, lora.fc1, S, ctx)
     var fc_gate = slice(fc1_out, 1, 0, F, ctx)
     var fc_value = slice(fc1_out, 1, F, F, ctx)
     var swi = swiglu(fc_gate, fc_value, ctx)
-    var ff_base = linear(swi, w.fc2_w[], no_bias, ctx)
+    var ff_base = _h3_base_fwd(swi, w.fc2_w[], base_int8, 3, ctx)
     var ff_y = _lora_add(ff_base, swi, lora.fc2, S, ctx)
     var out = add(h_mid, mul(gate_mlp, ff_y, ctx), ctx)
 
@@ -531,6 +600,9 @@ def h3_block_train_forward_lora[
         TArc(att_flat^), TArc(attn_y^), TArc(h_mid^),
         TArc(n2^), TArc(n2m^),
         TArc(fc_gate^), TArc(fc_value^), TArc(swi^), TArc(ff_y^),
+        Optional[TArc](flash_q_pad^), Optional[TArc](flash_k_pad^),
+        Optional[TArc](flash_v_pad^), Optional[TArc](flash_o_pad^),
+        Optional[TArc](flash_stats^),
     )
     return H3BlockTrainForward(TArc(out^), saved^)
 
@@ -701,6 +773,24 @@ def _bf16(t: Tensor, ctx: DeviceContext) raises -> Tensor:
     return cast_tensor(t, STDtype.BF16, ctx)
 
 
+def _h3_base_bwd_dx(
+    grad: Tensor, w_bf: Tensor, int8: Optional[H3BlockTrainInt8], slot: Int,
+    rows: Int, in_features: Int, out_features: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    if int8:
+        ref p = int8.value()
+        # Same exact-int32 NT lever used by the Klein trainer. Transpose on
+        # visit costs one compact INT8 pass and avoids a second resident copy.
+        var w8t = int8_transpose(p.w8[slot][], ctx)
+        return int8_linear_bwd(grad, w8t, p.scale[slot][], ctx)
+    return _bf16(
+        linear_backward_dx(
+            grad, w_bf, rows, in_features, out_features, ctx
+        ),
+        ctx,
+    )
+
+
 def h3_block_train_backward_lora_frozen[
     H: Int, Dh: Int
 ](
@@ -712,6 +802,7 @@ def h3_block_train_backward_lora_frozen[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, rotary_dim: Int, eps: Float32,
     ctx: DeviceContext,
+    base_int8: Optional[H3BlockTrainInt8] = None,
 ) raises -> H3BlockLoraFrozenBackward:
     var S = d_out.shape()[0]
     comptime I = H * Dh
@@ -725,7 +816,9 @@ def h3_block_train_backward_lora_frozen[
     var d_h_mid = d_out.clone(ctx)
     var d_ff_y = mul(d_out, gate_mlp, ctx)
 
-    var d_swi = _bf16(linear_backward_dx(d_ff_y, w.fc2_w[], S, F, D, ctx), ctx)
+    var d_swi = _h3_base_bwd_dx(
+        d_ff_y, w.fc2_w[], base_int8, 3, S, F, D, ctx
+    )
     var lg_fc2 = Optional[KleinLoraDeviceGradTensors](None)
     if lora.fc2:
         var g = klein_lora_bwd_device_resident_tensors(
@@ -737,8 +830,8 @@ def h3_block_train_backward_lora_frozen[
     var sgb = swiglu_backward(d_swi, saved.fc_gate[], saved.fc_value[], ctx)
     var d_fc1_out = concat(1, ctx, sgb.d_gate, sgb.d_up)
 
-    var d_n2m = _bf16(
-        linear_backward_dx(d_fc1_out, w.fc1_w[], S, D, 2 * F, ctx), ctx
+    var d_n2m = _h3_base_bwd_dx(
+        d_fc1_out, w.fc1_w[], base_int8, 2, S, D, 2 * F, ctx
     )
     var lg_fc1 = Optional[KleinLoraDeviceGradTensors](None)
     if lora.fc1:
@@ -757,8 +850,8 @@ def h3_block_train_backward_lora_frozen[
     var d_x = d_h_mid.clone(ctx)
     var d_attn_y = mul(d_h_mid, gate_msa, ctx)
 
-    var d_att_flat = _bf16(
-        linear_backward_dx(d_attn_y, w.out_w[], S, I, D, ctx), ctx
+    var d_att_flat = _h3_base_bwd_dx(
+        d_attn_y, w.out_w[], base_int8, 1, S, I, D, ctx
     )
     var lg_out = Optional[KleinLoraDeviceGradTensors](None)
     if lora.out:
@@ -769,8 +862,42 @@ def h3_block_train_backward_lora_frozen[
         lg_out = Optional[KleinLoraDeviceGradTensors](g^)
 
     var d_att = _reshaped(d_att_flat, [1, S, H, Dh], ctx)
-    var flash_fwd = sdpa_flash_train_fwd_dynamic(
-        saved.q_rope[], saved.k_rope[], saved.v[], scale, ctx,
+    if not saved.flash_stats:
+        raise Error(
+            "h3 frozen LoRA bwd: flash saved set missing "
+            "(recompute/backward mismatch)"
+        )
+    # Re-box the shallow tape handles into the dynamic wrapper expected by
+    # the existing cuDNN backward. `o` is not consumed by that wrapper; use a
+    # zero-copy [1,S,H,Dh] view of att_flat to satisfy the carrier contract.
+    var att_shape: List[Int] = [1, S, H, Dh]
+    var flash_fwd = SdpaFlashFwd(
+        Tensor(saved.att_flat[].buf.copy(), att_shape^, saved.att_flat[].dtype()),
+        Tensor(
+            saved.flash_o_pad.value()[].buf.copy(),
+            saved.flash_o_pad.value()[].shape(),
+            saved.flash_o_pad.value()[].dtype(),
+        ),
+        Tensor(
+            saved.flash_q_pad.value()[].buf.copy(),
+            saved.flash_q_pad.value()[].shape(),
+            saved.flash_q_pad.value()[].dtype(),
+        ),
+        Tensor(
+            saved.flash_k_pad.value()[].buf.copy(),
+            saved.flash_k_pad.value()[].shape(),
+            saved.flash_k_pad.value()[].dtype(),
+        ),
+        Tensor(
+            saved.flash_v_pad.value()[].buf.copy(),
+            saved.flash_v_pad.value()[].shape(),
+            saved.flash_v_pad.value()[].dtype(),
+        ),
+        Tensor(
+            saved.flash_stats.value()[].buf.copy(),
+            saved.flash_stats.value()[].shape(),
+            saved.flash_stats.value()[].dtype(),
+        ),
     )
     var sb = sdpa_flash_backward_dynamic(flash_fwd, d_att, scale, ctx)
     _ = flash_fwd^
@@ -788,8 +915,8 @@ def h3_block_train_backward_lora_frozen[
     var d_v_flat = _reshaped(sb.d_v, [S, I], ctx)
     var d_qkv = concat(1, ctx, d_q_flat, d_k_flat, d_v_flat)
 
-    var d_n1m = _bf16(
-        linear_backward_dx(d_qkv, w.qkv_w[], S, D, 3 * I, ctx), ctx
+    var d_n1m = _h3_base_bwd_dx(
+        d_qkv, w.qkv_w[], base_int8, 0, S, D, 3 * I, ctx
     )
     var lg_qkv = Optional[KleinLoraDeviceGradTensors](None)
     if lora.qkv:

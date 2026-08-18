@@ -371,13 +371,25 @@ fn minimax_h3_request_is_runtime_adjustable_and_switchable() {
     let long_geometry = minimax_h3_runtime_geometry(&request).unwrap();
     assert!(long_geometry.internal_frames > 362);
     assert!(long_geometry.sequence_tokens < MINIMAX_H3_LONG_CONTEXT_MAX_SEQUENCE_TOKENS);
-    request["duration_seconds"] = json!(60.0);
-    request["frames"] = json!(1440);
+    request["width"] = json!(320);
+    request["height"] = json!(192);
+    request["duration_seconds"] = json!(180.0);
+    request["frames"] = json!(4320);
     validate_minimax_h3_request(&request).unwrap();
-    request["duration_seconds"] = json!(60.01);
+    let monolithic_geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert_eq!(monolithic_geometry.output_frames, 4320);
+    assert_eq!(monolithic_geometry.internal_frames, 4323);
+    assert_eq!(monolithic_geometry.sequence_tokens, 90_971);
+    request["duration_seconds"] = json!(180.01);
     assert!(validate_minimax_h3_request(&request)
         .unwrap_err()
+        .contains("1 through 180 seconds"));
+    request["task"] = json!("i2va");
+    request["duration_seconds"] = json!(60.01);
+    assert!(minimax_h3_runtime_geometry(&request)
+        .unwrap_err()
         .contains("1 through 60 seconds"));
+    request["task"] = json!("t2va");
     request["duration_seconds"] = json!(2.0);
     request["frames"] = json!(48);
     request["prompt"] = json!(" ");
@@ -958,7 +970,7 @@ fn readiness_shape() {
         ])
     );
     assert_eq!(h3["geometry_constraints"]["seconds_min"], 1.0);
-    assert_eq!(h3["geometry_constraints"]["seconds_max"], 60.0);
+    assert_eq!(h3["geometry_constraints"]["seconds_max"], 180.0);
     assert_eq!(h3["geometry_constraints"]["trained_seconds_max"], 15.0);
     assert_eq!(
         h3["geometry_constraints"]["long_context_max_sequence_tokens"],

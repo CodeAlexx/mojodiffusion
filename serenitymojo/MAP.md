@@ -138,7 +138,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `serve/image_io.mojo` | Shared worker image/mask I/O, including alpha/luminance LanPaint masks, separately expanded sampler-context masks, crop helpers, and final source-preserving blend primitives. | ✅ CPU mask smoke + browser/real-job gates |
 | `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
 | `serve/{sd3,sdxl,flux,chroma}_backend.mojo` + `serve/*_decode_subprocess.mojo` | Product workers keep measured denoiser residency/promotion while moving VAE decode into a self-exec GPU child. Child exit is the CUDA allocation-reclaim boundary; every route retains its prior release/tiled fail-loud fallback. SD3/Flux/Chroma also cache unchanged conditioning and budget device-resident blocks from measured free-VRAM reserves. | 🟠 builds and bounded fallbacks wired; Klein has paired runtime timings below, other families require per-family speed parity before broader claims |
-| `scripts/mem_safe_runtime.sh` | Rootless systemd user-service wrapper for large GPU runtime process trees: hard 24-GiB host-memory ceiling, 2-GiB swap ceiling, OOM-group kill, desktop-reserve admission, and live cgroup peak/events reporting. Distinct from the build wrapper's compile-oriented limits. | ✅ used by H3/Klein runtime gates with zero cgroup OOM events |
+| `scripts/mem_safe_runtime.sh` | Rootless systemd user-service wrapper for bounded GPU runtime process trees: hard 24-GiB host-memory ceiling, 2-GiB swap ceiling, OOM-group kill, desktop-reserve admission, and live cgroup peak/events reporting. H3 training fails closed unless its launcher explicitly sets `H3_ALLOW_USER_SLICE=1`, which makes the transient child a managed pressure-kill target without requiring `sudo`. Distinct from the build wrapper's compile-oriented limits. | ✅ bounded H3/Klein runtime gates; rootless 200-step H3 trainer run |
 | `models/text_encoder/gemma3_ltx_streamed.mojo` | Pure-Mojo layer-streamed Gemma-3-12B FP8 text encoder for LTX2 positive/negative prompts. It preserves the 49-state FeatureExtractorV2 contract, exact Gemma RMSNorm/RoPE/padding semantics, shares each streamed layer load across both prompts, and releases clean mmap-backed checkpoint pages after each synchronized device upload. | ✅ exact tokenizer IDs; context cosine 0.99923-0.99973; real product V2V conditioner/runner scope peaked at 17.8GB after page release instead of the prior 54.9GB desktop-OOM path |
 | `pipeline/ltx2_encode_prompt.mojo` | Pure-Mojo automatic LTX2 prompt conditioner: tokenizes positive/negative text, runs streamed Gemma, packs the 49-state feature order, applies video/audio aggregate projections, and writes the six pre-connector safetensors consumed by the request CLI. The server caches by prompt, negative prompt, and conditioner digest and publishes tokenization plus 48-layer progress. | ✅ optimized real prompt 17.19s; no Python runtime |
 | `models/text_encoder/gemma4_ltx_streamed.mojo` + `pipeline/ltx25_encode_prompt.mojo` | Pure-Mojo Gemma-4-12B conditioner for LTX-2.5. Supports the standalone `model.language_model.` and Lightricks fine-tuned `model.` layouts, sliding/global attention differences, proportional partial RoPE, the embedded tokenizer byte tensor, and the unchanged 49-state FeatureExtractorV2 projections. | 🟠 all 49 Lightricks-weight states cosine >=0.999 (worst 0.99990787); three real LTX-2.5 MP4s completed, but sampler and speed parity remain unaccepted |
@@ -3832,7 +3832,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   run the vendor's OWN classes (AutoencoderKLLegacy etc.) via the torchref
   venv, GPU bf16/F32 — never CPU-fp32 references.
 
-## MiniMax-H3 LoRA trainer (2026-08-14/15, pushed ..c6753f5)
+## MiniMax-H3 LoRA trainer (2026-08-14/18)
 - PURE-MOJO H3 LoRA trainer, torchref (pinned upstream @ 04324c28) = oracle.
   Entry `training/train_minimax_h3.mojo` (image-mode maiden arm): mmh3 cache
   pair -> image-branch sigma (resolution-aware logit-normal, 1000-node grid
@@ -3841,40 +3841,58 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   contiguous, per-item text embeds precomputed) -> 50-block streamed LoRA
   fwd + recompute bwd (`h3_stack_train.mojo`) -> final-layer twin
   (`h3_final_train.mojo`) -> token loss + d_pred -> fused AdamW on F32
-  masters -> lora_unet_* saves + full resume state.
-- Stores: `h3_train_block_store.mojo` (mmap -> ~770MB pinned staging -> fixed
-  slab; v1's 38.5GB pinned fill KILLED the desktop 08-14 11:08 — unreclaimable
-  pages) and `h3_train_block_store_fp8.mojo` (HYBRID: 42/50 blocks E4M3 +
-  per-row scales resident, dequant-to-bf16 per stage, tail streamed; 46 OOMs
-  on 24GB). AdaLN: `h3_train_modgrid.mojo` — exact modcache tables at 1000
-  sigma nodes, build-once host sidecar (~9.7GB VRAM freed).
-- Speed: 49 -> 34 (fp8 base + frozen-base bwd skipping discarded weight
-  grads/rms d_g/d_mod) -> 11.5s/step (cuDNN flash train attention, dynamic
-  dims — math-mode sdpa bwd per-head loops were ~14k launches/step). Phase
-  split at 11.5s: fwd 4.0 / bwd 7.4. Same-seed loss parity vs exact arm:
-  4 decimals.
+  masters -> canonical PEFT A/B saves + full resume state.
+- Stores: `h3_train_block_store.mojo` retains the bounded mmap→staging BF16
+  streamer; `h3_train_block_store_int8.mojo` is the current fast path, keeping
+  42/50 frozen blocks as direct tensorwise W8A8 and streaming eight BF16 tails.
+  The earlier bulk 38.5GB pinned fill is forbidden. AdaLN remains an exact
+  1000-node build-once host sidecar (`h3_train_modgrid.mojo`).
+- Speed/current numeric contract (3090 Ti, 2026-08-18): direct-W8A8 42/50,
+  median full step 9.999s over 200 steps; mean phase split fwd 3.199 / bwd
+  6.631 / optimizer 0.087s. A controlled first-sample gate measured loss
+  0.829788 W8A8 versus 0.848637 streamed BF16 (-2.22%), so this fast mode is
+  explicitly a different numeric trajectory, not exact-BF16 parity.
 - Gates (all PASS, output/checks): block fwd+bwd + LoRA 21/21 vs torch on
   real block-0; 2-real-block stack chain 9/9; 50-block real-weight smoke;
   mmh3 cache reader 36/36 BIT-exact vs upstream-writer fixture; sigma/x_t
   bit-exact 5 sigma cases; final layer cos 1.0; sdpa_backward_dynamic
-  bit-identical; lora overlay 200 adapters + exact runtime add (never fused).
-- Runtime S: `sdpa_backward_rect_dynamic`(+storage) and flash train
-  fwd/bwd dynamic twins — captions vary per item, upstream avoids padding.
+  bit-identical; canonical PEFT/QKV/FC1 roundtrip; unaligned W8A8 M=65
+  fwd/bwd cosine 0.999931/0.999934. The former real M=737 sample-2 failure
+  now passes.
+- Runtime S: `sdpa_backward_rect_dynamic`(+storage) and flash train fwd/bwd
+  dynamic twins preserve real caption lengths. Only internal INT8 GEMM rows
+  are zero-padded to M%4 and trimmed back; the model sequence is never padded.
 - Caches: upstream scripts on the eri set (118 latents via downloaded video
   VAE; TE via nvfp4 conditioner streamed — bf16 32B needs ~51GB host, unsafe
   on 62GB; dedicated `.venv` in the h3 worktree). Weights:
   `.serenity/models/checkpoints/MiniMax-H3/single_file/`.
 - Inference LoRA overlay: `models/minimax_h3/h3_lora_overlay.mojo` +
-  `minimax_h3_load_block_device_lora` + runtime `--lora=`/`--lora-mult=`
-  (streamed bf16 base; W' computed IN VRAM at load, checkpoints untouched).
-- Convergence: released H3 is CFG-DISTILLED — plain LoRA loss cannot bind
-  identity (maiden 2000-step eri run: loss fell, zero likeness; every other
-  stage eliminated — cache decode, save keys, overlay, conditioner cos
-  0.9975). Fix per upstream field reports: guidance-consistent objective
-  (second empty-cond forward, c_hat=(g+(s-1)*g_empty)/s, s=3) — needs
-  empty-cond TE cache pairs. Diagnostic:
+  `h3_lora_format.mojo`/`h3_qkv_layout.mojo` + runtime `--lora=`/`--lora-mult=`.
+  Canonical PEFT is transformed to runtime QKV/FC1 row layout, and resident
+  INT8 bases use activation-time deltas (never a lossy requantized merge).
+  Matched seed/prompt/geometry one-eval evidence loaded all 200 adapters and
+  changed 107,519/107,520 video plus 2,368/2,368 audio latent elements.
+- Current acceptance (2026-08-18): fresh 200-step run completed rootlessly
+  with no OOM/nonfinite loss. First/last-20 mean loss was 0.367875/0.216782;
+  all 200 PEFT A and B tensors were finite and fully nonzero; cloned resume
+  advanced step 200→201. This proves mechanics and a learning trajectory, NOT
+  identity convergence at 200 steps. The old 2000-step zero-likeness verdict
+  predates the canonical QKV layout and non-requantizing inference fixes, so a
+  longer same-seed decoded A/B must re-test the default objective before a
+  convergence verdict. Guidance-consistent training remains available as the
+  slower experimental arm (second empty-cond forward, s=3). Diagnostic:
   `models/minimax_h3/parity/minimax_h3_cond_probe.mojo` dumps OUR runtime
   conditioner embeds for a prompt -> safetensors for cos vs cached TE.
+- Convergence oracle remains the pinned Musubi H3 trainer, not Mojo's loss
+  curve alone. The next decoded A/B should mirror the supplied long-run recipe:
+  rank/alpha 32, LR 5e-5 with 50-step warmup, spatial-density jitter 0.2,
+  guidance distillation 3.5, base-preservation weight 0.02, eight timestep
+  buckets, checkpoint resume, and a 15k-step ceiling. Mojo already has
+  canonical rank/alpha selection, guidance-consistent training, full optimizer
+  resume, cU-DNN train attention, and resident frozen weights. Spatial-density
+  jitter, base-preservation loss, stratified timestep buckets, and LR warmup are
+  still missing and must be ported from Musubi source before claiming recipe
+  parity or convergence.
 - Guidance objective (in OUR trainer, `--guidance_scale 3`): per-step
   no-grad TEACHER forward on the cached EMPTY conditioning (own packed
   layout/rope/adaln idx, same sigma-node mod tables; runs before the

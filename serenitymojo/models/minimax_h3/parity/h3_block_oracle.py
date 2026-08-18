@@ -1,7 +1,7 @@
 # h3_block_oracle.py — torch-autograd oracle for the MiniMax-H3 transformer
 # block backward (musubi-tuner akane/minimax-h3 @ 04324c28 is THE oracle).
 #
-# Loads block-0 REAL weights from the FL2VA diffusers shards into musubi's
+# Loads block-0 REAL weights from the FL2VA diffusers shards into Musubi's
 # MiniMaxH3TransformerBlock, runs fwd + autograd on seeded NON-DEGENERATE
 # inputs (randn — house rule: never modular fills), and dumps input/weight
 # grads to a safetensors bundle for the Mojo parity gate (cos >= 0.999 per
@@ -9,7 +9,7 @@
 # 14336; small S keeps torch cheap while every op runs at real width.
 #
 # Run:  /home/alex/musubi-tuner/.venv/bin/python h3_block_oracle.py
-import sys, json, struct, glob
+import sys, json, struct, glob, os
 sys.path.insert(0, "/home/alex/musubi-h3/src")
 
 import torch
@@ -20,7 +20,10 @@ from musubi_tuner.minimax_h3.model import (
 )
 
 CKPT = "/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transformer"
-OUT = "/home/alex/mojodiffusion/output/checks/h3_block0_oracle.safetensors"
+OUT = os.environ.get(
+    "H3_BLOCK_ORACLE_OUT",
+    "/home/alex/mojodiffusion/output/checks/h3_block0_oracle.safetensors",
+)
 S = 384          # packed rows (video+audio mix), small for oracle speed
 N_TS = 3         # distinct timestep rows (video/audio/observed classes)
 
@@ -51,7 +54,21 @@ for shard in sorted(glob.glob(f"{CKPT}/model-*.safetensors")):
         del sd
 print("block-0 tensors:", len(want))
 
+def _deinterleave_qkv(raw: torch.Tensor) -> torch.Tensor:
+    return (
+        raw.reshape(cfg.num_attention_heads, 3, cfg.attention_head_dim, cfg.hidden_size)
+        .permute(1, 0, 2, 3)
+        .reshape(3 * cfg.num_attention_heads * cfg.attention_head_dim, cfg.hidden_size)
+        .contiguous()
+    )
+
+
 block = MiniMaxH3TransformerBlock(cfg)
+# The released checkpoint fuses QKV per head, while the logical Musubi module
+# chunks its projection as contiguous [q_all;k_all;v_all]. Product inference
+# already performs this conversion. Apply the identical pure row permutation
+# before loading the oracle block so training and sampling use one base model.
+want["attn.qkv_proj.weight"] = _deinterleave_qkv(want["attn.qkv_proj.weight"])
 missing, unexpected = block.load_state_dict(want, strict=False)
 assert not unexpected, f"unexpected keys: {unexpected}"
 print("missing (expected none):", missing)
@@ -173,6 +190,7 @@ for shard in sorted(glob.glob(f"{CKPT}/model-*.safetensors")):
             want1[k[len("blocks.1."):]] = sd[k]
         del sd
 block1 = MiniMaxH3TransformerBlock(cfg)
+want1["attn.qkv_proj.weight"] = _deinterleave_qkv(want1["attn.qkv_proj.weight"])
 m1, u1 = block1.load_state_dict(want1, strict=False)
 assert not m1 and not u1, (m1, u1)
 block1 = block1.cuda().to(torch.bfloat16)

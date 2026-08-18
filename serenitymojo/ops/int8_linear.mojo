@@ -256,14 +256,27 @@ def _int8_matmul_dequant(
     var ash = a.shape()
     # Flatten leading dims to M (== `linear`): last dim is the contract axis K.
     var Kc = ash[len(ash) - 1]
-    var M = a.numel() // Kc
+    var M_out = a.numel() // Kc
+    # The cuBLAS INT8 shim requires M%4==0. Training token counts are runtime
+    # values (for H3 they include variable caption rows), so append zero rows
+    # for the GEMM and remove them after dequantization. Quantization is
+    # per-row; therefore every real row is bit-identical to the aligned call.
+    var M = ((M_out + 3) // 4) * 4
+    var a_gemm = Tensor(a.buf.copy(), ash.copy(), a.dtype())
+    if M != M_out:
+        var padded_buf = ctx.enqueue_create_buffer[DType.uint8](M * Kc * 2)
+        padded_buf.enqueue_fill(UInt8(0))
+        var real_dst = padded_buf.create_sub_buffer[DType.uint8](0, a.nbytes())
+        ctx.enqueue_copy(dst_buf=real_dst, src_buf=a.buf)
+        var padded_shape: List[Int] = [M, Kc]
+        a_gemm = Tensor(padded_buf^, padded_shape^, STDtype.BF16)
     var Nc = b_i8.shape()[0]
-    var a_scale = int8_rowscale(a, ctx)              # [M] per-token
-    var a_i8 = int8_encode_perrow(a, a_scale, ctx)   # [M,Kc] int8
+    var a_scale = int8_rowscale(a_gemm, ctx)              # [M] per-token
+    var a_i8 = int8_encode_perrow(a_gemm, a_scale, ctx)   # [M,Kc] int8
     var c_buf = ctx.enqueue_create_buffer[DType.uint8](M * Nc * 4)
     cublas_gemm_s8s8s32_nt(a_i8.buf, b_i8.buf, c_buf, M, Nc, Kc, ctx)
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](M * Nc * 2)
+    var padded_out_buf = ctx.enqueue_create_buffer[DType.uint8](M * Nc * 2)
     var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M * Nc))
     var rs_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](M))
     var ws_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
@@ -288,7 +301,7 @@ def _int8_matmul_dequant(
     )
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
         unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
-            unsafe_from_address=Int(out_buf.unsafe_ptr().bitcast[BFloat16]())
+            unsafe_from_address=Int(padded_out_buf.unsafe_ptr().bitcast[BFloat16]())
         ),
         runtime_layout=o_rl,
     )
@@ -299,6 +312,15 @@ def _int8_matmul_dequant(
     ctx.enqueue_function[_int8_dequant_scalar_kernel](
         C, RS, WS, O, Int32(M), Int32(Nc), grid_dim=grid, block_dim=_BLOCK,
     )
+    var out_buf: DeviceBuffer[DType.uint8]
+    if M != M_out:
+        out_buf = ctx.enqueue_create_buffer[DType.uint8](M_out * Nc * 2)
+        var real_src = padded_out_buf.create_sub_buffer[DType.uint8](
+            0, M_out * Nc * 2
+        )
+        ctx.enqueue_copy(dst_buf=out_buf, src_buf=real_src)
+    else:
+        out_buf = padded_out_buf^
     # Output keeps a's leading dims (== `linear`): [..., K] @ Wᵀ → [..., Nc].
     var outsh = List[Int]()
     for i in range(len(ash) - 1):

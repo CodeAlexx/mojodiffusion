@@ -231,6 +231,10 @@ struct H3StackLoraOnlyGrads(Copyable, Movable):
 from serenitymojo.models.minimax_h3.h3_train_block_store_fp8 import (
     H3TrainBlockStoreFp8,
 )
+from serenitymojo.models.minimax_h3.h3_train_fence_policy import (
+    h3_fp8_forward_should_fence,
+    h3_fp8_backward_should_fence,
+)
 from serenitymojo.models.minimax_h3.h3_block_train import (
     h3_block_train_backward_lora_frozen,
 )
@@ -266,7 +270,7 @@ def h3_stack_train_forward_streamed_fp8[
         # fence policy: tail blocks MUST fence (mmap slab reuse); resident
         # blocks fence every 8th to bound the async transient peak without
         # paying 50 pipeline drains per pass.
-        if i + 1 >= store.resident or (i % 8) == 7:
+        if h3_fp8_forward_should_fence(i, store.resident):
             ctx.synchronize()
     return H3StackTrainForward(TArc(h^), inputs^)
 
@@ -307,7 +311,96 @@ def h3_stack_train_backward_streamed_fp8[
         _ = b^
         _ = f^
         _ = bw^
-        if i <= store.resident or (i % 8) == 0:
+        # Reverse traversal visits the streamed tail first. Every tail block
+        # MUST fence before stage(i-1) overwrites the one shared mmap slab.
+        # Resident blocks own independent quantized storage, so fence only
+        # every eighth block to bound allocator transients without draining
+        # the GPU pipeline fifty times. The old `i <= store.resident` test was
+        # reversed: it skipped most required tail fences and serialized nearly
+        # every resident block, harming both correctness and speed.
+        if h3_fp8_backward_should_fence(i, store.resident):
+            ctx.synchronize()
+    var lora = List[H3BlockLoraGrads]()
+    for r in range(n):
+        lora.append(lora_rev[n - 1 - r].copy())
+    return H3StackLoraOnlyGrads(TArc(d^), lora^)
+
+
+# ── DIRECT INT8-RESIDENT variants: no resident weight dequantization ────────
+from serenitymojo.models.minimax_h3.h3_train_block_store_int8 import (
+    H3TrainBlockStoreInt8,
+)
+
+
+def h3_stack_train_forward_streamed_int8[
+    H: Int, Dh: Int
+](
+    x_in: Tensor,
+    mut store: H3TrainBlockStoreInt8,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackTrainForward:
+    var n = store.num_blocks
+    if len(mods) != n or len(loras) != n:
+        raise Error("h3 int8 stack forward: mods/loras length mismatch")
+    var inputs = List[TArc]()
+    var h = x_in.clone(ctx)
+    for i in range(n):
+        inputs.append(TArc(h.clone(ctx)))
+        var bw = store.stage(i, ctx)
+        var p8 = store.payload(i)
+        var f = h3_block_train_forward_lora[H, Dh](
+            h, bw, loras[i], mods[i][], adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx, p8,
+        )
+        h = f.out[].clone(ctx)
+        _ = f^
+        _ = bw^
+        if h3_fp8_forward_should_fence(i, store.resident):
+            ctx.synchronize()
+    return H3StackTrainForward(TArc(h^), inputs^)
+
+
+def h3_stack_train_backward_streamed_int8[
+    H: Int, Dh: Int
+](
+    d_out: Tensor,
+    fwd: H3StackTrainForward,
+    mut store: H3TrainBlockStoreInt8,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackLoraOnlyGrads:
+    var n = store.num_blocks
+    if len(fwd.block_inputs) != n:
+        raise Error("h3 int8 stack backward: forward length mismatch")
+    var lora_rev = List[H3BlockLoraGrads]()
+    var d = d_out.clone(ctx)
+    for r in range(n):
+        var i = n - 1 - r
+        var bw = store.stage(i, ctx)
+        var p8 = store.payload(i)
+        var f = h3_block_train_forward_lora[H, Dh](
+            fwd.block_inputs[i][], bw, loras[i], mods[i][],
+            adaln_indices, cos, sin, D, F, rotary_dim, eps, ctx, p8,
+        )
+        var b = h3_block_train_backward_lora_frozen[H, Dh](
+            d, bw, loras[i], f.saved, adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx, p8,
+        )
+        d = b.d_x[].clone(ctx)
+        lora_rev.append(b.lora.copy())
+        _ = b^
+        _ = f^
+        _ = bw^
+        if h3_fp8_backward_should_fence(i, store.resident):
             ctx.synchronize()
     var lora = List[H3BlockLoraGrads]()
     for r in range(n):

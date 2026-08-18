@@ -117,6 +117,7 @@ from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.tensor_algebra import reshape, permute, slice, add, mul, concat
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
 from serenitymojo.audio.wav import save_wav
+from serenitymojo.training.on_device_global_norm import on_device_grad_stats
 
 from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
@@ -129,7 +130,10 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_forward,
     minimax_h3_block_forward_dynamic,
 )
-from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
+from serenitymojo.ops.sage_attention_int8 import (
+    SageInt8Scratch,
+    SageUltraViCoConfig,
+)
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
     minimax_h3_load_qkv_device,
@@ -176,8 +180,11 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_timestep_embedding,
 )
 from serenitymojo.models.dit.minimax_h3_sampling import (
+    MINIMAX_H3_ANCHOR_FRACTION_BASE,
+    MINIMAX_H3_ANCHOR_FRACTION_SCALE,
     MiniMaxH3DualSchedule,
     minimax_h3_build_sampling_geometry,
+    minimax_h3_localize_semantic_rope_anchors,
 )
 from serenitymojo.models.text_encoder.minimax_h3_qwen3vl_int8 import (
     minimax_h3_encode_conditioning_int8_streamed,
@@ -221,6 +228,7 @@ from serenitymojo.pipeline.minimax_h3_keyframe_image import (
     MiniMaxH3RgbImage,
     minimax_h3_exif_transpose,
     minimax_h3_keyframe_anchors,
+    minimax_h3_prepare_keyframe_image,
     minimax_h3_prepare_keyframes,
 )
 from serenitymojo.pipeline.minimax_h3_media_in import (
@@ -293,8 +301,11 @@ comptime WIDTH = get_defined_int["H3_WIDTH", 832]()
 comptime FRAMES = get_defined_int["H3_FRAMES", 22]()
 comptime TEXT_TOKENS = get_defined_int["H3_TEXT_TOKENS", 32]()
 comptime MINIMAX_H3_TRAINED_MAX_FRAMES = 362
-comptime MINIMAX_H3_SINGLE_PASS_MAX_FRAMES = 1450
-comptime MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE = 109303
+comptime MINIMAX_H3_SINGLE_PASS_MAX_FRAMES = 2895
+# The 60 s gate proved S=109174 with substantial device headroom.  Admit only
+# the next requested rung here; its first evaluation must still pass before
+# the remaining schedule is resumed.
+comptime MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE = 160000
 
 comptime LATENT_H = HEIGHT // 16
 comptime LATENT_W = WIDTH // 16
@@ -406,30 +417,62 @@ def _preflight_geometry(width: Int, height: Int, frames: Int) raises:
             "minimax_h3_i2va: width/height must be multiples of 32 in [32,2048]"
         )
     if frames < 5 or frames > MINIMAX_H3_SINGLE_PASS_MAX_FRAMES:
-        raise Error("minimax_h3_i2va: internal frames must be in [5,1450]")
-    if frames > MINIMAX_H3_TRAINED_MAX_FRAMES:
-        var latent_h = height // 16
-        var latent_w = width // 16
-        var rows_per_frame = (latent_h // PATCH_H) * (latent_w // PATCH_W)
-        var latent_frames = (frames - 5) // 17 * 5 + 2
-        var audio_latents = Int(round(Float64(frames) / 24.0 * 40.0))
-        var sequence_length = (
-            TEXT_TOKENS + KEYFRAMES * rows_per_frame
-            + latent_frames * rows_per_frame + audio_latents * 2
-        )
-        if sequence_length > MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE:
-            raise Error(
-                String("minimax_h3_i2va: experimental single-pass long context S=")
-                + String(sequence_length) + " exceeds the 109303-token 24-GB"
-                " envelope; lower resolution or duration"
-            )
-    if KEYFRAMES < 1 or KEYFRAMES > 2:
+        raise Error("minimax_h3_i2va: internal frames must be in [5,2895]")
+    if KEYFRAMES < 1 or KEYFRAMES > 6:
         raise Error(
-            String("minimax_h3_i2va: H3_KEYFRAMES must be 1 (I2VA/L2VA) or 2"
-                   " (FL2VA), got ") + String(KEYFRAMES)
+            String("minimax_h3_i2va: H3_KEYFRAMES must be in [1,6], got ")
+            + String(KEYFRAMES)
         )
     if TEXT_TOKENS <= 0:
         raise Error("minimax_h3_i2va: H3_TEXT_TOKENS must be positive")
+
+
+def _preflight_sequence(
+    width: Int, height: Int, frames: Int, text_tokens: Int
+) raises:
+    """Admit long context against the presentation's exact row count.
+
+    `TEXT_TOKENS` is only the build profile's upper budget.  Using it here
+    rejected a real 640x384/60 s FL2VA request even though its tokenized
+    presentation fits the measured 24-GB sequence envelope.  The presentation
+    exists before any model weights are loaded, so use its exact count without
+    weakening the envelope.
+    """
+    if frames <= MINIMAX_H3_TRAINED_MAX_FRAMES:
+        return
+    var latent_h = height // 16
+    var latent_w = width // 16
+    var rows_per_frame = (latent_h // PATCH_H) * (latent_w // PATCH_W)
+    var latent_frames = (frames - 5) // 17 * 5 + 2
+    var audio_latents = Int(round(Float64(frames) / 24.0 * 40.0))
+    var sequence_length = (
+        text_tokens + KEYFRAMES * rows_per_frame
+        + latent_frames * rows_per_frame + audio_latents * 2
+    )
+    if sequence_length > MINIMAX_H3_SINGLE_PASS_MAX_SEQUENCE:
+        raise Error(
+            String("minimax_h3_i2va: experimental single-pass long context S=")
+            + String(sequence_length) + " exceeds the 160000-token 24-GB"
+            " envelope; lower resolution or duration"
+        )
+
+
+def _assert_finite_rows(
+    name: String, tensor: Tensor, ctx: DeviceContext
+) raises:
+    """Scan a checkpoint tensor on GPU and read back scalar summaries only."""
+    var tensors = List[ArcPointer[Tensor]]()
+    tensors.append(ArcPointer[Tensor](tensor.clone(ctx)))
+    var stats = on_device_grad_stats(tensors, ctx)
+    print(
+        "  finite gate", name, "l2=", stats.grad_norm,
+        "nonfinite=", stats.nonfinite_count,
+    )
+    if stats.nonfinite_count != 0:
+        raise Error(
+            String("minimax_h3_i2va: ") + name + String(" contains ")
+            + String(stats.nonfinite_count) + String(" non-finite values")
+        )
 
 
 def _preflight_block_tensors(
@@ -887,6 +930,7 @@ def _usage():
     print("  minimax_h3_i2va i2va  <prompt> <image>              <out_dir> [steps] [seed] [max_blocks]")
     print("  minimax_h3_i2va l2va  <prompt> <last_image>         <out_dir> [steps] [seed] [max_blocks]")
     print("  minimax_h3_i2va fl2va <prompt> <image> <last_image> <out_dir> [steps] [seed] [max_blocks]")
+    print("  minimax_h3_i2va mk2va <prompt> <image_1> ... <image_N> <out_dir> [steps] [seed] [max_blocks]")
     print("")
     print(
         "  compiled geometry:", WIDTH, "x", HEIGHT, ",", FRAMES, "frames,",
@@ -894,8 +938,12 @@ def _usage():
     )
     print("  <prompt> is the BODY text; the §2.1 alignment instruction is prepended for you")
     print("  optional flag: --attention-backend=cudnn|sage-int8 (default cudnn)")
+    print("  optional flag: --attention-backend=sage-int8-ultravico (training-free long-video score decay)")
     print("  optional flag: --step-cache=exact|high (default exact)")
     print("  optional flag: --resident-backend=groupwise|w8a8 (INT8 builds)")
+    print("  optional flags: --eval-start=N --eval-stop=N (exact resume/gate)")
+    print("  optional flag: --riflex-k=N (training-free temporal anti-repetition)")
+    print("  optional flag: --semantic-rope-anchors (time-localize picture grids)")
     print("  optional flag: --defer-video-decode (fresh-process GPU decode)")
 
 
@@ -908,11 +956,16 @@ def main() raises:
     var runtime_fps = 24
     var attention_backend = MINIMAX_H3_ATTN_CUDNN
     var attention_backend_name = String("cudnn")
+    var ultravico_enabled = False
     var step_cache_enabled = False
     var step_cache_name = String("exact")
     var resident_scheme = MINIMAX_H3_RESIDENT_INT8
     var resident_backend_name = String("groupwise")
     var defer_video_decode = False
+    var eval_start = 0
+    var eval_stop = -1
+    var riflex_k = 0
+    var semantic_rope_anchors = False
     for i in range(len(raw_args)):
         var arg = String(raw_args[i])
         if arg.startswith("--width="):
@@ -934,15 +987,22 @@ def main() raises:
         if arg == String("--attention-backend=sage-int8"):
             attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
             attention_backend_name = String("sage-int8")
+            ultravico_enabled = False
+            continue
+        if arg == String("--attention-backend=sage-int8-ultravico"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
+            attention_backend_name = String("sage-int8-ultravico")
+            ultravico_enabled = True
             continue
         if arg == String("--attention-backend=cudnn"):
             attention_backend = MINIMAX_H3_ATTN_CUDNN
             attention_backend_name = String("cudnn")
+            ultravico_enabled = False
             continue
         if arg.startswith("--attention-backend="):
             raise Error(
                 String("unknown attention backend flag: ") + arg
-                + String(" (expected cudnn or sage-int8)")
+                + String(" (expected cudnn, sage-int8, or sage-int8-ultravico)")
             )
         if arg == String("--step-cache=high"):
             step_cache_enabled = True
@@ -973,6 +1033,29 @@ def main() raises:
         if arg == String("--defer-video-decode"):
             defer_video_decode = True
             continue
+        if arg.startswith("--eval-start="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --eval-start flag")
+            eval_start = atol(String(fields[1]))
+            continue
+        if arg.startswith("--eval-stop="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --eval-stop flag")
+            eval_stop = atol(String(fields[1]))
+            continue
+        if arg.startswith("--riflex-k="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --riflex-k flag")
+            riflex_k = atol(String(fields[1]))
+            if riflex_k < 1:
+                raise Error("--riflex-k must be a positive one-based index")
+            continue
+        if arg == String("--semantic-rope-anchors"):
+            semantic_rope_anchors = True
+            continue
         args.append(arg)
     comptime if DIT_INT8_RESIDENT == 0:
         if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
@@ -982,10 +1065,16 @@ def main() raises:
     if len(args) < 5:
         _usage()
         return
+    if ultravico_enabled and riflex_k > 0:
+        raise Error(
+            "--attention-backend=sage-int8-ultravico and --riflex-k are "
+            "separate experiments and cannot be enabled together"
+        )
 
     var mode = String(args[1])
     var have_first: Bool
     var have_last: Bool
+    var multi_keyframes = False
     if mode == String("i2va"):
         have_first = True
         have_last = False
@@ -995,11 +1084,20 @@ def main() raises:
     elif mode == String("fl2va"):
         have_first = True
         have_last = True
+    elif mode == String("mk2va"):
+        have_first = True
+        have_last = True
+        multi_keyframes = True
     else:
         _usage()
         raise Error(String("minimax_h3_i2va: unknown mode '") + mode + "'")
+    if semantic_rope_anchors and not multi_keyframes:
+        raise Error("--semantic-rope-anchors requires mk2va mode")
 
-    var num_keyframes = 2 if (have_first and have_last) else 1
+    var num_keyframes = (
+        KEYFRAMES if multi_keyframes
+        else (2 if (have_first and have_last) else 1)
+    )
     if num_keyframes != KEYFRAMES:
         raise Error(
             String("minimax_h3_i2va: mode '") + mode + "' needs "
@@ -1060,6 +1158,11 @@ def main() raises:
     print("  steps=", steps, " seed=", seed, " max_blocks=", max_blocks)
     print("  attention_backend=", attention_backend_name)
     print("  step_cache=", step_cache_name)
+    if riflex_k > 0:
+        print(
+            "  riflex temporal frequency k=", riflex_k,
+            " span=", num_audio_latents, "media clock units",
+        )
     comptime if DIT_INT8_RESIDENT != 0:
         print(
             "  weight_storage=resident-int8-", resident_backend_name,
@@ -1079,16 +1182,39 @@ def main() raises:
     # Keyframes: decode, EXIF-transpose, resolve+check the canvas, put them on it.
     var raw_keyframes = List[MiniMaxH3RgbImage]()
     for i in range(len(image_paths)):
-        var tag = String("first") if (i == 0 and have_first) else String("last")
+        var tag = (
+            String(i) if multi_keyframes
+            else (String("first") if (i == 0 and have_first) else String("last"))
+        )
         raw_keyframes.append(_read_keyframe(image_paths[i], out_dir, tag))
         print(
             "  keyframe", i, ":", image_paths[i], "->",
             raw_keyframes[i].width, "x", raw_keyframes[i].height,
         )
-    var keyframes = minimax_h3_prepare_keyframes(
-        raw_keyframes, have_first, have_last, runtime_height, runtime_width
-    )
-    var anchors = minimax_h3_keyframe_anchors(have_first, have_last)
+    var keyframes = List[MiniMaxH3RgbImage]()
+    var anchors = List[Int]()
+    if multi_keyframes:
+        for i in range(len(raw_keyframes)):
+            keyframes.append(
+                minimax_h3_prepare_keyframe_image(
+                    raw_keyframes[i], runtime_height, runtime_width, i == 0
+                )
+            )
+            if i == 0:
+                anchors.append(0)
+            elif i == len(raw_keyframes) - 1:
+                anchors.append(1)
+            else:
+                var ppm = (
+                    i * MINIMAX_H3_ANCHOR_FRACTION_SCALE
+                    + (len(raw_keyframes) - 1) // 2
+                ) // (len(raw_keyframes) - 1)
+                anchors.append(MINIMAX_H3_ANCHOR_FRACTION_BASE + ppm)
+    else:
+        keyframes = minimax_h3_prepare_keyframes(
+            raw_keyframes, have_first, have_last, runtime_height, runtime_width
+        )
+        anchors = minimax_h3_keyframe_anchors(have_first, have_last)
     print(
         "  keyframes prepared onto", runtime_width, "x", runtime_height,
         ", anchors:", len(anchors),
@@ -1099,6 +1225,24 @@ def main() raises:
     # no way to know how many shots it declares, and 1 is the guide's own single
     # shot case. A caller with multiple shots should pass a pre-built prompt.
     var instruction = minimax_h3_alignment_instruction(task, runtime_frames, 1)
+    if multi_keyframes:
+        instruction = String(
+            "How the reference pictures align with the target video — "
+        )
+        var request_seconds = (
+            Float64(runtime_frames) / Float64(runtime_fps)
+        )
+        for i in range(num_keyframes):
+            if i > 0:
+                instruction += String("; ")
+            var anchor_seconds = (
+                request_seconds * Float64(i) / Float64(num_keyframes - 1)
+            )
+            instruction += (
+                String("Picture ") + String(i + 1) + String(" aligns with ")
+                + String(anchor_seconds) + String(" seconds")
+            )
+        instruction += String(".")
     var prompt = prompt_body
     if instruction != String(""):
         prompt = instruction + "\n\n" + prompt_body
@@ -1132,6 +1276,9 @@ def main() raises:
         "text rows total,", len(presentation.pad_positions), "image_pad rows",
     )
     var runtime_text_tokens = presentation.num_text_tokens()
+    _preflight_sequence(
+        runtime_width, runtime_height, runtime_frames, runtime_text_tokens
+    )
 
     # ── THE VISION PATH, as a CONSUMED interface ────────────────────────────
     # The tower is h3-ref2va's and is not this file's to reimplement. This file
@@ -1296,6 +1443,45 @@ def main() raises:
     )
     var audio_shape: List[Int] = [num_audio_rows, config.audio_latents_dim]
     var audio_state = Tensor.from_host(audio_noise_rows, audio_shape^, STDtype.F32, ctx)
+    if eval_start > 0:
+        var resume_path = (
+            out_dir + String("/resume_latents_step_")
+            + String(eval_start) + String(".safetensors")
+        )
+        var resume_st = SafeTensors.open(resume_path)
+        var vinfo = resume_st.tensor_info(String("video_state_rows"))
+        var ainfo = resume_st.tensor_info(String("audio_state_rows"))
+        if (
+            vinfo.dtype != STDtype.F32
+            or len(vinfo.shape) != 2
+            or vinfo.shape[0] != num_target_video_rows
+            or vinfo.shape[1] != patch_dim
+            or ainfo.dtype != STDtype.F32
+            or len(ainfo.shape) != 2
+            or ainfo.shape[0] != num_audio_rows
+            or ainfo.shape[1] != config.audio_latents_dim
+        ):
+            raise Error(
+                "MiniMax-H3 conditioned resume latent dtype/shape mismatch"
+            )
+        video_state = Tensor.from_view(
+            from_parts(
+                vinfo.dtype, vinfo.shape.copy(),
+                resume_st.tensor_bytes(String("video_state_rows")),
+            ),
+            ctx,
+        )
+        audio_state = Tensor.from_view(
+            from_parts(
+                ainfo.dtype, ainfo.shape.copy(),
+                resume_st.tensor_bytes(String("audio_state_rows")),
+            ),
+            ctx,
+        )
+        print(
+            "  resumed conditioned latent rows at evaluation", eval_start,
+            "from", resume_path,
+        )
     var t_kf1 = perf_counter_ns()
     print(
         "  keyframe conditioning ready:", num_condition_rows, "condition rows (",
@@ -1359,6 +1545,19 @@ def main() raises:
     var sequence_length = geometry.sequence_length
     if geometry.num_condition_video_rows != num_condition_rows:
         raise Error("minimax_h3_i2va: condition row count mismatch")
+    if semantic_rope_anchors:
+        comptime if NO_VISION != 0:
+            raise Error(
+                "--semantic-rope-anchors requires the real vision tower"
+            )
+        var vision_rows_per_keyframe = minimax_h3_localize_semantic_rope_anchors(
+            geometry, presentation.pad_positions, runtime_text_tokens,
+            num_keyframes, rows_per_frame,
+        )
+        print(
+            "  semantic RoPE anchors:", num_keyframes, "picture grids x",
+            vision_rows_per_keyframe, "rows localized to condition times",
+        )
 
     # ── 4. RoPE ────────────────────────────────────────────────────────────
     var positions_f32 = List[Float32](capacity=len(geometry.position_ids))
@@ -1368,13 +1567,36 @@ def main() raises:
     var positions_tensor = Tensor.from_host(
         positions_f32, positions_shape^, STDtype.F32, ctx
     )
-    var rope = build_minimax_h3_rope_tables(positions_tensor, ctx, config.rope_inv_freq_len)
+    var rope = build_minimax_h3_rope_tables(
+        positions_tensor, ctx, config.rope_inv_freq_len,
+        out_dtype=STDtype.F32,
+        riflex_time_frequency_index=riflex_k,
+        riflex_media_time_origin=Float32(runtime_text_tokens),
+        riflex_time_span=Float32(num_audio_latents),
+    )
     var rotary_dim = rope[0].shape()[1]
 
     # ── 5. Dual schedule + a THREE-row-per-step modulation cache ───────────
     var schedule = MiniMaxH3DualSchedule()
     schedule.set_timesteps(steps)
     var num_steps = schedule.num_inference_steps()
+    if eval_stop < 0:
+        eval_stop = num_steps
+    if (
+        eval_start < 0
+        or eval_start >= num_steps
+        or eval_stop <= eval_start
+        or eval_stop > num_steps
+    ):
+        raise Error(
+            "MiniMax-H3 conditioned evaluation range is outside the schedule"
+        )
+    if step_cache_enabled and eval_start != 0:
+        raise Error(
+            "MiniMax-H3 High step cache cannot resume mid-denoise;"
+            " start at evaluation 0"
+        )
+    print("  evaluation range: [", eval_start, ",", eval_stop, ")")
 
     var t_mod0 = perf_counter_ns()
     var distinct_timesteps = 3 * num_steps
@@ -1502,6 +1724,46 @@ def main() raises:
                 / (1024.0 * 1024.0 * 1024.0),
             "GiB for S=", sequence_length,
         )
+    var sage_ultravico = Optional[SageUltraViCoConfig](None)
+    if ultravico_enabled:
+        if len(geometry.video_indices) != (
+            num_condition_rows + num_target_video_rows
+        ):
+            raise Error("UltraViCo video-row count does not match H3 geometry")
+        if num_target_video_rows == 0:
+            raise Error("UltraViCo requires at least one packed video row")
+        # `video_indices` starts with the pinned keyframe-condition rows.
+        # Start decay at the target band so the anchors themselves and every
+        # condition<->target attention score retain the released-model math.
+        var video_start = geometry.video_indices[num_condition_rows]
+        for i in range(num_target_video_rows):
+            if geometry.video_indices[num_condition_rows + i] != video_start + i:
+                raise Error(
+                    "UltraViCo requires target-video rows to be contiguous"
+                )
+        # H3 was authored for 15-second clips: 362 internal frames map to
+        # 107 latent frames.  UltraViCo leaves half that learned window
+        # untouched, decays other positive video/video scores by 0.9, and
+        # applies 0.6 around the first measured 120-second repeat harmonic.
+        var learned_latent_frames = (362 - 5) // 17 * 5 + 2
+        var uv_window_frames = learned_latent_frames // 2
+        var uv_repeat_period_frames = 194
+        var uv_repeat_radius_frames = 16
+        sage_ultravico = Optional[SageUltraViCoConfig](
+            SageUltraViCoConfig(
+                video_start, rows_per_frame, uv_window_frames,
+                uv_repeat_period_frames, uv_repeat_radius_frames,
+                0.9, 0.6,
+            )
+        )
+        print(
+            "  UltraViCo: video_start=", video_start,
+            " rows_per_frame=", rows_per_frame,
+            " window=", uv_window_frames,
+            " repeat=", uv_repeat_period_frames,
+            " radius=", uv_repeat_radius_frames,
+            " alpha=0.9 beta=0.6",
+        )
     var t_den0 = perf_counter_ns()
     var step_cache = MiniMaxH3StepCache(step_cache_enabled, num_steps)
     # Audio-protection probe rows: up to 16 evenly sampled AUDIO positions.
@@ -1520,7 +1782,7 @@ def main() raises:
                 cache_audio_probe_ids.append(
                     geometry.audio_indices[(i * (n_audio - 1)) // (want_rows - 1)]
                 )
-    for i in range(num_steps):
+    for i in range(eval_start, eval_stop):
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
         var audio_ts = schedule.audio_timestep(i)
@@ -1667,7 +1929,7 @@ def main() raises:
             hidden3 = minimax_h3_block_forward_dynamic[H3_HEADS, H3_HEAD_DIM](
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
-                attention_backend, sage_scratch,
+                attention_backend, sage_scratch, sage_ultravico,
             )
             # At the 15-second base-area product geometry the reusable tail
             # store and the long-sequence attention temporaries otherwise
@@ -1770,6 +2032,24 @@ def main() raises:
             " cond_t=", (video_ts if video_ts > Float32(0.999) else Float32(0.999)),
             " (", Float64(t_step1 - t_step0) / 1.0e9, "s)",
         )
+        _assert_finite_rows("video_state_rows", video_state, ctx)
+        _assert_finite_rows("audio_state_rows", audio_state, ctx)
+        var resume_names = List[String]()
+        resume_names.append(String("video_state_rows"))
+        resume_names.append(String("audio_state_rows"))
+        var resume_tensors = List[ArcPointer[Tensor]]()
+        resume_tensors.append(ArcPointer[Tensor](slice(
+            video_state, 0, 0, num_target_video_rows, ctx
+        )))
+        resume_tensors.append(ArcPointer[Tensor](slice(
+            audio_state, 0, 0, num_audio_rows, ctx
+        )))
+        var resume_path = (
+            out_dir + String("/resume_latents_step_")
+            + String(i + 1) + String(".safetensors")
+        )
+        save_safetensors(resume_names, resume_tensors, resume_path, ctx)
+        print("  saved resume latents ->", resume_path)
 
     if step_cache.enabled:
         print(
@@ -1777,6 +2057,13 @@ def main() raises:
             " cached=", step_cache.cached_evaluations,
             " residual_bytes=", step_cache.residual_bytes(),
         )
+
+    if eval_stop < num_steps:
+        print(
+            "  partial conditioned denoise complete at evaluation", eval_stop,
+            "; decode intentionally skipped",
+        )
+        return
 
     var lat_names = List[String]()
     lat_names.append(String("video_state_rows"))
@@ -1848,6 +2135,8 @@ def main() raises:
     body += String("  \"fps\":") + String(runtime_fps) + String(",\n")
     body += String("  \"keyframes\":") + String(KEYFRAMES) + String(",\n")
     body += String("  \"condition_rows\":") + String(num_condition_rows) + String(",\n")
+    body += String("  \"semantic_rope_anchors\":") \
+        + json_bool(semantic_rope_anchors) + String(",\n")
     body += String("  \"sequence_length\":") + String(sequence_length) + String(",\n")
     body += String("  \"attention_backend\":\"") \
         + attention_backend_name + String("\",\n")

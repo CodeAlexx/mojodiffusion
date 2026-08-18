@@ -346,6 +346,12 @@ def minimax_h3_build_resident_fp8(
     scheme: Int = MINIMAX_H3_RESIDENT_INT8,
     lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
 ) raises -> MiniMaxH3ResidentFp8:
+    if lora_overlay:
+        raise Error(
+            "minimax_h3_build_resident_fp8: LoRA must remain an activation "
+            "overlay; pre-quantization merge is disabled because groupwise "
+            "INT8 erases trained adapter deltas"
+        )
     if (
         scheme != MINIMAX_H3_RESIDENT_E4M3
         and scheme != MINIMAX_H3_RESIDENT_INT8

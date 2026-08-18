@@ -1,7 +1,10 @@
 # serenitymojo/models/minimax_h3/h3_train_block_store.mojo
 #
-# mmap-staging streamer for H3 TRAINING block weights (raw torchref layout,
-# bf16 verbatim from the FL2VA diffusers shards — no conversion).
+# mmap-staging streamer for H3 TRAINING block weights. The mmap and fixed slab
+# retain the released checkpoint bytes verbatim; stage() deinterleaves the QKV
+# rows on device before returning the block so training consumes the same
+# [q_all;k_all;v_all] base function as product inference. FC1 remains raw
+# [gate;value], which is the training block's native SwiGLU convention.
 #
 # v2 DESIGN (the 08-14 oomd lesson): v1 filled a single 38.5GB pinned host
 # store up front; pinned pages are UNRECLAIMABLE, so once filled the kernel
@@ -32,9 +35,14 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.tensor import Tensor
 from serenitymojo.models.minimax_h3.h3_block_train import H3BlockTrainWeights
+from serenitymojo.models.minimax_h3.h3_qkv_layout import (
+    h3_qkv_deinterleave_rows,
+)
 
 comptime TArc = ArcPointer[Tensor]
 comptime H3_TRAIN_BLOCK_TENSORS = 8
+comptime H3_TRAIN_HEADS = 56
+comptime H3_TRAIN_HEAD_DIM = 128
 
 
 def h3_train_block_tensor_names() -> List[String]:
@@ -174,7 +182,15 @@ struct H3TrainBlockStore(Movable):
                 view^, self.shapes[i][].copy(), self.dtypes[i]
             )))
         self.staged_layer = layer
+        # The released shard stores [head, qkv, dim] rows. The training block
+        # splits a contiguous [q_all;k_all;v_all] projection, just like the
+        # product block after its loader conversion. This allocation is also
+        # what the FP8 resident builder quantizes, so steady-state resident
+        # training pays no recurring permutation cost.
+        var qkv = h3_qkv_deinterleave_rows(
+            views[0][], H3_TRAIN_HEADS, H3_TRAIN_HEAD_DIM, ctx
+        )
         return H3BlockTrainWeights(
-            views[0], views[1], views[2], views[3],
+            TArc(qkv^), views[1], views[2], views[3],
             views[4], views[5], views[6], views[7],
         )

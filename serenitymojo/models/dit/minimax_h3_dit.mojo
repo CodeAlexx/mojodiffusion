@@ -79,6 +79,7 @@ from serenitymojo.ops.attention_flash import (
 )
 from serenitymojo.ops.sage_attention_int8 import (
     SageInt8Scratch,
+    SageUltraViCoConfig,
     sage_attention_int8_fwd,
     sage_attention_int8_fwd_dynamic,
     sage_attention_int8_fwd_scratch,
@@ -100,6 +101,7 @@ from serenitymojo.models.dit.minimax_h3_int8_linear import (
 from serenitymojo.models.dit.minimax_h3_qk_inplace import (
     minimax_h3_qk_norm_partial_rope_inplace,
 )
+from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 from serenitymojo.ops.tensor_algebra import (
     gather_rows,
@@ -132,6 +134,7 @@ def _minimax_h3_attention_dispatch(
     ctx: DeviceContext,
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch] = None,
+    sage_ultravico: Optional[SageUltraViCoConfig] = None,
 ) raises -> Tensor:
     """Exact cuDNN, raw Sage, or Sage with an exact query prefix.
 
@@ -144,6 +147,21 @@ def _minimax_h3_attention_dispatch(
     if attention_backend == MINIMAX_H3_ATTN_CUDNN:
         return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
     if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+        if sage_ultravico:
+            var uv = sage_ultravico.value()
+            if sage_scratch:
+                return sage_attention_int8_fwd_scratch(
+                    q, k, v, scale, sage_scratch.value(), ctx,
+                    uv.video_start, uv.rows_per_frame, uv.window_frames,
+                    uv.repeat_period_frames, uv.repeat_radius_frames,
+                    uv.alpha, uv.beta,
+                )
+            return sage_attention_int8_fwd_dynamic(
+                q, k, v, scale, ctx,
+                uv.video_start, uv.rows_per_frame, uv.window_frames,
+                uv.repeat_period_frames, uv.repeat_radius_frames,
+                uv.alpha, uv.beta,
+            )
         if sage_scratch:
             return sage_attention_int8_fwd_scratch(
                 q, k, v, scale, sage_scratch.value(), ctx
@@ -161,7 +179,23 @@ def _minimax_h3_attention_dispatch(
         # the small text+audio prefix with exact cross-SDPA against the same
         # complete K/V document.  T2VA packs rows as text|audio|video.
         var approximate: Tensor
-        if sage_scratch:
+        if sage_ultravico:
+            var uv = sage_ultravico.value()
+            if sage_scratch:
+                approximate = sage_attention_int8_fwd_scratch(
+                    q, k, v, scale, sage_scratch.value(), ctx,
+                    uv.video_start, uv.rows_per_frame, uv.window_frames,
+                    uv.repeat_period_frames, uv.repeat_radius_frames,
+                    uv.alpha, uv.beta,
+                )
+            else:
+                approximate = sage_attention_int8_fwd_dynamic(
+                    q, k, v, scale, ctx,
+                    uv.video_start, uv.rows_per_frame, uv.window_frames,
+                    uv.repeat_period_frames, uv.repeat_radius_frames,
+                    uv.alpha, uv.beta,
+                )
+        elif sage_scratch:
             approximate = sage_attention_int8_fwd_scratch(
                 q, k, v, scale, sage_scratch.value(), ctx
             )
@@ -611,6 +645,69 @@ def _minimax_h3_block_linear(
     )
 
 
+def _minimax_h3_block_linear_lora(
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    name: String,
+    layer: Int,
+    slot: Int,
+    lora_overlay: Optional[H3LoraOverlay],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Base projection plus the separately-resident LoRA activation branch.
+
+    The base may be BF16, W8A8, or groupwise INT8. The adapter is deliberately
+    applied after that base projection; folding it into the weight before INT8
+    encoding destroys small trained deltas and does not match training.
+    """
+    var base = _minimax_h3_block_linear(x, weights, name, ctx)
+    if lora_overlay and lora_overlay.value().has(layer, slot):
+        var delta = lora_overlay.value().activation_delta(
+            layer, slot, x, ctx
+        )
+        return add(base, delta, ctx)
+    return base^
+
+
+def _minimax_h3_block_swiglu_linear_lora(
+    x: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    name: String,
+    layer: Int,
+    lora_overlay: Optional[H3LoraOverlay],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if lora_overlay and lora_overlay.value().has(layer, 2):
+        var packed = _minimax_h3_block_linear_lora(
+            x, weights, name, layer, 2, lora_overlay, ctx
+        )
+        return swiglu_packed_value_gate(packed, ctx)
+    return _minimax_h3_block_swiglu_linear(
+        x, weights, name, False, ctx
+    )
+
+
+def _minimax_h3_block_residual_linear_lora(
+    x: Tensor,
+    residual: Tensor,
+    gate: Tensor,
+    weights: Dict[String, ArcPointer[Tensor]],
+    name: String,
+    layer: Int,
+    slot: Int,
+    lora_overlay: Optional[H3LoraOverlay],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if lora_overlay and lora_overlay.value().has(layer, slot):
+        var projected = _minimax_h3_block_linear_lora(
+            x, weights, name, layer, slot, lora_overlay, ctx
+        )
+        return residual_gate(residual, gate, projected, ctx)
+    return _minimax_h3_block_residual_linear(
+        x, residual, gate, weights, name, False, ctx
+    )
+
+
 def _minimax_h3_block_swiglu_linear(
     x: Tensor,
     weights: Dict[String, ArcPointer[Tensor]],
@@ -768,6 +865,7 @@ def _minimax_h3_low_headroom_attention[
     ctx: DeviceContext,
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch] = None,
+    sage_ultravico: Optional[SageUltraViCoConfig] = None,
 ) raises -> Tensor:
     """Long-sequence attention in a lifetime isolated from the MLP.
 
@@ -842,7 +940,7 @@ def _minimax_h3_low_headroom_attention[
                 )
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx,
-            attention_backend, sage_scratch,
+            attention_backend, sage_scratch, sage_ultravico,
         )
         # Consume Q/K/V before the branch-local owner is destroyed.
         ctx.synchronize()
@@ -878,6 +976,7 @@ def _minimax_h3_low_headroom_attention[
                 )
         attn = _minimax_h3_attention_dispatch(
             q4, k4, v4, attn_scale, ctx, attention_backend, sage_scratch,
+            sage_ultravico,
         )
         ctx.synchronize()
     var merged = reshape_owned(attn^, [1, S, inner])
@@ -904,6 +1003,7 @@ def _minimax_h3_block_forward_low_headroom[
     ctx: DeviceContext,
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch] = None,
+    sage_ultravico: Optional[SageUltraViCoConfig] = None,
 ) raises -> Tensor:
     var prefix = minimax_h3_block_prefix(layer)
     var x1 = _minimax_h3_low_headroom_attention[Heads, HeadDim](
@@ -911,6 +1011,7 @@ def _minimax_h3_block_forward_low_headroom[
         config.inner_dim(), config.num_attention_heads,
         config.attention_head_dim, config.norm_eps, config.qk_norm_eps,
         cos, sin, rotary_dim, ctx, attention_backend, sage_scratch,
+        sage_ultravico,
     )
     # The attention helper's local QKV/rope/SDPA tensors are destroyed only
     # after it returns. Trim here—not inside that helper—so their pool pages
@@ -1021,6 +1122,8 @@ def _minimax_h3_block_forward_impl[
     ctx: DeviceContext,
     attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
     sage_scratch: Optional[SageInt8Scratch] = None,
+    sage_ultravico: Optional[SageUltraViCoConfig] = None,
+    lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
 ) raises -> Tensor:
     """One `MiniMaxH3TransformerBlock`. Mirrors `models/minimax_h3/
     block_forward.mojo::_transformer_block` op-for-op (see that file for the
@@ -1112,9 +1215,15 @@ def _minimax_h3_block_forward_impl[
     # branch is gathered after attention has completed.
     var low_headroom = S >= 48000
     if low_headroom:
+        if lora_overlay and lora_overlay.value().has_layer(layer):
+            raise Error(
+                "MiniMax-H3 activation LoRA is not admitted for S>=48000: "
+                "the low-headroom fused MLP cannot expose the four projection "
+                "outputs safely under the 24 GiB runtime cap"
+            )
         return _minimax_h3_block_forward_low_headroom[Heads, HeadDim](
             x, weights, layer, config, mod, adaln_indices, cos, sin,
-            rotary_dim, ctx, attention_backend, sage_scratch,
+            rotary_dim, ctx, attention_backend, sage_scratch, sage_ultravico,
         )
     var shift_msa: Tensor
     var scale_msa: Tensor
@@ -1170,10 +1279,14 @@ def _minimax_h3_block_forward_impl[
     var qkv_name = prefix + "attn.qkv_proj.weight"
     ref qkv_weight = weights[qkv_name][]
     var qkv_scale_name = qkv_name + String(".scale")
+    var qkv_lora = False
+    if lora_overlay:
+        qkv_lora = lora_overlay.value().has(layer, 0)
     var direct_w8a8_qkv = (
         qkv_weight.dtype() == STDtype.I8
         and qkv_scale_name in weights
         and weights[qkv_scale_name][].dtype() == STDtype.F32
+        and not qkv_lora
     )
     if direct_w8a8_qkv:
         # Write Q/K/V directly from the single packed W8A8 accumulator. The
@@ -1199,15 +1312,15 @@ def _minimax_h3_block_forward_impl[
         )
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v,
-            scale, ctx, attention_backend, sage_scratch,
+            scale, ctx, attention_backend, sage_scratch, sage_ultravico,
         )
         # The split owner is branch-local.  Finish its final consumer before
         # its three buffers are returned to the stream-ordered allocator.
         ctx.synchronize()
     else:
         # Compatibility fallback for non-production test weights.
-        var qkv_out = _minimax_h3_block_linear(
-            attn_in, weights, qkv_name, ctx
+        var qkv_out = _minimax_h3_block_linear_lora(
+            attn_in, weights, qkv_name, layer, 0, lora_overlay, ctx
         )
         var q = slice(qkv_out, 2, 0 * inner, inner, ctx)
         var k = slice(qkv_out, 2, 1 * inner, inner, ctx)
@@ -1225,13 +1338,14 @@ def _minimax_h3_block_forward_impl[
         )
         attn = _minimax_h3_attention_dispatch(
             q4, k4, v4, scale, ctx, attention_backend, sage_scratch,
+            sage_ultravico,
         )
         ctx.synchronize()
                                                                         # [1, S, heads, head_dim] bf16
     var merged = reshape_owned(attn^, [1, S, inner])
-    var x1 = _minimax_h3_block_residual_linear(
-        merged, x, gate_msa, weights, prefix + "attn.out_proj.weight", False,
-        ctx,
+    var x1 = _minimax_h3_block_residual_linear_lora(
+        merged, x, gate_msa, weights, prefix + "attn.out_proj.weight",
+        layer, 1, lora_overlay, ctx,
     )
 
     # ── MLP branch ──
@@ -1256,12 +1370,13 @@ def _minimax_h3_block_forward_impl[
             shift_mlp.value(), config.norm_eps, ctx,
         )
         # fc1 is swapped to [value;gate] by the transformed loader.
-        var act = _minimax_h3_block_swiglu_linear(
-            mlp_in, weights, prefix + "mlp.fc1.weight", False, ctx
+        var act = _minimax_h3_block_swiglu_linear_lora(
+            mlp_in, weights, prefix + "mlp.fc1.weight", layer,
+            lora_overlay, ctx,
         )
-        x2 = _minimax_h3_block_residual_linear(
+        x2 = _minimax_h3_block_residual_linear_lora(
             act, x1, gate_mlp.value(), weights, prefix + "mlp.fc2.weight",
-            False, ctx,
+            layer, 3, lora_overlay, ctx,
         )
     return x2^
 
@@ -1281,6 +1396,8 @@ def minimax_h3_block_forward[
     ctx: DeviceContext,
     attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
     sage_scratch: Optional[SageInt8Scratch] = None,
+    sage_ultravico: Optional[SageUltraViCoConfig] = None,
+    lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
 ) raises -> Tensor:
     """Static-S compatibility surface for parity gates and existing callers."""
     var x_shape = x.shape()
@@ -1288,7 +1405,7 @@ def minimax_h3_block_forward[
         raise Error("minimax_h3_block_forward: runtime S != static S")
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
-        ctx, attention_backend, sage_scratch,
+        ctx, attention_backend, sage_scratch, sage_ultravico, lora_overlay,
     )
 
 
@@ -1307,9 +1424,11 @@ def minimax_h3_block_forward_dynamic[
     ctx: DeviceContext,
     attention_backend: Int = MINIMAX_H3_ATTN_CUDNN,
     sage_scratch: Optional[SageInt8Scratch] = None,
+    sage_ultravico: Optional[SageUltraViCoConfig] = None,
+    lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
 ) raises -> Tensor:
     """Runtime-S product surface used by arbitrary H3 canvas geometry."""
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
-        ctx, attention_backend, sage_scratch,
+        ctx, attention_backend, sage_scratch, sage_ultravico, lora_overlay,
     )

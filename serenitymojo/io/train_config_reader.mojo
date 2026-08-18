@@ -31,6 +31,8 @@
 #   enable_activation_offloading | layer_offload_fraction
 #   dit_high_noise | dual_expert | i2v | wan_variant | timestep_boundary
 #     (P3 wan21/wan22 config-first keys; env WAN21_*/WAN22_* override when set)
+#   h3_num_timestep_buckets | h3_spatial_density_jitter |
+#   h3_base_preservation_loss_weight | h3_base_preservation_probability
 #
 # Mojo 1.0.0b1: `def` not `fn`; no Python.
 
@@ -1208,6 +1210,14 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.dynamic_timestep_shifting = _read_bool(cur)
         elif key == "guidance_scale" or key == "transformer_guidance_scale":
             cfg.guidance_scale = Float32(_read_scalar(cur).num)
+        elif key == "h3_num_timestep_buckets" or key == "num_timestep_buckets":
+            cfg.h3_num_timestep_buckets = Int(_read_scalar(cur).num)
+        elif key == "h3_spatial_density_jitter" or key == "spatial_density_jitter":
+            cfg.h3_spatial_density_jitter = Float32(_read_scalar(cur).num)
+        elif key == "h3_base_preservation_loss_weight" or key == "base_preservation_loss_weight":
+            cfg.h3_base_preservation_loss_weight = Float32(_read_scalar(cur).num)
+        elif key == "h3_base_preservation_probability" or key == "base_preservation_probability":
+            cfg.h3_base_preservation_probability = Float32(_read_scalar(cur).num)
         elif key == "lr_warmup_steps" or key == "learning_rate_warmup_steps":
             cfg.lr_warmup_steps = Int(_read_scalar(cur).num)
         elif key == "optimizer_warmup_steps":

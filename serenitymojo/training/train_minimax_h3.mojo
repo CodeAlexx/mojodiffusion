@@ -1,15 +1,15 @@
 # train_minimax_h3.mojo — MiniMax-H3 FL2VA LoRA trainer, IMAGE-mode maiden arm.
 #
-# Oracle = torchref (pinned upstream checkout @ 04324c28). Recipe = the
-# upstream OFFICIAL image-concept recipe (docs/minimax_h3.md + examples/
-# minimax_h3/image_fl2va.toml + parser set_defaults):
+# Numeric oracle = torchref (pinned upstream checkout @ 04324c28). Production
+# recipe controls are cross-checked against the local Musubi H3 fork; Musubi is
+# a reference only and is never part of this trainer's runtime:
 #   * caches: torchref-native mmh3 pair (h3_train_cache.mojo reader, gated
 #     bit-exact); text task t2va (id 0); image items ([24,1,H,W], no audio,
 #     no keyframe rows packed for plain image training).
-#   * LoRA: dim 16 / alpha 16 (scale 1.0) on the 4 block Linears
+#   * LoRA: configurable dim / alpha (alpha must equal dim) on 4 block Linears
 #     (qkv/out/fc1/fc2 — the full target set minus frozen adaln/norms);
 #     down = kaiming_uniform(a=sqrt(5)) = U(+-1/sqrt(in)), up = zeros;
-#     F32 masters + AdamW(lr 1e-4, betas 0.9/0.999, eps 1e-8, wd 1e-2);
+#     F32 masters + bnb-compatible blockwise AdamW8bit moments;
 #     bf16 compute copies refreshed each step; batch=1.
 #   * sigma (image branch): resolution-aware logit-normal —
 #     mu = lin(x1=256,y1=0.5 -> x2=6400,y2=1.15)((H/2)*(W/2)), shift=e^mu,
@@ -26,9 +26,12 @@
 # bit-exact) -> patchify -> packed layout + rope (gated inference frontend,
 # frozen) -> frontend embed -> 50-block streamed LoRA fwd (mmap store) ->
 # final-layer twin -> token loss + d_pred -> final bwd -> streamed recompute
-# bwd -> fused AdamW on masters -> refresh bf16 copies. Save canonical stack
+# bwd -> device AdamW8bit on masters -> refresh bf16 copies. Save canonical
 # PEFT LoRA (diffusion_model.*.lora_A/B.weight, BF16) every --save_every plus
-# the unchanged F32 full-resume state (masters + moments + step).
+# exact resume state (F32 masters, U8 moments/F32 absmax, RNG, recipe, step).
+# Validation generation is deliberately process-separated by the run wrapper:
+# the trainer exits at sample boundaries, then the pure-Mojo runtime loads the
+# saved PEFT adapter after all training VRAM has been released.
 from std.collections import Dict
 from std.math import sqrt, exp, log, cos
 from std.ffi import external_call
@@ -86,7 +89,18 @@ from serenitymojo.models.minimax_h3.h3_stack_train import (
 from serenitymojo.models.minimax_h3.h3_final_train import (
     H3FinalTrainWeights, h3_final_train_forward, h3_final_train_backward,
 )
-from serenitymojo.training.fused_adamw_multitensor import fused_adamw_step
+from serenitymojo.training.adamw8bit import (
+    Adam8bitDeviceState,
+    adamw8bit_device_state,
+    adamw8bit_device_state_from_tensors,
+    adamw8bit_device_step,
+)
+from serenitymojo.training.on_device_global_norm import on_device_grad_stats
+from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.train_config import (
+    TRAIN_OPTIMIZER_ADAMW_8BIT, TRAIN_DTYPE_BFLOAT_16,
+)
 from serenitymojo.training.lora_save import (
     F32NamedLora, save_lora_peft_host_f32,
 )
@@ -107,6 +121,13 @@ comptime SIGMA_NODES = 1000
 comptime N_BLOCKS = 50
 
 comptime SLOT_NAMES_LEN = 4
+comptime H3_TARGET_MLP_FC1_FC2 = 1
+
+
+def _slot_active(slot: Int, target_preset: Int) -> Bool:
+    if target_preset == H3_TARGET_MLP_FC1_FC2:
+        return slot == 2 or slot == 3
+    return False
 
 
 def _grad_pair(g: H3BlockLoraGrads, s: Int) raises -> Tuple[TArc, TArc]:
@@ -178,6 +199,136 @@ def _image_sigma(mut rng: _Rng, lat_h: Int, lat_w: Int) -> Float64:
     return t * shift / (1.0 + (shift - 1.0) * t)
 
 
+def _normal_ppf(p_in: Float64) -> Float64:
+    """Acklam inverse-normal CDF used to transform a stratified uniform draw.
+    The approximation error is far below the trainer's 1/999 sigma grid."""
+    var p = p_in
+    if p < 1.0e-7:
+        p = 1.0e-7
+    if p > 1.0 - 1.0e-7:
+        p = 1.0 - 1.0e-7
+    var a1 = -3.969683028665376e1
+    var a2 = 2.209460984245205e2
+    var a3 = -2.759285104469687e2
+    var a4 = 1.383577518672690e2
+    var a5 = -3.066479806614716e1
+    var a6 = 2.506628277459239
+    var b1 = -5.447609879822406e1
+    var b2 = 1.615858368580409e2
+    var b3 = -1.556989798598866e2
+    var b4 = 6.680131188771972e1
+    var b5 = -1.328068155288572e1
+    var c1 = -7.784894002430293e-3
+    var c2 = -3.223964580411365e-1
+    var c3 = -2.400758277161838
+    var c4 = -2.549732539343734
+    var c5 = 4.374664141464968
+    var c6 = 2.938163982698783
+    var d1 = 7.784695709041462e-3
+    var d2 = 3.224671290700398e-1
+    var d3 = 2.445134137142996
+    var d4 = 3.754408661907416
+    var plow = 0.02425
+    var phigh = 1.0 - plow
+    if p < plow:
+        var q = sqrt(-2.0 * log(p))
+        return (
+            (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6)
+            / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+        )
+    if p > phigh:
+        var q = sqrt(-2.0 * log(1.0 - p))
+        return -(
+            (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6)
+            / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+        )
+    var q = p - 0.5
+    var r = q * q
+    return (
+        (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q
+        / (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    )
+
+
+def _timestep_bucket(seed: Int, step: Int, buckets: Int) -> Int:
+    """One deterministic Fisher-Yates permutation per bucket cycle.
+    Resume therefore needs only the global step and not a second RNG state."""
+    if buckets <= 1:
+        return 0
+    var cycle = (step - 1) // buckets
+    var position = (step - 1) % buckets
+    var order = List[Int]()
+    for i in range(buckets):
+        order.append(i)
+    var brng = _Rng(
+        UInt64(seed) ^ (UInt64(cycle + 1) * UInt64(0xD1342543DE82EF95))
+    )
+    for i in range(buckets - 1, 0, -1):
+        var j = Int(brng.next_u64() % UInt64(i + 1))
+        var tmp = order[i]
+        order[i] = order[j]
+        order[j] = tmp
+    return order[position]
+
+
+def _shuffle_data_order(mut order: List[Int], seed: Int, epoch: Int):
+    for i in range(len(order)):
+        order[i] = i
+    var erng = _Rng(
+        UInt64(seed) ^ (UInt64(epoch + 1) * UInt64(0x9E3779B97F4A7C15))
+    )
+    for i in range(len(order) - 1, 0, -1):
+        var j = Int(erng.next_u64() % UInt64(i + 1))
+        var tmp = order[i]
+        order[i] = order[j]
+        order[j] = tmp
+
+
+def _bucketed_image_sigma(
+    mut rng: _Rng, seed: Int, step: Int, buckets: Int,
+    lat_h: Int, lat_w: Int,
+) -> Float64:
+    if buckets <= 1:
+        return _image_sigma(rng, lat_h, lat_w)
+    var bucket = _timestep_bucket(seed, step, buckets)
+    var u = (Float64(bucket) + rng.uniform()) / Float64(buckets)
+    var z = _normal_ppf(u)
+    var tokens = Float64((lat_h // 2) * (lat_w // 2))
+    var m = (1.15 - 0.5) / (6400.0 - 256.0)
+    var mu = m * (tokens - 256.0) + 0.5
+    var shift = exp(mu)
+    var t = 1.0 / (1.0 + exp(-z))
+    return t * shift / (1.0 + (shift - 1.0) * t)
+
+
+def _density_scale(mut rng: _Rng, jitter: Float32) -> Float64:
+    if jitter <= Float32(0.0):
+        return Float64(1.0)
+    var span = log(1.0 + Float64(jitter))
+    return exp((rng.uniform() * 2.0 - 1.0) * span)
+
+
+def _encode_rng_state(state: UInt64) -> List[Float32]:
+    return [
+        Float32(UInt16(state & UInt64(0xFFFF))),
+        Float32(UInt16((state >> 16) & UInt64(0xFFFF))),
+        Float32(UInt16((state >> 32) & UInt64(0xFFFF))),
+        Float32(UInt16((state >> 48) & UInt64(0xFFFF))),
+    ]
+
+
+def _decode_rng_state(meta: List[Float32], offset: Int) raises -> UInt64:
+    if len(meta) < offset + 4:
+        raise Error("H3 trainer state is missing the exact RNG words")
+    var out = UInt64(0)
+    for i in range(4):
+        var word = UInt64(Int(meta[offset + i]))
+        if word > UInt64(0xFFFF):
+            raise Error("H3 trainer state contains an invalid RNG word")
+        out |= word << UInt64(16 * i)
+    return out
+
+
 def _arg(name: String, default: String) raises -> String:
     var a = argv()
     var flag = String("--") + name
@@ -213,25 +364,16 @@ def _atof(s: String) -> Float64:
     return v
 
 
-# ── LoRA state: masters + moments (F32 device) + compute copies (bf16) ───────
+# ── LoRA state: F32 masters + BF16 compute copies ─────────────────────────────────
 struct _AdapterState(Movable):
     var a_m: TArc  # [rank, in] F32 master
     var b_m: TArc  # [out, rank] F32 master
-    var m_a: TArc
-    var v_a: TArc
-    var m_b: TArc
-    var v_b: TArc
 
     def __init__(
         out self, var a_m: TArc, var b_m: TArc,
-        var m_a: TArc, var v_a: TArc, var m_b: TArc, var v_b: TArc,
     ):
         self.a_m = a_m^
         self.b_m = b_m^
-        self.m_a = m_a^
-        self.v_a = v_a^
-        self.m_b = m_b^
-        self.v_b = v_b^
 
 
 def _init_adapter_state(
@@ -246,25 +388,32 @@ def _init_adapter_state(
     var a_m = Tensor.from_host(avals, ash^, STDtype.F32, ctx)
     var bsh: List[Int] = [out_f, rank]
     var b_m = full_device(bsh.copy(), Float32(0.0), STDtype.F32, ctx)
-    var zsh_a: List[Int] = [rank, in_f]
-    var zsh_b: List[Int] = [out_f, rank]
-    return _AdapterState(
-        TArc(a_m^), TArc(b_m^),
-        TArc(full_device(zsh_a.copy(), Float32(0.0), STDtype.F32, ctx)),
-        TArc(full_device(zsh_a.copy(), Float32(0.0), STDtype.F32, ctx)),
-        TArc(full_device(zsh_b.copy(), Float32(0.0), STDtype.F32, ctx)),
-        TArc(full_device(zsh_b.copy(), Float32(0.0), STDtype.F32, ctx)),
-    )
+    return _AdapterState(TArc(a_m^), TArc(b_m^))
+
+
+def _zero_adapter_state(
+    ctx: DeviceContext
+) raises -> _AdapterState:
+    # Inactive slots need a placeholder only to preserve the fixed block/slot
+    # index map; no forward, optimizer, save, or resume path touches it.
+    var sh: List[Int] = [1, 1]
+    var a_m = full_device(sh.copy(), Float32(0.0), STDtype.F32, ctx)
+    var b_m = full_device(sh^, Float32(0.0), STDtype.F32, ctx)
+    return _AdapterState(TArc(a_m^), TArc(b_m^))
 
 
 def _compute_loras(
-    states: List[_AdapterState], rank: Int, scale: Float32, ctx: DeviceContext
+    states: List[_AdapterState], rank: Int, scale: Float32,
+    target_preset: Int, ctx: DeviceContext,
 ) raises -> List[H3BlockLoraDevice]:
     """bf16 compute copies of the masters, packed per block."""
     var loras = List[H3BlockLoraDevice]()
     for b in range(N_BLOCKS):
         var slots = List[Optional[LoraAdapterDevice]]()
         for s in range(SLOT_NAMES_LEN):
+            if not _slot_active(s, target_preset):
+                slots.append(Optional[LoraAdapterDevice](None))
+                continue
             var st = b * SLOT_NAMES_LEN + s
             var dims = _slot_out_in(s)
             var a16 = cast_tensor(states[st].a_m[], STDtype.BF16, ctx)
@@ -285,18 +434,60 @@ def _load_st(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor
     )
 
 
-def _state_names() raises -> List[String]:
+def _load_st_u8(
+    st: SafeTensors, name: String, ctx: DeviceContext
+) raises -> Tensor:
+    """Raw-byte U8 upload; Tensor.from_view only accepts compute dtypes."""
+    var info = st.tensor_info(name)
+    if info.dtype != STDtype.U8:
+        raise Error(String("H3 trainer state tensor is not U8: ") + name)
+    var bytes = st.tensor_bytes(name)
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](len(bytes))
+    var hp = host.unsafe_ptr()
+    for i in range(len(bytes)):
+        hp[i] = bytes[i]
+    var dev = ctx.enqueue_create_buffer[DType.uint8](len(bytes))
+    ctx.enqueue_copy(dst_buf=dev, src_buf=host)
+    ctx.synchronize()
+    return Tensor(dev^, info.shape.copy(), STDtype.U8)
+
+
+def _param_state_names(target_preset: Int) raises -> List[String]:
     var names = List[String]()
     for b in range(N_BLOCKS):
         for s in range(SLOT_NAMES_LEN):
+            if not _slot_active(s, target_preset):
+                continue
             var base = String("b") + String(b) + "_" + h3_lora_legacy_slot_key(s)
             names.append(base + "_a_p")
             names.append(base + "_b_p")
-            names.append(base + "_a_m")
-            names.append(base + "_a_v")
-            names.append(base + "_b_m")
-            names.append(base + "_b_v")
     return names^
+
+
+def _optimizer_params(
+    states: List[_AdapterState], target_preset: Int
+) -> List[TArc]:
+    var params = List[TArc]()
+    for b in range(N_BLOCKS):
+        for s in range(SLOT_NAMES_LEN):
+            if not _slot_active(s, target_preset):
+                continue
+            var i = b * SLOT_NAMES_LEN + s
+            params.append(states[i].a_m.copy())
+            params.append(states[i].b_m.copy())
+    return params^
+
+
+def _base_loras() -> List[H3BlockLoraDevice]:
+    var out = List[H3BlockLoraDevice]()
+    for _ in range(N_BLOCKS):
+        out.append(H3BlockLoraDevice(
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+        ))
+    return out^
 
 
 comptime _CStr = UnsafePointer[UInt8, MutExternalOrigin]
@@ -321,38 +512,123 @@ def main() raises:
         _cstr(String("true")),
         Int32(0),
     )
-    var ctx = DeviceContext()
-    var cache_dir = _arg(String("cache_dir"), String(""))
-    var ckpt = _arg(
-        String("ckpt"),
-        String("/home/alex/.serenity/models/checkpoints/MiniMax-H3/FL2VA/transformer"),
-    )
-    var out_dir = _arg(String("out_dir"), String("/output/h3_lora"))
-    var name = _arg(String("name"), String("h3_lora"))
-    var max_steps = _arg_int(String("steps"), 3000)
-    var lr = _arg_f32(String("lr"), Float32(1.0e-4))
-    var rank = _arg_int(String("dim"), 16)
-    var alpha = _arg_f32(String("alpha"), Float32(16.0))
-    var seed = _arg_int(String("seed"), 42)
-    var save_every = _arg_int(String("save_every"), 250)
-    var sample_every = _arg_int(String("sample_every"), 1000)
-    var baseline_only = _arg_int(String("baseline_only"), 0) != 0
+    var raw_args = argv()
+    var config_path = _arg(String("config"), String(""))
+    if (
+        config_path == String("") and len(raw_args) > 1
+        and not String(raw_args[1]).startswith("--")
+    ):
+        config_path = String(raw_args[1])
+    if config_path == String(""):
+        raise Error(
+            "MiniMax-H3 trainer is config-driven: pass <config.json> or "
+            "--config <config.json>"
+        )
+    var train_cfg = read_model_config(config_path)
+    train_cfg.validate_serenity_trainer_policy_config()
+    train_cfg.validate_offload_checkpoint_config()
+    if train_cfg.name != String("minimax_h3"):
+        raise Error("MiniMax-H3 trainer config requires model_type=minimax_h3")
+    if train_cfg.optimizer != TRAIN_OPTIMIZER_ADAMW_8BIT:
+        raise Error("MiniMax-H3 trainer requires optimizer=ADAMW_8BIT")
+    if train_cfg.train_dtype != TRAIN_DTYPE_BFLOAT_16:
+        raise Error("MiniMax-H3 trainer requires train_dtype=BFLOAT_16")
+    if train_cfg.grad_accum_steps != 1:
+        raise Error("MiniMax-H3 trainer currently requires grad_accum_steps=1")
+    if train_cfg.quantized_resident != String("int_w8a8"):
+        raise Error("MiniMax-H3 trainer requires quantized_resident=int_w8a8")
+    if (
+        train_cfg.layer_filter_preset != String("h3_mlp_fc1_fc2")
+        or not train_cfg.layer_filter_regex
+    ):
+        raise Error(
+            "MiniMax-H3 trainer requires config layer_filter_preset="
+            "h3_mlp_fc1_fc2 with layer_filter_regex=true"
+        )
+    var target_preset = H3_TARGET_MLP_FC1_FC2
+    if train_cfg.checkpoint == String(""):
+        raise Error("MiniMax-H3 trainer config requires checkpoint")
+    var cache_dir = train_cfg.dataset_cache_dir
     if cache_dir == String(""):
-        raise Error("--cache_dir is required")
+        cache_dir = train_cfg.cache_dir
+    var ckpt = train_cfg.checkpoint
+    var out_dir = train_cfg.workspace_dir
+    var name = train_cfg.save_filename_prefix
+    if name == String(""):
+        raise Error("MiniMax-H3 trainer config requires save_filename_prefix")
+    var max_steps = train_cfg.max_steps
+    var lr = train_cfg.lr
+    var optimizer_beta1 = train_cfg.beta1
+    var optimizer_beta2 = train_cfg.beta2
+    var optimizer_eps = train_cfg.eps
+    var optimizer_weight_decay = train_cfg.weight_decay
+    var rank = train_cfg.lora_rank
+    var alpha = train_cfg.lora_alpha
+    var seed = Int(train_cfg.seed)
+    var save_every = train_cfg.save_every
+    var sample_every = train_cfg.sample_every
+    var timestep_buckets = train_cfg.h3_num_timestep_buckets
+    var lr_warmup_steps = train_cfg.lr_warmup_steps
+    var max_grad_norm = train_cfg.max_grad_norm
+    var spatial_density_jitter = train_cfg.h3_spatial_density_jitter
+    var base_preservation_weight = train_cfg.h3_base_preservation_loss_weight
+    var base_preservation_probability = train_cfg.h3_base_preservation_probability
+    var resident_blocks = train_cfg.resident_blocks
+    if resident_blocks < 0:
+        resident_blocks = 42
+    if resident_blocks > N_BLOCKS:
+        raise Error("MiniMax-H3 config resident_blocks exceeds 50")
+    var baseline_only = _arg_int(String("baseline_only"), 0) != 0
+    var cadence_segment = _arg_int(String("cadence_segment"), 0) != 0
+    if cache_dir == String(""):
+        raise Error("MiniMax-H3 config dataset_cache_dir is required")
+    if out_dir == String(""):
+        raise Error("MiniMax-H3 config workspace_dir is required")
+    if max_steps <= 0:
+        raise Error("MiniMax-H3 config max_steps must be positive")
     if rank <= 0:
-        raise Error("--dim must be positive")
+        raise Error("MiniMax-H3 config lora_rank must be positive")
+    if save_every <= 0 or sample_every <= 0:
+        raise Error("MiniMax-H3 config save_every and sample_every must be positive")
+    if timestep_buckets <= 0:
+        raise Error("--num_timestep_buckets must be positive")
+    if lr_warmup_steps < 0:
+        raise Error("--lr_warmup_steps cannot be negative")
+    if max_grad_norm <= Float32(0.0):
+        raise Error("--max_grad_norm must be positive")
+    if spatial_density_jitter < Float32(0.0):
+        raise Error("--h3_spatial_density_jitter cannot be negative")
+    if base_preservation_weight < Float32(0.0):
+        raise Error("--h3_base_preservation_loss_weight cannot be negative")
+    if (
+        base_preservation_probability <= Float32(0.0)
+        or base_preservation_probability > Float32(1.0)
+    ):
+        raise Error("--h3_base_preservation_probability must be within (0,1]")
     # Canonical PEFT files carry A/B only. Match the rest of the stack's
     # alpha=rank contract instead of silently changing inference strength.
     if alpha != Float32(rank):
         raise Error(
-            "H3 canonical PEFT export requires --alpha == --dim because the "
+            "H3 canonical PEFT export requires lora_alpha == lora_rank because the "
             "external artifact does not carry per-module alpha"
         )
     var scale = alpha / Float32(rank)
+    # Keep config parsing and fail-fast validation before CUDA ownership.
+    var ctx = DeviceContext()
 
     print("[h3-train] cache_dir:", cache_dir)
+    print("[h3-train] config:", config_path)
     print("[h3-train] recipe: dim", rank, "alpha", alpha, "lr", lr,
           "steps", max_steps, "seed", seed)
+    print("[h3-train] optimizer AdamW8bit; warmup", lr_warmup_steps,
+          "grad_clip", max_grad_norm, "timestep_buckets", timestep_buckets,
+          "betas", optimizer_beta1, optimizer_beta2,
+          "eps", optimizer_eps, "weight_decay", optimizer_weight_decay)
+    print("[h3-train] targets: mlp.fc1/fc2 only (100 adapters)")
+    print("[h3-train] guidance/preservation/density:",
+          train_cfg.guidance_scale,
+          base_preservation_weight, base_preservation_probability,
+          spatial_density_jitter)
     if baseline_only:
         print(
             "[h3-train] BASELINE ONLY: fresh zero-output LoRA; "
@@ -415,7 +691,7 @@ def main() raises:
     # much of the adapter. Re-test the default one-pass objective after those
     # two root fixes before requiring this slower two-forward arm. Guidance
     # requires empty-cond TE cache pairs.
-    var guidance_scale = _arg_f32(String("guidance_scale"), Float32(0.0))
+    var guidance_scale = train_cfg.guidance_scale
     var empty_embeds_host = List[BFloat16]()
     var empty_embeds_rows = 0
     var empty_tags = List[Int]()
@@ -456,7 +732,6 @@ def main() raises:
     print("[h3-train] building direct-int8 resident base (one streamed pass)...")
     # tail blocks stream bf16 from the retained mmap store
     var tq0 = perf_counter_ns()
-    var resident_blocks = _arg_int(String("resident_blocks"), 42)
     var store = H3TrainBlockStoreInt8.open(ckpt, N_BLOCKS, resident_blocks, ctx)
     print("[h3-train] direct-int8 base resident in",
           Float64(perf_counter_ns() - tq0) / 1.0e9, "s")
@@ -475,55 +750,114 @@ def main() raises:
         have_state = False
     if have_state and not baseline_only:
         var st = SafeTensors.open(state_path)
-        var names = _state_names()
+        var names = _param_state_names(target_preset)
         var ni = 0
         for b in range(N_BLOCKS):
             for s in range(SLOT_NAMES_LEN):
-                var t0 = _load_st(st, names[ni], ctx)
-                var t1 = _load_st(st, names[ni + 1], ctx)
-                var t2 = _load_st(st, names[ni + 2], ctx)
-                var t3 = _load_st(st, names[ni + 3], ctx)
-                var t4 = _load_st(st, names[ni + 4], ctx)
-                var t5 = _load_st(st, names[ni + 5], ctx)
-                states.append(_AdapterState(
-                    TArc(t0^), TArc(t1^), TArc(t2^), TArc(t3^), TArc(t4^), TArc(t5^),
-                ))
-                ni += 6
+                var dims = _slot_out_in(s)
+                if _slot_active(s, target_preset):
+                    var t0 = _load_st(st, names[ni], ctx)
+                    var t1 = _load_st(st, names[ni + 1], ctx)
+                    states.append(_AdapterState(TArc(t0^), TArc(t1^)))
+                    ni += 2
+                else:
+                    states.append(_zero_adapter_state(ctx))
         var meta = _load_st(st, String("train_meta"), ctx).to_host(ctx)
         start_step = Int(meta[0])
-        # advance the RNG to where the interrupted run left it
-        for _ in range(Int(meta[1])):
-            _ = rng.next_u64()
+        if len(meta) < 15:
+            raise Error(
+                "H3 trainer state predates the AdamW8bit exact-resume format; "
+                "start a fresh output name"
+            )
+        if Int(meta[5]) != rank:
+            raise Error("H3 trainer state rank does not match --dim")
+        if Int(meta[6]) != timestep_buckets:
+            raise Error("H3 trainer state timestep buckets changed on resume")
+        if Int(meta[7]) != lr_warmup_steps:
+            raise Error("H3 trainer state LR warmup changed on resume")
+        if (
+            meta[8] != guidance_scale
+            or meta[9] != spatial_density_jitter
+            or meta[10] != base_preservation_weight
+            or meta[11] != max_grad_norm
+            or meta[12] != lr
+            or Int(meta[13]) != target_preset
+            or meta[14] != base_preservation_probability
+        ):
+            raise Error("H3 trainer recipe changed on resume")
+        rng.state = _decode_rng_state(meta, 1)
         print("[h3-train] RESUMED from step", start_step)
     else:
         for _ in range(N_BLOCKS):
             for s in range(SLOT_NAMES_LEN):
                 var dims = _slot_out_in(s)
-                states.append(_init_adapter_state(rank, dims[0], dims[1], rng, ctx))
+                if _slot_active(s, target_preset):
+                    states.append(_init_adapter_state(
+                        rank, dims[0], dims[1], rng, ctx
+                    ))
+                else:
+                    states.append(_zero_adapter_state(ctx))
         print("[h3-train] fresh LoRA init (kaiming-uniform down, zero up)")
 
-    var rng_draws = 0  # draws since init (persisted for exact resume)
+    var optimizer_params = _optimizer_params(states, target_preset)
+    var optimizer_maybe = Optional[Adam8bitDeviceState](None)
+    if have_state and not baseline_only:
+        var st = SafeTensors.open(state_path)
+        var m_codes = _load_st_u8(st, String("adam8_m_codes"), ctx)
+        var v_codes = _load_st_u8(st, String("adam8_v_codes"), ctx)
+        var m_absmax = _load_st(st, String("adam8_m_absmax"), ctx)
+        var v_absmax = _load_st(st, String("adam8_v_absmax"), ctx)
+        optimizer_maybe = Optional[Adam8bitDeviceState](
+            adamw8bit_device_state_from_tensors(
+                optimizer_params,
+                TArc(m_codes^), TArc(v_codes^),
+                TArc(m_absmax^), TArc(v_absmax^), ctx,
+            )
+        )
+    else:
+        optimizer_maybe = Optional[Adam8bitDeviceState](
+            adamw8bit_device_state(optimizer_params, ctx)
+        )
+    var optimizer = optimizer_maybe.value().copy()
 
-    # data order: LCG shuffle per epoch
+    # Data order is independently seeded per epoch so a mid-epoch resume
+    # reconstructs the identical permutation without replaying prior steps.
     var order = List[Int]()
     for i in range(len(items)):
         order.append(i)
+    var active_epoch = -1
 
-    var loras = _compute_loras(states, rank, scale, ctx)
+    var loras = _compute_loras(states, rank, scale, target_preset, ctx)
+    var base_loras = _base_loras()
+    var run_t0 = perf_counter_ns()
 
-    print("[h3-train] entering loop at step", start_step + 1, "/", max_steps)
-    for step in range(start_step + 1, max_steps + 1):
+    # The cadence supervisor invokes one config-defined segment at a time so
+    # the worker exits and releases CUDA before validation sampling. No recipe
+    # scalar is overridden: the next boundary comes only from sample_every.
+    var loop_stop_step = max_steps
+    if cadence_segment and start_step < max_steps:
+        loop_stop_step = ((start_step // sample_every) + 1) * sample_every
+        if loop_stop_step > max_steps:
+            loop_stop_step = max_steps
+
+    print("[h3-train] entering loop at step", start_step + 1, "/", max_steps,
+          "segment_stop", loop_stop_step)
+    for step in range(start_step + 1, loop_stop_step + 1):
         var t_step0 = perf_counter_ns()
         # ── item selection (reshuffle each epoch) ────────────────────────────
         var epoch_pos = (step - 1) % len(items)
-        if epoch_pos == 0:
-            for i in range(len(items) - 1, 0, -1):
-                var j = Int(rng.next_u64() % UInt64(i + 1))
-                rng_draws += 1
-                var tmp = order[i]
-                order[i] = order[j]
-                order[j] = tmp
+        var epoch_index = (step - 1) // len(items)
+        if epoch_index != active_epoch:
+            _shuffle_data_order(order, seed, epoch_index)
+            active_epoch = epoch_index
         var it = items[order[epoch_pos]].copy()
+        # Musubi's sparse base-preservation branch: draw once per item and
+        # inverse-probability scale active losses so the expected preservation
+        # gradient retains the configured weight.
+        var preservation_active = (
+            base_preservation_weight > Float32(0.0)
+            and rng.uniform() < Float64(base_preservation_probability)
+        )
 
         var lat = h3_read_latent_cache(it.latent_path, ctx)
         if not lat.has_video or lat.lat_f != 1:
@@ -536,8 +870,9 @@ def main() raises:
             x0 = cast_tensor(x0, STDtype.BF16, ctx)
 
         # ── sigma (image branch), quantized to the grid ──────────────────────
-        var sigma_raw = _image_sigma(rng, lat.lat_h, lat.lat_w)
-        rng_draws += 2
+        var sigma_raw = _bucketed_image_sigma(
+            rng, seed, step, timestep_buckets, lat.lat_h, lat.lat_w
+        )
         var node = Int(sigma_raw * Float64(SIGMA_NODES - 1) + 0.5)
         if node < 0:
             node = 0
@@ -559,9 +894,10 @@ def main() raises:
         var target_rows = minimax_h3_video_patchify(target, ctx)
 
         # ── packed layout + rope + frontend (frozen, gated inference code) ───
+        var density_scale = _density_scale(rng, spatial_density_jitter)
         var anchors = List[Int]()
         var layout = minimax_h3_build_packed_sequence(
-            te.tags, 1, lat.lat_h, lat.lat_w, 0, 2, 2, anchors,
+            te.tags, 1, lat.lat_h, lat.lat_w, 0, 2, 2, anchors, density_scale,
         )
         var S = layout.sequence_length
         var row_ts = minimax_h3_build_row_timesteps(
@@ -610,6 +946,7 @@ def main() raises:
             var anchors_e = List[Int]()
             var layout_e = minimax_h3_build_packed_sequence(
                 empty_tags, 1, lat.lat_h, lat.lat_w, 0, 2, 2, anchors_e,
+                density_scale,
             )
             var S_e = layout_e.sequence_length
             var pos_e_f32 = List[Float32](capacity=len(layout_e.position_ids))
@@ -642,6 +979,29 @@ def main() raises:
             )
             g_empty = Optional[Tensor](ffwd_e.video[].clone(ctx))
             ctx.synchronize()
+            _ = ffwd_e^
+            _ = fwd_e^
+
+        # Frozen-base preservation teacher: same prompt/noise/geometry with
+        # every adapter absent. It is evaluated before the graph-carrying
+        # student pass so only one 50-block activation chain is live at once.
+        var base_prediction = Optional[Tensor](None)
+        if preservation_active:
+            var fwd_base = h3_stack_train_forward_streamed_int8[
+                H3_HEADS, H3_HEAD_DIM
+            ](
+                hidden0, store, base_loras, mods, adaln_idx,
+                rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
+            )
+            var empty_base_idx = List[Int]()
+            var ffwd_base = h3_final_train_forward(
+                fwd_base.out[], final_w, final_mod_rows, node_idx,
+                layout.video_indices, empty_base_idx, H3_EPS, ctx,
+            )
+            base_prediction = Optional[Tensor](ffwd_base.video[].clone(ctx))
+            ctx.synchronize()
+            _ = ffwd_base^
+            _ = fwd_base^
 
         var fwd = h3_stack_train_forward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
             hidden0, store, loras, mods, adaln_idx,
@@ -680,6 +1040,16 @@ def main() raises:
         var empty_mask = List[Bool]()
         var ml = h3_modality_loss(pred_rows, target_rows, empty_mask, ctx)
         var loss = ml.total / Float64(ml.elements)
+        var preservation_loss = Float64(0.0)
+        if base_prediction:
+            var pl = h3_modality_loss(
+                ffwd.video[], base_prediction.value(), empty_mask, ctx
+            )
+            preservation_loss = pl.total / Float64(pl.elements)
+            loss += (
+                Float64(base_preservation_weight)
+                / Float64(base_preservation_probability)
+            ) * preservation_loss
 
         # Dataset-level untrained-loss baseline. Fresh LoRA B matrices are
         # exactly zero, so this is the corrected frozen base function. Stop at
@@ -706,6 +1076,14 @@ def main() raises:
                 cast_tensor(d_video, STDtype.F32, ctx),
                 Float32(1.0) / s_eff, ctx,
             )
+        if base_prediction:
+            var d_preserve = h3_loss_grad(
+                ffwd.video[], base_prediction.value(), none_mask^,
+                Float64(base_preservation_weight)
+                / Float64(base_preservation_probability),
+                Float64(ml.elements), ctx,
+            )
+            d_video = add(d_video, d_preserve, ctx)
 
         # ── backward chain ───────────────────────────────────────────────────
         var d_audio_sh: List[Int] = [1, 1]
@@ -723,28 +1101,34 @@ def main() raises:
 
         ctx.synchronize()
         var tp3 = perf_counter_ns()
-        # ── fused AdamW on the F32 masters ───────────────────────────────────
-        var params = List[TArc]()
+        # ── bnb-parity device AdamW8bit on the F32 masters ──────────────────
         var gts = List[TArc]()
-        var ms = List[TArc]()
-        var vs = List[TArc]()
         for b in range(N_BLOCKS):
             for s in range(SLOT_NAMES_LEN):
-                var st_i = b * SLOT_NAMES_LEN + s
+                if not _slot_active(s, target_preset):
+                    continue
                 var g = _grad_pair(grads.lora[b], s)
-                params.append(states[st_i].a_m.copy())
                 gts.append(g[0])
-                ms.append(states[st_i].m_a.copy())
-                vs.append(states[st_i].v_a.copy())
-                params.append(states[st_i].b_m.copy())
                 gts.append(g[1])
-                ms.append(states[st_i].m_b.copy())
-                vs.append(states[st_i].v_b.copy())
-        fused_adamw_step(
-            params, gts, ms, vs, step, lr,
-            Float32(0.9), Float32(0.999), Float32(1.0e-8), Float32(0.01), ctx,
+        var grad_stats = on_device_grad_stats(gts, ctx)
+        if grad_stats.nonfinite_count != 0:
+            raise Error(
+                "H3 trainer found non-finite gradients: "
+                + String(grad_stats.nonfinite_count)
+            )
+        var clip_scale = Float32(1.0)
+        if grad_stats.grad_norm > max_grad_norm:
+            clip_scale = max_grad_norm / grad_stats.grad_norm
+        var step_lr = lr
+        if lr_warmup_steps > 0 and step <= lr_warmup_steps:
+            step_lr = lr * Float32(step) / Float32(lr_warmup_steps)
+        adamw8bit_device_step(
+            optimizer_params, gts, optimizer, step, step_lr,
+            optimizer_beta1, optimizer_beta2, optimizer_eps,
+            optimizer_weight_decay, ctx,
+            clip_scale,
         )
-        loras = _compute_loras(states, rank, scale, ctx)
+        loras = _compute_loras(states, rank, scale, target_preset, ctx)
         ctx.synchronize()
 
         var tp4 = perf_counter_ns()
@@ -755,21 +1139,40 @@ def main() raises:
               "prep", Float64(tp0 - t_step0) / 1.0e9)
         var dt = Float64(perf_counter_ns() - t_step0) / 1.0e9
         print("[h3-train] step", step, "loss", loss, "sigma", sigma,
-              "S", S, "item", it.item_key, "dt", dt, "s")
+              "preserve", preservation_loss,
+              "preserve_active", preservation_active,
+              "density", density_scale,
+              "lr", step_lr, "S", S, "item", it.item_key, "dt", dt, "s")
+        print_trainer_progress(
+            String("H3-lora"), step, max_steps, len(items), Float32(loss),
+            Float64(grad_stats.grad_norm), dt, 0.0,
+            Float64(perf_counter_ns() - run_t0) / 1.0e9,
+        )
 
         # ── save / sample snapshots ──────────────────────────────────────────
         if not baseline_only and (
-            step % save_every == 0 or step == max_steps or
+            step % save_every == 0 or step == loop_stop_step or
             step % sample_every == 0
         ):
-            _save_all(states, rank, step, rng_draws, out_dir, name, ctx)
+            _save_all(
+                states, optimizer, rank, step, rng.state,
+                timestep_buckets, lr_warmup_steps, guidance_scale,
+                spatial_density_jitter, base_preservation_weight,
+                base_preservation_probability,
+                max_grad_norm, lr, target_preset, out_dir, name, ctx,
+            )
 
-    print("[h3-train] DONE at step", max_steps)
+    print("[h3-train] DONE at step", loop_stop_step, "/", max_steps)
 
 
 def _save_all(
-    states: List[_AdapterState], rank: Int,
-    step: Int, rng_draws: Int, out_dir: String, name: String,
+    states: List[_AdapterState], optimizer: Adam8bitDeviceState, rank: Int,
+    step: Int, rng_state: UInt64,
+    timestep_buckets: Int, lr_warmup_steps: Int, guidance_scale: Float32,
+    spatial_density_jitter: Float32, base_preservation_weight: Float32,
+    base_preservation_probability: Float32,
+    max_grad_norm: Float32, lr: Float32, target_preset: Int,
+    out_dir: String, name: String,
     ctx: DeviceContext,
 ) raises:
     # 1) External LoRA: same canonical BF16 PEFT contract as LTX and the rest
@@ -778,6 +1181,8 @@ def _save_all(
     var adapters = List[F32NamedLora]()
     for b in range(N_BLOCKS):
         for s in range(SLOT_NAMES_LEN):
+            if not _slot_active(s, target_preset):
+                continue
             var st_i = b * SLOT_NAMES_LEN + s
             var dims = _slot_out_in(s)
             var a_host = states[st_i].a_m[].to_host(ctx)
@@ -796,19 +1201,33 @@ def _save_all(
     var n_pairs = save_lora_peft_host_f32(adapters, lora_path)
     print("[h3-train] saved PEFT LoRA:", lora_path, "pairs", n_pairs)
 
-    # 2) resume state (masters + moments + step + rng position)
-    var snames = _state_names()
+    # 2) resume state (masters + quantized bnb moments + exact RNG state)
+    var snames = _param_state_names(target_preset)
     var stensors = List[TArc]()
-    for i in range(len(states)):
-        stensors.append(states[i].a_m)
-        stensors.append(states[i].b_m)
-        stensors.append(states[i].m_a)
-        stensors.append(states[i].v_a)
-        stensors.append(states[i].m_b)
-        stensors.append(states[i].v_b)
+    for b in range(N_BLOCKS):
+        for s in range(SLOT_NAMES_LEN):
+            if not _slot_active(s, target_preset):
+                continue
+            var i = b * SLOT_NAMES_LEN + s
+            stensors.append(states[i].a_m)
+            stensors.append(states[i].b_m)
+    snames.append(String("adam8_m_codes"))
+    stensors.append(optimizer.m_codes)
+    snames.append(String("adam8_v_codes"))
+    stensors.append(optimizer.v_codes)
+    snames.append(String("adam8_m_absmax"))
+    stensors.append(optimizer.m_absmax)
+    snames.append(String("adam8_v_absmax"))
+    stensors.append(optimizer.v_absmax)
     snames.append(String("train_meta"))
-    var meta: List[Float32] = [Float32(step), Float32(rng_draws)]
-    var msh: List[Int] = [2]
+    var rng_words = _encode_rng_state(rng_state)
+    var meta: List[Float32] = [
+        Float32(step), rng_words[0], rng_words[1], rng_words[2], rng_words[3],
+        Float32(rank), Float32(timestep_buckets), Float32(lr_warmup_steps),
+        guidance_scale, spatial_density_jitter, base_preservation_weight,
+        max_grad_norm, lr, Float32(target_preset), base_preservation_probability,
+    ]
+    var msh: List[Int] = [len(meta)]
     stensors.append(TArc(Tensor.from_host(meta, msh^, STDtype.F32, ctx)))
     var state_path = out_dir + "/" + name + "_state.safetensors"
     save_safetensors(snames, stensors, state_path, ctx)

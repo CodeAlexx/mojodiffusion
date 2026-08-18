@@ -257,7 +257,8 @@ def minimax_h3_audio_latent_num_frames(num_frames: Int) -> Int:
 
 
 def minimax_h3_spatial_position_grid(
-    dim: Int, patch: Int, sqrt_area: Float64
+    dim: Int, patch: Int, sqrt_area: Float64,
+    spatial_density_scale: Float64 = Float64(1.0),
 ) -> List[Float64]:
     """One aspect-normalized spatial rotary axis (packing.py:331).
 
@@ -267,7 +268,7 @@ def minimax_h3_spatial_position_grid(
     numpy's `linspace(start, stop, num, endpoint=False)` computes
     `arange(num) * ((stop - start) / num) + start`. Reproduced exactly: `stop`
     is formed first, then the difference is taken from it."""
-    var ratio = Float64(dim) / sqrt_area
+    var ratio = Float64(dim) / (sqrt_area * spatial_density_scale)
     var left = (1.0 - ratio) / 2.0
     var stop = left + ratio
     var num = dim // patch
@@ -331,6 +332,7 @@ def minimax_h3_build_packed_sequence(
     patch_h: Int,
     patch_w: Int,
     keyframe_anchors: List[Int],
+    spatial_density_scale: Float64 = Float64(1.0),
 ) raises -> MiniMaxH3PackedSequence:
     """Build the [text | keyframe conditions | target audio | target video]
     layout used by the t2va and fl2va tasks (packing.py:369).
@@ -360,9 +362,15 @@ def minimax_h3_build_packed_sequence(
     for i in range(num_text_tokens):
         position_ids[3 * i] = Float64(i)
 
+    if spatial_density_scale <= Float64(0.0):
+        raise Error("MiniMax-H3 spatial density scale must be positive")
     var sqrt_area = sqrt(Float64(latent_height * latent_width))
-    var height_grid = minimax_h3_spatial_position_grid(latent_height, patch_h, sqrt_area)
-    var width_grid = minimax_h3_spatial_position_grid(latent_width, patch_w, sqrt_area)
+    var height_grid = minimax_h3_spatial_position_grid(
+        latent_height, patch_h, sqrt_area, spatial_density_scale
+    )
+    var width_grid = minimax_h3_spatial_position_grid(
+        latent_width, patch_w, sqrt_area, spatial_density_scale
+    )
     # meshgrid(height, width, indexing="ij") flattened row-major.
     var frame_h = List[Float64]()
     var frame_w = List[Float64]()

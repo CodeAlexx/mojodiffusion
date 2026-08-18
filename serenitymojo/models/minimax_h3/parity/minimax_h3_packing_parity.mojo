@@ -323,9 +323,11 @@ def main() raises:
     # 5. packed sequences
     print("[5] packed sequences")
     var no_anchor = List[Int]()
-    var first_anchor = [MINIMAX_H3_ANCHOR_FIRST]
-    var both_anchors = [MINIMAX_H3_ANCHOR_FIRST, MINIMAX_H3_ANCHOR_LAST]
-    var last_anchor = [MINIMAX_H3_ANCHOR_LAST]
+    var first_anchor: List[Int] = [MINIMAX_H3_ANCHOR_FIRST]
+    var both_anchors: List[Int] = [
+        MINIMAX_H3_ANCHOR_FIRST, MINIMAX_H3_ANCHOR_LAST
+    ]
+    var last_anchor: List[Int] = [MINIMAX_H3_ANCHOR_LAST]
 
     var tags7 = List[Int]()
     for _ in range(7):

@@ -58,6 +58,18 @@
 # Mojo 1.0.0b1.
 
 from std.math import fma, sqrt
+from std.memory import ArcPointer, stack_allocation
+from std.gpu import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
+from std.utils.index import IndexList
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
+
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.tensor import Tensor
+from serenitymojo.ops.tensor_algebra import full_device
 
 comptime ADAMW8BIT_BLOCK_SIZE = 256
 """bnb block size for the blockwise 8-bit optimizer state
@@ -307,3 +319,408 @@ def adamw8bit_step(
         lr, beta1, beta2, eps, weight_decay,
     )
     state.step = k
+
+
+# ---------------------------------------------------------------------------
+# Device-resident multi-tensor AdamW8bit
+# ---------------------------------------------------------------------------
+#
+# The original API above remains the byte-parity host oracle. Production H3
+# has roughly 140M rank-32 adapter parameters, so downloading those gradients
+# and running the 256-code search on the CPU would dominate every step. This
+# sibling executes the same bnb blockwise algorithm on the GPU while keeping
+# the quantized moments resident. Parameter tensors remain separate; the
+# optimizer state is one padded flat slab. Each parameter starts on a fresh
+# 256-element block, exactly preserving bnb's per-parameter block boundary.
+
+comptime _TArc = ArcPointer[Tensor]
+comptime _DYN1 = Layout.row_major(-1)
+
+
+struct Adam8bitDeviceState(Copyable, Movable):
+    var m_codes: _TArc       # U8 [total padded parameter elements]
+    var v_codes: _TArc       # U8 [total padded parameter elements]
+    var m_absmax: _TArc      # F32 [total 256-element blocks]
+    var v_absmax: _TArc      # F32 [total 256-element blocks]
+    var qmap_signed: _TArc   # F32 [256]
+    var qmap_unsigned: _TArc # F32 [256]
+    var total_padded: Int
+    var total_blocks: Int
+
+    def __init__(
+        out self,
+        var m_codes: _TArc,
+        var v_codes: _TArc,
+        var m_absmax: _TArc,
+        var v_absmax: _TArc,
+        var qmap_signed: _TArc,
+        var qmap_unsigned: _TArc,
+        total_padded: Int,
+        total_blocks: Int,
+    ):
+        self.m_codes = m_codes^
+        self.v_codes = v_codes^
+        self.m_absmax = m_absmax^
+        self.v_absmax = v_absmax^
+        self.qmap_signed = qmap_signed^
+        self.qmap_unsigned = qmap_unsigned^
+        self.total_padded = total_padded
+        self.total_blocks = total_blocks
+
+
+def _zero_u8_tensor(n: Int, ctx: DeviceContext) raises -> Tensor:
+    if n <= 0:
+        raise Error("AdamW8bit device state must contain at least one byte")
+    var buf = ctx.enqueue_create_buffer[DType.uint8](n)
+    ctx.enqueue_memset(buf, UInt8(0))
+    var shape: List[Int] = [n]
+    return Tensor(buf^, shape^, STDtype.U8)
+
+
+def _adam8bit_total_blocks(params: List[_TArc]) raises -> Int:
+    var total = 0
+    for i in range(len(params)):
+        var n = params[i][].numel()
+        if n <= 0:
+            raise Error("AdamW8bit device parameter tensor is empty")
+        total += (n + ADAMW8BIT_BLOCK_SIZE - 1) // ADAMW8BIT_BLOCK_SIZE
+    return total
+
+
+def adamw8bit_device_state(
+    params: List[_TArc], ctx: DeviceContext
+) raises -> Adam8bitDeviceState:
+    var blocks = _adam8bit_total_blocks(params)
+    var padded = blocks * ADAMW8BIT_BLOCK_SIZE
+    var m_codes = _zero_u8_tensor(padded, ctx)
+    var v_codes = _zero_u8_tensor(padded, ctx)
+    var bshape: List[Int] = [blocks]
+    var m_absmax = full_device(bshape.copy(), Float32(0.0), STDtype.F32, ctx)
+    var v_absmax = full_device(bshape.copy(), Float32(0.0), STDtype.F32, ctx)
+    var qshape: List[Int] = [256]
+    var q_signed = Tensor.from_host(
+        adam8bit_create_dynamic_map(True), qshape.copy(), STDtype.F32, ctx
+    )
+    var q_unsigned = Tensor.from_host(
+        adam8bit_create_dynamic_map(False), qshape^, STDtype.F32, ctx
+    )
+    return Adam8bitDeviceState(
+        _TArc(m_codes^), _TArc(v_codes^),
+        _TArc(m_absmax^), _TArc(v_absmax^),
+        _TArc(q_signed^), _TArc(q_unsigned^), padded, blocks,
+    )
+
+
+def adamw8bit_device_state_from_tensors(
+    params: List[_TArc],
+    var m_codes: _TArc,
+    var v_codes: _TArc,
+    var m_absmax: _TArc,
+    var v_absmax: _TArc,
+    ctx: DeviceContext,
+) raises -> Adam8bitDeviceState:
+    var blocks = _adam8bit_total_blocks(params)
+    var padded = blocks * ADAMW8BIT_BLOCK_SIZE
+    if m_codes[].dtype() != STDtype.U8 or v_codes[].dtype() != STDtype.U8:
+        raise Error("AdamW8bit device code tensors must be U8")
+    if m_absmax[].dtype() != STDtype.F32 or v_absmax[].dtype() != STDtype.F32:
+        raise Error("AdamW8bit device absmax tensors must be F32")
+    if m_codes[].numel() != padded or v_codes[].numel() != padded:
+        raise Error("AdamW8bit device code-state size mismatch")
+    if m_absmax[].numel() != blocks or v_absmax[].numel() != blocks:
+        raise Error("AdamW8bit device absmax-state size mismatch")
+    var qshape: List[Int] = [256]
+    var q_signed = Tensor.from_host(
+        adam8bit_create_dynamic_map(True), qshape.copy(), STDtype.F32, ctx
+    )
+    var q_unsigned = Tensor.from_host(
+        adam8bit_create_dynamic_map(False), qshape^, STDtype.F32, ctx
+    )
+    return Adam8bitDeviceState(
+        m_codes^, v_codes^, m_absmax^, v_absmax^,
+        _TArc(q_signed^), _TArc(q_unsigned^), padded, blocks,
+    )
+
+
+def _adamw8bit_device_kernel[g_dtype: DType](
+    p_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    param_numel: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
+    block_offsets: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
+    m_codes: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    v_codes: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    m_absmax: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    v_absmax: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    qmap_signed: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    qmap_unsigned: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    ntensors_w: Int32,
+    lr: Float32,
+    beta1: Float32,
+    beta2: Float32,
+    eps: Float32,
+    weight_decay: Float32,
+    bc1: Float32,
+    bc2: Float32,
+    clip_scale: Float32,
+):
+    var tid = Int(thread_idx.x)
+    var bid = Int(block_idx.x)
+    var ntensors = Int(ntensors_w)
+    var sh_signed = stack_allocation[
+        ADAMW8BIT_BLOCK_SIZE, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var sh_unsigned = stack_allocation[
+        ADAMW8BIT_BLOCK_SIZE, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var sh_m = stack_allocation[
+        ADAMW8BIT_BLOCK_SIZE, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var sh_v = stack_allocation[
+        ADAMW8BIT_BLOCK_SIZE, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var sh_tensor = stack_allocation[
+        1, Scalar[DType.int32], address_space=AddressSpace.SHARED
+    ]()
+
+    sh_signed[tid] = rebind[Scalar[DType.float32]](qmap_signed[tid])
+    sh_unsigned[tid] = rebind[Scalar[DType.float32]](qmap_unsigned[tid])
+    if tid == 0:
+        var ti = 0
+        while ti + 1 < ntensors and Int(rebind[Scalar[DType.int64]](block_offsets[ti + 1])) <= bid:
+            ti += 1
+        sh_tensor[0] = Int32(ti)
+    barrier()
+
+    var ti = Int(sh_tensor[0])
+    var local_block = bid - Int(rebind[Scalar[DType.int64]](block_offsets[ti]))
+    var local_idx = local_block * ADAMW8BIT_BLOCK_SIZE + tid
+    var n = Int(rebind[Scalar[DType.int64]](param_numel[ti]))
+    var active = local_idx < n
+    var state_idx = bid * ADAMW8BIT_BLOCK_SIZE + tid
+
+    var pa = rebind[Scalar[DType.uint64]](p_addr[ti])
+    var ga = rebind[Scalar[DType.uint64]](g_addr[ti])
+    var pp = UnsafePointer[Scalar[DType.float32], MutExternalOrigin](
+        unsafe_from_address=Int(pa)
+    )
+    var gp = UnsafePointer[Scalar[g_dtype], MutExternalOrigin](
+        unsafe_from_address=Int(ga)
+    )
+
+    var gv = Float32(0.0)
+    var pv = Float32(0.0)
+    var m_old = Float32(0.0)
+    var v_old = Float32(0.0)
+    if active:
+        gv = gp[local_idx].cast[DType.float32]() * clip_scale
+        pv = pp[local_idx].cast[DType.float32]()
+        var mc = Int(rebind[Scalar[DType.uint8]](m_codes[state_idx]))
+        var vc = Int(rebind[Scalar[DType.uint8]](v_codes[state_idx]))
+        m_old = sh_signed[mc] * rebind[Scalar[DType.float32]](m_absmax[bid])
+        v_old = sh_unsigned[vc] * rebind[Scalar[DType.float32]](v_absmax[bid])
+
+    var m_new = beta1 * m_old + (Float32(1.0) - beta1) * gv
+    var v_new = beta2 * v_old + (Float32(1.0) - beta2) * gv * gv
+    if active:
+        var m_hat = m_new / bc1
+        var v_hat = v_new / bc2
+        pv -= lr * m_hat / (sqrt(v_hat) + eps)
+        if weight_decay != Float32(0.0):
+            pv -= lr * weight_decay * pv
+        pp[local_idx] = pv
+
+    var am = m_new if m_new >= Float32(0.0) else -m_new
+    var av = v_new if v_new >= Float32(0.0) else -v_new
+    sh_m[tid] = am if active else Float32(0.0)
+    sh_v[tid] = av if active else Float32(0.0)
+    barrier()
+    var width = ADAMW8BIT_BLOCK_SIZE // 2
+    while width > 0:
+        if tid < width:
+            if sh_m[tid + width] > sh_m[tid]:
+                sh_m[tid] = sh_m[tid + width]
+            if sh_v[tid + width] > sh_v[tid]:
+                sh_v[tid] = sh_v[tid + width]
+        barrier()
+        width //= 2
+
+    var new_m_abs = sh_m[0]
+    var new_v_abs = sh_v[0]
+    if new_m_abs == Float32(0.0):
+        new_m_abs = Float32(1.0e-12)
+    if new_v_abs == Float32(0.0):
+        new_v_abs = Float32(1.0e-12)
+    if tid == 0:
+        m_absmax[bid] = new_m_abs
+        v_absmax[bid] = new_v_abs
+    barrier()
+
+    if active:
+        var m_norm = m_new / new_m_abs
+        var v_norm = v_new / new_v_abs
+        var best_m = 0
+        var dm0 = sh_signed[0] - m_norm
+        var best_dm = dm0 if dm0 >= Float32(0.0) else -dm0
+        var best_v = 0
+        var dv0 = sh_unsigned[0] - v_norm
+        var best_dv = dv0 if dv0 >= Float32(0.0) else -dv0
+        for code in range(1, 256):
+            var dm = sh_signed[code] - m_norm
+            if dm < Float32(0.0):
+                dm = -dm
+            if dm < best_dm:
+                best_dm = dm
+                best_m = code
+            var dv = sh_unsigned[code] - v_norm
+            if dv < Float32(0.0):
+                dv = -dv
+            if dv < best_dv:
+                best_dv = dv
+                best_v = code
+        m_codes[state_idx] = UInt8(best_m)
+        v_codes[state_idx] = UInt8(best_v)
+
+
+def adamw8bit_device_step(
+    params: List[_TArc],
+    grads: List[_TArc],
+    state: Adam8bitDeviceState,
+    step: Int,
+    lr: Float32,
+    beta1: Float32,
+    beta2: Float32,
+    eps: Float32,
+    weight_decay: Float32,
+    ctx: DeviceContext,
+    clip_scale: Float32 = Float32(1.0),
+) raises:
+    var nt = len(params)
+    if nt == 0 or len(grads) != nt:
+        raise Error("AdamW8bit device params/grads must be non-empty and matched")
+    if step < 1:
+        raise Error("AdamW8bit device step must be >= 1")
+    var blocks = _adam8bit_total_blocks(params)
+    if blocks != state.total_blocks:
+        raise Error("AdamW8bit device state no longer matches parameter geometry")
+    var grad_dtype = grads[0][].dtype()
+    if grad_dtype != STDtype.F32 and grad_dtype != STDtype.BF16 and grad_dtype != STDtype.F16:
+        raise Error("AdamW8bit device gradients must be F32, BF16, or F16")
+
+    var p_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
+    var g_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
+    var n_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
+    var bo_host = ctx.enqueue_create_host_buffer[DType.uint8]((nt + 1) * 8)
+    var pp = p_host.unsafe_ptr().bitcast[UInt64]()
+    var gp = g_host.unsafe_ptr().bitcast[UInt64]()
+    var np = n_host.unsafe_ptr().bitcast[Int64]()
+    var bp = bo_host.unsafe_ptr().bitcast[Int64]()
+    var block_cursor = 0
+    bp[0] = Int64(0)
+    for i in range(nt):
+        if params[i][].dtype() != STDtype.F32:
+            raise Error("AdamW8bit device master parameters must be F32")
+        if grads[i][].dtype() != grad_dtype:
+            raise Error("AdamW8bit device gradients must share one dtype")
+        var n = params[i][].numel()
+        if grads[i][].numel() != n:
+            raise Error("AdamW8bit device per-tensor param/grad mismatch")
+        pp[i] = UInt64(Int(params[i][].buf.unsafe_ptr().bitcast[Float32]()))
+        gp[i] = UInt64(Int(grads[i][].buf.unsafe_ptr()))
+        np[i] = Int64(n)
+        block_cursor += (n + ADAMW8BIT_BLOCK_SIZE - 1) // ADAMW8BIT_BLOCK_SIZE
+        bp[i + 1] = Int64(block_cursor)
+
+    var p_dev = ctx.enqueue_create_buffer[DType.uint8](nt * 8)
+    var g_dev = ctx.enqueue_create_buffer[DType.uint8](nt * 8)
+    var n_dev = ctx.enqueue_create_buffer[DType.uint8](nt * 8)
+    var bo_dev = ctx.enqueue_create_buffer[DType.uint8]((nt + 1) * 8)
+    ctx.enqueue_copy(dst_buf=p_dev, src_buf=p_host)
+    ctx.enqueue_copy(dst_buf=g_dev, src_buf=g_host)
+    ctx.enqueue_copy(dst_buf=n_dev, src_buf=n_host)
+    ctx.enqueue_copy(dst_buf=bo_dev, src_buf=bo_host)
+
+    var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt))
+    var bo_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nt + 1))
+    var code_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.total_padded))
+    var block_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](state.total_blocks))
+    var q_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](256))
+    var PA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(p_dev.unsafe_ptr().bitcast[UInt64]())
+        ), runtime_layout=a_rl,
+    )
+    var GA = LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint64], MutAnyOrigin](
+            unsafe_from_address=Int(g_dev.unsafe_ptr().bitcast[UInt64]())
+        ), runtime_layout=a_rl,
+    )
+    var NN = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(n_dev.unsafe_ptr().bitcast[Int64]())
+        ), runtime_layout=a_rl,
+    )
+    var BO = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.int64], MutAnyOrigin](
+            unsafe_from_address=Int(bo_dev.unsafe_ptr().bitcast[Int64]())
+        ), runtime_layout=bo_rl,
+    )
+    var MC = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(state.m_codes[].buf.unsafe_ptr())
+        ), runtime_layout=code_rl,
+    )
+    var VC = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.uint8], MutAnyOrigin](
+            unsafe_from_address=Int(state.v_codes[].buf.unsafe_ptr())
+        ), runtime_layout=code_rl,
+    )
+    var MA = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.m_absmax[].buf.unsafe_ptr().bitcast[Float32]())
+        ), runtime_layout=block_rl,
+    )
+    var VA = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.v_absmax[].buf.unsafe_ptr().bitcast[Float32]())
+        ), runtime_layout=block_rl,
+    )
+    var QS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.qmap_signed[].buf.unsafe_ptr().bitcast[Float32]())
+        ), runtime_layout=q_rl,
+    )
+    var QU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        unsafe_ptr=Pointer[Scalar[DType.float32], MutAnyOrigin](
+            unsafe_from_address=Int(state.qmap_unsigned[].buf.unsafe_ptr().bitcast[Float32]())
+        ), runtime_layout=q_rl,
+    )
+
+    var b1p = Float32(1.0)
+    var b2p = Float32(1.0)
+    for _ in range(step):
+        b1p *= beta1
+        b2p *= beta2
+    var bc1 = Float32(1.0) - b1p
+    var bc2 = Float32(1.0) - b2p
+    if grad_dtype == STDtype.F32:
+        ctx.enqueue_function[_adamw8bit_device_kernel[DType.float32]](
+            PA, GA, NN, BO, MC, VC, MA, VA, QS, QU, Int32(nt),
+            lr, beta1, beta2, eps, weight_decay, bc1, bc2, clip_scale,
+            grid_dim=state.total_blocks, block_dim=ADAMW8BIT_BLOCK_SIZE,
+        )
+    elif grad_dtype == STDtype.BF16:
+        ctx.enqueue_function[_adamw8bit_device_kernel[DType.bfloat16]](
+            PA, GA, NN, BO, MC, VC, MA, VA, QS, QU, Int32(nt),
+            lr, beta1, beta2, eps, weight_decay, bc1, bc2, clip_scale,
+            grid_dim=state.total_blocks, block_dim=ADAMW8BIT_BLOCK_SIZE,
+        )
+    else:
+        ctx.enqueue_function[_adamw8bit_device_kernel[DType.float16]](
+            PA, GA, NN, BO, MC, VC, MA, VA, QS, QU, Int32(nt),
+            lr, beta1, beta2, eps, weight_decay, bc1, bc2, clip_scale,
+            grid_dim=state.total_blocks, block_dim=ADAMW8BIT_BLOCK_SIZE,
+        )

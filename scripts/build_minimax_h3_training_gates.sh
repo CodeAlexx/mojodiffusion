@@ -39,3 +39,6 @@ build_gate \
 build_gate \
   serenitymojo/models/minimax_h3/parity/minimax_h3_lora_peft_roundtrip.mojo \
   output/checks/minimax_h3_lora_peft_roundtrip
+build_gate \
+  serenitymojo/training/tests/adamw8bit_device_parity.mojo \
+  output/checks/minimax_h3_adamw8bit_device_parity

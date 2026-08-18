@@ -3834,17 +3834,32 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 
 ## MiniMax-H3 LoRA trainer (2026-08-14/18)
 - PURE-MOJO H3 LoRA trainer, torchref (pinned upstream @ 04324c28) = oracle.
-  Entry `training/train_minimax_h3.mojo` (image-mode maiden arm): mmh3 cache
+  Entry `training/train_minimax_h3.mojo` is driven by the shared `TrainConfig`;
+  Musubi/torchref remains an oracle and is never the production training path.
+  The image-mode arm runs mmh3 cache
   pair -> image-branch sigma (resolution-aware logit-normal, 1000-node grid
-  quantization — documented deviation) -> bit-exact noising/target
+  quantization) -> bit-exact noising/target
   (`models/minimax_h3/h3_train_sigma.mojo`) -> frozen frontend ([text|video]
   contiguous, per-item text embeds precomputed) -> 50-block streamed LoRA
   fwd + recompute bwd (`h3_stack_train.mojo`) -> final-layer twin
-  (`h3_final_train.mojo`) -> token loss + d_pred -> fused AdamW on F32
-  masters -> canonical PEFT A/B saves + full resume state.
+  (`h3_final_train.mojo`) -> token loss + d_pred -> device-resident blockwise
+  AdamW8bit -> canonical PEFT A/B saves + exact uint8/F32 optimizer resume.
+- Config contract: rank/alpha, LR and warmup, gradient clipping, timestep
+  buckets, spatial-density jitter, guidance distillation, base-preservation
+  weight/probability, target selector, resident blocks, and save/sample cadence all come
+  from JSON. `h3_mlp_fc1_fc2` matches the oracle regex and creates 100 active
+  adapters (200 PEFT tensors); disabled QKV/out targets are not optimized or
+  serialized. `scripts/run_minimax_h3_eri2_mojo_4000.sh` runs each configured
+  training segment rootlessly, then samples the checkpoint in a fresh pure-Mojo
+  process using the shared `serenity.sample_prompts.v1` file.
 - Stores: `h3_train_block_store.mojo` retains the bounded mmap→staging BF16
   streamer; `h3_train_block_store_int8.mojo` is the current fast path, keeping
-  42/50 frozen blocks as direct tensorwise W8A8 and streaming eight BF16 tails.
+  a config-selected prefix of frozen blocks as direct tensorwise W8A8 and
+  streaming only the remaining BF16 tail. The production Eri2 speed gate uses
+  48 resident; all 50 crossed VRAM on its first activation, while the original
+  42-block mode remains the proven fallback. The stored-orientation NN INT8
+  backward passed a small gate but produced a delayed illegal address under
+  changing real H3 shapes, so production retains the stable transpose+NT path.
   The earlier bulk 38.5GB pinned fill is forbidden. AdaLN remains an exact
   1000-node build-once host sidecar (`h3_train_modgrid.mojo`).
 - Speed/current numeric contract (3090 Ti, 2026-08-18): direct-W8A8 42/50,
@@ -3852,6 +3867,12 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   6.631 / optimizer 0.087s. A controlled first-sample gate measured loss
   0.829788 W8A8 versus 0.848637 streamed BF16 (-2.22%), so this fast mode is
   explicitly a different numeric trajectory, not exact-BF16 parity.
+- Production-recipe speed gate (rank 32 MLP-only, guidance 3.5, preservation
+  0.02 at probability 0.25, 48/50 resident): first stable clean steps measure
+  9.13-10.18s and preservation-active steps 10.83-12.25s at about 20.1-20.9
+  GiB. The earlier dense-preservation 42/50 run measured 13-14s/step. These
+  timings include the extra guidance teacher and recompute backward; first-step
+  compilation and failed 50/50/NN experiments are excluded.
 - Gates (all PASS, output/checks): block fwd+bwd + LoRA 21/21 vs torch on
   real block-0; 2-real-block stack chain 9/9; 50-block real-weight smoke;
   mmh3 cache reader 36/36 BIT-exact vs upstream-writer fixture; sigma/x_t
@@ -3884,15 +3905,16 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   `models/minimax_h3/parity/minimax_h3_cond_probe.mojo` dumps OUR runtime
   conditioner embeds for a prompt -> safetensors for cos vs cached TE.
 - Convergence oracle remains the pinned Musubi H3 trainer, not Mojo's loss
-  curve alone. The next decoded A/B should mirror the supplied long-run recipe:
-  rank/alpha 32, LR 5e-5 with 50-step warmup, spatial-density jitter 0.2,
-  guidance distillation 3.5, base-preservation weight 0.02, eight timestep
-  buckets, checkpoint resume, and a 15k-step ceiling. Mojo already has
-  canonical rank/alpha selection, guidance-consistent training, full optimizer
-  resume, cU-DNN train attention, and resident frozen weights. Spatial-density
-  jitter, base-preservation loss, stratified timestep buckets, and LR warmup are
-  still missing and must be ported from Musubi source before claiming recipe
-  parity or convergence.
+  curve alone. The production Eri2 gate now mirrors the supplied recipe at a
+  4,000-step ceiling: rank/alpha 32, MLP `fc1`/`fc2` targets, LR 5e-5 with
+  50-step warmup, gradient clip 1.0, spatial-density jitter 0.2, guidance
+  distillation 3.5, base-preservation weight 0.02 sampled on 25% of steps
+  with oracle-defined inverse-probability scaling, eight timestep buckets,
+  and exact checkpoint resume. Its two-step config/resume smoke saved 100
+  adapter pairs, resumed step 1→2 with nonzero AdamW8bit state and nonzero
+  preservation loss, and produced valid 512x320x22 Mojo validation videos.
+  Those are mechanics gates; convergence still requires same-seed decoded
+  checkpoint comparisons during the long run.
 - Guidance objective (in OUR trainer, `--guidance_scale 3`): per-step
   no-grad TEACHER forward on the cached EMPTY conditioning (own packed
   layout/rope/adaln idx, same sigma-node mod tables; runs before the

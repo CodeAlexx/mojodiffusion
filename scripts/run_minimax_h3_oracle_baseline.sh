@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the pinned Musubi MiniMax-H3 implementation as the external 200-step
 # training-loss oracle on the same native 768x768 image cache used by Mojo.
-# Run after `sudo -v` in the same local terminal.
+# Rootless; this is reference measurement only, never the production trainer.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -22,9 +22,14 @@ for required in "$oracle_python" "$oracle_accelerate" "$dataset" "$dit"; do
     exit 66
   fi
 done
-if ! sudo -n true 2>/dev/null; then
-  echo "H3 oracle baseline: sudo is not cached; run 'sudo -v' in this terminal" >&2
-  exit 77
+gpu_busy_limit_mib="${H3_GPU_BUSY_LIMIT_MIB:-1024}"
+gpu_used_mib=$(nvidia-smi \
+  --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null \
+  | awk '{sum += $1} END {print sum + 0}')
+if (( gpu_used_mib > gpu_busy_limit_mib )); then
+  echo "H3 oracle baseline: GPU compute users hold ${gpu_used_mib} MiB" >&2
+  echo "H3 oracle baseline: limit is ${gpu_busy_limit_mib} MiB" >&2
+  exit 75
 fi
 
 tag=$(date +%Y%m%d-%H%M%S)
@@ -44,11 +49,11 @@ echo "run_dir=$run_dir"
 # The official Comfy single-file export already stores QKV as contiguous
 # [q_all;k_all;v_all], matching the pinned Musubi model's chunk(3) contract.
 # FP8 channel scaling is the closest upstream low-memory analogue to Mojo's
-# per-output-row FP8 frozen base. The system service contains any host OOM to
-# this run instead of user@UID.service.
+# per-output-row FP8 frozen base. The rootless user service contains any host
+# OOM to this run without requiring a sudo credential.
 cd "$oracle_root"
 MEM_MAX=40G MEM_HIGH=infinity SWAP_MAX=2G \
-  "$repo_root/scripts/mem_safe_system.sh" /usr/bin/env \
+  "$repo_root/scripts/mem_safe_runtime.sh" /usr/bin/env \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
     PYTHONPATH="$repo_root/scripts/h3_oracle_pydeps:$oracle_root/src" \
     MUSUBI_DASHBOARD_METRICS=1 \

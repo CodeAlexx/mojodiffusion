@@ -521,6 +521,15 @@ struct TrainConfig(Copyable, Movable):
     var omini_position_delta_w: Int
     var omini_position_scale: Float32
 
+    # ── MiniMax-H3 oracle recipe controls (default-neutral) ──────────────────
+    # These are runtime recipe scalars, not architecture shapes. They live in
+    # the shared descriptor so H3 follows the same config-first contract as
+    # every other production trainer.
+    var h3_num_timestep_buckets: Int
+    var h3_spatial_density_jitter: Float32
+    var h3_base_preservation_loss_weight: Float32
+    var h3_base_preservation_probability: Float32
+
     # ── T2.E ControlNet training (default-off == 0) ─────────────────────────
     # controlnet_layers: number of control blocks (DiT ControlNet pattern —
     #   copies of the first N main transformer blocks + zero-init before/after
@@ -913,6 +922,10 @@ struct TrainConfig(Copyable, Movable):
         omini_position_delta_h: Int = 0,
         omini_position_delta_w: Int = 0,
         omini_position_scale: Float32 = Float32(1.0),
+        h3_num_timestep_buckets: Int = 1,
+        h3_spatial_density_jitter: Float32 = Float32(0.0),
+        h3_base_preservation_loss_weight: Float32 = Float32(0.0),
+        h3_base_preservation_probability: Float32 = Float32(1.0),
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -1157,6 +1170,10 @@ struct TrainConfig(Copyable, Movable):
         self.omini_position_delta_h = omini_position_delta_h
         self.omini_position_delta_w = omini_position_delta_w
         self.omini_position_scale = omini_position_scale
+        self.h3_num_timestep_buckets = h3_num_timestep_buckets
+        self.h3_spatial_density_jitter = h3_spatial_density_jitter
+        self.h3_base_preservation_loss_weight = h3_base_preservation_loss_weight
+        self.h3_base_preservation_probability = h3_base_preservation_probability
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA
@@ -1311,3 +1328,16 @@ struct TrainConfig(Copyable, Movable):
             )
         if self.layer_offload_fraction < Float64(0.0) or self.layer_offload_fraction > Float64(1.0):
             raise Error("TrainConfig: layer_offload_fraction must be within 0..1")
+        if self.h3_num_timestep_buckets <= 0:
+            raise Error("TrainConfig: h3_num_timestep_buckets must be positive")
+        if self.h3_spatial_density_jitter < Float32(0.0):
+            raise Error("TrainConfig: h3_spatial_density_jitter cannot be negative")
+        if self.h3_base_preservation_loss_weight < Float32(0.0):
+            raise Error("TrainConfig: h3_base_preservation_loss_weight cannot be negative")
+        if (
+            self.h3_base_preservation_probability <= Float32(0.0)
+            or self.h3_base_preservation_probability > Float32(1.0)
+        ):
+            raise Error(
+                "TrainConfig: h3_base_preservation_probability must be within (0,1]"
+            )

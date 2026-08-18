@@ -1,0 +1,27 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 750,
+    "sample_at_start": false,
+    "save_before_sample": true,
+    "precache_required": false,
+    "enforce_min_image_size": false,
+    "width": 512,
+    "height": 320,
+    "frames": 22,
+    "fps": 24,
+    "steps": 20,
+    "cfg": 1.0,
+    "seed": 271828,
+    "negative": "",
+    "h3_quant": "int8-fast",
+    "h3_resident_blocks": 42,
+    "h3_attention_backend": "cudnn"
+  },
+  "prompts": [
+    {
+      "id": "eri2_pink_portrait",
+      "prompt": "vrtlEri2, The image features a person with long, curly dark hair. The individual is wearing a sleeveless top, and their hand is gently resting on their shoulder. The background is a solid, warm pink color, which complements the person's skin tone and hair. The lighting is soft and natural, casting a gentle glow on the person's face and hair, creating a serene and intimate atmosphere. The overall mood of the image is calm and reflective, with the person appearing to be in a moment of contemplation or relaxation. The simplicity of the background and the focus on the person's expression contribute to a sense of tranquility and introspection."
+    }
+  ]
+}

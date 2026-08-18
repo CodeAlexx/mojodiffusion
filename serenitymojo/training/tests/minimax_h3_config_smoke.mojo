@@ -51,7 +51,7 @@ def main() raises:
         cfg.h3_base_preservation_probability == Float32(0.25),
         String("sparse base preservation"),
     )
-    _check(cfg.resident_blocks == 48, String("resident blocks"))
+    _check(cfg.resident_blocks == 46, String("resident blocks"))
     _check(cfg.dataset_path == String("/home/alex/eri2_with_trigger"), String("dataset"))
     _check(cfg.validation_prompts_file != String(""), String("sample config"))
     print("PASS: MiniMax-H3 production config recipe and paths parsed exactly")

@@ -3855,9 +3855,10 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - Stores: `h3_train_block_store.mojo` retains the bounded mmap→staging BF16
   streamer; `h3_train_block_store_int8.mojo` is the current fast path, keeping
   a config-selected prefix of frozen blocks as direct tensorwise W8A8 and
-  streaming only the remaining BF16 tail. The production Eri2 speed gate uses
-  48 resident; all 50 crossed VRAM on its first activation, while the original
-  42-block mode remains the proven fallback. The stored-orientation NN INT8
+  streaming only the remaining BF16 tail. The production Eri2 run now uses
+  46 resident: 48 ran through step 926 but OOMed on the next changing shape,
+  while all 50 crossed VRAM on its first activation. The original 42-block
+  mode remains the proven fallback. The stored-orientation NN INT8
   backward passed a small gate but produced a delayed illegal address under
   changing real H3 shapes, so production retains the stable transpose+NT path.
   The earlier bulk 38.5GB pinned fill is forbidden. AdaLN remains an exact
@@ -3868,11 +3869,13 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   0.829788 W8A8 versus 0.848637 streamed BF16 (-2.22%), so this fast mode is
   explicitly a different numeric trajectory, not exact-BF16 parity.
 - Production-recipe speed gate (rank 32 MLP-only, guidance 3.5, preservation
-  0.02 at probability 0.25, 48/50 resident): first stable clean steps measure
-  9.80s median and preservation-active steps 11.82s median at about 20.1-20.9
-  GiB. The earlier dense-preservation 42/50 run measured 13-14s/step. These
-  timings include the extra guidance teacher and recompute backward; first-step
-  compilation and failed 50/50/NN experiments are excluded.
+  0.02 at probability 0.25): 48/50 initially measured 9.80s clean median and
+  11.82s preservation-active median at about 20.1-20.9 GiB, but OOMed at step
+  927 after resuming from 750. Production therefore uses 46/50 to restore two
+  blocks of shape/allocator headroom. The earlier dense-preservation 42/50 run
+  measured 13-14s/step. These timings include the extra guidance teacher and
+  recompute backward; first-step compilation and failed residency experiments
+  are excluded.
 - Gates (all PASS, output/checks): block fwd+bwd + LoRA 21/21 vs torch on
   real block-0; 2-real-block stack chain 9/9; 50-block real-weight smoke;
   mmh3 cache reader 36/36 BIT-exact vs upstream-writer fixture; sigma/x_t

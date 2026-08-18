@@ -19,7 +19,7 @@
   "train_dtype": "BFLOAT_16",
   "transformer_weight_dtype": "INT_W8A8",
   "quantized_resident": "int_w8a8",
-  "resident_blocks": 48,
+  "resident_blocks": 46,
   "learning_rate": 0.00005,
   "learning_rate_scheduler": "constant",
   "learning_rate_warmup_steps": 50,

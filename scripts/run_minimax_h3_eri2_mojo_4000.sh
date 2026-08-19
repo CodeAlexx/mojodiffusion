@@ -94,6 +94,8 @@ sample_all() {
       lora_arg+=("--lora=$lora")
     fi
     LD_LIBRARY_PATH="$runtime_ld" \
+    MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=85 \
+    MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT=100 \
     DESKTOP_RESERVE=24G MEM_MAX=18G MEM_HIGH=infinity SWAP_MAX=2G \
       scripts/mem_safe_runtime.sh "$sampler" \
         "$prompt" "$sample_dir" "$denoise_steps" "$seed" "$model_blocks" \
@@ -125,6 +127,8 @@ fi
 while (( current < max_steps )); do
   echo "[H3-cadence] training next config-defined segment after step $current"
   LD_LIBRARY_PATH="$runtime_ld" \
+  MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=85 \
+  MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT=100 \
   H3_ALLOW_USER_SLICE=1 DESKTOP_RESERVE=24G \
   MEM_MAX=18G MEM_HIGH=infinity SWAP_MAX=2G \
     scripts/mem_safe_runtime.sh "$trainer" "$config" --cadence_segment 1

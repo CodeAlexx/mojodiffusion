@@ -156,6 +156,7 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.minimax_h3_dit import MiniMaxH3DiTConfig
+from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.vec_rms_norm import vec_rms_norm
 from serenitymojo.ops.activations import swiglu
@@ -299,8 +300,10 @@ def _minimax_h3_token_refiner_block[
 ](
     hidden_in: Tensor,  # [S, hidden_size] bf16
     w: Dict[String, ArcPointer[Tensor]],
+    layer: Int,
     prefix: String,  # e.g. "token_refiner.blocks.0" (NO trailing dot)
     config: MiniMaxH3DiTConfig,
+    lora_overlay: Optional[H3LoraOverlay],
     ctx: DeviceContext,
 ) raises -> Tensor:
     var inner = config.inner_dim()
@@ -323,6 +326,13 @@ def _minimax_h3_token_refiner_block[
     var q = linear(normed, to_q_w, None, ctx)
     var k = linear(normed, to_k_w, None, ctx)
     var v = linear(normed, to_v_w, None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 0):
+        var delta = lora_overlay.value().refiner_activation_delta(
+            layer, 0, normed, ctx
+        )
+        q = add(q, slice(delta, 1, 0, inner, ctx), ctx)
+        k = add(k, slice(delta, 1, inner, inner, ctx), ctx)
+        v = add(v, slice(delta, 1, 2 * inner, inner, ctx), ctx)
 
     var q4 = reshape(q, [1, S, H, Dh], ctx)
     var k4 = reshape(k, [1, S, H, Dh], ctx)
@@ -354,6 +364,14 @@ def _minimax_h3_token_refiner_block[
         attn4 = sdpa_nomask[1, S, H, Dh](q4, k4, v4, scale, ctx)
     var attn = reshape(attn4, [S, inner], ctx)
     var attn_out = linear(attn, w[prefix + ".attn.out_proj.weight"][], None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 1):
+        attn_out = add(
+            attn_out,
+            lora_overlay.value().refiner_activation_delta(
+                layer, 1, attn, ctx
+            ),
+            ctx,
+        )
     state = add(state, attn_out, ctx)
 
     # ── SwiGLU FFN. mlp.fc1.weight is [2*ffn, hidden], loader-swapped from
@@ -365,8 +383,22 @@ def _minimax_h3_token_refiner_block[
     var gate_w = slice(fc1_w, 0, ffn, ffn, ctx)
     var value = linear(normed2, value_w, None, ctx)
     var gate = linear(normed2, gate_w, None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 2):
+        var delta = lora_overlay.value().refiner_activation_delta(
+            layer, 2, normed2, ctx
+        )
+        value = add(value, slice(delta, 1, 0, ffn, ctx), ctx)
+        gate = add(gate, slice(delta, 1, ffn, ffn, ctx), ctx)
     var ff_act = swiglu(gate, value, ctx)  # silu(gate) * value
     var ff_out = linear(ff_act, w[prefix + ".mlp.fc2.weight"][], None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 3):
+        ff_out = add(
+            ff_out,
+            lora_overlay.value().refiner_activation_delta(
+                layer, 3, ff_act, ctx
+            ),
+            ctx,
+        )
     state = add(state, ff_out, ctx)
 
     return state^
@@ -379,6 +411,7 @@ def minimax_h3_token_refiner[
     w: Dict[String, ArcPointer[Tensor]],
     config: MiniMaxH3DiTConfig,
     ctx: DeviceContext,
+    lora_overlay: Optional[H3LoraOverlay] = None,
 ) raises -> Tensor:
     """`token_refiner.blocks.{0,1}` + `token_refiner.final_norm`. S/H/Dh are
     comptime — the whole port follows this convention for any sdpa-bearing
@@ -390,7 +423,7 @@ def minimax_h3_token_refiner[
     for layer in range(config.token_refiner_num_layers):
         var prefix = String("token_refiner.blocks.") + String(layer)
         state = _minimax_h3_token_refiner_block[S, H, Dh, FORCE_TILED](
-            state, w, prefix, config, ctx
+            state, w, layer, prefix, config, lora_overlay, ctx
         )
     return vec_rms_norm(state, w["token_refiner.final_norm.weight"][], config.final_norm_eps, ctx)
 
@@ -400,8 +433,10 @@ def _minimax_h3_token_refiner_block_dynamic[
 ](
     hidden_in: Tensor,
     w: Dict[String, ArcPointer[Tensor]],
+    layer: Int,
     prefix: String,
     config: MiniMaxH3DiTConfig,
+    lora_overlay: Optional[H3LoraOverlay],
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Runtime-token-count refiner block for request-driven H3 inference."""
@@ -421,6 +456,13 @@ def _minimax_h3_token_refiner_block_dynamic[
     var q = linear(normed, to_q_w, None, ctx)
     var k = linear(normed, to_k_w, None, ctx)
     var v = linear(normed, to_v_w, None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 0):
+        var delta = lora_overlay.value().refiner_activation_delta(
+            layer, 0, normed, ctx
+        )
+        q = add(q, slice(delta, 1, 0, inner, ctx), ctx)
+        k = add(k, slice(delta, 1, inner, inner, ctx), ctx)
+        v = add(v, slice(delta, 1, 2 * inner, inner, ctx), ctx)
     var q4 = reshape(q, [1, S, H, Dh], ctx)
     var k4 = reshape(k, [1, S, H, Dh], ctx)
     var v4 = reshape(v, [1, S, H, Dh], ctx)
@@ -429,6 +471,14 @@ def _minimax_h3_token_refiner_block_dynamic[
     var attn4 = sdpa_nomask_dynamic(q4, k4, v4, scale, ctx)
     var attn = reshape(attn4, [S, inner], ctx)
     var attn_out = linear(attn, w[prefix + ".attn.out_proj.weight"][], None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 1):
+        attn_out = add(
+            attn_out,
+            lora_overlay.value().refiner_activation_delta(
+                layer, 1, attn, ctx
+            ),
+            ctx,
+        )
     state = add(state, attn_out, ctx)
 
     var normed2 = vec_rms_norm(state, w[prefix + ".norm2.weight"][], eps, ctx)
@@ -437,8 +487,22 @@ def _minimax_h3_token_refiner_block_dynamic[
     var gate_w = slice(fc1_w, 0, ffn, ffn, ctx)
     var value = linear(normed2, value_w, None, ctx)
     var gate = linear(normed2, gate_w, None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 2):
+        var delta = lora_overlay.value().refiner_activation_delta(
+            layer, 2, normed2, ctx
+        )
+        value = add(value, slice(delta, 1, 0, ffn, ctx), ctx)
+        gate = add(gate, slice(delta, 1, ffn, ffn, ctx), ctx)
     var ff_act = swiglu(gate, value, ctx)
     var ff_out = linear(ff_act, w[prefix + ".mlp.fc2.weight"][], None, ctx)
+    if lora_overlay and lora_overlay.value().has_refiner(layer, 3):
+        ff_out = add(
+            ff_out,
+            lora_overlay.value().refiner_activation_delta(
+                layer, 3, ff_act, ctx
+            ),
+            ctx,
+        )
     state = add(state, ff_out, ctx)
     return state^
 
@@ -450,13 +514,14 @@ def minimax_h3_token_refiner_dynamic[
     w: Dict[String, ArcPointer[Tensor]],
     config: MiniMaxH3DiTConfig,
     ctx: DeviceContext,
+    lora_overlay: Optional[H3LoraOverlay] = None,
 ) raises -> Tensor:
     """Two token-refiner blocks with runtime text length and exact math SDPA."""
     var state = text_embeds.clone(ctx)
     for layer in range(config.token_refiner_num_layers):
         var prefix = String("token_refiner.blocks.") + String(layer)
         state = _minimax_h3_token_refiner_block_dynamic[H, Dh](
-            state, w, prefix, config, ctx
+            state, w, layer, prefix, config, lora_overlay, ctx
         )
     return vec_rms_norm(
         state, w["token_refiner.final_norm.weight"][],
@@ -665,6 +730,7 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     w: Dict[String, ArcPointer[Tensor]],
     config: MiniMaxH3DiTConfig,
     ctx: DeviceContext,
+    lora_overlay: Optional[H3LoraOverlay] = None,
 ) raises -> MiniMaxH3FrontendEmbed:
     # video/audio patch-proj is fp32; the packed sequence the block stack
     # consumes is bf16-only (every blocks.* tensor is bf16) — cast down at
@@ -682,7 +748,9 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     var audio_embeds = torch_f32_to_bf16_rne(audio_embeds_f32, ctx)
 
     var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
-    var text_embeds = minimax_h3_token_refiner[TR_S, TR_H, TR_DH](text_embeds0, w, config, ctx)
+    var text_embeds = minimax_h3_token_refiner[TR_S, TR_H, TR_DH](
+        text_embeds0, w, config, ctx, lora_overlay
+    )
 
     var hidden = minimax_h3_scatter_streams(
         video_embeds,
@@ -714,13 +782,14 @@ def minimax_h3_frontend_embed_dynamic[
     config: MiniMaxH3DiTConfig,
     ctx: DeviceContext,
     t2va_contiguous: Bool = False,
+    lora_overlay: Optional[H3LoraOverlay] = None,
 ) raises -> MiniMaxH3FrontendEmbed:
     """Runtime text/packed sequence frontend for request-driven H3 modes."""
     var video_embeds = _minimax_h3_video_patch_embed_bf16(video_rows, w, ctx)
     var audio_embeds = _minimax_h3_audio_patch_embed_bf16(audio_rows, w, ctx)
     var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
     var text_embeds = minimax_h3_token_refiner_dynamic[TR_H, TR_DH](
-        text_embeds0, w, config, ctx
+        text_embeds0, w, config, ctx, lora_overlay
     )
     var hidden: Tensor
     if t2va_contiguous:

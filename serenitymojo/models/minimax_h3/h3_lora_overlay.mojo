@@ -28,12 +28,19 @@ from serenitymojo.ops.tensor_algebra import add, gather_rows, mul_scalar, slice
 from serenitymojo.models.minimax_h3.h3_lora_format import (
     h3_lora_peft_prefix,
     h3_lora_bare_peft_prefix,
+    h3_lora_token_refiner_peft_prefix,
+    h3_lora_token_refiner_bare_peft_prefix,
     h3_lora_legacy_prefix,
 )
 
 comptime TArc = ArcPointer[Tensor]
 comptime H3_OVERLAY_BLOCKS = 50
 comptime H3_OVERLAY_SLOTS = 4
+comptime H3_OVERLAY_REFINER_BLOCKS = 2
+comptime H3_OVERLAY_MAIN_COUNT = H3_OVERLAY_BLOCKS * H3_OVERLAY_SLOTS
+comptime H3_OVERLAY_TOTAL_COUNT = (
+    H3_OVERLAY_MAIN_COUNT + H3_OVERLAY_REFINER_BLOCKS * H3_OVERLAY_SLOTS
+)
 
 
 def h3_overlay_slot_of(raw_suffix: String) -> Int:
@@ -85,7 +92,7 @@ struct H3LoraOverlay(Copyable, Movable):
         var up = List[Optional[TArc]]()
         var runtime_up = List[Optional[TArc]]()
         var scale = List[Float32]()
-        for _ in range(H3_OVERLAY_BLOCKS * H3_OVERLAY_SLOTS):
+        for _ in range(H3_OVERLAY_TOTAL_COUNT):
             down.append(Optional[TArc](None))
             up.append(Optional[TArc](None))
             runtime_up.append(Optional[TArc](None))
@@ -158,9 +165,65 @@ struct H3LoraOverlay(Copyable, Movable):
                     runtime_up[idx] = Optional[TArc](u_arc^)
                 scale[idx] = multiplier * alpha / Float32(rank)
                 n += 1
+        for b in range(H3_OVERLAY_REFINER_BLOCKS):
+            for s in range(H3_OVERLAY_SLOTS):
+                var canonical = h3_lora_token_refiner_peft_prefix(b, s)
+                var bare = h3_lora_token_refiner_bare_peft_prefix(b, s)
+                var base = String("")
+                var dkey = String("")
+                var ukey = String("")
+                var alpha_key = String("")
+
+                var canonical_a = st.has_tensor(canonical + ".lora_A.weight")
+                var canonical_b = st.has_tensor(canonical + ".lora_B.weight")
+                if canonical_a and not canonical_b or canonical_b and not canonical_a:
+                    raise Error("h3 overlay: incomplete PEFT A/B pair at " + canonical)
+                var bare_a = st.has_tensor(bare + ".lora_A.weight")
+                var bare_b = st.has_tensor(bare + ".lora_B.weight")
+                if bare_a and not bare_b or bare_b and not bare_a:
+                    raise Error("h3 overlay: incomplete bare PEFT A/B pair at " + bare)
+                if canonical_a:
+                    base = canonical
+                    dkey = canonical + ".lora_A.weight"
+                    ukey = canonical + ".lora_B.weight"
+                    alpha_key = canonical + ".alpha"
+                elif bare_a:
+                    base = bare
+                    dkey = bare + ".lora_A.weight"
+                    ukey = bare + ".lora_B.weight"
+                    alpha_key = bare + ".alpha"
+                else:
+                    continue
+
+                var d = _bf16(st, dkey, ctx)
+                var u = _bf16(st, ukey, ctx)
+                var d_shape = d.shape()
+                var u_shape = u.shape()
+                if len(d_shape) != 2 or len(u_shape) != 2:
+                    raise Error("h3 overlay: A/B tensors must be 2-D at " + base)
+                var rank = d_shape[0]
+                if rank <= 0 or u_shape[1] != rank:
+                    raise Error("h3 overlay: down/up rank mismatch at " + base)
+                var alpha = Float32(rank)
+                if st.has_tensor(alpha_key):
+                    var ah = _f32(st, alpha_key, ctx).to_host(ctx)
+                    alpha = Float32(ah[0])
+                var idx = H3_OVERLAY_MAIN_COUNT + b * H3_OVERLAY_SLOTS + s
+                var d_arc = TArc(d^)
+                var u_arc = TArc(u^)
+                down[idx] = Optional[TArc](d_arc^)
+                if s == 2:
+                    var transformed = _runtime_up_bf16(u_arc[], s, ctx)
+                    up[idx] = Optional[TArc](u_arc^)
+                    runtime_up[idx] = Optional[TArc](TArc(transformed^))
+                else:
+                    up[idx] = Optional[TArc](u_arc.copy())
+                    runtime_up[idx] = Optional[TArc](u_arc^)
+                scale[idx] = multiplier * alpha / Float32(rank)
+                n += 1
         if n == 0:
             raise Error(
-                "h3 overlay: no diffusion_model.blocks.* PEFT or legacy "
+                "h3 overlay: no main-block/token-refiner PEFT or legacy "
                 "lora_unet_blocks_* adapters in " + path
             )
         return H3LoraOverlay(down^, up^, runtime_up^, scale^, n)
@@ -177,6 +240,16 @@ struct H3LoraOverlay(Copyable, Movable):
             if self.has(layer, slot):
                 return True
         return False
+
+    def has_refiner(self, layer: Int, slot: Int) -> Bool:
+        if (
+            slot < 0 or layer < 0
+            or layer >= H3_OVERLAY_REFINER_BLOCKS
+        ):
+            return False
+        return Bool(self.down[
+            H3_OVERLAY_MAIN_COUNT + layer * H3_OVERLAY_SLOTS + slot
+        ])
 
     def activation_delta(
         self, layer: Int, slot: Int, x: Tensor, ctx: DeviceContext
@@ -202,6 +275,18 @@ struct H3LoraOverlay(Copyable, Movable):
         var no_bias = Optional[Tensor](None)
         var hidden = linear(x, self.down[idx].value()[], no_bias^, ctx)
         var delta = linear(hidden, b, no_bias^, ctx)
+        return mul_scalar(delta, self.scale[idx], ctx)
+
+    def refiner_activation_delta(
+        self, layer: Int, slot: Int, x: Tensor, ctx: DeviceContext
+    ) raises -> Tensor:
+        """Scaled B(A(x)) for a token-refiner projection."""
+        var idx = H3_OVERLAY_MAIN_COUNT + layer * H3_OVERLAY_SLOTS + slot
+        var no_bias = Optional[Tensor](None)
+        var hidden = linear(x, self.down[idx].value()[], no_bias^, ctx)
+        var delta = linear(
+            hidden, self.runtime_up[idx].value()[], no_bias^, ctx
+        )
         return mul_scalar(delta, self.scale[idx], ctx)
 
     def delta_raw(

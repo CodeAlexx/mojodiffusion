@@ -3,6 +3,8 @@
 # Canonical stack / AI Toolkit-compatible external artifacts use PEFT keys:
 #   diffusion_model.blocks.{i}.<module>.lora_A.weight
 #   diffusion_model.blocks.{i}.<module>.lora_B.weight
+#   diffusion_model.token_refiner.blocks.{i}.<module>.lora_A.weight
+#   diffusion_model.token_refiner.blocks.{i}.<module>.lora_B.weight
 #
 # Older H3 artifacts used the Musubi/Kohya lora_unet encoding. The loader keeps
 # accepting that format, but new trainer outputs use only the canonical keys.
@@ -30,6 +32,22 @@ def h3_lora_peft_prefix(block: Int, slot: Int) raises -> String:
 def h3_lora_bare_peft_prefix(block: Int, slot: Int) raises -> String:
     """Bare PEFT is accepted because the shared stack loader accepts it too."""
     return String("blocks.") + String(block) + "." + h3_lora_module_path(slot)
+
+
+def h3_lora_token_refiner_peft_prefix(block: Int, slot: Int) raises -> String:
+    return (
+        String("diffusion_model.token_refiner.blocks.") + String(block) + "."
+        + h3_lora_module_path(slot)
+    )
+
+
+def h3_lora_token_refiner_bare_peft_prefix(
+    block: Int, slot: Int
+) raises -> String:
+    return (
+        String("token_refiner.blocks.") + String(block) + "."
+        + h3_lora_module_path(slot)
+    )
 
 
 def h3_lora_legacy_slot_key(slot: Int) raises -> String:

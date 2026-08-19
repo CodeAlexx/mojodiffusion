@@ -1,0 +1,27 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 250,
+    "sample_at_start": false,
+    "save_before_sample": true,
+    "precache_required": false,
+    "enforce_min_image_size": false,
+    "width": 512,
+    "height": 320,
+    "frames": 22,
+    "fps": 24,
+    "steps": 20,
+    "cfg": 1.0,
+    "seed": 271828,
+    "negative": "",
+    "h3_quant": "int8-fast",
+    "h3_resident_blocks": 42,
+    "h3_attention_backend": "cudnn"
+  },
+  "prompts": [
+    {
+      "id": "eri2_full_face",
+      "prompt": "integrated_multimodal_description: [Shot 1] Live-action studio portrait of vrtlEri2. A centered chest-up medium close-up keeps the subject's entire head, forehead, both eyes, nose, mouth, chin, neck, and both shoulders fully visible inside the frame at all times. The subject has long, curly dark hair and wears a sleeveless top against a solid warm-pink background. Soft frontal light clearly illuminates the complete face. The camera holds a static eye-level shot with no zoom and no crop as the subject looks directly into the lens, blinks once, and gently settles one hand on the opposite shoulder.\n\noverall_soundscape: Quiet studio room tone with a soft breath and faint fabric movement.\n\nnon_diegetic_music: N/A"
+    }
+  ]
+}

@@ -138,7 +138,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `serve/image_io.mojo` | Shared worker image/mask I/O, including alpha/luminance LanPaint masks, separately expanded sampler-context masks, crop helpers, and final source-preserving blend primitives. | ✅ CPU mask smoke + browser/real-job gates |
 | `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
 | `serve/{sd3,sdxl,flux,chroma}_backend.mojo` + `serve/*_decode_subprocess.mojo` | Product workers keep measured denoiser residency/promotion while moving VAE decode into a self-exec GPU child. Child exit is the CUDA allocation-reclaim boundary; every route retains its prior release/tiled fail-loud fallback. SD3/Flux/Chroma also cache unchanged conditioning and budget device-resident blocks from measured free-VRAM reserves. | 🟠 builds and bounded fallbacks wired; Klein has paired runtime timings below, other families require per-family speed parity before broader claims |
-| `scripts/mem_safe_runtime.sh` | Rootless systemd user-service wrapper for bounded GPU runtime process trees: hard 24-GiB host-memory ceiling, 2-GiB swap ceiling, OOM-group kill, desktop-reserve admission, and live cgroup peak/events reporting. H3 training fails closed unless its launcher explicitly sets `H3_ALLOW_USER_SLICE=1`, which makes the transient child a managed pressure-kill target without requiring `sudo`. Distinct from the build wrapper's compile-oriented limits. | ✅ bounded H3/Klein runtime gates; rootless 200-step H3 trainer run |
+| `scripts/mem_safe_runtime.sh` | Rootless systemd user-service wrapper for bounded GPU runtime process trees: hard host/swap ceilings, OOM-group kill, desktop-reserve admission, and live cgroup peak/events reporting. H3 training fails closed unless its launcher explicitly sets `H3_ALLOW_USER_SLICE=1`. Explicit Modular DeviceContext arena size/chunk settings are allow-listed across the clean transient-service environment, so allocator policy is no longer silently dropped. | ✅ bounded H3/Klein runtime gates; full-208 H3 step-1 -> step-2 resume under GPU desktop co-tenancy |
 | `models/text_encoder/gemma3_ltx_streamed.mojo` | Pure-Mojo layer-streamed Gemma-3-12B FP8 text encoder for LTX2 positive/negative prompts. It preserves the 49-state FeatureExtractorV2 contract, exact Gemma RMSNorm/RoPE/padding semantics, shares each streamed layer load across both prompts, and releases clean mmap-backed checkpoint pages after each synchronized device upload. | ✅ exact tokenizer IDs; context cosine 0.99923-0.99973; real product V2V conditioner/runner scope peaked at 17.8GB after page release instead of the prior 54.9GB desktop-OOM path |
 | `pipeline/ltx2_encode_prompt.mojo` | Pure-Mojo automatic LTX2 prompt conditioner: tokenizes positive/negative text, runs streamed Gemma, packs the 49-state feature order, applies video/audio aggregate projections, and writes the six pre-connector safetensors consumed by the request CLI. The server caches by prompt, negative prompt, and conditioner digest and publishes tokenization plus 48-layer progress. | ✅ optimized real prompt 17.19s; no Python runtime |
 | `models/text_encoder/gemma4_ltx_streamed.mojo` + `pipeline/ltx25_encode_prompt.mojo` | Pure-Mojo Gemma-4-12B conditioner for LTX-2.5. Supports the standalone `model.language_model.` and Lightricks fine-tuned `model.` layouts, sliding/global attention differences, proportional partial RoPE, the embedded tokenizer byte tensor, and the unchanged 49-state FeatureExtractorV2 projections. | 🟠 all 49 Lightricks-weight states cosine >=0.999 (worst 0.99990787); three real LTX-2.5 MP4s completed, but sampler and speed parity remain unaccepted |
@@ -3847,18 +3847,20 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 - Config contract: rank/alpha, LR and warmup, gradient clipping, timestep
   buckets, spatial-density jitter, guidance distillation, base-preservation
   weight/probability, target selector, resident blocks, and save/sample cadence all come
-  from JSON. `h3_mlp_fc1_fc2` matches the oracle regex and creates 100 active
-  adapters (200 PEFT tensors); disabled QKV/out targets are not optimized or
-  serialized. `scripts/run_minimax_h3_eri2_mojo_4000.sh` runs each configured
+  from JSON. `h3_mlp_fc1_fc2` retains the legacy 100-adapter MLP-only target;
+  `h3_full_aitoolkit_208` creates qkv/out/fc1/fc2 adapters in all 50 main
+  blocks plus both token-refiner blocks (208 adapters / 416 PEFT tensors).
+  `scripts/run_minimax_h3_eri2_mojo_4000.sh` runs each configured
   training segment rootlessly, then samples the checkpoint in a fresh pure-Mojo
   process using the shared `serenity.sample_prompts.v1` file.
 - Stores: `h3_train_block_store.mojo` retains the bounded mmap→staging BF16
   streamer; `h3_train_block_store_int8.mojo` is the current fast path, keeping
   a config-selected prefix of frozen blocks as direct tensorwise W8A8 and
-  streaming only the remaining BF16 tail. The production Eri2 run now uses
-  46 resident: 48 ran through step 926 but OOMed on the next changing shape,
-  while all 50 crossed VRAM on its first activation. The original 42-block
-  mode remains the proven fallback. The stored-orientation NN INT8
+  streaming only the remaining BF16 tail. The full-208 Eri2 run uses 36
+  resident: 40 completed a fresh step but failed its resume step while a GPU
+  video player was open; 36 passed the identical step-1 -> step-2 state resume
+  under that co-tenancy with about 4.7 GiB reported free. The older MLP-only
+  run used 46 resident. The stored-orientation NN INT8
   backward passed a small gate but produced a delayed illegal address under
   changing real H3 shapes, so production retains the stable transpose+NT path.
   The earlier bulk 38.5GB pinned fill is forbidden. AdaLN remains an exact
@@ -3880,7 +3882,9 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   real block-0; 2-real-block stack chain 9/9; 50-block real-weight smoke;
   mmh3 cache reader 36/36 BIT-exact vs upstream-writer fixture; sigma/x_t
   bit-exact 5 sigma cases; final layer cos 1.0; sdpa_backward_dynamic
-  bit-identical; canonical PEFT/QKV/FC1 roundtrip; unaligned W8A8 M=65
+  bit-identical; canonical PEFT/QKV/FC1 roundtrip; the verified external
+  AiToolkit file loads all 208 adapters; token-refiner LoRA output/d_x and all
+  eight A/B grads pass Torch autograd at cosine>=0.999; unaligned W8A8 M=65
   fwd/bwd cosine 0.999931/0.999934. The former real M=737 sample-2 failure
   now passes.
 - Runtime S: `sdpa_backward_rect_dynamic`(+storage) and flash train fwd/bwd
@@ -3894,8 +3898,9 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   `h3_lora_format.mojo`/`h3_qkv_layout.mojo` + runtime `--lora=`/`--lora-mult=`.
   Canonical PEFT is transformed to runtime QKV/FC1 row layout, and resident
   INT8 bases use activation-time deltas (never a lossy requantized merge).
-  Matched seed/prompt/geometry one-eval evidence loaded all 200 adapters and
-  changed 107,519/107,520 video plus 2,368/2,368 audio latent elements.
+  The product frontend applies the eight token-refiner adapters before the
+  packed main stack. A fresh full-208 checkpoint loaded all 208 adapters,
+  produced finite video/audio latents, and decoded 512x320x22 A/V.
 - Current acceptance (2026-08-18): fresh 200-step run completed rootlessly
   with no OOM/nonfinite loss. First/last-20 mean loss was 0.367875/0.216782;
   all 200 PEFT A and B tensors were finite and fully nonzero; cloned resume
@@ -3918,6 +3923,14 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   preservation loss, and produced valid 512x320x22 Mojo validation videos.
   Those are mechanics gates; convergence still requires same-seed decoded
   checkpoint comparisons during the long run.
+- Full-208 acceptance (2026-08-18): `h3_token_refiner_train.mojo` covers both
+  frozen-base refiner blocks and returns canonical FC1-B grads after the
+  product `[value|gate]` compute transform. The exact recipe smoke trained
+  step 1 at 24.95s with 40 residents, then restored optimizer state and trained
+  step 2 at 37.52s with the co-tenancy-safe 36-resident policy. Both saves
+  contain 208 finite, nonzero B pairs. The active 1000-step run uses LR 3e-4,
+  rank/alpha 32, guidance 3.5, jitter 0.2, preservation 0.02 at probability
+  0.25, eight timestep buckets, save/sample 250, and a fixed full-face prompt.
 - Guidance objective (in OUR trainer, `--guidance_scale 3`): per-step
   no-grad TEACHER forward on the cached EMPTY conditioning (own packed
   layout/rope/adaln idx, same sigma-node mod tables; runs before the

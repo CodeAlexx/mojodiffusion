@@ -51,7 +51,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import (
-    full_device, concat, add, mul_scalar, mul_scalar_bf16out,
+    full_device, concat, add, mul_scalar, mul_scalar_bf16out, slice,
 )
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice
 from serenitymojo.models.dit.minimax_h3_dit import (
@@ -89,6 +89,12 @@ from serenitymojo.models.minimax_h3.h3_stack_train import (
 from serenitymojo.models.minimax_h3.h3_final_train import (
     H3FinalTrainWeights, h3_final_train_forward, h3_final_train_backward,
 )
+from serenitymojo.models.minimax_h3.h3_token_refiner_train import (
+    H3TokenRefinerTrainForward, H3TokenRefinerTrainWeights,
+    h3_token_refiner_swap_fc1_rows,
+    h3_token_refiner_train_backward, h3_token_refiner_train_forward,
+    h3_token_refiner_train_weights,
+)
 from serenitymojo.training.adamw8bit import (
     Adam8bitDeviceState,
     adamw8bit_device_state,
@@ -105,7 +111,8 @@ from serenitymojo.training.lora_save import (
     F32NamedLora, save_lora_peft_host_f32,
 )
 from serenitymojo.models.minimax_h3.h3_lora_format import (
-    h3_lora_peft_prefix, h3_lora_legacy_slot_key,
+    h3_lora_peft_prefix, h3_lora_token_refiner_peft_prefix,
+    h3_lora_legacy_slot_key,
 )
 from serenitymojo.io.ffi import BytePtr
 from serenitymojo.pipeline.minimax_h3_t2va import _minimax_h3_load_frontend_weights
@@ -119,15 +126,30 @@ comptime H3_INNER = H3_HEADS * H3_HEAD_DIM
 comptime H3_EPS = Float32(1.0e-5)
 comptime SIGMA_NODES = 1000
 comptime N_BLOCKS = 50
+comptime N_REFINER_BLOCKS = 2
 
 comptime SLOT_NAMES_LEN = 4
 comptime H3_TARGET_MLP_FC1_FC2 = 1
+comptime H3_TARGET_FULL_208 = 2
+comptime H3_MAIN_STATE_COUNT = N_BLOCKS * SLOT_NAMES_LEN
+comptime H3_TOTAL_STATE_COUNT = (
+    H3_MAIN_STATE_COUNT + N_REFINER_BLOCKS * SLOT_NAMES_LEN
+)
 
 
 def _slot_active(slot: Int, target_preset: Int) -> Bool:
     if target_preset == H3_TARGET_MLP_FC1_FC2:
         return slot == 2 or slot == 3
+    if target_preset == H3_TARGET_FULL_208:
+        return slot >= 0 and slot < SLOT_NAMES_LEN
     return False
+
+
+def _refiner_slot_active(slot: Int, target_preset: Int) -> Bool:
+    return (
+        target_preset == H3_TARGET_FULL_208
+        and slot >= 0 and slot < SLOT_NAMES_LEN
+    )
 
 
 def _grad_pair(g: H3BlockLoraGrads, s: Int) raises -> Tuple[TArc, TArc]:
@@ -427,6 +449,33 @@ def _compute_loras(
     return loras^
 
 
+def _compute_refiner_loras(
+    states: List[_AdapterState], rank: Int, scale: Float32,
+    target_preset: Int, ctx: DeviceContext,
+) raises -> List[H3BlockLoraDevice]:
+    """Runtime-layout token-refiner LoRAs; FC1 B is [value|gate]."""
+    var loras = List[H3BlockLoraDevice]()
+    for b in range(N_REFINER_BLOCKS):
+        var slots = List[Optional[LoraAdapterDevice]]()
+        for s in range(SLOT_NAMES_LEN):
+            if not _refiner_slot_active(s, target_preset):
+                slots.append(Optional[LoraAdapterDevice](None))
+                continue
+            var st = H3_MAIN_STATE_COUNT + b * SLOT_NAMES_LEN + s
+            var dims = _slot_out_in(s)
+            var a16 = cast_tensor(states[st].a_m[], STDtype.BF16, ctx)
+            var b16 = cast_tensor(states[st].b_m[], STDtype.BF16, ctx)
+            if s == 2:
+                b16 = h3_token_refiner_swap_fc1_rows(b16, H3_F, ctx)
+            slots.append(Optional[LoraAdapterDevice](LoraAdapterDevice(
+                TArc(a16^), TArc(b16^), rank, dims[1], dims[0], scale,
+            )))
+        loras.append(H3BlockLoraDevice(
+            slots[0].copy(), slots[1].copy(), slots[2].copy(), slots[3].copy(),
+        ))
+    return loras^
+
+
 def _load_st(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     return Tensor.from_view(
@@ -461,6 +510,15 @@ def _param_state_names(target_preset: Int) raises -> List[String]:
             var base = String("b") + String(b) + "_" + h3_lora_legacy_slot_key(s)
             names.append(base + "_a_p")
             names.append(base + "_b_p")
+    for b in range(N_REFINER_BLOCKS):
+        for s in range(SLOT_NAMES_LEN):
+            if not _refiner_slot_active(s, target_preset):
+                continue
+            var base = (
+                String("tr") + String(b) + "_" + h3_lora_legacy_slot_key(s)
+            )
+            names.append(base + "_a_p")
+            names.append(base + "_b_p")
     return names^
 
 
@@ -475,12 +533,31 @@ def _optimizer_params(
             var i = b * SLOT_NAMES_LEN + s
             params.append(states[i].a_m.copy())
             params.append(states[i].b_m.copy())
+    for b in range(N_REFINER_BLOCKS):
+        for s in range(SLOT_NAMES_LEN):
+            if not _refiner_slot_active(s, target_preset):
+                continue
+            var i = H3_MAIN_STATE_COUNT + b * SLOT_NAMES_LEN + s
+            params.append(states[i].a_m.copy())
+            params.append(states[i].b_m.copy())
     return params^
 
 
 def _base_loras() -> List[H3BlockLoraDevice]:
     var out = List[H3BlockLoraDevice]()
     for _ in range(N_BLOCKS):
+        out.append(H3BlockLoraDevice(
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+        ))
+    return out^
+
+
+def _base_refiner_loras() -> List[H3BlockLoraDevice]:
+    var out = List[H3BlockLoraDevice]()
+    for _ in range(N_REFINER_BLOCKS):
         out.append(H3BlockLoraDevice(
             Optional[LoraAdapterDevice](None),
             Optional[LoraAdapterDevice](None),
@@ -537,15 +614,18 @@ def main() raises:
         raise Error("MiniMax-H3 trainer currently requires grad_accum_steps=1")
     if train_cfg.quantized_resident != String("int_w8a8"):
         raise Error("MiniMax-H3 trainer requires quantized_resident=int_w8a8")
-    if (
-        train_cfg.layer_filter_preset != String("h3_mlp_fc1_fc2")
-        or not train_cfg.layer_filter_regex
-    ):
+    if not train_cfg.layer_filter_regex:
         raise Error(
-            "MiniMax-H3 trainer requires config layer_filter_preset="
-            "h3_mlp_fc1_fc2 with layer_filter_regex=true"
+            "MiniMax-H3 trainer requires layer_filter_regex=true"
         )
     var target_preset = H3_TARGET_MLP_FC1_FC2
+    if train_cfg.layer_filter_preset == String("h3_full_aitoolkit_208"):
+        target_preset = H3_TARGET_FULL_208
+    elif train_cfg.layer_filter_preset != String("h3_mlp_fc1_fc2"):
+        raise Error(
+            "MiniMax-H3 layer_filter_preset must be h3_mlp_fc1_fc2 or "
+            "h3_full_aitoolkit_208"
+        )
     if train_cfg.checkpoint == String(""):
         raise Error("MiniMax-H3 trainer config requires checkpoint")
     var cache_dir = train_cfg.dataset_cache_dir
@@ -624,7 +704,10 @@ def main() raises:
           "grad_clip", max_grad_norm, "timestep_buckets", timestep_buckets,
           "betas", optimizer_beta1, optimizer_beta2,
           "eps", optimizer_eps, "weight_decay", optimizer_weight_decay)
-    print("[h3-train] targets: mlp.fc1/fc2 only (100 adapters)")
+    if target_preset == H3_TARGET_FULL_208:
+        print("[h3-train] targets: 50 main + 2 token-refiner blocks x 4 (208 adapters)")
+    else:
+        print("[h3-train] targets: mlp.fc1/fc2 only (100 adapters)")
     print("[h3-train] guidance/preservation/density:",
           train_cfg.guidance_scale,
           base_preservation_weight, base_preservation_probability,
@@ -664,10 +747,18 @@ def main() raises:
     )
     ctx.synchronize()
 
-    # Refined text embeds depend only on the cached captions — precompute
-    # once per item (condition_proj + token refiner), park on HOST, then
-    # drop those weights from VRAM (~0.9GB) and skip their per-step compute.
+    # Base-refined embeds remain cached for the legacy preset and the frozen
+    # preservation teacher. Full-208 also caches condition_proj output, then
+    # runs the trainable token refiner in each student step.
     print("[h3-train] precomputing per-item text embeds...")
+    var refiner_weights = Optional[H3TokenRefinerTrainWeights](None)
+    if target_preset == H3_TARGET_FULL_208:
+        refiner_weights = Optional[H3TokenRefinerTrainWeights](
+            h3_token_refiner_train_weights(
+                frontend_w, config.token_refiner_num_layers
+            )
+        )
+    var text_condition_host = List[List[BFloat16]]()
     var text_embeds_host = List[List[BFloat16]]()
     var text_embeds_rows = List[Int]()
     for i in range(len(items)):
@@ -676,6 +767,7 @@ def main() raises:
         if th.dtype() != STDtype.BF16:
             th = cast_tensor(th, STDtype.BF16, ctx)
         var t0e = minimax_h3_condition_embed(th, frontend_w, ctx)
+        text_condition_host.append(t0e.to_host_bf16(ctx))
         var te_ref = minimax_h3_token_refiner_dynamic[H3_HEADS, H3_HEAD_DIM](
             t0e, frontend_w, config, ctx
         )
@@ -692,6 +784,7 @@ def main() raises:
     # two root fixes before requiring this slower two-forward arm. Guidance
     # requires empty-cond TE cache pairs.
     var guidance_scale = train_cfg.guidance_scale
+    var empty_condition_host = List[BFloat16]()
     var empty_embeds_host = List[BFloat16]()
     var empty_embeds_rows = 0
     var empty_tags = List[Int]()
@@ -708,6 +801,7 @@ def main() raises:
         if eh.dtype() != STDtype.BF16:
             eh = cast_tensor(eh, STDtype.BF16, ctx)
         var e0 = minimax_h3_condition_embed(eh, frontend_w, ctx)
+        empty_condition_host = e0.to_host_bf16(ctx)
         var e_ref = minimax_h3_token_refiner_dynamic[H3_HEADS, H3_HEAD_DIM](
             e0, frontend_w, config, ctx
         )
@@ -718,14 +812,18 @@ def main() raises:
         print("[h3-train] guidance objective ON: scale", guidance_scale,
               "empty tokens", empty_embeds_rows)
 
-    # slim weight dict: per-step needs ONLY the video patch projection
+    # Slim the frontend dict. Full-208 retains only the token-refiner Arc
+    # carriers above; the legacy preset releases them exactly as before.
     var step_w = Dict[String, ArcPointer[Tensor]]()
     step_w[String("video_patch_proj.weight")] = frontend_w[String("video_patch_proj.weight")].copy()
     step_w[String("video_patch_proj.bias")] = frontend_w[String("video_patch_proj.bias")].copy()
     var empty_w = Dict[String, ArcPointer[Tensor]]()
     frontend_w = empty_w^
     ctx.synchronize()
-    print("[h3-train] text embeds cached; frontend weights slimmed")
+    if target_preset == H3_TARGET_FULL_208:
+        print("[h3-train] condition/base text cached; trainable token-refiner retained")
+    else:
+        print("[h3-train] text embeds cached; frontend weights slimmed")
 
     # Direct W8A8 resident frozen base (Klein trainer pattern): compact INT8
     # weights stay on device and execute directly; no per-visit BF16 expansion.
@@ -756,6 +854,16 @@ def main() raises:
             for s in range(SLOT_NAMES_LEN):
                 var dims = _slot_out_in(s)
                 if _slot_active(s, target_preset):
+                    var t0 = _load_st(st, names[ni], ctx)
+                    var t1 = _load_st(st, names[ni + 1], ctx)
+                    states.append(_AdapterState(TArc(t0^), TArc(t1^)))
+                    ni += 2
+                else:
+                    states.append(_zero_adapter_state(ctx))
+        for b in range(N_REFINER_BLOCKS):
+            for s in range(SLOT_NAMES_LEN):
+                var dims = _slot_out_in(s)
+                if _refiner_slot_active(s, target_preset):
                     var t0 = _load_st(st, names[ni], ctx)
                     var t1 = _load_st(st, names[ni + 1], ctx)
                     states.append(_AdapterState(TArc(t0^), TArc(t1^)))
@@ -797,6 +905,15 @@ def main() raises:
                     ))
                 else:
                     states.append(_zero_adapter_state(ctx))
+        for _ in range(N_REFINER_BLOCKS):
+            for s in range(SLOT_NAMES_LEN):
+                var dims = _slot_out_in(s)
+                if _refiner_slot_active(s, target_preset):
+                    states.append(_init_adapter_state(
+                        rank, dims[0], dims[1], rng, ctx
+                    ))
+                else:
+                    states.append(_zero_adapter_state(ctx))
         print("[h3-train] fresh LoRA init (kaiming-uniform down, zero up)")
 
     var optimizer_params = _optimizer_params(states, target_preset)
@@ -828,6 +945,9 @@ def main() raises:
     var active_epoch = -1
 
     var loras = _compute_loras(states, rank, scale, target_preset, ctx)
+    var refiner_loras = _compute_refiner_loras(
+        states, rank, scale, target_preset, ctx
+    )
     var base_loras = _base_loras()
     var run_t0 = perf_counter_ns()
 
@@ -916,9 +1036,25 @@ def main() raises:
         var video_embeds = _minimax_h3_video_patch_embed_bf16(x_rows, step_w, ctx)
         var item_i = order[epoch_pos]
         var tesh: List[Int] = [text_embeds_rows[item_i], H3_D]
-        var text_embeds = Tensor.from_host_bf16(
-            text_embeds_host[item_i], tesh^, ctx
-        )
+        var student_refiner_fwd = Optional[H3TokenRefinerTrainForward](None)
+        var text_embeds: Tensor
+        if target_preset == H3_TARGET_FULL_208:
+            var text_condition = Tensor.from_host_bf16(
+                text_condition_host[item_i], tesh.copy(), ctx
+            )
+            var trf = h3_token_refiner_train_forward[
+                H3_HEADS, H3_HEAD_DIM
+            ](
+                text_condition, refiner_weights.value(), refiner_loras,
+                H3_D, H3_F, config.norm_eps, config.qk_norm_eps,
+                config.final_norm_eps, ctx,
+            )
+            text_embeds = trf.out[].clone(ctx)
+            student_refiner_fwd = Optional[H3TokenRefinerTrainForward](trf^)
+        else:
+            text_embeds = Tensor.from_host_bf16(
+                text_embeds_host[item_i], tesh.copy(), ctx
+            )
         var hidden0 = concat(0, ctx, text_embeds, video_embeds)
         if hidden0.shape()[0] != S:
             raise Error("packed length mismatch (text+video != S)")
@@ -958,7 +1094,24 @@ def main() raises:
                 pos_e, ctx, config.rope_inv_freq_len
             )
             var tesh_e: List[Int] = [empty_embeds_rows, H3_D]
-            var e_text = Tensor.from_host_bf16(empty_embeds_host, tesh_e^, ctx)
+            var e_text: Tensor
+            if target_preset == H3_TARGET_FULL_208:
+                var e_condition = Tensor.from_host_bf16(
+                    empty_condition_host, tesh_e.copy(), ctx
+                )
+                var e_trf = h3_token_refiner_train_forward[
+                    H3_HEADS, H3_HEAD_DIM
+                ](
+                    e_condition, refiner_weights.value(), refiner_loras,
+                    H3_D, H3_F, config.norm_eps, config.qk_norm_eps,
+                    config.final_norm_eps, ctx,
+                )
+                e_text = e_trf.out[].clone(ctx)
+                _ = e_trf^
+            else:
+                e_text = Tensor.from_host_bf16(
+                    empty_embeds_host, tesh_e.copy(), ctx
+                )
             var hidden0_e = concat(0, ctx, e_text, video_embeds)
             if hidden0_e.shape()[0] != S_e:
                 raise Error("guidance: packed length mismatch (empty+video != S_e)")
@@ -987,10 +1140,14 @@ def main() raises:
         # student pass so only one 50-block activation chain is live at once.
         var base_prediction = Optional[Tensor](None)
         if preservation_active:
+            var base_text = Tensor.from_host_bf16(
+                text_embeds_host[item_i], tesh.copy(), ctx
+            )
+            var hidden0_base = concat(0, ctx, base_text, video_embeds)
             var fwd_base = h3_stack_train_forward_streamed_int8[
                 H3_HEADS, H3_HEAD_DIM
             ](
-                hidden0, store, base_loras, mods, adaln_idx,
+                hidden0_base, store, base_loras, mods, adaln_idx,
                 rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
             )
             var empty_base_idx = List[Int]()
@@ -1098,6 +1255,23 @@ def main() raises:
             d_hidden, fwd, store, loras, mods, adaln_idx,
             rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
         )
+        var refiner_grad_groups = List[H3BlockLoraGrads]()
+        if target_preset == H3_TARGET_FULL_208:
+            if not student_refiner_fwd:
+                raise Error("H3 full-208 step lost token-refiner forward state")
+            var d_text = slice(
+                grads.d_x[], 0, 0, text_embeds_rows[item_i], ctx
+            )
+            var trg = h3_token_refiner_train_backward[
+                H3_HEADS, H3_HEAD_DIM
+            ](
+                d_text, student_refiner_fwd.value(),
+                refiner_weights.value(), refiner_loras,
+                H3_D, H3_F, config.norm_eps, config.qk_norm_eps,
+                config.final_norm_eps, ctx,
+            )
+            for b in range(N_REFINER_BLOCKS):
+                refiner_grad_groups.append(trg.lora[b].copy())
 
         ctx.synchronize()
         var tp3 = perf_counter_ns()
@@ -1108,6 +1282,13 @@ def main() raises:
                 if not _slot_active(s, target_preset):
                     continue
                 var g = _grad_pair(grads.lora[b], s)
+                gts.append(g[0])
+                gts.append(g[1])
+        for b in range(N_REFINER_BLOCKS):
+            for s in range(SLOT_NAMES_LEN):
+                if not _refiner_slot_active(s, target_preset):
+                    continue
+                var g = _grad_pair(refiner_grad_groups[b], s)
                 gts.append(g[0])
                 gts.append(g[1])
         var grad_stats = on_device_grad_stats(gts, ctx)
@@ -1129,6 +1310,9 @@ def main() raises:
             clip_scale,
         )
         loras = _compute_loras(states, rank, scale, target_preset, ctx)
+        refiner_loras = _compute_refiner_loras(
+            states, rank, scale, target_preset, ctx
+        )
         ctx.synchronize()
 
         var tp4 = perf_counter_ns()
@@ -1195,6 +1379,22 @@ def _save_all(
                 dims[1],
                 dims[0],
             ))
+    for b in range(N_REFINER_BLOCKS):
+        for s in range(SLOT_NAMES_LEN):
+            if not _refiner_slot_active(s, target_preset):
+                continue
+            var st_i = H3_MAIN_STATE_COUNT + b * SLOT_NAMES_LEN + s
+            var dims = _slot_out_in(s)
+            var a_host = states[st_i].a_m[].to_host(ctx)
+            var b_host = states[st_i].b_m[].to_host(ctx)
+            adapters.append(F32NamedLora(
+                h3_lora_token_refiner_peft_prefix(b, s),
+                a_host^,
+                b_host^,
+                rank,
+                dims[1],
+                dims[0],
+            ))
     var lora_path = (
         out_dir + "/" + name + "_step" + String(step) + ".safetensors"
     )
@@ -1209,6 +1409,13 @@ def _save_all(
             if not _slot_active(s, target_preset):
                 continue
             var i = b * SLOT_NAMES_LEN + s
+            stensors.append(states[i].a_m)
+            stensors.append(states[i].b_m)
+    for b in range(N_REFINER_BLOCKS):
+        for s in range(SLOT_NAMES_LEN):
+            if not _refiner_slot_active(s, target_preset):
+                continue
+            var i = H3_MAIN_STATE_COUNT + b * SLOT_NAMES_LEN + s
             stensors.append(states[i].a_m)
             stensors.append(states[i].b_m)
     snames.append(String("adam8_m_codes"))

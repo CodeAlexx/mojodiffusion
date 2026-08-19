@@ -29,6 +29,7 @@ from serenitymojo.training.lora_save import (
 )
 from serenitymojo.models.minimax_h3.h3_lora_format import (
     h3_lora_peft_prefix,
+    h3_lora_token_refiner_peft_prefix,
     h3_lora_legacy_prefix,
 )
 from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
@@ -236,6 +237,11 @@ def main() raises:
         == String("diffusion_model.blocks.49.mlp.fc2"),
         String("fc2 PEFT prefix mismatch"),
     )
+    _require(
+        h3_lora_token_refiner_peft_prefix(1, 0)
+        == String("diffusion_model.token_refiner.blocks.1.attn.qkv_proj"),
+        String("token-refiner PEFT prefix mismatch"),
+    )
 
     var source = _values(Float32(0.3))
     var host_adapters = List[F32NamedLora]()
@@ -265,6 +271,17 @@ def main() raises:
         return
 
     var ctx = DeviceContext()
+    if len(args) > 1:
+        var external = H3LoraOverlay.load(String(args[1]), Float32(1.0), ctx)
+        _require(external.adapters == 208, String("external H3 LoRA must contain 208 adapters"))
+        for block in range(50):
+            for slot in range(4):
+                _require(external.has(block, slot), String("external main adapter missing"))
+        for block in range(2):
+            for slot in range(4):
+                _require(external.has_refiner(block, slot), String("external refiner adapter missing"))
+        print("PASS: external AI Toolkit H3 LoRA loaded all 208 adapters")
+        return
     _gate_fence_policy()
     _gate_training_qkv_layout(ctx)
     var overlay = H3LoraOverlay.load(String(PEFT_OUT), Float32(0.5), ctx)

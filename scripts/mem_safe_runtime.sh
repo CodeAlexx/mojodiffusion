@@ -132,6 +132,22 @@ extra_env=()
 [[ -n "${CONDA_PREFIX:-}" ]] && extra_env+=(--setenv="CONDA_PREFIX=$CONDA_PREFIX")
 [[ -n "${MODULAR_HOME:-}" ]] && extra_env+=(--setenv="MODULAR_HOME=$MODULAR_HOME")
 [[ -n "${LD_LIBRARY_PATH:-}" ]] && extra_env+=(--setenv="LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+# DeviceContext reads these before its singleton allocator is constructed.
+# Forward explicit caller policy across the clean `systemd-run --user` service
+# boundary; without this allow-list the values are silently lost and MAX falls
+# back to its large default arena, leaving too little VRAM for desktop clients.
+for env_name in \
+  MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE \
+  MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT \
+  MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT \
+  MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE \
+  MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_CHUNK_PERCENT \
+  MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_LOG
+do
+  if [[ -n "${!env_name:-}" ]]; then
+    extra_env+=(--setenv="$env_name=${!env_name}")
+  fi
+done
 
 systemd-run --user \
   --quiet --wait --collect --pipe --service-type=exec \

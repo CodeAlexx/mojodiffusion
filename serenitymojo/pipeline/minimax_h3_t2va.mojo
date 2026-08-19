@@ -1683,6 +1683,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             frontend_w,
             config,
             ctx,
+            lora_overlay,
         )
     else:
         embed = minimax_h3_frontend_embed_dynamic[H3_HEADS, H3_HEAD_DIM](
@@ -1698,6 +1699,7 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             config,
             ctx,
             t2va_contiguous,
+            lora_overlay,
         )
     var hidden3 = reshape(
         embed.hidden, [1, sequence_length, config.hidden_size], ctx

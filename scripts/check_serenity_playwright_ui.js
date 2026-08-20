@@ -882,7 +882,7 @@ async function run() {
         }, quant);
         const controls = await readGenerateH3Controls();
         assert(controls.quant === quant
-          && controls.attention === "cudnn"
+          && controls.attention === (quant === "bf16" ? "cudnn" : "ck-int8")
           && controls.attentionDisabled === (quant === "bf16")
           && controls.width === 992 && controls.height === 576
           && controls.duration === 4 && controls.frames === 96,
@@ -1077,9 +1077,9 @@ async function run() {
           && h3Default.width === 1344 && h3Default.height === 768
           && h3Default.bboxWidth === 1344 && h3Default.bboxHeight === 768
           && h3Default.durationMin === 1 && h3Default.durationMax === 15
-          && h3Default.attention === "sage-int8" && !h3Default.attentionDisabled
+          && h3Default.attention === "ck-int8" && !h3Default.attentionDisabled
           && JSON.stringify(h3Default.attentionOptions)
-            === JSON.stringify(["sage-int8", "cudnn"])
+            === JSON.stringify(["ck-int8", "sage-int8", "cudnn"])
           && h3Default.stepCache === "exact"
           && h3Default.steps === 20 && !h3Default.stepsDisabled
           && h3Default.framesMin === 1 && h3Default.framesMax === 1800

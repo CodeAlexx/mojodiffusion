@@ -62,6 +62,7 @@
 from std.collections import Dict, List, Optional
 from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
+from std.sys.defines import get_defined_int
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
@@ -83,6 +84,15 @@ from serenitymojo.ops.sage_attention_int8 import (
     sage_attention_int8_fwd,
     sage_attention_int8_fwd_dynamic,
     sage_attention_int8_fwd_scratch,
+    sage_attention_int8_pv8_fwd_scratch,
+)
+from serenitymojo.ops.comfy_kitchen_attention import (
+    ComfyKitchenAttentionScratch,
+    comfy_kitchen_attention_fwd_scratch,
+)
+from serenitymojo.ops.evg_attention_int8 import (
+    EVGH3RaggedLayout,
+    evg_h3_attention_for_layer,
 )
 from serenitymojo.models.dit.minimax_h3_int8_linear import (
     MiniMaxH3Int8QKV,
@@ -117,13 +127,35 @@ from serenitymojo.ops.tensor_algebra import (
 
 comptime MINIMAX_H3_ATTN_CUDNN = 0
 comptime MINIMAX_H3_ATTN_SAGE_INT8 = 1
+comptime MINIMAX_H3_ATTN_EVG_INT8 = 2
+comptime MINIMAX_H3_ATTN_SAGE_INT8_PV8 = 3
+comptime MINIMAX_H3_ATTN_SAGE_INT8_FAST = 4
+comptime MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8 = 5
+# H=56 crossover measured on RTX 3090 Ti at exact H3 shapes. PV8 loses below
+# this point; the adaptive backend retains BF16-PV there.
+comptime MINIMAX_H3_SAGE_PV8_MIN_S = 13312
 comptime MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE = 100000
+comptime MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE = 200000
+comptime MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE = 300000
+comptime MINIMAX_H3_EVG_BUILD_ENABLED = get_defined_int["H3_EVG", 0]() != 0
 
 
 def minimax_h3_sage_exact_prefix_backend(prefix_rows: Int) raises -> Int:
     if prefix_rows <= 0 or prefix_rows >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
         raise Error("MiniMax-H3 exact Sage prefix must be in [1,100000)")
     return MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE + prefix_rows
+
+
+def minimax_h3_sage_fast_exact_prefix_backend(prefix_rows: Int) raises -> Int:
+    if prefix_rows <= 0 or prefix_rows >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
+        raise Error("MiniMax-H3 exact Fast Sage prefix must be in [1,100000)")
+    return MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE + prefix_rows
+
+
+def minimax_h3_comfy_kitchen_exact_prefix_backend(prefix_rows: Int) raises -> Int:
+    if prefix_rows <= 0 or prefix_rows >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
+        raise Error("MiniMax-H3 exact Comfy Kitchen prefix must be in [1,100000)")
+    return MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE + prefix_rows
 
 
 def _minimax_h3_attention_dispatch(
@@ -135,8 +167,12 @@ def _minimax_h3_attention_dispatch(
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch] = None,
     sage_ultravico: Optional[SageUltraViCoConfig] = None,
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
+    evg_step: Int = 0,
+    evg_layer: Int = 0,
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
 ) raises -> Tensor:
-    """Exact cuDNN, raw Sage, or Sage with an exact query prefix.
+    """Exact cuDNN, Sage, or source-scheduled EVG sparse attention.
 
     When `sage_scratch` is provided, Sage runs with zero device allocations
     through the run-lifetime scratch; without it, every call allocates and
@@ -146,6 +182,50 @@ def _minimax_h3_attention_dispatch(
     """
     if attention_backend == MINIMAX_H3_ATTN_CUDNN:
         return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
+    if attention_backend == MINIMAX_H3_ATTN_EVG_INT8:
+        comptime if MINIMAX_H3_EVG_BUILD_ENABLED:
+            if not evg_layout:
+                raise Error("MiniMax-H3 EVG attention requires a ragged layout")
+            return evg_h3_attention_for_layer(
+                q, k, v, scale, evg_layout.value()[], evg_step, evg_layer, ctx
+            )
+        else:
+            raise Error(
+                "MiniMax-H3 EVG attention is not in this binary; rebuild"
+                " with -D H3_EVG=1"
+            )
+    if attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8:
+        if sage_ultravico:
+            raise Error(
+                "MiniMax-H3 Comfy Kitchen attention does not support UltraViCo"
+            )
+        if not comfy_kitchen_scratch:
+            raise Error(
+                "MiniMax-H3 Comfy Kitchen attention requires preallocated scratch"
+            )
+        return comfy_kitchen_attention_fwd_scratch(
+            q, k, v, scale, comfy_kitchen_scratch.value(), ctx
+        )
+    if (
+        attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8
+        or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
+    ):
+        if sage_ultravico:
+            raise Error(
+                "MiniMax-H3 PV8/fast Sage does not support UltraViCo score decay"
+            )
+        if not sage_scratch:
+            raise Error(
+                "MiniMax-H3 PV8/fast Sage requires preallocated scratch"
+            )
+        if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8 \
+                or q.shape()[1] >= MINIMAX_H3_SAGE_PV8_MIN_S:
+            return sage_attention_int8_pv8_fwd_scratch(
+                q, k, v, scale, sage_scratch.value(), ctx
+            )
+        return sage_attention_int8_fwd_scratch(
+            q, k, v, scale, sage_scratch.value(), ctx
+        )
     if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
         if sage_ultravico:
             var uv = sage_ultravico.value()
@@ -168,8 +248,20 @@ def _minimax_h3_attention_dispatch(
             )
         return sage_attention_int8_fwd_dynamic(q, k, v, scale, ctx)
     if attention_backend >= MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE:
-        var prefix_rows = (
-            attention_backend - MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE
+        var comfy_kitchen = (
+            attention_backend
+                >= MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE
+        )
+        var fast = (
+            not comfy_kitchen and attention_backend
+                >= MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE
+        )
+        var prefix_rows = attention_backend - (
+            MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE
+            if comfy_kitchen else (
+                MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE
+                if fast else MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE
+            )
         )
         var shape = q.shape()
         var sequence_length = shape[1]
@@ -179,7 +271,36 @@ def _minimax_h3_attention_dispatch(
         # the small text+audio prefix with exact cross-SDPA against the same
         # complete K/V document.  T2VA packs rows as text|audio|video.
         var approximate: Tensor
-        if sage_ultravico:
+        if comfy_kitchen:
+            if sage_ultravico:
+                raise Error(
+                    "MiniMax-H3 exact Comfy Kitchen prefix does not support UltraViCo"
+                )
+            if not comfy_kitchen_scratch:
+                raise Error(
+                    "MiniMax-H3 exact Comfy Kitchen prefix requires scratch"
+                )
+            approximate = comfy_kitchen_attention_fwd_scratch(
+                q, k, v, scale, comfy_kitchen_scratch.value(), ctx
+            )
+        elif fast:
+            if sage_ultravico:
+                raise Error(
+                    "MiniMax-H3 exact Fast Sage prefix does not support UltraViCo"
+                )
+            if not sage_scratch:
+                raise Error(
+                    "MiniMax-H3 exact Fast Sage prefix requires scratch"
+                )
+            if sequence_length >= MINIMAX_H3_SAGE_PV8_MIN_S:
+                approximate = sage_attention_int8_pv8_fwd_scratch(
+                    q, k, v, scale, sage_scratch.value(), ctx
+                )
+            else:
+                approximate = sage_attention_int8_fwd_scratch(
+                    q, k, v, scale, sage_scratch.value(), ctx
+                )
+        elif sage_ultravico:
             var uv = sage_ultravico.value()
             if sage_scratch:
                 approximate = sage_attention_int8_fwd_scratch(
@@ -866,6 +987,10 @@ def _minimax_h3_low_headroom_attention[
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch] = None,
     sage_ultravico: Optional[SageUltraViCoConfig] = None,
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
+    evg_step: Int = 0,
+    evg_layer: Int = 0,
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
 ) raises -> Tensor:
     """Long-sequence attention in a lifetime isolated from the MLP.
 
@@ -941,6 +1066,7 @@ def _minimax_h3_low_headroom_attention[
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx,
             attention_backend, sage_scratch, sage_ultravico,
+            evg_layout, evg_step, evg_layer, comfy_kitchen_scratch,
         )
         # Consume Q/K/V before the branch-local owner is destroyed.
         ctx.synchronize()
@@ -976,7 +1102,8 @@ def _minimax_h3_low_headroom_attention[
                 )
         attn = _minimax_h3_attention_dispatch(
             q4, k4, v4, attn_scale, ctx, attention_backend, sage_scratch,
-            sage_ultravico,
+            sage_ultravico, evg_layout, evg_step, evg_layer,
+            comfy_kitchen_scratch,
         )
         ctx.synchronize()
     var merged = reshape_owned(attn^, [1, S, inner])
@@ -1004,6 +1131,9 @@ def _minimax_h3_block_forward_low_headroom[
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch] = None,
     sage_ultravico: Optional[SageUltraViCoConfig] = None,
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
+    evg_step: Int = 0,
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
 ) raises -> Tensor:
     var prefix = minimax_h3_block_prefix(layer)
     var x1 = _minimax_h3_low_headroom_attention[Heads, HeadDim](
@@ -1011,7 +1141,7 @@ def _minimax_h3_block_forward_low_headroom[
         config.inner_dim(), config.num_attention_heads,
         config.attention_head_dim, config.norm_eps, config.qk_norm_eps,
         cos, sin, rotary_dim, ctx, attention_backend, sage_scratch,
-        sage_ultravico,
+        sage_ultravico, evg_layout, evg_step, layer, comfy_kitchen_scratch,
     )
     # The attention helper's local QKV/rope/SDPA tensors are destroyed only
     # after it returns. Trim here—not inside that helper—so their pool pages
@@ -1124,6 +1254,9 @@ def _minimax_h3_block_forward_impl[
     sage_scratch: Optional[SageInt8Scratch] = None,
     sage_ultravico: Optional[SageUltraViCoConfig] = None,
     lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
+    evg_step: Int = 0,
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
 ) raises -> Tensor:
     """One `MiniMaxH3TransformerBlock`. Mirrors `models/minimax_h3/
     block_forward.mojo::_transformer_block` op-for-op (see that file for the
@@ -1224,6 +1357,7 @@ def _minimax_h3_block_forward_impl[
         return _minimax_h3_block_forward_low_headroom[Heads, HeadDim](
             x, weights, layer, config, mod, adaln_indices, cos, sin,
             rotary_dim, ctx, attention_backend, sage_scratch, sage_ultravico,
+            evg_layout, evg_step, comfy_kitchen_scratch,
         )
     var shift_msa: Tensor
     var scale_msa: Tensor
@@ -1313,6 +1447,7 @@ def _minimax_h3_block_forward_impl[
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v,
             scale, ctx, attention_backend, sage_scratch, sage_ultravico,
+            evg_layout, evg_step, layer, comfy_kitchen_scratch,
         )
         # The split owner is branch-local.  Finish its final consumer before
         # its three buffers are returned to the stream-ordered allocator.
@@ -1338,7 +1473,8 @@ def _minimax_h3_block_forward_impl[
         )
         attn = _minimax_h3_attention_dispatch(
             q4, k4, v4, scale, ctx, attention_backend, sage_scratch,
-            sage_ultravico,
+            sage_ultravico, evg_layout, evg_step, layer,
+            comfy_kitchen_scratch,
         )
         ctx.synchronize()
                                                                         # [1, S, heads, head_dim] bf16
@@ -1398,6 +1534,9 @@ def minimax_h3_block_forward[
     sage_scratch: Optional[SageInt8Scratch] = None,
     sage_ultravico: Optional[SageUltraViCoConfig] = None,
     lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
+    evg_step: Int = 0,
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
 ) raises -> Tensor:
     """Static-S compatibility surface for parity gates and existing callers."""
     var x_shape = x.shape()
@@ -1406,6 +1545,7 @@ def minimax_h3_block_forward[
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
         ctx, attention_backend, sage_scratch, sage_ultravico, lora_overlay,
+        evg_layout, evg_step, comfy_kitchen_scratch,
     )
 
 
@@ -1426,9 +1566,13 @@ def minimax_h3_block_forward_dynamic[
     sage_scratch: Optional[SageInt8Scratch] = None,
     sage_ultravico: Optional[SageUltraViCoConfig] = None,
     lora_overlay: Optional[H3LoraOverlay] = Optional[H3LoraOverlay](None),
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
+    evg_step: Int = 0,
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
 ) raises -> Tensor:
     """Runtime-S product surface used by arbitrary H3 canvas geometry."""
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
         ctx, attention_backend, sage_scratch, sage_ultravico, lora_overlay,
+        evg_layout, evg_step, comfy_kitchen_scratch,
     )

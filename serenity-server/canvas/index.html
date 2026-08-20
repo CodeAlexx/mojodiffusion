@@ -14,6 +14,7 @@
     <link rel="stylesheet" href="css/models.css">
     <link rel="stylesheet" href="css/settings.css">
     <link rel="stylesheet" href="css/video-edit.css">
+    <link rel="stylesheet" href="css/h3-studio.css">
     <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
 </head>
 <body>
@@ -54,6 +55,10 @@
                 <button class="nav-btn" data-tab="video-edit" title="Video Edit">
                     <i data-lucide="film"></i>
                     <div class="tooltip">Video Edit</div>
+                </button>
+                <button class="nav-btn" data-tab="h3-studio" title="H3 Studio">
+                    <i data-lucide="clapperboard"></i>
+                    <div class="tooltip">H3 Studio</div>
                 </button>
                 <button class="nav-btn" data-tab="models" title="Models">
                     <i data-lucide="box"></i>
@@ -179,6 +184,9 @@
             <div class="tab-panel" id="panel-video-edit" style="display: none">
             </div>
 
+            <div class="tab-panel" id="panel-h3-studio" style="display: none">
+            </div>
+
             <div class="tab-panel" id="panel-models" style="display: none">
                 <div class="placeholder">Models</div>
             </div>
@@ -279,6 +287,10 @@
 
     <!-- Video Edit tab -->
     <script src="js/video-edit.js"></script>
+
+    <!-- Project-based MiniMax H3 filmmaker workspace -->
+    <script src="js/h3-project.js"></script>
+    <script src="js/h3-studio.js"></script>
 
     <!-- Shell navigation (runs after app.js init, switches to saved tab) -->
     <script src="js/shell.js"></script>

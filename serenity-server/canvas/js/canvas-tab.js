@@ -92,7 +92,7 @@ var CanvasTab = (function () {
         h3ProfileKey: '1344x768',
         h3Duration: 5,
         h3Quant: 'int8-fast',
-        h3AttentionBackend: 'sage-int8',
+        h3AttentionBackend: 'ck-int8',
         h3StepCache: 'exact',
         h3ContinueFrom: '',
         h3ContextFrames: 22,
@@ -1548,6 +1548,7 @@ var CanvasTab = (function () {
             '<details class="cv-h3-advanced"><summary class="cv-section-title">Advanced performance</summary>' +
             '<label class="cv-setting-label" for="cv-h3-attention">Attention</label>' +
             '<select id="cv-h3-attention" class="cv-select">' +
+            '<option value="ck-int8">CK INT8 · fastest</option>' +
             '<option value="sage-int8">Sage INT8 · faster, approximate</option>' +
             '<option value="cudnn">cuDNN · exact quality</option>' +
             '</select>' +
@@ -4691,8 +4692,8 @@ var CanvasTab = (function () {
             });
         });
         els.h3Attention.addEventListener('change', function () {
-            genState.h3AttentionBackend = this.value === 'sage-int8'
-                ? 'sage-int8' : 'cudnn';
+            genState.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(this.value) >= 0
+                ? this.value : 'cudnn';
         });
         els.h3StepCache.addEventListener('change', function () {
             genState.h3StepCache = this.value === 'high' ? 'high' : 'exact';
@@ -5652,8 +5653,9 @@ var CanvasTab = (function () {
                     .indexOf(state.genSettings.h3Quant) >= 0
                     ? state.genSettings.h3Quant : 'int8-fast';
                 genState.h3AttentionBackend =
-                    state.genSettings.h3AttentionBackend === 'cudnn'
-                        ? 'cudnn' : 'sage-int8';
+                    ['ck-int8', 'sage-int8', 'cudnn'].indexOf(
+                        state.genSettings.h3AttentionBackend) >= 0
+                        ? state.genSettings.h3AttentionBackend : 'ck-int8';
                 genState.h3StepCache = state.genSettings.h3StepCache === 'high'
                     ? 'high' : 'exact';
                 genState.h3ContinueFrom = /^video-\d+$/.test(

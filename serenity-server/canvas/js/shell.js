@@ -32,7 +32,9 @@ function setMode(mode) {
     }
     // If switching to advanced, restore the saved tab
     if (isAdvanced) {
-        var savedTab = localStorage.getItem('sf-active-tab') || 'generate';
+        var requestedTab = new URLSearchParams(window.location.search).get('tab');
+        var requestedTabExists = requestedTab && document.querySelector('.nav-btn[data-tab="' + requestedTab + '"]');
+        var savedTab = requestedTabExists ? requestedTab : (localStorage.getItem('sf-active-tab') || 'generate');
         switchTab(savedTab);
     }
 }
@@ -114,6 +116,10 @@ function switchTab(tabId) {
         } else {
             requestAnimationFrame(function () { VideoEditTab.resize(); });
         }
+    }
+    // Init the project-based MiniMax H3 filmmaker workspace.
+    if (tabId === 'h3-studio' && typeof H3StudioTab !== 'undefined') {
+        H3StudioTab.init();
     }
     // Resize Konva stage when workflows tab becomes visible
     if (tabId === 'workflows') {

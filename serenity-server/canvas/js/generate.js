@@ -72,7 +72,7 @@ var GenerateTab = (function () {
         videoPromptEnhancer: 'none',
         videoQuant: 'fp8',
         h3Quant: 'int8-fast',
-        h3AttentionBackend: 'cudnn',
+        h3AttentionBackend: 'ck-int8',
         h3StepCache: 'exact',
         cameraMotion: 'none',
         videoCheckpoint: 'ltx-2.3-22b-distilled',
@@ -820,8 +820,8 @@ var GenerateTab = (function () {
             '<select id="gen-video-guidance-mode" class="gen-select"><option value="distilled">Distilled</option><option value="dev">Dev CFG</option></select></div>' +
             '<div class="gen-param-row" data-param-search="quant bf16 fp8 int4"><label class="gen-label" for="gen-video-quant">Precision</label>' +
             '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int8">INT8</option><option value="int4">INT4</option></select></div>' +
-            '<div id="gen-h3-attention-row" class="gen-param-row" data-param-search="attention cudnn sage int8"><label class="gen-label" for="gen-h3-attention">Attention</label>' +
-            '<select id="gen-h3-attention" class="gen-select"><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option></select></div>' +
+            '<div id="gen-h3-attention-row" class="gen-param-row" data-param-search="attention cudnn ck sage int8"><label class="gen-label" for="gen-h3-attention">Attention</label>' +
+            '<select id="gen-h3-attention" class="gen-select"><option value="ck-int8">CK INT8 · fastest</option><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option></select></div>' +
             '<div id="gen-h3-step-cache-row" class="gen-param-row" data-param-search="denoise acceleration cache exact high speed"><label class="gen-label" for="gen-h3-step-cache">Denoise acceleration</label>' +
             '<select id="gen-h3-step-cache" class="gen-select"><option value="exact">Exact · quality default</option><option value="high">High · adaptive cache, ~1.5x, approximate</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
@@ -2133,8 +2133,8 @@ var GenerateTab = (function () {
                     this.value = 'cudnn';
                     return;
                 }
-                state.h3AttentionBackend = this.value === 'sage-int8'
-                    ? 'sage-int8' : 'cudnn';
+                state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(this.value) >= 0
+                    ? this.value : 'cudnn';
             });
         if (els.h3StepCache)
             els.h3StepCache.addEventListener('change', function () {
@@ -3578,8 +3578,8 @@ var GenerateTab = (function () {
         state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.h3Quant) >= 0
             ? state.h3Quant : 'int8-fast';
         state.videoQuant = state.h3Quant;
-        state.h3AttentionBackend = state.h3AttentionBackend === 'sage-int8'
-            ? 'sage-int8' : 'cudnn';
+        state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(
+            state.h3AttentionBackend) >= 0 ? state.h3AttentionBackend : 'cudnn';
         state.h3StepCache = state.h3StepCache === 'high' ? 'high' : 'exact';
         state.includeAudio = true;
         state.audioPolicy = 'generate';
@@ -3633,7 +3633,7 @@ var GenerateTab = (function () {
                 return '<option value="' + backend.id + '"' +
                     (backend.available === true ? '' : ' disabled') + '>' +
                     backend.label + '</option>';
-            }).join('') || '<option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option>';
+            }).join('') || '<option value="ck-int8">CK INT8 · fastest</option><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option>';
             if (state.videoQuant === 'bf16')
                 state.h3AttentionBackend = 'cudnn';
             els.h3Attention.value = state.h3AttentionBackend;
@@ -4433,8 +4433,8 @@ var GenerateTab = (function () {
                     ? 'bf16'
                     : (state.videoQuant === 'int8' ? 'int8' : 'int8-fast'),
                 attention_backend: state.videoQuant !== 'bf16'
-                    && state.h3AttentionBackend === 'sage-int8'
-                    ? 'sage-int8' : 'cudnn',
+                    && ['ck-int8', 'sage-int8'].indexOf(state.h3AttentionBackend) >= 0
+                    ? state.h3AttentionBackend : 'cudnn',
                 step_cache: state.h3StepCache === 'high' ? 'high' : 'exact',
                 include_audio: true
             };
@@ -6779,11 +6779,11 @@ var GenerateTab = (function () {
             state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.videoQuant) >= 0
                 ? state.videoQuant : 'int8-fast';
         if (typeof params.h3AttentionBackend === 'string')
-            state.h3AttentionBackend = params.h3AttentionBackend === 'sage-int8'
-                ? 'sage-int8' : 'cudnn';
+            state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(
+                params.h3AttentionBackend) >= 0 ? params.h3AttentionBackend : 'cudnn';
         else if (typeof params.attention_backend === 'string')
-            state.h3AttentionBackend = params.attention_backend === 'sage-int8'
-                ? 'sage-int8' : 'cudnn';
+            state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(
+                params.attention_backend) >= 0 ? params.attention_backend : 'cudnn';
         if (typeof params.h3StepCache === 'string')
             state.h3StepCache = params.h3StepCache === 'high' ? 'high' : 'exact';
         else if (typeof params.step_cache === 'string')

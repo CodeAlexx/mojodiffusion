@@ -113,6 +113,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `ops/softmax.mojo` | `softmax_lastdim` (stable, one block/row). | ✅ |
 | `ops/elementwise.mojo` | `modulate` ((1+s)x+sh), `residual_gate` (x+g·y) — DiT AdaLN. | ✅ |
 | `ops/attention.mojo` | `sdpa[B,S,H,Dh]` — flash (Dh==64) + math-mode fallback (any Dh); `sdpa_tiled`/`sdpa_nomask_tiled` — online-softmax (never materializes [S,S]) for LARGE S at Dh∈{64,128} (cosmos full-res, no OOM; cos=1.0 vs math-mode). | ✅ |
+| `ops/comfy_kitchen_attention.mojo` + `ops/cshim/comfy_kitchen_attention.cpp` | H3 BF16-QKV to Comfy Kitchen INT8-QK/INT8-PV Sage launcher bridge with run-lifetime scratch, current MAX CUDA-stream handoff, and zero steady-state device allocations. `scripts/build_h3_ck_attention.sh` produces the 6.7-MiB SM86-only launcher DSO from pinned v0.2.31 source; no Python runtime dependency. | ✅ H3 S=19,029/21,291 cosine 0.999860, repeat-bit mismatches 0, 70.01/88.69 ms |
 | `ops/conv.mojo` | `conv2d[...]` (NHWC/RSCF, SDK naive kernel + bias add). | ✅ |
 | `ops/embeddings.mojo` | `timestep_embedding`, `t_embedder`, `build_rope_tables`. | ✅ |
 | `ops/tensor_algebra.mojo` | `add/sub/mul/div` (+scalar), `reshape`, `permute`, `transpose`, `concat`, `slice`, `gather_rows`. | ✅ |
@@ -3185,7 +3186,7 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   live status prioritized the text-encoder store; that smoke was cancelled
   rather than claiming a complete 122-GB warm.
 
-## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-11)
+## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-20)
 
 The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
 layout (NOT the diffusers conversion). First valid video 2026-08-03
@@ -3398,8 +3399,42 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   result is not a sparse-attention claim and does not predict the 61k-token
   path. Therefore `sage-int8` is switchable on the two INT8 precision profiles
   but explicitly **experimental/approximate**; BF16 and exact-quality INT8 use
-  cU-DNN. The bare CLI defaults to cU-DNN, while Canvas defaults to Sage with
-  INT8 Fast and never silently relabels it as exact.
+  cU-DNN. The bare CLI defaults to cU-DNN, while Canvas defaults to CK with
+  INT8 Fast; Sage stays switchable with its experimental label.
+- **2026-08-20 CK INT8 fast default:** `ops/comfy_kitchen_attention.mojo`
+  owns a reusable H3 scratch allocation and calls the three raw CUDA launchers
+  through `ops/cshim/comfy_kitchen_attention.cpp` on the active MAX stream.
+  `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31 commit
+  `7c6ca3a5b63857d42c2d49777d6afb69de23f13f` (Apache-2.0) and builds only
+  Q/K quantization, V quantization, and Sage attention for SM86. The resulting
+  6.7-MiB `libserenity_ck_attention.so` has no Python dependency and avoids the
+  full extension's roughly 15-second first-process operator-registration cost.
+  The CUDA-12.4 compatibility header supplies the same 128-bit BF16 load used
+  upstream behind a newer-toolkit guard; the Mojo output is bit-identical to
+  the official full extension at the gated shapes.
+
+  `ops/tests/comfy_kitchen_attention_gate.mojo` uses alternating measurement
+  order, three warmups, eight iterations per order, exact cU-DNN comparison,
+  and a repeated-call bit check. On the RTX 3090 Ti, S=19,029/H=56/D=128
+  measured cosine 0.999860084, max-abs 0.00341797, 0 repeated mismatches, and
+  70.013 ms versus 121.392 ms for the former Mojo PV8 path (1.734x). At
+  S=21,291 it measured cosine 0.999859975, max-abs 0.00244141, 0 mismatches,
+  and 88.692 ms versus 149.832 ms (1.689x). Scratch is allocated once per run:
+  651.9 MiB and 729.6 MiB at those respective shapes.
+
+  `--attention-backend=ck-int8` is wired through T2VA, I2VA/L2VA/FL2VA,
+  Ref2VA, the Rust request boundary, Generate, Canvas, and H3 Studio. It keeps
+  the fixed text/audio prefix exact, admits only `int8-fast`/`int8`, and fails
+  loud on BF16. The bare/API omission remains cU-DNN exact-quality; CK is the
+  explicit accepted fast default in the INT8 UI. At 1024x576, 107 internal/97
+  output frames, 20 requested steps (19 full evaluations), 50 blocks, exact
+  step cache, and 8 resident W8A8 blocks, the cat render denoised in
+  262.3146 seconds versus 315.9725 seconds for the previous PV8 arm (16.98%
+  reduction). A separate uncached rally-car prompt denoised in 274.2861
+  seconds. Both fresh-process low-memory decodes passed finite and visual
+  inspection: stable identity, coherent motion/geometry, and no collapse.
+  These are decoded-quality gates for an approximate fast path, not a claim of
+  exact final-trajectory parity.
 - **2026-08-12 decode-failure retention:** H3 job cleanup deleted
   `latents.safetensors` on EVERY failure, so a transient decode failure
   destroyed the whole denoise (video-0190 lost a 3,434-s 1344x768x243 render;
@@ -3432,7 +3467,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
   URLs. UI and Canvas workflow controls expose Fast-W8A8 vs Quality-groupwise
   vs streamed-BF16 and
-  cU-DNN-vs-Sage on the INT8 profiles; BF16 is cU-DNN-only. H3 owns a separate precision state so BF16 selected on a
+  cU-DNN-vs-CK-vs-Sage on the INT8 profiles; BF16 is cU-DNN-only. H3 owns a separate precision state so BF16 selected on a
   different video model cannot leak into H3; first entry defaults to
   `int8-fast`, while an explicit H3 Quality/BF16 choice remains switchable.
   Canvas presents this as one H3 generator rather than six backend task modes:
@@ -3517,7 +3552,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   has variable length. All conditioned tasks share the native-timeline/delivery-FPS,
   precision, attention, and exact/high cache controls with T2VA; synchronized audio and fresh-process
   GPU decode remain mandatory. The UI exposes W8A8 `int8-fast`, groupwise `int8`, and
-  BF16-DiT + INT8-encoder runners. Sage and cU-DNN remain independently
+  BF16-DiT + INT8-encoder runners. CK, Sage, and cU-DNN remain independently
   switchable on INT8 Fast and INT8 Quality; BF16 is cU-DNN-only. Sage is
   labeled approximate and cU-DNN is labeled exact quality.
   Native continuation is owned by
@@ -3539,7 +3574,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   coordinates remain unchanged, while fixed A/V rows occupy the new target
   head. Canvas keeps the previous reference list (or accepts a new one) on
   Continue, with BF16/groupwise INT8/W8A8 and exact/high cache still
-  independent; cU-DNN/Sage is switchable on INT8 while BF16 stays on cU-DNN.
+  independent; cU-DNN/CK/Sage is switchable on INT8 while BF16 stays on cU-DNN.
   These reference-conditioned continuation legs remain in
   the trained 1-15 second window and are chained for longer delivery. A real
   512x320 W8A8/cU-DNN exact full-20 run packed S=7,156, completed 19 denoise
@@ -3850,6 +3885,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   from JSON. `h3_mlp_fc1_fc2` retains the legacy 100-adapter MLP-only target;
   `h3_full_aitoolkit_208` creates qkv/out/fc1/fc2 adapters in all 50 main
   blocks plus both token-refiner blocks (208 adapters / 416 PEFT tensors).
+  Config `resume_state` + `warm_resume=true` can expand a canonical partial
+  PEFT file into either preset: existing A/B pairs load as F32 masters, missing
+  pairs use the normal Kaiming-A/zero-B initialization, one-sided pairs and
+  shape/dtype mismatches fail loudly, and AdamW8bit moments restart at zero.
+  Exact continuation from the run's own full state sidecar still takes priority.
   `scripts/run_minimax_h3_eri2_mojo_4000.sh` runs each configured
   training segment rootlessly, then samples the checkpoint in a fresh pure-Mojo
   process using the shared `serenity.sample_prompts.v1` file.
@@ -3923,6 +3963,17 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   preservation loss, and produced valid 512x320x22 Mojo validation videos.
   Those are mechanics gates; convergence still requires same-seed decoded
   checkpoint comparisons during the long run.
+  The existing 200-step pinned-Musubi measurement is only a base-loss/speed
+  ballpark: median 7.500493 s/step and rounded moving loss 1.87 -> 2.05, but
+  all 200 saved `lora_up` tensors remained byte-zero. Its convergence-update
+  gate therefore fails, and it must not be treated as a learning-quality oracle
+  until a first-checkpoint nonzero-up tripwire passes.
+- Partial-topology acceptance (2026-08-18): the saved step-3750 MLP-only LoRA
+  is an exact 100-pair subset of the full-208 target. A real `--warm_init_only`
+  run imported all 100 pairs, initialized exactly 108 missing pairs, exported
+  208 pairs, and preserved all 200 imported BF16 tensors byte-for-byte through
+  the BF16-to-F32-master-to-BF16 path. Every new A was nonzero and every new B
+  was zero. The active 1000-step run loaded that full step-0 state before step 1.
 - Full-208 acceptance (2026-08-18): `h3_token_refiner_train.mojo` covers both
   frozen-base refiner blocks and returns canonical FC1-B grads after the
   product `[value|gate]` compute transform. The exact recipe smoke trained

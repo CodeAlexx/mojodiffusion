@@ -123,6 +123,10 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     MINIMAX_H3_ATTN_CUDNN,
     MINIMAX_H3_ATTN_SAGE_INT8,
+    MINIMAX_H3_ATTN_SAGE_INT8_PV8,
+    MINIMAX_H3_ATTN_SAGE_INT8_FAST,
+    MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8,
+    MINIMAX_H3_SAGE_PV8_MIN_S,
     minimax_h3_released_config,
     minimax_h3_adaln_rows,
     minimax_h3_block_tensor_names,
@@ -133,6 +137,9 @@ from serenitymojo.models.dit.minimax_h3_dit import (
 from serenitymojo.ops.sage_attention_int8 import (
     SageInt8Scratch,
     SageUltraViCoConfig,
+)
+from serenitymojo.ops.comfy_kitchen_attention import (
+    ComfyKitchenAttentionScratch,
 )
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
@@ -937,7 +944,12 @@ def _usage():
         "keyframes=", KEYFRAMES, ", text_tokens=", TEXT_TOKENS, ", S=", SEQ_LEN,
     )
     print("  <prompt> is the BODY text; the §2.1 alignment instruction is prepended for you")
-    print("  optional flag: --attention-backend=cudnn|sage-int8 (default cudnn)")
+    print(
+        "  optional flag:"
+        " --attention-backend=cudnn|ck-int8|sage-int8|sage-int8-pv8|"
+        "sage-int8-fast"
+        " (default cudnn)"
+    )
     print("  optional flag: --attention-backend=sage-int8-ultravico (training-free long-video score decay)")
     print("  optional flag: --step-cache=exact|high (default exact)")
     print("  optional flag: --resident-backend=groupwise|w8a8 (INT8 builds)")
@@ -989,6 +1001,21 @@ def main() raises:
             attention_backend_name = String("sage-int8")
             ultravico_enabled = False
             continue
+        if arg == String("--attention-backend=sage-int8-pv8"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8_PV8
+            attention_backend_name = String("sage-int8-pv8")
+            ultravico_enabled = False
+            continue
+        if arg == String("--attention-backend=sage-int8-fast"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8_FAST
+            attention_backend_name = String("sage-int8-fast")
+            ultravico_enabled = False
+            continue
+        if arg == String("--attention-backend=ck-int8"):
+            attention_backend = MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
+            attention_backend_name = String("ck-int8")
+            ultravico_enabled = False
+            continue
         if arg == String("--attention-backend=sage-int8-ultravico"):
             attention_backend = MINIMAX_H3_ATTN_SAGE_INT8
             attention_backend_name = String("sage-int8-ultravico")
@@ -1002,7 +1029,10 @@ def main() raises:
         if arg.startswith("--attention-backend="):
             raise Error(
                 String("unknown attention backend flag: ") + arg
-                + String(" (expected cudnn, sage-int8, or sage-int8-ultravico)")
+                + String(
+                    " (expected cudnn, sage-int8, sage-int8-pv8,"
+                    " sage-int8-fast, ck-int8, or sage-int8-ultravico)"
+                )
             )
         if arg == String("--step-cache=high"):
             step_cache_enabled = True
@@ -1058,9 +1088,15 @@ def main() raises:
             continue
         args.append(arg)
     comptime if DIT_INT8_RESIDENT == 0:
-        if attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+        if (
+            attention_backend == MINIMAX_H3_ATTN_SAGE_INT8
+            or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8
+            or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
+            or attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
+        ):
             raise Error(
-                "MiniMax-H3 Sage attention is INT8-only; BF16 conditioned runners use cU-DNN"
+                "MiniMax-H3 INT8 attention requires an INT8 conditioned runner;"
+                " BF16 uses cU-DNN"
             )
     if len(args) < 5:
         _usage()
@@ -1713,14 +1749,33 @@ def main() raises:
     # (video-0177). Allocated after the resident store so a geometry that
     # cannot hold both fails here, not minutes into denoise.
     var sage_scratch = Optional[SageInt8Scratch](None)
-    if attention_backend != MINIMAX_H3_ATTN_CUDNN:
+    if attention_backend != MINIMAX_H3_ATTN_CUDNN \
+            and attention_backend != MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8:
         sage_scratch = Optional[SageInt8Scratch](
-            SageInt8Scratch(sequence_length, H3_HEADS, ctx)
+            SageInt8Scratch(
+                sequence_length, H3_HEADS, ctx,
+                attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8 or (
+                    attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
+                    and sequence_length >= MINIMAX_H3_SAGE_PV8_MIN_S
+                ),
+            )
         )
         ctx.synchronize()
         print(
             "  sage scratch: preallocated",
             Float64(sage_scratch.value().resident_bytes())
+                / (1024.0 * 1024.0 * 1024.0),
+            "GiB for S=", sequence_length,
+        )
+    var comfy_kitchen_scratch = Optional[ComfyKitchenAttentionScratch](None)
+    if attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8:
+        comfy_kitchen_scratch = Optional[ComfyKitchenAttentionScratch](
+            ComfyKitchenAttentionScratch(sequence_length, H3_HEADS, ctx)
+        )
+        ctx.synchronize()
+        print(
+            "  ck scratch: preallocated",
+            Float64(comfy_kitchen_scratch.value().resident_bytes())
                 / (1024.0 * 1024.0 * 1024.0),
             "GiB for S=", sequence_length,
         )
@@ -1930,6 +1985,7 @@ def main() raises:
                 hidden3, block_w, layer, config, modcache.block_mod[layer][],
                 block_adaln_indices, rope[0], rope[1], rotary_dim, ctx,
                 attention_backend, sage_scratch, sage_ultravico,
+                comfy_kitchen_scratch=comfy_kitchen_scratch,
             )
             # At the 15-second base-area product geometry the reusable tail
             # store and the long-sequence attention temporaries otherwise

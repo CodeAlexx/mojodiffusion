@@ -267,6 +267,14 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     MiniMaxH3DiTConfig,
     MINIMAX_H3_ATTN_CUDNN,
     MINIMAX_H3_ATTN_SAGE_INT8,
+    MINIMAX_H3_ATTN_SAGE_INT8_PV8,
+    MINIMAX_H3_ATTN_SAGE_INT8_FAST,
+    MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8,
+    MINIMAX_H3_SAGE_PV8_MIN_S,
+    MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE,
+    MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE,
+    MINIMAX_H3_ATTN_EVG_INT8,
+    MINIMAX_H3_EVG_BUILD_ENABLED,
     minimax_h3_released_config,
     minimax_h3_adaln_rows,
     minimax_h3_block_tensor_names,
@@ -274,8 +282,14 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_block_forward,
     minimax_h3_block_forward_dynamic,
     minimax_h3_sage_exact_prefix_backend,
+    minimax_h3_sage_fast_exact_prefix_backend,
+    minimax_h3_comfy_kitchen_exact_prefix_backend,
 )
 from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
+from serenitymojo.ops.comfy_kitchen_attention import (
+    ComfyKitchenAttentionScratch,
+)
+from serenitymojo.ops.evg_attention_int8 import EVGH3RaggedLayout
 from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
@@ -1663,6 +1677,8 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     rotary_dim: Int,
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch],
+    comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch],
+    evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]],
     step_index: Int,
     mut step_cache: MiniMaxH3StepCache,
     t2va_contiguous: Bool,
@@ -1829,6 +1845,9 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             attention_backend,
             sage_scratch,
             lora_overlay=lora_overlay,
+            evg_layout=evg_layout,
+            evg_step=step_index,
+            comfy_kitchen_scratch=comfy_kitchen_scratch,
         )
         # The block's last-use temporaries are stream-ordered but large enough
         # at S>=60k that carrying them into the next streamed weight load can
@@ -1999,6 +2018,26 @@ def _job_main(raw_args: List[String]) raises:
             attention_backend_name = String("sage-int8")
             sage_exact_av_prefix = True
             continue
+        if arg == String("--attention-backend=sage-int8-pv8"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8_PV8
+            attention_backend_name = String("sage-int8-pv8")
+            sage_exact_av_prefix = False
+            continue
+        if arg == String("--attention-backend=sage-int8-fast"):
+            attention_backend = MINIMAX_H3_ATTN_SAGE_INT8_FAST
+            attention_backend_name = String("sage-int8-fast")
+            sage_exact_av_prefix = True
+            continue
+        if arg == String("--attention-backend=ck-int8"):
+            attention_backend = MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
+            attention_backend_name = String("ck-int8")
+            sage_exact_av_prefix = True
+            continue
+        if arg == String("--attention-backend=evg-int8"):
+            attention_backend = MINIMAX_H3_ATTN_EVG_INT8
+            attention_backend_name = String("evg-int8-sm86")
+            sage_exact_av_prefix = False
+            continue
         if arg == String("--attention-backend=cudnn"):
             attention_backend = MINIMAX_H3_ATTN_CUDNN
             attention_backend_name = String("cudnn")
@@ -2007,7 +2046,10 @@ def _job_main(raw_args: List[String]) raises:
         if arg.startswith("--attention-backend="):
             raise Error(
                 String("unknown attention backend flag: ") + arg
-                + String(" (expected cudnn or sage-int8)")
+                + String(
+                    " (expected cudnn, sage-int8, sage-int8-pv8,"
+                    " sage-int8-fast, ck-int8, or evg-int8)"
+                )
             )
         if arg == String("--step-cache=high"):
             step_cache_enabled = True
@@ -2104,6 +2146,22 @@ def _job_main(raw_args: List[String]) raises:
             trim_start_frames = motion_context_frames
     elif trim_start_frames != 0:
         raise Error("--trim-start-frames requires --motion-context")
+    if (
+        attention_backend == MINIMAX_H3_ATTN_EVG_INT8
+        and motion_context_enabled
+    ):
+        raise Error(
+            "MiniMax-H3 EVG attention currently requires contiguous"
+            " text|audio|video T2VA packing; motion context is not admitted"
+        )
+    if (
+        attention_backend == MINIMAX_H3_ATTN_EVG_INT8
+        and not MINIMAX_H3_EVG_BUILD_ENABLED
+    ):
+        raise Error(
+            "MiniMax-H3 EVG attention is not in this binary; rebuild with"
+            " -D H3_EVG=1"
+        )
     if quant == String("bf16"):
         use_resident = False
     elif quant == String("int8"):
@@ -2122,15 +2180,22 @@ def _job_main(raw_args: List[String]) raises:
     var _lora_overlay = Optional[H3LoraOverlay](None)
     if lora_path != String("") and use_resident and resident_blocks_requested == 0:
         raise Error("--lora with --resident-blocks=0 is unsupported (groupwise tail cache has no overlay)")
-    if quant == String("bf16") and attention_backend == MINIMAX_H3_ATTN_SAGE_INT8:
+    if quant == String("bf16") and (
+        attention_backend == MINIMAX_H3_ATTN_SAGE_INT8
+        or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8
+        or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
+        or attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
+    ):
         raise Error(
-            "MiniMax-H3 Sage attention is INT8-only; use --attention-backend=cudnn"
-            " with --quant=bf16"
+            "MiniMax-H3 INT8 attention requires --quant=int8 or int8-fast;"
+            " use --attention-backend=cudnn with --quant=bf16"
         )
     if len(args) < 3:
         print(
             "usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0]"
-            " [max_blocks=50] [--attention-backend=cudnn|sage-int8]"
+            " [max_blocks=50]"
+            " [--attention-backend=cudnn|ck-int8|sage-int8|sage-int8-pv8|"
+            "sage-int8-fast|evg-int8]"
             " [--step-cache=exact|high]"
             " [--resident-backend=groupwise|w8a8]"
             " [--quant=bf16|int8|int8-fast]"
@@ -2242,9 +2307,18 @@ def _job_main(raw_args: List[String]) raises:
         )
         resident_blocks_requested = 0
     if sage_exact_av_prefix and not motion_context_enabled:
-        attention_backend = minimax_h3_sage_exact_prefix_backend(
-            runtime_text_tokens + num_audio_rows
-        )
+        if attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8:
+            attention_backend = minimax_h3_comfy_kitchen_exact_prefix_backend(
+                runtime_text_tokens + num_audio_rows
+            )
+        elif attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST:
+            attention_backend = minimax_h3_sage_fast_exact_prefix_backend(
+                runtime_text_tokens + num_audio_rows
+            )
+        else:
+            attention_backend = minimax_h3_sage_exact_prefix_backend(
+                runtime_text_tokens + num_audio_rows
+            )
     if runtime_width < 32 or runtime_width > 2048 \
             or runtime_height < 32 or runtime_height > 2048 \
             or runtime_width % 32 != 0 or runtime_height % 32 != 0:
@@ -2791,20 +2865,77 @@ def _job_main(raw_args: List[String]) raises:
             "from", resume_path,
         )
 
+    # EVG keeps one immutable request geometry across all 50 layers and all
+    # denoise evaluations. T2VA packs text|audio|video contiguously; the video
+    # tail is a frame-major raster over the DiT patch grid.
+    var evg_layout = Optional[ArcPointer[EVGH3RaggedLayout]](None)
+    if attention_backend == MINIMAX_H3_ATTN_EVG_INT8:
+        evg_layout = Optional[ArcPointer[EVGH3RaggedLayout]](
+            ArcPointer(
+                EVGH3RaggedLayout(
+                    runtime_text_tokens + num_audio_rows,
+                    num_latent_frames,
+                    latent_h // PATCH_H,
+                    latent_w // PATCH_W,
+                    ctx,
+                )
+            )
+        )
+        ctx.synchronize()
+        print(
+            "  evg layout: prefix=",
+            evg_layout.value()[].prefix_tokens,
+            " video_blocks=", evg_layout.value()[].video_blocks,
+            " packed_rows=", evg_layout.value()[].packed_rows,
+        )
+
     # Sage attention runs the whole denoise through one preallocated scratch:
     # its per-call transient buffers otherwise churn ~1-2 GiB fifty times per
     # evaluation and intermittently OOM near the 24-GiB envelope
     # (video-0177). Allocated after the resident store so a geometry that
     # cannot hold both fails here, not minutes into denoise.
     var sage_scratch = Optional[SageInt8Scratch](None)
-    if attention_backend != MINIMAX_H3_ATTN_CUDNN:
+    if (
+        attention_backend != MINIMAX_H3_ATTN_CUDNN
+        and attention_backend != MINIMAX_H3_ATTN_EVG_INT8
+        and attention_backend < MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE
+        and attention_backend != MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
+    ):
         sage_scratch = Optional[SageInt8Scratch](
-            SageInt8Scratch(geometry.sequence_length, H3_HEADS, ctx)
+            SageInt8Scratch(
+                geometry.sequence_length, H3_HEADS, ctx,
+                attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8 or (
+                    (
+                        attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
+                        or attention_backend
+                            >= MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE
+                    )
+                    and geometry.sequence_length >= MINIMAX_H3_SAGE_PV8_MIN_S
+                ),
+            )
         )
         ctx.synchronize()
         print(
             "  sage scratch: preallocated",
             Float64(sage_scratch.value().resident_bytes())
+                / (1024.0 * 1024.0 * 1024.0),
+            "GiB for S=", geometry.sequence_length,
+        )
+    var comfy_kitchen_scratch = Optional[ComfyKitchenAttentionScratch](None)
+    if (
+        attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
+        or attention_backend
+            >= MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE
+    ):
+        comfy_kitchen_scratch = Optional[ComfyKitchenAttentionScratch](
+            ComfyKitchenAttentionScratch(
+                geometry.sequence_length, H3_HEADS, ctx
+            )
+        )
+        ctx.synchronize()
+        print(
+            "  ck scratch: preallocated",
+            Float64(comfy_kitchen_scratch.value().resident_bytes())
                 / (1024.0 * 1024.0 * 1024.0),
             "GiB for S=", geometry.sequence_length,
         )
@@ -2838,7 +2969,9 @@ def _job_main(raw_args: List[String]) raises:
                 transformer_shards, fp8_resident, reusable_w8a8_tail,
                 use_resident, resident_scheme, resident_cache_path,
                 _lora_overlay, rope[0],
-                rope[1], rotary_dim, attention_backend, sage_scratch, i,
+                rope[1], rotary_dim, attention_backend, sage_scratch,
+                comfy_kitchen_scratch,
+                evg_layout, i,
                 step_cache, False,
                 ctx,
             )
@@ -2864,7 +2997,9 @@ def _job_main(raw_args: List[String]) raises:
                 reusable_w8a8_tail,
                 use_resident, resident_scheme, resident_cache_path,
                 _lora_overlay, rope[0],
-                rope[1], rotary_dim, attention_backend, sage_scratch, i,
+                rope[1], rotary_dim, attention_backend, sage_scratch,
+                comfy_kitchen_scratch,
+                evg_layout, i,
                 step_cache, True,
                 ctx,
             )

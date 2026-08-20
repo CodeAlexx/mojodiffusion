@@ -27,11 +27,13 @@ fi
 "${CXX:-g++}" -shared -fPIC -std=c++17 -O2 \
   -I "$frontend" -I "$cudnn_root/include" -I "$cuda_include" \
   cudnn_sdpa.cpp cudnn_sdpa_bwd.cpp cudnn_conv2d.cpp cudnn_conv3d.cpp cublas_gemm.cpp \
+  comfy_kitchen_attention.cpp \
   -L lib/cudnn_stubs -lcudnn -L "$cuda_root/lib" -lcudart -lnvrtc -lcublas -lcublasLt \
+  -ldl \
   -Wl,-rpath,"$cudnn_rpath" -Wl,-rpath,"$cuda_rpath" \
   -Wno-deprecated-declarations -Wno-unused-parameter -Wno-unused-variable \
   -Wno-sign-compare -Wno-reorder \
   -o lib/libserenity_cudnn_sdpa.so
 
 echo "built: $(ls -la lib/libserenity_cudnn_sdpa.so)"
-nm -D lib/libserenity_cudnn_sdpa.so | grep -E 'flame_cudnn|serenity_cudnn|serenity_cublas'
+nm -D lib/libserenity_cudnn_sdpa.so | grep -E 'flame_cudnn|serenity_cudnn|serenity_cublas|serenity_comfy_kitchen'

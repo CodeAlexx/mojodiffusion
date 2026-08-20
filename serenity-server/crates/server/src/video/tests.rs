@@ -323,10 +323,12 @@ fn minimax_h3_request_is_runtime_adjustable_and_switchable() {
     validate_minimax_h3_request(&request).unwrap();
     request["attention_backend"] = json!("sage-int8");
     validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("ck-int8");
+    validate_minimax_h3_request(&request).unwrap();
     request["quant"] = json!("bf16");
     assert!(validate_minimax_h3_request(&request)
         .unwrap_err()
-        .contains("Sage attention is available only with INT8"));
+        .contains("INT8 attention is available only with INT8"));
     request["attention_backend"] = json!("cudnn");
     validate_minimax_h3_request(&request).unwrap();
     request["step_cache"] = json!("invalid");
@@ -565,6 +567,8 @@ fn minimax_h3_conditioned_requests_preserve_exact_media_contracts() {
     validate_minimax_h3_request(&request).unwrap();
     request["quant"] = json!("int8-fast");
     request["attention_backend"] = json!("sage-int8");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("ck-int8");
     validate_minimax_h3_request(&request).unwrap();
     let geometry = minimax_h3_runtime_geometry(&request).unwrap();
     assert_eq!((geometry.width, geometry.height), (1024, 768));
@@ -927,18 +931,31 @@ fn readiness_shape() {
     assert_eq!(h3["quant_modes"][0]["id"], "int8-fast");
     assert_eq!(h3["quant_modes"][1]["id"], "int8");
     assert_eq!(h3["quant_modes"][2]["id"], "bf16");
-    assert_eq!(h3["attention_backends"][0]["id"], "cudnn");
-    assert_eq!(h3["attention_backends"][1]["id"], "sage-int8");
+    assert_eq!(h3["attention_backends"][0]["id"], "ck-int8");
+    assert_eq!(h3["attention_backends"][1]["id"], "cudnn");
+    assert_eq!(h3["attention_backends"][2]["id"], "sage-int8");
     assert_eq!(
-        h3["attention_backends"][1]["quant_modes"],
+        h3["attention_backends"][0]["quant_modes"],
         json!(["int8-fast", "int8"])
     );
     assert_eq!(
         h3["attention_backends"][0]["accepted_quality_default"],
+        false
+    );
+    assert_eq!(
+        h3["attention_backends"][0]["accepted_fast_default"],
         true
     );
     assert_eq!(
+        h3["attention_backends"][0]["decoded_visual_prompt_gate_count"],
+        2
+    );
+    assert_eq!(
         h3["attention_backends"][1]["accepted_quality_default"],
+        true
+    );
+    assert_eq!(
+        h3["attention_backends"][2]["accepted_quality_default"],
         false
     );
     assert_eq!(h3["step_cache_modes"][0]["id"], "exact");

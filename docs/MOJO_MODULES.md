@@ -829,7 +829,7 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
-## MiniMax-H3 audio-video inference runtime (updated 2026-08-12)
+## MiniMax-H3 audio-video inference runtime (updated 2026-08-20)
 
 - `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
   modulation, and resident-weight sidecars used by the product runners. Cache
@@ -921,12 +921,59 @@ edits: see sections C and D of the parity-ported doc.
   seconds and 0.999048/0.994064. It is experimental and approximate, while
   cU-DNN remains the exact-quality choice. Both backends are admitted for INT8
   Quality and INT8 Fast; streamed BF16 is cU-DNN-only and rejects Sage at the
-  UI, server, and Mojo runner. Canvas defaults to Sage with INT8 Fast but keeps
-  the label and switch explicit; bare runners default to cU-DNN without a flag.
+  UI, server, and Mojo runner. Canvas defaults to CK with INT8 Fast; Sage keeps
+  its experimental label and remains switchable, while bare runners default to
+  cU-DNN without a flag.
   On INT8 Quality, a hot A-B-A measured 64.2411 seconds exact versus 58.7937
   seconds Sage, saving 5.4474 seconds/evaluation. Sage versus INT8-exact cosine
   was 0.999636 video / 0.999399 audio; combined INT8+Sage versus BF16 was
   0.999585 video PASS / 0.998413 audio FAIL under the strict 0.999 bar.
+- `ops/comfy_kitchen_attention.mojo`,
+  `ops/cshim/comfy_kitchen_attention.cpp`, and
+  `ops/cshim/comfy_kitchen_cuda124_compat.cuh` provide the accepted H3 fast
+  INT8 attention backend. The Mojo layer owns one run-lifetime scratch and
+  passes BF16 BSHD Q/K/V plus the active MAX CUDA stream directly to the raw
+  Q/K-quant, V-quant, and Sage launchers, with zero steady-state device
+  allocations. `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31
+  commit `7c6ca3a5b63857d42c2d49777d6afb69de23f13f` (Apache-2.0) and builds only
+  those launchers for SM86. The resulting 6.7-MiB native DSO has no Python
+  dependency; the full Python extension remains an optional fallback.
+
+  The product gate compares exact cU-DNN, CK, and the former Mojo PV8 path at
+  two H3 shapes with alternating order. S=19,029/H=56/D=128: cosine
+  0.999860084, max-abs 0.00341797, zero repeat mismatches, 70.013 ms CK versus
+  121.392 ms PV8 (1.734x). S=21,291: cosine 0.999859975, max-abs 0.00244141,
+  zero mismatches, 88.692 ms versus 149.832 ms (1.689x). `ck-int8` is wired
+  through T2VA, every conditioned runner, server validation, and the H3 UI;
+  it is the accepted fast default for `int8-fast`/`int8`, while omitted/API
+  requests and BF16 retain exact cU-DNN. Two independent 1024x576, 20-step,
+  50-block, exact-cache decoded gates passed: cat denoise 262.3146 seconds
+  (previous PV8 315.9725, 16.98% reduction) and rally-car denoise 274.2861
+  seconds. Both completed 19/19 evaluations with finite latents and coherent
+  decoded motion/identity; the path remains labeled approximate rather than
+  exact final-trajectory parity.
+- `ops/evg_ragged_attention.mojo` and `ops/evg_attention_int8.mojo` are an
+  experimental pure-Mojo port of `evg-project/evg` commit
+  `faf55cce6095965378f3477a85fb6b6a4997e3d4` (Apache-2.0) for H3 inference.
+  The request-static stripe-DP K64 cover, raster mapping, adjacency anchors,
+  Hamilton precision budget, and released dense-first/layer-band schedule
+  match EVG's own Python modules exactly across eleven rectangular and
+  degenerate-axis oracle cases (`ops/tests/evg_ragged_oracle_gate.py`). The
+  executor keeps EVG's pooled-QK DraftMap, global per-head routing, exact
+  dense prefix, INT8 Q/K main phase, BF16 rescue, and F32 online softmax. On
+  SM86 it deliberately keeps V in BF16 because Ampere has no native FP8 MMA;
+  this is named `evg-int8`, not presented as EVG's released SM89 FP8 kernel.
+  It is forward-only, as is the existing Sage inference backend.
+
+  `--attention-backend=evg-int8` is wired only into contiguous T2VA and
+  rejects motion-context packing. The large executor is compile-time dark in
+  standard H3 binaries; `scripts/build_minimax_h3_evg_profile.sh` builds the
+  separate `minimax_h3_serenity_runtime_evg` binary with `-D H3_EVG=1` under
+  the rootless 24-GiB whole-program build guard. The focused module, fully
+  instantiated rescue kernel, and DiT dispatch compile gates pass. GPU
+  At the real H3 geometry the SM86 executor measured about 622 ms versus about
+  186 ms cU-DNN and 155 ms Sage. It is therefore rejected for product speed,
+  remains experimental/dark, and is not exposed by Serenity.
 - `models/minimax_h3_device/audio_encoder_device.mojo` is the GPU reference
   AudioVAE encoder for Ref2VA audio tracks and standalone audio clips. Media
   decode/staging is host I/O; every learned DAC/Snake/attention/MLP/posterior
@@ -974,7 +1021,7 @@ edits: see sections C and D of the parity-ported doc.
   audio | target audio | target video]`, samples the new target, and trims the
   matching A/V overlap from delivery. Resolution and the native 24-FPS model
   timeline remain exact; BF16, groupwise INT8, W8A8 INT8 Fast, and exact/high
-  cache stay independently switchable. cU-DNN/Sage is switchable on INT8;
+  cache stay independently switchable. cU-DNN/CK/Sage is switchable on INT8;
   BF16 stays on cU-DNN. For an authored cut
   that falls between H3's `5+17n` endpoints, the tail ends at the nearest
   native endpoint instead of silently continuing from padded frames. Both
@@ -1319,6 +1366,6 @@ surface: `docs/MOJO_TRAINING_FREE_EDITING.md`.
 | `models/minimax_h3/h3_train_block_store.mojo` + `h3_train_block_store_int8.mojo` + `h3_train_modgrid.mojo` (2026-08-15/18) | Trainer weight residency: mmap→bounded staging; direct tensorwise-W8A8 frozen base with a config-selected resident prefix and BF16 streamed tail; 1000-node exact AdaLN grid as a build-once host sidecar. | **GPU-GATED** (42/50 completed 200 steps without OOM; 48/50 eventually OOMed at production step 927 after a step-750 resume, and 50/50 OOMs on the first activation; production now uses 46/50 for two-block headroom; direct-W8A8 first-sample loss is 2.22% below streamed BF16, so it is a measured fast trajectory, not exact BF16 parity) |
 | `models/minimax_h3/h3_train_cache.mojo` + `h3_train_sigma.mojo` (2026-08-14) | torchref-native mmh3 cache reader (latents/audio/masks/keyframes/TE + task ids) and the training sigma policy (per-modality shift, bf16-rounded noising, token-balance loss, d_pred seed). | **GPU-GATED** (reader 36/36 bit-exact vs upstream-writer fixture; x_t/targets BIT-exact, loss 1e-7, grad cos 1.0) |
 | `models/minimax_h3/h3_lora_overlay.mojo` + `h3_lora_format.mojo` + `h3_qkv_layout.mojo` (2026-08-15/18) | Canonical PEFT inference overlay with legacy-load compatibility. QKV/FC1 runtime transforms apply to LoRA-B rows, resident INT8 bases receive activation-time deltas rather than destructive requantized merges, and the product frontend applies both token-refiner blocks; runtime `--lora=`/`--lora-mult=`. | **GPU-GATED** (canonical A/B roundtrip exact; verified AiToolkit file and fresh Mojo save each load all 208 adapters; full-208 product sample finite and decoded) |
-| `training/train_minimax_h3.mojo` + `training/adamw8bit.mojo` (2026-08-15/18) | Config-driven H3 LoRA trainer: BF16 compute, device-resident blockwise AdamW8bit, canonical PEFT plus exact uint8/F32 optimizer-state resume, cuDNN flash train attention, and configurable direct-W8A8 frozen base. Presets cover legacy 100-adapter MLP-only and full 208-adapter AiToolkit topology. Rank/alpha, LR/warmup, gradient clip, timestep buckets, spatial-density jitter, guidance distillation, sparse base preservation, resident blocks, and save/sample cadence come from `TrainConfig`. Samples run in a fresh process from `serenity.sample_prompts.v1`. | **LIVE** (full-208 exact-recipe step 1->2 state resume; 416 finite PEFT tensors, every B nonzero; product 512x320x22 full-face sample; 1000-step save/sample-250 run active at 36 residents; no convergence claim before decoded checkpoints) |
+| `training/train_minimax_h3.mojo` + `training/adamw8bit.mojo` (2026-08-15/18) | Config-driven H3 LoRA trainer: BF16 compute, device-resident blockwise AdamW8bit, canonical PEFT plus exact uint8/F32 optimizer-state resume, config-driven partial PEFT warm expansion with zeroed optimizer moments, cuDNN flash train attention, and configurable direct-W8A8 frozen base. Presets cover legacy 100-adapter MLP-only and full 208-adapter AiToolkit topology. Rank/alpha, LR/warmup, gradient clip, timestep buckets, spatial-density jitter, guidance distillation, sparse base preservation, resident blocks, and save/sample cadence come from `TrainConfig`. Samples run in a fresh process from `serenity.sample_prompts.v1`. | **LIVE** (100-pair step-3750 MLP LoRA -> full-208 step-0 gate imported all 200 source tensors byte-exact, initialized exactly 108 missing pairs with nonzero A and zero B, and saved 416 tensors; 1000-new-step save/sample-250 run active at 36 residents; no convergence claim before decoded checkpoints) |
 | `ops/int8_linear.mojo` + `ops/tests/int8_linear_parity.mojo` (2026-08-18) | Shared tensorwise W8A8 wrapper pads runtime activation rows to the next multiple of four for the cuBLAS INT8 contract, then returns the original shape. This covers variable H3 caption lengths without padding the model sequence itself. | **GPU-GATED** (unaligned M=65 forward/backward cosine 0.999931/0.999934; former real failure M=737 passes through 200 steps) |
 | `ops/attention_backward.mojo` `sdpa_backward_rect_dynamic` + `ops/attention_flash.mojo` train `_dynamic` twins (2026-08-15) | Runtime-dim SDPA train backward (math) and cuDNN flash train fwd/bwd — per-item sequence lengths without padding. | **GPU-GATED** (math twin BIT-identical to comptime at S=384; flash arm same-seed loss to 4 decimals + gates re-run green) |

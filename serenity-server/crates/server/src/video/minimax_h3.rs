@@ -1515,12 +1515,15 @@ pub(super) fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
         .get("attention_backend")
         .and_then(Value::as_str)
         .unwrap_or("cudnn");
-    if !matches!(attention, "cudnn" | "sage-int8") {
-        return Err("MiniMax-H3 attention_backend must be 'cudnn' or 'sage-int8'".to_string());
-    }
-    if quant == "bf16" && attention == "sage-int8" {
+    if !matches!(attention, "cudnn" | "sage-int8" | "ck-int8") {
         return Err(
-            "MiniMax-H3 Sage attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN"
+            "MiniMax-H3 attention_backend must be 'cudnn', 'sage-int8', or 'ck-int8'"
+                .to_string(),
+        );
+    }
+    if quant == "bf16" && attention != "cudnn" {
+        return Err(
+            "MiniMax-H3 INT8 attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN"
                 .to_string(),
         );
     }
@@ -1591,12 +1594,15 @@ pub(super) fn validate_minimax_h3_conditioned_request(
         .get("attention_backend")
         .and_then(Value::as_str)
         .unwrap_or("cudnn");
-    if !matches!(attention, "cudnn" | "sage-int8") {
-        return Err("MiniMax-H3 attention_backend must be 'cudnn' or 'sage-int8'".to_string());
-    }
-    if quant == "bf16" && attention == "sage-int8" {
+    if !matches!(attention, "cudnn" | "sage-int8" | "ck-int8") {
         return Err(
-            "MiniMax-H3 Sage attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN"
+            "MiniMax-H3 attention_backend must be 'cudnn', 'sage-int8', or 'ck-int8'"
+                .to_string(),
+        );
+    }
+    if quant == "bf16" && attention != "cudnn" {
+        return Err(
+            "MiniMax-H3 INT8 attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN"
                 .to_string(),
         );
     }

@@ -625,6 +625,15 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
   rejects Sage at the UI, server, and runner boundaries. Dynamic sequence
   entry points in `ops/attention.mojo` and `ops/attention_flash.mojo` let one
   runner serve runtime geometry and variable reference-token counts.
+- `ops/comfy_kitchen_attention.mojo` and
+  `ops/cshim/comfy_kitchen_attention.cpp` expose the accepted CK INT8 fast
+  backend with one run-lifetime scratch and the active MAX CUDA stream.
+  `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31 and builds only
+  the three SM86 attention launchers into a 6.7-MiB Python-free DSO. At the
+  real H3 S=19,029/21,291 shapes it measured cosine 0.999860 versus exact
+  cU-DNN, zero repeat mismatches, and 1.73x/1.69x versus the former Mojo PV8
+  path. Two distinct 1024x576, 20-step decoded product gates passed. CK is the
+  INT8 UI fast default; bare/API omission and BF16 retain exact cU-DNN.
 - `models/minimax_h3_device/audio_encoder_device.mojo` implements the learned
   Ref2VA AudioVAE encoder on GPU after media staging. Its real-weight trunk,
   pre-block, and posterior mean all exceed 0.999999999 cosine.
@@ -643,6 +652,14 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
   quality-run simultaneously on a 24-GiB GPU. The bounded INT8 Quality audio
   comparison measured 0.997751 versus BF16, below the strict 0.999 bar, while
   video measured 0.999227.
+- `training/train_minimax_h3.mojo` supports the full AiToolkit-compatible H3
+  LoRA topology: qkv/out/fc1/fc2 in all 50 main blocks plus both token-refiner
+  blocks (208 adapters / 416 canonical PEFT tensors). Configured warm resume
+  can expand the trained 100-adapter MLP subset: existing pairs round-trip
+  byte-exact, the 108 missing pairs receive Kaiming-A/zero-B initialization,
+  shape or one-sided-pair mismatches fail loud, and optimizer moments restart
+  at zero. Exact same-run optimizer-state resume remains the higher-priority
+  path.
 
 ### `models/dit/zimage_dit.mojo` — `NextDiT`, `NextDiTConfig` ✅ (cos 0.99985)
 Z-Image NextDiT transformer (basic/non-omni). Reference = diffusers `transformer_z_image.py` (read line-by-line; flame-core Rust differs in t-embed inversion / concat order / final negate — diffusers is the oracle).

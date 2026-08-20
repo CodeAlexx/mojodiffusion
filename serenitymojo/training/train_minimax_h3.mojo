@@ -398,6 +398,18 @@ struct _AdapterState(Movable):
         self.b_m = b_m^
 
 
+struct _WarmAdapterLoad(Movable):
+    var state: _AdapterState
+    var imported: Bool
+
+    def __init__(out self, var state: _AdapterState, imported: Bool):
+        self.state = state^
+        self.imported = imported
+
+    def into_state(deinit self) -> _AdapterState:
+        return self.state^
+
+
 def _init_adapter_state(
     rank: Int, out_f: Int, in_f: Int, mut rng: _Rng, ctx: DeviceContext
 ) raises -> _AdapterState:
@@ -481,6 +493,65 @@ def _load_st(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor
     return Tensor.from_view(
         from_parts(info.dtype, info.shape.copy(), st.tensor_bytes(name)), ctx
     )
+
+
+def _warm_load_or_init_adapter(
+    st: SafeTensors, prefix: String, rank: Int, out_f: Int, in_f: Int,
+    mut rng: _Rng, ctx: DeviceContext,
+) raises -> _WarmAdapterLoad:
+    """Load one canonical PEFT pair as F32 masters, or initialize it.
+
+    Partial warm-resume is deliberately pair-atomic: one-sided A/B artifacts
+    fail loudly instead of silently mixing a trained half with a fresh half.
+    """
+    var a_name = prefix + String(".lora_A.weight")
+    var b_name = prefix + String(".lora_B.weight")
+    var has_a = st.has_tensor(a_name)
+    var has_b = st.has_tensor(b_name)
+    if has_a != has_b:
+        raise Error(
+            String("H3 warm resume has an incomplete PEFT pair for ") + prefix
+        )
+    if not has_a:
+        var fresh = _init_adapter_state(rank, out_f, in_f, rng, ctx)
+        return _WarmAdapterLoad(fresh^, False)
+
+    var a_info = st.tensor_info(a_name)
+    var b_info = st.tensor_info(b_name)
+    if (
+        len(a_info.shape) != 2 or a_info.shape[0] != rank
+        or a_info.shape[1] != in_f
+    ):
+        raise Error(
+            String("H3 warm resume A shape mismatch for ") + a_name
+            + String(": expected [") + String(rank) + String(",")
+            + String(in_f) + String("]")
+        )
+    if (
+        len(b_info.shape) != 2 or b_info.shape[0] != out_f
+        or b_info.shape[1] != rank
+    ):
+        raise Error(
+            String("H3 warm resume B shape mismatch for ") + b_name
+            + String(": expected [") + String(out_f) + String(",")
+            + String(rank) + String("]")
+        )
+    if (
+        (a_info.dtype != STDtype.F32 and a_info.dtype != STDtype.BF16
+         and a_info.dtype != STDtype.F16)
+        or (b_info.dtype != STDtype.F32 and b_info.dtype != STDtype.BF16
+            and b_info.dtype != STDtype.F16)
+    ):
+        raise Error(
+            String("H3 warm resume requires F32/BF16/F16 PEFT tensors for ")
+            + prefix
+        )
+    var a_loaded = _load_st(st, a_name, ctx)
+    var b_loaded = _load_st(st, b_name, ctx)
+    var a_m = cast_tensor(a_loaded, STDtype.F32, ctx)
+    var b_m = cast_tensor(b_loaded, STDtype.F32, ctx)
+    var loaded = _AdapterState(TArc(a_m^), TArc(b_m^))
+    return _WarmAdapterLoad(loaded^, True)
 
 
 def _load_st_u8(
@@ -660,6 +731,7 @@ def main() raises:
         raise Error("MiniMax-H3 config resident_blocks exceeds 50")
     var baseline_only = _arg_int(String("baseline_only"), 0) != 0
     var cadence_segment = _arg_int(String("cadence_segment"), 0) != 0
+    var warm_init_only = _arg_int(String("warm_init_only"), 0) != 0
     if cache_dir == String(""):
         raise Error("MiniMax-H3 config dataset_cache_dir is required")
     if out_dir == String(""):
@@ -692,6 +764,16 @@ def main() raises:
             "H3 canonical PEFT export requires lora_alpha == lora_rank because the "
             "external artifact does not carry per-module alpha"
         )
+    if train_cfg.resume_state != String("") and not train_cfg.warm_resume:
+        raise Error(
+            "H3 config resume_state currently accepts canonical PEFT warm resume "
+            "only; set warm_resume=true. Exact continuation from this run's "
+            "own state sidecar remains automatic."
+        )
+    if train_cfg.warm_resume and train_cfg.resume_state == String(""):
+        raise Error("H3 config warm_resume=true requires resume_state")
+    if warm_init_only and train_cfg.resume_state == String(""):
+        raise Error("--warm_init_only requires config resume_state")
     var scale = alpha / Float32(rank)
     # Keep config parsing and fail-fast validation before CUDA ownership.
     var ctx = DeviceContext()
@@ -834,7 +916,7 @@ def main() raises:
     print("[h3-train] direct-int8 base resident in",
           Float64(perf_counter_ns() - tq0) / 1.0e9, "s")
 
-    # LoRA state: init or resume
+    # LoRA state: exact own-state resume, partial PEFT warm-resume, or fresh.
     var rng = _Rng(UInt64(seed))
     var states = List[_AdapterState]()
     var start_step = 0
@@ -846,6 +928,8 @@ def main() raises:
         have_state = True
     except:
         have_state = False
+    var warm_imported = 0
+    var warm_initialized = 0
     if have_state and not baseline_only:
         var st = SafeTensors.open(state_path)
         var names = _param_state_names(target_preset)
@@ -895,6 +979,53 @@ def main() raises:
             raise Error("H3 trainer recipe changed on resume")
         rng.state = _decode_rng_state(meta, 1)
         print("[h3-train] RESUMED from step", start_step)
+    elif train_cfg.resume_state != String("") and not baseline_only:
+        var warm_st = SafeTensors.open(train_cfg.resume_state)
+        for b in range(N_BLOCKS):
+            for s in range(SLOT_NAMES_LEN):
+                var dims = _slot_out_in(s)
+                if _slot_active(s, target_preset):
+                    var loaded = _warm_load_or_init_adapter(
+                        warm_st, h3_lora_peft_prefix(b, s), rank,
+                        dims[0], dims[1], rng, ctx,
+                    )
+                    if loaded.imported:
+                        warm_imported += 1
+                    else:
+                        warm_initialized += 1
+                    states.append(loaded^.into_state())
+                else:
+                    states.append(_zero_adapter_state(ctx))
+        for b in range(N_REFINER_BLOCKS):
+            for s in range(SLOT_NAMES_LEN):
+                var dims = _slot_out_in(s)
+                if _refiner_slot_active(s, target_preset):
+                    var loaded = _warm_load_or_init_adapter(
+                        warm_st, h3_lora_token_refiner_peft_prefix(b, s),
+                        rank, dims[0], dims[1], rng, ctx,
+                    )
+                    if loaded.imported:
+                        warm_imported += 1
+                    else:
+                        warm_initialized += 1
+                    states.append(loaded^.into_state())
+                else:
+                    states.append(_zero_adapter_state(ctx))
+        if warm_imported == 0:
+            raise Error(
+                "H3 warm resume imported zero canonical PEFT adapters; refusing"
+            )
+        start_step = train_cfg.start_step if train_cfg.start_step >= 0 else 0
+        print("")
+        print("  ============================================================")
+        print("  [h3-resume] WARM PARTIAL INIT — optimizer moments ZEROED")
+        print("  source:", train_cfg.resume_state)
+        print("  imported trained adapters:", warm_imported)
+        print("  initialized missing adapters:", warm_initialized)
+        print("  New topology cannot reuse the old optimizer-state layout.")
+        print("  This is a new optimizer trajectory starting at step", start_step)
+        print("  ============================================================")
+        print("")
     else:
         for _ in range(N_BLOCKS):
             for s in range(SLOT_NAMES_LEN):
@@ -916,6 +1047,12 @@ def main() raises:
                     states.append(_zero_adapter_state(ctx))
         print("[h3-train] fresh LoRA init (kaiming-uniform down, zero up)")
 
+    if start_step >= max_steps:
+        raise Error(
+            String("H3 trainer start_step ") + String(start_step)
+            + String(" >= max_steps ") + String(max_steps)
+        )
+
     var optimizer_params = _optimizer_params(states, target_preset)
     var optimizer_maybe = Optional[Adam8bitDeviceState](None)
     if have_state and not baseline_only:
@@ -936,6 +1073,20 @@ def main() raises:
             adamw8bit_device_state(optimizer_params, ctx)
         )
     var optimizer = optimizer_maybe.value().copy()
+
+    if warm_init_only:
+        _save_all(
+            states, optimizer, rank, start_step, rng.state,
+            timestep_buckets, lr_warmup_steps, guidance_scale,
+            spatial_density_jitter, base_preservation_weight,
+            base_preservation_probability,
+            max_grad_norm, lr, target_preset, out_dir, name, ctx,
+        )
+        print(
+            "[h3-train] WARM INIT ONLY complete at step", start_step,
+            "imported", warm_imported, "initialized", warm_initialized,
+        )
+        return
 
     # Data order is independently seeded per epoch so a mid-epoch resume
     # reconstructs the identical permutation without replaying prior steps.

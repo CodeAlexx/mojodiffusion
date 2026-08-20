@@ -440,6 +440,8 @@ fn readiness_doc() -> Value {
         .any(|profile| minimax_h3_profile_mode_ready(profile, "bf16"));
     let minimax_h3_ready =
         minimax_h3_int8_fast_ready || minimax_h3_int8_ready || minimax_h3_bf16_ready;
+    let minimax_h3_ck_attention_ready = minimax_h3_ready
+        && nonempty_file(&repo_path("output/lib/libserenity_ck_attention.so"));
     let minimax_h3_conditioned_modes = vec![
         minimax_h3_conditioned_task_document("i2va", "First frame to video"),
         minimax_h3_conditioned_task_document("l2va", "Last frame to video"),
@@ -660,6 +662,20 @@ fn readiness_doc() -> Value {
                 }
             ],
             "attention_backends": [
+                {
+                    "id": "ck-int8",
+                    "label": "CK INT8 · fastest H3",
+                    "available": minimax_h3_ck_attention_ready,
+                    "quant_modes": ["int8-fast", "int8"],
+                    "accepted_quality_default": false,
+                    "accepted_fast_default": true,
+                    "kernel_cosine": 0.9998600836968164_f64,
+                    "kernel_ms_s19029_h56": 69.63113825_f64,
+                    "full20_denoise_seconds": 262.314619493_f64,
+                    "second_prompt_full20_denoise_seconds": 274.286097767_f64,
+                    "decoded_visual_prompt_gate_count": 2,
+                    "decoded_visual_inspection_passed": true,
+                },
                 {
                     "id": "cudnn",
                     "label": "cU-DNN · quality default",

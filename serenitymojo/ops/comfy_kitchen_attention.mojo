@@ -30,10 +30,20 @@ def _ck_ptr(t: Tensor) -> BytePtr:
 
 
 def comfy_kitchen_attention_available() -> Bool:
-    """True when the configured Comfy Kitchen CUDA launcher DSO is usable."""
+    """True only for a CK DSO tagged for the active CUDA device SM."""
     return Int(
         external_call["serenity_comfy_kitchen_available", Int32]()
     ) == 1
+
+
+def comfy_kitchen_attention_current_sm() -> Int:
+    """Return the active CUDA device compute capability as major*10+minor."""
+    return Int(external_call["serenity_comfy_kitchen_current_sm", Int32]())
+
+
+def comfy_kitchen_attention_target_sm() -> Int:
+    """Return the admitted CK DSO target, or zero when no DSO was admitted."""
+    return Int(external_call["serenity_comfy_kitchen_target_sm", Int32]())
 
 
 struct ComfyKitchenAttentionScratch(Copyable, Movable):
@@ -138,8 +148,8 @@ def comfy_kitchen_attention_fwd_scratch(
         raise Error("comfy_kitchen_attention exceeds scratch geometry")
     if not comfy_kitchen_attention_available():
         raise Error(
-            "Comfy Kitchen CUDA backend unavailable; set "
-            "SERENITY_COMFY_KITCHEN_CUDA to its _C.abi3.so"
+            "Comfy Kitchen CUDA backend unavailable for this GPU; build its "
+            "exact SM with scripts/build_h3_ck_attention.sh or use cU-DNN"
         )
 
     var stream = CUDA(ctx.stream())

@@ -113,7 +113,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `ops/softmax.mojo` | `softmax_lastdim` (stable, one block/row). | ✅ |
 | `ops/elementwise.mojo` | `modulate` ((1+s)x+sh), `residual_gate` (x+g·y) — DiT AdaLN. | ✅ |
 | `ops/attention.mojo` | `sdpa[B,S,H,Dh]` — flash (Dh==64) + math-mode fallback (any Dh); `sdpa_tiled`/`sdpa_nomask_tiled` — online-softmax (never materializes [S,S]) for LARGE S at Dh∈{64,128} (cosmos full-res, no OOM; cos=1.0 vs math-mode). | ✅ |
-| `ops/comfy_kitchen_attention.mojo` + `ops/cshim/comfy_kitchen_attention.cpp` | H3 BF16-QKV to Comfy Kitchen INT8-QK/INT8-PV Sage launcher bridge with run-lifetime scratch, current MAX CUDA-stream handoff, and zero steady-state device allocations. `scripts/build_h3_ck_attention.sh` produces the 6.7-MiB SM86-only launcher DSO from pinned v0.2.31 source; no Python runtime dependency. | ✅ H3 S=19,029/21,291 cosine 0.999860, repeat-bit mismatches 0, 70.01/88.69 ms |
+| `ops/comfy_kitchen_attention.mojo` + `ops/cshim/comfy_kitchen_attention.cpp` | H3 BF16-QKV to Comfy Kitchen INT8-QK/INT8-PV Sage launcher bridge with run-lifetime scratch, current MAX CUDA-stream handoff, and zero steady-state device allocations. `scripts/build_h3_ck_attention.sh` produces an exact-SM architecture-tagged launcher DSO from pinned v0.2.31 source; no Python runtime dependency. | ✅ SM86 H3 S=19,029/21,291 cosine 0.999860, repeat-bit mismatches 0, 68.36/87.91 ms in the paired cU-DNN gate |
 | `ops/conv.mojo` | `conv2d[...]` (NHWC/RSCF, SDK naive kernel + bias add). | ✅ |
 | `ops/embeddings.mojo` | `timestep_embedding`, `t_embedder`, `build_rope_tables`. | ✅ |
 | `ops/tensor_algebra.mojo` | `add/sub/mul/div` (+scalar), `reshape`, `permute`, `transpose`, `concat`, `slice`, `gather_rows`. | ✅ |
@@ -3401,13 +3401,14 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   but explicitly **experimental/approximate**; BF16 and exact-quality INT8 use
   cU-DNN. The bare CLI defaults to cU-DNN, while Canvas defaults to CK with
   INT8 Fast; Sage stays switchable with its experimental label.
-- **2026-08-20 CK INT8 fast default:** `ops/comfy_kitchen_attention.mojo`
+- **2026-08-20 CK INT8 exact-SM GPU-tuned path:** `ops/comfy_kitchen_attention.mojo`
   owns a reusable H3 scratch allocation and calls the three raw CUDA launchers
   through `ops/cshim/comfy_kitchen_attention.cpp` on the active MAX stream.
   `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31 commit
   `7c6ca3a5b63857d42c2d49777d6afb69de23f13f` (Apache-2.0) and builds only
-  Q/K quantization, V quantization, and Sage attention for SM86. The resulting
-  6.7-MiB `libserenity_ck_attention.so` has no Python dependency and avoids the
+  Q/K quantization, V quantization, and Sage attention for one explicit CUDA
+  architecture. The current measured artifact is the 6.7-MiB
+  `output/lib/ck/sm86/libserenity_ck_attention.so`; it has no Python dependency and avoids the
   full extension's roughly 15-second first-process operator-registration cost.
   The CUDA-12.4 compatibility header supplies the same 128-bit BF16 load used
   upstream behind a newer-toolkit guard; the Mojo output is bit-identical to
@@ -3415,18 +3416,26 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
 
   `ops/tests/comfy_kitchen_attention_gate.mojo` uses alternating measurement
   order, three warmups, eight iterations per order, exact cU-DNN comparison,
-  and a repeated-call bit check. On the RTX 3090 Ti, S=19,029/H=56/D=128
-  measured cosine 0.999860084, max-abs 0.00341797, 0 repeated mismatches, and
-  70.013 ms versus 121.392 ms for the former Mojo PV8 path (1.734x). At
-  S=21,291 it measured cosine 0.999859975, max-abs 0.00244141, 0 mismatches,
-  and 88.692 ms versus 149.832 ms (1.689x). Scratch is allocated once per run:
+  and a repeated-call bit check. On the RTX 3090 Ti, the latest focused gate at
+  S=19,029/H=56/D=128 measured cosine 0.999860084, max-abs 0.00341797, 0
+  repeated mismatches, and 67.190 ms versus 117.623 ms for the former Mojo PV8
+  path (1.751x); the separately paired CK/cU-DNN means were 68.365/149.884 ms
+  (2.192x). At S=21,291 it measured cosine 0.999859975, max-abs 0.00244141,
+  0 mismatches, and 87.556 ms versus 147.610 ms PV8 (1.686x), with paired
+  CK/cU-DNN means of 87.910/190.887 ms (2.171x). Scratch is allocated once per run:
   651.9 MiB and 729.6 MiB at those respective shapes.
 
   `--attention-backend=ck-int8` is wired through T2VA, I2VA/L2VA/FL2VA,
-  Ref2VA, the Rust request boundary, Generate, Canvas, and H3 Studio. It keeps
-  the fixed text/audio prefix exact, admits only `int8-fast`/`int8`, and fails
-  loud on BF16. The bare/API omission remains cU-DNN exact-quality; CK is the
-  explicit accepted fast default in the INT8 UI. At 1024x576, 107 internal/97
+  Ref2VA, the Rust request boundary, Generate, Canvas, and H3 Studio. CK
+  consumes BF16 Q/K/V independently of DiT weight storage, so it is admitted
+  for `int8-fast`, `int8`, and `bf16` when the active GPU's exact DSO exists;
+  Sage remains rejected for BF16. The bare/API omission remains cU-DNN
+  exact-quality. The Rust server maps the active visible NVIDIA compute capability
+  to `output/lib/ck/smXX/libserenity_ck_attention.so`, validates it before the
+  GPU lease/worker eviction, and publishes the selected GPU/SM/path/reason in
+  readiness. Generate, Canvas, and H3 Studio share one manifest-authoritative
+  helper; unavailable CK is disabled and resolved to portable cU-DNN. Only
+  SM86 carries measured/accepted-fast metadata. At 1024x576, 107 internal/97
   output frames, 20 requested steps (19 full evaluations), 50 blocks, exact
   step cache, and 8 resident W8A8 blocks, the cat render denoised in
   262.3146 seconds versus 315.9725 seconds for the previous PV8 arm (16.98%
@@ -3435,6 +3444,39 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   inspection: stable identity, coherent motion/geometry, and no collapse.
   These are decoded-quality gates for an approximate fast path, not a claim of
   exact final-trajectory parity.
+
+  A matched native 864x480 run used 260 internal frames, delivered 243 frames
+  at 24 FPS, and completed 19 model evaluations in 496.893 seconds
+  (26.152 seconds/evaluation) with the native
+  `resident-int8-w8a8-8+streamed-w8a8-cache-tail` storage contract. The fresh
+  low-memory decode/mux produced a coherent 10.125-second H.264/AAC artifact
+  with zero nonfinite latent values. This native arm is **not performance
+  accepted**: it was 30.6% slower per evaluation than ordinary Comfy Kitchen's
+  20.02 s/step and 36.1% slower than the public CodeAlexx node's 19.21 s/step.
+  Those Comfy arms used a pruned ConvRot checkpoint and 20 sampler steps, so
+  this is a product-implementation comparison, not same-weight parity.
+
+  The final same-process ComfyUI reference comparator used three warmups and
+  twelve rotating CUDA-event rounds on identical BF16 tensors. CK, the actual
+  KJNodes MiniMax-H3 Sage patch, and forced cU-DNN measured median
+  71.805/93.671/150.058 ms at S=19,029 and 90.611/117.425/186.641 ms at
+  S=21,291. CK was 1.305x/1.296x faster than KJ Sage, with CK-to-cU-DNN
+  cosine 0.999861/0.999858 and no nonfinite values. Sage was numerically closer
+  to cU-DNN at about 0.99993. These are SM86 attention-only results, not a full
+  Sage checkpoint-to-video time.
+
+  The standalone ComfyUI implementation is public at
+  `CodeAlexx/Ck-INT8` commit `90939b6`. It uses Python control code plus an
+  exact-SM C++/CUDA bridge (no Mojo/Rust runtime), consumes ComfyUI's real
+  strided H3 tensor containers, and reuses quant workspace. On the same SM86
+  tensors it was bit-identical to Comfy Kitchen and measured 61.012/82.090 ms
+  versus Comfy Kitchen 81.304/99.607 ms and cuDNN 152.800/189.414 ms. A paired
+  864x480x243 checkpoint-to-MP4 run measured 19.21 versus 20.02 s/step and
+  produced decoded video/audio hashes exactly equal to ordinary Comfy Kitchen.
+  The new original CK-TileRoute Probe v0 reads existing q8/k8 scratch and
+  builds 50%-density protected/grouped routes in 1.555/2.176 ms, 2.40%/2.64%
+  of dense CK, with deterministic routes and bit-unchanged dense output. It is
+  routing feasibility only; no sparse attention executor or speedup exists yet.
 - **2026-08-12 decode-failure retention:** H3 job cleanup deleted
   `latents.safetensors` on EVERY failure, so a transient decode failure
   destroyed the whole denoise (video-0190 lost a 3,434-s 1344x768x243 render;
@@ -3467,7 +3509,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   `serenity.minimax_h3.result.v1 state=done`, and publishes status/result/MP4
   URLs. UI and Canvas workflow controls expose Fast-W8A8 vs Quality-groupwise
   vs streamed-BF16 and
-  cU-DNN-vs-CK-vs-Sage on the INT8 profiles; BF16 is cU-DNN-only. H3 owns a separate precision state so BF16 selected on a
+  cU-DNN-vs-CK on every profile and Sage on the INT8 profiles. H3 owns a separate precision state so BF16 selected on a
   different video model cannot leak into H3; first entry defaults to
   `int8-fast`, while an explicit H3 Quality/BF16 choice remains switchable.
   Canvas presents this as one H3 generator rather than six backend task modes:
@@ -3552,8 +3594,8 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   has variable length. All conditioned tasks share the native-timeline/delivery-FPS,
   precision, attention, and exact/high cache controls with T2VA; synchronized audio and fresh-process
   GPU decode remain mandatory. The UI exposes W8A8 `int8-fast`, groupwise `int8`, and
-  BF16-DiT + INT8-encoder runners. CK, Sage, and cU-DNN remain independently
-  switchable on INT8 Fast and INT8 Quality; BF16 is cU-DNN-only. Sage is
+  BF16-DiT + INT8-encoder runners. CK and cU-DNN remain independently
+  switchable on every profile; Sage is available only for INT8 Fast and INT8 Quality. Sage is
   labeled approximate and cU-DNN is labeled exact quality.
   Native continuation is owned by
   `models/minimax_h3/motion_context.mojo`: it packs `[text | fixed video |
@@ -3574,7 +3616,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   coordinates remain unchanged, while fixed A/V rows occupy the new target
   head. Canvas keeps the previous reference list (or accepts a new one) on
   Continue, with BF16/groupwise INT8/W8A8 and exact/high cache still
-  independent; cU-DNN/CK/Sage is switchable on INT8 while BF16 stays on cU-DNN.
+  independent; cU-DNN/CK is switchable on every profile while Sage stays INT8-only.
   These reference-conditioned continuation legs remain in
   the trained 1-15 second window and are chained for longer delivery. A real
   512x320 W8A8/cU-DNN exact full-20 run packed S=7,156, completed 19 denoise

@@ -49,6 +49,12 @@ var H3ProjectContracts = (function () {
         return Math.max(0, Number(seconds) || 0).toFixed(2);
     }
 
+    function normalizeAttentionBackend(quant, backend) {
+        if (backend === 'ck-int8') return 'ck-int8';
+        if (quant !== 'bf16' && backend === 'sage-int8') return 'sage-int8';
+        return 'cudnn';
+    }
+
     function createReference(kind, path) {
         return {
             kind: kind || 'image', path: path || '', audio_use: 'reference',
@@ -131,9 +137,8 @@ var H3ProjectContracts = (function () {
         out.steps = Number(out.steps) || 20;
         out.seed = Number.isFinite(Number(out.seed)) ? Number(out.seed) : 42;
         out.quant = ['int8-fast', 'int8', 'bf16'].indexOf(out.quant) >= 0 ? out.quant : 'int8-fast';
-        out.attention_backend = out.quant !== 'bf16'
-            && ['ck-int8', 'sage-int8'].indexOf(out.attention_backend) >= 0
-            ? out.attention_backend : 'cudnn';
+        out.attention_backend = normalizeAttentionBackend(
+            out.quant, out.attention_backend);
         out.step_cache = out.step_cache === 'high' ? 'high' : 'exact';
         out.motion_context_frames = [5, 22, 39].indexOf(Number(out.motion_context_frames)) >= 0 ? Number(out.motion_context_frames) : 22;
         out.references = Array.isArray(out.references) ? out.references.map(normalizeReference) : [];
@@ -358,9 +363,8 @@ var H3ProjectContracts = (function () {
             duration_seconds: Number(shot.duration_seconds), fps: NATIVE_FPS, frames: internalFrames(shot),
             output_frames: outputFrames(shot), steps: Number(shot.steps) || 20, seed: Number(shot.seed),
             include_audio: true, quant: shot.quant || 'int8-fast',
-            attention_backend: shot.quant !== 'bf16'
-                && ['ck-int8', 'sage-int8'].indexOf(shot.attention_backend) >= 0
-                ? shot.attention_backend : 'cudnn',
+            attention_backend: normalizeAttentionBackend(
+                shot.quant, shot.attention_backend),
             step_cache: shot.step_cache === 'high' ? 'high' : 'exact'
         };
         if (shot.first_frame) request.source_image = shot.first_frame;

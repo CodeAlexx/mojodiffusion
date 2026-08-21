@@ -64,7 +64,11 @@ pub(super) fn minimax_h3_warm_kill() {
     }
 }
 
-fn minimax_h3_warm_submit(runner: &str, args: &[String]) -> std::io::Result<()> {
+fn minimax_h3_warm_submit(
+    runner: &str,
+    args: &[String],
+    attention_dso: Option<&std::path::Path>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let mut guard = H3_WARM_WORKER.lock().unwrap();
     if let Some(child) = guard.as_mut() {
@@ -96,6 +100,9 @@ fn minimax_h3_warm_submit(runner: &str, args: &[String]) -> std::io::Result<()> 
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::from(serve_log))
             .stderr(std::process::Stdio::from(serve_err));
+        if let Some(path) = attention_dso {
+            cmd.env("SERENITY_COMFY_KITCHEN_CUDA", path);
+        }
         tracing::info!("spawning warm MiniMax-H3 denoise worker");
         *guard = Some(cmd.spawn()?);
     }
@@ -1517,13 +1524,12 @@ pub(super) fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
         .unwrap_or("cudnn");
     if !matches!(attention, "cudnn" | "sage-int8" | "ck-int8") {
         return Err(
-            "MiniMax-H3 attention_backend must be 'cudnn', 'sage-int8', or 'ck-int8'"
-                .to_string(),
+            "MiniMax-H3 attention_backend must be 'cudnn', 'sage-int8', or 'ck-int8'".to_string(),
         );
     }
-    if quant == "bf16" && attention != "cudnn" {
+    if quant == "bf16" && attention == "sage-int8" {
         return Err(
-            "MiniMax-H3 INT8 attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN"
+            "MiniMax-H3 Sage attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN or CK INT8 attention"
                 .to_string(),
         );
     }
@@ -1596,13 +1602,12 @@ pub(super) fn validate_minimax_h3_conditioned_request(
         .unwrap_or("cudnn");
     if !matches!(attention, "cudnn" | "sage-int8" | "ck-int8") {
         return Err(
-            "MiniMax-H3 attention_backend must be 'cudnn', 'sage-int8', or 'ck-int8'"
-                .to_string(),
+            "MiniMax-H3 attention_backend must be 'cudnn', 'sage-int8', or 'ck-int8'".to_string(),
         );
     }
-    if quant == "bf16" && attention != "cudnn" {
+    if quant == "bf16" && attention == "sage-int8" {
         return Err(
-            "MiniMax-H3 INT8 attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN"
+            "MiniMax-H3 Sage attention is available only with INT8 Fast or INT8 Quality; BF16 uses cU-DNN or CK INT8 attention"
                 .to_string(),
         );
     }
@@ -1677,6 +1682,13 @@ pub(super) fn start_minimax_h3_request(
         .and_then(Value::as_str)
         .unwrap_or("cudnn")
         .to_string();
+    let attention_dso = if attention == "ck-int8" {
+        body.get("attention_backend_dso")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
     let step_cache = body
         .get("step_cache")
         .and_then(Value::as_str)
@@ -1750,6 +1762,7 @@ pub(super) fn start_minimax_h3_request(
     let thread_out_dir = out_dir.clone();
     let thread_quant = quant.clone();
     let thread_attention = attention.clone();
+    let thread_attention_dso = attention_dso.clone();
     let thread_step_cache = step_cache.clone();
     let thread_runner = runner.clone();
     let thread_profile_id = profile_id.clone();
@@ -1881,7 +1894,11 @@ pub(super) fn start_minimax_h3_request(
         if warm {
             drop(log);
             drop(stderr);
-            if let Err(error) = minimax_h3_warm_submit(&thread_runner, &runner_args) {
+            if let Err(error) = minimax_h3_warm_submit(
+                &thread_runner,
+                &runner_args,
+                thread_attention_dso.as_deref(),
+            ) {
                 fail(
                     "runner_start",
                     format!("cannot submit to warm MiniMax-H3 worker: {error}"),
@@ -1900,6 +1917,9 @@ pub(super) fn start_minimax_h3_request(
                 .args(&runner_args)
                 .stdout(std::process::Stdio::from(log))
                 .stderr(std::process::Stdio::from(stderr));
+            if let Some(path) = thread_attention_dso.as_ref() {
+                command.env("SERENITY_COMFY_KITCHEN_CUDA", path);
+            }
             child_opt = Some(match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
@@ -2250,6 +2270,13 @@ pub(super) fn start_minimax_h3_conditioned_request(
         .and_then(Value::as_str)
         .unwrap_or("cudnn")
         .to_string();
+    let attention_dso = if attention == "ck-int8" {
+        body.get("attention_backend_dso")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
     let step_cache = body
         .get("step_cache")
         .and_then(Value::as_str)
@@ -2460,6 +2487,7 @@ pub(super) fn start_minimax_h3_conditioned_request(
     let thread_task = task.clone();
     let thread_quant = quant.clone();
     let thread_attention = attention.clone();
+    let thread_attention_dso = attention_dso.clone();
     let thread_step_cache = step_cache.clone();
     let thread_runner = runner.clone();
     let thread_media = effective_media;
@@ -2565,6 +2593,9 @@ pub(super) fn start_minimax_h3_conditioned_request(
             .env("CUDA_MODULE_LOADING", "EAGER")
             .env("LD_BIND_NOW", "1")
             .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1");
+        if let Some(path) = thread_attention_dso.as_ref() {
+            command.env("SERENITY_COMFY_KITCHEN_CUDA", path);
+        }
         if thread_task == "ref2va" || thread_combined_continuation {
             let prompt_path = thread_out_dir.join("ref_prompt.txt");
             let conditioned_prompt =

@@ -292,6 +292,174 @@ fn nonempty_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+const MINIMAX_H3_CK_DSO_NAME: &str = "libserenity_ck_attention.so";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NvidiaGpuIdentity {
+    index: String,
+    uuid: String,
+    compute_capability: String,
+    name: String,
+    sm: u32,
+}
+
+#[derive(Clone, Debug)]
+struct MiniMaxH3CkAttentionCapability {
+    gpu: Option<NvidiaGpuIdentity>,
+    dso_path: Option<std::path::PathBuf>,
+    available: bool,
+    status: &'static str,
+    reason: String,
+}
+
+fn nvidia_sm_from_compute_capability(value: &str) -> Option<u32> {
+    let (major, minor) = value.trim().split_once('.')?;
+    let major = major.parse::<u32>().ok()?;
+    let minor = minor.parse::<u32>().ok()?;
+    (minor < 10).then_some(major * 10 + minor)
+}
+
+fn nvidia_gpu_inventory_from_csv(csv: &str) -> Vec<NvidiaGpuIdentity> {
+    csv.lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, ',').map(str::trim);
+            let index = fields.next()?.to_string();
+            let uuid = fields.next()?.to_string();
+            let compute_capability = fields.next()?.to_string();
+            let name = fields.next()?.to_string();
+            let sm = nvidia_sm_from_compute_capability(&compute_capability)?;
+            (!index.is_empty() && !uuid.is_empty() && !name.is_empty()).then_some(
+                NvidiaGpuIdentity {
+                    index,
+                    uuid,
+                    compute_capability,
+                    name,
+                    sm,
+                },
+            )
+        })
+        .collect()
+}
+
+fn select_nvidia_gpu<'a>(
+    inventory: &'a [NvidiaGpuIdentity],
+    visible_devices: Option<&str>,
+) -> Option<&'a NvidiaGpuIdentity> {
+    let Some(raw) = visible_devices else {
+        return inventory.first();
+    };
+    let token = raw.split(',').next().unwrap_or("").trim();
+    if token.eq_ignore_ascii_case("all") {
+        return inventory.first();
+    }
+    if token.is_empty()
+        || token == "-1"
+        || token.eq_ignore_ascii_case("none")
+        || token.eq_ignore_ascii_case("void")
+    {
+        return None;
+    }
+    inventory.iter().find(|gpu| {
+        gpu.index == token
+            || gpu.uuid == token
+            || (token.starts_with("GPU-") && gpu.uuid.starts_with(token))
+    })
+}
+
+fn current_nvidia_gpu_identity() -> Option<NvidiaGpuIdentity> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,uuid,compute_cap,name",
+            "--format=csv,noheader",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let inventory = nvidia_gpu_inventory_from_csv(&String::from_utf8_lossy(&output.stdout));
+    let visible_devices = std::env::var("CUDA_VISIBLE_DEVICES")
+        .ok()
+        .or_else(|| std::env::var("NVIDIA_VISIBLE_DEVICES").ok());
+    select_nvidia_gpu(&inventory, visible_devices.as_deref()).cloned()
+}
+
+fn minimax_h3_ck_dso_path_for_sm(sm: u32) -> std::path::PathBuf {
+    repo_path(&format!("output/lib/ck/sm{sm}/{MINIMAX_H3_CK_DSO_NAME}"))
+}
+
+fn minimax_h3_ck_attention_capability() -> MiniMaxH3CkAttentionCapability {
+    let Some(gpu) = current_nvidia_gpu_identity() else {
+        return MiniMaxH3CkAttentionCapability {
+            gpu: None,
+            dso_path: None,
+            available: false,
+            status: "gpu_capability_unavailable",
+            reason: "cannot identify the active NVIDIA compute capability".to_string(),
+        };
+    };
+    let dso_path = minimax_h3_ck_dso_path_for_sm(gpu.sm);
+    if !nonempty_file(&dso_path) {
+        return MiniMaxH3CkAttentionCapability {
+            reason: format!(
+                "exact SM{} launcher DSO is missing: {}",
+                gpu.sm,
+                dso_path.display()
+            ),
+            gpu: Some(gpu),
+            dso_path: Some(dso_path),
+            available: false,
+            status: "exact_sm_dso_missing",
+        };
+    }
+    MiniMaxH3CkAttentionCapability {
+        reason: format!("exact SM{} launcher DSO is installed", gpu.sm),
+        gpu: Some(gpu),
+        dso_path: Some(dso_path),
+        available: true,
+        status: "exact_sm_dso_ready",
+    }
+}
+
+fn admit_minimax_h3_ck_attention(body: &mut Value) -> Result<(), String> {
+    let requested_ck = body.get("attention_backend").and_then(Value::as_str) == Some("ck-int8");
+    if let Some(object) = body.as_object_mut() {
+        // These are server-owned fields. Never let a client choose a library
+        // path or claim GPU metadata, even when another backend is selected.
+        object.remove("attention_backend_dso");
+        object.remove("attention_backend_sm");
+        object.remove("attention_backend_compute_capability");
+    }
+    if !requested_ck {
+        return Ok(());
+    }
+    let capability = minimax_h3_ck_attention_capability();
+    if !capability.available {
+        return Err(format!(
+            "MiniMax-H3 CK attention is unavailable on the active GPU: {}. Use cU-DNN as the portable fallback",
+            capability.reason
+        ));
+    }
+    let gpu = capability
+        .gpu
+        .expect("available CK capability must identify its GPU");
+    let dso_path = capability
+        .dso_path
+        .expect("available CK capability must identify its exact DSO");
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "attention_backend_dso".to_string(),
+            json!(dso_path.to_string_lossy()),
+        );
+        object.insert("attention_backend_sm".to_string(), json!(gpu.sm));
+        object.insert(
+            "attention_backend_compute_capability".to_string(),
+            json!(gpu.compute_capability),
+        );
+    }
+    Ok(())
+}
+
 fn sha256sum(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new("sha256sum")
         .arg(path)
@@ -440,8 +608,31 @@ fn readiness_doc() -> Value {
         .any(|profile| minimax_h3_profile_mode_ready(profile, "bf16"));
     let minimax_h3_ready =
         minimax_h3_int8_fast_ready || minimax_h3_int8_ready || minimax_h3_bf16_ready;
-    let minimax_h3_ck_attention_ready = minimax_h3_ready
-        && nonempty_file(&repo_path("output/lib/libserenity_ck_attention.so"));
+    let minimax_h3_ck_capability = minimax_h3_ck_attention_capability();
+    let minimax_h3_ck_attention_ready = minimax_h3_ready && minimax_h3_ck_capability.available;
+    let minimax_h3_ck_status = if !minimax_h3_ready {
+        "h3_runtime_unavailable"
+    } else {
+        minimax_h3_ck_capability.status
+    };
+    let minimax_h3_ck_reason = if !minimax_h3_ready {
+        "MiniMax-H3 runtime prerequisites are unavailable".to_string()
+    } else {
+        minimax_h3_ck_capability.reason.clone()
+    };
+    let minimax_h3_ck_dso = minimax_h3_ck_capability
+        .dso_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let minimax_h3_ck_sm = minimax_h3_ck_capability.gpu.as_ref().map(|gpu| gpu.sm);
+    let minimax_h3_ck_compute_capability = minimax_h3_ck_capability
+        .gpu
+        .as_ref()
+        .map(|gpu| gpu.compute_capability.clone());
+    let minimax_h3_ck_gpu_name = minimax_h3_ck_capability
+        .gpu
+        .as_ref()
+        .map(|gpu| gpu.name.clone());
     let minimax_h3_conditioned_modes = vec![
         minimax_h3_conditioned_task_document("i2va", "First frame to video"),
         minimax_h3_conditioned_task_document("l2va", "Last frame to video"),
@@ -664,17 +855,31 @@ fn readiness_doc() -> Value {
             "attention_backends": [
                 {
                     "id": "ck-int8",
-                    "label": "CK INT8 · fastest H3",
+                    "label": "CK INT8 · GPU-tuned",
                     "available": minimax_h3_ck_attention_ready,
-                    "quant_modes": ["int8-fast", "int8"],
+                    "quant_modes": ["int8-fast", "int8", "bf16"],
                     "accepted_quality_default": false,
-                    "accepted_fast_default": true,
-                    "kernel_cosine": 0.9998600836968164_f64,
-                    "kernel_ms_s19029_h56": 69.63113825_f64,
-                    "full20_denoise_seconds": 262.314619493_f64,
-                    "second_prompt_full20_denoise_seconds": 274.286097767_f64,
-                    "decoded_visual_prompt_gate_count": 2,
-                    "decoded_visual_inspection_passed": true,
+                    "accepted_fast_default": minimax_h3_ck_attention_ready && minimax_h3_ck_sm == Some(86),
+                    "status": minimax_h3_ck_status,
+                    "reason": minimax_h3_ck_reason,
+                    "current_gpu": minimax_h3_ck_gpu_name,
+                    "current_compute_capability": minimax_h3_ck_compute_capability,
+                    "current_sm": minimax_h3_ck_sm,
+                    "selected_dso": minimax_h3_ck_dso,
+                    "selection_policy": "exact_active_gpu_sm_only",
+                    "portable_fallback": "cudnn",
+                    "measurement_status": if minimax_h3_ck_sm == Some(86) { "measured_sm86" } else { "unmeasured_current_gpu" },
+                    "measured_reference": {
+                        "gpu": "NVIDIA GeForce RTX 3090 Ti",
+                        "compute_capability": "8.6",
+                        "sm": 86,
+                        "kernel_cosine": 0.9998600836968164_f64,
+                        "kernel_ms_s19029_h56": 69.63113825_f64,
+                        "full20_denoise_seconds": 262.314619493_f64,
+                        "second_prompt_full20_denoise_seconds": 274.286097767_f64,
+                        "decoded_visual_prompt_gate_count": 2,
+                        "decoded_visual_inspection_passed": true,
+                    },
                 },
                 {
                     "id": "cudnn",
@@ -991,13 +1196,13 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
             return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
         }
         let quant = b.get("quant").and_then(Value::as_str).unwrap_or("int8");
-        let task = minimax_h3_task(&b);
+        let task = minimax_h3_task(&b).to_string();
         let missing = if minimax_h3_continue_with_references(&b) {
             minimax_h3_conditioned_missing("ref2va", quant)
-        } else if matches!(task, "t2va" | "continue") {
+        } else if matches!(task.as_str(), "t2va" | "continue") {
             minimax_h3_missing(minimax_h3_default_profile(), quant)
         } else {
-            minimax_h3_conditioned_missing(task, quant)
+            minimax_h3_conditioned_missing(&task, quant)
         };
         if !missing.is_empty() {
             return err_detail(
@@ -1007,6 +1212,9 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
                     missing.join(", ")
                 ),
             );
+        }
+        if let Err(error) = admit_minimax_h3_ck_attention(&mut b) {
+            return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &error);
         }
         if task == "continue" {
             if let Err(error) = minimax_h3_continuation_source(&st.out_dir, &b) {

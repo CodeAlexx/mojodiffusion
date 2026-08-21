@@ -761,6 +761,14 @@ async function run() {
     }
     const h3Model = modelResults.find((result) => result.backend === "minimax_h3");
     if (h3Model) {
+      const expectedH3Attention = await page.evaluate(() => {
+        const runners = GenerateTab.state.videoStatus
+          && GenerateTab.state.videoStatus.candidate_runners || [];
+        const runner = runners.find((entry) => entry && entry.model === "minimax_h3_t2va");
+        const ck = runner && Array.isArray(runner.attention_backends)
+          ? runner.attention_backends.find((entry) => entry && entry.id === "ck-int8") : null;
+        return ck && ck.available === true ? "ck-int8" : "cudnn";
+      });
       await page.locator('.nav-btn[data-tab="generate"]').click();
       await page.evaluate((name) => {
         const search = document.querySelector("#gen-model-search");
@@ -804,6 +812,8 @@ async function run() {
           .map((option) => ({ id: option.value, disabled: option.disabled })),
         attention: document.querySelector("#gen-h3-attention").value,
         attentionDisabled: document.querySelector("#gen-h3-attention").disabled,
+        attentionOptions: Array.from(document.querySelector("#gen-h3-attention").options)
+          .map((option) => ({ id: option.value, disabled: option.disabled })),
       }));
       const setGenerateH3Geometry = (aspect, width, height, seconds, fps) => page.evaluate(
         ({ aspect, width, height, seconds, fps }) => {
@@ -845,7 +855,11 @@ async function run() {
           && generateH3Default.fpsMin === 1 && generateH3Default.fpsMax === 120
           && JSON.stringify(generateH3Default.quants.map((mode) => mode.id))
             === JSON.stringify(["int8-fast", "int8", "bf16"])
-          && generateH3Default.quants.every((mode) => !mode.disabled),
+          && generateH3Default.quants.every((mode) => !mode.disabled)
+          && generateH3Default.attention === expectedH3Attention
+          && (expectedH3Attention === "ck-int8"
+            || generateH3Default.attentionOptions.some((option) =>
+              option.id === "ck-int8" && option.disabled)),
         `H3 Generate controls are locked or incomplete: ${JSON.stringify(generateH3Default)}`,
       );
 
@@ -882,8 +896,8 @@ async function run() {
         }, quant);
         const controls = await readGenerateH3Controls();
         assert(controls.quant === quant
-          && controls.attention === (quant === "bf16" ? "cudnn" : "ck-int8")
-          && controls.attentionDisabled === (quant === "bf16")
+          && controls.attention === expectedH3Attention
+          && !controls.attentionDisabled
           && controls.width === 992 && controls.height === 576
           && controls.duration === 4 && controls.frames === 96,
         `Generate H3 ${quant} changed authored geometry: ${JSON.stringify(controls)}`);
@@ -910,7 +924,7 @@ async function run() {
         && generateH3Request.task === "t2va"
         && !Object.prototype.hasOwnProperty.call(generateH3Request, "source_image")
         && generateH3Request.quant === "bf16"
-        && generateH3Request.attention_backend === "cudnn"
+        && generateH3Request.attention_backend === expectedH3Attention
         && generateH3Request.width === 320 && generateH3Request.height === 192
         && generateH3Request.duration_seconds === 180
         && generateH3Request.frames === 4320 && generateH3Request.fps === 24
@@ -1006,6 +1020,8 @@ async function run() {
         attentionDisabled: document.querySelector("#cv-h3-attention").disabled,
         attentionOptions: Array.from(document.querySelector("#cv-h3-attention").options)
           .map((option) => option.value),
+        attentionOptionStates: Array.from(document.querySelector("#cv-h3-attention").options)
+          .map((option) => ({ id: option.value, disabled: option.disabled })),
         resolution: document.querySelector("#cv-h3-resolution").value,
         resolutions: Array.from(document.querySelector("#cv-h3-resolution").options)
           .map((option) => option.value),
@@ -1077,7 +1093,10 @@ async function run() {
           && h3Default.width === 1344 && h3Default.height === 768
           && h3Default.bboxWidth === 1344 && h3Default.bboxHeight === 768
           && h3Default.durationMin === 1 && h3Default.durationMax === 15
-          && h3Default.attention === "ck-int8" && !h3Default.attentionDisabled
+          && h3Default.attention === expectedH3Attention && !h3Default.attentionDisabled
+          && (expectedH3Attention === "ck-int8"
+            || h3Default.attentionOptionStates.some((option) =>
+              option.id === "ck-int8" && option.disabled))
           && JSON.stringify(h3Default.attentionOptions)
             === JSON.stringify(["ck-int8", "sage-int8", "cudnn"])
           && h3Default.stepCache === "exact"
@@ -1127,13 +1146,14 @@ async function run() {
         && h3Custom.duration === 3 && h3Custom.frames === 72,
       `H3 custom runtime geometry did not resolve: ${JSON.stringify(h3Custom)}`);
 
+      await page.locator("#cv-h3-attention").selectOption(expectedH3Attention);
       await page.locator("#cv-h3-quant").selectOption("bf16");
       await setH3Geometry("1344x768", 2, 24);
       const h3TwoSeconds = await readH3Controls();
       assert(
         h3TwoSeconds.quant === "bf16"
-          && h3TwoSeconds.attention === "cudnn"
-          && h3TwoSeconds.attentionDisabled
+          && h3TwoSeconds.attention === expectedH3Attention
+          && !h3TwoSeconds.attentionDisabled
           && h3TwoSeconds.width === 1344 && h3TwoSeconds.height === 768
           && h3TwoSeconds.duration === 2 && h3TwoSeconds.frames === 48
           && h3TwoSeconds.fps === 24,
@@ -1142,7 +1162,7 @@ async function run() {
 
       await page.locator("#cv-h3-quant").selectOption("int8");
       const h3Int8Attention = await readH3Controls();
-      assert(h3Int8Attention.attention === "cudnn"
+      assert(h3Int8Attention.attention === expectedH3Attention
           && !h3Int8Attention.attentionDisabled,
         `H3 Sage switch did not return for INT8 Quality: ${JSON.stringify(h3Int8Attention)}`);
       await page.locator("#cv-h3-attention").selectOption("sage-int8");
@@ -1253,6 +1273,12 @@ async function run() {
       assert(h3LongRef2va.durationMax === 15 && h3LongRef2va.duration === 15
         && h3LongRef2va.frames === 360,
       `H3 references did not infer Ref2VA and retain its trained duration cap: ${JSON.stringify(h3LongRef2va)}`);
+      await page.locator("#cv-h3-quant").selectOption("bf16");
+      await page.evaluate((expectedAttention) => {
+        const attention = document.querySelector("#cv-h3-attention");
+        attention.value = expectedAttention;
+        attention.dispatchEvent(new Event("change", { bubbles: true }));
+      }, expectedH3Attention);
       const h3AudioRoles = page.locator("#cv-h3-references-list select");
       await h3AudioRoles.nth(0).selectOption("reuse");
       await h3AudioRoles.nth(1).selectOption("voice_timbre");
@@ -1269,7 +1295,8 @@ async function run() {
         "H3 Ref2VA Canvas did not POST /v1/video");
       const h3RefRequest = videoRequests[videoRequests.length - 1];
       assert(h3RefRequest.task === "ref2va"
-        && h3RefRequest.attention_backend === "sage-int8"
+        && h3RefRequest.quant === "bf16"
+        && h3RefRequest.attention_backend === expectedH3Attention
         && Array.isArray(h3RefRequest.references)
         && h3RefRequest.references.length === 3
         && h3RefRequest.references[0].kind === "image"
@@ -1410,6 +1437,36 @@ async function run() {
         && h3NativeRequest.step_cache === "exact"
         && h3NativeRequest.include_audio === true,
       `H3 native continuation request drifted: ${JSON.stringify(h3NativeRequest)}`);
+      await page.locator('.nav-btn[data-tab="h3-studio"]').click();
+      await page.waitForFunction(() => !!document.querySelector(
+        '#panel-h3-studio select[data-shot-field="attention_backend"]',
+      ));
+      await page.waitForFunction((expectedAttention) => {
+        const control = document.querySelector(
+          '#panel-h3-studio select[data-shot-field="attention_backend"]',
+        );
+        return control && control.value === expectedAttention;
+      }, expectedH3Attention);
+      const h3StudioAttention = await page.evaluate(() => {
+        const control = document.querySelector(
+          '#panel-h3-studio select[data-shot-field="attention_backend"]',
+        );
+        return {
+          attention: control.value,
+          disabled: control.disabled,
+          options: Array.from(control.options).map((option) => ({
+            id: option.value,
+            disabled: option.disabled,
+            label: option.textContent,
+          })),
+        };
+      });
+      assert(h3StudioAttention.attention === expectedH3Attention
+        && !h3StudioAttention.disabled
+        && (expectedH3Attention === "ck-int8"
+          || h3StudioAttention.options.some((option) =>
+            option.id === "ck-int8" && option.disabled)),
+      `H3 Studio did not honor GPU attention admission: ${JSON.stringify(h3StudioAttention)}`);
       if (process.env.SERENITY_H3_ONLY === "1") {
         assert(pageErrors.length === 0, `page errors: ${pageErrors.join(" | ")}`);
         assert(requestFailures.length === 0,
@@ -1434,6 +1491,7 @@ async function run() {
           continuation_ready: h3ContinuationReady,
           native_continuation_ready: h3NativeContinuationReady,
           native_continuation_request: h3NativeRequest,
+          studio_attention: h3StudioAttention,
         }, null, 2));
         return;
       }

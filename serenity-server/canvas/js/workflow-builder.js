@@ -1027,8 +1027,9 @@ var WorkflowBuilder = (function () {
                         ? 'bf16'
                         : (p.quantization === 'int8' ? 'int8' : 'int8-fast'),
                     task: p.h3Task || 't2va',
-                    attention_backend: p.quantization !== 'bf16'
-                        && ['ck-int8', 'sage-int8'].indexOf(p.h3AttentionBackend) >= 0
+                    attention_backend: (p.h3AttentionBackend === 'ck-int8'
+                        || (p.quantization !== 'bf16' &&
+                            p.h3AttentionBackend === 'sage-int8'))
                         ? p.h3AttentionBackend : 'cudnn',
                     step_cache: p.h3StepCache === 'high' ? 'high' : 'exact'
                 }

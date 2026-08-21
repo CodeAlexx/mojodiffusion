@@ -1,18 +1,20 @@
 // Direct C ABI bridge to Comfy Kitchen's exported Sage INT8 CUDA launchers.
 //
-// The upstream wheel exposes the CUDA launchers as extern "C" symbols, but
-// packages them inside a Python extension.  Loading libpython globally only
-// satisfies that extension's unused binding symbols; no Python API is called
-// on the attention path.  Q/K/V, scratch, output, and the MAX CUDA stream are
-// all owned by the Mojo caller.
+// The upstream sources expose the CUDA launchers as extern "C" symbols. We
+// compile only those launchers into an architecture-tagged DSO; no Python API
+// runs on the attention path. Q/K/V, scratch, output, and the MAX CUDA stream
+// are all owned by the Mojo caller.
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cuda_runtime_api.h>
 #include <dlfcn.h>
 #include <exception>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -33,11 +35,15 @@ using Attend = void (*)(
     int, int, int, int, int, int, int, int, int, int, int, int, int,
     float, int, void *);
 
+using MetadataInt = int (*)();
+
 struct Api {
   void *handle = nullptr;
   QuantQK quant_qk = nullptr;
   QuantV quant_v = nullptr;
   Attend attend = nullptr;
+  int current_sm = 0;
+  int target_sm = 0;
   std::string error;
 };
 
@@ -45,48 +51,100 @@ Api api;
 std::once_flag api_once;
 thread_local std::string call_error;
 
-void init_api() {
-  const char *configured = std::getenv("SERENITY_COMFY_KITCHEN_CUDA");
-  // Prefer the attention-only sm_86 library. Besides being self-contained,
-  // it avoids registering 160+ MiB of unrelated extension fatbins at every
-  // fresh H3 worker startup.
-  const char *minimal_candidates[] = {
-      configured,
-      "output/lib/libserenity_ck_attention.so",
-      "libserenity_ck_attention.so",
-      nullptr};
-  for (const char **path = minimal_candidates;
-       *path || path == minimal_candidates; ++path) {
-    if (!*path || !**path) continue;
-    api.handle = dlopen(*path, RTLD_NOW | RTLD_LOCAL);
-    if (api.handle) break;
+bool truthy_env(const char *name) {
+  const char *value = std::getenv(name);
+  return value && (!std::strcmp(value, "1") || !std::strcmp(value, "true") ||
+                   !std::strcmp(value, "yes"));
+}
+
+bool load_candidate(const std::string &path, bool allow_untagged,
+                    std::string &why) {
+  void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (!handle) {
+    const char *dl_why = dlerror();
+    why = path + ": " + (dl_why ? dl_why : "unknown dlopen error");
+    return false;
   }
 
-  if (!api.handle) {
-    // The fallback wheel is a Python extension. CPython symbols are referenced
-    // by nanobind but never called through this raw-launcher bridge.
-    const char *python_sonames[] = {
-        "libpython3.12.so.1.0", "libpython3.12.so", nullptr};
-    for (const char **name = python_sonames; *name; ++name) {
-      if (dlopen(*name, RTLD_NOW | RTLD_GLOBAL)) break;
+  auto abi = reinterpret_cast<MetadataInt>(
+      dlsym(handle, "serenity_ck_attention_abi_version"));
+  auto target = reinterpret_cast<MetadataInt>(
+      dlsym(handle, "serenity_ck_attention_target_sm"));
+  if (!abi || !target) {
+    if (!allow_untagged) {
+      why = path + ": missing CK architecture metadata";
+      dlclose(handle);
+      return false;
+    }
+    api.target_sm = api.current_sm;
+  } else {
+    const int abi_version = abi();
+    api.target_sm = target();
+    if (abi_version != 1) {
+      why = path + ": unsupported CK attention ABI " +
+            std::to_string(abi_version);
+      dlclose(handle);
+      return false;
+    }
+    if (api.target_sm != api.current_sm) {
+      why = path + ": compiled for sm_" + std::to_string(api.target_sm) +
+            " but active CUDA device is sm_" +
+            std::to_string(api.current_sm);
+      dlclose(handle);
+      return false;
     }
   }
-  const char *extension_candidates[] = {
-      configured,
-      "_C.abi3.so",
-      nullptr};
-  if (!api.handle) {
-    for (const char **path = extension_candidates;
-         *path || path == extension_candidates; ++path) {
-      if (!*path || !**path) continue;
-      api.handle = dlopen(*path, RTLD_NOW | RTLD_LOCAL);
-      if (api.handle) break;
-    }
+  api.handle = handle;
+  return true;
+}
+
+void init_api() {
+  int device = 0;
+  int major = 0;
+  int minor = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status == cudaSuccess)
+    status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                    device);
+  if (status == cudaSuccess)
+    status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                                    device);
+  if (status != cudaSuccess) {
+    api.error = std::string("unable to identify active CUDA device: ") +
+                cudaGetErrorString(status);
+    return;
+  }
+  api.current_sm = major * 10 + minor;
+
+  const char *configured = std::getenv("SERENITY_COMFY_KITCHEN_CUDA");
+  const bool allow_untagged = truthy_env("SERENITY_CK_ALLOW_UNTAGGED");
+  std::vector<std::string> candidates;
+  if (configured && *configured) {
+    // An explicit path is authoritative. A mismatch must fail closed rather
+    // than silently falling through to a different implementation.
+    candidates.emplace_back(configured);
+  } else {
+    candidates.emplace_back("output/lib/ck/sm" +
+                            std::to_string(api.current_sm) +
+                            "/libserenity_ck_attention.so");
+    candidates.emplace_back("libserenity_ck_attention_sm" +
+                            std::to_string(api.current_sm) + ".so");
+  }
+
+  std::ostringstream errors;
+  for (const std::string &path : candidates) {
+    std::string why;
+    if (load_candidate(path, allow_untagged, why)) break;
+    if (errors.tellp() > 0) errors << "; ";
+    errors << why;
   }
   if (!api.handle) {
-    const char *why = dlerror();
-    api.error = std::string("unable to load Comfy Kitchen CUDA extension: ") +
-                (why ? why : "unknown dlopen error");
+    api.error = "no CK attention build admitted for active sm_" +
+                std::to_string(api.current_sm) + ": " + errors.str() +
+                ". Use cU-DNN or build this exact target with "
+                "SERENITY_CK_CUDA_ARCH=sm_" +
+                std::to_string(api.current_sm) +
+                " scripts/build_h3_ck_attention.sh";
     return;
   }
 
@@ -117,6 +175,16 @@ extern "C" const char *serenity_comfy_kitchen_last_error() {
 extern "C" int serenity_comfy_kitchen_available() {
   std::call_once(api_once, init_api);
   return api.quant_qk && api.quant_v && api.attend ? 1 : 0;
+}
+
+extern "C" int serenity_comfy_kitchen_current_sm() {
+  std::call_once(api_once, init_api);
+  return api.current_sm;
+}
+
+extern "C" int serenity_comfy_kitchen_target_sm() {
+  std::call_once(api_once, init_api);
+  return api.target_sm;
 }
 
 extern "C" int serenity_comfy_kitchen_sage_bf16(

@@ -85,9 +85,23 @@ var H3StudioTab = (function () {
             ? state.readiness.candidate_runners : [];
         return runners.find(function (entry) { return entry && entry.model === 'minimax_h3_t2va'; }) || null;
     }
+    function h3AttentionBackends() {
+        var runner = h3Runner();
+        return runner && runner.attention_backends;
+    }
+    function resolvedH3Attention(shot) {
+        return H3AttentionContracts.resolveBackend(
+            shot.quant,
+            shot.attention_backend,
+            h3AttentionBackends()
+        );
+    }
     function h3Ready() {
         var runner = h3Runner();
-        return !!runner && ['ready', 'quality_profile_ready', 'experimental_request_runner_ready'].indexOf(String(runner.status || '')) >= 0;
+        return !!runner && (runner.available === true || [
+            'ready', 'quality_profile_ready', 'experimental_request_runner_ready',
+            'runtime_geometry_ready', 'conditioned_runtime_geometry_ready'
+        ].indexOf(String(runner.status || '')) >= 0);
     }
 
     function headerHtml() {
@@ -223,6 +237,19 @@ var H3StudioTab = (function () {
     function shotInspectorHtml() {
         var shot = selectedShot();
         var lock = shot.locked;
+        var attentionBackends = h3AttentionBackends();
+        var effectiveAttention = resolvedH3Attention(shot);
+        var attentionOptions = H3AttentionContracts.definitions(attentionBackends)
+            .filter(function (backend) {
+                return backend && ['ck-int8', 'cudnn', 'sage-int8'].indexOf(backend.id) >= 0;
+            }).map(function (backend) {
+                var available = H3AttentionContracts.isAvailable(
+                    shot.quant, backend.id, attentionBackends);
+                return '<option value="' + attr(backend.id) + '"' +
+                    selected(effectiveAttention, backend.id) + disabled(!available) + '>' +
+                    escapeHtml(backend.label || backend.id) +
+                    (available ? '' : ' · unavailable') + '</option>';
+            }).join('');
         return '<label class="h3s-check"><input type="checkbox" data-shot-field="locked"' + checked(lock) + '><span>Lock approved shot. Protect prompt, references, sound, order and takes.</span></label>' +
             '<label class="h3s-field" style="margin-top:10px"><span>Shot name</span><input class="h3s-input" data-shot-field="title" value="' + attr(shot.title) + '"' + disabled(lock) + '></label>' +
             '<div class="h3s-grid-2"><label class="h3s-field"><span>Duration · 5–15s</span><input class="h3s-input" type="number" min="5" max="15" step="0.25" data-shot-field="duration_seconds" value="' + attr(shot.duration_seconds) + '"' + disabled(lock) + '></label>' +
@@ -235,7 +262,7 @@ var H3StudioTab = (function () {
             '<label class="h3s-field"><span>Continue from · video-XXXX</span><input class="h3s-input" data-shot-field="continue_from" value="' + attr(shot.continue_from) + '"' + disabled(lock) + '></label>' +
             '<label class="h3s-field"><span>Motion seam</span><select class="h3s-select" data-shot-field="motion_context_frames"' + disabled(lock) + '><option value="5"' + selected(shot.motion_context_frames, 5) + '>Short · 5 frames</option><option value="22"' + selected(shot.motion_context_frames, 22) + '>Balanced · 22 frames</option><option value="39"' + selected(shot.motion_context_frames, 39) + '>Long · 39 frames</option></select></label>' +
             '<div class="h3s-grid-2"><label class="h3s-field"><span>Precision</span><select class="h3s-select" data-shot-field="quant"' + disabled(lock) + '><option value="int8-fast"' + selected(shot.quant, 'int8-fast') + '>INT8 Fast</option><option value="int8"' + selected(shot.quant, 'int8') + '>INT8 Quality</option><option value="bf16"' + selected(shot.quant, 'bf16') + '>BF16</option></select></label>' +
-            '<label class="h3s-field"><span>Attention</span><select class="h3s-select" data-shot-field="attention_backend"' + disabled(lock || shot.quant === 'bf16') + '><option value="ck-int8"' + selected(shot.attention_backend, 'ck-int8') + '>CK INT8 · fastest</option><option value="cudnn"' + selected(shot.attention_backend, 'cudnn') + '>cU-DNN</option><option value="sage-int8"' + selected(shot.attention_backend, 'sage-int8') + '>Sage INT8 · experimental</option></select></label></div>' +
+            '<label class="h3s-field"><span>Attention</span><select class="h3s-select" data-shot-field="attention_backend"' + disabled(lock) + '>' + attentionOptions + '</select></label></div>' +
             '<label class="h3s-field"><span>Denoise acceleration</span><select class="h3s-select" data-shot-field="step_cache"' + disabled(lock) + '><option value="exact"' + selected(shot.step_cache, 'exact') + '>Exact · quality default</option><option value="high"' + selected(shot.step_cache, 'high') + '>High · approximate</option></select></label>';
     }
 
@@ -314,7 +341,8 @@ var H3StudioTab = (function () {
         if (['duration_seconds', 'steps', 'seed', 'motion_context_frames'].indexOf(field) >= 0) value = Number(value);
         shot[field] = value;
         if (field !== 'prompt_override' && field !== 'locked' && ['title', 'seed', 'steps', 'quant', 'attention_backend', 'step_cache', 'motion_context_frames'].indexOf(field) < 0) shot.prompt_override = '';
-        if (field === 'quant' && value === 'bf16') shot.attention_backend = 'cudnn';
+        if (field === 'quant' || field === 'attention_backend')
+            shot.attention_backend = resolvedH3Attention(shot);
         saveProject();
     }
 
@@ -493,6 +521,12 @@ var H3StudioTab = (function () {
     function renderShot() {
         var shot = selectedShot();
         try {
+            var resolvedAttention = resolvedH3Attention(shot);
+            if (shot.attention_backend !== resolvedAttention) {
+                shot.attention_backend = resolvedAttention;
+                saveProject('Attention fell back to cU-DNN for this GPU');
+                render();
+            }
             var request = C.renderRequest(shot);
             if (!window.confirm('Queue one ' + C.secondsText(shot.duration_seconds) + '-second H3 take at ' + shot.width + '×' + shot.height + '? This starts GPU work.')) return;
             setStatus('Submitting H3 take…', 'live');

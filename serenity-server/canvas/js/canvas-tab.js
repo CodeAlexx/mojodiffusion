@@ -1548,9 +1548,9 @@ var CanvasTab = (function () {
             '<details class="cv-h3-advanced"><summary class="cv-section-title">Advanced performance</summary>' +
             '<label class="cv-setting-label" for="cv-h3-attention">Attention</label>' +
             '<select id="cv-h3-attention" class="cv-select">' +
-            '<option value="ck-int8">CK INT8 · fastest</option>' +
+            '<option value="ck-int8">CK INT8 · GPU-tuned</option>' +
             '<option value="sage-int8">Sage INT8 · faster, approximate</option>' +
-            '<option value="cudnn">cuDNN · exact quality</option>' +
+            '<option value="cudnn">cuDNN · portable quality default</option>' +
             '</select>' +
             '<label class="cv-setting-label" for="cv-h3-step-cache">Denoise acceleration</label>' +
             '<select id="cv-h3-step-cache" class="cv-select">' +
@@ -4692,8 +4692,13 @@ var CanvasTab = (function () {
             });
         });
         els.h3Attention.addEventListener('change', function () {
-            genState.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(this.value) >= 0
-                ? this.value : 'cudnn';
+            var runner = activeCanvasH3Runner();
+            genState.h3AttentionBackend = H3AttentionContracts.resolveBackend(
+                genState.h3Quant,
+                this.value,
+                runner && runner.attention_backends
+            );
+            this.value = genState.h3AttentionBackend;
         });
         els.h3StepCache.addEventListener('change', function () {
             genState.h3StepCache = this.value === 'high' ? 'high' : 'exact';
@@ -6187,10 +6192,24 @@ var CanvasTab = (function () {
             genState.h3Quant = firstQuant ? firstQuant.value : 'int8-fast';
         }
         els.h3Quant.value = genState.h3Quant;
-        if (genState.h3Quant === 'bf16')
-            genState.h3AttentionBackend = 'cudnn';
+        var attentionBackends = runner && runner.attention_backends;
+        Array.from(els.h3Attention.options).forEach(function (option) {
+            var backend = H3AttentionContracts.definition(
+                attentionBackends, option.value);
+            if (backend && backend.label)
+                option.textContent = backend.label;
+            option.disabled = !H3AttentionContracts.isAvailable(
+                genState.h3Quant, option.value, attentionBackends);
+        });
+        genState.h3AttentionBackend = H3AttentionContracts.resolveBackend(
+            genState.h3Quant,
+            genState.h3AttentionBackend,
+            attentionBackends
+        );
         els.h3Attention.value = genState.h3AttentionBackend;
-        els.h3Attention.disabled = genState.h3Quant === 'bf16';
+        els.h3Attention.disabled = !Array.from(els.h3Attention.options).some(function (option) {
+            return !option.disabled;
+        });
         genState.h3StepCache = genState.h3StepCache === 'high' ? 'high' : 'exact';
         els.h3StepCache.value = genState.h3StepCache;
         var nativeContinuation = genState.h3Mode === 'continue';

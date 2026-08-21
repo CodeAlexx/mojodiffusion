@@ -920,7 +920,7 @@ edits: see sections C and D of the parity-ported doc.
   0.998955/0.992443. Keeping fixed A/V prefix attention exact measured 42.3831
   seconds and 0.999048/0.994064. It is experimental and approximate, while
   cU-DNN remains the exact-quality choice. Both backends are admitted for INT8
-  Quality and INT8 Fast; streamed BF16 is cU-DNN-only and rejects Sage at the
+  Quality and INT8 Fast; streamed BF16 accepts cU-DNN or CK and rejects Sage at the
   UI, server, and Mojo runner. Canvas defaults to CK with INT8 Fast; Sage keeps
   its experimental label and remains switchable, while bare runners default to
   cU-DNN without a flag.
@@ -936,22 +936,63 @@ edits: see sections C and D of the parity-ported doc.
   Q/K-quant, V-quant, and Sage launchers, with zero steady-state device
   allocations. `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31
   commit `7c6ca3a5b63857d42c2d49777d6afb69de23f13f` (Apache-2.0) and builds only
-  those launchers for SM86. The resulting 6.7-MiB native DSO has no Python
-  dependency; the full Python extension remains an optional fallback.
+  those launchers for one explicit CUDA architecture. The measured SM86 output
+  is `output/lib/ck/sm86/libserenity_ck_attention.so`; it carries ABI/target-SM
+  metadata and has no Python dependency. The bridge admits only a DSO matching
+  the active CUDA device; the legacy untagged root DSO is not a product
+  readiness candidate.
 
   The product gate compares exact cU-DNN, CK, and the former Mojo PV8 path at
-  two H3 shapes with alternating order. S=19,029/H=56/D=128: cosine
-  0.999860084, max-abs 0.00341797, zero repeat mismatches, 70.013 ms CK versus
-  121.392 ms PV8 (1.734x). S=21,291: cosine 0.999859975, max-abs 0.00244141,
-  zero mismatches, 88.692 ms versus 149.832 ms (1.689x). `ck-int8` is wired
-  through T2VA, every conditioned runner, server validation, and the H3 UI;
-  it is the accepted fast default for `int8-fast`/`int8`, while omitted/API
-  requests and BF16 retain exact cU-DNN. Two independent 1024x576, 20-step,
+  two H3 shapes with alternating order. The latest gate at
+  S=19,029/H=56/D=128: cosine 0.999860084, max-abs 0.00341797, zero repeat
+  mismatches, 67.190 ms CK versus 117.623 ms PV8 (1.751x); its separately
+  paired CK/cU-DNN means were 68.365/149.884 ms (2.192x). S=21,291: cosine
+  0.999859975, max-abs 0.00244141, zero mismatches, 87.556 ms versus 147.610
+  ms PV8 (1.686x), with paired CK/cU-DNN means of 87.910/190.887 ms
+  (2.171x). `ck-int8` is wired
+  through T2VA, every conditioned runner, server validation, and the H3 UI
+  through exact active-GPU admission. CK consumes BF16 Q/K/V for all three DiT
+  weight profiles; Sage remains unavailable for BF16. Only measured SM86 is accepted-fast;
+  every unavailable architecture falls back in the UI to portable cU-DNN,
+  while explicit invalid API requests fail before GPU lease acquisition.
+  Generate, Canvas, and H3 Studio consume the same readiness helper. Omitted/API
+  requests retain exact cU-DNN. Two independent 1024x576, 20-step,
   50-block, exact-cache decoded gates passed: cat denoise 262.3146 seconds
   (previous PV8 315.9725, 16.98% reduction) and rally-car denoise 274.2861
   seconds. Both completed 19/19 evaluations with finite latents and coherent
   decoded motion/identity; the path remains labeled approximate rather than
   exact final-trajectory parity.
+
+  The matched native 864x480 run used 260 internal/243 delivered frames and
+  completed 19 model evaluations in 496.893 seconds (26.152
+  seconds/evaluation) with the native
+  `resident-int8-w8a8-8+streamed-w8a8-cache-tail` storage contract. Its fresh
+  decode/mux produced a coherent 10.125-second H.264/AAC artifact with finite
+  video/audio latents. Performance is unaccepted: native was 30.6% slower per
+  evaluation than ordinary Comfy Kitchen's 20.02 s/step and 36.1% slower than
+  the public node's 19.21 s/step. Comfy used a pruned ConvRot checkpoint and 20
+  sampler steps, so this is not same-weight parity.
+
+  The final same-process ComfyUI reference comparator used three warmups and
+  twelve rotating CUDA-event rounds on identical BF16 tensors. At S=19,029,
+  CK/KJNodes-H3-Sage/cU-DNN medians were 71.805/93.671/150.058 ms; at
+  S=21,291 they were 90.611/117.425/186.641 ms. CK was therefore 1.305x and
+  1.296x faster than the actual local KJNodes H3 Sage patch. CK cosine versus
+  cU-DNN was 0.999861/0.999858 with no nonfinite values; Sage was numerically
+  closer at about 0.99993. This is an attention-only SM86 comparison, not a
+  full Sage checkpoint-to-video timing.
+
+  A standalone inference-only ComfyUI extension is published at
+  `CodeAlexx/Ck-INT8` commit `90939b6`. It uses a C++/CUDA bridge with no
+  Mojo/Rust runtime, accepts ComfyUI H3's actual strided tensor-container
+  inputs, and keeps quant workspace persistent. The focused SM86 gate was
+  bit-identical to ordinary Comfy Kitchen at both product shapes and measured
+  61.012/82.090 ms versus 81.304/99.607 ms, with cuDNN at 152.800/189.414 ms.
+  A paired 864x480x243 checkpoint-to-MP4 A/B measured 19.21 versus 20.02
+  s/step and produced exactly equal decoded video/audio hashes. CK-TileRoute
+  Probe v0 then built deterministic protected/grouped 50%-density routes in
+  1.555/2.176 ms (2.40%/2.64% of dense CK) with bit-unchanged dense output.
+  Probe v0 does not execute sparse attention.
 - `ops/evg_ragged_attention.mojo` and `ops/evg_attention_int8.mojo` are an
   experimental pure-Mojo port of `evg-project/evg` commit
   `faf55cce6095965378f3477a85fb6b6a4997e3d4` (Apache-2.0) for H3 inference.
@@ -1021,8 +1062,8 @@ edits: see sections C and D of the parity-ported doc.
   audio | target audio | target video]`, samples the new target, and trims the
   matching A/V overlap from delivery. Resolution and the native 24-FPS model
   timeline remain exact; BF16, groupwise INT8, W8A8 INT8 Fast, and exact/high
-  cache stay independently switchable. cU-DNN/CK/Sage is switchable on INT8;
-  BF16 stays on cU-DNN. For an authored cut
+  cache stay independently switchable. cU-DNN/CK is switchable on every
+  profile, while Sage is INT8-only. For an authored cut
   that falls between H3's `5+17n` endpoints, the tail ends at the nearest
   native endpoint instead of silently continuing from padded frames. Both
   positive and negative audio-grid rounding residuals are retained. Legacy
@@ -1064,8 +1105,8 @@ edits: see sections C and D of the parity-ported doc.
   Batch rail instead of covering the preview. Video staging exposes `Continue H3`: native results
   use their compact video/audio latent tail, while legacy results decode the
   final displayed frame to PNG and fall back to I2VA. Both paths carry valid
-  geometry/FPS/duration forward, with Sage switchable on INT8 and BF16 fixed to
-  cU-DNN. Starting Continue clears unrelated media left by a prior Canvas
+  geometry/FPS/duration forward, with CK/cU-DNN switchable on every profile and
+  Sage restricted to INT8. Starting Continue clears unrelated media left by a prior Canvas
   request, preventing stale Ref2VA inputs from silently leaking into the new
   segment.
   The runner now advertises `default_steps=20`. Generate and Canvas apply that

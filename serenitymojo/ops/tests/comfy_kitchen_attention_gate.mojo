@@ -18,7 +18,9 @@ from serenitymojo.ops.sage_attention_int8 import (
 from serenitymojo.ops.comfy_kitchen_attention import (
     ComfyKitchenAttentionScratch,
     comfy_kitchen_attention_available,
+    comfy_kitchen_attention_current_sm,
     comfy_kitchen_attention_fwd_scratch,
+    comfy_kitchen_attention_target_sm,
 )
 
 
@@ -130,12 +132,59 @@ def _run_geometry[S: Int](ctx: DeviceContext) raises -> Bool:
         "  resident PV8=", pv8_ms, " ms CK=", ck_ms,
         " ms CK_speedup=", pv8_ms / ck_ms, "x",
     )
+
+    # Compare the same BF16 Q/K/V boundary against exact cuDNN directly.
+    # Keep this as a separate alternating pair so PV8 timing and allocator
+    # state cannot bias the result.
+    for _ in range(3):
+        _ = sdpa_flash_infer_fwd[1, S, H, D](q, k, v, scale, ctx)
+        _ = comfy_kitchen_attention_fwd_scratch(
+            q, k, v, scale, ck_scratch, ctx
+        )
+    ctx.synchronize()
+
+    var e0 = perf_counter_ns()
+    for _ in range(ITERS):
+        _ = sdpa_flash_infer_fwd[1, S, H, D](q, k, v, scale, ctx)
+    ctx.synchronize()
+    var e1 = perf_counter_ns()
+    for _ in range(ITERS):
+        _ = comfy_kitchen_attention_fwd_scratch(
+            q, k, v, scale, ck_scratch, ctx
+        )
+    ctx.synchronize()
+    var e2 = perf_counter_ns()
+
+    for _ in range(ITERS):
+        _ = comfy_kitchen_attention_fwd_scratch(
+            q, k, v, scale, ck_scratch, ctx
+        )
+    ctx.synchronize()
+    var e3 = perf_counter_ns()
+    for _ in range(ITERS):
+        _ = sdpa_flash_infer_fwd[1, S, H, D](q, k, v, scale, ctx)
+    ctx.synchronize()
+    var e4 = perf_counter_ns()
+
+    var exact_ms = Float64((e1 - e0) + (e4 - e3)) \
+        / Float64(2 * ITERS) / 1.0e6
+    var ck_exact_pair_ms = Float64((e2 - e1) + (e3 - e2)) \
+        / Float64(2 * ITERS) / 1.0e6
+    print(
+        "  exact cuDNN=", exact_ms, " ms CK=", ck_exact_pair_ms,
+        " ms CK_vs_exact=", exact_ms / ck_exact_pair_ms, "x",
+    )
     return metric[0] >= 0.999 and mismatches == 0 and ck_ms < pv8_ms
 
 
 def main() raises:
     if not comfy_kitchen_attention_available():
         raise Error("Comfy Kitchen CUDA launcher DSO is unavailable")
+    var current_sm = comfy_kitchen_attention_current_sm()
+    var target_sm = comfy_kitchen_attention_target_sm()
+    print("CK_DEVICE current_sm=", current_sm, " target_sm=", target_sm)
+    if current_sm <= 0 or target_sm != current_sm:
+        raise Error("CK attention DSO target does not match active CUDA device")
     var ctx = DeviceContext()
     var ok = True
     ok = _run_geometry[19029](ctx) and ok

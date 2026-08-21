@@ -1092,11 +1092,10 @@ def main() raises:
             attention_backend == MINIMAX_H3_ATTN_SAGE_INT8
             or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8
             or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
-            or attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
         ):
             raise Error(
-                "MiniMax-H3 INT8 attention requires an INT8 conditioned runner;"
-                " BF16 uses cU-DNN"
+                "MiniMax-H3 Sage attention requires an INT8 conditioned runner;"
+                " BF16 uses cU-DNN or CK INT8 attention"
             )
     if len(args) < 5:
         _usage()

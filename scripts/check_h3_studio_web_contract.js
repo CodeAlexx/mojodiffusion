@@ -6,6 +6,7 @@ const path = require('path');
 const vm = require('vm');
 
 const root = path.resolve(__dirname, '..');
+const attentionPath = path.join(root, 'serenity-server/canvas/js/h3-attention.js');
 const projectPath = path.join(root, 'serenity-server/canvas/js/h3-project.js');
 const studioPath = path.join(root, 'serenity-server/canvas/js/h3-studio.js');
 const indexPath = path.join(root, 'serenity-server/canvas/index.html');
@@ -17,9 +18,28 @@ function must(condition, message) {
 
 const context = {};
 vm.createContext(context);
+vm.runInContext(fs.readFileSync(attentionPath, 'utf8'), context, { filename: attentionPath });
 vm.runInContext(fs.readFileSync(projectPath, 'utf8'), context, { filename: projectPath });
+const A = context.H3AttentionContracts;
 const C = context.H3ProjectContracts;
+must(A, 'H3AttentionContracts did not load');
 must(C, 'H3ProjectContracts did not load');
+
+const portableOnly = [
+    { id: 'ck-int8', label: 'CK INT8 · GPU-tuned', available: false,
+        quant_modes: ['int8-fast', 'int8', 'bf16'] },
+    { id: 'cudnn', label: 'cU-DNN', available: true,
+        quant_modes: ['int8-fast', 'int8', 'bf16'] },
+    { id: 'sage-int8', label: 'Sage INT8', available: true,
+        quant_modes: ['int8-fast', 'int8'] },
+];
+must(A.resolveBackend('bf16', 'ck-int8', portableOnly) === 'cudnn',
+    'unavailable CK must fall back to cU-DNN');
+must(A.resolveBackend('bf16', 'sage-int8', portableOnly) === 'cudnn',
+    'BF16 Sage must fall back to cU-DNN');
+portableOnly[0].available = true;
+must(A.resolveBackend('bf16', 'ck-int8', portableOnly) === 'ck-int8',
+    'an exact-SM admitted CK backend must remain selectable');
 
 const project = C.createProject();
 must(project.schema === 'serenity.h3.movie.v1', 'movie schema drift');
@@ -59,6 +79,15 @@ let render = C.renderRequest(shot);
 must(render.model === 'minimax_h3' && render.runner === 'minimax_h3_mojo_request', 'production H3 route drift');
 must(render.task === 'ref2va' && render.include_audio === true, 'Ref2VA render request drift');
 must(render.fps === 24 && render.duration_seconds === 8, 'H3 native timing drift');
+shot.quant = 'bf16';
+shot.attention_backend = 'ck-int8';
+render = C.renderRequest(shot);
+must(render.attention_backend === 'ck-int8', 'BF16 must preserve CK attention');
+shot.attention_backend = 'sage-int8';
+render = C.renderRequest(shot);
+must(render.attention_backend === 'cudnn', 'BF16 must reject Sage attention');
+shot.quant = 'int8-fast';
+shot.attention_backend = 'ck-int8';
 
 project.director_brief = 'A two-minute odd-couple love story. Their meetings recur as visual comedy; in the final scene they simply click.';
 let dream = C.captionRequest(project, shot, 'dream_project');
@@ -103,8 +132,10 @@ const index = fs.readFileSync(indexPath, 'utf8');
 const studio = fs.readFileSync(studioPath, 'utf8');
 const css = fs.readFileSync(cssPath, 'utf8');
 must(index.includes('data-tab="h3-studio"') && index.includes('id="panel-h3-studio"'), 'H3 Studio navigation not mounted');
-must(index.includes('js/h3-project.js') && index.includes('js/h3-studio.js') && index.includes('css/h3-studio.css'), 'H3 Studio assets not loaded');
+must(index.includes('js/h3-attention.js') && index.includes('js/h3-project.js') && index.includes('js/h3-studio.js') && index.includes('css/h3-studio.css'), 'H3 Studio assets not loaded');
 must(studio.includes("SerenityAPI.postVideo(request)"), 'H3 render is not wired to production /v1/video API');
+must(studio.includes('resolvedH3Attention(shot)'), 'H3 Studio does not consume shared attention admission');
+must(!studio.includes('CK INT8 · fastest'), 'H3 Studio still makes a universal fastest claim');
 must(studio.includes("window.confirm('Queue one "), 'GPU render must require explicit confirmation');
 must(studio.includes('opening Studio never starts GPU work'), 'no-auto-generation status missing');
 must(studio.includes('Continuity spine') && studio.includes('Prepare Qwen Director pass'), 'filmmaker workspace surfaces missing');

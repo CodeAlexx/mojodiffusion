@@ -326,9 +326,11 @@ fn minimax_h3_request_is_runtime_adjustable_and_switchable() {
     request["attention_backend"] = json!("ck-int8");
     validate_minimax_h3_request(&request).unwrap();
     request["quant"] = json!("bf16");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("sage-int8");
     assert!(validate_minimax_h3_request(&request)
         .unwrap_err()
-        .contains("INT8 attention is available only with INT8"));
+        .contains("Sage attention is available only with INT8"));
     request["attention_backend"] = json!("cudnn");
     validate_minimax_h3_request(&request).unwrap();
     request["step_cache"] = json!("invalid");
@@ -570,6 +572,13 @@ fn minimax_h3_conditioned_requests_preserve_exact_media_contracts() {
     validate_minimax_h3_request(&request).unwrap();
     request["attention_backend"] = json!("ck-int8");
     validate_minimax_h3_request(&request).unwrap();
+    request["quant"] = json!("bf16");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("sage-int8");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("Sage attention is available only with INT8"));
+    request["attention_backend"] = json!("ck-int8");
     let geometry = minimax_h3_runtime_geometry(&request).unwrap();
     assert_eq!((geometry.width, geometry.height), (1024, 768));
     assert_eq!(geometry.output_frames, 96);
@@ -769,6 +778,47 @@ fn minimax_h3_runner_log_reports_cache_and_real_denoise_progress() {
 }
 
 #[test]
+fn minimax_h3_ck_attention_selects_the_exact_visible_gpu_sm() {
+    let inventory = nvidia_gpu_inventory_from_csv(
+        "0, GPU-aaaa1111, 8.6, NVIDIA GeForce RTX 3090 Ti\n\
+         1, GPU-bbbb2222, 8.9, NVIDIA GeForce RTX 4090\n",
+    );
+    assert_eq!(inventory.len(), 2);
+    assert_eq!(inventory[0].sm, 86);
+    assert_eq!(inventory[1].sm, 89);
+    assert_eq!(select_nvidia_gpu(&inventory, None).unwrap().sm, 86);
+    assert_eq!(select_nvidia_gpu(&inventory, Some("1")).unwrap().sm, 89);
+    assert_eq!(
+        select_nvidia_gpu(&inventory, Some("GPU-bbbb")).unwrap().sm,
+        89
+    );
+    assert!(select_nvidia_gpu(&inventory, Some("")).is_none());
+    assert!(select_nvidia_gpu(&inventory, Some("-1")).is_none());
+    assert!(select_nvidia_gpu(&inventory, Some("2")).is_none());
+    assert_eq!(nvidia_sm_from_compute_capability("12.0"), Some(120));
+    assert_eq!(
+        minimax_h3_ck_dso_path_for_sm(89),
+        repo_path("output/lib/ck/sm89/libserenity_ck_attention.so")
+    );
+}
+
+#[test]
+fn minimax_h3_ck_attention_metadata_is_server_owned() {
+    let mut request = json!({
+        "attention_backend": "cudnn",
+        "attention_backend_dso": "/tmp/client-selected.so",
+        "attention_backend_sm": 999,
+        "attention_backend_compute_capability": "99.9",
+    });
+    admit_minimax_h3_ck_attention(&mut request).unwrap();
+    assert!(request.get("attention_backend_dso").is_none());
+    assert!(request.get("attention_backend_sm").is_none());
+    assert!(request
+        .get("attention_backend_compute_capability")
+        .is_none());
+}
+
+#[test]
 fn readiness_shape() {
     let d = readiness_doc();
     assert_eq!(d.get("schema").unwrap(), "serenity.video_status.v1");
@@ -936,7 +986,7 @@ fn readiness_shape() {
     assert_eq!(h3["attention_backends"][2]["id"], "sage-int8");
     assert_eq!(
         h3["attention_backends"][0]["quant_modes"],
-        json!(["int8-fast", "int8"])
+        json!(["int8-fast", "int8", "bf16"])
     );
     assert_eq!(
         h3["attention_backends"][0]["accepted_quality_default"],
@@ -944,12 +994,43 @@ fn readiness_shape() {
     );
     assert_eq!(
         h3["attention_backends"][0]["accepted_fast_default"],
-        true
+        h3["attention_backends"][0]["available"] == true
+            && h3["attention_backends"][0]["current_sm"] == 86
     );
     assert_eq!(
-        h3["attention_backends"][0]["decoded_visual_prompt_gate_count"],
+        h3["attention_backends"][0]["measured_reference"]["decoded_visual_prompt_gate_count"],
         2
     );
+    assert_eq!(
+        h3["attention_backends"][0]["measured_reference"]["gpu"],
+        "NVIDIA GeForce RTX 3090 Ti"
+    );
+    assert_eq!(h3["attention_backends"][0]["measured_reference"]["sm"], 86);
+    assert_eq!(
+        h3["attention_backends"][0]["selection_policy"],
+        "exact_active_gpu_sm_only"
+    );
+    assert_eq!(h3["attention_backends"][0]["portable_fallback"], "cudnn");
+    assert!(!h3["attention_backends"][0]["label"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .contains("fastest"));
+    let ck_capability = minimax_h3_ck_attention_capability();
+    if let Some(gpu) = ck_capability.gpu.as_ref() {
+        assert_eq!(h3["attention_backends"][0]["current_sm"], gpu.sm);
+        assert_eq!(
+            h3["attention_backends"][0]["current_compute_capability"],
+            gpu.compute_capability
+        );
+        assert_eq!(
+            h3["attention_backends"][0]["selected_dso"],
+            json!(ck_capability
+                .dso_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()))
+        );
+    }
     assert_eq!(
         h3["attention_backends"][1]["accepted_quality_default"],
         true

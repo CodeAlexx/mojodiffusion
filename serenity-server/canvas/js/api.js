@@ -77,9 +77,10 @@ var SerenityAPI = (function () {
                         ? 'bf16'
                         : (h3Loader && h3Loader.precision === 'int8'
                             ? 'int8' : 'int8-fast'),
-                    attention_backend: h3Loader && h3Loader.precision !== 'bf16'
-                        && ['ck-int8', 'sage-int8'].indexOf(
-                            h3Loader.attention_backend) >= 0
+                    attention_backend: h3Loader && (
+                        h3Loader.attention_backend === 'ck-int8' ||
+                        (h3Loader.precision !== 'bf16' &&
+                            h3Loader.attention_backend === 'sage-int8'))
                         ? h3Loader.attention_backend : 'cudnn',
                     step_cache: h3Loader && h3Loader.step_cache === 'high'
                         ? 'high' : 'exact',

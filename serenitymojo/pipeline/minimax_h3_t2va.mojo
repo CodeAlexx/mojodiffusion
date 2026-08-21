@@ -2184,11 +2184,10 @@ def _job_main(raw_args: List[String]) raises:
         attention_backend == MINIMAX_H3_ATTN_SAGE_INT8
         or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_PV8
         or attention_backend == MINIMAX_H3_ATTN_SAGE_INT8_FAST
-        or attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
     ):
         raise Error(
-            "MiniMax-H3 INT8 attention requires --quant=int8 or int8-fast;"
-            " use --attention-backend=cudnn with --quant=bf16"
+            "MiniMax-H3 Sage attention requires --quant=int8 or int8-fast;"
+            " use --attention-backend=cudnn or ck-int8 with --quant=bf16"
         )
     if len(args) < 3:
         print(

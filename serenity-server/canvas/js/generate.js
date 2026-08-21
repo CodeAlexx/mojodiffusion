@@ -821,7 +821,7 @@ var GenerateTab = (function () {
             '<div class="gen-param-row" data-param-search="quant bf16 fp8 int4"><label class="gen-label" for="gen-video-quant">Precision</label>' +
             '<select id="gen-video-quant" class="gen-select"><option value="bf16">BF16</option><option value="fp8">FP8</option><option value="int8">INT8</option><option value="int4">INT4</option></select></div>' +
             '<div id="gen-h3-attention-row" class="gen-param-row" data-param-search="attention cudnn ck sage int8"><label class="gen-label" for="gen-h3-attention">Attention</label>' +
-            '<select id="gen-h3-attention" class="gen-select"><option value="ck-int8">CK INT8 · fastest</option><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option></select></div>' +
+            '<select id="gen-h3-attention" class="gen-select"><option value="ck-int8" disabled>CK INT8 · GPU-tuned</option><option value="cudnn">cU-DNN · portable quality default</option><option value="sage-int8" disabled>Sage INT8 · experimental</option></select></div>' +
             '<div id="gen-h3-step-cache-row" class="gen-param-row" data-param-search="denoise acceleration cache exact high speed"><label class="gen-label" for="gen-h3-step-cache">Denoise acceleration</label>' +
             '<select id="gen-h3-step-cache" class="gen-select"><option value="exact">Exact · quality default</option><option value="high">High · adaptive cache, ~1.5x, approximate</option></select></div>' +
             '<div class="gen-param-row" data-param-search="audio generate"><label class="gen-label" for="gen-audio-policy">Audio</label>' +
@@ -2094,13 +2094,7 @@ var GenerateTab = (function () {
                 state.videoQuant = this.value;
                 if (ModelUtils.archForModel(state.model) === 'minimax_h3') {
                     state.h3Quant = state.videoQuant;
-                    if (state.videoQuant === 'bf16') {
-                        state.h3AttentionBackend = 'cudnn';
-                        if (els.h3Attention)
-                            els.h3Attention.value = 'cudnn';
-                    }
-                    if (els.h3Attention)
-                        els.h3Attention.disabled = state.videoQuant === 'bf16';
+                    syncMinimaxH3AttentionControl();
                     ModelUtils.warmModel(state.model, {
                         quant: state.h3Quant,
                         task: state.h3Mode || 't2va'
@@ -2128,13 +2122,9 @@ var GenerateTab = (function () {
             });
         if (els.h3Attention)
             els.h3Attention.addEventListener('change', function () {
-                if (state.videoQuant === 'bf16') {
-                    state.h3AttentionBackend = 'cudnn';
-                    this.value = 'cudnn';
-                    return;
-                }
-                state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(this.value) >= 0
-                    ? this.value : 'cudnn';
+                state.h3AttentionBackend = normalizeMinimaxH3AttentionBackend(
+                    state.videoQuant, this.value);
+                syncMinimaxH3AttentionControl();
             });
         if (els.h3StepCache)
             els.h3StepCache.addEventListener('change', function () {
@@ -3460,6 +3450,31 @@ var GenerateTab = (function () {
         }) || null;
     }
 
+    function normalizeMinimaxH3AttentionBackend(quant, backend) {
+        var runner = activeMinimaxH3Runner();
+        return H3AttentionContracts.resolveBackend(
+            quant,
+            backend,
+            runner && runner.attention_backends
+        );
+    }
+
+    function syncMinimaxH3AttentionControl() {
+        if (!els.h3Attention) return;
+        var runner = activeMinimaxH3Runner();
+        var backends = runner && runner.attention_backends;
+        Array.from(els.h3Attention.options).forEach(function (option) {
+            option.disabled = !H3AttentionContracts.isAvailable(
+                state.videoQuant, option.value, backends);
+        });
+        state.h3AttentionBackend = normalizeMinimaxH3AttentionBackend(
+            state.videoQuant, state.h3AttentionBackend);
+        els.h3Attention.value = state.h3AttentionBackend;
+        els.h3Attention.disabled = !Array.from(els.h3Attention.options).some(function (option) {
+            return !option.disabled;
+        });
+    }
+
     function minimaxH3DefaultSteps() {
         var runner = activeMinimaxH3Runner();
         var advertised = Number(runner && runner.default_steps);
@@ -3578,8 +3593,8 @@ var GenerateTab = (function () {
         state.h3Quant = ['int8-fast', 'int8', 'bf16'].indexOf(state.h3Quant) >= 0
             ? state.h3Quant : 'int8-fast';
         state.videoQuant = state.h3Quant;
-        state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(
-            state.h3AttentionBackend) >= 0 ? state.h3AttentionBackend : 'cudnn';
+        state.h3AttentionBackend = normalizeMinimaxH3AttentionBackend(
+            state.videoQuant, state.h3AttentionBackend);
         state.h3StepCache = state.h3StepCache === 'high' ? 'high' : 'exact';
         state.includeAudio = true;
         state.audioPolicy = 'generate';
@@ -3631,13 +3646,17 @@ var GenerateTab = (function () {
                 ? runner.attention_backends : [];
             els.h3Attention.innerHTML = attentionBackends.map(function (backend) {
                 return '<option value="' + backend.id + '"' +
+                    ' data-available="' + (backend.available === true ? 'true' : 'false') + '"' +
+                    ' data-quant-modes="' + (Array.isArray(backend.quant_modes)
+                        ? backend.quant_modes.join(',') : '') + '"' +
                     (backend.available === true ? '' : ' disabled') + '>' +
                     backend.label + '</option>';
-            }).join('') || '<option value="ck-int8">CK INT8 · fastest</option><option value="cudnn">cU-DNN · quality default</option><option value="sage-int8">Sage INT8 · experimental</option>';
-            if (state.videoQuant === 'bf16')
-                state.h3AttentionBackend = 'cudnn';
-            els.h3Attention.value = state.h3AttentionBackend;
-            els.h3Attention.disabled = state.videoQuant === 'bf16';
+            }).join('') || H3AttentionContracts.fallbackDefinitions().map(function (backend) {
+                return '<option value="' + backend.id + '"' +
+                    (backend.available === true ? '' : ' disabled') + '>' +
+                    backend.label + '</option>';
+            }).join('');
+            syncMinimaxH3AttentionControl();
         }
         if (els.h3StepCache)
             els.h3StepCache.value = state.h3StepCache;
@@ -4432,9 +4451,8 @@ var GenerateTab = (function () {
                 quant: state.videoQuant === 'bf16'
                     ? 'bf16'
                     : (state.videoQuant === 'int8' ? 'int8' : 'int8-fast'),
-                attention_backend: state.videoQuant !== 'bf16'
-                    && ['ck-int8', 'sage-int8'].indexOf(state.h3AttentionBackend) >= 0
-                    ? state.h3AttentionBackend : 'cudnn',
+                attention_backend: normalizeMinimaxH3AttentionBackend(
+                    state.videoQuant, state.h3AttentionBackend),
                 step_cache: state.h3StepCache === 'high' ? 'high' : 'exact',
                 include_audio: true
             };
@@ -6784,6 +6802,9 @@ var GenerateTab = (function () {
         else if (typeof params.attention_backend === 'string')
             state.h3AttentionBackend = ['ck-int8', 'sage-int8'].indexOf(
                 params.attention_backend) >= 0 ? params.attention_backend : 'cudnn';
+        if (ModelUtils.archForModel(state.model) === 'minimax_h3')
+            state.h3AttentionBackend = normalizeMinimaxH3AttentionBackend(
+                state.videoQuant, state.h3AttentionBackend);
         if (typeof params.h3StepCache === 'string')
             state.h3StepCache = params.h3StepCache === 'high' ? 'high' : 'exact';
         else if (typeof params.step_cache === 'string')

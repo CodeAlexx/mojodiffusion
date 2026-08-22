@@ -131,55 +131,109 @@ def _s(a: Int, b: Int) -> Float64:
     return Float64(Int(b) - Int(a)) / 1.0e9
 
 
+def _read_text_file(path: String) raises -> String:
+    with open(path, "r") as f:
+        return f.read()
+
+
 def main() raises:
     var a = argv()
-    if len(a) < 2:
-        raise Error("usage: qwen3vl_caption <image> [prompt] [max_new]")
-    var img_path = String(a[1])
+    # Two CLI forms:
+    #   legacy:   qwen3vl_caption <image> [prompt] [max_new]
+    #   director: qwen3vl_caption --prompt-file=P [--system-file=S] [--image=I]
+    #             [--max-new=N]   (text-only when --image is absent; the H3
+    #             Director pass uses this with the serenity.h3.caption.v2
+    #             system prompt and a JSON response contract)
+    var img_path = String("")
     var prompt = String("Describe this image in detail.")
-    if len(a) >= 3:
-        prompt = String(a[2])
+    var system_prompt = String("")
     var max_new = 200
-    if len(a) >= 4:
-        max_new = Int(String(a[3]))
-
+    var flag_mode = len(a) >= 2 and String(a[1]).startswith("--")
+    if flag_mode:
+        var prompt_given = False
+        for i in range(1, len(a)):
+            var arg = String(a[i])
+            var fields = arg.split("=")
+            if len(fields) < 2:
+                raise Error(String("flag needs a value: ") + arg)
+            var value = String(fields[1])
+            for k in range(2, len(fields)):
+                value += "=" + String(fields[k])
+            if arg.startswith("--prompt-file="):
+                prompt = _read_text_file(value)
+                prompt_given = True
+            elif arg.startswith("--system-file="):
+                system_prompt = _read_text_file(value)
+            elif arg.startswith("--image="):
+                img_path = value
+            elif arg.startswith("--max-new="):
+                max_new = atol(value)
+            else:
+                raise Error(String("unknown flag: ") + arg)
+        if not prompt_given:
+            raise Error("--prompt-file is required in flag mode")
+    else:
+        if len(a) < 2:
+            raise Error("usage: qwen3vl_caption <image> [prompt] [max_new] | "
+                        "--prompt-file=P [--system-file=S] [--image=I] [--max-new=N]")
+        img_path = String(a[1])
+        if len(a) >= 3:
+            prompt = String(a[2])
+        if len(a) >= 4:
+            max_new = Int(String(a[3]))
+    if max_new < 1 or max_new > 4096:
+        raise Error("max_new must be 1..4096")
+    var has_image = img_path != String("")
     var ctx = DeviceContext()
     var t0 = perf_counter_ns()
-
-    # 1) vision preprocess: any image, squash-fit to the nearest grid bucket
-    var vp = lingbot_vision_preprocess_bucketed(img_path, ctx)
-    print("[caption] bucket grid:", vp.grid_h, "x", vp.grid_w, " (S =", vp.seq, ")")
-    var t_prep = perf_counter_ns()
-
-    # 2) vision tower — comptime-S dispatch over the three buckets
-    var vision = Qwen3VLVisionModel.load(SNAP, ctx)
-    var vout: VisionOutput
-    if vp.seq == 1024:
-        vout = vision.forward[1024](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx)
-    elif vp.seq == 1536:
-        vout = vision.forward[1536](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx)
-    elif vp.seq == 4096:
-        vout = vision.forward[4096](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx)
-    elif vp.seq == 6144:
-        vout = vision.forward[6144](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx)
-    elif vp.seq == 9216:
-        vout = vision.forward[9216](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx)
-    elif vp.seq == 16384:
-        vout = vision.forward[16384](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx)
-    else:
-        raise Error(String("unsupported vision bucket S=") + String(vp.seq))
+    # 1) vision preprocess + 2) vision tower (only when an image is supplied)
+    var grid_h = 0
+    var grid_w = 0
+    var nvis = 0
+    var vout: Optional[VisionOutput] = None
+    if has_image:
+        var vp = lingbot_vision_preprocess_bucketed(img_path, ctx)
+        print("[caption] bucket grid:", vp.grid_h, "x", vp.grid_w, " (S =", vp.seq, ")")
+        var vision = Qwen3VLVisionModel.load(SNAP, ctx)
+        if vp.seq == 1024:
+            vout = Optional[VisionOutput](vision.forward[1024](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx))
+        elif vp.seq == 1536:
+            vout = Optional[VisionOutput](vision.forward[1536](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx))
+        elif vp.seq == 4096:
+            vout = Optional[VisionOutput](vision.forward[4096](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx))
+        elif vp.seq == 6144:
+            vout = Optional[VisionOutput](vision.forward[6144](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx))
+        elif vp.seq == 9216:
+            vout = Optional[VisionOutput](vision.forward[9216](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx))
+        elif vp.seq == 16384:
+            vout = Optional[VisionOutput](vision.forward[16384](vp.pixel_values, vp.grid_t, vp.grid_h, vp.grid_w, ctx))
+        else:
+            raise Error(String("unsupported vision bucket S=") + String(vp.seq))
+        grid_h = vp.grid_h
+        grid_w = vp.grid_w
+        nvis = (vp.grid_h // 2) * (vp.grid_w // 2)   # merged vision tokens
     var t_vis = perf_counter_ns()
-
-    # 3) LM + tokenizer + fused token stream
+    # 3) LM + tokenizer + fused token stream (chat template: optional system
+    #    turn, user turn with optional vision block, assistant header)
     var enc = load_krea2_qwen3vl_4b(String(SNAP), ctx)
     var tok = Qwen3Tokenizer(TOKJSON)
-    var nvis = (vp.grid_h // 2) * (vp.grid_w // 2)   # merged vision tokens
-    var ids = tok.encode(String("<|im_start|>user\n<|vision_start|>"))
-    for _i in range(nvis):
-        ids.append(IMG_PAD)
-    var tail_ids = tok.encode(
-        String("<|vision_end|>") + prompt + "<|im_end|>\n<|im_start|>assistant\n"
-    )
+    var ids = List[Int]()
+    var has_system = system_prompt != String("")
+    if has_system:
+        ids = tok.encode(String("<|im_start|>system\n") + system_prompt
+                         + "<|im_end|>\n<|im_start|>user\n")
+    else:
+        ids = tok.encode(String("<|im_start|>user\n"))
+    if has_image:
+        var vs_ids = tok.encode(String("<|vision_start|>"))
+        for i in range(len(vs_ids)):
+            ids.append(vs_ids[i])
+        for _i in range(nvis):
+            ids.append(IMG_PAD)
+        var ve_ids = tok.encode(String("<|vision_end|>"))
+        for i in range(len(ve_ids)):
+            ids.append(ve_ids[i])
+    var tail_ids = tok.encode(prompt + "<|im_end|>\n<|im_start|>assistant\n")
     for i in range(len(tail_ids)):
         ids.append(tail_ids[i])
     var L = len(ids)
@@ -187,52 +241,66 @@ def main() raises:
     for i in range(L):
         if ids[i] == IMG_PAD:
             npad += 1
-    print("[caption] prefix tokens:", L, " image_pad:", npad, " nvis:", nvis)
+    print("[caption] prefix tokens:", L, " image_pad:", npad, " nvis:", nvis,
+          " system:", has_system)
     if npad != nvis:
         raise Error(String("token stream image_pad count ") + String(npad)
                     + " != nvis " + String(nvis))
     var t_load = perf_counter_ns()
-
-    # 3D interleaved M-RoPE tables over the whole prefix (parity-gated builder).
     var cfg = enc.config
     var half = cfg.head_dim // 2
-    var pos = _build_positions(ids, L, L, vp.grid_h, vp.grid_w)
-    var q_tab = _build_mrope_tables(pos, L, cfg.num_heads, cfg.head_dim, cfg.rope_theta)
-    var k_tab = _build_mrope_tables(pos, L, cfg.num_kv_heads, cfg.head_dim, cfg.rope_theta)
-
-    # 4) prime the fused stream row-by-row into the KV cache
-    var cache = KVCache(cfg.num_layers)
-    var vis_start = pos.vis_start
     var hidden_sz = cfg.hidden_size
+    var cache = KVCache(cfg.num_layers)
     var last_logits = Tensor.from_host([Float32(0.0)], [1], STDtype.BF16, ctx)
-    for i in range(L):
-        var qr = _rope_row(q_tab[0], q_tab[1], i, cfg.num_heads, half, ctx)
-        var kr = _rope_row(k_tab[0], k_tab[1], i, cfg.num_kv_heads, half, ctx)
-        var want = i == L - 1
-        if ids[i] == IMG_PAD:
-            var vi = i - vis_start
-            var emb = _row(vout.pooler, vi, hidden_sz, ctx)
-            var d0 = Optional[Tensor](_row(vout.ds0, vi, hidden_sz, ctx))
-            var d1 = Optional[Tensor](_row(vout.ds1, vi, hidden_sz, ctx))
-            var d2 = Optional[Tensor](_row(vout.ds2, vi, hidden_sz, ctx))
-            last_logits = vl_decode_step_embed(
-                enc, cache, emb^, qr.c, qr.s, kr.c, kr.s,
-                d0^, d1^, d2^, ctx, want_logits=want,
-            )
-        else:
+    var next_pos = L
+    if has_image:
+        # 3D interleaved M-RoPE tables over the whole prefix (parity-gated builder).
+        var pos = _build_positions(ids, L, L, grid_h, grid_w)
+        var q_tab = _build_mrope_tables(pos, L, cfg.num_heads, cfg.head_dim, cfg.rope_theta)
+        var k_tab = _build_mrope_tables(pos, L, cfg.num_kv_heads, cfg.head_dim, cfg.rope_theta)
+        var vis_start = pos.vis_start
+        ref vo = vout.value()
+        for i in range(L):
+            var qr = _rope_row(q_tab[0], q_tab[1], i, cfg.num_heads, half, ctx)
+            var kr = _rope_row(k_tab[0], k_tab[1], i, cfg.num_kv_heads, half, ctx)
+            var want = i == L - 1
+            if ids[i] == IMG_PAD:
+                var vi = i - vis_start
+                var emb = _row(vo.pooler, vi, hidden_sz, ctx)
+                var d0 = Optional[Tensor](_row(vo.ds0, vi, hidden_sz, ctx))
+                var d1 = Optional[Tensor](_row(vo.ds1, vi, hidden_sz, ctx))
+                var d2 = Optional[Tensor](_row(vo.ds2, vi, hidden_sz, ctx))
+                last_logits = vl_decode_step_embed(
+                    enc, cache, emb^, qr.c, qr.s, kr.c, kr.s,
+                    d0^, d1^, d2^, ctx, want_logits=want,
+                )
+            else:
+                var toks = List[Int]()
+                toks.append(ids[i])
+                var emb = enc._embed(toks, ctx)
+                last_logits = vl_decode_step_embed(
+                    enc, cache, emb^, qr.c, qr.s, kr.c, kr.s,
+                    Optional[Tensor](None), Optional[Tensor](None), Optional[Tensor](None),
+                    ctx, want_logits=want,
+                )
+        next_pos = pos.pt[L - 1] + 1
+    else:
+        # Text-only: Qwen3-VL positions are equal-axis (t=h=w=i) -> plain RoPE.
+        for i in range(L):
+            var qr = _plain_rope_row(i, cfg.num_heads, cfg.head_dim, cfg.rope_theta, ctx)
+            var kr = _plain_rope_row(i, cfg.num_kv_heads, cfg.head_dim, cfg.rope_theta, ctx)
             var toks = List[Int]()
             toks.append(ids[i])
             var emb = enc._embed(toks, ctx)
             last_logits = vl_decode_step_embed(
                 enc, cache, emb^, qr.c, qr.s, kr.c, kr.s,
                 Optional[Tensor](None), Optional[Tensor](None), Optional[Tensor](None),
-                ctx, want_logits=want,
+                ctx, want_logits=(i == L - 1),
             )
+        next_pos = L
     var t_prime = perf_counter_ns()
-
     # 5) greedy generation: text positions t=h=w=next_pos (equal-axis mrope ==
     #    plain rope — built via the SAME table builder for exactness).
-    var next_pos = pos.pt[L - 1] + 1
     var gen = List[Int]()
     for _g in range(max_new):
         var best = _argmax(last_logits, ctx)
@@ -251,10 +319,9 @@ def main() raises:
         )
         next_pos += 1
     var t_gen = perf_counter_ns()
-
     print("=== CAPTION ===")
     print(tok.decode(gen))
     print("=== END ===")
-    print("timing: preprocess", _s(t0, t_prep), "s | vision tower", _s(t_prep, t_vis),
-          "s | LM load", _s(t_vis, t_load), "s | prime(", L, "rows)", _s(t_load, t_prime),
+    print("timing: vision", _s(t0, t_vis), "s | LM load", _s(t_vis, t_load),
+          "s | prime(", L, "rows)", _s(t_load, t_prime),
           "s | generate(", len(gen), "tok)", _s(t_prime, t_gen), "s")

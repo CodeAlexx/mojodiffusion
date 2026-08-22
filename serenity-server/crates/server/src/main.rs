@@ -5813,6 +5813,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/magic_prompt", post(magic::post_magic_prompt))
         .route("/enhance_prompt", post(magic::post_enhance_prompt))
         .route("/v1/caption", post(caption::post_caption))
+        .route("/v1/h3/director", post(caption::post_h3_director))
         .route("/v1/jobs", get(jobs::get_jobs))
         .route(
             "/v1/history/artifacts",

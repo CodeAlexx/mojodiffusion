@@ -110,6 +110,7 @@ var H3ProjectContracts = (function () {
             director_brief: '',
             continuity_bible: '',
             brand_bible: '',
+            last_director_result: null,
             assets: [],
             character_sheets: [],
             shots: [createShot(1, 'Opening shot')],
@@ -498,6 +499,73 @@ var H3ProjectContracts = (function () {
         else project.character_sheets.push(copy(sheet));
     }
 
+    function firstText() {
+        for (var i = 0; i < arguments.length; i++) {
+            var value = arguments[i];
+            if (typeof value === 'string' && value.trim()) return value.trim();
+        }
+        return '';
+    }
+
+    function clampSeconds(value) {
+        var seconds = Number(value) || 8;
+        return Math.max(5, Math.min(15, Math.round(seconds)));
+    }
+
+    function directorShotFromItem(project, model, item, index) {
+        var shot = createShot(project.next_shot_id++, firstText(item.title) || ('Shot ' + (index + 1)));
+        shot.width = model.width; shot.height = model.height; shot.steps = model.steps; shot.seed = model.seed;
+        shot.quant = model.quant; shot.attention_backend = model.attention_backend; shot.step_cache = model.step_cache;
+        shot.duration_seconds = clampSeconds(item.duration_seconds);
+        shot.brief = firstText(item.brief, item.beat, item.summary);
+        var plan = firstText(item.shot_plan, item.plan, item.shot_description);
+        var continuity = [];
+        if (firstText(item.continuity_in)) continuity.push('Continuity in: ' + firstText(item.continuity_in));
+        if (firstText(item.continuity_out)) continuity.push('Continuity out: ' + firstText(item.continuity_out));
+        shot.shot_description = [plan].concat(continuity).filter(Boolean).join('\n');
+        shot.prompt_override = firstText(item.h3_prompt, item.prompt);
+        if (firstText(item.soundscape, item.overall_soundscape)) shot.soundscape = firstText(item.soundscape, item.overall_soundscape);
+        if (firstText(item.music, item.non_diegetic_music)) shot.music = firstText(item.music, item.non_diegetic_music);
+        return shot;
+    }
+
+    // Apply a serenity.h3.director.result.v2 object (or a single-shot doctor
+    // result) to the project. Returns { project, message, focusShotId }.
+    function applyDirectorResult(project, selectedShotId, actionId, result) {
+        var r = result && typeof result === 'object' ? result : null;
+        if (!r) throw new Error('Director result is not a JSON object; nothing to apply');
+        var index = project.shots.findIndex(function (shot) { return shot.id === selectedShotId; });
+        if (index < 0) index = 0;
+        var model = project.shots[index];
+        var messages = [];
+        var focusShotId = model.id;
+        var bible = firstText(r.continuity_bible, r.identity_lock);
+        if (bible && (!String(project.continuity_bible || '').trim() || ['dream_project', 'script_to_coverage', 'continue_story', 'sound_to_scene'].indexOf(actionId) >= 0)) {
+            project.continuity_bible = bible; messages.push('continuity bible');
+        }
+        var items = Array.isArray(r.shots) ? r.shots.filter(function (item) { return item && typeof item === 'object'; }) : [];
+        if (items.length) {
+            var made = items.map(function (item, i) { return directorShotFromItem(project, model, item, i); });
+            var untouched = project.shots.length === 1 && !model.take_job_ids.length
+                && !String(model.brief || model.shot_description || model.prompt_override || '').trim();
+            if (untouched) project.shots = made;
+            else Array.prototype.splice.apply(project.shots, [index + 1, 0].concat(made));
+            if (actionId === 'continue_story' && model.take_job_ids.length) {
+                var takeIndex = model.selected_take >= 0 ? model.selected_take : model.take_job_ids.length - 1;
+                made[0].continue_from = model.take_job_ids[takeIndex] || ''; made[0].motion_context_frames = 22;
+            }
+            focusShotId = made[0].id;
+            messages.push(made.length + ' shot' + (made.length === 1 ? '' : 's') + (untouched ? ' (replaced the empty opening shot)' : ' inserted after ' + model.title));
+        } else {
+            var prompt = firstText(r.revised_prompt, r.h3_prompt, r.prompt);
+            if (prompt) { model.prompt_override = prompt; messages.push('H3 prompt on ' + model.title); }
+            var brief = firstText(r.brief, r.literal_caption);
+            if (brief && !String(model.brief || '').trim()) { model.brief = brief; messages.push('brief on ' + model.title); }
+        }
+        if (!messages.length) throw new Error('Director result has no shots or prompt to apply');
+        return { project: project, message: 'Applied ' + messages.join(', '), focusShotId: focusShotId };
+    }
+
     function captionRequest(project, shot, actionId, options) {
         var issue = validateDirector(project, shot, actionId);
         if (issue) throw new Error(issue);
@@ -581,6 +649,7 @@ var H3ProjectContracts = (function () {
         characterSheetFromShot: characterSheetFromShot,
         upsertCharacterSheet: upsertCharacterSheet,
         captionRequest: captionRequest,
+        applyDirectorResult: applyDirectorResult,
         deliveryManifest: deliveryManifest
     };
 })();

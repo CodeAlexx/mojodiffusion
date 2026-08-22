@@ -4038,3 +4038,39 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   delivers exact-zero grads on an attached graph (probed: forwards run,
   loss attached, direct autograd.grad returns 0.0, params optimizer-bound);
   cause in the fork undiagnosed, zero-up tripwire caught it at step 250.
+
+## 2026-08-22: H3 STUDIO DIRECTOR PASS (real Qwen3-VL run) + STREAMED-TAIL STAGING
+- `pipeline/qwen3vl_caption.mojo`: second CLI form `--prompt-file=P [--system-file=S]
+  [--image=I] [--max-new=N]` (legacy `<image> [prompt] [max_new]` unchanged). Chat
+  template gains an optional system turn; text-only when no image (equal-axis
+  M-RoPE == plain RoPE rows, no vision tower load). Still greedy, row-by-row
+  priming (~0.22 s/row on the 3090 Ti: LM load 22 s, 104-row prime 23 s, 149
+  tokens 33 s in the text-only smoke; long director system prompts prime in
+  minutes — batch priming is the next speed item). Output markers unchanged.
+- `serenity-server/crates/server/src/caption.rs` + `main.rs`: `POST /v1/h3/director`
+  `{system_prompt, prompt, image_path?, max_new?}` → `{text, json|null, elapsed_ms}`;
+  stages prompts as files under `<out>/.h3_director/`, same GPU lease and idle
+  image-worker eviction as `/v1/caption`, JSON extracted with fence/prose stripping
+  (`parse_director_json`, unit-tested). Smoke: HTTP 200, valid
+  `serenity.h3.director.result.v2` JSON in 60 s.
+- `serenity-server/canvas/js/{api,h3-project,h3-studio}.js`: Director stage now has
+  **Run Qwen Director pass** (POSTs the prepared `serenity.h3.caption.v2` system prompt
+  + director input + context), a result panel (summary / warnings / JSON or raw),
+  and **Apply result to project** (`C.applyDirectorResult`: shots[] → new shots with
+  brief / shot plan (+continuity in/out) / `h3_prompt` as prompt_override, replacing
+  an untouched opening shot or inserting after the selected shot; `continue_story`
+  seeds `continue_from` from the selected take; single-shot doctor results apply
+  `revised_prompt`/`h3_prompt`; `continuity_bible` → project bible). Refusals
+  (e.g. "Write a shot brief…"), submission failures, and take completion now also
+  show a toast (`showToast`) instead of only the status bar. `last_director_result`
+  persists in the project.
+- `models/dit/minimax_h3_fp8_resident.mojo` + `minimax_h3_runtime_cache.mojo`: the
+  reusable one-block W8A8 streamed tail no longer does a pinned cudaHostAlloc +
+  `ctx.synchronize()` per tensor (600 per evaluation). One persistent two-half
+  pinned slab (2 × block bytes), memcpy mmap → half, async default-stream
+  `enqueue_copy` into the existing device tensors, DeviceEvent-fenced half reuse.
+  Bytes identical (A/B md5-equal latents/motion_context/mp4); 2nd evaluation at
+  S=3k 85 → 45 s. Deployed as `output/bin/minimax_h3_serenity_runtime`
+  (`.pre_staged` = previous). OPEN: ~40 s/eval of streamed-tail cost remains at
+  S=3k (compute ~5 s); first evaluation +29 s (one-time slab alloc under the 12G
+  cgroup?). Details: `HANDOFF_H3_STREAMED_TAIL_STAGING_2026-08-22.md` (local).

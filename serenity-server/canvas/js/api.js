@@ -309,6 +309,22 @@ var SerenityAPI = (function () {
             });
         });
     }
+    function postH3Director(payload) {
+        return fetch('/v1/h3/director', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        }).then(function (resp) {
+            return resp.text().then(function (body) {
+                var data = {};
+                try { data = JSON.parse(body); }
+                catch (e) { data = { error: body || ('HTTP ' + resp.status) }; }
+                if (!resp.ok)
+                    throw new Error(data.detail || data.error || ('HTTP ' + resp.status));
+                return data;
+            });
+        });
+    }
     function postPrompt(workflow, metadata) {
         var meta = metadata || {};
         var videoRequest = videoRequestFromWorkflow(workflow);
@@ -497,6 +513,7 @@ var SerenityAPI = (function () {
         postPrompt: postPrompt,
         postGenerate: postGenerate,
         postVideo: postVideo,
+        postH3Director: postH3Director,
         videoRequestFromWorkflow: videoRequestFromWorkflow,
         interrupt: interrupt,
         uploadImage: uploadImage,

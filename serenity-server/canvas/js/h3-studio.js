@@ -19,6 +19,7 @@ var H3StudioTab = (function () {
         characterPanels: 6,
         characterStyle: 'standard_orbit',
         requestJson: '',
+        directorRunning: false,
         readiness: null,
         status: 'Ready · opening Studio never starts GPU work',
         statusTone: '',
@@ -50,6 +51,20 @@ var H3StudioTab = (function () {
         state.project.updated_at = new Date().toISOString();
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state.project));
         if (message) setStatus(message, '');
+    }
+
+    function showToast(message, tone) {
+        var node = document.getElementById('h3s-toast');
+        if (!node) {
+            node = document.createElement('div'); node.id = 'h3s-toast';
+            node.style.cssText = 'position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:9999;max-width:720px;padding:10px 16px;border-radius:8px;font:13px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.45);pointer-events:none;transition:opacity .3s';
+            document.body.appendChild(node);
+        }
+        node.textContent = message;
+        node.style.background = tone === 'error' ? '#7a1f1f' : (tone === 'live' ? '#1f4d7a' : '#1f5a2e');
+        node.style.color = '#fff'; node.style.opacity = '1';
+        clearTimeout(showToast._timer);
+        showToast._timer = setTimeout(function () { node.style.opacity = '0'; }, tone === 'error' ? 9000 : 5000);
     }
 
     function setStatus(message, tone) {
@@ -218,9 +233,10 @@ var H3StudioTab = (function () {
                 '<label class="h3s-field"><span>Style</span><select id="h3s-character-style" class="h3s-select"><option value="standard_orbit"' + selected(state.characterStyle, 'standard_orbit') + '>Keep Picture 1 style</option><option value="anime_to_real"' + selected(state.characterStyle, 'anime_to_real') + '>Anime to photoreal</option></select></label></div>' +
                 (state.characterPanels === 4 ? '<div class="h3s-warning">Four-panel is metadata only: the upstream geometry conflicts and 73 frames is below Serenity’s five-second render minimum.</div>' : '') : '') +
             '<label class="h3s-field"><span>Director input</span><textarea class="h3s-textarea is-script" data-project-field="director_brief" placeholder="Story outline, script, edit request, shot diagnosis, or character extraction instructions…">' + escapeHtml(state.project.director_brief) + '</textarea></label>' +
-            '<div class="h3s-button-row"><button class="h3s-btn is-primary" data-h3-action="prepare-director">Prepare Qwen Director pass</button><button class="h3s-btn" data-h3-action="copy-request"' + disabled(!state.requestJson) + '>Copy request</button><button class="h3s-btn" data-h3-action="download-request"' + disabled(!state.requestJson) + '>Download request</button></div>' +
-            '<div class="h3s-help" style="margin-top:7px">Plan envelope: ' + minShots + '–' + maxShots + ' shots · ' + state.project.takes_per_shot + ' take(s) each. Preparation is CPU-only and does not launch Qwen or H3.</div>' +
-            (state.requestJson ? '<details class="h3s-request" open><summary>Prepared serenity.h3.caption.v2 request</summary><pre>' + escapeHtml(state.requestJson) + '</pre></details>' : '');
+            '<div class="h3s-button-row"><button class="h3s-btn is-primary" data-h3-action="run-director"' + disabled(state.directorRunning) + '>' + (state.directorRunning ? 'Director pass running…' : 'Run Qwen Director pass') + '</button><button class="h3s-btn" data-h3-action="apply-director"' + disabled(!directorResultJson()) + '>Apply result to project</button><button class="h3s-btn" data-h3-action="prepare-director">Prepare request only</button><button class="h3s-btn" data-h3-action="copy-request"' + disabled(!state.requestJson) + '>Copy request</button><button class="h3s-btn" data-h3-action="download-request"' + disabled(!state.requestJson) + '>Download request</button></div>' +
+            '<div class="h3s-help" style="margin-top:7px">Plan envelope: ' + minShots + '–' + maxShots + ' shots · ' + state.project.takes_per_shot + ' take(s) each. Run launches the pure-Mojo Qwen3-VL H3 captioner on the GPU (about 1–3 minutes, no H3 render). Prepare only is CPU-only.</div>' +
+            directorResultHtml() +
+            (state.requestJson ? '<details class="h3s-request"><summary>Prepared serenity.h3.caption.v2 request</summary><pre>' + escapeHtml(state.requestJson) + '</pre></details>' : '');
     }
 
     function stageHtml() {
@@ -229,7 +245,7 @@ var H3StudioTab = (function () {
         return '<div class="h3s-stage"><div class="h3s-stage-tabs">' + tabs.map(function (tab) {
             return '<button class="h3s-tab ' + (state.stageTab === tab[0] ? 'is-active' : '') + '" data-stage-tab="' + tab[0] + '">' + tab[1] + '</button>';
         }).join('') + '</div><div class="h3s-stage-body">' + body + '</div>' +
-            '<div class="h3s-button-row" style="margin-top:9px"><button class="h3s-btn is-primary" data-h3-action="render-shot">Queue H3 take</button><button class="h3s-btn" data-h3-action="continue-take"' + disabled(selectedShot().selected_take < 0) + '>Continue selected take</button></div></div>';
+            '<div class="h3s-button-row" style="margin-top:9px"><button class="h3s-btn is-primary" data-h3-action="render-shot">Queue H3 take</button><button class="h3s-btn" data-h3-action="continue-take"' + disabled(!selectedTakeDone()) + '>Continue selected take</button></div></div>';
     }
 
     function centerHtml() { return '<main class="h3s-center">' + monitorHtml() + stageHtml() + '</main>'; }
@@ -318,7 +334,21 @@ var H3StudioTab = (function () {
             '<input id="h3s-reference-files" type="file" accept="image/*,video/*,audio/*" multiple hidden><input id="h3s-asset-file" type="file" accept="image/*,video/*,audio/*" hidden>';
     }
 
+    var renderDepth = 0;
+    var renderPending = false;
     function render() {
+        // Field blur/change handlers can re-enter render() while innerHTML is
+        // being replaced (NotFoundError on detached nodes). Coalesce instead.
+        if (renderDepth > 0) { renderPending = true; return; }
+        renderDepth += 1;
+        try { renderNow(); }
+        finally {
+            renderDepth -= 1;
+            if (renderPending) { renderPending = false; setTimeout(render, 0); }
+        }
+    }
+
+    function renderNow() {
         var panel = document.getElementById('panel-h3-studio');
         if (!panel) return;
         if (!state.project) state.project = loadProject();
@@ -452,6 +482,8 @@ var H3StudioTab = (function () {
         else if (action === 'shot-right') moveShot(1);
         else if (action === 'compile-prompt') { selectedShot().prompt_override = ''; saveProject(); render(); }
         else if (action === 'prepare-director') prepareDirector();
+        else if (action === 'run-director') runDirector();
+        else if (action === 'apply-director') applyDirector();
         else if (action === 'copy-request') copyRequest();
         else if (action === 'download-request') downloadPreparedRequest();
         else if (action === 'upload-first') document.getElementById('h3s-first-file').click();
@@ -484,6 +516,68 @@ var H3StudioTab = (function () {
         var shot = state.project.shots.splice(index, 1)[0]; state.project.shots.splice(target, 0, shot); saveProject('Shot order updated'); render();
     }
 
+    function directorResultJson() {
+        var last = state.project.last_director_result;
+        return last && last.json && typeof last.json === 'object' ? last.json : null;
+    }
+
+    function directorResultHtml() {
+        var last = state.project.last_director_result;
+        if (!last) return '';
+        var json = directorResultJson();
+        var summary = json ? String(json.summary || '') : '';
+        var warnings = json && Array.isArray(json.warnings) ? json.warnings : [];
+        var shotCount = json && Array.isArray(json.shots) ? json.shots.length : 0;
+        return '<div class="h3s-director-result" style="margin-top:9px"><div class="h3s-help"><strong>Director result</strong> · ' + escapeHtml(String(last.operation || '')) + ' · ' + escapeHtml(String(last.ran_at || '')) + (last.elapsed_ms ? ' · ' + Math.round(last.elapsed_ms / 1000) + ' s' : '') + (shotCount ? ' · ' + shotCount + ' shots planned' : '') + (json ? '' : ' · <em>not valid JSON — shown raw</em>') + '</div>' +
+            (summary ? '<div class="h3s-stage-copy">' + escapeHtml(summary) + '</div>' : '') +
+            (warnings.length ? '<div class="h3s-warning">' + escapeHtml(warnings.join(' · ')) + '</div>' : '') +
+            '<details class="h3s-request" open><summary>' + (json ? 'Result JSON' : 'Raw model output') + '</summary><pre>' + escapeHtml(json ? JSON.stringify(json, null, 2) : String(last.text || '')) + '</pre></details></div>';
+    }
+
+    function directorUserPrompt(request) {
+        var body = C.copy(request);
+        delete body.system_prompt;
+        var brief = String(state.project.director_brief || '').trim();
+        return (brief ? 'DIRECTOR INPUT:\n' + brief + '\n\n' : '') + 'CONTEXT (serenity.h3.caption.v2 request without system_prompt):\n' + JSON.stringify(body, null, 2) + '\n\nRespond with the JSON object only.';
+    }
+
+    function runDirector() {
+        if (state.directorRunning) return;
+        try {
+            var request = C.captionRequest(state.project, selectedShot(), state.directorAction, { panel_count: state.characterPanels, style_mode: state.characterStyle });
+            state.requestJson = JSON.stringify(request, null, 2);
+            var image = '';
+            (request.inputs || []).some(function (item) { if (item && item.kind === 'image' && String(item.path || '').trim()) { image = String(item.path).trim(); return true; } return false; });
+            var payload = { system_prompt: request.system_prompt, prompt: directorUserPrompt(request), max_new: 1500 };
+            if (image) payload.image_path = image;
+            state.directorRunning = true; saveProject(); render();
+            setStatus('Qwen Director pass running (' + state.directorAction + ')… about 1–3 minutes', 'live'); showToast('Director pass running on the GPU (Qwen3-VL)… about 1–3 minutes', 'live');
+            var startedAt = Date.now();
+            SerenityAPI.postH3Director(payload).then(function (data) {
+                state.directorRunning = false;
+                state.project.last_director_result = { schema: 'serenity.h3.director.run.v1', operation: state.directorAction, ran_at: new Date().toISOString(), elapsed_ms: Number(data.elapsed_ms) || (Date.now() - startedAt), text: String(data.text || ''), json: data.json && typeof data.json === 'object' ? data.json : null, image_path: image };
+                saveProject('Director pass finished'); render();
+                var ok = !!state.project.last_director_result.json;
+                setStatus(ok ? 'Director pass done · review the result, then Apply result to project' : 'Director pass returned text that is not valid JSON; shown raw', ok ? '' : 'error');
+                showToast(ok ? 'Director pass done in ' + Math.round((Number(data.elapsed_ms) || 0) / 1000) + ' s — review, then Apply' : 'Director pass finished but returned non-JSON text (shown raw)', ok ? '' : 'error');
+            }).catch(function (error) {
+                state.directorRunning = false; render();
+                setStatus('Director pass failed: ' + error.message, 'error'); showToast('Director pass failed: ' + error.message, 'error');
+            });
+        } catch (error) { state.directorRunning = false; setStatus(error.message, 'error'); showToast(error.message, 'error'); }
+    }
+
+    function applyDirector() {
+        var last = state.project.last_director_result;
+        var json = directorResultJson();
+        if (!json) { showToast('No JSON director result to apply', 'error'); return; }
+        try {
+            var applied = C.applyDirectorResult(state.project, state.selectedShotId, last.operation || state.directorAction, json);
+            state.project = applied.project; state.selectedShotId = applied.focusShotId; state.stageTab = 'brief';
+            saveProject(applied.message); render(); setStatus(applied.message, ''); showToast(applied.message, '');
+        } catch (error) { setStatus(error.message, 'error'); showToast(error.message, 'error'); }
+    }
+
     function prepareDirector() {
         try {
             var request = C.captionRequest(state.project, selectedShot(), state.directorAction, { panel_count: state.characterPanels, style_mode: state.characterStyle });
@@ -510,11 +604,18 @@ var H3StudioTab = (function () {
             .catch(function (error) { setStatus('Project import failed: ' + error.message, 'error'); });
     }
 
+    function selectedTakeDone() {
+        var shot = selectedShot();
+        if (!shot || shot.selected_take < 0) return false;
+        return shot.take_states[shot.selected_take] === 'done';
+    }
+
     function continueTake() {
         var shot = selectedShot();
-        if (shot.selected_take < 0) return;
+        if (shot.selected_take < 0) { showToast('Select a finished take first (queue one, wait for Ready)', 'error'); return; }
+        if (!selectedTakeDone()) { showToast('The selected take is still ' + (shot.take_states[shot.selected_take] || 'pending') + ' — continuation needs its finished motion context', 'error'); return; }
         var jobId = shot.take_job_ids[shot.selected_take] || '';
-        if (!jobId) { setStatus('Selected take has no H3 job id', 'error'); return; }
+        if (!jobId) { setStatus('Selected take has no H3 job id', 'error'); showToast('Selected take has no H3 job id', 'error'); return; }
         addShot(); var next = selectedShot(); next.continue_from = jobId; next.motion_context_frames = 22; next.brief = 'Continue naturally from the approved take while preserving identity, motion, camera, lighting, sound and story state.'; next.title = 'Continue ' + shot.title; saveProject('Continuation shot created'); state.inspectorTab = 'shot'; render();
     }
 
@@ -535,8 +636,8 @@ var H3StudioTab = (function () {
                 var id = String(job.video_id || job.prompt_id); shot.take_job_ids.push(id); shot.take_states.push('queued'); shot.take_output_paths.push(''); shot.selected_take = shot.take_job_ids.length - 1; shot.status = 'Queued'; saveProject();
                 if (typeof QueueTab !== 'undefined') { QueueTab.init(); QueueTab.registerPending({ promptId: id, prompt: shot.brief || shot.shot_description, model: 'MiniMax H3', queuedAt: Date.now(), batchLabel: state.project.title + ' · ' + shot.title }); }
                 setStatus('Queued ' + id + ' · waiting for H3 runtime', 'live'); render(); pollVideo(job, shot.id);
-            }).catch(function (error) { setStatus('H3 submission failed: ' + error.message, 'error'); });
-        } catch (error) { setStatus(error.message, 'error'); }
+            }).catch(function (error) { setStatus('H3 submission failed: ' + error.message, 'error'); showToast('H3 submission failed: ' + error.message, 'error'); });
+        } catch (error) { setStatus(error.message, 'error'); showToast(error.message, 'error'); }
     }
 
     function pollVideo(job, shotId) {
@@ -563,11 +664,11 @@ var H3StudioTab = (function () {
                 var artifact = String(manifest.mp4_url || manifest.artifact_path || ''); var src = manifest.mp4_url || (artifact ? '/out/' + encodeURIComponent(videoId) + '/' + encodeURIComponent(artifact.split('/').pop()) : '');
                 if (!src) throw new Error('completed video manifest has no playable MP4');
                 var take = shot.take_job_ids.indexOf(videoId); if (take >= 0) { shot.take_states[take] = 'done'; shot.take_output_paths[take] = src; shot.selected_take = take; }
-                shot.status = 'Ready'; shot.output_path = src; saveProject(); setStatus(videoId + ' ready', ''); render();
+                shot.status = 'Ready'; shot.output_path = src; saveProject(); setStatus(videoId + ' ready', ''); showToast(videoId + ' ready — playing in the monitor', ''); render();
             }).catch(function (error) {
                 if (token !== state.videoPollToken) return;
                 if (/status HTTP 404/.test(error.message)) { setTimeout(poll, 750); return; }
-                var shot = findShot(); if (shot) shot.status = 'Failed'; saveProject(); setStatus('H3 generation failed: ' + error.message, 'error'); render();
+                var shot = findShot(); if (shot) shot.status = 'Failed'; saveProject(); setStatus('H3 generation failed: ' + error.message, 'error'); showToast('H3 generation failed: ' + error.message, 'error'); render();
             });
         }
         setTimeout(poll, 300);

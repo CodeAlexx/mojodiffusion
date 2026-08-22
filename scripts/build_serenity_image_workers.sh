@@ -31,10 +31,11 @@ for worker_name in "${worker_names[@]}"; do
   final_path="output/bin/serenity_worker_${worker_name}"
   scratch_path="${final_path}.optimizing"
   echo "[image-worker-build] ${worker_name}: pinned -O2, one compiler job"
-  MEM_MAX="${MEM_MAX:-12G}" \
-  MEM_HIGH="${MEM_HIGH:-10G}" \
-  SWAP_MAX="${SWAP_MAX:-2G}" \
-    pixi run scripts/mem_safe.sh mojo build \
+  # mem_safe_runtime.sh (MemoryHigh=infinity, finite MemoryMax, desktop
+  # reserve), not mem_safe.sh: the low-MemoryHigh scope caused sustained
+  # reclaim pressure and systemd-oomd session kills on 2026-08-13 (MJ-1140).
+  MEM_MAX="${MEM_MAX:-16G}" \
+    pixi run scripts/mem_safe_runtime.sh mojo build \
       --optimization-level 2 -j 1 \
       -I . -I trainer/src -I vendor/mojo-libs \
       -Xlinker -L.pixi/envs/default/lib \

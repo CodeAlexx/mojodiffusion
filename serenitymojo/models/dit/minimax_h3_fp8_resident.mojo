@@ -74,7 +74,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, HostBuffer, DeviceEvent
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
@@ -211,6 +211,22 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
     # pages of a held mapping stay reclaimable under memory pressure.
     var tail_st: List[ArcPointer[SafeTensors]]
     var tail_st_path: String
+    # Streamed-tail pinned staging (2026-08-22). The reusable one-block tail
+    # used to stage EVERY tensor through a fresh pinned host allocation plus
+    # ctx.synchronize() (12 cudaHostAlloc + 12 fences per block, 600 per
+    # denoise evaluation at 50 blocks): ~40-65 s of the 100-150 s evaluation
+    # at S=58k was that churn, not transfer. Now: one persistent pinned slab
+    # with two halves sized to a block; a block's tensors are memcpy'd from
+    # the mmap into the active half and enqueued as async default-stream
+    # copies into the existing device tensors (stream order places them
+    # before the block's kernels). A DeviceEvent recorded after a half's
+    # copies fences host reuse of that half two blocks later. Bytes are
+    # identical to the synchronous path. Lazily created by the reload.
+    var tail_stage: List[ArcPointer[HostBuffer[DType.uint8]]]
+    var tail_stage_half_bytes: Int
+    var tail_stage_events: List[ArcPointer[DeviceEvent]]
+    var tail_stage_armed: List[Bool]
+    var tail_stage_turn: Int
 
     def __init__(
         out self,
@@ -225,6 +241,11 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
         self.scheme = scheme
         self.tail_st = List[ArcPointer[SafeTensors]]()
         self.tail_st_path = String("")
+        self.tail_stage = List[ArcPointer[HostBuffer[DType.uint8]]]()
+        self.tail_stage_half_bytes = 0
+        self.tail_stage_events = List[ArcPointer[DeviceEvent]]()
+        self.tail_stage_armed = List[Bool]()
+        self.tail_stage_turn = 0
 
     def resident_bytes(self) raises -> Int:
         """Actual device bytes held by this store (quantized 1B/param + the

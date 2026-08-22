@@ -8,7 +8,7 @@
 # no requantization occur on a cache hit.
 
 from std.ffi import external_call
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, HostBuffer, DeviceEvent
 from std.memory import alloc, ArcPointer
 
 from serenitymojo.io.dtype import STDtype
@@ -202,6 +202,74 @@ def _load_raw_h2d_into(
     _ = sys_memcpy(host_dst, src, nbytes)
     ctx.enqueue_copy(dst_buf=dst.buf, src_buf=host)
     ctx.synchronize()
+
+
+comptime _TAIL_STAGE_ALIGN = 256
+
+
+def _tail_stage_ensure(
+    mut resident: MiniMaxH3ResidentFp8, block_bytes: Int, ctx: DeviceContext
+) raises:
+    """Lazily allocate the two-half pinned staging slab for the streamed tail."""
+    if len(resident.tail_stage) != 0:
+        if resident.tail_stage_half_bytes < block_bytes:
+            raise Error("MiniMax-H3 tail staging slab smaller than a block")
+        return
+    var half = (block_bytes + _TAIL_STAGE_ALIGN - 1) & ~(_TAIL_STAGE_ALIGN - 1)
+    var slab = ctx.enqueue_create_host_buffer[DType.uint8](2 * half)
+    resident.tail_stage.append(ArcPointer(slab^))
+    resident.tail_stage_half_bytes = half
+    resident.tail_stage_events = List[ArcPointer[DeviceEvent]]()
+    resident.tail_stage_events.append(
+        ArcPointer(ctx.create_event[disable_timing=True]())
+    )
+    resident.tail_stage_events.append(
+        ArcPointer(ctx.create_event[disable_timing=True]())
+    )
+    resident.tail_stage_armed = List[Bool]()
+    resident.tail_stage_armed.append(False)
+    resident.tail_stage_armed.append(False)
+    resident.tail_stage_turn = 0
+
+
+def _tail_stage_copy(
+    st: SafeTensors,
+    name: String,
+    mut dst: Tensor,
+    slab_arc: ArcPointer[HostBuffer[DType.uint8]],
+    half_bytes: Int,
+    half_base: Int,
+    mut cursor: Int,
+    ctx: DeviceContext,
+) raises:
+    """memcpy one cached tensor from the mmap into the active pinned half and
+    enqueue an async default-stream copy into the existing device tensor."""
+    var info = st.tensor_info(name)
+    if info.dtype != dst.dtype() or info.shape != dst.shape():
+        raise Error(
+            String("MiniMax-H3 reusable resident tensor mismatch: ") + name
+        )
+    var bytes = st.tensor_bytes(name)
+    var view = from_parts(info.dtype, info.shape.copy(), bytes)
+    var nbytes = view.nbytes()
+    if nbytes != dst.nbytes():
+        raise Error(
+            String("MiniMax-H3 reusable resident byte mismatch: ") + name
+        )
+    var offset = (cursor + _TAIL_STAGE_ALIGN - 1) & ~(_TAIL_STAGE_ALIGN - 1)
+    if offset + nbytes > half_bytes:
+        raise Error("MiniMax-H3 tail staging half overflow")
+    ref slab = slab_arc[]
+    var host_dst = BytePtr(
+        unsafe_from_address=Int(slab.unsafe_ptr()) + half_base + offset
+    )
+    var src = BytePtr(unsafe_from_address=Int(view.data.unsafe_ptr()))
+    _ = sys_memcpy(host_dst, src, nbytes)
+    var host_view = slab.create_sub_buffer[DType.uint8](
+        half_base + offset, nbytes
+    )
+    ctx.enqueue_copy(dst_buf=dst.buf, src_buf=host_view)
+    cursor = offset + nbytes
 
 
 def _block_prefix(layer: Int) -> String:
@@ -429,6 +497,31 @@ def reload_minimax_h3_resident_w8a8_block_st(
     if layer < cached_start or layer >= cached_start + cached_blocks:
         raise Error("MiniMax-H3 reusable tail layer outside cache range")
 
+    # Pinned two-half staging sized to one block (all H3 blocks share shapes).
+    var block_bytes = 0
+    for k in range(len(resident.blocks[0].fp8)):
+        block_bytes += (
+            resident.blocks[0].fp8[k][].nbytes() + 2 * _TAIL_STAGE_ALIGN
+        )
+        block_bytes += (
+            resident.blocks[0].scale[k][].nbytes() + 2 * _TAIL_STAGE_ALIGN
+        )
+    for k in range(len(resident.blocks[0].bf16)):
+        block_bytes += (
+            resident.blocks[0].bf16[k][].nbytes() + 2 * _TAIL_STAGE_ALIGN
+        )
+    _tail_stage_ensure(resident, block_bytes, ctx)
+    var half = resident.tail_stage_turn & 1
+    var half_bytes = resident.tail_stage_half_bytes
+    var half_base = half * half_bytes
+    var slab_arc = resident.tail_stage[0]
+    var event_arc = resident.tail_stage_events[half]
+    if resident.tail_stage_armed[half]:
+        # The GPU must have consumed this half's previous copies (recorded
+        # after them on the default stream) before the host overwrites it.
+        event_arc[].synchronize()
+    var cursor = 0
+
     ref block = resident.blocks[0]
     var expected = minimax_h3_block_tensor_names(layer)
     var qslot = 0
@@ -443,22 +536,22 @@ def reload_minimax_h3_resident_w8a8_block_st(
         if cls == H3_FP8_ROW:
             if qslot >= len(block.fp8):
                 raise Error("MiniMax-H3 reusable tail quantized-slot mismatch")
-            _load_raw_h2d_into(
+            _tail_stage_copy(
                 st, prefix + String("weight.") + String(qslot),
-                block.fp8[qslot][], ctx,
+                block.fp8[qslot][], slab_arc, half_bytes, half_base, cursor, ctx,
             )
-            _load_raw_h2d_into(
+            _tail_stage_copy(
                 st, prefix + String("scale.") + String(qslot),
-                block.scale[qslot][], ctx,
+                block.scale[qslot][], slab_arc, half_bytes, half_base, cursor, ctx,
             )
             block.fp8_names[qslot] = name.copy()
             qslot += 1
         elif cls == H3_FP8_BF16_KEEP:
             if kslot >= len(block.bf16):
                 raise Error("MiniMax-H3 reusable tail keep-slot mismatch")
-            _load_raw_h2d_into(
+            _tail_stage_copy(
                 st, prefix + String("keep.") + String(kslot),
-                block.bf16[kslot][], ctx,
+                block.bf16[kslot][], slab_arc, half_bytes, half_base, cursor, ctx,
             )
             block.bf16_names[kslot] = name.copy()
             kslot += 1
@@ -466,6 +559,9 @@ def reload_minimax_h3_resident_w8a8_block_st(
             raise Error("MiniMax-H3 reusable tail cache class mismatch")
     if qslot != len(block.fp8) or kslot != len(block.bf16):
         raise Error("MiniMax-H3 reusable tail slot-count mismatch")
+    ctx.stream().record_event(event_arc[])
+    resident.tail_stage_armed[half] = True
+    resident.tail_stage_turn += 1
     resident.start_layer = layer
     # Do not call release_to_os() here.  It applies MADV_DONTNEED to the whole
     # packed cache mapping, so a one-block refill would evict all other blocks

@@ -4082,3 +4082,180 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   fixed. Separately, the fresh video decode needs a capped MAX arena
   (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=55`) at 768x768 or it
   OOMs even on a clean card when the warm --serve worker is resident.
+
+### Moviemaker contract facts (durable) + skill pointer
+Operational how-to lives in the local handoffs above and in the skill
+**`serenity-h3-studio-moviemaker`** (`~/.claude/skills/`); the durable
+client/server contract:
+- Tab: nav button 5, `/?tab=h3-studio`, panel `#panel-h3-studio`. UI
+  `canvas/js/h3-studio.js` (`H3StudioTab`) over the pure contracts
+  `canvas/js/h3-project.js` (`H3ProjectContracts`). Project state is
+  **browser `localStorage` only** (`serenity-h3-current-project-v1`) — no
+  server project store; Export/Import project JSON moves it.
+- Schemas: project `serenity.h3.movie.v1`, Director request
+  `serenity.h3.caption.v2`, Director run reply `serenity.h3.director.run.v1`
+  wrapping a `serenity.h3.director.result.v2` (or single-shot doctor) `json`,
+  render `serenity.h3.render.v1`, delivery `serenity.h3.edit.v1`, character
+  sheet `serenity.h3.character_sheet.v1`.
+- Task-mode precedence (`C.detectMode`): `continue_from` → continue; else
+  `references` → ref2va; else first+last frame → fl2va; else first → i2va; else
+  last → l2va; else t2va. Prompt is mode-shaped + locally contract-checked
+  (`C.promptComplianceIssue`) before render.
+- Render request invariants (`C.renderRequest` → `/v1/video`):
+  **`include_audio:true` always** (server rejects `false` for every task),
+  `output_frames = round(24·seconds)`, `frames` aligned so `frames % 17 == 5`
+  (`minimax_h3_align_internal_frames`; 5 s → 124 internal), 24 fps source.
+- Continuation: `continue_from` must be a local `video-XXXX` done job at the
+  **same resolution**; server reads `<out>/<video-XXXX>/motion_context.safetensors`
+  (`latents.safetensors` fallback); `motion_context_frames ∈ {5,22,39}` (default
+  22); `trim_start_frames = motion_context_frames` trims the overlap at mux.
+- Ref2VA/character-sheet admission (beyond the base gate): fixed-geometry runner
+  `output/bin/minimax_h3_ref2va_768x768x124_{int8_fast|int8|bf16}` must exist
+  (`minimax_h3_conditioned_runner` / `..._missing`) — **int8 (Quality) runner is
+  not built on disk today**; plus decode runner `minimax_h3_decode_768x768x124`,
+  checkpoint `checkpoints/MiniMax-H3/Ref2VA`, and the shared encoder cache.
+- Character sheet preset: `PoopMan333/H3_Character_Sheet_Generator` rev
+  `ccc9d411…`; 6-panel canonical (124 frames, indices [2,21,42,63,84,113],
+  render-admitted) vs 4-panel experimental (73 frames ≈3.04 s, below the 5 s
+  minimum, metadata-only).
+- OPEN: `/v1/h3/director` passes only the **first** image reference
+  (`image_path`); true multi-image character_sheet/reference_director needs the
+  captioner extended to multiple `<|vision_start|>` blocks. Audio/video
+  references reach the Director as text context only.
+
+## 2026-08-22: SERENITY GENERATE UI + SHARED RESOLUTION LADDER
+
+**Where image text-to-image is driven from the browser, and the one ladder file
+every image backend shares for its valid sizes.** Companion local skill:
+`serenity-generate-ui` (how to use/test the Generate tab).
+
+### The shared aspect ladder (one file, no drift)
+
+`serenitymojo/training/aspect_buckets.mojo` owns the ladder that training, cache
+staging, and every image inference backend consume, so their geometry cannot
+diverge:
+
+- `DEFAULT_ASPECT_LADDER_X100 = [100, 133, 75, 178, 56, 150, 67]`
+  (`DEFAULT_ASPECT_LADDER_LEN = 7`) = 1:1, 4:3, 3:4, 16:9, 9:16, 3:2, 2:3.
+- `aspect_lat_w_units(x100, e)` / `aspect_lat_h_units(x100, e)` — integer-only,
+  comptime-evaluable, SimpleTuner "area" parity. Return stride-8 VAE latent units
+  for edge-units `e = E/align`. Image backends use `e = 16` (≈1 MP / 1024px area).
+  `zimage_t2d_lat_{w,h}` are the pinned `e=8` (512px) special case.
+- Pixel target = `8 * aspect_lat_{w,h}_units(x100, 16)`. Over the seven ladder
+  entries this yields exactly:
+  **1024×1024, 1152×896, 896×1152, 1344×768, 768×1344, 1280×832, 832×1280**.
+
+Per-backend size gates (each fail-loud rejects anything off its list):
+
+| backend(s) | edge | valid image sizes | shape gate |
+|---|---|---|---|
+| zimage | 16 | 512×512 + 7-shape ladder = **8** | `_zimage_shape_supported` (serve/zimage_backend.mojo, `ZIMAGE_PRODUCT_EDGE_UNITS=16`) |
+| klein (backend name `flux2`) | 16 | 512×512 + 7-shape ladder = **8** | `_klein_shape_supported` — packed 16-px cell, `aspect_lat_*_units//2 * 16`, same pixel sizes |
+| flux, chroma, qwenimage, sd3, sdxl, anima, ideogram4 | 16 | 7-shape ladder | `_<model>_shape_supported`, all over `DEFAULT_ASPECT_LADDER_X100` |
+| krea2 | 16 | 7-shape ladder | `_krea2_t2i_shape_supported` via `krea2_lat_h/krea2_lat_w` (same derivation) |
+| sensenova | — | 512×512, 1024×1024 | capabilities.rs const |
+| lens | — | 1024×1024 (fixed geometry) | capabilities.rs const |
+
+The **wire contract the UI reads** is the Rust mirror in
+`serenity-server/crates/server/src/capabilities.rs`: `ZIMAGE_SIZES` /
+`KLEIN_SIZES` (8) and `IMAGE_1024_ASPECT_SIZES` (7), exported as
+`limits.sizes` (`[{width,height}]`) and `resolution_policy.admitted_product_shapes`
+under `serenity.capabilities.v1`. These `const` arrays are kept **manually
+synchronized** with the Mojo ladder — a unit test in capabilities.rs asserts the
+8/7 counts. **Changing the ladder means editing BOTH** `aspect_buckets.mojo` and
+the Rust consts. 768×768 is rejected everywhere: it is an off-ladder 0.59 MP
+square; the only admitted squares are 512 (zimage/klein) and 1024.
+
+### Generate UI wiring (browser → job)
+
+- Tab code: `serenity-server/canvas/js/generate.js`; API layer:
+  `.../js/api.js` (`SerenityAPI.postGenerate`); model/capability helpers:
+  `.../js/model-utils.js` (`ModelUtils`).
+- Size hydration: on load `loadCapabilities()` fetches `/v1/capabilities` into
+  `state.capabilities`; `getActiveAspects()` → `ModelUtils.aspectsForArch(caps,
+  arch)` maps arch→backend (`backendForArch`; klein→`flux2`), reads
+  `profile.limits.sizes`, and `buildAspectOptions()` fills `#gen-aspect-dropdown`.
+  So the dropdown can only offer **server-advertised** sizes.
+- Submit: `generate()` → `buildGenerateRequest(seed)` (width/height from the
+  dropdown, plus model/prompt/steps/cfg/seed/sampler/scheduler) →
+  `postGenerate` → `POST /v1/preflight` (throws if `admitted===false`) →
+  `POST /v1/generate` → `{ job_id: "job-XXXX" }` (`format!("job-{n:04}")`, atomic
+  counter in main.rs). Progress via the `/v1/progress` websocket.
+- Key selectors: `#gen-model` (hidden, set by `#gen-model-search`), `#gen-prompt`,
+  `#gen-btn` / `#gen-float-generate`, `#gen-aspect-dropdown`,
+  `#gen-width-slider` / `#gen-height-slider` (display-only, `disabled` for image
+  archs), `#gen-steps`, `#gen-cfg`, `#gen-seed`, `#gen-sampler`, `#gen-scheduler`.
+- **Two-tier guard:** the dropdown is the *soft* guard (offers only admitted
+  sizes); the Mojo `_<model>_shape_supported` gate is the *hard* guard (fail-loud).
+  The Rust preflight/gate does **not** validate WxH — a raw `/v1/generate` with an
+  off-ladder size is admitted by Rust and only rejected inside the worker. **Always
+  drive image gens through the UI**, never a hand-rolled request.
+- Gallery/job list is **pull** (`GET /v1/jobs`, `GET /v1/gallery*`) — no gallery
+  push, so a stale browser tab does not live-refresh new `job-XXXX` entries; hard
+  reload to pick them up.
+- zimage capability defaults: 1024×1024, 28 steps, cfg 4.0, euler / simple
+  (turbo → 8 steps).
+
+### Headless test
+
+Playwright + real Chrome (`chromium.launch({channel:"chrome", headless:true})`)
+against `http://127.0.0.1:7811`; drive `#gen-model-search` → `#gen-prompt` →
+`#gen-aspect-dropdown` (labels `W×H`, Unicode ×) → `#gen-btn`; assert
+`POST /v1/preflight` then `POST /v1/generate` → `job-XXXX`, and the image lands in
+the Current Batch panel. Enumerate admitted sizes without the UI:
+`curl -s .../v1/capabilities | jq '.backends[]|select(.backend=="zimage").limits.sizes'`.
+See the `serenity-generate-ui` skill for the full procedure.
+
+## 2026-08-22: SERENITY CANVAS (KONVA LAYER CANVAS)
+
+The **Canvas** is Serenity Studio's InvokeAI-style layer editing / compositing /
+inpaint surface — left nav `.nav-btn[data-tab="canvas"]`, panel `#panel-canvas`.
+Product shape (memory `project_konva_canvas_pivot`): InvokeAI's **Konva
+retained-2D-scene-graph layer canvas** + the Rust serenity-server speaking the
+**ComfyUI API** + the Mojo GPU workers. The canvas JS was reused from
+serenityflow-v2. `serenity-server/canvas/CONTRACT.md` is binding for production
+changes; the checked-in JS is authoritative and served directly (no bundler).
+Inpainting and source-image editing are **Canvas-owned** (Generate does neither).
+
+- `serenity-server/canvas/js/canvas-tab.js` (~494 KB, `CanvasTab` IIFE) is the
+  Canvas: a Konva stage **separate** from the Workflows node-graph editor.
+  `#panel-canvas` ships as a bare placeholder and is **lazy-built** by
+  `CanvasTab.init()` when the tab is first activated (via `switchTab` in
+  `shell.js`); `resize()` re-sizes the stage. Konva bundled = **9.3.6**
+  (`js/konva.min.js`), not the 10.x an older memory claims.
+- Layer model in `js/layer-types.js`: six typed layers — `draw`, `mask`,
+  `guidance`, `control`, `adjustment`, `text` (legacy `raster`→`draw`,
+  `ipadapter`→`control`). Session serialize = `LayerSerializer`, version 3,
+  localStorage `sf-canvas-session`, file ext `.serenity-canvas`; 12 blend modes.
+- Tools (rail `.cv-tools`, `.cv-tool-btn[data-tool=…]`): select(V, = bbox/transform),
+  move, brush, eraser, mask, rect, gradient, fill, text, lasso, pencil,
+  speechbubble, clonestamp, sam (SAM3), colorpicker, pan, resetView + undo/redo.
+- Composition: `js/canvas-compositor.js` (`Compositor.detectMode`) auto-classifies
+  the layer stack into a `GenMode` (txt2img/img2img/inpaint/outpaint/regional/
+  video_inpaint) — the user never picks a mode. `genState.editMode`
+  (create/style/inpaint/flowedit/edit_models/dynaedit/i2v_ltx23/…) selects the
+  `WorkflowBuilder` entry (`build`/`buildImg2Img`/`buildInpaint`/`buildEditModel`/
+  `buildFlowEdit`, `js/workflow-builder.js`). Results land in the staging area
+  (`js/canvas-staging.js`) / floating preview `#canvas-preview-panel` for
+  Accept→Canvas / Discard before commit.
+- Submission: `queueWorkflow` → `SerenityAPI.postPrompt` (`js/api.js`) →
+  `POST /prompt` body `{prompt:<graph object>, client_id}` → `{prompt_id,number,
+  node_errors}`. Progress over the shared `/ws` socket (`js/ws.js`, `SerenityWS`,
+  `client_id` persisted in localStorage `sf-client-id`). Video-shaped workflows
+  divert to `POST /v1/video`.
+- Server (`crates/server/src/comfy.rs`, routes in `main.rs`): `POST /prompt`
+  (`post_prompt`) reuses the shared `enqueue_generate` lowering; a missing/non-object
+  `prompt` → HTTP 400 `{"error":{"type":"invalid_prompt",…},"node_errors":{}}`.
+  Plus `/ws` (global ComfyUI event socket), `/view`, `/object_info`, `/system_stats`,
+  `/queue`, `/history`, `/interrupt`, `/models`(+`/loras`), `/embeddings`,
+  `/upload/{image,mask,media}`, `/canvas/sam3/{status,prepare}`; static canvas via
+  the `serve_canvas` fallback.
+- **Incomplete surfaces (honest):** SAM3 (`js/canvas-sam.js`) needs a separate mask
+  service on **127.0.0.1:7812** — `/canvas/sam3/status` reports `available:false`
+  until it's up. ControlNet preprocessors (`js/canvas-preprocess.js` POSTs
+  `/canvas/preprocess/<method>`) are **client-only** — no such route is registered
+  server-side.
+- Headless: Playwright `channel:"chrome"` at `http://127.0.0.1:7811`, click
+  `.nav-btn[data-tab="canvas"]` FIRST (selectors don't exist before the lazy build),
+  then `.cv-*` ids. Full operational detail in the local `serenity-canvas` skill;
+  launch/recover harness in `serenity-ui-testing-ops`.

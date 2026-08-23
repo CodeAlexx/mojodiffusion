@@ -253,7 +253,7 @@ model filtering, Krea parameter reuse, Z-Image's sampler/scheduler surfaces,
 exact Generate-to-Workflow values, admitted LTX/Sulphur/WAN profiles, identical
 image preflight/generate bodies, and the flat `/v1/generate` request. The full
 design and current real-generation evidence are recorded in
-`../docs/SERENITY_GENERATE_UI_2026-07-24.md`.
+`../docs/SERENITY_GENERATE_UI_2026-07-24.md`. The shared resolution ladder those "compiled resolution choices" come from — the one `serenitymojo/training/aspect_buckets.mojo` file every image backend derives its valid sizes from, and how the Generate tab hydrates them via `/v1/capabilities` — is mapped in `../../serenitymojo/MAP.md` (2026-08-22: SERENITY GENERATE UI + SHARED RESOLUTION LADDER).
 
 To inspect a particular persisted project through the same browser gate:
 

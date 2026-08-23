@@ -4074,3 +4074,11 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   (`.pre_staged` = previous). OPEN: ~40 s/eval of streamed-tail cost remains at
   S=3k (compute ~5 s); first evaluation +29 s (one-time slab alloc under the 12G
   cgroup?). Details: `HANDOFF_H3_STREAMED_TAIL_STAGING_2026-08-22.md` (local).
+  **REGRESSION (2026-08-22, do NOT deploy the staged binary yet):** a runtime
+  built with this staged-tail change OOMs the fresh video VAE decode at
+  768x768x124 (the A/B only covered 512x320x56). The deployed
+  `output/bin/minimax_h3_serenity_runtime` is reverted to the pre-staged
+  build; rebuild+deploy the staged binary only after the decode path is
+  fixed. Separately, the fresh video decode needs a capped MAX arena
+  (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=55`) at 768x768 or it
+  OOMs even on a clean card when the warm --serve worker is resident.

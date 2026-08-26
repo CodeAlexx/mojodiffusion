@@ -527,6 +527,7 @@ struct TrainConfig(Copyable, Movable):
     # every other production trainer.
     var h3_num_timestep_buckets: Int
     var h3_spatial_density_jitter: Float32
+    var h3_seed_offload: Bool
     var h3_base_preservation_loss_weight: Float32
     var h3_base_preservation_probability: Float32
 
@@ -924,6 +925,7 @@ struct TrainConfig(Copyable, Movable):
         omini_position_scale: Float32 = Float32(1.0),
         h3_num_timestep_buckets: Int = 1,
         h3_spatial_density_jitter: Float32 = Float32(0.0),
+        h3_seed_offload: Bool = False,
         h3_base_preservation_loss_weight: Float32 = Float32(0.0),
         h3_base_preservation_probability: Float32 = Float32(1.0),
     ):
@@ -1172,6 +1174,7 @@ struct TrainConfig(Copyable, Movable):
         self.omini_position_scale = omini_position_scale
         self.h3_num_timestep_buckets = h3_num_timestep_buckets
         self.h3_spatial_density_jitter = h3_spatial_density_jitter
+        self.h3_seed_offload = h3_seed_offload
         self.h3_base_preservation_loss_weight = h3_base_preservation_loss_weight
         self.h3_base_preservation_probability = h3_base_preservation_probability
 

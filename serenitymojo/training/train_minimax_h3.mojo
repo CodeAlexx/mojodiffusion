@@ -85,6 +85,11 @@ from serenitymojo.models.minimax_h3.h3_block_train import (
 from serenitymojo.models.minimax_h3.h3_stack_train import (
     h3_stack_train_forward_streamed_int8,
     h3_stack_train_backward_streamed_int8,
+    h3_stack_train_forward_streamed_int8_seedoff,
+    h3_stack_train_backward_streamed_int8_seedoff,
+    H3SeedStore,
+    H3StackTrainForward,
+    H3StackLoraOnlyGrads,
 )
 from serenitymojo.models.minimax_h3.h3_final_train import (
     H3FinalTrainWeights, h3_final_train_forward, h3_final_train_backward,
@@ -1100,6 +1105,11 @@ def main() raises:
         states, rank, scale, target_preset, ctx
     )
     var base_loras = _base_loras()
+    # Recompute-seed offload (h3_seed_offload): pinned-host slab instead of
+    # 50 device-resident [S,D] seeds — measured 2.6GB at the AV bring-up
+    # geometry. Grow-only: recreated when the packed length changes.
+    var seed_offload = train_cfg.h3_seed_offload
+    var seeds = H3SeedStore.create(N_BLOCKS, 4, 4, ctx)
     var run_t0 = perf_counter_ns()
 
     # The cadence supervisor invokes one config-defined segment at a time so
@@ -1311,10 +1321,23 @@ def main() raises:
             _ = ffwd_base^
             _ = fwd_base^
 
-        var fwd = h3_stack_train_forward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
-            hidden0, store, loras, mods, adaln_idx,
-            rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
-        )
+        var fwd: H3StackTrainForward
+        if seed_offload:
+            if seeds.s_len != S or seeds.d_model != H3_D:
+                seeds = H3SeedStore.create(N_BLOCKS, S, H3_D, ctx)
+            var fo = h3_stack_train_forward_streamed_int8_seedoff[
+                H3_HEADS, H3_HEAD_DIM
+            ](
+                hidden0, store, seeds, loras, mods, adaln_idx,
+                rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
+            )
+            fwd = H3StackTrainForward(fo.out.copy(), List[TArc]())
+            _ = fo^
+        else:
+            fwd = h3_stack_train_forward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
+                hidden0, store, loras, mods, adaln_idx,
+                rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
+            )
 
         # ── final layer twin ─────────────────────────────────────────────────
         ctx.synchronize()
@@ -1402,10 +1425,19 @@ def main() raises:
         )
         ctx.synchronize()
         var tp2 = perf_counter_ns()
-        var grads = h3_stack_train_backward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
-            d_hidden, fwd, store, loras, mods, adaln_idx,
-            rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
-        )
+        var grads: H3StackLoraOnlyGrads
+        if seed_offload:
+            grads = h3_stack_train_backward_streamed_int8_seedoff[
+                H3_HEADS, H3_HEAD_DIM
+            ](
+                d_hidden, store, seeds, loras, mods, adaln_idx,
+                rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
+            )
+        else:
+            grads = h3_stack_train_backward_streamed_int8[H3_HEADS, H3_HEAD_DIM](
+                d_hidden, fwd, store, loras, mods, adaln_idx,
+                rope[0], rope[1], H3_D, H3_F, rotary_dim, H3_EPS, ctx,
+            )
         var refiner_grad_groups = List[H3BlockLoraGrads]()
         if target_preset == H3_TARGET_FULL_208:
             if not student_refiner_fwd:

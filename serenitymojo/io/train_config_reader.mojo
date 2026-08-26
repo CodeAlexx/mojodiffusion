@@ -1214,6 +1214,8 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.h3_num_timestep_buckets = Int(_read_scalar(cur).num)
         elif key == "h3_spatial_density_jitter" or key == "spatial_density_jitter":
             cfg.h3_spatial_density_jitter = Float32(_read_scalar(cur).num)
+        elif key == "h3_seed_offload":
+            cfg.h3_seed_offload = _read_bool(cur)
         elif key == "h3_base_preservation_loss_weight" or key == "base_preservation_loss_weight":
             cfg.h3_base_preservation_loss_weight = Float32(_read_scalar(cur).num)
         elif key == "h3_base_preservation_probability" or key == "base_preservation_probability":

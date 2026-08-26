@@ -406,3 +406,178 @@ def h3_stack_train_backward_streamed_int8[
     for r in range(n):
         lora.append(lora_rev[n - 1 - r].copy())
     return H3StackLoraOnlyGrads(TArc(d^), lora^)
+
+
+# ── SEED-OFFLOAD variants: recompute seeds live in pinned host memory ───────
+# Measured need (docs/H3_AV_ACTIVATION_FOOTPRINT_2026-08-26, trainerdocs): the
+# device-resident `block_inputs` list is 50 x S x D x 2B — 0.67GB in image mode
+# but 2.6GB at the AV bring-up geometry (S=4910) and 8.5GB at film res, against
+# a 16GB card that also holds the 9.7GB resident base. Seeds are written once
+# (forward) and read once (backward, reverse order): classic offload shape.
+#
+# Design: ONE pinned host slab (n x seed_bytes) + a 2-slot device scratch ring
+# for backward staging. All copies are `enqueue_copy` on the ctx stream, so
+# they order with the block kernels that produce/consume them — no host-side
+# memcpy exists here, hence NO extra fences beyond the arm's existing policy
+# (unlike H3TrainBlockStore.stage, whose sys_memcpy into pinned staging is
+# host-side and forces the per-block fence).
+from max.gpu.host import HostBuffer, DeviceBuffer
+from serenitymojo.io.dtype import STDtype
+
+
+struct H3SeedStore(Movable):
+    """Pinned-host store for the stack's recompute seeds ([S, D] bf16 each)."""
+    var slab: HostBuffer[DType.uint8]   # pinned, n * seed_bytes
+    var dev: DeviceBuffer[DType.uint8]  # 2-slot staging ring for backward
+    var n: Int
+    var s_len: Int
+    var d_model: Int
+    var seed_bytes: Int
+    var slot: Int
+
+    def __init__(
+        out self,
+        var slab: HostBuffer[DType.uint8],
+        var dev: DeviceBuffer[DType.uint8],
+        n: Int, s_len: Int, d_model: Int, seed_bytes: Int,
+    ):
+        self.slab = slab^
+        self.dev = dev^
+        self.n = n
+        self.s_len = s_len
+        self.d_model = d_model
+        self.seed_bytes = seed_bytes
+        self.slot = 0
+
+    @staticmethod
+    def create(
+        n: Int, s_len: Int, d_model: Int, ctx: DeviceContext
+    ) raises -> H3SeedStore:
+        var seed_bytes = s_len * d_model * 2  # bf16
+        var slab = ctx.enqueue_create_host_buffer[DType.uint8](n * seed_bytes)
+        var dev = ctx.enqueue_create_buffer[DType.uint8](2 * seed_bytes)
+        ctx.synchronize()
+        return H3SeedStore(slab^, dev^, n, s_len, d_model, seed_bytes)
+
+    def save(mut self, i: Int, t: Tensor, ctx: DeviceContext) raises:
+        """Async D2H of block i's input into the pinned slab (stream-ordered
+        after the kernels that produced `t`; `t` must be [s_len, d_model] bf16)."""
+        if i < 0 or i >= self.n:
+            raise Error("H3SeedStore.save: index out of range")
+        if t.nbytes() != self.seed_bytes:
+            raise Error("H3SeedStore.save: seed byte-size mismatch")
+        var hsub = self.slab.create_sub_buffer[DType.uint8](
+            i * self.seed_bytes, self.seed_bytes
+        )
+        ctx.enqueue_copy(dst_buf=hsub, src_buf=t.buf)
+
+    def load(mut self, i: Int, ctx: DeviceContext) raises -> Tensor:
+        """Async H2D of block i's seed into the next scratch slot; returns a
+        [s_len, d_model] bf16 view. Slot reuse is safe by single-stream
+        ordering: the copy is enqueued after every kernel that read the
+        previous tenant of the slot."""
+        if i < 0 or i >= self.n:
+            raise Error("H3SeedStore.load: index out of range")
+        var hsub = self.slab.create_sub_buffer[DType.uint8](
+            i * self.seed_bytes, self.seed_bytes
+        )
+        var dsub = self.dev.create_sub_buffer[DType.uint8](
+            self.slot * self.seed_bytes, self.seed_bytes
+        )
+        ctx.enqueue_copy(dst_buf=dsub, src_buf=hsub)
+        self.slot = 1 - self.slot
+        var sh: List[Int] = [self.s_len, self.d_model]
+        return Tensor(dsub^, sh^, STDtype.BF16)
+
+
+struct H3StackTrainForwardOff(Movable):
+    """Seed-offload forward result: stack output only — the recompute seeds
+    live in the H3SeedStore, not on device."""
+    var out: TArc
+
+    def __init__(out self, var out: TArc):
+        self.out = out^
+
+
+def h3_stack_train_forward_streamed_int8_seedoff[
+    H: Int, Dh: Int
+](
+    x_in: Tensor,
+    mut store: H3TrainBlockStoreInt8,
+    mut seeds: H3SeedStore,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackTrainForwardOff:
+    """`h3_stack_train_forward_streamed_int8` with the per-block input clone
+    replaced by an async D2H into the pinned seed slab."""
+    var n = store.num_blocks
+    if len(mods) != n or len(loras) != n:
+        raise Error("h3 int8 seedoff forward: mods/loras length mismatch")
+    if seeds.n != n:
+        raise Error("h3 int8 seedoff forward: seed store block count mismatch")
+    var h = x_in.clone(ctx)
+    for i in range(n):
+        seeds.save(i, h, ctx)
+        var bw = store.stage(i, ctx)
+        var p8 = store.payload(i)
+        var f = h3_block_train_forward_lora[H, Dh](
+            h, bw, loras[i], mods[i][], adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx, p8,
+        )
+        h = f.out[].clone(ctx)
+        _ = f^
+        _ = bw^
+        if h3_fp8_forward_should_fence(i, store.resident):
+            ctx.synchronize()
+    return H3StackTrainForwardOff(TArc(h^))
+
+
+def h3_stack_train_backward_streamed_int8_seedoff[
+    H: Int, Dh: Int
+](
+    d_out: Tensor,
+    mut store: H3TrainBlockStoreInt8,
+    mut seeds: H3SeedStore,
+    loras: List[H3BlockLoraDevice],
+    mods: List[TArc],
+    adaln_indices: List[Int],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, rotary_dim: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> H3StackLoraOnlyGrads:
+    """`h3_stack_train_backward_streamed_int8` reading recompute seeds from the
+    pinned slab (2-slot device ring) instead of device-resident block_inputs."""
+    var n = store.num_blocks
+    if seeds.n != n:
+        raise Error("h3 int8 seedoff backward: seed store block count mismatch")
+    var lora_rev = List[H3BlockLoraGrads]()
+    var d = d_out.clone(ctx)
+    for r in range(n):
+        var i = n - 1 - r
+        var seed = seeds.load(i, ctx)
+        var bw = store.stage(i, ctx)
+        var p8 = store.payload(i)
+        var f = h3_block_train_forward_lora[H, Dh](
+            seed, bw, loras[i], mods[i][],
+            adaln_indices, cos, sin, D, F, rotary_dim, eps, ctx, p8,
+        )
+        var b = h3_block_train_backward_lora_frozen[H, Dh](
+            d, bw, loras[i], f.saved, adaln_indices, cos, sin,
+            D, F, rotary_dim, eps, ctx, p8,
+        )
+        d = b.d_x[].clone(ctx)
+        lora_rev.append(b.lora.copy())
+        _ = b^
+        _ = f^
+        _ = bw^
+        _ = seed^
+        if h3_fp8_backward_should_fence(i, store.resident):
+            ctx.synchronize()
+    var lora = List[H3BlockLoraGrads]()
+    for r in range(n):
+        lora.append(lora_rev[n - 1 - r].copy())
+    return H3StackLoraOnlyGrads(TArc(d^), lora^)

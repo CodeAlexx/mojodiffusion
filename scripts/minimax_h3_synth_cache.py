@@ -35,7 +35,7 @@ for n in range(count):
         lat = {
             "latents_37x16x28_bfloat16": torch.randn(24, 37, 16, 28).to(torch.bfloat16),
             "latents_audio_2x32x207_bfloat16": torch.randn(2, 32, 207).to(torch.bfloat16),
-            "audio_loss_mask": torch.ones(207, dtype=torch.bool),
+            "audio_loss_mask": torch.cat([torch.ones(204, dtype=torch.bool), torch.zeros(3, dtype=torch.bool)]),
             # first+last keyframe rows: [2R, RW], R = (16//2)*(28//2), RW = 24*2*2
             "varlen_mmh3_keyframe_video_rows_bfloat16": torch.randn(
                 2 * (16 // 2) * (28 // 2), 24 * 2 * 2

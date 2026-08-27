@@ -6,8 +6,8 @@
     "save_before_sample": true,
     "precache_required": false,
     "enforce_min_image_size": false,
-    "width": 512,
-    "height": 320,
+    "width": 1024,
+    "height": 1024,
     "frames": 22,
     "fps": 24,
     "steps": 20,
@@ -15,7 +15,7 @@
     "seed": 271828,
     "negative": "",
     "h3_quant": "int8-fast",
-    "h3_resident_blocks": 42,
+    "h3_resident_blocks": 8,
     "h3_attention_backend": "cudnn"
   },
   "prompts": [

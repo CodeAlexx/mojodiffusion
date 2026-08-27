@@ -1132,12 +1132,19 @@ def _minimax_h3_mux_av(
     if output_fps != input_fps:
         cmd += String(" -vf fps=") + String(output_fps)
     cmd += String(" -frames:v ") + String(frames)
-    cmd += String(" -c:v h264_nvenc -preset p7 -tune hq -rc vbr -cq 18")
-    cmd += String(" -b:v 0 -pix_fmt yuv420p -af apad -c:a aac -shortest")
-    cmd += String(" -movflags +faststart ") + shell_quote(mp4)
-    if sys_system(cmd) != 0:
-        raise Error("minimax_h3_t2va: GPU NVENC A/V mux failed")
-    print("  muxed", mp4, "with h264_nvenc")
+    var tail = String(" -pix_fmt yuv420p -af apad -c:a aac -shortest")
+    tail += String(" -movflags +faststart ") + shell_quote(mp4)
+    var nv = cmd + String(
+        " -c:v h264_nvenc -preset p7 -tune hq -rc vbr -cq 18 -b:v 0"
+    ) + tail
+    if sys_system(nv) == 0:
+        print("  muxed", mp4, "with h264_nvenc")
+        return mp4^
+    # NVENC unavailable (e.g. a static ffmpeg build without it): CPU fallback.
+    var cpu = cmd + String(" -c:v libx264 -preset medium -crf 18") + tail
+    if sys_system(cpu) != 0:
+        raise Error("minimax_h3_t2va: A/V mux failed (nvenc and libx264)")
+    print("  muxed", mp4, "with libx264 (nvenc unavailable)")
     return mp4^
 
 

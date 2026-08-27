@@ -104,8 +104,24 @@ sample_all() {
         --fps="$fps" --output-fps="$fps" \
         --quant="$quant" --resident-blocks="$resident" \
         --encoder-storage=int8 --attention-backend="$attention" \
-        --step-cache=exact --temporal-rope-scale=1.0 "${lora_arg[@]}" \
+        --step-cache=exact --temporal-rope-scale=1.0 --defer-video-decode \
+        "${lora_arg[@]}" \
         2>&1 | tee "$sample_dir/sample.log"
+    # 16GB discipline (matches the film scripts): the resident DiT store and
+    # the GPU video VAE cannot coexist — decode the deferred latents in a
+    # fresh GPU process, which also muxes video.mp4.
+    LD_LIBRARY_PATH="$runtime_ld" \
+    MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=85 \
+    MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT=100 \
+    DESKTOP_RESERVE=24G MEM_MAX=18G MEM_HIGH=infinity SWAP_MAX=2G \
+      scripts/mem_safe_runtime.sh "$sampler" \
+        "$prompt" "$sample_dir" "$denoise_steps" "$seed" "$model_blocks" \
+        decode_only \
+        --width="$width" --height="$height" \
+        --frames="$frames" --output-frames="$frames" \
+        --fps="$fps" --output-fps="$fps" \
+        --quant="$quant" --resident-blocks="$resident" \
+        2>&1 | tee "$sample_dir/decode.log"
     if [[ ! -s "$sample_dir/video.mp4" ]]; then
       echo "step-$step validation did not produce video.mp4" >&2
       exit 1
@@ -130,7 +146,7 @@ while (( current < max_steps )); do
   MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=85 \
   MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT=100 \
   H3_ALLOW_USER_SLICE=1 DESKTOP_RESERVE=24G \
-  MEM_MAX=18G MEM_HIGH=infinity SWAP_MAX=2G \
+  MEM_MAX=24G MEM_HIGH=infinity SWAP_MAX=2G \
     scripts/mem_safe_runtime.sh "$trainer" "$config" --cadence_segment 1
   next=$(latest_checkpoint_step)
   if (( next <= current )); then

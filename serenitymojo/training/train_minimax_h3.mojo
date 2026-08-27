@@ -61,19 +61,26 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     minimax_h3_video_patchify, minimax_h3_timestep_embedding,
     minimax_h3_condition_embed, minimax_h3_token_refiner_dynamic,
     _minimax_h3_video_patch_embed_bf16,
+    _minimax_h3_audio_patch_embed_bf16,
 )
 from serenitymojo.models.dit.minimax_h3_rope import build_minimax_h3_rope_tables
 from serenitymojo.models.minimax_h3.packing import (
     minimax_h3_build_packed_sequence, minimax_h3_build_row_timesteps,
+    MINIMAX_H3_ANCHOR_FIRST, MINIMAX_H3_ANCHOR_LAST,
 )
 from serenitymojo.models.minimax_h3.dit_frontend import minimax_h3_adaln_indices
 from serenitymojo.models.minimax_h3.h3_train_cache import (
     H3CacheItemPaths, h3_discover_cache_items,
     h3_read_latent_cache, h3_read_text_cache,
 )
+from serenitymojo.models.minimax_h3.h3_train_av import (
+    h3_audio_latents_to_rows, h3_audio_rows_to_latents, h3_audio_mask_tensor,
+)
 from serenitymojo.models.minimax_h3.h3_train_sigma import (
     h3_noisy_input, h3_velocity_target,
     h3_modality_loss, h3_joint_token_loss, h3_loss_grad,
+    h3_shift_sigma,
+    H3ModalityLoss,
 )
 from serenitymojo.models.minimax_h3.h3_train_block_store_int8 import (
     H3TrainBlockStoreInt8,
@@ -904,6 +911,8 @@ def main() raises:
     var step_w = Dict[String, ArcPointer[Tensor]]()
     step_w[String("video_patch_proj.weight")] = frontend_w[String("video_patch_proj.weight")].copy()
     step_w[String("video_patch_proj.bias")] = frontend_w[String("video_patch_proj.bias")].copy()
+    step_w[String("audio_patch_proj.weight")] = frontend_w[String("audio_patch_proj.weight")].copy()
+    step_w[String("audio_patch_proj.bias")] = frontend_w[String("audio_patch_proj.bias")].copy()
     var empty_w = Dict[String, ArcPointer[Tensor]]()
     frontend_w = empty_w^
     ctx.synchronize()
@@ -1141,8 +1150,14 @@ def main() raises:
         )
 
         var lat = h3_read_latent_cache(it.latent_path, ctx)
-        if not lat.has_video or lat.lat_f != 1:
-            raise Error("maiden arm expects image items ([24,1,H,W]): " + it.item_key)
+        var is_av = lat.has_audio or lat.lat_f != 1
+        if not lat.has_video:
+            raise Error("H3 trainer requires video latents: " + it.item_key)
+        if is_av and guidance_scale > Float32(0.0):
+            raise Error(
+                "H3 AV arm: guidance distillation is image-only today; set "
+                "guidance_scale 0 for AV items"
+            )
         var te = h3_read_text_cache(it.te_path, ctx)
         # upstream trains in dit_dtype bf16: cast cached latents down exactly
         # like its .to(dtype) load (caches may be stored F32)
@@ -1150,10 +1165,18 @@ def main() raises:
         if x0.dtype() != STDtype.BF16:
             x0 = cast_tensor(x0, STDtype.BF16, ctx)
 
-        # ── sigma (image branch), quantized to the grid ──────────────────────
-        var sigma_raw = _bucketed_image_sigma(
-            rng, seed, step, timestep_buckets, lat.lat_h, lat.lat_w
-        )
+        # ── sigma, quantized to the grid. Image keeps the resolution-aware
+        # bucketed draw; AV uses the released shared-u recipe (u ~ U[0,1),
+        # per-modality shift 12/3 — h3_train_sigma, musubi parity). ───────────
+        var u_av = Float64(0.0)
+        var sigma_raw: Float64
+        if is_av:
+            u_av = rng.uniform()
+            sigma_raw = Float64(h3_shift_sigma(Float32(u_av), Float32(12.0)))
+        else:
+            sigma_raw = _bucketed_image_sigma(
+                rng, seed, step, timestep_buckets, lat.lat_h, lat.lat_w
+            )
         var node = Int(sigma_raw * Float64(SIGMA_NODES - 1) + 0.5)
         if node < 0:
             node = 0
@@ -1161,12 +1184,42 @@ def main() raises:
             node = SIGMA_NODES - 1
         var sigma = Float32(node) / Float32(SIGMA_NODES - 1)
         var t_v = Float32(1.0) - sigma
+        var audio_t = 0
+        if lat.has_audio:
+            audio_t = lat.audio_t
+        var sigma_a = Float32(0.0)
+        var t_a = Float32(1.0)
+        var node_a = 0
+        if is_av and lat.has_audio:
+            var sa_raw = Float64(h3_shift_sigma(Float32(u_av), Float32(3.0)))
+            node_a = Int(sa_raw * Float64(SIGMA_NODES - 1) + 0.5)
+            if node_a < 0:
+                node_a = 0
+            if node_a > SIGMA_NODES - 1:
+                node_a = SIGMA_NODES - 1
+            sigma_a = Float32(node_a) / Float32(SIGMA_NODES - 1)
+            t_a = Float32(1.0) - sigma_a
 
         # ── noise + target (gated bit-exact vs torch) ────────────────────────
-        var vsh: List[Int] = [24, 1, lat.lat_h, lat.lat_w]
+        var vsh: List[Int] = [24, lat.lat_f, lat.lat_h, lat.lat_w]
         var noise = randn(vsh^, UInt64(seed * 1000003 + step), STDtype.BF16, ctx)
         var x_t = h3_noisy_input(x0, noise, sigma, ctx)
         var target = h3_velocity_target(x0, noise, ctx)
+        # audio: separate noise draw (distinct deterministic stream), the
+        # gated dual-sigma path.
+        var xt_audio = Optional[Tensor](None)
+        var target_audio = Optional[Tensor](None)
+        if is_av and lat.has_audio:
+            var a0 = lat.audio[].clone(ctx)
+            if a0.dtype() != STDtype.BF16:
+                a0 = cast_tensor(a0, STDtype.BF16, ctx)
+            var ash: List[Int] = [2, 32, audio_t]
+            var noise_a = randn(
+                ash^, UInt64(seed * 1000003 + step + 500009), STDtype.BF16, ctx
+            )
+            xt_audio = Optional[Tensor](h3_noisy_input(a0, noise_a, sigma_a, ctx))
+            target_audio = Optional[Tensor](h3_velocity_target(a0, noise_a, ctx))
+            _ = a0^
         # the frontend's patch projection is an fp32-trap path (checkpoint F32
         # weights): feed F32 rows (exact bf16 upcast), it rne-casts back down.
         var x_rows = cast_tensor(
@@ -1177,12 +1230,16 @@ def main() raises:
         # ── packed layout + rope + frontend (frozen, gated inference code) ───
         var density_scale = _density_scale(rng, spatial_density_jitter)
         var anchors = List[Int]()
+        if is_av and lat.has_keyframe_rows and te.task_id == 2:
+            anchors.append(MINIMAX_H3_ANCHOR_FIRST)
+            anchors.append(MINIMAX_H3_ANCHOR_LAST)
         var layout = minimax_h3_build_packed_sequence(
-            te.tags, 1, lat.lat_h, lat.lat_w, 0, 2, 2, anchors, density_scale,
+            te.tags, lat.lat_f, lat.lat_h, lat.lat_w, audio_t, 2, 2, anchors,
+            density_scale,
         )
         var S = layout.sequence_length
         var row_ts = minimax_h3_build_row_timesteps(
-            layout, t_v, Float32(1.0), Float32(0.999), Float32(1.0),
+            layout, t_v, t_a, Float32(0.999), Float32(1.0),
         )
         var positions_f32 = List[Float32](capacity=len(layout.position_ids))
         for i in range(len(layout.position_ids)):
@@ -1216,21 +1273,64 @@ def main() raises:
             text_embeds = Tensor.from_host_bf16(
                 text_embeds_host[item_i], tesh.copy(), ctx
             )
-        var hidden0 = concat(0, ctx, text_embeds, video_embeds)
+        var hidden0: Tensor
+        if is_av:
+            var media = video_embeds.clone(ctx)
+            if lat.has_audio:
+                var a_rows = cast_tensor(
+                    h3_audio_latents_to_rows(xt_audio.value(), ctx),
+                    STDtype.F32, ctx,
+                )
+                var a_emb = _minimax_h3_audio_patch_embed_bf16(a_rows, step_w, ctx)
+                media = concat(0, ctx, a_emb, media)
+            if len(anchors) > 0:
+                var kf_rows = cast_tensor(
+                    lat.keyframe_rows[].clone(ctx), STDtype.F32, ctx
+                )
+                var kf_emb = _minimax_h3_video_patch_embed_bf16(kf_rows, step_w, ctx)
+                media = concat(0, ctx, kf_emb, media)
+            hidden0 = concat(0, ctx, text_embeds, media)
+        else:
+            hidden0 = concat(0, ctx, text_embeds, video_embeds)
         if hidden0.shape()[0] != S:
-            raise Error("packed length mismatch (text+video != S)")
+            raise Error("packed length mismatch (text+media != S)")
 
         # ── per-step mod tables: fetch ONLY this node's rows (host grid) ─────
+        var ts_nodes = List[Int]()
         var node_idx = List[Int]()
-        for _ in range(S):
-            node_idx.append(0)  # fetched tables carry just this node's rows
+        if not is_av:
+            ts_nodes.append(node)
+            for _ in range(S):
+                node_idx.append(0)  # fetched tables carry just this node's rows
+        else:
+            # one grid node per DISTINCT row timestep, in row_ts order; the
+            # fetched tables below concatenate one [3,6D] chunk per node.
+            var node_c = Int(Float64(0.001) * Float64(SIGMA_NODES - 1) + 0.5)
+            for k in range(len(row_ts.values)):
+                var v = row_ts.values[k]
+                if v == t_v:
+                    ts_nodes.append(node)
+                elif v == t_a:
+                    ts_nodes.append(node_a)
+                elif v == Float32(0.999):
+                    ts_nodes.append(node_c)
+                else:
+                    raise Error("H3 AV arm: unrecognized row timestep value")
+            node_idx = row_ts.indices.copy()
         var adaln_idx = minimax_h3_adaln_indices(node_idx, layout.token_tags)
-        var final_mod_rows = modgrid.final_row(node, ctx)
+        var final_mod_rows = modgrid.final_row(ts_nodes[0], ctx)
+        for k in range(1, len(ts_nodes)):
+            final_mod_rows = concat(
+                0, ctx, final_mod_rows, modgrid.final_row(ts_nodes[k], ctx)
+            )
 
         # ── 50-block streamed LoRA forward ───────────────────────────────────
         var mods = List[TArc]()
         for b in range(N_BLOCKS):
-            mods.append(TArc(modgrid.block_rows(b, node, ctx)))
+            var tbl = modgrid.block_rows(b, ts_nodes[0], ctx)
+            for k in range(1, len(ts_nodes)):
+                tbl = concat(0, ctx, tbl, modgrid.block_rows(b, ts_nodes[k], ctx))
+            mods.append(TArc(tbl^))
         ctx.synchronize()
         var tp0 = perf_counter_ns()
 
@@ -1304,7 +1404,9 @@ def main() raises:
             var base_text = Tensor.from_host_bf16(
                 text_embeds_host[item_i], tesh.copy(), ctx
             )
-            var hidden0_base = concat(0, ctx, base_text, video_embeds)
+            var text_rows_n = text_embeds.shape()[0]
+            var media_part = slice(hidden0, 0, text_rows_n, S - text_rows_n, ctx)
+            var hidden0_base = concat(0, ctx, base_text, media_part)
             var fwd_base = h3_stack_train_forward_streamed_int8[
                 H3_HEADS, H3_HEAD_DIM
             ](
@@ -1343,9 +1445,12 @@ def main() raises:
         ctx.synchronize()
         var tp1 = perf_counter_ns()
         var empty_idx = List[Int]()
+        var audio_out_idx = List[Int]()
+        if is_av and lat.has_audio:
+            audio_out_idx = layout.audio_indices.copy()
         var ffwd = h3_final_train_forward(
             fwd.out[], final_w, final_mod_rows, node_idx,
-            layout.video_indices, empty_idx, H3_EPS, ctx,
+            layout.video_indices, audio_out_idx, H3_EPS, ctx,
         )
 
         # ── loss + d_pred (gated bit-exact vs torch) ─────────────────────────
@@ -1369,8 +1474,26 @@ def main() raises:
         else:
             pred_rows = ffwd.video[].clone(ctx)
         var empty_mask = List[Bool]()
-        var ml = h3_modality_loss(pred_rows, target_rows, empty_mask, ctx)
-        var loss = ml.total / Float64(ml.elements)
+        var n_cond_v = layout.num_condition_video_rows
+        var pred_target_rows: Tensor
+        if n_cond_v == 0:
+            pred_target_rows = pred_rows.clone(ctx)
+        else:
+            pred_target_rows = slice(
+                pred_rows, 0, n_cond_v, pred_rows.shape()[0] - n_cond_v, ctx
+            )
+        var ml = h3_modality_loss(pred_target_rows, target_rows, empty_mask, ctx)
+        var ml_a = H3ModalityLoss(Float64(0.0), 0)
+        var pred_audio_lat = Optional[Tensor](None)
+        if is_av and lat.has_audio:
+            pred_audio_lat = Optional[Tensor](
+                h3_audio_rows_to_latents(ffwd.audio[], audio_t, ctx)
+            )
+            ml_a = h3_modality_loss(
+                pred_audio_lat.value(), target_audio.value(),
+                lat.audio_loss_mask, ctx,
+            )
+        var loss = h3_joint_token_loss(ml, ml_a, Float64(1.0), Float64(1.0))
         var preservation_loss = Float64(0.0)
         if base_prediction:
             var pl = h3_modality_loss(
@@ -1399,9 +1522,14 @@ def main() raises:
             continue
 
         var none_mask = Optional[Tensor](None)
+        var denom_all = Float64(ml.elements) + Float64(ml_a.elements)
         var d_video = h3_loss_grad(
-            pred_rows, target_rows, none_mask^, 1.0, Float64(ml.elements), ctx,
+            pred_target_rows, target_rows, none_mask^, 1.0, denom_all, ctx,
         )
+        if n_cond_v > 0:
+            var zsh: List[Int] = [n_cond_v, d_video.shape()[1]]
+            var zeros_c = full_device(zsh^, Float32(0.0), STDtype.BF16, ctx)
+            d_video = concat(0, ctx, zeros_c, d_video)
         if use_guidance:
             d_video = mul_scalar_bf16out(
                 cast_tensor(d_video, STDtype.F32, ctx),
@@ -1417,11 +1545,21 @@ def main() raises:
             d_video = add(d_video, d_preserve, ctx)
 
         # ── backward chain ───────────────────────────────────────────────────
-        var d_audio_sh: List[Int] = [1, 1]
-        var d_audio = full_device(d_audio_sh^, Float32(0.0), STDtype.BF16, ctx)
+        var d_audio: Tensor
+        if is_av and lat.has_audio:
+            var amask = h3_audio_mask_tensor(lat.audio_loss_mask, 32, ctx)
+            var amask_opt = Optional[Tensor](amask^)
+            var d_a_lat = h3_loss_grad(
+                pred_audio_lat.value(), target_audio.value(), amask_opt^,
+                1.0, denom_all, ctx,
+            )
+            d_audio = h3_audio_latents_to_rows(d_a_lat, ctx)
+        else:
+            var d_audio_sh: List[Int] = [1, 1]
+            d_audio = full_device(d_audio_sh^, Float32(0.0), STDtype.BF16, ctx)
         var d_hidden = h3_final_train_backward(
             d_video, d_audio, ffwd.saved, final_w, node_idx,
-            layout.video_indices, empty_idx, S, H3_EPS, ctx,
+            layout.video_indices, audio_out_idx, S, H3_EPS, ctx,
         )
         ctx.synchronize()
         var tp2 = perf_counter_ns()

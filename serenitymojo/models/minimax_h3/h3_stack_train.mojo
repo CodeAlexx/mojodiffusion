@@ -19,6 +19,7 @@ from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
 from serenitymojo.tensor import Tensor
+from serenitymojo.models.klein.lora_block import KleinLoraDeviceGradTensors
 from serenitymojo.models.minimax_h3.h3_block_train import (
     H3BlockTrainWeights, H3BlockLoraDevice, H3BlockTrainGrads,
     H3BlockLoraGrads, H3BlockTrainLoraBackward,
@@ -519,6 +520,10 @@ def h3_stack_train_forward_streamed_int8_seedoff[
         raise Error("h3 int8 seedoff forward: mods/loras length mismatch")
     if seeds.n != n:
         raise Error("h3 int8 seedoff forward: seed store block count mismatch")
+    # AV-scale sequences: per-block transients are large enough that the
+    # every-8th resident fence lets several coexist and OOMs a 16GB card —
+    # fence every block once S crosses the threshold (image S stays fast).
+    var fence_all = x_in.shape()[0] >= 2048
     var h = x_in.clone(ctx)
     for i in range(n):
         seeds.save(i, h, ctx)
@@ -531,9 +536,34 @@ def h3_stack_train_forward_streamed_int8_seedoff[
         h = f.out[].clone(ctx)
         _ = f^
         _ = bw^
-        if h3_fp8_forward_should_fence(i, store.resident):
+        if fence_all or h3_fp8_forward_should_fence(i, store.resident):
             ctx.synchronize()
     return H3StackTrainForwardOff(TArc(h^))
+
+
+def _h3_prune_adapter_grads(
+    g: H3BlockLoraGrads, dummy: TArc
+) raises -> H3BlockLoraGrads:
+    """Keep d_a/d_b (what the optimizer consumes), replace the retained
+    per-adapter d_x — [S,D]/[S,F] tensors already consumed inside the block
+    backward — with a shared [1,1] dummy. 184MB/block at the AV geometry."""
+    var out = List[Optional[KleinLoraDeviceGradTensors]]()
+    var slots = List[Optional[KleinLoraDeviceGradTensors]]()
+    slots.append(g.qkv.copy())
+    slots.append(g.out.copy())
+    slots.append(g.fc1.copy())
+    slots.append(g.fc2.copy())
+    for i in range(4):
+        if slots[i]:
+            var t = slots[i].value().copy()
+            out.append(Optional[KleinLoraDeviceGradTensors](
+                KleinLoraDeviceGradTensors(t.d_a.copy(), t.d_b.copy(), dummy.copy())
+            ))
+        else:
+            out.append(Optional[KleinLoraDeviceGradTensors](None))
+    return H3BlockLoraGrads(
+        out[0].copy(), out[1].copy(), out[2].copy(), out[3].copy()
+    )
 
 
 def h3_stack_train_backward_streamed_int8_seedoff[
@@ -554,7 +584,12 @@ def h3_stack_train_backward_streamed_int8_seedoff[
     var n = store.num_blocks
     if seeds.n != n:
         raise Error("h3 int8 seedoff backward: seed store block count mismatch")
+    var fence_all = d_out.shape()[0] >= 2048
     var lora_rev = List[H3BlockLoraGrads]()
+    var dummy_sh: List[Int] = [1, 1]
+    var dummy = TArc(Tensor(
+        ctx.enqueue_create_buffer[DType.uint8](2), dummy_sh^, STDtype.BF16
+    ))
     var d = d_out.clone(ctx)
     for r in range(n):
         var i = n - 1 - r
@@ -570,12 +605,12 @@ def h3_stack_train_backward_streamed_int8_seedoff[
             D, F, rotary_dim, eps, ctx, p8,
         )
         d = b.d_x[].clone(ctx)
-        lora_rev.append(b.lora.copy())
+        lora_rev.append(_h3_prune_adapter_grads(b.lora, dummy))
         _ = b^
         _ = f^
         _ = bw^
         _ = seed^
-        if h3_fp8_backward_should_fence(i, store.resident):
+        if fence_all or h3_fp8_backward_should_fence(i, store.resident):
             ctx.synchronize()
     var lora = List[H3BlockLoraGrads]()
     for r in range(n):

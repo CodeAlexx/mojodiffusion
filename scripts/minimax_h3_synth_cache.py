@@ -28,7 +28,7 @@ for n in range(count):
         w, h = 832, 480
         lat = {"latents_1x30x52_bfloat16": torch.randn(24, 1, 30, 52).to(torch.bfloat16)}
         tokens = 87
-    elif kind == "av256":
+    elif kind in ("av256", "av256fl"):
         # smallest legal AV clip at the bring-up geometry: 124 pixel frames ->
         # 37 video latent frames, 207 audio latents, 16x28 latent grid.
         w, h = 448, 256
@@ -49,7 +49,9 @@ for n in range(count):
     te = {
         "varlen_mmh3_hidden_states_bfloat16": torch.randn(tokens, 5120).to(torch.bfloat16),
         "varlen_mmh3_token_tags_int64": torch.ones(tokens, dtype=torch.long),
-        "mmh3_conditioning_task": torch.tensor(0, dtype=torch.long),  # t2va
+        "mmh3_conditioning_task": torch.tensor(
+            2 if kind == "av256fl" else 0, dtype=torch.long
+        ),  # fl2va=2 / t2va=0
         # empty-cond entries so --guidance_scale runs can use these items
         "varlen_mmh3_empty_hidden_states_bfloat16": torch.randn(12, 5120).to(torch.bfloat16),
         "varlen_mmh3_empty_token_tags_int64": torch.ones(12, dtype=torch.long),

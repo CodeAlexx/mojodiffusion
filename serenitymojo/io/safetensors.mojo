@@ -10,7 +10,7 @@
 #   6. file_len = file size; data_len = file_len - data_offset
 #      (mmap.rs:193-194). Reject data_len == 0 (mmap.rs:196-198).
 #   7. mmap the DATA segment via MmapRegion.new (mmap.rs:201).
-#   8. build name -> TensorRef index, skipping "__metadata__" (mmap.rs:204-235).
+#   8. build name -> TensorRef index and retain validated string metadata.
 #      offset = data_offsets[0]; size = data_offsets[1] - data_offsets[0].
 #
 # The DATA segment is mmap'd (never read into RAM). The 8-byte length + header
@@ -20,7 +20,7 @@
 from std.memory import alloc, UnsafePointer, bitcast
 from .dtype import STDtype
 from .mmap import MmapRegion
-from .json_header import parse_header, HeaderEntry
+from .json_header import parse_header_with_metadata, HeaderEntry
 from .ffi import (
     BytePtr,
     sys_open,
@@ -87,6 +87,7 @@ struct SafeTensors(Movable):
     var region: MmapRegion
     var tensors: Dict[String, TensorRef]
     var storage_names: List[String]
+    var metadata_values: Dict[String, String]
     var path: String
 
     def __init__(
@@ -94,11 +95,13 @@ struct SafeTensors(Movable):
         var region: MmapRegion,
         var tensors: Dict[String, TensorRef],
         var storage_names: List[String],
+        var metadata_values: Dict[String, String],
         path: String,
     ):
         self.region = region^
         self.tensors = tensors^
         self.storage_names = storage_names^
+        self.metadata_values = metadata_values^
         self.path = path
 
     @staticmethod
@@ -161,8 +164,15 @@ struct SafeTensors(Movable):
 
         # Parse header BEFORE mmap so a parse failure closes fd cleanly.
         var entries: List[HeaderEntry]
+        var metadata_values = Dict[String, String]()
         try:
-            entries = parse_header(hbytes^)
+            var parsed = parse_header_with_metadata(hbytes^)
+            # Copy metadata entries before consuming the sibling `entries`
+            # field; moving either field out of the middle would partially
+            # destroy `parsed` and make the other field inaccessible.
+            for ref item in parsed.metadata.items():
+                metadata_values[item.key] = item.value.copy()
+            entries = parsed.entries.copy()
         except e:
             _ = sys_close(fd)
             raise e^
@@ -186,7 +196,6 @@ struct SafeTensors(Movable):
         var header_is_storage_order = True
         var last_offset = -1
         for ref e in entries:
-            # __metadata__ is already skipped by parse_header (mmap.rs:207-209).
             var start = e.off_start
             var end = e.off_end
             # 2026-07-07 hardening (HF-crate parity): a corrupt/truncated file
@@ -233,7 +242,9 @@ struct SafeTensors(Movable):
                 sorted_offsets.insert(pos, storage_offsets[i])
             storage_names = sorted_names^
 
-        return SafeTensors(region^, tensors^, storage_names^, path.copy())
+        return SafeTensors(
+            region^, tensors^, storage_names^, metadata_values^, path.copy()
+        )
 
     def tensor_bytes(
         self, name: String
@@ -290,6 +301,21 @@ struct SafeTensors(Movable):
     def has_tensor(self, name: String) -> Bool:
         """Non-raising tensor existence check."""
         return name in self.tensors
+
+    def metadata(self) -> Dict[String, String]:
+        """Return a copy of the decoded safetensors `__metadata__` string map."""
+        var out = Dict[String, String]()
+        for ref item in self.metadata_values.items():
+            out[item.key] = item.value.copy()
+        return out^
+
+    def has_metadata(self, key: String) -> Bool:
+        return key in self.metadata_values
+
+    def metadata_value(self, key: String) raises -> String:
+        if key not in self.metadata_values:
+            raise Error(String("safetensors metadata key not found: ") + key)
+        return self.metadata_values[key].copy()
 
     def names_storage_order(self) -> List[String]:
         """Tensor names in ascending on-disk data-offset order.

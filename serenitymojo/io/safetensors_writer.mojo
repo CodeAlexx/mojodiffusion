@@ -33,6 +33,7 @@
 # uint8 buffers throughout.
 
 from std.memory import alloc, UnsafePointer, ArcPointer
+from std.collections import Dict, List
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .dtype import STDtype
 from .ffi import (
@@ -110,6 +111,47 @@ def _hex_digit(v: Int) -> UInt8:
     return UInt8(0x61 + (v - 10))  # 'a'..'f'
 
 
+def _sorted_metadata_keys(metadata: Dict[String, String]) -> List[String]:
+    """C/UTF-8 deterministic key order for stable safetensors headers."""
+    var keys = List[String]()
+    for ref item in metadata.items():
+        var pos = len(keys)
+        for index in range(len(keys)):
+            if item.key < keys[index]:
+                pos = index
+                break
+        keys.insert(pos, item.key.copy())
+    return keys^
+
+
+def _append_metadata_object(
+    mut hdr: List[UInt8], metadata: Dict[String, String],
+) raises:
+    _append_json_string(hdr, String("__metadata__"))
+    hdr.append(0x3A)  # ':'
+    hdr.append(0x7B)  # '{'
+    var keys = _sorted_metadata_keys(metadata)
+    for index in range(len(keys)):
+        if index > 0:
+            hdr.append(0x2C)
+        _append_json_string(hdr, keys[index])
+        hdr.append(0x3A)
+        _append_json_string(hdr, metadata[keys[index]])
+    hdr.append(0x7D)  # '}'
+
+
+def _validate_tensor_names(names: List[String], label: String) raises:
+    for index in range(len(names)):
+        if names[index] == String("__metadata__"):
+            raise Error(label + String(": tensor name '__metadata__' is reserved"))
+        for prior in range(index):
+            if names[prior] == names[index]:
+                raise Error(
+                    label + String(": duplicate tensor name '")
+                    + names[index] + String("'")
+                )
+
+
 def _tensor_offsets(
     tensors: List[ArcPointer[Tensor]]
 ) -> List[Int]:
@@ -168,6 +210,41 @@ def _build_header(
         hdr.append(0x5D)  # ']'
         hdr.append(0x7D)  # '}' close tensor object
     hdr.append(0x7D)  # '}'
+    return hdr^
+
+
+def _build_header_with_metadata(
+    names: List[String],
+    tensors: List[ArcPointer[Tensor]],
+    offsets: List[Int],
+    metadata: Dict[String, String],
+) raises -> List[UInt8]:
+    var hdr = List[UInt8]()
+    hdr.append(0x7B)
+    _append_metadata_object(hdr, metadata)
+    for i in range(len(names)):
+        hdr.append(0x2C)
+        _append_json_string(hdr, names[i])
+        hdr.append(0x3A)
+        hdr.append(0x7B)
+        _append_str(hdr, String('"dtype":'))
+        _append_json_string(hdr, tensors[i][].dtype().name())
+        hdr.append(0x2C)
+        _append_str(hdr, String('"shape":['))
+        var shp = tensors[i][].shape()
+        for d in range(len(shp)):
+            if d > 0:
+                hdr.append(0x2C)
+            _append_str(hdr, String(shp[d]))
+        hdr.append(0x5D)
+        hdr.append(0x2C)
+        _append_str(hdr, String('"data_offsets":['))
+        _append_str(hdr, String(offsets[i]))
+        hdr.append(0x2C)
+        _append_str(hdr, String(offsets[i + 1]))
+        hdr.append(0x5D)
+        hdr.append(0x7D)
+    hdr.append(0x7D)
     return hdr^
 
 
@@ -264,15 +341,52 @@ def _build_header_host(
     return hdr^
 
 
-def save_safetensors_host(
+def _build_header_host_with_metadata(
     names: List[String],
     descs: List[HostTensorDesc],
+    offsets: List[Int],
+    metadata: Dict[String, String],
+) raises -> List[UInt8]:
+    var hdr = List[UInt8]()
+    hdr.append(0x7B)
+    _append_metadata_object(hdr, metadata)
+    for i in range(len(names)):
+        hdr.append(0x2C)
+        _append_json_string(hdr, names[i])
+        hdr.append(0x3A)
+        hdr.append(0x7B)
+        _append_str(hdr, String('"dtype":'))
+        _append_json_string(hdr, descs[i].dtype.name())
+        hdr.append(0x2C)
+        _append_str(hdr, String('"shape":['))
+        for d in range(len(descs[i].shape)):
+            if d > 0:
+                hdr.append(0x2C)
+            _append_str(hdr, String(descs[i].shape[d]))
+        hdr.append(0x5D)
+        hdr.append(0x2C)
+        _append_str(hdr, String('"data_offsets":['))
+        _append_str(hdr, String(offsets[i]))
+        hdr.append(0x2C)
+        _append_str(hdr, String(offsets[i + 1]))
+        hdr.append(0x5D)
+        hdr.append(0x7D)
+    hdr.append(0x7D)
+    return hdr^
+
+
+def _save_safetensors_host_impl(
+    names: List[String],
+    descs: List[HostTensorDesc],
+    metadata: Dict[String, String],
+    write_metadata: Bool,
     path: String,
 ) raises:
     """Write host-resident tensors to `path` as a single-file safetensors,
     byte-identical in format to save_safetensors, WITHOUT any DeviceContext:
     the payload bytes are pwritten straight from the host lists. Same atomic
     tmp-then-rename crash-safety as the device path."""
+    _validate_tensor_names(names, String("save_safetensors_host"))
     if len(names) != len(descs):
         raise Error(
             String("save_safetensors_host: len(names)=") + String(len(names))
@@ -293,7 +407,11 @@ def save_safetensors_host(
             )
 
     var offsets = _tensor_offsets_host(descs)
-    var hdr = _build_header_host(names, descs, offsets)
+    var hdr = List[UInt8]()
+    if write_metadata:
+        hdr = _build_header_host_with_metadata(names, descs, offsets, metadata)
+    else:
+        hdr = _build_header_host(names, descs, offsets)
     var header_len = len(hdr)
 
     var tmp_path = path + String(".tmp")
@@ -359,12 +477,33 @@ def save_safetensors_host(
         )
 
 
+def save_safetensors_host(
+    names: List[String],
+    descs: List[HostTensorDesc],
+    path: String,
+) raises:
+    """Original metadata-free host API, preserved unchanged."""
+    var metadata = Dict[String, String]()
+    _save_safetensors_host_impl(names, descs, metadata^, False, path)
+
+
+def save_safetensors_host_with_metadata(
+    names: List[String],
+    descs: List[HostTensorDesc],
+    metadata: Dict[String, String],
+    path: String,
+) raises:
+    """Atomic host save with explicit safetensors string metadata."""
+    _save_safetensors_host_impl(names, descs, metadata, True, path)
+
+
 def save_safetensors_host_buffers(
     names: List[String],
     descs: List[HostBufferTensorDesc],
     path: String,
 ) raises:
     """Atomic safetensors write directly from owned pinned-host buffers."""
+    _validate_tensor_names(names, String("save_safetensors_host_buffers"))
     if len(names) != len(descs):
         raise Error(
             String("save_safetensors_host_buffers: len(names)=")
@@ -456,9 +595,11 @@ def save_safetensors_host_buffers(
         )
 
 
-def save_safetensors(
+def _save_safetensors_impl(
     names: List[String],
     tensors: List[ArcPointer[Tensor]],
+    metadata: Dict[String, String],
+    write_metadata: Bool,
     path: String,
     ctx: DeviceContext,
 ) raises:
@@ -470,6 +611,7 @@ def save_safetensors(
     pwritten at 8 + header_len + data_offsets[0]. Supports any STDtype the
     Tensor carries; F32 and BF16 are exercised by the round-trip smoke.
     """
+    _validate_tensor_names(names, String("save_safetensors"))
     if len(names) != len(tensors):
         raise Error(
             String("save_safetensors: len(names)=")
@@ -481,7 +623,11 @@ def save_safetensors(
         raise Error("save_safetensors: refusing to write an empty file")
 
     var offsets = _tensor_offsets(tensors)
-    var hdr = _build_header(names, tensors, offsets)
+    var hdr = List[UInt8]()
+    if write_metadata:
+        hdr = _build_header_with_metadata(names, tensors, offsets, metadata)
+    else:
+        hdr = _build_header(names, tensors, offsets)
     var header_len = len(hdr)
 
     # ATOMIC WRITE: write the whole file to "<path>.tmp" then rename(2) it onto the
@@ -570,3 +716,25 @@ def save_safetensors(
             String("save_safetensors: atomic rename ") + tmp_path + " -> " + path
             + " failed (different filesystem? out of space?)"
         )
+
+
+def save_safetensors(
+    names: List[String],
+    tensors: List[ArcPointer[Tensor]],
+    path: String,
+    ctx: DeviceContext,
+) raises:
+    """Original metadata-free device API, preserved unchanged."""
+    var metadata = Dict[String, String]()
+    _save_safetensors_impl(names, tensors, metadata^, False, path, ctx)
+
+
+def save_safetensors_with_metadata(
+    names: List[String],
+    tensors: List[ArcPointer[Tensor]],
+    metadata: Dict[String, String],
+    path: String,
+    ctx: DeviceContext,
+) raises:
+    """Atomic device-tensor save with explicit safetensors string metadata."""
+    _save_safetensors_impl(names, tensors, metadata, True, path, ctx)

@@ -8,8 +8,9 @@
 #
 # We parse the top-level object key-by-key. For each non-__metadata__ key, the
 # value is an object with keys dtype/shape/data_offsets (any order, whitespace
-# tolerated). The "__metadata__" key's value is an arbitrary object which we
-# skip by balanced-brace scanning.
+# tolerated). The optional "__metadata__" value must be the safetensors
+# string-to-string object. It is parsed and exposed by parse_header_with_metadata;
+# parse_header retains its original tensor-only API for existing callers.
 #
 # Notes mirrored from the task spec:
 #   * tensor names contain '.', '/', '-', digits — handled by generic string
@@ -28,6 +29,14 @@ struct HeaderEntry(Copyable, Movable):
     var shape: List[Int]
     var off_start: Int
     var off_end: Int
+
+
+@fieldwise_init
+struct ParsedSafeTensorsHeader(Movable):
+    """Parsed tensors plus exact decoded safetensors string metadata."""
+
+    var entries: List[HeaderEntry]
+    var metadata: Dict[String, String]
 
 
 struct _Cursor:
@@ -133,6 +142,8 @@ def _parse_string(mut cur: _Cursor) raises -> String:
                     + _chr(e)
                 )
         else:
+            if c < 0x20:
+                raise Error("JSON parse: unescaped control byte in string")
             out.append(UInt8(c))
     raise Error("JSON parse: unterminated string")
 
@@ -250,24 +261,68 @@ def _skip_value(mut cur: _Cursor) raises:
         cur.pos += 1
 
 
-def parse_header(var data: List[UInt8]) raises -> List[HeaderEntry]:
-    """Parse a flat safetensors header. Returns one HeaderEntry per tensor,
-    skipping the "__metadata__" key. Mirrors mmap.rs:204-235 semantics."""
+def _parse_metadata_object(mut cur: _Cursor) raises -> Dict[String, String]:
+    """Parse the safetensors `__metadata__` contract: object<string,string>.
+
+    Values of any other JSON type and duplicate decoded keys are malformed.
+    This is intentionally stricter than the old arbitrary-value skip because
+    the safetensors format defines metadata as a string map.
+    """
+    var metadata = Dict[String, String]()
+    cur.expect(0x7B)  # '{'
+    cur.skip_ws()
+    if cur.peek() == 0x7D:
+        cur.advance()
+        return metadata^
+    while True:
+        var key = _parse_string(cur)
+        if key in metadata:
+            raise Error(String("JSON parse: duplicate metadata key '") + key + String("'"))
+        cur.expect(0x3A)
+        # _parse_string is deliberate: numbers/objects/arrays/bools are not
+        # legal safetensors metadata values.
+        var value = _parse_string(cur)
+        metadata[key] = value
+        cur.skip_ws()
+        var c = cur.peek()
+        if c == 0x2C:
+            cur.advance()
+            continue
+        if c == 0x7D:
+            cur.advance()
+            break
+        raise Error(
+            String("JSON parse: expected ',' or '}' in __metadata__ at byte ")
+            + String(cur.pos)
+        )
+    return metadata^
+
+
+def parse_header_with_metadata(
+    var data: List[UInt8],
+) raises -> ParsedSafeTensorsHeader:
+    """Parse tensors and the optional exact string-to-string metadata map."""
     var cur = _Cursor(data^)
     var entries = List[HeaderEntry]()
+    var metadata = Dict[String, String]()
+    var seen_top_keys = List[String]()
 
     cur.expect(0x7B)  # top-level '{'
     cur.skip_ws()
     if cur.peek() == 0x7D:  # empty object '}'
         cur.advance()
-        return entries^
+        return ParsedSafeTensorsHeader(entries^, metadata^)
 
     while True:
         var key = _parse_string(cur)
+        for seen in seen_top_keys:
+            if seen == key:
+                raise Error(String("JSON parse: duplicate top-level key '") + key + String("'"))
+        seen_top_keys.append(key)
         cur.expect(0x3A)  # ':'
 
         if key == "__metadata__":
-            _skip_value(cur)  # mmap.rs:207-209 — skip __metadata__
+            metadata = _parse_metadata_object(cur)
         else:
             # Value is an object {"dtype":..,"shape":..,"data_offsets":..}.
             var dtype = String("")
@@ -339,7 +394,19 @@ def parse_header(var data: List[UInt8]) raises -> List[HeaderEntry]:
             + String(cur.pos)
         )
 
-    return entries^
+    cur.skip_ws()
+    if not cur.at_end():
+        raise Error(
+            String("JSON parse: trailing bytes after top-level object at byte ")
+            + String(cur.pos)
+        )
+    return ParsedSafeTensorsHeader(entries^, metadata^)
+
+
+def parse_header(var data: List[UInt8]) raises -> List[HeaderEntry]:
+    """Original tensor-only API; metadata is parsed/validated, then omitted."""
+    var parsed = parse_header_with_metadata(data^)
+    return parsed.entries.copy()
 
 
 # ── Unit test (task-required): hand-written header, 2 tensors + __metadata__ ──
@@ -355,8 +422,10 @@ def test_parse_sample() raises:
     var bytes = List[UInt8]()
     for b in s.as_bytes():
         bytes.append(b)
-    var entries = parse_header(bytes^)
-    # __metadata__ skipped -> 2 entries.
+    var parsed = parse_header_with_metadata(bytes^)
+    assert_equal(parsed.metadata[String("format")], String("pt"))
+    var entries = parsed.entries.copy()
+    # Metadata is separate -> 2 tensor entries.
     assert_equal(len(entries), 2)
 
     # entry 0

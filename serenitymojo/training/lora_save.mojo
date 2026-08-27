@@ -47,6 +47,7 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.io.safetensors_writer import (
     save_safetensors, save_safetensors_host, HostTensorDesc,
+    save_safetensors_host_with_metadata,
 )
 from serenitymojo.training.train_step import LoraAdapter, _f32_to_bf16_list
 
@@ -279,6 +280,43 @@ def save_lora_peft_host_f32(
         ))
 
     save_safetensors_host(names, descs, path)
+    return len(adapters)
+
+
+def save_lora_peft_host_f32_meta(
+    adapters: List[F32NamedLora], path: String,
+    metadata: Dict[String, String],
+) raises -> Int:
+    """`save_lora_peft_host_f32` plus an ai-toolkit-style safetensors metadata
+    header (name / ss_output_name / training_info / format / software / base
+    model) so our artifacts carry the same provenance the rest of the LoRA
+    ecosystem writes. Tensor payload is byte-identical to the plain saver."""
+    if len(adapters) == 0:
+        raise Error("save_lora_peft_host_f32_meta: refusing to write an empty LoRA file")
+    var names = List[String]()
+    var descs = List[HostTensorDesc]()
+    for ref nl in adapters:
+        if len(nl.a) != nl.rank * nl.in_f:
+            raise Error(
+                String("save_lora_peft_host_f32_meta: A numel mismatch for '")
+                + nl.prefix + "'"
+            )
+        if len(nl.b) != nl.out_f * nl.rank:
+            raise Error(
+                String("save_lora_peft_host_f32_meta: B numel mismatch for '")
+                + nl.prefix + "'"
+            )
+        names.append(nl.prefix + ".lora_A.weight")
+        descs.append(HostTensorDesc(
+            STDtype.BF16, _shape2(nl.rank, nl.in_f),
+            _bf16_le_bytes_from_f32(nl.a),
+        ))
+        names.append(nl.prefix + ".lora_B.weight")
+        descs.append(HostTensorDesc(
+            STDtype.BF16, _shape2(nl.out_f, nl.rank),
+            _bf16_le_bytes_from_f32(nl.b),
+        ))
+    save_safetensors_host_with_metadata(names, descs, metadata, path)
     return len(adapters)
 
 

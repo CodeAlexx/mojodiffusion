@@ -120,7 +120,7 @@ from serenitymojo.training.train_config import (
     TRAIN_OPTIMIZER_ADAMW_8BIT, TRAIN_DTYPE_BFLOAT_16,
 )
 from serenitymojo.training.lora_save import (
-    F32NamedLora, save_lora_peft_host_f32,
+    F32NamedLora, save_lora_peft_host_f32, save_lora_peft_host_f32_meta,
 )
 from serenitymojo.models.minimax_h3.h3_lora_format import (
     h3_lora_peft_prefix, h3_lora_token_refiner_peft_prefix,
@@ -1719,7 +1719,21 @@ def _save_all(
     var lora_path = (
         out_dir + "/" + name + "_step" + String(step) + ".safetensors"
     )
-    var n_pairs = save_lora_peft_host_f32(adapters, lora_path)
+    var lmeta = Dict[String, String]()
+    lmeta[String("name")] = name
+    lmeta[String("ss_output_name")] = name
+    lmeta[String("format")] = String("pt")
+    lmeta[String("training_info")] = (
+        String("{\"step\": ") + String(step) + String("}")
+    )
+    lmeta[String("ss_base_model_version")] = String("minimax_h3_fl2va")
+    lmeta[String("ss_network_dim")] = String(rank)
+    lmeta[String("ss_network_alpha")] = String(rank)
+    lmeta[String("software")] = String(
+        "{\"name\": \"serenitymojo\","
+        " \"repo\": \"https://github.com/CodeAlexx/mojodiffusion\"}"
+    )
+    var n_pairs = save_lora_peft_host_f32_meta(adapters, lora_path, lmeta)
     print("[h3-train] saved PEFT LoRA:", lora_path, "pairs", n_pairs)
 
     # 2) resume state (masters + quantized bnb moments + exact RNG state)

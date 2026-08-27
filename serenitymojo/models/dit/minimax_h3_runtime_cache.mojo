@@ -14,7 +14,10 @@ from std.memory import alloc, ArcPointer
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr, sys_memcpy
 from serenitymojo.io.safetensors import SafeTensors
-from serenitymojo.io.safetensors_writer import save_safetensors
+from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.safetensors_writer import (
+    save_safetensors, save_safetensors_host, HostTensorDesc,
+)
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.tensor import BatchedTensorUploader, Tensor
 from serenitymojo.models.minimax_h3.fp8_policy import (
@@ -38,6 +41,7 @@ from serenitymojo.models.dit.minimax_h3_fp8_resident import (
     MiniMaxH3ResidentFp8,
     minimax_h3_allocate_resident_scratch,
     minimax_h3_int8_group_size,
+    minimax_h3_build_resident_fp8,
 )
 from serenitymojo.models.dit.minimax_h3_modcache import MiniMaxH3ModCache
 
@@ -712,3 +716,90 @@ def load_minimax_h3_modcache(
     var final = ArcPointer(_load_raw_h2d(st, String("final"), uploader, ctx))
     uploader.finish(ctx)
     return MiniMaxH3ModCache(mods^, final^, distinct_timesteps)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamed cache preparation for 16GB cards. The in-place prepare mode holds
+# every quantized block on device before saving (fits the 24GB box, OOMs the
+# 5080 at ~block 30). This variant builds ONE block at a time, spills its raw
+# bytes to host, frees the device copy, and writes the identical file via the
+# host-side atomic saver. Metadata goes through the exact same
+# `_append_common_metadata` device path, so `_check_common_metadata` semantics
+# cannot drift.
+# ─────────────────────────────────────────────────────────────────────────────
+def _host_desc_from_tensor(t: Tensor, ctx: DeviceContext) raises -> HostTensorDesc:
+    var nb = t.nbytes()
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](nb)
+    ctx.enqueue_copy(dst_buf=host, src_buf=t.buf)
+    ctx.synchronize()
+    var bytes = List[UInt8]()
+    bytes.resize(nb, 0)
+    _ = sys_memcpy(
+        BytePtr(unsafe_from_address=Int(bytes.unsafe_ptr())),
+        BytePtr(unsafe_from_address=Int(host.unsafe_ptr())),
+        nb,
+    )
+    return HostTensorDesc(t.dtype(), t.shape().copy(), bytes^)
+
+
+def _host_i64_desc(value: Int) raises -> HostTensorDesc:
+    var bytes = List[UInt8]()
+    bytes.resize(8, 0)
+    bytes.unsafe_ptr().bitcast[Int64]()[0] = Int64(value)
+    var shape: List[Int] = [1]
+    return HostTensorDesc(STDtype.I64, shape^, bytes^)
+
+
+def minimax_h3_prepare_resident_cache_w8a8_streamed(
+    shards: ShardedSafeTensors,
+    config: MiniMaxH3DiTConfig,
+    source_index: String,
+    cache_path: String,
+    ctx: DeviceContext,
+) raises:
+    var names = List[String]()
+    var descs = List[HostTensorDesc]()
+    var mnames = List[String]()
+    var mtensors = List[ArcPointer[Tensor]]()
+    _append_common_metadata(
+        mnames, mtensors, String("resident-int8-w8a8-row"), source_index, ctx
+    )
+    for i in range(len(mnames)):
+        names.append(mnames[i])
+        descs.append(_host_desc_from_tensor(mtensors[i][], ctx))
+    names.append(String("__meta__.start_layer"))
+    descs.append(_host_i64_desc(0))
+    names.append(String("__meta__.nblocks"))
+    descs.append(_host_i64_desc(config.num_layers))
+    names.append(String("__meta__.qkv_group"))
+    descs.append(_host_i64_desc(MINIMAX_H3_INT8_QKV_GROUP_SIZE))
+    names.append(String("__meta__.out_group"))
+    descs.append(_host_i64_desc(MINIMAX_H3_INT8_OUT_GROUP_SIZE))
+    names.append(String("__meta__.fc1_group"))
+    descs.append(_host_i64_desc(MINIMAX_H3_INT8_FC1_GROUP_SIZE))
+    names.append(String("__meta__.fc2_group"))
+    descs.append(_host_i64_desc(MINIMAX_H3_INT8_FC2_GROUP_SIZE))
+
+    for layer in range(config.num_layers):
+        var one = minimax_h3_build_resident_fp8(
+            shards, config, ctx, 1, layer,
+            scheme=MINIMAX_H3_RESIDENT_INT8_W8A8,
+        )
+        ref block = one.blocks[0]
+        var prefix = _block_prefix(layer)
+        for k in range(len(block.fp8)):
+            names.append(prefix + String("weight.") + String(k))
+            descs.append(_host_desc_from_tensor(block.fp8[k][], ctx))
+            names.append(prefix + String("scale.") + String(k))
+            descs.append(_host_desc_from_tensor(block.scale[k][], ctx))
+        for k in range(len(block.bf16)):
+            names.append(prefix + String("keep.") + String(k))
+            descs.append(_host_desc_from_tensor(block.bf16[k][], ctx))
+        _ = one^
+        ctx.synchronize()
+        if layer % 10 == 9:
+            print(
+                "  streamed prepare: block", layer + 1, "/", config.num_layers
+            )
+    save_safetensors_host(names, descs, cache_path)
+    print("  streamed prepare: SAVED", cache_path)

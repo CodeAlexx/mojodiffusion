@@ -807,9 +807,13 @@ def _minimax_h3_global_timestep_row(
 
 
 def _minimax_h3_motion_context_global_timestep_row(
-    geometry: MiniMaxH3SamplingGeometry, step: Int
+    geometry: MiniMaxH3SamplingGeometry,
+    step: Int,
+    boundary_video_rows: Int = 0,
+    boundary_audio_latents: Int = 0,
+    target_audio_latents: Int = 0,
 ) raises -> List[Int]:
-    """Global 4-row modulation-cache addressing for latent continuation."""
+    """Global 4-row modulation addressing for continuation/endless rows."""
     var out = List[Int](capacity=geometry.sequence_length)
     for _ in range(geometry.sequence_length):
         out.append(4 * step)
@@ -821,6 +825,16 @@ def _minimax_h3_motion_context_global_timestep_row(
         geometry.num_condition_audio_rows, len(geometry.audio_indices)
     ):
         out[geometry.audio_indices[i]] = 4 * step + 1
+    var target_video_start = geometry.num_condition_video_rows
+    for i in range(boundary_video_rows):
+        out[geometry.video_indices[target_video_start + i]] = 4 * step + 2
+    if boundary_audio_latents > 0:
+        var target_audio_start = geometry.num_condition_audio_rows
+        for i in range(boundary_audio_latents):
+            out[geometry.audio_indices[target_audio_start + i]] = 4 * step + 3
+            out[geometry.audio_indices[
+                target_audio_start + target_audio_latents + i
+            ]] = 4 * step + 3
     return out^
 
 
@@ -1970,6 +1984,8 @@ def _job_main(raw_args: List[String]) raises:
     var motion_context_path = String("")
     var motion_context_frames = 22
     var trim_start_frames = 0
+    var endless_boundary_frames = 0
+    var endless_boundary_audio_latents = 0
     var temporal_rope_scale = Float32(1.0)
     for i in range(len(raw_args)):
         var arg = String(raw_args[i])
@@ -2148,6 +2164,18 @@ def _job_main(raw_args: List[String]) raises:
                 raise Error("invalid --trim-start-frames flag")
             trim_start_frames = atol(String(fields[1]))
             continue
+        if arg.startswith("--endless-boundary-frames="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --endless-boundary-frames flag")
+            endless_boundary_frames = atol(String(fields[1]))
+            continue
+        if arg.startswith("--endless-boundary-audio-latents="):
+            var fields = arg.split("=")
+            if len(fields) != 2:
+                raise Error("invalid --endless-boundary-audio-latents flag")
+            endless_boundary_audio_latents = atol(String(fields[1]))
+            continue
         if arg.startswith("--temporal-rope-scale="):
             var fields = arg.split("=")
             if len(fields) != 2:
@@ -2156,12 +2184,29 @@ def _job_main(raw_args: List[String]) raises:
             continue
         args.append(arg)
     var motion_context_enabled = motion_context_path != String("")
+    var endless_boundary_enabled = endless_boundary_frames > 0
     if motion_context_enabled:
         _ = minimax_h3_motion_context_steps(motion_context_frames)
         if trim_start_frames == 0:
-            trim_start_frames = motion_context_frames
+            trim_start_frames = (
+                endless_boundary_frames
+                if endless_boundary_enabled else motion_context_frames
+            )
     elif trim_start_frames != 0:
         raise Error("--trim-start-frames requires --motion-context")
+    if endless_boundary_enabled:
+        if not motion_context_enabled:
+            raise Error("--endless-boundary-frames requires --motion-context")
+        _ = minimax_h3_motion_context_steps(endless_boundary_frames)
+        if endless_boundary_frames >= motion_context_frames:
+            raise Error("MiniMax-H3 endless boundary must be shorter than its reference")
+        if endless_boundary_audio_latents < 1:
+            raise Error("MiniMax-H3 endless boundary needs phase-exact audio latents")
+    elif endless_boundary_audio_latents != 0:
+        raise Error(
+            "--endless-boundary-audio-latents requires"
+            " --endless-boundary-frames"
+        )
     if (
         attention_backend == MINIMAX_H3_ATTN_EVG_INT8
         and motion_context_enabled
@@ -2225,6 +2270,8 @@ def _job_main(raw_args: List[String]) raises:
             " [--motion-context=PATH]"
             " [--motion-context-frames=5|22|39]"
             " [--trim-start-frames=N]"
+            " [--endless-boundary-frames=5]"
+            " [--endless-boundary-audio-latents=N]"
             " [--temporal-rope-scale=F]"
             " [--defer-video-decode]"
         )
@@ -2284,9 +2331,15 @@ def _job_main(raw_args: List[String]) raises:
     if motion_context_enabled:
         if runtime_fps != MINIMAX_H3_MOTION_CONTEXT_FPS:
             raise Error("MiniMax-H3 motion context requires native 24 FPS")
-        if trim_start_frames != motion_context_frames:
+        if (
+            (not endless_boundary_enabled and trim_start_frames != motion_context_frames)
+            or (
+                endless_boundary_enabled
+                and trim_start_frames != endless_boundary_frames
+            )
+        ):
             raise Error(
-                "MiniMax-H3 motion context must trim exactly its overlap"
+                "MiniMax-H3 continuation must trim exactly its protected head"
             )
     var latent_h = runtime_height // 16
     var latent_w = runtime_width // 16
@@ -2297,6 +2350,16 @@ def _job_main(raw_args: List[String]) raises:
     var rows_per_frame = (latent_h // PATCH_H) * (latent_w // PATCH_W)
     var num_video_rows = num_latent_frames * rows_per_frame
     var num_audio_rows = num_audio_latents * 2
+    var endless_boundary_video_rows = 0
+    if endless_boundary_enabled:
+        endless_boundary_video_rows = (
+            minimax_h3_motion_context_steps(endless_boundary_frames)
+            * rows_per_frame
+        )
+        if endless_boundary_video_rows >= num_video_rows:
+            raise Error("MiniMax-H3 endless boundary consumes the video target")
+        if endless_boundary_audio_latents >= num_audio_latents:
+            raise Error("MiniMax-H3 endless boundary consumes the audio target")
     var num_condition_video_rows = 0
     var num_condition_audio_rows = 0
     if motion_context_enabled:
@@ -2585,6 +2648,9 @@ def _job_main(raw_args: List[String]) raises:
     # denoise step; audio remains bit-identical to the generated source tail.
     var condition_video_rows = Optional[Tensor](None)
     var condition_audio_rows = Optional[Tensor](None)
+    var endless_boundary_video_clean = Optional[Tensor](None)
+    var endless_boundary_video_noisy = Optional[Tensor](None)
+    var endless_boundary_audio_clean = Optional[Tensor](None)
     var source_audio_overhang = Float64(0.0)
     if motion_context_enabled:
         var loaded_context = minimax_h3_load_motion_context(
@@ -2614,12 +2680,54 @@ def _job_main(raw_args: List[String]) raises:
             loaded_context.audio_rows, 0, 0,
             loaded_context.audio_rows.shape()[0], ctx,
         ))
+        if endless_boundary_enabled:
+            endless_boundary_video_clean = Optional[Tensor](slice(
+                loaded_context.video_rows,
+                0,
+                loaded_context.video_rows.shape()[0]
+                    - endless_boundary_video_rows,
+                endless_boundary_video_rows,
+                ctx,
+            ))
+            endless_boundary_video_noisy = Optional[Tensor](slice(
+                condition_video_rows.value(),
+                0,
+                condition_video_rows.value().shape()[0]
+                    - endless_boundary_video_rows,
+                endless_boundary_video_rows,
+                ctx,
+            ))
+            var reference_audio_t = loaded_context.audio_rows.shape()[0] // 2
+            var boundary_left = slice(
+                loaded_context.audio_rows,
+                0,
+                reference_audio_t - endless_boundary_audio_latents,
+                endless_boundary_audio_latents,
+                ctx,
+            )
+            var boundary_right = slice(
+                loaded_context.audio_rows,
+                0,
+                2 * reference_audio_t - endless_boundary_audio_latents,
+                endless_boundary_audio_latents,
+                ctx,
+            )
+            endless_boundary_audio_clean = Optional[Tensor](concat(
+                0, ctx, boundary_left, boundary_right
+            ))
         print(
             "  motion context: pinned video rows=",
             condition_video_rows.value().shape()[0],
             " audio rows=", condition_audio_rows.value().shape()[0],
             " source_audio_overhang=", source_audio_overhang,
         )
+        if endless_boundary_enabled:
+            print(
+                "  endless protected boundary: video_frames=",
+                endless_boundary_frames,
+                " video_rows=", endless_boundary_video_rows,
+                " audio_latents=", endless_boundary_audio_latents,
+            )
 
     # ── 2. Packed-sequence geometry (host scalar, this port's own reproduction) ──
     var no_anchors = List[Int]()
@@ -2964,13 +3072,68 @@ def _job_main(raw_args: List[String]) raises:
         )
         if motion_context_enabled:
             global_row = _minimax_h3_motion_context_global_timestep_row(
-                geometry, i
+                geometry,
+                i,
+                endless_boundary_video_rows,
+                endless_boundary_audio_latents,
+                num_audio_latents,
             )
         var block_adaln_indices = minimax_h3_adaln_rows(global_row, geometry.token_tags)
 
         var placeholder_ts_shape: List[Int] = [1]
         var placeholder_ts = Tensor.from_host([video_ts], placeholder_ts_shape^, STDtype.F32, ctx)
         if motion_context_enabled:
+            if endless_boundary_enabled:
+                var generated_video_tail = slice(
+                    video_state,
+                    0,
+                    endless_boundary_video_rows,
+                    num_video_rows - endless_boundary_video_rows,
+                    ctx,
+                )
+                video_state = concat(
+                    0,
+                    ctx,
+                    endless_boundary_video_noisy.value(),
+                    generated_video_tail,
+                )
+                var generated_audio_left = slice(
+                    audio_state,
+                    0,
+                    endless_boundary_audio_latents,
+                    num_audio_latents - endless_boundary_audio_latents,
+                    ctx,
+                )
+                var generated_audio_right = slice(
+                    audio_state,
+                    0,
+                    num_audio_latents + endless_boundary_audio_latents,
+                    num_audio_latents - endless_boundary_audio_latents,
+                    ctx,
+                )
+                var fixed_audio_left = slice(
+                    endless_boundary_audio_clean.value(),
+                    0,
+                    0,
+                    endless_boundary_audio_latents,
+                    ctx,
+                )
+                var fixed_audio_right = slice(
+                    endless_boundary_audio_clean.value(),
+                    0,
+                    endless_boundary_audio_latents,
+                    endless_boundary_audio_latents,
+                    ctx,
+                )
+                var composited_audio_left = concat(
+                    0, ctx, fixed_audio_left, generated_audio_left
+                )
+                var composited_audio_right = concat(
+                    0, ctx, fixed_audio_right, generated_audio_right
+                )
+                audio_state = concat(
+                    0, ctx, composited_audio_left, composited_audio_right
+                )
             var video_rows_combined = concat(
                 0, ctx, condition_video_rows.value(), video_state
             )
@@ -3031,6 +3194,46 @@ def _job_main(raw_args: List[String]) raises:
             " video_t=", video_ts, " audio_t=", audio_ts,
             " (", Float64(t_step1 - t_step0) / 1.0e9, "s)",
         )
+
+    # The boundary is source state, not generated output. Restore the exact
+    # clean A/V rows before checkpointing and decode; decode removes the head.
+    if endless_boundary_enabled:
+        var final_video_tail = slice(
+            video_state,
+            0,
+            endless_boundary_video_rows,
+            num_video_rows - endless_boundary_video_rows,
+            ctx,
+        )
+        video_state = concat(
+            0, ctx, endless_boundary_video_clean.value(), final_video_tail
+        )
+        var final_audio_left = slice(
+            audio_state,
+            0,
+            endless_boundary_audio_latents,
+            num_audio_latents - endless_boundary_audio_latents,
+            ctx,
+        )
+        var final_audio_right = slice(
+            audio_state,
+            0,
+            num_audio_latents + endless_boundary_audio_latents,
+            num_audio_latents - endless_boundary_audio_latents,
+            ctx,
+        )
+        var clean_audio_left = slice(
+            endless_boundary_audio_clean.value(),
+            0, 0, endless_boundary_audio_latents, ctx,
+        )
+        var clean_audio_right = slice(
+            endless_boundary_audio_clean.value(),
+            0, endless_boundary_audio_latents,
+            endless_boundary_audio_latents, ctx,
+        )
+        var final_left = concat(0, ctx, clean_audio_left, final_audio_left)
+        var final_right = concat(0, ctx, clean_audio_right, final_audio_right)
+        audio_state = concat(0, ctx, final_left, final_right)
 
     # Quantized product paths fail at the latent boundary instead of surfacing
     # later as a misleading VAE/pixel error.  The scans and reductions run on
@@ -3197,6 +3400,16 @@ def _job_main(raw_args: List[String]) raises:
                 if motion_context_enabled else String("")
             ),
             String("--motion-context-frames=") + String(motion_context_frames),
+            (
+                String("--endless-boundary-frames=")
+                + String(endless_boundary_frames)
+                if endless_boundary_enabled else String("")
+            ),
+            (
+                String("--endless-boundary-audio-latents=")
+                + String(endless_boundary_audio_latents)
+                if endless_boundary_enabled else String("")
+            ),
             String("--quant=") + quant,
             String("--resident-blocks=") + String(resident_blocks_requested),
         )

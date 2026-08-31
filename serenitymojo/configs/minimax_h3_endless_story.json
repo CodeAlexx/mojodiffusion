@@ -1,0 +1,74 @@
+{
+  "1": {
+    "class_type": "MiniMaxH3TextEncode",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "prompt": "integrated_multimodal_description: [Opening] Live-action cinematic night car chase. A scratched red 1970 muscle car with a black hood races through rain-slick downtown streets while a matte-black police interceptor follows close behind. Keep both exact cars, their damage, drivers, lighting, weather, and direction of travel consistent. The camera tracks low beside the red car as both cars enter a narrow tunnel at speed. Continue the action through the end of the shot.\n\noverall_soundscape: Continuous high-revving engines, wet tire spray, tunnel reflections, two distinct engine tones, distant sirens, and rain.\n\nnon_diegetic_music: Driving electronic percussion and a tense bass pulse that continue without resolving."
+    }
+  },
+  "2": {
+    "class_type": "MiniMaxH3TextEncode",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "prompt": "integrated_multimodal_description: [Continuous extension] Continue directly from the preceding frames without restarting or cutting away. The same scratched red 1970 muscle car with black hood and the same matte-black police interceptor keep their speed, positions, damage, drivers, lighting, and forward direction. The red car swerves around traffic, the interceptor follows through the same gaps, and both eventually burst from the tunnel into rain at night. Sustain the chase naturally for the full remaining timeline while keeping the exact cars recognizable. The camera evolves smoothly from a low rear tracking angle into a wide overhead follow shot.\n\noverall_soundscape: Continue the same two engine tones, tire spray, sirens, tunnel reverb changing naturally to open rain, with no audio reset.\n\nnon_diegetic_music: Continue the same electronic percussion and bass pulse at the same tempo without a fade or restart."
+    }
+  },
+  "3": {
+    "class_type": "MiniMaxH3Loader",
+    "inputs": {
+      "unet_name": "MiniMax-H3/FL2VA/transformer/model.safetensors.index.json",
+      "window": 2,
+      "prefetch": 1,
+      "attention_backend": "ck-int8"
+    }
+  },
+  "4": {
+    "class_type": "MiniMaxH3EndlessLatent",
+    "inputs": {"width": 1344, "height": 768, "duration": 20}
+  },
+  "5": {
+    "class_type": "MiniMaxH3SigmaShift",
+    "inputs": {"shift_video": 12.0, "shift_audio": 3.0}
+  },
+  "6": {
+    "class_type": "MiniMaxH3EndlessSampler",
+    "inputs": {
+      "model": ["3", 0],
+      "streamer": ["3", 1],
+      "opening_conditioning": ["1", 0],
+      "continuation_conditioning": ["2", 0],
+      "latent": ["4", 0],
+      "shift": ["5", 0],
+      "seed": 1970,
+      "steps": 20,
+      "chunk_frames": 124,
+      "reference_frames": 22,
+      "boundary_frames": 5,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "checkpoint_name": "minimax_h3_endless_story",
+      "resume": true
+    }
+  },
+  "7": {
+    "class_type": "MiniMaxH3DecodeRelease",
+    "inputs": {
+      "latent": ["6", 0],
+      "video_vae_name": "MiniMaxH3/minimax_h3_video_vae_fp16.safetensors",
+      "audio_vae_name": "MiniMaxH3/minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "8": {
+    "class_type": "CreateVideo",
+    "inputs": {"images": ["7", 0], "audio": ["7", 1], "fps": 24.0}
+  },
+  "9": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["8", 0],
+      "filename_prefix": "minimax_h3_endless_story",
+      "fps": 24.0,
+      "format": "mp4"
+    }
+  }
+}

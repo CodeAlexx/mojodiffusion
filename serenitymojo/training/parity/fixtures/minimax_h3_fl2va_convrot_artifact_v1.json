@@ -1,0 +1,261 @@
+{
+  "artifact": {
+    "basename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "dtype_counts": {
+      "BF16": 220,
+      "F16": 102,
+      "F32": 210,
+      "I8": 200,
+      "U8": 200
+    },
+    "file_size": 20970445465,
+    "header_len": 161265,
+    "header_sha256": "33f7e56818346cbca53fc5a10515bf11fbc15e4c8b0141c37bdd582b900c87c0",
+    "modelspec_hash_sha256": "0xd8d5a93cbdaad2a60b8654980424b0f1bcacba549f2ce9c516fe8d1ed8224bb5",
+    "modelspec_title": "minimax_h3_fl2va_pruned_int8_convrot",
+    "tensor_count": 932
+  },
+  "block0_markers": {
+    "fc1_runtime_scale": [
+      {
+        "f32_bits": 997004277,
+        "runtime_row": 0,
+        "source_row": 14336
+      },
+      {
+        "f32_bits": 999223207,
+        "runtime_row": 14335,
+        "source_row": 28671
+      },
+      {
+        "f32_bits": 998662180,
+        "runtime_row": 14336,
+        "source_row": 0
+      },
+      {
+        "f32_bits": 999219212,
+        "runtime_row": 28671,
+        "source_row": 14335
+      }
+    ],
+    "fc1_runtime_weight": [
+      {
+        "col": 0,
+        "runtime_row": 0,
+        "source_row": 14336,
+        "value": 45
+      },
+      {
+        "col": 1,
+        "runtime_row": 0,
+        "source_row": 14336,
+        "value": 16
+      },
+      {
+        "col": 5375,
+        "runtime_row": 0,
+        "source_row": 14336,
+        "value": 16
+      },
+      {
+        "col": 0,
+        "runtime_row": 14335,
+        "source_row": 28671,
+        "value": 17
+      },
+      {
+        "col": 1,
+        "runtime_row": 14335,
+        "source_row": 28671,
+        "value": 5
+      },
+      {
+        "col": 5375,
+        "runtime_row": 14335,
+        "source_row": 28671,
+        "value": -58
+      },
+      {
+        "col": 0,
+        "runtime_row": 14336,
+        "source_row": 0,
+        "value": -11
+      },
+      {
+        "col": 1,
+        "runtime_row": 14336,
+        "source_row": 0,
+        "value": -42
+      },
+      {
+        "col": 5375,
+        "runtime_row": 14336,
+        "source_row": 0,
+        "value": -12
+      },
+      {
+        "col": 0,
+        "runtime_row": 28671,
+        "source_row": 14335,
+        "value": 26
+      },
+      {
+        "col": 1,
+        "runtime_row": 28671,
+        "source_row": 14335,
+        "value": -12
+      },
+      {
+        "col": 5375,
+        "runtime_row": 28671,
+        "source_row": 14335,
+        "value": -50
+      }
+    ],
+    "qkv_uploaded_verbatim": [
+      {
+        "col": 0,
+        "row": 0,
+        "value": -3
+      },
+      {
+        "col": 5375,
+        "row": 0,
+        "value": -41
+      },
+      {
+        "col": 0,
+        "row": 7167,
+        "value": 55
+      },
+      {
+        "col": 5375,
+        "row": 7167,
+        "value": 57
+      },
+      {
+        "col": 0,
+        "row": 7168,
+        "value": -39
+      },
+      {
+        "col": 5375,
+        "row": 7168,
+        "value": -24
+      },
+      {
+        "col": 0,
+        "row": 14335,
+        "value": -6
+      },
+      {
+        "col": 5375,
+        "row": 14335,
+        "value": -31
+      },
+      {
+        "col": 0,
+        "row": 14336,
+        "value": -39
+      },
+      {
+        "col": 5375,
+        "row": 14336,
+        "value": -21
+      },
+      {
+        "col": 0,
+        "row": 21503,
+        "value": -56
+      },
+      {
+        "col": 5375,
+        "row": 21503,
+        "value": 24
+      }
+    ]
+  },
+  "contract": {
+    "adaln": {
+      "block_projection_bias": {
+        "dtype": "F16",
+        "shape": [
+          96768
+        ]
+      },
+      "block_projection_weight": {
+        "dtype": "F16",
+        "shape": [
+          96768,
+          8
+        ]
+      },
+      "final_projection_bias": {
+        "dtype": "F16",
+        "shape": [
+          10752
+        ]
+      },
+      "final_projection_weight": {
+        "dtype": "F16",
+        "shape": [
+          10752,
+          8
+        ]
+      },
+      "table": {
+        "dtype": "F32",
+        "shape": [
+          1025,
+          8
+        ]
+      }
+    },
+    "blocks": 50,
+    "convrot_group_size": 256,
+    "convrot_triples": 200,
+    "fc1_runtime_layout": "value_gate",
+    "fc1_storage_layout": "gate_value",
+    "fc1_transform_count": 1,
+    "projections": {
+      "attn.out_proj": {
+        "shape": [
+          5376,
+          7168
+        ],
+        "storage_layout": "ordinary_rows"
+      },
+      "attn.qkv_proj": {
+        "shape": [
+          21504,
+          5376
+        ],
+        "storage_layout": "all_q_all_k_all_v"
+      },
+      "mlp.fc1": {
+        "shape": [
+          28672,
+          5376
+        ],
+        "storage_layout": "gate_value"
+      },
+      "mlp.fc2": {
+        "shape": [
+          5376,
+          14336
+        ],
+        "storage_layout": "ordinary_rows"
+      }
+    },
+    "qkv_storage_and_runtime_layout": "all_q_all_k_all_v",
+    "qkv_transform": "none"
+  },
+  "schema": "serenity.minimax_h3.fl2va_convrot_artifact.v1",
+  "source_receipt": {
+    "comfy_ldm_minimax_model_sha256": "b3f51bfd5c44962c3bbe09c3e16e34698a286c5279e050ea6c3defbb8434c34e",
+    "comfy_ops_sha256": "28a44d8c49d37534c5fb3af0855ad689c4261f5a90295034d397d84a0835f90d",
+    "comfyui_commit": "8e869efc8764546415036e5fdac05fc287dbe926",
+    "fc1_consumer": "gate,up = x.chunk(2, dim=-1); silu(gate)*up",
+    "qkv_consumer": "q,k,v = qkv_proj(x).split(heads*head_dim, dim=-1)"
+  }
+}

@@ -1,0 +1,2794 @@
+{
+  "excluded_evidence": [
+    "Musubi LoRA weight-file export/import",
+    "full 200-target optimizer allocation or update",
+    "model forward/backward, dataset, cache, trainer, and product launch"
+  ],
+  "executed_dtype_probe": {
+    "base": "torch.bfloat16",
+    "lora_down": "torch.float32",
+    "lora_up": "torch.float32",
+    "lora_up_zero_initialized": true
+  },
+  "inventory": [
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 0,
+      "module_path": "blocks.0.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_0_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 0,
+      "module_path": "blocks.0.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_0_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 0,
+      "module_path": "blocks.0.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_0_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 0,
+      "module_path": "blocks.0.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_0_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 1,
+      "module_path": "blocks.1.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_1_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 1,
+      "module_path": "blocks.1.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_1_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 1,
+      "module_path": "blocks.1.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_1_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 1,
+      "module_path": "blocks.1.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_1_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 2,
+      "module_path": "blocks.2.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_2_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 2,
+      "module_path": "blocks.2.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_2_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 2,
+      "module_path": "blocks.2.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_2_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 2,
+      "module_path": "blocks.2.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_2_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 3,
+      "module_path": "blocks.3.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_3_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 3,
+      "module_path": "blocks.3.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_3_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 3,
+      "module_path": "blocks.3.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_3_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 3,
+      "module_path": "blocks.3.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_3_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 4,
+      "module_path": "blocks.4.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_4_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 4,
+      "module_path": "blocks.4.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_4_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 4,
+      "module_path": "blocks.4.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_4_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 4,
+      "module_path": "blocks.4.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_4_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 5,
+      "module_path": "blocks.5.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_5_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 5,
+      "module_path": "blocks.5.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_5_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 5,
+      "module_path": "blocks.5.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_5_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 5,
+      "module_path": "blocks.5.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_5_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 6,
+      "module_path": "blocks.6.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_6_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 6,
+      "module_path": "blocks.6.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_6_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 6,
+      "module_path": "blocks.6.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_6_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 6,
+      "module_path": "blocks.6.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_6_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 7,
+      "module_path": "blocks.7.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_7_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 7,
+      "module_path": "blocks.7.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_7_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 7,
+      "module_path": "blocks.7.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_7_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 7,
+      "module_path": "blocks.7.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_7_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 8,
+      "module_path": "blocks.8.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_8_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 8,
+      "module_path": "blocks.8.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_8_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 8,
+      "module_path": "blocks.8.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_8_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 8,
+      "module_path": "blocks.8.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_8_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 9,
+      "module_path": "blocks.9.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_9_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 9,
+      "module_path": "blocks.9.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_9_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 9,
+      "module_path": "blocks.9.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_9_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 9,
+      "module_path": "blocks.9.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_9_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 10,
+      "module_path": "blocks.10.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_10_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 10,
+      "module_path": "blocks.10.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_10_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 10,
+      "module_path": "blocks.10.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_10_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 10,
+      "module_path": "blocks.10.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_10_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 11,
+      "module_path": "blocks.11.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_11_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 11,
+      "module_path": "blocks.11.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_11_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 11,
+      "module_path": "blocks.11.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_11_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 11,
+      "module_path": "blocks.11.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_11_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 12,
+      "module_path": "blocks.12.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_12_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 12,
+      "module_path": "blocks.12.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_12_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 12,
+      "module_path": "blocks.12.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_12_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 12,
+      "module_path": "blocks.12.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_12_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 13,
+      "module_path": "blocks.13.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_13_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 13,
+      "module_path": "blocks.13.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_13_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 13,
+      "module_path": "blocks.13.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_13_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 13,
+      "module_path": "blocks.13.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_13_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 14,
+      "module_path": "blocks.14.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_14_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 14,
+      "module_path": "blocks.14.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_14_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 14,
+      "module_path": "blocks.14.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_14_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 14,
+      "module_path": "blocks.14.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_14_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 15,
+      "module_path": "blocks.15.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_15_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 15,
+      "module_path": "blocks.15.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_15_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 15,
+      "module_path": "blocks.15.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_15_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 15,
+      "module_path": "blocks.15.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_15_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 16,
+      "module_path": "blocks.16.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_16_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 16,
+      "module_path": "blocks.16.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_16_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 16,
+      "module_path": "blocks.16.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_16_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 16,
+      "module_path": "blocks.16.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_16_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 17,
+      "module_path": "blocks.17.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_17_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 17,
+      "module_path": "blocks.17.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_17_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 17,
+      "module_path": "blocks.17.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_17_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 17,
+      "module_path": "blocks.17.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_17_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 18,
+      "module_path": "blocks.18.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_18_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 18,
+      "module_path": "blocks.18.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_18_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 18,
+      "module_path": "blocks.18.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_18_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 18,
+      "module_path": "blocks.18.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_18_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 19,
+      "module_path": "blocks.19.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_19_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 19,
+      "module_path": "blocks.19.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_19_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 19,
+      "module_path": "blocks.19.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_19_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 19,
+      "module_path": "blocks.19.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_19_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 20,
+      "module_path": "blocks.20.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_20_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 20,
+      "module_path": "blocks.20.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_20_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 20,
+      "module_path": "blocks.20.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_20_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 20,
+      "module_path": "blocks.20.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_20_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 21,
+      "module_path": "blocks.21.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_21_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 21,
+      "module_path": "blocks.21.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_21_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 21,
+      "module_path": "blocks.21.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_21_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 21,
+      "module_path": "blocks.21.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_21_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 22,
+      "module_path": "blocks.22.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_22_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 22,
+      "module_path": "blocks.22.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_22_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 22,
+      "module_path": "blocks.22.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_22_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 22,
+      "module_path": "blocks.22.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_22_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 23,
+      "module_path": "blocks.23.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_23_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 23,
+      "module_path": "blocks.23.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_23_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 23,
+      "module_path": "blocks.23.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_23_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 23,
+      "module_path": "blocks.23.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_23_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 24,
+      "module_path": "blocks.24.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_24_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 24,
+      "module_path": "blocks.24.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_24_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 24,
+      "module_path": "blocks.24.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_24_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 24,
+      "module_path": "blocks.24.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_24_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 25,
+      "module_path": "blocks.25.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_25_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 25,
+      "module_path": "blocks.25.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_25_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 25,
+      "module_path": "blocks.25.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_25_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 25,
+      "module_path": "blocks.25.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_25_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 26,
+      "module_path": "blocks.26.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_26_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 26,
+      "module_path": "blocks.26.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_26_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 26,
+      "module_path": "blocks.26.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_26_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 26,
+      "module_path": "blocks.26.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_26_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 27,
+      "module_path": "blocks.27.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_27_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 27,
+      "module_path": "blocks.27.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_27_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 27,
+      "module_path": "blocks.27.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_27_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 27,
+      "module_path": "blocks.27.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_27_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 28,
+      "module_path": "blocks.28.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_28_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 28,
+      "module_path": "blocks.28.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_28_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 28,
+      "module_path": "blocks.28.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_28_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 28,
+      "module_path": "blocks.28.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_28_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 29,
+      "module_path": "blocks.29.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_29_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 29,
+      "module_path": "blocks.29.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_29_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 29,
+      "module_path": "blocks.29.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_29_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 29,
+      "module_path": "blocks.29.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_29_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 30,
+      "module_path": "blocks.30.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_30_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 30,
+      "module_path": "blocks.30.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_30_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 30,
+      "module_path": "blocks.30.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_30_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 30,
+      "module_path": "blocks.30.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_30_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 31,
+      "module_path": "blocks.31.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_31_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 31,
+      "module_path": "blocks.31.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_31_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 31,
+      "module_path": "blocks.31.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_31_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 31,
+      "module_path": "blocks.31.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_31_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 32,
+      "module_path": "blocks.32.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_32_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 32,
+      "module_path": "blocks.32.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_32_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 32,
+      "module_path": "blocks.32.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_32_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 32,
+      "module_path": "blocks.32.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_32_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 33,
+      "module_path": "blocks.33.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_33_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 33,
+      "module_path": "blocks.33.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_33_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 33,
+      "module_path": "blocks.33.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_33_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 33,
+      "module_path": "blocks.33.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_33_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 34,
+      "module_path": "blocks.34.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_34_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 34,
+      "module_path": "blocks.34.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_34_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 34,
+      "module_path": "blocks.34.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_34_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 34,
+      "module_path": "blocks.34.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_34_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 35,
+      "module_path": "blocks.35.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_35_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 35,
+      "module_path": "blocks.35.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_35_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 35,
+      "module_path": "blocks.35.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_35_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 35,
+      "module_path": "blocks.35.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_35_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 36,
+      "module_path": "blocks.36.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_36_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 36,
+      "module_path": "blocks.36.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_36_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 36,
+      "module_path": "blocks.36.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_36_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 36,
+      "module_path": "blocks.36.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_36_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 37,
+      "module_path": "blocks.37.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_37_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 37,
+      "module_path": "blocks.37.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_37_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 37,
+      "module_path": "blocks.37.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_37_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 37,
+      "module_path": "blocks.37.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_37_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 38,
+      "module_path": "blocks.38.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_38_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 38,
+      "module_path": "blocks.38.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_38_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 38,
+      "module_path": "blocks.38.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_38_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 38,
+      "module_path": "blocks.38.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_38_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 39,
+      "module_path": "blocks.39.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_39_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 39,
+      "module_path": "blocks.39.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_39_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 39,
+      "module_path": "blocks.39.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_39_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 39,
+      "module_path": "blocks.39.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_39_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 40,
+      "module_path": "blocks.40.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_40_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 40,
+      "module_path": "blocks.40.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_40_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 40,
+      "module_path": "blocks.40.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_40_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 40,
+      "module_path": "blocks.40.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_40_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 41,
+      "module_path": "blocks.41.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_41_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 41,
+      "module_path": "blocks.41.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_41_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 41,
+      "module_path": "blocks.41.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_41_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 41,
+      "module_path": "blocks.41.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_41_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 42,
+      "module_path": "blocks.42.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_42_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 42,
+      "module_path": "blocks.42.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_42_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 42,
+      "module_path": "blocks.42.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_42_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 42,
+      "module_path": "blocks.42.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_42_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 43,
+      "module_path": "blocks.43.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_43_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 43,
+      "module_path": "blocks.43.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_43_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 43,
+      "module_path": "blocks.43.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_43_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 43,
+      "module_path": "blocks.43.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_43_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 44,
+      "module_path": "blocks.44.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_44_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 44,
+      "module_path": "blocks.44.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_44_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 44,
+      "module_path": "blocks.44.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_44_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 44,
+      "module_path": "blocks.44.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_44_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 45,
+      "module_path": "blocks.45.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_45_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 45,
+      "module_path": "blocks.45.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_45_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 45,
+      "module_path": "blocks.45.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_45_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 45,
+      "module_path": "blocks.45.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_45_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 46,
+      "module_path": "blocks.46.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_46_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 46,
+      "module_path": "blocks.46.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_46_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 46,
+      "module_path": "blocks.46.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_46_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 46,
+      "module_path": "blocks.46.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_46_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 47,
+      "module_path": "blocks.47.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_47_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 47,
+      "module_path": "blocks.47.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_47_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 47,
+      "module_path": "blocks.47.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_47_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 47,
+      "module_path": "blocks.47.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_47_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 48,
+      "module_path": "blocks.48.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_48_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 48,
+      "module_path": "blocks.48.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_48_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 48,
+      "module_path": "blocks.48.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_48_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 48,
+      "module_path": "blocks.48.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_48_mlp_fc2",
+      "out_features": 5376
+    },
+    {
+      "family": "qkv_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 5376,
+      "layer": 49,
+      "module_path": "blocks.49.attn.qkv_proj",
+      "musubi_prefix": "lora_unet_blocks_49_attn_qkv_proj",
+      "out_features": 21504
+    },
+    {
+      "family": "out_proj",
+      "fc1_runtime_swap": false,
+      "in_features": 7168,
+      "layer": 49,
+      "module_path": "blocks.49.attn.out_proj",
+      "musubi_prefix": "lora_unet_blocks_49_attn_out_proj",
+      "out_features": 5376
+    },
+    {
+      "family": "fc1",
+      "fc1_runtime_swap": true,
+      "in_features": 5376,
+      "layer": 49,
+      "module_path": "blocks.49.mlp.fc1",
+      "musubi_prefix": "lora_unet_blocks_49_mlp_fc1",
+      "out_features": 28672
+    },
+    {
+      "family": "fc2",
+      "fc1_runtime_swap": false,
+      "in_features": 14336,
+      "layer": 49,
+      "module_path": "blocks.49.mlp.fc2",
+      "musubi_prefix": "lora_unet_blocks_49_mlp_fc2",
+      "out_features": 5376
+    }
+  ],
+  "optimizer_trajectory": {
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "cases": [
+      {
+        "family": "qkv_proj",
+        "in_features": 3,
+        "initial_a": [
+          0.0012781302211806178,
+          0.004219260066747665,
+          0.0021433900110423565,
+          0.00508452020585537,
+          0.0030086501501500607,
+          0.005949779879301786
+        ],
+        "initial_b": [
+          0.002489130012691021,
+          0.005430259741842747,
+          0.0033543899189680815,
+          0.001278520212508738,
+          0.004219650290906429,
+          0.0021437800023704767,
+          0.005084909964352846,
+          0.003009040141478181,
+          0.00595017010346055,
+          0.0038742998149245977,
+          0.0017984301084652543,
+          0.0047395601868629456,
+          0.002663689898326993,
+          0.005604819860309362,
+          0.003528950037434697,
+          0.00145308009814471
+        ],
+        "musubi_prefix": "lora_unet_blocks_0_attn_qkv_proj",
+        "out_features": 8,
+        "rank": 2,
+        "steps": [
+          {
+            "a": [
+              0.0009781348053365946,
+              0.00391924986615777,
+              0.002443376462906599,
+              0.004784510936588049,
+              0.0033086384646594524,
+              0.006249751430004835
+            ],
+            "b": [
+              0.0021891267970204353,
+              0.005730240605771542,
+              0.0036543358583003283,
+              0.000978519907221198,
+              0.004519633948802948,
+              0.0018438142724335194,
+              0.004784897435456514,
+              0.003309026826173067,
+              0.005650166422128677,
+              0.0035742907784879208,
+              0.0020984194707125425,
+              0.004439554642885923,
+              0.002363684354349971,
+              0.005904796067625284,
+              0.0032289456576108932,
+              0.0017530733020976186
+            ],
+            "ma": [
+              3.579000258469023e-05,
+              0.00012809001782443374,
+              -4.2310002754675224e-05,
+              4.999000157113187e-05,
+              -0.00012040999718010426,
+              -2.811000194924418e-05
+            ],
+            "mb": [
+              7.129000732675195e-05,
+              -9.91100023384206e-05,
+              -6.8100002863502596e-06,
+              8.549000631319359e-05,
+              -8.491000335197896e-05,
+              7.390000519080786e-06,
+              9.969000529963523e-05,
+              -7.071000436553732e-05,
+              2.158999996026978e-05,
+              0.00011389000428607687,
+              -5.6510001741116866e-05,
+              3.579000258469023e-05,
+              0.00012809001782443374,
+              -4.2310002754675224e-05,
+              4.999000157113187e-05,
+              -0.00012040999718010426
+            ],
+            "step": 1,
+            "va": [
+              1.2809242555533729e-10,
+              1.6407051273148454e-09,
+              1.7901363724703856e-10,
+              2.4990004510172525e-10,
+              1.4498567901810588e-09,
+              7.901722332004368e-11
+            ],
+            "vb": [
+              5.082265164269018e-10,
+              9.822792579328166e-10,
+              4.637610608038134e-12,
+              7.308540994621637e-10,
+              7.209708385857994e-10,
+              5.461210476898071e-12,
+              9.93809701199666e-10,
+              4.999904934521737e-10,
+              4.6612814302848804e-11,
+              1.2970933216394087e-09,
+              3.1933802824291035e-10,
+              1.2809242555533729e-10,
+              1.6407051273148454e-09,
+              1.7901363724703856e-10,
+              2.4990004510172525e-10,
+              1.4498567901810588e-09
+            ]
+          },
+          {
+            "a": [
+              0.0010736228432506323,
+              0.0036738975904881954,
+              0.002298761159181595,
+              0.004797651898115873,
+              0.003422444686293602,
+              0.006511067505925894
+            ],
+            "b": [
+              0.0020830624271184206,
+              0.005776910111308098,
+              0.003889994462952018,
+              0.0008151484071277082,
+              0.004515259061008692,
+              0.0020501904655247927,
+              0.004582572262734175,
+              0.0032530867028981447,
+              0.00581130338832736,
+              0.003346194513142109,
+              0.0019947427790611982,
+              0.00453503243625164,
+              0.0021183365024626255,
+              0.005760170053690672,
+              0.0032420915085822344,
+              0.0018668840639293194
+            ],
+            "ma": [
+              -3.11090043396689e-05,
+              0.00014426102279685438,
+              8.320100459968671e-05,
+              -4.129002718400443e-06,
+              -6.51889931759797e-05,
+              -0.0001525190018583089
+            ],
+            "mb": [
+              3.6341003578854725e-05,
+              -2.4718998247408308e-05,
+              -0.00011204901238670573,
+              6.332100747385994e-05,
+              2.2609992811339907e-06,
+              -8.506900485372171e-05,
+              9.030100773088634e-05,
+              2.92410022666445e-05,
+              -5.80890009587165e-05,
+              0.00011728100798791274,
+              5.6221007980639115e-05,
+              -3.11090043396689e-05,
+              0.00014426102279685438,
+              8.320100459968671e-05,
+              -4.129002718400443e-06,
+              -6.51889931759797e-05
+            ],
+            "step": 2,
+            "va": [
+              5.289066962177458e-10,
+              1.7230484816721514e-09,
+              1.6497185839625672e-09,
+              4.909276318798561e-10,
+              1.6348582487779595e-09,
+              1.6974311956019505e-09
+            ],
+            "vb": [
+              5.85113568707385e-10,
+              1.3970641310478982e-09,
+              1.1265376409497208e-09,
+              7.486736786077586e-10,
+              1.3393041120579596e-09,
+              8.467117562638293e-10,
+              9.928495803279702e-10,
+              1.3621600514213128e-09,
+              6.475013303308685e-10,
+              1.3176411073345662e-09,
+              1.4656316160710503e-09,
+              5.289066962177458e-10,
+              1.7230484816721514e-09,
+              1.6497185839625672e-09,
+              4.909276318798561e-10,
+              1.6348582487779595e-09
+            ]
+          },
+          {
+            "a": [
+              0.0009617850300855935,
+              0.0035969745367765427,
+              0.0021559898741543293,
+              0.004639469087123871,
+              0.0035798687022179365,
+              0.006654062308371067
+            ],
+            "b": [
+              0.0022049176041036844,
+              0.005865432322025299,
+              0.0039585055783391,
+              0.0008903301786631346,
+              0.004545257892459631,
+              0.002057888312265277,
+              0.0046061682514846325,
+              0.0032201246358454227,
+              0.005756314843893051,
+              0.0033176206052303314,
+              0.001902177231386304,
+              0.00442318432033062,
+              0.002041418105363846,
+              0.005617388524115086,
+              0.0030839138198643923,
+              0.002024312736466527
+            ],
+            "ma": [
+              7.227189053082839e-05,
+              5.9704918385250494e-05,
+              9.705090633360669e-05,
+              0.00011075389920733869,
+              -0.0001146001013694331,
+              -0.00010089709394378588
+            ],
+            "mb": [
+              -9.422311268281192e-05,
+              -5.687710290658288e-05,
+              -4.3174110032850876e-05,
+              -5.5741100368322805e-05,
+              -1.839510332501959e-05,
+              -4.692099537351169e-06,
+              -1.725910260574892e-05,
+              2.0086901713511907e-05,
+              3.378990004421212e-05,
+              2.1222906070761383e-05,
+              5.856890857103281e-05,
+              7.227189053082839e-05,
+              5.9704918385250494e-05,
+              9.705090633360669e-05,
+              0.00011075389920733869,
+              -0.0001146001013694331
+            ],
+            "step": 3,
+            "va": [
+              1.5337849879060172e-09,
+              2.2131472210418224e-09,
+              1.697219809138062e-09,
+              1.8007747515369488e-09,
+              1.9460399958148855e-09,
+              1.8280115199331703e-09
+            ],
+            "vb": [
+              2.1956512163967545e-09,
+              1.5155908750230651e-09,
+              1.4579940588177465e-09,
+              2.018730516084588e-09,
+              1.3797033515672297e-09,
+              1.362394863591021e-09,
+              1.9626729130806098e-09,
+              1.3646792584864897e-09,
+              1.3876584326055763e-09,
+              2.0274784073848195e-09,
+              1.4705181516916355e-09,
+              1.5337849879060172e-09,
+              2.2131472210418224e-09,
+              1.697219809138062e-09,
+              1.8007747515369488e-09,
+              1.9460399958148855e-09
+            ]
+          }
+        ]
+      },
+      {
+        "family": "out_proj",
+        "in_features": 4,
+        "initial_a": [
+          0.006881129927933216,
+          0.009822259657084942,
+          0.00774639006704092,
+          0.005670520011335611,
+          0.008611650206148624,
+          0.0065357801504433155,
+          0.009476910345256329,
+          0.007401039823889732
+        ],
+        "initial_b": [
+          0.008092130534350872,
+          0.006016260012984276,
+          0.008957390673458576,
+          0.00688152015209198,
+          0.009822649881243706,
+          0.007746779825538397,
+          0.005670909769833088,
+          0.008612040430307388,
+          0.006536170374602079,
+          0.009477300569415092
+        ],
+        "musubi_prefix": "lora_unet_blocks_0_attn_out_proj",
+        "out_features": 5,
+        "rank": 2,
+        "steps": [
+          {
+            "a": [
+              0.007181106135249138,
+              0.009523261338472366,
+              0.0074463700875639915,
+              0.005970499478280544,
+              0.00831164512783289,
+              0.006235763430595398,
+              0.009776877239346504,
+              0.007101028226315975
+            ],
+            "b": [
+              0.008392101153731346,
+              0.005716250278055668,
+              0.008657366037368774,
+              0.007181492634117603,
+              0.009522627107799053,
+              0.008046753704547882,
+              0.005970882251858711,
+              0.00831201858818531,
+              0.006836147978901863,
+              0.009777250699698925
+            ],
+            "ma": [
+              -9.201000648317859e-05,
+              2.900000026784255e-07,
+              9.259000944439322e-05,
+              -7.781000022077933e-05,
+              1.4489999557554256e-05,
+              0.00010679000843083486,
+              -6.361000123433769e-05,
+              2.8690001272480004e-05
+            ],
+            "mb": [
+              -5.6510001741116866e-05,
+              3.579000258469023e-05,
+              0.00012809001782443374,
+              -4.2310002754675224e-05,
+              4.999000157113187e-05,
+              -0.00012040999718010426,
+              -2.811000194924418e-05,
+              6.419000419555232e-05,
+              -0.00010621000546962023,
+              -1.3910001143813133e-05
+            ],
+            "step": 1,
+            "va": [
+              8.465841361271487e-10,
+              8.410000397907763e-15,
+              8.5729096044318e-10,
+              6.054395873533736e-10,
+              2.0996008751050788e-11,
+              1.1404106547985293e-09,
+              4.046232238152925e-10,
+              8.231161585658953e-11
+            ],
+            "vb": [
+              3.1933802824291035e-10,
+              1.2809242555533729e-10,
+              1.6407051273148454e-09,
+              1.7901363724703856e-10,
+              2.4990004510172525e-10,
+              1.4498567901810588e-09,
+              7.901722332004368e-11,
+              4.120357111059292e-10,
+              1.1280565370697104e-09,
+              1.9348814217501342e-11
+            ]
+          },
+          {
+            "a": [
+              0.007202595006674528,
+              0.009745880961418152,
+              0.007261519320309162,
+              0.005940113682299852,
+              0.008497747592628002,
+              0.006019227206707001,
+              0.009696337394416332,
+              0.007231949362903833
+            ],
+            "b": [
+              0.00828840583562851,
+              0.005811723880469799,
+              0.008411998860538006,
+              0.0070368628948926926,
+              0.009535754099488258,
+              0.008160545490682125,
+              0.0062321992591023445,
+              0.008242158219218254,
+              0.0069068125449121,
+              0.010023332200944424
+            ],
+            "ma": [
+              -1.122899993788451e-05,
+              -9.855899406829849e-05,
+              7.681101124035195e-05,
+              1.57510039571207e-05,
+              -7.15790010872297e-05,
+              0.00010379100422142074,
+              4.273100785212591e-05,
+              -4.45990044681821e-05
+            ],
+            "mb": [
+              5.6221007980639115e-05,
+              -3.11090043396689e-05,
+              0.00014426102279685438,
+              8.320100459968671e-05,
+              -4.129002718400443e-06,
+              -6.51889931759797e-05,
+              -0.0001525190018583089,
+              2.2850997993373312e-05,
+              -3.820900383288972e-05,
+              -0.00012553900887724012
+            ],
+            "step": 2,
+            "va": [
+              1.3581072932922211e-09,
+              9.765476205458867e-10,
+              8.606847456960054e-10,
+              1.3406550314343235e-09,
+              7.370295485031875e-10,
+              1.1451685155705604e-09,
+              1.40381883895202e-09,
+              5.781270462357213e-10
+            ],
+            "vb": [
+              1.4656316160710503e-09,
+              5.289066962177458e-10,
+              1.7230484816721514e-09,
+              1.6497185839625672e-09,
+              4.909276318798561e-10,
+              1.6348582487779595e-09,
+              1.6974311956019505e-09,
+              5.335643593618045e-10,
+              1.4561749583918981e-09,
+              1.2966815399195752e-09
+            ]
+          },
+          {
+            "a": [
+              0.007262835279107094,
+              0.009784683585166931,
+              0.007311264052987099,
+              0.005938704591244459,
+              0.008473813533782959,
+              0.006016509607434273,
+              0.009632667526602745,
+              0.007147401571273804
+            ],
+            "b": [
+              0.008195821195840836,
+              0.00569987203925848,
+              0.008335061371326447,
+              0.006894077640026808,
+              0.00937755685299635,
+              0.008317955769598484,
+              0.006375194992870092,
+              0.008048813790082932,
+              0.0070210895501077175,
+              0.010119343176484108
+            ],
+            "ma": [
+              -3.7636098568327725e-05,
+              -2.393308750470169e-05,
+              -3.650011058198288e-05,
+              8.459018658868445e-07,
+              1.454890298191458e-05,
+              1.9819037788693095e-06,
+              3.932790787075646e-05,
+              5.303090074448846e-05
+            ],
+            "mb": [
+              5.856890857103281e-05,
+              7.227189053082839e-05,
+              5.9704918385250494e-05,
+              9.705090633360669e-05,
+              0.00011075389920733869,
+              -0.0001146001013694331,
+              -0.00010089709394378588,
+              0.00014923590060789138,
+              -7.611810724483803e-05,
+              -6.241510709514841e-05
+            ],
+            "step": 3,
+            "va": [
+              1.4325391983760483e-09,
+              1.395086379751831e-09,
+              1.975594132730407e-09,
+              1.3570833345966093e-09,
+              1.359918622156897e-09,
+              1.9799679673582204e-09,
+              1.4024907901699635e-09,
+              1.4456139618701513e-09
+            ],
+            "vb": [
+              1.4705181516916355e-09,
+              1.5337849879060172e-09,
+              2.2131472210418224e-09,
+              1.697219809138062e-09,
+              1.8007747515369488e-09,
+              1.9460399958148855e-09,
+              1.8280115199331703e-09,
+              2.188627945542976e-09,
+              1.6288580484413728e-09,
+              1.5511174566995578e-09
+            ]
+          }
+        ]
+      },
+      {
+        "family": "fc1",
+        "in_features": 3,
+        "initial_a": [
+          0.012484130449593067,
+          0.010408259928226471,
+          0.013349389657378197,
+          0.0112735191360116,
+          0.009197649545967579,
+          0.01213878020644188
+        ],
+        "initial_b": [
+          0.008678130805492401,
+          0.011619259603321552,
+          0.00954339001327753,
+          0.012484519742429256,
+          0.010408650152385235,
+          0.01334977988153696,
+          0.011273909360170364,
+          0.009198039770126343,
+          0.012139169499278069,
+          0.010063299909234047,
+          0.013004429638385773,
+          0.010928560048341751
+        ],
+        "musubi_prefix": "lora_unet_blocks_0_mlp_fc1",
+        "out_features": 6,
+        "rank": 2,
+        "steps": [
+          {
+            "a": [
+              0.012184100225567818,
+              0.010708226822316647,
+              0.013649340718984604,
+              0.0109734907746315,
+              0.009497620165348053,
+              0.012438729405403137
+            ],
+            "b": [
+              0.008378108963370323,
+              0.011919221840798855,
+              0.009244391694664955,
+              0.012184485793113708,
+              0.010708615183830261,
+              0.013049760833382607,
+              0.010973879136145115,
+              0.009498007595539093,
+              0.011839143931865692,
+              0.009763272479176521,
+              0.013304384425282478,
+              0.010628534480929375
+            ],
+            "ma": [
+              4.289000207791105e-05,
+              -0.0001275100075872615,
+              -3.5210003261454403e-05,
+              5.70900047023315e-05,
+              -0.00011331000132486224,
+              -2.1010002456023358e-05
+            ],
+            "mb": [
+              7.839000318199396e-05,
+              -9.201000648317859e-05,
+              2.900000026784255e-07,
+              9.259000944439322e-05,
+              -7.781000022077933e-05,
+              1.4489999557554256e-05,
+              0.00010679000843083486,
+              -6.361000123433769e-05,
+              2.8690001272480004e-05,
+              0.00012099000014131889,
+              -4.940999860991724e-05,
+              4.289000207791105e-05
+            ],
+            "step": 1,
+            "va": [
+              1.8395522605185732e-10,
+              1.6258802082447232e-09,
+              1.2397444182354889e-10,
+              3.2592686882715327e-10,
+              1.2839157514932253e-09,
+              4.414201990043942e-11
+            ],
+            "vb": [
+              6.14499284790071e-10,
+              8.465841361271487e-10,
+              8.410000397907763e-15,
+              8.5729096044318e-10,
+              6.054395873533736e-10,
+              2.0996008751050788e-11,
+              1.1404106547985293e-09,
+              4.046232238152925e-10,
+              8.231161585658953e-11,
+              1.463858145811514e-09,
+              2.441347957127249e-10,
+              1.8395522605185732e-10
+            ]
+          },
+          {
+            "a": [
+              0.012239696457982063,
+              0.01084080059081316,
+              0.01348714716732502,
+              0.010943968780338764,
+              0.00959073193371296,
+              0.012693212367594242
+            ],
+            "b": [
+              0.00824082363396883,
+              0.011940696276724339,
+              0.00946701131761074,
+              0.01199962105602026,
+              0.010678214952349663,
+              0.0132358493283391,
+              0.010757328942418098,
+              0.009417468681931496,
+              0.011970050632953644,
+              0.009525694884359837,
+              0.013179249130189419,
+              0.010684135369956493
+            ],
+            "ma": [
+              -1.7619004211155698e-05,
+              -7.867900421842933e-05,
+              9.669101564213634e-05,
+              9.360999683849514e-06,
+              -5.1699000323424116e-05,
+              -0.0001390289980918169
+            ],
+            "mb": [
+              4.983100006938912e-05,
+              -1.122899993788451e-05,
+              -9.855899406829849e-05,
+              7.681101124035195e-05,
+              1.57510039571207e-05,
+              -7.15790010872297e-05,
+              0.00010379100422142074,
+              4.273100785212591e-05,
+              -4.45990044681821e-05,
+              0.00013077100447844714,
+              6.971101538510993e-05,
+              -1.7619004211155698e-05
+            ],
+            "step": 2,
+            "va": [
+              4.998401692546395e-10,
+              1.7544310448869282e-09,
+              1.7719933298465662e-09,
+              5.021690285822444e-10,
+              1.5354396643019186e-09,
+              1.4869793174554502e-09
+            ],
+            "vb": [
+              6.568166011078347e-10,
+              1.3581072932922211e-09,
+              9.765476205458867e-10,
+              8.606847456960054e-10,
+              1.3406550314343235e-09,
+              7.370295485031875e-10,
+              1.1451685155705604e-09,
+              1.40381883895202e-09,
+              5.781270462357213e-10,
+              1.5102677997091973e-09,
+              1.5475981607337985e-09,
+              4.998401692546395e-10
+            ]
+          },
+          {
+            "a": [
+              0.012103219516575336,
+              0.011015698313713074,
+              0.013323514722287655,
+              0.010766873136162758,
+              0.009727973490953445,
+              0.012814106419682503
+            ],
+            "b": [
+              0.008340147323906422,
+              0.012000922113656998,
+              0.009505814872682095,
+              0.012049351818859577,
+              0.01067679189145565,
+              0.013211901299655437,
+              0.010754598304629326,
+              0.009353799745440483,
+              0.011885489337146282,
+              0.00947222113609314,
+              0.01306015532463789,
+              0.01054766308516264
+            ],
+            "ma": [
+              9.151289850706235e-05,
+              -0.00013384110934566706,
+              0.00011629191430984065,
+              0.00012999490718357265,
+              -9.535910066915676e-05,
+              -8.165609324350953e-05
+            ],
+            "mb": [
+              -7.498210470657796e-05,
+              -3.7636098568327725e-05,
+              -2.393308750470169e-05,
+              -3.650011058198288e-05,
+              8.459018658868445e-07,
+              1.454890298191458e-05,
+              1.9819037788693095e-06,
+              3.932790787075646e-05,
+              5.303090074448846e-05,
+              4.0463899495080113e-05,
+              7.780991290928796e-05,
+              9.151289850706235e-05
+            ],
+            "step": 3,
+            "va": [
+              1.6521721768469888e-09,
+              2.149954880792393e-09,
+              1.8558947711966312e-09,
+              1.979593156065107e-09,
+              1.7723411627201813e-09,
+              1.6744564623749625e-09
+            ],
+            "vb": [
+              2.0920827292769673e-09,
+              1.4325391983760483e-09,
+              1.395086379751831e-09,
+              1.975594132730407e-09,
+              1.3570833345966093e-09,
+              1.359918622156897e-09,
+              1.9799679673582204e-09,
+              1.4024907901699635e-09,
+              1.4456139618701513e-09,
+              2.105204899294222e-09,
+              1.5687611210069008e-09,
+              1.6521721768469888e-09
+            ]
+          }
+        ]
+      },
+      {
+        "family": "fc2",
+        "in_features": 3,
+        "initial_a": [
+          0.013070130720734596,
+          0.016011260449886322,
+          0.013935389928519726,
+          0.016876520588994026,
+          0.01480065006762743,
+          0.012724780477583408
+        ],
+        "initial_b": [
+          0.014281130395829678,
+          0.017222261056303978,
+          0.015146390534937382,
+          0.013070520013570786,
+          0.01601164974272251,
+          0.01393578015267849,
+          0.016876911744475365,
+          0.014801040291786194
+        ],
+        "musubi_prefix": "lora_unet_blocks_0_mlp_fc2",
+        "out_features": 4,
+        "rank": 2,
+        "steps": [
+          {
+            "a": [
+              0.013370088301599026,
+              0.015711253508925438,
+              0.013635351322591305,
+              0.017176466062664986,
+              0.01450061984360218,
+              0.012424744665622711
+            ],
+            "b": [
+              0.014581081457436085,
+              0.01692221499979496,
+              0.015446343459188938,
+              0.013370472006499767,
+              0.015711607411503792,
+              0.01423573587089777,
+              0.017176847904920578,
+              0.014501000754535198
+            ],
+            "ma": [
+              -8.491000335197896e-05,
+              7.390000519080786e-06,
+              9.969000529963523e-05,
+              -7.071000436553732e-05,
+              2.158999996026978e-05,
+              0.00011389000428607687
+            ],
+            "mb": [
+              -4.940999860991724e-05,
+              4.289000207791105e-05,
+              -0.0001275100075872615,
+              -3.5210003261454403e-05,
+              5.70900047023315e-05,
+              -0.00011331000132486224,
+              -2.1010002456023358e-05,
+              7.129000732675195e-05
+            ],
+            "step": 1,
+            "va": [
+              7.209708385857994e-10,
+              5.461210476898071e-12,
+              9.93809701199666e-10,
+              4.999904934521737e-10,
+              4.6612814302848804e-11,
+              1.2970933216394087e-09
+            ],
+            "vb": [
+              2.441347957127249e-10,
+              1.8395522605185732e-10,
+              1.6258802082447232e-09,
+              1.2397444182354889e-10,
+              3.2592686882715327e-10,
+              1.2839157514932253e-09,
+              4.414201990043942e-11,
+              5.082265164269018e-10
+            ]
+          },
+          {
+            "a": [
+              0.013365686871111393,
+              0.015917588025331497,
+              0.013433000072836876,
+              0.01712048612535,
+              0.014661730267107487,
+              0.012196621857583523
+            ],
+            "b": [
+              0.014455942437052727,
+              0.01697779819369316,
+              0.015578903257846832,
+              0.013208279386162758,
+              0.015682071447372437,
+              0.014328832738101482,
+              0.017431316897273064,
+              0.01439489983022213
+            ],
+            "ma": [
+              2.2609992811339907e-06,
+              -8.506900485372171e-05,
+              9.030100773088634e-05,
+              2.92410022666445e-05,
+              -5.80890009587165e-05,
+              0.00011728100798791274
+            ],
+            "mb": [
+              6.971101538510993e-05,
+              -1.7619004211155698e-05,
+              -7.867900421842933e-05,
+              9.669101564213634e-05,
+              9.360999683849514e-06,
+              -5.1699000323424116e-05,
+              -0.0001390289980918169,
+              3.6341003578854725e-05
+            ],
+            "step": 2,
+            "va": [
+              1.3393041120579596e-09,
+              8.467117562638293e-10,
+              9.928495803279702e-10,
+              1.3621600514213128e-09,
+              6.475013303308685e-10,
+              1.3176411073345662e-09
+            ],
+            "vb": [
+              1.5475981607337985e-09,
+              4.998401692546395e-10,
+              1.7544310448869282e-09,
+              1.7719933298465662e-09,
+              5.021690285822444e-10,
+              1.5354396643019186e-09,
+              1.4869793174554502e-09,
+              5.85113568707385e-10
+            ]
+          },
+          {
+            "a": [
+              0.013395658694207668,
+              0.015925245359539986,
+              0.01345656905323267,
+              0.017087483778595924,
+              0.014606715179979801,
+              0.012168021872639656
+            ],
+            "b": [
+              0.0143368449062109,
+              0.016841307282447815,
+              0.015753787010908127,
+              0.013044647872447968,
+              0.015504961833357811,
+              0.01446606032550335,
+              0.017552196979522705,
+              0.014516718685626984
+            ],
+            "ma": [
+              -1.839510332501959e-05,
+              -4.692099537351169e-06,
+              -1.725910260574892e-05,
+              2.0086901713511907e-05,
+              3.378990004421212e-05,
+              2.1222906070761383e-05
+            ],
+            "mb": [
+              7.780991290928796e-05,
+              9.151289850706235e-05,
+              -0.00013384110934566706,
+              0.00011629191430984065,
+              0.00012999490718357265,
+              -9.535910066915676e-05,
+              -8.165609324350953e-05,
+              -9.422311268281192e-05
+            ],
+            "step": 3,
+            "va": [
+              1.3797033515672297e-09,
+              1.362394863591021e-09,
+              1.9626729130806098e-09,
+              1.3646792584864897e-09,
+              1.3876584326055763e-09,
+              2.0274784073848195e-09
+            ],
+            "vb": [
+              1.5687611210069008e-09,
+              1.6521721768469888e-09,
+              2.149954880792393e-09,
+              1.8558947711966312e-09,
+              1.979593156065107e-09,
+              1.7723411627201813e-09,
+              1.6744564623749625e-09,
+              2.1956512163967545e-09
+            ]
+          }
+        ]
+      }
+    ],
+    "eps": 1e-08,
+    "learning_rate": 0.0003,
+    "oracle": "torch.optim.AdamW foreach=False fused=False",
+    "rank": 2,
+    "weight_decay": 0.01
+  },
+  "oracle_commit": "b8717864713c9e4e7ef3d56eba1fc695a9b626a5",
+  "oracle_repository": "kohya-ss/musubi-tuner",
+  "schema": "serenity.minimax_h3.target_inventory_reduced_optimizer_private_state.v1",
+  "source_contracts": [
+    "lora_minimax_h3.MINIMAX_H3_TARGET_REPLACE_MODULES",
+    "lora_minimax_h3.MINIMAX_H3_DEFAULT_TARGET_PATTERN",
+    "lora.LoRAModule.__init__",
+    "lora.LoRANetwork.__init__.create_modules",
+    "model.MLP.forward"
+  ],
+  "source_sha256": {
+    "minimax_h3/model.py": "500fcacf93b40fac49b1ccbb21d8b382cb1f1b9fbd7954d1ac08155b2d0d243a",
+    "networks/lora.py": "694bcf27bebd8911a7868628ac1bc075d07cc8e87fdb289993b17ecab71475d5",
+    "networks/lora_minimax_h3.py": "4c2c4c850f2ad6ad901e9d49088b54128f4e17ee09c88564db88602ede71fe17"
+  },
+  "target_pattern": "blocks\\.\\d+\\.(?:attn\\.(?:qkv_proj|out_proj)|mlp\\.(?:fc1|fc2))"
+}

@@ -1,0 +1,100 @@
+{
+  "schema": "serenitymojo.minimax_h3.bf16_flash_core_envelope.v1",
+  "evidence": "reduced-shape mixed-dtype Torch-vs-Mojo parity",
+  "oracle": {
+    "commit": "b8717864713c9e4e7ef3d56eba1fc695a9b626a5",
+    "model_sha256": "500fcacf93b40fac49b1ccbb21d8b382cb1f1b9fbd7954d1ac08155b2d0d243a",
+    "lora_sha256": "4c2c4c850f2ad6ad901e9d49088b54128f4e17ee09c88564db88602ede71fe17"
+  },
+  "geometry": {
+    "S": 3,
+    "H": 56,
+    "Dh": 8,
+    "D": 8,
+    "F": 12,
+    "Rot": 4,
+    "rank": 2
+  },
+  "dtype": "BF16 base/input/mod/compute/y/dx; F32 LoRA leaves and saved gradients",
+  "fixture": {
+    "sha256": "096ba15169c9d7ebaeb25c30dd102ed3a4a44a52a4dee3ee2becd8242f737647",
+    "fresh_generation_processes": 3,
+    "generation_digests": [
+      "096ba15169c9d7ebaeb25c30dd102ed3a4a44a52a4dee3ee2becd8242f737647",
+      "096ba15169c9d7ebaeb25c30dd102ed3a4a44a52a4dee3ee2becd8242f737647",
+      "096ba15169c9d7ebaeb25c30dd102ed3a4a44a52a4dee3ee2becd8242f737647"
+    ],
+    "byte_identical": true,
+    "determinism_note": "The oracle sorts and 8-byte-pads the SafeTensors JSON header after save; tensor bytes are unchanged and offsets remain relative to the data section."
+  },
+  "device_runs": {
+    "fresh_processes": 3,
+    "all_passed": true,
+    "all_observed_metrics_identical": true
+  },
+  "metrics": {
+    "boundary.fc1.raw_to_runtime": {
+      "observed": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_min": 1.0, "mag_ratio_max": 1.0},
+      "limits": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_error_max": 0.0}
+    },
+    "boundary.fc1.runtime_to_raw": {
+      "observed": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_min": 1.0, "mag_ratio_max": 1.0},
+      "limits": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_error_max": 0.0}
+    },
+    "boundary.fc1_lora_b.raw_to_runtime": {
+      "observed": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_min": 1.0, "mag_ratio_max": 1.0},
+      "limits": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_error_max": 0.0}
+    },
+    "boundary.fc1_lora_b.runtime_to_raw": {
+      "observed": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_min": 1.0, "mag_ratio_max": 1.0},
+      "limits": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_ratio_error_max": 0.0}
+    },
+    "forward.y": {
+      "observed": {"cos_min": 0.99999726, "max_abs_max": 0.001953125, "rel_l2_max": 0.0023559754709145527, "mag_ratio_min": 1.0002462966366041, "mag_ratio_max": 1.0002462966366041},
+      "limits": {"cos_min": 0.99999, "max_abs_max": 0.0021, "rel_l2_max": 0.0026, "mag_ratio_error_max": 0.0005}
+    },
+    "grad.x": {
+      "observed": {"cos_min": 0.99999523, "max_abs_max": 0.001953125, "rel_l2_max": 0.0031550868527446207, "mag_ratio_min": 1.0006676959440235, "mag_ratio_max": 1.0006676959440235},
+      "limits": {"cos_min": 0.99999, "max_abs_max": 0.0021, "rel_l2_max": 0.0034, "mag_ratio_error_max": 0.0009}
+    },
+    "grad.qkv.A": {
+      "observed": {"cos_min": 0.99994457, "max_abs_max": 0.00036621094, "rel_l2_max": 0.010527898986693473, "mag_ratio_min": 0.9997780258909252, "mag_ratio_max": 0.9997780258909252},
+      "limits": {"cos_min": 0.99993, "max_abs_max": 0.0004, "rel_l2_max": 0.011, "mag_ratio_error_max": 0.0005}
+    },
+    "grad.qkv.B": {
+      "observed": {"cos_min": 0.9999741, "max_abs_max": 0.00012207031, "rel_l2_max": 0.0073703368384608675, "mag_ratio_min": 1.0015613699791857, "mag_ratio_max": 1.0015613699791857},
+      "limits": {"cos_min": 0.999965, "max_abs_max": 0.00014, "rel_l2_max": 0.0078, "mag_ratio_error_max": 0.0018}
+    },
+    "grad.out_proj.A": {
+      "observed": {"cos_min": 0.9999811, "max_abs_max": 0.00006389618, "rel_l2_max": 0.0061484561734535675, "mag_ratio_min": 1.0001985097820867, "mag_ratio_max": 1.0001985097820867},
+      "limits": {"cos_min": 0.99997, "max_abs_max": 0.00007, "rel_l2_max": 0.0065, "mag_ratio_error_max": 0.0004}
+    },
+    "grad.out_proj.B": {
+      "observed": {"cos_min": 0.99996746, "max_abs_max": 0.00024414063, "rel_l2_max": 0.011470772875889322, "mag_ratio_min": 1.00811898581317, "mag_ratio_max": 1.00811898581317},
+      "limits": {"cos_min": 0.999955, "max_abs_max": 0.00027, "rel_l2_max": 0.0122, "mag_ratio_error_max": 0.0087}
+    },
+    "grad.fc1.A": {
+      "observed": {"cos_min": 0.9999952, "max_abs_max": 0.000030517578, "rel_l2_max": 0.0033174548476392098, "mag_ratio_min": 1.001165780307393, "mag_ratio_max": 1.001165780307393},
+      "limits": {"cos_min": 0.99999, "max_abs_max": 0.000035, "rel_l2_max": 0.0036, "mag_ratio_error_max": 0.0014}
+    },
+    "grad.fc1.B": {
+      "observed": {"cos_min": 0.99997014, "max_abs_max": 0.000015258789, "rel_l2_max": 0.007838789413573624, "mag_ratio_min": 1.0012691969837626, "mag_ratio_max": 1.0012691969837626},
+      "limits": {"cos_min": 0.99996, "max_abs_max": 0.000018, "rel_l2_max": 0.0083, "mag_ratio_error_max": 0.0015}
+    },
+    "grad.fc2.A": {
+      "observed": {"cos_min": 0.99995637, "max_abs_max": 0.00001335144, "rel_l2_max": 0.00940536873801449, "mag_ratio_min": 1.0010309383953624, "mag_ratio_max": 1.0010309383953624},
+      "limits": {"cos_min": 0.999945, "max_abs_max": 0.000015, "rel_l2_max": 0.01, "mag_ratio_error_max": 0.0013}
+    },
+    "grad.fc2.B": {
+      "observed": {"cos_min": 0.99993473, "max_abs_max": 0.000011444092, "rel_l2_max": 0.011974055510789162, "mag_ratio_min": 0.9963488420867684, "mag_ratio_max": 0.9963488420867684},
+      "limits": {"cos_min": 0.99992, "max_abs_max": 0.000014, "rel_l2_max": 0.0126, "mag_ratio_error_max": 0.004}
+    }
+  },
+  "required_runner": "bash serenitymojo/models/minimax_h3/parity/run_minimax_h3_training_block_bf16_flash_parity.sh",
+  "limitations": [
+    "DiT block core only with injected per-row modulation; not full DiTBlock",
+    "Reduced geometry only; not released-geometry Torch parity",
+    "QKV raw-checkpoint deinterleave is covered by the separate loader parity gate",
+    "No product, trainer, dataset, optimizer, INT8, or stack-readiness claim"
+  ]
+}

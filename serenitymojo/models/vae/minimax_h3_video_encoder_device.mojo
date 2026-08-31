@@ -202,25 +202,65 @@ struct MiniMaxH3VideoEncoderDevice(Movable):
     def load(
         dir: String, config: MiniMaxH3VideoEncoderDeviceConfig, ctx: DeviceContext
     ) raises -> MiniMaxH3VideoEncoderDevice:
-        """Preflight every expected tensor (presence only — shape/dtype
-        mismatches surface as loud errors from the ops that consume them),
-        then stream each into a device Tensor via `Tensor.from_view` (bf16 or
-        f32, whatever the checkpoint stores)."""
-        var shards = ShardedSafeTensors.open(dir)
-        var names = minimax_h3_video_encoder_key_names(config)
-        for i in range(len(names)):
-            if names[i] not in shards.name_to_shard:
-                raise Error(
-                    String("MiniMax-H3 video encoder device: missing weight ")
-                    + names[i] + " in " + dir
-                )
-        var weights = List[TArc]()
-        var name_to_idx = Dict[String, Int]()
-        for i in range(len(names)):
-            var t = Tensor.from_view(shards.tensor_view(names[i]), ctx)
-            name_to_idx[names[i]] = len(weights)
-            weights.append(TArc(t^))
-        return MiniMaxH3VideoEncoderDevice(weights^, name_to_idx^, config)
+        """Storage-preserving inference loader. F16/BF16/F32 checkpoint
+        tensors remain resident in their checkpoint dtype."""
+        return _load_minimax_h3_video_encoder_device(
+            dir, config, ctx, f32_compute=False,
+        )
+
+    @staticmethod
+    def load_f32_compute(
+        dir: String, config: MiniMaxH3VideoEncoderDeviceConfig, ctx: DeviceContext
+    ) raises -> MiniMaxH3VideoEncoderDevice:
+        """Explicit F32-compute loader for the pinned Musubi cache encoder.
+
+        Every supported F16/BF16/F32 checkpoint tensor becomes a resident F32
+        device Tensor. `Tensor.from_view_as_f32` performs the storage conversion
+        before upload, avoiding a second checkpoint-dtype device allocation.
+        This intentional F32 boundary is cache-encode-only; ordinary inference
+        keeps using the storage-preserving `load` API above.
+        """
+        return _load_minimax_h3_video_encoder_device(
+            dir, config, ctx, f32_compute=True,
+        )
+
+
+def _load_minimax_h3_video_encoder_device(
+    dir: String, config: MiniMaxH3VideoEncoderDeviceConfig,
+    ctx: DeviceContext, f32_compute: Bool,
+) raises -> MiniMaxH3VideoEncoderDevice:
+    """Shared loader body with complete host-side presence/dtype preflight."""
+    var shards = ShardedSafeTensors.open(dir)
+    var names = minimax_h3_video_encoder_key_names(config)
+    for i in range(len(names)):
+        var name = names[i]
+        if name not in shards.name_to_shard:
+            raise Error(
+                String("MiniMax-H3 video encoder device: missing weight ")
+                + name + " in " + dir
+            )
+        var dtype = shards.tensor_info(name).dtype
+        if (
+            dtype != STDtype.F16 and dtype != STDtype.BF16
+            and dtype != STDtype.F32
+        ):
+            raise Error(
+                String("MiniMax-H3 video encoder device: unsupported storage dtype ")
+                + dtype.name() + String(" for ") + name
+            )
+
+    var weights = List[TArc]()
+    var name_to_idx = Dict[String, Int]()
+    for i in range(len(names)):
+        var name = names[i]
+        var tensor: Tensor
+        if f32_compute:
+            tensor = Tensor.from_view_as_f32(shards.tensor_view(name), ctx)
+        else:
+            tensor = Tensor.from_view(shards.tensor_view(name), ctx)
+        name_to_idx[name] = len(weights)
+        weights.append(TArc(tensor^))
+    return MiniMaxH3VideoEncoderDevice(weights^, name_to_idx^, config)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -73,6 +73,7 @@
 !vendor/mojo-libs/ui/README.md
 *.mojopkg
 *.pyc
+serenitymojo/models/minimax_h3/parity/fixtures/*.safetensors
 __pycache__/
 .env
 .env.*

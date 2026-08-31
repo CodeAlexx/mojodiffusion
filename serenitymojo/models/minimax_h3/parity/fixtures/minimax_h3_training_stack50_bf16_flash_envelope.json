@@ -1,0 +1,94 @@
+{
+  "schema": "serenitymojo.minimax_h3.stack50_bf16_flash_envelope.v1",
+  "evidence": "exact-50 reduced mixed-dtype Torch-vs-Mojo DiT-core stack parity",
+  "oracle_commit": "b8717864713c9e4e7ef3d56eba1fc695a9b626a5",
+  "fixture_sha256": "7f98af1639d600776c3aea8e51f846dbf2208ab6b4713c949eb32114b5c80b6c",
+  "geometry": {"blocks": 50, "S": 3, "H": 56, "Dh": 8, "D": 8, "F": 12, "Rot": 4, "rank": 2},
+  "dtype": "BF16 base/input/mod/compute/y/dx; F32 LoRA leaves and 400 saved dA/dB tensors",
+  "fixture_generation": {
+    "fresh_processes": 3,
+    "byte_identical": true,
+    "digests": [
+      "7f98af1639d600776c3aea8e51f846dbf2208ab6b4713c949eb32114b5c80b6c",
+      "7f98af1639d600776c3aea8e51f846dbf2208ab6b4713c949eb32114b5c80b6c",
+      "7f98af1639d600776c3aea8e51f846dbf2208ab6b4713c949eb32114b5c80b6c"
+    ]
+  },
+  "device_envelope": {
+    "fresh_processes": 3,
+    "all_passed": true,
+    "all_metric_lines_identical": true,
+    "independent_tensor_checks": {"checkpoints": 51, "reverse_handoffs": 51, "adapters": 200, "adapter_gradient_tensors": 400}
+  },
+  "checkpoint_discipline": {
+    "saved_device_state": "51 BF16 residual-stream states (initial input plus every core output)",
+    "saved_internal_core_activations": 0,
+    "backward": "exact block49-to-block0 order; each core recomputes its attention/MLP internals; every returned d_x is compared to the Torch state gradient before becoming the next d_y"
+  },
+  "observed_class_envelope_and_limits": {
+    "checkpoint": {
+      "count": 51,
+      "observed": {"cos_min": 0.99997026, "max_abs_max": 0.0029296875, "rel_l2_max": 0.007873232048, "mag_ratio_error_max": 0.002182645825},
+      "limits": {"cos_min": 0.99996, "max_abs_max": 0.0033, "rel_l2_max": 0.0087, "mag_ratio_error_max": 0.0025}
+    },
+    "handoff": {
+      "count": 51,
+      "observed": {"cos_min": 0.9999687, "max_abs_max": 0.0014648438, "rel_l2_max": 0.008036870494, "mag_ratio_error_max": 0.001937989537},
+      "limits": {"cos_min": 0.999955, "max_abs_max": 0.0017, "rel_l2_max": 0.0089, "mag_ratio_error_max": 0.0023}
+    },
+    "grad.qkv.A": {
+      "count": 50,
+      "observed": {"cos_min": 0.99976647, "max_abs_max": 0.000022888184, "rel_l2_max": 0.02287336845, "mag_ratio_error_max": 0.01677935554},
+      "limits": {"cos_min": 0.99972, "max_abs_max": 0.000026, "rel_l2_max": 0.0255, "mag_ratio_error_max": 0.019}
+    },
+    "grad.qkv.B": {
+      "count": 50,
+      "observed": {"cos_min": 0.99959105, "max_abs_max": 0.000012397766, "rel_l2_max": 0.03856411222, "mag_ratio_error_max": 0.0254659898},
+      "limits": {"cos_min": 0.99952, "max_abs_max": 0.0000145, "rel_l2_max": 0.043, "mag_ratio_error_max": 0.029}
+    },
+    "grad.out_proj.A": {
+      "count": 50,
+      "observed": {"cos_min": 0.9997936, "max_abs_max": 0.0000038444996, "rel_l2_max": 0.02610780121, "mag_ratio_error_max": 0.02116718758},
+      "limits": {"cos_min": 0.99975, "max_abs_max": 0.0000045, "rel_l2_max": 0.029, "mag_ratio_error_max": 0.024}
+    },
+    "grad.out_proj.B": {
+      "count": 50,
+      "observed": {"cos_min": 0.9992842, "max_abs_max": 0.000015258789, "rel_l2_max": 0.04789868138, "mag_ratio_error_max": 0.03009636001},
+      "limits": {"cos_min": 0.9992, "max_abs_max": 0.000018, "rel_l2_max": 0.053, "mag_ratio_error_max": 0.034}
+    },
+    "grad.fc1.A": {
+      "count": 50,
+      "observed": {"cos_min": 0.99961, "max_abs_max": 0.00000059604645, "rel_l2_max": 0.02984587717, "mag_ratio_error_max": 0.01717828732},
+      "limits": {"cos_min": 0.99955, "max_abs_max": 0.0000007, "rel_l2_max": 0.033, "mag_ratio_error_max": 0.019}
+    },
+    "grad.fc1.B": {
+      "count": 50,
+      "observed": {"cos_min": 0.9997171, "max_abs_max": 0.00000071525574, "rel_l2_max": 0.02521342525, "mag_ratio_error_max": 0.02122184005},
+      "limits": {"cos_min": 0.99966, "max_abs_max": 0.00000085, "rel_l2_max": 0.028, "mag_ratio_error_max": 0.024}
+    },
+    "grad.fc2.A": {
+      "count": 50,
+      "observed": {"cos_min": 0.99968654, "max_abs_max": 0.00000071525574, "rel_l2_max": 0.02843242888, "mag_ratio_error_max": 0.02314408176},
+      "limits": {"cos_min": 0.99962, "max_abs_max": 0.00000085, "rel_l2_max": 0.0315, "mag_ratio_error_max": 0.026}
+    },
+    "grad.fc2.B": {
+      "count": 50,
+      "observed": {"cos_min": 0.9995862, "max_abs_max": 0.00000047683716, "rel_l2_max": 0.03300744642, "mag_ratio_error_max": 0.01789000851},
+      "limits": {"cos_min": 0.99952, "max_abs_max": 0.00000058, "rel_l2_max": 0.0365, "mag_ratio_error_max": 0.02}
+    }
+  },
+  "headline_tensors": {
+    "final.y": {"cos": 0.99997026, "max_abs": 0.0029296875, "rel_l2": 0.007873232048406897, "mag_ratio": 0.9983932244603592},
+    "initial.dx": {"cos": 0.9999691, "max_abs": 0.0014648438, "rel_l2": 0.008002939822172006, "mag_ratio": 0.9984562757445881}
+  },
+  "required_runner": "bash serenitymojo/models/minimax_h3/parity/run_minimax_h3_training_stack50_bf16_flash_parity.sh",
+  "limitations": [
+    "Reduced DiT-core geometry with injected modulation; not full DiTBlock",
+    "Torch oracle is a manual transcription against pinned Musubi contracts; source hashes are metadata provenance, not runtime source execution",
+    "Checkpoint discipline describes the Mojo gate only; Torch fixture generation uses ordinary autograd",
+    "All 51 inter-block residual boundaries are saved; no sparse inter-block checkpointing, block offload, streaming, or memory measurement",
+    "Tolerance envelope is a frozen local RTX 5080/driver observation, not cross-device stability evidence",
+    "No released weights or released sequence geometry",
+    "No AdaLN projection/gather, loader-boundary, product, dataset, trainer, optimizer, or stack-readiness claim"
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "dataset_identity": "eri_with_trigger",
+  "media_utils_sha256": "b3f99b70183eab2fac857eb96a74f01b6c00902abeacb6d6aa581c7d8977ceec",
+  "musubi_commit": "b8717864713c9e4e7ef3d56eba1fc695a9b626a5",
+  "numpy_version": "2.5.2",
+  "opencv_version": "4.10.0",
+  "pillow_version": "11.3.0",
+  "samples": [
+    {
+      "bucket_height": 1024,
+      "bucket_width": 1024,
+      "decoded_rgb_sha256": "sha256:d9d996ff5f085ccc0ad7c4080dad532003a67881f6a7784799e6633ddbee042c",
+      "prepared_rgb_sha256": "sha256:d9d996ff5f085ccc0ad7c4080dad532003a67881f6a7784799e6633ddbee042c",
+      "relative_path": "1.jpg",
+      "source_height": 1024,
+      "source_width": 1024
+    },
+    {
+      "bucket_height": 1248,
+      "bucket_width": 832,
+      "decoded_rgb_sha256": "sha256:d843756e70bd16b63ffdf9b988ead581d0abb64218cae292ec9e50edf5a4d13d",
+      "prepared_rgb_sha256": "sha256:0b833559aab78a9ba7630f0c05d812b2af9eceed0772e8211311e4365aaa5d64",
+      "relative_path": "1000154615.jpg",
+      "source_height": 931,
+      "source_width": 620
+    },
+    {
+      "bucket_height": 1056,
+      "bucket_width": 992,
+      "decoded_rgb_sha256": "sha256:c4e8ccc5688b798f63c9439924742f7e519bbbefcec607a119518593ce648cea",
+      "prepared_rgb_sha256": "sha256:194e6e96ea0cf990eb8bcae1d5c8ef08b2a82625fe6258687fa56e8a27a7936d",
+      "relative_path": "Screenshot from 2025-12-29 06-25-50.png",
+      "source_height": 1370,
+      "source_width": 1260
+    }
+  ],
+  "schema": "serenity.minimax_h3.real_image_preprocess.v1"
+}

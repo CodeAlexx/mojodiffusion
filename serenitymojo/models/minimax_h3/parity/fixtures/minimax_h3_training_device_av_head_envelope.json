@@ -1,0 +1,36 @@
+{
+  "schema": "minimax-h3-device-av-head-envelope-v1",
+  "fixture_sha256": "35aa2d4d40e36a51948b53d287a8184f037413525126063622670ac2123c2f95",
+  "oracle_commit": "b8717864713c9e4e7ef3d56eba1fc695a9b626a5",
+  "fresh_generation_sha256": [
+    "35aa2d4d40e36a51948b53d287a8184f037413525126063622670ac2123c2f95",
+    "35aa2d4d40e36a51948b53d287a8184f037413525126063622670ac2123c2f95",
+    "35aa2d4d40e36a51948b53d287a8184f037413525126063622670ac2123c2f95"
+  ],
+  "fresh_device_processes": 3,
+  "device_process_metrics_identical": true,
+  "observed": {
+    "video_x_t_rows": {"cos_min": 1.0, "max_abs_max": 1.1920929e-7, "rel_l2_max": 1.6766437951633886e-8, "mag_error_max": 1.609256e-9},
+    "audio_x_t_rows": {"cos_min": 1.0, "max_abs_max": 0.0, "rel_l2_max": 0.0, "mag_error_max": 0.0},
+    "head_video_prediction": {"cos_min": 0.99999654, "max_abs_max": 0.00390625, "rel_l2_max": 0.002662367802692681, "mag_error_max": 0.000416337055058},
+    "head_audio_prediction": {"cos_min": 0.9999942, "max_abs_max": 0.00390625, "rel_l2_max": 0.0034085567600163048, "mag_error_max": 0.000170922302467},
+    "video_loss_abs": 5.686283e-5,
+    "audio_loss_abs": 1.1765957e-4,
+    "total_loss_abs": 1.335144e-4,
+    "d_video": {"cos_min": 0.99999976, "max_abs_max": 4.0691346e-5, "rel_l2_max": 0.0007118185438614093, "mag_error_max": 2.0220292264e-5},
+    "d_audio": {"cos_min": 0.99999934, "max_abs_max": 3.967341e-5, "rel_l2_max": 0.0011442137770972054, "mag_error_max": 6.2369657221e-5},
+    "d_hidden": {"cos_min": 0.99998444, "max_abs_max": 0.00048828125, "rel_l2_max": 0.005687905503895455, "mag_error_max": 0.0011190716535872}
+  },
+  "frozen_limits": {
+    "video_x_t_rows": {"cos_min": 0.9999999, "max_abs": 1.4e-7, "rel_l2": 2.0e-8, "mag_error": 2.0e-8},
+    "head_video_prediction": {"cos_min": 0.999996, "max_abs": 0.0045, "rel_l2": 0.0031, "mag_error": 0.0005},
+    "head_audio_prediction": {"cos_min": 0.9999933, "max_abs": 0.0045, "rel_l2": 0.00395, "mag_error": 0.0002},
+    "video_loss_abs": 6.5e-5,
+    "audio_loss_abs": 1.35e-4,
+    "total_loss_abs": 1.53e-4,
+    "d_video": {"cos_min": 0.9999997, "max_abs": 4.7e-5, "rel_l2": 0.00082, "mag_error": 2.4e-5},
+    "d_audio": {"cos_min": 0.9999992, "max_abs": 4.6e-5, "rel_l2": 0.00132, "mag_error": 7.2e-5},
+    "d_hidden": {"cos_min": 0.999982, "max_abs": 0.00057, "rel_l2": 0.00655, "mag_error": 0.0013}
+  },
+  "scope": "Reduced hidden synthetic AV objective and ordinary frozen final-head root only; no released checkpoint, long-sequence chunked backward, dataset, trainer, or quality claim."
+}

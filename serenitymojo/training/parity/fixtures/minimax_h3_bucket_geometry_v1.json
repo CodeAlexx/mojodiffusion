@@ -1,0 +1,409 @@
+{
+  "cases": [
+    {
+      "mode": "bucket",
+      "source": [
+        1364,
+        2048
+      ],
+      "target": [
+        832,
+        1248
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1364,
+        2048
+      ],
+      "target": [
+        832,
+        1248
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1364,
+        2048
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1024,
+        1024
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1024,
+        1024
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1024,
+        1024
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1536,
+        1536
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1536,
+        1536
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1536,
+        1536
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        6336,
+        9520
+      ],
+      "target": [
+        832,
+        1248
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        6336,
+        9520
+      ],
+      "target": [
+        832,
+        1248
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        6336,
+        9520
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        9331,
+        6211
+      ],
+      "target": [
+        1248,
+        832
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        9331,
+        6211
+      ],
+      "target": [
+        1248,
+        832
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        9331,
+        6211
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1080,
+        1920
+      ],
+      "target": [
+        768,
+        1344
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1080,
+        1920
+      ],
+      "target": [
+        768,
+        1344
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1080,
+        1920
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1920,
+        1080
+      ],
+      "target": [
+        1344,
+        768
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1920,
+        1080
+      ],
+      "target": [
+        1344,
+        768
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1920,
+        1080
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        640,
+        480
+      ],
+      "target": [
+        1184,
+        864
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        640,
+        480
+      ],
+      "target": [
+        640,
+        480
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        640,
+        480
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        480,
+        640
+      ],
+      "target": [
+        864,
+        1184
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        480,
+        640
+      ],
+      "target": [
+        480,
+        640
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        480,
+        640
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1024,
+        1536
+      ],
+      "target": [
+        832,
+        1248
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1024,
+        1536
+      ],
+      "target": [
+        832,
+        1248
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1024,
+        1536
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1536,
+        1024
+      ],
+      "target": [
+        1248,
+        832
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1536,
+        1024
+      ],
+      "target": [
+        1248,
+        832
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1536,
+        1024
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "bucket",
+      "source": [
+        1000,
+        1001
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "mode": "no_upscale",
+      "source": [
+        1000,
+        1001
+      ],
+      "target": [
+        992,
+        992
+      ]
+    },
+    {
+      "mode": "fixed",
+      "source": [
+        1000,
+        1001
+      ],
+      "target": [
+        1024,
+        1024
+      ]
+    }
+  ],
+  "oracle_commit": "b8717864713c9e4e7ef3d56eba1fc695a9b626a5",
+  "resolution": [
+    1024,
+    1024
+  ],
+  "schema": "serenity.minimax_h3.bucket_geometry_oracle.v1",
+  "source_file": "src/musubi_tuner/dataset/bucket.py",
+  "source_sha256": "2cb4d4c1c74f3becb00070aac84597529cec1313865c9042a7149c2ae41cc1ed",
+  "step": 32
+}
